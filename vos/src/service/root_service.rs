@@ -22,7 +22,7 @@ use super::{
     BlobRef, CausalCallContext, CommittedImageStore, ConsistencyBase, ConsistencyMode,
     ContinuationSnapshot, CrdtChange, CrdtSyncEnvelope, DedupRecord, DeliveryRecord, DeviceSecret,
     DeviceSignerRefineHost, DirectIngress, DurableServiceStore, DurableStoreOpenError,
-    ExternalActorBinding, ExternalActorDirectory, Hash, ImportedBlob, ImportedProgram,
+    ExternalActorBinding, ExternalActorDirectory, ImportedBlob, ImportedProgram,
     LocalStoreReadError, LocalWorkRequest, LocalWorkScheduler, MemoryServiceHost,
     MemoryServiceStore, MessageRecord, MethodPolicy, Origin, PackageError, PackageRolePolicies,
     PreparedWork, ProductionTrust, ProductionTrustError, ProgramId, ProofArtifactStore,
@@ -1127,7 +1127,6 @@ pub struct LocalRootTreeService<B> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthorityUpgradePolicy {
     public_key: Vec<u8>,
-    actor_program: ProgramId,
     interfaces: super::Hash,
     role_policies: super::Hash,
     schemas: super::Hash,
@@ -1139,7 +1138,6 @@ impl AuthorityUpgradePolicy {
     fn from_package(package: &VosPackage) -> Self {
         Self {
             public_key: package.deployment_signature.public_key.clone(),
-            actor_program: package.manifest.actor_program,
             interfaces: package.manifest.interfaces_hash,
             role_policies: package.manifest.role_policies_hash,
             schemas: package.manifest.schemas_hash,
@@ -1152,8 +1150,7 @@ impl AuthorityUpgradePolicy {
         let candidate = Self::from_package(package);
         package.manifest.name == super::ROLE_AUTHORITY_INSTANCE_
             && package.deployment_signature.public_key == self.public_key
-            && (candidate.same_contract(self)
-                || (self.is_pre_access_contract() && candidate.is_access_contract()))
+            && candidate.same_contract(self)
     }
 
     fn same_contract(&self, other: &Self) -> bool {
@@ -1163,62 +1160,7 @@ impl AuthorityUpgradePolicy {
             && self.task_dependencies == other.task_dependencies
             && self.crdt == other.crdt
     }
-
-    fn is_pre_access_contract(&self) -> bool {
-        self.actor_program == PRE_ACCESS_AUTHORITY_PROGRAM
-            && self.interfaces == CANONICAL_EMPTY_INTERFACES
-            && self.role_policies == PRE_ACCESS_AUTHORITY_POLICIES
-            && self.schemas == PRE_ACCESS_AUTHORITY_SCHEMAS
-            && self.task_dependencies == CANONICAL_EMPTY_TASKS
-            && !self.crdt
-    }
-
-    fn is_access_contract(&self) -> bool {
-        self.actor_program == ACCESS_AUTHORITY_PROGRAM
-            && self.interfaces == CANONICAL_EMPTY_INTERFACES
-            && self.role_policies == ACCESS_AUTHORITY_POLICIES
-            && self.schemas == ACCESS_AUTHORITY_SCHEMAS
-            && self.task_dependencies == CANONICAL_EMPTY_TASKS
-            && !self.crdt
-    }
 }
-
-// One deliberately narrow pre-release migration edge. Package validation
-// binds these commitments to the actual PVM and generated policy/schema
-// bytes; the immutable space root must also sign the replacement. No other
-// authority contract expansion is accepted by the service proposal boundary.
-const PRE_ACCESS_AUTHORITY_PROGRAM: ProgramId = ProgramId([
-    0xa5, 0xd4, 0xef, 0xeb, 0xf5, 0xc0, 0xf3, 0xdb, 0xea, 0x9f, 0x04, 0x3a, 0x32, 0xfc, 0x2b, 0xfb,
-    0xa5, 0xa9, 0x6a, 0xaa, 0xbb, 0x7f, 0x32, 0x26, 0xb4, 0x1c, 0x73, 0xf5, 0x13, 0xdb, 0x1a, 0x24,
-]);
-const PRE_ACCESS_AUTHORITY_POLICIES: Hash = Hash([
-    0x06, 0x06, 0xf8, 0x35, 0x88, 0xa1, 0x44, 0x89, 0x8d, 0xbb, 0x9d, 0xbf, 0x3c, 0x9a, 0x95, 0x55,
-    0x4a, 0x75, 0xf6, 0xce, 0x73, 0x76, 0xe7, 0x2a, 0x77, 0x61, 0x43, 0x3a, 0xbf, 0xff, 0x8a, 0xf7,
-]);
-const PRE_ACCESS_AUTHORITY_SCHEMAS: Hash = Hash([
-    0x0b, 0xf1, 0x11, 0x91, 0xaf, 0x3d, 0x36, 0x27, 0xf9, 0xf6, 0x59, 0x50, 0x7b, 0x83, 0x97, 0xa0,
-    0xe5, 0xcd, 0xdb, 0x13, 0x14, 0xdb, 0xa9, 0x81, 0xad, 0x0c, 0xaf, 0xb2, 0x23, 0xcd, 0xe9, 0xe2,
-]);
-const ACCESS_AUTHORITY_PROGRAM: ProgramId = ProgramId([
-    0xac, 0xf7, 0xb0, 0x77, 0xcb, 0x57, 0x3c, 0x46, 0xdb, 0xd2, 0x29, 0x1e, 0xff, 0xad, 0x2d, 0xec,
-    0x52, 0x3c, 0xbd, 0x75, 0x84, 0xdd, 0x54, 0x50, 0x68, 0x93, 0x8d, 0x4e, 0x57, 0xd7, 0x7e, 0xd3,
-]);
-const ACCESS_AUTHORITY_POLICIES: Hash = Hash([
-    0x52, 0x29, 0xa0, 0xdd, 0xfc, 0x2f, 0x95, 0xc4, 0xf6, 0x66, 0x36, 0x0d, 0x42, 0x61, 0x59, 0x6b,
-    0x30, 0xee, 0xbd, 0xef, 0x02, 0x80, 0x6f, 0x9b, 0x32, 0x33, 0x24, 0x90, 0x85, 0x15, 0xb8, 0x55,
-]);
-const ACCESS_AUTHORITY_SCHEMAS: Hash = Hash([
-    0x5c, 0xfd, 0x36, 0x81, 0x80, 0x18, 0x28, 0x5d, 0x25, 0x19, 0x3b, 0x08, 0x4a, 0x81, 0xca, 0xf7,
-    0x00, 0x7f, 0x23, 0xed, 0xc3, 0x35, 0xf8, 0x0b, 0x93, 0x13, 0xad, 0x12, 0x56, 0x8a, 0xfd, 0x93,
-]);
-const CANONICAL_EMPTY_INTERFACES: Hash = Hash([
-    0x54, 0x90, 0xbf, 0xe5, 0xa0, 0xa0, 0x35, 0x00, 0xae, 0x8f, 0x1a, 0x62, 0x4a, 0xc1, 0xcd, 0xed,
-    0x4e, 0x62, 0x59, 0x94, 0x85, 0x9a, 0x79, 0x73, 0x9d, 0x19, 0x9d, 0x38, 0xa8, 0x78, 0xd7, 0x0c,
-]);
-const CANONICAL_EMPTY_TASKS: Hash = Hash([
-    0xb0, 0x75, 0xe7, 0x58, 0xea, 0x03, 0x8f, 0xc4, 0xee, 0xbb, 0xe0, 0xdf, 0x8e, 0x78, 0x4b, 0xdf,
-    0xb6, 0x95, 0x3d, 0x66, 0x9a, 0x3d, 0x48, 0xe5, 0x50, 0x8a, 0x81, 0xf1, 0x2e, 0xf9, 0x0f, 0x76,
-]);
 
 fn verify_ed25519_signature(public_key_wire: &[u8], message: &[u8], signature: &[u8]) -> bool {
     // `.vos` service deployment keys are the canonical libp2p Ed25519 public-key

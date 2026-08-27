@@ -3,9 +3,9 @@
 //! Ingress is intentionally separate from actor extensions. An adapter owns
 //! sockets, framing, TLS, authentication, limits, and shutdown. It hands the
 //! runtime only a canonical actor invocation plus an authenticated
-//! [`SubjectId`](crate::service::SubjectId). HTTP lives here; a future SSH
-//! adapter can reuse the same [`IngressHandle`](crate::node::IngressHandle)
-//! without becoming part of the actor DSL.
+//! [`SubjectId`](crate::service::SubjectId). HTTP and SSH reuse the same
+//! [`IngressHandle`](crate::node::IngressHandle), but retain independent
+//! framing, limits, and lifecycle without becoming part of the actor DSL.
 
 mod json;
 mod limits;
@@ -97,6 +97,7 @@ impl HttpIngressContext {
                 target,
                 payload.to_vec(),
                 proof_requested,
+                "http",
                 key,
             ),
             None => self

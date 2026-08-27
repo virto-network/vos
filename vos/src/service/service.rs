@@ -601,9 +601,9 @@ pub struct CommittedServiceSnapshot {
     /// proof bytes because duplicate routing resolves from the admission row.
     pub proof_artifacts: Vec<CommittedProofArtifact>,
     pub result_artifacts: Vec<CommittedResultArtifact>,
-    /// Host-owned state-machine contract used to produce this image. Legacy
-    /// snapshots without host mutations decode as `None`; newly written
-    /// snapshots always carry the current identity.
+    /// Host-owned state-machine contract used to produce this image. A
+    /// snapshot without host mutations uses `None`; newly written snapshots
+    /// always carry the current identity.
     pub host_state_machine: Option<super::Hash>,
 }
 

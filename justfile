@@ -100,15 +100,15 @@ refresh-bundled-registry:
 
 # Build a deliberately distinct, contract-compatible authority PVM for the
 # physical UpgradeActor rehearsal. Canonical release builds never enable
-# `migration-fixture` and must not be replaced through this recipe.
+# `upgrade-fixture` and must not be replaced through this recipe.
 build-authority-upgrade-candidate:
-    cd actors/space-authority; cargo +nightly actor --features migration-fixture
+    cd actors/space-authority; cargo +nightly actor --features upgrade-fixture
     cargo run -p vosx -- build \
       actors/space-authority/target/riscv64em-vos/release/space_authority.elf \
       --name space-authority \
       --out-dir target/bundled-space-authority
     @echo "candidate: target/bundled-space-authority/space-authority.pvm"
-    @echo "install only through a reviewed UpgradeActor migration"
+    @echo "install only through a reviewed UpgradeActor operation"
 
 # Reproduce the canonical authority through vosx's checkout-independent actor
 # build and require exact identity with the committed release artifact.

@@ -151,7 +151,7 @@ pub use actors::{
     IntraCap, IntraCapParseError, MAX_MEMBER_CREDENTIALS, MAX_MEMBER_ROLES, MAX_ROLE_CAPABILITIES,
     MAX_SPACE_ROLES, Message, NO_ROLES_MAP, NoRoles, RoleByte, RunResult, SpaceMemberRoles,
     SpaceRole, SpaceRoleDefinition, SpaceRoleMap, Yield, capability, default_space_roles,
-    ingress_credential_id, metadata, run_blocking, try_poll,
+    ingress_credential_id, metadata, run_blocking, ssh_credential_id, try_poll,
 };
 pub use actors::{Decode, Encode};
 pub use actors::{
@@ -204,6 +204,8 @@ pub mod node;
 
 #[cfg(feature = "http-ingress")]
 pub mod ingress;
+#[cfg(feature = "ssh-ingress")]
+pub mod ssh_ingress;
 
 /// Drive a future to completion on the current thread.
 ///

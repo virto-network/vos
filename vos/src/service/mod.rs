@@ -124,13 +124,13 @@ pub use wire::{DecodeError, ServiceWire};
 /// Identity of the canonical wire, package, store, continuation, and
 /// attestation contract. A contract change creates a new clean platform
 /// identity; no alternate decoder is retained.
-pub const PLATFORM_ID: Hash = Hash(*b"vos-platform-canonical-20260825!");
+pub const PLATFORM_ID: Hash = Hash(*b"vos-platform-canonical-20260827!");
 
 /// Replicated host state-machine contract. Unlike actor execution semantics,
 /// this identifies host-owned mutations performed around guest Accumulate.
-/// Every new Raft application entry carries it so an older voter refuses the
+/// Every new Raft application entry carries it so a mismatched voter refuses the
 /// entry before applying a different physical snapshot.
-pub const HOST_STATE_MACHINE_ID: Hash = Hash(*b"vos-host-sm-canonical-20260827!!");
+pub const HOST_STATE_MACHINE_ID: Hash = Hash(*b"vos-host-sm-canonical-ssh-rui!!!");
 
 /// Program identity of the canonical [`vos-service.pvm`](../../../services/vos-service/vos-service.pvm).
 ///
@@ -255,4 +255,4 @@ pub const PVM_REVISION: &str = "41d31e64b0f5d6c57a43769d7b8785556a311684";
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-semantics-cut001");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-semantics-sshrui");

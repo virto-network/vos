@@ -138,10 +138,10 @@ impl ProducerId {
 }
 
 impl InvocationId {
-    /// Marker reserved for HTTP mutations carrying a caller-owned
+    /// Marker reserved for ingress mutations carrying a caller-owned
     /// idempotency key. Only this namespace is eligible for bounded,
     /// host-retained response recovery after publication acknowledgement.
-    const HTTP_IDEMPOTENCY_PREFIX: [u8; 8] = *b"VOSHTTP!";
+    const INGRESS_IDEMPOTENCY_PREFIX: [u8; 8] = *b"VOSINGR!";
 
     /// Derive a stable invocation identifier from an application namespace and
     /// caller-provided nonce.
@@ -154,19 +154,30 @@ impl InvocationId {
         ))
     }
 
-    pub(crate) fn for_http_idempotency(subject: SubjectId, target: ActorId, key: &str) -> Self {
-        let mut nonce = alloc::vec::Vec::with_capacity(64 + key.len());
+    /// Derive the durable identity of one ingress operation. `ingress`
+    /// separates protocol namespaces; callers must reuse `key` only for the
+    /// exact same operation.
+    pub fn for_ingress_idempotency(
+        subject: SubjectId,
+        target: ActorId,
+        ingress: &str,
+        key: &[u8],
+    ) -> Self {
+        let mut nonce = alloc::vec::Vec::with_capacity(64 + ingress.len() + key.len() + 16);
         nonce.extend_from_slice(&subject.0);
         nonce.extend_from_slice(&target.0);
-        nonce.extend_from_slice(key.as_bytes());
-        let mut invocation = Self::derive(b"vos/http-ingress/idempotency-key", &nonce);
-        invocation.0[..Self::HTTP_IDEMPOTENCY_PREFIX.len()]
-            .copy_from_slice(&Self::HTTP_IDEMPOTENCY_PREFIX);
+        nonce.extend_from_slice(&(ingress.len() as u64).to_le_bytes());
+        nonce.extend_from_slice(ingress.as_bytes());
+        nonce.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        nonce.extend_from_slice(key);
+        let mut invocation = Self::derive(b"vos/ingress/idempotency-key", &nonce);
+        invocation.0[..Self::INGRESS_IDEMPOTENCY_PREFIX.len()]
+            .copy_from_slice(&Self::INGRESS_IDEMPOTENCY_PREFIX);
         invocation
     }
 
     pub(crate) fn retains_idempotent_result(self) -> bool {
-        self.0.starts_with(&Self::HTTP_IDEMPOTENCY_PREFIX)
+        self.0.starts_with(&Self::INGRESS_IDEMPOTENCY_PREFIX)
     }
 
     /// The nth await in an invocation always derives the same call id. Retries

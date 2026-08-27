@@ -704,7 +704,7 @@ fn authority_upgrade_package_fixture(
     assert_ne!(
         candidate.manifest.actor_program,
         vos::service::ProgramId::of_pvm(&frozen),
-        "the migration gate must exercise a real authority code change",
+        "the upgrade gate must exercise a real authority code change",
     );
     package
 }
@@ -1572,7 +1572,7 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
     );
     assert!(
         authority_retry.contains("upgraded space-authority"),
-        "an exact authority migration retry must recover the durable disposition: {authority_retry}",
+        "an exact authority upgrade retry must recover the durable disposition: {authority_retry}",
     );
 
     let package_source = package.to_string_lossy().into_owned();

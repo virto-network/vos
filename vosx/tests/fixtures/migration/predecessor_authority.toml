@@ -1,8 +1,0 @@
-source_revision = "ad459011a0803538eaeda5418bd9ddc5e12bcdd6"
-image_blake2b_256 = "82b603c12264140d39618724aa4f66d6d484e8a0cdea7e6caaa89c29dccb6fc2"
-raft_blake2b_256 = "d50cccc810cadd9ae564169ef062ce865fdef9f08e39b2cda3af04eb2c420c24"
-package_blake2b_256 = "48d2cfc21d68e7a2ed811c1f06c4793ff040f69b9a5819e9e24d0761f2e9f3f2"
-
-# These files were produced by the predecessor revision itself after a
-# production-trust Raft genesis commit. The migration test decompresses the
-# exact image and database before opening them with the current daemon.

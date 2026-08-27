@@ -88,11 +88,13 @@ pub struct LocalConfig {
 pub struct IngressLocal {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http: Vec<HttpIngressLocal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh: Vec<SshIngressLocal>,
 }
 
 impl IngressLocal {
     fn is_empty(&self) -> bool {
-        self.http.is_empty()
+        self.http.is_empty() && self.ssh.is_empty()
     }
 }
 
@@ -107,6 +109,25 @@ pub struct HttpIngressLocal {
     pub tls_key: Option<String>,
     #[serde(default = "default_http_max_connections")]
     pub max_connections: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SshIngressLocal {
+    pub name: String,
+    pub listen: String,
+    #[serde(default = "default_ssh_max_connections")]
+    pub max_connections: usize,
+    #[serde(default = "default_ssh_max_sessions_per_member")]
+    pub max_sessions_per_member: usize,
+}
+
+fn default_ssh_max_connections() -> usize {
+    128
+}
+
+fn default_ssh_max_sessions_per_member() -> usize {
+    4
 }
 
 fn default_http_max_connections() -> usize {
@@ -357,6 +378,12 @@ mod tests {
                     tls_cert: None,
                     tls_key: None,
                     max_connections: 32,
+                }],
+                ssh: vec![SshIngressLocal {
+                    name: "shell".into(),
+                    listen: "127.0.0.1:2222".into(),
+                    max_connections: 16,
+                    max_sessions_per_member: 2,
                 }],
             },
             extensions: vec![ExtensionLocal {

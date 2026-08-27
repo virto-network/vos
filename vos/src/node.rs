@@ -154,9 +154,10 @@ const SERVICE_LOCAL_INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 fn ingress_invocation_id(
     subject: crate::service::SubjectId,
     target: crate::service::ActorId,
+    ingress: &str,
     key: &str,
 ) -> crate::service::InvocationId {
-    crate::service::InvocationId::for_http_idempotency(subject, target, key)
+    crate::service::InvocationId::for_ingress_idempotency(subject, target, ingress, key.as_bytes())
 }
 
 fn receive_service_invocation_reply(
@@ -1201,7 +1202,7 @@ pub struct VosNode {
     /// Built-in ingress listeners are host infrastructure, not actors. Their
     /// threads share the node shutdown signal and are joined before routes are
     /// torn down.
-    #[cfg(feature = "http-ingress")]
+    #[cfg(any(feature = "http-ingress", feature = "ssh-ingress"))]
     ingress_threads: Vec<thread::JoinHandle<()>>,
     /// Content-addressed store for large opaque blobs (today: STARK
     /// proof bodies; future: any payload too big to ride inline
@@ -1905,7 +1906,10 @@ pub struct InvokeHandle {
 /// keeps bearer material outside actor arguments and preserves the same member
 /// origin through local, CRDT, and Raft execution.
 #[derive(Clone)]
-#[cfg_attr(not(feature = "http-ingress"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "http-ingress", feature = "ssh-ingress")),
+    allow(dead_code)
+)]
 pub struct IngressHandle {
     invoke_routes: InvokeRoutes,
     service_actor_routes: Arc<RwLock<HashMap<crate::service::ActorId, ActorRoute>>>,
@@ -1923,7 +1927,10 @@ pub enum IngressAuthenticationError {
     AuthorityUnavailable,
 }
 
-#[cfg_attr(not(feature = "http-ingress"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "http-ingress", feature = "ssh-ingress")),
+    allow(dead_code)
+)]
 impl IngressHandle {
     /// Resolve a locally catalogued service root by its operator-visible name.
     /// Remote aliases are intentionally excluded: ingress listeners are
@@ -1941,6 +1948,17 @@ impl IngressHandle {
                 .is_some_and(|candidate| candidate == name)
                 .then_some(*actor)
         })
+    }
+
+    /// Return the authenticated space identity owning one attached actor.
+    /// Ingress adapters use this only to derive space-scoped identifiers;
+    /// actor routing still binds the complete service identity separately.
+    pub fn actor_space(&self, actor: crate::service::ActorId) -> Option<crate::service::SpaceId> {
+        self.service_actor_routes
+            .read()
+            .ok()?
+            .get(&actor)
+            .map(|route| route.service.space)
     }
 
     /// Invoke one canonical actor as an already-authenticated member.
@@ -1969,9 +1987,10 @@ impl IngressHandle {
         target: crate::service::ActorId,
         arguments: Vec<u8>,
         proof_requested: bool,
+        ingress: &str,
         key: &str,
     ) -> Result<Vec<u8>, crate::actors::client::ClientError> {
-        let invocation = ingress_invocation_id(subject, target, key);
+        let invocation = ingress_invocation_id(subject, target, ingress, key);
         self.invoke_actor_wire(
             crate::actors::Caller::Member(subject),
             target,
@@ -2025,6 +2044,16 @@ impl IngressHandle {
         (status.credential_id == credential_id)
             .then_some(status)
             .ok_or(IngressAuthenticationError::Invalid)
+    }
+
+    /// Resolve one canonical SSH public-key encoding against the same live
+    /// authority used by bearer ingress.
+    #[cfg(feature = "ssh-ingress")]
+    pub fn authenticate_ssh_public_key(
+        &self,
+        public_key: &[u8],
+    ) -> Result<crate::IngressAccessStatus, IngressAuthenticationError> {
+        self.authenticate_credential(crate::ssh_credential_id(public_key))
     }
 
     fn invoke_actor_wire(
@@ -4495,7 +4524,7 @@ impl VosNode {
             manifest: Arc::new(OnceLock::new()),
             #[cfg(all(feature = "network", feature = "storage"))]
             sync_threads: Vec::new(),
-            #[cfg(feature = "http-ingress")]
+            #[cfg(any(feature = "http-ingress", feature = "ssh-ingress"))]
             ingress_threads: Vec::new(),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,
@@ -6894,6 +6923,17 @@ impl VosNode {
         Ok(())
     }
 
+    /// Bind one built-in SSH space-shell listener.
+    #[cfg(feature = "ssh-ingress")]
+    pub fn add_ssh_ingress(
+        &mut self,
+        config: crate::ssh_ingress::SshIngressConfig,
+    ) -> Result<(), crate::ssh_ingress::SshIngressError> {
+        let thread = crate::ssh_ingress::start(config, self.ingress_handle())?;
+        self.ingress_threads.push(thread);
+        Ok(())
+    }
+
     /// Clone of the outbox sender. Pushing an [`Envelope`] here
     /// runs it through [`route`](Self::route) — the same path
     /// agent threads use for outgoing transfers — so addresses
@@ -7616,7 +7656,7 @@ impl VosNode {
         // Fan the node-wide shutdown out to every per-agent flag
         // so agent threads polling their OWN flag exit cleanly.
         self.signal_node_shutdown();
-        #[cfg(feature = "http-ingress")]
+        #[cfg(any(feature = "http-ingress", feature = "ssh-ingress"))]
         for thread in self.ingress_threads.drain(..) {
             let _ = thread.join();
         }
@@ -13797,20 +13837,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_idempotency_identity_is_stable_and_caller_scoped() {
+    fn ingress_idempotency_identity_is_stable_and_protocol_scoped() {
         let target = crate::service::ActorId([3; 32]);
-        let first = ingress_invocation_id(crate::service::SubjectId([1; 32]), target, "request-7");
+        let first = ingress_invocation_id(
+            crate::service::SubjectId([1; 32]),
+            target,
+            "http",
+            "request-7",
+        );
         assert_eq!(
             first,
-            ingress_invocation_id(crate::service::SubjectId([1; 32]), target, "request-7"),
+            ingress_invocation_id(
+                crate::service::SubjectId([1; 32]),
+                target,
+                "http",
+                "request-7",
+            ),
         );
         assert_ne!(
             first,
-            ingress_invocation_id(crate::service::SubjectId([2; 32]), target, "request-7"),
+            ingress_invocation_id(
+                crate::service::SubjectId([2; 32]),
+                target,
+                "http",
+                "request-7",
+            ),
         );
         assert_ne!(
             first,
-            ingress_invocation_id(crate::service::SubjectId([1; 32]), target, "request-8"),
+            ingress_invocation_id(
+                crate::service::SubjectId([1; 32]),
+                target,
+                "http",
+                "request-8",
+            ),
+        );
+        assert_ne!(
+            first,
+            ingress_invocation_id(
+                crate::service::SubjectId([1; 32]),
+                target,
+                "ssh",
+                "request-7",
+            ),
         );
         assert!(first.retains_idempotent_result());
         assert!(

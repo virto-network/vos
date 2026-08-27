@@ -1116,6 +1116,7 @@ mod tests {
             timeout_ms: 0,
             mode: 0,
             attested: false,
+            capability: None,
             space_role: None,
             actor_role: None,
         };
@@ -1137,6 +1138,7 @@ mod tests {
             timeout_ms: 0,
             mode: 0,
             attested: false,
+            capability: None,
             space_role: None,
             actor_role: None,
         }

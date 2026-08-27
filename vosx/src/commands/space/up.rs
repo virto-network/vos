@@ -39,26 +39,12 @@ pub struct Args {
 #[derive(Clone)]
 struct PinnedService {
     current: std::sync::Arc<Vec<u8>>,
-    predecessor: std::sync::Arc<Vec<u8>>,
 }
-
-const PREDECESSOR_SERVICE_PROGRAM_ID: vos::service::ProgramId = vos::service::ProgramId([
-    0x84, 0xe5, 0xf7, 0x05, 0x9f, 0xa0, 0x87, 0x9b, 0x11, 0xcc, 0xcc, 0x23, 0xc4, 0xf8, 0x23, 0x25,
-    0xb8, 0x4d, 0x44, 0x81, 0x9a, 0xe4, 0xa9, 0x85, 0xae, 0x2d, 0x59, 0xcc, 0xcb, 0xf2, 0xc0, 0x3b,
-]);
-
-const PREDECESSOR_AUTHORITY_DEPLOYMENT: vos::service::DeploymentId = vos::service::DeploymentId([
-    0x12, 0xd0, 0x7c, 0x21, 0xae, 0x70, 0xb1, 0xc4, 0x34, 0xa7, 0x9e, 0x13, 0x26, 0xc8, 0xac, 0x7c,
-    0x18, 0x54, 0xfe, 0xf0, 0x13, 0xa2, 0xf4, 0xb4, 0x2d, 0x74, 0xd0, 0x5f, 0x79, 0x4d, 0x66, 0xa8,
-]);
 
 impl PinnedService {
     fn for_program(&self, program: vos::service::ProgramId) -> anyhow::Result<Vec<u8>> {
         if program == vos::service::VOS_SERVICE_PROGRAM_ID {
             return Ok(self.current.as_ref().clone());
-        }
-        if program == PREDECESSOR_SERVICE_PROGRAM_ID {
-            return Ok(self.predecessor.as_ref().clone());
         }
         anyhow::bail!(
             "signed package requires unsupported service ProgramId {}",
@@ -86,23 +72,8 @@ fn load_pinned_service_service(path: Option<&Path>) -> anyhow::Result<Option<Pin
     }
     vos::service::ServicePvm::new(pvm.clone(), vos::service::VOS_SERVICE_PROGRAM_ID)
         .map_err(|error| anyhow::anyhow!("invalid generic service PVM: {error}"))?;
-    let predecessor = vos::service::transpile_service_elf(include_bytes!(
-        "../../../blobs/vos_service_predecessor.elf"
-    ))
-    .map_err(|error| anyhow::anyhow!("transpile predecessor service ELF: {error:?}"))?;
-    let predecessor_program = vos::service::ProgramId::of_pvm(&predecessor);
-    if predecessor_program != PREDECESSOR_SERVICE_PROGRAM_ID {
-        anyhow::bail!(
-            "bundled predecessor service has ProgramId {}, expected {}",
-            hex::encode(predecessor_program.0),
-            hex::encode(PREDECESSOR_SERVICE_PROGRAM_ID.0),
-        );
-    }
-    vos::service::ServicePvm::new(predecessor.clone(), PREDECESSOR_SERVICE_PROGRAM_ID)
-        .map_err(|error| anyhow::anyhow!("invalid predecessor service PVM: {error}"))?;
     Ok(Some(PinnedService {
         current: std::sync::Arc::new(pvm),
-        predecessor: std::sync::Arc::new(predecessor),
     }))
 }
 
@@ -315,7 +286,7 @@ fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::
         // The replication incarnation is the immutable authority binding,
         // not a function of the latest package. Existing spaces deliberately
         // keep it across an explicit `space upgrade`; publishing the current
-        // package here makes that migration available without rewriting the
+        // package here makes that upgrade available without rewriting the
         // catalog ahead of the guest-owned UpgradeActor transition.
         return Ok(());
     }
@@ -634,6 +605,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     )?;
 
     register_http_ingress_from_local(&mut node, &local_cfg)?;
+    register_ssh_ingress_from_local(&mut node, &local_cfg, &data_dir)?;
 
     // The space creator's operator key is granted ADMIN at genesis
     // (a signed `grant_role` baked into the DAG by `space new`),
@@ -1030,6 +1002,49 @@ fn register_http_ingress_from_local(
             max_connections: listener.max_connections,
         })?;
         tracing::info!(name = %listener.name, %listen, "HTTP ingress listening");
+    }
+    Ok(())
+}
+
+fn register_ssh_ingress_from_local(
+    node: &mut VosNode,
+    cfg: &subscriptions::LocalConfig,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::net::SocketAddr;
+
+    let mut names = std::collections::BTreeSet::new();
+    for listener in &cfg.ingress.ssh {
+        if listener.name.is_empty()
+            || !listener
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            anyhow::bail!(
+                "SSH ingress name '{}' must contain only ASCII letters, digits, '-' or '_'",
+                listener.name
+            );
+        }
+        if !names.insert(listener.name.as_str()) {
+            anyhow::bail!("duplicate SSH ingress name '{}'", listener.name);
+        }
+        let listen: SocketAddr = listener
+            .listen
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid SSH ingress listen address: {error}"))?;
+        let host_key = data_dir
+            .join("private/ssh")
+            .join(&listener.name)
+            .join("host_ed25519");
+        node.add_ssh_ingress(vos::ssh_ingress::SshIngressConfig {
+            name: listener.name.clone(),
+            listen,
+            host_key,
+            max_connections: listener.max_connections,
+            max_sessions_per_member: listener.max_sessions_per_member,
+        })?;
+        tracing::info!(name = %listener.name, %listen, "SSH space shell listening");
     }
     Ok(())
 }
@@ -1870,19 +1885,7 @@ pub(super) fn validate_role_authority_deployment(
         && package.schemas == frozen.schemas
         && package.task_dependencies == frozen.task_dependencies
         && package.manifest.crdt == frozen.manifest.crdt;
-    let predecessor_contract = package.manifest.service_program == PREDECESSOR_SERVICE_PROGRAM_ID
-        && hex::encode(package.manifest.actor_program.0)
-            == "a5d4efebf5c0f3dbea9f043a32fc2bfba5a96aaabb7f3226b41c73f513db1a24"
-        && hex::encode(package.manifest.interfaces_hash.0)
-            == "5490bfe5a0a03500ae8f1a624ac1cded4e625994859a79739d199d38a878d70c"
-        && hex::encode(package.manifest.role_policies_hash.0)
-            == "0606f83588a144898dbb9dbf3c9a95554a75f6ce7376e72a7761433abfff8af7"
-        && hex::encode(package.manifest.schemas_hash.0)
-            == "0bf11191af3d3627f9f659507b8397a0e5cddb1314dba981ad0cafb223cde9e2"
-        && hex::encode(package.manifest.task_dependencies_hash.0)
-            == "b075e758ea038fc4eebbe0df8e784bdfb6953d669a3d48e5508a81f12ef90f76"
-        && !package.manifest.crdt;
-    if !current_contract && !predecessor_contract {
+    if !current_contract {
         anyhow::bail!("space-authority package changes the canonical platform contract");
     }
     let deployment_key =
@@ -1907,39 +1910,26 @@ pub(super) fn validate_role_authority_deployment(
         .map(|method| (method.method.as_str(), method.public, method.attested))
         .collect::<Vec<_>>();
     methods.sort_unstable();
-    let expected_methods = if predecessor_contract {
-        vec![
-            (vos::service::ROLE_AUTHORITY_DECISION_METHOD_, true, false),
-            (vos::service::ROLE_AUTHORITY_MUTATION_METHOD_, true, false),
-            (vos::service::ROLE_AUTHORITY_INVITE_METHOD_, true, false),
-            (
-                vos::service::ROLE_AUTHORITY_INVITE_REVOKE_METHOD_,
-                true,
-                false,
-            ),
-        ]
-    } else {
-        vec![
-            ("authenticate_access", true, false),
-            (vos::service::ROLE_AUTHORITY_DECISION_METHOD_, true, false),
-            ("delete_role", true, false),
-            ("issue_access", true, false),
-            ("list_access", true, false),
-            ("list_member_roles", true, false),
-            ("list_roles", true, false),
-            (vos::service::ROLE_AUTHORITY_MUTATION_METHOD_, true, false),
-            ("put_role", true, false),
-            (vos::service::ROLE_AUTHORITY_INVITE_METHOD_, true, false),
-            ("revoke_access", true, false),
-            (
-                vos::service::ROLE_AUTHORITY_INVITE_REVOKE_METHOD_,
-                true,
-                false,
-            ),
-            ("revoke_member_roles", true, false),
-            ("set_member_roles", true, false),
-        ]
-    };
+    let expected_methods = vec![
+        ("authenticate_access", true, false),
+        (vos::service::ROLE_AUTHORITY_DECISION_METHOD_, true, false),
+        ("delete_role", true, false),
+        ("issue_access", true, false),
+        ("list_access", true, false),
+        ("list_member_roles", true, false),
+        ("list_roles", true, false),
+        (vos::service::ROLE_AUTHORITY_MUTATION_METHOD_, true, false),
+        ("put_role", true, false),
+        (vos::service::ROLE_AUTHORITY_INVITE_METHOD_, true, false),
+        ("revoke_access", true, false),
+        (
+            vos::service::ROLE_AUTHORITY_INVITE_REVOKE_METHOD_,
+            true,
+            false,
+        ),
+        ("revoke_member_roles", true, false),
+        ("set_member_roles", true, false),
+    ];
     if methods != expected_methods {
         anyhow::bail!(
             "space-authority package exposes a non-canonical method policy surface: {methods:?}"
@@ -2002,11 +1992,7 @@ fn resolve_service_role_authority_with(
                 // Actor upgrades preserve the authority service account's
                 // genesis identity. Dependent roots bind that stable service
                 // identity, not the catalog's current actor deployment.
-                deployment: if package.manifest.service_program == PREDECESSOR_SERVICE_PROGRAM_ID {
-                    PREDECESSOR_AUTHORITY_DEPLOYMENT
-                } else {
-                    frozen_role_authority_deployment()?
-                },
+                deployment: frozen_role_authority_deployment()?,
                 service_program: package.manifest.service_program,
                 platform: vos::service::PLATFORM_ID,
                 execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
@@ -3882,259 +3868,49 @@ fn sweep_orphan_service_services(
 mod tests {
     use super::*;
 
-    fn pinned_service(pvm: Vec<u8>) -> PinnedService {
-        let pvm = std::sync::Arc::new(pvm);
-        PinnedService {
-            current: pvm.clone(),
-            predecessor: pvm,
-        }
-    }
-
-    fn migration_pinned_service() -> PinnedService {
-        let current = std::fs::read(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm"),
-        )
-        .unwrap();
-        let predecessor = vos::service::transpile_service_elf(include_bytes!(
-            "../../../blobs/vos_service_predecessor.elf"
-        ))
-        .unwrap();
-        assert_eq!(
-            vos::service::ProgramId::of_pvm(&predecessor),
-            PREDECESSOR_SERVICE_PROGRAM_ID
-        );
-        PinnedService {
-            current: std::sync::Arc::new(current),
-            predecessor: std::sync::Arc::new(predecessor),
-        }
-    }
-
-    fn inflate_predecessor_fixture(bytes: &[u8], destination: &Path) {
-        let mut decoder = flate2::read::GzDecoder::new(bytes);
-        let mut file = std::fs::File::create(destination).unwrap();
-        std::io::copy(&mut decoder, &mut file).unwrap();
-        file.sync_all().unwrap();
-    }
-
-    fn assert_fixture_digest(path: &Path, expected: &str) {
-        let bytes = std::fs::read(path).unwrap();
-        assert_eq!(hex::encode(BlobHash::of(&bytes).0), expected);
-    }
-
     #[test]
-    fn predecessor_authority_physically_upgrades_and_reopens() {
-        use vos::service::ServiceWire as _;
-
-        let predecessor_bytes =
-            include_bytes!("../../../tests/fixtures/migration/space_authority_predecessor.vos")
-                .to_vec();
-        let provenance =
-            include_str!("../../../tests/fixtures/migration/predecessor_authority.toml")
-                .parse::<toml::Value>()
-                .unwrap();
-        assert_eq!(
-            provenance["source_revision"].as_str().unwrap(),
-            "ad459011a0803538eaeda5418bd9ddc5e12bcdd6"
-        );
-        assert_eq!(
-            hex::encode(BlobHash::of(&predecessor_bytes).0),
-            provenance["package_blake2b_256"].as_str().unwrap()
-        );
-        let predecessor = vos::service::VosPackage::decode(&predecessor_bytes).unwrap();
-        assert_eq!(
-            predecessor.manifest.service_program,
-            PREDECESSOR_SERVICE_PROGRAM_ID
-        );
-        let root = libp2p::identity::Keypair::ed25519_from_bytes([7; 32]).unwrap();
-        let root_peer = libp2p::PeerId::from(root.public()).to_bytes();
-        validate_role_authority_deployment(&predecessor, &root_peer, Consistency::Raft).unwrap();
-
+    fn ssh_listener_creates_a_private_space_owned_host_key() {
         let directory = std::env::temp_dir().join(format!(
-            "vos-authority-migration-{}-{}",
+            "vosx-ssh-ingress-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
         ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let image = directory.join("authority.image");
-        let raft_path = directory.join("authority.raft.redb");
-        inflate_predecessor_fixture(
-            include_bytes!("../../../tests/fixtures/migration/authority.image.gz"),
-            &image,
-        );
-        inflate_predecessor_fixture(
-            include_bytes!("../../../tests/fixtures/migration/authority.raft.redb.gz"),
-            &raft_path,
-        );
-        assert_fixture_digest(&image, provenance["image_blake2b_256"].as_str().unwrap());
-        assert_fixture_digest(&raft_path, provenance["raft_blake2b_256"].as_str().unwrap());
-        let space_id = [0x61; 32];
-        let mut row = vos::registry::AgentRow {
-            instance_name: vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
-            program_hash: BlobHash::of(&predecessor_bytes).0,
-            program_name: vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
-            replication_id: [0x62; 32],
-            consistency: Consistency::Raft as u8,
-            network_reachable: false,
-            sync_role: vos::registry::SyncFloor::Member,
+        let mut node = VosNode::with_prefix(0x7a01);
+        let local = subscriptions::LocalConfig {
+            ingress: subscriptions::IngressLocal {
+                ssh: vec![subscriptions::SshIngressLocal {
+                    name: "space-shell".into(),
+                    listen: "127.0.0.1:0".into(),
+                    max_connections: 4,
+                    max_sessions_per_member: 2,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
         };
-        let pinned = migration_pinned_service();
-        let RowConfig::Service { config, .. } = service_config_from_row(
-            &directory,
-            space_id,
-            &row,
-            std::slice::from_ref(&row),
-            &AgentPolicies::new(),
-            Consistency::Raft,
-            predecessor_bytes.clone(),
-            Some(&pinned),
-            &root_peer,
-        )
-        .unwrap() else {
-            panic!("predecessor authority did not resolve")
-        };
-        let predecessor_config = *config;
-        let expected_actor = predecessor_config.root_actor;
-        let trust = std::sync::Arc::new(AllowProductionTrust(Hash([0x63; 32])));
-        let log = vos::raft::service::RaftAccumulateLog::open(
-            &raft_path,
-            vos::raft::RaftConfig::default(),
-        )
-        .unwrap();
-        let mut service = vos::service::LocalRootTreeService::open_raft_production(
-            predecessor_config,
-            vos::service::FileCommittedImageStore::new(image.clone()),
-            log,
-            trust.clone(),
-        )
-        .expect("current code opens the physical predecessor production Raft image and log");
-        assert_eq!(
-            service.store().header().unwrap().unwrap().consistency,
-            vos::service::ConsistencyMode::Raft,
-        );
+        register_ssh_ingress_from_local(&mut node, &local, &directory).unwrap();
+        let host_key = directory.join("private/ssh/space-shell/host_ed25519");
+        assert!(host_key.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&host_key).unwrap().permissions().mode() & 0o777,
+                0o600,
+            );
+        }
+        node.shutdown();
+        let _ = node.collect();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
-        let successor =
-            root_signed_role_authority_package_for_service(&root, PREDECESSOR_SERVICE_PROGRAM_ID)
-                .unwrap();
-        validate_role_authority_deployment(&successor, &root_peer, Consistency::Raft).unwrap();
-        let result = service
-            .upgrade_root(vos::service::RootTreeUpgradeRequest {
-                expected_deployment: predecessor.deployment_id(),
-                expected_program: predecessor.manifest.actor_program,
-                replacement: successor.clone(),
-            })
-            .unwrap();
-        assert!(matches!(
-            result,
-            vos::service::AccumulationResult::ActorUpgraded { actor, .. }
-                if actor == expected_actor
-        ));
-        drop(service);
-
-        let successor_bytes = successor.encode();
-        row.program_hash = BlobHash::of(&successor_bytes).0;
-        let RowConfig::Service { config, .. } = service_config_from_row(
-            &directory,
-            space_id,
-            &row,
-            std::slice::from_ref(&row),
-            &AgentPolicies::new(),
-            Consistency::Raft,
-            successor_bytes,
-            Some(&pinned),
-            &root_peer,
-        )
-        .unwrap() else {
-            panic!("upgraded authority did not resolve")
-        };
-        let successor_config = *config;
-        let log = vos::raft::service::RaftAccumulateLog::open(
-            &raft_path,
-            vos::raft::RaftConfig::default(),
-        )
-        .unwrap();
-        let mut reopened = vos::service::LocalRootTreeService::open_raft_production(
-            successor_config.clone(),
-            vos::service::FileCommittedImageStore::new(image.clone()),
-            log,
-            trust.clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            reopened.identity().service_program,
-            PREDECESSOR_SERVICE_PROGRAM_ID
-        );
-        assert_eq!(reopened.identity().deployment, predecessor.deployment_id());
-
-        // Exercise a method which did not exist in the predecessor contract.
-        // The call mutates the upgraded authority's storage, is acknowledged
-        // through the predecessor service guest, and must still recover its
-        // exact result after another production Raft reopen.
-        let credential_id = [0x64_u8; 32];
-        let message = vos::value::Msg::new("issue_access")
-            .with("credential_id", credential_id.to_vec())
-            .with("role", vos::SpaceRole::Member as u8)
-            .with("expires_at", 10_000_u64);
-        let mut arguments = vec![vos::value::TAG_DYNAMIC];
-        arguments.extend_from_slice(&vos::Encode::encode(&message));
-        let mut invocation = [0x65; 32];
-        invocation[..8].copy_from_slice(b"VOSHTTP!");
-        let request = vos::service::LocalWorkRequest {
-            invocation: vos::service::InvocationId(invocation),
-            workflow_step: 0,
-            logical_timeslot: 100,
-            target: expected_actor,
-            method: "issue_access".into(),
-            arguments,
-            origin: vos::service::Origin::Member(vos::service::SubjectId::of_authenticated_peer(
-                &root_peer,
-            )),
-            authorization: vos::service::AuthorizationEvidence::Public,
-            causal_parent: None,
-            parent_call: None,
-            causal_context: None,
-            awaited_reply: None,
-            awaited_timeout: None,
-            imported_blobs: vec![],
-            proof_requested: false,
-        };
-        let issued = reopened
-            .invoke(request.clone())
-            .expect("the upgraded access method executes through the predecessor service guest");
-        let reply = issued
-            .published
-            .reply
-            .as_ref()
-            .expect("issue_access returns its durable credential status");
-        assert_ne!(
-            reply.result,
-            vos::Encode::encode(&vos::value::Value::Bytes(Vec::new()))
-        );
-        let publication = issued.publication.clone().unwrap();
-        assert!(!reopened.acknowledge_publication(&publication).unwrap());
-        drop(reopened);
-
-        let log = vos::raft::service::RaftAccumulateLog::open(
-            &raft_path,
-            vos::raft::RaftConfig::default(),
-        )
-        .unwrap();
-        let mut recovered = vos::service::LocalRootTreeService::open_raft_production(
-            successor_config,
-            vos::service::FileCommittedImageStore::new(image),
-            log,
-            trust,
-        )
-        .unwrap();
-        let retry = recovered
-            .invoke(request)
-            .expect("an acknowledged predecessor result survives production Raft reopen");
-        assert!(retry.duplicate);
-        assert_eq!(retry.published.reply, issued.published.reply);
-        assert!(retry.publication.is_none());
-        assert_eq!(retry.recovered_result.unwrap().bytes, reply.result);
+    fn pinned_service(pvm: Vec<u8>) -> PinnedService {
+        PinnedService {
+            current: std::sync::Arc::new(pvm),
+        }
     }
 
     #[test]
@@ -4345,6 +4121,7 @@ mod tests {
             timeout_ms: 0,
             mode: 0,
             attested: false,
+            capability: None,
             space_role: None,
             actor_role: None,
         }],

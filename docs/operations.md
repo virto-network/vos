@@ -14,20 +14,23 @@ Production roots also require a configured trust provider. Route publication
 happens only after the local service has caught up, validated its trust policy,
 and—when applicable—proved committed final Raft membership.
 
-## HTTP ingress
+## Built-in ingress
 
 HTTP listeners are configured per node in `<space-data>/local.toml`. Issue and
 revoke their protocol-neutral credentials through the canonical authority:
 
 ```bash
-vosx space access team issue --role member --expires 24h
+vosx space access team issue --expires 24h
+vosx space access team issue-ssh ~/.ssh/id_ed25519.pub --expires 30d
 vosx space access team list
 vosx space access team revoke <credential-prefix>
 ```
 
-Only `/__status` is anonymous. Schemas and OpenAPI require Member, metrics
-requires Admin, and actor calls also pass the actor's signed method policy.
-See [HTTP ingress](http-ingress.md) for listener and TLS configuration.
+The authority binds each credential to a stable member. Add `--subject <hex>`
+only when an administrator is adding a device for someone else. HTTP actor
+calls and SSH shell actions both pass the actor's signed method policy and the
+member's live capability decision. See [HTTP ingress](http-ingress.md) and the
+[SSH space shell](ssh-ingress.md).
 
 ## Backup and restore
 
@@ -66,7 +69,7 @@ Host state-machine changes use a separate identity in every new Raft
 application entry and applied snapshot. Before replacing binaries, pause
 ingress and transport acknowledgement and verify `last_applied ==
 commit_index` on every voter. Replace the complete voter set, then resume
-traffic. A predecessor host cannot apply a new-format entry: it rejects the
+traffic. A host with a different state-machine identity cannot apply a new-format entry: it rejects the
 entry before guest execution and leaves its applied cursor unchanged. This
 turns a mixed deployment into an explicit unavailable replica instead of two
 replicas silently committing different service images.
@@ -75,18 +78,10 @@ The role authority's replication incarnation is fixed when a space is
 created. Rebuilding or upgrading its signed package does not derive a new
 incarnation.
 
-The HTTP-ingress cutover carries one explicit migration bridge for spaces
-created by the immediately preceding canonical release. The daemon embeds
-that release's exact service guest and selects it only when an installed
-package names its ProgramId. Start the new daemon, run the ordinary
-guest-owned `space upgrade` for `space-authority`, and restart once the
-catalog compare-and-swap completes. The authority actor and signed contract
-advance; its service identity, service guest, and replication incarnation do
-not. Fresh spaces use only the current guest. No arbitrary historical guest
-or contract is accepted. The release gate opens a production Raft image and
-log created by the predecessor release, performs this catalog cutover, invokes
-a newly added access method, acknowledges it through the predecessor guest,
-and proves its exact result still recovers after restart.
+Platform identities are clean compatibility boundaries. This repository is
+not released yet, so the capability-role and SSH-shell cutover deliberately
+does not retain a decoder or conversion bridge for earlier development spaces.
+Recreate those spaces from packages and application exports.
 
 ## Release artifacts
 

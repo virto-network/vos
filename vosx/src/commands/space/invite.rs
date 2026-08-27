@@ -157,7 +157,7 @@ fn revoke(space: &str, selector: &str) -> anyhow::Result<()> {
                 println!("revoked invite {short}… in space '{}'", client.entry.name);
                 println!(
                     "note: this stops future redemptions; it does not claw back a role already \
-                     granted. Use `space role {} revoke <node-peer-id>` for that.",
+                     granted. Use `space role {} revoke <node-peer-id> --operation-key <key>` for that.",
                     client.entry.name,
                 );
                 Ok(())
@@ -203,7 +203,8 @@ fn mint(args: Args) -> anyhow::Result<()> {
         if op_role < AUTH_ROLE_ADMIN {
             anyhow::bail!(
                 "minting an invite requires ADMIN in space '{}'; this operator holds {}. \
-                 Ask an admin to `space role {} grant <your-peer-id> admin`, or mint from the \
+                 Ask an admin to `space role {} grant <your-peer-id> --role admin \
+                 --operation-key <key>`, or mint from the \
                  admin node.",
                 client.entry.name,
                 role_label(op_role),

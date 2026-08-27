@@ -12,7 +12,7 @@ limits which actor identities and roles an extension may relay through VOS.
 Extensions do not own listeners or long-lived connections. Protocol ingress
 belongs to the node, where connection limits, authentication, shutdown, and
 identity preservation can be enforced consistently. See [HTTP
-ingress](http-ingress.md).
+ingress](http-ingress.md) and [SSH space shell](ssh-ingress.md).
 
 Use an extension when the interaction has this shape:
 

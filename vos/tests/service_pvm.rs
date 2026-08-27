@@ -1466,7 +1466,7 @@ fn attested_root_fixture(
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(&Msg::new("attested_value").encode());
     let mut invocation = [salt.wrapping_add(5); 32];
-    invocation[..8].copy_from_slice(b"VOSHTTP!");
+    invocation[..8].copy_from_slice(b"VOSINGR!");
     let request = LocalWorkRequest {
         invocation: InvocationId(invocation),
         workflow_step: 0,
@@ -1986,14 +1986,20 @@ fn raft_replay_binds_production_trust_and_host_machine_before_genesis() {
     );
 
     shared.lock().unwrap().entries[0].host_state_machine = None;
-    let mut legacy_host_follower = make_replica(0x91, false);
+    let mut incompatible_host_follower = make_replica(0x91, false);
     assert!(matches!(
-        legacy_host_follower.catch_up(),
+        incompatible_host_follower.catch_up(),
         Err(ReplicatedServiceError::InvalidCommittedLog),
     ));
-    assert_eq!(legacy_host_follower.log_mut().applied_index().unwrap(), 0);
+    assert_eq!(
+        incompatible_host_follower
+            .log_mut()
+            .applied_index()
+            .unwrap(),
+        0
+    );
     assert!(
-        legacy_host_follower
+        incompatible_host_follower
             .service()
             .accumulate_host()
             .header()
@@ -4723,7 +4729,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(&Msg::new("start").encode());
     let mut invocation = [96; 32];
-    invocation[..8].copy_from_slice(b"VOSHTTP!");
+    invocation[..8].copy_from_slice(b"VOSINGR!");
     let request = LocalWorkRequest {
         invocation: InvocationId(invocation),
         workflow_step: 0,

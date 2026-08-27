@@ -28,7 +28,7 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     participant Client
-    participant Ingress
+    participant Ingress as HTTP or SSH
     participant Node
     participant Service
     participant Actor
@@ -46,10 +46,11 @@ The host proposes work, but the generic service guest validates package
 identity, method policy, credentials, causal state, effects, and transition
 shape before state changes become durable.
 
-Ingress adapters are node infrastructure. They terminate a protocol, enforce
-resource limits, authenticate it into a VOS subject, and then leave the
-request path. Native extensions instead serve bounded typed requests from
-actors; they do not own listeners.
+Ingress adapters are node infrastructure. HTTP serves machine clients. SSH
+serves the built-in semantic space application used by people. Both terminate
+their protocol, enforce resource limits, authenticate a credential into a
+stable member subject, and then submit ordinary actor work. Native extensions
+instead serve bounded typed requests from actors; they do not own listeners.
 
 ## Consistency
 

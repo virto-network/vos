@@ -195,6 +195,22 @@ pub mod capability {
     pub const AGENT_CREATE_SHARED: &str = "agent.create.shared";
     pub const AGENT_UPGRADE: &str = "agent.upgrade";
     pub const AGENT_REMOVE: &str = "agent.remove";
+
+    /// Complete built-in control-plane vocabulary. The immutable space root
+    /// owns these capabilities even when every editable role is removed.
+    pub const ALL: &[&str] = &[
+        SPACE_DISCOVER,
+        SPACE_METRICS_READ,
+        SPACE_MEMBERS_MANAGE,
+        SPACE_ROLES_MANAGE,
+        SPACE_CREDENTIALS_MANAGE,
+        AGENT_DISCOVER,
+        AGENT_INVOKE,
+        AGENT_CREATE_LOCAL,
+        AGENT_CREATE_SHARED,
+        AGENT_UPGRADE,
+        AGENT_REMOVE,
+    ];
 }
 
 /// Editable role definition owned by the canonical space authority.
@@ -205,6 +221,10 @@ pub struct SpaceRoleDefinition {
     pub power: u16,
     /// Sorted, unique capability identifiers.
     pub capabilities: Vec<[u8; 32]>,
+    /// Human-readable names in the same order as `capabilities`. Keeping the
+    /// names in authority state makes custom roles inspectable without a
+    /// reverse hash catalogue.
+    pub capability_names: Vec<String>,
 }
 
 impl SpaceRoleDefinition {
@@ -229,15 +249,17 @@ pub fn default_space_roles(space: crate::service::SpaceId) -> Vec<SpaceRoleDefin
     let definition = |name: &str, power, names: &[&str]| {
         let mut capabilities: Vec<_> = names
             .iter()
-            .map(|name| crate::CapabilityId::named(name).0)
+            .map(|name| (crate::CapabilityId::named(name).0, (*name).to_owned()))
             .collect();
-        capabilities.sort_unstable();
-        capabilities.dedup();
+        capabilities.sort_unstable_by_key(|(id, _)| *id);
+        capabilities.dedup_by_key(|(id, _)| *id);
+        let (capabilities, capability_names) = capabilities.into_iter().unzip();
         SpaceRoleDefinition {
             id: crate::RoleId::named(space, name).0,
             name: name.into(),
             power,
             capabilities,
+            capability_names,
         }
     };
     alloc::vec![
@@ -283,9 +305,10 @@ pub fn default_space_roles(space: crate::service::SpaceId) -> Vec<SpaceRoleDefin
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IngressAccessGrant {
     pub credential_id: [u8; 32],
+    /// Stable member authenticated by this credential. Several credentials
+    /// may name the same subject; roles are assigned to the subject rather
+    /// than copied into each device credential.
     pub subject: [u8; 32],
-    /// Sorted, unique role identifiers assigned to this credential.
-    pub roles: Vec<[u8; 32]>,
     pub expires_at: u64,
     pub issuer: [u8; 32],
     pub epoch: u64,
@@ -302,6 +325,13 @@ pub struct IngressAccessStatus {
     pub capabilities: Vec<[u8; 32]>,
     pub power: u16,
     pub expires_at: u64,
+}
+
+/// Derive the identifier stored by the authority for an SSH public key.
+/// The input is the canonical SSH key-data encoding, not a username or an
+/// authorized_keys line with mutable comments.
+pub fn ssh_credential_id(public_key: &[u8]) -> [u8; 32] {
+    crate::crypto::blake2b_hash::<32>(b"vos/ssh-credential/id", &[public_key])
 }
 
 impl IngressAccessStatus {

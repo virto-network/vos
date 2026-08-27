@@ -8,7 +8,7 @@ actor invocation.
 flowchart LR
     Client[HTTP client] --> Listener[Built-in HTTP ingress]
     Listener --> Authority[Space authority]
-    Authority -->|subject + current role| Listener
+    Authority -->|member + capabilities| Listener
     Listener --> Service[Root service]
     Service --> Actor[Actor method]
 ```
@@ -34,11 +34,11 @@ already enables it.
 
 ## Issue access
 
-An Admin can issue Member or Developer access. Only the immutable root
-operator can issue Admin access.
+Members may add another bearer credential for themselves. A member holding
+`space.credentials.manage` may add one for another member.
 
 ```bash
-TOKEN=$(vosx space access demo issue --role member --expires 24h)
+TOKEN=$(vosx space access demo issue --expires 24h)
 vosx space access demo list
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/openapi.json
 vosx space access demo revoke <credential-prefix>
@@ -48,19 +48,19 @@ The bearer secret is printed and durably written to the reported mode-0600
 recovery file before the authority is asked to activate it. A lost CLI or
 daemon response therefore cannot leave an active credential whose bearer is
 unrecoverable. The authority stores only a
-domain-separated credential identifier, its subject, role, expiry, issuer,
-and revocation state. Every request asks the live authority, so revocation and
-issuer-role changes take effect immediately.
+domain-separated credential identifier, its stable member subject, expiry,
+issuer, and revocation state. Roles remain member-owned. Every request asks
+the live authority, so revocation and role changes take effect immediately.
 
 ## Routes
 
 | Route | Required authority |
 | --- | --- |
 | `GET /__status` | none |
-| `GET /__schema`, `GET /__schema/<actor>` | Member |
-| `GET /openapi.json` | Member |
-| `GET /__metrics` | Admin |
-| `/<actor>/<method>` | Member, then the actor's method policy |
+| `GET /__schema`, `GET /__schema/<actor>` | `space.discover` |
+| `GET /openapi.json` | `space.discover` |
+| `GET /__metrics` | `space.metrics.read` |
+| `/<actor>/<method>` | `agent.invoke`, then the actor's method capability |
 
 Queries use `GET` query parameters. Array query values use comma-separated
 OpenAPI form encoding; byte values use hexadecimal text. Mutating methods use

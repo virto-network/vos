@@ -11,8 +11,8 @@ license = "AGPL-3.0-or-later"
 default = ["bin"]
 bin = []
 # Test-only code-identity delta used by the physical UpgradeActor gate. The
-# The canonical authority artifact is always built without this feature.
-migration-fixture = []
+# canonical authority artifact is always built without this feature.
+upgrade-fixture = []
 
 [lib]
 crate-type = ["rlib", "cdylib"]

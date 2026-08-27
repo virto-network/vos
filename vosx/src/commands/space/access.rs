@@ -12,13 +12,25 @@ use super::client::DaemonClient;
 
 #[derive(Subcommand, Debug)]
 pub enum AccessCommand {
-    /// Issue a bearer token. The secret is displayed once.
+    /// Issue a bearer token for a stable space member. The secret is
+    /// displayed once. Omit `--subject` to add a credential for yourself.
     Issue {
-        /// Role name to attach. Repeat for multiple roles.
-        #[arg(long = "role", default_value = "member")]
-        roles: Vec<String>,
+        /// Hex-encoded member SubjectId. Requires credential-management
+        /// authority when it differs from the caller.
+        #[arg(long)]
+        subject: Option<String>,
         /// `24h`, `7d`, `30m`, `90s`, or bare seconds.
         #[arg(long, default_value = "24h")]
+        expires: String,
+    },
+    /// Register an OpenSSH public key as another credential for a member.
+    IssueSsh {
+        /// Path to an OpenSSH public key (for example `~/.ssh/id_ed25519.pub`).
+        public_key: PathBuf,
+        /// Hex-encoded member SubjectId. Omit to add the key for yourself.
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long, default_value = "30d")]
         expires: String,
     },
     /// List non-secret authority rows.
@@ -51,15 +63,31 @@ struct AccessView {
     revoked: bool,
 }
 
+#[derive(Serialize)]
+struct IssuedSshAccess {
+    credential_id: String,
+    subject: String,
+    roles: Vec<String>,
+    expires_at: u64,
+    public_key: String,
+}
+
 pub fn run(args: Args) -> anyhow::Result<()> {
     match args.command {
-        AccessCommand::Issue { roles, expires } => issue(&args.space, &roles, &expires),
+        AccessCommand::Issue { subject, expires } => {
+            issue(&args.space, subject.as_deref(), &expires)
+        }
+        AccessCommand::IssueSsh {
+            public_key,
+            subject,
+            expires,
+        } => issue_ssh(&args.space, &public_key, subject.as_deref(), &expires),
         AccessCommand::List => list(&args.space),
         AccessCommand::Revoke { credential } => revoke(&args.space, &credential),
     }
 }
 
-fn issue(space: &str, role_names: &[String], expires: &str) -> anyhow::Result<()> {
+fn issue(space: &str, subject: Option<&str>, expires: &str) -> anyhow::Result<()> {
     let ttl = crate::token::parse_duration(expires)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let expires_at = now
@@ -73,23 +101,21 @@ fn issue(space: &str, role_names: &[String], expires: &str) -> anyhow::Result<()
     DaemonClient::with_connect(space, |client| {
         let target = client.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
         let catalogue = role_catalog(client, target)?;
-        let mut roles = Vec::with_capacity(role_names.len());
-        for requested in role_names {
-            let role = catalogue
-                .iter()
-                .find(|role| role.name.eq_ignore_ascii_case(requested))
-                .ok_or_else(|| anyhow::anyhow!("unknown space role '{requested}'"))?;
-            roles.push(role.id);
-        }
-        roles.sort_unstable();
-        roles.dedup();
-        let encoded_roles = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&roles)
-            .map_err(|_| anyhow::anyhow!("encode access roles"))?;
+        let subject = match subject {
+            Some(value) => {
+                let bytes =
+                    hex::decode(value).map_err(|_| anyhow::anyhow!("subject must be hex"))?;
+                <[u8; 32]>::try_from(bytes.as_slice())
+                    .map_err(|_| anyhow::anyhow!("subject must be exactly 32 bytes"))?
+            }
+            None => [0; 32],
+        };
         let message = vos::value::Msg::new("issue_access")
             .with("credential_id", credential_id.to_vec())
-            .with("roles", vos::value::Value::Bytes(encoded_roles.to_vec()))
+            .with("subject", subject.to_vec())
             .with("expires_at", expires_at);
-        let value = client.invoke_dyn(target, &message)?;
+        let operation_key = format!("issue-access:{}", hex::encode(credential_id));
+        let value = client.invoke_dyn_idempotent(target, &message, &operation_key)?;
         let bytes = value
             .as_bytes()
             .ok_or_else(|| anyhow::anyhow!("authority returned an invalid access decision"))?;
@@ -114,6 +140,73 @@ fn issue(space: &str, role_names: &[String], expires: &str) -> anyhow::Result<()
             eprintln!("credential  {}", view.credential_id);
             eprintln!("roles       {}", view.roles.join(", "));
             eprintln!("expires_at  {}", view.expires_at);
+        }
+        Ok(())
+    })
+}
+
+fn issue_ssh(
+    space: &str,
+    public_key_path: &Path,
+    subject: Option<&str>,
+    expires: &str,
+) -> anyhow::Result<()> {
+    let encoded = std::fs::read_to_string(public_key_path)
+        .map_err(|error| anyhow::anyhow!("read {}: {error}", public_key_path.display()))?;
+    let public_key = ssh_key::PublicKey::from_openssh(encoded.trim())
+        .map_err(|error| anyhow::anyhow!("parse {}: {error}", public_key_path.display()))?;
+    let canonical = public_key
+        .to_bytes()
+        .map_err(|error| anyhow::anyhow!("encode SSH public key: {error}"))?;
+    let credential_id = vos::ssh_credential_id(&canonical);
+    let ttl = crate::token::parse_duration(expires)?;
+    let expires_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_secs()
+        .checked_add(ttl)
+        .ok_or_else(|| anyhow::anyhow!("access expiry overflows Unix time"))?;
+    let subject = match subject {
+        Some(value) => {
+            let bytes = hex::decode(value).map_err(|_| anyhow::anyhow!("subject must be hex"))?;
+            <[u8; 32]>::try_from(bytes.as_slice())
+                .map_err(|_| anyhow::anyhow!("subject must be exactly 32 bytes"))?
+        }
+        None => [0; 32],
+    };
+    DaemonClient::with_connect(space, |client| {
+        let target = client.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
+        let catalogue = role_catalog(client, target)?;
+        let message = vos::value::Msg::new("issue_access")
+            .with("credential_id", credential_id.to_vec())
+            .with("subject", subject.to_vec())
+            .with("expires_at", expires_at);
+        let operation_key = format!("issue-ssh:{}", hex::encode(credential_id));
+        let value = client.invoke_dyn_idempotent(target, &message, &operation_key)?;
+        let bytes = value
+            .as_bytes()
+            .ok_or_else(|| anyhow::anyhow!("authority returned an invalid access decision"))?;
+        let status = vos::IngressAccessStatus::try_decode(bytes)
+            .ok_or_else(|| anyhow::anyhow!("authority refused SSH access issuance"))?;
+        if status.credential_id != credential_id {
+            anyhow::bail!("authority returned a mismatched SSH credential");
+        }
+        let view = IssuedSshAccess {
+            credential_id: hex::encode(status.credential_id),
+            subject: hex::encode(status.subject),
+            roles: role_names_for(&catalogue, &status.roles),
+            expires_at: status.expires_at,
+            public_key: public_key
+                .to_openssh()
+                .map_err(|error| anyhow::anyhow!("render SSH public key: {error}"))?,
+        };
+        if crate::output::is_json() {
+            crate::output::print_json(&view);
+        } else {
+            println!("credential  {}", view.credential_id);
+            println!("subject     {}", view.subject);
+            println!("roles       {}", view.roles.join(", "));
+            println!("expires_at  {}", view.expires_at);
+            println!("public_key  {}", view.public_key);
         }
         Ok(())
     })
@@ -161,7 +254,10 @@ fn list(space: &str) -> anyhow::Result<()> {
         let target = client.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
         let catalogue = role_catalog(client, target)?;
         let rows = access_rows_for(client, target)?;
-        let views: Vec<_> = rows.iter().map(|row| view(row, &catalogue)).collect();
+        let views: Vec<_> = rows
+            .iter()
+            .map(|row| view(client, target, row, &catalogue))
+            .collect::<anyhow::Result<_>>()?;
         if crate::output::is_json() {
             crate::output::print_json(&views);
         } else if views.is_empty() {
@@ -200,7 +296,12 @@ fn revoke(space: &str, selector: &str) -> anyhow::Result<()> {
         };
         let message =
             vos::value::Msg::new("revoke_access").with("credential_id", row.credential_id.to_vec());
-        if client.invoke_dyn(target, &message)?.as_bool() != Some(true) {
+        let operation_key = format!("revoke-access:{}", hex::encode(row.credential_id));
+        if client
+            .invoke_dyn_idempotent(target, &message, &operation_key)?
+            .as_bool()
+            != Some(true)
+        {
             anyhow::bail!("authority refused access revocation");
         }
         if crate::output::is_json() {
@@ -234,7 +335,7 @@ fn access_rows_for(
         let count = page.len();
         after = page
             .last()
-            .map(|row| row.subject.to_vec())
+            .map(|row| row.credential_id.to_vec())
             .unwrap_or_default();
         rows.extend(page);
         if count < 128 {
@@ -269,12 +370,26 @@ fn role_names_for(catalogue: &[vos::SpaceRoleDefinition], roles: &[[u8; 32]]) ->
         .collect()
 }
 
-fn view(row: &vos::IngressAccessGrant, catalogue: &[vos::SpaceRoleDefinition]) -> AccessView {
-    AccessView {
+fn view(
+    client: &DaemonClient,
+    target: vos::actors::context::ServiceId,
+    row: &vos::IngressAccessGrant,
+    catalogue: &[vos::SpaceRoleDefinition],
+) -> anyhow::Result<AccessView> {
+    let message = vos::value::Msg::new("authenticate_access")
+        .with("credential_id", row.credential_id.to_vec());
+    let value = client.invoke_dyn(target, &message)?;
+    let status = value
+        .as_bytes()
+        .and_then(vos::IngressAccessStatus::try_decode);
+    Ok(AccessView {
         credential_id: hex::encode(row.credential_id),
         subject: hex::encode(row.subject),
-        roles: role_names_for(catalogue, &row.roles),
+        roles: status
+            .as_ref()
+            .map(|status| role_names_for(catalogue, &status.roles))
+            .unwrap_or_default(),
         expires_at: row.expires_at,
         revoked: row.revoked,
-    }
+    })
 }

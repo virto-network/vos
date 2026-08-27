@@ -328,10 +328,8 @@ pub enum SpaceCommand {
         #[command(subcommand)]
         command: Option<members::MembersCommand>,
     },
-    /// Manage auth-role grants. Subcommands: list, grant, revoke.
-    /// Bare `space role <space>` lists. When service is active, space-level
-    /// mutations are also committed to the root-signed canonical authority;
-    /// actor-local grants are carried by signed service policy.
+    /// Manage custom capability roles and member assignments in the canonical
+    /// space authority. Bare `space role <space>` lists both catalogues.
     Role {
         space: String,
         #[command(subcommand)]

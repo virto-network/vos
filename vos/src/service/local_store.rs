@@ -31,7 +31,7 @@ use super::{
 /// pre-admission plaintext to 4 MiB while leaving exact retries admissible.
 pub(crate) const MAX_REPLICATED_PRIVATE_INGRESS_ARTIFACTS: usize = 64;
 
-/// Bounded durable HTTP idempotency window per root. Selection is canonical:
+/// Bounded durable ingress idempotency window per root. Selection is canonical:
 /// the greatest `(receipt sequence, input)` pairs survive, so CRDT replicas
 /// converge even when equivalent acknowledgements arrive in another order.
 pub(crate) const MAX_RETAINED_INVOCATION_RESULTS: usize = 256;
@@ -41,8 +41,7 @@ const INVOCATION_RESULTS_MAGIC: [u8; 4] = *b"VIRS";
 /// Exact caller-visible bytes retained independently from publication
 /// delivery. The guest owns execution deduplication and transport rows; this
 /// host record lets an exact invocation retry recover the response after the
-/// publication has been acknowledged and removed, including when the
-/// predecessor guest performed that removal.
+/// publication has been acknowledged and removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommittedInvocationResult {
     pub input: WorkInputId,
@@ -158,12 +157,6 @@ impl MemoryServiceSnapshot {
         super::Hash::digest(b"vos/proof-verifier-provenance/service", &[&input])
     }
 
-    fn expected_legacy_proof_verifier_provenance(&self) -> super::Hash {
-        let mut input = Vec::new();
-        self.encode_snapshot_core(&mut input);
-        super::Hash::digest(b"vos/proof-verifier-provenance/service", &[&input])
-    }
-
     fn seal_proof_verifier_provenance(&mut self) {
         self.proof_verifier_provenance = Some(self.expected_proof_verifier_provenance());
     }
@@ -171,15 +164,6 @@ impl MemoryServiceSnapshot {
     fn expected_production_trust_provenance(&self, policy: super::Hash) -> super::Hash {
         let mut input = Vec::new();
         self.encode_provenance_input(&mut input);
-        super::Hash::digest(
-            b"vos/production-trust-provenance/service",
-            &[&policy.0, &input],
-        )
-    }
-
-    fn expected_legacy_production_trust_provenance(&self, policy: super::Hash) -> super::Hash {
-        let mut input = Vec::new();
-        self.encode_snapshot_core(&mut input);
         super::Hash::digest(
             b"vos/production-trust-provenance/service",
             &[&policy.0, &input],
@@ -355,57 +339,50 @@ impl ServiceWire for MemoryServiceSnapshot {
             decoder.option(|decoder| Ok(super::Hash(decoder.fixed()?)))?;
         let production_trust_provenance = decoder
             .option(|decoder| Ok((super::Hash(decoder.fixed()?), super::Hash(decoder.fixed()?))))?;
-        // Images produced before host-owned result retention end here. They
-        // remain reopenable; no built-in HTTP invocation existed in those
-        // releases whose response could require recovery.
-        let legacy_image = decoder.remaining() == 0;
-        let invocation_results = if legacy_image {
-            BTreeMap::new()
-        } else {
-            if decoder.take(4)? != INVOCATION_RESULTS_MAGIC {
+        if decoder.take(4)? != INVOCATION_RESULTS_MAGIC {
+            return Err(DecodeError::NonCanonical);
+        }
+        let values = decoder.list(|decoder| {
+            let input = WorkInputId {
+                invocation: super::InvocationId(decoder.fixed()?),
+                workflow_step: decoder.u64()?,
+            };
+            let result = CommittedInvocationResult {
+                input,
+                receipt: AccumulationReceipt::decode(&decoder.bytes()?)?,
+                producer: ActorId(decoder.fixed()?),
+                attested: decoder.bool()?,
+                response: BlobRef {
+                    hash: super::Hash(decoder.fixed()?),
+                    len: decoder.u64()?,
+                },
+            };
+            if result.input.invocation == super::InvocationId::ZERO
+                || !result.input.invocation.retains_idempotent_result()
+                || result.receipt.checkpoint != result.input.workflow_step
+                || result.receipt.reply_commitment.is_none()
+            {
                 return Err(DecodeError::NonCanonical);
             }
-            let values = decoder.list(|decoder| {
-                let input = WorkInputId {
-                    invocation: super::InvocationId(decoder.fixed()?),
-                    workflow_step: decoder.u64()?,
-                };
-                let result = CommittedInvocationResult {
-                    input,
-                    receipt: AccumulationReceipt::decode(&decoder.bytes()?)?,
-                    producer: ActorId(decoder.fixed()?),
-                    attested: decoder.bool()?,
-                    response: BlobRef {
-                        hash: super::Hash(decoder.fixed()?),
-                        len: decoder.u64()?,
-                    },
-                };
-                if result.input.invocation == super::InvocationId::ZERO
-                    || !result.input.invocation.retains_idempotent_result()
-                    || result.receipt.checkpoint != result.input.workflow_step
-                    || result.receipt.reply_commitment.is_none()
-                {
-                    return Err(DecodeError::NonCanonical);
-                }
-                Ok(result)
-            })?;
-            let mut results = BTreeMap::new();
-            for result in values {
-                if results.insert(result.input, result).is_some() {
-                    return Err(DecodeError::NonCanonical);
-                }
-            }
-            if results.len() > MAX_RETAINED_INVOCATION_RESULTS {
+            Ok(result)
+        })?;
+        let mut invocation_results = BTreeMap::new();
+        for result in values {
+            if invocation_results.insert(result.input, result).is_some() {
                 return Err(DecodeError::NonCanonical);
             }
-            let total = results.values().try_fold(0_u64, |total, result| {
+        }
+        if invocation_results.len() > MAX_RETAINED_INVOCATION_RESULTS {
+            return Err(DecodeError::NonCanonical);
+        }
+        let total = invocation_results
+            .values()
+            .try_fold(0_u64, |total, result| {
                 total.checked_add(result.response.len)
             });
-            if total.is_none_or(|total| total > MAX_RETAINED_INVOCATION_RESULT_BYTES) {
-                return Err(DecodeError::NonCanonical);
-            }
-            results
-        };
+        if total.is_none_or(|total| total > MAX_RETAINED_INVOCATION_RESULT_BYTES) {
+            return Err(DecodeError::NonCanonical);
+        }
         if rows.is_empty() != (commit_sequence == 0) {
             return Err(DecodeError::NonCanonical);
         }
@@ -415,7 +392,7 @@ impl ServiceWire for MemoryServiceSnapshot {
                 .ok_or(DecodeError::NonCanonical)?;
             StoreHeader::open(header).map_err(|_| DecodeError::NonCanonical)?;
         }
-        let mut snapshot = Self {
+        let snapshot = Self {
             rows,
             blobs,
             programs,
@@ -426,14 +403,7 @@ impl ServiceWire for MemoryServiceSnapshot {
         };
         if snapshot
             .proof_verifier_provenance
-            .is_some_and(|provenance| {
-                provenance
-                    != if legacy_image {
-                        snapshot.expected_legacy_proof_verifier_provenance()
-                    } else {
-                        snapshot.expected_proof_verifier_provenance()
-                    }
-            })
+            .is_some_and(|provenance| provenance != snapshot.expected_proof_verifier_provenance())
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -441,23 +411,10 @@ impl ServiceWire for MemoryServiceSnapshot {
             .production_trust_provenance
             .is_some_and(|(policy, provenance)| {
                 policy == super::Hash::ZERO
-                    || provenance
-                        != if legacy_image {
-                            snapshot.expected_legacy_production_trust_provenance(policy)
-                        } else {
-                            snapshot.expected_production_trust_provenance(policy)
-                        }
+                    || provenance != snapshot.expected_production_trust_provenance(policy)
             })
         {
             return Err(DecodeError::NonCanonical);
-        }
-        if legacy_image {
-            if snapshot.proof_verifier_provenance.is_some() {
-                snapshot.seal_proof_verifier_provenance();
-            }
-            if let Some((policy, _)) = snapshot.production_trust_provenance {
-                snapshot.seal_production_trust_provenance(policy);
-            }
         }
         Ok(snapshot)
     }
@@ -3701,10 +3658,11 @@ mod tests {
     #[test]
     fn acknowledged_effectful_publication_stages_an_independent_exact_result() {
         let input = WorkInputId {
-            invocation: super::super::InvocationId::for_http_idempotency(
+            invocation: super::super::InvocationId::for_ingress_idempotency(
                 super::super::SubjectId([0x30; 32]),
                 ActorId([0x31; 32]),
-                "effectful-result",
+                "http",
+                b"effectful-result",
             ),
             workflow_step: 0,
         };
@@ -3825,10 +3783,11 @@ mod tests {
     #[test]
     fn empty_idempotent_reply_round_trips_through_snapshot_artifacts() {
         let input = WorkInputId {
-            invocation: super::super::InvocationId::for_http_idempotency(
+            invocation: super::super::InvocationId::for_ingress_idempotency(
                 super::super::SubjectId([0x40; 32]),
                 ActorId([0x41; 32]),
-                "empty-result",
+                "http",
+                b"empty-result",
             ),
             workflow_step: 0,
         };
@@ -3950,7 +3909,7 @@ mod tests {
         let mut results = BTreeMap::new();
         for sequence in 0..=MAX_RETAINED_INVOCATION_RESULTS as u64 {
             let mut invocation = [0_u8; 32];
-            invocation[..8].copy_from_slice(b"VOSHTTP!");
+            invocation[..8].copy_from_slice(b"VOSINGR!");
             invocation[8..16].copy_from_slice(&sequence.to_be_bytes());
             let input = WorkInputId {
                 invocation: super::super::InvocationId(invocation),

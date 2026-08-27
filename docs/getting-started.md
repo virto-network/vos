@@ -30,7 +30,7 @@ impl Counter {
         Self { value: 0 }
     }
 
-    #[msg]
+    #[msg(capability = "counter.write")]
     pub fn add(&mut self, amount: u64) {
         self.value += amount;
     }
@@ -73,3 +73,14 @@ cargo run -p vosx -- counter value --space demo
 
 Use `--consistency raft` for one ordered replicated state machine, or
 `--consistency crdt` for convergent operation history.
+
+Assign package capabilities through editable space roles. A member can use
+the same stable identity through several HTTP tokens and SSH keys:
+
+```bash
+vosx space role demo define operator --power 150 \
+  --capability counter.write --capability agent.invoke \
+  --operation-key define-operator-1
+vosx space role demo grant me --role operator --operation-key grant-me-operator-1
+vosx space access demo issue-ssh ~/.ssh/id_ed25519.pub --expires 30d
+```

@@ -5,7 +5,6 @@ members = [
     "vos/vos-macros",
     "vosx",
     "support/vos-raft",
-    "support/vos-shell",
     "support/merkle-crdt",
     "pvm/runtime",
     "pvm/compiler",

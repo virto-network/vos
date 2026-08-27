@@ -735,7 +735,7 @@ mod tests {
         assert_eq!(
             PackageRolePolicies::from_metadata(&metadata),
             Err(PackageError::InvalidRolePolicies),
-            "a method cannot combine a stable capability with a legacy space-role threshold",
+            "a method cannot combine a stable capability with a space-role threshold",
         );
         assert_eq!(
             method_role_policy_hash(None, Some(u8::MAX)),

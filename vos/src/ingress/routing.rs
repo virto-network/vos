@@ -1095,6 +1095,7 @@ mod tests {
             attested: false,
             space_role: None,
             actor_role: None,
+            capability: None,
         }
     }
 }

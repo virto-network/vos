@@ -8,6 +8,7 @@ and a chosen consistency model.
 flowchart LR
     C[Client] --> N[Node]
     N --> R[Root service]
+    H[HTTP / SSH] --> N
     R --> A[Actor tree]
     R --> S[(Durable state)]
     N <--> P[Peer nodes]
@@ -56,6 +57,11 @@ See [Getting started](docs/getting-started.md),
 | `actors/` | Platform actors |
 | `examples/` | Small supported applications |
 | `extensions/` | Trusted request/response host workers |
+
+HTTP and SSH are built-in ingress adapters. HTTP exposes package schemas and
+actor methods; SSH serves a semantic terminal for members to discover and
+manage the space. Native extensions remain request/response workers called by
+actors and never own public listeners.
 
 ## Development
 

@@ -3,8 +3,8 @@
 VOS separates four kinds of trust:
 
 1. Network identity authenticates the peer connection.
-2. The space authority assigns space roles.
-3. Actor policy decides which role may call each method.
+2. The space authority assigns editable capability roles to stable members.
+3. Actor policy names the exact capability required by each method.
 4. Proof verification decides whether an attested result is acceptable.
 
 The node transports evidence. The generic service guest binds accepted
@@ -14,10 +14,31 @@ and logical time.
 ## Ingress identity
 
 Built-in protocol adapters authenticate protocol credentials into a canonical
-`SubjectId`. For HTTP, the space authority issues and revokes bearer access;
-the node checks the current authority decision on every request. Bearer
-secrets never become actor arguments or replicated state. Actor methods still
-enforce their signed package policy after ingress authentication.
+`SubjectId`. One member may have several HTTP bearer tokens and SSH public
+keys. Roles belong to the member, not the device, so adding a laptop does not
+copy authority into another policy row. The node checks the live authority
+before every request; revocation and role changes therefore affect the next
+operation. Bearer secrets and SSH private keys never become actor arguments or
+replicated state.
+
+Roles have a stable ID, a name, a numeric power, and a set of stable capability
+names. A member may hold several roles; effective power is the maximum and
+effective authority is the union of their capabilities. Delegation is
+strictly downward: a member can grant only lower-power roles whose capabilities
+are a subset of their own. The immutable space root is the recovery authority.
+
+The default catalogue is editable:
+
+| Role | Power | Intended scope |
+| --- | ---: | --- |
+| Guest | 0 | discover public space and agent information |
+| Member | 100 | invoke ordinary agents |
+| Developer | 200 | create Local agents |
+| Admin | 300 | manage members, roles, credentials, and shared agents |
+
+Actor packages declare capabilities directly, for example
+`#[msg(capability = "ledger.transfer")]`. Actor-local roles remain a separate
+mechanism for authority defined by one actor's own state.
 
 ## Private ingress
 
