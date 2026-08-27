@@ -175,6 +175,23 @@ fn receive_service_invocation_reply(
     }
 }
 
+/// Await the terminal result of work already accepted by a root service.
+///
+/// Built-in ingress dispatches this wait on its bounded blocking pool. Once
+/// the root owns the request there is no cancellation boundary: timing out
+/// here would drop the reply channel while the invocation can still commit.
+/// A subsequent HTTP query would then use a fresh invocation identity and can
+/// build an unbounded queue of abandoned work behind a slow authorization or
+/// recovery pass. Retaining the original receiver lets the root finish or
+/// disconnect and keeps publication acknowledgement tied to the real caller.
+fn receive_service_ingress_reply(
+    reply: &mpsc::Receiver<Vec<u8>>,
+) -> Result<Vec<u8>, crate::actors::client::ClientError> {
+    reply
+        .recv()
+        .map_err(|_| crate::actors::client::ClientError::Unreachable)
+}
+
 fn send_service_ingress(
     route: &mpsc::Sender<InvokeRequest>,
     ingress: &[u8],
@@ -2032,6 +2049,7 @@ impl IngressHandle {
             .get(&target)
             .cloned()
             .ok_or(crate::actors::client::ClientError::NotFound)?;
+        #[cfg(all(feature = "network", feature = "storage"))]
         let deadline = Instant::now()
             .checked_add(binding.invoke_timeout)
             .ok_or(crate::actors::client::ClientError::Unreachable)?;
@@ -2061,7 +2079,7 @@ impl IngressHandle {
         };
         let ingress_wire = crate::service::ServiceWire::encode(&ingress);
         let reply_rx = send_service_ingress(&tx, &ingress_wire, caller.clone())?;
-        let envelope = receive_service_invocation_reply(&reply_rx, proof_requested, deadline)?;
+        let envelope = receive_service_ingress_reply(&reply_rx)?;
         #[cfg(all(feature = "network", feature = "storage"))]
         if let Some(redirect) = decode_service_raft_redirect(&envelope) {
             let network = self
@@ -13808,6 +13826,62 @@ mod tests {
             receive_service_invocation_reply(&rx, false, Instant::now()),
             Err(crate::actors::client::ClientError::Unreachable)
         ));
+    }
+
+    #[test]
+    fn ingress_handle_does_not_abandon_accepted_work_at_the_route_timeout() {
+        use crate::Encode as _;
+
+        let node = VosNode::new();
+        let target = crate::service::ActorId([0x71; 32]);
+        let route = ServiceId::new(0, 0x7272);
+        let service = crate::service::ServiceIdentity {
+            space: crate::service::SpaceId([0x73; 32]),
+            root_service: crate::service::RootServiceId([0x74; 32]),
+            deployment: crate::service::DeploymentId([0x75; 32]),
+            service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
+            platform: crate::service::PLATFORM_ID,
+            execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::service::GasSchedule::new(1_000_000, 1_000_000),
+        };
+        node.service_actor_routes.write().unwrap().insert(
+            target,
+            ActorRoute {
+                route: route.0,
+                service,
+                consistency: crate::service::ConsistencyMode::Crdt,
+                replication_id: None,
+                is_role_authority: false,
+                invoke_timeout: Duration::from_millis(1),
+                authenticated_peer: None,
+            },
+        );
+        let (tx, rx) = mpsc::channel();
+        node.invoke_routes.lock().unwrap().insert(route.0, tx);
+        let responder = std::thread::spawn(move || {
+            let request = rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(request.reply.send(encode_invoke_envelope(
+                crate::actors::run::STATUS_DONE,
+                &[],
+                b"recovered authorized reply",
+            )));
+        });
+        let mut arguments = vec![crate::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(&crate::value::Msg::new("member_only").encode());
+        assert_eq!(
+            node.ingress_handle()
+                .invoke_actor(
+                    crate::service::SubjectId([0x76; 32]),
+                    target,
+                    arguments,
+                    false,
+                )
+                .unwrap(),
+            b"recovered authorized reply",
+        );
+        responder.join().unwrap();
+        assert!(node.collect().is_empty());
     }
 
     #[cfg(all(feature = "network", feature = "storage"))]
