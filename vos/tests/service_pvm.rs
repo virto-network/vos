@@ -994,7 +994,7 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
 
     assert!(
         PRODUCTION_ARTIFACT_PROVENANCE
-            .contains("source_revision = \"684e1401f62c274eafd17856db74f90f2b300d8b\"")
+            .contains("source_revision = \"5657927665935479835b3636fa78265db5871bd9\"")
     );
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("guest_toolchain = \"nightly-2026-03-20\""));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("host_toolchain = \"nightly-2025-05-09\""));
@@ -1020,7 +1020,7 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
         "clerk_actor_program_id = \"0ce632f716c05def31cbe3b65fbaef7f5e92ed50ae3160681d1f50bd36e690dd\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_deployment_id = \"5f6777f148924c22ad4f2a72aaf8127a861dddd98637c615a1cb41de8ad8f126\""
+        "clerk_deployment_id = \"022ba3d06d221e3ea08363224b687ed85e8ffb8e03769e443e3f7a2ef54551da\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
         "clerk_task_hash = \"e3289ae3851565b869c4f9d8c0bc3712184dd6ad35de24c912368db54a24ffa6\""
@@ -1054,7 +1054,7 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
     );
     assert_eq!(
         hex(&clerk.deployment_id().0),
-        "5f6777f148924c22ad4f2a72aaf8127a861dddd98637c615a1cb41de8ad8f126",
+        "022ba3d06d221e3ea08363224b687ed85e8ffb8e03769e443e3f7a2ef54551da",
     );
     assert_eq!(
         hex(&clerk.task_dependencies[0].binding.task.0),

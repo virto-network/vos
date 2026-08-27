@@ -4287,15 +4287,15 @@ mod tests {
         );
         assert_eq!(
             hex::encode(package.deployment_id().0),
-            "b0271246712265699ced714b65bc069e951f2fc7d966d986da61cb6d8d6ee18a",
+            "b0fdaedf1f67116cc94b4499e16731999459c224d3b990e41a55af3b327f5322",
         );
         assert_eq!(
             hex::encode(package_hash),
-            "1b3257737bae97b68175db34e8da3fe3143736f8e198ce5424d607f16dfda2cd",
+            "64f8dae0eb62c168b89a920dd31716db70d7fdb6045924f57523f8beeccaab3d",
         );
         assert_eq!(
             hex::encode(replication_id),
-            "c5922d3d0d558d71d3bf4ce1ab6aab7523b5aed5eef3383124d6cf66279dce48",
+            "ee4359014a21ebec76687e378e3f0f533ce0196460ae0b38b00bd86a1ec597d3",
         );
     }
 
