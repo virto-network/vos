@@ -715,12 +715,12 @@ fn assert_bundled_space_authority_matches_canonical_program() {
         .expect("vosx ships the canonical authority PVM");
     assert_eq!(
         hex::encode(vos::service::ProgramId::of_pvm(&bundled).0),
-        "acf7b077cb573c46dbd2291effad2dec523cbd7584dd545068938d4e57d77ed3",
+        "bb859eb9f4a773875e5722f79e56793b44bc1b95513b373bdf4f208ea9a1b075",
         "the built-in authority program must implement the canonical private-input contract",
     );
     assert_eq!(
         hex::encode(vos::crypto::blake2b_hash::<32>(&[], &[&bundled])),
-        "b9909611476ac6cbf80789eadd98d75ef767fb1ad0b08007efb6c019433c26df",
+        "913314bb841911566b208fa0a93aca0cd82e53d310edd6b2f3d6f6c7f3eb4261",
         "the authority bytes must remain exact so sealed spaces can reopen",
     );
 }

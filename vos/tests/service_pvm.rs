@@ -994,27 +994,27 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
 
     assert!(
         PRODUCTION_ARTIFACT_PROVENANCE
-            .contains("source_revision = \"cf8337742cd2fb278b3312f0a4da2adc0b94c3b2\"")
+            .contains("source_revision = \"df90ed761afa9c78026a73b1595649814e1462f8\"")
     );
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("guest_toolchain = \"nightly-2026-03-20\""));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("host_toolchain = \"nightly-2025-05-09\""));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "service_program_id = \"740ca0b6c39e6e4ecf08c4a23a122eb04511dc33e28d4f0c8927a1fc7ed78dc3\""
+        "service_program_id = \"d8bbefbba963546f223a2a3207408551e70950f4b8e3952fb2818ecfa30abfa0\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "service_elf_blake2b_256 = \"254db4d44eae63c32bde7e52a0075bd80934dab3446422360e8439304f4d3f66\""
+        "service_elf_blake2b_256 = \"f6b0d60f816e44738d24b94405d07a9a7fa6815908927555573fb97134a8e191\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "service_pvm_blake2b_256 = \"e99609fc3d12af2a766077cc759c0da4954b91b72fcd06ddc0cbc9452715e39f\""
+        "service_pvm_blake2b_256 = \"12e2d6a83da05cd19b16ff48b5da2496af75f3733bcf857ef53be7ba95308b1e\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "authority_program_id = \"acf7b077cb573c46dbd2291effad2dec523cbd7584dd545068938d4e57d77ed3\""
+        "authority_program_id = \"bb859eb9f4a773875e5722f79e56793b44bc1b95513b373bdf4f208ea9a1b075\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "authority_pvm_blake2b_256 = \"b9909611476ac6cbf80789eadd98d75ef767fb1ad0b08007efb6c019433c26df\""
+        "authority_pvm_blake2b_256 = \"913314bb841911566b208fa0a93aca0cd82e53d310edd6b2f3d6f6c7f3eb4261\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "registry_elf_blake2b_256 = \"370f4c44a7c5491609c5b716ef80e26307f92019fcd3e585937cbe90eded91a9\""
+        "registry_elf_blake2b_256 = \"af208c89a8164bef947ec64ac19912225fb889ac3db893eb15f67da36ad05974\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
         "clerk_actor_program_id = \"4f3675880e08e03b202767b774a6d069195d663ec38f601e3b9a161e7a844357\""
