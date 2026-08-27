@@ -67,7 +67,10 @@ OpenAPI form encoding; byte values use hexadecimal text. Mutating methods use
 a JSON object in a `POST`, `PUT`, or `PATCH` body and require an
 `Idempotency-Key` header. Reusing the key with the same authenticated caller
 recovers the original durable result; reusing it for different work is
-rejected. The schema and OpenAPI endpoints describe the installed packages
-that the listener can route locally. An attested method returns an object with
-the decoded `reply` and `attestation_wire`, the hex form of the canonical
-committed `RootTreeAttestedResult` wire.
+rejected. Result recovery is stored independently from publication delivery,
+so acknowledgement can retire outbox, proof, attestation, and exported-blob
+transport state without losing the caller response or redriving its effects.
+The schema and OpenAPI endpoints describe the installed packages that the
+listener can route locally. An attested method returns an object with the
+decoded `reply` and `attestation_wire`, the hex form of the canonical committed
+`RootTreeAttestedResult` wire.

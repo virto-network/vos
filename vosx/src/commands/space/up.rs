@@ -3903,6 +3903,18 @@ mod tests {
         }
     }
 
+    fn inflate_predecessor_fixture(bytes: &[u8], destination: &Path) {
+        let mut decoder = flate2::read::GzDecoder::new(bytes);
+        let mut file = std::fs::File::create(destination).unwrap();
+        std::io::copy(&mut decoder, &mut file).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn assert_fixture_digest(path: &Path, expected: &str) {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(hex::encode(BlobHash::of(&bytes).0), expected);
+    }
+
     #[test]
     fn predecessor_authority_physically_upgrades_and_reopens() {
         use vos::service::ServiceWire as _;
@@ -3910,6 +3922,18 @@ mod tests {
         let predecessor_bytes =
             include_bytes!("../../../tests/fixtures/migration/space_authority_predecessor.vos")
                 .to_vec();
+        let provenance =
+            include_str!("../../../tests/fixtures/migration/predecessor_authority.toml")
+                .parse::<toml::Value>()
+                .unwrap();
+        assert_eq!(
+            provenance["source_revision"].as_str().unwrap(),
+            "ad459011a0803538eaeda5418bd9ddc5e12bcdd6"
+        );
+        assert_eq!(
+            hex::encode(BlobHash::of(&predecessor_bytes).0),
+            provenance["package_blake2b_256"].as_str().unwrap()
+        );
         let predecessor = vos::service::VosPackage::decode(&predecessor_bytes).unwrap();
         assert_eq!(
             predecessor.manifest.service_program,
@@ -3929,6 +3953,17 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).unwrap();
         let image = directory.join("authority.image");
+        let raft_path = directory.join("authority.raft.redb");
+        inflate_predecessor_fixture(
+            include_bytes!("../../../tests/fixtures/migration/authority.image.gz"),
+            &image,
+        );
+        inflate_predecessor_fixture(
+            include_bytes!("../../../tests/fixtures/migration/authority.raft.redb.gz"),
+            &raft_path,
+        );
+        assert_fixture_digest(&image, provenance["image_blake2b_256"].as_str().unwrap());
+        assert_fixture_digest(&raft_path, provenance["raft_blake2b_256"].as_str().unwrap());
         let space_id = [0x61; 32];
         let mut row = vos::registry::AgentRow {
             instance_name: vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
@@ -3954,14 +3989,25 @@ mod tests {
         .unwrap() else {
             panic!("predecessor authority did not resolve")
         };
-        let mut config = *config;
-        config.consistency = vos::service::ConsistencyMode::Local;
-        let expected_actor = config.root_actor;
-        let mut service = vos::service::LocalRootTreeService::open(
-            config,
-            vos::service::FileCommittedImageStore::new(image.clone()),
+        let predecessor_config = *config;
+        let expected_actor = predecessor_config.root_actor;
+        let trust = std::sync::Arc::new(AllowProductionTrust(Hash([0x63; 32])));
+        let log = vos::raft::service::RaftAccumulateLog::open(
+            &raft_path,
+            vos::raft::RaftConfig::default(),
         )
         .unwrap();
+        let mut service = vos::service::LocalRootTreeService::open_raft_production(
+            predecessor_config,
+            vos::service::FileCommittedImageStore::new(image.clone()),
+            log,
+            trust.clone(),
+        )
+        .expect("current code opens the physical predecessor production Raft image and log");
+        assert_eq!(
+            service.store().header().unwrap().unwrap().consistency,
+            vos::service::ConsistencyMode::Raft,
+        );
 
         let successor =
             root_signed_role_authority_package_for_service(&root, PREDECESSOR_SERVICE_PROGRAM_ID)
@@ -3997,11 +4043,17 @@ mod tests {
         .unwrap() else {
             panic!("upgraded authority did not resolve")
         };
-        let mut config = *config;
-        config.consistency = vos::service::ConsistencyMode::Local;
-        let reopened = vos::service::LocalRootTreeService::open(
-            config,
-            vos::service::FileCommittedImageStore::new(image),
+        let successor_config = *config;
+        let log = vos::raft::service::RaftAccumulateLog::open(
+            &raft_path,
+            vos::raft::RaftConfig::default(),
+        )
+        .unwrap();
+        let mut reopened = vos::service::LocalRootTreeService::open_raft_production(
+            successor_config.clone(),
+            vos::service::FileCommittedImageStore::new(image.clone()),
+            log,
+            trust.clone(),
         )
         .unwrap();
         assert_eq!(
@@ -4009,6 +4061,72 @@ mod tests {
             PREDECESSOR_SERVICE_PROGRAM_ID
         );
         assert_eq!(reopened.identity().deployment, predecessor.deployment_id());
+
+        // Exercise a method which did not exist in the predecessor contract.
+        // The call mutates the upgraded authority's storage, is acknowledged
+        // through the predecessor service guest, and must still recover its
+        // exact result after another production Raft reopen.
+        let credential_id = [0x64_u8; 32];
+        let message = vos::value::Msg::new("issue_access")
+            .with("credential_id", credential_id.to_vec())
+            .with("role", vos::SpaceRole::Member as u8)
+            .with("expires_at", 10_000_u64);
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(&vos::Encode::encode(&message));
+        let request = vos::service::LocalWorkRequest {
+            invocation: vos::service::InvocationId([0x65; 32]),
+            workflow_step: 0,
+            logical_timeslot: 100,
+            target: expected_actor,
+            method: "issue_access".into(),
+            arguments,
+            origin: vos::service::Origin::Member(vos::service::SubjectId::of_authenticated_peer(
+                &root_peer,
+            )),
+            authorization: vos::service::AuthorizationEvidence::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        };
+        let issued = reopened
+            .invoke(request.clone())
+            .expect("the upgraded access method executes through the predecessor service guest");
+        let reply = issued
+            .published
+            .reply
+            .as_ref()
+            .expect("issue_access returns its durable credential status");
+        assert_ne!(
+            reply.result,
+            vos::Encode::encode(&vos::value::Value::Bytes(Vec::new()))
+        );
+        let publication = issued.publication.clone().unwrap();
+        assert!(!reopened.acknowledge_publication(&publication).unwrap());
+        drop(reopened);
+
+        let log = vos::raft::service::RaftAccumulateLog::open(
+            &raft_path,
+            vos::raft::RaftConfig::default(),
+        )
+        .unwrap();
+        let mut recovered = vos::service::LocalRootTreeService::open_raft_production(
+            successor_config,
+            vos::service::FileCommittedImageStore::new(image),
+            log,
+            trust,
+        )
+        .unwrap();
+        let retry = recovered
+            .invoke(request)
+            .expect("an acknowledged predecessor result survives production Raft reopen");
+        assert!(retry.duplicate);
+        assert_eq!(retry.published.reply, issued.published.reply);
+        assert!(retry.publication.is_none());
+        assert_eq!(retry.recovered_result.unwrap().bytes, reply.result);
     }
 
     #[test]

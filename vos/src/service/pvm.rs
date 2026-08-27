@@ -427,6 +427,19 @@ pub trait AccumulateProtocolHost {
         self.begin_at(logical_timeslot)
     }
 
+    /// Stage host-owned metadata derived from the exact request before the
+    /// guest mutates its rows. Implementations use this for data whose
+    /// lifecycle is deliberately independent of guest transport rows. The
+    /// metadata becomes visible only if the guest returns a committing result
+    /// and [`Self::commit`] accepts the same transaction.
+    fn prepare_transaction(
+        &mut self,
+        _transaction: &mut Self::Transaction,
+        _arguments: &[u8],
+    ) -> Result<(), ServicePvmError> {
+        Ok(())
+    }
+
     fn commit(&mut self, transaction: Self::Transaction) -> Result<(), ServicePvmError>;
 }
 
@@ -1828,6 +1841,7 @@ impl ServicePvm {
         install_accumulate_scheduler_caps(&mut kernel);
         kernel.set_entry_ic(ACCUMULATE_ENTRY_IC);
         let mut transaction = host.begin_at_with_availability(logical_timeslot, programs, blobs)?;
+        host.prepare_transaction(&mut transaction, arguments)?;
 
         loop {
             match kernel.run() {

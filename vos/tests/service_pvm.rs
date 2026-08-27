@@ -2803,9 +2803,10 @@ fn attested_root_driver_recovers_queued_and_committed_proofs_across_restart() {
             .map(|artifact| artifact.bytes),
         Some(b"durable-root-attestation-proof".to_vec())
     );
+    let publication = committed.publication.as_ref().unwrap().clone();
 
     let backend = service.into_backend();
-    let mut service = LocalRootTreeService::open(config, backend)
+    let mut service = LocalRootTreeService::open(config.clone(), backend)
         .expect("the proof side-CAS and publication reopen together");
     assert_eq!(
         service
@@ -2820,6 +2821,27 @@ fn attested_root_driver_recovers_queued_and_committed_proofs_across_restart() {
     assert_eq!(retry.refine_gas_used, 0);
     assert_eq!(retry.accumulate_gas_used, 0);
     assert_eq!(producer.calls, 2, "retry never re-enters the producer");
+    assert!(!service.acknowledge_publication(&publication).unwrap());
+    let backend = service.into_backend();
+    let mut service = LocalRootTreeService::open(config, backend)
+        .expect("the acknowledged attested result reopens without its publication");
+    assert!(service.pending_publications().unwrap().is_empty());
+    assert!(
+        service
+            .store()
+            .row(&vos::service::publication_storage_key(committed.input))
+            .is_none(),
+    );
+    let recovered = service
+        .invoke_admitted_attested(request.invocation, &mut producer)
+        .expect("the exact attested response survives acknowledgement and restart");
+    let result = recovered
+        .recovered_result
+        .expect("attested recovery uses the independent result record");
+    assert!(result.attested);
+    RootTreeAttestedResult::decode(&result.bytes)
+        .expect("the retained caller response is the canonical attested wire");
+    assert_eq!(producer.calls, 2);
 }
 
 #[test]
@@ -4791,6 +4813,13 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     let mut restarted = LocalRootTreeService::open(config, backend)
         .expect("acknowledged image restores through the same service identity");
     assert!(restarted.pending_publications().unwrap().is_empty());
+    assert!(
+        restarted
+            .store()
+            .row(&vos::service::publication_storage_key(first.input))
+            .is_none(),
+        "transport acknowledgement removes the publication independently of result retention",
+    );
     assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
     let mut retry = request.clone();
     retry.logical_timeslot = 10_000;
@@ -4800,6 +4829,17 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     assert!(recovered.duplicate);
     assert_eq!(recovered.published, first.published);
     assert_eq!(recovered.publication, None);
+    assert_eq!(
+        recovered
+            .recovered_result
+            .as_ref()
+            .map(|result| result.bytes.as_slice()),
+        first
+            .published
+            .reply
+            .as_ref()
+            .map(|reply| reply.result.as_slice()),
+    );
     assert_eq!(recovered.refine_gas_used, 0);
     assert_eq!(recovered.accumulate_gas_used, 0);
 }

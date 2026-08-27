@@ -91,6 +91,10 @@ blake2b_simd = { version = "1", default-features = false }
 
 [dev-dependencies]
 clerk-ledger = { path = "../actors/clerk-ledger", default-features = false }
+# The migration gate opens a compressed image and Raft database produced by
+# the predecessor release. Keeping those physical fixtures compressed avoids
+# committing redb's mostly-empty initial allocation.
+flate2 = "1"
 # Dev-only: the registry protocol (rows / status / canonical signing
 # bytes / the `RegistryRef` client) now lives in `vos::registry`, so the
 # shipped `vosx` binary carries no dependency on the space-registry actor

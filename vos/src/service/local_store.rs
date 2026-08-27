@@ -17,18 +17,33 @@ use crate::attestation::AttestationProofHost;
 
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
-    AccumulateProtocolHost, AccumulateTransaction, AccumulatedTimeout, AccumulationReceipt,
-    ActorId, ActorUpgrade, ActorUpgradeRecord, AttestationDelivery, BlobRef, DedupRecord,
-    DeliveryRecord, DirectIngress, IngressRecord, MessageRecord, ProgramId,
+    AccumulateProtocolHost, AccumulateRequest, AccumulateTransaction, AccumulatedTimeout,
+    AccumulationReceipt, ActorId, ActorUpgrade, ActorUpgradeRecord, AttestationDelivery, BlobRef,
+    DedupRecord, DeliveryRecord, DirectIngress, IngressRecord, MessageRecord, ProgramId,
     ProofVerificationRequest, PublicationAckRecord, PublicationRecord, ReceiptVerificationRequest,
-    ReplyAdmissionRecord, RoleCredentialVerificationRequest, ServiceGenesis, ServicePvmError,
-    ServiceStateTree, ServiceWire, StateKey, StateTreeStore, StoreHeader, StoreOpenError,
+    ReplyAdmissionRecord, ReplyRecord, RoleCredentialVerificationRequest, RootTreeAttestedResult,
+    ServiceGenesis, ServicePvmError, ServiceStateTree, ServiceWire, StateKey, StateTreeStore,
+    StoreHeader, StoreOpenError, WorkInputId,
 };
 
 /// Artifact-count ceiling for admitting a new replicated private input. Each
 /// payload is independently capped at 64 KiB, bounding ambiguous Raft
 /// pre-admission plaintext to 4 MiB while leaving exact retries admissible.
 pub(crate) const MAX_REPLICATED_PRIVATE_INGRESS_ARTIFACTS: usize = 64;
+
+/// Exact caller-visible bytes retained independently from publication
+/// delivery. The guest owns execution deduplication and transport rows; this
+/// host record lets an exact invocation retry recover the response after the
+/// publication has been acknowledged and removed, including when the
+/// predecessor guest performed that removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedInvocationResult {
+    pub input: WorkInputId,
+    pub receipt: AccumulationReceipt,
+    pub reply: ReplyRecord,
+    pub attested: bool,
+    pub bytes: Vec<u8>,
+}
 
 fn proof_verification_for_attestation(
     attestation: &AttestationDelivery,
@@ -68,6 +83,10 @@ pub struct MemoryServiceSnapshot {
     /// durable: a production image cannot later be reopened under a different
     /// verifier set, or without one, and continue executing.
     production_trust_provenance: Option<(super::Hash, super::Hash)>,
+    /// Host-owned exact invocation responses. These are consensus-replayed
+    /// and snapshot-carried, but are not actor state and do not participate
+    /// in the guest service-state root.
+    invocation_results: BTreeMap<WorkInputId, CommittedInvocationResult>,
 }
 
 impl MemoryServiceSnapshot {
@@ -78,7 +97,7 @@ impl MemoryServiceSnapshot {
         self.blobs.values().map(Vec::as_slice)
     }
 
-    fn encode_provenance_input(&self, out: &mut Vec<u8>) {
+    fn encode_snapshot_core(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
         encoder.u64(self.commit_sequence);
         encoder.u32(self.rows.len() as u32);
@@ -98,9 +117,34 @@ impl MemoryServiceSnapshot {
         }
     }
 
+    fn encode_invocation_results(&self, out: &mut Vec<u8>) {
+        let results: Vec<_> = self.invocation_results.values().collect();
+        Encoder(out).list(&results, |encoder, result| {
+            encoder.fixed(&result.input.invocation.0);
+            encoder.u64(result.input.workflow_step);
+            encoder.bytes(&result.receipt.encode());
+            encoder.fixed(&result.reply.call_id.0);
+            encoder.fixed(&result.reply.producer.0);
+            encoder.bytes(&result.reply.result);
+            encoder.bool(result.attested);
+            encoder.bytes(&result.bytes);
+        });
+    }
+
+    fn encode_provenance_input(&self, out: &mut Vec<u8>) {
+        self.encode_snapshot_core(out);
+        self.encode_invocation_results(out);
+    }
+
     fn expected_proof_verifier_provenance(&self) -> super::Hash {
         let mut input = Vec::new();
         self.encode_provenance_input(&mut input);
+        super::Hash::digest(b"vos/proof-verifier-provenance/service", &[&input])
+    }
+
+    fn expected_legacy_proof_verifier_provenance(&self) -> super::Hash {
+        let mut input = Vec::new();
+        self.encode_snapshot_core(&mut input);
         super::Hash::digest(b"vos/proof-verifier-provenance/service", &[&input])
     }
 
@@ -111,6 +155,15 @@ impl MemoryServiceSnapshot {
     fn expected_production_trust_provenance(&self, policy: super::Hash) -> super::Hash {
         let mut input = Vec::new();
         self.encode_provenance_input(&mut input);
+        super::Hash::digest(
+            b"vos/production-trust-provenance/service",
+            &[&policy.0, &input],
+        )
+    }
+
+    fn expected_legacy_production_trust_provenance(&self, policy: super::Hash) -> super::Hash {
+        let mut input = Vec::new();
+        self.encode_snapshot_core(&mut input);
         super::Hash::digest(
             b"vos/production-trust-provenance/service",
             &[&policy.0, &input],
@@ -133,7 +186,10 @@ impl MemoryServiceSnapshot {
     /// Compare consensus-visible rows, blobs, and programs while ignoring
     /// host-local commit metadata.
     pub fn same_service_state(&self, other: &Self) -> bool {
-        self.rows == other.rows && self.blobs == other.blobs && self.programs == other.programs
+        self.rows == other.rows
+            && self.blobs == other.blobs
+            && self.programs == other.programs
+            && self.invocation_results == other.invocation_results
     }
 
     /// Service identity declared by this image, when genesis has committed.
@@ -218,7 +274,7 @@ impl ServiceWire for MemoryServiceSnapshot {
     const MAGIC: [u8; 4] = *b"VSSW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
-        self.encode_provenance_input(out);
+        self.encode_snapshot_core(out);
         Encoder(out).option(&self.proof_verifier_provenance, |encoder, provenance| {
             encoder.fixed(&provenance.0);
         });
@@ -229,6 +285,7 @@ impl ServiceWire for MemoryServiceSnapshot {
                 encoder.fixed(&provenance.0);
             },
         );
+        self.encode_invocation_results(out);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -243,6 +300,46 @@ impl ServiceWire for MemoryServiceSnapshot {
             decoder.option(|decoder| Ok(super::Hash(decoder.fixed()?)))?;
         let production_trust_provenance = decoder
             .option(|decoder| Ok((super::Hash(decoder.fixed()?), super::Hash(decoder.fixed()?))))?;
+        // Images produced before host-owned result retention end here. They
+        // remain reopenable; no built-in HTTP invocation existed in those
+        // releases whose response could require recovery.
+        let legacy_image = decoder.remaining() == 0;
+        let invocation_results = if legacy_image {
+            BTreeMap::new()
+        } else {
+            let values = decoder.list(|decoder| {
+                let input = WorkInputId {
+                    invocation: super::InvocationId(decoder.fixed()?),
+                    workflow_step: decoder.u64()?,
+                };
+                let result = CommittedInvocationResult {
+                    input,
+                    receipt: AccumulationReceipt::decode(&decoder.bytes()?)?,
+                    reply: ReplyRecord {
+                        call_id: super::CallId(decoder.fixed()?),
+                        producer: ActorId(decoder.fixed()?),
+                        result: decoder.bytes()?,
+                    },
+                    attested: decoder.bool()?,
+                    bytes: decoder.bytes()?,
+                };
+                if result.input.invocation == super::InvocationId::ZERO
+                    || result.receipt.checkpoint != result.input.workflow_step
+                    || result.reply.call_id != result.input.invocation.root_reply_id()
+                    || result.receipt.reply_commitment != Some(result.reply.commitment())
+                {
+                    return Err(DecodeError::NonCanonical);
+                }
+                Ok(result)
+            })?;
+            let mut results = BTreeMap::new();
+            for result in values {
+                if results.insert(result.input, result).is_some() {
+                    return Err(DecodeError::NonCanonical);
+                }
+            }
+            results
+        };
         if rows.is_empty() != (commit_sequence == 0) {
             return Err(DecodeError::NonCanonical);
         }
@@ -252,17 +349,25 @@ impl ServiceWire for MemoryServiceSnapshot {
                 .ok_or(DecodeError::NonCanonical)?;
             StoreHeader::open(header).map_err(|_| DecodeError::NonCanonical)?;
         }
-        let snapshot = Self {
+        let mut snapshot = Self {
             rows,
             blobs,
             programs,
             commit_sequence,
             proof_verifier_provenance,
             production_trust_provenance,
+            invocation_results,
         };
         if snapshot
             .proof_verifier_provenance
-            .is_some_and(|provenance| provenance != snapshot.expected_proof_verifier_provenance())
+            .is_some_and(|provenance| {
+                provenance
+                    != if legacy_image {
+                        snapshot.expected_legacy_proof_verifier_provenance()
+                    } else {
+                        snapshot.expected_proof_verifier_provenance()
+                    }
+            })
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -270,10 +375,23 @@ impl ServiceWire for MemoryServiceSnapshot {
             .production_trust_provenance
             .is_some_and(|(policy, provenance)| {
                 policy == super::Hash::ZERO
-                    || provenance != snapshot.expected_production_trust_provenance(policy)
+                    || provenance
+                        != if legacy_image {
+                            snapshot.expected_legacy_production_trust_provenance(policy)
+                        } else {
+                            snapshot.expected_production_trust_provenance(policy)
+                        }
             })
         {
             return Err(DecodeError::NonCanonical);
+        }
+        if legacy_image {
+            if snapshot.proof_verifier_provenance.is_some() {
+                snapshot.seal_proof_verifier_provenance();
+            }
+            if let Some((policy, _)) = snapshot.production_trust_provenance {
+                snapshot.seal_production_trust_provenance(policy);
+            }
         }
         Ok(snapshot)
     }
@@ -1547,6 +1665,7 @@ impl MemoryServiceStore {
                 commit_sequence: 0,
                 proof_verifier_provenance: None,
                 production_trust_provenance: None,
+                invocation_results: BTreeMap::new(),
             },
             proof_blobs: BTreeMap::new(),
             private_witnesses: BTreeMap::new(),
@@ -1627,6 +1746,13 @@ impl MemoryServiceStore {
     /// policy and deliberately remain outside persisted service state.
     pub fn snapshot_bytes(&self) -> Vec<u8> {
         self.committed.encode()
+    }
+
+    pub(crate) fn committed_invocation_result(
+        &self,
+        input: WorkInputId,
+    ) -> Option<CommittedInvocationResult> {
+        self.committed.invocation_results.get(&input).cloned()
     }
 
     pub const fn commit_sequence(&self) -> u64 {
@@ -2435,6 +2561,80 @@ pub struct LocalJamTransaction {
     production_trust: Option<Arc<dyn ProductionTrust>>,
 }
 
+fn capture_acknowledged_invocation_result(
+    transaction: &mut LocalJamTransaction,
+    arguments: &[u8],
+    mut load_proof: impl FnMut(&BlobRef) -> Option<Vec<u8>>,
+) -> Result<(), ServicePvmError> {
+    let Ok(AccumulateRequest::AcknowledgePublication(acknowledgement)) =
+        AccumulateRequest::decode(arguments)
+    else {
+        return Ok(());
+    };
+    let Some(publication_bytes) = transaction
+        .staged
+        .rows
+        .get(&super::publication_storage_key(acknowledgement.input))
+    else {
+        return Ok(());
+    };
+    let publication = PublicationRecord::decode(publication_bytes)
+        .map_err(|_| ServicePvmError::AccumulateCommitRejected)?;
+    if publication.input != acknowledgement.input
+        || publication.commitment() != acknowledgement.publication
+        || publication.receipt.service != acknowledgement.service
+    {
+        // The guest will reject this acknowledgement. Do not turn the host
+        // pre-commit hook into a second, observably different validator.
+        return Ok(());
+    }
+    let Some(reply) = publication.published.reply.as_ref() else {
+        return Ok(());
+    };
+    if reply.call_id != publication.input.invocation.root_reply_id() {
+        return Ok(());
+    }
+    let (attested, bytes) = match (
+        publication.published.attestation.as_deref(),
+        publication.published.proof.as_ref(),
+    ) {
+        (None, None) => (false, reply.result.clone()),
+        (Some(attestation), Some(proof)) if proof == &attestation.proof => {
+            let proof_bytes = load_proof(&proof.proof_blob)
+                .filter(|bytes| proof.proof_blob.matches(bytes))
+                .ok_or(ServicePvmError::AccumulateCommitRejected)?;
+            let result = RootTreeAttestedResult {
+                reply: reply.result.clone(),
+                attestation: attestation.clone(),
+                proof: proof_bytes,
+            };
+            result
+                .validate()
+                .map_err(|_| ServicePvmError::AccumulateCommitRejected)?;
+            (true, result.encode())
+        }
+        _ => return Err(ServicePvmError::AccumulateCommitRejected),
+    };
+    let result = CommittedInvocationResult {
+        input: publication.input,
+        receipt: publication.receipt,
+        reply: reply.clone(),
+        attested,
+        bytes,
+    };
+    match transaction.staged.invocation_results.get(&result.input) {
+        Some(existing) if existing == &result => Ok(()),
+        Some(_) => Err(ServicePvmError::AccumulateCommitRejected),
+        None => {
+            transaction
+                .staged
+                .invocation_results
+                .insert(result.input, result);
+            Ok(())
+        }
+    }
+}
+
 impl LocalJamTransaction {
     fn read_guest_bytes(
         kernel: &InvocationKernel,
@@ -2795,6 +2995,17 @@ impl AccumulateProtocolHost for MemoryServiceStore {
         })
     }
 
+    fn prepare_transaction(
+        &mut self,
+        transaction: &mut Self::Transaction,
+        arguments: &[u8],
+    ) -> Result<(), ServicePvmError> {
+        let proofs = transaction.proof_blobs.clone();
+        capture_acknowledged_invocation_result(transaction, arguments, |reference| {
+            proofs.get(&reference.hash.0).cloned()
+        })
+    }
+
     fn commit(&mut self, mut transaction: Self::Transaction) -> Result<(), ServicePvmError> {
         transaction.staged.commit_sequence = self
             .committed
@@ -2854,6 +3065,16 @@ where
     ) -> Result<Self::Transaction, ServicePvmError> {
         self.local
             .begin_at_with_availability(logical_timeslot, programs, blobs)
+    }
+
+    fn prepare_transaction(
+        &mut self,
+        transaction: &mut Self::Transaction,
+        arguments: &[u8],
+    ) -> Result<(), ServicePvmError> {
+        capture_acknowledged_invocation_result(transaction, arguments, |reference| {
+            AttestationProofHost::proof_bytes(self, reference)
+        })
     }
 
     fn commit(&mut self, mut transaction: Self::Transaction) -> Result<(), ServicePvmError> {
@@ -3086,6 +3307,81 @@ mod tests {
             },
             super::super::ConsistencyMode::Local,
         )
+    }
+
+    #[test]
+    fn acknowledged_effectful_publication_stages_an_independent_exact_result() {
+        let input = WorkInputId {
+            invocation: super::super::InvocationId([0x31; 32]),
+            workflow_step: 0,
+        };
+        let reply = ReplyRecord {
+            call_id: input.invocation.root_reply_id(),
+            producer: ActorId([0x32; 32]),
+            result: b"caller-visible result".to_vec(),
+        };
+        let receipt = AccumulationReceipt {
+            service: valid_header().service,
+            accepted_transition: super::super::Hash([0x33; 32]),
+            reply_commitment: Some(reply.commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(super::super::Hash([0x34; 32])),
+            resulting_crdt_heads: Vec::new(),
+            sequence: 1,
+            checkpoint: 0,
+            consistency: super::super::ConsistencyMode::Local,
+        };
+        let publication = PublicationRecord {
+            input,
+            receipt: receipt.clone(),
+            published: super::super::PublishedEffects {
+                reply: Some(reply.clone()),
+                exported_blobs: vec![BlobRef::of_bytes(b"application export")],
+                ..super::super::PublishedEffects::default()
+            },
+        };
+        let acknowledgement =
+            AccumulateRequest::AcknowledgePublication(super::super::PublicationAck {
+                service: receipt.service.clone(),
+                input,
+                publication: publication.commitment(),
+            });
+        let mut store = MemoryServiceStore::new();
+        store.committed.rows.insert(
+            super::super::header_storage_key().to_vec(),
+            valid_header().encode(),
+        );
+        store.committed.rows.insert(
+            super::super::publication_storage_key(input),
+            publication.encode(),
+        );
+        let mut transaction = store.begin().unwrap();
+        store
+            .prepare_transaction(&mut transaction, &acknowledgement.encode())
+            .unwrap();
+        let result = transaction
+            .staged
+            .invocation_results
+            .get(&input)
+            .expect("exports do not suppress caller-result capture");
+        assert_eq!(result.reply, reply);
+        assert_eq!(result.bytes, b"caller-visible result");
+
+        transaction
+            .staged
+            .rows
+            .remove(&super::super::publication_storage_key(input));
+        store.commit(transaction).unwrap();
+        let reopened = MemoryServiceStore::from_snapshot_bytes(&store.snapshot_bytes()).unwrap();
+        assert_eq!(
+            reopened.committed_invocation_result(input),
+            store.committed_invocation_result(input),
+        );
+        assert!(
+            reopened
+                .row(&super::super::publication_storage_key(input))
+                .is_none(),
+        );
     }
 
     fn receipt_verification() -> ReceiptVerificationRequest {

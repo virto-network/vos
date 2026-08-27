@@ -691,10 +691,39 @@ pub struct CommittedRootTreeSlice {
     pub receipt: AccumulationReceipt,
     pub published: PublishedEffects,
     pub publication: Option<PublicationRecord>,
+    /// Exact caller-visible bytes captured when the publication was
+    /// acknowledged. This is independent of transport retention and is set
+    /// only for durable duplicate recovery after the publication is gone.
+    pub recovered_result: Option<RecoveredRootTreeResult>,
     pub role_assertion_eligibility: Option<RoleAssertionEligibility>,
     pub duplicate: bool,
     pub refine_gas_used: u64,
     pub accumulate_gas_used: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredRootTreeResult {
+    pub attested: bool,
+    pub bytes: Vec<u8>,
+}
+
+fn published_from_committed_result(
+    result: &super::local_store::CommittedInvocationResult,
+) -> Result<PublishedEffects, LocalRootTreeInvokeError> {
+    let mut published = PublishedEffects {
+        reply: Some(result.reply.clone()),
+        ..PublishedEffects::default()
+    };
+    if result.attested {
+        let attested = RootTreeAttestedResult::decode(&result.bytes)
+            .map_err(|_| LocalRootTreeInvokeError::CorruptWorkflow)?;
+        if attested.reply != result.reply.result {
+            return Err(LocalRootTreeInvokeError::CorruptWorkflow);
+        }
+        published.proof = Some(attested.attestation.proof.clone());
+        published.attestation = Some(Box::new(attested.attestation));
+    }
+    Ok(published)
 }
 
 impl CommittedRootTreeSlice {
@@ -1586,13 +1615,31 @@ where
             {
                 return Err(LocalRootTreeInvokeError::CorruptWorkflow);
             }
+            let recovered_result = self
+                .service
+                .accumulate_host()
+                .committed_invocation_result(input)
+                .map(|result| {
+                    if result.receipt != dedup.receipt {
+                        return Err(LocalRootTreeInvokeError::CorruptWorkflow);
+                    }
+                    Ok(result)
+                })
+                .transpose()?;
+            let published = match (publication.as_ref(), recovered_result.as_ref()) {
+                (Some(publication), _) => publication.published.clone(),
+                (None, Some(result)) => published_from_committed_result(result)?,
+                (None, None) => PublishedEffects::default(),
+            };
             return Ok(Some(CommittedRootTreeSlice {
                 input,
-                receipt: dedup.receipt,
-                published: publication
-                    .as_ref()
-                    .map_or_else(PublishedEffects::default, |row| row.published.clone()),
+                receipt: dedup.receipt.clone(),
+                published,
                 publication,
+                recovered_result: recovered_result.map(|result| RecoveredRootTreeResult {
+                    attested: result.attested,
+                    bytes: result.bytes,
+                }),
                 role_assertion_eligibility: self
                     .service
                     .accumulate_host()
@@ -1718,22 +1765,40 @@ where
         {
             return Err(LocalRootTreeInvokeError::CorruptWorkflow);
         }
+        let committed_result = self
+            .service
+            .accumulate_host()
+            .committed_invocation_result(checkpoint.input)
+            .map(|result| {
+                if result.receipt != dedup.receipt {
+                    return Err(LocalRootTreeInvokeError::CorruptWorkflow);
+                }
+                Ok(result)
+            })
+            .transpose()?;
         let published = match (
             publication.as_ref().or(retained_publication.as_ref()),
             crdt_change.as_ref(),
+            committed_result.as_ref(),
         ) {
-            (Some(publication), _) => publication.published.clone(),
-            (None, Some(change)) => change
+            (Some(publication), _, _) => publication.published.clone(),
+            (None, Some(change), _) => change
                 .published_effects()
                 .map_err(|()| LocalRootTreeInvokeError::CorruptWorkflow)?
                 .ok_or(LocalRootTreeInvokeError::CorruptWorkflow)?,
-            (None, None) => PublishedEffects::default(),
+            (None, None, Some(result)) => published_from_committed_result(result)?,
+            (None, None, None) => PublishedEffects::default(),
         };
+        let recovered_result = committed_result.map(|result| RecoveredRootTreeResult {
+            attested: result.attested,
+            bytes: result.bytes,
+        });
         Ok(Some(CommittedRootTreeSlice {
             input: checkpoint.input,
             receipt: dedup.receipt,
             published,
             publication,
+            recovered_result,
             role_assertion_eligibility: self
                 .service
                 .accumulate_host()
@@ -3850,6 +3915,7 @@ where
             receipt,
             published,
             publication,
+            recovered_result: None,
             role_assertion_eligibility: self
                 .service
                 .accumulate_host()
@@ -3909,6 +3975,7 @@ where
             receipt: committed.preparation.receipt,
             published: committed.published,
             publication: Some(publication),
+            recovered_result: None,
             role_assertion_eligibility: self
                 .service
                 .accumulate_host()
@@ -4396,6 +4463,7 @@ mod tests {
                 receipt,
                 published,
                 publication: Some(publication),
+                recovered_result: None,
                 duplicate: false,
                 refine_gas_used: 10,
                 accumulate_gas_used: 11,

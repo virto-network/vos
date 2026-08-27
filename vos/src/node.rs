@@ -10360,9 +10360,13 @@ fn publish_service_root_slice<B>(
             Error = <B as crate::service::CommittedImageStore>::Error,
         >,
 {
+    let committed_attested = committed.recovered_result.as_ref().map_or_else(
+        || committed.published.attestation.is_some(),
+        |result| result.attested,
+    );
     if caller
         .as_ref()
-        .is_some_and(|caller| caller.attested != committed.published.attestation.is_some())
+        .is_some_and(|caller| caller.attested != committed_attested)
     {
         send_service_status(
             caller.expect("checked above").reply,
@@ -10383,6 +10387,7 @@ fn publish_service_root_slice<B>(
         .reply
         .as_ref()
         .map(|reply| reply.result.as_slice());
+    let recovered_result = committed.recovered_result.as_ref();
     let Some(publication) = committed.publication else {
         if committed.duplicate
             && let Some(callers) = state.pending_callers.remove(&committed.input.invocation)
@@ -10397,6 +10402,14 @@ fn publish_service_root_slice<B>(
                         );
                     }
                     Some(Err(status)) => send_service_status(caller.reply, status, id),
+                    None if recovered_result.is_some() => {
+                        let result = recovered_result.expect("checked above");
+                        let _ = send_reply_capped(
+                            caller.reply,
+                            encode_invoke_envelope(crate::STATUS_DONE, &[], &result.bytes),
+                            id,
+                        );
+                    }
                     None if caller.attested => {
                         match encode_service_attested_result(service, &committed.published) {
                             Some(result) => {

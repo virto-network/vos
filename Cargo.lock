@@ -6773,6 +6773,7 @@ dependencies = [
  "bs58",
  "clap",
  "clerk-ledger",
+ "flate2",
  "fs2",
  "getrandom 0.2.17",
  "hex",

@@ -74,7 +74,10 @@ guest-owned `space upgrade` for `space-authority`, and restart once the
 catalog compare-and-swap completes. The authority actor and signed contract
 advance; its service identity, service guest, and replication incarnation do
 not. Fresh spaces use only the current guest. No arbitrary historical guest
-or contract is accepted.
+or contract is accepted. The release gate opens a production Raft image and
+log created by the predecessor release, performs this catalog cutover, invokes
+a newly added access method, acknowledges it through the predecessor guest,
+and proves its exact result still recovers after restart.
 
 ## Release artifacts
 
