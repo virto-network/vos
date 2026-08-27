@@ -176,6 +176,7 @@ impl InvocationId {
         invocation
     }
 
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(crate) fn retains_idempotent_result(self) -> bool {
         self.0.starts_with(&Self::INGRESS_IDEMPOTENCY_PREFIX)
     }

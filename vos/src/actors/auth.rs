@@ -249,7 +249,7 @@ pub fn default_space_roles(space: crate::service::SpaceId) -> Vec<SpaceRoleDefin
     let definition = |name: &str, power, names: &[&str]| {
         let mut capabilities: Vec<_> = names
             .iter()
-            .map(|name| (crate::CapabilityId::named(name).0, (*name).to_owned()))
+            .map(|name| (crate::CapabilityId::named(name).0, String::from(*name)))
             .collect();
         capabilities.sort_unstable_by_key(|(id, _)| *id);
         capabilities.dedup_by_key(|(id, _)| *id);
