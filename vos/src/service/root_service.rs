@@ -708,7 +708,7 @@ pub struct RecoveredRootTreeResult {
 }
 
 fn published_from_committed_result(
-    result: &super::local_store::CommittedInvocationResult,
+    result: &super::local_store::RecoveredInvocationResult,
 ) -> Result<PublishedEffects, LocalRootTreeInvokeError> {
     let mut published = PublishedEffects {
         reply: Some(result.reply.clone()),

@@ -116,6 +116,11 @@ impl ProducerId {
 }
 
 impl InvocationId {
+    /// Marker reserved for HTTP mutations carrying a caller-owned
+    /// idempotency key. Only this namespace is eligible for bounded,
+    /// host-retained response recovery after publication acknowledgement.
+    const HTTP_IDEMPOTENCY_PREFIX: [u8; 8] = *b"VOSHTTP!";
+
     /// Derive a stable invocation identifier from an application namespace and
     /// caller-provided nonce.
     pub fn derive(namespace: &[u8], nonce: &[u8]) -> Self {
@@ -125,6 +130,21 @@ impl InvocationId {
             b"vos/invocation/service",
             &[&namespace_len, namespace, &nonce_len, nonce],
         ))
+    }
+
+    pub(crate) fn for_http_idempotency(subject: SubjectId, target: ActorId, key: &str) -> Self {
+        let mut nonce = alloc::vec::Vec::with_capacity(64 + key.len());
+        nonce.extend_from_slice(&subject.0);
+        nonce.extend_from_slice(&target.0);
+        nonce.extend_from_slice(key.as_bytes());
+        let mut invocation = Self::derive(b"vos/http-ingress/idempotency-key", &nonce);
+        invocation.0[..Self::HTTP_IDEMPOTENCY_PREFIX.len()]
+            .copy_from_slice(&Self::HTTP_IDEMPOTENCY_PREFIX);
+        invocation
+    }
+
+    pub(crate) fn retains_idempotent_result(self) -> bool {
+        self.0.starts_with(&Self::HTTP_IDEMPOTENCY_PREFIX)
     }
 
     /// The nth await in an invocation always derives the same call id. Retries

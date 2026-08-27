@@ -156,11 +156,7 @@ fn ingress_invocation_id(
     target: crate::service::ActorId,
     key: &str,
 ) -> crate::service::InvocationId {
-    let mut nonce = Vec::with_capacity(64 + key.len());
-    nonce.extend_from_slice(&subject.0);
-    nonce.extend_from_slice(&target.0);
-    nonce.extend_from_slice(key.as_bytes());
-    crate::service::InvocationId::derive(b"vos/http-ingress/idempotency-key", &nonce)
+    crate::service::InvocationId::for_http_idempotency(subject, target, key)
 }
 
 fn receive_service_invocation_reply(
@@ -13767,6 +13763,12 @@ mod tests {
         assert_ne!(
             first,
             ingress_invocation_id(crate::service::SubjectId([1; 32]), target, "request-8"),
+        );
+        assert!(first.retains_idempotent_result());
+        assert!(
+            !crate::service::InvocationId::derive(b"vos/node/ordinary-ingress", b"request-7")
+                .retains_idempotent_result(),
+            "ordinary authentication and query invocations never consume the recovery budget",
         );
     }
 

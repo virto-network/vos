@@ -31,6 +31,13 @@ use super::{
 /// pre-admission plaintext to 4 MiB while leaving exact retries admissible.
 pub(crate) const MAX_REPLICATED_PRIVATE_INGRESS_ARTIFACTS: usize = 64;
 
+/// Bounded durable HTTP idempotency window per root. Selection is canonical:
+/// the greatest `(receipt sequence, input)` pairs survive, so CRDT replicas
+/// converge even when equivalent acknowledgements arrive in another order.
+pub(crate) const MAX_RETAINED_INVOCATION_RESULTS: usize = 256;
+pub(crate) const MAX_RETAINED_INVOCATION_RESULT_BYTES: u64 = 16 * 1024 * 1024;
+const INVOCATION_RESULTS_MAGIC: [u8; 4] = *b"VIRS";
+
 /// Exact caller-visible bytes retained independently from publication
 /// delivery. The guest owns execution deduplication and transport rows; this
 /// host record lets an exact invocation retry recover the response after the
@@ -38,6 +45,15 @@ pub(crate) const MAX_REPLICATED_PRIVATE_INGRESS_ARTIFACTS: usize = 64;
 /// predecessor guest performed that removal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommittedInvocationResult {
+    pub input: WorkInputId,
+    pub receipt: AccumulationReceipt,
+    pub producer: ActorId,
+    pub attested: bool,
+    pub response: BlobRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredInvocationResult {
     pub input: WorkInputId,
     pub receipt: AccumulationReceipt,
     pub reply: ReplyRecord,
@@ -118,16 +134,16 @@ impl MemoryServiceSnapshot {
     }
 
     fn encode_invocation_results(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&INVOCATION_RESULTS_MAGIC);
         let results: Vec<_> = self.invocation_results.values().collect();
         Encoder(out).list(&results, |encoder, result| {
             encoder.fixed(&result.input.invocation.0);
             encoder.u64(result.input.workflow_step);
             encoder.bytes(&result.receipt.encode());
-            encoder.fixed(&result.reply.call_id.0);
-            encoder.fixed(&result.reply.producer.0);
-            encoder.bytes(&result.reply.result);
+            encoder.fixed(&result.producer.0);
             encoder.bool(result.attested);
-            encoder.bytes(&result.bytes);
+            encoder.fixed(&result.response.hash.0);
+            encoder.u64(result.response.len);
         });
     }
 
@@ -268,6 +284,30 @@ impl MemoryServiceSnapshot {
         requests.dedup();
         Ok(requests)
     }
+
+    pub(crate) fn referenced_invocation_results(&self) -> Vec<BlobRef> {
+        let mut references: Vec<_> = self
+            .invocation_results
+            .values()
+            .map(|result| result.response.clone())
+            .collect();
+        references.sort_unstable_by_key(|reference| (reference.hash, reference.len));
+        references.dedup();
+        references
+    }
+
+    pub(crate) fn validate_invocation_result_artifacts(
+        &self,
+        artifacts: &BTreeMap<[u8; 32], Vec<u8>>,
+    ) -> Result<(), DecodeError> {
+        for stored in self.invocation_results.values() {
+            let bytes = artifacts
+                .get(&stored.response.hash.0)
+                .ok_or(DecodeError::NonCanonical)?;
+            recover_invocation_result(stored, bytes.clone())?;
+        }
+        Ok(())
+    }
 }
 
 impl ServiceWire for MemoryServiceSnapshot {
@@ -307,6 +347,9 @@ impl ServiceWire for MemoryServiceSnapshot {
         let invocation_results = if legacy_image {
             BTreeMap::new()
         } else {
+            if decoder.take(4)? != INVOCATION_RESULTS_MAGIC {
+                return Err(DecodeError::NonCanonical);
+            }
             let values = decoder.list(|decoder| {
                 let input = WorkInputId {
                     invocation: super::InvocationId(decoder.fixed()?),
@@ -315,18 +358,18 @@ impl ServiceWire for MemoryServiceSnapshot {
                 let result = CommittedInvocationResult {
                     input,
                     receipt: AccumulationReceipt::decode(&decoder.bytes()?)?,
-                    reply: ReplyRecord {
-                        call_id: super::CallId(decoder.fixed()?),
-                        producer: ActorId(decoder.fixed()?),
-                        result: decoder.bytes()?,
-                    },
+                    producer: ActorId(decoder.fixed()?),
                     attested: decoder.bool()?,
-                    bytes: decoder.bytes()?,
+                    response: BlobRef {
+                        hash: super::Hash(decoder.fixed()?),
+                        len: decoder.u64()?,
+                    },
                 };
                 if result.input.invocation == super::InvocationId::ZERO
+                    || !result.input.invocation.retains_idempotent_result()
                     || result.receipt.checkpoint != result.input.workflow_step
-                    || result.reply.call_id != result.input.invocation.root_reply_id()
-                    || result.receipt.reply_commitment != Some(result.reply.commitment())
+                    || result.receipt.reply_commitment.is_none()
+                    || result.response.len == 0
                 {
                     return Err(DecodeError::NonCanonical);
                 }
@@ -337,6 +380,15 @@ impl ServiceWire for MemoryServiceSnapshot {
                 if results.insert(result.input, result).is_some() {
                     return Err(DecodeError::NonCanonical);
                 }
+            }
+            if results.len() > MAX_RETAINED_INVOCATION_RESULTS {
+                return Err(DecodeError::NonCanonical);
+            }
+            let total = results.values().try_fold(0_u64, |total, result| {
+                total.checked_add(result.response.len)
+            });
+            if total.is_none_or(|total| total > MAX_RETAINED_INVOCATION_RESULT_BYTES) {
+                return Err(DecodeError::NonCanonical);
             }
             results
         };
@@ -445,12 +497,13 @@ pub trait CommittedImageStore {
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error>;
 }
 
-/// Durable side-CAS for proof artifacts referenced by committed publications.
+/// Durable side-CAS for content-addressed host artifacts.
 ///
 /// Proof bytes remain outside the consensus service image, but a successful
 /// proved Apply must not outlive the only copy needed to route its reply after
-/// restart. Implementations persist bytes by their authenticated [`BlobRef`]
-/// before guest Accumulate can publish the corresponding commitment.
+/// restart. Bounded idempotent-response bytes use the same address discipline
+/// without becoming proof-verifier inputs. Implementations persist bytes by
+/// their authenticated [`BlobRef`] before the referencing image can commit.
 pub trait ProofArtifactStore {
     type Error;
 
@@ -566,6 +619,13 @@ pub enum ServiceImageInstallError {
 /// snapshot; it never reconstructs actor state from native commands.
 pub trait CommittedServiceImageHost {
     fn committed_service_image(&self) -> Vec<u8>;
+
+    /// Read exact idempotent-response bytes from the host side-CAS.
+    fn invocation_result_bytes(&self, reference: &BlobRef) -> Option<Vec<u8>>;
+
+    /// Persist one snapshot-carried idempotent response by content address
+    /// before making the referencing service image visible.
+    fn make_invocation_result_available(&mut self, reference: &BlobRef, bytes: &[u8]) -> bool;
 
     fn install_committed_service_image(
         &mut self,
@@ -1327,9 +1387,10 @@ impl core::fmt::Debug for MemoryServiceStore {
 /// service platform storage host whose committed image is durable before IC-5 returns.
 ///
 /// Private-witness inputs and credential, receipt, and install verifier
-/// configuration remain process-local. Proof bytes and producer-private Task
-/// records use the backend's separate [`ProofArtifactStore`] side stores and
-/// never enter the consensus service image.
+/// configuration remain process-local. Proof bytes, bounded invocation
+/// results, and producer-private Task records use the backend's separate
+/// [`ProofArtifactStore`] side stores and never enter the consensus service
+/// image.
 pub struct DurableServiceStore<B> {
     local: MemoryServiceStore,
     backend: B,
@@ -1376,11 +1437,22 @@ where
     pub fn open(
         mut backend: B,
     ) -> Result<Self, DurableStoreOpenError<<B as CommittedImageStore>::Error>> {
-        let local = match backend.load().map_err(DurableStoreOpenError::Backend)? {
+        let mut local = match backend.load().map_err(DurableStoreOpenError::Backend)? {
             Some(bytes) => MemoryServiceStore::from_snapshot_bytes(&bytes)
                 .map_err(DurableStoreOpenError::InvalidSnapshot)?,
             None => MemoryServiceStore::new(),
         };
+        for stored in local.committed.invocation_results.values() {
+            let bytes = backend
+                .load_proof(&stored.response)
+                .map_err(DurableStoreOpenError::Backend)?
+                .ok_or(DurableStoreOpenError::InvalidSnapshot(
+                    DecodeError::NonCanonical,
+                ))?;
+            recover_invocation_result(stored, bytes.clone())
+                .map_err(DurableStoreOpenError::InvalidSnapshot)?;
+            local.proof_blobs.insert(stored.response.hash.0, bytes);
+        }
         let (retained, terminal) = local
             .private_ingress_recovery()
             .map_err(DurableStoreOpenError::CorruptStore)?;
@@ -1751,8 +1823,14 @@ impl MemoryServiceStore {
     pub(crate) fn committed_invocation_result(
         &self,
         input: WorkInputId,
-    ) -> Option<CommittedInvocationResult> {
-        self.committed.invocation_results.get(&input).cloned()
+    ) -> Option<RecoveredInvocationResult> {
+        let stored = self.committed.invocation_results.get(&input)?;
+        let bytes = self
+            .proof_blobs
+            .get(&stored.response.hash.0)
+            .filter(|bytes| stored.response.matches(bytes))?
+            .clone();
+        recover_invocation_result(stored, bytes).ok()
     }
 
     pub const fn commit_sequence(&self) -> u64 {
@@ -2485,11 +2563,35 @@ impl CommittedServiceImageHost for MemoryServiceStore {
         self.snapshot_bytes()
     }
 
+    fn invocation_result_bytes(&self, reference: &BlobRef) -> Option<Vec<u8>> {
+        self.proof_blobs
+            .get(&reference.hash.0)
+            .filter(|bytes| reference.matches(bytes))
+            .cloned()
+    }
+
+    fn make_invocation_result_available(&mut self, reference: &BlobRef, bytes: &[u8]) -> bool {
+        if !reference.matches(bytes)
+            || self
+                .proof_blobs
+                .get(&reference.hash.0)
+                .is_some_and(|existing| existing.as_slice() != bytes)
+        {
+            return false;
+        }
+        self.proof_blobs.insert(reference.hash.0, bytes.to_vec());
+        true
+    }
+
     fn install_committed_service_image(
         &mut self,
         image: &[u8],
     ) -> Result<(), ServiceImageInstallError> {
-        self.committed = self.validate_replacement(image)?;
+        let replacement = self.validate_replacement(image)?;
+        replacement
+            .validate_invocation_result_artifacts(&self.proof_blobs)
+            .map_err(|_| ServiceImageInstallError::PersistenceRejected)?;
+        self.committed = replacement;
         Ok(())
     }
 }
@@ -2502,11 +2604,29 @@ where
         self.local.snapshot_bytes()
     }
 
+    fn invocation_result_bytes(&self, reference: &BlobRef) -> Option<Vec<u8>> {
+        self.local
+            .invocation_result_bytes(reference)
+            .or_else(|| self.backend.load_proof(reference).ok().flatten())
+            .filter(|bytes| reference.matches(bytes))
+    }
+
+    fn make_invocation_result_available(&mut self, reference: &BlobRef, bytes: &[u8]) -> bool {
+        if !reference.matches(bytes) || self.backend.commit_proof(reference, bytes).is_err() {
+            return false;
+        }
+        self.local
+            .make_invocation_result_available(reference, bytes)
+    }
+
     fn install_committed_service_image(
         &mut self,
         image: &[u8],
     ) -> Result<(), ServiceImageInstallError> {
         let replacement = self.local.validate_replacement(image)?;
+        replacement
+            .validate_invocation_result_artifacts(&self.local.proof_blobs)
+            .map_err(|_| ServiceImageInstallError::PersistenceRejected)?;
         let (retained, terminal) = MemoryServiceStore::from_snapshot(replacement.clone())
             .private_ingress_recovery()
             .map_err(|_| ServiceImageInstallError::InvalidSnapshot)?;
@@ -2565,18 +2685,18 @@ fn capture_acknowledged_invocation_result(
     transaction: &mut LocalJamTransaction,
     arguments: &[u8],
     mut load_proof: impl FnMut(&BlobRef) -> Option<Vec<u8>>,
-) -> Result<(), ServicePvmError> {
+) -> Result<Option<BlobRef>, ServicePvmError> {
     let Ok(AccumulateRequest::AcknowledgePublication(acknowledgement)) =
         AccumulateRequest::decode(arguments)
     else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(publication_bytes) = transaction
         .staged
         .rows
         .get(&super::publication_storage_key(acknowledgement.input))
     else {
-        return Ok(());
+        return Ok(None);
     };
     let publication = PublicationRecord::decode(publication_bytes)
         .map_err(|_| ServicePvmError::AccumulateCommitRejected)?;
@@ -2586,13 +2706,22 @@ fn capture_acknowledged_invocation_result(
     {
         // The guest will reject this acknowledgement. Do not turn the host
         // pre-commit hook into a second, observably different validator.
-        return Ok(());
+        return Ok(None);
+    }
+    if !publication.input.invocation.retains_idempotent_result() {
+        return Ok(None);
+    }
+    if publication.receipt.consistency == super::ConsistencyMode::Crdt {
+        // CRDT duplicate recovery is derived from the canonical causal node.
+        // A host-only acknowledgement index would not be propagated by DAG
+        // synchronization and would make otherwise converged replicas differ.
+        return Ok(None);
     }
     let Some(reply) = publication.published.reply.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     if reply.call_id != publication.input.invocation.root_reply_id() {
-        return Ok(());
+        return Ok(None);
     }
     let (attested, bytes) = match (
         publication.published.attestation.as_deref(),
@@ -2615,24 +2744,87 @@ fn capture_acknowledged_invocation_result(
         }
         _ => return Err(ServicePvmError::AccumulateCommitRejected),
     };
+    let response = BlobRef::of_bytes(&bytes);
+    if response.len > MAX_RETAINED_INVOCATION_RESULT_BYTES {
+        return Err(ServicePvmError::AccumulateCommitRejected);
+    }
+    if let Some(existing) = transaction.proof_blobs.get(&response.hash.0)
+        && existing != &bytes
+    {
+        return Err(ServicePvmError::AccumulateCommitRejected);
+    }
+    transaction.proof_blobs.insert(response.hash.0, bytes);
     let result = CommittedInvocationResult {
         input: publication.input,
         receipt: publication.receipt,
-        reply: reply.clone(),
+        producer: reply.producer,
         attested,
-        bytes,
+        response: response.clone(),
     };
-    match transaction.staged.invocation_results.get(&result.input) {
+    insert_invocation_result(&mut transaction.staged.invocation_results, result)?;
+    Ok(Some(response))
+}
+
+fn insert_invocation_result(
+    results: &mut BTreeMap<WorkInputId, CommittedInvocationResult>,
+    result: CommittedInvocationResult,
+) -> Result<(), ServicePvmError> {
+    match results.get(&result.input) {
         Some(existing) if existing == &result => Ok(()),
         Some(_) => Err(ServicePvmError::AccumulateCommitRejected),
         None => {
-            transaction
-                .staged
-                .invocation_results
-                .insert(result.input, result);
+            results.insert(result.input, result);
+            while results.len() > MAX_RETAINED_INVOCATION_RESULTS
+                || results
+                    .values()
+                    .try_fold(0_u64, |total, result| {
+                        total.checked_add(result.response.len)
+                    })
+                    .is_none_or(|total| total > MAX_RETAINED_INVOCATION_RESULT_BYTES)
+            {
+                let evicted = results
+                    .values()
+                    .min_by_key(|result| (result.receipt.sequence, result.input))
+                    .map(|result| result.input)
+                    .ok_or(ServicePvmError::AccumulateCommitRejected)?;
+                results.remove(&evicted);
+            }
             Ok(())
         }
     }
+}
+
+fn recover_invocation_result(
+    stored: &CommittedInvocationResult,
+    bytes: Vec<u8>,
+) -> Result<RecoveredInvocationResult, DecodeError> {
+    if !stored.response.matches(&bytes) {
+        return Err(DecodeError::NonCanonical);
+    }
+    let reply_result = if stored.attested {
+        let result = RootTreeAttestedResult::decode(&bytes)?;
+        result.validate()?;
+        result.reply
+    } else {
+        bytes.clone()
+    };
+    let reply = ReplyRecord {
+        call_id: stored.input.invocation.root_reply_id(),
+        producer: stored.producer,
+        result: reply_result,
+    };
+    if stored.receipt.checkpoint != stored.input.workflow_step
+        || stored.receipt.reply_commitment != Some(reply.commitment())
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(RecoveredInvocationResult {
+        input: stored.input,
+        receipt: stored.receipt.clone(),
+        reply,
+        attested: stored.attested,
+        bytes,
+    })
 }
 
 fn retire_acknowledged_publication(
@@ -3031,6 +3223,7 @@ impl AccumulateProtocolHost for MemoryServiceStore {
         capture_acknowledged_invocation_result(transaction, arguments, |reference| {
             proofs.get(&reference.hash.0).cloned()
         })
+        .map(|_| ())
     }
 
     fn finalize_transaction(
@@ -3057,6 +3250,7 @@ impl AccumulateProtocolHost for MemoryServiceStore {
             transaction.staged.seal_production_trust_provenance(policy);
         }
         self.committed = transaction.staged;
+        self.proof_blobs = transaction.proof_blobs;
         Ok(())
     }
 }
@@ -3108,9 +3302,21 @@ where
         transaction: &mut Self::Transaction,
         arguments: &[u8],
     ) -> Result<(), ServicePvmError> {
-        capture_acknowledged_invocation_result(transaction, arguments, |reference| {
-            AttestationProofHost::proof_bytes(self, reference)
-        })
+        let captured =
+            capture_acknowledged_invocation_result(transaction, arguments, |reference| {
+                AttestationProofHost::proof_bytes(self, reference)
+            })?;
+        if let Some(reference) = captured {
+            let bytes = transaction
+                .proof_blobs
+                .get(&reference.hash.0)
+                .filter(|bytes| reference.matches(bytes))
+                .ok_or(ServicePvmError::AccumulateCommitRejected)?;
+            self.backend
+                .commit_proof(&reference, bytes)
+                .map_err(|_| ServicePvmError::AccumulateCommitRejected)?;
+        }
+        Ok(())
     }
 
     fn finalize_transaction(
@@ -3172,6 +3378,7 @@ where
             .commit(&image)
             .map_err(|_| ServicePvmError::AccumulateCommitRejected)?;
         self.local.committed = transaction.staged;
+        self.local.proof_blobs = transaction.proof_blobs;
         // Every replica executes this boundary while applying the ordered
         // entry. Retirement is therefore holder-wide, not a leader-only host
         // epilogue. Failure is cleanup debt and cannot turn an already durable
@@ -3357,7 +3564,11 @@ mod tests {
     #[test]
     fn acknowledged_effectful_publication_stages_an_independent_exact_result() {
         let input = WorkInputId {
-            invocation: super::super::InvocationId([0x31; 32]),
+            invocation: super::super::InvocationId::for_http_idempotency(
+                super::super::SubjectId([0x30; 32]),
+                ActorId([0x31; 32]),
+                "effectful-result",
+            ),
             workflow_step: 0,
         };
         let reply = ReplyRecord {
@@ -3409,8 +3620,8 @@ mod tests {
             .invocation_results
             .get(&input)
             .expect("exports do not suppress caller-result capture");
-        assert_eq!(result.reply, reply);
-        assert_eq!(result.bytes, b"caller-visible result");
+        assert_eq!(result.producer, reply.producer);
+        assert_eq!(result.response, BlobRef::of_bytes(b"caller-visible result"));
 
         store
             .finalize_transaction(
@@ -3423,7 +3634,38 @@ mod tests {
             )
             .unwrap();
         store.commit(transaction).unwrap();
-        let reopened = MemoryServiceStore::from_snapshot_bytes(&store.snapshot_bytes()).unwrap();
+        assert!(
+            !store
+                .snapshot_bytes()
+                .windows(b"caller-visible result".len())
+                .any(|window| window == b"caller-visible result"),
+            "the consensus service image contains only the response content address",
+        );
+        let response = BlobRef::of_bytes(b"caller-visible result");
+        let raft_snapshot = super::super::CommittedServiceSnapshot {
+            applied_index: 1,
+            service_image: store.snapshot_bytes(),
+            proof_artifacts: vec![],
+            result_artifacts: vec![super::super::CommittedResultArtifact {
+                reference: response.clone(),
+                bytes: b"caller-visible result".to_vec(),
+            }],
+            host_state_machine: Some(super::super::HOST_STATE_MACHINE_ID),
+        };
+        assert_eq!(
+            super::super::CommittedServiceSnapshot::decode(&raft_snapshot.encode()).unwrap(),
+            raft_snapshot,
+        );
+        let mut missing_result = raft_snapshot.clone();
+        missing_result.result_artifacts.clear();
+        assert_eq!(
+            super::super::CommittedServiceSnapshot::decode(&missing_result.encode()),
+            Err(DecodeError::NonCanonical),
+        );
+        let mut reopened =
+            MemoryServiceStore::from_snapshot_bytes(&store.snapshot_bytes()).unwrap();
+        assert!(reopened.committed_invocation_result(input).is_none());
+        assert!(reopened.make_invocation_result_available(&response, b"caller-visible result",));
         assert_eq!(
             reopened.committed_invocation_result(input),
             store.committed_invocation_result(input),
@@ -3433,6 +3675,63 @@ mod tests {
                 .row(&super::super::publication_storage_key(input))
                 .is_none(),
         );
+    }
+
+    #[test]
+    fn invocation_result_retention_is_canonically_count_and_byte_bounded() {
+        let mut results = BTreeMap::new();
+        for sequence in 0..=MAX_RETAINED_INVOCATION_RESULTS as u64 {
+            let mut invocation = [0_u8; 32];
+            invocation[..8].copy_from_slice(b"VOSHTTP!");
+            invocation[8..16].copy_from_slice(&sequence.to_be_bytes());
+            let input = WorkInputId {
+                invocation: super::super::InvocationId(invocation),
+                workflow_step: 0,
+            };
+            insert_invocation_result(
+                &mut results,
+                CommittedInvocationResult {
+                    input,
+                    receipt: AccumulationReceipt {
+                        service: valid_header().service,
+                        accepted_transition: super::super::Hash([1; 32]),
+                        reply_commitment: Some(super::super::Hash([2; 32])),
+                        outbox_commitment: None,
+                        resulting_state_root: Some(super::super::Hash([3; 32])),
+                        resulting_crdt_heads: vec![],
+                        sequence,
+                        checkpoint: 0,
+                        consistency: super::super::ConsistencyMode::Local,
+                    },
+                    producer: ActorId([4; 32]),
+                    attested: false,
+                    response: BlobRef {
+                        hash: super::super::Hash(invocation),
+                        len: 1,
+                    },
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(results.len(), MAX_RETAINED_INVOCATION_RESULTS);
+        assert!(results.values().all(|result| result.receipt.sequence != 0));
+
+        let newest = results
+            .values()
+            .max_by_key(|result| (result.receipt.sequence, result.input))
+            .unwrap()
+            .clone();
+        let mut oversized_window = newest.clone();
+        oversized_window.input.invocation.0[16] ^= 1;
+        oversized_window.receipt.sequence += 1;
+        oversized_window.response.len = MAX_RETAINED_INVOCATION_RESULT_BYTES / 2 + 1;
+        results.clear();
+        let mut older = newest;
+        older.response.len = MAX_RETAINED_INVOCATION_RESULT_BYTES / 2 + 1;
+        insert_invocation_result(&mut results, older).unwrap();
+        insert_invocation_result(&mut results, oversized_window.clone()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results.contains_key(&oversized_window.input));
     }
 
     fn receipt_verification() -> ReceiptVerificationRequest {

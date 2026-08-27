@@ -62,6 +62,15 @@ replacement package on every voter, propose the upgrade, wait for application,
 then update the catalog with compare-and-swap. Exact retries recover the
 already committed result.
 
+Host state-machine changes use a separate identity in every new Raft
+application entry and applied snapshot. Before replacing binaries, pause
+ingress and transport acknowledgement and verify `last_applied ==
+commit_index` on every voter. Replace the complete voter set, then resume
+traffic. A predecessor host cannot apply a new-format entry: it rejects the
+entry before guest execution and leaves its applied cursor unchanged. This
+turns a mixed deployment into an explicit unavailable replica instead of two
+replicas silently committing different service images.
+
 The role authority's replication incarnation is fixed when a space is
 created. Rebuilding or upgrading its signed package does not derive a new
 incarnation.

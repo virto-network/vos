@@ -755,6 +755,7 @@ impl CommittedAccumulateLog for TestCommittedLog {
             let entry = CommittedAccumulateEntry {
                 index: shared.entries.len() as u64 + 1,
                 request,
+                host_state_machine: Some(vos::service::HOST_STATE_MACHINE_ID),
                 logical_timeslot: None,
                 production_trust_policy: None,
                 availability_programs: vec![],
@@ -783,6 +784,7 @@ impl CommittedAccumulateLog for TestCommittedLog {
             let entry = CommittedAccumulateEntry {
                 index: shared.entries.len() as u64 + 1,
                 request,
+                host_state_machine: Some(vos::service::HOST_STATE_MACHINE_ID),
                 logical_timeslot: None,
                 production_trust_policy: None,
                 availability_programs: vec![],
@@ -794,6 +796,7 @@ impl CommittedAccumulateLog for TestCommittedLog {
         let entry = CommittedAccumulateEntry {
             index: shared.entries.len() as u64 + 1,
             request: request.to_vec(),
+            host_state_machine: Some(vos::service::HOST_STATE_MACHINE_ID),
             logical_timeslot,
             production_trust_policy,
             availability_programs: programs.to_vec(),
@@ -849,6 +852,7 @@ impl CommittedAccumulateLog for TestCommittedLog {
         index: u64,
         _service_image: &[u8],
         _proof_artifacts: &[vos::service::CommittedProofArtifact],
+        _result_artifacts: &[vos::service::CommittedResultArtifact],
     ) -> Result<(), Self::Error> {
         let committed = self
             .committed_index_floor
@@ -1431,8 +1435,10 @@ fn attested_root_fixture(
     };
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(&Msg::new("attested_value").encode());
+    let mut invocation = [salt.wrapping_add(5); 32];
+    invocation[..8].copy_from_slice(b"VOSHTTP!");
     let request = LocalWorkRequest {
-        invocation: InvocationId([salt.wrapping_add(5); 32]),
+        invocation: InvocationId(invocation),
         workflow_step: 0,
         logical_timeslot: 11,
         target: actor,
@@ -1839,7 +1845,7 @@ fn production_root_requires_the_same_durable_trust_policy_after_restart() {
 }
 
 #[test]
-fn raft_replay_rejects_a_different_production_trust_policy_before_genesis() {
+fn raft_replay_binds_production_trust_and_host_machine_before_genesis() {
     let actor_pvm = actor_pvm(0);
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = Vec::new();
@@ -1946,6 +1952,23 @@ fn raft_replay_rejects_a_different_production_trust_policy_before_genesis() {
             .header()
             .unwrap()
             .is_none()
+    );
+
+    shared.lock().unwrap().entries[0].host_state_machine = None;
+    let mut legacy_host_follower = make_replica(0x91, false);
+    assert!(matches!(
+        legacy_host_follower.catch_up(),
+        Err(ReplicatedServiceError::InvalidCommittedLog),
+    ));
+    assert_eq!(legacy_host_follower.log_mut().applied_index().unwrap(), 0);
+    assert!(
+        legacy_host_follower
+            .service()
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .is_none(),
+        "a voter must reject an entry from another host state machine before guest mutation",
     );
 }
 
@@ -4666,8 +4689,10 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
             .expect("fresh service installs through physical Accumulate");
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(&Msg::new("start").encode());
+    let mut invocation = [96; 32];
+    invocation[..8].copy_from_slice(b"VOSHTTP!");
     let request = LocalWorkRequest {
-        invocation: InvocationId([96; 32]),
+        invocation: InvocationId(invocation),
         workflow_step: 0,
         logical_timeslot: 1,
         target: actor,
@@ -6915,6 +6940,8 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
         applied_index: source_index,
         service_image: source_image,
         proof_artifacts: vec![],
+        result_artifacts: vec![],
+        host_state_machine: Some(vos::service::HOST_STATE_MACHINE_ID),
     };
     let installed = worker_handle.install_snapshot(
         &[0xE2; 32],
@@ -16423,6 +16450,8 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
                 applied_index: 1,
                 service_image: source.accumulate_host().committed_service_image(),
                 proof_artifacts: vec![],
+                result_artifacts: vec![],
+                host_state_machine: Some(vos::service::HOST_STATE_MACHINE_ID),
             }
             .encode(),
         )
@@ -18296,6 +18325,8 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         applied_index: 3,
         service_image: leader.service().accumulate_host().committed_service_image(),
         proof_artifacts: snapshot_proofs,
+        result_artifacts: vec![],
+        host_state_machine: Some(vos::service::HOST_STATE_MACHINE_ID),
     };
     let mut missing_proof_snapshot = snapshot.clone();
     missing_proof_snapshot.proof_artifacts.clear();
@@ -18635,6 +18666,8 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
         applied_index: 1,
         service_image: source_image,
         proof_artifacts: vec![],
+        result_artifacts: vec![],
+        host_state_machine: Some(vos::service::HOST_STATE_MACHINE_ID),
     };
     let raft_config = RaftConfig {
         me: 0xBBBB,

@@ -20,8 +20,9 @@ use crate::commit::CommitError;
 use crate::service::wire::{DecodeError, Decoder, Encoder};
 use crate::service::{
     AccumulateRequest, CommittedAccumulateBatch, CommittedAccumulateEntry, CommittedAccumulateLog,
-    CommittedProofArtifact, CommittedServiceSnapshot, Hash, ImportedBlob, ImportedProgram,
-    MemoryServiceSnapshot, ProgramId, ReceiptVerificationRequest, ServiceWire, VosPackage,
+    CommittedProofArtifact, CommittedResultArtifact, CommittedServiceSnapshot,
+    HOST_STATE_MACHINE_ID, Hash, ImportedBlob, ImportedProgram, MemoryServiceSnapshot, ProgramId,
+    ReceiptVerificationRequest, ServiceWire, VosPackage,
 };
 
 use super::log::{LogEntry, RaftLog, RaftMeta};
@@ -49,6 +50,7 @@ struct RaftAccumulatePayload {
     programs: Vec<ImportedProgram>,
     blobs: Vec<ImportedBlob>,
     receipt_verifications: Vec<ReceiptVerificationRequest>,
+    host_state_machine: Option<Hash>,
 }
 
 impl RaftAccumulatePayload {
@@ -97,6 +99,7 @@ impl RaftAccumulatePayload {
             programs: programs.to_vec(),
             blobs: blobs.to_vec(),
             receipt_verifications: receipt_verifications.to_vec(),
+            host_state_machine: Some(HOST_STATE_MACHINE_ID),
         })
     }
 }
@@ -247,6 +250,9 @@ impl ServiceWire for RaftAccumulatePayload {
         encoder.list(&self.receipt_verifications, |encoder, verification| {
             encoder.bytes(&verification.encode());
         });
+        encoder.option(&self.host_state_machine, |encoder, identity| {
+            encoder.fixed(&identity.0);
+        });
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -270,6 +276,14 @@ impl ServiceWire for RaftAccumulatePayload {
         })?;
         let receipt_verifications =
             decoder.list(|decoder| ReceiptVerificationRequest::decode(&decoder.bytes()?))?;
+        // Payloads written before host-owned acknowledgement state end here.
+        // They remain decodable for read-only artifact recovery, but the
+        // application runtime refuses to replay them under newer semantics.
+        let host_state_machine = if decoder.remaining() == 0 {
+            None
+        } else {
+            decoder.option(|decoder| Ok(Hash(decoder.fixed()?)))?
+        };
         let decoded = AccumulateRequest::decode(&request).map_err(|_| DecodeError::NonCanonical)?;
         if matches!(&decoded, AccumulateRequest::ExpireCall(_)) != logical_timeslot.is_some()
             || production_trust_policy.is_some_and(|policy| policy == Hash::ZERO)
@@ -289,6 +303,7 @@ impl ServiceWire for RaftAccumulatePayload {
             programs,
             blobs,
             receipt_verifications,
+            host_state_machine,
         })
     }
 }
@@ -448,6 +463,7 @@ impl RaftAccumulateLog {
                 Ok(Some(CommittedAccumulateEntry {
                     index: entry.index,
                     request: payload.request,
+                    host_state_machine: payload.host_state_machine,
                     logical_timeslot: payload.logical_timeslot,
                     production_trust_policy: payload.production_trust_policy,
                     availability_programs: payload.programs,
@@ -499,6 +515,7 @@ impl RaftAccumulateLog {
             Ok(CommittedAccumulateEntry {
                 index,
                 request: decoded.request,
+                host_state_machine: decoded.host_state_machine,
                 logical_timeslot: decoded.logical_timeslot,
                 production_trust_policy: decoded.production_trust_policy,
                 availability_programs: decoded.programs,
@@ -558,6 +575,7 @@ impl RaftAccumulateLog {
         }
         let entry = self.committed_entry(index)?;
         if entry.request != decoded.request
+            || entry.host_state_machine != decoded.host_state_machine
             || entry.logical_timeslot != decoded.logical_timeslot
             || entry.production_trust_policy != decoded.production_trust_policy
             || entry.availability_programs != decoded.programs
@@ -699,6 +717,7 @@ impl CommittedAccumulateLog for RaftAccumulateLog {
         index: u64,
         service_image: &[u8],
         proof_artifacts: &[CommittedProofArtifact],
+        result_artifacts: &[CommittedResultArtifact],
     ) -> Result<(), Self::Error> {
         self.meta = RaftMeta::load(&self.db)?;
         if index < self.meta.last_applied || index > self.meta.commit_index {
@@ -715,6 +734,8 @@ impl CommittedAccumulateLog for RaftAccumulateLog {
             applied_index: index,
             service_image: service_image.to_vec(),
             proof_artifacts: proof_artifacts.to_vec(),
+            result_artifacts: result_artifacts.to_vec(),
+            host_state_machine: Some(HOST_STATE_MACHINE_ID),
         }
         .encode();
         CommittedServiceSnapshot::decode(&snapshot).map_err(|_| {
@@ -821,7 +842,7 @@ mod tests {
             }
         );
         let service_image = MemoryServiceSnapshot::default().encode();
-        log.mark_applied(1, &service_image, &[]).unwrap();
+        log.mark_applied(1, &service_image, &[], &[]).unwrap();
         drop(log);
 
         let mut restarted = RaftAccumulateLog::open(&path, RaftConfig::default()).unwrap();
@@ -905,10 +926,12 @@ mod tests {
         let mut log = RaftAccumulateLog::from_db_arc(db.clone(), RaftConfig::default()).unwrap();
         let first = log.propose(&request(1).encode()).unwrap();
         let first_image = service_image(1);
-        log.mark_applied(first.index, &first_image, &[]).unwrap();
+        log.mark_applied(first.index, &first_image, &[], &[])
+            .unwrap();
         let second = log.propose(&request(2).encode()).unwrap();
         let second_image = service_image(2);
-        log.mark_applied(second.index, &second_image, &[]).unwrap();
+        log.mark_applied(second.index, &second_image, &[], &[])
+            .unwrap();
         drop(log);
 
         let mut storage = RedbStorage::open(db).unwrap();
@@ -947,7 +970,7 @@ mod tests {
         let db = Arc::new(Database::create(&path).unwrap());
         let mut log = RaftAccumulateLog::from_db_arc(db.clone(), RaftConfig::default()).unwrap();
         let entry = log.propose(&request(1).encode()).unwrap();
-        log.mark_applied(entry.index, &service_image(1), &[])
+        log.mark_applied(entry.index, &service_image(1), &[], &[])
             .unwrap();
         drop(log);
 
@@ -989,7 +1012,7 @@ mod tests {
         for index in 1..=total {
             let entry = log.propose(&request(index as u8).encode()).unwrap();
             assert_eq!(entry.index, index);
-            log.mark_applied(entry.index, &service_image(index as u8), &[])
+            log.mark_applied(entry.index, &service_image(index as u8), &[], &[])
                 .unwrap();
         }
         drop(log);
@@ -1027,6 +1050,8 @@ mod tests {
             applied_index: 4,
             service_image: service_image.clone(),
             proof_artifacts: vec![],
+            result_artifacts: vec![],
+            host_state_machine: Some(HOST_STATE_MACHINE_ID),
         };
         let mut storage = RedbStorage::open(db.clone()).unwrap();
         futures_executor::block_on(storage.commit_batch(WriteBatch {
@@ -1047,7 +1072,7 @@ mod tests {
         let mut log = RaftAccumulateLog::from_db_arc(db, RaftConfig::default()).unwrap();
         assert_eq!(log.applied_index().unwrap(), 0);
         assert_eq!(log.installed_snapshot_after(0).unwrap(), Some(snapshot));
-        log.mark_applied(4, &service_image, &[]).unwrap();
+        log.mark_applied(4, &service_image, &[], &[]).unwrap();
         assert_eq!(log.applied_index().unwrap(), 4);
         assert_eq!(log.installed_snapshot_after(4).unwrap(), None);
         drop(log);
@@ -1114,7 +1139,7 @@ mod tests {
             }
         );
         let service_image = MemoryServiceSnapshot::default().encode();
-        log.mark_applied(2, &service_image, &[]).unwrap();
+        log.mark_applied(2, &service_image, &[], &[]).unwrap();
         assert_eq!(log.applied_index().unwrap(), 2);
 
         drop(log);

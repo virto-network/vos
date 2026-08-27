@@ -4073,8 +4073,10 @@ mod tests {
             .with("expires_at", 10_000_u64);
         let mut arguments = vec![vos::value::TAG_DYNAMIC];
         arguments.extend_from_slice(&vos::Encode::encode(&message));
+        let mut invocation = [0x65; 32];
+        invocation[..8].copy_from_slice(b"VOSHTTP!");
         let request = vos::service::LocalWorkRequest {
-            invocation: vos::service::InvocationId([0x65; 32]),
+            invocation: vos::service::InvocationId(invocation),
             workflow_step: 0,
             logical_timeslot: 100,
             target: expected_actor,

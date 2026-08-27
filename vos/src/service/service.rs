@@ -516,6 +516,9 @@ impl<E: core::fmt::Debug, P: core::fmt::Debug> core::error::Error for AttestedSe
 pub struct CommittedAccumulateEntry {
     pub index: u64,
     pub request: Vec<u8>,
+    /// Host-owned state-machine identity encoded in this exact log entry.
+    /// Replicas reject a mismatch before invoking guest Accumulate.
+    pub host_state_machine: Option<super::Hash>,
     pub logical_timeslot: Option<u64>,
     /// Consensus-visible commitment to the production verifier set used for
     /// this root. Every entry carries the same value; conformance groups carry
@@ -578,6 +581,16 @@ pub struct CommittedProofArtifact {
     pub bytes: Vec<u8>,
 }
 
+/// Exact caller-visible response retained outside the consensus service
+/// image. The image contains only this content address and a bounded recovery
+/// index. Snapshot transfer carries these bounded bytes as a separately
+/// validated side-CAS artifact rather than embedding them in actor state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedResultArtifact {
+    pub reference: super::BlobRef,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedServiceSnapshot {
     pub applied_index: u64,
@@ -587,6 +600,11 @@ pub struct CommittedServiceSnapshot {
     /// installed on another replica. Completed reply admissions do not retain
     /// proof bytes because duplicate routing resolves from the admission row.
     pub proof_artifacts: Vec<CommittedProofArtifact>,
+    pub result_artifacts: Vec<CommittedResultArtifact>,
+    /// Host-owned state-machine contract used to produce this image. Legacy
+    /// snapshots without host mutations decode as `None`; newly written
+    /// snapshots always carry the current identity.
+    pub host_state_machine: Option<super::Hash>,
 }
 
 impl ServiceWire for CommittedServiceSnapshot {
@@ -600,6 +618,14 @@ impl ServiceWire for CommittedServiceSnapshot {
             encoder.bytes(&artifact.verification.encode());
             encoder.bytes(&artifact.bytes);
         });
+        encoder.option(&self.host_state_machine, |encoder, identity| {
+            encoder.fixed(&identity.0);
+        });
+        encoder.list(&self.result_artifacts, |encoder, artifact| {
+            encoder.fixed(&artifact.reference.hash.0);
+            encoder.u64(artifact.reference.len);
+            encoder.bytes(&artifact.bytes);
+        });
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -611,6 +637,21 @@ impl ServiceWire for CommittedServiceSnapshot {
                 bytes: decoder.bytes()?,
             })
         })?;
+        let (host_state_machine, result_artifacts) = if decoder.remaining() == 0 {
+            (None, Vec::new())
+        } else {
+            let identity = decoder.option(|decoder| Ok(super::Hash(decoder.fixed()?)))?;
+            let artifacts = decoder.list(|decoder| {
+                Ok(CommittedResultArtifact {
+                    reference: super::BlobRef {
+                        hash: super::Hash(decoder.fixed()?),
+                        len: decoder.u64()?,
+                    },
+                    bytes: decoder.bytes()?,
+                })
+            })?;
+            (identity, artifacts)
+        };
         let service_snapshot = MemoryServiceSnapshot::decode(&service_image)?;
         if applied_index == 0 {
             return Err(DecodeError::NonCanonical);
@@ -633,10 +674,32 @@ impl ServiceWire for CommittedServiceSnapshot {
         {
             return Err(DecodeError::NonCanonical);
         }
+        let result_references = service_snapshot.referenced_invocation_results();
+        let result_bytes: alloc::collections::BTreeMap<_, _> = result_artifacts
+            .iter()
+            .map(|artifact| (artifact.reference.hash.0, artifact.bytes.clone()))
+            .collect();
+        if host_state_machine.is_some_and(|identity| identity != super::HOST_STATE_MACHINE_ID)
+            || host_state_machine.is_none() && !result_references.is_empty()
+            || result_artifacts.len() != result_references.len()
+            || result_artifacts
+                .iter()
+                .zip(&result_references)
+                .any(|(artifact, reference)| {
+                    artifact.reference != *reference || !reference.matches(&artifact.bytes)
+                })
+            || service_snapshot
+                .validate_invocation_result_artifacts(&result_bytes)
+                .is_err()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
         Ok(Self {
             applied_index,
             service_image,
             proof_artifacts,
+            result_artifacts,
+            host_state_machine,
         })
     }
 }
@@ -706,6 +769,7 @@ pub trait CommittedAccumulateLog {
         index: u64,
         service_image: &[u8],
         proof_artifacts: &[CommittedProofArtifact],
+        result_artifacts: &[CommittedResultArtifact],
     ) -> Result<(), Self::Error>;
 }
 
@@ -1399,8 +1463,11 @@ where
         let proof_artifacts =
             snapshot_proof_artifacts(self.service.accumulate_host(), &service_image)
                 .map_err(|_| ReplicatedServiceError::ProofUnavailable)?;
+        let result_artifacts =
+            snapshot_result_artifacts(self.service.accumulate_host(), &service_image)
+                .map_err(|_| ReplicatedServiceError::ProofUnavailable)?;
         self.log
-            .mark_applied(applied, &service_image, &proof_artifacts)
+            .mark_applied(applied, &service_image, &proof_artifacts, &result_artifacts)
             .map_err(ReplicatedServiceError::Log)
     }
 
@@ -1451,6 +1518,7 @@ where
             if is_captured
                 && capture.is_some_and(|target| {
                     target.request.as_slice() != entry.request.as_slice()
+                        || target.host_state_machine != entry.host_state_machine
                         || target.logical_timeslot != entry.logical_timeslot
                         || target.production_trust_policy != entry.production_trust_policy
                         || target.availability_programs != entry.availability_programs
@@ -1462,6 +1530,9 @@ where
             }
             let request = AccumulateRequest::decode(&entry.request)
                 .map_err(|_| ReplicatedServiceError::InvalidCommittedLog)?;
+            if entry.host_state_machine != Some(super::HOST_STATE_MACHINE_ID) {
+                return Err(ReplicatedServiceError::InvalidCommittedLog);
+            }
             if entry.production_trust_policy
                 != self.service.accumulate_host().production_trust_policy_id()
             {
@@ -1509,8 +1580,16 @@ where
             let proof_artifacts =
                 snapshot_proof_artifacts(self.service.accumulate_host(), &service_image)
                     .map_err(|_| ReplicatedServiceError::ProofUnavailable)?;
+            let result_artifacts =
+                snapshot_result_artifacts(self.service.accumulate_host(), &service_image)
+                    .map_err(|_| ReplicatedServiceError::ProofUnavailable)?;
             self.log
-                .mark_applied(entry.index, &service_image, &proof_artifacts)
+                .mark_applied(
+                    entry.index,
+                    &service_image,
+                    &proof_artifacts,
+                    &result_artifacts,
+                )
                 .map_err(ReplicatedServiceError::Log)?;
             let output = match outcome {
                 Ok(output) => Some(output),
@@ -1534,8 +1613,16 @@ where
             let proof_artifacts =
                 snapshot_proof_artifacts(self.service.accumulate_host(), &service_image)
                     .map_err(|_| ReplicatedServiceError::ProofUnavailable)?;
+            let result_artifacts =
+                snapshot_result_artifacts(self.service.accumulate_host(), &service_image)
+                    .map_err(|_| ReplicatedServiceError::ProofUnavailable)?;
             self.log
-                .mark_applied(batch.committed_index, &service_image, &proof_artifacts)
+                .mark_applied(
+                    batch.committed_index,
+                    &service_image,
+                    &proof_artifacts,
+                    &result_artifacts,
+                )
                 .map_err(ReplicatedServiceError::Log)?;
         }
         if capture.is_some() && captured.is_none() {
@@ -1583,6 +1670,15 @@ where
                     return Err(ReplicatedServiceError::ProofUnavailable);
                 }
             }
+            for artifact in &snapshot.result_artifacts {
+                if !self
+                    .service
+                    .accumulate_host_mut()
+                    .make_invocation_result_available(&artifact.reference, &artifact.bytes)
+                {
+                    return Err(ReplicatedServiceError::ProofUnavailable);
+                }
+            }
             self.service
                 .accumulate_host_mut()
                 .install_committed_service_image(&snapshot.service_image)
@@ -1592,6 +1688,7 @@ where
                     snapshot.applied_index,
                     &snapshot.service_image,
                     &snapshot.proof_artifacts,
+                    &snapshot.result_artifacts,
                 )
                 .map_err(ReplicatedServiceError::Log)?;
             applied = snapshot.applied_index;
@@ -1923,6 +2020,24 @@ fn snapshot_proof_artifacts<A: AttestationProofHost>(
                 verification,
                 bytes,
             })
+        })
+        .collect()
+}
+
+fn snapshot_result_artifacts<A: CommittedServiceImageHost>(
+    host: &A,
+    service_image: &[u8],
+) -> Result<Vec<CommittedResultArtifact>, ()> {
+    let snapshot = MemoryServiceSnapshot::decode(service_image).map_err(|_| ())?;
+    snapshot
+        .referenced_invocation_results()
+        .into_iter()
+        .map(|reference| {
+            let bytes = host.invocation_result_bytes(&reference).ok_or(())?;
+            if !reference.matches(&bytes) {
+                return Err(());
+            }
+            Ok(CommittedResultArtifact { reference, bytes })
         })
         .collect()
 }

@@ -95,8 +95,9 @@ pub use scheduler::{LocalWorkRequest, LocalWorkScheduler, PreparedWork, Schedule
 pub use service::{
     AccumulatedServiceOutput, AttestedServiceError, CommittedAccumulateBatch,
     CommittedAccumulateEntry, CommittedAccumulateLog, CommittedAttestationOutput,
-    CommittedProofArtifact, CommittedServiceSnapshot, RefinedServiceOutput, ReplicatedServiceError,
-    ReplicatedServiceRuntime, ServiceDispatchError, ServiceRuntime,
+    CommittedProofArtifact, CommittedResultArtifact, CommittedServiceSnapshot,
+    RefinedServiceOutput, ReplicatedServiceError, ReplicatedServiceRuntime, ServiceDispatchError,
+    ServiceRuntime,
 };
 pub use state_tree::{
     SERVICE_STATE_KEY_DOMAIN, SERVICE_STATE_LEAF_DOMAIN, SERVICE_STATE_NODE_DOMAIN,
@@ -123,6 +124,12 @@ pub use wire::{DecodeError, ServiceWire};
 /// attestation contract. A contract change creates a new clean platform
 /// identity; no alternate decoder is retained.
 pub const PLATFORM_ID: Hash = Hash(*b"vos-platform-canonical-20260825!");
+
+/// Replicated host state-machine contract. Unlike actor execution semantics,
+/// this identifies host-owned mutations performed around guest Accumulate.
+/// Every new Raft application entry carries it so an older voter refuses the
+/// entry before applying a different physical snapshot.
+pub const HOST_STATE_MACHINE_ID: Hash = Hash(*b"vos-host-sm-canonical-20260827!!");
 
 /// Program identity of the canonical [`vos-service.pvm`](../../../services/vos-service/vos-service.pvm).
 ///
