@@ -6874,7 +6874,11 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
     let follower_db = Arc::new(redb::Database::create(directory.join("follower.redb")).unwrap());
     let raft_config = RaftConfig {
         me: 0xBEEF,
-        members: vec![0xBEEF],
+        // A second unavailable voter keeps this worker non-writable while
+        // the relatively expensive root open validates the headerless path.
+        // The installed snapshot below then commits the final singleton
+        // membership and permits election deterministically.
+        members: vec![0xBEEF, 0xCAFE],
         voter_peer_ids: Vec::new(),
         election_timeout_ms: (5_000, 6_000),
         heartbeat_interval_ms: 100,

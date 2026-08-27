@@ -896,11 +896,18 @@ fn acknowledge_publication<S: GuestAccumulateStore>(
         &acknowledgement_key,
         Some(&acknowledgement_record.encode()),
     )?;
-    // Transport delivery and invocation-result recovery are distinct
-    // lifecycles. The host atomically captures the caller-visible result in
-    // the same committing transaction, so every acknowledged publication can
-    // be removed uniformly—including under the predecessor guest.
-    write(store, &key, None)?;
+    let terminal_direct_reply = publication
+        .published
+        .reply
+        .as_ref()
+        .is_some_and(|reply| reply.call_id == publication.input.invocation.root_reply_id())
+        && publication.published.outbox.is_empty()
+        && publication.published.exported_blobs.is_empty()
+        && publication.published.proof.is_none()
+        && publication.published.attestation.is_none();
+    if header.consistency == ConsistencyMode::Crdt || !terminal_direct_reply {
+        write(store, &key, None)?;
+    }
     Ok(AccumulationResult::PublicationAcknowledged {
         input: acknowledgement.input,
         duplicate: false,
@@ -7232,7 +7239,7 @@ mod tests {
                 store
                     .rows
                     .get(&publication_key)
-                    .expect("a terminal direct reply remains available for exact recovery"),
+                    .expect("the pure guest leaves terminal retention to its host lifecycle"),
             )
             .unwrap(),
             publication,

@@ -440,6 +440,19 @@ pub trait AccumulateProtocolHost {
         Ok(())
     }
 
+    /// Finish host-owned metadata after the guest has accepted a committing
+    /// request but before the transaction becomes durable. This is the
+    /// counterpart to [`Self::prepare_transaction`] for lifecycle changes
+    /// which must observe the guest's decision.
+    fn finalize_transaction(
+        &mut self,
+        _transaction: &mut Self::Transaction,
+        _arguments: &[u8],
+        _result: &AccumulationResult,
+    ) -> Result<(), ServicePvmError> {
+        Ok(())
+    }
+
     fn commit(&mut self, transaction: Self::Transaction) -> Result<(), ServicePvmError>;
 }
 
@@ -1878,6 +1891,7 @@ impl ServicePvm {
                                 ..
                             }
                     ) {
+                        host.finalize_transaction(&mut transaction, arguments, &result)?;
                         host.commit(transaction)?;
                     }
                     return Ok(ServicePvmOutput {

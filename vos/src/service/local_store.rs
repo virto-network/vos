@@ -2635,6 +2635,33 @@ fn capture_acknowledged_invocation_result(
     }
 }
 
+fn retire_acknowledged_publication(
+    transaction: &mut LocalJamTransaction,
+    arguments: &[u8],
+    result: &super::AccumulationResult,
+) -> Result<(), ServicePvmError> {
+    let Ok(AccumulateRequest::AcknowledgePublication(acknowledgement)) =
+        AccumulateRequest::decode(arguments)
+    else {
+        return Ok(());
+    };
+    let super::AccumulationResult::PublicationAcknowledged {
+        input,
+        duplicate: false,
+    } = result
+    else {
+        return Ok(());
+    };
+    if input != &acknowledgement.input {
+        return Err(ServicePvmError::AccumulateCommitRejected);
+    }
+    transaction
+        .staged
+        .rows
+        .remove(&super::publication_storage_key(*input));
+    Ok(())
+}
+
 impl LocalJamTransaction {
     fn read_guest_bytes(
         kernel: &InvocationKernel,
@@ -3006,6 +3033,15 @@ impl AccumulateProtocolHost for MemoryServiceStore {
         })
     }
 
+    fn finalize_transaction(
+        &mut self,
+        transaction: &mut Self::Transaction,
+        arguments: &[u8],
+        result: &super::AccumulationResult,
+    ) -> Result<(), ServicePvmError> {
+        retire_acknowledged_publication(transaction, arguments, result)
+    }
+
     fn commit(&mut self, mut transaction: Self::Transaction) -> Result<(), ServicePvmError> {
         transaction.staged.commit_sequence = self
             .committed
@@ -3075,6 +3111,15 @@ where
         capture_acknowledged_invocation_result(transaction, arguments, |reference| {
             AttestationProofHost::proof_bytes(self, reference)
         })
+    }
+
+    fn finalize_transaction(
+        &mut self,
+        transaction: &mut Self::Transaction,
+        arguments: &[u8],
+        result: &super::AccumulationResult,
+    ) -> Result<(), ServicePvmError> {
+        retire_acknowledged_publication(transaction, arguments, result)
     }
 
     fn commit(&mut self, mut transaction: Self::Transaction) -> Result<(), ServicePvmError> {
@@ -3367,10 +3412,16 @@ mod tests {
         assert_eq!(result.reply, reply);
         assert_eq!(result.bytes, b"caller-visible result");
 
-        transaction
-            .staged
-            .rows
-            .remove(&super::super::publication_storage_key(input));
+        store
+            .finalize_transaction(
+                &mut transaction,
+                &acknowledgement.encode(),
+                &super::super::AccumulationResult::PublicationAcknowledged {
+                    input,
+                    duplicate: false,
+                },
+            )
+            .unwrap();
         store.commit(transaction).unwrap();
         let reopened = MemoryServiceStore::from_snapshot_bytes(&store.snapshot_bytes()).unwrap();
         assert_eq!(
