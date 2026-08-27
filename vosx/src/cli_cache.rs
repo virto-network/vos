@@ -268,7 +268,10 @@ fn now_iso8601() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use vos::metadata::{ParsedField, ParsedMessage};
+
+    static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn tmp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -436,10 +439,12 @@ mod tests {
         // XDG_CONFIG_HOME. Previous tests built CliCache by hand;
         // a typo in update_target's field mapping would go
         // unnoticed otherwise.
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
         let tmp = tmp_path("update-via-xdg");
         std::fs::create_dir_all(&tmp).unwrap();
         let saved = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: see comment in render_summary_skips_when_empty.
+        // SAFETY: tests which mutate this process-global variable serialize
+        // on CONFIG_ENV_LOCK and restore it before releasing the guard.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
 
         let m = fake_meta();
@@ -481,13 +486,12 @@ mod tests {
         // Setting XDG_CONFIG_HOME to a fresh dir guarantees
         // `load()` finds no file. The fn must return None so
         // `--help` doesn't print an empty heading.
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
         let tmp = tmp_path("summary-empty");
         std::fs::create_dir_all(&tmp).unwrap();
         let saved = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: tests in this crate run single-threaded by
-        // default (`cargo test` defaults to one thread per test
-        // module unless the user overrides). The env var is
-        // restored before drop.
+        // SAFETY: tests which mutate this process-global variable serialize
+        // on CONFIG_ENV_LOCK and restore it before releasing the guard.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
         let out = render_summary();
         if let Some(prev) = saved {
