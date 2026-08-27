@@ -5008,12 +5008,41 @@ mod tests {
         let mut node_a = VosNode::with_prefix(prefix_a);
         node_a.attach_network(net_a);
         let outbox_a = node_a.outbox_sender();
+        let keepalive_a = outbox_a.clone();
         let shutdown_a = node_a.shutdown_handle();
 
         let mut node_b = VosNode::with_prefix(prefix_b);
         let (inspector_id, inspector_rx) = node_b.install_inspector();
         node_b.attach_network(net_b);
+        let keepalive_b = node_b.outbox_sender();
         let shutdown_b = node_b.shutdown_handle();
+
+        // These network-only test nodes intentionally have no agent threads.
+        // `run_forever` may therefore finish on its first quiet timeout. Keep
+        // each router active with bounded local misses until the asynchronous
+        // Tell is observed; this avoids changing production's empty-node exit
+        // contract merely for a transport test.
+        let keep_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let spawn_keepalive =
+            |tx: std::sync::mpsc::Sender<Envelope>,
+             prefix: u16,
+             running: std::sync::Arc<std::sync::atomic::AtomicBool>| {
+                std::thread::spawn(move || {
+                    let missing = ServiceId::new(prefix, 0xfffe);
+                    while running.load(Ordering::Relaxed) {
+                        let _ = tx.send(Envelope {
+                            from: missing,
+                            to: missing,
+                            payload: Vec::new(),
+                            authenticated_source_peer: None,
+                            destination_peer: None,
+                        });
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                })
+            };
+        let wake_a = spawn_keepalive(keepalive_a, prefix_a, keep_running.clone());
+        let wake_b = spawn_keepalive(keepalive_b, prefix_b, keep_running.clone());
 
         let join_a = std::thread::spawn(move || node_a.run_forever());
         let join_b = std::thread::spawn(move || node_b.run_forever());
@@ -5040,8 +5069,11 @@ mod tests {
         assert_eq!(received.payload, payload);
 
         // Stop both nodes (run_forever exits on shutdown flag).
+        keep_running.store(false, Ordering::Relaxed);
         shutdown_a.store(true, Ordering::Relaxed);
         shutdown_b.store(true, Ordering::Relaxed);
+        let _ = wake_a.join();
+        let _ = wake_b.join();
         let _ = join_a.join();
         let _ = join_b.join();
     }

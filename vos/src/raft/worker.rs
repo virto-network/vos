@@ -831,7 +831,18 @@ mod tests {
         let resp = h.append_entries(&[0xC0; 32], 0xBBBB, 3, 0, 0, 2, entries);
         assert!(resp.success);
         assert_eq!(resp.match_index, 2);
-        let status = h.local_status().expect("running worker publishes status");
+        let status_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let status = loop {
+            let status = h.local_status().expect("running worker publishes status");
+            if status.commit_index == 2 {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < status_deadline,
+                "follower status did not publish the committed append"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
         assert_eq!(status.commit_index, 2);
         assert_eq!(
             status.last_applied, 0,
