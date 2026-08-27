@@ -153,13 +153,10 @@ fn validate_service(bytes: &[u8]) -> anyhow::Result<()> {
 }
 
 fn validate_authority(bytes: &[u8]) -> anyhow::Result<()> {
-    let digest = vos::crypto::blake2b_hash::<32>(&[], &[bytes]);
-    if digest != bundled::SPACE_AUTHORITY_BLAKE2B_256 {
+    let canonical = bundled::space_authority_pvm()
+        .context("this vosx build does not contain the frozen production authority")?;
+    if bytes != canonical {
         bail!("authority PVM does not match the canonical release bytes");
-    }
-    let program = ProgramId::of_pvm(bytes);
-    if program.0 != bundled::SPACE_AUTHORITY_PROGRAM_ID {
-        bail!("authority PVM does not match the canonical program identity");
     }
     Ok(())
 }
@@ -346,6 +343,12 @@ mod tests {
     #[test]
     fn authority_pin_rejects_changed_bytes() {
         assert!(validate_authority(b"not the canonical authority").is_err());
+    }
+
+    #[test]
+    fn bundled_authority_matches_the_runtime_release_pins() {
+        let authority = bundled::space_authority_pvm().expect("bundled authority");
+        validate_authority(authority).expect("build-time and runtime authority pins must agree");
     }
 
     #[cfg(unix)]

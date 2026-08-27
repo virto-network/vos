@@ -960,7 +960,7 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
 
     assert!(
         PRODUCTION_ARTIFACT_PROVENANCE
-            .contains("source_revision = \"8e9cfa5b4015d6f455ee750bfdff9c8e23adacd7\"")
+            .contains("source_revision = \"cf8337742cd2fb278b3312f0a4da2adc0b94c3b2\"")
     );
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("guest_toolchain = \"nightly-2026-03-20\""));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("host_toolchain = \"nightly-2025-05-09\""));
@@ -983,10 +983,10 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
         "registry_elf_blake2b_256 = \"370f4c44a7c5491609c5b716ef80e26307f92019fcd3e585937cbe90eded91a9\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_actor_program_id = \"6ce3f95f7c7453208e272e2afad43b507c9008a9708ee03991d2b3182fe9fdc1\""
+        "clerk_actor_program_id = \"4f3675880e08e03b202767b774a6d069195d663ec38f601e3b9a161e7a844357\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_deployment_id = \"b6a98122ebac68178ebd716c4db8287f25cf0091853abcf10ca4d62280f162f3\""
+        "clerk_deployment_id = \"1d948e7684e3e74e307f1835387df5744320b38f3dc124b2ace6038b62af089d\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
         "clerk_task_hash = \"334e0e1a68ee64635b47b675e3863e307a6a18373ff2fd2714cab5255095b057\""
@@ -1016,11 +1016,11 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
     let clerk = canonical_clerk_package();
     assert_eq!(
         hex(&clerk.manifest.actor_program.0),
-        "6ce3f95f7c7453208e272e2afad43b507c9008a9708ee03991d2b3182fe9fdc1",
+        "4f3675880e08e03b202767b774a6d069195d663ec38f601e3b9a161e7a844357",
     );
     assert_eq!(
         hex(&clerk.deployment_id().0),
-        "b6a98122ebac68178ebd716c4db8287f25cf0091853abcf10ca4d62280f162f3",
+        "1d948e7684e3e74e307f1835387df5744320b38f3dc124b2ace6038b62af089d",
     );
     assert_eq!(
         hex(&clerk.task_dependencies[0].binding.task.0),
