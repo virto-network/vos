@@ -44,8 +44,12 @@ macro_rules! id_type {
 
 id_type!(Hash, "Hash");
 id_type!(SpaceId, "SpaceId");
+id_type!(AgentId, "AgentId");
 id_type!(RootServiceId, "RootServiceId");
 id_type!(ActorId, "ActorId");
+id_type!(PrincipalId, "PrincipalId");
+id_type!(NodeId, "NodeId");
+id_type!(CredentialId, "CredentialId");
 id_type!(SubjectId, "SubjectId");
 id_type!(ProducerId, "ProducerId");
 id_type!(ProgramId, "ProgramId");
@@ -95,6 +99,45 @@ impl ProgramId {
     }
 }
 
+impl AgentId {
+    /// Derive a durable agent identity from its space, owner, and
+    /// caller-chosen creation nonce.
+    pub fn derive(space: SpaceId, owner: PrincipalId, nonce: &[u8]) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(
+            b"vos/agent",
+            &[space.as_bytes(), owner.as_bytes(), nonce],
+        ))
+    }
+}
+
+impl PrincipalId {
+    /// A principal is the long-lived human or operator identity, independent
+    /// of any one node or login credential.
+    pub fn of_public_key(public_key: &[u8]) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(
+            b"vos/principal",
+            &[public_key],
+        ))
+    }
+}
+
+impl NodeId {
+    /// Bind a replica node to its complete authenticated transport identity.
+    pub fn of_authenticated_peer(peer_id: &[u8]) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(b"vos/node", &[peer_id]))
+    }
+}
+
+impl CredentialId {
+    /// Stable identifier of one independently revocable login credential.
+    pub fn of_public_key(public_key: &[u8]) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(
+            b"vos/credential",
+            &[public_key],
+        ))
+    }
+}
+
 impl SubjectId {
     /// Canonical service identity of a transport-authenticated peer. The raw
     /// libp2p multihash remains a host credential; actor wires carry only this
@@ -117,6 +160,14 @@ impl SubjectId {
 }
 
 impl ActorId {
+    /// Stable identity of one top-level actor in an agent namespace.
+    pub fn top_level(agent: AgentId, name: &str) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(
+            b"vos/actor/top-level",
+            &[agent.as_bytes(), name.as_bytes()],
+        ))
+    }
+
     /// Stable identity of one owned child in its parent's namespace.
     /// Replaying the same spawn therefore addresses the same actor, while
     /// equal names below different globally unique parents remain distinct.

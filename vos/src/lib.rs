@@ -45,7 +45,10 @@ pub mod prelude {
     pub use crate::{Decode, Encode};
     // Available for explicit actor helper methods and manual Actor impls.
     pub use crate::Context;
-    pub use crate::{ActorId, CallError, CallId, CapabilityId, InvocationId, Origin, SpaceRole};
+    pub use crate::{
+        ActorId, AgentId, CallError, CallId, CapabilityId, CredentialId, InvocationId, NodeId,
+        Origin, PrincipalId, SpaceRole,
+    };
     pub use crate::{Attestation, AttestationError, Verified};
     #[cfg(feature = "macros")]
     pub use crate::{actor, messages};
@@ -69,6 +72,7 @@ pub mod __io {
 // --- ABI (hostcall IDs, error codes, ecall wrappers) ---
 
 pub mod abi;
+pub mod agent;
 pub mod attestation;
 pub mod crypto;
 /// Canonical service contracts and the local conformance harness.
@@ -168,7 +172,8 @@ pub use attestation::{
     Verified, VerifyAttestationBuilder, VerifyAttestationFrom, verify_once,
 };
 pub use service::{
-    ActorId, CallId, CapabilityId, InvocationId, Origin, ProducerId, ProgramId, RoleId, SubjectId,
+    ActorId, AgentId, CallId, CapabilityId, CredentialId, InvocationId, NodeId, Origin,
+    PrincipalId, ProducerId, ProgramId, RoleId, SubjectId,
 };
 // Per-task future machinery for native extensions: the scheduler lives
 // host-side (see node.rs). Re-exported at the crate root so the
@@ -182,12 +187,6 @@ pub use actors::run_refine_entry;
 pub use actors::{run_nested_actor_entry, run_task_entry};
 #[cfg(feature = "macros")]
 pub use vos_macros::{actor, messages};
-
-/// The agent model: parent-managed children — `Tasks` tables of
-/// `Child::{Task, Peer}` records, spawned and driven from handlers.
-pub mod agent {
-    pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
-}
 
 /// Re-export guest hostcalls for direct use by actors (e.g. agent calling invoke).
 #[cfg(feature = "pvm")]
