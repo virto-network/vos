@@ -10,6 +10,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
+#[cfg(feature = "pvm")]
+pub mod machine;
 use crate::service::{
     ActorId, AgentId, BlobRef, DeploymentId, Hash, NodeId, PrincipalId, ProducerId, ProgramId,
     SpaceId,

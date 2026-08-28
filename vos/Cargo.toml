@@ -69,6 +69,7 @@ rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytech
 # in no_std actor / wasm guests; the std-side host code can use
 # the same facade and bridge to tracing if it wants.
 log = { version = "0.4", default-features = false }
+vos-pvm-program = { workspace = true }
 
 # std-only: workspace-owned PVM runtime and compiler dependencies.
 vos-pvm = { workspace = true, optional = true }

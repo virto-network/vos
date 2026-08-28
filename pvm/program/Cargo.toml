@@ -1,0 +1,15 @@
+[package]
+name = "vos-pvm-program"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+authors.workspace = true
+description = "Portable codec and memory layout for standard PVM programs."
+
+[features]
+default = []
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"

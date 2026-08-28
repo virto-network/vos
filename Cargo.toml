@@ -8,6 +8,7 @@ members = [
     "support/merkle-crdt",
     "pvm/runtime",
     "pvm/compiler",
+    "pvm/program",
     "pvm/codec",
     "pvm/codec-derive",
     "pvm/proof",
@@ -112,6 +113,7 @@ vos-pvm-proof-verifier = { path = "pvm/proof/verifier" }
 vos-pvm-precompiles = { path = "pvm/proof/precompiles" }
 vos-pvm = { path = "pvm/runtime" }
 vos-pvm-compiler = { path = "pvm/compiler" }
+vos-pvm-program = { path = "pvm/program" }
 vos-pvm-codec = { path = "pvm/codec", default-features = false }
 vos-pvm-codec-derive = { path = "pvm/codec-derive" }
 

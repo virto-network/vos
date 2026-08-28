@@ -1,6 +1,6 @@
 //! GP standard-program (SPI) blob emitter.
 //!
-//! Serializes the graypaper v0.7.2 *standard program* format — the blob
+//! Serializes the standard PVM program format — the blob
 //! `vos_pvm::spi::parse_standard_program` consumes. This is the byte-for-byte
 //! inverse of that parser and its `deblob_compact` code decoder:
 //!
@@ -15,29 +15,7 @@
 //! the JAM natural (GP eq C.1). No metadata prefix is emitted — the result is
 //! a bare program blob (`parse_standard_program` accepts both forms).
 
-use crate::emitter::{jump_table_entry_size, pack_bitmask};
-
-/// Encode a JAM natural (GP eq C.1) into 1–9 bytes, appending to `out`.
-///
-/// Mirrors `upstream_crypto::gp072_codec::encode_nat` (kept local so the
-/// transpiler does not pull the crypto stack for ten lines of codec); the
-/// exact inverse of `vos_pvm::spi::read_nat`, pinned by the tests below.
-pub fn encode_nat(x: u64, out: &mut Vec<u8>) {
-    // Smallest length class l in 0..=7 with x < 2^(7·(l+1)); 8 otherwise.
-    let l = (0u8..8).find(|l| x < 1u64 << (7 * (u32::from(*l) + 1)));
-    match l {
-        Some(0) => out.push(x as u8),
-        Some(l) => {
-            // header = 2^8 − 2^(8−l) + ⌊x / 2^(8l)⌋, then l LE value bytes.
-            out.push((256u64 - (256u64 >> l) + (x >> (8 * u32::from(l)))) as u8);
-            out.extend_from_slice(&x.to_le_bytes()[..usize::from(l)]);
-        }
-        None => {
-            out.push(0xFF);
-            out.extend_from_slice(&x.to_le_bytes());
-        }
-    }
-}
+pub use vos_pvm_program::encode_nat;
 
 /// Serialize a GP standard-program (SPI) blob from its parts.
 ///
@@ -72,34 +50,18 @@ pub fn build_spi_blob(
     assert!(rw_data.len() < 1 << 24, "rw_data exceeds E₃ width");
     assert!(stack_size < 1 << 24, "stack_size exceeds E₃ width");
 
-    // Code sub-blob (deblob compact form):
-    // E(|j|) ‖ E₁(z_j) ‖ E(|code|) ‖ jump_table ‖ code ‖ packed_bitmask.
-    let entry_size = jump_table_entry_size(jump_table);
-    let mut c = Vec::new();
-    encode_nat(jump_table.len() as u64, &mut c);
-    c.push(entry_size);
-    encode_nat(code.len() as u64, &mut c);
-    for &entry in jump_table {
-        c.extend_from_slice(&entry.to_le_bytes()[..usize::from(entry_size)]);
-    }
-    c.extend_from_slice(code);
-    c.extend_from_slice(&pack_bitmask(bitmask));
-
-    // Program: E₃(|o|) ‖ E₃(|w|) ‖ E₂(z) ‖ E₃(s) ‖ o ‖ w ‖ E₄(|c|) ‖ c.
-    let mut blob = Vec::with_capacity(15 + ro_data.len() + rw_data.len() + c.len());
-    blob.extend_from_slice(&(ro_data.len() as u32).to_le_bytes()[..3]);
-    blob.extend_from_slice(&(rw_data.len() as u32).to_le_bytes()[..3]);
-    blob.extend_from_slice(&heap_pages.to_le_bytes());
-    blob.extend_from_slice(&stack_size.to_le_bytes()[..3]);
-    blob.extend_from_slice(ro_data);
-    blob.extend_from_slice(rw_data);
-    blob.extend_from_slice(
-        &u32::try_from(c.len())
-            .expect("code sub-blob fits E₄")
-            .to_le_bytes(),
-    );
-    blob.extend_from_slice(&c);
-    blob
+    vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
+        ro_data: ro_data.to_vec(),
+        rw_data: rw_data.to_vec(),
+        heap_pages: u32::from(heap_pages),
+        stack_size,
+        code: vos_pvm_program::CodeBlob {
+            jump_table: jump_table.to_vec(),
+            code: code.to_vec(),
+            bitmask: bitmask.to_vec(),
+        },
+    })
+    .expect("validated standard program fields fit their wire widths")
 }
 
 #[cfg(test)]
@@ -149,8 +111,6 @@ mod tests {
         let bitmask = vec![1u8; code.len()];
         // Entries above 0xFF force entry_size = 2.
         let jump_table: Vec<u32> = (0..40).map(|i| 10 + i * 12).collect();
-        assert_eq!(jump_table_entry_size(&jump_table), 2);
-
         let blob = build_spi_blob(&ro, &rw, 3, 8192, &code, &bitmask, &jump_table);
         let prog = parse_standard_program(&blob).expect("emitted blob parses");
         assert_eq!(prog.ro_data, ro);
