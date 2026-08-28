@@ -363,7 +363,7 @@ fn transaction_caller_is_authorized(ctx: &Context<SubstrateExtension>) -> bool {
     }
 }
 
-#[messages]
+#[messages(extension)]
 impl SubstrateExtension {
     /// Optional init keys: `network`, `chain_spec_path`, `relay_spec_path`.
     /// Empty paths select the pinned bundled Kreivo/Kusama specifications.
@@ -1024,10 +1024,10 @@ mod native {
             }
             let result = async {
                 let client = self.ensure_client().await?;
-                let block = match at {
+                let (block, response) = match at {
                     Some(at) => {
-                        let block = client
-                            .block_info_at_hash(at.hash)
+                        let (block, response) = client
+                            .query_at_finalized_hash_with_info(&path, at.hash)
                             .await
                             .map_err(map_sube_error)?;
                         if block.number != at.number {
@@ -1036,18 +1036,20 @@ mod native {
                                 "block number does not match the supplied hash",
                             ));
                         }
-                        block
+                        (block, response)
                     }
-                    None => client
-                        .backend()
-                        .block_info(None)
-                        .await
-                        .map_err(map_sube_error)?,
+                    None => {
+                        let finalized = client
+                            .backend()
+                            .block_info(None)
+                            .await
+                            .map_err(map_sube_error)?;
+                        client
+                            .query_at_finalized_hash_with_info(&path, finalized.hash)
+                            .await
+                            .map_err(map_sube_error)?
+                    }
                 };
-                let response = client
-                    .query_at_finalized_hash(&path, block.hash)
-                    .await
-                    .map_err(map_sube_error)?;
                 let value = match response {
                     Response::Value(value, metadata) => {
                         Some(value.to_text(&metadata.registry).map_err(map_sube_error)?)
@@ -1854,7 +1856,9 @@ mod native {
             | sube::Error::CallNotFound
             | sube::Error::MissingConstantName
             | sube::Error::ConstantNotFound(_)
-            | sube::Error::AccountNotFound => ErrorCode::BadRequest,
+            | sube::Error::AccountNotFound
+            | sube::Error::InvalidFinalizedBlock(_)
+            | sube::Error::ManagedExtensionOverride(_) => ErrorCode::BadRequest,
             sube::Error::ChainUnavailable
             | sube::Error::ConnectionTimeout
             | sube::Error::SubscriptionClosed

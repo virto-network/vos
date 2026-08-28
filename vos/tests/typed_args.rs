@@ -19,7 +19,8 @@
 
 use vos::abi::service::ServiceId;
 use vos::actors::client::{
-    ActorReference, AttestationInvoker, AttestedInvocationResult, ClientError, Invoker,
+    ActorReference, AttestationInvoker, AttestedInvocationResult, ClientError, ExtensionInvoker,
+    ExtensionReference, Invoker,
 };
 use vos::service::{
     AccumulationReceipt, ActorId, ConsistencyMode, DeploymentId, Hash, InvocationId, ProducerId,
@@ -110,7 +111,7 @@ mod fixture {
     )]
     pub struct Vault;
 
-    #[messages]
+    #[messages(extension)]
     impl Vault {
         fn new() -> Self {
             Vault
@@ -590,6 +591,12 @@ struct BoundMockInvoker {
     actor: Option<ActorId>,
 }
 
+struct BoundExtensionInvoker {
+    reply: Value,
+    target: Option<String>,
+    payload: Option<Vec<u8>>,
+}
+
 struct DeniedBoundInvoker;
 
 impl Invoker for DeniedBoundInvoker {
@@ -609,6 +616,18 @@ impl Invoker for BoundMockInvoker {
         _payload: Vec<u8>,
     ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
         self.actor = Some(target);
+        core::future::ready(Ok(self.reply.clone()))
+    }
+}
+
+impl ExtensionInvoker for BoundExtensionInvoker {
+    fn invoke_extension(
+        &mut self,
+        target: String,
+        payload: Vec<u8>,
+    ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
+        self.target = Some(target);
+        self.payload = Some(payload);
         core::future::ready(Ok(self.reply.clone()))
     }
 }
@@ -785,6 +804,27 @@ fn ref_decodes_valid_custom_reply() {
     let mut vault = VaultRef::bind(ActorId([5; 32]), &mut inv);
     let got = vos::block_on(vault.read_receipt()).expect("valid reply decodes");
     assert_eq!(got, receipt);
+}
+
+#[test]
+fn extension_ref_binds_name_and_uses_the_ordinary_typed_wire() {
+    let mut invoker = BoundExtensionInvoker {
+        reply: Value::U64(500),
+        target: None,
+        payload: None,
+    };
+    let mut vault = VaultRef::bind_extension("substrate".into(), &mut invoker);
+    assert_eq!(vault.extension_name(), "substrate");
+    assert_eq!(vos::block_on(vault.deposit(500)).unwrap(), 500);
+    assert_eq!(invoker.target.as_deref(), Some("substrate"));
+
+    let payload = invoker
+        .payload
+        .expect("typed extension payload was captured");
+    assert_eq!(payload.first(), Some(&vos::value::TAG_DYNAMIC));
+    let message = <Msg as vos::Decode>::decode(&payload[1..]);
+    assert_eq!(message.name, "deposit");
+    assert_eq!(message.args.get("amount"), Some(&Value::U64(500)));
 }
 
 #[test]

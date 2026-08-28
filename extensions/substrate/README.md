@@ -29,8 +29,48 @@ The actor-facing API is generated as `SubstrateExtensionRef`:
 - `cancel_transaction(id)` releases an unused signing request while that
   request is still live in the current extension process.
 
+Actor crates use a Ref-only dependency and bind that API to the host-local
+extension instance name:
+
+```toml
+[dependencies]
+vos = { version = "0.1", default-features = false, features = ["macros", "service", "native-extension-client"] }
+substrate-extension = { path = "../../extensions/substrate", default-features = false }
+```
+
+```rust,ignore
+let mut substrate = ctx
+    .extension::<substrate_extension::SubstrateExtensionRef>("substrate")
+    .await?;
+let result = substrate.query("system/number".into(), None).await?;
+```
+
+The VOS client feature is opt-in so actors that do not use native extensions
+keep their existing PVM identity. This crate declares its generated extension
+handle with `#[messages(extension)]`.
+
+The corresponding service entry in the space recipe must opt into the bounded
+authority explicitly:
+
+```toml
+[[agent]]
+name = "chain-reader"
+path = "target/vos/chain-reader.vos"
+intra_caps = ["substrate:member"]
+
+[[extension]]
+name = "substrate"
+path = "target/release/libsubstrate_extension.so"
+```
+
+The node-local route permits at most eight calls per Refine and 64 KiB per
+request or reply. Proof-requested invocations reject native extension I/O.
+Caller-supplied block hashes are additionally verified as finalized and
+canonical before storage is read.
+
 Transaction methods accept trusted local system calls. PVM actors require a
-matching host-side `intra_cap` for the Substrate target at `Member` or higher;
+matching host-side `[[agent]] intra_caps` entry for the Substrate target at
+`Member` or higher;
 the host binds that bounded grant to the actor identity. Network peers and
 credential-backed ingress callers likewise require at least a `Member` space
 grant; Noise transport identity by itself is not authorization. Signing
@@ -66,12 +106,6 @@ Build the `.so` with:
 
 ```sh
 cargo build -p substrate-extension --release
-```
-
-For Ref-only actor dependencies:
-
-```toml
-substrate-extension = { path = "../../extensions/substrate", default-features = false }
 ```
 
 Chain-spec sources, patches, and checksums are recorded in

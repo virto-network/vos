@@ -6,6 +6,7 @@
 //! rejected before a handler can observe them.
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use vos_pvm::cap::{Access, CallableCap, Cap, DataCap, ProtocolCap};
@@ -22,8 +23,10 @@ use super::{
     ActorPrivateInput, ActorSliceInput, ActorSliceOutput, ActorStorageKey, ActorTreeImport,
     AuthorizationEvidence, AwaitResume, BlobRef, CheckpointToken, ContinuationSnapshot, CrdtChange,
     CrdtDispatch, DEVICE_SIGN_MAX_CALLS_PER_REFINE, DEVICE_SIGN_MAX_PAYLOAD_BYTES, Hash,
-    ImportedBlob, MAX_ROOT_TREE_ACTORS, Origin, ProgramId, REFINE_ENTRY_IC, RefineImports,
-    RoleCredential, ServiceWire, TARGET_ACTOR_HANDLE_SLOT, WorkEnvelope,
+    ImportedBlob, MAX_ROOT_TREE_ACTORS, NATIVE_EXTENSION_MAX_CALLS_PER_REFINE,
+    NATIVE_EXTENSION_REPLY_MAX_BYTES, NATIVE_EXTENSION_REQUEST_MAX_BYTES, Origin, ProgramId,
+    REFINE_ENTRY_IC, RefineImports, RoleCredential, ServiceWire, TARGET_ACTOR_HANDLE_SLOT,
+    WorkEnvelope,
 };
 
 const MAX_ACTOR_IPC_PAGES: u32 = 1024;
@@ -349,6 +352,18 @@ pub trait RefineProtocolHost {
     ) -> Result<[u64; 2], ServicePvmError>;
 }
 
+/// Node-local native-extension dispatcher installed into one root's Refine
+/// host. The implementation owns route resolution and capability enforcement;
+/// the service runtime sees only a bounded synchronous result.
+pub trait NativeExtensionInvoker: Send + Sync {
+    fn invoke(
+        &self,
+        target: &str,
+        invocation: super::InvocationId,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, u8>;
+}
+
 /// Private staging area for one Accumulate execution.
 ///
 /// Implementations buffer storage mutations, receipts, dedup rows, messages,
@@ -532,6 +547,7 @@ pub struct DeviceSignerRefineHost {
     signer: Option<cipher_clerk::crypto::SecretKey>,
     nonce_key: Option<[u8; 32]>,
     public_key: Option<[u8; 32]>,
+    native_extensions: Option<Arc<dyn NativeExtensionInvoker>>,
 }
 
 impl DeviceSignerRefineHost {
@@ -546,11 +562,90 @@ impl DeviceSignerRefineHost {
             signer: Some(signer),
             nonce_key: Some(nonce_key),
             public_key: Some(public_key),
+            native_extensions: None,
         }
     }
 
     pub const fn public_key(&self) -> Option<[u8; 32]> {
         self.public_key
+    }
+
+    /// Install the node-local, capability-gated native-extension dispatcher.
+    pub fn set_native_extension_invoker(&mut self, invoker: Arc<dyn NativeExtensionInvoker>) {
+        self.native_extensions = Some(invoker);
+    }
+
+    fn invoke_native_extension(
+        &self,
+        slot: u8,
+        registers: &[u64; 13],
+        kernel: &mut InvocationKernel,
+    ) -> Result<[u64; 2], ServicePvmError> {
+        if kernel.active_vm == 0 {
+            return Err(ServicePvmError::RefineHostRejected(slot));
+        }
+        let request_address =
+            u32::try_from(registers[7]).map_err(|_| ServicePvmError::RefineHostRejected(slot))?;
+        let request_len =
+            u32::try_from(registers[8]).map_err(|_| ServicePvmError::RefineHostRejected(slot))?;
+        let max_wire = 35usize
+            .checked_add(super::MAX_ACTOR_NAME_BYTES)
+            .and_then(|len| len.checked_add(NATIVE_EXTENSION_REQUEST_MAX_BYTES))
+            .ok_or(ServicePvmError::RefineHostRejected(slot))?;
+        if request_len as usize > max_wire {
+            return Err(ServicePvmError::RefineHostRejected(slot));
+        }
+        let request = kernel
+            .read_data_cap_window(request_address, request_len)
+            .ok_or(ServicePvmError::RefineHostRejected(slot))?;
+        if request.len() < 35 || request[0] != 1 {
+            return Err(ServicePvmError::RefineHostRejected(slot));
+        }
+        let invocation = super::InvocationId::new(
+            request[1..33]
+                .try_into()
+                .map_err(|_| ServicePvmError::RefineHostRejected(slot))?,
+        );
+        let name_len = u16::from_le_bytes(
+            request[33..35]
+                .try_into()
+                .map_err(|_| ServicePvmError::RefineHostRejected(slot))?,
+        ) as usize;
+        let name_end = 35usize
+            .checked_add(name_len)
+            .filter(|end| *end <= request.len())
+            .ok_or(ServicePvmError::RefineHostRejected(slot))?;
+        let name = core::str::from_utf8(&request[35..name_end])
+            .ok()
+            .filter(|name| !name.is_empty() && name.len() <= super::MAX_ACTOR_NAME_BYTES)
+            .ok_or(ServicePvmError::RefineHostRejected(slot))?;
+        let payload = &request[name_end..];
+        if payload.is_empty() || payload.len() > NATIVE_EXTENSION_REQUEST_MAX_BYTES {
+            return Err(ServicePvmError::RefineHostRejected(slot));
+        }
+
+        let output_address =
+            u32::try_from(registers[9]).map_err(|_| ServicePvmError::RefineHostRejected(slot))?;
+        let output_capacity = usize::try_from(registers[10])
+            .map_err(|_| ServicePvmError::RefineHostRejected(slot))?;
+        if output_capacity > NATIVE_EXTENSION_REPLY_MAX_BYTES {
+            return Err(ServicePvmError::RefineHostRejected(slot));
+        }
+        let Some(invoker) = self.native_extensions.as_ref() else {
+            return Ok([0, crate::actors::run::STATUS_NOT_FOUND as u64]);
+        };
+        match invoker.invoke(name, invocation, payload) {
+            Ok(reply) => {
+                if reply.len() > output_capacity || reply.len() > NATIVE_EXTENSION_REPLY_MAX_BYTES {
+                    return Ok([0, crate::actors::run::STATUS_TOO_BIG as u64]);
+                }
+                if !kernel.write_data_cap_window(output_address, &reply) {
+                    return Err(ServicePvmError::RefineHostRejected(slot));
+                }
+                Ok([reply.len() as u64, crate::actors::run::STATUS_DONE as u64])
+            }
+            Err(status) => Ok([0, status as u64]),
+        }
     }
 }
 
@@ -581,6 +676,7 @@ impl core::fmt::Debug for DeviceSignerRefineHost {
         f.debug_struct("DeviceSignerRefineHost")
             .field("configured", &self.signer.is_some())
             .field("public_key", &self.public_key)
+            .field("native_extensions", &self.native_extensions.is_some())
             .finish()
     }
 }
@@ -592,6 +688,9 @@ impl RefineProtocolHost for DeviceSignerRefineHost {
         registers: &[u64; 13],
         kernel: &mut InvocationKernel,
     ) -> Result<[u64; 2], ServicePvmError> {
+        if slot as u32 == crate::abi::hostcall::NATIVE_EXTENSION_INVOKE {
+            return self.invoke_native_extension(slot, registers, kernel);
+        }
         if slot as u32 != crate::abi::hostcall::DEVICE_SIGN || kernel.active_vm == 0 {
             return Err(ServicePvmError::RefineHostRejected(slot));
         }
@@ -2412,6 +2511,7 @@ fn run_refine_kernel<H: RefineProtocolHost>(
     }
     let starting_gas = kernel.active_gas();
     let mut device_sign_calls = 0u32;
+    let mut native_extension_calls = 0u32;
 
     loop {
         let result = if let Some(recorder) = trace.as_mut() {
@@ -2619,11 +2719,27 @@ fn run_refine_kernel<H: RefineProtocolHost>(
                     // trace independently reproduced this host-side result.
                     return Err(ServicePvmError::RefineHostRejected(slot));
                 }
+                if slot == crate::abi::hostcall::NATIVE_EXTENSION_INVOKE as u8
+                    && suspension_work.is_some_and(|work| work.proof_requested)
+                {
+                    // Native extension results are producer-local I/O and are
+                    // absent from proof imports. Never claim a proof replay
+                    // independently reproduced them.
+                    return Err(ServicePvmError::RefineHostRejected(slot));
+                }
                 if slot == crate::abi::hostcall::DEVICE_SIGN as u8 {
                     device_sign_calls = device_sign_calls
                         .checked_add(1)
                         .ok_or(ServicePvmError::RefineHostRejected(slot))?;
                     if device_sign_calls > DEVICE_SIGN_MAX_CALLS_PER_REFINE {
+                        return Err(ServicePvmError::RefineHostRejected(slot));
+                    }
+                }
+                if slot == crate::abi::hostcall::NATIVE_EXTENSION_INVOKE as u8 {
+                    native_extension_calls = native_extension_calls
+                        .checked_add(1)
+                        .ok_or(ServicePvmError::RefineHostRejected(slot))?;
+                    if native_extension_calls > NATIVE_EXTENSION_MAX_CALLS_PER_REFINE {
                         return Err(ServicePvmError::RefineHostRejected(slot));
                     }
                 }
@@ -2672,6 +2788,7 @@ fn install_actor_scheduler_caps(kernel: &mut InvocationKernel, actor_count: usiz
             crate::abi::hostcall::INVOKE as u8,
             crate::abi::hostcall::PROVABLE_RECORD_INTENT as u8,
             crate::abi::hostcall::DEVICE_SIGN as u8,
+            crate::abi::hostcall::NATIVE_EXTENSION_INVOKE as u8,
             crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
             crate::abi::hostcall::GROW_HEAP as u8,
             crate::abi::hostcall::DEBUG_WRITE as u8,
@@ -2792,6 +2909,7 @@ pub fn validate_actor_program_layout(program: &[u8]) -> Result<(), ServicePvmErr
             || cap.cap_index == crate::abi::hostcall::INVOKE as u8
             || cap.cap_index == crate::abi::hostcall::PROVABLE_RECORD_INTENT as u8
             || cap.cap_index == crate::abi::hostcall::DEVICE_SIGN as u8
+            || cap.cap_index == crate::abi::hostcall::NATIVE_EXTENSION_INVOKE as u8
     }) {
         return Err(ServicePvmError::InvalidActorCapabilityLayout);
     }
@@ -2819,6 +2937,7 @@ fn refine_protocol_call_is_pure(slot: u8) -> bool {
             | crate::abi::hostcall::ACTOR_PRIVATE_FETCH
             | crate::abi::hostcall::ACTOR_EFFECT_EXPORT
             | crate::abi::hostcall::DEVICE_SIGN
+            | crate::abi::hostcall::NATIVE_EXTENSION_INVOKE
             | crate::crypto::ECALL_BLAKE2B_COMPRESS
             | crate::abi::hostcall::FETCH
             | crate::abi::hostcall::COMPILE

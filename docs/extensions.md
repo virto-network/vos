@@ -53,6 +53,12 @@ Operators may replace the complete parachain and relay specifications through
 host-local init configuration:
 
 ```toml
+[[agent]]
+name = "chain-reader"
+path = "target/vos/chain-reader.vos"
+# Node-local authority granted to this service root. Omit to deny calls.
+intra_caps = ["substrate:member"]
+
 [[extension]]
 name = "substrate"
 path = "target/release/libsubstrate_extension.so"
@@ -62,6 +68,33 @@ network = "kreivo-kusama"
 chain_spec_path = "/etc/vos/kreivo.json.zst"
 relay_spec_path = "/etc/vos/kusama.json.zst"
 ```
+
+With a Ref-only dependency on `substrate-extension`, an actor binds the
+generated API to that installed name rather than to an `ActorId`:
+
+```toml
+[dependencies]
+vos = { version = "0.1", default-features = false, features = ["macros", "service", "native-extension-client"] }
+substrate-extension = { version = "0.1", default-features = false }
+```
+
+```rust,ignore
+let mut substrate = ctx
+    .extension::<substrate_extension::SubstrateExtensionRef>("substrate")
+    .await?;
+let result = substrate.query("system/number".into(), None).await?;
+```
+
+`native-extension-client` is deliberately opt-in so actors that never invoke
+native extensions retain their existing PVM binary and identity. Extension API
+crates expose their typed handle by declaring the interface with
+`#[messages(extension)]`; ordinary `#[messages]` interfaces do not generate
+native-extension bindings.
+
+The dedicated host route is node-local, capped at eight calls per Refine and
+64 KiB in either direction, and is rejected for proof-requested invocations.
+An explicit `BlockRef` is accepted only when its hash is finalized and
+canonical at the supplied height.
 
 Omit both paths for the bundled defaults. Actor-visible requests are capped at
 32 map rows, a 7 KiB encoded success reply, 16 active map snapshots per caller,
@@ -88,9 +121,10 @@ when a persisted nested type changes incompatibly, for example
 `#[actor(state_version = 2)]`.
 
 Transaction preparation, submission, and cancellation accept trusted local
-system calls. PVM actors need an explicit matching `intra_cap` for the
-Substrate target at `Member` or higher; the host binds that bounded grant to
-the actor identity. Network peers and credential-backed ingress callers also
+system calls. A service actor needs an explicit matching `[[agent]]`
+`intra_caps` entry for the Substrate target at `Member` or higher; the host
+binds that bounded grant to the service actor identity. Network peers and
+credential-backed ingress callers also
 need at least a `Member` space grant; a Noise-authenticated peer identity alone
 does not authorize nonce reservations or signing capabilities. Signing request
 IDs and map snapshot IDs are non-sequential and caller-bound; unauthenticated

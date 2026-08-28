@@ -942,6 +942,10 @@ impl<R, A> ServiceRuntime<R, A> {
         &mut self.accumulate_host
     }
 
+    pub fn refine_host_mut(&mut self) -> &mut R {
+        &mut self.refine_host
+    }
+
     pub fn into_hosts(self) -> (R, A) {
         (self.refine_host, self.accumulate_host)
     }

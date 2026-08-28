@@ -34,7 +34,7 @@ use crate::blob_store;
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::{auto_replication_id, parse_consistency};
 use crate::commands::space::reconcile::{self, AgentDef, Recipe};
-use crate::commands::space::subscriptions::{self, AgentLocal, ExtensionLocal, LocalConfig};
+use crate::commands::space::subscriptions::{self, ExtensionLocal, LocalConfig};
 use crate::output;
 
 pub struct Args {
@@ -475,15 +475,16 @@ pub(crate) fn project_node_local(
     let mut out = base.clone();
     // agents: upsert each recipe agent that carries node-local policy.
     for a in &recipe.agents {
-        if !a.device_secret {
+        if !a.device_secret && a.intra_caps.is_none() {
             continue; // no node-local policy — leave any base entry intact
         }
-        out.agents.insert(
-            a.name.clone(),
-            AgentLocal {
-                device_secret: a.device_secret,
-            },
-        );
+        let policy = out.agents.entry(a.name.clone()).or_default();
+        if a.device_secret {
+            policy.device_secret = true;
+        }
+        if let Some(intra_caps) = &a.intra_caps {
+            policy.intra_caps.clone_from(intra_caps);
+        }
     }
     // extensions: upsert by name (recipe wins), preserving base
     // extensions the recipe doesn't mention.
@@ -579,7 +580,7 @@ mod tests {
 
     #[test]
     fn project_node_local_only_emits_agents_with_policy() {
-        // A bare service gets no local table; one with a device signer does.
+        // A bare service gets no local table; either local policy does.
         let m = recipe_from(
             r#"
             [[agent]]
@@ -589,6 +590,10 @@ mod tests {
             name = "authority"
             path = "authority.vos"
             device_secret = true
+            [[agent]]
+            name = "chain-reader"
+            path = "reader.vos"
+            intra_caps = ["substrate:member"]
             [[extension]]
             name = "worker"
             path = "libgw.so"
@@ -606,6 +611,10 @@ mod tests {
         // recipe-owned fields projected
         assert!(!out.agents.contains_key("plain"), "bare agent has no table");
         assert!(out.agents["authority"].device_secret);
+        assert_eq!(
+            out.agents["chain-reader"].intra_caps,
+            vec!["substrate:member"]
+        );
         assert_eq!(out.extensions.len(), 1);
         assert_eq!(out.extensions[0].name, "worker");
         // extension .so path resolved absolute against the recipe dir.
@@ -644,8 +653,9 @@ mod tests {
         let mut existing_agents = BTreeMap::new();
         existing_agents.insert(
             "ledger".to_string(),
-            AgentLocal {
+            subscriptions::AgentLocal {
                 device_secret: true,
+                intra_caps: Vec::new(),
             },
         );
         let base = LocalConfig {
@@ -675,6 +685,29 @@ mod tests {
             out, base,
             "an export recipe must not wipe existing node-local policy"
         );
+    }
+
+    #[test]
+    fn project_node_local_explicit_empty_caps_revoke_existing_grant() {
+        let mut base = LocalConfig::default();
+        base.agents.insert(
+            "reader".into(),
+            subscriptions::AgentLocal {
+                device_secret: true,
+                intra_caps: vec!["substrate:member".into()],
+            },
+        );
+        let recipe = recipe_from(
+            r#"
+            [[agent]]
+            name = "reader"
+            path = "reader.vos"
+            intra_caps = []
+        "#,
+        );
+        let out = project_node_local(&base, &recipe, Path::new("/recipes"));
+        assert!(out.agents["reader"].intra_caps.is_empty());
+        assert!(out.agents["reader"].device_secret);
     }
 
     #[test]

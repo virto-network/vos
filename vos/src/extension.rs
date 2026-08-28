@@ -29,7 +29,9 @@
 
 use alloc::vec::Vec;
 
+#[cfg(any(feature = "std", feature = "extension"))]
 const INVOCATION_CONTEXT_MAGIC: &[u8; 8] = b"VOSXCTX2";
+#[cfg(any(feature = "std", feature = "extension"))]
 const MAX_CALLER_WIRE_BYTES: usize = 1024;
 
 /// Host-authenticated context installed for one native-extension invocation.
@@ -38,6 +40,7 @@ const MAX_CALLER_WIRE_BYTES: usize = 1024;
 /// of a Rust `repr(C)` enum: [`crate::Caller::Peer`] is variable length, and no
 /// Rust enum layout is stable across independently-built host/plugin binaries.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "std", feature = "extension"))]
 pub struct ExtensionInvocationContext {
     service_id: crate::actors::context::ServiceId,
     invocation_id: crate::service::InvocationId,
@@ -46,6 +49,7 @@ pub struct ExtensionInvocationContext {
     actor_local_role: Option<u8>,
 }
 
+#[cfg(any(feature = "std", feature = "extension"))]
 impl ExtensionInvocationContext {
     pub fn new(
         service_id: crate::actors::context::ServiceId,
@@ -155,6 +159,7 @@ impl ExtensionInvocationContext {
     }
 }
 
+#[cfg(any(feature = "std", feature = "extension"))]
 impl Default for ExtensionInvocationContext {
     fn default() -> Self {
         Self::new(

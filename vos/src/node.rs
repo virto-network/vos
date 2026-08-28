@@ -208,6 +208,7 @@ fn send_service_ingress(
             delegated_origin: None,
             role_authority_request: false,
             root_upgrade_request: false,
+            invocation_id: None,
             msg: ingress.to_vec(),
             reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
@@ -959,6 +960,10 @@ struct InvokeRequest {
     /// the serving daemon. Raft redirects preserve it only inside the
     /// full-PeerId voter-authenticated delegation wire.
     root_upgrade_request: bool,
+    /// Stable caller-selected identity for a native-extension dispatch. Only
+    /// the service Refine bridge populates it; ordinary routes allocate their
+    /// existing host dispatch identity.
+    invocation_id: Option<crate::service::InvocationId>,
     msg: Vec<u8>,
     reply: ReplyChannel,
     // Read by agent_thread via `&req.chain` before moving `req`
@@ -1886,6 +1891,127 @@ type AgentShutdown = Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>;
 /// interceptor reads it.
 type AgentInfos = Arc<std::sync::RwLock<HashMap<u32, AgentInfo>>>;
 
+thread_local! {
+    /// Complete invoke lineage for the service root currently executing on
+    /// this thread. The root's native-extension bridge is installed once, but
+    /// the lineage is dispatch-local; keeping it thread-local lets a nested
+    /// extension → service → extension call retain the upstream extension and
+    /// fail its cycle check before either serial worker blocks on the other.
+    static SERVICE_NATIVE_EXTENSION_CHAIN: core::cell::RefCell<Vec<u32>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+struct ServiceNativeExtensionChainGuard {
+    previous: Vec<u32>,
+}
+
+impl ServiceNativeExtensionChainGuard {
+    fn stamp(upstream: &[u32], caller: ServiceId) -> Self {
+        let mut chain = upstream.to_vec();
+        if chain.last().copied() != Some(caller.0) {
+            chain.push(caller.0);
+        }
+        let previous = SERVICE_NATIVE_EXTENSION_CHAIN
+            .with(|current| core::mem::replace(&mut *current.borrow_mut(), chain));
+        Self { previous }
+    }
+}
+
+impl Drop for ServiceNativeExtensionChainGuard {
+    fn drop(&mut self) {
+        SERVICE_NATIVE_EXTENSION_CHAIN.with(|current| {
+            *current.borrow_mut() = core::mem::take(&mut self.previous);
+        });
+    }
+}
+
+fn current_service_native_extension_chain(caller: ServiceId) -> Vec<u32> {
+    SERVICE_NATIVE_EXTENSION_CHAIN.with(|current| {
+        let mut chain = current.borrow().clone();
+        if chain.last().copied() != Some(caller.0) {
+            chain.push(caller.0);
+        }
+        chain
+    })
+}
+
+/// Synchronous bridge used only by service-actor Refine to reach a named
+/// native extension. It resolves against the live node roster, rejects
+/// non-extension targets, and activates only an explicit matching `intra_cap`.
+struct ServiceNativeExtensionInvoker {
+    caller: ServiceId,
+    caps: Vec<crate::actors::IntraCap>,
+    invoke_routes: InvokeRoutes,
+    agent_info: AgentInfos,
+}
+
+impl crate::service::NativeExtensionInvoker for ServiceNativeExtensionInvoker {
+    fn invoke(
+        &self,
+        target: &str,
+        invocation: crate::service::InvocationId,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, u8> {
+        let Some(ceiling) = crate::actors::cap_for(&self.caps, Some(target)) else {
+            return Err(crate::actors::run::STATUS_FORBIDDEN);
+        };
+        let target_id = {
+            let infos = self
+                .agent_info
+                .read()
+                .map_err(|_| crate::actors::run::STATUS_PANICKED)?;
+            let mut matches = infos.iter().filter_map(|(id, info)| {
+                (info.consistency.is_none()
+                    && info
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(target)))
+                .then_some(*id)
+            });
+            let target_id = matches.next().ok_or(crate::actors::run::STATUS_NOT_FOUND)?;
+            if matches.next().is_some() {
+                // Case-insensitive duplicate extension names would otherwise
+                // make HashMap iteration choose the dispatch target.
+                return Err(crate::actors::run::STATUS_PANICKED);
+            }
+            target_id
+        };
+        let chain = current_service_native_extension_chain(self.caller);
+        match check_invoke_forward(&chain, target_id) {
+            InvokeForwardCheck::Allowed => {}
+            InvokeForwardCheck::Cycle | InvokeForwardCheck::DepthExceeded => {
+                return Err(crate::actors::run::STATUS_PANICKED);
+            }
+        }
+        let tx = self
+            .invoke_routes
+            .lock()
+            .map_err(|_| crate::actors::run::STATUS_PANICKED)?
+            .get(&target_id)
+            .cloned()
+            .ok_or(crate::actors::run::STATUS_NOT_FOUND)?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(InvokeRequest {
+            caller: crate::actors::Caller::Actor(self.caller),
+            space_role: Some(ceiling.as_u8()),
+            actor_local_role: None,
+            #[cfg(all(feature = "network", feature = "storage"))]
+            delegated_origin: None,
+            role_authority_request: false,
+            root_upgrade_request: false,
+            invocation_id: Some(invocation),
+            msg: payload.to_vec(),
+            reply: ReplyChannel::Sync(reply_tx),
+            chain,
+        })
+        .map_err(|_| crate::actors::run::STATUS_NOT_FOUND)?;
+        let envelope = reply_rx
+            .recv_timeout(ASK_TIMEOUT)
+            .map_err(|_| crate::actors::run::STATUS_PANICKED)?;
+        unwrap_invoke_envelope_result(&envelope)
+    }
+}
+
 /// Render one agent's [`AgentInfo`] + live `running` flag as the JSON
 /// object the `__describe` primitive replies with (hand-built — vos has
 /// no `serde_json` dep). Shape:
@@ -2267,6 +2393,7 @@ impl InvokeHandle {
             delegated_origin: None,
             role_authority_request: false,
             root_upgrade_request: false,
+            invocation_id: None,
             msg,
             reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
@@ -2554,6 +2681,7 @@ impl NodeService {
             delegated_origin: None,
             role_authority_request: false,
             root_upgrade_request: false,
+            invocation_id: None,
             msg: ingress.clone(),
             reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
@@ -3004,6 +3132,7 @@ fn registry_probe_reply_with_timeout(
             delegated_origin: None,
             role_authority_request: false,
             root_upgrade_request: false,
+            invocation_id: None,
             msg: payload,
             reply: ReplyChannel::Sync(reply_tx),
             chain: vec![],
@@ -3584,6 +3713,7 @@ impl crate::network::NetworkService for NodeService {
                 delegated_origin,
                 role_authority_request,
                 root_upgrade_request,
+                invocation_id: None,
                 msg,
                 reply: ReplyChannel::Sync(reply_tx),
                 chain,
@@ -5027,7 +5157,7 @@ impl VosNode {
     fn attach_service_root_unchecked<B>(
         &mut self,
         name: String,
-        service: crate::service::LocalRootTreeService<B>,
+        mut service: crate::service::LocalRootTreeService<B>,
         id: ServiceId,
         network_reachable: bool,
         proof_producer: Option<NodeAttestationProofProducer>,
@@ -5039,6 +5169,13 @@ impl VosNode {
             > + Send
             + 'static,
     {
+        let native_extension_caps = service.intra_caps().to_vec();
+        service.set_native_extension_invoker(Arc::new(ServiceNativeExtensionInvoker {
+            caller: id,
+            caps: native_extension_caps,
+            invoke_routes: self.invoke_routes.clone(),
+            agent_info: self.agent_info.clone(),
+        }));
         let actor = service.root_actor();
         let is_role_authority = name == crate::service::ROLE_AUTHORITY_INSTANCE_;
         let root_name = name.clone();
@@ -7361,6 +7498,7 @@ impl VosNode {
                 delegated_origin: None,
                 role_authority_request: false,
                 root_upgrade_request: false,
+                invocation_id: None,
                 msg: msg.clone(),
                 reply: ReplyChannel::Sync(reply_tx),
                 chain: Vec::new(),
@@ -9318,6 +9456,7 @@ fn request_service_role_assertion(
         delegated_origin: None,
         role_authority_request: true,
         root_upgrade_request: false,
+        invocation_id: None,
         msg: ingress_wire.clone(),
         reply: ReplyChannel::Sync(reply_tx),
         chain: Vec::new(),
@@ -9522,6 +9661,7 @@ where
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        let _native_extension_chain = ServiceNativeExtensionChainGuard::stamp(&req.chain, id);
         *activity.lock().unwrap() = Instant::now();
         let ingress = match crate::service::RootTreeInvocation::decode(&req.msg) {
             Ok(ingress) => ingress,
@@ -11464,6 +11604,7 @@ fn agent_thread(
                 delegated_origin: None,
                 role_authority_request: false,
                 root_upgrade_request: false,
+                invocation_id: None,
                 msg: msg.to_vec(),
                 reply: ReplyChannel::Sync(reply_tx),
                 chain: chain_snapshot,
@@ -12916,7 +13057,8 @@ fn extension_thread(
                     bump();
                     let task_context = crate::extension::ExtensionInvocationContext::new(
                         id,
-                        next_dispatch_invocation_id(strategy.as_ref(), id),
+                        req.invocation_id
+                            .unwrap_or_else(|| next_dispatch_invocation_id(strategy.as_ref(), id)),
                         req.caller.clone(),
                         req.space_role,
                         req.actor_local_role,
@@ -13495,6 +13637,7 @@ async fn route_invoke(
             delegated_origin: None,
             role_authority_request: false,
             root_upgrade_request: false,
+            invocation_id: None,
             msg: payload,
             reply: ReplyChannel::Async(reply_tx),
             chain: invoke_chain.to_vec(),
@@ -14152,6 +14295,162 @@ fn persist(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_native_extension_dispatch_is_capability_gated_and_context_bound() {
+        use crate::service::NativeExtensionInvoker as _;
+
+        let caller = ServiceId::new(0, 0x4400);
+        let target = ServiceId::new(0, 0x4401);
+        let invocation = crate::service::InvocationId([0x42; 32]);
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let infos: AgentInfos = Arc::new(std::sync::RwLock::new(HashMap::from([(
+            target.0,
+            AgentInfo {
+                name: Some("Substrate".into()),
+                consistency: None,
+                network_reachable: true,
+            },
+        )])));
+        let (tx, rx) = mpsc::channel();
+        routes.lock().unwrap().insert(target.0, tx);
+
+        let denied = ServiceNativeExtensionInvoker {
+            caller,
+            caps: Vec::new(),
+            invoke_routes: routes.clone(),
+            agent_info: infos.clone(),
+        };
+        assert_eq!(
+            denied.invoke("substrate", invocation, b"request"),
+            Err(crate::actors::run::STATUS_FORBIDDEN),
+        );
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        let worker = thread::spawn(move || {
+            let request = rx.recv().unwrap();
+            assert_eq!(request.caller, crate::Caller::Actor(caller));
+            assert_eq!(request.space_role, Some(crate::SpaceRole::Member.as_u8()));
+            assert_eq!(request.actor_local_role, None);
+            assert_eq!(request.invocation_id, Some(invocation));
+            assert_eq!(request.chain, vec![0x3300, caller.0]);
+            assert_eq!(request.msg, b"request");
+            request.reply.send(encode_invoke_envelope(
+                crate::actors::run::STATUS_DONE,
+                &[],
+                b"reply",
+            ));
+        });
+        let allowed = ServiceNativeExtensionInvoker {
+            caller,
+            caps: vec![crate::IntraCap::parse("substrate:member").unwrap()],
+            invoke_routes: routes,
+            agent_info: infos,
+        };
+        {
+            let _chain = ServiceNativeExtensionChainGuard::stamp(&[0x3300], caller);
+            assert_eq!(
+                allowed.invoke("substrate", invocation, b"request"),
+                Ok(b"reply".to_vec()),
+            );
+        }
+        assert_eq!(
+            current_service_native_extension_chain(caller),
+            vec![caller.0],
+            "the dispatch-local lineage must be cleared after the request",
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn service_native_extension_dispatch_rejects_reentry_from_its_target() {
+        use crate::service::NativeExtensionInvoker as _;
+
+        let caller = ServiceId::new(0, 0x4600);
+        let target = ServiceId::new(0, 0x4601);
+        let invocation = crate::service::InvocationId([0x44; 32]);
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let infos: AgentInfos = Arc::new(std::sync::RwLock::new(HashMap::from([(
+            target.0,
+            AgentInfo {
+                name: Some("substrate".into()),
+                consistency: None,
+                network_reachable: true,
+            },
+        )])));
+        let (tx, rx) = mpsc::channel();
+        routes.lock().unwrap().insert(target.0, tx);
+        let invoker = ServiceNativeExtensionInvoker {
+            caller,
+            caps: vec![crate::IntraCap::parse("substrate:member").unwrap()],
+            invoke_routes: routes,
+            agent_info: infos,
+        };
+
+        let _chain = ServiceNativeExtensionChainGuard::stamp(&[0x3200, target.0], caller);
+        assert_eq!(
+            invoker.invoke("substrate", invocation, b"request"),
+            Err(crate::actors::run::STATUS_PANICKED),
+        );
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn service_native_extension_dispatch_rejects_actor_and_ambiguous_names() {
+        use crate::service::NativeExtensionInvoker as _;
+
+        let caller = ServiceId::new(0, 0x4500);
+        let invocation = crate::service::InvocationId([0x43; 32]);
+        let cap = vec![crate::IntraCap::parse("substrate:member").unwrap()];
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let actor_infos: AgentInfos = Arc::new(std::sync::RwLock::new(HashMap::from([(
+            0x4501,
+            AgentInfo {
+                name: Some("substrate".into()),
+                consistency: Some(Consistency::Local),
+                network_reachable: false,
+            },
+        )])));
+        let actor_only = ServiceNativeExtensionInvoker {
+            caller,
+            caps: cap.clone(),
+            invoke_routes: routes.clone(),
+            agent_info: actor_infos,
+        };
+        assert_eq!(
+            actor_only.invoke("substrate", invocation, b"request"),
+            Err(crate::actors::run::STATUS_NOT_FOUND),
+        );
+
+        let ambiguous_infos: AgentInfos = Arc::new(std::sync::RwLock::new(HashMap::from([
+            (
+                0x4502,
+                AgentInfo {
+                    name: Some("substrate".into()),
+                    consistency: None,
+                    network_reachable: true,
+                },
+            ),
+            (
+                0x4503,
+                AgentInfo {
+                    name: Some("Substrate".into()),
+                    consistency: None,
+                    network_reachable: true,
+                },
+            ),
+        ])));
+        let ambiguous = ServiceNativeExtensionInvoker {
+            caller,
+            caps: cap,
+            invoke_routes: routes,
+            agent_info: ambiguous_infos,
+        };
+        assert_eq!(
+            ambiguous.invoke("substrate", invocation, b"request"),
+            Err(crate::actors::run::STATUS_PANICKED),
+        );
+    }
 
     #[test]
     fn ingress_idempotency_identity_is_stable_and_protocol_scoped() {
@@ -14968,6 +15267,7 @@ mod tests {
                 delegated_origin: None,
                 role_authority_request: false,
                 root_upgrade_request: false,
+                invocation_id: None,
                 msg: payload,
                 reply: ReplyChannel::Sync(reply_tx),
                 chain: Vec::new(),

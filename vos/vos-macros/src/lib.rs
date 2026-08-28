@@ -649,7 +649,18 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `_start` PVM entry point (PC=0, refine)
 /// - `.vos_meta` section with actor metadata
 #[proc_macro_attribute]
-pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let emit_extension_reference = if attr.is_empty() {
+        false
+    } else {
+        let mode = parse_macro_input!(attr as syn::Ident);
+        if mode != "extension" {
+            return syn::Error::new_spanned(mode, "expected #[messages] or #[messages(extension)]")
+                .to_compile_error()
+                .into();
+        }
+        true
+    };
     let input = parse_macro_input!(item as ItemImpl);
     let actor_ty = &input.self_ty;
 
@@ -1735,7 +1746,91 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect();
+    // Native extensions expose the same ordinary message methods but bind to
+    // an installed instance name and the dedicated ExtensionInvoker transport.
+    // Attested methods intentionally remain actor-only: native host I/O cannot
+    // produce the deterministic service proof contract.
+    let extension_handle_methods_emit: Vec<proc_macro2::TokenStream> = if emit_extension_reference {
+        client_methods
+            .iter()
+            .filter(|method| !method.attested)
+            .map(|m| {
+                let method_ident = &m.wire_name;
+                let wire_name = m.wire_name.to_string();
+                let arg_decls: Vec<proc_macro2::TokenStream> =
+                    m.args.iter().map(|(n, t)| quote! { #n: #t }).collect();
+                let with_calls: Vec<proc_macro2::TokenStream> =
+                    m.args.iter().map(|(n, t)| ref_arg_with(n, t)).collect();
+                let return_ty: proc_macro2::TokenStream = match &m.success_ty {
+                    None => quote! { () },
+                    Some(t) => quote! { #t },
+                };
+                let value_ident = format_ident!("__value");
+                let decode = client_decode_body(&m.success_ty, &value_ident);
+                quote! {
+                    pub async fn #method_ident(
+                        &mut self,
+                        #( #arg_decls ),*
+                    ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
+                        use vos::Encode;
+                        let __msg = vos::value::Msg::new(#wire_name)
+                            #( #with_calls )*;
+                        let __encoded = __msg.encode();
+                        let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
+                        __payload.push(vos::value::TAG_DYNAMIC);
+                        __payload.extend_from_slice(&__encoded);
+                        let #value_ident: vos::value::Value = self
+                            .invoker
+                            .invoke_extension(self.target.clone(), __payload)
+                            .await?;
+                        #decode
+                    }
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let handle_struct_name = format_ident!("{}Handle", actor_name);
+    let extension_handle_struct_name = format_ident!("{}ExtensionHandle", actor_name);
+
+    let extension_ref_emission = emit_extension_reference.then(|| {
+        quote! {
+            pub struct #extension_handle_struct_name<
+                'a,
+                __I: vos::actors::client::ExtensionInvoker,
+            > {
+                target: alloc::string::String,
+                invoker: &'a mut __I,
+            }
+
+            impl<'a, __I: vos::actors::client::ExtensionInvoker>
+                #extension_handle_struct_name<'a, __I>
+            {
+                /// Node-local installed instance name carried by this handle.
+                pub fn extension_name(&self) -> &str {
+                    &self.target
+                }
+
+                #( #extension_handle_methods_emit )*
+            }
+
+            impl vos::actors::client::ExtensionReference for #ref_struct_name {
+                type Handle<'a, __I: vos::actors::client::ExtensionInvoker + 'a> =
+                    #extension_handle_struct_name<'a, __I>;
+
+                fn bind_extension<'a, __I: vos::actors::client::ExtensionInvoker + 'a>(
+                    target: alloc::string::String,
+                    invoker: &'a mut __I,
+                ) -> Self::Handle<'a, __I> {
+                    #extension_handle_struct_name {
+                        target,
+                        invoker,
+                    }
+                }
+            }
+        }
+    });
 
     let ref_emission = quote! {
         #[derive(Copy, Clone)]
@@ -1769,6 +1864,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         }
+
+        #extension_ref_emission
 
         impl vos::actors::client::ActorReferenceFor<#actor_name> for #ref_struct_name {}
     };

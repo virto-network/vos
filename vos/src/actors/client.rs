@@ -161,6 +161,19 @@ impl Future for ClientAsk {
     }
 }
 
+/// Send a dynamically-shaped message to a node-local native extension.
+///
+/// This is deliberately separate from [`Invoker`]: an extension instance name
+/// is host-local configuration, not a canonical [`ActorId`](crate::ActorId),
+/// and it must pass the root's explicit `intra_caps` gate.
+pub trait ExtensionInvoker {
+    fn invoke_extension(
+        &mut self,
+        target: String,
+        payload: Vec<u8>,
+    ) -> impl Future<Output = Result<Value, ClientError>> + '_;
+}
+
 /// Runtime result for an attested invocation. The generated client decodes
 /// `value` with the ordinary method reply codec and then binds that preview to
 /// `statement` before exposing an [`Attestation`](crate::Attestation).
@@ -235,8 +248,24 @@ pub trait ActorReference: Copy {
 #[doc(hidden)]
 pub trait ActorReferenceFor<A: super::Actor>: ActorReference {}
 
+/// Implemented by macro-generated references that can also bind their message
+/// surface to a node-local native extension instance.
+pub trait ExtensionReference: Copy {
+    type Handle<'a, I: ExtensionInvoker + 'a>: 'a
+    where
+        Self: 'a;
+
+    fn bind_extension<'a, I: ExtensionInvoker + 'a>(
+        target: String,
+        invoker: &'a mut I,
+    ) -> Self::Handle<'a, I>;
+}
+
 /// Generic spelling for a bound macro-generated actor handle.
 pub type ActorHandle<'a, R, I> = <R as ActorReference>::Handle<'a, I>;
+
+/// Generic spelling for a bound macro-generated native-extension handle.
+pub type ExtensionHandle<'a, R, I> = <R as ExtensionReference>::Handle<'a, I>;
 
 impl<A: super::Actor> Invoker for super::Context<A> {
     fn invoke_actor(
@@ -246,6 +275,22 @@ impl<A: super::Actor> Invoker for super::Context<A> {
     ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
         let ask = self.ask_actor_raw(target, payload.as_slice(), None);
         ClientAsk::new(ask)
+    }
+}
+
+#[cfg(feature = "native-extension-client")]
+impl<A: super::Actor> ExtensionInvoker for super::Context<A> {
+    #[allow(clippy::manual_async_fn)]
+    fn invoke_extension(
+        &mut self,
+        target: String,
+        payload: Vec<u8>,
+    ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
+        async move {
+            self.ask_extension_raw(&target, &payload)
+                .await
+                .map_err(ClientError::from)
+        }
     }
 }
 

@@ -1347,9 +1347,10 @@ fn build_network_for_daemon(
 }
 
 /// Node-local service policy from the recipe (never replicated).
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 struct AgentLocalPolicy {
     device_secret: bool,
+    intra_caps: Vec<vos::IntraCap>,
 }
 
 type AgentPolicies = std::collections::BTreeMap<String, AgentLocalPolicy>;
@@ -1358,11 +1359,21 @@ type AgentPolicies = std::collections::BTreeMap<String, AgentLocalPolicy>;
 fn agent_policies_from_local(cfg: &subscriptions::LocalConfig) -> anyhow::Result<AgentPolicies> {
     let mut map = AgentPolicies::new();
     for (name, a) in &cfg.agents {
-        if a.device_secret {
+        let intra_caps = a
+            .intra_caps
+            .iter()
+            .map(|token| {
+                vos::IntraCap::parse(token).map_err(|error| {
+                    anyhow::anyhow!("agent '{name}' has invalid intra_cap '{token}': {error}")
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if a.device_secret || !intra_caps.is_empty() {
             map.insert(
                 name.clone(),
                 AgentLocalPolicy {
                     device_secret: a.device_secret,
+                    intra_caps,
                 },
             );
         }
@@ -2192,6 +2203,10 @@ fn service_config_from_row(
     let device_secret_requested = policies
         .get(&row.instance_name)
         .is_some_and(|policy| policy.device_secret);
+    let intra_caps = policies
+        .get(&row.instance_name)
+        .map(|policy| policy.intra_caps.clone())
+        .unwrap_or_default();
     if consistency == Consistency::Crdt && device_secret_requested {
         anyhow::bail!("service CRDT roots do not support host-private device signing");
     }
@@ -2232,6 +2247,7 @@ fn service_config_from_row(
         },
         initial_state,
         external_actors: Vec::new(),
+        intra_caps,
         install_authorization: vos::service::AuthorizationEvidence::SystemCapability {
             capability: vos::service::SystemCapabilityId(
                 vos::service::Hash::digest(
@@ -5037,23 +5053,44 @@ mod tests {
 
     #[test]
     fn agent_policies_come_from_local_toml() {
-        // Host-private signing configuration is sourced from local.toml.
+        // Host-private signing and extension authority come from local.toml.
         let mut cfg = subscriptions::LocalConfig::default();
         cfg.agents.insert(
             "authority".into(),
             subscriptions::AgentLocal {
                 device_secret: true,
+                intra_caps: vec!["substrate:member".into()],
             },
         );
         cfg.agents.insert(
             "plain".into(),
             subscriptions::AgentLocal {
                 device_secret: false,
+                intra_caps: Vec::new(),
             },
         );
         let policies = agent_policies_from_local(&cfg).unwrap();
         assert!(policies["authority"].device_secret);
+        assert_eq!(
+            policies["authority"].intra_caps,
+            vec![vos::IntraCap::parse("substrate:member").unwrap()]
+        );
         assert!(!policies.contains_key("plain"));
+    }
+
+    #[test]
+    fn malformed_agent_intra_cap_fails_boot_policy_loading() {
+        let mut cfg = subscriptions::LocalConfig::default();
+        cfg.agents.insert(
+            "reader".into(),
+            subscriptions::AgentLocal {
+                device_secret: false,
+                intra_caps: vec!["substrate".into()],
+            },
+        );
+        let error = agent_policies_from_local(&cfg).unwrap_err().to_string();
+        assert!(error.contains("agent 'reader'"));
+        assert!(error.contains("substrate"));
     }
 
     #[test]

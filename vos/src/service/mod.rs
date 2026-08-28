@@ -79,9 +79,9 @@ pub use package::{
 #[cfg(feature = "std")]
 pub use pvm::{
     AccumulateProtocolHost, AccumulateTransaction, DeviceSecret, DeviceSignerRefineHost,
-    NoRefineProtocolHost, ProducedProvableRecord, ReceiptVerificationHost, RefineProtocolHost,
-    RefineTrace, SERVICE_ARGUMENT_PAGES_, ServicePvm, ServicePvmError, ServicePvmOutput,
-    transpile_service_elf, validate_actor_program_layout,
+    NativeExtensionInvoker, NoRefineProtocolHost, ProducedProvableRecord, ReceiptVerificationHost,
+    RefineProtocolHost, RefineTrace, SERVICE_ARGUMENT_PAGES_, ServicePvm, ServicePvmError,
+    ServicePvmOutput, transpile_service_elf, validate_actor_program_layout,
 };
 #[cfg(feature = "std")]
 pub use root_service::{
@@ -209,6 +209,12 @@ pub const ACTOR_PRIVATE_INPUT_MAX_BYTES: usize = 64 * 1024;
 pub const DEVICE_SIGN_MAX_PAYLOAD_BYTES: usize = 4 * 1024;
 /// Maximum host-private signatures produced during one Refine slice.
 pub const DEVICE_SIGN_MAX_CALLS_PER_REFINE: u32 = 8;
+/// Maximum dynamic payload sent from a service actor to a native extension.
+pub const NATIVE_EXTENSION_REQUEST_MAX_BYTES: usize = 64 * 1024;
+/// Maximum native-extension reply copied into a service actor VM.
+pub const NATIVE_EXTENSION_REPLY_MAX_BYTES: usize = 64 * 1024;
+/// Maximum synchronous native-extension calls in one actor Refine slice.
+pub const NATIVE_EXTENSION_MAX_CALLS_PER_REFINE: u32 = 8;
 /// Maximum opaque actor-effect batch returned to the generic service guest.
 pub const ACTOR_EFFECT_BATCH_MAX_BYTES: usize =
     MAX_ROOT_TREE_ACTORS * ACTOR_PRIVATE_INPUT_MAX_BYTES;

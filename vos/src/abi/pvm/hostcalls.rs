@@ -100,6 +100,24 @@ pub fn device_sign(payload: &[u8], output: &mut [u8; 96]) -> u64 {
     )
 }
 
+/// Invoke one capability-approved native extension.
+///
+/// `request` carries the stable call identity, target instance name, and
+/// dynamic actor payload. The host returns `[reply_len, invoke_status]`; a
+/// successful status is `STATUS_DONE` and writes exactly `reply_len` bytes when
+/// they fit in `output`.
+#[inline]
+#[cfg(feature = "native-extension-client")]
+pub fn native_extension_invoke(request: &[u8], output: &mut [u8]) -> [u64; 2] {
+    ecall4_pair(
+        hostcall::NATIVE_EXTENSION_INVOKE,
+        request.as_ptr() as u64,
+        request.len() as u64,
+        output.as_mut_ptr() as u64,
+        output.len() as u64,
+    )
+}
+
 /// Write debug output. vosx prints to stderr.
 #[inline]
 pub fn debug_write(data: &[u8]) -> u64 {

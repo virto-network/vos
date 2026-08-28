@@ -18,6 +18,9 @@ macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
 service-runtime = ["service"]
+# Typed service-actor client for node-local native extensions. Opt-in keeps
+# actors that do not use native I/O byte-identical to their existing PVMs.
+native-extension-client = ["pvm"]
 # NOTE: the ZK actor-IO binding is tagless (`vos::zk`) — the io-hash
 # primitive `compute_io_hash` is pure and always available (guest +
 # host).  Proof *verification* (STARK validity ∧ io-binding) lives in

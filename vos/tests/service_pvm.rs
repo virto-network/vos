@@ -1455,6 +1455,7 @@ fn attested_root_fixture(
         consistency,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([salt.wrapping_add(3); 32]),
             authenticator: vec![salt.wrapping_add(4)],
@@ -1497,6 +1498,137 @@ fn decode_device_signature(committed: &vos::service::CommittedRootTreeSlice) -> 
         panic!("device signature is encoded as Value::Bytes")
     };
     bytes
+}
+
+#[derive(Default)]
+struct RecordingNativeExtension {
+    calls: Mutex<Vec<(String, InvocationId, Vec<u8>)>>,
+}
+
+impl vos::service::NativeExtensionInvoker for RecordingNativeExtension {
+    fn invoke(
+        &self,
+        target: &str,
+        invocation: InvocationId,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, u8> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((target.into(), invocation, payload.to_vec()));
+        Ok(Value::U32(7).encode())
+    }
+}
+
+fn set_workflow_request(request: &mut LocalWorkRequest, method: &str, message: Msg) {
+    request.method = method.into();
+    request.arguments = {
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(&message.encode());
+        arguments
+    };
+}
+
+#[test]
+fn service_actor_native_extension_hostcall_preserves_typed_wire_and_stable_identity() {
+    let (mut config, mut request) = attested_root_fixture(ConsistencyMode::Local, 0x61);
+    config.intra_caps = vec![vos::IntraCap::parse("native-peer:member").unwrap()];
+    set_workflow_request(
+        &mut request,
+        "extension_peer_value",
+        Msg::new("extension_peer_value"),
+    );
+    request.proof_requested = false;
+    let parent_invocation = request.invocation;
+    let actor = config.root_actor;
+
+    let recorder = Arc::new(RecordingNativeExtension::default());
+    let mut service = LocalRootTreeService::open(config, SharedCommittedImages::default())
+        .expect("native extension hostcall fixture opens");
+    service.set_native_extension_invoker(recorder.clone());
+    let committed = service
+        .invoke(request)
+        .expect("typed native extension call completes");
+    assert_eq!(
+        committed
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U32(7)),
+    );
+
+    let calls = recorder.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let (target, invocation, payload) = &calls[0];
+    assert_eq!(target, "native-peer");
+    assert_eq!(payload.first(), Some(&vos::value::TAG_DYNAMIC));
+    let typed = <Msg as Decode>::decode(&payload[1..]);
+    assert_eq!(typed.name, "peer_value");
+    let mut nonce = Vec::new();
+    nonce.extend_from_slice(parent_invocation.as_bytes());
+    nonce.extend_from_slice(&actor.0);
+    nonce.extend_from_slice(&0u64.to_le_bytes());
+    nonce.extend_from_slice(b"native-peer");
+    assert_eq!(
+        *invocation,
+        InvocationId::derive(b"vos/native-extension-call/service", &nonce),
+    );
+}
+
+#[test]
+fn native_extension_hostcall_is_rejected_for_proofs_and_over_quota() {
+    let (mut proof_config, mut proof_request) = attested_root_fixture(ConsistencyMode::Local, 0x62);
+    proof_config.intra_caps = vec![vos::IntraCap::parse("native-peer:member").unwrap()];
+    set_workflow_request(
+        &mut proof_request,
+        "attested_extension_peer_value",
+        Msg::new("attested_extension_peer_value"),
+    );
+    let proof_recorder = Arc::new(RecordingNativeExtension::default());
+    let mut proof_service =
+        LocalRootTreeService::open(proof_config, SharedCommittedImages::default()).unwrap();
+    proof_service.set_native_extension_invoker(proof_recorder.clone());
+    let mut producer = CanonicalTestProofProducer {
+        proof: canonical_test_proof_manifest(0x63),
+        calls: 0,
+    };
+    assert!(matches!(
+        proof_service.invoke_attested(proof_request, &mut producer),
+        Err(AttestedRootTreeInvokeError::Root(
+            LocalRootTreeInvokeError::Service(ServiceDispatchError::Pvm(
+                ServicePvmError::RefineHostRejected(slot),
+            )),
+        )) if slot == vos::abi::hostcall::NATIVE_EXTENSION_INVOKE as u8,
+    ));
+    assert!(proof_recorder.calls.lock().unwrap().is_empty());
+    assert_eq!(producer.calls, 0);
+
+    let (mut quota_config, mut quota_request) = attested_root_fixture(ConsistencyMode::Local, 0x64);
+    quota_config.intra_caps = vec![vos::IntraCap::parse("native-peer:member").unwrap()];
+    set_workflow_request(
+        &mut quota_request,
+        "extension_peer_value_repeatedly",
+        Msg::new("extension_peer_value_repeatedly").with(
+            "calls",
+            vos::service::NATIVE_EXTENSION_MAX_CALLS_PER_REFINE + 1,
+        ),
+    );
+    quota_request.proof_requested = false;
+    let quota_recorder = Arc::new(RecordingNativeExtension::default());
+    let mut quota_service =
+        LocalRootTreeService::open(quota_config, SharedCommittedImages::default()).unwrap();
+    quota_service.set_native_extension_invoker(quota_recorder.clone());
+    assert!(matches!(
+        quota_service.invoke(quota_request),
+        Err(LocalRootTreeInvokeError::Service(
+            ServiceDispatchError::Pvm(ServicePvmError::RefineHostRejected(slot)),
+        )) if slot == vos::abi::hostcall::NATIVE_EXTENSION_INVOKE as u8,
+    ));
+    assert_eq!(
+        quota_recorder.calls.lock().unwrap().len(),
+        vos::service::NATIVE_EXTENSION_MAX_CALLS_PER_REFINE as usize,
+    );
 }
 
 #[test]
@@ -3780,6 +3912,7 @@ fn canonical_clerk_package_executes_a_private_provable_transfer_through_raft() {
         consistency: ConsistencyMode::Raft,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([124; 32]),
             authenticator: vec![125],
@@ -4577,6 +4710,7 @@ fn signed_task_dependency_actor_config(
         consistency,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([124; 32]),
             authenticator: vec![125],
@@ -4658,6 +4792,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         consistency: ConsistencyMode::Local,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([94; 32]),
             authenticator: vec![95],
@@ -4943,6 +5078,7 @@ fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
         consistency: ConsistencyMode::Local,
         initial_state,
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([186; 32]),
             authenticator: vec![187],
@@ -5247,6 +5383,7 @@ fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
         consistency: ConsistencyMode::Local,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([208; 32]),
             authenticator: vec![209],
@@ -5414,6 +5551,7 @@ fn crdt_role_authorization_survives_causal_sync_restart_and_exact_retry() {
         initial_state: vec![],
         external_actors: vec![],
         package,
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([0xD7; 32]),
             authenticator: vec![0xD8],
@@ -5641,6 +5779,7 @@ fn node_ingress_uses_canonical_authority_for_raft_and_crdt_targets() {
         )
         .unwrap(),
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([215; 32]),
             authenticator: vec![216],
@@ -5745,6 +5884,7 @@ fn node_ingress_uses_canonical_authority_for_raft_and_crdt_targets() {
             consistency: ConsistencyMode::Raft,
             initial_state: vec![],
             external_actors: vec![],
+            intra_caps: vec![],
             install_authorization: AuthorizationEvidence::SystemCapability {
                 capability: SystemCapabilityId([220; 32]),
                 authenticator: vec![221],
@@ -5780,6 +5920,7 @@ fn node_ingress_uses_canonical_authority_for_raft_and_crdt_targets() {
         consistency: ConsistencyMode::Crdt,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([0xE3; 32]),
             authenticator: vec![0xE4],
@@ -6026,6 +6167,7 @@ fn raft_root_tree_orders_genesis_apply_and_ack_through_physical_accumulate() {
         consistency: ConsistencyMode::Raft,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([116; 32]),
             authenticator: vec![117],
@@ -6136,6 +6278,7 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
         consistency: ConsistencyMode::Raft,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([0xA4; 32]),
             authenticator: vec![0xA5],
@@ -6874,6 +7017,7 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
         consistency: ConsistencyMode::Raft,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([122; 32]),
             authenticator: vec![123],
@@ -7055,6 +7199,7 @@ fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
         consistency: ConsistencyMode::Local,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([106; 32]),
             authenticator: vec![107],
@@ -7196,6 +7341,7 @@ fn root_upgrade_is_exactly_once_and_reopens_across_the_catalog_cutover() {
         consistency: ConsistencyMode::Local,
         initial_state: b"preserved application state".to_vec(),
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([0x64; 32]),
             authenticator: vec![0x65],
@@ -7342,6 +7488,7 @@ fn conformance_raft_and_role_authority_shape_changes_are_refused_before_upgrade(
         consistency: ConsistencyMode::Raft,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([0xB4; 32]),
             authenticator: vec![0xB5],
@@ -7445,6 +7592,7 @@ fn production_raft_authority_upgrade_is_ordered_once_and_preserves_service_ident
         consistency: ConsistencyMode::Raft,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([0x69; 32]),
             authenticator: vec![0x6A],
@@ -7904,6 +8052,7 @@ fn attested_node_transport_fixture(
             producer,
             program,
         )],
+        intra_caps: vec![],
         install_authorization: install_authorization.clone(),
         device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
@@ -7919,6 +8068,7 @@ fn attested_node_transport_fixture(
         consistency,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization,
         device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
@@ -8317,6 +8467,7 @@ fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
             producer,
             program,
         )],
+        intra_caps: vec![],
         install_authorization: install_authorization.clone(),
         device_secret: None,
         refine_gas: 1_000_000_000,
@@ -8332,6 +8483,7 @@ fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
         consistency: ConsistencyMode::Local,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization,
         device_secret: None,
         refine_gas: 1_000_000_000,
@@ -8469,6 +8621,7 @@ fn node_routes_a_crdt_cross_root_await_and_acknowledges_both_publications() {
             producer,
             program,
         )],
+        intra_caps: vec![],
         install_authorization: install_authorization.clone(),
         device_secret: None,
         refine_gas: 1_000_000_000,
@@ -8484,6 +8637,7 @@ fn node_routes_a_crdt_cross_root_await_and_acknowledges_both_publications() {
         consistency: ConsistencyMode::Crdt,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization,
         device_secret: None,
         refine_gas: 1_000_000_000,
@@ -8596,6 +8750,7 @@ fn node_routes_networkless_single_voter_raft_roots() {
             producer,
             program,
         )],
+        intra_caps: vec![],
         install_authorization: install_authorization.clone(),
         device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
@@ -8611,6 +8766,7 @@ fn node_routes_networkless_single_voter_raft_roots() {
         consistency: ConsistencyMode::Raft,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization,
         device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
@@ -8737,6 +8893,7 @@ fn node_routes_raft_cross_root_reply_between_different_leaders() {
             producer,
             program,
         )],
+        intra_caps: vec![],
         install_authorization: install_authorization.clone(),
         device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
@@ -8752,6 +8909,7 @@ fn node_routes_raft_cross_root_reply_between_different_leaders() {
         consistency: ConsistencyMode::Raft,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization,
         device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
@@ -8965,6 +9123,7 @@ fn node_retries_a_direct_reply_publication_ack_after_the_caller_is_gone() {
         consistency: ConsistencyMode::Local,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([0xD4; 32]),
             authenticator: vec![0xD5],
@@ -9047,6 +9206,7 @@ fn node_expires_and_resumes_an_unreachable_durable_call() {
             producer,
             program,
         )],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([0xC5; 32]),
             authenticator: vec![0xC6],
@@ -9140,6 +9300,7 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
         consistency: ConsistencyMode::Crdt,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([100; 32]),
             authenticator: vec![101],
@@ -9402,6 +9563,7 @@ fn node_anti_entropy_converges_authenticated_crdt_roots_across_restart() {
         consistency: ConsistencyMode::Crdt,
         initial_state: vec![],
         external_actors: vec![],
+        intra_caps: vec![],
         install_authorization: AuthorizationEvidence::SystemCapability {
             capability: SystemCapabilityId([0x54; 32]),
             authenticator: vec![0x55],

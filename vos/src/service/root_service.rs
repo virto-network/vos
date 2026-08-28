@@ -560,6 +560,9 @@ pub struct LocalRootTreeConfig {
     pub consistency: ConsistencyMode,
     pub initial_state: Vec<u8>,
     pub external_actors: Vec<ExternalActorBinding>,
+    /// Node-local authority this service root may exercise when invoking named
+    /// native extensions. Empty denies all native extension calls.
+    pub intra_caps: Vec<crate::IntraCap>,
     pub role_authority: Option<RoleAuthorityBinding>,
     pub install_authorization: AuthorizationEvidence,
     /// Optional host-private device-signing seed. It has no wire encoding and
@@ -870,6 +873,14 @@ impl<B> RootTreeServiceDriver<B>
 where
     B: CommittedImageStore + ProofArtifactStore<Error = <B as CommittedImageStore>::Error>,
 {
+    fn refine_host_mut(&mut self) -> &mut DeviceSignerRefineHost {
+        match self {
+            Self::Direct(service) => service.refine_host_mut(),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service.service_mut().refine_host_mut(),
+        }
+    }
+
     fn refresh_proof_provenance_snapshot(&mut self) -> Result<(), RootTreeDriverError> {
         match self {
             Self::Direct(_) => Ok(()),
@@ -1115,6 +1126,7 @@ pub struct LocalRootTreeService<B> {
     pending_install_availability: Option<(Vec<ImportedProgram>, Vec<ImportedBlob>)>,
     expected_root: ActorGenesis,
     expected_external_actors: Vec<ExternalActorBinding>,
+    intra_caps: Vec<crate::IntraCap>,
     expected_role_authority: Option<RoleAuthorityBinding>,
     /// Host-enforced upgrade boundary for the reserved canonical authority.
     /// The guest-owned descriptor retains the current code/policy state, but
@@ -1409,6 +1421,23 @@ impl<B> LocalRootTreeService<B>
 where
     B: CommittedImageStore + ProofArtifactStore<Error = <B as CommittedImageStore>::Error>,
 {
+    /// Install the host-owned native-extension dispatcher used by actor
+    /// Refine. Implementations must resolve only native targets and enforce
+    /// this root's [`Self::intra_caps`] before dispatching any payload.
+    pub fn set_native_extension_invoker(
+        &mut self,
+        invoker: alloc::sync::Arc<dyn super::NativeExtensionInvoker>,
+    ) {
+        self.service
+            .refine_host_mut()
+            .set_native_extension_invoker(invoker);
+    }
+
+    /// Effective node-local native-extension grants for this root.
+    pub fn intra_caps(&self) -> &[crate::IntraCap] {
+        &self.intra_caps
+    }
+
     fn request_from_admitted_ingress(
         &self,
         record: super::IngressRecord,
@@ -1925,6 +1954,7 @@ where
             pending_install_availability: Some((install_programs, install_blobs)),
             expected_root,
             expected_external_actors: config.external_actors,
+            intra_caps: config.intra_caps,
             expected_role_authority: config.role_authority,
             authority_upgrade_policy,
         };

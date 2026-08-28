@@ -616,6 +616,86 @@ impl<A: Actor> Context<A> {
         }
     }
 
+    /// Invoke a node-local native extension by installed instance name.
+    ///
+    /// Service actors reach this through a macro-generated extension handle
+    /// returned by [`Self::extension`]. The dedicated host capability keeps a
+    /// host-local extension name distinct from canonical [`crate::ActorId`]
+    /// routing and lets the root host enforce its explicit `intra_caps` before
+    /// any native code runs.
+    #[cfg(feature = "native-extension-client")]
+    #[doc(hidden)]
+    pub fn ask_extension_raw(&mut self, target: &str, payload: &[u8]) -> super::run::Ask {
+        #[cfg(feature = "pvm")]
+        {
+            use super::value::InvokeError;
+
+            let Some(actor) = self.actor_id else {
+                return super::run::Ask::ready_err(InvokeError::NotFound);
+            };
+            if target.is_empty()
+                || target.len() > crate::service::MAX_ACTOR_NAME_BYTES
+                || payload.is_empty()
+                || payload.len() > crate::service::NATIVE_EXTENSION_REQUEST_MAX_BYTES
+            {
+                return super::run::Ask::ready_err(InvokeError::TooBig);
+            }
+
+            // Native calls share the service call ordinal with durable awaits.
+            // That existing counter survives a continuation and keeps every
+            // actor-originated call in one stable invocation-local sequence.
+            let ordinal = self.next_await_ordinal;
+            self.next_await_ordinal = ordinal
+                .checked_add(1)
+                .expect("native extension call ordinal overflow");
+            let mut nonce = Vec::with_capacity(72 + target.len());
+            nonce.extend_from_slice(self.invocation_id.as_bytes());
+            nonce.extend_from_slice(&actor.0);
+            nonce.extend_from_slice(&ordinal.to_le_bytes());
+            nonce.extend_from_slice(target.as_bytes());
+            let invocation =
+                crate::service::InvocationId::derive(b"vos/native-extension-call/service", &nonce);
+
+            // Wire: version | stable invocation | name_len | name | payload.
+            let name_len =
+                u16::try_from(target.len()).expect("bounded native extension name fits in u16");
+            let mut request = Vec::with_capacity(35 + target.len() + payload.len());
+            request.push(1);
+            request.extend_from_slice(invocation.as_bytes());
+            request.extend_from_slice(&name_len.to_le_bytes());
+            request.extend_from_slice(target.as_bytes());
+            request.extend_from_slice(payload);
+
+            let mut response = alloc::vec![0; crate::service::NATIVE_EXTENSION_REPLY_MAX_BYTES];
+            let [response_len, status] =
+                crate::abi::pvm::hostcalls::native_extension_invoke(&request, &mut response);
+            if status != super::run::STATUS_DONE as u64 {
+                let error = match status as u8 {
+                    super::run::STATUS_NOT_FOUND => InvokeError::NotFound,
+                    super::run::STATUS_FORBIDDEN => InvokeError::Forbidden,
+                    super::run::STATUS_OOG => InvokeError::OutOfGas,
+                    super::run::STATUS_TOO_BIG => InvokeError::TooBig,
+                    super::run::STATUS_PANICKED => InvokeError::Panicked,
+                    other => InvokeError::Unknown(other),
+                };
+                return super::run::Ask::ready_err(error);
+            }
+            let Ok(response_len) = usize::try_from(response_len) else {
+                return super::run::Ask::ready_err(InvokeError::TooBig);
+            };
+            if response_len > response.len() {
+                return super::run::Ask::ready_err(InvokeError::TooBig);
+            }
+            response.truncate(response_len);
+            super::run::Ask::ready(response)
+        }
+        #[cfg(not(feature = "pvm"))]
+        {
+            let _ = (target, payload);
+            super::run::Ask::ready_err(super::value::InvokeError::NotFound)
+        }
+    }
+
     /// Issue a durable service call to an actor in another root tree.
     ///
     /// Unlike a control-plane [`ask`](Self::ask), this call records
@@ -1084,6 +1164,26 @@ impl<A: Actor> Context<A> {
             })
             .ok_or(super::client::ClientError::NotFound)?;
         Ok(R::bind(actor, self))
+    }
+
+    /// Bind a macro-generated typed reference to one node-local native
+    /// extension instance.
+    ///
+    /// Resolution and authorization happen at the hostcall boundary, against
+    /// the running node's extension roster and this root's `intra_caps`.
+    #[cfg(feature = "native-extension-client")]
+    pub async fn extension<'a, R: super::client::ExtensionReference + 'a>(
+        &'a mut self,
+        name: impl Into<alloc::string::String>,
+    ) -> Result<R::Handle<'a, Self>, super::client::ClientError> {
+        let name = name.into();
+        if self.actor_id.is_none()
+            || name.is_empty()
+            || name.len() > crate::service::MAX_ACTOR_NAME_BYTES
+        {
+            return Err(super::client::ClientError::NotFound);
+        }
+        Ok(R::bind_extension(name, self))
     }
 
     /// Resolve an existing actor directly owned by the current actor. Under service

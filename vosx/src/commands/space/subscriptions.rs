@@ -141,6 +141,9 @@ pub struct AgentLocal {
     /// Configure the service with a host-private device signer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub device_secret: bool,
+    /// Bound the native extensions and roles this service may invoke.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intra_caps: Vec<String>,
 }
 
 /// A native `.so` extension registration — the node-local mirror of a
@@ -363,6 +366,7 @@ mod tests {
             "ledger".to_string(),
             AgentLocal {
                 device_secret: true,
+                intra_caps: vec!["substrate:member".into()],
             },
         );
         let mut init = BTreeMap::new();

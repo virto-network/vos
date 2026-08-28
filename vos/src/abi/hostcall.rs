@@ -76,6 +76,14 @@ pub const PROVABLE_RECORD_INTENT: u32 = 109;
 /// generic service VM, never in application actors.
 pub const REFINE_WORK_FETCH: u32 = 108;
 
+/// Invoke a node-local native extension by its installed instance name.
+///
+/// This capability is installed only in application actor VMs during Refine.
+/// The root host resolves the name, enforces the actor's node-local
+/// `intra_caps`, and returns a bounded reply. Proof-requested Refine rejects the
+/// call because native I/O is not independently reproducible by the proof VM.
+pub const NATIVE_EXTENSION_INVOKE: u32 = 107;
+
 /// Exchange invocation-private actor data with the generic VOS scheduler.
 ///
 /// An active application VM receives only its own state and authenticated
@@ -169,6 +177,7 @@ mod tests {
     fn vos_capabilities_never_use_reserved_pvm_slots() {
         let supplied = [
             REFINE_WORK_FETCH,
+            NATIVE_EXTENSION_INVOKE,
             PROVABLE_RECORD_INTENT,
             GROW_HEAP,
             DEBUG_WRITE,
@@ -206,6 +215,7 @@ mod tests {
         let occupied = [
             crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
             REFINE_WORK_FETCH as u8,
+            NATIVE_EXTENSION_INVOKE as u8,
             PROVABLE_RECORD_INTENT as u8,
             GROW_HEAP as u8,
             DEBUG_WRITE as u8,

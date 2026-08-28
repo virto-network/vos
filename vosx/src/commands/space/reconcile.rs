@@ -136,6 +136,12 @@ pub struct AgentDef {
     /// stored beside the service image and never enters replicated state.
     #[serde(default)]
     pub device_secret: bool,
+    /// Node-local authority this service may exercise when invoking native
+    /// extensions, expressed as `"extension:role"` capability strings.
+    /// Omitted preserves existing node-local policy during recipe merge;
+    /// an explicit empty list revokes all native-extension calls.
+    #[serde(default)]
+    pub intra_caps: Option<Vec<String>>,
 }
 
 fn default_consistency() -> String {
@@ -906,6 +912,30 @@ mod tests {
         let m: Recipe = toml::from_str(s).unwrap();
         assert_eq!(m.space.as_deref(), Some("bank-a"));
         assert_eq!(m.hyperspace.as_deref(), Some("bank-federation"));
+    }
+
+    #[test]
+    fn agent_intra_caps_distinguish_omission_from_explicit_revocation() {
+        let omitted: Recipe = toml::from_str(
+            r#"
+            [[agent]]
+            name = "reader"
+            path = "reader.vos"
+        "#,
+        )
+        .unwrap();
+        assert!(omitted.agents[0].intra_caps.is_none());
+
+        let revoked: Recipe = toml::from_str(
+            r#"
+            [[agent]]
+            name = "reader"
+            path = "reader.vos"
+            intra_caps = []
+        "#,
+        )
+        .unwrap();
+        assert_eq!(revoked.agents[0].intra_caps, Some(Vec::new()));
     }
 
     #[test]

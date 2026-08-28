@@ -36,7 +36,9 @@ pub use auth::{
     SpaceRoleDefinition, SpaceRoleMap, cap_for, capability, default_space_roles,
     ingress_credential_id, ssh_credential_id,
 };
-pub use client::{ActorHandle, ActorReference, CallError, ClientError};
+pub use client::{
+    ActorHandle, ActorReference, CallError, ClientError, ExtensionHandle, ExtensionReference,
+};
 pub use codec::{Decode, Encode};
 pub mod context;
 pub use context::{Context, DeviceSignature, Extension, ExtensionCtx};

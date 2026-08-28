@@ -14,7 +14,7 @@ bin = []
 crate-type = ["rlib", "cdylib"]
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-vos = { path = "../../..", default-features = false, features = ["macros", "service"] }
+vos = { path = "../../..", default-features = false, features = ["macros", "service", "native-extension-client"] }
 
 [target.'cfg(not(target_arch = "riscv64"))'.dependencies]
 vos = { path = "../../..", default-features = false, features = ["macros", "extension"] }

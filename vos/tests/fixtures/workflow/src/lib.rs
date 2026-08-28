@@ -9,7 +9,7 @@ pub struct Workflow {
     counters: StorageMap<u64, u32>,
 }
 
-#[messages]
+#[messages(extension)]
 impl Workflow {
     fn new() -> Self {
         Self {
@@ -99,6 +99,44 @@ impl Workflow {
     #[msg]
     fn peer_value(&self) -> u32 {
         7
+    }
+
+    /// Exercise the dedicated service-actor → native-extension host route.
+    #[msg]
+    async fn extension_peer_value(&mut self, ctx: &mut Context<Self>) -> u32 {
+        let Ok(mut extension) = ctx.extension::<WorkflowRef>("native-peer").await else {
+            return 0;
+        };
+        extension.peer_value().await.unwrap_or(0)
+    }
+
+    /// Native I/O is deliberately unavailable to proof-requested Refine.
+    #[msg(attested)]
+    async fn attested_extension_peer_value(&mut self, ctx: &mut Context<Self>) -> u32 {
+        let Ok(mut extension) = ctx.extension::<WorkflowRef>("native-peer").await else {
+            return 0;
+        };
+        extension.peer_value().await.unwrap_or(0)
+    }
+
+    /// Exercise the invocation-wide native-extension host-work quota.
+    #[msg]
+    async fn extension_peer_value_repeatedly(
+        &mut self,
+        ctx: &mut Context<Self>,
+        calls: u32,
+    ) -> u32 {
+        let Ok(mut extension) = ctx.extension::<WorkflowRef>("native-peer").await else {
+            return 0;
+        };
+        let mut completed = 0;
+        for _ in 0..calls {
+            if extension.peer_value().await.is_err() {
+                break;
+            }
+            completed += 1;
+        }
+        completed
     }
 
     #[msg(attested)]
