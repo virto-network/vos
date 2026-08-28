@@ -33,7 +33,7 @@ vos = { path = "../../vos", default-features = false, features = ["macros", "ext
 [dependencies]
 # Immutable reviewable Sube revision. This supplies snapshot pagination,
 # external V4 signing, and a joinable smoldot std platform.
-sube = { git = "https://github.com/virto-network/virto-sdk", rev = "77198d1d04ef5c93cdc71dfb9c071c0102b7d404", default-features = false, features = ["smoldot-std"], optional = true }
+sube = { git = "https://github.com/virto-network/virto-sdk", rev = "121527d4d6d047357efaa986ac9e5fc1d8dc79dd", default-features = false, features = ["smoldot-std"], optional = true }
 zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]

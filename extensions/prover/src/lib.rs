@@ -202,7 +202,7 @@ struct PendingProve {
     expected_io_hash: Option<[u8; 32]>,
 }
 
-#[actor]
+#[actor(state_version = 1)]
 struct Prover {
     /// Async prove-job state (output bytes + done/error), driving the standard
     /// `job_poll` / `job_release` surface.

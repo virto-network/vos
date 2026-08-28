@@ -5,7 +5,7 @@
 
 use vos::{actor, messages, value::Msg};
 
-#[actor]
+#[actor(state_version = 1)]
 struct ProxyExtension {
     target: u32,
 }

@@ -334,7 +334,7 @@ struct NativeRuntime;
 
 /// Trusted host adapter for bounded Substrate queries and externally-signed
 /// V4 transactions. It never accepts or stores signing keys.
-#[actor]
+#[actor(state_version = 1)]
 pub struct SubstrateExtension {
     config: Config,
     next_request_id: u64,
@@ -345,6 +345,21 @@ pub struct SubstrateExtension {
     nonce_reservations: Vec<NonceReservation>,
     #[rkyv(with = vos::rkyv::with::Skip)]
     runtime: NativeRuntime,
+}
+
+#[cfg(any(feature = "native", test))]
+fn transaction_caller_is_authorized(ctx: &Context<SubstrateExtension>) -> bool {
+    match ctx.caller() {
+        // These variants can only be constructed by the local host dispatch
+        // path, so they remain available for system orchestration and actors.
+        vos::Caller::System | vos::Caller::Actor(_) => true,
+        // Noise authenticates a peer connection, but does not enroll that
+        // peer in this space. Network and credential-backed callers need an
+        // actual space membership grant before they can reserve nonces or
+        // create signing capabilities.
+        vos::Caller::Peer(_) | vos::Caller::Member(_) => ctx.has_space_role(vos::SpaceRole::Member),
+        vos::Caller::Unauthenticated => false,
+    }
 }
 
 #[messages]
@@ -435,13 +450,13 @@ impl SubstrateExtension {
     ) -> SubstrateResult<SigningPayload> {
         #[cfg(feature = "native")]
         {
-            let owner = native::CallerKey::from_caller(ctx.caller());
-            if !owner.is_authenticated() {
+            if !transaction_caller_is_authorized(ctx) {
                 return SubstrateResult::error(
                     ErrorCode::Forbidden,
-                    "transaction preparation requires an authenticated caller",
+                    "transaction preparation requires a space member or trusted in-process caller",
                 );
             }
+            let owner = native::CallerKey::from_caller(ctx.caller());
             let invocation = ctx.invocation_id();
             return self
                 .native_prepare_transaction_with_deadline(request, owner, invocation)
@@ -467,13 +482,13 @@ impl SubstrateExtension {
     ) -> SubstrateResult<TransactionResult> {
         #[cfg(feature = "native")]
         {
-            let owner = native::CallerKey::from_caller(ctx.caller());
-            if !owner.is_authenticated() {
+            if !transaction_caller_is_authorized(ctx) {
                 return SubstrateResult::error(
                     ErrorCode::Forbidden,
-                    "transaction submission requires an authenticated caller",
+                    "transaction submission requires a space member or trusted in-process caller",
                 );
             }
+            let owner = native::CallerKey::from_caller(ctx.caller());
             return self
                 .native_submit_transaction_with_deadline(request_id, signature, wait_for, owner)
                 .await;
@@ -496,13 +511,13 @@ impl SubstrateExtension {
     ) -> SubstrateResult<bool> {
         #[cfg(feature = "native")]
         {
-            let owner = native::CallerKey::from_caller(ctx.caller());
-            if !owner.is_authenticated() {
+            if !transaction_caller_is_authorized(ctx) {
                 return SubstrateResult::error(
                     ErrorCode::Forbidden,
-                    "transaction cancellation requires an authenticated caller",
+                    "transaction cancellation requires a space member or trusted in-process caller",
                 );
             }
+            let owner = native::CallerKey::from_caller(ctx.caller());
             return SubstrateResult::Ok(self.native_cancel_transaction(request_id, &owner));
         }
         #[cfg(not(feature = "native"))]
@@ -635,10 +650,6 @@ mod native {
                 vos::Caller::Member(subject) => Self::Member(subject.0),
                 vos::Caller::Actor(service) => Self::Actor(service.0),
             }
-        }
-
-        pub(super) fn is_authenticated(&self) -> bool {
-            !matches!(self, Self::Unauthenticated)
         }
 
         fn encoded(&self) -> Vec<u8> {
@@ -2055,6 +2066,43 @@ mod tests {
         let error: SubstrateResult<QueryResult> =
             SubstrateResult::error(ErrorCode::Chain, "x".repeat(10_000));
         assert!(error.encode().len() < MAX_REPLY_BYTES);
+    }
+
+    #[test]
+    fn transaction_authorization_distinguishes_noise_identity_from_membership() {
+        let authorized = |caller: vos::Caller, role: Option<vos::SpaceRole>| {
+            let mut ctx = Context::<SubstrateExtension>::new(vos::actors::context::ServiceId(0));
+            ctx.set_caller(caller);
+            ctx.set_caller_roles(role.map(vos::SpaceRole::as_u8), None);
+            transaction_caller_is_authorized(&ctx)
+        };
+
+        assert!(authorized(vos::Caller::System, None));
+        assert!(authorized(
+            vos::Caller::Actor(vos::actors::context::ServiceId(7)),
+            None
+        ));
+        assert!(!authorized(vos::Caller::Peer(vec![1, 2, 3]), None));
+        assert!(!authorized(
+            vos::Caller::Peer(vec![1, 2, 3]),
+            Some(vos::SpaceRole::Guest)
+        ));
+        assert!(authorized(
+            vos::Caller::Peer(vec![1, 2, 3]),
+            Some(vos::SpaceRole::Member)
+        ));
+        assert!(!authorized(
+            vos::Caller::Member(vos::SubjectId([4; 32])),
+            None
+        ));
+        assert!(authorized(
+            vos::Caller::Member(vos::SubjectId([4; 32])),
+            Some(vos::SpaceRole::Developer)
+        ));
+        assert!(!authorized(
+            vos::Caller::Unauthenticated,
+            Some(vos::SpaceRole::Admin)
+        ));
     }
 
     #[cfg(feature = "native")]

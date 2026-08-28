@@ -82,6 +82,13 @@ fn first_doc_paragraph(attrs: &[syn::Attribute]) -> String {
 /// struct Counter { count: i32 }
 /// ```
 ///
+/// Stateful native extensions should declare a persisted-state version and
+/// bump it whenever a nested archived type changes incompatibly:
+/// ```ignore
+/// #[actor(state_version = 1)]
+/// struct Counter { config: CounterConfig }
+/// ```
+///
 /// ## Determinism
 ///
 /// PVM actors are deterministic by construction — their `Context`
@@ -129,6 +136,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let default_role = parsed.default_role;
     let space_role_map = parsed.space_role_map;
     let crdt = parsed.crdt;
+    let state_version = parsed.state_version;
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let vis = &input.vis;
@@ -137,6 +145,16 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     // actor-level line in `.vos_meta` (shown by `vosx <target>` help).
     let actor_doc = first_doc_paragraph(&input.attrs);
     let fields = &input.fields;
+    // Stable FNV-1a over the direct state declaration. This catches field
+    // additions/removals/reorders and direct type changes automatically. A
+    // declared `state_version` covers representation changes inside a named
+    // nested type, whose definition is intentionally outside this macro's AST.
+    let state_shape = quote! { #name #impl_generics #fields }.to_string();
+    let mut state_fingerprint = 0xcbf29ce484222325u64;
+    for byte in state_shape.as_bytes() {
+        state_fingerprint ^= u64::from(*byte);
+        state_fingerprint = state_fingerprint.wrapping_mul(0x100000001b3);
+    }
 
     // Re-emit struct with rkyv derives injected
     let struct_def = match fields {
@@ -358,6 +376,9 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             const DOC: &'static str = #actor_doc;
 
             const CRDT: bool = #crdt;
+
+            const STATE_SCHEMA_VERSION: u64 = #state_version;
+            const STATE_SCHEMA_FINGERPRINT: u64 = #state_fingerprint;
 
             fn create() -> Self {
                 Self::__vos_create()
@@ -1623,6 +1644,9 @@ struct ActorAttrs {
     /// provable flag. Valid
     /// only with `task`; the macro rejects it otherwise.
     provable: bool,
+    /// Explicit persisted-state contract version. Direct fields are also
+    /// fingerprinted automatically; this covers changes inside nested types.
+    state_version: proc_macro2::TokenStream,
 }
 
 /// Pull `#[storage]` / `#[storage(prefix = "…")]` off the state
@@ -1731,6 +1755,7 @@ fn extract_storage_fields(input: &mut ItemStruct) -> Vec<StorageField> {
 ///
 /// Recognised keys:
 /// - `error = Type` — custom Actor::Error type (default `()`)
+/// - `state_version = N` — explicit nested persisted-state schema version
 fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
     use syn::Token;
     use syn::parse::Parser;
@@ -1745,6 +1770,7 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
         task_buf: None,
         crdt: false,
         provable: false,
+        state_version: quote! { 0u64 },
     };
     if attr.is_empty() {
         return out;
@@ -1779,6 +1805,10 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
             syn::Meta::NameValue(nv) if nv.path.is_ident("space_role_map") => {
                 let val = &nv.value;
                 out.space_role_map = quote! { #val };
+            }
+            syn::Meta::NameValue(nv) if nv.path.is_ident("state_version") => {
+                let val = &nv.value;
+                out.state_version = quote! { #val };
             }
             // Task blob: `task` (default 16 KiB witness buffer) or
             // `task = N` for a custom size. The buffer bounds the

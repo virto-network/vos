@@ -29,10 +29,12 @@ The actor-facing API is generated as `SubstrateExtensionRef`:
 - `cancel_transaction(id)` releases an unused signing request while that
   request is still live in the current extension process.
 
-Transaction methods reject unauthenticated callers. Signing request IDs and
-map cursors are non-sequential capabilities bound to the caller identity when
-VOS has one; anonymous read cursors remain bearer capabilities and share the
-anonymous caller quota.
+Transaction methods accept trusted local system/actor calls. Network peers and
+credential-backed ingress callers require at least a `Member` space grant;
+Noise transport identity by itself is not authorization. Signing request IDs
+and map cursors are non-sequential capabilities bound to the caller identity
+when VOS has one; anonymous read cursors remain bearer capabilities and share
+the anonymous caller quota.
 
 No signing keys are accepted or retained. V5/general extrinsics are not
 exposed. The light client and pending signing data are transient actor fields;
@@ -43,7 +45,10 @@ possibly submitted and cannot be cancelled without its transient pending
 request; finalized nonce advancement or mortal-era expiry retires it. `vosx`
 enables instance-scoped persistence for installed extensions and refuses to
 start an extension if storage cannot be opened or its saved schema cannot be
-decoded. Dropping or reloading the actor drops Sube and joins its smoldot
+decoded. The snapshot envelope binds state to the actor's direct-field
+fingerprint and declared `state_version`; bump `state_version` whenever the
+archived representation or meaning of `Config` or `NonceReservation` changes.
+Dropping or reloading the actor drops Sube and joins its smoldot
 executor before the extension library can unload. A failed operation cleanup
 poisons and drops the current light-client session instead of reusing uncertain
 server state.

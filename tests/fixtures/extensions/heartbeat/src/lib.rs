@@ -25,7 +25,7 @@ fn heartbeat_target() -> u32 {
         .unwrap_or(1)
 }
 
-#[actor]
+#[actor(state_version = 1)]
 pub struct Heartbeat {
     pings_sent: u32,
 }

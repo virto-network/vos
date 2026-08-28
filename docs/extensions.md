@@ -82,9 +82,14 @@ manually cancelled.
 database. Persistence setup and commits are fail-closed: a stateful reply is
 not exposed until its state commits, and an unreadable or schema-incompatible
 snapshot prevents that extension worker from starting instead of silently
-constructing default state.
+constructing default state. `#[actor]` fingerprints direct state fields in the
+snapshot envelope. Extension authors must also set `state_version` and bump it
+when a persisted nested type changes incompatibly, for example
+`#[actor(state_version = 2)]`.
 
-Transaction preparation, submission, and cancellation require an authenticated
-VOS caller. Signing request IDs and map snapshot IDs are non-sequential and
-caller-bound; unauthenticated map reads use bearer cursors and share one
-anonymous caller quota.
+Transaction preparation, submission, and cancellation accept trusted local
+system/actor calls. Network peers and credential-backed ingress callers also
+need at least a `Member` space grant; a Noise-authenticated peer identity alone
+does not authorize nonce reservations or signing capabilities. Signing request
+IDs and map snapshot IDs are non-sequential and caller-bound; unauthenticated
+map reads use bearer cursors and share one anonymous caller quota.

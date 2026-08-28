@@ -9,7 +9,7 @@
 
 use vos::prelude::*;
 
-#[actor]
+#[actor(state_version = 1)]
 struct Fetcher;
 
 #[messages]

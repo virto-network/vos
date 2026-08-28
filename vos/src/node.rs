@@ -6561,8 +6561,16 @@ impl VosNode {
     }
 
     /// Register a native extension at a freshly-allocated
-    /// ServiceId. Spawns the extension thread immediately.
+    /// ServiceId. Waits until plugin loading, state restore, and the initial
+    /// persistence check have succeeded before returning.
     pub fn register_extension(&mut self, config: ExtensionConfig) -> ServiceId {
+        self.try_register_extension(config)
+            .unwrap_or_else(|error| panic!("extension registration failed: {error}"))
+    }
+
+    /// Fallible extension registration. No route or agent metadata is
+    /// published unless the worker acknowledges successful startup.
+    pub fn try_register_extension(&mut self, config: ExtensionConfig) -> Result<ServiceId, String> {
         let id = self.alloc_id();
         self.register_extension_inner(config, id)
     }
@@ -6579,31 +6587,35 @@ impl VosNode {
         config: ExtensionConfig,
         id: ServiceId,
     ) -> ServiceId {
+        self.try_register_extension_at_id(config, id)
+            .unwrap_or_else(|error| panic!("extension registration failed for {id}: {error}"))
+    }
+
+    /// Fallible explicit-id variant of [`try_register_extension`](Self::try_register_extension).
+    pub fn try_register_extension_at_id(
+        &mut self,
+        config: ExtensionConfig,
+        id: ServiceId,
+    ) -> Result<ServiceId, String> {
         self.register_extension_inner(config, id)
     }
 
-    fn register_extension_inner(&mut self, config: ExtensionConfig, id: ServiceId) -> ServiceId {
+    fn register_extension_inner(
+        &mut self,
+        config: ExtensionConfig,
+        id: ServiceId,
+    ) -> Result<ServiceId, String> {
         let (tx, rx) = mpsc::channel();
         let (invoke_tx, invoke_rx) = mpsc::channel();
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
         let outbox = self.outbox_tx.clone();
 
-        self.routes.insert(id.0, tx);
-        self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
-        self.record_agent_name(id, config.name.clone());
-        self.agent_info.write().unwrap().insert(
-            id.0,
-            AgentInfo {
-                name: config.name.clone(),
-                // Native extensions have no consistency tier; they relay
-                // through explicit relay authority and stay network-reachable.
-                consistency: None,
-                network_reachable: true,
-            },
-        );
-
         // Per-agent shutdown flag (node-wide shutdown fans out to
-        // it) so the daemon can stop this extension individually.
-        let shutdown = self.register_agent_shutdown(id);
+        // it) so the daemon can stop this extension individually. Install it
+        // in the node map only after startup succeeds.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = shutdown.clone();
+        let registered_name = config.name.clone();
         let activity = self.last_activity.clone();
         let invoke_routes = self.invoke_routes.clone();
         let agent_names = self.agent_names.clone();
@@ -6627,18 +6639,52 @@ impl VosNode {
                 outbox,
                 invoke_routes,
                 agent_names,
-                shutdown,
+                worker_shutdown,
                 activity,
                 proof_blobs,
                 proof_blobs_dir,
                 raft_fwd,
+                startup_tx,
                 #[cfg(feature = "network")]
                 shared_network,
             )
         });
 
+        match startup_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = join.join();
+                return Err(error);
+            }
+            Err(_) => {
+                let detail = match join.join() {
+                    Ok(result) => result
+                        .error
+                        .unwrap_or_else(|| "extension worker exited during startup".into()),
+                    Err(_) => "extension worker panicked during startup".into(),
+                };
+                return Err(detail);
+            }
+        }
+
+        // Startup is now committed and acknowledged. Only at this point is
+        // the extension discoverable or reachable through either route map.
+        self.routes.insert(id.0, tx);
+        self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
+        self.record_agent_name(id, registered_name.clone());
+        self.agent_info.write().unwrap().insert(
+            id.0,
+            AgentInfo {
+                name: registered_name,
+                // Native extensions have no consistency tier; they relay
+                // through explicit relay authority and stay network-reachable.
+                consistency: None,
+                network_reachable: true,
+            },
+        );
+        self.install_agent_shutdown(id, shutdown);
         self.agents.push(AgentHandle { join: Some(join) });
-        id
+        Ok(id)
     }
 
     /// Route messages until the node has been globally idle for the
@@ -6797,6 +6843,11 @@ impl VosNode {
     /// can flip it. Idempotent per id (re-registering returns a fresh flag).
     fn register_agent_shutdown(&mut self, id: ServiceId) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(false));
+        self.install_agent_shutdown(id, flag.clone());
+        flag
+    }
+
+    fn install_agent_shutdown(&mut self, id: ServiceId, flag: Arc<AtomicBool>) {
         if self
             .agent_shutdown
             .lock()
@@ -6816,7 +6867,6 @@ impl VosNode {
                  may not reach the evicted agent (rename one of the colliding instances)"
             );
         }
-        flag
     }
 
     /// Stop a SINGLE agent by id without tearing down the node.
@@ -12652,6 +12702,20 @@ fn build_agent_strategy(
 
 // ── Worker thread ────────────────────────────────────────────────────
 
+fn extension_startup_failed(
+    startup: &mpsc::SyncSender<Result<(), String>>,
+    id: ServiceId,
+    panics: u32,
+    error: String,
+) -> AgentResult {
+    let _ = startup.send(Err(error.clone()));
+    AgentResult {
+        id,
+        panics,
+        error: Some(error),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn extension_thread(
     id: ServiceId,
@@ -12666,6 +12730,7 @@ fn extension_thread(
     proof_blobs: ProofBlobStore,
     proof_blobs_dir: Option<std::path::PathBuf>,
     raft_fwd: RaftFwd,
+    startup: mpsc::SyncSender<Result<(), String>>,
     #[cfg(feature = "network")] shared_network: SharedNetwork,
 ) -> AgentResult {
     use crate::extension::ExtensionPlugin;
@@ -12679,11 +12744,7 @@ fn extension_thread(
         Err(e) => {
             let err = format!("failed to load extension plugin: {e}");
             error!(%id, "extension: {err}");
-            return AgentResult {
-                id,
-                panics: 1,
-                error: Some(err),
-            };
+            return extension_startup_failed(&startup, id, 1, err);
         }
     };
 
@@ -12702,11 +12763,7 @@ fn extension_thread(
             Ok(strategy) => strategy,
             Err(error) => {
                 error!(%id, %error, "extension: persistence setup failed");
-                return AgentResult {
-                    id,
-                    panics: 0,
-                    error: Some(error),
-                };
+                return extension_startup_failed(&startup, id, 0, error);
             }
         };
     let saved_state = match strategy.restore_checked() {
@@ -12714,32 +12771,42 @@ fn extension_thread(
         Err(error) => {
             let message = format!("extension state restore failed: {error}");
             error!(%id, %error, "extension: failed to restore persisted state");
-            return AgentResult {
-                id,
-                panics: 0,
-                error: Some(message),
-            };
+            return extension_startup_failed(&startup, id, 0, message);
         }
     };
 
-    let mut instance = match saved_state {
+    let instance = match saved_state {
         Some(bytes) => {
             info!(%id, bytes = bytes.len(), "extension: restored state");
-            match plugin.load_state(&bytes) {
-                Ok(instance) => instance,
-                Err(error) => {
-                    error!(%id, %error, "extension: persisted state is incompatible");
-                    return AgentResult {
-                        id,
-                        panics: 0,
-                        error: Some(error),
-                    };
-                }
-            }
+            plugin.load_state(&bytes)
         }
-        None if config.init_args.is_empty() => plugin.create(),
-        None => plugin.create_with_args(&config.init_args),
+        None if config.init_args.is_empty() => plugin.try_create(),
+        None => plugin.try_create_with_args(&config.init_args),
     };
+    let mut instance = match instance {
+        Ok(instance) => instance,
+        Err(error) => {
+            error!(%id, %error, "extension: creation or persisted state load failed");
+            return extension_startup_failed(&startup, id, 0, error);
+        }
+    };
+
+    // Exercise both state serialization and the configured commit backend
+    // before publishing a route. This catches a bad state ABI or a database
+    // that can open but cannot commit while registration is still fallible.
+    if let Err(error) = persist(strategy.as_mut(), &instance) {
+        let message = format!("extension initial state commit failed: {error}");
+        error!(%id, %error, "extension: initial persistence check failed");
+        return extension_startup_failed(&startup, id, 0, message);
+    }
+
+    if startup.send(Ok(())).is_err() {
+        return AgentResult {
+            id,
+            panics: 0,
+            error: Some("extension registration was abandoned during startup".into()),
+        };
+    }
 
     let blob_fetch = BlobFetchCtx {
         proof_blobs: &proof_blobs,
@@ -13912,7 +13979,9 @@ fn persist(
     strategy: &mut dyn crate::commit::CommitStrategy,
     instance: &crate::extension::ExtensionInstance<'_>,
 ) -> Result<(), crate::commit::CommitError> {
-    let bytes = instance.save_state();
+    let bytes = instance
+        .save_state()
+        .map_err(crate::commit::CommitError::Config)?;
     strategy.commit_state(&bytes).map(|_| ())
 }
 
@@ -14699,7 +14768,55 @@ mod tests {
             .expect("configured persistence failure must abort startup");
         assert!(error.contains("derive extension state path"));
 
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let echo_path = workspace
+            .join("target")
+            .join(profile)
+            .join("libecho_extension.so");
+        if echo_path.exists() {
+            let mut node = VosNode::new();
+            let id = ServiceId(0x00ff_1001);
+            let error = node
+                .try_register_extension_at_id(
+                    ExtensionConfig::new(echo_path).persist(&data_dir),
+                    id,
+                )
+                .expect_err("worker startup must report persistence setup failure");
+            assert!(error.contains("derive extension state path"));
+            assert!(!node.has_agent(id));
+            assert!(!node.routes.contains_key(&id.0));
+            assert!(!node.invoke_routes.lock().unwrap().contains_key(&id.0));
+            assert!(!node.agent_shutdown.lock().unwrap().contains_key(&id.0));
+        }
+
         std::fs::remove_file(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn failed_extension_load_is_reported_before_publication() {
+        let mut node = VosNode::new();
+        let id = ServiceId(0x00ff_1002);
+        let missing = std::env::temp_dir().join(format!(
+            "vos_missing_extension_{}_{}.so",
+            std::process::id(),
+            id.0
+        ));
+        let error = node
+            .try_register_extension_at_id(ExtensionConfig::new(missing), id)
+            .expect_err("a missing plugin must fail registration");
+        assert!(error.contains("failed to load extension plugin"));
+        assert!(!node.has_agent(id));
+        assert!(!node.routes.contains_key(&id.0));
+        assert!(!node.invoke_routes.lock().unwrap().contains_key(&id.0));
+        assert!(!node.agent_shutdown.lock().unwrap().contains_key(&id.0));
     }
 
     // ── unwrap_invoke_envelope contract ─────────────────────────
@@ -16511,10 +16628,11 @@ mod tests {
             .value()
             .to_vec();
 
-        // EchoExtension has a single u32 `count` field — rkyv packs it to
-        // exactly 4 bytes. After 3 echoes, count = 3.
-        assert_eq!(bytes.len(), 4, "EchoExtension state is one u32");
-        let count = u32::from_le_bytes(bytes.try_into().unwrap());
+        // The v2 envelope is 24 bytes (magic, declared version, direct-state
+        // fingerprint), followed by EchoExtension's single archived u32.
+        assert_eq!(&bytes[..8], b"VOSXST02");
+        assert_eq!(bytes.len(), 28, "state envelope plus one archived u32");
+        let count = u32::from_le_bytes(bytes[24..].try_into().unwrap());
         assert_eq!(count, 3, "expected 3 echoes total across both runs");
 
         let _ = std::fs::remove_dir_all(&data_dir);

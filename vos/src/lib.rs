@@ -350,9 +350,9 @@ macro_rules! __vos_emit_worker_glue {
         // - `(msg_ptr, msg_len)`, `(args_ptr, args_len)`, etc., are
         //   borrowed slices owned by the caller for the duration of
         //   the call. We read them, never store the pointer.
-        // - The `(state_ptr, state_len)` we return from snapshot fns
-        //   is a `Vec::into_raw_parts` triple the host must hand back
-        //   to `vos_extension_free_buf` so we can drop it.
+        // - The `(state_ptr, state_len, state_cap)` returned from the v2
+        //   snapshot function is a `Vec` raw-parts triple the host must hand
+        //   back unchanged to `vos_extension_free` so we can drop it.
         // - The `_VOS_WORKER_META` byte slice is a `'static` array;
         //   the host promises not to mutate through the pointer.
         #[cfg(feature = "bin")]
@@ -454,7 +454,10 @@ macro_rules! __vos_emit_worker_glue {
                 // discarded ctx preserves behaviour).
                 let mut tmp =
                     $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
-                let _ = $crate::run_blocking(actor.on_start(&mut tmp));
+                if let Err(error) = $crate::run_blocking(actor.on_start(&mut tmp)) {
+                    $crate::log::error!("extension on_start failed: {:?}", error);
+                    return core::ptr::null_mut();
+                }
                 let state = Box::new(WorkerState {
                     tasks: $crate::TaskTable::new(),
                     actor: Box::new(actor),
@@ -630,7 +633,25 @@ macro_rules! __vos_emit_worker_glue {
             ) -> *mut () {
                 use $crate::Actor as _;
                 let bytes = unsafe { core::slice::from_raw_parts(state_ptr, state_len) };
-                let Some(mut actor): Option<$actor_name> = $crate::Decode::try_decode(bytes) else {
+                const STATE_MAGIC: &[u8; 8] = b"VOSXST02";
+                const STATE_HEADER_LEN: usize = 24;
+                if bytes.len() < STATE_HEADER_LEN || &bytes[..8] != STATE_MAGIC {
+                    return core::ptr::null_mut();
+                }
+                let mut version_bytes = [0u8; 8];
+                version_bytes.copy_from_slice(&bytes[8..16]);
+                let mut fingerprint_bytes = [0u8; 8];
+                fingerprint_bytes.copy_from_slice(&bytes[16..24]);
+                if u64::from_le_bytes(version_bytes)
+                    != <$actor_name as $crate::Actor>::STATE_SCHEMA_VERSION
+                    || u64::from_le_bytes(fingerprint_bytes)
+                        != <$actor_name as $crate::Actor>::STATE_SCHEMA_FINGERPRINT
+                {
+                    return core::ptr::null_mut();
+                }
+                let Some(mut actor): Option<$actor_name> =
+                    $crate::Decode::try_decode(&bytes[STATE_HEADER_LEN..])
+                else {
                     // A null state tells the host that this plugin cannot
                     // decode the persisted schema. Silently constructing a
                     // default actor here can change operator configuration
@@ -639,7 +660,10 @@ macro_rules! __vos_emit_worker_glue {
                 };
                 let mut tmp =
                     $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
-                let _ = $crate::run_blocking(actor.on_start(&mut tmp));
+                if let Err(error) = $crate::run_blocking(actor.on_start(&mut tmp)) {
+                    $crate::log::error!("extension on_start failed after restore: {:?}", error);
+                    return core::ptr::null_mut();
+                }
                 let state = Box::new(WorkerState {
                     tasks: $crate::TaskTable::new(),
                     actor: Box::new(actor),
@@ -648,23 +672,34 @@ macro_rules! __vos_emit_worker_glue {
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_extension_state(
+            pub extern "C" fn vos_extension_state_v2(
                 state: *mut (),
                 out_ptr: *mut *mut u8,
                 out_len: *mut usize,
+                out_cap: *mut usize,
             ) {
-                use $crate::Encode;
+                use $crate::{Actor as _, Encode};
                 let ws = unsafe { &*(state as *const WorkerState) };
                 // Encode the INNER actor, not the `Box` — the blanket
                 // `impl<T> Encode for T` also covers `Box<actor>` (rkyv would
                 // archive a relative pointer), but `vos_extension_load` decodes
                 // straight into `$actor_name`, so the two must agree on the bare
                 // actor's layout.
-                let mut bytes = (*ws.actor).encode();
-                bytes.shrink_to_fit();
+                const STATE_MAGIC: &[u8; 8] = b"VOSXST02";
+                let actor_bytes = (*ws.actor).encode();
+                let mut bytes = Vec::with_capacity(24 + actor_bytes.len());
+                bytes.extend_from_slice(STATE_MAGIC);
+                bytes.extend_from_slice(
+                    &<$actor_name as $crate::Actor>::STATE_SCHEMA_VERSION.to_le_bytes(),
+                );
+                bytes.extend_from_slice(
+                    &<$actor_name as $crate::Actor>::STATE_SCHEMA_FINGERPRINT.to_le_bytes(),
+                );
+                bytes.extend_from_slice(&actor_bytes);
                 unsafe {
                     *out_ptr = bytes.as_mut_ptr();
                     *out_len = bytes.len();
+                    *out_cap = bytes.capacity();
                 }
                 core::mem::forget(bytes);
             }

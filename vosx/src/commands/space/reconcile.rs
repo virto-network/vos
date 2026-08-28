@@ -194,33 +194,24 @@ pub(crate) fn register_extension(
     }
 
     // Open the .so once to read meta + keep the handle alive past
-    // the `node.register_extension` call below. The worker thread
+    // the `node.try_register_extension_at_id` call below. The worker thread
     // does its own dlopen; by holding our handle until after the
     // worker is spawned, we make the common interleaving (worker
     // dlopens before our drop) keep dlopen's refcount ≥ 1, so the
     // library never round-trips through an unmap. There's still a
-    // narrow race if the worker thread hasn't run yet at our drop;
-    // a stronger fix would have `node.register_extension` return
-    // the meta blob itself, which is the right long-term shape.
+    // registration handshake now waits until that worker has loaded,
+    // restored, and committed its initial state before returning.
     // SAFETY: dlopen on a vos-built extension .so; the recipe's
     // path is operator-supplied. See `vos::extension::ExtensionPlugin::load`
     // for the full FFI contract docstring.
-    let plugin = match unsafe { vos::extension::ExtensionPlugin::load(&so_path) } {
-        Ok(p) => Some(p),
-        Err(e) => {
-            tracing::warn!(
-                "extension '{}': failed to read .vos_meta from {} ({e}); \
-                 schema-aware CLI dispatch disabled",
-                ext.name,
-                so_path.display(),
-            );
-            None
-        }
-    };
-    let meta_blob = plugin
-        .as_ref()
-        .map(|p| p.meta_bytes().to_vec())
-        .unwrap_or_default();
+    let plugin = unsafe { vos::extension::ExtensionPlugin::load(&so_path) }.map_err(|error| {
+        anyhow::anyhow!(
+            "extension '{}': failed to load metadata from {}: {error}",
+            ext.name,
+            so_path.display(),
+        )
+    })?;
+    let meta_blob = plugin.meta_bytes().to_vec();
 
     // Parse declared intra-system caps eagerly: a malformed entry is
     // a boot failure naming the offending token, not a silent loss of
@@ -280,7 +271,9 @@ pub(crate) fn register_extension(
     // — making `vosx <ext> <method>` unreachable. The blake2b-
     // derived id is stable across daemon restarts so the cache
     // and any external scripting stay valid.
-    let id = node.register_extension_at_id(cfg, instance_service_id(&ext.name, daemon_prefix));
+    let id = node
+        .try_register_extension_at_id(cfg, instance_service_id(&ext.name, daemon_prefix))
+        .map_err(|error| anyhow::anyhow!("extension '{}': startup failed: {error}", ext.name))?;
     tracing::info!(
         "extension '{}' loaded from {} as {id}",
         ext.name,

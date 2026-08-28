@@ -11,17 +11,16 @@
 //!
 //! - `vos_extension_meta` — returns a pointer to the `.vos_meta` blob
 //! - `vos_extension_create` — allocates an extension instance (actor + context)
-//! - `vos_extension_dispatch` — starts handling a message (stores future)
-//! - `vos_extension_poll` — polls the in-flight handler once
-//! - `vos_extension_pending_effect` — reads the pending host I/O request
-//! - `vos_extension_provide_result` — provides the host I/O result
+//! - `vos_extension_task_new` / `vos_extension_task_poll` — create and drive a task
+//! - `vos_extension_task_drop` — releases a completed or failed task
+//! - `vos_extension_load` — restores a versioned persisted-state envelope
+//! - `vos_extension_state_v2` — returns state pointer, length, and true capacity
 //! - `vos_extension_drop` — frees an extension instance
-//! - `vos_extension_free` — frees a reply buffer
+//! - `vos_extension_free` — frees an extension-owned state buffer
 //!
-//! The host drives the handler by polling repeatedly. When the handler
-//! needs I/O (e.g. `ctx.ask()`), it yields `Pending` and the host
-//! reads the request via `pending_effect`, fulfills it, writes back
-//! via `provide_result`, then re-polls.
+//! The host drives each task by polling repeatedly. When the handler needs I/O
+//! (e.g. `ctx.ask()`), the pending poll returns the encoded effect; the host
+//! fulfills it and supplies the result on the next poll.
 //!
 //! ## Extension feature
 //!
@@ -196,7 +195,12 @@ mod host {
     type DropFn = unsafe extern "C" fn(state: *mut ());
     type FreeFn = unsafe extern "C" fn(ptr: *mut u8, len: usize, cap: usize);
     type LoadFn = unsafe extern "C" fn(state_ptr: *const u8, state_len: usize) -> *mut ();
-    type StateFn = unsafe extern "C" fn(state: *mut (), out_ptr: *mut *mut u8, out_len: *mut usize);
+    type StateFn = unsafe extern "C" fn(
+        state: *mut (),
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+        out_cap: *mut usize,
+    );
     /// A loaded request-driven extension plugin.
     pub struct ExtensionPlugin {
         _lib: libloading::Library,
@@ -278,8 +282,12 @@ mod host {
                         .get::<LoadFn>(b"vos_extension_load")
                         .map_err(|e| format!("missing vos_extension_load: {e}"))?,
                     state_fn: *lib
-                        .get::<StateFn>(b"vos_extension_state")
-                        .map_err(|e| format!("missing vos_extension_state: {e}"))?,
+                        .get::<StateFn>(b"vos_extension_state_v2")
+                        .map_err(|e| {
+                            format!(
+                                "missing vos_extension_state_v2 (rebuild the extension for the current state ABI): {e}"
+                            )
+                        })?,
                 };
 
                 Ok(ExtensionPlugin {
@@ -312,20 +320,39 @@ mod host {
 
         /// Create a new extension instance with no init args.
         pub fn create(&self) -> ExtensionInstance<'_> {
+            self.try_create()
+                .expect("extension rejected creation or startup")
+        }
+
+        /// Fallible creation used by daemon startup so constructor/start-hook
+        /// failures are reported before the extension is registered.
+        pub fn try_create(&self) -> Result<ExtensionInstance<'_>, String> {
             let state = unsafe { (self.create_fn)(std::ptr::null(), 0) };
-            ExtensionInstance {
+            if state.is_null() {
+                return Err("extension rejected creation or startup".into());
+            }
+            Ok(ExtensionInstance {
                 plugin: self,
                 state,
-            }
+            })
         }
 
         /// Create a new extension instance with rkyv-encoded init args.
         pub fn create_with_args(&self, args: &[u8]) -> ExtensionInstance<'_> {
+            self.try_create_with_args(args)
+                .expect("extension rejected init arguments or startup")
+        }
+
+        /// Fallible argument-bearing creation used by daemon startup.
+        pub fn try_create_with_args(&self, args: &[u8]) -> Result<ExtensionInstance<'_>, String> {
             let state = unsafe { (self.create_fn)(args.as_ptr(), args.len()) };
-            ExtensionInstance {
+            if state.is_null() {
+                return Err("extension rejected init arguments or startup".into());
+            }
+            Ok(ExtensionInstance {
                 plugin: self,
                 state,
-            }
+            })
         }
 
         /// Restore an extension instance from previously serialized state.
@@ -460,19 +487,23 @@ mod host {
         /// Serialize the current actor state to bytes.
         /// Useful for persistence — write the bytes to your storage,
         /// later restore via `ExtensionPlugin::load_state`.
-        pub fn save_state(&self) -> Vec<u8> {
+        pub fn save_state(&self) -> Result<Vec<u8>, String> {
             let syms = self.plugin.actor_syms();
             let mut ptr: *mut u8 = std::ptr::null_mut();
             let mut len: usize = 0;
+            let mut cap: usize = 0;
             unsafe {
-                (syms.state_fn)(self.state, &mut ptr, &mut len);
+                (syms.state_fn)(self.state, &mut ptr, &mut len, &mut cap);
             }
-            if ptr.is_null() || len == 0 {
-                return Vec::new();
+            if ptr.is_null() || len == 0 || cap < len {
+                return Err(format!(
+                    "extension returned an invalid state buffer (ptr_null={}, len={len}, cap={cap})",
+                    ptr.is_null()
+                ));
             }
             let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
-            unsafe { (syms.free_fn)(ptr, len, len) };
-            bytes
+            unsafe { (syms.free_fn)(ptr, len, cap) };
+            Ok(bytes)
         }
     }
 
@@ -570,5 +601,14 @@ mod tests {
 
         let plugin = unsafe { ExtensionPlugin::load(&path) }.expect("load extension");
         assert!(plugin.load_state(&[0xff]).is_err());
+
+        let instance = plugin.create();
+        let mut state = instance.save_state().expect("save extension state");
+        assert_eq!(&state[..8], b"VOSXST02");
+        state[8] ^= 1;
+        assert!(
+            plugin.load_state(&state).is_err(),
+            "a snapshot from a different declared schema version must fail closed"
+        );
     }
 }
