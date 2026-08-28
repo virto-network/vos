@@ -13,6 +13,7 @@ pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
 #[cfg(feature = "pvm")]
 pub mod machine;
 pub mod package;
+pub mod standard;
 use crate::service::{
     ActorId, AgentId, BlobRef, DeploymentId, Hash, NodeId, PrincipalId, ProducerId, ProgramId,
     SpaceId,
@@ -239,6 +240,7 @@ pub struct AgentIdentity {
     pub profile: AgentProfile,
     pub runtime_deployment: DeploymentId,
     pub runtime_program: ProgramId,
+    pub runtime_producer: ProducerId,
 }
 
 /// Durable actor-directory entry. `parent = None` denotes a top-level actor;
@@ -287,7 +289,18 @@ pub struct UpgradeActor {
     pub from_deployment: DeploymentId,
     pub to_deployment: DeploymentId,
     pub to_program: ProgramId,
+    pub producer: ProducerId,
     pub package: BlobRef,
+    pub requirements: RuntimeRequirements,
+}
+
+/// Complete durable provenance and lane roots of one installed actor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActorRecord {
+    pub entry: ActorEntry,
+    pub producer: ProducerId,
+    pub package: BlobRef,
+    pub initial_state: ActorInitialState,
     pub requirements: RuntimeRequirements,
 }
 
@@ -335,7 +348,10 @@ pub enum LifecycleRequest {
         from_deployment: DeploymentId,
         to_deployment: DeploymentId,
         to_program: ProgramId,
+        producer: ProducerId,
         package: BlobRef,
+        abi: Hash,
+        capabilities: RuntimeCapabilities,
     },
 }
 
@@ -385,12 +401,14 @@ pub enum AgentConfigError {
     InvalidPrivateReplicaRole,
     InvalidPrivateReplicaOwner,
     InvalidRuntimeCapacity,
+    InvalidRuntimePackage,
 }
 
 /// Immutable creation descriptor consumed by an agent runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentConfig {
     pub identity: AgentIdentity,
+    pub runtime_package: BlobRef,
     pub capabilities: RuntimeCapabilities,
     pub replicas: Vec<AgentReplica>,
 }
@@ -399,6 +417,14 @@ impl AgentConfig {
     pub fn validate(&self) -> Result<(), AgentConfigError> {
         if self.capabilities.max_actors == 0 {
             return Err(AgentConfigError::InvalidRuntimeCapacity);
+        }
+        if self.identity.runtime_deployment == DeploymentId::ZERO
+            || self.identity.runtime_program == ProgramId::ZERO
+            || self.identity.runtime_producer == ProducerId::ZERO
+            || self.runtime_package.hash == Hash::ZERO
+            || self.runtime_package.len == 0
+        {
+            return Err(AgentConfigError::InvalidRuntimePackage);
         }
         if !self.capabilities.lanes.supported_by(self.identity.profile) {
             return Err(AgentConfigError::UnsupportedLane);
@@ -516,12 +542,17 @@ mod tests {
                 profile: AgentProfile::Private,
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
+                runtime_producer: ProducerId([8; 32]),
             },
             capabilities: RuntimeCapabilities {
                 lanes: LaneSet::of(StateLane::Merge).union(LaneSet::of(StateLane::Local)),
                 scheduling: false,
                 proofs: false,
                 max_actors: 4096,
+            },
+            runtime_package: BlobRef {
+                hash: Hash([9; 32]),
+                len: 100,
             },
             replicas: vec![AgentReplica {
                 node: NodeId([6; 32]),
