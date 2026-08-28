@@ -30,6 +30,19 @@ pub struct StandardAgentRuntime {
     actors: BTreeMap<ActorId, ManagedActor>,
 }
 
+/// Canonical persisted state of the bundled runtime.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StandardRuntimeState {
+    pub config: Option<AgentConfig>,
+    pub actors: Vec<StandardActorState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandardActorState {
+    pub record: ActorRecord,
+    pub debt: ActorLifecycleDebt,
+}
+
 impl StandardAgentRuntime {
     pub const fn new() -> Self {
         Self {
@@ -56,6 +69,74 @@ impl StandardAgentRuntime {
 
     pub fn is_empty(&self) -> bool {
         self.actors.is_empty()
+    }
+
+    pub fn snapshot(&self) -> StandardRuntimeState {
+        StandardRuntimeState {
+            config: self.config.clone(),
+            actors: self
+                .actors
+                .values()
+                .map(|actor| StandardActorState {
+                    record: actor.record.clone(),
+                    debt: actor.debt,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn restore(state: StandardRuntimeState) -> Result<Self, LifecycleError> {
+        let Some(config) = state.config else {
+            return if state.actors.is_empty() {
+                Ok(Self::new())
+            } else {
+                Err(LifecycleError::InvalidRequest)
+            };
+        };
+        if state
+            .actors
+            .windows(2)
+            .any(|pair| pair[0].record.entry.actor >= pair[1].record.entry.actor)
+            || state.actors.iter().any(|actor| actor.debt.children != 0)
+        {
+            return Err(LifecycleError::InvalidRequest);
+        }
+
+        let mut runtime = Self::new();
+        runtime.apply(LifecycleRequest::Create(config))?;
+        let mut pending = state.actors;
+        let mut suspended = Vec::new();
+        while !pending.is_empty() {
+            let Some(index) = pending.iter().position(|actor| {
+                actor.record.entry.parent.is_none()
+                    || actor
+                        .record
+                        .entry
+                        .parent
+                        .is_some_and(|parent| runtime.actors.contains_key(&parent))
+            }) else {
+                return Err(LifecycleError::InvalidRequest);
+            };
+            let actor = pending.remove(index);
+            let mut entry = actor.record.entry;
+            if entry.suspended {
+                suspended.push(entry.actor);
+                entry.suspended = false;
+            }
+            let actor_id = entry.actor;
+            runtime.install(super::InstallActor {
+                entry,
+                producer: actor.record.producer,
+                package: actor.record.package,
+                initial_state: actor.record.initial_state,
+                requirements: actor.record.requirements,
+            })?;
+            runtime.set_lifecycle_debt(actor_id, actor.debt)?;
+        }
+        for actor in suspended {
+            runtime.set_suspended(actor, true)?;
+        }
+        Ok(runtime)
     }
 
     /// Update non-structural lifecycle debt from durable runtime indexes.
@@ -137,6 +218,7 @@ impl StandardAgentRuntime {
             || install.entry.lanes != install.requirements.lanes
             || install.entry.deployment == DeploymentId::ZERO
             || install.entry.program == ProgramId::ZERO
+            || install.entry.suspended
             || install.producer == ProducerId::ZERO
             || install.package.hash == Hash::ZERO
             || install.package.len == 0

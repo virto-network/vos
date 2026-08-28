@@ -2,6 +2,8 @@
 
 use alloc::vec::Vec;
 
+use super::AgentRuntime;
+use super::standard::{StandardActorState, StandardAgentRuntime, StandardRuntimeState};
 use super::{
     ActorDirectoryPage, ActorEntry, ActorInitialState, ActorLifecycleDebt, AgentConfig,
     AgentIdentity, AgentProfile, AgentReplica, LaneSet, LifecycleError, LifecycleReply,
@@ -79,6 +81,63 @@ impl ServiceWire for RuntimeReturn {
         };
         Ok(Self { state, result })
     }
+}
+
+impl ServiceWire for StandardRuntimeState {
+    const MAGIC: [u8; 4] = *b"AGST";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&super::RUNTIME_ABI_ID.0);
+        encoder.option(&self.config, encode_config);
+        encoder.list(&self.actors, |encoder, actor| {
+            encode_entry(encoder, &actor.record.entry);
+            encoder.fixed(&actor.record.producer.0);
+            encode_blob(encoder, &actor.record.package);
+            encode_initial_state(encoder, &actor.record.initial_state);
+            encode_requirements(encoder, actor.record.requirements);
+            encode_debt(encoder, actor.debt);
+        });
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID {
+            return Err(DecodeError::InvalidPlatform);
+        }
+        let state = StandardRuntimeState {
+            config: decoder.option(decode_config)?,
+            actors: decoder.list(|decoder| {
+                Ok(StandardActorState {
+                    record: super::ActorRecord {
+                        entry: decode_entry(decoder)?,
+                        producer: ProducerId(decoder.fixed()?),
+                        package: decode_blob(decoder)?,
+                        initial_state: decode_initial_state(decoder)?,
+                        requirements: decode_requirements(decoder)?,
+                    },
+                    debt: decode_debt(decoder)?,
+                })
+            })?,
+        };
+        StandardAgentRuntime::restore(state.clone()).map_err(|_| DecodeError::NonCanonical)?;
+        Ok(state)
+    }
+}
+
+/// Apply one management call with the bundled deterministic runtime.
+pub fn apply_standard(call: RuntimeCall) -> Result<RuntimeReturn, DecodeError> {
+    let state = if call.state.is_empty() {
+        StandardRuntimeState::default()
+    } else {
+        StandardRuntimeState::decode(&call.state)?
+    };
+    let mut runtime =
+        StandardAgentRuntime::restore(state).map_err(|_| DecodeError::NonCanonical)?;
+    let result = runtime.apply(call.request);
+    Ok(RuntimeReturn {
+        state: runtime.snapshot().encode(),
+        result,
+    })
 }
 
 fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
@@ -542,6 +601,31 @@ mod tests {
         assert_eq!(
             RuntimeCall::decode(&call.encode()),
             Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn standard_runtime_state_survives_independent_calls() {
+        let created = apply_standard(RuntimeCall {
+            state: Vec::new(),
+            request: LifecycleRequest::Create(config()),
+        })
+        .unwrap();
+        assert!(matches!(created.result, Ok(LifecycleReply::Created(_))));
+        let inspected = apply_standard(RuntimeCall {
+            state: created.state,
+            request: LifecycleRequest::Inspect {
+                after: None,
+                limit: 16,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            inspected.result,
+            Ok(LifecycleReply::Directory(ActorDirectoryPage {
+                entries: Vec::new(),
+                next: None,
+            }))
         );
     }
 }
