@@ -14,6 +14,7 @@ pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
 pub mod machine;
 pub mod package;
 pub mod standard;
+pub mod wire;
 use crate::service::{
     ActorId, AgentId, BlobRef, DeploymentId, Hash, NodeId, PrincipalId, ProducerId, ProgramId,
     SpaceId,
