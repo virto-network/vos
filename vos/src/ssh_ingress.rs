@@ -27,6 +27,11 @@ const SHELL_SERVICE: &str = "vos.space";
 const LOAD_EFFECT: &str = "space.load";
 const INVOKE_EFFECT: &str = "space.invoke";
 const MAX_BLOCKING_OPERATIONS: usize = 32;
+/// VOS root admission has no cancellation boundary after acceptance. A
+/// shorter S4 deadline could report failure while the invocation remains live
+/// and later commits. Tokio represents this as a far-future timer; the global
+/// blocking semaphore remains the resource bound for accepted work.
+const ACCEPTED_WORK_TIMEOUT: Duration = Duration::MAX;
 
 fn default_max_connections() -> usize {
     128
@@ -145,11 +150,7 @@ fn build_server(
     handle: IngressHandle,
     blocking: Arc<tokio::sync::Semaphore>,
 ) -> Server {
-    let limits = ServerLimits {
-        max_connections: config.max_connections,
-        max_sessions_per_identity: config.max_sessions_per_member,
-        ..ServerLimits::default()
-    };
+    let limits = server_limits(config);
 
     let auth_handle = handle.clone();
     let auth_blocking = blocking.clone();
@@ -194,6 +195,16 @@ fn build_server(
             host_service(service_handle.clone(), service_blocking.clone(), request)
         })
         .limits(limits)
+}
+
+fn server_limits(config: &SshIngressConfig) -> ServerLimits {
+    let mut limits = ServerLimits {
+        max_connections: config.max_connections,
+        max_sessions_per_identity: config.max_sessions_per_member,
+        ..ServerLimits::default()
+    };
+    limits.host_services.timeout = ACCEPTED_WORK_TIMEOUT;
+    limits
 }
 
 #[derive(Clone)]
@@ -1089,6 +1100,13 @@ mod tests {
         let mut invalid = config();
         invalid.host_key.clear();
         assert!(validate_config(&invalid).is_err());
+    }
+
+    #[test]
+    fn accepted_work_outlives_the_s4_default_deadline() {
+        let limits = server_limits(&config());
+        assert_eq!(limits.host_services.timeout, Duration::MAX);
+        assert!(limits.host_services.timeout > Duration::from_secs(35));
     }
 
     #[test]

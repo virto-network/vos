@@ -58,6 +58,11 @@ Attested methods return a structured S4 result containing the rendered actor
 reply and the complete canonical `VARW` attestation wire. The built-in terminal
 prints that wire as hex so the proof package is never silently discarded.
 
+Once a root accepts an invocation, the shell waits for its terminal result and
+does not apply S4's ordinary 30-second host-service timeout. Accepted work
+cannot be safely cancelled and may commit after the SSH session disconnects;
+the listener's bounded execution pool limits concurrent accepted operations.
+
 The current built-in routes are:
 
 | Route | Purpose | Minimum capability |
