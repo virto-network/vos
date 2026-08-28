@@ -20,6 +20,7 @@ use s4_server::{
 
 use crate::actors::context::ServiceId;
 use crate::node::{IngressAuthenticationError, IngressHandle};
+use crate::service::ServiceWire;
 use crate::{Decode, Encode};
 
 const SHELL_SERVICE: &str = "vos.space";
@@ -895,22 +896,7 @@ fn describe_roles(
 }
 
 fn describe_agent(handle: &IngressHandle, name: &str) -> Result<String, HostServiceError> {
-    if handle.resolve_actor(name).is_none() {
-        return Err(service_error(
-            "vos.not-found",
-            "agent is not attached to this node",
-        ));
-    }
-    let value = registry_value(
-        handle,
-        crate::value::Msg::new("meta_for_instance").with("name", name.to_owned()),
-    )
-    .ok_or_else(|| service_error("vos.registry-unavailable", "agent schema unavailable"))?;
-    let crate::value::Value::Bytes(bytes) = value else {
-        return Err(service_error("vos.invalid-reply", "invalid agent schema"));
-    };
-    let meta = crate::metadata::decode(&bytes)
-        .ok_or_else(|| service_error("vos.not-found", "agent has no canonical schema"))?;
+    let meta = agent_metadata(handle, name)?;
     Ok(format!(
         "{}\n{}\n\nMethods:\n{}",
         meta.actor_name,
@@ -928,6 +914,28 @@ fn describe_agent(handle: &IngressHandle, name: &str) -> Result<String, HostServ
             .collect::<Vec<_>>()
             .join("\n")
     ))
+}
+
+fn agent_metadata(
+    handle: &IngressHandle,
+    name: &str,
+) -> Result<crate::metadata::ParsedMeta, HostServiceError> {
+    if handle.resolve_actor(name).is_none() {
+        return Err(service_error(
+            "vos.not-found",
+            "agent is not attached to this node",
+        ));
+    }
+    let value = registry_value(
+        handle,
+        crate::value::Msg::new("meta_for_instance").with("name", name.to_owned()),
+    )
+    .ok_or_else(|| service_error("vos.registry-unavailable", "agent schema unavailable"))?;
+    let crate::value::Value::Bytes(bytes) = value else {
+        return Err(service_error("vos.invalid-reply", "invalid agent schema"));
+    };
+    crate::metadata::decode(&bytes)
+        .ok_or_else(|| service_error("vos.not-found", "agent has no canonical schema"))
 }
 
 fn dynamic_payload(message: crate::value::Msg) -> Vec<u8> {
@@ -963,26 +971,66 @@ fn invoke(
     let target = handle
         .resolve_actor(agent)
         .ok_or_else(|| service_error("vos.not-found", "agent is not attached to this node"))?;
+    let meta = agent_metadata(handle, agent)?;
+    let method_meta = meta
+        .messages
+        .iter()
+        .find(|candidate| candidate.name == method)
+        .ok_or_else(|| {
+            service_error("vos.not-found", "method is not in the signed actor schema")
+        })?;
+    let idempotency_key = ssh_invocation_key(method_meta, key)?;
     let payload = dynamic_payload(crate::value::Msg::new(method));
-    let reply = if key.is_empty() {
-        handle.invoke_actor(crate::SubjectId(access.subject), target, payload, false)
-    } else {
+    let reply = if let Some(key) = idempotency_key {
         handle.invoke_actor_idempotent(
             crate::SubjectId(access.subject),
             target,
             payload,
-            false,
+            method_meta.attested,
             "ssh",
             key,
         )
+    } else {
+        handle.invoke_actor(
+            crate::SubjectId(access.subject),
+            target,
+            payload,
+            method_meta.attested,
+        )
     }
     .map_err(|error| service_error("vos.invoke-failed", format!("{error:?}")))?;
+    let reply = if method_meta.attested {
+        crate::service::RootTreeAttestedResult::decode(&reply)
+            .map_err(|_| service_error("vos.invalid-reply", "actor returned invalid attestation"))?
+            .reply
+    } else {
+        reply
+    };
     if reply.is_empty() {
         return Ok("Completed".into());
     }
     let value = crate::value::Value::try_decode(&reply)
         .ok_or_else(|| service_error("vos.invalid-reply", "actor returned invalid data"))?;
     Ok(format!("{value:?}"))
+}
+
+fn ssh_invocation_key<'a>(
+    method: &crate::metadata::ParsedMessage,
+    key: &'a str,
+) -> Result<Option<&'a str>, HostServiceError> {
+    if key.len() > 128 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(service_error(
+            "vos.invalid-request",
+            "idempotency key must contain 1..=128 visible ASCII characters",
+        ));
+    }
+    if !method.is_query && key.is_empty() {
+        return Err(service_error(
+            "vos.idempotency-required",
+            "mutating methods require an idempotency key",
+        ));
+    }
+    Ok((!key.is_empty()).then_some(key))
 }
 
 #[cfg(test)]
@@ -1047,5 +1095,31 @@ mod tests {
         };
         assert!(require(&allowed, crate::capability::AGENT_INVOKE).is_ok());
         assert!(require(&allowed, crate::capability::AGENT_UPGRADE).is_err());
+    }
+
+    #[test]
+    fn signed_method_metadata_controls_idempotency_and_attestation() {
+        let method = |is_query, attested| crate::metadata::ParsedMessage {
+            name: "call".into(),
+            is_query,
+            fields: Vec::new(),
+            exposed_to_cli: false,
+            returns: "()".into(),
+            doc: String::new(),
+            timeout_ms: 0,
+            mode: 0,
+            attested,
+            space_role: None,
+            actor_role: None,
+            capability: None,
+        };
+        assert_eq!(ssh_invocation_key(&method(true, false), "").unwrap(), None);
+        assert!(ssh_invocation_key(&method(false, false), "").is_err());
+        assert_eq!(
+            ssh_invocation_key(&method(false, true), "transfer-42").unwrap(),
+            Some("transfer-42"),
+        );
+        assert!(ssh_invocation_key(&method(false, false), &"x".repeat(129)).is_err());
+        assert!(method(false, true).attested);
     }
 }

@@ -81,6 +81,7 @@ the same stable identity through several HTTP tokens and SSH keys:
 vosx space role demo define operator --power 150 \
   --capability counter.write --capability agent.invoke \
   --operation-key define-operator-1
-vosx space role demo grant me --role operator --operation-key grant-me-operator-1
+vosx space role demo grant me --role member --role operator \
+  --operation-key grant-me-operator-1
 vosx space access demo issue-ssh ~/.ssh/id_ed25519.pub --expires 30d
 ```

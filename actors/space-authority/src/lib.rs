@@ -87,6 +87,7 @@ pub fn initial_state(
                 grantor_peer_id: root_grantor_peer_id,
             }],
             access_grants: StorageMap::default(),
+            access_by_subject: StorageMap::default(),
         }
         .encode(),
     )
@@ -109,6 +110,10 @@ pub struct SpaceAuthority {
     /// Bearer secrets and SSH private keys never enter durable actor state.
     #[storage]
     access_grants: StorageMap<[u8; 32], IngressAccessGrant>,
+    /// Bounded live credential IDs for each member. Historical grant rows are
+    /// retained as revocation evidence, but issuance never scans them.
+    #[storage]
+    access_by_subject: StorageMap<[u8; 32], Vec<[u8; 32]>>,
 }
 
 #[messages]
@@ -132,6 +137,7 @@ impl SpaceAuthority {
             member_roles: StorageMap::default(),
             grants: Vec::new(),
             access_grants: StorageMap::default(),
+            access_by_subject: StorageMap::default(),
         }
     }
 
@@ -179,15 +185,16 @@ impl SpaceAuthority {
                 return Vec::new();
             }
         } else {
-            let credential_count = self
-                .access_grants
-                .iter()
-                .filter(|(_, row)| row.subject == subject.0 && !row.revoked)
-                .count();
-            if credential_count >= vos::MAX_MEMBER_CREDENTIALS {
+            let mut credentials = self.access_by_subject.get(&subject.0).unwrap_or_default();
+            if credentials.len() >= vos::MAX_MEMBER_CREDENTIALS {
                 return Vec::new();
             }
+            match credentials.binary_search(&credential_id) {
+                Ok(_) => return Vec::new(),
+                Err(index) => credentials.insert(index, credential_id),
+            }
             self.access_grants.insert(&credential_id, &candidate);
+            self.access_by_subject.insert(&subject.0, &credentials);
         }
         let (power, capabilities) = self.effective_member_authority(subject).unwrap_or_default();
         let roles = self.member_role_ids(subject);
@@ -223,9 +230,22 @@ impl SpaceAuthority {
         {
             return false;
         }
+        if row.revoked {
+            return true;
+        }
         row.revoked = true;
         row.epoch = row.epoch.saturating_add(1);
         self.access_grants.insert(&credential_id, &row);
+        if let Some(mut credentials) = self.access_by_subject.get(&row.subject) {
+            if let Ok(index) = credentials.binary_search(&credential_id) {
+                credentials.remove(index);
+            }
+            if credentials.is_empty() {
+                self.access_by_subject.remove(&row.subject);
+            } else {
+                self.access_by_subject.insert(&row.subject, &credentials);
+            }
+        }
         true
     }
 
@@ -310,6 +330,14 @@ impl SpaceAuthority {
         };
         let caller = Origin::Member(caller);
         if !self.valid_role_definition(&definition) || !self.can_define_role(caller, &definition) {
+            return false;
+        }
+        if let Some(current) = self
+            .roles
+            .iter()
+            .find(|row| row.definition.id == definition.id && !row.deleted)
+            && !self.can_define_role(caller, &current.definition)
+        {
             return false;
         }
         if let Some(row) = self
@@ -714,9 +742,10 @@ impl SpaceAuthority {
         }
         seen.push(subject.0);
 
-        let (roles, grantor) = if let Some(assignment) =
-            self.member_roles.get(&subject.0).filter(|row| !row.revoked)
-        {
+        let (roles, grantor) = if let Some(assignment) = self.member_roles.get(&subject.0) {
+            if assignment.revoked {
+                return None;
+            }
             (assignment.roles.clone(), SubjectId(assignment.grantor))
         } else {
             let holder = Origin::Member(subject);
@@ -762,6 +791,9 @@ impl SpaceAuthority {
             if let Some((power, _)) = self.effective_member_authority(subject) {
                 return Some(power);
             }
+            if self.member_roles.contains(&subject.0) {
+                return None;
+            }
             if !self.has_base_grant(holder) {
                 return None;
             }
@@ -778,6 +810,9 @@ impl SpaceAuthority {
         if let Origin::Member(subject) = holder {
             if let Some((_, capabilities)) = self.effective_member_authority(subject) {
                 return capabilities;
+            }
+            if self.member_roles.contains(&subject.0) {
+                return Vec::new();
             }
             if !self.has_base_grant(holder) {
                 return Vec::new();
@@ -825,7 +860,7 @@ impl SpaceAuthority {
         let capabilities = self.effective_capabilities(issuer);
         self.has_capability(
             issuer,
-            CapabilityId::named(vos::capability::SPACE_CREDENTIALS_MANAGE),
+            CapabilityId::named(vos::capability::SPACE_MEMBERS_MANAGE),
         ) && roles.iter().all(|role| {
             self.role_definition(role).is_some_and(|role| {
                 role.power < power
@@ -838,6 +873,20 @@ impl SpaceAuthority {
     }
 
     fn effective_role(&self, holder: Origin) -> Option<SpaceRole> {
+        if let Origin::Member(subject) = holder
+            && self.member_roles.contains(&subject.0)
+        {
+            let (power, _) = self.effective_member_authority(subject)?;
+            return Some(if power >= 300 {
+                SpaceRole::Admin
+            } else if power >= 200 {
+                SpaceRole::Developer
+            } else if power >= 100 {
+                SpaceRole::Member
+            } else {
+                SpaceRole::Guest
+            });
+        }
         let holder = holder_key(holder)?;
         self.effective_role_inner(holder, &mut Vec::new())
     }
@@ -868,27 +917,7 @@ impl SpaceAuthority {
             return (self.effective_role_inner(grantor, seen) == Some(SpaceRole::Admin))
                 .then_some(role);
         }
-        if holder.0 != 0 {
-            return None;
-        }
-        let assignment = self
-            .member_roles
-            .get(&holder.1)
-            .filter(|row| !row.revoked)?;
-        let power = assignment
-            .roles
-            .iter()
-            .filter_map(|role| self.role_definition(role).map(|role| role.power))
-            .max()?;
-        Some(if power >= 300 {
-            SpaceRole::Admin
-        } else if power >= 200 {
-            SpaceRole::Developer
-        } else if power >= 100 {
-            SpaceRole::Member
-        } else {
-            SpaceRole::Guest
-        })
+        None
     }
 
     fn apply_grant(
@@ -1421,6 +1450,137 @@ mod tests {
     }
 
     #[test]
+    fn member_management_and_role_replacement_use_the_exact_authority() {
+        let signing = SigningKey::from_bytes(&[0x41; 32]);
+        let space = SpaceId([0x42; 32]);
+        let root = Origin::Member(SubjectId::of_authenticated_peer(&root_peer(&signing)));
+        let member_manager = SubjectId([0x43; 32]);
+        let credential_manager = SubjectId([0x44; 32]);
+        let role_manager = SubjectId([0x45; 32]);
+        let target = SubjectId([0x46; 32]);
+        let mut authority = actor(space, &signing);
+
+        let role = |name: &str, power: u16, capability: &str| SpaceRoleDefinition {
+            id: RoleId::named(space, name).0,
+            name: name.into(),
+            power,
+            capabilities: vec![CapabilityId::named(capability).0],
+            capability_names: vec![capability.into()],
+        };
+        let assigner = role("member-manager", 200, vos::capability::SPACE_MEMBERS_MANAGE);
+        let issuer = role(
+            "credential-manager",
+            200,
+            vos::capability::SPACE_CREDENTIALS_MANAGE,
+        );
+        let editor = role("role-manager", 150, vos::capability::SPACE_ROLES_MANAGE);
+        let target_role = SpaceRoleDefinition {
+            id: RoleId::named(space, "low-power").0,
+            name: "low-power".into(),
+            power: 10,
+            capabilities: Vec::new(),
+            capability_names: Vec::new(),
+        };
+        for definition in [&assigner, &issuer, &editor, &target_role] {
+            assert!(dispatch_as(
+                &mut authority,
+                root,
+                PutRole {
+                    definition: definition.encode(),
+                },
+            ));
+        }
+        for (subject, role) in [
+            (member_manager, assigner.id),
+            (credential_manager, issuer.id),
+            (role_manager, editor.id),
+        ] {
+            assert!(dispatch_as(
+                &mut authority,
+                root,
+                SetMemberRoles {
+                    subject: subject.0,
+                    roles: vec![role],
+                },
+            ));
+        }
+        assert!(dispatch_as(
+            &mut authority,
+            Origin::Member(member_manager),
+            SetMemberRoles {
+                subject: target.0,
+                roles: vec![target_role.id],
+            },
+        ));
+        assert!(!dispatch_as(
+            &mut authority,
+            Origin::Member(credential_manager),
+            SetMemberRoles {
+                subject: target.0,
+                roles: vec![target_role.id],
+            },
+        ));
+
+        let weakened_admin = SpaceRoleDefinition {
+            id: RoleId::named(space, "admin").0,
+            name: "admin".into(),
+            power: 149,
+            capabilities: editor.capabilities.clone(),
+            capability_names: editor.capability_names.clone(),
+        };
+        assert!(!dispatch_as(
+            &mut authority,
+            Origin::Member(role_manager),
+            PutRole {
+                definition: weakened_admin.encode(),
+            },
+        ));
+        assert_eq!(
+            authority
+                .role_definition(&RoleId::named(space, "admin").0)
+                .expect("admin role")
+                .power,
+            300,
+        );
+    }
+
+    #[test]
+    fn revoked_credential_history_does_not_consume_the_live_limit() {
+        let signing = SigningKey::from_bytes(&[0x51; 32]);
+        let space = SpaceId([0x52; 32]);
+        let root = Origin::Member(SubjectId::of_authenticated_peer(&root_peer(&signing)));
+        let root_subject = match root {
+            Origin::Member(subject) => subject,
+            _ => unreachable!(),
+        };
+        let mut authority = actor(space, &signing);
+        for ordinal in 1_u16..=300 {
+            let mut credential = [0_u8; 32];
+            credential[..2].copy_from_slice(&ordinal.to_le_bytes());
+            assert!(
+                !dispatch_as(
+                    &mut authority,
+                    root,
+                    IssueAccess {
+                        credential_id: credential,
+                        subject: [0; 32],
+                        expires_at: u64::from(ordinal) + 1,
+                    },
+                )
+                .is_empty()
+            );
+            assert!(dispatch_as(
+                &mut authority,
+                root,
+                RevokeAccess {
+                    credential_id: credential,
+                },
+            ));
+        }
+        assert!(authority.access_by_subject.get(&root_subject.0).is_none());
+    }
+
+    #[test]
     fn signed_grant_authorizes_exact_claim_and_threshold() {
         let signing = SigningKey::from_bytes(&[1; 32]);
         let space = SpaceId([2; 32]);
@@ -1636,7 +1796,6 @@ mod tests {
         let access = IngressAccessStatus::try_decode(&access)
             .expect("invite redemption materializes an editable role assignment");
         assert_eq!(access.roles, vec![RoleId::named(space, "developer").0]);
-
         let second_holder_key = SigningKey::from_bytes(&[36; 32]);
         let second_holder = Origin::Member(SubjectId::of_authenticated_peer(&root_peer(
             &second_holder_key,
@@ -1700,6 +1859,30 @@ mod tests {
             developer.encode(),
             "invite revocation does not claw back an already committed grant"
         );
+        assert!(dispatch_as(
+            &mut authority,
+            Origin::Member(SubjectId::of_authenticated_peer(&root_peer(&root))),
+            RevokeMemberRoles {
+                subject: match holder {
+                    Origin::Member(subject) => subject.0,
+                    _ => unreachable!(),
+                },
+            },
+        ));
+        let encoded = authority.encode();
+        authority = SpaceAuthority::decode(&encoded);
+        <SpaceAuthority as vos::Actor>::__init_storage(&mut authority);
+        assert!(authorize(&mut authority, &developer).is_empty());
+        assert!(
+            dispatch(
+                &mut authority,
+                AuthenticateAccess {
+                    credential_id: credential,
+                },
+            )
+            .is_empty(),
+            "a revoked assignment suppresses the invite grant after restart",
+        );
 
         assert!(apply(
             &mut authority,
@@ -1711,7 +1894,7 @@ mod tests {
             },
         ));
         assert!(
-            authorize(&mut authority, &developer).is_empty(),
+            authorize(&mut authority, &second_developer).is_empty(),
             "revoking the minting admin invalidates its delegated invite grants",
         );
     }

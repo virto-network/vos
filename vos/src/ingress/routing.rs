@@ -11,9 +11,9 @@
 //! |---|-----------------------------|--------|----------|---------------|
 //! | 1 | `/__status`                  | GET    | none     | anonymous     |
 //! | 2 | `/__metrics`                 | GET    | none     | Admin         |
-//! | 3 | `/__schema`, `/__schema/<a>` | GET    | registry | Member        |
-//! | 4 | `/openapi.json`              | GET    | registry | Member        |
-//! | 5 | `/<actor>/<method>`           | any    | actor    | Member + policy |
+//! | 3 | `/__schema`, `/__schema/<a>` | GET    | registry | space.discover |
+//! | 4 | `/openapi.json`              | GET    | registry | space.discover |
+//! | 5 | `/<actor>/<method>`           | any    | actor    | agent.invoke + policy |
 //!
 //! Credential revocation and role changes take effect on the next request.
 
@@ -45,11 +45,25 @@ pub(crate) fn dispatch(req: &Request, inner: &Inner, ctx: &mut HttpIngressContex
         }
         return handle_metrics(req, inner).expect("metrics path matched");
     }
-    if !ctx.has_capability(crate::capability::SPACE_DISCOVER) {
-        return text(403, "member access is required");
+    let path = req.uri().path();
+    let required = required_route_capability(path);
+    if !ctx.has_capability(required) {
+        return text(403, format!("'{required}' capability is required"));
     }
     inner.requests.fetch_add(1, Ordering::Relaxed);
     handle(req, inner, ctx)
+}
+
+fn is_discovery_route(path: &str) -> bool {
+    path == "/openapi.json" || path.starts_with("/__schema")
+}
+
+fn required_route_capability(path: &str) -> &'static str {
+    if is_discovery_route(path) {
+        crate::capability::SPACE_DISCOVER
+    } else {
+        crate::capability::AGENT_INVOKE
+    }
 }
 
 /// `GET /__status` — compact JSON liveness snapshot (port, running,
@@ -1097,5 +1111,22 @@ mod tests {
             actor_role: None,
             capability: None,
         }
+    }
+
+    #[test]
+    fn discovery_and_actor_routes_use_distinct_capabilities() {
+        assert!(is_discovery_route("/__schema"));
+        assert!(is_discovery_route("/__schema/counter"));
+        assert!(is_discovery_route("/openapi.json"));
+        assert!(!is_discovery_route("/counter/value"));
+        assert!(!is_discovery_route("/counter/add"));
+        assert_eq!(
+            required_route_capability("/__schema/counter"),
+            crate::capability::SPACE_DISCOVER,
+        );
+        assert_eq!(
+            required_route_capability("/counter/add"),
+            crate::capability::AGENT_INVOKE,
+        );
     }
 }

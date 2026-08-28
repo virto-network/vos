@@ -284,19 +284,27 @@ fn list(space: &str) -> anyhow::Result<()> {
 fn revoke(space: &str, selector: &str) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| {
         let target = client.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
-        let rows = access_rows_for(client, target)?;
-        let matches: Vec<_> = rows
-            .iter()
-            .filter(|row| hex::encode(row.credential_id).starts_with(selector))
-            .collect();
-        let row = match matches.as_slice() {
-            [row] => *row,
-            [] => anyhow::bail!("no credential matches '{selector}'"),
-            _ => anyhow::bail!("credential prefix '{selector}' is ambiguous"),
+        let credential_id = if selector.len() == 64 {
+            let bytes = hex::decode(selector)
+                .map_err(|_| anyhow::anyhow!("credential ID must be 64 hexadecimal characters"))?;
+            bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("credential ID must be 32 bytes"))?
+        } else {
+            let rows = access_rows_for(client, target)?;
+            let matches: Vec<_> = rows
+                .iter()
+                .filter(|row| hex::encode(row.credential_id).starts_with(selector))
+                .collect();
+            match matches.as_slice() {
+                [row] => row.credential_id,
+                [] => anyhow::bail!("no credential matches '{selector}'"),
+                _ => anyhow::bail!("credential prefix '{selector}' is ambiguous"),
+            }
         };
         let message =
-            vos::value::Msg::new("revoke_access").with("credential_id", row.credential_id.to_vec());
-        let operation_key = format!("revoke-access:{}", hex::encode(row.credential_id));
+            vos::value::Msg::new("revoke_access").with("credential_id", credential_id.to_vec());
+        let operation_key = format!("revoke-access:{}", hex::encode(credential_id));
         if client
             .invoke_dyn_idempotent(target, &message, &operation_key)?
             .as_bool()
@@ -306,11 +314,11 @@ fn revoke(space: &str, selector: &str) -> anyhow::Result<()> {
         }
         if crate::output::is_json() {
             crate::output::print_json(&serde_json::json!({
-                "credential_id": hex::encode(row.credential_id),
+                "credential_id": hex::encode(credential_id),
                 "revoked": true,
             }));
         } else {
-            println!("revoked {}", hex::encode(row.credential_id));
+            println!("revoked {}", hex::encode(credential_id));
         }
         Ok(())
     })
