@@ -48,6 +48,9 @@ pub enum ErrorCode {
     Stale = 10,
     ReplyTooLarge = 11,
     Forbidden = 12,
+    /// A prior automatic-nonce submission may still finalize. Callers must
+    /// wait for finalized nonce advancement or provide an explicit nonce.
+    NonceUncertain = 13,
 }
 
 #[derive(
@@ -279,6 +282,35 @@ impl Default for Config {
     }
 }
 
+#[derive(
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+#[repr(u8)]
+enum NonceReservationState {
+    AwaitingSignature = 0,
+    SubmissionUnknown = 1,
+}
+
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+struct NonceReservation {
+    request_id: u64,
+    owner: [u8; 32],
+    nonce_account: Vec<u8>,
+    nonce: u64,
+    state: NonceReservationState,
+}
+
 #[cfg(feature = "native")]
 #[derive(Default)]
 struct NativeRuntime {
@@ -300,6 +332,10 @@ struct NativeRuntime;
 pub struct SubstrateExtension {
     config: Config,
     next_request_id: u64,
+    // Automatic-nonce uncertainty crosses light-client reconnects and actor
+    // reloads. Awaiting reservations can be cancelled; once submission starts
+    // only finalized nonce advancement can retire the reservation.
+    nonce_reservations: Vec<NonceReservation>,
     #[rkyv(with = vos::rkyv::with::Skip)]
     runtime: NativeRuntime,
 }
@@ -323,6 +359,7 @@ impl SubstrateExtension {
         Self {
             config,
             next_request_id: 1,
+            nonce_reservations: Vec::new(),
             runtime: NativeRuntime::default(),
         }
     }
@@ -331,7 +368,7 @@ impl SubstrateExtension {
     #[msg(timeout_ms = 120000)]
     async fn status(&mut self, _ctx: &mut Context<Self>) -> SubstrateResult<ChainStatus> {
         #[cfg(feature = "native")]
-        return native::with_deadline(native::STANDARD_DEADLINE, self.native_status()).await;
+        return self.native_status_with_deadline().await;
         #[cfg(not(feature = "native"))]
         SubstrateResult::error(ErrorCode::Unsupported, "native backend is disabled")
     }
@@ -347,7 +384,7 @@ impl SubstrateExtension {
         _ctx: &mut Context<Self>,
     ) -> SubstrateResult<QueryResult> {
         #[cfg(feature = "native")]
-        return native::with_deadline(native::STANDARD_DEADLINE, self.native_query(path, at)).await;
+        return self.native_query_with_deadline(path, at).await;
         #[cfg(not(feature = "native"))]
         {
             let _ = (path, at);
@@ -399,11 +436,9 @@ impl SubstrateExtension {
                 );
             }
             let invocation = ctx.invocation_id();
-            return native::with_deadline(
-                native::STANDARD_DEADLINE,
-                self.native_prepare_transaction(request, owner, invocation),
-            )
-            .await;
+            return self
+                .native_prepare_transaction_with_deadline(request, owner, invocation)
+                .await;
         }
         #[cfg(not(feature = "native"))]
         {
@@ -556,7 +591,6 @@ fn decode_cursor(
 mod native {
     use super::*;
     use core::time::Duration;
-    use std::future::Future;
     use std::{fs, io::Read, time::Instant};
 
     use sube::{Backend as _, DispatchOutcome, Response, TransactionOptions};
@@ -567,21 +601,12 @@ mod native {
     const MAX_RECEIPT_EVENTS: usize = 16;
     const MAX_TOTAL_MAP_SNAPSHOTS: usize = 64;
     const MAX_TOTAL_PENDING_TRANSACTIONS: usize = 128;
+    const MAX_TOTAL_NONCE_RESERVATIONS: usize = 128;
     const LIGHT_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
     pub(super) const STANDARD_DEADLINE: Duration = Duration::from_secs(105);
     pub(super) const SUBMISSION_DEADLINE: Duration = Duration::from_secs(210);
     const BACKEND_CANCELLATION_DEADLINE: Duration = Duration::from_secs(10);
     const TRANSACTION_WATCH_TIMEOUT: Duration = Duration::from_secs(180);
-
-    pub(super) async fn with_deadline<T>(
-        duration: Duration,
-        future: impl Future<Output = SubstrateResult<T>>,
-    ) -> SubstrateResult<T> {
-        match sube::time::timeout(duration, future).await {
-            Ok(result) => result,
-            Err(_) => SubstrateResult::error(ErrorCode::Unavailable, "operation timed out"),
-        }
-    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(super) enum CallerKey {
@@ -616,6 +641,11 @@ mod native {
                 Self::Actor(service) => [&[4][..], &service.to_le_bytes()].concat(),
             }
         }
+
+        fn reservation_owner(&self) -> [u8; 32] {
+            let encoded = self.encoded();
+            vos::crypto::blake2b_hash::<32>(b"vos/substrate/nonce-owner", &[&encoded])
+        }
     }
 
     pub(super) fn capability_id(
@@ -643,7 +673,6 @@ mod native {
         owner: CallerKey,
         created: Instant,
         automatic_nonce: bool,
-        nonce_account: Vec<u8>,
         metadata: sube::Rc<sube::Metadata>,
         request: sube::ExternalSigningRequest,
     }
@@ -696,9 +725,38 @@ mod native {
 
         fn expire_pending(&mut self) {
             let ttl = Duration::from_secs(SIGNING_REQUEST_TTL_SECS);
+            let expired = self
+                .runtime
+                .pending
+                .iter()
+                .filter(|pending| pending.created.elapsed() > ttl)
+                .map(|pending| pending.id)
+                .collect::<Vec<_>>();
             self.runtime
                 .pending
-                .retain(|pending| pending.created.elapsed() <= ttl);
+                .retain(|pending| !expired.contains(&pending.id));
+            self.nonce_reservations.retain(|reservation| {
+                reservation.state == NonceReservationState::SubmissionUnknown
+                    || !expired.contains(&reservation.request_id)
+            });
+        }
+
+        fn release_nonce_reservation(&mut self, request_id: u64) {
+            self.nonce_reservations
+                .retain(|reservation| reservation.request_id != request_id);
+        }
+
+        fn mark_nonce_submission_unknown(&mut self, request_id: u64) -> bool {
+            if let Some(reservation) = self
+                .nonce_reservations
+                .iter_mut()
+                .find(|reservation| reservation.request_id == request_id)
+            {
+                reservation.state = NonceReservationState::SubmissionUnknown;
+                true
+            } else {
+                false
+            }
         }
 
         fn expire_map_snapshots(&mut self) {
@@ -760,12 +818,25 @@ mod native {
         }
 
         async fn cancel_backend_operation(&mut self) {
-            if let Some(client) = self.runtime.client.as_mut() {
-                let _ = sube::time::timeout(
-                    BACKEND_CANCELLATION_DEADLINE,
-                    client.cancel_active_operation(),
+            let cleanup_succeeded = if let Some(client) = self.runtime.client.as_mut() {
+                matches!(
+                    sube::time::timeout(
+                        BACKEND_CANCELLATION_DEADLINE,
+                        client.cancel_active_operation(),
+                    )
+                    .await,
+                    Ok(Ok(()))
                 )
-                .await;
+            } else {
+                true
+            };
+            if !cleanup_succeeded {
+                // A client with unconfirmed server-side cleanup is poisoned:
+                // dropping it closes every subscription and joins its owned
+                // runtime. Snapshot pins belong to that session and are no
+                // longer reusable.
+                self.runtime.client = None;
+                self.runtime.map_snapshots.clear();
             }
         }
 
@@ -788,7 +859,7 @@ mod native {
             owner: &CallerKey,
             invocation: InvocationId,
         ) -> Option<u64> {
-            for _ in 0..=MAX_TOTAL_PENDING_TRANSACTIONS {
+            for _ in 0..=(MAX_TOTAL_PENDING_TRANSACTIONS + MAX_TOTAL_NONCE_RESERVATIONS) {
                 let counter = self.next_request_id;
                 self.next_request_id = counter.wrapping_add(1);
                 let candidate =
@@ -798,11 +869,74 @@ mod native {
                     .pending
                     .iter()
                     .all(|pending| pending.id != candidate)
+                    && self
+                        .nonce_reservations
+                        .iter()
+                        .all(|reservation| reservation.request_id != candidate)
                 {
                     return Some(candidate);
                 }
             }
             None
+        }
+
+        pub(super) async fn native_status_with_deadline(&mut self) -> SubstrateResult<ChainStatus> {
+            match sube::time::timeout(STANDARD_DEADLINE, self.native_status()).await {
+                Ok(result) => {
+                    if let SubstrateResult::Err(_) = &result {
+                        self.cancel_backend_operation().await;
+                    }
+                    result
+                }
+                Err(_) => {
+                    self.cancel_backend_operation().await;
+                    SubstrateResult::error(ErrorCode::Unavailable, "operation timed out")
+                }
+            }
+        }
+
+        pub(super) async fn native_query_with_deadline(
+            &mut self,
+            path: String,
+            at: Option<BlockRef>,
+        ) -> SubstrateResult<QueryResult> {
+            match sube::time::timeout(STANDARD_DEADLINE, self.native_query(path, at)).await {
+                Ok(result) => {
+                    if let SubstrateResult::Err(_) = &result {
+                        self.cancel_backend_operation().await;
+                    }
+                    result
+                }
+                Err(_) => {
+                    self.cancel_backend_operation().await;
+                    SubstrateResult::error(ErrorCode::Unavailable, "operation timed out")
+                }
+            }
+        }
+
+        pub(super) async fn native_prepare_transaction_with_deadline(
+            &mut self,
+            request: TransactionRequest,
+            owner: CallerKey,
+            invocation: InvocationId,
+        ) -> SubstrateResult<SigningPayload> {
+            match sube::time::timeout(
+                STANDARD_DEADLINE,
+                self.native_prepare_transaction(request, owner, invocation),
+            )
+            .await
+            {
+                Ok(result) => {
+                    if let SubstrateResult::Err(_) = &result {
+                        self.cancel_backend_operation().await;
+                    }
+                    result
+                }
+                Err(_) => {
+                    self.cancel_backend_operation().await;
+                    SubstrateResult::error(ErrorCode::Unavailable, "operation timed out")
+                }
+            }
         }
 
         pub(super) async fn native_status(&mut self) -> SubstrateResult<ChainStatus> {
@@ -913,7 +1047,12 @@ mod native {
             )
             .await
             {
-                Ok(result) => result,
+                Ok(result) => {
+                    if let SubstrateResult::Err(_) = &result {
+                        self.cancel_map_invocation(&cleanup_owner, invocation).await;
+                    }
+                    result
+                }
                 Err(_) => {
                     self.cancel_map_invocation(&cleanup_owner, invocation).await;
                     SubstrateResult::error(ErrorCode::Unavailable, "operation timed out")
@@ -1165,16 +1304,43 @@ mod native {
                 );
             }
             let automatic_nonce = request.nonce.is_none();
-            if automatic_nonce
-                && self.runtime.pending.iter().any(|pending| {
-                    pending.automatic_nonce && pending.nonce_account == request.nonce_account
-                })
-            {
-                return SubstrateResult::error(
-                    ErrorCode::Busy,
-                    "an automatic-nonce request already exists for this account",
-                );
-            }
+            let reservation_owner = owner.reservation_owner();
+            let prior_ambiguous_nonce = if automatic_nonce {
+                match self
+                    .nonce_reservations
+                    .iter()
+                    .find(|reservation| reservation.nonce_account == request.nonce_account)
+                {
+                    Some(NonceReservation {
+                        state: NonceReservationState::AwaitingSignature,
+                        ..
+                    }) => {
+                        return SubstrateResult::error(
+                            ErrorCode::Busy,
+                            "an automatic-nonce signing request already exists for this account",
+                        );
+                    }
+                    Some(reservation) => Some(reservation.nonce),
+                    None => {
+                        if self.nonce_reservations.len() >= MAX_TOTAL_NONCE_RESERVATIONS
+                            || self
+                                .nonce_reservations
+                                .iter()
+                                .filter(|reservation| reservation.owner == reservation_owner)
+                                .count()
+                                >= MAX_PENDING_TRANSACTIONS
+                        {
+                            return SubstrateResult::error(
+                                ErrorCode::Busy,
+                                "too many unresolved automatic-nonce submissions",
+                            );
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
             let result = async {
                 let client = self.ensure_client().await?;
@@ -1205,6 +1371,18 @@ mod native {
                 Ok(request) => request,
                 Err(error) => return SubstrateResult::Err(error),
             };
+            if let Some(reserved_nonce) = prior_ambiguous_nonce {
+                if external.context.account_nonce <= reserved_nonce {
+                    return SubstrateResult::error(
+                        ErrorCode::NonceUncertain,
+                        format!(
+                            "automatic nonce {reserved_nonce} may still finalize; retry after the finalized account nonce advances or provide an explicit nonce"
+                        ),
+                    );
+                }
+                self.nonce_reservations
+                    .retain(|reservation| reservation.nonce_account != request.nonce_account);
+            }
             // Metadata is large. Pending requests from the same runtime can
             // safely share one immutable registry while older runtime
             // versions keep their own exact signing schema.
@@ -1235,15 +1413,24 @@ mod native {
                     "prepared transaction exceeds the extension reply budget",
                 );
             }
+            let reservation = automatic_nonce.then_some(NonceReservation {
+                request_id: id,
+                owner: reservation_owner,
+                nonce_account: request.nonce_account,
+                nonce: external.context.account_nonce,
+                state: NonceReservationState::AwaitingSignature,
+            });
             self.runtime.pending.push(PendingTransaction {
                 id,
                 owner,
                 created: Instant::now(),
                 automatic_nonce,
-                nonce_account: request.nonce_account,
                 metadata,
                 request: external,
             });
+            if let Some(reservation) = reservation {
+                self.nonce_reservations.push(reservation);
+            }
             reply
         }
 
@@ -1287,7 +1474,10 @@ mod native {
             if self.runtime.pending[position].created.elapsed()
                 > Duration::from_secs(SIGNING_REQUEST_TTL_SECS)
             {
-                self.runtime.pending.swap_remove(position);
+                let expired = self.runtime.pending.swap_remove(position);
+                if expired.automatic_nonce {
+                    self.release_nonce_reservation(expired.id);
+                }
                 return SubstrateResult::error(ErrorCode::Expired, "signing request expired");
             }
             let request = self.runtime.pending[position].request.clone();
@@ -1297,25 +1487,42 @@ mod native {
                     Ok(extrinsic) => extrinsic,
                     Err(error) => return SubstrateResult::Err(map_sube_error(error)),
                 };
-            // Consume before submission. A timeout or ambiguous network result
-            // must never make the same signature conveniently replayable.
-            self.runtime.pending.swap_remove(position);
-            let result = async {
-                let client = self.ensure_client().await?;
-                let receipt = client
-                    .submit_transaction_with_timeout(
-                        &extrinsic,
-                        match wait_for {
-                            Inclusion::BestBlock => sube::WaitFor::BestBlock,
-                            Inclusion::Finalized => sube::WaitFor::Finalized,
-                        },
-                        TRANSACTION_WATCH_TIMEOUT,
-                    )
-                    .await
-                    .map_err(map_sube_error)?;
-                Ok(transaction_result(extrinsic, receipt))
+            if let Err(error) = self.ensure_client().await {
+                // No submission was attempted; keep the signed request and its
+                // awaiting-signature reservation retryable.
+                return SubstrateResult::Err(error);
             }
-            .await;
+            // Consume before submission. A timeout or ambiguous network result
+            // must never make the same signature conveniently replayable. An
+            // automatic nonce remains reserved until finalization proves that
+            // the account nonce advanced.
+            let consumed = self.runtime.pending.swap_remove(position);
+            if consumed.automatic_nonce && !self.mark_nonce_submission_unknown(consumed.id) {
+                return SubstrateResult::error(
+                    ErrorCode::Unavailable,
+                    "automatic nonce reservation is missing; transaction was not submitted",
+                );
+            }
+            let submission = self
+                .runtime
+                .client
+                .as_mut()
+                .expect("client was connected immediately before submission")
+                .submit_transaction_with_timeout(
+                    &extrinsic,
+                    match wait_for {
+                        Inclusion::BestBlock => sube::WaitFor::BestBlock,
+                        Inclusion::Finalized => sube::WaitFor::Finalized,
+                    },
+                    TRANSACTION_WATCH_TIMEOUT,
+                )
+                .await;
+            let result = submission
+                .map(|receipt| transaction_result(extrinsic, receipt))
+                .map_err(map_sube_error);
+            if result.is_ok() && consumed.automatic_nonce {
+                self.release_nonce_reservation(consumed.id);
+            }
             bounded_result(result)
         }
 
@@ -1351,12 +1558,35 @@ mod native {
             owner: &CallerKey,
         ) -> bool {
             self.expire_pending();
-            self.runtime
+            let Some(position) = self
+                .runtime
                 .pending
                 .iter()
                 .position(|pending| pending.id == request_id && &pending.owner == owner)
-                .map(|position| self.runtime.pending.swap_remove(position))
-                .is_some()
+            else {
+                let reservation_owner = owner.reservation_owner();
+                let Some(position) = self.nonce_reservations.iter().position(|reservation| {
+                    reservation.request_id == request_id
+                        && reservation.owner == reservation_owner
+                        && reservation.state == NonceReservationState::AwaitingSignature
+                }) else {
+                    return false;
+                };
+                self.nonce_reservations.swap_remove(position);
+                return true;
+            };
+            let pending = self.runtime.pending.swap_remove(position);
+            if pending.automatic_nonce {
+                self.release_nonce_reservation(pending.id);
+            }
+            true
+        }
+
+        #[cfg(test)]
+        fn automatic_nonce_reservation(&self, nonce_account: &[u8]) -> Option<&NonceReservation> {
+            self.nonce_reservations
+                .iter()
+                .find(|reservation| reservation.nonce_account == nonce_account)
         }
     }
 
@@ -1590,6 +1820,50 @@ mod native {
         };
         ExtensionError::new(code, error.to_string())
     }
+
+    #[cfg(test)]
+    mod reservation_tests {
+        use super::*;
+
+        #[test]
+        fn submitted_nonce_reservation_cannot_be_cancelled_as_unused() {
+            let mut actor = SubstrateExtension::new(&[]);
+            let owner = CallerKey::Actor(1);
+            actor.nonce_reservations.push(NonceReservation {
+                request_id: 7,
+                owner: owner.reservation_owner(),
+                nonce_account: vec![3; 32],
+                nonce: 11,
+                state: NonceReservationState::AwaitingSignature,
+            });
+
+            assert!(actor.mark_nonce_submission_unknown(7));
+            let reservation = actor.automatic_nonce_reservation(&[3; 32]).unwrap();
+            assert_eq!(reservation.nonce, 11);
+            assert_eq!(reservation.state, NonceReservationState::SubmissionUnknown);
+            assert!(!actor.native_cancel_transaction(7, &owner));
+            assert!(actor.automatic_nonce_reservation(&[3; 32]).is_some());
+
+            actor.release_nonce_reservation(7);
+            assert!(actor.automatic_nonce_reservation(&[3; 32]).is_none());
+        }
+
+        #[test]
+        fn restored_unused_nonce_reservation_remains_cancellable() {
+            let mut actor = SubstrateExtension::new(&[]);
+            let owner = CallerKey::Actor(1);
+            actor.nonce_reservations.push(NonceReservation {
+                request_id: 7,
+                owner: owner.reservation_owner(),
+                nonce_account: vec![3; 32],
+                nonce: 11,
+                state: NonceReservationState::AwaitingSignature,
+            });
+
+            assert!(actor.native_cancel_transaction(7, &owner));
+            assert!(actor.nonce_reservations.is_empty());
+        }
+    }
 }
 
 #[cfg(feature = "native")]
@@ -1676,16 +1950,24 @@ mod tests {
 
     #[cfg(feature = "native")]
     #[test]
-    fn native_runtime_is_not_persisted_in_actor_snapshots() {
+    fn native_runtime_is_transient_but_nonce_uncertainty_is_persisted() {
         let mut actor = SubstrateExtension::new(&[]);
         actor.config.network = "custom-network".into();
         actor.config.chain_spec_path = "/operator/para.json".into();
         actor.next_request_id = 91;
+        actor.nonce_reservations.push(NonceReservation {
+            request_id: 17,
+            owner: [4; 32],
+            nonce_account: vec![5; 32],
+            nonce: 23,
+            state: NonceReservationState::SubmissionUnknown,
+        });
 
         let restored = SubstrateExtension::try_decode(&actor.encode()).unwrap();
         assert_eq!(restored.config.network, "custom-network");
         assert_eq!(restored.config.chain_spec_path, "/operator/para.json");
         assert_eq!(restored.next_request_id, 91);
+        assert_eq!(restored.nonce_reservations, actor.nonce_reservations);
         assert!(restored.runtime.client.is_none());
         assert!(restored.runtime.pending.is_empty());
         assert!(restored.runtime.map_snapshots.is_empty());

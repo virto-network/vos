@@ -69,7 +69,12 @@ and 32 pending signing payloads per caller. Map pages may be short while a
 non-empty cursor indicates more bounded trie partitions. Idle map cursors and
 unsigned preparations expire after four minutes; only one automatic-nonce
 request per nonce account may be pending at once, and automatic-nonce
-submissions must wait for finalization.
+submissions must wait for finalization. An ambiguous submission keeps its nonce
+reserved until the finalized account nonce advances; automatic preparation
+reports `NonceUncertain` in the meantime, and callers may recover with an
+explicitly managed nonce. These bounded reservations are part of the actor
+snapshot, so reconnecting the light client or reloading the extension does not
+silently make an uncertain nonce reusable.
 
 Transaction preparation, submission, and cancellation require an authenticated
 VOS caller. Signing request IDs and map snapshot IDs are non-sequential and

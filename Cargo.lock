@@ -6091,7 +6091,7 @@ dependencies = [
 [[package]]
 name = "scale-serialization"
 version = "1.1.0"
-source = "git+https://github.com/virto-network/virto-sdk?rev=45d91df04386b13c98cb803d86f3da37962a6f90#45d91df04386b13c98cb803d86f3da37962a6f90"
+source = "git+https://github.com/virto-network/virto-sdk?rev=20948f1915ed9e325d93a11f1a89732686ac810b#20948f1915ed9e325d93a11f1a89732686ac810b"
 dependencies = [
  "bytes",
  "scale-info",
@@ -6852,7 +6852,7 @@ checksum = "5c21e2c707fb8926e6c4355a87494c29e8e46640ff4796aa8fbb74952327dfdc"
 [[package]]
 name = "sube"
 version = "1.0.0"
-source = "git+https://github.com/virto-network/virto-sdk?rev=45d91df04386b13c98cb803d86f3da37962a6f90#45d91df04386b13c98cb803d86f3da37962a6f90"
+source = "git+https://github.com/virto-network/virto-sdk?rev=20948f1915ed9e325d93a11f1a89732686ac810b#20948f1915ed9e325d93a11f1a89732686ac810b"
 dependencies = [
  "blake2 0.10.6",
  "futures-util",
