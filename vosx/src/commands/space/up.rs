@@ -928,8 +928,8 @@ fn genesis_apply(
 
 /// Register every `[[extension]]` recorded in `local.toml`, returning
 /// each one's effective relay caps for the endpoint descriptor. `.so`
-/// paths are stored absolute (by `apply` / genesis), so the base dir
-/// passed to `register_extension` is inert.
+/// paths are stored absolute (by `apply` / genesis); the data directory
+/// passed to `register_extension` supplies instance-local durable state.
 fn register_extensions_from_local(
     node: &mut VosNode,
     cfg: &subscriptions::LocalConfig,

@@ -142,8 +142,8 @@ fn default_consistency() -> String {
     "local".to_string()
 }
 
-/// Resolve an extension's `.so` path against the recipe dir,
-/// build init args (rkyv `Args`), and hand off to
+/// Resolve an extension's `.so` path against the space data directory,
+/// enable instance-scoped persistence, build init args (rkyv `Args`), and hand off to
 /// `node.register_extension`. Logs the load + each init arg so
 /// operators can spot misconfigured recipes at boot.
 ///
@@ -158,11 +158,14 @@ pub(crate) fn register_extension(
     node: &mut VosNode,
     reg: &RegistryRef,
     ext: &ExtensionDef,
-    recipe_dir: &Path,
+    data_dir: &Path,
     daemon_prefix: u16,
     known_names: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Vec<String>> {
-    let so_path = recipe_dir.join(&ext.path);
+    // `local.toml` stores absolute extension paths, so joining with the space
+    // data directory preserves that path while also giving this function the
+    // durable state root for the installed instance.
+    let so_path = data_dir.join(&ext.path);
     if !so_path.exists() {
         anyhow::bail!(
             "extension '{}': .so not found at {}",
@@ -258,7 +261,7 @@ pub(crate) fn register_extension(
     // this extension's ServiceId — letting it be the *target* of a
     // named intra_cap or an actor-local grant.
     let cfg = cfg.with_name(ext.name.clone());
-    let cfg = cfg.with_intra_caps(intra_caps);
+    let cfg = cfg.with_intra_caps(intra_caps).persist(data_dir);
 
     // Periodic `tick` cadence. `with_tick_ms` treats 0 as off.
     let cfg = match ext.tick_ms {

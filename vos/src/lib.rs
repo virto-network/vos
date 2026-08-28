@@ -630,8 +630,13 @@ macro_rules! __vos_emit_worker_glue {
             ) -> *mut () {
                 use $crate::Actor as _;
                 let bytes = unsafe { core::slice::from_raw_parts(state_ptr, state_len) };
-                let mut actor: $actor_name = $crate::Decode::try_decode(bytes)
-                    .unwrap_or_else(<$actor_name as $crate::Actor>::create);
+                let Some(mut actor): Option<$actor_name> = $crate::Decode::try_decode(bytes) else {
+                    // A null state tells the host that this plugin cannot
+                    // decode the persisted schema. Silently constructing a
+                    // default actor here can change operator configuration
+                    // (and, for chain adapters, the target network).
+                    return core::ptr::null_mut();
+                };
                 let mut tmp =
                     $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
                 let _ = $crate::run_blocking(actor.on_start(&mut tmp));

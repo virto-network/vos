@@ -49,7 +49,8 @@ pub enum ErrorCode {
     ReplyTooLarge = 11,
     Forbidden = 12,
     /// A prior automatic-nonce submission may still finalize. Callers must
-    /// wait for finalized nonce advancement or provide an explicit nonce.
+    /// wait for finalized nonce advancement or mortal-era expiry, or provide
+    /// an explicit nonce.
     NonceUncertain = 13,
 }
 
@@ -195,10 +196,12 @@ pub struct TransactionRequest {
     pub nonce_account: Vec<u8>,
     pub scheme: SignatureScheme,
     /// `None` performs one on-chain nonce lookup. Only one such pending
-    /// request per nonce account is allowed at a time.
+    /// request per nonce account is allowed at a time, and it requires a
+    /// non-zero `mortality_period`.
     pub nonce: Option<u64>,
     pub tip: u64,
-    /// `0` means immortal; otherwise this is the mortal era period.
+    /// `0` means immortal and is only accepted with an explicit nonce;
+    /// otherwise this is the mortal era period.
     pub mortality_period: u64,
 }
 
@@ -308,6 +311,9 @@ struct NonceReservation {
     owner: [u8; 32],
     nonce_account: Vec<u8>,
     nonce: u64,
+    /// First finalized block at which the mortal extrinsic can no longer be
+    /// included. Automatic nonces never use immortal transactions.
+    expires_at: u64,
     state: NonceReservationState,
 }
 
@@ -333,8 +339,9 @@ pub struct SubstrateExtension {
     config: Config,
     next_request_id: u64,
     // Automatic-nonce uncertainty crosses light-client reconnects and actor
-    // reloads. Awaiting reservations can be cancelled; once submission starts
-    // only finalized nonce advancement can retire the reservation.
+    // reloads. Only reservations backed by a live pending request can be
+    // cancelled; recovered reservations are conservative until finalized
+    // nonce advancement or mortality expiry proves the old transaction dead.
     nonce_reservations: Vec<NonceReservation>,
     #[rkyv(with = vos::rkyv::with::Skip)]
     runtime: NativeRuntime,
@@ -478,7 +485,9 @@ impl SubstrateExtension {
         }
     }
 
-    /// Release a prepared request without submitting it.
+    /// Release a prepared request without submitting it. A request recovered
+    /// only as a persisted nonce reservation cannot be cancelled because the
+    /// host cannot prove that submission did not begin before a crash.
     #[msg]
     async fn cancel_transaction(
         &mut self,
@@ -741,6 +750,19 @@ mod native {
             });
         }
 
+        fn prune_expired_nonce_reservations(&mut self, finalized_number: u64) {
+            let live_request_ids = self
+                .runtime
+                .pending
+                .iter()
+                .map(|pending| pending.id)
+                .collect::<Vec<_>>();
+            self.nonce_reservations.retain(|reservation| {
+                live_request_ids.contains(&reservation.request_id)
+                    || reservation.expires_at > finalized_number
+            });
+        }
+
         fn release_nonce_reservation(&mut self, request_id: u64) {
             self.nonce_reservations
                 .retain(|reservation| reservation.request_id != request_id);
@@ -757,6 +779,15 @@ mod native {
             } else {
                 false
             }
+        }
+
+        fn submission_definitely_unused(error: &sube::Error) -> bool {
+            matches!(
+                error,
+                sube::Error::RuntimeUpgrade { .. }
+                    | sube::Error::GenesisMismatch
+                    | sube::Error::TransactionInvalid(_)
+            )
         }
 
         fn expire_map_snapshots(&mut self) {
@@ -1304,39 +1335,35 @@ mod native {
                 );
             }
             let automatic_nonce = request.nonce.is_none();
+            if automatic_nonce && request.mortality_period == 0 {
+                return SubstrateResult::error(
+                    ErrorCode::BadRequest,
+                    "automatic nonces require a mortal transaction; provide a mortality period or an explicit nonce",
+                );
+            }
             let reservation_owner = owner.reservation_owner();
             let prior_ambiguous_nonce = if automatic_nonce {
                 match self
                     .nonce_reservations
                     .iter()
                     .find(|reservation| reservation.nonce_account == request.nonce_account)
+                    .cloned()
                 {
-                    Some(NonceReservation {
-                        state: NonceReservationState::AwaitingSignature,
-                        ..
-                    }) => {
+                    Some(reservation)
+                        if reservation.state == NonceReservationState::AwaitingSignature
+                            && self
+                                .runtime
+                                .pending
+                                .iter()
+                                .any(|pending| pending.id == reservation.request_id) =>
+                    {
                         return SubstrateResult::error(
                             ErrorCode::Busy,
                             "an automatic-nonce signing request already exists for this account",
                         );
                     }
-                    Some(reservation) => Some(reservation.nonce),
-                    None => {
-                        if self.nonce_reservations.len() >= MAX_TOTAL_NONCE_RESERVATIONS
-                            || self
-                                .nonce_reservations
-                                .iter()
-                                .filter(|reservation| reservation.owner == reservation_owner)
-                                .count()
-                                >= MAX_PENDING_TRANSACTIONS
-                        {
-                            return SubstrateResult::error(
-                                ErrorCode::Busy,
-                                "too many unresolved automatic-nonce submissions",
-                            );
-                        }
-                        None
-                    }
+                    Some(reservation) => Some((reservation.nonce, reservation.expires_at)),
+                    None => None,
                 }
             } else {
                 None
@@ -1371,17 +1398,36 @@ mod native {
                 Ok(request) => request,
                 Err(error) => return SubstrateResult::Err(error),
             };
-            if let Some(reserved_nonce) = prior_ambiguous_nonce {
-                if external.context.account_nonce <= reserved_nonce {
+            if automatic_nonce {
+                self.prune_expired_nonce_reservations(external.context.checkpoint_number);
+            }
+            if let Some((reserved_nonce, expires_at)) = prior_ambiguous_nonce {
+                if external.context.account_nonce <= reserved_nonce
+                    && external.context.checkpoint_number < expires_at
+                {
                     return SubstrateResult::error(
                         ErrorCode::NonceUncertain,
                         format!(
-                            "automatic nonce {reserved_nonce} may still finalize; retry after the finalized account nonce advances or provide an explicit nonce"
+                            "automatic nonce {reserved_nonce} may still finalize before block {expires_at}; retry after finalized nonce advancement or mortality expiry, or provide an explicit nonce"
                         ),
                     );
                 }
                 self.nonce_reservations
                     .retain(|reservation| reservation.nonce_account != request.nonce_account);
+            }
+            if automatic_nonce
+                && (self.nonce_reservations.len() >= MAX_TOTAL_NONCE_RESERVATIONS
+                    || self
+                        .nonce_reservations
+                        .iter()
+                        .filter(|reservation| reservation.owner == reservation_owner)
+                        .count()
+                        >= MAX_PENDING_TRANSACTIONS)
+            {
+                return SubstrateResult::error(
+                    ErrorCode::Busy,
+                    "too many unresolved automatic-nonce submissions",
+                );
             }
             // Metadata is large. Pending requests from the same runtime can
             // safely share one immutable registry while older runtime
@@ -1418,6 +1464,8 @@ mod native {
                 owner: reservation_owner,
                 nonce_account: request.nonce_account,
                 nonce: external.context.account_nonce,
+                expires_at: mortality_expiry(&external.context)
+                    .expect("automatic nonce mortality was validated before preparation"),
                 state: NonceReservationState::AwaitingSignature,
             });
             self.runtime.pending.push(PendingTransaction {
@@ -1494,8 +1542,9 @@ mod native {
             }
             // Consume before submission. A timeout or ambiguous network result
             // must never make the same signature conveniently replayable. An
-            // automatic nonce remains reserved until finalization proves that
-            // the account nonce advanced.
+            // automatic nonce remains reserved until finalization, a terminal
+            // rejection, or preflight proves that no transaction can consume
+            // it. Mortal expiry bounds every genuinely ambiguous outcome.
             let consumed = self.runtime.pending.swap_remove(position);
             if consumed.automatic_nonce && !self.mark_nonce_submission_unknown(consumed.id) {
                 return SubstrateResult::error(
@@ -1517,10 +1566,14 @@ mod native {
                     TRANSACTION_WATCH_TIMEOUT,
                 )
                 .await;
+            let nonce_is_resolved = match &submission {
+                Ok(_) => true,
+                Err(error) => Self::submission_definitely_unused(error),
+            };
             let result = submission
                 .map(|receipt| transaction_result(extrinsic, receipt))
                 .map_err(map_sube_error);
-            if result.is_ok() && consumed.automatic_nonce {
+            if nonce_is_resolved && consumed.automatic_nonce {
                 self.release_nonce_reservation(consumed.id);
             }
             bounded_result(result)
@@ -1564,16 +1617,11 @@ mod native {
                 .iter()
                 .position(|pending| pending.id == request_id && &pending.owner == owner)
             else {
-                let reservation_owner = owner.reservation_owner();
-                let Some(position) = self.nonce_reservations.iter().position(|reservation| {
-                    reservation.request_id == request_id
-                        && reservation.owner == reservation_owner
-                        && reservation.state == NonceReservationState::AwaitingSignature
-                }) else {
-                    return false;
-                };
-                self.nonce_reservations.swap_remove(position);
-                return true;
+                // A persisted AwaitingSignature record without its transient
+                // pending request may be a stale pre-submit snapshot from a
+                // crash during broadcast. It is therefore just as uncertain
+                // as SubmissionUnknown and cannot be manually released.
+                return false;
             };
             let pending = self.runtime.pending.swap_remove(position);
             if pending.automatic_nonce {
@@ -1670,6 +1718,22 @@ mod native {
         }
     }
 
+    fn mortality_expiry(context: &sube::extrinsic::ChainContext) -> Option<u64> {
+        match context.mortality {
+            sube::Mortality::Immortal => None,
+            sube::Mortality::Mortal { period } => {
+                let period = period
+                    .checked_next_power_of_two()
+                    .unwrap_or(1 << 16)
+                    .clamp(4, 1 << 16);
+                Some(
+                    (context.checkpoint_number - (context.checkpoint_number % period))
+                        .saturating_add(period),
+                )
+            }
+        }
+    }
+
     fn signing_payload(
         request_id: u64,
         scheme: SignatureScheme,
@@ -1688,20 +1752,7 @@ mod native {
                 number: request.context.checkpoint_number,
                 hash: request.context.checkpoint_hash,
             },
-            expires_at: match request.context.mortality {
-                sube::Mortality::Immortal => None,
-                sube::Mortality::Mortal { period } => {
-                    let period = period
-                        .checked_next_power_of_two()
-                        .unwrap_or(1 << 16)
-                        .clamp(4, 1 << 16);
-                    Some(
-                        (request.context.checkpoint_number
-                            - (request.context.checkpoint_number % period))
-                            .saturating_add(period),
-                    )
-                }
-            },
+            expires_at: mortality_expiry(&request.context),
             spec_version: request.context.spec_version,
             transaction_version: request.context.tx_version,
             extensions: request
@@ -1811,9 +1862,9 @@ mod native {
             sube::Error::Decode(_) | sube::Error::Encode(_) | sube::Error::Mapping(_) => {
                 ErrorCode::Encoding
             }
-            sube::Error::MissingExtensionValue(_) | sube::Error::OperationFailed(_) => {
-                ErrorCode::Chain
-            }
+            sube::Error::MissingExtensionValue(_)
+            | sube::Error::OperationFailed(_)
+            | sube::Error::TransactionInvalid(_) => ErrorCode::Chain,
             sube::Error::Signing(_) => ErrorCode::InvalidSignature,
             sube::Error::RuntimeUpgrade { .. } | sube::Error::GenesisMismatch => ErrorCode::Stale,
             sube::Error::BadMetadata => ErrorCode::Unsupported,
@@ -1834,6 +1885,7 @@ mod native {
                 owner: owner.reservation_owner(),
                 nonce_account: vec![3; 32],
                 nonce: 11,
+                expires_at: 64,
                 state: NonceReservationState::AwaitingSignature,
             });
 
@@ -1849,7 +1901,7 @@ mod native {
         }
 
         #[test]
-        fn restored_unused_nonce_reservation_remains_cancellable() {
+        fn restored_awaiting_nonce_reservation_is_conservatively_uncertain() {
             let mut actor = SubstrateExtension::new(&[]);
             let owner = CallerKey::Actor(1);
             actor.nonce_reservations.push(NonceReservation {
@@ -1857,11 +1909,84 @@ mod native {
                 owner: owner.reservation_owner(),
                 nonce_account: vec![3; 32],
                 nonce: 11,
+                expires_at: 64,
                 state: NonceReservationState::AwaitingSignature,
             });
 
-            assert!(actor.native_cancel_transaction(7, &owner));
-            assert!(actor.nonce_reservations.is_empty());
+            assert!(!actor.native_cancel_transaction(7, &owner));
+            assert_eq!(actor.nonce_reservations.len(), 1);
+        }
+
+        #[test]
+        fn mortality_expiry_reclaims_orphaned_nonce_reservations() {
+            let mut actor = SubstrateExtension::new(&[]);
+            actor.nonce_reservations.extend([
+                NonceReservation {
+                    request_id: 7,
+                    owner: [1; 32],
+                    nonce_account: vec![3; 32],
+                    nonce: 11,
+                    expires_at: 64,
+                    state: NonceReservationState::AwaitingSignature,
+                },
+                NonceReservation {
+                    request_id: 8,
+                    owner: [2; 32],
+                    nonce_account: vec![4; 32],
+                    nonce: 12,
+                    expires_at: 65,
+                    state: NonceReservationState::SubmissionUnknown,
+                },
+            ]);
+
+            actor.prune_expired_nonce_reservations(64);
+            assert_eq!(actor.nonce_reservations.len(), 1);
+            assert_eq!(actor.nonce_reservations[0].request_id, 8);
+        }
+
+        #[test]
+        fn definite_non_submission_errors_release_automatic_nonces() {
+            assert!(SubstrateExtension::submission_definitely_unused(
+                &sube::Error::RuntimeUpgrade {
+                    built_spec: 1,
+                    current_spec: 2,
+                }
+            ));
+            assert!(SubstrateExtension::submission_definitely_unused(
+                &sube::Error::GenesisMismatch
+            ));
+            assert!(SubstrateExtension::submission_definitely_unused(
+                &sube::Error::TransactionInvalid("bad proof".into())
+            ));
+            assert!(!SubstrateExtension::submission_definitely_unused(
+                &sube::Error::ConnectionTimeout
+            ));
+        }
+
+        #[test]
+        fn automatic_nonce_rejects_immortal_transactions() {
+            let mut actor = SubstrateExtension::new(&[]);
+            let result = smol::block_on(actor.native_prepare_transaction(
+                TransactionRequest {
+                    call_path: "system/remark".into(),
+                    call_body: "()".into(),
+                    signing_account: vec![1; 32],
+                    nonce_account: vec![1; 32],
+                    scheme: SignatureScheme::Sr25519,
+                    nonce: None,
+                    tip: 0,
+                    mortality_period: 0,
+                },
+                CallerKey::Actor(1),
+                InvocationId([2; 32]),
+            ));
+            assert!(matches!(
+                result,
+                SubstrateResult::Err(ExtensionError {
+                    code: ErrorCode::BadRequest,
+                    ..
+                })
+            ));
         }
     }
 }
@@ -1960,6 +2085,7 @@ mod tests {
             owner: [4; 32],
             nonce_account: vec![5; 32],
             nonce: 23,
+            expires_at: 128,
             state: NonceReservationState::SubmissionUnknown,
         });
 

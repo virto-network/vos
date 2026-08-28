@@ -8,7 +8,7 @@
 //!
 //! A strategy owns its own backend (redb database, network handle,
 //! etc.) and any change-detection bookkeeping. The host calls
-//! [`CommitStrategy::restore`] once at startup and
+//! [`CommitStrategy::restore_checked`] once at startup and
 //! [`CommitStrategy::commit`] after every dispatch.
 
 // `Path` is only referenced by the storage-backed strategies' `open`.
@@ -177,6 +177,14 @@ pub trait CommitStrategy: Send {
     /// — the host should then call [`replay_logs`](Self::replay_logs)
     /// and rebuild state by replaying each entry.
     fn restore(&mut self) -> Option<Vec<u8>>;
+
+    /// Fallible form of [`Self::restore`] for callers that must not confuse a
+    /// backend read error with a genuinely fresh actor. Existing strategies
+    /// retain their historical behavior by default; storage-backed strategies
+    /// should override this method and preserve the backend error.
+    fn restore_checked(&mut self) -> Result<Option<Vec<u8>>, CommitError> {
+        Ok(self.restore())
+    }
 
     /// Return the non-STATE agent rows persisted by previous deltas,
     /// so the host can rehydrate the runtime's storage alongside
@@ -473,11 +481,21 @@ mod local {
 
     impl CommitStrategy for LocalCommit {
         fn restore(&mut self) -> Option<Vec<u8>> {
-            let txn = self.db.begin_read().ok()?;
-            let table = txn.open_table(STATE_TABLE).ok()?;
-            let bytes = table.get(STATE_KEY).ok().flatten()?.value().to_vec();
-            self.last = bytes.clone();
-            Some(bytes)
+            self.restore_checked().ok().flatten()
+        }
+
+        fn restore_checked(&mut self) -> Result<Option<Vec<u8>>, CommitError> {
+            let txn = self.db.begin_read()?;
+            let table = match txn.open_table(STATE_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let bytes = table.get(STATE_KEY)?.map(|value| value.value().to_vec());
+            if let Some(bytes) = &bytes {
+                self.last.clone_from(bytes);
+            }
+            Ok(bytes)
         }
 
         fn restore_writes(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CommitError> {

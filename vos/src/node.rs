@@ -869,26 +869,45 @@ impl ExtensionConfig {
     }
 
     /// Enable state persistence under the given data directory.
-    /// The extension's state is stored in `{data_dir}/extensions/{name}.redb`
-    /// where `name` is derived from the `.so` filename.
+    /// The extension's state is stored under `{data_dir}/extensions`, keyed by
+    /// a hash of the installed instance name when present, or by the `.so`
+    /// filename for anonymous embedders.
     pub fn persist(mut self, data_dir: impl Into<std::path::PathBuf>) -> Self {
         self.data_dir = Some(data_dir.into());
         self
     }
 
-    /// Derive the redb path from the data directory and the .so filename.
+    /// Derive an instance-scoped redb path. Named instances hash the full
+    /// operator-controlled name into a traversal-safe filename; anonymous
+    /// embedders retain the historical `.so`-stem path.
     #[cfg(feature = "storage")]
-    fn db_path(&self) -> Option<std::path::PathBuf> {
-        let data_dir = self.data_dir.as_ref()?;
-        let name = self
-            .path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("extension")
-            .trim_start_matches("lib");
+    fn db_path(&self) -> std::io::Result<Option<std::path::PathBuf>> {
+        let Some(data_dir) = self.data_dir.as_ref() else {
+            return Ok(None);
+        };
+        let name = if let Some(instance_name) = self.name.as_deref() {
+            use std::fmt::Write as _;
+
+            let digest = crate::crypto::blake2b_hash::<16>(
+                b"vos/extension/state-file",
+                &[instance_name.as_bytes()],
+            );
+            let mut encoded = String::with_capacity(32);
+            for byte in digest {
+                let _ = write!(encoded, "{byte:02x}");
+            }
+            format!("instance-{encoded}")
+        } else {
+            self.path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("extension")
+                .trim_start_matches("lib")
+                .to_owned()
+        };
         let dir = data_dir.join("extensions");
-        std::fs::create_dir_all(&dir).ok()?;
-        Some(dir.join(format!("{name}.redb")))
+        std::fs::create_dir_all(&dir)?;
+        Ok(Some(dir.join(format!("{name}.redb"))))
     }
 }
 
@@ -12679,13 +12698,44 @@ fn extension_thread(
     // replication strategies (CRDT, Raft) are not available to
     // extensions since they live outside the deterministic universe.
     let mut strategy: Box<dyn crate::commit::CommitStrategy> =
-        build_extension_strategy(&config, id);
-    let saved_state = strategy.restore();
+        match build_extension_strategy(&config) {
+            Ok(strategy) => strategy,
+            Err(error) => {
+                error!(%id, %error, "extension: persistence setup failed");
+                return AgentResult {
+                    id,
+                    panics: 0,
+                    error: Some(error),
+                };
+            }
+        };
+    let saved_state = match strategy.restore_checked() {
+        Ok(state) => state,
+        Err(error) => {
+            let message = format!("extension state restore failed: {error}");
+            error!(%id, %error, "extension: failed to restore persisted state");
+            return AgentResult {
+                id,
+                panics: 0,
+                error: Some(message),
+            };
+        }
+    };
 
     let mut instance = match saved_state {
         Some(bytes) => {
             info!(%id, bytes = bytes.len(), "extension: restored state");
-            plugin.load_state(&bytes)
+            match plugin.load_state(&bytes) {
+                Ok(instance) => instance,
+                Err(error) => {
+                    error!(%id, %error, "extension: persisted state is incompatible");
+                    return AgentResult {
+                        id,
+                        panics: 0,
+                        error: Some(error),
+                    };
+                }
+            }
         }
         None if config.init_args.is_empty() => plugin.create(),
         None => plugin.create_with_args(&config.init_args),
@@ -12749,7 +12799,15 @@ fn extension_thread(
                     );
                     tick_disabled = true;
                 }
-                persist(strategy.as_mut(), &instance, id);
+                if let Err(error) = persist(strategy.as_mut(), &instance) {
+                    let message = format!("extension state commit failed: {error}");
+                    error!(%id, %error, "extension: failed to persist tick state");
+                    return AgentResult {
+                        id,
+                        panics: 0,
+                        error: Some(message),
+                    };
+                }
                 // Re-arm from *now* (not deadline+iv) so a slow tick doesn't
                 // build up a burst of catch-up ticks.
                 tick_deadline = tick_interval.map(|iv| Instant::now() + iv);
@@ -12803,8 +12861,22 @@ fn extension_thread(
                             encode_invoke_envelope(crate::actors::run::STATUS_PANICKED, &[], &[])
                         }
                     };
+                    // Commit before exposing the handler result. A caller must
+                    // never receive a signing capability or other stateful
+                    // success whose actor state is not yet durable.
+                    if let Err(error) = persist(strategy.as_mut(), &instance) {
+                        let message = format!("extension state commit failed: {error}");
+                        error!(%id, %error, "extension: failed to persist invoke state");
+                        let failure =
+                            encode_invoke_envelope(crate::actors::run::STATUS_PANICKED, &[], &[]);
+                        send_reply_capped(req.reply, failure, id);
+                        return AgentResult {
+                            id,
+                            panics: 0,
+                            error: Some(message),
+                        };
+                    }
                     send_reply_capped(req.reply, envelope, id);
-                    persist(strategy.as_mut(), &instance, id);
                 }
                 Err(_) => break,
             }
@@ -12855,6 +12927,22 @@ fn extension_thread(
             DispatchOutcome::Ok(b) => b,
             DispatchOutcome::Err => Vec::new(),
         };
+        if let Err(error) = persist(strategy.as_mut(), &instance) {
+            let message = format!("extension state commit failed: {error}");
+            error!(%id, %error, "extension: failed to persist envelope state");
+            let _ = outbox.send(Envelope {
+                from: id,
+                to: envelope.from,
+                payload: Vec::new(),
+                authenticated_source_peer: None,
+                destination_peer: None,
+            });
+            return AgentResult {
+                id,
+                panics: 0,
+                error: Some(message),
+            };
+        }
         let _ = outbox.send(Envelope {
             from: id,
             to: envelope.from,
@@ -12862,7 +12950,6 @@ fn extension_thread(
             authenticated_source_peer: None,
             destination_peer: None,
         });
-        persist(strategy.as_mut(), &instance, id);
     }
 
     AgentResult {
@@ -13793,43 +13880,40 @@ fn ureq_response_to(r: ureq::Response) -> crate::effects::FetchResponse {
 ///
 /// Workers never get CRDT or Raft commits — they live outside the
 /// deterministic universe. If a data directory is configured and the
-/// `storage` feature is on, use [`LocalCommit`]; otherwise fall back
-/// to [`NoCommit`] (state is held in memory only).
+/// `storage` feature is on, use [`LocalCommit`]; otherwise use [`NoCommit`]
+/// (state is held in memory only). A configured persistence path is
+/// fail-closed: path creation or database-open errors abort the worker.
 ///
 /// [`LocalCommit`]: crate::commit::LocalCommit
 /// [`NoCommit`]: crate::commit::NoCommit
 fn build_extension_strategy(
     config: &ExtensionConfig,
-    id: ServiceId,
-) -> Box<dyn crate::commit::CommitStrategy> {
+) -> Result<Box<dyn crate::commit::CommitStrategy>, String> {
     #[cfg(feature = "storage")]
     {
-        if let Some(path) = config.db_path() {
-            match crate::commit::LocalCommit::open(&path) {
-                Ok(lc) => return Box::new(lc),
-                Err(e) => {
-                    warn!(%id, error = %e, "extension: failed to open storage; continuing without persistence")
-                }
-            }
+        let path = config
+            .db_path()
+            .map_err(|error| format!("derive extension state path: {error}"))?;
+        if let Some(path) = path {
+            let strategy = crate::commit::LocalCommit::open(&path)
+                .map_err(|error| format!("open extension state {}: {error}", path.display()))?;
+            return Ok(Box::new(strategy));
         }
     }
     #[cfg(not(feature = "storage"))]
     {
-        let _ = (config, id);
+        let _ = config;
     }
-    Box::new(crate::commit::NoCommit)
+    Ok(Box::new(crate::commit::NoCommit))
 }
 
 /// Serialize the worker's state and hand it to the commit strategy.
 fn persist(
     strategy: &mut dyn crate::commit::CommitStrategy,
     instance: &crate::extension::ExtensionInstance<'_>,
-    id: ServiceId,
-) {
+) -> Result<(), crate::commit::CommitError> {
     let bytes = instance.save_state();
-    if let Err(e) = strategy.commit_state(&bytes) {
-        warn!(%id, error = %e, "extension: failed to persist state");
-    }
+    strategy.commit_state(&bytes).map(|_| ())
 }
 
 #[cfg(test)]
@@ -14556,6 +14640,66 @@ mod tests {
         let cfg = ExtensionConfig::new("x.so").with_intra_caps(caps());
         assert_eq!(cfg.intra_caps.len(), 1);
         assert!(ExtensionConfig::new("x.so").intra_caps.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "storage")]
+    fn named_extension_state_paths_are_stable_isolated_and_traversal_safe() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "vos_extension_path_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+
+        let first = ExtensionConfig::new("libshared.so")
+            .with_name("../../first")
+            .persist(&data_dir)
+            .db_path()
+            .unwrap()
+            .unwrap();
+        let first_again = ExtensionConfig::new("libother.so")
+            .with_name("../../first")
+            .persist(&data_dir)
+            .db_path()
+            .unwrap()
+            .unwrap();
+        let second = ExtensionConfig::new("libshared.so")
+            .with_name("second")
+            .persist(&data_dir)
+            .db_path()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, first_again);
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(data_dir.join("extensions").as_path()));
+        let filename = first.file_name().unwrap().to_str().unwrap();
+        assert!(filename.starts_with("instance-"));
+        assert!(filename.ends_with(".redb"));
+        assert!(!filename.contains(".."));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    #[cfg(feature = "storage")]
+    fn configured_extension_persistence_is_fail_closed() {
+        let data_dir =
+            std::env::temp_dir().join(format!("vos_extension_storage_file_{}", std::process::id()));
+        let _ = std::fs::remove_file(&data_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::write(&data_dir, b"not a directory").unwrap();
+
+        let config = ExtensionConfig::new("libshared.so")
+            .with_name("substrate")
+            .persist(&data_dir);
+        let error = build_extension_strategy(&config)
+            .err()
+            .expect("configured persistence failure must abort startup");
+        assert!(error.contains("derive extension state path"));
+
+        std::fs::remove_file(&data_dir).unwrap();
     }
 
     // ── unwrap_invoke_envelope contract ─────────────────────────

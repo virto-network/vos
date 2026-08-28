@@ -329,13 +329,18 @@ mod host {
         }
 
         /// Restore an extension instance from previously serialized state.
-        pub fn load_state(&self, state: &[u8]) -> ExtensionInstance<'_> {
+        pub fn load_state(&self, state: &[u8]) -> Result<ExtensionInstance<'_>, String> {
             let load_fn = self.actor_syms().load_fn;
             let s = unsafe { load_fn(state.as_ptr(), state.len()) };
-            ExtensionInstance {
+            if s.is_null() {
+                return Err(
+                    "extension rejected persisted state (corrupt or incompatible schema)".into(),
+                );
+            }
+            Ok(ExtensionInstance {
                 plugin: self,
                 state: s,
-            }
+            })
         }
 
         fn actor_syms(&self) -> &ActorSymbols {
@@ -551,5 +556,19 @@ mod tests {
         let count_val: crate::actors::value::Value =
             crate::actors::codec::Decode::decode(&count_bytes);
         assert_eq!(count_val.as_u32().unwrap(), 2);
+    }
+
+    #[test]
+    fn corrupt_extension_state_is_rejected() {
+        let path = echo_extension_path();
+        if !path.exists() {
+            eprintln!(
+                "skipping extension test: build echo-extension first (cargo build -p echo-extension)"
+            );
+            return;
+        }
+
+        let plugin = unsafe { ExtensionPlugin::load(&path) }.expect("load extension");
+        assert!(plugin.load_state(&[0xff]).is_err());
     }
 }

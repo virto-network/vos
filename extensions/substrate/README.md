@@ -13,18 +13,21 @@ The actor-facing API is generated as `SubstrateExtensionRef`:
   requested limit while still returning a continuation cursor because the
   light client caps trie-proof work per request.
 - `prepare_transaction(request)` freezes a metadata-driven V4 signing
-  payload. Signing and nonce accounts are separate fields.
+  payload. Signing and nonce accounts are separate fields. Automatic nonce
+  lookup requires a mortal transaction; explicitly managed nonces may still
+  use an immortal era.
 - `submit_transaction(id, signature, wait_for)` validates the signature,
   consumes the request immediately before network submission, and waits
   synchronously for best-chain inclusion or finalization. Automatic nonces
   require finalization; callers selecting best-block inclusion provide an
   explicit nonce. If submission has an ambiguous timeout or connection result,
   that automatic nonce remains reserved: another automatic request returns
-  `NonceUncertain` until finalized state advances, while an explicitly managed
-  nonce remains available as the recovery path. The receipt always identifies
-  the submitted extrinsic by hash; its full hex and tail events are omitted
-  when necessary to stay inside the reply bound.
-- `cancel_transaction(id)` releases an unused signing request.
+  `NonceUncertain` until the finalized account nonce advances or the mortal era
+  expires, while an explicitly managed nonce remains available as the recovery
+  path. The receipt always identifies the submitted extrinsic by hash; its full
+  hex and tail events are omitted when necessary to stay inside the reply bound.
+- `cancel_transaction(id)` releases an unused signing request while that
+  request is still live in the current extension process.
 
 Transaction methods reject unauthenticated callers. Signing request IDs and
 map cursors are non-sequential capabilities bound to the caller identity when
@@ -35,12 +38,15 @@ No signing keys are accepted or retained. V5/general extrinsics are not
 exposed. The light client and pending signing data are transient actor fields;
 snapshots persist operator configuration, the request-id counter, and bounded
 automatic-nonce reservations so submission uncertainty survives a light-client
-reconnect or actor reload. A restored unused reservation can still be released
-with `cancel_transaction`; one whose submission began remains guarded until
-finalized state advances. Dropping or reloading the actor drops Sube and joins
-its smoldot executor before the extension library can unload. A failed operation
-cleanup poisons and drops the current light-client session instead of reusing
-uncertain server state.
+reconnect or actor reload. A restored reservation is conservatively treated as
+possibly submitted and cannot be cancelled without its transient pending
+request; finalized nonce advancement or mortal-era expiry retires it. `vosx`
+enables instance-scoped persistence for installed extensions and refuses to
+start an extension if storage cannot be opened or its saved schema cannot be
+decoded. Dropping or reloading the actor drops Sube and joins its smoldot
+executor before the extension library can unload. A failed operation cleanup
+poisons and drops the current light-client session instead of reusing uncertain
+server state.
 
 The first query may spend up to 105 seconds initializing and synchronizing the
 light client. Subsequent queries normally use the already-running client.
