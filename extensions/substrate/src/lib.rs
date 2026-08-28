@@ -286,6 +286,46 @@ impl Default for Config {
 }
 
 #[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub(crate) enum OwnerKey {
+    Unauthenticated,
+    System,
+    Peer(Vec<u8>),
+    Member([u8; 32]),
+    Actor(u32),
+}
+
+#[cfg(any(feature = "native", test))]
+impl OwnerKey {
+    fn from_caller(caller: &vos::Caller) -> Self {
+        match caller {
+            vos::Caller::Unauthenticated => Self::Unauthenticated,
+            vos::Caller::System => Self::System,
+            vos::Caller::Peer(peer) => Self::Peer(peer.clone()),
+            vos::Caller::Member(subject) => Self::Member(subject.0),
+            vos::Caller::Actor(service) => Self::Actor(service.0),
+        }
+    }
+
+    fn encoded(&self) -> Vec<u8> {
+        match self {
+            Self::Unauthenticated => vec![0],
+            Self::System => vec![1],
+            Self::Peer(peer) => [&[2][..], peer.as_slice()].concat(),
+            Self::Member(subject) => [&[3][..], subject.as_slice()].concat(),
+            Self::Actor(service) => [&[4][..], &service.to_le_bytes()].concat(),
+        }
+    }
+
+    fn reservation_owner(&self) -> [u8; 32] {
+        let encoded = self.encoded();
+        vos::crypto::blake2b_hash::<32>(b"vos/substrate/nonce-owner", &[&encoded])
+    }
+}
+
+#[derive(
     vos::rkyv::Archive,
     vos::rkyv::Serialize,
     vos::rkyv::Deserialize,
@@ -317,13 +357,83 @@ struct NonceReservation {
     state: NonceReservationState,
 }
 
+#[derive(
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+#[repr(u8)]
+enum PreparedTransactionState {
+    AwaitingSignature = 0,
+    SubmissionUnknown = 1,
+    Submitted = 2,
+    Cancelled = 3,
+    Expired = 4,
+}
+
+#[cfg(any(feature = "native", test))]
+impl PreparedTransactionState {
+    fn is_active(self) -> bool {
+        matches!(self, Self::AwaitingSignature | Self::SubmissionUnknown)
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Submitted | Self::Cancelled | Self::Expired)
+    }
+}
+
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+struct PreparedSubmission {
+    invocation: [u8; 32],
+    request_digest: [u8; 32],
+    signature: Vec<u8>,
+    wait_for: Inclusion,
+}
+
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+struct PreparedTransaction {
+    id: u64,
+    owner: OwnerKey,
+    created_at_ms: u64,
+    automatic_nonce: bool,
+    prepare_invocation: [u8; 32],
+    request_digest: [u8; 32],
+    frozen_request: Vec<u8>,
+    payload: SigningPayload,
+    submission: Option<PreparedSubmission>,
+    state: PreparedTransactionState,
+}
+
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+struct SubmissionReplay {
+    owner: OwnerKey,
+    invocation: [u8; 32],
+    request_digest: [u8; 32],
+    completed_at_ms: u64,
+    result: SubstrateResult<TransactionResult>,
+}
+
 #[cfg(feature = "native")]
 #[derive(Default)]
 struct NativeRuntime {
     // Declared first: dropping the actor stops and joins smoldot before the
-    // pending request records are released or the cdylib can be unmapped.
+    // cdylib can be unmapped.
     client: Option<sube::Sube>,
-    pending: Vec<PendingTransaction>,
     map_snapshots: Vec<MapSnapshot>,
     next_snapshot_id: u64,
 }
@@ -334,15 +444,20 @@ struct NativeRuntime;
 
 /// Trusted host adapter for bounded Substrate queries and externally-signed
 /// V4 transactions. It never accepts or stores signing keys.
-#[actor(state_version = 1)]
+#[actor(state_version = 2)]
 pub struct SubstrateExtension {
     config: Config,
     next_request_id: u64,
     // Automatic-nonce uncertainty crosses light-client reconnects and actor
-    // reloads. Only reservations backed by a live pending request can be
-    // cancelled; recovered reservations are conservative until finalized
-    // nonce advancement or mortality expiry proves the old transaction dead.
+    // reloads. Awaiting requests may be cancelled; once submission begins the
+    // reservation remains conservative until finalized nonce advancement or
+    // mortality expiry proves the old transaction dead.
     nonce_reservations: Vec<NonceReservation>,
+    // Frozen requests and submission outcomes are durable replay journals.
+    // A Refine retry therefore observes the exact same signing payload and
+    // never constructs a second extrinsic from a newer account nonce.
+    prepared_transactions: Vec<PreparedTransaction>,
+    submission_replays: Vec<SubmissionReplay>,
     #[rkyv(with = vos::rkyv::with::Skip)]
     runtime: NativeRuntime,
 }
@@ -383,6 +498,8 @@ impl SubstrateExtension {
             config,
             next_request_id: 1,
             nonce_reservations: Vec::new(),
+            prepared_transactions: Vec::new(),
+            submission_replays: Vec::new(),
             runtime: NativeRuntime::default(),
         }
     }
@@ -471,8 +588,9 @@ impl SubstrateExtension {
     }
 
     /// Finish and synchronously submit a prepared request, waiting for best
-    /// inclusion or finalization. A valid request is consumed immediately
-    /// before network submission.
+    /// inclusion or finalization. Retries of the same native invocation
+    /// return its durable result; crash recovery can only resubmit the exact
+    /// same signed extrinsic.
     #[msg(timeout_ms = 240000)]
     async fn submit_transaction(
         &mut self,
@@ -490,8 +608,11 @@ impl SubstrateExtension {
                 );
             }
             let owner = native::CallerKey::from_caller(ctx.caller());
+            let invocation = ctx.invocation_id();
             return self
-                .native_submit_transaction_with_deadline(request_id, signature, wait_for, owner)
+                .native_submit_transaction_with_deadline(
+                    request_id, signature, wait_for, owner, invocation,
+                )
                 .await;
         }
         #[cfg(not(feature = "native"))]
@@ -501,9 +622,9 @@ impl SubstrateExtension {
         }
     }
 
-    /// Release a prepared request without submitting it. A request recovered
-    /// only as a persisted nonce reservation cannot be cancelled because the
-    /// host cannot prove that submission did not begin before a crash.
+    /// Release a prepared request without submitting it. Cancellation is
+    /// idempotent, but a request already consumed by submission cannot be
+    /// reopened.
     #[msg]
     async fn cancel_transaction(
         &mut self,
@@ -616,7 +737,11 @@ fn decode_cursor(
 mod native {
     use super::*;
     use core::time::Duration;
-    use std::{fs, io::Read, time::Instant};
+    use std::{
+        fs,
+        io::Read,
+        time::{Instant, SystemTime, UNIX_EPOCH},
+    };
 
     use sube::{Backend as _, DispatchOutcome, Response, TransactionOptions};
 
@@ -624,50 +749,21 @@ mod native {
     const MAX_CALL_BODY_LEN: usize = 2048;
     const MAX_CHAIN_SPEC_BYTES: u64 = 16 * 1024 * 1024;
     const MAX_RECEIPT_EVENTS: usize = 16;
+    const MAX_FROZEN_SIGNING_REQUEST_BYTES: usize = 16 * 1024;
     const MAX_TOTAL_MAP_SNAPSHOTS: usize = 64;
     const MAX_TOTAL_PENDING_TRANSACTIONS: usize = 128;
     const MAX_TOTAL_NONCE_RESERVATIONS: usize = 128;
+    const MAX_PREPARED_HISTORY_PER_OWNER: usize = 8;
+    const MAX_SUBMISSION_HISTORY_PER_OWNER: usize = 8;
+    const MAX_TOTAL_PREPARED_HISTORY: usize = 256;
+    const MAX_TOTAL_SUBMISSION_HISTORY: usize = 256;
     const LIGHT_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
     pub(super) const STANDARD_DEADLINE: Duration = Duration::from_secs(105);
     pub(super) const SUBMISSION_DEADLINE: Duration = Duration::from_secs(210);
     const BACKEND_CANCELLATION_DEADLINE: Duration = Duration::from_secs(10);
     const TRANSACTION_WATCH_TIMEOUT: Duration = Duration::from_secs(180);
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub(super) enum CallerKey {
-        Unauthenticated,
-        System,
-        Peer(Vec<u8>),
-        Member([u8; 32]),
-        Actor(u32),
-    }
-
-    impl CallerKey {
-        pub(super) fn from_caller(caller: &vos::Caller) -> Self {
-            match caller {
-                vos::Caller::Unauthenticated => Self::Unauthenticated,
-                vos::Caller::System => Self::System,
-                vos::Caller::Peer(peer) => Self::Peer(peer.clone()),
-                vos::Caller::Member(subject) => Self::Member(subject.0),
-                vos::Caller::Actor(service) => Self::Actor(service.0),
-            }
-        }
-
-        fn encoded(&self) -> Vec<u8> {
-            match self {
-                Self::Unauthenticated => vec![0],
-                Self::System => vec![1],
-                Self::Peer(peer) => [&[2][..], peer.as_slice()].concat(),
-                Self::Member(subject) => [&[3][..], subject.as_slice()].concat(),
-                Self::Actor(service) => [&[4][..], &service.to_le_bytes()].concat(),
-            }
-        }
-
-        fn reservation_owner(&self) -> [u8; 32] {
-            let encoded = self.encoded();
-            vos::crypto::blake2b_hash::<32>(b"vos/substrate/nonce-owner", &[&encoded])
-        }
-    }
+    pub(super) use super::OwnerKey as CallerKey;
 
     pub(super) fn capability_id(
         domain: &[u8],
@@ -689,13 +785,35 @@ mod native {
         .max(1)
     }
 
-    pub(super) struct PendingTransaction {
-        id: u64,
-        owner: CallerKey,
-        created: Instant,
-        automatic_nonce: bool,
-        metadata: sube::Rc<sube::Metadata>,
-        request: sube::ExternalSigningRequest,
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    fn prepare_request_digest(request: &TransactionRequest) -> [u8; 32] {
+        vos::crypto::blake2b_hash::<32>(b"vos/substrate/prepare-request", &[&request.encode()])
+    }
+
+    fn submission_request_digest(
+        request_id: u64,
+        signature: &[u8],
+        wait_for: Inclusion,
+    ) -> [u8; 32] {
+        vos::crypto::blake2b_hash::<32>(
+            b"vos/substrate/submit-request",
+            &[
+                &request_id.to_le_bytes(),
+                signature,
+                &[match wait_for {
+                    Inclusion::BestBlock => 0,
+                    Inclusion::Finalized => 1,
+                }],
+            ],
+        )
     }
 
     #[derive(Clone)]
@@ -745,17 +863,22 @@ mod native {
         }
 
         fn expire_pending(&mut self) {
-            let ttl = Duration::from_secs(SIGNING_REQUEST_TTL_SECS);
+            let now = now_ms();
+            let ttl_ms = SIGNING_REQUEST_TTL_SECS.saturating_mul(1_000);
             let expired = self
-                .runtime
-                .pending
+                .prepared_transactions
                 .iter()
-                .filter(|pending| pending.created.elapsed() > ttl)
+                .filter(|pending| {
+                    pending.state == PreparedTransactionState::AwaitingSignature
+                        && now.saturating_sub(pending.created_at_ms) > ttl_ms
+                })
                 .map(|pending| pending.id)
                 .collect::<Vec<_>>();
-            self.runtime
-                .pending
-                .retain(|pending| !expired.contains(&pending.id));
+            for pending in &mut self.prepared_transactions {
+                if expired.contains(&pending.id) {
+                    pending.state = PreparedTransactionState::Expired;
+                }
+            }
             self.nonce_reservations.retain(|reservation| {
                 reservation.state == NonceReservationState::SubmissionUnknown
                     || !expired.contains(&reservation.request_id)
@@ -763,16 +886,19 @@ mod native {
         }
 
         fn prune_expired_nonce_reservations(&mut self, finalized_number: u64) {
-            let live_request_ids = self
-                .runtime
-                .pending
+            let expired_request_ids = self
+                .nonce_reservations
                 .iter()
-                .map(|pending| pending.id)
+                .filter(|reservation| reservation.expires_at <= finalized_number)
+                .map(|reservation| reservation.request_id)
                 .collect::<Vec<_>>();
-            self.nonce_reservations.retain(|reservation| {
-                live_request_ids.contains(&reservation.request_id)
-                    || reservation.expires_at > finalized_number
-            });
+            for prepared in &mut self.prepared_transactions {
+                if expired_request_ids.contains(&prepared.id) && prepared.state.is_active() {
+                    prepared.state = PreparedTransactionState::Expired;
+                }
+            }
+            self.nonce_reservations
+                .retain(|reservation| reservation.expires_at > finalized_number);
         }
 
         fn release_nonce_reservation(&mut self, request_id: u64) {
@@ -791,6 +917,78 @@ mod native {
             } else {
                 false
             }
+        }
+
+        fn prune_prepare_history_for_owner(&mut self, owner: &CallerKey) {
+            while self
+                .prepared_transactions
+                .iter()
+                .filter(|record| record.state.is_terminal())
+                .count()
+                >= MAX_TOTAL_PREPARED_HISTORY
+            {
+                let Some(position) = self
+                    .prepared_transactions
+                    .iter()
+                    .position(|record| record.state.is_terminal())
+                else {
+                    break;
+                };
+                self.prepared_transactions.remove(position);
+            }
+            while self
+                .prepared_transactions
+                .iter()
+                .filter(|record| &record.owner == owner && record.state.is_terminal())
+                .count()
+                >= MAX_PREPARED_HISTORY_PER_OWNER
+            {
+                let Some(position) = self
+                    .prepared_transactions
+                    .iter()
+                    .position(|record| &record.owner == owner && record.state.is_terminal())
+                else {
+                    break;
+                };
+                self.prepared_transactions.remove(position);
+            }
+        }
+
+        fn push_submission_replay(&mut self, replay: SubmissionReplay) {
+            while self.submission_replays.len() >= MAX_TOTAL_SUBMISSION_HISTORY {
+                let Some(position) = self.submission_replays.iter().position(|record| {
+                    !self.prepared_transactions.iter().any(|prepared| {
+                        prepared.owner == record.owner
+                            && prepared.submission.as_ref().is_some_and(|submission| {
+                                submission.invocation == record.invocation
+                            })
+                    })
+                }) else {
+                    break;
+                };
+                self.submission_replays.remove(position);
+            }
+            while self
+                .submission_replays
+                .iter()
+                .filter(|record| record.owner == replay.owner)
+                .count()
+                >= MAX_SUBMISSION_HISTORY_PER_OWNER
+            {
+                let Some(position) = self.submission_replays.iter().position(|record| {
+                    record.owner == replay.owner
+                        && !self.prepared_transactions.iter().any(|prepared| {
+                            prepared.owner == record.owner
+                                && prepared.submission.as_ref().is_some_and(|submission| {
+                                    submission.invocation == record.invocation
+                                })
+                        })
+                }) else {
+                    break;
+                };
+                self.submission_replays.remove(position);
+            }
+            self.submission_replays.push(replay);
         }
 
         fn submission_definitely_unused(error: &sube::Error) -> bool {
@@ -908,8 +1106,7 @@ mod native {
                 let candidate =
                     capability_id(b"vos/substrate/signing-request", owner, invocation, counter);
                 if self
-                    .runtime
-                    .pending
+                    .prepared_transactions
                     .iter()
                     .all(|pending| pending.id != candidate)
                     && self
@@ -1316,15 +1513,33 @@ mod native {
             owner: CallerKey,
             invocation: InvocationId,
         ) -> SubstrateResult<SigningPayload> {
+            let request_digest = prepare_request_digest(&request);
+            if let Some(previous) = self.prepared_transactions.iter().find(|record| {
+                record.owner == owner && record.prepare_invocation == *invocation.as_bytes()
+            }) {
+                if previous.request_digest != request_digest {
+                    return SubstrateResult::error(
+                        ErrorCode::BadRequest,
+                        "native invocation was reused with a different transaction request",
+                    );
+                }
+                return SubstrateResult::Ok(previous.payload.clone());
+            }
+
             self.expire_pending();
-            if self.runtime.pending.len() >= MAX_TOTAL_PENDING_TRANSACTIONS
-                || self
-                    .runtime
-                    .pending
-                    .iter()
-                    .filter(|pending| pending.owner == owner)
-                    .count()
-                    >= MAX_PENDING_TRANSACTIONS
+            self.prune_prepare_history_for_owner(&owner);
+            let active_total = self
+                .prepared_transactions
+                .iter()
+                .filter(|pending| pending.state.is_active())
+                .count();
+            let active_owner = self
+                .prepared_transactions
+                .iter()
+                .filter(|pending| pending.owner == owner && pending.state.is_active())
+                .count();
+            if active_total >= MAX_TOTAL_PENDING_TRANSACTIONS
+                || active_owner >= MAX_PENDING_TRANSACTIONS
             {
                 return SubstrateResult::error(
                     ErrorCode::Busy,
@@ -1365,18 +1580,21 @@ mod native {
                 {
                     Some(reservation)
                         if reservation.state == NonceReservationState::AwaitingSignature
-                            && self
-                                .runtime
-                                .pending
-                                .iter()
-                                .any(|pending| pending.id == reservation.request_id) =>
+                            && self.prepared_transactions.iter().any(|pending| {
+                                pending.id == reservation.request_id
+                                    && pending.state == PreparedTransactionState::AwaitingSignature
+                            }) =>
                     {
                         return SubstrateResult::error(
                             ErrorCode::Busy,
                             "an automatic-nonce signing request already exists for this account",
                         );
                     }
-                    Some(reservation) => Some((reservation.nonce, reservation.expires_at)),
+                    Some(reservation) => Some((
+                        reservation.request_id,
+                        reservation.nonce,
+                        reservation.expires_at,
+                    )),
                     None => None,
                 }
             } else {
@@ -1405,17 +1623,17 @@ mod native {
                     )
                     .await
                     .map_err(map_sube_error)?;
-                Ok((external, client.metadata_rc()))
+                Ok(external)
             }
             .await;
-            let (external, metadata) = match result {
+            let external = match result {
                 Ok(request) => request,
                 Err(error) => return SubstrateResult::Err(error),
             };
             if automatic_nonce {
                 self.prune_expired_nonce_reservations(external.context.checkpoint_number);
             }
-            if let Some((reserved_nonce, expires_at)) = prior_ambiguous_nonce {
+            if let Some((reserved_request_id, reserved_nonce, expires_at)) = prior_ambiguous_nonce {
                 if external.context.account_nonce <= reserved_nonce
                     && external.context.checkpoint_number < expires_at
                 {
@@ -1425,6 +1643,16 @@ mod native {
                             "automatic nonce {reserved_nonce} may still finalize before block {expires_at}; retry after finalized nonce advancement or mortality expiry, or provide an explicit nonce"
                         ),
                     );
+                }
+                if let Some(prepared) = self.prepared_transactions.iter_mut().find(|prepared| {
+                    prepared.id == reserved_request_id
+                        && prepared.state == PreparedTransactionState::SubmissionUnknown
+                }) {
+                    prepared.state = if external.context.checkpoint_number >= expires_at {
+                        PreparedTransactionState::Expired
+                    } else {
+                        PreparedTransactionState::Submitted
+                    };
                 }
                 self.nonce_reservations
                     .retain(|reservation| reservation.nonce_account != request.nonce_account);
@@ -1443,19 +1671,6 @@ mod native {
                     "too many unresolved automatic-nonce submissions",
                 );
             }
-            // Metadata is large. Pending requests from the same runtime can
-            // safely share one immutable registry while older runtime
-            // versions keep their own exact signing schema.
-            let metadata = self
-                .runtime
-                .pending
-                .iter()
-                .find(|pending| {
-                    pending.request.context.spec_version == external.context.spec_version
-                        && pending.request.context.tx_version == external.context.tx_version
-                })
-                .map(|pending| sube::Rc::clone(&pending.metadata))
-                .unwrap_or(metadata);
             let id = match self.allocate_request_id(&owner, invocation) {
                 Some(id) => id,
                 None => {
@@ -1466,13 +1681,23 @@ mod native {
                 }
             };
             let payload = signing_payload(id, request.scheme, &external);
-            let reply = SubstrateResult::Ok(payload);
+            let reply = SubstrateResult::Ok(payload.clone());
             if reply.encode().len() > MAX_REPLY_BYTES {
                 return SubstrateResult::error(
                     ErrorCode::ReplyTooLarge,
                     "prepared transaction exceeds the extension reply budget",
                 );
             }
+            let frozen_request = match external.to_frozen() {
+                Ok(frozen) if frozen.len() <= MAX_FROZEN_SIGNING_REQUEST_BYTES => frozen,
+                Ok(_) => {
+                    return SubstrateResult::error(
+                        ErrorCode::ReplyTooLarge,
+                        "frozen signing request exceeds 16 KiB",
+                    );
+                }
+                Err(error) => return SubstrateResult::Err(map_sube_error(error)),
+            };
             let reservation = automatic_nonce.then_some(NonceReservation {
                 request_id: id,
                 owner: reservation_owner,
@@ -1482,13 +1707,17 @@ mod native {
                     .expect("automatic nonce mortality was validated before preparation"),
                 state: NonceReservationState::AwaitingSignature,
             });
-            self.runtime.pending.push(PendingTransaction {
+            self.prepared_transactions.push(PreparedTransaction {
                 id,
                 owner,
-                created: Instant::now(),
+                created_at_ms: now_ms(),
                 automatic_nonce,
-                metadata,
-                request: external,
+                prepare_invocation: *invocation.as_bytes(),
+                request_digest,
+                frozen_request,
+                payload,
+                submission: None,
+                state: PreparedTransactionState::AwaitingSignature,
             });
             if let Some(reservation) = reservation {
                 self.nonce_reservations.push(reservation);
@@ -1502,20 +1731,70 @@ mod native {
             signature: Vec<u8>,
             wait_for: Inclusion,
             owner: CallerKey,
+            invocation: InvocationId,
         ) -> SubstrateResult<TransactionResult> {
+            let request_digest = submission_request_digest(request_id, &signature, wait_for);
+            if let Some(previous) = self
+                .submission_replays
+                .iter()
+                .find(|record| record.owner == owner && record.invocation == *invocation.as_bytes())
+            {
+                if previous.request_digest != request_digest {
+                    return SubstrateResult::error(
+                        ErrorCode::BadRequest,
+                        "native invocation was reused with a different submission request",
+                    );
+                }
+                return previous.result.clone();
+            }
+
+            self.expire_pending();
             let Some(position) = self
-                .runtime
-                .pending
+                .prepared_transactions
                 .iter()
                 .position(|pending| pending.id == request_id && pending.owner == owner)
             else {
-                self.expire_pending();
                 return SubstrateResult::error(ErrorCode::NotFound, "unknown signing request");
             };
-            let expected_signature_len = self.runtime.pending[position]
-                .request
-                .scheme
-                .signature_len();
+            let prior_submission = match self.prepared_transactions[position].state {
+                PreparedTransactionState::AwaitingSignature => None,
+                PreparedTransactionState::SubmissionUnknown => {
+                    let Some(submission) = self.prepared_transactions[position].submission.clone()
+                    else {
+                        return SubstrateResult::error(
+                            ErrorCode::Encoding,
+                            "unresolved submission is missing its replay data",
+                        );
+                    };
+                    if submission.request_digest != request_digest {
+                        return SubstrateResult::error(
+                            ErrorCode::NonceUncertain,
+                            "signing request already has an unresolved submission; retry the exact signature and inclusion target",
+                        );
+                    }
+                    Some(submission)
+                }
+                PreparedTransactionState::Expired => {
+                    return SubstrateResult::error(ErrorCode::Expired, "signing request expired");
+                }
+                PreparedTransactionState::Submitted | PreparedTransactionState::Cancelled => {
+                    return SubstrateResult::error(
+                        ErrorCode::NotFound,
+                        "signing request is no longer available",
+                    );
+                }
+            };
+            let (signature, wait_for) = match prior_submission.as_ref() {
+                Some(submission) => (submission.signature.clone(), submission.wait_for),
+                None => (signature, wait_for),
+            };
+            let request = match sube::ExternalSigningRequest::from_frozen(
+                &self.prepared_transactions[position].frozen_request,
+            ) {
+                Ok(request) => request,
+                Err(error) => return SubstrateResult::Err(map_sube_error(error)),
+            };
+            let expected_signature_len = request.scheme.signature_len();
             if signature.len() != expected_signature_len {
                 return SubstrateResult::error(
                     ErrorCode::InvalidSignature,
@@ -1525,47 +1804,50 @@ mod native {
                     ),
                 );
             }
-            if self.runtime.pending[position].automatic_nonce
-                && matches!(wait_for, Inclusion::BestBlock)
-            {
+            let automatic_nonce = self.prepared_transactions[position].automatic_nonce;
+            if automatic_nonce && matches!(wait_for, Inclusion::BestBlock) {
                 return SubstrateResult::error(
                     ErrorCode::BadRequest,
                     "automatic-nonce transactions must wait for finalization",
                 );
             }
-            if self.runtime.pending[position].created.elapsed()
-                > Duration::from_secs(SIGNING_REQUEST_TTL_SECS)
-            {
-                let expired = self.runtime.pending.swap_remove(position);
-                if expired.automatic_nonce {
-                    self.release_nonce_reservation(expired.id);
-                }
-                return SubstrateResult::error(ErrorCode::Expired, "signing request expired");
+            if let Err(error) = self.ensure_client().await {
+                // No submission was attempted, so a later invocation may
+                // safely retry the frozen request.
+                return SubstrateResult::Err(error);
             }
-            let request = self.runtime.pending[position].request.clone();
-            let metadata = sube::Rc::clone(&self.runtime.pending[position].metadata);
+            let metadata = self
+                .runtime
+                .client
+                .as_ref()
+                .expect("client was connected immediately above")
+                .metadata_rc();
             let extrinsic =
                 match sube::extrinsic::finish_external_signing(&metadata, &request, &signature) {
                     Ok(extrinsic) => extrinsic,
                     Err(error) => return SubstrateResult::Err(map_sube_error(error)),
                 };
-            if let Err(error) = self.ensure_client().await {
-                // No submission was attempted; keep the signed request and its
-                // awaiting-signature reservation retryable.
-                return SubstrateResult::Err(error);
-            }
-            // Consume before submission. A timeout or ambiguous network result
-            // must never make the same signature conveniently replayable. An
-            // automatic nonce remains reserved until finalization, a terminal
-            // rejection, or preflight proves that no transaction can consume
-            // it. Mortal expiry bounds every genuinely ambiguous outcome.
-            let consumed = self.runtime.pending.swap_remove(position);
-            if consumed.automatic_nonce && !self.mark_nonce_submission_unknown(consumed.id) {
+            if automatic_nonce && !self.mark_nonce_submission_unknown(request_id) {
                 return SubstrateResult::error(
                     ErrorCode::Unavailable,
                     "automatic nonce reservation is missing; transaction was not submitted",
                 );
             }
+            if prior_submission.is_none() {
+                self.prepared_transactions[position].submission = Some(PreparedSubmission {
+                    invocation: *invocation.as_bytes(),
+                    request_digest,
+                    signature: signature.clone(),
+                    wait_for,
+                });
+                self.prepared_transactions[position].state =
+                    PreparedTransactionState::SubmissionUnknown;
+            }
+            // From this point onward the request is consumed. If the process
+            // dies before actor state is flushed, recovery retains the frozen
+            // call and nonce. A persisted unresolved attempt also retains the
+            // exact signature and inclusion target. Repeated broadcasts cannot
+            // execute twice at the chain account-nonce boundary.
             let submission = self
                 .runtime
                 .client
@@ -1587,10 +1869,19 @@ mod native {
             let result = submission
                 .map(|receipt| transaction_result(extrinsic, receipt))
                 .map_err(map_sube_error);
-            if nonce_is_resolved && consumed.automatic_nonce {
-                self.release_nonce_reservation(consumed.id);
+            if nonce_is_resolved && automatic_nonce {
+                self.release_nonce_reservation(request_id);
             }
-            bounded_result(result)
+            self.prepared_transactions[position].state = PreparedTransactionState::Submitted;
+            let result = bounded_result(result);
+            self.push_submission_replay(SubmissionReplay {
+                owner,
+                invocation: *invocation.as_bytes(),
+                request_digest,
+                completed_at_ms: now_ms(),
+                result: result.clone(),
+            });
+            result
         }
 
         pub(super) async fn native_submit_transaction_with_deadline(
@@ -1599,10 +1890,26 @@ mod native {
             signature: Vec<u8>,
             wait_for: Inclusion,
             owner: CallerKey,
+            invocation: InvocationId,
         ) -> SubstrateResult<TransactionResult> {
-            match sube::time::timeout(
+            let request_digest = submission_request_digest(request_id, &signature, wait_for);
+            if let Some(previous) = self
+                .submission_replays
+                .iter()
+                .find(|record| record.owner == owner && record.invocation == *invocation.as_bytes())
+            {
+                if previous.request_digest != request_digest {
+                    return SubstrateResult::error(
+                        ErrorCode::BadRequest,
+                        "native invocation was reused with a different submission request",
+                    );
+                }
+                return previous.result.clone();
+            }
+            let replay_owner = owner.clone();
+            let result = match sube::time::timeout(
                 SUBMISSION_DEADLINE,
-                self.native_submit_transaction(request_id, signature, wait_for, owner),
+                self.native_submit_transaction(request_id, signature, wait_for, owner, invocation),
             )
             .await
             {
@@ -1616,7 +1923,19 @@ mod native {
                     self.cancel_backend_operation().await;
                     SubstrateResult::error(ErrorCode::Unavailable, "operation timed out")
                 }
+            };
+            if !self.submission_replays.iter().any(|record| {
+                record.owner == replay_owner && record.invocation == *invocation.as_bytes()
+            }) {
+                self.push_submission_replay(SubmissionReplay {
+                    owner: replay_owner,
+                    invocation: *invocation.as_bytes(),
+                    request_digest,
+                    completed_at_ms: now_ms(),
+                    result: result.clone(),
+                });
             }
+            result
         }
 
         pub(super) fn native_cancel_transaction(
@@ -1626,22 +1945,26 @@ mod native {
         ) -> bool {
             self.expire_pending();
             let Some(position) = self
-                .runtime
-                .pending
+                .prepared_transactions
                 .iter()
                 .position(|pending| pending.id == request_id && &pending.owner == owner)
             else {
-                // A persisted AwaitingSignature record without its transient
-                // pending request may be a stale pre-submit snapshot from a
-                // crash during broadcast. It is therefore just as uncertain
-                // as SubmissionUnknown and cannot be manually released.
                 return false;
             };
-            let pending = self.runtime.pending.swap_remove(position);
-            if pending.automatic_nonce {
-                self.release_nonce_reservation(pending.id);
+            match self.prepared_transactions[position].state {
+                PreparedTransactionState::AwaitingSignature => {
+                    self.prepared_transactions[position].state =
+                        PreparedTransactionState::Cancelled;
+                    if self.prepared_transactions[position].automatic_nonce {
+                        self.release_nonce_reservation(request_id);
+                    }
+                    true
+                }
+                PreparedTransactionState::Cancelled => true,
+                PreparedTransactionState::SubmissionUnknown
+                | PreparedTransactionState::Submitted
+                | PreparedTransactionState::Expired => false,
             }
-            true
         }
 
         #[cfg(test)]
@@ -1880,20 +2203,276 @@ mod native {
     mod reservation_tests {
         use super::*;
 
+        fn transaction_request() -> TransactionRequest {
+            TransactionRequest {
+                call_path: "system/remark".into(),
+                call_body: "()".into(),
+                signing_account: vec![1; 32],
+                nonce_account: vec![2; 32],
+                scheme: SignatureScheme::Sr25519,
+                nonce: Some(3),
+                tip: 0,
+                mortality_period: 0,
+            }
+        }
+
+        fn signing_payload(request_id: u64) -> SigningPayload {
+            SigningPayload {
+                request_id,
+                payload: vec![4; 32],
+                encoded_call: vec![5, 6],
+                signing_account: vec![1; 32],
+                nonce_account: vec![2; 32],
+                scheme: SignatureScheme::Sr25519,
+                nonce: 3,
+                genesis_hash: [7; 32],
+                checkpoint: BlockRef {
+                    number: 8,
+                    hash: [9; 32],
+                },
+                expires_at: None,
+                spec_version: 10,
+                transaction_version: 11,
+                extensions: Vec::new(),
+            }
+        }
+
+        fn prepared_record(
+            id: u64,
+            owner: CallerKey,
+            invocation: InvocationId,
+            request: &TransactionRequest,
+            automatic_nonce: bool,
+        ) -> PreparedTransaction {
+            PreparedTransaction {
+                id,
+                owner,
+                created_at_ms: now_ms(),
+                automatic_nonce,
+                prepare_invocation: *invocation.as_bytes(),
+                request_digest: prepare_request_digest(request),
+                frozen_request: vec![12, 13],
+                payload: signing_payload(id),
+                submission: None,
+                state: PreparedTransactionState::AwaitingSignature,
+            }
+        }
+
+        #[test]
+        fn prepare_replay_returns_the_durable_payload_without_repreparing() {
+            let mut actor = SubstrateExtension::new(&[]);
+            let owner = CallerKey::Actor(1);
+            let invocation = InvocationId([2; 32]);
+            let request = transaction_request();
+            let record = prepared_record(7, owner.clone(), invocation, &request, false);
+            let expected = record.payload.clone();
+            actor.prepared_transactions.push(record);
+
+            assert_eq!(
+                smol::block_on(actor.native_prepare_transaction(
+                    request.clone(),
+                    owner.clone(),
+                    invocation,
+                )),
+                SubstrateResult::Ok(expected),
+            );
+            assert_eq!(actor.prepared_transactions.len(), 1);
+
+            let mut changed = request;
+            changed.tip = 1;
+            assert!(matches!(
+                smol::block_on(actor.native_prepare_transaction(changed, owner, invocation)),
+                SubstrateResult::Err(ExtensionError {
+                    code: ErrorCode::BadRequest,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn submission_replay_returns_the_durable_outcome_without_resubmitting() {
+            let mut actor = SubstrateExtension::new(&[]);
+            let owner = CallerKey::Actor(1);
+            let invocation = InvocationId([3; 32]);
+            let mut signature = vec![4; 64];
+            let expected = SubstrateResult::error(ErrorCode::Unavailable, "ambiguous");
+            actor.submission_replays.push(SubmissionReplay {
+                owner: owner.clone(),
+                invocation: *invocation.as_bytes(),
+                request_digest: submission_request_digest(7, &signature, Inclusion::Finalized),
+                completed_at_ms: now_ms(),
+                result: expected.clone(),
+            });
+
+            assert_eq!(
+                smol::block_on(actor.native_submit_transaction(
+                    7,
+                    signature.clone(),
+                    Inclusion::Finalized,
+                    owner.clone(),
+                    invocation,
+                )),
+                expected,
+            );
+            signature.fill(5);
+            assert!(matches!(
+                smol::block_on(actor.native_submit_transaction(
+                    7,
+                    signature,
+                    Inclusion::Finalized,
+                    owner,
+                    invocation,
+                )),
+                SubstrateResult::Err(ExtensionError {
+                    code: ErrorCode::BadRequest,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn submission_wrapper_journals_preflight_failures_by_invocation() {
+            let mut actor = SubstrateExtension::new(&[]);
+            let owner = CallerKey::Actor(1);
+            let invocation = InvocationId([8; 32]);
+            let signature = vec![9; 64];
+            let expected = smol::block_on(actor.native_submit_transaction_with_deadline(
+                77,
+                signature.clone(),
+                Inclusion::Finalized,
+                owner.clone(),
+                invocation,
+            ));
+            assert!(matches!(
+                &expected,
+                SubstrateResult::Err(ExtensionError {
+                    code: ErrorCode::NotFound,
+                    ..
+                })
+            ));
+            assert_eq!(actor.submission_replays.len(), 1);
+            assert_eq!(
+                smol::block_on(actor.native_submit_transaction_with_deadline(
+                    77,
+                    signature,
+                    Inclusion::Finalized,
+                    owner.clone(),
+                    invocation,
+                )),
+                expected,
+            );
+            assert!(matches!(
+                smol::block_on(actor.native_submit_transaction_with_deadline(
+                    77,
+                    vec![10; 64],
+                    Inclusion::Finalized,
+                    owner,
+                    invocation,
+                )),
+                SubstrateResult::Err(ExtensionError {
+                    code: ErrorCode::BadRequest,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn submission_history_does_not_prune_a_prepared_replay() {
+            let mut actor = SubstrateExtension::new(&[]);
+            let owner = CallerKey::Actor(1);
+            let request = transaction_request();
+            let pinned_invocation = InvocationId([20; 32]);
+            let mut prepared =
+                prepared_record(7, owner.clone(), InvocationId([19; 32]), &request, false);
+            prepared.state = PreparedTransactionState::Submitted;
+            prepared.submission = Some(PreparedSubmission {
+                invocation: *pinned_invocation.as_bytes(),
+                request_digest: [21; 32],
+                signature: vec![22; 64],
+                wait_for: Inclusion::Finalized,
+            });
+            actor.prepared_transactions.push(prepared);
+            for byte in 20..28 {
+                actor.submission_replays.push(SubmissionReplay {
+                    owner: owner.clone(),
+                    invocation: [byte; 32],
+                    request_digest: [byte.wrapping_add(1); 32],
+                    completed_at_ms: u64::from(byte),
+                    result: SubstrateResult::error(ErrorCode::Unavailable, "test"),
+                });
+            }
+
+            actor.push_submission_replay(SubmissionReplay {
+                owner,
+                invocation: [28; 32],
+                request_digest: [29; 32],
+                completed_at_ms: 28,
+                result: SubstrateResult::error(ErrorCode::Unavailable, "new"),
+            });
+
+            assert_eq!(actor.submission_replays.len(), 8);
+            assert!(
+                actor
+                    .submission_replays
+                    .iter()
+                    .any(|record| { record.invocation == *pinned_invocation.as_bytes() })
+            );
+        }
+
+        #[test]
+        fn cancellation_is_persisted_and_idempotent() {
+            let mut actor = SubstrateExtension::new(&[]);
+            let owner = CallerKey::Actor(1);
+            let request = transaction_request();
+            actor.prepared_transactions.push(prepared_record(
+                7,
+                owner.clone(),
+                InvocationId([4; 32]),
+                &request,
+                true,
+            ));
+            actor.nonce_reservations.push(NonceReservation {
+                request_id: 7,
+                owner: owner.reservation_owner(),
+                nonce_account: request.nonce_account,
+                nonce: 3,
+                expires_at: 64,
+                state: NonceReservationState::AwaitingSignature,
+            });
+
+            assert!(actor.native_cancel_transaction(7, &owner));
+            assert!(actor.native_cancel_transaction(7, &owner));
+            assert_eq!(
+                actor.prepared_transactions[0].state,
+                PreparedTransactionState::Cancelled,
+            );
+            assert!(actor.nonce_reservations.is_empty());
+        }
+
         #[test]
         fn submitted_nonce_reservation_cannot_be_cancelled_as_unused() {
             let mut actor = SubstrateExtension::new(&[]);
             let owner = CallerKey::Actor(1);
+            let request = transaction_request();
+            let mut prepared =
+                prepared_record(7, owner.clone(), InvocationId([5; 32]), &request, true);
+            prepared.state = PreparedTransactionState::SubmissionUnknown;
+            prepared.submission = Some(PreparedSubmission {
+                invocation: [6; 32],
+                request_digest: submission_request_digest(7, &[7; 64], Inclusion::Finalized),
+                signature: vec![7; 64],
+                wait_for: Inclusion::Finalized,
+            });
+            actor.prepared_transactions.push(prepared);
             actor.nonce_reservations.push(NonceReservation {
                 request_id: 7,
                 owner: owner.reservation_owner(),
                 nonce_account: vec![3; 32],
                 nonce: 11,
                 expires_at: 64,
-                state: NonceReservationState::AwaitingSignature,
+                state: NonceReservationState::SubmissionUnknown,
             });
 
-            assert!(actor.mark_nonce_submission_unknown(7));
             let reservation = actor.automatic_nonce_reservation(&[3; 32]).unwrap();
             assert_eq!(reservation.nonce, 11);
             assert_eq!(reservation.state, NonceReservationState::SubmissionUnknown);
@@ -1996,7 +2575,7 @@ mod native {
 }
 
 #[cfg(feature = "native")]
-use native::{MapSnapshot, PendingTransaction};
+use native::MapSnapshot;
 
 #[cfg(test)]
 mod tests {
@@ -2124,7 +2703,7 @@ mod tests {
 
     #[cfg(feature = "native")]
     #[test]
-    fn native_runtime_is_transient_but_nonce_uncertainty_is_persisted() {
+    fn native_runtime_is_transient_but_transaction_journals_are_persisted() {
         let mut actor = SubstrateExtension::new(&[]);
         actor.config.network = "custom-network".into();
         actor.config.chain_spec_path = "/operator/para.json".into();
@@ -2137,14 +2716,51 @@ mod tests {
             expires_at: 128,
             state: NonceReservationState::SubmissionUnknown,
         });
+        actor.prepared_transactions.push(PreparedTransaction {
+            id: 17,
+            owner: OwnerKey::Actor(7),
+            created_at_ms: 123,
+            automatic_nonce: true,
+            prepare_invocation: [6; 32],
+            request_digest: [7; 32],
+            frozen_request: vec![8, 9],
+            payload: SigningPayload {
+                request_id: 17,
+                payload: vec![10],
+                encoded_call: vec![11],
+                signing_account: vec![12; 32],
+                nonce_account: vec![5; 32],
+                scheme: SignatureScheme::Sr25519,
+                nonce: 23,
+                genesis_hash: [13; 32],
+                checkpoint: BlockRef {
+                    number: 64,
+                    hash: [14; 32],
+                },
+                expires_at: Some(128),
+                spec_version: 1,
+                transaction_version: 2,
+                extensions: Vec::new(),
+            },
+            submission: None,
+            state: PreparedTransactionState::AwaitingSignature,
+        });
+        actor.submission_replays.push(SubmissionReplay {
+            owner: OwnerKey::Actor(8),
+            invocation: [15; 32],
+            request_digest: [16; 32],
+            completed_at_ms: 456,
+            result: SubstrateResult::error(ErrorCode::Unavailable, "ambiguous"),
+        });
 
         let restored = SubstrateExtension::try_decode(&actor.encode()).unwrap();
         assert_eq!(restored.config.network, "custom-network");
         assert_eq!(restored.config.chain_spec_path, "/operator/para.json");
         assert_eq!(restored.next_request_id, 91);
         assert_eq!(restored.nonce_reservations, actor.nonce_reservations);
+        assert_eq!(restored.prepared_transactions, actor.prepared_transactions);
+        assert_eq!(restored.submission_replays, actor.submission_replays);
         assert!(restored.runtime.client.is_none());
-        assert!(restored.runtime.pending.is_empty());
         assert!(restored.runtime.map_snapshots.is_empty());
     }
 

@@ -56,6 +56,7 @@ host-local init configuration:
 [[agent]]
 name = "chain-reader"
 path = "target/vos/chain-reader.vos"
+consistency = "local"
 # Node-local authority granted to this service root. Omit to deny calls.
 intra_caps = ["substrate:member"]
 
@@ -93,8 +94,14 @@ native-extension bindings.
 
 The dedicated host route is node-local, capped at eight calls per Refine and
 64 KiB in either direction, and is rejected for proof-requested invocations.
-An explicit `BlockRef` is accepted only when its hash is finalized and
-canonical at the supplied height.
+It is available only to durable `Local` roots. Raft and CRDT roots need a
+future consensus-committed extension outbox before they can safely coordinate
+node-local side effects; ephemeral roots cannot durably bind the result. A
+queued native call can time out only while it is still cancelable. Once the
+serial extension worker claims it, the bridge waits for the actual committed
+reply, preventing a reported timeout from being followed by late work. An
+explicit `BlockRef` is accepted only when its hash is finalized and canonical
+at the supplied height.
 
 Omit both paths for the bundled defaults. Actor-visible requests are capped at
 32 map rows, a 7 KiB encoded success reply, 16 active map snapshots per caller,
@@ -106,10 +113,13 @@ must be mortal and wait for finalization. An ambiguous submission keeps its
 nonce reserved until the finalized account nonce advances or its mortal era
 expires; automatic preparation reports `NonceUncertain` in the meantime, and
 callers may recover with an explicitly managed nonce. These bounded
-reservations are part of the actor snapshot, so reconnecting the light client
-or reloading the extension does not silently make an uncertain nonce reusable.
-A restored reservation has no live signing request and therefore cannot be
-manually cancelled.
+reservations, frozen preparations, and bounded submission outcomes are part of
+the actor snapshot. Reconnecting the light client or reloading the extension
+therefore does not silently make an uncertain nonce reusable. Replaying the
+same native invocation returns its original signing payload or submission
+outcome. Recovery after an uncommitted broadcast retains the original call and
+account nonce, preventing a second execution; a persisted unresolved attempt
+also pins the exact signature and inclusion target.
 
 `vosx space up` gives every installed extension an instance-scoped state
 database. Persistence setup and commits are fail-closed: a stateful reply is

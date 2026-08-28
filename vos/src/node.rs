@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(feature = "network")]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -209,6 +209,7 @@ fn send_service_ingress(
             role_authority_request: false,
             root_upgrade_request: false,
             invocation_id: None,
+            native_call: None,
             msg: ingress.to_vec(),
             reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
@@ -925,6 +926,61 @@ impl ExtensionConfig {
 /// hop instead of deadlocking until the 10 s reply timeout. The
 /// chain doubles as a depth counter — capped at
 /// [`MAX_CROSS_AGENT_DEPTH`] hops.
+const NATIVE_CALL_QUEUED: u8 = 0;
+const NATIVE_CALL_RUNNING: u8 = 1;
+const NATIVE_CALL_CANCELED: u8 = 2;
+
+/// Shared ownership handshake for a service actor's synchronous native call.
+///
+/// A caller may abandon only work that is still queued. Once the extension
+/// worker atomically claims the request, the caller waits for its real durable
+/// outcome even if the ordinary ask deadline passes. This prevents a timeout
+/// from being reported while the serial worker later performs the call.
+#[derive(Clone)]
+struct NativeCallControl {
+    deadline: Instant,
+    state: Arc<AtomicU8>,
+}
+
+impl NativeCallControl {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            deadline: Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now),
+            state: Arc::new(AtomicU8::new(NATIVE_CALL_QUEUED)),
+        }
+    }
+
+    /// Claim queued work for execution, unless its caller canceled it or its
+    /// deadline already elapsed. Exactly one of this and `cancel_queued` wins.
+    fn try_start(&self) -> bool {
+        if Instant::now() >= self.deadline {
+            let _ = self.cancel_queued();
+            return false;
+        }
+        self.state
+            .compare_exchange(
+                NATIVE_CALL_QUEUED,
+                NATIVE_CALL_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn cancel_queued(&self) -> bool {
+        self.state
+            .compare_exchange(
+                NATIVE_CALL_QUEUED,
+                NATIVE_CALL_CANCELED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
 struct InvokeRequest {
     /// Who's calling — host-side identity as seen by the dispatch
     /// gate. `Caller::Peer` for libp2p inbound (multihash bytes of
@@ -964,6 +1020,9 @@ struct InvokeRequest {
     /// the service Refine bridge populates it; ordinary routes allocate their
     /// existing host dispatch identity.
     invocation_id: Option<crate::service::InvocationId>,
+    /// Present only for the service-actor native-extension bridge. Ordinary
+    /// invoke routes retain their existing timeout semantics.
+    native_call: Option<NativeCallControl>,
     msg: Vec<u8>,
     reply: ReplyChannel,
     // Read by agent_thread via `&req.chain` before moving `req`
@@ -1940,6 +1999,8 @@ fn current_service_native_extension_chain(caller: ServiceId) -> Vec<u32> {
 /// non-extension targets, and activates only an explicit matching `intra_cap`.
 struct ServiceNativeExtensionInvoker {
     caller: ServiceId,
+    consistency: crate::service::ConsistencyMode,
+    timeout: Duration,
     caps: Vec<crate::actors::IntraCap>,
     invoke_routes: InvokeRoutes,
     agent_info: AgentInfos,
@@ -1955,6 +2016,13 @@ impl crate::service::NativeExtensionInvoker for ServiceNativeExtensionInvoker {
         let Some(ceiling) = crate::actors::cap_for(&self.caps, Some(target)) else {
             return Err(crate::actors::run::STATUS_FORBIDDEN);
         };
+        if self.consistency != crate::service::ConsistencyMode::Local {
+            // Extension state is node-local. A Raft/CRDT Refine retry on a
+            // different replica cannot consult the same side-effect journal,
+            // while an ephemeral root cannot durably bind the result. Keep the
+            // bridge local until an outbox is committed by consensus.
+            return Err(crate::actors::run::STATUS_FORBIDDEN);
+        }
         let target_id = {
             let infos = self
                 .agent_info
@@ -1990,6 +2058,7 @@ impl crate::service::NativeExtensionInvoker for ServiceNativeExtensionInvoker {
             .get(&target_id)
             .cloned()
             .ok_or(crate::actors::run::STATUS_NOT_FOUND)?;
+        let control = NativeCallControl::new(self.timeout);
         let (reply_tx, reply_rx) = mpsc::channel();
         tx.send(InvokeRequest {
             caller: crate::actors::Caller::Actor(self.caller),
@@ -2000,14 +2069,34 @@ impl crate::service::NativeExtensionInvoker for ServiceNativeExtensionInvoker {
             role_authority_request: false,
             root_upgrade_request: false,
             invocation_id: Some(invocation),
+            native_call: Some(control.clone()),
             msg: payload.to_vec(),
             reply: ReplyChannel::Sync(reply_tx),
             chain,
         })
         .map_err(|_| crate::actors::run::STATUS_NOT_FOUND)?;
-        let envelope = reply_rx
-            .recv_timeout(ASK_TIMEOUT)
-            .map_err(|_| crate::actors::run::STATUS_PANICKED)?;
+        let envelope = match reply_rx
+            .recv_timeout(control.deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(envelope) => envelope,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(crate::actors::run::STATUS_PANICKED);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if control.cancel_queued() => {
+                // The worker can no longer claim this request, so returning is
+                // safe even though its canceled envelope remains in the queue.
+                return Err(crate::actors::run::STATUS_PANICKED);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The worker already owns the request. There is no safe way to
+                // interrupt an in-process cdylib while it may be performing an
+                // external side effect, so retain the receiver until the real
+                // durable result (or worker disconnect) arrives.
+                reply_rx
+                    .recv()
+                    .map_err(|_| crate::actors::run::STATUS_PANICKED)?
+            }
+        };
         unwrap_invoke_envelope_result(&envelope)
     }
 }
@@ -2394,6 +2483,7 @@ impl InvokeHandle {
             role_authority_request: false,
             root_upgrade_request: false,
             invocation_id: None,
+            native_call: None,
             msg,
             reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
@@ -2682,6 +2772,7 @@ impl NodeService {
             role_authority_request: false,
             root_upgrade_request: false,
             invocation_id: None,
+            native_call: None,
             msg: ingress.clone(),
             reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
@@ -3133,6 +3224,7 @@ fn registry_probe_reply_with_timeout(
             role_authority_request: false,
             root_upgrade_request: false,
             invocation_id: None,
+            native_call: None,
             msg: payload,
             reply: ReplyChannel::Sync(reply_tx),
             chain: vec![],
@@ -3714,6 +3806,7 @@ impl crate::network::NetworkService for NodeService {
                 role_authority_request,
                 root_upgrade_request,
                 invocation_id: None,
+                native_call: None,
                 msg,
                 reply: ReplyChannel::Sync(reply_tx),
                 chain,
@@ -5170,8 +5263,11 @@ impl VosNode {
             + 'static,
     {
         let native_extension_caps = service.intra_caps().to_vec();
+        let native_extension_consistency = service.consistency();
         service.set_native_extension_invoker(Arc::new(ServiceNativeExtensionInvoker {
             caller: id,
+            consistency: native_extension_consistency,
+            timeout: ASK_TIMEOUT,
             caps: native_extension_caps,
             invoke_routes: self.invoke_routes.clone(),
             agent_info: self.agent_info.clone(),
@@ -7499,6 +7595,7 @@ impl VosNode {
                 role_authority_request: false,
                 root_upgrade_request: false,
                 invocation_id: None,
+                native_call: None,
                 msg: msg.clone(),
                 reply: ReplyChannel::Sync(reply_tx),
                 chain: Vec::new(),
@@ -9457,6 +9554,7 @@ fn request_service_role_assertion(
         role_authority_request: true,
         root_upgrade_request: false,
         invocation_id: None,
+        native_call: None,
         msg: ingress_wire.clone(),
         reply: ReplyChannel::Sync(reply_tx),
         chain: Vec::new(),
@@ -11605,6 +11703,7 @@ fn agent_thread(
                 role_authority_request: false,
                 root_upgrade_request: false,
                 invocation_id: None,
+                native_call: None,
                 msg: msg.to_vec(),
                 reply: ReplyChannel::Sync(reply_tx),
                 chain: chain_snapshot,
@@ -13054,6 +13153,19 @@ fn extension_thread(
         for _ in 0..4 {
             match invoke_rx.try_recv() {
                 Ok(req) => {
+                    if req
+                        .native_call
+                        .as_ref()
+                        .is_some_and(|control| !control.try_start())
+                    {
+                        // The service caller won the queued-work cancellation
+                        // race (or its deadline elapsed before dequeue). The
+                        // extension actor is deliberately left untouched.
+                        let failure =
+                            encode_invoke_envelope(crate::actors::run::STATUS_PANICKED, &[], &[]);
+                        send_reply_capped(req.reply, failure, id);
+                        continue;
+                    }
                     bump();
                     let task_context = crate::extension::ExtensionInvocationContext::new(
                         id,
@@ -13638,6 +13750,7 @@ async fn route_invoke(
             role_authority_request: false,
             root_upgrade_request: false,
             invocation_id: None,
+            native_call: None,
             msg: payload,
             reply: ReplyChannel::Async(reply_tx),
             chain: invoke_chain.to_vec(),
@@ -14317,6 +14430,8 @@ mod tests {
 
         let denied = ServiceNativeExtensionInvoker {
             caller,
+            consistency: crate::service::ConsistencyMode::Local,
+            timeout: ASK_TIMEOUT,
             caps: Vec::new(),
             invoke_routes: routes.clone(),
             agent_info: infos.clone(),
@@ -14333,6 +14448,13 @@ mod tests {
             assert_eq!(request.space_role, Some(crate::SpaceRole::Member.as_u8()));
             assert_eq!(request.actor_local_role, None);
             assert_eq!(request.invocation_id, Some(invocation));
+            assert!(
+                request
+                    .native_call
+                    .as_ref()
+                    .expect("service bridge installs call control")
+                    .try_start()
+            );
             assert_eq!(request.chain, vec![0x3300, caller.0]);
             assert_eq!(request.msg, b"request");
             request.reply.send(encode_invoke_envelope(
@@ -14343,6 +14465,8 @@ mod tests {
         });
         let allowed = ServiceNativeExtensionInvoker {
             caller,
+            consistency: crate::service::ConsistencyMode::Local,
+            timeout: ASK_TIMEOUT,
             caps: vec![crate::IntraCap::parse("substrate:member").unwrap()],
             invoke_routes: routes,
             agent_info: infos,
@@ -14360,6 +14484,131 @@ mod tests {
             "the dispatch-local lineage must be cleared after the request",
         );
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn service_native_extension_timeout_cancels_only_queued_work() {
+        use crate::service::NativeExtensionInvoker as _;
+
+        let caller = ServiceId::new(0, 0x4410);
+        let target = ServiceId::new(0, 0x4411);
+        let invocation = crate::service::InvocationId([0x52; 32]);
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let infos: AgentInfos = Arc::new(std::sync::RwLock::new(HashMap::from([(
+            target.0,
+            AgentInfo {
+                name: Some("substrate".into()),
+                consistency: None,
+                network_reachable: true,
+            },
+        )])));
+        let (tx, rx) = mpsc::channel();
+        routes.lock().unwrap().insert(target.0, tx);
+        let invoker = ServiceNativeExtensionInvoker {
+            caller,
+            consistency: crate::service::ConsistencyMode::Local,
+            timeout: Duration::from_millis(5),
+            caps: vec![crate::IntraCap::parse("substrate:member").unwrap()],
+            invoke_routes: routes,
+            agent_info: infos,
+        };
+
+        assert_eq!(
+            invoker.invoke("substrate", invocation, b"queued"),
+            Err(crate::actors::run::STATUS_PANICKED),
+        );
+        let request = rx.recv().expect("canceled request remains queued");
+        assert!(
+            !request
+                .native_call
+                .as_ref()
+                .expect("service bridge installs call control")
+                .try_start()
+        );
+    }
+
+    #[test]
+    fn service_native_extension_waits_for_work_the_worker_claimed() {
+        use crate::service::NativeExtensionInvoker as _;
+
+        let caller = ServiceId::new(0, 0x4420);
+        let target = ServiceId::new(0, 0x4421);
+        let invocation = crate::service::InvocationId([0x62; 32]);
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let infos: AgentInfos = Arc::new(std::sync::RwLock::new(HashMap::from([(
+            target.0,
+            AgentInfo {
+                name: Some("substrate".into()),
+                consistency: None,
+                network_reachable: true,
+            },
+        )])));
+        let (tx, rx) = mpsc::channel();
+        routes.lock().unwrap().insert(target.0, tx);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let request = rx.recv().unwrap();
+            assert!(request.native_call.as_ref().unwrap().try_start());
+            thread::sleep(Duration::from_millis(300));
+            request.reply.send(encode_invoke_envelope(
+                crate::actors::run::STATUS_DONE,
+                &[],
+                b"durable",
+            ));
+        });
+        ready_rx.recv().unwrap();
+        let invoker = ServiceNativeExtensionInvoker {
+            caller,
+            consistency: crate::service::ConsistencyMode::Local,
+            timeout: Duration::from_millis(250),
+            caps: vec![crate::IntraCap::parse("substrate:member").unwrap()],
+            invoke_routes: routes,
+            agent_info: infos,
+        };
+
+        assert_eq!(
+            invoker.invoke("substrate", invocation, b"running"),
+            Ok(b"durable".to_vec()),
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn service_native_extension_bridge_rejects_replicated_roots() {
+        use crate::service::NativeExtensionInvoker as _;
+
+        let caller = ServiceId::new(0, 0x4430);
+        let target = ServiceId::new(0, 0x4431);
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let infos: AgentInfos = Arc::new(std::sync::RwLock::new(HashMap::from([(
+            target.0,
+            AgentInfo {
+                name: Some("substrate".into()),
+                consistency: None,
+                network_reachable: true,
+            },
+        )])));
+        let (tx, rx) = mpsc::channel();
+        routes.lock().unwrap().insert(target.0, tx);
+        let invoker = ServiceNativeExtensionInvoker {
+            caller,
+            consistency: crate::service::ConsistencyMode::Raft,
+            timeout: ASK_TIMEOUT,
+            caps: vec![crate::IntraCap::parse("substrate:member").unwrap()],
+            invoke_routes: routes,
+            agent_info: infos,
+        };
+
+        assert_eq!(
+            invoker.invoke(
+                "substrate",
+                crate::service::InvocationId([0x72; 32]),
+                b"request",
+            ),
+            Err(crate::actors::run::STATUS_FORBIDDEN),
+        );
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 
     #[test]
@@ -14382,6 +14631,8 @@ mod tests {
         routes.lock().unwrap().insert(target.0, tx);
         let invoker = ServiceNativeExtensionInvoker {
             caller,
+            consistency: crate::service::ConsistencyMode::Local,
+            timeout: ASK_TIMEOUT,
             caps: vec![crate::IntraCap::parse("substrate:member").unwrap()],
             invoke_routes: routes,
             agent_info: infos,
@@ -14413,6 +14664,8 @@ mod tests {
         )])));
         let actor_only = ServiceNativeExtensionInvoker {
             caller,
+            consistency: crate::service::ConsistencyMode::Local,
+            timeout: ASK_TIMEOUT,
             caps: cap.clone(),
             invoke_routes: routes.clone(),
             agent_info: actor_infos,
@@ -14442,6 +14695,8 @@ mod tests {
         ])));
         let ambiguous = ServiceNativeExtensionInvoker {
             caller,
+            consistency: crate::service::ConsistencyMode::Local,
+            timeout: ASK_TIMEOUT,
             caps: cap,
             invoke_routes: routes,
             agent_info: ambiguous_infos,
@@ -15268,6 +15523,7 @@ mod tests {
                 role_authority_request: false,
                 root_upgrade_request: false,
                 invocation_id: None,
+                native_call: None,
                 msg: payload,
                 reply: ReplyChannel::Sync(reply_tx),
                 chain: Vec::new(),

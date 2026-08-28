@@ -17,17 +17,22 @@ The actor-facing API is generated as `SubstrateExtensionRef`:
   lookup requires a mortal transaction; explicitly managed nonces may still
   use an immortal era.
 - `submit_transaction(id, signature, wait_for)` validates the signature,
-  consumes the request immediately before network submission, and waits
-  synchronously for best-chain inclusion or finalization. Automatic nonces
-  require finalization; callers selecting best-block inclusion provide an
-  explicit nonce. If submission has an ambiguous timeout or connection result,
-  that automatic nonce remains reserved: another automatic request returns
-  `NonceUncertain` until the finalized account nonce advances or the mortal era
-  expires, while an explicitly managed nonce remains available as the recovery
-  path. The receipt always identifies the submitted extrinsic by hash; its full
-  hex and tail events are omitted when necessary to stay inside the reply bound.
+  consumes the request at network submission, and waits synchronously for
+  best-chain inclusion or finalization. The frozen request and bounded outcome
+  journal make a repeated native invocation return the same result. Recovery
+  retains the original call, signing payload, account nonce, and checkpoint;
+  once an unresolved attempt is persisted it also pins the exact signature and
+  inclusion target. Automatic nonces require finalization; callers selecting
+  best-block inclusion provide an explicit nonce. If submission has an
+  ambiguous timeout or connection result, that automatic nonce remains
+  reserved: another automatic request returns `NonceUncertain` until the
+  finalized account nonce advances or the mortal era expires, while an
+  explicitly managed nonce remains available as the recovery path. The receipt
+  always identifies the submitted extrinsic by hash; its full hex and tail
+  events are omitted when necessary to stay inside the reply bound.
 - `cancel_transaction(id)` releases an unused signing request while that
-  request is still live in the current extension process.
+  durable request is still awaiting a signature. Repeated cancellation is
+  idempotent.
 
 Actor crates use a Ref-only dependency and bind that API to the host-local
 extension instance name:
@@ -56,6 +61,7 @@ authority explicitly:
 [[agent]]
 name = "chain-reader"
 path = "target/vos/chain-reader.vos"
+consistency = "local"
 intra_caps = ["substrate:member"]
 
 [[extension]]
@@ -64,7 +70,13 @@ path = "target/release/libsubstrate_extension.so"
 ```
 
 The node-local route permits at most eight calls per Refine and 64 KiB per
-request or reply. Proof-requested invocations reject native extension I/O.
+request or reply. It is installed only for roots using `consistency = "local"`:
+Raft and CRDT replicas cannot safely share a node-local side-effect journal,
+and ephemeral roots cannot durably bind a result. Proof-requested invocations
+reject native extension I/O. A queued call that reaches its host deadline is
+canceled before dispatch; after the extension worker claims a call, the host
+waits for the real persisted result instead of reporting a timeout while work
+continues.
 Caller-supplied block hashes are additionally verified as finalized and
 canonical before storage is read.
 
@@ -79,17 +91,22 @@ identity when VOS has one; anonymous read cursors remain bearer capabilities
 and share the anonymous caller quota.
 
 No signing keys are accepted or retained. V5/general extrinsics are not
-exposed. The light client and pending signing data are transient actor fields;
-snapshots persist operator configuration, the request-id counter, and bounded
-automatic-nonce reservations so submission uncertainty survives a light-client
-reconnect or actor reload. A restored reservation is conservatively treated as
-possibly submitted and cannot be cancelled without its transient pending
-request; finalized nonce advancement or mortal-era expiry retires it. `vosx`
+exposed. The light client and map snapshots are transient actor fields.
+Snapshots persist operator configuration, the request-id counter, bounded
+frozen signing preparations and submission outcomes, and automatic-nonce
+reservations. A Refine replay therefore receives the original signing payload
+instead of preparing against a newer nonce or checkpoint. If a process dies
+after broadcast but before the result commits, the restored frozen request
+retains that call and account nonce, so a replay cannot execute a second
+transaction; persisted unresolved attempts additionally retain the exact
+signature. Finalized nonce advancement or mortal-era expiry retires any
+remaining automatic-nonce uncertainty. `vosx`
 enables instance-scoped persistence for installed extensions and refuses to
 start an extension if storage cannot be opened or its saved schema cannot be
 decoded. The snapshot envelope binds state to the actor's direct-field
 fingerprint and declared `state_version`; bump `state_version` whenever the
-archived representation or meaning of `Config` or `NonceReservation` changes.
+archived representation or meaning of `Config`, `NonceReservation`, or either
+transaction journal changes.
 Dropping or reloading the actor drops Sube and joins its smoldot
 executor before the extension library can unload. A failed operation cleanup
 poisons and drops the current light-client session instead of reusing uncertain
