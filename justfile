@@ -48,13 +48,16 @@ build-daemon-root-artifacts: build-vos-service
     cd vos/tests/fixtures/counter-upgrade; cargo +nightly actor
 
 # Build every guest consumed by the physical service gate.
-build-pvm-test-artifacts: build-daemon-root-artifacts build-registry-fixtures (build-actor "space-authority") (build-actor "clerk-ledger") (build-actor "clerk-bridge") build-clerk-apply
+build-pvm-test-artifacts: build-daemon-root-artifacts build-registry-fixtures (build-actor "space-authority") (build-actor "clerk-ledger") (build-actor "clerk-bridge") build-clerk-apply build-workflow-fixture
     cd vos/tests/fixtures/greeter; cargo +nightly actor
     cd vos/tests/fixtures/probe; cargo +nightly actor
     cd vos/tests/fixtures/tally; cargo +nightly actor
     cd vos/tests/fixtures/crdt-counter; cargo +nightly actor
-    cd vos/tests/fixtures/workflow; cargo +nightly actor
     cd vos/tests/fixtures/cycle; cargo +nightly actor
+
+# Build the workflow guest shared by the physical and extension hostcall tests.
+build-workflow-fixture:
+    cd vos/tests/fixtures/workflow; cargo +nightly actor
 
 # Build a single built-in PVM actor by name (e.g., just build-actor space-registry).
 build-actor name:
@@ -148,7 +151,7 @@ test-examples:
     cd examples/actors; cargo +nightly actor -p shared-board
 
 # Run extension tests.
-test-extensions: build-extensions
+test-extensions: build-extensions build-workflow-fixture
     cargo test -p vos extension -- --nocapture
     cargo test -p substrate-extension
     cargo check -p substrate-extension --no-default-features

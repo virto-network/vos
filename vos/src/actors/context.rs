@@ -687,6 +687,11 @@ impl<A: Actor> Context<A> {
                 return super::run::Ask::ready_err(InvokeError::TooBig);
             }
             response.truncate(response_len);
+            if !response.is_empty()
+                && <super::value::Value as super::codec::Decode>::try_decode(&response).is_none()
+            {
+                return super::run::Ask::ready_err(InvokeError::Panicked);
+            }
             super::run::Ask::ready(response)
         }
         #[cfg(not(feature = "pvm"))]

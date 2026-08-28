@@ -136,10 +136,11 @@ pub trait Invoker {
     ) -> impl Future<Output = Result<Value, ClientError>> + '_;
 }
 
-/// Error-mapping wrapper for an actor invocation which has already copied its
-/// request bytes into the runtime. Keeping only the returned [`Ask`] alive is
-/// important on guest targets: the request buffer must not become an
-/// unrelated field in the compiler-generated future state beside the reply.
+/// Error-mapping wrapper for an actor or native-extension invocation which has
+/// already copied its request bytes into the runtime. Keeping only the returned
+/// [`Ask`] alive is important on guest targets: the request buffer must not
+/// become an unrelated field in the compiler-generated future state beside the
+/// reply.
 #[doc(hidden)]
 pub struct ClientAsk {
     inner: super::run::Ask,
@@ -280,17 +281,13 @@ impl<A: super::Actor> Invoker for super::Context<A> {
 
 #[cfg(feature = "native-extension-client")]
 impl<A: super::Actor> ExtensionInvoker for super::Context<A> {
-    #[allow(clippy::manual_async_fn)]
     fn invoke_extension(
         &mut self,
         target: String,
         payload: Vec<u8>,
     ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
-        async move {
-            self.ask_extension_raw(&target, &payload)
-                .await
-                .map_err(ClientError::from)
-        }
+        let ask = self.ask_extension_raw(&target, &payload);
+        ClientAsk::new(ask)
     }
 }
 

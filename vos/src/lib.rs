@@ -149,11 +149,10 @@ pub use actors::{
     Actor, ActorHandle, ActorReference, Ask, CallError, Caller, ClientError, Context,
     DeviceSignature, Extension, ExtensionCtx, ExtensionHandle, ExtensionReference, Forbidden,
     IngressAccessGrant, IngressAccessStatus, IntraCap, IntraCapParseError,
-    MAX_MEMBER_CREDENTIAL_HISTORY, MAX_MEMBER_CREDENTIALS, MAX_MEMBER_ROLES,
-    MAX_ROLE_CAPABILITIES, MAX_SPACE_ROLES, Message, NO_ROLES_MAP, NoRoles, RoleByte, RunResult,
-    SpaceMemberRoles, SpaceRole, SpaceRoleDefinition, SpaceRoleMap, Yield, capability,
-    default_space_roles, ingress_credential_id, metadata, run_blocking, ssh_credential_id,
-    try_poll,
+    MAX_MEMBER_CREDENTIAL_HISTORY, MAX_MEMBER_CREDENTIALS, MAX_MEMBER_ROLES, MAX_ROLE_CAPABILITIES,
+    MAX_SPACE_ROLES, Message, NO_ROLES_MAP, NoRoles, RoleByte, RunResult, SpaceMemberRoles,
+    SpaceRole, SpaceRoleDefinition, SpaceRoleMap, Yield, capability, default_space_roles,
+    ingress_credential_id, metadata, run_blocking, ssh_credential_id, try_poll,
 };
 pub use actors::{Decode, Encode};
 pub use actors::{

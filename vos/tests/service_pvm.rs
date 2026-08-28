@@ -1520,6 +1520,23 @@ impl vos::service::NativeExtensionInvoker for RecordingNativeExtension {
     }
 }
 
+#[derive(Default)]
+struct MalformedReplyNativeExtension {
+    calls: AtomicUsize,
+}
+
+impl vos::service::NativeExtensionInvoker for MalformedReplyNativeExtension {
+    fn invoke(
+        &self,
+        _target: &str,
+        _invocation: InvocationId,
+        _payload: &[u8],
+    ) -> Result<Vec<u8>, u8> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(vec![0xff])
+    }
+}
+
 fn set_workflow_request(request: &mut LocalWorkRequest, method: &str, message: Msg) {
     request.method = method.into();
     request.arguments = {
@@ -1573,6 +1590,35 @@ fn service_actor_native_extension_hostcall_preserves_typed_wire_and_stable_ident
     assert_eq!(
         *invocation,
         InvocationId::derive(b"vos/native-extension-call/service", &nonce),
+    );
+}
+
+#[test]
+fn service_actor_native_extension_malformed_reply_is_a_typed_failure() {
+    let (mut config, mut request) = attested_root_fixture(ConsistencyMode::Local, 0x65);
+    config.intra_caps = vec![vos::IntraCap::parse("native-peer:member").unwrap()];
+    set_workflow_request(
+        &mut request,
+        "extension_peer_value",
+        Msg::new("extension_peer_value"),
+    );
+    request.proof_requested = false;
+
+    let mut service = LocalRootTreeService::open(config, SharedCommittedImages::default())
+        .expect("native extension malformed-reply fixture opens");
+    let extension = Arc::new(MalformedReplyNativeExtension::default());
+    service.set_native_extension_invoker(extension.clone());
+    let committed = service
+        .invoke(request)
+        .expect("the actor handles a malformed extension reply as a typed failure");
+    assert_eq!(extension.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        committed
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U32(0)),
     );
 }
 
