@@ -12844,6 +12844,13 @@ fn extension_thread(
             if Instant::now() >= deadline {
                 bump();
                 let payload = encode_tick_payload();
+                let task_context = crate::extension::ExtensionInvocationContext::new(
+                    id,
+                    next_dispatch_invocation_id(strategy.as_ref(), id),
+                    crate::actors::Caller::Unauthenticated,
+                    None,
+                    None,
+                );
                 // No external caller → RELAY_CALLER unset → a tick's
                 // `ctx.ask` relays as `Unauthenticated`
                 // (no authenticated caller to propagate).
@@ -12851,6 +12858,7 @@ fn extension_thread(
                     &ex,
                     &mut instance,
                     &payload,
+                    task_context,
                     id,
                     &blob_fetch,
                     &invoke_routes,
@@ -12887,14 +12895,21 @@ fn extension_thread(
             match invoke_rx.try_recv() {
                 Ok(req) => {
                     bump();
+                    let task_context = crate::extension::ExtensionInvocationContext::new(
+                        id,
+                        next_dispatch_invocation_id(strategy.as_ref(), id),
+                        req.caller.clone(),
+                        req.space_role,
+                        req.actor_local_role,
+                    );
                     // Stamp the real caller of this invoke for
-                    // the duration of the dispatch, so an `EFFECT_ASK`
-                    // raised by the handler relays it (bounded by `intra_caps`)
-                    // instead of the `Caller::Actor` bypass. RAII-cleared after
-                    // the dispatch (and on panic, via the catch in run_ext_task)
-                    // so it never leaks to the next invoke or a self-originated
-                    // call. The envelope path below leaves it unstamped → such
-                    // calls relay as `Unauthenticated`.
+                    // the duration of the dispatch. The task context exposes it
+                    // to the handler, while `RELAY_CALLER` propagates it through
+                    // an `EFFECT_ASK` (bounded by `intra_caps`) instead of the
+                    // `Caller::Actor` bypass. RAII-cleared after the dispatch
+                    // (and on panic, via the catch in run_ext_task) so it never
+                    // leaks to the next invoke or a self-originated call. The
+                    // envelope path below leaves it unstamped and unauthenticated.
                     let outcome = {
                         let _relay = RelayCallerGuard::stamp(PropagatedCaller {
                             caller: req.caller.clone(),
@@ -12904,6 +12919,7 @@ fn extension_thread(
                             &ex,
                             &mut instance,
                             &req.msg,
+                            task_context,
                             id,
                             &blob_fetch,
                             &invoke_routes,
@@ -12970,10 +12986,18 @@ fn extension_thread(
         // Envelope path: actor-to-actor messaging carries no external caller,
         // so `RELAY_CALLER` stays unset → any `ctx.ask` here relays as
         // `Unauthenticated` (no authenticated caller to propagate).
+        let task_context = crate::extension::ExtensionInvocationContext::new(
+            id,
+            next_dispatch_invocation_id(strategy.as_ref(), id),
+            crate::actors::Caller::Unauthenticated,
+            None,
+            None,
+        );
         let outcome = dispatch_and_poll(
             &ex,
             &mut instance,
             &envelope.payload,
+            task_context,
             id,
             &blob_fetch,
             &invoke_routes,
@@ -13641,6 +13665,7 @@ fn dispatch_and_poll(
     ex: &async_executor::LocalExecutor<'_>,
     instance: &mut crate::extension::ExtensionInstance<'_>,
     msg: &[u8],
+    task_context: crate::extension::ExtensionInvocationContext,
     extension_id: ServiceId,
     blob_fetch: &BlobFetchCtx<'_>,
     invoke_routes: &InvokeRoutes,
@@ -13652,7 +13677,7 @@ fn dispatch_and_poll(
     // before the next message. Running a second root task while this one holds
     // `&mut actor` would alias — concurrency is reserved for the `&self` service
     // model (later phases).
-    let handle = instance.new_task(msg);
+    let handle = instance.new_task_with_context(msg, &task_context);
     if handle == 0 {
         // No handler matched (unknown / undecodable method) — the old
         // POLL_ERR_NO_FUTURE / "went idle" path.
@@ -14709,6 +14734,78 @@ mod tests {
         let cfg = ExtensionConfig::new("x.so").with_intra_caps(caps());
         assert_eq!(cfg.intra_caps.len(), 1);
         assert!(ExtensionConfig::new("x.so").intra_caps.is_empty());
+    }
+
+    #[test]
+    fn extension_receives_authenticated_invocation_context() {
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let echo_path = workspace
+            .join("target")
+            .join(profile)
+            .join("libecho_extension.so");
+        if !echo_path.exists() {
+            eprintln!("skipping: build echo-extension first");
+            return;
+        }
+
+        use crate::actors::codec::Encode as _;
+        use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
+        let mut payload = vec![TAG_DYNAMIC];
+        payload.extend_from_slice(&Msg::new("invocation_context").encode());
+
+        let mut node = VosNode::new();
+        let id = ServiceId(0x00ff_1010);
+        node.register_extension_at_id(ExtensionConfig::new(echo_path), id);
+
+        let system_reply = node
+            .invoke(id, payload.clone())
+            .expect("system invoke reply");
+        let system_value: Value = crate::Decode::decode(&system_reply);
+        let expected_system = format!("system|{}|set|none", id.0);
+        assert_eq!(system_value.as_str(), Some(expected_system.as_str()));
+
+        let invoke_tx = node
+            .invoke_routes
+            .lock()
+            .unwrap()
+            .get(&id.0)
+            .cloned()
+            .expect("extension invoke route");
+        let (reply_tx, reply_rx) = mpsc::channel();
+        invoke_tx
+            .send(InvokeRequest {
+                caller: crate::actors::Caller::Peer(vec![1, 2, 3]),
+                space_role: Some(crate::actors::SpaceRole::Member.as_u8()),
+                actor_local_role: None,
+                #[cfg(all(feature = "network", feature = "storage"))]
+                delegated_origin: None,
+                role_authority_request: false,
+                root_upgrade_request: false,
+                msg: payload,
+                reply: ReplyChannel::Sync(reply_tx),
+                chain: Vec::new(),
+            })
+            .expect("send authenticated invoke");
+        let envelope = reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("authenticated invoke reply");
+        let peer_reply = unwrap_invoke_envelope(&envelope).expect("successful invoke envelope");
+        let peer_value: Value = crate::Decode::decode(&peer_reply);
+        let expected_peer = format!("peer:[1, 2, 3]|{}|set|member", id.0);
+        assert_eq!(peer_value.as_str(), Some(expected_peer.as_str()));
+
+        node.shutdown();
+        let results = node.collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].error, None);
     }
 
     #[test]

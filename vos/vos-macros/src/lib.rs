@@ -4,8 +4,209 @@
 //! - `#[messages]` — message types, dispatch enum, entry points
 
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::{FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType, parse_macro_input};
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+fn fingerprint_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+}
+
+fn fingerprint_frame(hash: &mut u64, bytes: &[u8]) {
+    fingerprint_bytes(hash, &(bytes.len() as u64).to_le_bytes());
+    fingerprint_bytes(hash, bytes);
+}
+
+fn fingerprint_literal(hash: &mut u64, literal: proc_macro2::Literal) {
+    let original = literal.to_string();
+    let tokens = proc_macro2::TokenStream::from(proc_macro2::TokenTree::Literal(literal));
+    let Ok(literal) = syn::parse2::<syn::Lit>(tokens) else {
+        fingerprint_bytes(hash, &[0xff]);
+        fingerprint_frame(hash, original.as_bytes());
+        return;
+    };
+
+    match literal {
+        syn::Lit::Str(value) => {
+            fingerprint_bytes(hash, &[0]);
+            fingerprint_frame(hash, value.value().as_bytes());
+            fingerprint_frame(hash, value.suffix().as_bytes());
+        }
+        syn::Lit::ByteStr(value) => {
+            fingerprint_bytes(hash, &[1]);
+            fingerprint_frame(hash, &value.value());
+            fingerprint_frame(hash, value.suffix().as_bytes());
+        }
+        syn::Lit::CStr(value) => {
+            fingerprint_bytes(hash, &[2]);
+            fingerprint_frame(hash, value.value().as_bytes_with_nul());
+            fingerprint_frame(hash, value.suffix().as_bytes());
+        }
+        syn::Lit::Byte(value) => {
+            fingerprint_bytes(hash, &[3, value.value()]);
+            fingerprint_frame(hash, value.suffix().as_bytes());
+        }
+        syn::Lit::Char(value) => {
+            fingerprint_bytes(hash, &[4]);
+            fingerprint_bytes(hash, &(value.value() as u32).to_le_bytes());
+            fingerprint_frame(hash, value.suffix().as_bytes());
+        }
+        syn::Lit::Int(value) => {
+            fingerprint_bytes(hash, &[5]);
+            fingerprint_frame(hash, value.base10_digits().as_bytes());
+            fingerprint_frame(hash, value.suffix().as_bytes());
+        }
+        syn::Lit::Float(value) => {
+            fingerprint_bytes(hash, &[6]);
+            fingerprint_frame(hash, value.base10_digits().as_bytes());
+            fingerprint_frame(hash, value.suffix().as_bytes());
+        }
+        syn::Lit::Bool(value) => fingerprint_bytes(hash, &[7, u8::from(value.value())]),
+        syn::Lit::Verbatim(value) => {
+            fingerprint_bytes(hash, &[0xff]);
+            fingerprint_frame(hash, value.to_string().as_bytes());
+        }
+        _ => {
+            fingerprint_bytes(hash, &[0xff]);
+            fingerprint_frame(hash, original.as_bytes());
+        }
+    }
+}
+
+/// Hash a token tree structurally: whitespace, spans, and rustc's pretty
+/// printer never enter the fingerprint. Delimiters and punctuation spacing do,
+/// because they distinguish otherwise-ambiguous Rust syntax.
+fn fingerprint_tokens(hash: &mut u64, tokens: proc_macro2::TokenStream) {
+    use proc_macro2::{Delimiter, Spacing, TokenTree};
+
+    for token in tokens {
+        match token {
+            TokenTree::Group(group) => {
+                fingerprint_bytes(hash, &[0]);
+                fingerprint_bytes(
+                    hash,
+                    &[match group.delimiter() {
+                        Delimiter::Parenthesis => 0,
+                        Delimiter::Brace => 1,
+                        Delimiter::Bracket => 2,
+                        Delimiter::None => 3,
+                    }],
+                );
+                fingerprint_tokens(hash, group.stream());
+                fingerprint_bytes(hash, &[0xff]);
+            }
+            TokenTree::Ident(ident) => {
+                fingerprint_bytes(hash, &[1]);
+                fingerprint_frame(hash, ident.to_string().as_bytes());
+            }
+            TokenTree::Punct(punct) => {
+                fingerprint_bytes(hash, &[2]);
+                fingerprint_bytes(hash, &(punct.as_char() as u32).to_le_bytes());
+                fingerprint_bytes(
+                    hash,
+                    &[match punct.spacing() {
+                        Spacing::Alone => 0,
+                        Spacing::Joint => 1,
+                    }],
+                );
+            }
+            TokenTree::Literal(literal) => {
+                fingerprint_bytes(hash, &[3]);
+                fingerprint_literal(hash, literal);
+            }
+        }
+    }
+}
+
+fn fingerprint_relevant_attrs(hash: &mut u64, attrs: &[syn::Attribute]) {
+    for attr in attrs.iter().filter(|attr| {
+        let path = attr.path();
+        path.is_ident("rkyv")
+            || path.is_ident("repr")
+            || path.is_ident("cfg")
+            || path.is_ident("cfg_attr")
+            || path.is_ident("storage")
+            || path.is_ident("crdt")
+    }) {
+        fingerprint_bytes(hash, &[0xa0]);
+        fingerprint_tokens(hash, attr.meta.to_token_stream());
+    }
+}
+
+/// Canonical fingerprint of the direct archived state schema.
+///
+/// This deliberately excludes the struct's name, visibility, documentation,
+/// lint attributes, spans, and formatting. Field kind/order/name/type and the
+/// attributes that can alter compiled/archive representation or framework
+/// persistence remain part of the contract. Nested named types still require
+/// an explicit state-version bump when their representation changes.
+fn state_schema_fingerprint(input: &ItemStruct) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    fingerprint_frame(&mut hash, b"vos/state-schema/v1");
+    fingerprint_relevant_attrs(&mut hash, &input.attrs);
+
+    // Generic parameter declarations are part of the type vocabulary used by
+    // field types. Bounds and where clauses do not change the archived fields,
+    // so hash the parameter kind/name (and const parameter type) only.
+    for param in &input.generics.params {
+        match param {
+            syn::GenericParam::Lifetime(param) => {
+                fingerprint_bytes(&mut hash, &[0xb0]);
+                fingerprint_frame(&mut hash, param.lifetime.ident.to_string().as_bytes());
+            }
+            syn::GenericParam::Type(param) => {
+                fingerprint_bytes(&mut hash, &[0xb1]);
+                fingerprint_frame(&mut hash, param.ident.to_string().as_bytes());
+            }
+            syn::GenericParam::Const(param) => {
+                fingerprint_bytes(&mut hash, &[0xb2]);
+                fingerprint_frame(&mut hash, param.ident.to_string().as_bytes());
+                fingerprint_tokens(&mut hash, param.ty.to_token_stream());
+                if let Some(default) = &param.default {
+                    fingerprint_bytes(&mut hash, &[1]);
+                    fingerprint_tokens(&mut hash, default.to_token_stream());
+                } else {
+                    fingerprint_bytes(&mut hash, &[0]);
+                }
+            }
+        }
+    }
+
+    match &input.fields {
+        syn::Fields::Named(fields) => {
+            fingerprint_bytes(&mut hash, &[0xc0]);
+            for field in &fields.named {
+                fingerprint_bytes(&mut hash, &[0xc1]);
+                fingerprint_relevant_attrs(&mut hash, &field.attrs);
+                fingerprint_frame(
+                    &mut hash,
+                    field
+                        .ident
+                        .as_ref()
+                        .expect("named field")
+                        .to_string()
+                        .as_bytes(),
+                );
+                fingerprint_tokens(&mut hash, field.ty.to_token_stream());
+            }
+        }
+        syn::Fields::Unnamed(fields) => {
+            fingerprint_bytes(&mut hash, &[0xc2]);
+            for field in &fields.unnamed {
+                fingerprint_bytes(&mut hash, &[0xc3]);
+                fingerprint_relevant_attrs(&mut hash, &field.attrs);
+                fingerprint_tokens(&mut hash, field.ty.to_token_stream());
+            }
+        }
+        syn::Fields::Unit => fingerprint_bytes(&mut hash, &[0xc4]),
+    }
+    hash
+}
 
 /// First paragraph of a doc comment: the `#[doc = "..."]` text joined
 /// with spaces (each line trimmed), stopping at the first blank line.
@@ -106,7 +307,13 @@ fn first_doc_paragraph(attrs: &[syn::Attribute]) -> String {
 #[proc_macro_attribute]
 pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(item as ItemStruct);
-    let parsed = parse_actor_attrs(attr);
+    let parsed = match parse_actor_attrs(attr.into()) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    // Validation and code generation strip framework-owned field attributes;
+    // retain the declared form for the persistence fingerprint.
+    let state_schema = input.clone();
     let crdt_fields = match prepare_crdt_fields(&mut input, parsed.crdt) {
         Ok(fields) => fields,
         Err(error) => return error.to_compile_error().into(),
@@ -145,16 +352,14 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     // actor-level line in `.vos_meta` (shown by `vosx <target>` help).
     let actor_doc = first_doc_paragraph(&input.attrs);
     let fields = &input.fields;
-    // Stable FNV-1a over the direct state declaration. This catches field
-    // additions/removals/reorders and direct type changes automatically. A
-    // declared `state_version` covers representation changes inside a named
-    // nested type, whose definition is intentionally outside this macro's AST.
-    let state_shape = quote! { #name #impl_generics #fields }.to_string();
-    let mut state_fingerprint = 0xcbf29ce484222325u64;
-    for byte in state_shape.as_bytes() {
-        state_fingerprint ^= u64::from(*byte);
-        state_fingerprint = state_fingerprint.wrapping_mul(0x100000001b3);
-    }
+    let state_fingerprint = state_schema_fingerprint(&state_schema);
+    // `VOSXST02` snapshots written before the canonical schema encoder used
+    // quote's display rendering. Keep this exact declaration-specific value as
+    // a one-way migration path; all newly-written snapshots use the canonical
+    // fingerprint above.
+    let legacy_state_shape = quote! { #name #impl_generics #fields }.to_string();
+    let mut legacy_state_fingerprint = FNV_OFFSET_BASIS;
+    fingerprint_bytes(&mut legacy_state_fingerprint, legacy_state_shape.as_bytes());
 
     // Re-emit struct with rkyv derives injected
     let struct_def = match fields {
@@ -379,6 +584,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             const STATE_SCHEMA_VERSION: u64 = #state_version;
             const STATE_SCHEMA_FINGERPRINT: u64 = #state_fingerprint;
+            const STATE_SCHEMA_LEGACY_FINGERPRINTS: &'static [u64] = &[#legacy_state_fingerprint];
 
             fn create() -> Self {
                 Self::__vos_create()
@@ -1646,7 +1852,7 @@ struct ActorAttrs {
     provable: bool,
     /// Explicit persisted-state contract version. Direct fields are also
     /// fingerprinted automatically; this covers changes inside nested types.
-    state_version: proc_macro2::TokenStream,
+    state_version: u64,
 }
 
 /// Pull `#[storage]` / `#[storage(prefix = "…")]` off the state
@@ -1756,7 +1962,7 @@ fn extract_storage_fields(input: &mut ItemStruct) -> Vec<StorageField> {
 /// Recognised keys:
 /// - `error = Type` — custom Actor::Error type (default `()`)
 /// - `state_version = N` — explicit nested persisted-state schema version
-fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
+fn parse_actor_attrs(attr: proc_macro2::TokenStream) -> syn::Result<ActorAttrs> {
     use syn::Token;
     use syn::parse::Parser;
     use syn::punctuated::Punctuated;
@@ -1770,10 +1976,10 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
         task_buf: None,
         crdt: false,
         provable: false,
-        state_version: quote! { 0u64 },
+        state_version: 0,
     };
     if attr.is_empty() {
-        return out;
+        return Ok(out);
     }
 
     // Proc-macro attribute body is the tokens inside the parens,
@@ -1782,10 +1988,7 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
     // `#[actor(role = X, default_role = Y, ...)]` work — a bare
     // `syn::parse::<syn::Meta>` only handles a single arg.
     let metas: Punctuated<syn::Meta, Token![,]> =
-        match Punctuated::<syn::Meta, Token![,]>::parse_terminated.parse(attr) {
-            Ok(p) => p,
-            Err(_) => return out,
-        };
+        Punctuated::<syn::Meta, Token![,]>::parse_terminated.parse2(attr)?;
 
     for meta in metas {
         match meta {
@@ -1807,8 +2010,17 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
                 out.space_role_map = quote! { #val };
             }
             syn::Meta::NameValue(nv) if nv.path.is_ident("state_version") => {
-                let val = &nv.value;
-                out.state_version = quote! { #val };
+                let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Int(version),
+                    ..
+                }) = &nv.value
+                else {
+                    return Err(syn::Error::new_spanned(
+                        &nv.value,
+                        "`state_version` must be an integer literal",
+                    ));
+                };
+                out.state_version = version.base10_parse::<u64>()?;
             }
             // Task blob: `task` (default 16 KiB witness buffer) or
             // `task = N` for a custom size. The buffer bounds the
@@ -1822,24 +2034,35 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
                 out.crdt = true;
             }
             syn::Meta::NameValue(nv) if nv.path.is_ident("task") => {
-                if let syn::Expr::Lit(syn::ExprLit {
+                let syn::Expr::Lit(syn::ExprLit {
                     lit: syn::Lit::Int(n),
                     ..
                 }) = &nv.value
-                {
-                    out.task_buf = Some(n.base10_parse().unwrap_or(DEFAULT_TASK_BUF));
-                }
+                else {
+                    return Err(syn::Error::new_spanned(
+                        &nv.value,
+                        "`task` buffer size must be an integer literal",
+                    ));
+                };
+                out.task_buf = Some(n.base10_parse::<usize>()?);
             }
             // Publication mark for the pin/verify tooling; validated
-            // against `task` in `actor()` (the parse layer has no
-            // error channel).
+            // against `task` in `actor()` after parsing.
             syn::Meta::Path(p) if p.is_ident("provable") => {
                 out.provable = true;
             }
-            _ => {}
+            unsupported => {
+                return Err(syn::Error::new_spanned(
+                    unsupported,
+                    "unsupported #[actor] option; expected `error = Type`, \
+                     `role = Type`, `default_role = Role`, \
+                     `space_role_map = MAP`, `state_version = N`, `task`, \
+                     `task = N`, `crdt`, or `provable`",
+                ));
+            }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Strip and validate `#[crdt(const)]` / `#[crdt(skip)]` field annotations.
@@ -2361,7 +2584,11 @@ fn to_pascal_case(s: &str) -> String {
 
 #[cfg(test)]
 mod doc_tests {
-    use super::{first_doc_paragraph, is_attestation_type, valid_capability_name};
+    use super::{
+        first_doc_paragraph, is_attestation_type, parse_actor_attrs, state_schema_fingerprint,
+        valid_capability_name,
+    };
+    use quote::quote;
 
     fn attrs(src: &str) -> Vec<syn::Attribute> {
         syn::parse_str::<syn::ItemStruct>(src).unwrap().attrs
@@ -2419,7 +2646,6 @@ mod doc_tests {
         assert!(!is_attestation_type(&ty("vos::Attestation<Claim>")));
         assert!(!is_attestation_type(&ty("vos::Attestation")));
     }
-
     #[test]
     fn capability_names_are_stable_lowercase_identifiers() {
         assert!(valid_capability_name("agent.invoke"));
@@ -2429,5 +2655,91 @@ mod doc_tests {
         assert!(!valid_capability_name("2agent.invoke"));
         assert!(!valid_capability_name("agent/invoke"));
         assert!(!valid_capability_name(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn state_fingerprint_ignores_non_schema_source_details() {
+        let first: syn::ItemStruct = syn::parse_quote! {
+            /// Documentation is not persisted.
+            pub struct PublicName {
+                #[allow(dead_code)]
+                pub value: Vec<u8>,
+            }
+        };
+        let second: syn::ItemStruct = syn::parse_quote! {
+            #[allow(non_camel_case_types)]
+            struct renamed {
+                value: Vec < u8 >,
+            }
+        };
+
+        assert_eq!(
+            state_schema_fingerprint(&first),
+            state_schema_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn state_fingerprint_tracks_direct_archive_schema() {
+        let base: syn::ItemStruct = syn::parse_quote! {
+            struct State { first: u8, second: u16 }
+        };
+        let reordered: syn::ItemStruct = syn::parse_quote! {
+            struct State { second: u16, first: u8 }
+        };
+        let changed_type: syn::ItemStruct = syn::parse_quote! {
+            struct State { first: u8, second: u32 }
+        };
+        let archive_attr: syn::ItemStruct = syn::parse_quote! {
+            struct State {
+                first: u8,
+                #[rkyv(with = Adapter)]
+                second: u16,
+            }
+        };
+        let storage_attr: syn::ItemStruct = syn::parse_quote! {
+            struct State {
+                first: u8,
+                #[storage(prefix = "different/")]
+                second: u16,
+            }
+        };
+        let fingerprint = state_schema_fingerprint(&base);
+
+        assert_ne!(fingerprint, state_schema_fingerprint(&reordered));
+        assert_ne!(fingerprint, state_schema_fingerprint(&changed_type));
+        assert_ne!(fingerprint, state_schema_fingerprint(&archive_attr));
+        assert_ne!(fingerprint, state_schema_fingerprint(&storage_attr));
+    }
+
+    #[test]
+    fn state_fingerprint_normalizes_equivalent_integer_literals() {
+        let decimal: syn::ItemStruct = syn::parse_quote! {
+            struct State { bytes: [u8; 16] }
+        };
+        let hexadecimal: syn::ItemStruct = syn::parse_quote! {
+            struct State { bytes: [u8; 0x10] }
+        };
+        let separated: syn::ItemStruct = syn::parse_quote! {
+            struct State { bytes: [u8; 1_6] }
+        };
+
+        let expected = state_schema_fingerprint(&decimal);
+        assert_eq!(expected, state_schema_fingerprint(&hexadecimal));
+        assert_eq!(expected, state_schema_fingerprint(&separated));
+    }
+
+    #[test]
+    fn actor_attributes_reject_typos_and_malformed_values() {
+        assert!(parse_actor_attrs(quote!(state_verison = 1)).is_err());
+        assert!(parse_actor_attrs(quote!(state_version = CURRENT)).is_err());
+        assert!(parse_actor_attrs(quote!(task = "large")).is_err());
+        assert!(parse_actor_attrs(quote!(task,, crdt)).is_err());
+
+        let parsed = parse_actor_attrs(quote!(task = 4096, crdt, state_version = 2))
+            .expect("valid actor attributes");
+        assert_eq!(parsed.task_buf, Some(4096));
+        assert!(parsed.crdt);
+        assert_eq!(parsed.state_version, 2);
     }
 }

@@ -472,13 +472,24 @@ macro_rules! __vos_emit_worker_glue {
             // (reserved). The scheduler runs host-side.
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_extension_task_new(
+            pub extern "C" fn vos_extension_task_new_v2(
                 state: *mut (),
                 msg_ptr: *const u8,
                 msg_len: usize,
+                context_ptr: *const u8,
+                context_len: usize,
             ) -> u64 {
+                if state.is_null() || msg_ptr.is_null() || context_ptr.is_null() {
+                    return 0;
+                }
                 let ws = unsafe { &mut *(state as *mut WorkerState) };
                 let raw = unsafe { core::slice::from_raw_parts(msg_ptr, msg_len) };
+                let context_raw = unsafe { core::slice::from_raw_parts(context_ptr, context_len) };
+                let Some(task_context) =
+                    $crate::extension::ExtensionInvocationContext::decode(context_raw)
+                else {
+                    return 0;
+                };
 
                 if raw.first() != Some(&$crate::value::TAG_DYNAMIC) {
                     return 0;
@@ -501,8 +512,7 @@ macro_rules! __vos_emit_worker_glue {
                 // waker hands ExecIo). Output = the reply bytes, so the
                 // (non-generic) per-task machinery never touches this Context.
                 let future: Pin<Box<dyn Future<Output = Vec<u8>>>> = Box::pin(async move {
-                    let mut ctx =
-                        $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
+                    let mut ctx = task_context.into_actor_context::<$actor_name>();
                     // SAFETY: extensions are driven N=1 by the host (one root task
                     // at a time, to completion), so this is the only live &mut to
                     // the actor.
@@ -642,10 +652,13 @@ macro_rules! __vos_emit_worker_glue {
                 version_bytes.copy_from_slice(&bytes[8..16]);
                 let mut fingerprint_bytes = [0u8; 8];
                 fingerprint_bytes.copy_from_slice(&bytes[16..24]);
+                let saved_fingerprint = u64::from_le_bytes(fingerprint_bytes);
                 if u64::from_le_bytes(version_bytes)
                     != <$actor_name as $crate::Actor>::STATE_SCHEMA_VERSION
-                    || u64::from_le_bytes(fingerprint_bytes)
+                    || (saved_fingerprint
                         != <$actor_name as $crate::Actor>::STATE_SCHEMA_FINGERPRINT
+                        && !<$actor_name as $crate::Actor>::STATE_SCHEMA_LEGACY_FINGERPRINTS
+                            .contains(&saved_fingerprint))
                 {
                     return core::ptr::null_mut();
                 }

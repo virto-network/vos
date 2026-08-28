@@ -11,7 +11,7 @@
 //!
 //! - `vos_extension_meta` — returns a pointer to the `.vos_meta` blob
 //! - `vos_extension_create` — allocates an extension instance (actor + context)
-//! - `vos_extension_task_new` / `vos_extension_task_poll` — create and drive a task
+//! - `vos_extension_task_new_v2` / `vos_extension_task_poll` — create and drive a task
 //! - `vos_extension_task_drop` — releases a completed or failed task
 //! - `vos_extension_load` — restores a versioned persisted-state envelope
 //! - `vos_extension_state_v2` — returns state pointer, length, and true capacity
@@ -28,6 +28,144 @@
 //! generated automatically by the `#[messages]` macro.
 
 use alloc::vec::Vec;
+
+const INVOCATION_CONTEXT_MAGIC: &[u8; 8] = b"VOSXCTX2";
+const MAX_CALLER_WIRE_BYTES: usize = 1024;
+
+/// Host-authenticated context installed for one native-extension invocation.
+///
+/// The C ABI carries this as a small, explicitly-versioned byte string instead
+/// of a Rust `repr(C)` enum: [`crate::Caller::Peer`] is variable length, and no
+/// Rust enum layout is stable across independently-built host/plugin binaries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionInvocationContext {
+    service_id: crate::actors::context::ServiceId,
+    invocation_id: crate::service::InvocationId,
+    caller: crate::Caller,
+    space_role: Option<u8>,
+    actor_local_role: Option<u8>,
+}
+
+impl ExtensionInvocationContext {
+    pub fn new(
+        service_id: crate::actors::context::ServiceId,
+        invocation_id: crate::service::InvocationId,
+        caller: crate::Caller,
+        space_role: Option<u8>,
+        actor_local_role: Option<u8>,
+    ) -> Self {
+        Self {
+            service_id,
+            invocation_id,
+            caller,
+            space_role,
+            actor_local_role,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        let (caller_tag, caller_payload): (u8, Vec<u8>) = match &self.caller {
+            crate::Caller::Unauthenticated => (0, Vec::new()),
+            crate::Caller::System => (1, Vec::new()),
+            crate::Caller::Peer(peer) if peer.len() <= MAX_CALLER_WIRE_BYTES => (2, peer.clone()),
+            crate::Caller::Peer(_) => return None,
+            crate::Caller::Member(subject) => (3, subject.0.to_vec()),
+            crate::Caller::Actor(service) => (4, service.0.to_le_bytes().to_vec()),
+        };
+        let caller_len = u32::try_from(caller_payload.len()).ok()?;
+        let mut bytes = Vec::with_capacity(53 + caller_payload.len());
+        bytes.extend_from_slice(INVOCATION_CONTEXT_MAGIC);
+        bytes.extend_from_slice(&self.service_id.0.to_le_bytes());
+        bytes.extend_from_slice(self.invocation_id.as_bytes());
+        bytes.push(caller_tag);
+        bytes.extend_from_slice(&caller_len.to_le_bytes());
+        bytes.extend_from_slice(&caller_payload);
+        for role in [self.space_role, self.actor_local_role] {
+            match role {
+                Some(role) => bytes.extend_from_slice(&[1, role]),
+                None => bytes.extend_from_slice(&[0, 0]),
+            }
+        }
+        Some(bytes)
+    }
+
+    #[doc(hidden)]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 53 || bytes.len() > 53 + MAX_CALLER_WIRE_BYTES {
+            return None;
+        }
+        let mut offset = 0usize;
+        let mut take = |len: usize| {
+            let end = offset.checked_add(len)?;
+            let value = bytes.get(offset..end)?;
+            offset = end;
+            Some(value)
+        };
+        if take(8)? != INVOCATION_CONTEXT_MAGIC {
+            return None;
+        }
+        let service_id =
+            crate::actors::context::ServiceId(u32::from_le_bytes(take(4)?.try_into().ok()?));
+        let invocation_id = crate::service::InvocationId::new(take(32)?.try_into().ok()?);
+        let caller_tag = *take(1)?.first()?;
+        let caller_len = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        if caller_len > MAX_CALLER_WIRE_BYTES {
+            return None;
+        }
+        let caller_payload = take(caller_len)?;
+        let caller = match (caller_tag, caller_payload) {
+            (0, []) => crate::Caller::Unauthenticated,
+            (1, []) => crate::Caller::System,
+            (2, peer) => crate::Caller::Peer(peer.to_vec()),
+            (3, subject) if subject.len() == 32 => {
+                crate::Caller::Member(crate::service::SubjectId::new(subject.try_into().ok()?))
+            }
+            (4, service) if service.len() == 4 => crate::Caller::Actor(
+                crate::actors::context::ServiceId(u32::from_le_bytes(service.try_into().ok()?)),
+            ),
+            _ => return None,
+        };
+        let decode_role = |wire: &[u8]| match wire {
+            [0, 0] => Some(None),
+            [1, role] => Some(Some(*role)),
+            _ => None,
+        };
+        let space_role = decode_role(take(2)?)?;
+        let actor_local_role = decode_role(take(2)?)?;
+        if offset != bytes.len() {
+            return None;
+        }
+        Some(Self {
+            service_id,
+            invocation_id,
+            caller,
+            space_role,
+            actor_local_role,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn into_actor_context<A: crate::Actor>(self) -> crate::Context<A> {
+        let mut context = crate::Context::new(self.service_id);
+        context.__set_invocation_id(self.invocation_id);
+        context.set_caller(self.caller);
+        context.set_caller_roles(self.space_role, self.actor_local_role);
+        context
+    }
+}
+
+impl Default for ExtensionInvocationContext {
+    fn default() -> Self {
+        Self::new(
+            crate::actors::context::ServiceId(0),
+            crate::service::InvocationId::ZERO,
+            crate::Caller::Unauthenticated,
+            None,
+            None,
+        )
+    }
+}
 
 /// Result of polling a extension handler, returned across the C ABI.
 #[repr(C)]
@@ -96,10 +234,10 @@ impl ExtensionPollResult {
 // `node.rs`). The `.so` keeps only the irreducible per-task future machinery
 // (`vos::actors::exec`), driven by four symbols the host calls per task:
 //
-//   vos_extension_task_new(state, msg_ptr, msg_len) -> u64
-//       Build the handler future for `msg`, box it in the instance's task slab,
-//       return a stable non-zero handle (0 = couldn't build, e.g. unknown
-//       method → the host maps that to an error).
+//   vos_extension_task_new_v2(state, msg_ptr, msg_len, context_ptr, context_len)
+//       Decode the host-authenticated invocation context, build the handler
+//       future for `msg`, and return a stable non-zero task handle (0 = invalid
+//       context or unknown message).
 //   vos_extension_task_poll(state, handle, result_ptr, result_len) -> TaskPoll
 //       Inject the host's fulfilment of the previous TASK_PENDING (empty on the
 //       first poll), then poll the future once under the `.so`'s own
@@ -179,7 +317,13 @@ mod host {
     type CreateFn = unsafe extern "C" fn(args_ptr: *const u8, args_len: usize) -> *mut ();
     /// Build the handler future for `msg`, box it in the task slab, return a
     /// stable non-zero handle (0 = couldn't build, e.g. unknown method).
-    type TaskNewFn = unsafe extern "C" fn(state: *mut (), msg: *const u8, msg_len: usize) -> u64;
+    type TaskNewFn = unsafe extern "C" fn(
+        state: *mut (),
+        msg: *const u8,
+        msg_len: usize,
+        context: *const u8,
+        context_len: usize,
+    ) -> u64;
     /// Inject `result` (the fulfilment of the previous TASK_PENDING; empty on
     /// the first poll), then poll the task's future once.
     type TaskPollFn = unsafe extern "C" fn(
@@ -264,8 +408,12 @@ mod host {
                 // clear error.
                 let actor = ActorSymbols {
                     task_new_fn: *lib
-                        .get::<TaskNewFn>(b"vos_extension_task_new")
-                        .map_err(|e| format!("missing vos_extension_task_new: {e}"))?,
+                        .get::<TaskNewFn>(b"vos_extension_task_new_v2")
+                        .map_err(|e| {
+                            format!(
+                                "missing vos_extension_task_new_v2 (rebuild the extension for the current task ABI): {e}"
+                            )
+                        })?,
                     task_poll_fn: *lib
                         .get::<TaskPollFn>(b"vos_extension_task_poll")
                         .map_err(|e| format!("missing vos_extension_task_poll: {e}"))?,
@@ -400,8 +548,29 @@ mod host {
         /// Returns a stable non-zero handle, or `0` when no handler matched
         /// (e.g. an unknown method) — the caller maps `0` to an error.
         pub fn new_task(&mut self, msg: &[u8]) -> u64 {
+            self.new_task_with_context(msg, &super::ExtensionInvocationContext::default())
+        }
+
+        /// Build a handler future with the caller identity and authorization
+        /// data authenticated by the host for this invocation.
+        pub fn new_task_with_context(
+            &mut self,
+            msg: &[u8],
+            context: &super::ExtensionInvocationContext,
+        ) -> u64 {
+            let Some(context) = context.encode() else {
+                return 0;
+            };
             let syms = self.plugin.actor_syms();
-            unsafe { (syms.task_new_fn)(self.state, msg.as_ptr(), msg.len()) }
+            unsafe {
+                (syms.task_new_fn)(
+                    self.state,
+                    msg.as_ptr(),
+                    msg.len(),
+                    context.as_ptr(),
+                    context.len(),
+                )
+            }
         }
 
         /// Inject `result` (the fulfilment of the previous [`TaskOutcome::Pending`];
@@ -529,6 +698,66 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[test]
+    fn invocation_context_wire_round_trips_all_caller_variants() {
+        let service_id = crate::actors::context::ServiceId(0x1234_5678);
+        let invocation_id = crate::service::InvocationId::new([0x5a; 32]);
+        let callers = [
+            crate::Caller::Unauthenticated,
+            crate::Caller::System,
+            crate::Caller::Peer(vec![1, 2, 3, 4]),
+            crate::Caller::Member(crate::service::SubjectId::new([0xa5; 32])),
+            crate::Caller::Actor(crate::actors::context::ServiceId(42)),
+        ];
+
+        for caller in callers {
+            let expected = ExtensionInvocationContext::new(
+                service_id,
+                invocation_id,
+                caller,
+                Some(3),
+                Some(7),
+            );
+            let encoded = expected.encode().expect("encode invocation context");
+            assert_eq!(ExtensionInvocationContext::decode(&encoded), Some(expected));
+        }
+    }
+
+    #[test]
+    fn invocation_context_wire_rejects_malformed_or_oversized_inputs() {
+        let expected = ExtensionInvocationContext::new(
+            crate::actors::context::ServiceId(9),
+            crate::service::InvocationId::new([1; 32]),
+            crate::Caller::Peer(vec![2; MAX_CALLER_WIRE_BYTES + 1]),
+            None,
+            None,
+        );
+        assert!(expected.encode().is_none());
+
+        let valid = ExtensionInvocationContext::default()
+            .encode()
+            .expect("encode default invocation context");
+        for end in 0..valid.len() {
+            assert!(ExtensionInvocationContext::decode(&valid[..end]).is_none());
+        }
+
+        let mut bad_magic = valid.clone();
+        bad_magic[0] ^= 0xff;
+        assert!(ExtensionInvocationContext::decode(&bad_magic).is_none());
+
+        let mut bad_caller_tag = valid.clone();
+        bad_caller_tag[44] = 0xff;
+        assert!(ExtensionInvocationContext::decode(&bad_caller_tag).is_none());
+
+        let mut bad_role_tag = valid.clone();
+        bad_role_tag[49] = 2;
+        assert!(ExtensionInvocationContext::decode(&bad_role_tag).is_none());
+
+        let mut trailing = valid;
+        trailing.push(0);
+        assert!(ExtensionInvocationContext::decode(&trailing).is_none());
+    }
+
     fn echo_extension_path() -> PathBuf {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let workspace_root = PathBuf::from(manifest_dir).parent().unwrap().to_path_buf();
@@ -602,9 +831,24 @@ mod tests {
         let plugin = unsafe { ExtensionPlugin::load(&path) }.expect("load extension");
         assert!(plugin.load_state(&[0xff]).is_err());
 
-        let instance = plugin.create();
+        let mut instance = plugin.create();
         let mut state = instance.save_state().expect("save extension state");
         assert_eq!(&state[..8], b"VOSXST02");
+        let canonical = u64::from_le_bytes(state[16..24].try_into().unwrap());
+
+        let legacy_reply = instance
+            .dispatch(&crate::actors::value::Msg::new("legacy_state_fingerprint"))
+            .expect("query legacy schema fingerprint");
+        let legacy: crate::actors::value::Value =
+            crate::actors::codec::Decode::decode(&legacy_reply);
+        let legacy = legacy.as_u64().expect("legacy fingerprint reply");
+        assert_ne!(canonical, legacy);
+        state[16..24].copy_from_slice(&legacy.to_le_bytes());
+        assert!(
+            plugin.load_state(&state).is_ok(),
+            "the exact pre-canonical fingerprint for this declaration must migrate"
+        );
+
         state[8] ^= 1;
         assert!(
             plugin.load_state(&state).is_err(),

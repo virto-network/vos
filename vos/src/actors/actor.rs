@@ -109,6 +109,13 @@ pub trait Actor: Sized + Encode + Decode {
     #[doc(hidden)]
     const STATE_SCHEMA_FINGERPRINT: u64 = 0;
 
+    /// Fingerprints produced by earlier schema encoders that may be migrated
+    /// into the current canonical fingerprint. Generated actors list only the
+    /// exact legacy rendering of their current declaration, so an actually
+    /// different historic schema still fails closed.
+    #[doc(hidden)]
+    const STATE_SCHEMA_LEGACY_FINGERPRINTS: &'static [u64] = &[];
+
     /// Create a fresh actor instance with default state.
     /// Any initialization data should arrive as a regular message.
     fn create() -> Self;

@@ -137,7 +137,7 @@ impl TaskState {
 /// instance (lives in the glue's `WorkerState`); never shared across threads.
 ///
 /// Handles are `slab index + 1`, so `0` is reserved for "no task" (the
-/// `vos_extension_task_new` "couldn't build a handler" sentinel and the
+/// `vos_extension_task_new_v2` "couldn't build a handler" sentinel and the
 /// `vos_extension_take_spawned` "nothing spawned" sentinel).
 pub struct TaskTable {
     slots: Vec<Option<Box<TaskState>>>,
