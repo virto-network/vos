@@ -99,15 +99,18 @@ future consensus-committed extension outbox before they can safely coordinate
 node-local side effects; ephemeral roots cannot durably bind the result. A
 queued native call can time out only while it is still cancelable. Once the
 serial extension worker claims it, the bridge waits for the actual committed
-reply, preventing a reported timeout from being followed by late work. An
-explicit `BlockRef` is accepted only when its hash is finalized and canonical
-at the supplied height.
+reply, preventing a reported timeout from being followed by late work.
+`BlockRef`s returned by status or a query are backed by transient authenticated
+finalized-block tokens. The same caller can reuse one without an archive node;
+arbitrary, cross-caller, expired, reloaded, or reconnected references return
+`Stale`.
 
 Omit both paths for the bundled defaults. Actor-visible requests are capped at
-32 map rows, a 7 KiB encoded success reply, 16 active map snapshots per caller,
-and 32 pending signing payloads per caller. Map pages may be short while a
-non-empty cursor indicates more bounded trie partitions. Idle map cursors and
-unsigned preparations expire after four minutes; only one automatic-nonce
+32 map rows, a 7 KiB encoded success reply, 16 reusable query block references
+per caller, 16 active map snapshots per caller, and 32 pending signing payloads
+per caller. Query references, map cursors, and unsigned preparations expire
+after four minutes. Map pages may be short while a non-empty cursor indicates
+more bounded trie partitions. Only one automatic-nonce
 request per nonce account may be pending at once, and automatic-nonce requests
 must be mortal and wait for finalization. An ambiguous submission keeps its
 nonce reserved until the finalized account nonce advances or its mortal era

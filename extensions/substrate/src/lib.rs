@@ -14,6 +14,10 @@ use vos::prelude::*;
 pub const MAX_REPLY_BYTES: usize = 7 * 1024;
 /// Maximum map rows per request.
 pub const MAX_MAP_PAGE: u32 = 32;
+/// Maximum reusable finalized query block references retained for one caller.
+pub const MAX_QUERY_SNAPSHOTS: usize = 16;
+/// Reusable finalized query block references expire after four minutes of inactivity.
+pub const QUERY_SNAPSHOT_TTL_SECS: u64 = 240;
 /// Maximum live snapshot cursors retained for one caller.
 pub const MAX_MAP_SNAPSHOTS: usize = 16;
 /// Map snapshot cursors expire after four minutes of inactivity.
@@ -146,6 +150,7 @@ pub struct BlockRef {
 pub struct ChainStatus {
     pub network: String,
     pub genesis_hash: [u8; 32],
+    /// The same caller can reuse this finalized snapshot in [`SubstrateExtension::query`].
     pub finalized: BlockRef,
     pub ss58_format: Option<u16>,
     pub token_symbols: Vec<String>,
@@ -434,6 +439,7 @@ struct NativeRuntime {
     // Declared first: dropping the actor stops and joins smoldot before the
     // cdylib can be unmapped.
     client: Option<sube::Sube>,
+    query_snapshots: Vec<QuerySnapshot>,
     map_snapshots: Vec<MapSnapshot>,
     next_snapshot_id: u64,
 }
@@ -506,28 +512,36 @@ impl SubstrateExtension {
 
     /// Connect lazily and report finalized light-client state.
     #[msg(timeout_ms = 120000)]
-    async fn status(&mut self, _ctx: &mut Context<Self>) -> SubstrateResult<ChainStatus> {
+    async fn status(&mut self, ctx: &mut Context<Self>) -> SubstrateResult<ChainStatus> {
         #[cfg(feature = "native")]
-        return self.native_status_with_deadline().await;
+        return self
+            .native_status_with_deadline(native::CallerKey::from_caller(ctx.caller()))
+            .await;
         #[cfg(not(feature = "native"))]
-        SubstrateResult::error(ErrorCode::Unsupported, "native backend is disabled")
+        {
+            let _ = ctx;
+            SubstrateResult::error(ErrorCode::Unsupported, "native backend is disabled")
+        }
     }
 
     /// Query one constant or fully-keyed storage item. `at = None` captures
-    /// the current finalized block. Reusing a returned `BlockRef` queries that
-    /// exact authenticated hash without requiring an archive node.
+    /// the current finalized block. The same caller can reuse the returned
+    /// `BlockRef` while its transient authenticated snapshot remains retained;
+    /// arbitrary references and references from another caller are rejected.
     #[msg(timeout_ms = 120000)]
     async fn query(
         &mut self,
         path: String,
         at: Option<BlockRef>,
-        _ctx: &mut Context<Self>,
+        ctx: &mut Context<Self>,
     ) -> SubstrateResult<QueryResult> {
         #[cfg(feature = "native")]
-        return self.native_query_with_deadline(path, at).await;
+        return self
+            .native_query_with_deadline(path, at, native::CallerKey::from_caller(ctx.caller()))
+            .await;
         #[cfg(not(feature = "native"))]
         {
-            let _ = (path, at);
+            let _ = (path, at, ctx);
             SubstrateResult::error(ErrorCode::Unsupported, "native backend is disabled")
         }
     }
@@ -750,6 +764,8 @@ mod native {
     const MAX_CHAIN_SPEC_BYTES: u64 = 16 * 1024 * 1024;
     const MAX_RECEIPT_EVENTS: usize = 16;
     const MAX_FROZEN_SIGNING_REQUEST_BYTES: usize = 16 * 1024;
+    const INITIAL_MAP_SNAPSHOT_ATTEMPTS: usize = 3;
+    const MAX_TOTAL_QUERY_SNAPSHOTS: usize = 64;
     const MAX_TOTAL_MAP_SNAPSHOTS: usize = 64;
     const MAX_TOTAL_PENDING_TRANSACTIONS: usize = 128;
     const MAX_TOTAL_NONCE_RESERVATIONS: usize = 128;
@@ -814,6 +830,14 @@ mod native {
                 }],
             ],
         )
+    }
+
+    #[derive(Clone)]
+    pub(super) struct QuerySnapshot {
+        pub(super) owner: CallerKey,
+        pub(super) last_used: Instant,
+        pub(super) at: BlockRef,
+        pub(super) block: sube::FinalizedBlock,
     }
 
     #[derive(Clone)]
@@ -1000,6 +1024,85 @@ mod native {
             )
         }
 
+        fn expire_query_snapshots(&mut self) {
+            let ttl = Duration::from_secs(QUERY_SNAPSHOT_TTL_SECS);
+            self.runtime
+                .query_snapshots
+                .retain(|snapshot| snapshot.last_used.elapsed() <= ttl);
+        }
+
+        fn remember_query_snapshot(
+            &mut self,
+            owner: CallerKey,
+            block: sube::FinalizedBlock,
+        ) -> BlockRef {
+            self.expire_query_snapshots();
+            let at = block_ref(block.info().clone());
+            if let Some(snapshot) = self
+                .runtime
+                .query_snapshots
+                .iter_mut()
+                .find(|snapshot| snapshot.owner == owner && snapshot.at == at)
+            {
+                snapshot.last_used = Instant::now();
+                snapshot.block = block;
+                return at;
+            }
+
+            while self
+                .runtime
+                .query_snapshots
+                .iter()
+                .filter(|snapshot| snapshot.owner == owner)
+                .count()
+                >= MAX_QUERY_SNAPSHOTS
+            {
+                let position = self
+                    .runtime
+                    .query_snapshots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, snapshot)| snapshot.owner == owner)
+                    .min_by_key(|(_, snapshot)| snapshot.last_used)
+                    .map(|(position, _)| position)
+                    .expect("the per-caller query snapshot limit was reached");
+                self.runtime.query_snapshots.swap_remove(position);
+            }
+            while self.runtime.query_snapshots.len() >= MAX_TOTAL_QUERY_SNAPSHOTS {
+                let position = self
+                    .runtime
+                    .query_snapshots
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, snapshot)| snapshot.last_used)
+                    .map(|(position, _)| position)
+                    .expect("the global query snapshot limit was reached");
+                self.runtime.query_snapshots.swap_remove(position);
+            }
+            self.runtime.query_snapshots.push(QuerySnapshot {
+                owner,
+                last_used: Instant::now(),
+                at: at.clone(),
+                block,
+            });
+            at
+        }
+
+        fn query_snapshot(
+            &mut self,
+            owner: &CallerKey,
+            at: &BlockRef,
+        ) -> Option<sube::FinalizedBlock> {
+            self.expire_query_snapshots();
+            let snapshot = self
+                .runtime
+                .query_snapshots
+                .iter_mut()
+                .find(|snapshot| &snapshot.owner == owner && &snapshot.at == at)?;
+            snapshot.last_used = Instant::now();
+            Some(snapshot.block.clone())
+        }
+
         fn expire_map_snapshots(&mut self) {
             let ttl = Duration::from_secs(MAP_SNAPSHOT_TTL_SECS);
             let mut expired = Vec::new();
@@ -1077,6 +1180,7 @@ mod native {
                 // runtime. Snapshot pins belong to that session and are no
                 // longer reusable.
                 self.runtime.client = None;
+                self.runtime.query_snapshots.clear();
                 self.runtime.map_snapshots.clear();
             }
         }
@@ -1120,8 +1224,11 @@ mod native {
             None
         }
 
-        pub(super) async fn native_status_with_deadline(&mut self) -> SubstrateResult<ChainStatus> {
-            match sube::time::timeout(STANDARD_DEADLINE, self.native_status()).await {
+        pub(super) async fn native_status_with_deadline(
+            &mut self,
+            owner: CallerKey,
+        ) -> SubstrateResult<ChainStatus> {
+            match sube::time::timeout(STANDARD_DEADLINE, self.native_status(owner)).await {
                 Ok(result) => {
                     if let SubstrateResult::Err(_) = &result {
                         self.cancel_backend_operation().await;
@@ -1139,8 +1246,9 @@ mod native {
             &mut self,
             path: String,
             at: Option<BlockRef>,
+            owner: CallerKey,
         ) -> SubstrateResult<QueryResult> {
-            match sube::time::timeout(STANDARD_DEADLINE, self.native_query(path, at)).await {
+            match sube::time::timeout(STANDARD_DEADLINE, self.native_query(path, at, owner)).await {
                 Ok(result) => {
                     if let SubstrateResult::Err(_) = &result {
                         self.cancel_backend_operation().await;
@@ -1179,29 +1287,32 @@ mod native {
             }
         }
 
-        pub(super) async fn native_status(&mut self) -> SubstrateResult<ChainStatus> {
+        pub(super) async fn native_status(
+            &mut self,
+            owner: CallerKey,
+        ) -> SubstrateResult<ChainStatus> {
             let network = self.config.network.clone();
             let result = async {
-                let client = self.ensure_client().await?;
-                let genesis = client
-                    .backend()
-                    .block_info(Some(0))
-                    .await
-                    .map_err(map_sube_error)?;
-                let finalized = client
-                    .backend()
-                    .block_info(None)
-                    .await
-                    .map_err(map_sube_error)?;
-                let properties = client
-                    .chain_properties()
-                    .await
-                    .map_err(map_sube_error)?
-                    .clone();
+                let (genesis, finalized, properties) = {
+                    let client = self.ensure_client().await?;
+                    let genesis = client
+                        .backend()
+                        .block_info(Some(0))
+                        .await
+                        .map_err(map_sube_error)?;
+                    let finalized = client.finalized_block().await.map_err(map_sube_error)?;
+                    let properties = client
+                        .chain_properties()
+                        .await
+                        .map_err(map_sube_error)?
+                        .clone();
+                    (genesis, finalized, properties)
+                };
+                let finalized = self.remember_query_snapshot(owner, finalized);
                 Ok(ChainStatus {
                     network,
                     genesis_hash: genesis.hash,
-                    finalized: block_ref(finalized),
+                    finalized,
                     ss58_format: properties.ss58_format,
                     token_symbols: properties.token_symbols,
                     token_decimals: properties.token_decimals,
@@ -1215,36 +1326,36 @@ mod native {
             &mut self,
             path: String,
             at: Option<BlockRef>,
+            owner: CallerKey,
         ) -> SubstrateResult<QueryResult> {
             if let Err(error) = validate_query_path(&path) {
                 return SubstrateResult::Err(error);
             }
             let result = async {
-                let client = self.ensure_client().await?;
-                let (block, response) = match at {
+                let (at, response, captured) = match at {
                     Some(at) => {
-                        let (block, response) = client
-                            .query_at_finalized_hash_with_info(&path, at.hash)
+                        let Some(block) = self.query_snapshot(&owner, &at) else {
+                            return Err(ExtensionError::new(
+                                ErrorCode::Stale,
+                                "block reference is expired, unrecognized, or belongs to another caller",
+                            ));
+                        };
+                        let response = self
+                            .ensure_client()
+                            .await?
+                            .query_at_finalized_block(&path, &block)
                             .await
                             .map_err(map_sube_error)?;
-                        if block.number != at.number {
-                            return Err(ExtensionError::new(
-                                ErrorCode::BadRequest,
-                                "block number does not match the supplied hash",
-                            ));
-                        }
-                        (block, response)
+                        (at, response, None)
                     }
                     None => {
-                        let finalized = client
-                            .backend()
-                            .block_info(None)
+                        let (block, response) = self
+                            .ensure_client()
+                            .await?
+                            .query_finalized_with_info(&path)
                             .await
                             .map_err(map_sube_error)?;
-                        client
-                            .query_at_finalized_hash_with_info(&path, finalized.hash)
-                            .await
-                            .map_err(map_sube_error)?
+                        (block_ref(block.info().clone()), response, Some(block))
                     }
                 };
                 let value = match response {
@@ -1265,10 +1376,14 @@ mod native {
                         ));
                     }
                 };
-                Ok(QueryResult {
-                    at: block_ref(block),
-                    value,
-                })
+                let at = if let Some(block) = captured {
+                    let remembered = self.remember_query_snapshot(owner, block);
+                    debug_assert_eq!(remembered, at);
+                    remembered
+                } else {
+                    at
+                };
+                Ok(QueryResult { at, value })
             }
             .await;
             bounded_result(result)
@@ -1283,12 +1398,35 @@ mod native {
             invocation: InvocationId,
         ) -> SubstrateResult<MapPage> {
             let cleanup_owner = owner.clone();
-            match sube::time::timeout(
-                STANDARD_DEADLINE,
-                self.native_query_map(path, limit, cursor, owner, invocation),
-            )
-            .await
-            {
+            let retry_initial_snapshot = cursor.is_empty();
+            let operation = async {
+                for attempt in 0..INITIAL_MAP_SNAPSHOT_ATTEMPTS {
+                    let result = self
+                        .native_query_map(
+                            path.clone(),
+                            limit,
+                            cursor.clone(),
+                            owner.clone(),
+                            invocation,
+                        )
+                        .await;
+                    let should_retry = retry_initial_snapshot
+                        && attempt + 1 < INITIAL_MAP_SNAPSHOT_ATTEMPTS
+                        && matches!(
+                            &result,
+                            SubstrateResult::Err(ExtensionError {
+                                code: ErrorCode::Stale,
+                                ..
+                            })
+                        );
+                    if !should_retry {
+                        return result;
+                    }
+                    self.cancel_backend_operation().await;
+                }
+                unreachable!("the bounded map retry loop always returns")
+            };
+            match sube::time::timeout(STANDARD_DEADLINE, operation).await {
                 Ok(result) => {
                     if let SubstrateResult::Err(_) = &result {
                         self.cancel_map_invocation(&cleanup_owner, invocation).await;
@@ -1423,7 +1561,7 @@ mod native {
                         },
                     )
                     .await
-                    .map_err(map_sube_error)?;
+                    .map_err(map_query_page_error)?;
                 let at = block_ref(page.at);
                 if at != snapshot.at {
                     return Err(ExtensionError::new(
@@ -2199,6 +2337,24 @@ mod native {
         ExtensionError::new(code, error.to_string())
     }
 
+    fn map_query_page_error(error: sube::Error) -> ExtensionError {
+        match &error {
+            sube::Error::SubscriptionClosed => ExtensionError::new(
+                ErrorCode::Stale,
+                "map snapshot was invalidated by a light-client reconnect",
+            ),
+            sube::Error::OperationFailed(message)
+                if message == "block snapshot is not retained" =>
+            {
+                ExtensionError::new(
+                    ErrorCode::Stale,
+                    "map snapshot is no longer retained by the light client",
+                )
+            }
+            _ => map_sube_error(error),
+        }
+    }
+
     #[cfg(test)]
     mod reservation_tests {
         use super::*;
@@ -2575,7 +2731,7 @@ mod native {
 }
 
 #[cfg(feature = "native")]
-use native::MapSnapshot;
+use native::{MapSnapshot, QuerySnapshot};
 
 #[cfg(test)]
 mod tests {
@@ -2761,7 +2917,30 @@ mod tests {
         assert_eq!(restored.prepared_transactions, actor.prepared_transactions);
         assert_eq!(restored.submission_replays, actor.submission_replays);
         assert!(restored.runtime.client.is_none());
+        assert!(restored.runtime.query_snapshots.is_empty());
         assert!(restored.runtime.map_snapshots.is_empty());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn query_rejects_an_unrecognized_block_reference_without_connecting() {
+        let mut actor = SubstrateExtension::new(&[]);
+        let result = smol::block_on(actor.native_query(
+            "system/number".into(),
+            Some(BlockRef {
+                number: 42,
+                hash: [7; 32],
+            }),
+            native::CallerKey::Actor(7),
+        ));
+        assert!(matches!(
+            result,
+            SubstrateResult::Err(ExtensionError {
+                code: ErrorCode::Stale,
+                ..
+            })
+        ));
+        assert!(actor.runtime.client.is_none());
     }
 
     #[cfg(feature = "native")]
@@ -2867,7 +3046,7 @@ mod tests {
         let _ = log::set_logger(&TEST_LOGGER);
         log::set_max_level(log::LevelFilter::Info);
         let mut actor = SubstrateExtension::new(&[]);
-        let status = match smol::block_on(actor.native_status()) {
+        let status = match smol::block_on(actor.native_status(native::CallerKey::System)) {
             SubstrateResult::Ok(status) => status,
             SubstrateResult::Err(error) => panic!("light-client status failed: {error:?}"),
         };
@@ -2876,22 +3055,76 @@ mod tests {
         assert!(status.finalized.number > 0);
         assert!(status.token_symbols.iter().any(|symbol| symbol == "KSM"));
 
-        let query = match smol::block_on(actor.native_query("system/number".into(), None)) {
+        let foreign_status_query = smol::block_on(actor.native_query(
+            "system/number".into(),
+            Some(status.finalized.clone()),
+            native::CallerKey::Actor(7),
+        ));
+        assert!(matches!(
+            foreign_status_query,
+            SubstrateResult::Err(ExtensionError {
+                code: ErrorCode::Stale,
+                ..
+            })
+        ));
+
+        let status_query = match smol::block_on(actor.native_query(
+            "system/number".into(),
+            Some(status.finalized.clone()),
+            native::CallerKey::System,
+        )) {
+            SubstrateResult::Ok(query) => query,
+            SubstrateResult::Err(error) => panic!("status-pinned query failed: {error:?}"),
+        };
+        assert_eq!(status_query.at, status.finalized);
+        assert!(status_query.value.is_some());
+
+        let query = match smol::block_on(actor.native_query(
+            "system/number".into(),
+            None,
+            native::CallerKey::System,
+        )) {
             SubstrateResult::Ok(query) => query,
             SubstrateResult::Err(error) => panic!("light-client query failed: {error:?}"),
         };
         assert!(query.value.is_some());
 
-        let page = match smol::block_on(actor.native_query_map_with_deadline(
-            "system/account".into(),
-            1,
-            Vec::new(),
+        let repeated = match smol::block_on(actor.native_query(
+            "system/number".into(),
+            Some(query.at.clone()),
             native::CallerKey::System,
-            InvocationId([1; 32]),
         )) {
-            SubstrateResult::Ok(page) => page,
-            SubstrateResult::Err(error) => panic!("light-client map query failed: {error:?}"),
+            SubstrateResult::Ok(query) => query,
+            SubstrateResult::Err(error) => panic!("pinned light-client query failed: {error:?}"),
         };
+        assert_eq!(repeated.at, query.at);
+        assert!(repeated.value.is_some());
+
+        let mut first_page = None;
+        for attempt in 0..3u8 {
+            match smol::block_on(actor.native_query_map_with_deadline(
+                "system/account".into(),
+                1,
+                Vec::new(),
+                native::CallerKey::System,
+                InvocationId([attempt + 1; 32]),
+            )) {
+                SubstrateResult::Ok(page) => {
+                    first_page = Some(page);
+                    break;
+                }
+                SubstrateResult::Err(error)
+                    if attempt < 2
+                        && matches!(error.code, ErrorCode::Unavailable | ErrorCode::Stale) =>
+                {
+                    eprintln!("cold light-client map attempt {}: {error:?}", attempt + 1);
+                }
+                SubstrateResult::Err(error) => {
+                    panic!("light-client map query failed: {error:?}")
+                }
+            }
+        }
+        let page = first_page.expect("a bounded cold-start map attempt must succeed");
         assert_eq!(page.entries.len(), 1);
         assert!(!page.next_cursor.is_empty());
 
@@ -2900,7 +3133,7 @@ mod tests {
             1,
             page.next_cursor.clone(),
             native::CallerKey::System,
-            InvocationId([2; 32]),
+            InvocationId([0xff; 32]),
         )) {
             SubstrateResult::Ok(page) => page,
             SubstrateResult::Err(error) => panic!("continued map query failed: {error:?}"),

@@ -77,8 +77,11 @@ reject native extension I/O. A queued call that reaches its host deadline is
 canceled before dispatch; after the extension worker claims a call, the host
 waits for the real persisted result instead of reporting a timeout while work
 continues.
-Caller-supplied block hashes are additionally verified as finalized and
-canonical before storage is read.
+`BlockRef`s returned by `status` or `query` are backed by an authenticated
+finalized-block token retained in memory. The same caller can reuse one for
+four minutes of inactivity (up to 16 live references); arbitrary references,
+references owned by another caller, and references lost on reload or reconnect
+return `Stale`.
 
 Transaction methods accept trusted local system calls. PVM actors require a
 matching host-side `[[agent]] intra_caps` entry for the Substrate target at
@@ -87,8 +90,9 @@ the host binds that bounded grant to the actor identity. Network peers and
 credential-backed ingress callers likewise require at least a `Member` space
 grant; Noise transport identity by itself is not authorization. Signing
 request IDs and map cursors are non-sequential capabilities bound to the caller
-identity when VOS has one; anonymous read cursors remain bearer capabilities
-and share the anonymous caller quota.
+identity when VOS has one. Returned block references are likewise caller-bound
+through their retained token. Anonymous read capabilities share the anonymous
+caller quota and remain bearer capabilities.
 
 No signing keys are accepted or retained. V5/general extrinsics are not
 exposed. The light client and map snapshots are transient actor fields.
