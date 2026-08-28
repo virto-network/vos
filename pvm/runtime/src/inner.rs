@@ -53,7 +53,13 @@ pub mod gas {
 
     /// The standard memory-sized gas function, `ceil(rate * bytes / 1024)`.
     pub const fn memory(rate: u64, bytes: u64) -> u64 {
-        rate.saturating_mul(bytes).saturating_add(1023) / 1024
+        let Some(product) = rate.checked_mul(bytes) else {
+            return u64::MAX;
+        };
+        let Some(rounded) = product.checked_add(1023) else {
+            return u64::MAX;
+        };
+        rounded / 1024
     }
 }
 
@@ -170,6 +176,10 @@ impl InnerMachines {
 
     pub fn is_empty(&self) -> bool {
         self.machines.is_empty()
+    }
+
+    pub fn contains(&self, id: u32) -> bool {
+        self.machines.contains_key(&id)
     }
 
     /// Create a machine from one canonical compact code blob.

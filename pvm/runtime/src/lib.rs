@@ -23,6 +23,7 @@ pub mod interpreter;
 pub mod kernel;
 pub mod program;
 pub mod refine;
+pub mod refine_host;
 #[cfg(feature = "std")]
 pub mod snapshot;
 pub mod spi;

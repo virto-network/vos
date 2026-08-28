@@ -85,7 +85,9 @@ impl PagePerms {
         if len == 0 {
             return true;
         }
-        let end = addr as u64 + len as u64;
+        let Some(end) = (addr as u64).checked_add(len as u64) else {
+            return false;
+        };
         if end > self.perms.len() as u64 * PAGE as u64 {
             return false;
         }

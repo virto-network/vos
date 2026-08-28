@@ -118,6 +118,154 @@ pub struct Invocation {
     mem: Memory,
 }
 
+/// A loaded, resumable standard PVM invocation.
+///
+/// [`execute`] is the convenient one-shot API. Embedders that implement
+/// standard host calls use this type to resume after each
+/// [`ExitReason::HostCall`].
+pub struct Machine {
+    initial_gas: Gas,
+    interp: Interpreter,
+}
+
+impl Machine {
+    /// Load a standard program using the automatically selected memory
+    /// representation.
+    pub fn load(spi_blob: &[u8], args: &[u8], gas: Gas) -> Result<Self, RefineError> {
+        Self::load_with(spi_blob, args, gas, MemoryModel::Auto)
+    }
+
+    /// Load a standard program with an explicit memory representation.
+    pub fn load_with(
+        spi_blob: &[u8],
+        args: &[u8],
+        gas: Gas,
+        model: MemoryModel,
+    ) -> Result<Self, RefineError> {
+        let prog = parse_standard_program(spi_blob).ok_or(RefineError::InvalidBlob)?;
+
+        if args.len() as u64 > PVM_INIT_INPUT_SIZE as u64 {
+            return Err(RefineError::LayoutOverflow);
+        }
+        let layout = prog.layout(args).ok_or(RefineError::LayoutOverflow)?;
+        let regions = [layout.ro, layout.rw, layout.stack, layout.args];
+        let registers = layout.registers;
+
+        let page = PVM_PAGE_SIZE as u64;
+        let total_pages: u64 = regions.iter().map(|r| r.size / page).sum();
+        let mem_cycles = compute_mem_cycles(total_pages as u32);
+        let init_gas = total_pages * GAS_PER_PAGE;
+        if gas < init_gas {
+            return Err(RefineError::OutOfGas);
+        }
+
+        let max_addr: u64 = regions
+            .iter()
+            .filter(|r| r.size > 0)
+            .map(|r| r.base + r.size)
+            .max()
+            .unwrap_or(0);
+        let use_sparse = match model {
+            MemoryModel::Auto => cfg!(target_pointer_width = "32"),
+            MemoryModel::Flat => false,
+            MemoryModel::Sparse => true,
+        };
+        if !use_sparse && max_addr > isize::MAX as u64 {
+            return Err(RefineError::LayoutOverflow);
+        }
+        let mut mem = if use_sparse {
+            Memory::sparse(max_addr)
+        } else {
+            Memory::flat(vec![0u8; max_addr as usize])
+        };
+        let mut page_perms = vec![PERM_NONE; (max_addr / page) as usize];
+        for r in regions.iter().filter(|r| r.size > 0) {
+            let perm = if r.writable { PERM_RW } else { PERM_RO };
+            let first = (r.base / page) as usize;
+            page_perms[first..first + (r.size / page) as usize].fill(perm);
+        }
+        for (base, data) in [
+            (layout.ro.base, layout.ro_data),
+            (layout.rw.base, layout.rw_data),
+            (layout.args.base, layout.args_data),
+        ] {
+            if !data.is_empty() {
+                mem.init_copy(base as u32, data);
+            }
+        }
+
+        let code = prog.code;
+        let mut interp = Interpreter::with_memory(
+            code.code,
+            code.bitmask,
+            code.jump_table,
+            registers,
+            mem,
+            gas - init_gas,
+            mem_cycles,
+        );
+        interp.isa_mode = IsaMode::Conformance;
+        interp.set_page_perms(page_perms);
+
+        Ok(Self {
+            initial_gas: gas,
+            interp,
+        })
+    }
+
+    /// Run until the next PVM exit.
+    pub fn resume(&mut self) -> ExitReason {
+        self.interp.run().0
+    }
+
+    pub fn gas_remaining(&self) -> Gas {
+        self.interp.gas
+    }
+
+    /// Charge host-call gas. Returns `false` without wrapping when the
+    /// invocation has insufficient gas.
+    pub fn charge(&mut self, gas: Gas) -> bool {
+        if self.interp.gas < gas {
+            self.interp.gas = 0;
+            false
+        } else {
+            self.interp.gas -= gas;
+            true
+        }
+    }
+
+    /// Return unused gas reserved for an inner invocation.
+    pub fn credit(&mut self, gas: Gas) {
+        self.interp.gas = self.interp.gas.saturating_add(gas);
+    }
+
+    pub fn registers(&self) -> &[u64; PVM_REGISTER_COUNT] {
+        &self.interp.registers
+    }
+
+    pub fn registers_mut(&mut self) -> &mut [u64; PVM_REGISTER_COUNT] {
+        &mut self.interp.registers
+    }
+
+    pub fn memory(&self) -> &Memory {
+        self.interp.memory()
+    }
+
+    pub fn memory_mut(&mut self) -> &mut Memory {
+        self.interp.memory_mut()
+    }
+
+    /// Consume the machine and retain its final state for inspection.
+    pub fn finish(mut self, exit: ExitReason) -> Invocation {
+        Invocation {
+            exit,
+            gas_used: self.initial_gas.saturating_sub(self.interp.gas),
+            registers: self.interp.registers,
+            mem: self.interp.take_memory(),
+        }
+    }
+}
+
 impl Invocation {
     /// The output bytes designated by φ7/φ8 at a normal halt, per GP:
     /// `o = μ[φ7 .. φ7+φ8]`.
@@ -177,90 +325,9 @@ pub fn execute_with(
     gas: Gas,
     model: MemoryModel,
 ) -> Result<Invocation, RefineError> {
-    let prog = parse_standard_program(spi_blob).ok_or(RefineError::InvalidBlob)?;
-
-    // GP bounds the argument data by the Z_I input zone. `layout` does not
-    // re-check it (the zone is a fixed term of its total-size guard), and
-    // an oversized args region would overflow the 32-bit address space.
-    if args.len() as u64 > PVM_INIT_INPUT_SIZE as u64 {
-        return Err(RefineError::LayoutOverflow);
-    }
-    let layout = prog.layout(args).ok_or(RefineError::LayoutOverflow)?;
-    let regions = [layout.ro, layout.rw, layout.stack, layout.args];
-    let registers = layout.registers;
-
-    // The kernel derives both the init-gas charge and the mem_cycles tier
-    // from the total mapped page count (the manifest's `memory_pages`) —
-    // declared pages, independent of the memory representation.
-    let page = PVM_PAGE_SIZE as u64;
-    let total_pages: u64 = regions.iter().map(|r| r.size / page).sum();
-    let mem_cycles = compute_mem_cycles(total_pages as u32);
-    let init_gas = total_pages * GAS_PER_PAGE;
-    if gas < init_gas {
-        return Err(RefineError::OutOfGas);
-    }
-
-    // Memory image + per-page permissions: regions at their GP addresses,
-    // everything else unmapped.
-    let max_addr: u64 = regions
-        .iter()
-        .filter(|r| r.size > 0)
-        .map(|r| r.base + r.size)
-        .max()
-        .unwrap_or(0);
-    let use_sparse = match model {
-        MemoryModel::Auto => cfg!(target_pointer_width = "32"),
-        MemoryModel::Flat => false,
-        MemoryModel::Sparse => true,
-    };
-    // A flat buffer must be allocatable on the host (Rust caps single
-    // allocations at isize::MAX): on 32-bit hosts a real SPI span is not.
-    if !use_sparse && max_addr > isize::MAX as u64 {
-        return Err(RefineError::LayoutOverflow);
-    }
-    let mut mem = if use_sparse {
-        Memory::sparse(max_addr)
-    } else {
-        Memory::flat(vec![0u8; max_addr as usize])
-    };
-    let mut page_perms = vec![PERM_NONE; (max_addr / page) as usize];
-    for r in regions.iter().filter(|r| r.size > 0) {
-        let perm = if r.writable { PERM_RW } else { PERM_RO };
-        let first = (r.base / page) as usize;
-        page_perms[first..first + (r.size / page) as usize].fill(perm);
-    }
-    for (base, data) in [
-        (layout.ro.base, layout.ro_data),
-        (layout.rw.base, layout.rw_data),
-        (layout.args.base, layout.args_data),
-    ] {
-        if !data.is_empty() {
-            mem.init_copy(base as u32, data);
-        }
-    }
-
-    // `layout` (which borrows `prog`) is done, so the code can move.
-    let code = prog.code;
-
-    let mut interp = Interpreter::with_memory(
-        code.code,
-        code.bitmask,
-        code.jump_table,
-        registers,
-        mem,
-        gas - init_gas,
-        mem_cycles,
-    );
-    interp.isa_mode = IsaMode::Conformance;
-    interp.set_page_perms(page_perms);
-
-    let (exit, exec_gas) = interp.run();
-    Ok(Invocation {
-        exit,
-        gas_used: init_gas + exec_gas,
-        registers: interp.registers,
-        mem: interp.take_memory(),
-    })
+    let mut machine = Machine::load_with(spi_blob, args, gas, model)?;
+    let exit = machine.resume();
+    Ok(machine.finish(exit))
 }
 
 #[cfg(test)]
