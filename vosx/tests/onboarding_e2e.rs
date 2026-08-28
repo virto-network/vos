@@ -1248,7 +1248,7 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
         Some(&service_pvm),
     ));
     poll_until(
-        30,
+        DAEMON_READINESS_TIMEOUT.as_secs(),
         || {
             let output = vosx(
                 data.path(),
@@ -2168,7 +2168,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
         "()",
     );
     poll_until(
-        60,
+        DAEMON_READINESS_TIMEOUT.as_secs(),
         || {
             trust_b
                 .new_receipt_digests_since(
@@ -2698,7 +2698,7 @@ fn production_raft_root_survives_voter_join_leader_loss_and_backup_relocation() 
         try_call_on(prefix, args).unwrap_or_else(|error| panic!("{error}"))
     };
     poll_until(
-        60,
+        DAEMON_READINESS_TIMEOUT.as_secs(),
         || {
             [prefix_a, prefix_b, prefix_c].into_iter().all(|prefix| {
                 try_call_on(prefix, &["space", "call", space, root, "value"])

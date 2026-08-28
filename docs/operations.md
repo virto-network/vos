@@ -23,10 +23,12 @@ revoke their protocol-neutral credentials through the canonical authority:
 vosx space access team issue --expires 24h
 vosx space access team issue-ssh ~/.ssh/id_ed25519.pub --expires 30d
 vosx space access team list
-vosx space access team revoke <credential-prefix>
+vosx space access team revoke <full-credential-id>
 ```
 
-The authority binds each credential to a stable member. Add `--subject <hex>`
+The authority binds each credential to a stable member. Owners can revoke a
+credential by its full ID; prefix lookup and listing require
+credential-management authority. Add `--subject <hex>`
 only when an administrator is adding a device for someone else. HTTP actor
 calls and SSH shell actions both pass the actor's signed method policy and the
 member's live capability decision. See [HTTP ingress](http-ingress.md) and the
