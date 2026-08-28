@@ -17,6 +17,7 @@ build-crates:
 # Build native extension plugins (.so files).
 build-extensions:
     cargo build -p echo-extension -p proxy-extension -p fetcher-extension -p heartbeat-extension
+    cargo build -p substrate-extension
 
 # Build WASM actors (wasm32-unknown-unknown target).
 build-wasm:
@@ -149,6 +150,8 @@ test-examples:
 # Run extension tests.
 test-extensions: build-extensions
     cargo test -p vos extension -- --nocapture
+    cargo test -p substrate-extension
+    cargo check -p substrate-extension --no-default-features
 
 # Run the physical service integration tests.
 test-pvm: build-test-artifacts

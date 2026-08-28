@@ -15,6 +15,7 @@ members = [
     "pvm/proof/derive",
     "pvm/proof/verifier",
     "extensions/prover",
+    "extensions/substrate",
     "clerk-witness",
     "tests/fixtures/extensions/*",
 ]
