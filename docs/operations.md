@@ -34,6 +34,10 @@ calls and SSH shell actions both pass the actor's signed method policy and the
 member's live capability decision. See [HTTP ingress](http-ingress.md) and the
 [SSH space shell](ssh-ingress.md).
 
+Each member may have 32 live credentials and may issue 256 credential
+identities over the lifetime of one authority installation. Revoked identities
+remain as bounded tombstones so an old bearer can never be activated again.
+
 ## Backup and restore
 
 Stop the local daemon before backup:

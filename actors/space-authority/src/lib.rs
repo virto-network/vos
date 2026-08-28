@@ -88,6 +88,7 @@ pub fn initial_state(
             }],
             access_grants: StorageMap::default(),
             access_by_subject: StorageMap::default(),
+            access_issuance_count: StorageMap::default(),
         }
         .encode(),
     )
@@ -114,6 +115,10 @@ pub struct SpaceAuthority {
     /// retained as revocation evidence, but issuance never scans them.
     #[storage]
     access_by_subject: StorageMap<[u8; 32], Vec<[u8; 32]>>,
+    /// Lifetime issuance count per member. This bounds durable revoked rows
+    /// without ever making an old bearer identity reusable.
+    #[storage]
+    access_issuance_count: StorageMap<[u8; 32], u32>,
 }
 
 #[messages]
@@ -138,6 +143,7 @@ impl SpaceAuthority {
             grants: Vec::new(),
             access_grants: StorageMap::default(),
             access_by_subject: StorageMap::default(),
+            access_issuance_count: StorageMap::default(),
         }
     }
 
@@ -185,6 +191,13 @@ impl SpaceAuthority {
                 return Vec::new();
             }
         } else {
+            let issued = self
+                .access_issuance_count
+                .get(&subject.0)
+                .unwrap_or_default();
+            if issued >= vos::MAX_MEMBER_CREDENTIAL_HISTORY {
+                return Vec::new();
+            }
             let mut credentials = self.access_by_subject.get(&subject.0).unwrap_or_default();
             if credentials.len() >= vos::MAX_MEMBER_CREDENTIALS {
                 return Vec::new();
@@ -195,6 +208,7 @@ impl SpaceAuthority {
             }
             self.access_grants.insert(&credential_id, &candidate);
             self.access_by_subject.insert(&subject.0, &credentials);
+            self.access_issuance_count.insert(&subject.0, &(issued + 1));
         }
         let (power, capabilities) = self.effective_member_authority(subject).unwrap_or_default();
         let roles = self.member_role_ids(subject);
@@ -1545,7 +1559,7 @@ mod tests {
     }
 
     #[test]
-    fn revoked_credential_history_does_not_consume_the_live_limit() {
+    fn credential_history_is_durably_bounded_without_consuming_the_live_limit() {
         let signing = SigningKey::from_bytes(&[0x51; 32]);
         let space = SpaceId([0x52; 32]);
         let root = Origin::Member(SubjectId::of_authenticated_peer(&root_peer(&signing)));
@@ -1554,7 +1568,7 @@ mod tests {
             _ => unreachable!(),
         };
         let mut authority = actor(space, &signing);
-        for ordinal in 1_u16..=300 {
+        for ordinal in 1_u16..=vos::MAX_MEMBER_CREDENTIAL_HISTORY as u16 {
             let mut credential = [0_u8; 32];
             credential[..2].copy_from_slice(&ordinal.to_le_bytes());
             assert!(
@@ -1578,6 +1592,29 @@ mod tests {
             ));
         }
         assert!(authority.access_by_subject.get(&root_subject.0).is_none());
+        assert_eq!(
+            authority.access_issuance_count.get(&root_subject.0),
+            Some(vos::MAX_MEMBER_CREDENTIAL_HISTORY),
+        );
+        assert_eq!(
+            authority.access_grants.len(),
+            u64::from(vos::MAX_MEMBER_CREDENTIAL_HISTORY),
+        );
+        let mut overflow = [0_u8; 32];
+        overflow[..2]
+            .copy_from_slice(&(vos::MAX_MEMBER_CREDENTIAL_HISTORY as u16 + 1).to_le_bytes());
+        assert!(
+            dispatch_as(
+                &mut authority,
+                root,
+                IssueAccess {
+                    credential_id: overflow,
+                    subject: [0; 32],
+                    expires_at: u64::MAX,
+                },
+            )
+            .is_empty()
+        );
     }
 
     #[test]

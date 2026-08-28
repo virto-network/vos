@@ -378,6 +378,15 @@ impl SpaceApp {
 fn effect_text(output: EffectOutput) -> String {
     match output {
         EffectOutput::HostService(Ok(Value::Text(text))) => text,
+        EffectOutput::HostService(Ok(Value::Map(fields))) => {
+            match (fields.get("reply"), fields.get("attestation_wire")) {
+                (Some(Value::Text(reply)), Some(Value::Bytes(wire))) => format!(
+                    "{reply}\n\nAttestation (canonical VARW wire, hex):\n{}",
+                    hex(wire),
+                ),
+                _ => "Unexpected space-shell response".into(),
+            }
+        }
         EffectOutput::HostService(Err(error)) => format!("{}: {}", error.code, error.message),
         EffectOutput::Cancelled => "Operation cancelled".into(),
         _ => "Unexpected space-shell response".into(),
@@ -486,7 +495,7 @@ fn host_service(
                     };
                     describe(&handle, &access, &route).map(Value::Text)
                 }
-                "invoke" => invoke(&handle, &access, request.args).map(Value::Text),
+                "invoke" => invoke(&handle, &access, request.args),
                 "put-role" => put_role(&handle, &access, request.args).map(Value::Text),
                 "delete-role" => delete_role(&handle, &access, request.args).map(Value::Text),
                 "set-member-roles" => {
@@ -950,7 +959,7 @@ fn invoke(
     handle: &IngressHandle,
     access: &crate::IngressAccessStatus,
     args: Value,
-) -> Result<String, HostServiceError> {
+) -> Result<Value, HostServiceError> {
     require(access, crate::capability::AGENT_INVOKE)?;
     let Value::Map(args) = args else {
         return Err(service_error(
@@ -999,19 +1008,34 @@ fn invoke(
         )
     }
     .map_err(|error| service_error("vos.invoke-failed", format!("{error:?}")))?;
-    let reply = if method_meta.attested {
-        crate::service::RootTreeAttestedResult::decode(&reply)
-            .map_err(|_| service_error("vos.invalid-reply", "actor returned invalid attestation"))?
-            .reply
-    } else {
-        reply
-    };
+    ssh_invoke_result(reply, method_meta.attested)
+}
+
+fn ssh_invoke_result(reply: Vec<u8>, attested: bool) -> Result<Value, HostServiceError> {
+    if attested {
+        let result = crate::service::RootTreeAttestedResult::decode(&reply).map_err(|_| {
+            service_error("vos.invalid-reply", "actor returned invalid attestation")
+        })?;
+        let rendered = render_actor_reply(&result.reply)?;
+        return Ok(attested_invoke_value(rendered, reply));
+    }
+    render_actor_reply(&reply).map(Value::Text)
+}
+
+fn render_actor_reply(reply: &[u8]) -> Result<String, HostServiceError> {
     if reply.is_empty() {
         return Ok("Completed".into());
     }
-    let value = crate::value::Value::try_decode(&reply)
+    let value = crate::value::Value::try_decode(reply)
         .ok_or_else(|| service_error("vos.invalid-reply", "actor returned invalid data"))?;
     Ok(format!("{value:?}"))
+}
+
+fn attested_invoke_value(reply: String, wire: Vec<u8>) -> Value {
+    Value::object([
+        ("reply".into(), Value::Text(reply)),
+        ("attestation_wire".into(), Value::Bytes(wire)),
+    ])
 }
 
 fn ssh_invocation_key<'a>(
@@ -1121,5 +1145,22 @@ mod tests {
         );
         assert!(ssh_invocation_key(&method(false, false), &"x".repeat(129)).is_err());
         assert!(method(false, true).attested);
+    }
+
+    #[test]
+    fn attested_shell_results_preserve_and_render_the_complete_wire() {
+        let wire = b"VARW-complete-proof-package".to_vec();
+        let value = attested_invoke_value("U64(7)".into(), wire.clone());
+        let Value::Map(fields) = &value else {
+            panic!("attested result must be structured");
+        };
+        assert_eq!(fields.get("reply"), Some(&Value::Text("U64(7)".into())));
+        assert_eq!(
+            fields.get("attestation_wire"),
+            Some(&Value::Bytes(wire.clone())),
+        );
+        let rendered = effect_text(EffectOutput::HostService(Ok(value)));
+        assert!(rendered.contains("U64(7)"));
+        assert!(rendered.contains(&hex(&wire)));
     }
 }

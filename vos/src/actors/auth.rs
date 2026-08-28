@@ -179,6 +179,10 @@ pub const MAX_SPACE_ROLES: usize = 128;
 pub const MAX_MEMBER_ROLES: usize = 16;
 pub const MAX_ROLE_CAPABILITIES: usize = 64;
 pub const MAX_MEMBER_CREDENTIALS: usize = 32;
+/// Maximum number of credential identities one member may create over the
+/// lifetime of an authority installation. Revoked identities remain durable
+/// so the same bearer can never be reactivated accidentally.
+pub const MAX_MEMBER_CREDENTIAL_HISTORY: u32 = 256;
 
 /// Stable capability names used by the built-in space surface. Actor packages
 /// may declare additional names; all names enter policy as a

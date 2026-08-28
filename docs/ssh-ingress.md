@@ -54,6 +54,10 @@ its delegation chain affects the next operation. Durable mutations require an
 operation key. Retrying the same member, target, and key recovers the exact
 committed result; reusing a key for different work is rejected.
 
+Attested methods return a structured S4 result containing the rendered actor
+reply and the complete canonical `VARW` attestation wire. The built-in terminal
+prints that wire as hex so the proof package is never silently discarded.
+
 The current built-in routes are:
 
 | Route | Purpose | Minimum capability |
