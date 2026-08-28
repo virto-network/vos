@@ -14,13 +14,11 @@ use vos::prelude::*;
 pub const MAX_REPLY_BYTES: usize = 7 * 1024;
 /// Maximum map rows per request.
 pub const MAX_MAP_PAGE: u32 = 32;
-/// Maximum live snapshot cursors retained by one extension instance.
+/// Maximum live snapshot cursors retained for one caller.
 pub const MAX_MAP_SNAPSHOTS: usize = 16;
-/// Maximum pages that one snapshot cursor may traverse.
-pub const MAX_MAP_PAGES: u16 = 32;
-/// Map snapshot cursors expire after four minutes.
+/// Map snapshot cursors expire after four minutes of inactivity.
 pub const MAP_SNAPSHOT_TTL_SECS: u64 = 240;
-/// Maximum outstanding external-signature requests per extension instance.
+/// Maximum outstanding external-signature requests for one caller.
 pub const MAX_PENDING_TRANSACTIONS: usize = 32;
 /// External signing requests expire after four minutes.
 pub const SIGNING_REQUEST_TTL_SECS: u64 = 240;
@@ -49,6 +47,7 @@ pub enum ErrorCode {
     InvalidSignature = 9,
     Stale = 10,
     ReplyTooLarge = 11,
+    Forbidden = 12,
 }
 
 #[derive(
@@ -332,7 +331,7 @@ impl SubstrateExtension {
     #[msg(timeout_ms = 120000)]
     async fn status(&mut self, _ctx: &mut Context<Self>) -> SubstrateResult<ChainStatus> {
         #[cfg(feature = "native")]
-        return self.native_status().await;
+        return native::with_deadline(native::STANDARD_DEADLINE, self.native_status()).await;
         #[cfg(not(feature = "native"))]
         SubstrateResult::error(ErrorCode::Unsupported, "native backend is disabled")
     }
@@ -348,7 +347,7 @@ impl SubstrateExtension {
         _ctx: &mut Context<Self>,
     ) -> SubstrateResult<QueryResult> {
         #[cfg(feature = "native")]
-        return self.native_query(path, at).await;
+        return native::with_deadline(native::STANDARD_DEADLINE, self.native_query(path, at)).await;
         #[cfg(not(feature = "native"))]
         {
             let _ = (path, at);
@@ -365,10 +364,16 @@ impl SubstrateExtension {
         path: String,
         limit: u32,
         cursor: Vec<u8>,
-        _ctx: &mut Context<Self>,
+        ctx: &mut Context<Self>,
     ) -> SubstrateResult<MapPage> {
         #[cfg(feature = "native")]
-        return self.native_query_map(path, limit, cursor).await;
+        {
+            let owner = native::CallerKey::from_caller(ctx.caller());
+            let invocation = ctx.invocation_id();
+            return self
+                .native_query_map_with_deadline(path, limit, cursor, owner, invocation)
+                .await;
+        }
         #[cfg(not(feature = "native"))]
         {
             let _ = (path, limit, cursor);
@@ -382,10 +387,24 @@ impl SubstrateExtension {
     async fn prepare_transaction(
         &mut self,
         request: TransactionRequest,
-        _ctx: &mut Context<Self>,
+        ctx: &mut Context<Self>,
     ) -> SubstrateResult<SigningPayload> {
         #[cfg(feature = "native")]
-        return self.native_prepare_transaction(request).await;
+        {
+            let owner = native::CallerKey::from_caller(ctx.caller());
+            if !owner.is_authenticated() {
+                return SubstrateResult::error(
+                    ErrorCode::Forbidden,
+                    "transaction preparation requires an authenticated caller",
+                );
+            }
+            let invocation = ctx.invocation_id();
+            return native::with_deadline(
+                native::STANDARD_DEADLINE,
+                self.native_prepare_transaction(request, owner, invocation),
+            )
+            .await;
+        }
         #[cfg(not(feature = "native"))]
         {
             let _ = request;
@@ -394,19 +413,29 @@ impl SubstrateExtension {
     }
 
     /// Finish and synchronously submit a prepared request, waiting for best
-    /// inclusion or finalization. A request id is consumed by this call.
+    /// inclusion or finalization. A valid request is consumed immediately
+    /// before network submission.
     #[msg(timeout_ms = 240000)]
     async fn submit_transaction(
         &mut self,
         request_id: u64,
         signature: Vec<u8>,
         wait_for: Inclusion,
-        _ctx: &mut Context<Self>,
+        ctx: &mut Context<Self>,
     ) -> SubstrateResult<TransactionResult> {
         #[cfg(feature = "native")]
-        return self
-            .native_submit_transaction(request_id, signature, wait_for)
-            .await;
+        {
+            let owner = native::CallerKey::from_caller(ctx.caller());
+            if !owner.is_authenticated() {
+                return SubstrateResult::error(
+                    ErrorCode::Forbidden,
+                    "transaction submission requires an authenticated caller",
+                );
+            }
+            return self
+                .native_submit_transaction_with_deadline(request_id, signature, wait_for, owner)
+                .await;
+        }
         #[cfg(not(feature = "native"))]
         {
             let _ = (request_id, signature, wait_for);
@@ -419,10 +448,19 @@ impl SubstrateExtension {
     async fn cancel_transaction(
         &mut self,
         request_id: u64,
-        _ctx: &mut Context<Self>,
+        ctx: &mut Context<Self>,
     ) -> SubstrateResult<bool> {
         #[cfg(feature = "native")]
-        return SubstrateResult::Ok(self.native_cancel_transaction(request_id));
+        {
+            let owner = native::CallerKey::from_caller(ctx.caller());
+            if !owner.is_authenticated() {
+                return SubstrateResult::error(
+                    ErrorCode::Forbidden,
+                    "transaction cancellation requires an authenticated caller",
+                );
+            }
+            return SubstrateResult::Ok(self.native_cancel_transaction(request_id, &owner));
+        }
         #[cfg(not(feature = "native"))]
         {
             let _ = request_id;
@@ -518,6 +556,7 @@ fn decode_cursor(
 mod native {
     use super::*;
     use core::time::Duration;
+    use std::future::Future;
     use std::{fs, io::Read, time::Instant};
 
     use sube::{Backend as _, DispatchOutcome, Response, TransactionOptions};
@@ -526,23 +565,99 @@ mod native {
     const MAX_CALL_BODY_LEN: usize = 2048;
     const MAX_CHAIN_SPEC_BYTES: u64 = 16 * 1024 * 1024;
     const MAX_RECEIPT_EVENTS: usize = 16;
-    const LIGHT_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+    const MAX_TOTAL_MAP_SNAPSHOTS: usize = 64;
+    const MAX_TOTAL_PENDING_TRANSACTIONS: usize = 128;
+    const LIGHT_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
+    pub(super) const STANDARD_DEADLINE: Duration = Duration::from_secs(105);
+    pub(super) const SUBMISSION_DEADLINE: Duration = Duration::from_secs(210);
+    const BACKEND_CANCELLATION_DEADLINE: Duration = Duration::from_secs(10);
+    const TRANSACTION_WATCH_TIMEOUT: Duration = Duration::from_secs(180);
+
+    pub(super) async fn with_deadline<T>(
+        duration: Duration,
+        future: impl Future<Output = SubstrateResult<T>>,
+    ) -> SubstrateResult<T> {
+        match sube::time::timeout(duration, future).await {
+            Ok(result) => result,
+            Err(_) => SubstrateResult::error(ErrorCode::Unavailable, "operation timed out"),
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) enum CallerKey {
+        Unauthenticated,
+        System,
+        Peer(Vec<u8>),
+        Member([u8; 32]),
+        Actor(u32),
+    }
+
+    impl CallerKey {
+        pub(super) fn from_caller(caller: &vos::Caller) -> Self {
+            match caller {
+                vos::Caller::Unauthenticated => Self::Unauthenticated,
+                vos::Caller::System => Self::System,
+                vos::Caller::Peer(peer) => Self::Peer(peer.clone()),
+                vos::Caller::Member(subject) => Self::Member(subject.0),
+                vos::Caller::Actor(service) => Self::Actor(service.0),
+            }
+        }
+
+        pub(super) fn is_authenticated(&self) -> bool {
+            !matches!(self, Self::Unauthenticated)
+        }
+
+        fn encoded(&self) -> Vec<u8> {
+            match self {
+                Self::Unauthenticated => vec![0],
+                Self::System => vec![1],
+                Self::Peer(peer) => [&[2][..], peer.as_slice()].concat(),
+                Self::Member(subject) => [&[3][..], subject.as_slice()].concat(),
+                Self::Actor(service) => [&[4][..], &service.to_le_bytes()].concat(),
+            }
+        }
+    }
+
+    pub(super) fn capability_id(
+        domain: &[u8],
+        owner: &CallerKey,
+        invocation: InvocationId,
+        counter: u64,
+    ) -> u64 {
+        let counter = counter.to_le_bytes();
+        let owner = owner.encoded();
+        let digest = vos::crypto::blake2b_hash::<32>(
+            domain,
+            &[invocation.as_bytes(), &counter, owner.as_slice()],
+        );
+        u64::from_le_bytes(
+            digest[..8]
+                .try_into()
+                .expect("eight-byte capability prefix"),
+        )
+        .max(1)
+    }
 
     pub(super) struct PendingTransaction {
         id: u64,
+        owner: CallerKey,
         created: Instant,
         automatic_nonce: bool,
         nonce_account: Vec<u8>,
+        metadata: sube::Rc<sube::Metadata>,
         request: sube::ExternalSigningRequest,
     }
 
+    #[derive(Clone)]
     pub(super) struct MapSnapshot {
-        id: u64,
-        created: Instant,
-        path: String,
-        at: BlockRef,
-        next_key: Vec<u8>,
-        pages: u16,
+        pub(super) id: u64,
+        pub(super) owner: CallerKey,
+        pub(super) last_used: Instant,
+        pub(super) path: String,
+        pub(super) at: BlockRef,
+        pub(super) next_key: Vec<u8>,
+        pub(super) started: bool,
+        pub(super) active_invocation: InvocationId,
     }
 
     impl SubstrateExtension {
@@ -590,7 +705,7 @@ mod native {
             let ttl = Duration::from_secs(MAP_SNAPSHOT_TTL_SECS);
             let mut expired = Vec::new();
             self.runtime.map_snapshots.retain(|snapshot| {
-                if snapshot.created.elapsed() <= ttl {
+                if snapshot.last_used.elapsed() <= ttl {
                     true
                 } else {
                     expired.push(snapshot.at.hash);
@@ -604,10 +719,16 @@ mod native {
             }
         }
 
-        fn allocate_snapshot_id(&mut self) -> Option<u64> {
-            for _ in 0..=MAX_MAP_SNAPSHOTS {
-                let candidate = self.runtime.next_snapshot_id.max(1);
-                self.runtime.next_snapshot_id = candidate.wrapping_add(1).max(1);
+        fn allocate_snapshot_id(
+            &mut self,
+            owner: &CallerKey,
+            invocation: InvocationId,
+        ) -> Option<u64> {
+            for _ in 0..=MAX_TOTAL_MAP_SNAPSHOTS {
+                let counter = self.runtime.next_snapshot_id;
+                self.runtime.next_snapshot_id = counter.wrapping_add(1);
+                let candidate =
+                    capability_id(b"vos/substrate/map-snapshot", owner, invocation, counter);
                 if self
                     .runtime
                     .map_snapshots
@@ -626,10 +747,52 @@ mod native {
             }
         }
 
-        fn allocate_request_id(&mut self) -> Option<u64> {
-            for _ in 0..=MAX_PENDING_TRANSACTIONS {
-                let candidate = self.next_request_id.max(1);
-                self.next_request_id = candidate.wrapping_add(1).max(1);
+        pub(super) fn take_map_snapshot(
+            &mut self,
+            id: u64,
+            owner: &CallerKey,
+        ) -> Option<MapSnapshot> {
+            self.runtime
+                .map_snapshots
+                .iter()
+                .position(|snapshot| snapshot.id == id && &snapshot.owner == owner)
+                .map(|position| self.runtime.map_snapshots.swap_remove(position))
+        }
+
+        async fn cancel_backend_operation(&mut self) {
+            if let Some(client) = self.runtime.client.as_mut() {
+                let _ = sube::time::timeout(
+                    BACKEND_CANCELLATION_DEADLINE,
+                    client.cancel_active_operation(),
+                )
+                .await;
+            }
+        }
+
+        async fn cancel_map_invocation(&mut self, owner: &CallerKey, invocation: InvocationId) {
+            self.cancel_backend_operation().await;
+            let snapshots = self
+                .runtime
+                .map_snapshots
+                .extract_if(.., |snapshot| {
+                    &snapshot.owner == owner && snapshot.active_invocation == invocation
+                })
+                .collect::<Vec<_>>();
+            for snapshot in snapshots {
+                self.release_map_snapshot(snapshot);
+            }
+        }
+
+        fn allocate_request_id(
+            &mut self,
+            owner: &CallerKey,
+            invocation: InvocationId,
+        ) -> Option<u64> {
+            for _ in 0..=MAX_TOTAL_PENDING_TRANSACTIONS {
+                let counter = self.next_request_id;
+                self.next_request_id = counter.wrapping_add(1);
+                let candidate =
+                    capability_id(b"vos/substrate/signing-request", owner, invocation, counter);
                 if self
                     .runtime
                     .pending
@@ -685,11 +848,19 @@ mod native {
             let result = async {
                 let client = self.ensure_client().await?;
                 let block = match at {
-                    Some(at) => sube::BlockInfo {
-                        number: at.number,
-                        hash: at.hash,
-                        parent: [0; 32],
-                    },
+                    Some(at) => {
+                        let block = client
+                            .block_info_at_hash(at.hash)
+                            .await
+                            .map_err(map_sube_error)?;
+                        if block.number != at.number {
+                            return Err(ExtensionError::new(
+                                ErrorCode::BadRequest,
+                                "block number does not match the supplied hash",
+                            ));
+                        }
+                        block
+                    }
                     None => client
                         .backend()
                         .block_info(None)
@@ -727,11 +898,36 @@ mod native {
             bounded_result(result)
         }
 
-        pub(super) async fn native_query_map(
+        pub(super) async fn native_query_map_with_deadline(
             &mut self,
             path: String,
             limit: u32,
             cursor: Vec<u8>,
+            owner: CallerKey,
+            invocation: InvocationId,
+        ) -> SubstrateResult<MapPage> {
+            let cleanup_owner = owner.clone();
+            match sube::time::timeout(
+                STANDARD_DEADLINE,
+                self.native_query_map(path, limit, cursor, owner, invocation),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    self.cancel_map_invocation(&cleanup_owner, invocation).await;
+                    SubstrateResult::error(ErrorCode::Unavailable, "operation timed out")
+                }
+            }
+        }
+
+        async fn native_query_map(
+            &mut self,
+            path: String,
+            limit: u32,
+            cursor: Vec<u8>,
+            owner: CallerKey,
+            invocation: InvocationId,
         ) -> SubstrateResult<MapPage> {
             if let Err(error) = validate_query_path(&path) {
                 return SubstrateResult::Err(error);
@@ -744,14 +940,22 @@ mod native {
             }
             self.expire_map_snapshots();
 
-            let mut snapshot = if cursor.is_empty() {
-                if self.runtime.map_snapshots.len() >= MAX_MAP_SNAPSHOTS {
+            let snapshot_id = if cursor.is_empty() {
+                if self.runtime.map_snapshots.len() >= MAX_TOTAL_MAP_SNAPSHOTS
+                    || self
+                        .runtime
+                        .map_snapshots
+                        .iter()
+                        .filter(|snapshot| snapshot.owner == owner)
+                        .count()
+                        >= MAX_MAP_SNAPSHOTS
+                {
                     return SubstrateResult::error(
                         ErrorCode::Busy,
                         "too many active map snapshots",
                     );
                 }
-                let Some(id) = self.allocate_snapshot_id() else {
+                let Some(id) = self.allocate_snapshot_id(&owner, invocation) else {
                     return SubstrateResult::error(
                         ErrorCode::Busy,
                         "unable to allocate map snapshot id",
@@ -769,14 +973,17 @@ mod native {
                     client.retain_finalized_hash(at.hash);
                     block_ref(at)
                 };
-                MapSnapshot {
+                self.runtime.map_snapshots.push(MapSnapshot {
                     id,
-                    created: Instant::now(),
+                    owner: owner.clone(),
+                    last_used: Instant::now(),
                     path: path.clone(),
                     at,
                     next_key: Vec::new(),
-                    pages: 0,
-                }
+                    started: false,
+                    active_invocation: invocation,
+                });
+                id
             } else {
                 let (id, number, hash, key) = match decode_cursor(&path, &cursor) {
                     Ok(cursor) => cursor,
@@ -786,37 +993,38 @@ mod native {
                     .runtime
                     .map_snapshots
                     .iter()
-                    .position(|snapshot| snapshot.id == id)
+                    .position(|snapshot| snapshot.id == id && snapshot.owner == owner)
                 else {
                     return SubstrateResult::error(
                         ErrorCode::Stale,
                         "map cursor is expired, consumed, or belongs to another instance",
                     );
                 };
-                let snapshot = self.runtime.map_snapshots.swap_remove(position);
+                let snapshot = &self.runtime.map_snapshots[position];
                 if snapshot.path != path
                     || snapshot.at.number != number
                     || snapshot.at.hash != hash
                     || snapshot.next_key != key
                 {
-                    self.release_map_snapshot(snapshot);
                     return SubstrateResult::error(
                         ErrorCode::BadRequest,
                         "map cursor does not match its retained snapshot",
                     );
                 }
-                if snapshot.pages >= MAX_MAP_PAGES {
-                    self.release_map_snapshot(snapshot);
-                    return SubstrateResult::error(
-                        ErrorCode::BadRequest,
-                        "map cursor exceeded its 32-page work limit",
-                    );
-                }
-                snapshot
+                self.runtime.map_snapshots[position].active_invocation = invocation;
+                id
             };
 
+            let snapshot = self
+                .runtime
+                .map_snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == snapshot_id && snapshot.owner == owner)
+                .cloned()
+                .expect("map snapshot was inserted or validated above");
+
             let result = async {
-                let start_key = if snapshot.pages == 0 {
+                let start_key = if !snapshot.started {
                     None
                 } else {
                     Some(snapshot.next_key.clone())
@@ -866,25 +1074,25 @@ mod native {
             let (at, entries, next_key) = match result {
                 Ok(result) => result,
                 Err(error) => {
-                    self.release_map_snapshot(snapshot);
+                    if let Some(snapshot) = self.take_map_snapshot(snapshot_id, &owner) {
+                        self.release_map_snapshot(snapshot);
+                    }
                     return SubstrateResult::Err(error);
                 }
             };
-            snapshot.pages += 1;
-            let next_cursor = match next_key {
-                Some(next_key) => {
-                    snapshot.next_key = next_key;
-                    match encode_cursor(&path, snapshot.id, &at, &snapshot.next_key) {
-                        Some(cursor) => cursor,
-                        None => {
+            let next_cursor = match next_key.as_ref() {
+                Some(next_key) => match encode_cursor(&path, snapshot_id, &at, next_key) {
+                    Some(cursor) => cursor,
+                    None => {
+                        if let Some(snapshot) = self.take_map_snapshot(snapshot_id, &owner) {
                             self.release_map_snapshot(snapshot);
-                            return SubstrateResult::error(
-                                ErrorCode::Encoding,
-                                "map cursor is too large",
-                            );
                         }
+                        return SubstrateResult::error(
+                            ErrorCode::Encoding,
+                            "map cursor is too large",
+                        );
                     }
-                }
+                },
                 None => Vec::new(),
             };
             let reply = SubstrateResult::Ok(MapPage {
@@ -893,7 +1101,9 @@ mod native {
                 next_cursor,
             });
             if reply.encode().len() > MAX_REPLY_BYTES {
-                self.release_map_snapshot(snapshot);
+                if let Some(snapshot) = self.take_map_snapshot(snapshot_id, &owner) {
+                    self.release_map_snapshot(snapshot);
+                }
                 return SubstrateResult::error(
                     ErrorCode::ReplyTooLarge,
                     "response exceeds 7 KiB; request a smaller page",
@@ -901,8 +1111,16 @@ mod native {
             }
             if matches!(reply, SubstrateResult::Ok(MapPage { ref next_cursor, .. }) if !next_cursor.is_empty())
             {
-                self.runtime.map_snapshots.push(snapshot);
-            } else {
+                let snapshot = self
+                    .runtime
+                    .map_snapshots
+                    .iter_mut()
+                    .find(|snapshot| snapshot.id == snapshot_id && snapshot.owner == owner)
+                    .expect("active snapshot remains installed until page commit");
+                snapshot.next_key = next_key.expect("non-empty cursor has a backend key");
+                snapshot.started = true;
+                snapshot.last_used = Instant::now();
+            } else if let Some(snapshot) = self.take_map_snapshot(snapshot_id, &owner) {
                 self.release_map_snapshot(snapshot);
             }
             reply
@@ -911,9 +1129,19 @@ mod native {
         pub(super) async fn native_prepare_transaction(
             &mut self,
             request: TransactionRequest,
+            owner: CallerKey,
+            invocation: InvocationId,
         ) -> SubstrateResult<SigningPayload> {
             self.expire_pending();
-            if self.runtime.pending.len() >= MAX_PENDING_TRANSACTIONS {
+            if self.runtime.pending.len() >= MAX_TOTAL_PENDING_TRANSACTIONS
+                || self
+                    .runtime
+                    .pending
+                    .iter()
+                    .filter(|pending| pending.owner == owner)
+                    .count()
+                    >= MAX_PENDING_TRANSACTIONS
+            {
                 return SubstrateResult::error(
                     ErrorCode::Busy,
                     "too many pending signing requests",
@@ -950,9 +1178,6 @@ mod native {
 
             let result = async {
                 let client = self.ensure_client().await?;
-                let call = client
-                    .prepare_call(&request.call_path, &sube::Text(&request.call_body))
-                    .map_err(map_sube_error)?;
                 let mut options = TransactionOptions::default().tip(request.tip);
                 options = if request.mortality_period == 0 {
                     options.immortal()
@@ -963,8 +1188,9 @@ mod native {
                     options = options.nonce(nonce);
                 }
                 let external = client
-                    .prepare_external_signing(
-                        &call,
+                    .prepare_external_call_signing(
+                        &request.call_path,
+                        &sube::Text(&request.call_body),
                         &request.signing_account,
                         &request.nonce_account,
                         to_sube_scheme(request.scheme),
@@ -972,14 +1198,27 @@ mod native {
                     )
                     .await
                     .map_err(map_sube_error)?;
-                Ok(external)
+                Ok((external, client.metadata_rc()))
             }
             .await;
-            let external = match result {
+            let (external, metadata) = match result {
                 Ok(request) => request,
                 Err(error) => return SubstrateResult::Err(error),
             };
-            let id = match self.allocate_request_id() {
+            // Metadata is large. Pending requests from the same runtime can
+            // safely share one immutable registry while older runtime
+            // versions keep their own exact signing schema.
+            let metadata = self
+                .runtime
+                .pending
+                .iter()
+                .find(|pending| {
+                    pending.request.context.spec_version == external.context.spec_version
+                        && pending.request.context.tx_version == external.context.tx_version
+                })
+                .map(|pending| sube::Rc::clone(&pending.metadata))
+                .unwrap_or(metadata);
+            let id = match self.allocate_request_id(&owner, invocation) {
                 Some(id) => id,
                 None => {
                     return SubstrateResult::error(
@@ -998,9 +1237,11 @@ mod native {
             }
             self.runtime.pending.push(PendingTransaction {
                 id,
+                owner,
                 created: Instant::now(),
                 automatic_nonce,
                 nonce_account: request.nonce_account,
+                metadata,
                 request: external,
             });
             reply
@@ -1011,43 +1252,64 @@ mod native {
             request_id: u64,
             signature: Vec<u8>,
             wait_for: Inclusion,
+            owner: CallerKey,
         ) -> SubstrateResult<TransactionResult> {
-            if signature.len() > 65 {
-                return SubstrateResult::error(
-                    ErrorCode::InvalidSignature,
-                    "signature is longer than 65 bytes",
-                );
-            }
             let Some(position) = self
                 .runtime
                 .pending
                 .iter()
-                .position(|pending| pending.id == request_id)
+                .position(|pending| pending.id == request_id && pending.owner == owner)
             else {
                 self.expire_pending();
                 return SubstrateResult::error(ErrorCode::NotFound, "unknown signing request");
             };
+            let expected_signature_len = self.runtime.pending[position]
+                .request
+                .scheme
+                .signature_len();
+            if signature.len() != expected_signature_len {
+                return SubstrateResult::error(
+                    ErrorCode::InvalidSignature,
+                    format!(
+                        "signature must be {expected_signature_len} bytes, got {}",
+                        signature.len()
+                    ),
+                );
+            }
+            if self.runtime.pending[position].automatic_nonce
+                && matches!(wait_for, Inclusion::BestBlock)
+            {
+                return SubstrateResult::error(
+                    ErrorCode::BadRequest,
+                    "automatic-nonce transactions must wait for finalization",
+                );
+            }
             if self.runtime.pending[position].created.elapsed()
                 > Duration::from_secs(SIGNING_REQUEST_TTL_SECS)
             {
                 self.runtime.pending.swap_remove(position);
                 return SubstrateResult::error(ErrorCode::Expired, "signing request expired");
             }
+            let request = self.runtime.pending[position].request.clone();
+            let metadata = sube::Rc::clone(&self.runtime.pending[position].metadata);
+            let extrinsic =
+                match sube::extrinsic::finish_external_signing(&metadata, &request, &signature) {
+                    Ok(extrinsic) => extrinsic,
+                    Err(error) => return SubstrateResult::Err(map_sube_error(error)),
+                };
             // Consume before submission. A timeout or ambiguous network result
             // must never make the same signature conveniently replayable.
-            let pending = self.runtime.pending.swap_remove(position);
+            self.runtime.pending.swap_remove(position);
             let result = async {
                 let client = self.ensure_client().await?;
-                let extrinsic = client
-                    .finish_external_signing(&pending.request, &signature)
-                    .map_err(map_sube_error)?;
                 let receipt = client
-                    .submit_transaction(
+                    .submit_transaction_with_timeout(
                         &extrinsic,
                         match wait_for {
                             Inclusion::BestBlock => sube::WaitFor::BestBlock,
                             Inclusion::Finalized => sube::WaitFor::Finalized,
                         },
+                        TRANSACTION_WATCH_TIMEOUT,
                     )
                     .await
                     .map_err(map_sube_error)?;
@@ -1057,12 +1319,42 @@ mod native {
             bounded_result(result)
         }
 
-        pub(super) fn native_cancel_transaction(&mut self, request_id: u64) -> bool {
+        pub(super) async fn native_submit_transaction_with_deadline(
+            &mut self,
+            request_id: u64,
+            signature: Vec<u8>,
+            wait_for: Inclusion,
+            owner: CallerKey,
+        ) -> SubstrateResult<TransactionResult> {
+            match sube::time::timeout(
+                SUBMISSION_DEADLINE,
+                self.native_submit_transaction(request_id, signature, wait_for, owner),
+            )
+            .await
+            {
+                Ok(result) => {
+                    if matches!(result, SubstrateResult::Err(_)) {
+                        self.cancel_backend_operation().await;
+                    }
+                    result
+                }
+                Err(_) => {
+                    self.cancel_backend_operation().await;
+                    SubstrateResult::error(ErrorCode::Unavailable, "operation timed out")
+                }
+            }
+        }
+
+        pub(super) fn native_cancel_transaction(
+            &mut self,
+            request_id: u64,
+            owner: &CallerKey,
+        ) -> bool {
             self.expire_pending();
             self.runtime
                 .pending
                 .iter()
-                .position(|pending| pending.id == request_id)
+                .position(|pending| pending.id == request_id && &pending.owner == owner)
                 .map(|position| self.runtime.pending.swap_remove(position))
                 .is_some()
         }
@@ -1401,6 +1693,37 @@ mod tests {
 
     #[cfg(feature = "native")]
     #[test]
+    fn native_capabilities_and_snapshots_are_bound_to_the_caller() {
+        let actor_owner = native::CallerKey::Actor(7);
+        let other_owner = native::CallerKey::Actor(8);
+        let invocation = InvocationId([9; 32]);
+        let id = native::capability_id(b"vos/substrate/test", &actor_owner, invocation, 1);
+        assert_ne!(
+            id,
+            native::capability_id(b"vos/substrate/test", &other_owner, invocation, 1,)
+        );
+
+        let mut actor = SubstrateExtension::new(&[]);
+        actor.runtime.map_snapshots.push(MapSnapshot {
+            id,
+            owner: actor_owner.clone(),
+            last_used: std::time::Instant::now(),
+            path: "system/account".into(),
+            at: BlockRef {
+                number: 1,
+                hash: [2; 32],
+            },
+            next_key: Vec::new(),
+            started: false,
+            active_invocation: invocation,
+        });
+        assert!(actor.take_map_snapshot(id, &other_owner).is_none());
+        assert_eq!(actor.runtime.map_snapshots.len(), 1);
+        assert!(actor.take_map_snapshot(id, &actor_owner).is_some());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
     fn oversized_success_is_replaced_with_a_bounded_error() {
         let result = native::bounded_result(Ok(QueryResult {
             at: BlockRef {
@@ -1486,18 +1809,25 @@ mod tests {
         };
         assert!(query.value.is_some());
 
-        let page =
-            match smol::block_on(actor.native_query_map("system/account".into(), 1, Vec::new())) {
-                SubstrateResult::Ok(page) => page,
-                SubstrateResult::Err(error) => panic!("light-client map query failed: {error:?}"),
-            };
+        let page = match smol::block_on(actor.native_query_map_with_deadline(
+            "system/account".into(),
+            1,
+            Vec::new(),
+            native::CallerKey::System,
+            InvocationId([1; 32]),
+        )) {
+            SubstrateResult::Ok(page) => page,
+            SubstrateResult::Err(error) => panic!("light-client map query failed: {error:?}"),
+        };
         assert_eq!(page.entries.len(), 1);
         assert!(!page.next_cursor.is_empty());
 
-        let next = match smol::block_on(actor.native_query_map(
+        let next = match smol::block_on(actor.native_query_map_with_deadline(
             "system/account".into(),
             1,
             page.next_cursor.clone(),
+            native::CallerKey::System,
+            InvocationId([2; 32]),
         )) {
             SubstrateResult::Ok(page) => page,
             SubstrateResult::Err(error) => panic!("continued map query failed: {error:?}"),

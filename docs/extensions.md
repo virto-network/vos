@@ -64,8 +64,14 @@ relay_spec_path = "/etc/vos/kusama.json.zst"
 ```
 
 Omit both paths for the bundled defaults. Actor-visible requests are capped at
-32 map rows, a 7 KiB encoded success reply, 16 active map snapshots, 32 pages
-per map cursor, and 32 pending signing payloads. Map pages may be short while a
-non-empty cursor indicates more bounded trie partitions. Map cursors and
+32 map rows, a 7 KiB encoded success reply, 16 active map snapshots per caller,
+and 32 pending signing payloads per caller. Map pages may be short while a
+non-empty cursor indicates more bounded trie partitions. Idle map cursors and
 unsigned preparations expire after four minutes; only one automatic-nonce
-request per nonce account may be pending at once.
+request per nonce account may be pending at once, and automatic-nonce
+submissions must wait for finalization.
+
+Transaction preparation, submission, and cancellation require an authenticated
+VOS caller. Signing request IDs and map snapshot IDs are non-sequential and
+caller-bound; unauthenticated map reads use bearer cursors and share one
+anonymous caller quota.
