@@ -1861,6 +1861,7 @@ impl<'ctx, A: Actor> core::future::IntoFuture for FetchBuilder<'ctx, A> {
 mod tests {
     use super::*;
     use crate::actors::auth::{NO_ROLES_MAP, NoRoles};
+    use crate::actors::codec::Encode;
 
     // Minimal fixture Actor — just enough to satisfy the trait
     // bounds for Context<A> construction. Roles default to

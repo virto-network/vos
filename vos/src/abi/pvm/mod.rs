@@ -13,3 +13,4 @@ pub(crate) mod alloc;
 
 pub mod ecall;
 pub mod hostcalls;
+pub mod inner;
