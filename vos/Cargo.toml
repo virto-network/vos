@@ -21,6 +21,10 @@ service-runtime = ["service"]
 # Typed service-actor client for node-local native extensions. Opt-in keeps
 # actors that do not use native I/O byte-identical to their existing PVMs.
 native-extension-client = ["pvm"]
+# The bundled agent runtime is an infrastructure guest like the former
+# service runtime, but it uses only the standard PVM inner-machine surface.
+# Keep its larger transient arena out of ordinary application actors.
+agent-runtime = ["pvm"]
 # NOTE: the ZK actor-IO binding is tagless (`vos::zk`) — the io-hash
 # primitive `compute_io_hash` is pure and always available (guest +
 # host).  Proof *verification* (STARK validity ∧ io-binding) lives in

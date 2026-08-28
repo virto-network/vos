@@ -23,6 +23,12 @@ use crate::service::{
 /// Stable lifecycle contract implemented by every agent runtime.
 pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829!!");
 
+/// Program identity of the bundled standard runtime artifact.
+pub const STANDARD_RUNTIME_PROGRAM_ID: ProgramId = ProgramId([
+    0x85, 0x39, 0x98, 0x96, 0xb8, 0x89, 0xb3, 0x1c, 0xbc, 0xaf, 0x0d, 0x5e, 0x92, 0x06, 0x10, 0x6e,
+    0x1a, 0xbf, 0xde, 0x8e, 0xfa, 0xcd, 0x98, 0xaa, 0x30, 0x18, 0x0f, 0x87, 0x05, 0x85, 0x84, 0xcd,
+]);
+
 /// Immutable storage and publication profile of an agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]

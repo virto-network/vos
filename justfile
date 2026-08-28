@@ -24,7 +24,7 @@ build-wasm:
     cd tests/fixtures/wasm/echo; cargo build --target wasm32-unknown-unknown --release
 
 # Build the service and the actors used by examples and integration tests.
-build-pvm: build-vos-service build-examples build-registry-fixtures
+build-pvm: build-agent-runtime-candidate build-vos-service build-examples build-registry-fixtures
 
 # Build the four public service examples (private-age + age-gate is one scenario).
 build-examples:
@@ -97,6 +97,15 @@ build-clerk-package signer:
 build-vos-service-candidate:
     cd services/vos-service; cargo actor
     @echo "candidate ELF: services/vos-service/target/riscv64em-vos/release/vos_service.elf"
+
+# Build and physically validate the bundled standard agent runtime without
+# replacing its committed release artifact.
+build-agent-runtime-candidate:
+    cd services/agent-runtime; cargo actor
+    cargo run -p vosx -- agent-runtime-pvm \
+      services/agent-runtime/target/riscv64em-vos/release/agent_runtime.elf \
+      --out target/agent-runtime-candidate.pvm
+    @echo "candidate PVM: target/agent-runtime-candidate.pvm"
 
 # Refresh the bundled registry from the pinned source and toolchain.
 refresh-bundled-registry:

@@ -115,6 +115,9 @@ pub struct Invocation {
     pub gas_used: Gas,
     /// The register file φ at exit.
     pub registers: [u64; PVM_REGISTER_COUNT],
+    /// Instruction counter at the exit boundary. Useful for deterministic
+    /// diagnostics without exposing the interpreter itself.
+    pub pc: u32,
     mem: Memory,
 }
 
@@ -261,6 +264,7 @@ impl Machine {
             exit,
             gas_used: self.initial_gas.saturating_sub(self.interp.gas),
             registers: self.interp.registers,
+            pc: self.interp.pc,
             mem: self.interp.take_memory(),
         }
     }

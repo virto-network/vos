@@ -288,6 +288,31 @@ fn rw_data_lands_at_linked_vaddr_under_spi() {
     assert_eq!(inv.output().as_deref(), Some(&rw_const.to_le_bytes()[..]));
 }
 
+#[test]
+fn trailing_bss_is_encoded_as_zero_pages_not_artifact_bytes() {
+    let rw_vaddr = 3 * PVM_ZONE_SIZE as u64;
+    let data = 0xCAFE_BABEu64.to_le_bytes();
+    let bss = [0u8; 2 * 4096];
+    let text = assemble(&[ret()]);
+    let elf = build_elf(
+        TEXT_VADDR,
+        &[
+            (".text", 1, 0x6, TEXT_VADDR, &text),
+            (".rodata", 1, 0x2, RO_VADDR, &RO_CONST.to_le_bytes()),
+            (".data", 1, 0x3, rw_vaddr, &data),
+            (".bss", 8, 0x3, rw_vaddr + 4096, &bss),
+        ],
+    );
+
+    let blob = link_elf_spi(&elf).expect("links");
+    let program = parse_standard_program(&blob).expect("parses");
+    assert_eq!(program.rw_data, &data[..4]);
+    assert_eq!(program.heap_pages, 18, "two BSS pages plus base heap");
+    let layout = program.layout(&[]).expect("lays out");
+    assert_eq!(layout.rw.base, rw_vaddr);
+    assert_eq!(layout.rw.size, 19 * 4096);
+}
+
 /// Guests linked below the GP bases cannot resolve their absolute data
 /// addresses under the SPI layout — rejected loudly, not mis-emitted.
 #[test]

@@ -1,6 +1,7 @@
 //! Per-subcommand implementations.
 //!
-//! - `service_pvm` — build and validate the protocol infrastructure PVM.
+//! - `agent_runtime_pvm` — build and validate an agent-runtime PVM.
+//! - `service_pvm` — build and validate the predecessor service PVM.
 //! - `production_release` — package and independently verify the pinned
 //!   production service/authority artifacts.
 //! - `space::*` — everything space-related: lifecycle (new,
@@ -12,6 +13,7 @@
 //!   `DaemonClient::invoke_dyn` path `space call` uses. Routing
 //!   into this module is decided in `main` by peeking argv.
 
+pub mod agent_runtime_pvm;
 pub mod build;
 pub mod dynamic;
 pub mod new_project;

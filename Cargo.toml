@@ -29,6 +29,7 @@ exclude = [
     "actors",
     # Protocol infrastructure PVMs are independently locked no_std guests.
     "services/vos-service",
+    "services/agent-runtime",
     # Every actor crate, incl. those path-dep'd by host members as dev-deps
     # (Cargo would otherwise promote a member's path dep to a member).
     "actors/*",

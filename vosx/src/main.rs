@@ -109,6 +109,14 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Transpile and validate a standard agent-runtime PVM.
+    AgentRuntimePvm {
+        /// `agent_runtime.elf` built from an agent-runtime guest.
+        elf: PathBuf,
+        /// Output path; defaults to the input path with a `.pvm` extension.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Package or verify the protocol-pinned production runtime artifacts.
     Release {
         #[command(subcommand)]
@@ -267,6 +275,11 @@ fn main() {
                 report_error(error);
             }
         }
+        Some(Command::AgentRuntimePvm { elf, out }) => {
+            if let Err(error) = commands::agent_runtime_pvm::run(&elf, out) {
+                report_error(error);
+            }
+        }
         Some(Command::Release { command }) => {
             if let Err(error) = commands::production_release::run(command) {
                 report_error(error);
@@ -363,6 +376,7 @@ fn should_dynamic_dispatch(argv: &[String]) -> bool {
         "new",
         "build",
         "service-pvm",
+        "agent-runtime-pvm",
         "release",
         "space",
         "zk",

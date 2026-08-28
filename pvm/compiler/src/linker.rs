@@ -174,9 +174,11 @@ fn zone_round(x: u64) -> u64 {
 ///   `φ1 = s`, while `StandardProgram::layout` maps `page_round(s)` bytes
 ///   just below the argument zone with `φ1 = 0xFEFE_0000`. `φ1` is
 ///   host-installed in both, so SP-relative guest code is placement-blind.
-/// - **`z` (heap pages, `E₂`)** = the manifest's `heap_pages`. The layout
-///   maps `page_round(|w| + z·4096)` read-write bytes, which equals the
-///   manifest's separate rw + heap caps page-for-page.
+/// - **`z` (heap pages, `E₂`)** includes the manifest's explicit heap and
+///   every trailing all-zero read-write page (normally `.bss`). Standard
+///   programs distinguish initialized bytes from zero pages directly, so
+///   encoding those pages in `w` would only inflate the artifact. The total
+///   mapped read-write span remains identical page-for-page.
 /// - **`o` (read-only data)** = the ro blob **re-based to the GP ro base
 ///   `Z_Z` = `0x1_0000`**: zero-prefix padding covers `[Z_Z, ro_base)`. An
 ///   ELF whose ro sections are linked below `Z_Z` is rejected — its embedded
@@ -212,7 +214,7 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
 
     // Re-base the rw blob to the GP rw base 2·Z_Z + zone_round(|o|).
     let rw_spi_base = 2 * Z_Z + zone_round(ro_data.len() as u64);
-    let rw_data = if t.rw_data.is_empty() {
+    let mut rw_data = if t.rw_data.is_empty() {
         Vec::new()
     } else if t.rw_min < rw_spi_base {
         return Err(TranspileError::InvalidSection(format!(
@@ -230,6 +232,23 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
         t.rw_data[(rw_spi_base - t.rw_base) as usize..].to_vec()
     };
 
+    // Standard programs encode zero-initialized memory as heap pages. Fold
+    // the read-write blob's trailing zero pages (principally ELF NOBITS
+    // `.bss`) into `z` while preserving the exact total mapped page count.
+    let page_size = vos_pvm::PVM_PAGE_SIZE as usize;
+    let original_rw_pages = rw_data.len().div_ceil(page_size);
+    let compact_len = rw_data
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |index| index + 1);
+    rw_data.truncate(compact_len);
+    let compact_rw_pages = compact_len.div_ceil(page_size);
+    let reclaimed_zero_pages = original_rw_pages - compact_rw_pages;
+    let heap_pages = t
+        .heap_pages
+        .checked_add(reclaimed_zero_pages as u32)
+        .ok_or_else(|| TranspileError::InvalidSection("SPI: heap page count overflow".into()))?;
+
     // Wire-width guards: |o|, |w|, s are E₃-encoded; z is E₂-encoded.
     for (what, len) in [("read-only", ro_data.len()), ("read-write", rw_data.len())] {
         if len >= 1 << 24 {
@@ -244,10 +263,10 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
             t.stack_size,
         )));
     }
-    let heap_pages = u16::try_from(t.heap_pages).map_err(|_| {
+    let heap_pages = u16::try_from(heap_pages).map_err(|_| {
         TranspileError::InvalidSection(format!(
             "SPI: heap page count {} exceeds the E2 field width",
-            t.heap_pages,
+            heap_pages,
         ))
     })?;
 
@@ -694,7 +713,7 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
 /// Detects code pointers via:
 /// 1. R_RISCV_32/64 absolute relocations targeting code sections
 /// 2. R_RISCV_SUB32 relocations (relative jump table entries: value = target - table_base)
-/// 3. Heuristic scan for 8-byte values in rodata that match code addresses
+/// 3. Heuristic scan for 8-byte values in initialized data that match code addresses
 ///
 /// Creates PVM jump table entries for each target and rewrites the data
 /// so that the loaded values are valid PVM djump addresses.
@@ -702,9 +721,10 @@ fn rewrite_data_code_ptrs(
     elf: &LinkedElf,
     ctx: &mut TranslationContext,
     ro_data: &mut [u8],
-    _rw_data: &mut [u8],
+    rw_data: &mut [u8],
 ) {
-    let ro_base = elf.stack_size as u64;
+    let ro_base = elf.ro_base;
+    let rw_base = elf.rw_base;
     let is_code_addr = |addr: u64| -> bool {
         elf.code_ranges
             .iter()
@@ -741,30 +761,39 @@ fn rewrite_data_code_ptrs(
         if entries.iter().any(|e| e.data_vaddr == data_vaddr) {
             continue; // Already handled via ADD32 pairing above
         }
-        if data_vaddr >= ro_base {
+        let bytes = if data_vaddr >= ro_base {
             let off = (data_vaddr - ro_base) as usize;
-            if off + 4 <= ro_data.len() {
-                let val = i32::from_le_bytes(ro_data[off..off + 4].try_into().unwrap());
-                let target = (base_addr as i64 + val as i64) as u64;
-                if is_code_addr(target) {
-                    entries.push(Entry {
-                        data_vaddr,
-                        rv_target: target,
-                        size: 4,
-                        table_base_rv: Some(base_addr),
-                    });
-                }
+            ro_data.get(off..off + 4)
+        } else {
+            None
+        }
+        .or_else(|| {
+            let off = data_vaddr.checked_sub(rw_base)? as usize;
+            rw_data.get(off..off + 4)
+        });
+        if let Some(bytes) = bytes {
+            let val = i32::from_le_bytes(bytes.try_into().unwrap());
+            let target = (base_addr as i64 + val as i64) as u64;
+            if is_code_addr(target) {
+                entries.push(Entry {
+                    data_vaddr,
+                    rv_target: target,
+                    size: 4,
+                    table_base_rv: Some(base_addr),
+                });
             }
         }
     }
 
-    // Heuristic: 8-byte values in rodata that are code addresses
-    {
+    // Heuristic: 8-byte values in either initialized region that are code
+    // addresses. Relocations normally cover these; the scan also supports
+    // stripped-but-still-linked inputs.
+    for (base, data) in [(ro_base, &*ro_data), (rw_base, &*rw_data)] {
         let mut off = 0;
-        while off + 8 <= ro_data.len() {
-            let val = u64::from_le_bytes(ro_data[off..off + 8].try_into().unwrap());
+        while off + 8 <= data.len() {
+            let val = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
             if is_code_addr(val) {
-                let vaddr = ro_base + off as u64;
+                let vaddr = base + off as u64;
                 if !entries.iter().any(|e| e.data_vaddr == vaddr) {
                     entries.push(Entry {
                         data_vaddr: vaddr,
@@ -786,32 +815,40 @@ fn rewrite_data_code_ptrs(
     let rv_to_jt = ctx.build_function_pointer_map(&targets);
 
     for entry in &entries {
-        if let Some(&jt_addr) = rv_to_jt.get(&entry.rv_target)
-            && entry.data_vaddr >= ro_base
-            && (entry.data_vaddr - ro_base) as usize + entry.size as usize <= ro_data.len()
-        {
-            let off = (entry.data_vaddr - ro_base) as usize;
-            match (entry.size, entry.table_base_rv) {
-                (8, _) => {
-                    ro_data[off..off + 8].copy_from_slice(&(jt_addr as u64).to_le_bytes());
-                }
-                (4, None) => {
-                    ro_data[off..off + 4].copy_from_slice(&jt_addr.to_le_bytes());
-                }
-                (4, Some(rv_base)) => {
-                    // Relative entry: code does `lw off, table(idx); add target, off, base; jr target`.
-                    // base register holds the PVM mapping of rv_base (from load_imm).
-                    // new_val + pvm_base = jt_addr → new_val = jt_addr - pvm_base.
-                    let pvm_base = ctx
-                        .address_map
-                        .get(&rv_base)
-                        .copied()
-                        .unwrap_or(rv_base as u32);
-                    let new_val = (jt_addr as i64 - pvm_base as i64) as i32;
-                    ro_data[off..off + 4].copy_from_slice(&new_val.to_le_bytes());
-                }
-                _ => {}
+        let Some(&jt_addr) = rv_to_jt.get(&entry.rv_target) else {
+            continue;
+        };
+        let replacement = match (entry.size, entry.table_base_rv) {
+            (8, _) => (jt_addr as u64).to_le_bytes().to_vec(),
+            (4, None) => jt_addr.to_le_bytes().to_vec(),
+            (4, Some(rv_base)) => {
+                // Relative entry: code does `lw off, table(idx); add target,
+                // off, base; jr target`.
+                let pvm_base = ctx
+                    .address_map
+                    .get(&rv_base)
+                    .copied()
+                    .unwrap_or(rv_base as u32);
+                let value = (jt_addr as i64 - pvm_base as i64) as i32;
+                value.to_le_bytes().to_vec()
             }
+            _ => continue,
+        };
+        let size = replacement.len();
+        if let Some(off) = entry
+            .data_vaddr
+            .checked_sub(ro_base)
+            .and_then(|off| usize::try_from(off).ok())
+            .filter(|off| off.saturating_add(size) <= ro_data.len())
+        {
+            ro_data[off..off + size].copy_from_slice(&replacement);
+        } else if let Some(off) = entry
+            .data_vaddr
+            .checked_sub(rw_base)
+            .and_then(|off| usize::try_from(off).ok())
+            .filter(|off| off.saturating_add(size) <= rw_data.len())
+        {
+            rw_data[off..off + size].copy_from_slice(&replacement);
         }
     }
 }

@@ -2,14 +2,13 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 
 /// Guest heap arena. Application actors retain the compact 256 KiB profile.
-/// The protocol-pinned generic service opts into a larger arena because a
-/// single Refine or Accumulate input may contain a complete continuation or
-/// CRDT batch and its canonical decoder owns transient copies of that wire.
-/// Both arenas are zero-initialized static data (`.bss`), so their size affects
-/// the declared memory/gas budget rather than the PVM artifact bytes.
-#[cfg(feature = "service-runtime")]
+/// Infrastructure guests opt into a larger arena because one invocation may
+/// decode and re-encode a complete durable state transition. Both arenas are
+/// zero-initialized static data (`.bss`), so their size affects the declared
+/// memory/gas budget rather than the PVM artifact bytes.
+#[cfg(any(feature = "service-runtime", feature = "agent-runtime"))]
 const HEAP_SIZE: usize = 8 * 1024 * 1024;
-#[cfg(not(feature = "service-runtime"))]
+#[cfg(not(any(feature = "service-runtime", feature = "agent-runtime")))]
 const HEAP_SIZE: usize = 256 * 1024;
 
 /// Minimum block size: must fit a `FreeNode` (2 × usize = 16 bytes on rv64).
