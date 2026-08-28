@@ -1,3 +1,4 @@
+use vos::agent::driver::{AgentDriver, MemoryAgentStore};
 use vos::agent::wire::{RuntimeCall, RuntimeReturn};
 use vos::agent::{
     AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LifecycleReply, LifecycleRequest,
@@ -10,7 +11,7 @@ use vos::service::{
 use vos_pvm::ExitReason;
 use vos_pvm::refine_host::RefineContext;
 
-const AGENT_RUNTIME_PVM: &[u8] = include_bytes!("../../services/agent-runtime/agent-runtime.pvm");
+const AGENT_RUNTIME_PVM: &[u8] = include_bytes!("../../vosx/blobs/agent_runtime.pvm");
 const GAS: u64 = 1_000_000_000;
 
 fn config() -> AgentConfig {
@@ -98,4 +99,34 @@ fn bundled_runtime_persists_an_empty_agent_between_invocations() {
             next: None,
         }))
     );
+}
+
+#[test]
+fn host_driver_atomically_creates_and_reopens_an_empty_agent() {
+    let config = config();
+    let mut driver = AgentDriver::create_or_open(
+        AGENT_RUNTIME_PVM.to_vec(),
+        config.clone(),
+        MemoryAgentStore::default(),
+    )
+    .expect("create agent");
+    assert_eq!(driver.image().revision, 1);
+    assert_eq!(
+        driver
+            .lifecycle(LifecycleRequest::Inspect {
+                after: None,
+                limit: 16,
+            })
+            .expect("inspect agent"),
+        LifecycleReply::Directory(vos::agent::ActorDirectoryPage {
+            entries: Vec::new(),
+            next: None,
+        })
+    );
+    assert_eq!(driver.image().revision, 1, "inspection is not a commit");
+
+    let store = driver.into_store();
+    let reopened = AgentDriver::create_or_open(AGENT_RUNTIME_PVM.to_vec(), config, store)
+        .expect("reopen agent");
+    assert_eq!(reopened.image().revision, 1);
 }

@@ -1,6 +1,7 @@
 //! Build-time-bundled PVM actor ELFs.
 //!
-//! Two platform actors are bundled:
+//! The binary carries the infrastructure needed to start a space without
+//! auxiliary artifact paths:
 //!
 //! - **space-registry**: per-space program/agent/member catalog.
 //!   Required for every `vosx space new` / `space up <token>`; without it
@@ -8,12 +9,15 @@
 //! - **space-authority**: canonical actor PVM used to construct the root-signed
 //!   authority package at first service startup. Package signing remains local to
 //!   the immutable space root.
+//! - **agent-runtime**: standard runtime used for newly created agents unless
+//!   the caller selects a compatible custom runtime package.
 //!
 //! `build.rs` loads the checked release blobs and verifies their pinned
 //! digests. Developer target directories are never selected implicitly.
 
 const BUNDLED_REGISTRY_ELF: &[u8] = include_bytes!(env!("VOSX_BUNDLED_REGISTRY_ELF"));
 const BUNDLED_SPACE_AUTHORITY_PVM: &[u8] = include_bytes!(env!("VOSX_BUNDLED_SPACE_AUTHORITY_PVM"));
+const BUNDLED_AGENT_RUNTIME_PVM: &[u8] = include_bytes!(env!("VOSX_BUNDLED_AGENT_RUNTIME_PVM"));
 
 /// Returns the bundled space-registry ELF bytes, or `None` if
 /// vosx was built without the actor pre-built.
@@ -39,4 +43,9 @@ pub fn space_authority_pvm() -> Option<&'static [u8]> {
     } else {
         Some(BUNDLED_SPACE_AUTHORITY_PVM)
     }
+}
+
+/// Returns the canonical bundled standard agent runtime.
+pub fn agent_runtime_pvm() -> &'static [u8] {
+    BUNDLED_AGENT_RUNTIME_PVM
 }

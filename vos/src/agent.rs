@@ -10,6 +10,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
+#[cfg(feature = "std")]
+pub mod driver;
 #[cfg(feature = "pvm")]
 pub mod machine;
 pub mod package;

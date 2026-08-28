@@ -11,19 +11,33 @@ use vos_pvm::refine_host::RefineContext;
 
 const ABI_PROBE_GAS: u64 = 1_000_000_000;
 
-pub fn run(elf: &Path, out: Option<PathBuf>) -> anyhow::Result<()> {
-    let elf_bytes = std::fs::read(elf).with_context(|| format!("read {}", elf.display()))?;
-    let pvm = canonical_agent_runtime_pvm(&elf_bytes)?;
+pub fn run(elf: Option<&Path>, out: Option<PathBuf>) -> anyhow::Result<()> {
+    let pvm = match elf {
+        Some(elf) => {
+            let elf_bytes =
+                std::fs::read(elf).with_context(|| format!("read {}", elf.display()))?;
+            canonical_agent_runtime_pvm(&elf_bytes)?
+        }
+        None => {
+            let pvm = crate::bundled::agent_runtime_pvm().to_vec();
+            validate_agent_runtime_pvm(&pvm)?;
+            pvm
+        }
+    };
     let program = ProgramId::of_pvm(&pvm);
-    let out = out.unwrap_or_else(|| elf.with_extension("pvm"));
-    if let Some(parent) = out.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let out = out.or_else(|| elf.map(|elf| elf.with_extension("pvm")));
+    if let Some(out) = out {
+        if let Some(parent) = out.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::write(&out, &pvm).with_context(|| format!("write {}", out.display()))?;
+        println!("built {}", out.display());
+    } else {
+        println!("verified bundled standard agent runtime");
     }
-    std::fs::write(&out, &pvm).with_context(|| format!("write {}", out.display()))?;
-
-    println!("built {}", out.display());
     println!("  agent_runtime_program_id = {}", hex::encode(program.0));
     Ok(())
 }

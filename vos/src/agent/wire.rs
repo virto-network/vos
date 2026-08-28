@@ -50,6 +50,23 @@ impl ServiceWire for RuntimeCall {
     }
 }
 
+impl ServiceWire for AgentConfig {
+    const MAGIC: [u8; 4] = *b"AGCF";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&super::RUNTIME_ABI_ID.0);
+        encode_config(&mut encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID {
+            return Err(DecodeError::InvalidPlatform);
+        }
+        decode_config(decoder)
+    }
+}
+
 impl ServiceWire for RuntimeReturn {
     const MAGIC: [u8; 4] = *b"AGRR";
 

@@ -111,8 +111,9 @@ enum Command {
     },
     /// Transpile and validate a standard agent-runtime PVM.
     AgentRuntimePvm {
-        /// `agent_runtime.elf` built from an agent-runtime guest.
-        elf: PathBuf,
+        /// `agent_runtime.elf` built from an agent-runtime guest. Omit it to
+        /// verify the runtime embedded in this vosx binary.
+        elf: Option<PathBuf>,
         /// Output path; defaults to the input path with a `.pvm` extension.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -276,7 +277,7 @@ fn main() {
             }
         }
         Some(Command::AgentRuntimePvm { elf, out }) => {
-            if let Err(error) = commands::agent_runtime_pvm::run(&elf, out) {
+            if let Err(error) = commands::agent_runtime_pvm::run(elf.as_deref(), out) {
                 report_error(error);
             }
         }
