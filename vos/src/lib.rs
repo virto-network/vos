@@ -494,7 +494,10 @@ macro_rules! __vos_emit_worker_glue {
                 if raw.first() != Some(&$crate::value::TAG_DYNAMIC) {
                     return 0;
                 }
-                let dynamic: $crate::value::Msg = $crate::Decode::decode(&raw[1..]);
+                let Some(dynamic) = <$crate::value::Msg as $crate::Decode>::try_decode(&raw[1..])
+                else {
+                    return 0;
+                };
                 let msg = match <$enum_name as $crate::value::FromDynamic>::from_dynamic(&dynamic) {
                     Some(m) => m,
                     // Unknown method → no future built; return 0 so the host
@@ -828,7 +831,10 @@ macro_rules! __vos_emit_wasm_glue {
                 if raw.first() != Some(&$crate::value::TAG_DYNAMIC) {
                     return;
                 }
-                let dynamic: $crate::value::Msg = $crate::Decode::decode(&raw[1..]);
+                let Some(dynamic) = <$crate::value::Msg as $crate::Decode>::try_decode(&raw[1..])
+                else {
+                    return;
+                };
                 let msg = match <$enum_name as $crate::value::FromDynamic>::from_dynamic(&dynamic) {
                     Some(m) => m,
                     None => return,

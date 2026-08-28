@@ -553,7 +553,9 @@ pub struct AgentConfig {
     /// tick (the thread never preempts a handler).
     pub tick_ms: Option<u64>,
     /// Declared intra-system capabilities — the ceiling [`SpaceRole`] this
-    /// agent may relay to each named target on its outbound invokes. Empty
+    /// agent may exercise at each named target on outbound invokes. A matching
+    /// cap authenticates autonomous calls as this [`ServiceId`]; external
+    /// callers remain bounded by the lower of their role and the cap. Empty
     /// denies role-bearing relays. See [`IntraCap`].
     pub intra_caps: Vec<crate::actors::IntraCap>,
     /// Pre-spawned Raft worker for `Consistency::Raft` multi-mode
@@ -623,7 +625,9 @@ impl AgentConfig {
         self
     }
 
-    /// Set the bounded authority this agent may relay on outbound invokes.
+    /// Set the bounded authority this agent may exercise on outbound invokes.
+    /// Matching autonomous calls carry this agent's identity; this is the
+    /// explicit host grant required by protected native extensions.
     pub fn with_intra_caps(mut self, caps: Vec<crate::actors::IntraCap>) -> Self {
         self.intra_caps = caps;
         self
@@ -11449,6 +11453,7 @@ fn agent_thread(
                 propagated.as_ref(),
                 &intra_caps_for_ext,
                 target_name.as_deref(),
+                Some(id),
             );
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(InvokeRequest {
@@ -11732,10 +11737,10 @@ fn agent_thread(
                     // Stamp this thread's relay caller for the duration of the
                     // dispatch, so an outbound ask during it can relay the real
                     // caller bounded by `intra_caps` (read in `external_invoke`).
-                    // Only when this agent opted into bounded relay — otherwise
-                    // the relay carrier is unread and the internal `Caller::Actor`
-                    // path is byte-for-byte unchanged. Cleared on scope exit
-                    // (even on panic), so a refused call can't poison the next.
+                    // Only cap-bearing agents need this propagated carrier;
+                    // without a matching cap the outbound target receives no
+                    // authority. Cleared on scope exit (even on panic), so a
+                    // refused call cannot poison the next dispatch.
                     let _relay = (!config.intra_caps.is_empty()).then(|| {
                         RelayCallerGuard::stamp(PropagatedCaller {
                             caller: req.caller.clone(),
@@ -12860,19 +12865,33 @@ fn extension_thread(
                     &payload,
                     task_context,
                     id,
+                    &[id.0],
                     &blob_fetch,
                     &invoke_routes,
                     &config.intra_caps,
                     &agent_names,
                     &raft_fwd,
                 );
-                if matches!(outcome, DispatchOutcome::Err) {
-                    warn!(
-                        %id,
-                        "extension: tick_ms set but `tick` dispatch failed (no `tick` handler?) \
-                         — disabling periodic ticks"
-                    );
-                    tick_disabled = true;
+                match outcome {
+                    DispatchOutcome::Ok(_) => {}
+                    DispatchOutcome::NoHandler => {
+                        warn!(
+                            %id,
+                            "extension: tick_ms set but no `tick` handler exists — disabling periodic ticks"
+                        );
+                        tick_disabled = true;
+                    }
+                    DispatchOutcome::Panicked => {
+                        let message =
+                            "extension tick handler panicked; refusing to retain partial state"
+                                .to_owned();
+                        error!(%id, "{message}");
+                        return AgentResult {
+                            id,
+                            panics: 1,
+                            error: Some(message),
+                        };
+                    }
                 }
                 if let Err(error) = persist(strategy.as_mut(), &instance) {
                     let message = format!("extension state commit failed: {error}");
@@ -12902,6 +12921,8 @@ fn extension_thread(
                         req.space_role,
                         req.actor_local_role,
                     );
+                    let mut invoke_chain = req.chain.clone();
+                    invoke_chain.push(id.0);
                     // Stamp the real caller of this invoke for
                     // the duration of the dispatch. The task context exposes it
                     // to the handler, while `RELAY_CALLER` propagates it through
@@ -12921,6 +12942,7 @@ fn extension_thread(
                             &req.msg,
                             task_context,
                             id,
+                            &invoke_chain,
                             &blob_fetch,
                             &invoke_routes,
                             &config.intra_caps,
@@ -12931,18 +12953,32 @@ fn extension_thread(
                     // Workers don't yield — pack as DONE with no
                     // state so the caller's invoke_raw decodes
                     // `InvokeResult::Done { state: empty, reply }`.
-                    // A `DispatchOutcome::Err` (handler panicked,
-                    // missing future, etc) becomes STATUS_PANICKED
-                    // so ingress response decoding
-                    // can distinguish it from a legitimate `()`
-                    // return — see vos::actors::run::STATUS_*.
+                    // A missing handler becomes STATUS_PANICKED so ingress
+                    // response decoding can distinguish it from a legitimate
+                    // `()` return. A true handler panic takes the fatal path
+                    // below and deliberately skips persistence.
+                    if matches!(&outcome, DispatchOutcome::Panicked) {
+                        let failure =
+                            encode_invoke_envelope(crate::actors::run::STATUS_PANICKED, &[], &[]);
+                        send_reply_capped(req.reply, failure, id);
+                        let message =
+                            "extension invoke handler panicked; refusing to retain partial state"
+                                .to_owned();
+                        error!(%id, "{message}");
+                        return AgentResult {
+                            id,
+                            panics: 1,
+                            error: Some(message),
+                        };
+                    }
                     let envelope = match outcome {
                         DispatchOutcome::Ok(reply) => {
                             encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &reply)
                         }
-                        DispatchOutcome::Err => {
+                        DispatchOutcome::NoHandler => {
                             encode_invoke_envelope(crate::actors::run::STATUS_PANICKED, &[], &[])
                         }
+                        DispatchOutcome::Panicked => unreachable!("handled above"),
                     };
                     // Commit before exposing the handler result. A caller must
                     // never receive a signing capability or other stateful
@@ -12999,6 +13035,7 @@ fn extension_thread(
             &envelope.payload,
             task_context,
             id,
+            &[id.0],
             &blob_fetch,
             &invoke_routes,
             &config.intra_caps,
@@ -13008,15 +13045,31 @@ fn extension_thread(
         // Envelope-mode replies don't carry the `[status][state][reply]`
         // wrapper — that's an invoke-channel detail. On the envelope
         // path the receiver just gets the reply bytes addressed
-        // `from = target`. Treat a `DispatchOutcome::Err` as an empty
-        // reply here (we lose the panic vs () distinction in the
-        // envelope path, but no caller demands it today — the
-        // ask-style path that *does* distinguish them goes through
-        // invoke). Always reply even on empty so an ask-style caller
-        // doesn't hang for the full reply timeout.
+        // `from = target`. A missing handler becomes an empty reply. A true
+        // panic sends the same empty failure shape, then terminates without
+        // persisting partial state. Always reply so an ask-style caller does
+        // not hang for the full reply timeout.
+        if matches!(&outcome, DispatchOutcome::Panicked) {
+            let _ = outbox.send(Envelope {
+                from: id,
+                to: envelope.from,
+                payload: Vec::new(),
+                authenticated_source_peer: None,
+                destination_peer: None,
+            });
+            let message =
+                "extension envelope handler panicked; refusing to retain partial state".to_owned();
+            error!(%id, "{message}");
+            return AgentResult {
+                id,
+                panics: 1,
+                error: Some(message),
+            };
+        }
         let reply_bytes = match outcome {
             DispatchOutcome::Ok(b) => b,
-            DispatchOutcome::Err => Vec::new(),
+            DispatchOutcome::NoHandler => Vec::new(),
+            DispatchOutcome::Panicked => unreachable!("handled above"),
         };
         if let Err(error) = persist(strategy.as_mut(), &instance) {
             let message = format!("extension state commit failed: {error}");
@@ -13122,27 +13175,30 @@ pub const REGISTRY_AGENT_NAME: &str = "space-registry";
 /// carries it (a bare `AgentConfig` would leave the name empty).
 pub const HYPERSPACE_REGISTRY_AGENT_NAME: &str = "hyperspace-registry";
 
-/// Compute the `(caller, space_role byte)` an extension relays for an
-/// outbound `ctx.ask` to `target_name`, applying the
-/// intersection model: the effective authority is
-/// `min(caller's space role, the extension's declared cap ceiling for
-/// the target)`. The extension can never *amplify* the caller, and
-/// the caller can never reach actors the extension didn't declare.
-/// The returned caller is a peer or anonymous; role authority is always the
-/// intersection of the explicitly carried space role and the extension cap.
+/// Compute the `(caller, space_role byte)` relayed by a bounded outbound
+/// `ctx.ask` to `target_name`. External callers use the intersection model:
+/// `min(caller's space role, the declared cap ceiling)`, so the relay cannot
+/// amplify them. A PVM actor may instead activate its own matching cap as an
+/// autonomous principal. In every case, no matching cap means no authority.
+/// The returned caller preserves an external peer/member identity or names the
+/// cap-bearing PVM actor; native internal origins remain anonymous.
 ///
 /// - No matching cap → `(Unauthenticated, None)`: the extension has
 ///   no authority for this target; role-gated handlers refuse.
-/// - `propagated == None` (a `run()`-thread / self-originated call
-///   with no external caller) → `(Unauthenticated, None)`.
+/// - `propagated == None` from a native extension → `(Unauthenticated, None)`.
+/// - `propagated == None` from a PVM actor with a matching cap → that actor's
+///   authenticated identity plus the cap role. The cap is the explicit
+///   operator grant that lets autonomous actors call protected extensions.
 /// - Peer caller → relays the peer's identity + `min(space_role,
 ///   ceiling)`.
-/// - System / Actor caller → relays anonymously with only an explicitly
-///   carried role. Origin kind alone grants nothing.
+/// - An unauthenticated propagated caller is never amplified into actor
+///   authority. System/Actor parents may activate the current PVM actor's own
+///   explicit cap; native extensions still relay them anonymously.
 fn resolve_relay_caller(
     propagated: Option<&PropagatedCaller>,
     caps: &[crate::actors::IntraCap],
     target_name: Option<&str>,
+    actor_principal: Option<ServiceId>,
 ) -> (crate::actors::Caller, Option<u8>) {
     use crate::actors::{Caller, SpaceRole, cap_for};
 
@@ -13150,19 +13206,30 @@ fn resolve_relay_caller(
         return (Caller::Unauthenticated, None);
     };
     let Some(pc) = propagated else {
-        return (Caller::Unauthenticated, None);
+        return actor_principal
+            .map(|actor| (Caller::Actor(actor), Some(ceiling.as_u8())))
+            .unwrap_or((Caller::Unauthenticated, None));
     };
+    if matches!(pc.caller, Caller::Unauthenticated) {
+        return (Caller::Unauthenticated, None);
+    }
+    if matches!(pc.caller, Caller::System | Caller::Actor(_))
+        && let Some(actor) = actor_principal
+    {
+        return (Caller::Actor(actor), Some(ceiling.as_u8()));
+    }
     // The caller's effective space-wide authority entering the relay.
     let carried = pc.space_role.and_then(SpaceRole::from_u8);
     let Some(carried) = carried else {
         return (Caller::Unauthenticated, None);
     };
     let effective = carried.min(ceiling);
-    // Preserve a peer identity for audit and actor-local lookups. Internal
-    // origins are anonymous at this boundary; their explicit role remains
-    // capped in the same way as a peer's.
+    // Preserve externally authenticated identities for audit, request
+    // ownership, and actor-local lookups. Internal origins from a native
+    // extension remain anonymous; their explicit carried role is still capped.
     let carrier = match &pc.caller {
         Caller::Peer(bytes) => Caller::Peer(bytes.clone()),
+        Caller::Member(subject) => Caller::Member(*subject),
         _ => Caller::Unauthenticated,
     };
     (carrier, Some(effective.as_u8()))
@@ -13170,15 +13237,17 @@ fn resolve_relay_caller(
 
 /// Outcome of a single extension dispatch. `Ok(bytes)` means the
 /// handler completed with the given reply (`bytes` may be empty
-/// for a `()` return). `Err` covers the cases that can't be
-/// represented as bytes — handler panic, decode failure, missing
-/// future — and lets `extension_thread` pick the right `STATUS_*`
-/// byte for the invoke envelope. The exact `POLL_ERR_*` code
-/// behind the failure is logged inside `dispatch_and_poll` (the
-/// caller doesn't need it to pick a status byte).
+/// for a `()` return). Failures distinguish a rejected message, which
+/// leaves state untouched, from a handler panic, after which state must be
+/// discarded. The exact `POLL_ERR_*` code is logged in `dispatch_and_poll`.
 enum DispatchOutcome {
     Ok(Vec<u8>),
-    Err,
+    /// The dynamic bytes were malformed or named no declared handler. Actor
+    /// state was never borrowed and remains safe to retain.
+    NoHandler,
+    /// User handler code panicked after it may have mutated actor state. The
+    /// worker must terminate without persisting or continuing from that state.
+    Panicked,
 }
 
 /// Host-side context the extension thread hands to `handle_effect`
@@ -13228,6 +13297,10 @@ enum AskOutcome {
 /// are preserved.
 struct Fulfiller<'a> {
     extension_id: ServiceId,
+    /// Complete synchronous-invoke lineage through this extension, including
+    /// the extension itself. Forwarding preserves it so cycles fail before a
+    /// serial extension worker waits on its own queue.
+    invoke_chain: &'a [u32],
     blob_fetch: &'a BlobFetchCtx<'a>,
     /// Outbound-invoke routing table. An extension's `ctx.ask` routes through
     /// the host invoke substrate
@@ -13268,11 +13341,13 @@ impl Fulfiller<'_> {
                     propagated.as_ref(),
                     self.intra_caps,
                     target_name.as_deref(),
+                    None,
                 );
                 match route_invoke(
                     self.invoke_routes,
                     self.raft_fwd,
                     self.extension_id,
+                    self.invoke_chain,
                     caller,
                     space_role,
                     None,
@@ -13310,6 +13385,7 @@ async fn route_invoke(
     invoke_routes: &InvokeRoutes,
     fwd: &RaftFwd,
     extension_id: ServiceId,
+    invoke_chain: &[u32],
     caller: crate::actors::Caller,
     space_role: Option<u8>,
     actor_local_role: Option<u8>,
@@ -13321,10 +13397,28 @@ async fn route_invoke(
     let target = u32::from_le_bytes(rest[..4].try_into().unwrap());
     let payload = rest[4..].to_vec();
 
-    // Snapshot the forward plan up front (and clone the payload only
-    // when one exists) — the local send consumes `payload`.
-    let forward_plan =
-        raft_forward_plan(fwd, extension_id, target).map(|rep| (rep, payload.clone()));
+    match check_invoke_forward(invoke_chain, target) {
+        InvokeForwardCheck::Allowed => {}
+        InvokeForwardCheck::Cycle => {
+            warn!(
+                %extension_id,
+                target,
+                chain = ?invoke_chain,
+                "extension invoke would form a cycle; aborting forward",
+            );
+            return Err(crate::actors::run::STATUS_PANICKED);
+        }
+        InvokeForwardCheck::DepthExceeded => {
+            warn!(
+                %extension_id,
+                target,
+                depth = invoke_chain.len(),
+                cap = MAX_CROSS_AGENT_DEPTH,
+                "extension invoke chain exceeded depth cap; aborting forward",
+            );
+            return Err(crate::actors::run::STATUS_PANICKED);
+        }
+    }
 
     // Route lookup with two-way prefix fallback against the local table:
     //
@@ -13341,22 +13435,55 @@ async fn route_invoke(
     //   `.so` doesn't) so a same-space dep resolves. A 0-prefix host collapses
     //   this to the unscoped form (harmless).
     let scoped = (extension_id.0 & 0xFFFF_0000) | (target & 0xFFFF);
-    let tx = {
+    let (routed_target, tx) = {
         let map = invoke_routes
             .lock()
             .map_err(|_| crate::actors::run::STATUS_PANICKED)?;
         match map
             .get(&target)
-            .or_else(|| map.get(&(target & 0xFFFF)))
-            .or_else(|| map.get(&scoped))
+            .map(|tx| (target, tx))
+            .or_else(|| {
+                let unscoped = target & 0xFFFF;
+                map.get(&unscoped).map(|tx| (unscoped, tx))
+            })
+            .or_else(|| map.get(&scoped).map(|tx| (scoped, tx)))
         {
-            Some(tx) => tx.clone(),
+            Some((resolved, tx)) => (resolved, tx.clone()),
             None => {
                 warn!(%extension_id, target, "ext ask: no route for target");
                 return Err(crate::actors::run::STATUS_NOT_FOUND);
             }
         }
     };
+
+    // Prefix fallback can resolve a different numeric ServiceId than the one
+    // encoded by the extension. Check that concrete route too: otherwise
+    // A(scoped) → B → A(unscoped) evades the raw-ID check above and queues a
+    // request onto A while A is synchronously waiting for B.
+    if routed_target != target {
+        match check_invoke_forward(invoke_chain, routed_target) {
+            InvokeForwardCheck::Allowed => {}
+            InvokeForwardCheck::Cycle => {
+                warn!(
+                    %extension_id,
+                    target,
+                    routed_target,
+                    chain = ?invoke_chain,
+                    "extension invoke fallback would form a cycle; aborting forward",
+                );
+                return Err(crate::actors::run::STATUS_PANICKED);
+            }
+            InvokeForwardCheck::DepthExceeded => {
+                // The raw target passed the same depth check above.
+                unreachable!("invoke depth result changed while resolving a route")
+            }
+        }
+    }
+
+    // Snapshot the forward plan up front (and clone the payload only
+    // when one exists) — the local send consumes `payload`.
+    let forward_plan =
+        raft_forward_plan(fwd, extension_id, target).map(|rep| (rep, payload.clone()));
 
     let (reply_tx, reply_rx) = futures_channel::oneshot::channel::<Vec<u8>>();
     if tx
@@ -13370,7 +13497,7 @@ async fn route_invoke(
             root_upgrade_request: false,
             msg: payload,
             reply: ReplyChannel::Async(reply_tx),
-            chain: Vec::new(),
+            chain: invoke_chain.to_vec(),
         })
         .is_err()
     {
@@ -13405,6 +13532,7 @@ async fn route_invoke(
                         extension_id,
                         target,
                         rep_id,
+                        invoke_chain,
                         payload,
                         Some(redirect.origin),
                     )
@@ -13417,11 +13545,17 @@ async fn route_invoke(
         }
         AskOutcome::Timeout => Err(crate::actors::run::STATUS_PANICKED),
         AskOutcome::Canceled => match forward_plan {
-            Some((rep_id, payload)) => {
-                forward_to_raft_leader(fwd, extension_id, target, rep_id, payload, None)
-                    .await
-                    .ok_or(crate::actors::run::STATUS_PANICKED)
-            }
+            Some((rep_id, payload)) => forward_to_raft_leader(
+                fwd,
+                extension_id,
+                target,
+                rep_id,
+                invoke_chain,
+                payload,
+                None,
+            )
+            .await
+            .ok_or(crate::actors::run::STATUS_PANICKED),
             None => Err(crate::actors::run::STATUS_PANICKED),
         },
     }
@@ -13520,6 +13654,7 @@ async fn forward_to_raft_leader(
     extension_id: ServiceId,
     target: u32,
     rep_id: [u8; 32],
+    invoke_chain: &[u32],
     mut payload: Vec<u8>,
     delegated_origin: Option<crate::service::Origin>,
 ) -> Option<Vec<u8>> {
@@ -13543,7 +13678,7 @@ async fn forward_to_raft_leader(
         %extension_id, target, leader,
         "ext ask: forwarding follower-dropped raft write to leader"
     );
-    let rx = net.send_invoke(peer, extension_id.0, to, Vec::new(), payload);
+    let rx = net.send_invoke(peer, extension_id.0, to, invoke_chain.to_vec(), payload);
     // Poll the sync receiver cooperatively — the swarm thread fills
     // it; this task yields between polls so sibling tasks keep
     // running.
@@ -13576,6 +13711,7 @@ async fn forward_to_raft_leader(
     _extension_id: ServiceId,
     _target: u32,
     _rep_id: [u8; 32],
+    _invoke_chain: &[u32],
     _payload: Vec<u8>,
     _delegated_origin: Option<crate::service::Origin>,
 ) -> Option<Vec<u8>> {
@@ -13634,7 +13770,7 @@ async fn run_ext_task(
             }
             TaskOutcome::Panic => {
                 error!(%extension_id, "extension: task panicked during dispatch");
-                break DispatchOutcome::Err;
+                break DispatchOutcome::Panicked;
             }
         }
     };
@@ -13659,7 +13795,8 @@ fn encode_tick_payload() -> Vec<u8> {
 
 /// Dispatch a message to a native extension instance and drive it to
 /// completion on the host executor `ex`. Returns the reply bytes on success or
-/// `DispatchOutcome::Err` on a poisoned future (panic) or an unknown method.
+/// `DispatchOutcome::Panicked` on a poisoned future or `NoHandler` when the
+/// dynamic bytes cannot construct a declared handler.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_and_poll(
     ex: &async_executor::LocalExecutor<'_>,
@@ -13667,6 +13804,7 @@ fn dispatch_and_poll(
     msg: &[u8],
     task_context: crate::extension::ExtensionInvocationContext,
     extension_id: ServiceId,
+    invoke_chain: &[u32],
     blob_fetch: &BlobFetchCtx<'_>,
     invoke_routes: &InvokeRoutes,
     intra_caps: &[crate::actors::IntraCap],
@@ -13682,11 +13820,12 @@ fn dispatch_and_poll(
         // No handler matched (unknown / undecodable method) — the old
         // POLL_ERR_NO_FUTURE / "went idle" path.
         error!(%extension_id, "extension: no handler matched message");
-        return DispatchOutcome::Err;
+        return DispatchOutcome::NoHandler;
     }
 
     let mut fulfiller = Fulfiller {
         extension_id,
+        invoke_chain,
         blob_fetch,
         invoke_routes,
         intra_caps,
@@ -14636,32 +14775,34 @@ mod tests {
         //    refuse). Holds even for an admin caller.
         let p_admin = pc(peer(&[1]), Some(SpaceRole::Admin));
         assert_eq!(
-            resolve_relay_caller(Some(&p_admin), &[], Some("space-registry")),
+            resolve_relay_caller(Some(&p_admin), &[], Some("space-registry"), None),
             (Caller::Unauthenticated, None),
             "empty caps deny every role-gated relay",
         );
         // A cap for a *different* actor doesn't apply to this target.
         assert_eq!(
-            resolve_relay_caller(Some(&p_admin), &admin_cap, Some("workspace")),
+            resolve_relay_caller(Some(&p_admin), &admin_cap, Some("workspace"), None),
             (Caller::Unauthenticated, None),
         );
 
         // 2. Peer admin + admin cap → full admin relayed (transparent,
         //    identity preserved).
-        let (c, sr) = resolve_relay_caller(Some(&p_admin), &admin_cap, Some("space-registry"));
+        let (c, sr) =
+            resolve_relay_caller(Some(&p_admin), &admin_cap, Some("space-registry"), None);
         assert_eq!(c, peer(&[1]));
         assert_eq!(sr, Some(SpaceRole::Admin.as_u8()));
 
         // 3. Peer member + admin cap → bounded by the *caller's* own
         //    role (min(Member, Admin) = Member): no amplification.
         let p_member = pc(peer(&[2]), Some(SpaceRole::Member));
-        let (c, sr) = resolve_relay_caller(Some(&p_member), &admin_cap, Some("space-registry"));
+        let (c, sr) =
+            resolve_relay_caller(Some(&p_member), &admin_cap, Some("space-registry"), None);
         assert_eq!(c, peer(&[2]));
         assert_eq!(sr, Some(SpaceRole::Member.as_u8()));
 
         // 4. Peer admin but a lower cap ceiling → bounded DOWN by the
         //    cap (min(Admin, Developer) = Developer).
-        let (_, sr) = resolve_relay_caller(Some(&p_admin), &dev_cap, Some("space-registry"));
+        let (_, sr) = resolve_relay_caller(Some(&p_admin), &dev_cap, Some("space-registry"), None);
         assert_eq!(
             sr,
             Some(SpaceRole::Developer.as_u8()),
@@ -14671,14 +14812,14 @@ mod tests {
         // 5. No propagated caller (run()-thread / boot) → Unauthenticated
         //    even with a cap.
         assert_eq!(
-            resolve_relay_caller(None, &admin_cap, Some("space-registry")),
+            resolve_relay_caller(None, &admin_cap, Some("space-registry"), None),
             (Caller::Unauthenticated, None),
         );
 
         // 6. Unauthenticated incoming → nothing to relay.
         let p_unauth = pc(Caller::Unauthenticated, None);
         assert_eq!(
-            resolve_relay_caller(Some(&p_unauth), &admin_cap, Some("space-registry")),
+            resolve_relay_caller(Some(&p_unauth), &admin_cap, Some("space-registry"), None,),
             (Caller::Unauthenticated, None),
         );
 
@@ -14687,11 +14828,12 @@ mod tests {
         for internal in [Caller::System, Caller::Actor(ServiceId(9))] {
             let p_internal = pc(internal.clone(), None);
             assert_eq!(
-                resolve_relay_caller(Some(&p_internal), &dev_cap, Some("space-registry")),
+                resolve_relay_caller(Some(&p_internal), &dev_cap, Some("space-registry"), None,),
                 (Caller::Unauthenticated, None),
             );
             let p_internal = pc(internal, Some(SpaceRole::Admin));
-            let (c, sr) = resolve_relay_caller(Some(&p_internal), &dev_cap, Some("space-registry"));
+            let (c, sr) =
+                resolve_relay_caller(Some(&p_internal), &dev_cap, Some("space-registry"), None);
             assert_eq!(c, Caller::Unauthenticated);
             assert_eq!(
                 sr,
@@ -14703,26 +14845,63 @@ mod tests {
         // 8. Wildcard-role cap ("space-registry:*") → uncapped: a peer
         //    admin keeps admin.
         let any_role = [IntraCap::parse("space-registry:*").unwrap()];
-        let (_, sr) = resolve_relay_caller(Some(&p_admin), &any_role, Some("space-registry"));
+        let (_, sr) = resolve_relay_caller(Some(&p_admin), &any_role, Some("space-registry"), None);
         assert_eq!(sr, Some(SpaceRole::Admin.as_u8()));
 
         // 9. Wildcard-actor cap ("*:member") applies to an unresolved
         //    target and caps the admin caller to member.
         let any_actor = [IntraCap::parse("*:member").unwrap()];
-        let (_, sr) = resolve_relay_caller(Some(&p_admin), &any_actor, None);
+        let (_, sr) = resolve_relay_caller(Some(&p_admin), &any_actor, None, None);
         assert_eq!(sr, Some(SpaceRole::Member.as_u8()));
 
         // 10. Full wildcard ("*:*") — any role on any actor — uncaps a
         //     peer admin on both a named and an unresolved target.
         let full = [IntraCap::parse("*:*").unwrap()];
-        let (c, sr) = resolve_relay_caller(Some(&p_admin), &full, Some("space-registry"));
+        let (c, sr) = resolve_relay_caller(Some(&p_admin), &full, Some("space-registry"), None);
         assert_eq!(c, peer(&[1]));
         assert_eq!(sr, Some(SpaceRole::Admin.as_u8()));
-        let (_, sr) = resolve_relay_caller(Some(&p_admin), &full, None);
+        let (_, sr) = resolve_relay_caller(Some(&p_admin), &full, None, None);
         assert_eq!(
             sr,
             Some(SpaceRole::Admin.as_u8()),
             "full wildcard matches unresolved targets too"
+        );
+    }
+
+    #[test]
+    fn actor_principal_requires_a_matching_cap_and_never_amplifies_a_peer() {
+        use crate::actors::{Caller, IntraCap, SpaceRole};
+
+        let actor = ServiceId(77);
+        let cap = [IntraCap::parse("substrate:member").unwrap()];
+        assert_eq!(
+            resolve_relay_caller(None, &cap, Some("substrate"), Some(actor)),
+            (Caller::Actor(actor), Some(SpaceRole::Member.as_u8())),
+        );
+        assert_eq!(
+            resolve_relay_caller(None, &[], Some("substrate"), Some(actor)),
+            (Caller::Unauthenticated, None),
+        );
+
+        let anonymous = PropagatedCaller {
+            caller: Caller::Unauthenticated,
+            space_role: None,
+        };
+        assert_eq!(
+            resolve_relay_caller(Some(&anonymous), &cap, Some("substrate"), Some(actor)),
+            (Caller::Unauthenticated, None),
+            "an untrusted caller cannot borrow the actor's autonomous capability",
+        );
+
+        let member = crate::service::SubjectId([9; 32]);
+        let authenticated = PropagatedCaller {
+            caller: Caller::Member(member),
+            space_role: Some(SpaceRole::Developer.as_u8()),
+        };
+        assert_eq!(
+            resolve_relay_caller(Some(&authenticated), &cap, Some("substrate"), Some(actor),),
+            (Caller::Member(member), Some(SpaceRole::Member.as_u8())),
+            "credential-backed identity remains caller-bound while the cap lowers its role",
         );
     }
 
@@ -15147,6 +15326,96 @@ mod tests {
         // A→B→C, fresh target D — allowed.
         let chain = [1u32, 2u32, 3u32];
         assert_eq!(check_invoke_forward(&chain, 4), InvokeForwardCheck::Allowed);
+    }
+
+    #[test]
+    fn extension_route_rejects_a_self_cycle_before_queueing() {
+        let extension_id = ServiceId(41);
+        let routes = InvokeRoutes::default();
+        let (tx, rx) = mpsc::channel();
+        routes.lock().unwrap().insert(extension_id.0, tx);
+        let mut request = extension_id.0.to_le_bytes().to_vec();
+        request.extend_from_slice(b"ignored");
+
+        let result = async_io::block_on(route_invoke(
+            &routes,
+            &RaftFwd::default(),
+            extension_id,
+            &[extension_id.0],
+            crate::actors::Caller::Unauthenticated,
+            None,
+            None,
+            &request,
+        ));
+
+        assert_eq!(result, Err(crate::actors::run::STATUS_PANICKED));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn extension_route_rejects_a_cycle_through_scoped_fallback() {
+        let prefix = 0x0042;
+        let first = ServiceId::new(prefix, 2);
+        let extension_id = ServiceId::new(prefix, 3);
+        let routes = InvokeRoutes::default();
+        let (tx, rx) = mpsc::channel();
+        routes.lock().unwrap().insert(first.0, tx);
+        // Extensions commonly receive unscoped local IDs from name
+        // resolution. Routing would fall this `2` back to `first`.
+        let mut request = u32::from(first.local_id()).to_le_bytes().to_vec();
+        request.extend_from_slice(b"ignored");
+
+        let result = async_io::block_on(route_invoke(
+            &routes,
+            &RaftFwd::default(),
+            extension_id,
+            &[first.0, extension_id.0],
+            crate::actors::Caller::Unauthenticated,
+            None,
+            None,
+            &request,
+        ));
+
+        assert_eq!(result, Err(crate::actors::run::STATUS_PANICKED));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn extension_route_preserves_the_complete_invoke_chain() {
+        let extension_id = ServiceId(42);
+        let target = ServiceId(43);
+        let routes = InvokeRoutes::default();
+        let (tx, rx) = mpsc::channel();
+        routes.lock().unwrap().insert(target.0, tx);
+        let responder = std::thread::spawn(move || {
+            let req = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("routed invoke");
+            assert_eq!(req.chain, vec![7, extension_id.0]);
+            assert_eq!(req.msg, b"request");
+            assert!(req.reply.send(encode_invoke_envelope(
+                crate::actors::run::STATUS_DONE,
+                &[],
+                b"reply",
+            )));
+        });
+        let mut request = target.0.to_le_bytes().to_vec();
+        request.extend_from_slice(b"request");
+
+        let reply = async_io::block_on(route_invoke(
+            &routes,
+            &RaftFwd::default(),
+            extension_id,
+            &[7, extension_id.0],
+            crate::actors::Caller::Unauthenticated,
+            None,
+            None,
+            &request,
+        ))
+        .expect("extension route reply");
+
+        assert_eq!(reply, b"reply");
+        responder.join().unwrap();
     }
 
     #[test]
@@ -16731,6 +17000,90 @@ mod tests {
         assert_eq!(bytes.len(), 28, "state envelope plus one archived u32");
         let count = u32::from_le_bytes(bytes[24..].try_into().unwrap());
         assert_eq!(count, 3, "expected 3 echoes total across both runs");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    #[cfg(feature = "storage")]
+    fn extension_handler_panic_does_not_persist_partial_state() {
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let echo_path = workspace
+            .join("target")
+            .join(profile)
+            .join("libecho_extension.so");
+        if !echo_path.exists() {
+            eprintln!("skipping: build echo-extension first");
+            return;
+        }
+
+        use crate::actors::codec::Encode;
+        use crate::actors::value::{Msg, Value};
+        let payload = |method: &str| {
+            let encoded = Msg::new(method).encode();
+            let mut payload = Vec::with_capacity(1 + encoded.len());
+            payload.push(crate::actors::value::TAG_DYNAMIC);
+            payload.extend_from_slice(&encoded);
+            payload
+        };
+        let echo_payload = || {
+            let encoded = Msg::new("echo").with("text", "committed").encode();
+            let mut payload = Vec::with_capacity(1 + encoded.len());
+            payload.push(crate::actors::value::TAG_DYNAMIC);
+            payload.extend_from_slice(&encoded);
+            payload
+        };
+        let data_dir = std::env::temp_dir().join(format!(
+            "vos_extension_panic_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let id = ServiceId(0x00ff_1020);
+
+        {
+            let mut node = VosNode::new();
+            node.register_extension_at_id(
+                ExtensionConfig::new(echo_path.clone())
+                    .with_name("panic-rollback")
+                    .persist(&data_dir),
+                id,
+            );
+            assert!(node.invoke(id, echo_payload()).is_some());
+            assert_eq!(node.invoke(id, payload("mutate_then_panic")), None);
+            let results = node.collect();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].panics, 1);
+            assert!(
+                results[0]
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| { error.contains("refusing to retain partial state") })
+            );
+        }
+
+        {
+            let mut node = VosNode::new();
+            node.register_extension_at_id(
+                ExtensionConfig::new(echo_path)
+                    .with_name("panic-rollback")
+                    .persist(&data_dir),
+                id,
+            );
+            let count = node.invoke(id, payload("count")).expect("restored count");
+            let count: Value = crate::Decode::decode(&count);
+            assert_eq!(count.as_u32(), Some(1));
+            let results = node.collect();
+            assert_eq!(results[0].error, None);
+        }
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

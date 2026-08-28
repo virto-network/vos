@@ -88,7 +88,9 @@ when a persisted nested type changes incompatibly, for example
 `#[actor(state_version = 2)]`.
 
 Transaction preparation, submission, and cancellation accept trusted local
-system/actor calls. Network peers and credential-backed ingress callers also
+system calls. PVM actors need an explicit matching `intra_cap` for the
+Substrate target at `Member` or higher; the host binds that bounded grant to
+the actor identity. Network peers and credential-backed ingress callers also
 need at least a `Member` space grant; a Noise-authenticated peer identity alone
 does not authorize nonce reservations or signing capabilities. Signing request
 IDs and map snapshot IDs are non-sequential and caller-bound; unauthenticated

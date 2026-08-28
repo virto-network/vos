@@ -29,12 +29,14 @@ The actor-facing API is generated as `SubstrateExtensionRef`:
 - `cancel_transaction(id)` releases an unused signing request while that
   request is still live in the current extension process.
 
-Transaction methods accept trusted local system/actor calls. Network peers and
-credential-backed ingress callers require at least a `Member` space grant;
-Noise transport identity by itself is not authorization. Signing request IDs
-and map cursors are non-sequential capabilities bound to the caller identity
-when VOS has one; anonymous read cursors remain bearer capabilities and share
-the anonymous caller quota.
+Transaction methods accept trusted local system calls. PVM actors require a
+matching host-side `intra_cap` for the Substrate target at `Member` or higher;
+the host binds that bounded grant to the actor identity. Network peers and
+credential-backed ingress callers likewise require at least a `Member` space
+grant; Noise transport identity by itself is not authorization. Signing
+request IDs and map cursors are non-sequential capabilities bound to the caller
+identity when VOS has one; anonymous read cursors remain bearer capabilities
+and share the anonymous caller quota.
 
 No signing keys are accepted or retained. V5/general extrinsics are not
 exposed. The light client and pending signing data are transient actor fields;

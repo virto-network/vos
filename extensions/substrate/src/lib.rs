@@ -350,14 +350,15 @@ pub struct SubstrateExtension {
 #[cfg(any(feature = "native", test))]
 fn transaction_caller_is_authorized(ctx: &Context<SubstrateExtension>) -> bool {
     match ctx.caller() {
-        // These variants can only be constructed by the local host dispatch
-        // path, so they remain available for system orchestration and actors.
-        vos::Caller::System | vos::Caller::Actor(_) => true,
-        // Noise authenticates a peer connection, but does not enroll that
-        // peer in this space. Network and credential-backed callers need an
-        // actual space membership grant before they can reserve nonces or
-        // create signing capabilities.
-        vos::Caller::Peer(_) | vos::Caller::Member(_) => ctx.has_space_role(vos::SpaceRole::Member),
+        // System authority is constructed only by the trusted local host.
+        vos::Caller::System => true,
+        // Actors are authenticated by the host, but transaction authority is
+        // still an explicit operator grant: their matching `intra_cap` is
+        // carried as a bounded space role by the relay path. The same role
+        // check applies to network and credential-backed callers.
+        vos::Caller::Actor(_) | vos::Caller::Peer(_) | vos::Caller::Member(_) => {
+            ctx.has_space_role(vos::SpaceRole::Member)
+        }
         vos::Caller::Unauthenticated => false,
     }
 }
@@ -1730,19 +1731,7 @@ mod native {
     }
 
     fn mortality_expiry(context: &sube::extrinsic::ChainContext) -> Option<u64> {
-        match context.mortality {
-            sube::Mortality::Immortal => None,
-            sube::Mortality::Mortal { period } => {
-                let period = period
-                    .checked_next_power_of_two()
-                    .unwrap_or(1 << 16)
-                    .clamp(4, 1 << 16);
-                Some(
-                    (context.checkpoint_number - (context.checkpoint_number % period))
-                        .saturating_add(period),
-                )
-            }
-        }
+        sube::mortality_expiry(context.mortality, context.checkpoint_number)
     }
 
     fn signing_payload(
@@ -2078,9 +2067,17 @@ mod tests {
         };
 
         assert!(authorized(vos::Caller::System, None));
-        assert!(authorized(
+        assert!(!authorized(
             vos::Caller::Actor(vos::actors::context::ServiceId(7)),
             None
+        ));
+        assert!(!authorized(
+            vos::Caller::Actor(vos::actors::context::ServiceId(7)),
+            Some(vos::SpaceRole::Guest)
+        ));
+        assert!(authorized(
+            vos::Caller::Actor(vos::actors::context::ServiceId(7)),
+            Some(vos::SpaceRole::Member)
         ));
         assert!(!authorized(vos::Caller::Peer(vec![1, 2, 3]), None));
         assert!(!authorized(

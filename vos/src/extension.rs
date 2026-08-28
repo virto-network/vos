@@ -773,6 +773,43 @@ mod tests {
     }
 
     #[test]
+    fn native_task_construction_rejects_malformed_dynamic_messages() {
+        const CHILD_ENV: &str = "VOS_MALFORMED_EXTENSION_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "extension::tests::native_task_construction_rejects_malformed_dynamic_messages",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("spawn malformed-extension subprocess");
+            assert!(
+                status.success(),
+                "native extension aborted while rejecting malformed dynamic bytes: {status}"
+            );
+            return;
+        }
+
+        let path = echo_extension_path();
+        if !path.exists() {
+            eprintln!(
+                "skipping extension test: build echo-extension first (cargo build -p echo-extension)"
+            );
+            return;
+        }
+
+        let plugin = unsafe { ExtensionPlugin::load(&path) }.expect("load extension");
+        let mut instance = plugin.create();
+        let malformed = [crate::actors::value::TAG_DYNAMIC];
+        assert_eq!(
+            instance.new_task_with_context(&malformed, &ExtensionInvocationContext::default()),
+            0,
+        );
+    }
+
+    #[test]
     fn load_and_dispatch_echo_extension() {
         let path = echo_extension_path();
         if !path.exists() {

@@ -28,6 +28,14 @@ impl EchoExtension {
         self.count
     }
 
+    /// Regression probe: a caught handler panic must never make this partial
+    /// mutation durable or leave the worker running from poisoned state.
+    #[msg]
+    async fn mutate_then_panic(&mut self, _ctx: &mut Context<Self>) -> u32 {
+        self.count += 1_000;
+        panic!("intentional extension panic after mutation")
+    }
+
     /// Test probe for the host-authenticated native-extension task context.
     #[msg]
     async fn invocation_context(&self, ctx: &mut Context<Self>) -> String {
