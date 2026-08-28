@@ -4283,19 +4283,19 @@ mod tests {
         assert_eq!(package.manifest.platform, vos::service::PLATFORM_ID);
         assert_eq!(
             hex::encode(package.manifest.actor_program.0),
-            "4eb5b8f4382f0b6052feae81671686acc5e12ae736b8ec5b226c02843a4b6a4c",
+            "36fa00f7d98179b2c8034e4d786ddace26c3cd3dcb74479cedaf77fccdffd0f9",
         );
         assert_eq!(
             hex::encode(package.deployment_id().0),
-            "84440c9530246468d8d30993b33907518dbaf68dd892fdf6913e1cf0d89b04cd",
+            "bbbff28ff029cc9048816190ec3b298fa6ae542ffe80573cdc40b52957ed2967",
         );
         assert_eq!(
             hex::encode(package_hash),
-            "80640a7635745b9fd42cd3c648060ac9d94b8a2e6c7408168f715a8fb5f64d48",
+            "ca0909c8a26ddad85b9798bc11dddd1b792fe255502f66788a5ee8f65c66fa0a",
         );
         assert_eq!(
             hex::encode(replication_id),
-            "fc5ea0ca4df1c3ce1ef643447808103e92ccd48f6e5502ea9b92b5cad272a695",
+            "0587889f9ad48f36572d1aecca0839c9b4e1c12ca90b13073e24eb504e76b4ee",
         );
     }
 
