@@ -22,6 +22,7 @@
 use alloc::vec::Vec;
 
 use crate::cap::Access;
+use crate::instruction::Opcode;
 use crate::program::{
     CapEntryType, CapManifestEntry, ParsedCodeBlob, build_blob, encode_code_blob, unpack_bitmask,
 };
@@ -187,7 +188,12 @@ fn strip_metadata(blob: &[u8]) -> &[u8] {
 ///
 /// Format: `E(|j|) ‖ E₁(z) ‖ E(|c|) ‖ jump_table ‖ code ‖ packed_bitmask`,
 /// where `z` is the jump-table entry width in bytes (1..=4).
-fn deblob_compact(data: &[u8]) -> Option<ParsedCodeBlob> {
+/// Decode the canonical compact PVM code-blob format used by standard
+/// programs and by Refine's `machine` host call.
+///
+/// The decoder consumes the complete input. Accepting a valid prefix with
+/// trailing bytes would make the program commitment ambiguous.
+pub fn parse_compact_code_blob(data: &[u8]) -> Option<ParsedCodeBlob> {
     let (jump_len, n1) = read_nat(data, 0)?;
     let mut offset = n1;
     let entry_size = *data.get(offset)? as usize;
@@ -217,7 +223,7 @@ fn deblob_compact(data: &[u8]) -> Option<ParsedCodeBlob> {
     offset += code_len;
 
     let bitmask_bytes = code_len.div_ceil(8);
-    if offset + bitmask_bytes > data.len() {
+    if offset + bitmask_bytes != data.len() {
         return None;
     }
     let bitmask = unpack_bitmask(&data[offset..offset + bitmask_bytes], code_len);
@@ -227,6 +233,48 @@ fn deblob_compact(data: &[u8]) -> Option<ParsedCodeBlob> {
         code,
         bitmask,
     })
+}
+
+/// Validate a deblobbed program and an initial instruction counter.
+///
+/// This mirrors the standard `deblob(program, pc)` predicate: the bitmask
+/// describes one complete sequence of valid instructions, the final
+/// instruction terminates its basic block, and `pc` names a valid
+/// instruction start.
+pub fn validate_code_blob(program: &ParsedCodeBlob, initial_pc: u32) -> bool {
+    let code = &program.code;
+    let bitmask = &program.bitmask;
+    let initial_pc = initial_pc as usize;
+    if code.is_empty()
+        || bitmask.len() != code.len()
+        || initial_pc >= code.len()
+        || bitmask[initial_pc] != 1
+        || Opcode::from_byte(code[initial_pc]).is_none()
+    {
+        return false;
+    }
+
+    let mut pc = 0usize;
+    loop {
+        if pc >= code.len() || bitmask[pc] != 1 {
+            return false;
+        }
+        let Some(opcode) = Opcode::from_byte(code[pc]) else {
+            return false;
+        };
+
+        let next = (1..=25)
+            .map(|delta| pc + delta)
+            .find(|&candidate| candidate >= code.len() || bitmask[candidate] == 1)
+            .unwrap_or(pc + 25);
+        if next > code.len() {
+            return false;
+        }
+        if next == code.len() {
+            return opcode.is_terminator();
+        }
+        pc = next;
+    }
 }
 
 /// Parse a GP standard-program blob (after stripping any metadata prefix).
@@ -264,7 +312,10 @@ pub fn parse_standard_program(blob: &[u8]) -> Option<StandardProgram> {
     if offset + code_len > blob.len() {
         return None;
     }
-    let code = deblob_compact(&blob[offset..offset + code_len])?;
+    let code = parse_compact_code_blob(&blob[offset..offset + code_len])?;
+    if !validate_code_blob(&code, 0) {
+        return None;
+    }
 
     Some(StandardProgram {
         ro_data,

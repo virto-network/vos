@@ -76,6 +76,24 @@ impl PagePerms {
         &self.perms
     }
 
+    fn set_range(&mut self, first: usize, count: usize, permission: u8) {
+        self.perms[first..first + count].fill(permission);
+        self.uniform_rw = self.perms.iter().all(|&p| p == PERM_RW);
+    }
+
+    fn range_has_at_least(&self, addr: u32, len: usize, permission: u8) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let end = addr as u64 + len as u64;
+        if end > self.perms.len() as u64 * PAGE as u64 {
+            return false;
+        }
+        let first = (addr as usize) / PAGE;
+        let last = ((end - 1) as usize) / PAGE;
+        self.perms[first..=last].iter().all(|&p| p >= permission)
+    }
+
     /// True when the last byte of `[addr, addr+n)` is on a mapped page
     /// (bounds check). Under uniform-RW memory this subsumes both
     /// readable/writable.
@@ -394,6 +412,77 @@ impl Memory {
             "page_perms must cover guest memory exactly"
         );
         dispatch!(self, m => m.perms.install(perms));
+    }
+
+    /// Change the access mode of a page range without replacing the rest of
+    /// the page table.
+    ///
+    /// The range must lie within the logical memory span. This is the
+    /// primitive used by the standard inner-machine `pages` host call.
+    pub fn set_page_range(&mut self, first: usize, count: usize, permission: u8) -> bool {
+        let Some(end) = first.checked_add(count) else {
+            return false;
+        };
+        if end > self.pages() {
+            return false;
+        }
+        dispatch!(self, m => m.perms.set_range(first, count, permission));
+        true
+    }
+
+    /// Reset complete pages to zero without allocating untouched sparse
+    /// frames. Existing sparse frames are retained and cleared, so repeatedly
+    /// recycling one page range cannot grow host memory.
+    pub fn clear_pages(&mut self, first: usize, count: usize) -> bool {
+        let Some(end) = first.checked_add(count) else {
+            return false;
+        };
+        if end > self.pages() {
+            return false;
+        }
+        match self {
+            Memory::Flat(m) => m.bytes[first * PAGE..end * PAGE].fill(0),
+            Memory::Sparse(m) => {
+                for page in first..end {
+                    let frame = m.table[page];
+                    if frame != NO_FRAME {
+                        let base = frame as usize * PAGE;
+                        m.frames[base..base + PAGE].fill(0);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether the whole byte range is readable under the installed page
+    /// map. Zero-length ranges are always accessible.
+    pub fn is_readable(&self, addr: u32, len: usize) -> bool {
+        dispatch!(self, m => m.perms.range_has_at_least(addr, len, super::PERM_RO))
+    }
+
+    /// Whether the whole byte range is writable under the installed page
+    /// map. Zero-length ranges are always accessible.
+    pub fn is_writable(&self, addr: u32, len: usize) -> bool {
+        dispatch!(self, m => m.perms.range_has_at_least(addr, len, PERM_RW))
+    }
+
+    /// Copy a readable range into host memory.
+    pub fn read_bytes_checked(&self, addr: u32, out: &mut [u8]) -> bool {
+        if !self.is_readable(addr, out.len()) {
+            return false;
+        }
+        self.read_bytes(addr, out);
+        true
+    }
+
+    /// Copy host bytes into a writable range.
+    pub fn write_bytes_checked(&mut self, addr: u32, data: &[u8]) -> bool {
+        if !self.is_writable(addr, data.len()) {
+            return false;
+        }
+        self.init_copy(addr, data);
+        true
     }
 
     /// Read a byte; `Err` carries the faulting page base.

@@ -16,6 +16,7 @@ pub mod backing;
 pub mod cap;
 pub mod gas_cost;
 pub mod gas_sim;
+pub mod inner;
 pub mod instruction;
 pub mod interpreter;
 #[cfg(feature = "std")]
@@ -40,6 +41,12 @@ pub use backend::PvmBackend;
 pub use interpreter::Interpreter;
 #[cfg(feature = "std")]
 pub use kernel::CodeCache;
+
+/// Standard PVM specification version implemented by the portable path.
+pub const STANDARD_PVM_SPEC_VERSION: &str = "0.8.0";
+
+/// Exact upstream specification commit used for the standard PVM contract.
+pub const STANDARD_PVM_SPEC_REVISION: &str = "07f041dabd073f9018b418e9ee72e79dd2185401";
 
 // --- PVM types ---
 

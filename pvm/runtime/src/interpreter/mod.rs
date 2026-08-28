@@ -302,6 +302,15 @@ impl Interpreter {
         &self.mem
     }
 
+    /// The guest memory, mutably.
+    ///
+    /// This is intentionally lower-level than the instruction accessors: a
+    /// standard Refine embedder needs to implement the `pages`, `peek`, and
+    /// `poke` host calls between invocations of an inner machine.
+    pub fn memory_mut(&mut self) -> &mut Memory {
+        &mut self.mem
+    }
+
     /// Take ownership of the guest memory, leaving an empty flat buffer.
     pub fn take_memory(&mut self) -> Memory {
         core::mem::take(&mut self.mem)
