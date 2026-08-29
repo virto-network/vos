@@ -23,6 +23,12 @@ use std::path::Path;
 /// stringification dance at every call site.
 #[derive(Debug)]
 pub enum CommitError {
+    /// A replicated commit reached a replica that is no longer the leader.
+    ///
+    /// Keep this distinct from configuration/storage failures so ingress can
+    /// redirect the exact invocation without misclassifying corruption as a
+    /// retryable leadership handoff.
+    LeadershipLost,
     /// Configuration error — caller supplied incompatible options.
     Config(String),
     /// Backend I/O failure. The inner error is preserved for the
@@ -33,6 +39,7 @@ pub enum CommitError {
 impl core::fmt::Display for CommitError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::LeadershipLost => write!(f, "replication leadership was lost"),
             Self::Config(s) => write!(f, "configuration error: {s}"),
             Self::Backend(e) => write!(f, "backend error: {e}"),
         }
@@ -42,6 +49,7 @@ impl core::fmt::Display for CommitError {
 impl std::error::Error for CommitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::LeadershipLost => None,
             Self::Config(_) => None,
             Self::Backend(e) => Some(&**e),
         }

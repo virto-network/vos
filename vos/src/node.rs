@@ -8205,6 +8205,30 @@ fn encode_service_raft_redirect(
     wire
 }
 
+/// Turn only a typed Raft leadership handoff into a transport redirect.
+/// Storage/configuration failures remain terminal, and a stale self-hint is
+/// rejected so an old leader cannot bounce the exact invocation back to itself.
+#[cfg(all(feature = "storage", feature = "network"))]
+fn encode_service_raft_leadership_redirect(
+    failure: &crate::service::ReplicatedServiceError<crate::commit::CommitError>,
+    leader_hint: Option<u16>,
+    local_prefix: u16,
+    origin: crate::service::Origin,
+    root_upgrade_request: bool,
+) -> Option<Vec<u8>> {
+    matches!(
+        failure,
+        crate::service::ReplicatedServiceError::Log(crate::commit::CommitError::LeadershipLost)
+    )
+    .then_some(())?;
+    let leader_prefix = leader_hint.filter(|leader| *leader != local_prefix)?;
+    Some(encode_service_raft_redirect(
+        leader_prefix,
+        origin,
+        root_upgrade_request,
+    ))
+}
+
 #[cfg(all(feature = "storage", feature = "network"))]
 fn decode_service_raft_redirect(wire: &[u8]) -> Option<RaftRedirect> {
     if wire.first().copied() != Some(SERVICE_RAFT_REDIRECT_STATUS) || wire.len() < 4 {
@@ -9809,14 +9833,16 @@ where
                     send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                 }
                 #[cfg(all(feature = "storage", feature = "network"))]
-                Err(failure @ crate::service::LocalRootTreeInvokeError::Replication(_)) => {
+                Err(crate::service::LocalRootTreeInvokeError::Replication(failure)) => {
                     warn!(%id, ?failure, "service root upgrade leader barrier failed");
-                    if let Some(leader_prefix) = service.admission_leader_hint() {
-                        let _ = send_reply_capped(
-                            req.reply,
-                            encode_service_raft_redirect(leader_prefix, origin, true),
-                            id,
-                        );
+                    if let Some(redirect) = encode_service_raft_leadership_redirect(
+                        &failure,
+                        service.admission_leader_hint(),
+                        id.node_prefix(),
+                        origin,
+                        true,
+                    ) {
+                        let _ = send_reply_capped(req.reply, redirect, id);
                     } else {
                         send_service_status(req.reply, crate::STATUS_PANICKED, id);
                     }
@@ -9850,12 +9876,16 @@ where
             Err(failure) => {
                 error!(%id, ?failure, "service root-tree admission barrier failed");
                 #[cfg(all(feature = "storage", feature = "network"))]
-                if let Some(leader_prefix) = service.admission_leader_hint() {
-                    let _ = send_reply_capped(
-                        req.reply,
-                        encode_service_raft_redirect(leader_prefix, origin, false),
-                        id,
-                    );
+                if let crate::service::LocalRootTreeInvokeError::Replication(replication) = &failure
+                    && let Some(redirect) = encode_service_raft_leadership_redirect(
+                        replication,
+                        service.admission_leader_hint(),
+                        id.node_prefix(),
+                        origin,
+                        false,
+                    )
+                {
+                    let _ = send_reply_capped(req.reply, redirect, id);
                     continue;
                 }
                 send_service_status(req.reply, crate::STATUS_PANICKED, id);
@@ -10139,6 +10169,25 @@ where
                     send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                     continue;
                 }
+                #[cfg(all(feature = "storage", feature = "network"))]
+                Err(crate::service::AttestedRootTreeInvokeError::Root(
+                    crate::service::LocalRootTreeInvokeError::Replication(failure),
+                )) => {
+                    if let Some(redirect) = encode_service_raft_leadership_redirect(
+                        &failure,
+                        service.admission_leader_hint(),
+                        id.node_prefix(),
+                        origin,
+                        false,
+                    ) {
+                        warn!(%id, ?failure, "service attested root invocation lost leadership");
+                        let _ = send_reply_capped(req.reply, redirect, id);
+                    } else {
+                        error!(%id, ?failure, "service attested root invocation replication failed");
+                        send_service_status(req.reply, crate::STATUS_PANICKED, id);
+                    }
+                    continue;
+                }
                 Err(failure) => {
                     error!(%id, ?failure, "service attested root invocation failed");
                     send_service_status(req.reply, crate::STATUS_PANICKED, id);
@@ -10154,6 +10203,23 @@ where
                     crate::service::AccumulationRejection::Unauthorized,
                 )) => {
                     send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    continue;
+                }
+                #[cfg(all(feature = "storage", feature = "network"))]
+                Err(crate::service::LocalRootTreeInvokeError::Replication(failure)) => {
+                    if let Some(redirect) = encode_service_raft_leadership_redirect(
+                        &failure,
+                        service.admission_leader_hint(),
+                        id.node_prefix(),
+                        origin,
+                        false,
+                    ) {
+                        warn!(%id, ?failure, "service root invocation lost leadership");
+                        let _ = send_reply_capped(req.reply, redirect, id);
+                    } else {
+                        error!(%id, ?failure, "service root invocation replication failed");
+                        send_service_status(req.reply, crate::STATUS_PANICKED, id);
+                    }
                     continue;
                 }
                 Err(failure) => {
@@ -17242,6 +17308,49 @@ mod tests {
                 })),
             );
         }
+        let leadership =
+            crate::service::ReplicatedServiceError::Log(crate::commit::CommitError::LeadershipLost);
+        assert_eq!(
+            decode_service_raft_redirect(
+                &encode_service_raft_leadership_redirect(
+                    &leadership,
+                    Some(42),
+                    41,
+                    crate::service::Origin::System,
+                    false,
+                )
+                .expect("a different current leader is redirectable"),
+            ),
+            Some(RaftRedirect {
+                leader_prefix: 42,
+                origin: crate::service::Origin::System,
+                root_upgrade_request: false,
+            }),
+        );
+        assert!(
+            encode_service_raft_leadership_redirect(
+                &leadership,
+                Some(41),
+                41,
+                crate::service::Origin::System,
+                false,
+            )
+            .is_none(),
+            "a stale self hint must fail closed",
+        );
+        assert!(
+            encode_service_raft_leadership_redirect(
+                &crate::service::ReplicatedServiceError::Log(crate::commit::CommitError::Config(
+                    "corrupt log".into()
+                ),),
+                Some(42),
+                41,
+                crate::service::Origin::System,
+                false,
+            )
+            .is_none(),
+            "non-leadership replication failures are not retryable redirects",
+        );
         let authority = encode_service_raft_delegation(
             crate::service::Origin::System,
             true,

@@ -536,16 +536,15 @@ impl RaftAccumulateLog {
     #[cfg(feature = "network")]
     fn propose_multi(&mut self, payload: &[u8]) -> Result<CommittedAccumulateEntry, CommitError> {
         let decoded = Self::decode_payload(payload)?;
-        let Role::Multi { worker, apply_rx } = &self.role else {
-            unreachable!()
+        let (worker, apply_rx) = match &self.role {
+            Role::Multi { worker, apply_rx } => (Arc::clone(worker), Arc::clone(apply_rx)),
+            Role::SingleNode => unreachable!(),
         };
         let index = worker
             .handler()
             .propose(payload.to_vec())
             .map_err(|error| match error {
-                ProposeError::NotLeader => {
-                    CommitError::Config("raft service proposal reached a non-leader replica".into())
-                }
+                ProposeError::NotLeader => CommitError::LeadershipLost,
                 ProposeError::Storage(error) => error,
             })?;
         let timeout = Duration::from_millis(self.cfg.propose_timeout_ms);
@@ -553,6 +552,9 @@ impl RaftAccumulateLog {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                if worker.role() != super::worker::Role::Leader {
+                    return Err(CommitError::LeadershipLost);
+                }
                 return Err(CommitError::Config(alloc::format!(
                     "raft service proposal at index {index} did not reach quorum within {} ms",
                     self.cfg.propose_timeout_ms,
@@ -562,6 +564,9 @@ impl RaftAccumulateLog {
                 Ok(committed) if committed >= index => break,
                 Ok(_) => continue,
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                    if worker.role() != super::worker::Role::Leader {
+                        return Err(CommitError::LeadershipLost);
+                    }
                     return Err(CommitError::Config(alloc::format!(
                         "raft service timeout waiting for committed index {index}"
                     )));
@@ -573,6 +578,9 @@ impl RaftAccumulateLog {
                 }
             }
         }
+        // Structural/storage failures from the committed log remain terminal
+        // even if leadership changed concurrently. Only a successfully decoded
+        // but different row below proves this proposal was superseded.
         let entry = self.committed_entry(index)?;
         if entry.request != decoded.request
             || entry.host_state_machine != decoded.host_state_machine
@@ -582,6 +590,9 @@ impl RaftAccumulateLog {
             || entry.availability_blobs != decoded.blobs
             || entry.receipt_verifications != decoded.receipt_verifications
         {
+            if worker.role() != super::worker::Role::Leader {
+                return Err(CommitError::LeadershipLost);
+            }
             return Err(CommitError::Config(alloc::format!(
                 "raft service committed bytes at proposal index {index} changed"
             )));
@@ -609,8 +620,9 @@ impl CommittedAccumulateLog for RaftAccumulateLog {
                 .read_index(Duration::from_millis(self.cfg.propose_timeout_ms))
                 .map_err(|error| {
                     let reason = match error {
-                        ReadIndexError::NotLeader => "not leader",
-                        ReadIndexError::LeaderStepped => "leader stepped down",
+                        ReadIndexError::NotLeader | ReadIndexError::LeaderStepped => {
+                            return CommitError::LeadershipLost;
+                        }
                         ReadIndexError::Backpressure => "backpressure",
                         ReadIndexError::TimedOut => "timed out",
                     };
@@ -1141,6 +1153,50 @@ mod tests {
         let service_image = MemoryServiceSnapshot::default().encode();
         log.mark_applied(2, &service_image, &[], &[]).unwrap();
         assert_eq!(log.applied_index().unwrap(), 2);
+
+        drop(log);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn worker_backed_log_preserves_leadership_loss_for_exact_redirection() {
+        use super::super::worker::{RaftWorker, WorkerConfig};
+
+        let (path, directory) = temp_path();
+        let db = Arc::new(Database::create(&path).unwrap());
+        let cfg = RaftConfig {
+            me: 0xA11C,
+            members: vec![0xA11C, 0xB22D],
+            voter_peer_ids: Vec::new(),
+            election_timeout_ms: (1_000, 2_000),
+            heartbeat_interval_ms: 100,
+            replication_id: [0xA2; 32],
+            propose_timeout_ms: 2_000,
+        };
+        let (apply_tx, apply_rx) = std_mpsc::channel::<u64>();
+        let worker = RaftWorker::spawn(
+            db.clone(),
+            WorkerConfig {
+                me: cfg.me,
+                members: cfg.members.clone(),
+                replication_id: cfg.replication_id,
+                election_timeout_ms: cfg.election_timeout_ms,
+                heartbeat_interval_ms: cfg.heartbeat_interval_ms,
+            },
+            None,
+            Some(apply_tx),
+        );
+        let mut log = RaftAccumulateLog::from_worker(db, cfg, worker, apply_rx).unwrap();
+
+        assert!(matches!(
+            log.propose(&request(3).encode()),
+            Err(CommitError::LeadershipLost)
+        ));
+        assert!(matches!(
+            log.leader_read_index(),
+            Err(CommitError::LeadershipLost)
+        ));
 
         drop(log);
         std::fs::remove_dir_all(directory).unwrap();
