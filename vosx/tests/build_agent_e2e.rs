@@ -3,11 +3,10 @@ use std::process::Command;
 
 use vos::agent::driver::{AgentDriver, MemoryAgentStore};
 use vos::agent::execution::{ActorExecutionStatus, ActorInvocation};
-use vos::agent::package::Package;
+use vos::agent::package::{Ed25519PackageVerifier, Package};
 use vos::agent::{
-    ActorEntry, ActorInitialState, AgentConfig, AgentIdentity, AgentProfile, AgentReplica,
-    InstallActor, LifecycleRequest, PackageKind, ReplicaRole, RuntimeCapabilities,
-    STANDARD_RUNTIME_PROGRAM_ID,
+    ActorInitialState, AgentConfig, AgentIdentity, AgentProfile, AgentReplica, PackageKind,
+    ReplicaRole, RuntimeCapabilities, STANDARD_RUNTIME_PROGRAM_ID,
 };
 use vos::service::{
     ActorId, AgentId, BlobRef, DeploymentId, InvocationId, NodeId, PrincipalId, ProducerId,
@@ -63,8 +62,8 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
 
     let package_bytes = std::fs::read(out.join("Counter.vos")).unwrap();
     let package = Package::decode(&package_bytes).unwrap();
-    package.validate().unwrap();
-    let PackageKind::Actor { requirements } = package.manifest.kind else {
+    let verified = package.clone().verify(&Ed25519PackageVerifier).unwrap();
+    let PackageKind::Actor { .. } = package.manifest.kind else {
         panic!("counter must be an actor package")
     };
 
@@ -97,25 +96,16 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
     let actor = ActorId::top_level(agent, "counter");
     let deployment = package.deployment_id();
     driver
-        .lifecycle(LifecycleRequest::Install(InstallActor {
-            entry: ActorEntry {
-                actor,
-                name: "counter".into(),
-                parent: None,
-                deployment,
-                program: package.manifest.program,
-                lanes: requirements.lanes,
-                suspended: false,
-            },
-            producer: package.deployment_signature.producer,
-            package: BlobRef::of_bytes(&package_bytes),
-            initial_state: ActorInitialState {
+        .install_actor(
+            "counter".into(),
+            None,
+            &verified,
+            ActorInitialState {
                 linear: None,
                 merge: None,
                 local: None,
             },
-            requirements,
-        }))
+        )
         .unwrap();
 
     for (index, (by, expected)) in [(2, 2), (3, 5)].into_iter().enumerate() {

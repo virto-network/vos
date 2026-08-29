@@ -46,6 +46,7 @@ pub enum PackageError {
     WrongExecutionSemantics,
     EmptyName,
     EmptyProgram,
+    InvalidProgram,
     ProgramIdMismatch,
     InterfaceHashMismatch,
     PolicyHashMismatch,
@@ -57,6 +58,8 @@ pub enum PackageError {
     InvalidRuntimeCapacity,
     MissingSignature,
     ProducerIdMismatch,
+    InvalidSignature,
+    WrongKind,
 }
 
 impl core::fmt::Display for PackageError {
@@ -80,6 +83,9 @@ impl Package {
         }
         if self.pvm.is_empty() {
             return Err(PackageError::EmptyProgram);
+        }
+        if vos_pvm_program::parse_standard_program(&self.pvm).is_none() {
+            return Err(PackageError::InvalidProgram);
         }
         if ProgramId::of_pvm(&self.pvm) != self.manifest.program {
             return Err(PackageError::ProgramIdMismatch);
@@ -174,6 +180,58 @@ impl Package {
 
     pub fn signing_message(&self) -> [u8; 32] {
         self.deployment_id().0
+    }
+
+    /// Validate package structure and authenticate the producer signature.
+    pub fn verify<V: PackageSignatureVerifier>(
+        self,
+        verifier: &V,
+    ) -> Result<VerifiedPackage, PackageError> {
+        self.validate()?;
+        if !verifier.verify(
+            &self.deployment_signature.public_key,
+            &self.signing_message(),
+            &self.deployment_signature.signature,
+        ) {
+            return Err(PackageError::InvalidSignature);
+        }
+        Ok(VerifiedPackage(self))
+    }
+}
+
+/// Host trust seam for package signatures. It is deliberately smaller than
+/// package policy: production admission can verify cryptography locally and
+/// then require a separate authority receipt for the lifecycle operation.
+pub trait PackageSignatureVerifier {
+    fn verify(&self, public_key: &[u8], message: &[u8], signature: &[u8]) -> bool;
+}
+
+/// Package whose content and producer signature have both been checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedPackage(Package);
+
+impl VerifiedPackage {
+    pub fn package(&self) -> &Package {
+        &self.0
+    }
+
+    pub fn into_package(self) -> Package {
+        self.0
+    }
+}
+
+/// Default host verifier for the protobuf-encoded Ed25519 public keys emitted
+/// by `vosx build`. Bare hosts may provide another implementation without
+/// enabling networking.
+#[cfg(feature = "network")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ed25519PackageVerifier;
+
+#[cfg(feature = "network")]
+impl PackageSignatureVerifier for Ed25519PackageVerifier {
+    fn verify(&self, public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+        libp2p::identity::PublicKey::try_decode_protobuf(public_key)
+            .is_ok_and(|public_key| public_key.verify(message, signature))
     }
 }
 
@@ -358,7 +416,18 @@ mod tests {
     }
 
     fn runtime_package() -> Package {
-        let pvm = vec![1, 2, 3];
+        let pvm = vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
+            ro_data: Vec::new(),
+            rw_data: Vec::new(),
+            heap_pages: 0,
+            stack_size: vos_pvm_program::PAGE_SIZE,
+            code: vos_pvm_program::CodeBlob {
+                jump_table: Vec::new(),
+                code: vec![0],
+                bitmask: vec![1],
+            },
+        })
+        .unwrap();
         let interfaces = b"agent-runtime-lifecycle".to_vec();
         let schemas = b"agent-runtime-schema".to_vec();
         Package {
@@ -426,5 +495,21 @@ mod tests {
         let kind = PackageKind::Actor { requirements };
         assert!(kind.is_compatible_with(RuntimeCapabilities::standard()));
         assert_ne!(package.manifest.program, ProgramId([0; 32]));
+    }
+
+    #[test]
+    fn verified_package_requires_the_signature_trust_seam() {
+        struct Verifier(bool);
+        impl PackageSignatureVerifier for Verifier {
+            fn verify(&self, _: &[u8], _: &[u8], _: &[u8]) -> bool {
+                self.0
+            }
+        }
+
+        assert_eq!(
+            runtime_package().verify(&Verifier(false)),
+            Err(PackageError::InvalidSignature)
+        );
+        assert!(runtime_package().verify(&Verifier(true)).is_ok());
     }
 }

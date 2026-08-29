@@ -8,6 +8,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::string::String;
 
 use vos_pvm::refine_host::RefineContext;
 use vos_pvm::{ExitReason, Gas};
@@ -16,13 +17,14 @@ use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
     RuntimeExecutionCall, RuntimeExecutionReturn,
 };
+use super::package::{PackageError, VerifiedPackage};
 use super::wire::{RuntimeCall, RuntimeReturn, RuntimeState};
 use super::{
-    AgentConfig, AgentConfigError, LifecycleError, LifecycleReply, LifecycleRequest,
-    RUNTIME_ABI_ID, RuntimeCapabilities,
+    ActorEntry, ActorInitialState, AgentConfig, AgentConfigError, InstallActor, LifecycleError,
+    LifecycleReply, LifecycleRequest, PackageKind, RUNTIME_ABI_ID, RuntimeCapabilities,
 };
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
-use crate::service::{BlobRef, DeploymentId, Hash, ProducerId, ProgramId};
+use crate::service::{ActorId, BlobRef, DeploymentId, Hash, ProducerId, ProgramId};
 
 pub const DEFAULT_MANAGEMENT_GAS: Gas = 1_000_000_000;
 pub const MAX_RUNTIME_STATE_BYTES: usize = 16 * 1024 * 1024;
@@ -216,6 +218,7 @@ pub enum AgentDriverError {
     RuntimeStateTooLarge,
     Lifecycle(LifecycleError),
     Execution(ActorExecutionError),
+    Package(PackageError),
     Store(AgentStoreError),
 }
 
@@ -351,6 +354,46 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 self.image = next;
                 Ok(reply)
             }
+        }
+    }
+
+    /// Install one signature-verified actor package. Package-derived identity,
+    /// program, producer, and runtime requirements are never accepted as
+    /// parallel caller-controlled fields.
+    pub fn install_actor(
+        &mut self,
+        name: String,
+        parent: Option<ActorId>,
+        package: &VerifiedPackage,
+        initial_state: ActorInitialState,
+    ) -> Result<ActorEntry, AgentDriverError> {
+        let package = package.package();
+        let PackageKind::Actor { requirements } = package.manifest.kind else {
+            return Err(AgentDriverError::Package(PackageError::WrongKind));
+        };
+        let actor = match parent {
+            Some(parent) => ActorId::owned_child(parent, &name),
+            None => ActorId::top_level(self.image.config.identity.agent, &name),
+        };
+        let entry = ActorEntry {
+            actor,
+            name,
+            parent,
+            deployment: package.deployment_id(),
+            program: package.manifest.program,
+            lanes: requirements.lanes,
+            suspended: false,
+        };
+        let reply = self.lifecycle(LifecycleRequest::Install(InstallActor {
+            entry: entry.clone(),
+            producer: package.deployment_signature.producer,
+            package: BlobRef::of_bytes(&package.encode()),
+            initial_state,
+            requirements,
+        }))?;
+        match reply {
+            LifecycleReply::Installed(installed) if installed == entry => Ok(installed),
+            _ => Err(AgentDriverError::InvalidRuntime),
         }
     }
 
