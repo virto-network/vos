@@ -1,4 +1,4 @@
-use vos::agent::driver::{AgentDriver, MemoryAgentStore};
+use vos::agent::driver::{AgentDriver, AgentImageStore, MemoryAgentStore};
 use vos::agent::execution::{ActorExecutionStatus, ActorInvocation};
 use vos::agent::host::AgentHost;
 use vos::agent::wire::{RuntimeCall, RuntimeReturn, RuntimeState, decode_standard_runtime_state};
@@ -195,14 +195,14 @@ fn static_actor_pvm() -> Vec<u8> {
 #[test]
 fn installed_actor_executes_inside_the_bundled_runtime() {
     let config = config();
-    let mut driver = AgentDriver::create_or_open(
-        AGENT_RUNTIME_PVM.to_vec(),
-        config.clone(),
-        MemoryAgentStore::default(),
-    )
-    .expect("create agent");
     let actor_pvm = static_actor_pvm();
     let program = ProgramId::of_pvm(&actor_pvm);
+    let mut store = MemoryAgentStore::default();
+    store
+        .put_program(program, &actor_pvm)
+        .expect("catalog actor program");
+    let mut driver = AgentDriver::create_or_open(AGENT_RUNTIME_PVM.to_vec(), config.clone(), store)
+        .expect("create agent");
     let actor = ActorId::top_level(config.identity.agent, "counter");
     let deployment = DeploymentId([0x44; 32]);
     driver
@@ -239,7 +239,6 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
             program,
             mode: MethodMode::Linear,
             message: vec![0x77],
-            actor_pvm,
             availability: Vec::new(),
             gas: 10_000_000,
         })

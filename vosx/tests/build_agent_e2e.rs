@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use vos::agent::driver::{AgentDriver, MemoryAgentStore};
+use vos::agent::driver::{AgentDriver, FileAgentStore};
 use vos::agent::execution::{ActorExecutionStatus, ActorInvocation};
 use vos::agent::package::{Ed25519PackageVerifier, Package};
 use vos::agent::{
@@ -87,10 +87,11 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
             role: ReplicaRole::Voter,
         }],
     };
+    let image = temp.0.join("counter.agent-image");
     let mut driver = AgentDriver::create_or_open(
         AGENT_RUNTIME_PVM.to_vec(),
-        agent_config,
-        MemoryAgentStore::default(),
+        agent_config.clone(),
+        FileAgentStore::new(&image),
     )
     .unwrap();
     let actor = ActorId::top_level(agent, "counter");
@@ -117,7 +118,6 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
                 program: package.manifest.program,
                 mode: vos::agent::MethodMode::Linear,
                 message: dynamic_message("increment", "by", by),
-                actor_pvm: package.pvm.clone(),
                 availability: Vec::new(),
                 gas: 1_000_000_000,
             })
@@ -127,5 +127,14 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
             vos::value::Value::decode(&reply.reply).as_u64(),
             Some(expected)
         );
+        if index == 0 {
+            drop(driver);
+            driver = AgentDriver::create_or_open(
+                AGENT_RUNTIME_PVM.to_vec(),
+                agent_config.clone(),
+                FileAgentStore::new(&image),
+            )
+            .expect("reopen agent with its durable actor catalog");
+        }
     }
 }

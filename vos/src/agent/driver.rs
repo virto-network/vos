@@ -5,6 +5,7 @@
 //! runtime is therefore free to change those internals while preserving the
 //! stable lifecycle ABI.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -104,11 +105,23 @@ pub trait AgentImageStore {
         expected_revision: Option<u64>,
         image: &AgentImage,
     ) -> Result<(), AgentStoreError>;
+
+    /// Persist a canonical signed package before its lifecycle transition is
+    /// made durable. Returns `true` when this call created the artifact.
+    fn put_package(&mut self, reference: &BlobRef, bytes: &[u8]) -> Result<bool, AgentStoreError>;
+    fn remove_package(&mut self, reference: &BlobRef) -> Result<(), AgentStoreError>;
+
+    /// Persist and resolve executable actor bytes by their exact ProgramId.
+    fn put_program(&mut self, program: ProgramId, bytes: &[u8]) -> Result<bool, AgentStoreError>;
+    fn load_program(&self, program: ProgramId) -> Result<Option<Vec<u8>>, AgentStoreError>;
+    fn remove_program(&mut self, program: ProgramId) -> Result<(), AgentStoreError>;
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryAgentStore {
     image: Option<AgentImage>,
+    packages: BTreeMap<Hash, Vec<u8>>,
+    programs: BTreeMap<ProgramId, Vec<u8>>,
 }
 
 impl MemoryAgentStore {
@@ -133,6 +146,50 @@ impl AgentImageStore for MemoryAgentStore {
         self.image = Some(image.clone());
         Ok(())
     }
+
+    fn put_package(&mut self, reference: &BlobRef, bytes: &[u8]) -> Result<bool, AgentStoreError> {
+        if !reference.matches(bytes) {
+            return Err(AgentStoreError::Corrupt);
+        }
+        put_memory_artifact(&mut self.packages, reference.hash, bytes)
+    }
+
+    fn remove_package(&mut self, reference: &BlobRef) -> Result<(), AgentStoreError> {
+        self.packages.remove(&reference.hash);
+        Ok(())
+    }
+
+    fn put_program(&mut self, program: ProgramId, bytes: &[u8]) -> Result<bool, AgentStoreError> {
+        if ProgramId::of_pvm(bytes) != program {
+            return Err(AgentStoreError::Corrupt);
+        }
+        put_memory_artifact(&mut self.programs, program, bytes)
+    }
+
+    fn load_program(&self, program: ProgramId) -> Result<Option<Vec<u8>>, AgentStoreError> {
+        Ok(self.programs.get(&program).cloned())
+    }
+
+    fn remove_program(&mut self, program: ProgramId) -> Result<(), AgentStoreError> {
+        self.programs.remove(&program);
+        Ok(())
+    }
+}
+
+fn put_memory_artifact<K: Ord + Copy>(
+    artifacts: &mut BTreeMap<K, Vec<u8>>,
+    key: K,
+    bytes: &[u8],
+) -> Result<bool, AgentStoreError> {
+    if let Some(existing) = artifacts.get(&key) {
+        return if existing == bytes {
+            Ok(false)
+        } else {
+            Err(AgentStoreError::Corrupt)
+        };
+    }
+    artifacts.insert(key, bytes.to_vec());
+    Ok(true)
 }
 
 /// Crash-durable single-image store for Local agents. Daemon-level agent
@@ -172,6 +229,72 @@ impl FileAgentStore {
             .and_then(|directory| directory.sync_all())
             .map_err(|_| AgentStoreError::Unavailable)
     }
+
+    fn catalog_path(&self, kind: &str, id: &[u8; 32], suffix: &str) -> PathBuf {
+        self.path
+            .with_extension("agent-catalog")
+            .join(kind)
+            .join(format!("{}.{suffix}", encode_hex(id)))
+    }
+
+    fn put_artifact(&self, path: &Path, bytes: &[u8]) -> Result<bool, AgentStoreError> {
+        match std::fs::read(path) {
+            Ok(existing) => {
+                return if existing == bytes {
+                    Ok(false)
+                } else {
+                    Err(AgentStoreError::Corrupt)
+                };
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Err(AgentStoreError::Unavailable),
+        }
+        let parent = path.parent().ok_or(AgentStoreError::Unavailable)?;
+        std::fs::create_dir_all(parent).map_err(|_| AgentStoreError::Unavailable)?;
+        let next = path.with_extension("next");
+        match std::fs::read(&next) {
+            Ok(staged) if staged == bytes => {
+                std::fs::rename(&next, path).map_err(|_| AgentStoreError::Unavailable)?;
+                File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|_| AgentStoreError::Unavailable)?;
+                return Ok(true);
+            }
+            Ok(_) => return Err(AgentStoreError::Corrupt),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Err(AgentStoreError::Unavailable),
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&next)
+            .map_err(|_| AgentStoreError::Unavailable)?;
+        let result = file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| std::fs::rename(&next, path))
+            .and_then(|()| File::open(parent)?.sync_all());
+        if result.is_err() {
+            let _ = std::fs::remove_file(&next);
+            return Err(AgentStoreError::Unavailable);
+        }
+        Ok(true)
+    }
+
+    fn remove_artifact(&self, path: &Path) -> Result<(), AgentStoreError> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|_| AgentStoreError::Unavailable)?;
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(AgentStoreError::Unavailable),
+        }
+    }
 }
 
 impl AgentImageStore for FileAgentStore {
@@ -206,6 +329,51 @@ impl AgentImageStore for FileAgentStore {
         std::fs::rename(&next, &self.path).map_err(|_| AgentStoreError::Unavailable)?;
         self.sync_parent()
     }
+
+    fn put_package(&mut self, reference: &BlobRef, bytes: &[u8]) -> Result<bool, AgentStoreError> {
+        if !reference.matches(bytes) {
+            return Err(AgentStoreError::Corrupt);
+        }
+        self.put_artifact(
+            &self.catalog_path("packages", &reference.hash.0, "vos"),
+            bytes,
+        )
+    }
+
+    fn remove_package(&mut self, reference: &BlobRef) -> Result<(), AgentStoreError> {
+        self.remove_artifact(&self.catalog_path("packages", &reference.hash.0, "vos"))
+    }
+
+    fn put_program(&mut self, program: ProgramId, bytes: &[u8]) -> Result<bool, AgentStoreError> {
+        if ProgramId::of_pvm(bytes) != program {
+            return Err(AgentStoreError::Corrupt);
+        }
+        self.put_artifact(&self.catalog_path("programs", &program.0, "pvm"), bytes)
+    }
+
+    fn load_program(&self, program: ProgramId) -> Result<Option<Vec<u8>>, AgentStoreError> {
+        let path = self.catalog_path("programs", &program.0, "pvm");
+        match std::fs::read(path) {
+            Ok(bytes) if ProgramId::of_pvm(&bytes) == program => Ok(Some(bytes)),
+            Ok(_) => Err(AgentStoreError::Corrupt),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(AgentStoreError::Unavailable),
+        }
+    }
+
+    fn remove_program(&mut self, program: ProgramId) -> Result<(), AgentStoreError> {
+        self.remove_artifact(&self.catalog_path("programs", &program.0, "pvm"))
+    }
+}
+
+fn encode_hex(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +384,7 @@ pub enum AgentDriverError {
     RuntimeExit { reason: ExitReason, pc: u32 },
     RuntimeOutput,
     RuntimeStateTooLarge,
+    ProgramUnavailable(ProgramId),
     Lifecycle(LifecycleError),
     Execution(ActorExecutionError),
     Package(PackageError),
@@ -384,13 +553,47 @@ impl<S: AgentImageStore> AgentDriver<S> {
             lanes: requirements.lanes,
             suspended: false,
         };
+        let package_bytes = package.encode();
+        let package_reference = BlobRef::of_bytes(&package_bytes);
+        let created_package = self.store.put_package(&package_reference, &package_bytes)?;
+        let created_program = match self
+            .store
+            .put_program(package.manifest.program, &package.pvm)
+        {
+            Ok(created) => created,
+            Err(error) => {
+                if created_package {
+                    let _ = self.store.remove_package(&package_reference);
+                }
+                return Err(error.into());
+            }
+        };
         let reply = self.lifecycle(LifecycleRequest::Install(InstallActor {
             entry: entry.clone(),
             producer: package.deployment_signature.producer,
-            package: BlobRef::of_bytes(&package.encode()),
+            package: package_reference.clone(),
             initial_state,
             requirements,
-        }))?;
+        }));
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                // A typed runtime refusal happened before image persistence,
+                // so newly staged artifacts are unowned and may be removed.
+                // Store failures are intentionally retained: a rename may
+                // have reached durable storage before a directory sync error,
+                // and deleting its program would make that image unusable.
+                if matches!(error, AgentDriverError::Lifecycle(_)) {
+                    if created_program {
+                        let _ = self.store.remove_program(package.manifest.program);
+                    }
+                    if created_package {
+                        let _ = self.store.remove_package(&package_reference);
+                    }
+                }
+                return Err(error);
+            }
+        };
         match reply {
             LifecycleReply::Installed(installed) if installed == entry => Ok(installed),
             _ => Err(AgentDriverError::InvalidRuntime),
@@ -409,12 +612,17 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let expected_deployment = invocation.deployment;
         let mode = invocation.mode;
         let outer_gas = self.management_gas.saturating_add(invocation.gas);
+        let actor_pvm = self
+            .store
+            .load_program(invocation.program)?
+            .ok_or(AgentDriverError::ProgramUnavailable(invocation.program))?;
         let output: RuntimeExecutionReturn = execute_runtime_wire(
             &self.runtime_pvm,
             outer_gas,
             &RuntimeExecutionCall {
                 state: self.image.runtime_state.clone(),
                 invocation,
+                actor_pvm,
             }
             .encode(),
         )?;
@@ -538,21 +746,34 @@ impl<S: AgentImageStore> AgentDriver<S> {
 
     fn validate_loaded_state(&self) -> Result<(), AgentDriverError> {
         validate_state_size(&self.image.runtime_state)?;
-        let output = execute_runtime(
-            &self.runtime_pvm,
-            self.management_gas,
-            RuntimeCall {
-                state: self.image.runtime_state.clone(),
-                request: LifecycleRequest::Inspect {
-                    after: None,
-                    limit: 1,
+        let mut after = None;
+        loop {
+            let output = execute_runtime(
+                &self.runtime_pvm,
+                self.management_gas,
+                RuntimeCall {
+                    state: self.image.runtime_state.clone(),
+                    request: LifecycleRequest::Inspect {
+                        after,
+                        limit: super::standard::MAX_DIRECTORY_PAGE,
+                    },
                 },
-            },
-        )?;
-        if !matches!(output.result, Ok(LifecycleReply::Directory(_)))
-            || output.state != self.image.runtime_state
-        {
-            return Err(AgentDriverError::InvalidRuntime);
+            )?;
+            let Ok(LifecycleReply::Directory(page)) = output.result else {
+                return Err(AgentDriverError::InvalidRuntime);
+            };
+            if output.state != self.image.runtime_state {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            for actor in &page.entries {
+                self.store
+                    .load_program(actor.program)?
+                    .ok_or(AgentDriverError::ProgramUnavailable(actor.program))?;
+            }
+            let Some(next) = page.next else {
+                break;
+            };
+            after = Some(next);
         }
         Ok(())
     }

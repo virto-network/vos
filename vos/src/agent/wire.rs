@@ -125,6 +125,7 @@ impl ServiceWire for RuntimeExecutionCall {
         encoder.fixed(&super::RUNTIME_ABI_ID.0);
         encode_runtime_state(&mut encoder, &self.state);
         encode_actor_invocation(&mut encoder, &self.invocation);
+        encoder.bytes(&self.actor_pvm);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -134,10 +135,17 @@ impl ServiceWire for RuntimeExecutionCall {
         let call = Self {
             state: decode_runtime_state(decoder)?,
             invocation: decode_actor_invocation(decoder)?,
+            actor_pvm: decoder.bytes()?,
         };
         call.invocation
             .validate()
             .map_err(|_| DecodeError::NonCanonical)?;
+        if call.actor_pvm.is_empty()
+            || call.actor_pvm.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
+            || ProgramId::of_pvm(&call.actor_pvm) != call.invocation.program
+        {
+            return Err(DecodeError::NonCanonical);
+        }
         Ok(call)
     }
 }
@@ -347,14 +355,13 @@ pub fn apply_standard_execution(
         runtime
             .prepare_execution_state(&call.invocation)
             .and_then(|(lane, actor_state)| {
-                super::execution::run_inner_actor(&call.invocation, &actor_state).and_then(
-                    |(reply, next_state)| {
+                super::execution::run_inner_actor(&call.invocation, &call.actor_pvm, &actor_state)
+                    .and_then(|(reply, next_state)| {
                         if reply.status == ActorExecutionStatus::Done {
                             runtime.commit_execution_state(reply.actor, lane, next_state)?;
                         }
                         Ok(reply)
-                    },
-                )
+                    })
             });
     let state = if result.is_ok() {
         encode_standard_runtime_state(&runtime.snapshot())
@@ -387,7 +394,6 @@ fn encode_actor_invocation(encoder: &mut Encoder<'_>, invocation: &ActorInvocati
     encoder.fixed(&invocation.program.0);
     encoder.u8(encode_method_mode(invocation.mode));
     encoder.bytes(&invocation.message);
-    encoder.bytes(&invocation.actor_pvm);
     encoder.list(&invocation.availability, |encoder, blob| {
         encode_blob(encoder, &blob.reference);
         encoder.bytes(&blob.bytes);
@@ -403,7 +409,6 @@ fn decode_actor_invocation(decoder: &mut Decoder<'_>) -> Result<ActorInvocation,
         program: ProgramId(decoder.fixed()?),
         mode: decode_method_mode(decoder.u8()?)?,
         message: decoder.bytes()?,
-        actor_pvm: decoder.bytes()?,
         availability: decoder.list(|decoder| {
             Ok(RuntimeBlob {
                 reference: decode_blob(decoder)?,
@@ -969,13 +974,13 @@ mod tests {
                 program: ProgramId::of_pvm(&actor_pvm),
                 mode: MethodMode::Linear,
                 message: vec![0x41],
-                actor_pvm,
                 availability: vec![RuntimeBlob {
                     reference: BlobRef::of_bytes(&state),
                     bytes: state,
                 }],
                 gas: 1_000_000,
             },
+            actor_pvm,
         };
         assert_eq!(RuntimeExecutionCall::decode(&call.encode()).unwrap(), call);
     }

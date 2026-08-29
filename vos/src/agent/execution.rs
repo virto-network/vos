@@ -31,7 +31,6 @@ pub struct ActorInvocation {
     pub program: ProgramId,
     pub mode: MethodMode,
     pub message: Vec<u8>,
-    pub actor_pvm: Vec<u8>,
     pub availability: Vec<RuntimeBlob>,
     pub gas: u64,
 }
@@ -76,6 +75,10 @@ pub enum ActorExecutionError {
 pub struct RuntimeExecutionCall {
     pub state: super::wire::RuntimeState,
     pub invocation: ActorInvocation,
+    /// Exact content-addressed program resolved by the host from its durable
+    /// package catalog. It is intentionally absent from [`ActorInvocation`]
+    /// so callers cannot select executable bytes.
+    pub actor_pvm: Vec<u8>,
 }
 
 /// Complete deterministic runtime execution result.
@@ -94,9 +97,6 @@ impl ActorInvocation {
             || self.gas == 0
             || self.message.is_empty()
             || self.message.len() > MAX_EXECUTION_MESSAGE_BYTES
-            || self.actor_pvm.is_empty()
-            || self.actor_pvm.len() > MAX_EXECUTION_PROGRAM_BYTES
-            || ProgramId::of_pvm(&self.actor_pvm) != self.program
             || self.availability.len() > MAX_EXECUTION_BLOBS
             || self
                 .availability
@@ -126,13 +126,14 @@ impl ActorInvocation {
 #[cfg(feature = "pvm")]
 pub(crate) fn run_inner_actor(
     invocation: &ActorInvocation,
+    actor_pvm: &[u8],
     actor_state: &[u8],
 ) -> Result<(ActorExecutionReply, Vec<u8>), ActorExecutionError> {
     use super::machine::{ActorMachine, InnerExit};
     use crate::abi::{error, hostcall};
 
-    let mut machine = ActorMachine::load(&invocation.actor_pvm, &[])
-        .map_err(|_| ActorExecutionError::InvalidInput)?;
+    let mut machine =
+        ActorMachine::load(actor_pvm, &[]).map_err(|_| ActorExecutionError::InvalidInput)?;
     let mut fetch = [actor_state, invocation.message.as_slice()].into_iter();
     let mut next_fetch = fetch.next();
     let mut gas = invocation.gas;
