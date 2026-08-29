@@ -74,21 +74,6 @@ pub mod __io {
 pub mod abi;
 pub mod agent;
 
-/// Actor process-entry ABI selected by this guest's `vos` dependency.
-///
-/// The actor macro embeds this value into `.vos_agent`. Keeping feature
-/// selection in the dependency crate prevents the proc macro from guessing a
-/// downstream build configuration it cannot observe.
-#[cfg(feature = "service")]
-#[doc(hidden)]
-pub const ACTOR_EXECUTION_ENTRY_KIND: agent::schema::ExecutionEntryKind =
-    agent::schema::ExecutionEntryKind::ServiceActor;
-
-/// Actor process-entry ABI selected by a standard-agent guest build.
-#[cfg(all(feature = "pvm", not(feature = "service")))]
-#[doc(hidden)]
-pub const ACTOR_EXECUTION_ENTRY_KIND: agent::schema::ExecutionEntryKind =
-    agent::schema::ExecutionEntryKind::AgentActor;
 pub mod attestation;
 pub mod crypto;
 /// Canonical service contracts and the local conformance harness.

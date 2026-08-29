@@ -22,6 +22,38 @@ cross-packaged.
 The package is the installation unit. Raw ELFs and PVMs are build inputs, not
 deployable applications.
 
+## Agent actors
+
+Agent actors opt into the lane-aware source ABI on both macros:
+
+```rust,ignore
+#[actor(agent)]
+pub struct Board {
+    title: String,              // Linear
+    edits: crdt::Counter,       // Merge
+    #[state(local)] draft: String,
+}
+
+#[messages(agent)]
+impl Board {
+    #[msg(linear)]
+    pub fn rename(&mut self, title: String) { self.title = title; }
+
+    #[msg(merge)]
+    pub fn record_edit(&mut self) {
+        self.edits.increment(1).expect("one stable operation per slice");
+    }
+
+    #[msg]
+    pub fn title(&self) -> String { self.title.clone() }
+}
+```
+
+The generated method view exposes only the lanes permitted by its mode. The
+runtime independently projects the same lanes before execution and rejects a
+transition that changes any other lane. Service actors continue to use plain
+`#[actor]` and `#[messages]`.
+
 ## Actor trees
 
 A root actor may spawn package-authorized children. Calls use bound handles,

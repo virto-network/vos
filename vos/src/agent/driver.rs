@@ -15,15 +15,11 @@ use std::sync::Arc;
 use vos_pvm::refine_host::RefineContext;
 use vos_pvm::{ExitReason, Gas};
 
-use super::authority::{
-    AgentAuthorityBinding, AgentAuthorityReceipt, AgentAuthorityVerifier, AuthorityError,
-    authorize_lifecycle,
-};
+use super::authority::{ActorInvocationReceipt, AgentAuthorityReceipt, AuthorityError};
 pub use super::execution::MAX_RUNTIME_STATE_BYTES;
 use super::execution::{
-    ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
-    ActorInvocationVerificationError, ActorInvocationVerifier, RuntimeBlob, RuntimeExecutionCall,
-    RuntimeExecutionReturn,
+    ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation, RuntimeBlob,
+    RuntimeExecutionCall, RuntimeExecutionReturn,
 };
 use super::package::{Package, PackageError};
 use super::wire::{RuntimeCall, RuntimeReturn, RuntimeState};
@@ -37,23 +33,18 @@ use crate::service::{ActorId, BlobRef, CapabilityId, DeploymentId, Hash, Program
 
 pub const DEFAULT_MANAGEMENT_GAS: Gas = 1_000_000_000;
 
-/// Driver-owned source of current logical time and authority decisions.
-/// Public callers submit evidence; they cannot select either the clock or
-/// verifier used at the durable admission boundary.
+/// Driver-owned source of logical time and signed-package trust. Lifecycle
+/// and invocation authority is carried as canonical signed receipts and
+/// verified again by the runtime guest.
 pub trait AgentTrustProvider: Send + Sync {
     fn current_logical_slot(&self) -> Option<u64>;
-    fn verify_authority(
+
+    /// Immutable system-authority deployment anchored for this space. This
+    /// selects trust; it does not decide individual lifecycle operations.
+    fn authority_for_space(
         &self,
-        authority: &AgentAuthorityBinding,
-        message: &[u8],
-        signature: &[u8],
-    ) -> bool;
-    fn verify_invocation(
-        &self,
-        agent: &AgentConfig,
-        authorization_message: &[u8],
-        evidence: &[u8],
-    ) -> bool;
+        space: crate::service::SpaceId,
+    ) -> Option<super::authority::AgentAuthorityBinding>;
 
     /// Authenticate a signed package for this complete target agent.
     /// Durable APIs accept raw packages and always cross this driver-owned
@@ -61,25 +52,6 @@ pub trait AgentTrustProvider: Send + Sync {
     fn verify_package(&self, agent: &AgentConfig, package: &Package) -> bool;
 }
 
-struct TrustAuthorityVerifier<'a>(&'a dyn AgentTrustProvider);
-
-impl AgentAuthorityVerifier for TrustAuthorityVerifier<'_> {
-    fn verify(&self, authority: &AgentAuthorityBinding, message: &[u8], signature: &[u8]) -> bool {
-        self.0.verify_authority(authority, message, signature)
-    }
-}
-
-struct TrustInvocationVerifier<'a> {
-    trust: &'a dyn AgentTrustProvider,
-    agent: &'a AgentConfig,
-}
-
-impl ActorInvocationVerifier for TrustInvocationVerifier<'_> {
-    fn verify(&self, authorization_message: &[u8], evidence: &[u8]) -> bool {
-        self.trust
-            .verify_invocation(self.agent, authorization_message, evidence)
-    }
-}
 /// Maximum canonical configuration embedded in one image. Replica and
 /// authority lists are protocol-bounded independently; this outer limit keeps
 /// their decoder from allocating the generic service-wire maximum first.
@@ -257,6 +229,12 @@ impl ServiceWire for AgentImage {
             || image.runtime_program == ProgramId::ZERO
             || image.runtime_state.is_empty()
             || runtime_state_size(&image.runtime_state) > MAX_RUNTIME_STATE_BYTES
+            || runtime_state_size(&image.runtime_state)
+                > image
+                    .config
+                    .runtime_contract
+                    .resources
+                    .max_runtime_state_bytes as usize
             || image.config.replicas.len() > MAX_AGENT_IMAGE_REPLICAS
             || image.config.validate().is_err()
             || image.config.identity.runtime_program != image.runtime_program
@@ -1140,7 +1118,6 @@ pub enum AgentDriverError {
     PolicyMismatch(DeploymentId),
     Lifecycle(LifecycleError),
     Execution(ActorExecutionError),
-    InvocationVerification(ActorInvocationVerificationError),
     Package(PackageError),
     Authority(AuthorityError),
     Store(AgentStoreError),
@@ -1184,18 +1161,36 @@ fn verify_runtime_package_binding(
     package: &Package,
 ) -> Result<(), AgentDriverError> {
     verify_trusted_package(trust, config, package)?;
-    let PackageKind::AgentRuntime { abi, capabilities } = package.manifest.kind else {
+    let PackageKind::AgentRuntime {
+        contract,
+        capabilities,
+    } = package.manifest.kind
+    else {
         return Err(AgentDriverError::Package(PackageError::WrongKind));
     };
     let package_bytes = package.encode();
-    if abi != RUNTIME_ABI_ID
+    if !contract.is_valid()
         || config.identity.runtime_deployment != package.deployment_id()
         || config.identity.runtime_program != package.manifest.program
         || config.identity.runtime_producer != package.deployment_signature.producer
         || config.runtime_package != BlobRef::of_bytes(&package_bytes)
+        || config.runtime_contract != contract
         || config.capabilities != capabilities
     {
         return Err(AgentDriverError::RuntimeProgramMismatch);
+    }
+    Ok(())
+}
+
+fn verify_authority_anchor(
+    trust: &dyn AgentTrustProvider,
+    config: &AgentConfig,
+) -> Result<(), AgentDriverError> {
+    let anchored = trust
+        .authority_for_space(config.identity.space)
+        .ok_or(AgentDriverError::TrustUnavailable)?;
+    if anchored != config.authority {
+        return Err(AgentDriverError::Authority(AuthorityError::WrongAuthority));
     }
     Ok(())
 }
@@ -1210,28 +1205,26 @@ fn verify_authority_admission(
     let current_slot = trust
         .current_logical_slot()
         .ok_or(AgentDriverError::TrustUnavailable)?;
-    let verified = receipt.clone().verify(
-        &config.authority,
-        current_slot,
-        &TrustAuthorityVerifier(trust),
-    )?;
-    authorize_lifecycle(
-        &verified,
-        &config.authority,
-        config.identity.space,
-        config.identity.agent,
-        CapabilityId::named(capability),
-        request,
-        current_slot,
-    )?;
-    let claim = verified.claim();
+    receipt.verify_guest_signature(&config.authority)?;
+    let claim = &receipt.claim;
+    if claim.space != config.identity.space {
+        return Err(AgentDriverError::Authority(AuthorityError::WrongSpace));
+    }
+    if claim.agent != config.identity.agent {
+        return Err(AgentDriverError::Authority(AuthorityError::WrongAgent));
+    }
+    if matches!(request, LifecycleRequest::Create(_)) && claim.principal != config.identity.owner {
+        return Err(AgentDriverError::Authority(AuthorityError::WrongOperation));
+    }
+    if claim.capability != CapabilityId::named(capability) {
+        return Err(AgentDriverError::Authority(AuthorityError::WrongCapability));
+    }
+    if claim.operation != request.commitment() {
+        return Err(AgentDriverError::Authority(AuthorityError::WrongOperation));
+    }
     Ok(LifecycleAuthorityAdmission {
-        authority: config.authority.commitment(),
-        credential: claim.credential,
-        sequence: claim.sequence,
+        receipt: receipt.clone(),
         observed_slot: current_slot,
-        claim: claim.signing_message(),
-        operation: claim.operation,
     })
 }
 
@@ -1262,6 +1255,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
     ) -> Result<Self, AgentDriverError> {
         config.validate().map_err(AgentDriverError::InvalidConfig)?;
         validate_process_local_profile(config.identity.profile)?;
+        verify_authority_anchor(trust.as_ref(), &config)?;
         verify_runtime_package_binding(trust.as_ref(), &config, &runtime_package)?;
         let runtime_pvm = runtime_package.pvm.clone();
         let runtime_program = runtime_package.manifest.program;
@@ -1290,7 +1284,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         if output.result != Ok(LifecycleReply::Created(config.identity.clone())) {
             return Err(AgentDriverError::InvalidRuntime);
         }
-        validate_state_size(&output.state)?;
+        validate_state_size(&output.state, &config.runtime_contract)?;
         let image = AgentImage {
             revision: 1,
             runtime_program,
@@ -1331,6 +1325,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             .validate()
             .map_err(AgentDriverError::InvalidConfig)?;
         validate_process_local_profile(image.config.identity.profile)?;
+        verify_authority_anchor(trust.as_ref(), &image.config)?;
         let package_bytes = store.load_package(&image.config.runtime_package)?.ok_or(
             AgentDriverError::PackageUnavailable(image.config.runtime_package.hash),
         )?;
@@ -1410,14 +1405,14 @@ impl<S: AgentImageStore> AgentDriver<S> {
                     if !authorized {
                         return Err(AgentDriverError::InvalidRuntime);
                     }
-                    validate_state_size(&output.state)?;
+                    validate_state_size(&output.state, &self.image.config.runtime_contract)?;
                     self.commit_runtime_state(output.state)?;
                     self.reconcile_catalog_after_commit();
                 }
                 Err(AgentDriverError::Lifecycle(error))
             }
             Ok(reply) => {
-                validate_state_size(&output.state)?;
+                validate_state_size(&output.state, &self.image.config.runtime_contract)?;
                 if read_only {
                     if output.state != self.image.runtime_state {
                         return Err(AgentDriverError::InvalidRuntime);
@@ -1464,6 +1459,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         if config != &self.image.config {
             return Err(AgentDriverError::RuntimeProgramMismatch);
         }
+        verify_authority_anchor(self.trust.as_ref(), config)?;
         verify_runtime_package_binding(self.trust.as_ref(), config, runtime_package)?;
         let request = LifecycleRequest::Create(config.clone());
         let admission = self.authorize(
@@ -1500,9 +1496,16 @@ impl<S: AgentImageStore> AgentDriver<S> {
         package: &Package,
     ) -> Result<LifecycleRequest, AgentDriverError> {
         verify_trusted_package(self.trust.as_ref(), &self.image.config, package)?;
-        let PackageKind::Actor { requirements } = package.manifest.kind else {
+        let PackageKind::Actor {
+            contract,
+            requirements,
+        } = package.manifest.kind
+        else {
             return Err(AgentDriverError::Package(PackageError::WrongKind));
         };
+        if !self.image.config.runtime_contract.supports(contract) {
+            return Err(AgentDriverError::Package(PackageError::InvalidActorAbi));
+        }
         let actor = match parent {
             Some(parent) => ActorId::owned_child(parent, &name),
             None => ActorId::top_level(self.image.config.identity.agent, &name),
@@ -1529,6 +1532,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             agent_schema: BlobRef::of_bytes(&package.agent_schema),
             role_policies: BlobRef::of_bytes(&package.role_policies),
             state_layout: agent_schema.state_layout_hash(),
+            contract,
             requirements,
         }))
     }
@@ -1649,9 +1653,16 @@ impl<S: AgentImageStore> AgentDriver<S> {
         package: &Package,
     ) -> Result<LifecycleRequest, AgentDriverError> {
         verify_trusted_package(self.trust.as_ref(), &self.image.config, package)?;
-        let PackageKind::Actor { requirements } = package.manifest.kind else {
+        let PackageKind::Actor {
+            contract,
+            requirements,
+        } = package.manifest.kind
+        else {
             return Err(AgentDriverError::Package(PackageError::WrongKind));
         };
+        if !self.image.config.runtime_contract.supports(contract) {
+            return Err(AgentDriverError::Package(PackageError::InvalidActorAbi));
+        }
         let agent_schema = super::schema::decode(&package.agent_schema).ok_or(
             AgentDriverError::Package(PackageError::InvalidActorArtifacts),
         )?;
@@ -1665,6 +1676,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             agent_schema: BlobRef::of_bytes(&package.agent_schema),
             role_policies: BlobRef::of_bytes(&package.role_policies),
             state_layout: agent_schema.state_layout_hash(),
+            contract,
             requirements,
         }))
     }
@@ -1853,18 +1865,22 @@ impl<S: AgentImageStore> AgentDriver<S> {
     pub fn invoke(
         &mut self,
         invocation: ActorInvocation,
-        evidence: &[u8],
+        authority: &ActorInvocationReceipt,
     ) -> Result<ActorExecutionReply, AgentDriverError> {
-        let verified = invocation
-            .verify(
-                evidence,
-                &TrustInvocationVerifier {
-                    trust: self.trust.as_ref(),
-                    agent: &self.image.config,
-                },
+        invocation.validate().map_err(AgentDriverError::Execution)?;
+        authority
+            .validate_for(
+                &self.image.config.authority,
+                self.image.config.identity.space,
+                self.image.config.identity.agent,
+                &invocation,
             )
-            .map_err(AgentDriverError::InvocationVerification)?;
-        self.invoke_raw(verified.into_inner())
+            .map_err(AgentDriverError::Authority)?;
+        let observed_slot = self
+            .trust
+            .current_logical_slot()
+            .ok_or(AgentDriverError::TrustUnavailable)?;
+        self.invoke_raw(invocation, authority.clone(), observed_slot)
     }
 
     /// Execute the raw runtime invocation after the public verification seam
@@ -1874,6 +1890,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
     pub(crate) fn invoke_raw(
         &mut self,
         invocation: ActorInvocation,
+        authority: ActorInvocationReceipt,
+        observed_slot: u64,
     ) -> Result<ActorExecutionReply, AgentDriverError> {
         if self.catalog_cleanup_pending {
             let _ = self.reconcile_catalog();
@@ -1887,24 +1905,36 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let expected_deployment = invocation.deployment;
         let mode = invocation.mode;
         let outer_gas = self.management_gas.saturating_add(invocation.gas);
-        let actor_pvm = self
-            .store
-            .load_program(invocation.program)?
-            .ok_or(AgentDriverError::ProgramUnavailable(invocation.program))?;
-        let actor_schema = self
-            .store
-            .load_actor_schema(invocation.deployment)?
-            .ok_or(AgentDriverError::SchemaUnavailable(invocation.deployment))?;
-        let actor_policies = self
-            .store
-            .load_actor_policies(invocation.deployment)?
-            .ok_or(AgentDriverError::PolicyUnavailable(invocation.deployment))?;
+        let actor_pvm = self.store.load_program(invocation.program)?;
+        let actor_schema = self.store.load_actor_schema(invocation.deployment)?;
+        let actor_policies = self.store.load_actor_policies(invocation.deployment)?;
+        let recovery_only =
+            actor_pvm.is_none() || actor_schema.is_none() || actor_policies.is_none();
+        let empty_blob = || RuntimeBlob {
+            reference: BlobRef {
+                hash: Hash::ZERO,
+                len: 0,
+            },
+            bytes: Vec::new(),
+        };
+        let (actor_pvm, actor_schema, actor_policies) = if recovery_only {
+            (Vec::new(), empty_blob(), empty_blob())
+        } else {
+            (
+                actor_pvm.expect("checked above"),
+                actor_schema.expect("checked above"),
+                actor_policies.expect("checked above"),
+            )
+        };
         let output: RuntimeExecutionReturn = execute_runtime_wire(
             &self.runtime_pvm,
             outer_gas,
             &RuntimeExecutionCall {
                 state: self.image.runtime_state.clone(),
                 invocation,
+                authority,
+                observed_slot,
+                recovery_only,
                 actor_pvm,
                 actor_schema,
                 actor_policies,
@@ -1923,10 +1953,11 @@ impl<S: AgentImageStore> AgentDriver<S> {
         if reply.invocation != expected_invocation
             || reply.actor != expected_actor
             || reply.deployment != expected_deployment
+            || reply.mode != mode
         {
             return Err(AgentDriverError::InvalidRuntime);
         }
-        validate_state_size(&output.state)?;
+        validate_state_size(&output.state, &self.image.config.runtime_contract)?;
         if reply.status != ActorExecutionStatus::Done {
             if output.state != self.image.runtime_state {
                 return Err(AgentDriverError::InvalidRuntime);
@@ -1962,21 +1993,21 @@ impl<S: AgentImageStore> AgentDriver<S> {
     pub fn acknowledge_invocation(
         &mut self,
         invocation: ActorInvocation,
-        evidence: &[u8],
+        authority: &ActorInvocationReceipt,
     ) -> Result<(), AgentDriverError> {
-        let invocation = invocation
-            .verify(
-                evidence,
-                &TrustInvocationVerifier {
-                    trust: self.trust.as_ref(),
-                    agent: &self.image.config,
-                },
+        invocation.validate().map_err(AgentDriverError::Execution)?;
+        authority
+            .validate_for(
+                &self.image.config.authority,
+                self.image.config.identity.space,
+                self.image.config.identity.agent,
+                &invocation,
             )
-            .map_err(AgentDriverError::InvocationVerification)?;
-        let invocation = invocation.invocation();
+            .map_err(AgentDriverError::Authority)?;
         let reply = self.lifecycle(LifecycleRequest::AcknowledgeInvocation {
             invocation: invocation.invocation,
             request: invocation.commitment(),
+            authority: Box::new(authority.clone()),
         })?;
         if reply == LifecycleReply::InvocationAcknowledged(invocation.invocation) {
             Ok(())
@@ -2003,7 +2034,11 @@ impl<S: AgentImageStore> AgentDriver<S> {
         // trust provider then authenticates the package against that complete
         // post-upgrade descriptor, not merely its producer key.
         package.validate().map_err(AgentDriverError::Package)?;
-        let PackageKind::AgentRuntime { abi, capabilities } = package.manifest.kind else {
+        let PackageKind::AgentRuntime {
+            contract,
+            capabilities,
+        } = package.manifest.kind
+        else {
             return Err(AgentDriverError::Package(PackageError::WrongKind));
         };
         let package_reference = BlobRef::of_bytes(&package.encode());
@@ -2012,6 +2047,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         target.identity.runtime_program = package.manifest.program;
         target.identity.runtime_producer = package.deployment_signature.producer;
         target.runtime_package = package_reference.clone();
+        target.runtime_contract = contract;
         target.capabilities = capabilities;
         target.validate().map_err(AgentDriverError::InvalidConfig)?;
         verify_runtime_package_binding(self.trust.as_ref(), &target, package)?;
@@ -2021,7 +2057,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             to_program: package.manifest.program,
             producer: package.deployment_signature.producer,
             package: package_reference,
-            abi,
+            contract,
             capabilities,
         };
         Ok((request, target))
@@ -2066,7 +2102,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             Ok(reply) => reply,
             Err(error) => {
                 if output.state != self.image.runtime_state {
-                    validate_state_size(&output.state)?;
+                    validate_state_size(&output.state, &self.image.config.runtime_contract)?;
                     self.commit_runtime_state(output.state)?;
                     self.reconcile_catalog_after_commit();
                 }
@@ -2083,7 +2119,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         {
             return Err(AgentDriverError::InvalidRuntime);
         }
-        validate_state_size(&output.state)?;
+        validate_state_size(&output.state, &target_config.runtime_contract)?;
         let probe = execute_runtime(
             &new_runtime_pvm,
             self.management_gas,
@@ -2147,7 +2183,10 @@ impl<S: AgentImageStore> AgentDriver<S> {
     }
 
     fn catalog_references(&self) -> Result<AgentCatalogReferences, AgentDriverError> {
-        validate_state_size(&self.image.runtime_state)?;
+        validate_state_size(
+            &self.image.runtime_state,
+            &self.image.config.runtime_contract,
+        )?;
         let mut actors = Vec::new();
         let mut after = None;
         loop {
@@ -2244,6 +2283,12 @@ fn encode_valid_image(image: &AgentImage) -> Result<Vec<u8>, AgentStoreError> {
             .runtime_state
             .encoded_len()
             .is_none_or(|bytes| bytes > MAX_RUNTIME_STATE_BYTES)
+        || runtime_state_size(&image.runtime_state)
+            > image
+                .config
+                .runtime_contract
+                .resources
+                .max_runtime_state_bytes as usize
     {
         return Err(AgentStoreError::Corrupt);
     }
@@ -2257,8 +2302,15 @@ fn encode_valid_image(image: &AgentImage) -> Result<Vec<u8>, AgentStoreError> {
     Ok(bytes)
 }
 
-fn validate_state_size(state: &RuntimeState) -> Result<(), AgentDriverError> {
-    if state.is_empty() || runtime_state_size(state) > MAX_RUNTIME_STATE_BYTES {
+fn validate_state_size(
+    state: &RuntimeState,
+    contract: &super::contract::RuntimePackageContract,
+) -> Result<(), AgentDriverError> {
+    if state.is_empty()
+        || !contract.is_valid()
+        || runtime_state_size(state) > MAX_RUNTIME_STATE_BYTES
+        || runtime_state_size(state) > contract.resources.max_runtime_state_bytes as usize
+    {
         Err(AgentDriverError::RuntimeStateTooLarge)
     } else {
         Ok(())
@@ -2270,21 +2322,18 @@ fn validate_execution_transition(
     next: &RuntimeState,
     mode: super::MethodMode,
 ) -> Result<(), AgentDriverError> {
-    let Some(write_lane) = mode.write_lane() else {
-        return if next == prior {
-            Ok(())
-        } else {
-            Err(AgentDriverError::InvalidRuntime)
-        };
-    };
-    if next.control != prior.control
+    let storage = mode.result_storage();
+    if (storage != super::InvocationResultStorage::Control && next.control != prior.control)
         || [
             super::StateLane::Linear,
             super::StateLane::Merge,
             super::StateLane::Local,
         ]
         .into_iter()
-        .any(|lane| lane != write_lane && next.component(lane) != prior.component(lane))
+        .any(|lane| {
+            storage != super::InvocationResultStorage::Lane(lane)
+                && next.component(lane) != prior.component(lane)
+        })
     {
         return Err(AgentDriverError::InvalidRuntime);
     }
@@ -2323,6 +2372,28 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct AnchorTrust {
+        space: crate::service::SpaceId,
+        authority: super::super::authority::AgentAuthorityBinding,
+    }
+
+    impl AgentTrustProvider for AnchorTrust {
+        fn current_logical_slot(&self) -> Option<u64> {
+            Some(1)
+        }
+
+        fn authority_for_space(
+            &self,
+            space: crate::service::SpaceId,
+        ) -> Option<super::super::authority::AgentAuthorityBinding> {
+            (space == self.space).then(|| self.authority.clone())
+        }
+
+        fn verify_package(&self, _agent: &AgentConfig, _package: &Package) -> bool {
+            true
+        }
+    }
 
     struct CatalogFixture {
         entry: ActorEntry,
@@ -2457,109 +2528,21 @@ mod tests {
     }
 
     #[test]
-    fn authority_admission_uses_the_provider_slot_for_expiry() {
-        struct TrustAt(u64);
-        impl AgentTrustProvider for TrustAt {
-            fn current_logical_slot(&self) -> Option<u64> {
-                Some(self.0)
-            }
-
-            fn verify_authority(&self, _: &AgentAuthorityBinding, _: &[u8], _: &[u8]) -> bool {
-                true
-            }
-
-            fn verify_invocation(&self, _: &AgentConfig, _: &[u8], _: &[u8]) -> bool {
-                false
-            }
-
-            fn verify_package(&self, _: &AgentConfig, _: &Package) -> bool {
-                false
-            }
-        }
-
-        let config = invalid_config();
-        let request = LifecycleRequest::Suspend(ActorId([0x42; 32]));
-        let receipt = AgentAuthorityReceipt {
-            claim: super::super::authority::AgentAuthorityClaim {
-                authority: config.authority.clone(),
-                space: config.identity.space,
-                agent: config.identity.agent,
-                principal: config.identity.owner,
-                credential: crate::service::CredentialId([0x43; 32]),
-                capability: CapabilityId::named(
-                    super::super::authority::CAPABILITY_ACTOR_LIFECYCLE,
-                ),
-                operation: request.commitment(),
-                sequence: 1,
-                valid_from: 10,
-                valid_until: 19,
-            },
-            signature: vec![1],
+    fn creation_authority_is_selected_by_the_space_anchor_not_the_caller() {
+        let mut config = invalid_config();
+        let anchored = config.authority.clone();
+        let trust = AnchorTrust {
+            space: config.identity.space,
+            authority: anchored.clone(),
         };
+        assert_eq!(verify_authority_anchor(&trust, &config), Ok(()));
+
+        let attacker_key = super::super::authority::ed25519_public_key_wire([0x52; 32]);
+        config.authority.public_key = attacker_key.clone();
+        config.authority.producer = crate::service::ProducerId::of_public_key(&attacker_key);
         assert_eq!(
-            verify_authority_admission(
-                &TrustAt(20),
-                &receipt,
-                &config,
-                super::super::authority::CAPABILITY_ACTOR_LIFECYCLE,
-                &request,
-            ),
-            Err(AgentDriverError::Authority(AuthorityError::Expired))
-        );
-        let admitted = verify_authority_admission(
-            &TrustAt(19),
-            &receipt,
-            &config,
-            super::super::authority::CAPABILITY_ACTOR_LIFECYCLE,
-            &request,
-        )
-        .unwrap();
-        assert_eq!(admitted.observed_slot, 19);
-    }
-
-    #[test]
-    fn invocation_trust_receives_the_complete_target_agent_config() {
-        struct ConfigBoundTrust(AgentConfig);
-        impl AgentTrustProvider for ConfigBoundTrust {
-            fn current_logical_slot(&self) -> Option<u64> {
-                Some(1)
-            }
-
-            fn verify_authority(&self, _: &AgentAuthorityBinding, _: &[u8], _: &[u8]) -> bool {
-                false
-            }
-
-            fn verify_invocation(
-                &self,
-                agent: &AgentConfig,
-                message: &[u8],
-                evidence: &[u8],
-            ) -> bool {
-                agent == &self.0 && message == b"message" && evidence == b"evidence"
-            }
-
-            fn verify_package(&self, _: &AgentConfig, _: &Package) -> bool {
-                false
-            }
-        }
-
-        let expected = invalid_config();
-        let trust = ConfigBoundTrust(expected.clone());
-        assert!(
-            TrustInvocationVerifier {
-                trust: &trust,
-                agent: &expected,
-            }
-            .verify(b"message", b"evidence")
-        );
-        let mut other = expected.clone();
-        other.identity.space = crate::service::SpaceId([0x55; 32]);
-        assert!(
-            !TrustInvocationVerifier {
-                trust: &trust,
-                agent: &other,
-            }
-            .verify(b"message", b"evidence")
+            verify_authority_anchor(&trust, &config),
+            Err(AgentDriverError::Authority(AuthorityError::WrongAuthority))
         );
     }
 
@@ -2573,6 +2556,37 @@ mod tests {
         }
         .encode();
         assert!(AgentImage::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn signed_runtime_resource_limit_is_stricter_than_the_global_decoder_cap() {
+        let mut contract = super::super::contract::RuntimePackageContract::canonical();
+        contract.resources.max_runtime_state_bytes = 3;
+        assert!(contract.is_valid());
+        assert_eq!(
+            validate_state_size(
+                &RuntimeState {
+                    control: vec![1, 2],
+                    linear: vec![3, 4],
+                    merge: Vec::new(),
+                    local: Vec::new(),
+                },
+                &contract,
+            ),
+            Err(AgentDriverError::RuntimeStateTooLarge)
+        );
+        assert_eq!(
+            validate_state_size(
+                &RuntimeState {
+                    control: vec![1],
+                    linear: vec![2],
+                    merge: vec![3],
+                    local: Vec::new(),
+                },
+                &contract,
+            ),
+            Ok(())
+        );
     }
 
     fn valid_image(revision: u64) -> AgentImage {
@@ -3003,28 +3017,34 @@ mod tests {
     fn invalid_config() -> AgentConfig {
         use crate::agent::{AgentIdentity, AgentProfile, RuntimeCapabilities};
         use crate::service::{AgentId, BlobRef, DeploymentId, PrincipalId, ProducerId, SpaceId};
+        let authority_key = crate::agent::authority::ed25519_public_key_wire([0x41; 32]);
+        let space = SpaceId([1; 32]);
+        let owner = PrincipalId([3; 32]);
+        let creation_nonce = Hash([0x15; 32]);
         AgentConfig {
             identity: AgentIdentity {
-                space: SpaceId([1; 32]),
-                agent: AgentId([2; 32]),
-                owner: PrincipalId([3; 32]),
+                space,
+                agent: AgentId::derive(space, owner, &creation_nonce.0),
+                owner,
                 profile: AgentProfile::Local,
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([1; 32]),
                 runtime_producer: ProducerId([5; 32]),
             },
+            creation_nonce,
             authority: crate::agent::authority::AgentAuthorityBinding {
                 agent: AgentId([7; 32]),
                 actor: ActorId([8; 32]),
                 deployment: DeploymentId([9; 32]),
                 program: ProgramId([10; 32]),
-                producer: ProducerId::of_public_key(b"authority-key"),
-                public_key: b"authority-key".to_vec(),
+                producer: ProducerId::of_public_key(&authority_key),
+                public_key: authority_key,
             },
             runtime_package: BlobRef {
                 hash: Hash([6; 32]),
                 len: 1,
             },
+            runtime_contract: crate::agent::contract::RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities::standard(),
             replicas: Vec::new(),
         }

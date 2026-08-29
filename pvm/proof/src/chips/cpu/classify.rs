@@ -490,15 +490,6 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_tzb = true;
             f.is_32bit = true;
         }
-        // Sbrk panics on execution (not part of the ISA — the
-        // grow_heap hostcall is used instead).  Mark it terminal in
-        // the same way as Trap so the no-successor-row constraint
-        // fires.  is_exit covers the execution-stops semantics;
-        // is_trap forbids any subsequent real row.
-        Opcode::Sbrk => {
-            f.is_exit = true;
-            f.is_trap = true;
-        }
         // Branches (conditional) — classify by comparison type
         // For Le/Gt variants we'll flip the operand order / invert
         Opcode::BranchEq | Opcode::BranchEqImm => {

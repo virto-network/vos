@@ -3547,11 +3547,13 @@ dependencies = [
  "cipher-clerk",
  "clap",
  "dlmalloc",
+ "ed25519-dalek",
  "futures-channel",
  "futures-executor",
  "futures-lite",
  "futures-rustls",
  "getrandom 0.2.17",
+ "libc",
  "libloading",
  "libp2p",
  "log",
@@ -3570,6 +3572,7 @@ dependencies = [
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-pvm-precompiles",
+ "vos-pvm-program",
  "vos-raft",
  "zeroize",
 ]
@@ -3593,6 +3596,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "vos-pvm-codec",
+ "vos-pvm-program",
 ]
 
 [[package]]
@@ -3621,6 +3625,7 @@ dependencies = [
  "tracing-test",
  "vos-pvm",
  "vos-pvm-codec",
+ "vos-pvm-program",
 ]
 
 [[package]]
@@ -3629,6 +3634,10 @@ version = "0.1.0"
 dependencies = [
  "curve25519-dalek",
 ]
+
+[[package]]
+name = "vos-pvm-program"
+version = "0.1.0"
 
 [[package]]
 name = "vos-raft"

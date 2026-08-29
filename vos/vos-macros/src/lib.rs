@@ -6,6 +6,7 @@
 use proc_macro::TokenStream;
 use quote::{ToTokens, format_ident, quote};
 use syn::spanned::Spanned;
+use syn::visit_mut::VisitMut;
 use syn::{FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType, parse_macro_input};
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -338,6 +339,15 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
+    if parsed.agent && parsed.task_buf.is_some() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[actor(agent)] and #[actor(task)] select different execution ABIs",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let agent_actor = parsed.agent;
     let error_ty = parsed.error_ty;
     let provable = parsed.provable;
     let role_ty = parsed.role_ty;
@@ -441,12 +451,10 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     });
     let agent_entry_kind = if parsed.task_buf.is_some() {
         quote! { vos::agent::schema::ExecutionEntryKind::Task }
+    } else if agent_actor {
+        quote! { vos::agent::schema::ExecutionEntryKind::AgentActor }
     } else {
-        // This constant comes from the actor's `vos` dependency, whose
-        // selected `service` or `pvm` feature is the ABI actually compiled
-        // into the guest. The proc-macro crate cannot observe downstream
-        // feature selection and must not guess it here.
-        quote! { vos::ACTOR_EXECUTION_ENTRY_KIND }
+        quote! { vos::agent::schema::ExecutionEntryKind::ServiceActor }
     };
     let agent_uses_storage = !storage_fields.is_empty();
     let pvm_entries = quote! {
@@ -579,6 +587,119 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let linear_fields = lane_fields(PersistencePlan::Linear);
     let merge_fields = lane_fields(PersistencePlan::Merge);
     let local_fields = lane_fields(PersistencePlan::Local);
+    let mut view_generics = input.generics.clone();
+    view_generics.params.insert(
+        0,
+        syn::GenericParam::Lifetime(syn::parse_quote!('__vos_agent_view)),
+    );
+    let (view_impl_generics, view_ty_generics, view_where_clause) = view_generics.split_for_impl();
+    let lane_view = |suffix: &str,
+                     mutable: &[PersistencePlan],
+                     immutable: &[PersistencePlan],
+                     shared_receiver: bool| {
+        let view_name = format_ident!("__Vos{}{}View", name, suffix);
+        let selected = state_fields
+            .fields
+            .iter()
+            .filter(|field| {
+                mutable.contains(&field.persistence) || immutable.contains(&field.persistence)
+            })
+            .collect::<Vec<_>>();
+        let declarations = selected.iter().map(|field| {
+            let ident = &field.ident;
+            let ty = &field.ty;
+            if mutable.contains(&field.persistence) {
+                quote! { #ident: &'__vos_agent_view mut #ty }
+            } else {
+                quote! { #ident: &'__vos_agent_view #ty }
+            }
+        });
+        let initializers = selected.iter().map(|field| {
+            let ident = &field.ident;
+            if mutable.contains(&field.persistence) {
+                quote! { #ident: &mut actor.#ident }
+            } else {
+                quote! { #ident: &actor.#ident }
+            }
+        });
+        let receiver = if shared_receiver {
+            quote! { &'__vos_agent_view #name #ty_generics }
+        } else {
+            quote! { &'__vos_agent_view mut #name #ty_generics }
+        };
+        let marker = if shared_receiver {
+            quote! { core::marker::PhantomData<&'__vos_agent_view #name #ty_generics> }
+        } else {
+            quote! { core::marker::PhantomData<&'__vos_agent_view mut #name #ty_generics> }
+        };
+        quote! {
+            #[doc(hidden)]
+            struct #view_name #view_generics {
+                #( #declarations, )*
+                __marker: #marker,
+            }
+
+            impl #view_impl_generics #view_name #view_ty_generics #view_where_clause {
+                #[doc(hidden)]
+                fn __new(actor: #receiver) -> Self {
+                    Self {
+                        #( #initializers, )*
+                        __marker: core::marker::PhantomData,
+                    }
+                }
+            }
+        }
+    };
+    let agent_lane_views = agent_actor
+        .then(|| {
+            [
+                lane_view(
+                    "SharedQuery",
+                    &[],
+                    &[
+                        PersistencePlan::Linear,
+                        PersistencePlan::Merge,
+                        PersistencePlan::Constant,
+                    ],
+                    true,
+                ),
+                lane_view(
+                    "LocalQuery",
+                    &[],
+                    &[
+                        PersistencePlan::Linear,
+                        PersistencePlan::Merge,
+                        PersistencePlan::Local,
+                        PersistencePlan::Constant,
+                    ],
+                    true,
+                ),
+                lane_view(
+                    "Linear",
+                    &[PersistencePlan::Linear],
+                    &[PersistencePlan::Merge, PersistencePlan::Constant],
+                    false,
+                ),
+                lane_view(
+                    "Merge",
+                    &[PersistencePlan::Merge],
+                    &[PersistencePlan::Constant],
+                    false,
+                ),
+                lane_view(
+                    "Local",
+                    &[PersistencePlan::Local],
+                    &[
+                        PersistencePlan::Linear,
+                        PersistencePlan::Merge,
+                        PersistencePlan::Constant,
+                    ],
+                    false,
+                ),
+            ]
+        })
+        .into_iter()
+        .flatten();
     let load_lane = |argument: &syn::Ident, fields: &[syn::Ident]| {
         let count = fields.len() as u16;
         quote! {
@@ -663,13 +784,26 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
     let default_mutation_mode = state_fields.default_mutation_mode.tokens();
+    let agent_message_assert = agent_actor.then(|| {
+        quote! {
+            const _: () = {
+                fn __vos_require_agent_messages<T: vos::agent::schema::AgentMessageSet>() {}
+                let _ = __vos_require_agent_messages::<#msg_enum> as fn();
+            };
+        }
+    });
 
     let expanded = quote! {
         #struct_def
 
+        #( #agent_lane_views )*
+
         impl #impl_generics vos::Actor for #name #ty_generics #where_clause {
             type Error = #error_ty;
             type Message = #msg_enum;
+
+            #[doc(hidden)]
+            const AGENT_ACTOR_SOURCE: bool = #agent_actor;
 
             // Per-agent ACL framework — sentinel defaults so
             // actors that haven't declared their own `Role` enum
@@ -737,10 +871,74 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
+        #agent_message_assert
+
         #pvm_entries
     };
 
     expanded.into()
+}
+
+fn path_is_self(expression: &syn::Expr) -> bool {
+    matches!(
+        expression,
+        syn::Expr::Path(path)
+            if path.qself.is_none()
+                && path.path.leading_colon.is_none()
+                && path.path.segments.len() == 1
+                && path.path.segments[0].ident == "self"
+    )
+}
+
+fn tokens_contain_self(tokens: proc_macro2::TokenStream) -> bool {
+    use proc_macro2::TokenTree;
+
+    tokens.into_iter().any(|token| match token {
+        TokenTree::Ident(ident) => ident == "self",
+        TokenTree::Group(group) => tokens_contain_self(group.stream()),
+        TokenTree::Punct(_) | TokenTree::Literal(_) => false,
+    })
+}
+
+/// Rewrite an explicit agent handler onto the mode-specific field view.
+///
+/// A field place becomes `(*__vos_agent_lane_view.field)`, so an immutable
+/// view field is rejected by rustc when used as an assignment target. Bare
+/// `self` and helper-method receivers become the view itself; helpers must be
+/// written against an explicit view API rather than regaining the full actor.
+struct AgentLaneBodyRewriter {
+    error: Option<syn::Error>,
+}
+
+impl VisitMut for AgentLaneBodyRewriter {
+    fn visit_expr_mut(&mut self, expression: &mut syn::Expr) {
+        match expression {
+            syn::Expr::Field(field) if path_is_self(&field.base) => {
+                let member = field.member.clone();
+                *expression = syn::parse_quote!((*__vos_agent_lane_view.#member));
+            }
+            syn::Expr::Path(path)
+                if path.qself.is_none()
+                    && path.path.leading_colon.is_none()
+                    && path.path.segments.len() == 1
+                    && path.path.segments[0].ident == "self" =>
+            {
+                path.path.segments[0].ident =
+                    syn::Ident::new("__vos_agent_lane_view", path.path.segments[0].ident.span());
+            }
+            syn::Expr::Macro(expression_macro) => {
+                if tokens_contain_self(expression_macro.mac.tokens.clone()) {
+                    self.error.get_or_insert_with(|| {
+                        syn::Error::new_spanned(
+                            expression_macro,
+                            "explicit agent handlers cannot hide `self` lane access inside a macro; move the field access outside the macro",
+                        )
+                    });
+                }
+            }
+            _ => syn::visit_mut::visit_expr_mut(self, expression),
+        }
+    }
 }
 
 /// Generates message types, dispatch enum, and PVM entry points from an impl block.
@@ -763,16 +961,22 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `.vos_meta` section with actor metadata
 #[proc_macro_attribute]
 pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let emit_extension_reference = if attr.is_empty() {
-        false
+    let (emit_extension_reference, agent_messages) = if attr.is_empty() {
+        (false, false)
     } else {
         let mode = parse_macro_input!(attr as syn::Ident);
-        if mode != "extension" {
-            return syn::Error::new_spanned(mode, "expected #[messages] or #[messages(extension)]")
-                .to_compile_error()
-                .into();
+        if mode == "extension" {
+            (true, false)
+        } else if mode == "agent" {
+            (false, true)
+        } else {
+            return syn::Error::new_spanned(
+                mode,
+                "expected #[messages], #[messages(agent)], or #[messages(extension)]",
+            )
+            .to_compile_error()
+            .into();
         }
-        true
     };
     let input = parse_macro_input!(item as ItemImpl);
     let actor_ty = &input.self_ty;
@@ -974,6 +1178,25 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
             _ => false,
         };
         let explicit_execution_mode = execution_mode.is_some();
+        let effective_lane_view_mode = agent_messages
+            .then(|| {
+                execution_mode
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .or_else(|| is_query.then(|| "query".to_owned()))
+            })
+            .flatten();
+        let agent_lane_view = effective_lane_view_mode.as_deref().map(|mode| {
+            let suffix = match mode {
+                "query" | "linearizable" => "SharedQuery",
+                "local_query" => "LocalQuery",
+                "linear" => "Linear",
+                "merge" => "Merge",
+                "local" => "Local",
+                _ => unreachable!("execution modes were validated while parsing"),
+            };
+            format_ident!("__Vos{}{}View", actor_name, suffix)
+        });
         let agent_execution_mode = match execution_mode.as_ref().map(ToString::to_string) {
             Some(mode) if mode == "query" && is_query => {
                 quote! { vos::agent::MethodMode::Query }
@@ -1051,16 +1274,32 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         msg_structs.push(msg_struct);
 
         // Generate Message impl
-        let body = &method.block;
+        let mut body = method.block.clone();
+        if agent_lane_view.is_some() {
+            let mut rewriter = AgentLaneBodyRewriter { error: None };
+            rewriter.visit_block_mut(&mut body);
+            if let Some(error) = rewriter.error {
+                return error.to_compile_error().into();
+            }
+        }
         let field_binds = if field_names.is_empty() {
             quote! { let _ = msg; }
         } else {
             quote! { let #struct_name { #( #field_names ),* } = msg; }
         };
 
-        let handler_body = quote! {
-            #field_binds
-            #body
+        let handler_body = if let Some(view) = agent_lane_view {
+            quote! {
+                #field_binds
+                #[allow(unused_mut)]
+                let mut __vos_agent_lane_view = #view::__new(self);
+                #body
+            }
+        } else {
+            quote! {
+                #field_binds
+                #body
+            }
         };
 
         let msg_impl = quote! {
@@ -1522,6 +1761,16 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         });
     }
 
+    let agent_message_marker = agent_messages.then(|| {
+        quote! {
+            impl vos::agent::schema::AgentMessageSet for #enum_name {}
+            const _: () = assert!(
+                <#actor_ty as vos::Actor>::AGENT_ACTOR_SOURCE,
+                "#[messages(agent)] requires #[actor(agent)] on the actor type",
+            );
+        }
+    });
+
     // Generate the aggregated enum
     let aggregated_enum = quote! {
         pub enum #enum_name {
@@ -1614,6 +1863,8 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
+        #agent_message_marker
+
         impl #enum_name {
             #[doc(hidden)]
             pub const AGENT_METHODS: &'static [vos::agent::schema::MethodMeta] =
@@ -1640,6 +1891,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
                 provable: <#actor_ty as vos::Actor>::PROVABLE,
             };
         }
+
     };
 
     // Generate __vos_create() — reads init args from storage if constructor has params
@@ -2113,6 +2365,10 @@ struct ActorAttrs {
     /// that many bytes is emitted for the invoker (and the prover) to
     /// patch `(state, msg)` into.
     task_buf: Option<usize>,
+    /// Standard agent actor execution ABI (`#[actor(agent)]`). This is an
+    /// explicit source-level choice rather than an inference from Cargo
+    /// features, which the proc macro cannot observe reliably.
+    agent: bool,
     /// Explicit CRDT source model (`#[actor(crdt)]`).
     crdt: bool,
     /// `#[actor(task, provable)]` — publish this Task as a provable
@@ -2244,6 +2500,7 @@ fn parse_actor_attrs(attr: proc_macro2::TokenStream) -> syn::Result<ActorAttrs> 
         default_role: quote! { vos::NoRoles::Any },
         space_role_map: quote! { vos::NO_ROLES_MAP },
         task_buf: None,
+        agent: false,
         crdt: false,
         provable: false,
         state_version: 0,
@@ -2300,6 +2557,9 @@ fn parse_actor_attrs(attr: proc_macro2::TokenStream) -> syn::Result<ActorAttrs> 
             syn::Meta::Path(p) if p.is_ident("task") => {
                 out.task_buf = Some(DEFAULT_TASK_BUF);
             }
+            syn::Meta::Path(p) if p.is_ident("agent") => {
+                out.agent = true;
+            }
             syn::Meta::Path(p) if p.is_ident("crdt") => {
                 out.crdt = true;
             }
@@ -2327,7 +2587,7 @@ fn parse_actor_attrs(attr: proc_macro2::TokenStream) -> syn::Result<ActorAttrs> 
                     "unsupported #[actor] option; expected `error = Type`, \
                      `role = Type`, `default_role = Role`, \
                      `space_role_map = MAP`, `state_version = N`, `task`, \
-                     `task = N`, `crdt`, or `provable`",
+                     `task = N`, `agent`, `crdt`, or `provable`",
                 ));
             }
         }

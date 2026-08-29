@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::authority::AgentAuthorityReceipt;
+use super::authority::{ActorInvocationReceipt, AgentAuthorityReceipt};
 use super::driver::{AgentDriver, AgentDriverError, AgentTrustProvider, FileAgentStore};
 use super::execution::{ActorExecutionReply, ActorInvocation};
 use super::package::Package;
@@ -283,12 +283,12 @@ impl AgentHost {
         &mut self,
         agent: AgentId,
         invocation: ActorInvocation,
-        evidence: &[u8],
+        authority: &ActorInvocationReceipt,
     ) -> Result<ActorExecutionReply, AgentHostError> {
         self.agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?
-            .invoke(invocation, evidence)
+            .invoke(invocation, authority)
             .map_err(Into::into)
     }
 
@@ -296,12 +296,12 @@ impl AgentHost {
         &mut self,
         agent: AgentId,
         invocation: ActorInvocation,
-        evidence: &[u8],
+        authority: &ActorInvocationReceipt,
     ) -> Result<(), AgentHostError> {
         self.agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?
-            .acknowledge_invocation(invocation, evidence)
+            .acknowledge_invocation(invocation, authority)
             .map_err(Into::into)
     }
 

@@ -13,7 +13,7 @@
 
 use crate::TranspileError;
 use crate::emitter;
-use crate::riscv::TranslationContext;
+use crate::riscv::{OpcodeEncoding, TranslationContext};
 use std::collections::HashMap;
 
 /// RISC-V relocation types we care about.
@@ -137,7 +137,10 @@ pub fn link_elf_with_argument_pages(
             "argument DATA capability must contain at least one page".into(),
         ));
     }
-    let t = transpile_elf(elf_data)?;
+    // The capability-manifest container is an already-pinned production
+    // format. Keep its historical read-only code-pointer rewrite so changes
+    // needed by standard programs cannot silently repin existing services.
+    let t = transpile_elf(elf_data, false, OpcodeEncoding::CapabilityManifest)?;
     Ok(emitter::build_service_program_with_args_pages(
         &t.code,
         &t.bitmask,
@@ -161,9 +164,9 @@ fn zone_round(x: u64) -> u64 {
 
 /// Transpile an rv64em ELF into a **GP standard-program (SPI) blob** — the
 /// format `vos_pvm::spi::parse_standard_program` consumes and
-/// `vos_pvm::refine::execute_with` runs. Same translation as [`link_elf`]
-/// (identical code, bitmask, and jump table; entry prologue at IC 0 =
-/// refine, IC 5 = accumulate-or-trap), re-containered per GP Appendix A.
+/// `vos_pvm::refine::execute_with` runs. It shares instruction translation
+/// with [`link_elf`], adds standard-program read-write code-pointer rewriting,
+/// and uses the entry prologue IC 0 = refine, IC 5 = accumulate-or-trap.
 ///
 /// Header-field derivation (manifest ↔ SPI mapping):
 ///
@@ -196,7 +199,7 @@ fn zone_round(x: u64) -> u64 {
 /// placement need no linker cooperation (code addresses are translated;
 /// the stack is SP-relative).
 pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
-    let t = transpile_elf(elf_data)?;
+    let t = transpile_elf(elf_data, true, OpcodeEncoding::Standard)?;
 
     // Re-base the ro blob from its linked base to the GP ro base Z_Z.
     let ro_data = if t.ro_data.is_empty() {
@@ -294,9 +297,13 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
 }
 
 /// The shared ELF → GP-encoded-program translation both containers build on.
-fn transpile_elf(elf_data: &[u8]) -> Result<TranspiledElf, TranspileError> {
+fn transpile_elf(
+    elf_data: &[u8],
+    rewrite_read_write_code_pointers: bool,
+    opcode_encoding: OpcodeEncoding,
+) -> Result<TranspiledElf, TranspileError> {
     let elf = parse_linked_elf(elf_data)?;
-    let mut ctx = TranslationContext::new(elf.is_64bit);
+    let mut ctx = TranslationContext::with_opcode_encoding(elf.is_64bit, opcode_encoding);
     ctx.code_ranges = elf.code_ranges.clone();
 
     // Emit the two-slot GP entry prologue. ICs are byte offsets into the code,
@@ -332,7 +339,13 @@ fn transpile_elf(elf_data: &[u8]) -> Result<TranspiledElf, TranspileError> {
 
     let mut ro_data = elf.ro_data.clone();
     let mut rw_data = elf.rw_data.clone();
-    rewrite_data_code_ptrs(&elf, &mut ctx, &mut ro_data, &mut rw_data);
+    rewrite_data_code_ptrs(
+        &elf,
+        &mut ctx,
+        &mut ro_data,
+        &mut rw_data,
+        rewrite_read_write_code_pointers,
+    );
 
     crate::peephole_fuse_load_imm_alu(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
     crate::peephole_fuse_load_imm_memory(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
@@ -721,8 +734,14 @@ fn rewrite_data_code_ptrs(
     ctx: &mut TranslationContext,
     ro_data: &mut [u8],
     rw_data: &mut [u8],
+    rewrite_read_write: bool,
 ) {
-    let ro_base = elf.ro_base;
+    let ro_base = if rewrite_read_write {
+        elf.ro_base
+    } else {
+        // Preserve the established manifest-container translation exactly.
+        elf.stack_size as u64
+    };
     let rw_base = elf.rw_base;
     let is_code_addr = |addr: u64| -> bool {
         elf.code_ranges
@@ -767,6 +786,9 @@ fn rewrite_data_code_ptrs(
             None
         }
         .or_else(|| {
+            if !rewrite_read_write {
+                return None;
+            }
             let off = data_vaddr.checked_sub(rw_base)? as usize;
             rw_data.get(off..off + 4)
         });
@@ -787,7 +809,11 @@ fn rewrite_data_code_ptrs(
     // Heuristic: 8-byte values in either initialized region that are code
     // addresses. Relocations normally cover these; the scan also supports
     // stripped-but-still-linked inputs.
-    for (base, data) in [(ro_base, &*ro_data), (rw_base, &*rw_data)] {
+    let initialized_regions = [(ro_base, &*ro_data), (rw_base, &*rw_data)];
+    for (base, data) in initialized_regions
+        .into_iter()
+        .take(if rewrite_read_write { 2 } else { 1 })
+    {
         let mut off = 0;
         while off + 8 <= data.len() {
             let val = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
@@ -841,11 +867,12 @@ fn rewrite_data_code_ptrs(
             .filter(|off| off.saturating_add(size) <= ro_data.len())
         {
             ro_data[off..off + size].copy_from_slice(&replacement);
-        } else if let Some(off) = entry
-            .data_vaddr
-            .checked_sub(rw_base)
-            .and_then(|off| usize::try_from(off).ok())
-            .filter(|off| off.saturating_add(size) <= rw_data.len())
+        } else if rewrite_read_write
+            && let Some(off) = entry
+                .data_vaddr
+                .checked_sub(rw_base)
+                .and_then(|off| usize::try_from(off).ok())
+                .filter(|off| off.saturating_add(size) <= rw_data.len())
         {
             rw_data[off..off + size].copy_from_slice(&replacement);
         }

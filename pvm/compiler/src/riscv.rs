@@ -65,6 +65,8 @@ pub struct TranslationContext {
     pub jump_table: Vec<u32>,
     /// Whether translating 64-bit RISC-V.
     pub is_64bit: bool,
+    /// Wire opcode profile selected by the output container.
+    opcode_encoding: OpcodeEncoding,
     /// Map from RISC-V address to PVM code offset.
     pub address_map: std::collections::HashMap<u64, u32>,
     /// Pending branch fixups: (pvm_imm_offset, target_rv_address, fixup_size)
@@ -92,13 +94,27 @@ pub struct TranslationContext {
     pub code_ranges: Vec<(u64, u64)>,
 }
 
+/// The standard program follows the current Gray Paper opcode table. Frozen
+/// capability manifests retain their private pre-v0.8 unary numbering so
+/// rebuilding one cannot silently change its program identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpcodeEncoding {
+    Standard,
+    CapabilityManifest,
+}
+
 impl TranslationContext {
     pub fn new(is_64bit: bool) -> Self {
+        Self::with_opcode_encoding(is_64bit, OpcodeEncoding::Standard)
+    }
+
+    pub(crate) fn with_opcode_encoding(is_64bit: bool, opcode_encoding: OpcodeEncoding) -> Self {
         Self {
             code: Vec::new(),
             bitmask: Vec::new(),
             jump_table: Vec::new(),
             is_64bit,
+            opcode_encoding,
             address_map: std::collections::HashMap::new(),
             fixups: Vec::new(),
             fixup_pcs: std::collections::HashMap::new(),
@@ -823,27 +839,27 @@ impl TranslationContext {
                     let opc = match rs2 {
                         0 => {
                             if self.is_64bit {
-                                104
+                                103
                             } else {
-                                105
+                                104
                             }
                         }
                         1 => {
                             if self.is_64bit {
-                                106
+                                105
                             } else {
-                                107
+                                106
                             }
                         }
                         2 => {
                             if self.is_64bit {
-                                102
+                                101
                             } else {
-                                103
+                                102
                             }
                         }
-                        4 => 108,
-                        5 => 109,
+                        4 => 107,
+                        5 => 108,
                         _ => {
                             return Err(TranspileError::UnsupportedInstruction {
                                 offset: 0,
@@ -868,7 +884,7 @@ impl TranslationContext {
             5 => {
                 if (funct7 == 0x35 || funct7 == 0x34) && (imm & 0x1F) == 0x18 {
                     // Zbb rev8 (RV64: 0x35, RV32: 0x34)
-                    self.emit_inst(111);
+                    self.emit_inst(110);
                     self.emit_data(pvm_rd | (pvm_rs1 << 4));
                     return Ok(());
                 }
@@ -1398,9 +1414,9 @@ impl TranslationContext {
                     // Zbb: clzw(rs2=0), ctzw(rs2=1), cpopw(rs2=2)
                     let rs2 = (imm & 0x1F) as u8;
                     let opc = match rs2 {
-                        0 => 105,
-                        1 => 107,
-                        2 => 103,
+                        0 => 104,
+                        1 => 106,
+                        2 => 102,
                         _ => {
                             return Err(TranspileError::UnsupportedInstruction {
                                 offset: 0,
@@ -1636,7 +1652,7 @@ impl TranslationContext {
             return Ok(());
         } else if funct7 == 0x04 && funct3 == 4 {
             // Zbb zext.h
-            self.emit_inst(110);
+            self.emit_inst(109);
             self.emit_data(pvm_rd | (pvm_rs1 << 4));
             return Ok(());
         } else if funct7 == 0 {
@@ -1676,6 +1692,12 @@ impl TranslationContext {
     }
 
     pub(crate) fn emit_inst(&mut self, opcode: u8) {
+        let opcode = match (self.opcode_encoding, opcode) {
+            // The frozen manifest profile encoded the removed sbrk at 101,
+            // shifting the standard unary instructions up by one byte.
+            (OpcodeEncoding::CapabilityManifest, 101..=110) => opcode + 1,
+            _ => opcode,
+        };
         self.code.push(opcode);
         self.bitmask.push(1);
     }
@@ -1959,6 +1981,7 @@ fn decode_s_imm(inst: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vos_pvm::instruction::Opcode;
 
     #[test]
     fn test_register_mapping() {
@@ -2214,5 +2237,19 @@ mod tests {
         ctx.translate_instruction(&0x0000_0073_u32.to_le_bytes(), 0, 0)
             .unwrap();
         assert_eq!(ctx.code, [0], "unmarked ECALL must compile to trap");
+    }
+
+    #[test]
+    fn opcode_profiles_separate_standard_and_frozen_manifest_unaries() {
+        let mut standard = TranslationContext::new(true);
+        standard.emit_inst(Opcode::CountSetBits64 as u8);
+        standard.emit_inst(Opcode::ReverseBytes as u8);
+        assert_eq!(standard.code, [101, 110]);
+
+        let mut manifest =
+            TranslationContext::with_opcode_encoding(true, OpcodeEncoding::CapabilityManifest);
+        manifest.emit_inst(Opcode::CountSetBits64 as u8);
+        manifest.emit_inst(Opcode::ReverseBytes as u8);
+        assert_eq!(manifest.code, [102, 111]);
     }
 }

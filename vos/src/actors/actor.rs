@@ -81,6 +81,13 @@ pub trait Actor: Sized + Encode + Decode {
     /// The message enum dispatched to this actor.
     type Message: super::value::FromDynamic;
 
+    /// Source-level opt-in to the standard agent lane ABI. Generated agent
+    /// actors set this together with an agent-only message dispatch marker;
+    /// service actors keep the default and are never subjected to lane-view
+    /// rewriting by accident.
+    #[doc(hidden)]
+    const AGENT_ACTOR_SOURCE: bool = false;
+
     /// The actor's own role hierarchy — the domain-specific tiers
     /// `#[msg(role = X)]` references and `ctx.ensure_role` checks
     /// against. Auto-derived to [`NoRoles`](super::auth::NoRoles)

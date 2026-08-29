@@ -138,7 +138,7 @@ impl InnerMachine {
             let program = self.program.take().expect("program exists until VM init");
             let mut memory = Memory::sparse(1u64 << 32);
             memory.set_page_perms(vec![PERM_NONE; INNER_ADDRESS_PAGES]);
-            let mut vm = Interpreter::with_memory(
+            let mut vm = Interpreter::with_memory_and_mode(
                 program.code,
                 program.bitmask,
                 program.jump_table,
@@ -146,8 +146,8 @@ impl InnerMachine {
                 memory,
                 0,
                 DEFAULT_MEM_CYCLES,
+                IsaMode::Conformance,
             );
-            vm.isa_mode = IsaMode::Conformance;
             vm.set_pc(self.initial_pc);
             self.vm = Some(vm);
         }

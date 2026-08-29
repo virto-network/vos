@@ -11,8 +11,8 @@ use crate::service::wire::Encoder;
 #[cfg(feature = "pvm")]
 use crate::service::wire::ServiceWire;
 use crate::service::{
-    ActorId, BlobRef, CapabilityId, DeploymentId, Hash, InvocationId, Origin, ProgramId,
-    ServiceIdentity,
+    ActorId, BlobRef, CapabilityId, DeploymentId, Hash, InvocationId, Origin, PrincipalId,
+    ProgramId, ServiceIdentity,
 };
 
 /// Maximum dynamic request passed to an application actor. This matches the
@@ -42,15 +42,12 @@ pub const MAX_EXECUTION_GAS: u64 = 1_000_000_000;
 /// This is separate from actor availability because it is deployment
 /// provenance, not caller-selected input.
 pub const MAX_EXECUTION_POLICY_BYTES: usize = 64 * 1024;
-/// Maximum opaque evidence accepted by the invocation-authentication seam.
-/// Production verifiers normally receive a compact authority receipt; the
-/// wider bound leaves room for a bounded certificate chain without allowing
-/// caller-controlled evidence to become an unbounded host allocation.
-pub const MAX_INVOCATION_AUTHORIZATION_BYTES: usize = 64 * 1024;
-/// Maximum opaque runtime image accepted by the bundled 8-MiB runtime guest.
+/// Maximum opaque runtime image accepted by the bundled 32-MiB agent-runtime
+/// guest. The runtime contract signs this ceiling and the wire decoder
+/// enforces it before allocation.
 /// Execution temporarily owns the decoded image, its runtime representation,
 /// a snapshot, and the encoded successor in addition to the actor PVM.
-pub const MAX_RUNTIME_STATE_BYTES: usize = 512 * 1024;
+pub const MAX_RUNTIME_STATE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EXECUTION_BLOBS: usize = 4;
 #[cfg(feature = "pvm")]
 const ACTOR_DISPATCH_CONTROL_CAPACITY: usize = 512;
@@ -98,6 +95,20 @@ impl ActorStateLanes {
             self.local.as_deref(),
         ])
     }
+
+    /// Build the only lane image an actor running in `mode` is allowed to
+    /// observe. The complete preimage stays inside the outer runtime so a
+    /// hand-written actor PVM cannot learn a hidden lane merely by ignoring
+    /// the generated Rust lane views.
+    pub fn visible_for(&self, mode: super::MethodMode) -> Self {
+        let visible =
+            |lane, value: &Option<Vec<u8>>| mode.can_read(lane).then(|| value.clone()).flatten();
+        Self {
+            linear: visible(StateLane::Linear, &self.linear),
+            merge: visible(StateLane::Merge, &self.merge),
+            local: visible(StateLane::Local, &self.local),
+        }
+    }
 }
 
 /// Checked aggregate size for a set of optional lane images.
@@ -118,17 +129,16 @@ pub struct RuntimeBlob {
     pub bytes: Vec<u8>,
 }
 
-/// Claimed caller context awaiting verification at the agent-host boundary.
-///
-/// Public actor message bytes never carry these fields. Constructing this
-/// value does **not** authenticate its role or capability assertions: only a
-/// [`VerifiedActorInvocation`] may enter the durable `AgentDriver` or
-/// `AgentHost`. The runtime commits the verified
-/// fields as part of the exact invocation and delivers them through a private
-/// control item.
+/// Caller context signed into an [`ActorInvocationReceipt`](super::authority::ActorInvocationReceipt).
+/// Public actor message bytes never carry these fields; the runtime guest
+/// verifies the receipt before using them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActorInvocationAuth {
     pub origin: Origin,
+    /// Authority-authenticated application principal. Transport subjects and
+    /// causal actor/service identities remain in `origin`; neither is a
+    /// substitute for this authorization identity.
+    pub principal: Option<PrincipalId>,
     pub origin_service: Option<ServiceIdentity>,
     pub space_role: Option<u8>,
     pub actor_role: Option<u8>,
@@ -139,6 +149,7 @@ impl ActorInvocationAuth {
     pub const fn anonymous() -> Self {
         Self {
             origin: Origin::Anonymous,
+            principal: None,
             origin_service: None,
             space_role: None,
             actor_role: None,
@@ -152,19 +163,29 @@ impl ActorInvocationAuth {
         let origin_valid = match self.origin {
             // Anonymous is an absence of authenticated authority, not merely
             // a caller label. Never let it carry host-trusted assertions.
-            Origin::Anonymous => self.origin_service.is_none() && claims_are_empty,
+            Origin::Anonymous => {
+                self.principal.is_none() && self.origin_service.is_none() && claims_are_empty
+            }
             // System work may carry one exact platform capability, but has no
             // principal or actor against which a role grant could be bound.
             Origin::System => {
                 self.origin_service.is_none()
+                    && self.principal.is_none()
                     && self.space_role.is_none()
                     && self.actor_role.is_none()
             }
             Origin::Member(subject) => {
-                subject != crate::service::SubjectId::ZERO && self.origin_service.is_none()
+                subject != crate::service::SubjectId::ZERO
+                    && self
+                        .principal
+                        .is_some_and(|principal| principal != PrincipalId::ZERO)
+                    && self.origin_service.is_none()
             }
             Origin::Actor(actor) => {
                 actor != ActorId::ZERO
+                    && self
+                        .principal
+                        .is_some_and(|principal| principal != PrincipalId::ZERO)
                     && self.origin_service.as_ref().is_some_and(|service| {
                         service.space != crate::service::SpaceId::ZERO
                             && service.root_service != crate::service::RootServiceId::ZERO
@@ -207,44 +228,6 @@ pub struct ActorInvocation {
     pub gas: u64,
 }
 
-/// Authentication seam used before durable actor execution.
-///
-/// `authorization_message` is a domain-separated commitment to every
-/// execution-significant invocation field, including the exact member or
-/// actor origin, the actor's complete source [`ServiceIdentity`], roles,
-/// capability, method input, and availability. Implementations must verify
-/// that `evidence` was issued by the configured space/agent authority for
-/// that message. A verifier is an explicitly trusted host dependency; shape
-/// validation alone is never treated as authentication.
-pub(crate) trait ActorInvocationVerifier {
-    fn verify(&self, authorization_message: &[u8], evidence: &[u8]) -> bool;
-}
-
-/// An actor invocation authenticated by an explicit host verifier.
-///
-/// The inner invocation is intentionally immutable and cannot be constructed
-/// directly. This prevents public `AgentDriver`/`AgentHost` users from
-/// assigning trusted role or capability assertions on the execution call.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct VerifiedActorInvocation(ActorInvocation);
-
-impl VerifiedActorInvocation {
-    pub(crate) fn invocation(&self) -> &ActorInvocation {
-        &self.0
-    }
-
-    #[cfg(feature = "std")]
-    pub(crate) fn into_inner(self) -> ActorInvocation {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActorInvocationVerificationError {
-    InvalidInvocation(ActorExecutionError),
-    InvalidAuthorization,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ActorExecutionStatus {
@@ -254,15 +237,29 @@ pub enum ActorExecutionStatus {
     OutOfGas = 3,
 }
 
+/// Durable state observation which produced one exact actor reply.
+///
+/// Missing lanes are represented explicitly. Merge state uses a canonical
+/// content frontier because the standard Local adapter has no causal DAG;
+/// replicated adapters may map their canonical frontier to the same hash.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActorObservation {
+    pub linear_revision: Option<u64>,
+    pub merge_frontier: Option<Hash>,
+    pub local_revision: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActorExecutionReply {
     pub invocation: InvocationId,
     pub actor: ActorId,
     pub deployment: DeploymentId,
+    pub mode: MethodMode,
     pub lane: Option<StateLane>,
     pub status: ActorExecutionStatus,
     pub reply: Vec<u8>,
     pub gas_remaining: u64,
+    pub observation: ActorObservation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,6 +276,9 @@ pub enum ActorExecutionError {
     InvalidActorOutput,
     DivergentInvocation,
     ResultCapacity,
+    InvalidAuthorization,
+    AuthorityExpired,
+    AuthoritySlotRegressed,
     UnsupportedHostCall(u32),
 }
 
@@ -287,6 +287,14 @@ pub enum ActorExecutionError {
 pub struct RuntimeExecutionCall {
     pub state: super::wire::RuntimeState,
     pub invocation: ActorInvocation,
+    /// Complete authority evidence verified again by the runtime guest.
+    pub authority: super::authority::ActorInvocationReceipt,
+    /// Canonical logical slot selected by the host/replication transition.
+    pub observed_slot: u64,
+    /// Exact-result recovery when the historical actor package has already
+    /// been retired after an upgrade. This mode may only recover a guest-owned
+    /// disposition; it can never execute unseen work.
+    pub recovery_only: bool,
     /// Exact content-addressed program resolved by the host from its durable
     /// package catalog. It is intentionally absent from [`ActorInvocation`]
     /// so callers cannot select executable bytes.
@@ -327,6 +335,9 @@ impl ActorInvocation {
             super::MethodMode::Local => 5,
         });
         crate::service::encode_origin(&mut encoder, self.auth.origin);
+        encoder.option(&self.auth.principal, |encoder, principal| {
+            encoder.fixed(&principal.0)
+        });
         encoder.option(&self.auth.origin_service, crate::service::encode_service);
         encoder.option(&self.auth.space_role, |encoder, role| encoder.u8(*role));
         encoder.option(&self.auth.actor_role, |encoder, role| encoder.u8(*role));
@@ -343,32 +354,14 @@ impl ActorInvocation {
         Hash::digest(b"vos/agent/invocation", &[&bytes])
     }
 
-    /// Message authenticated by the driver-owned trust provider. It is
-    /// deliberately distinct from the durable retry commitment so a receipt
-    /// for one protocol cannot be replayed in the other.
+    /// Message signed by the configured agent authority. It is deliberately
+    /// distinct from the durable retry commitment so a receipt for one
+    /// protocol cannot be replayed in the other.
     pub fn authorization_message(&self) -> Hash {
         Hash::digest(
             b"vos/agent/invocation-authorization",
             &[&self.commitment().0],
         )
-    }
-
-    /// Validate canonical shape and authenticate this exact invocation
-    /// through the explicitly configured verifier.
-    pub(crate) fn verify<V: ActorInvocationVerifier + ?Sized>(
-        self,
-        evidence: &[u8],
-        verifier: &V,
-    ) -> Result<VerifiedActorInvocation, ActorInvocationVerificationError> {
-        self.validate()
-            .map_err(ActorInvocationVerificationError::InvalidInvocation)?;
-        if evidence.is_empty()
-            || evidence.len() > MAX_INVOCATION_AUTHORIZATION_BYTES
-            || !verifier.verify(&self.authorization_message().0, evidence)
-        {
-            return Err(ActorInvocationVerificationError::InvalidAuthorization);
-        }
-        Ok(VerifiedActorInvocation(self))
     }
 
     pub fn validate(&self) -> Result<(), ActorExecutionError> {
@@ -651,10 +644,12 @@ fn terminal_reply(
         invocation: invocation.invocation,
         actor: invocation.actor,
         deployment: invocation.deployment,
+        mode: invocation.mode,
         lane: invocation.mode.write_lane(),
         status,
         reply: Vec::new(),
         gas_remaining,
+        observation: ActorObservation::default(),
     }
 }
 
@@ -724,10 +719,12 @@ fn decode_actor_output(
             invocation: invocation.invocation,
             actor: invocation.actor,
             deployment: invocation.deployment,
+            mode: invocation.mode,
             lane: invocation.mode.write_lane(),
             status,
             reply,
             gas_remaining,
+            observation: ActorObservation::default(),
         },
         next_state,
     ))
@@ -736,27 +733,6 @@ fn decode_actor_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const TEST_AUTHORITY_KEY: &[u8] = b"vos-agent-execution-test-authority";
-
-    struct TestVerifier;
-
-    impl ActorInvocationVerifier for TestVerifier {
-        fn verify(&self, authorization_message: &[u8], evidence: &[u8]) -> bool {
-            Hash::digest(
-                b"vos/agent/test-invocation-authorization",
-                &[TEST_AUTHORITY_KEY, authorization_message],
-            )
-            .0 == evidence
-        }
-    }
-
-    fn authorization_evidence(invocation: &ActorInvocation) -> Hash {
-        Hash::digest(
-            b"vos/agent/test-invocation-authorization",
-            &[TEST_AUTHORITY_KEY, &invocation.authorization_message().0],
-        )
-    }
 
     fn invocation() -> ActorInvocation {
         ActorInvocation {
@@ -811,6 +787,7 @@ mod tests {
         assert!(
             ActorInvocationAuth {
                 origin: Origin::System,
+                principal: None,
                 origin_service: None,
                 space_role: None,
                 actor_role: None,
@@ -821,6 +798,7 @@ mod tests {
         assert!(
             !ActorInvocationAuth {
                 origin: Origin::System,
+                principal: None,
                 origin_service: None,
                 space_role: Some(crate::SpaceRole::Member.as_u8()),
                 actor_role: None,
@@ -831,6 +809,7 @@ mod tests {
         assert!(
             !ActorInvocationAuth {
                 origin: Origin::Member(crate::service::SubjectId::ZERO),
+                principal: Some(crate::service::PrincipalId([0x31; 32])),
                 origin_service: None,
                 space_role: None,
                 actor_role: None,
@@ -841,6 +820,7 @@ mod tests {
         assert!(
             ActorInvocationAuth {
                 origin: Origin::Member(crate::service::SubjectId([0x21; 32])),
+                principal: Some(crate::service::PrincipalId([0x31; 32])),
                 origin_service: None,
                 space_role: Some(crate::SpaceRole::Member.as_u8()),
                 actor_role: Some(1),
@@ -851,6 +831,7 @@ mod tests {
         assert!(
             !ActorInvocationAuth {
                 origin: Origin::Member(crate::service::SubjectId([0x21; 32])),
+                principal: Some(crate::service::PrincipalId([0x31; 32])),
                 origin_service: Some(source_service()),
                 space_role: None,
                 actor_role: None,
@@ -861,6 +842,7 @@ mod tests {
         assert!(
             !ActorInvocationAuth {
                 origin: Origin::Actor(ActorId([0x22; 32])),
+                principal: Some(crate::service::PrincipalId([0x31; 32])),
                 origin_service: None,
                 space_role: None,
                 actor_role: None,
@@ -871,6 +853,7 @@ mod tests {
         assert!(
             ActorInvocationAuth {
                 origin: Origin::Actor(ActorId([0x22; 32])),
+                principal: Some(crate::service::PrincipalId([0x31; 32])),
                 origin_service: Some(source_service()),
                 space_role: None,
                 actor_role: Some(1),
@@ -884,6 +867,7 @@ mod tests {
         assert!(
             !ActorInvocationAuth {
                 origin: Origin::Actor(ActorId([0x22; 32])),
+                principal: Some(crate::service::PrincipalId([0x31; 32])),
                 origin_service: Some(malformed_service),
                 space_role: None,
                 actor_role: None,
@@ -894,52 +878,36 @@ mod tests {
     }
 
     #[test]
-    fn verification_seal_binds_member_claims_and_complete_actor_source() {
+    fn authorization_commitment_binds_principal_roles_and_complete_actor_source() {
         let capability = CapabilityId::named("actor.write");
         let mut member = invocation();
         member.auth = ActorInvocationAuth {
             origin: Origin::Member(crate::service::SubjectId([0x21; 32])),
+            principal: Some(crate::service::PrincipalId([0x31; 32])),
             origin_service: None,
             space_role: Some(crate::SpaceRole::Member.as_u8()),
             actor_role: Some(3),
             capability: Some(capability),
         };
-        let member_evidence = authorization_evidence(&member);
-        assert!(
-            member
-                .clone()
-                .verify(&member_evidence.0, &TestVerifier)
-                .is_ok()
-        );
+        let member_authorization = member.authorization_message();
 
         let mut forged_member = member.clone();
         forged_member.auth.origin = Origin::Member(crate::service::SubjectId([0x22; 32]));
-        assert_eq!(
-            forged_member.verify(&member_evidence.0, &TestVerifier),
-            Err(ActorInvocationVerificationError::InvalidAuthorization)
-        );
+        assert_ne!(forged_member.authorization_message(), member_authorization);
         let mut forged_role = member;
         forged_role.auth.actor_role = Some(4);
-        assert_eq!(
-            forged_role.verify(&member_evidence.0, &TestVerifier),
-            Err(ActorInvocationVerificationError::InvalidAuthorization)
-        );
+        assert_ne!(forged_role.authorization_message(), member_authorization);
 
         let mut actor = invocation();
         actor.auth = ActorInvocationAuth {
             origin: Origin::Actor(ActorId([0x31; 32])),
+            principal: Some(crate::service::PrincipalId([0x32; 32])),
             origin_service: Some(source_service()),
             space_role: None,
             actor_role: Some(2),
             capability: None,
         };
-        let actor_evidence = authorization_evidence(&actor);
-        assert!(
-            actor
-                .clone()
-                .verify(&actor_evidence.0, &TestVerifier)
-                .is_ok()
-        );
+        let actor_authorization = actor.authorization_message();
 
         // Reusing the same ActorId from another root is not authenticated as
         // the original caller: the complete source identity is committed.
@@ -950,26 +918,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .root_service = crate::service::RootServiceId([0x41; 32]);
-        assert_eq!(
-            forged_source.verify(&actor_evidence.0, &TestVerifier),
-            Err(ActorInvocationVerificationError::InvalidAuthorization)
-        );
-    }
-
-    #[test]
-    fn verification_requires_bounded_nonempty_evidence() {
-        let invocation = invocation();
-        assert_eq!(
-            invocation.clone().verify(&[], &TestVerifier),
-            Err(ActorInvocationVerificationError::InvalidAuthorization)
-        );
-        assert_eq!(
-            invocation.verify(
-                &vec![0; MAX_INVOCATION_AUTHORIZATION_BYTES + 1],
-                &TestVerifier,
-            ),
-            Err(ActorInvocationVerificationError::InvalidAuthorization)
-        );
+        assert_ne!(forged_source.authorization_message(), actor_authorization);
     }
 
     #[test]

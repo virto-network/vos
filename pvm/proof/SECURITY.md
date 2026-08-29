@@ -63,7 +63,7 @@ A proof verified against `hash = H(P)` for program `P` proves that:
 
 - **Per-step semantics**: each ALU / branch / load / store / shift
   / rotate / bitmanip / divrem / mul / compare / cmov / move /
-  jump / ECALL / Trap / Sbrk row satisfies the AIR's per-opcode
+  jump / ECALL / Trap row satisfies the AIR's per-opcode
   constraints.  See `docs/status.md` for the per-opcode breakdown of
   *which* semantic property is bound.
 
@@ -91,7 +91,7 @@ A proof verified against `hash = H(P)` for program `P` proves that:
 - **Control-flow continuity**: step n+1's `pc` equals step n's
   `next_pc`; static branch / jump targets equal `pc + sign-
   extend(offset)`; indirect jumps land in the program's
-  `jump_table`; Trap / Sbrk admit no successor row.
+  `jump_table`; Trap admits no successor row.
 
 - **Blake2b precompiles**: every `Blake2b` ECALL row's `(h, m, t,
   f)` block is correctly compressed for 12 rounds — bound by the

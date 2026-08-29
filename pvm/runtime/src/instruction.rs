@@ -1,4 +1,4 @@
-//! PVM instruction set (JAR v0.8.0 / Appendix A.5).
+//! PVM instruction set (Gray Paper v0.8.0 / Appendix A.5).
 //!
 //! Opcodes and instruction categories matching the specification exactly.
 
@@ -12,7 +12,9 @@ pub enum Opcode {
     Trap = 0,
     Fallthrough = 1,
     Unlikely = 2,
-    /// Management ops + dynamic CALL. φ\[11\]=op, φ\[12\]=subject|object.
+    /// VOS capability-runtime extension for management ops and dynamic CALL.
+    /// This discriminant is deliberately excluded from the Gray Paper opcode
+    /// set decoded by [`Opcode::from_byte`].
     Ecall = 3,
 
     // A.5.2: One immediate
@@ -66,17 +68,16 @@ pub enum Opcode {
 
     // A.5.9: Two registers
     MoveReg = 100,
-    Sbrk = 101,
-    CountSetBits64 = 102,
-    CountSetBits32 = 103,
-    LeadingZeroBits64 = 104,
-    LeadingZeroBits32 = 105,
-    TrailingZeroBits64 = 106,
-    TrailingZeroBits32 = 107,
-    SignExtend8 = 108,
-    SignExtend16 = 109,
-    ZeroExtend16 = 110,
-    ReverseBytes = 111,
+    CountSetBits64 = 101,
+    CountSetBits32 = 102,
+    LeadingZeroBits64 = 103,
+    LeadingZeroBits32 = 104,
+    TrailingZeroBits64 = 105,
+    TrailingZeroBits32 = 106,
+    SignExtend8 = 107,
+    SignExtend16 = 108,
+    ZeroExtend16 = 109,
+    ReverseBytes = 110,
 
     // A.5.10: Two registers + one immediate
     StoreIndU8 = 120,
@@ -184,18 +185,19 @@ pub enum Opcode {
     MinU = 230,
 }
 
-/// Lookup table for O(1) opcode validation. OPCODE_TABLE[byte] = 1 if valid.
+/// Lookup table for the exact Gray Paper v0.8.0 opcode set `U`.
+/// `OPCODE_TABLE[byte] = 1` iff the byte is a valid standard opcode.
 static OPCODE_TABLE: [u8; 256] = {
     let mut t = [0u8; 256];
     let valid: &[u8] = &[
-        0, 1, 2, 3, 10, 20, 30, 31, 32, 33, 40, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+        0, 1, 2, 10, 20, 30, 31, 32, 33, 40, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
         70, 71, 72, 73, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 100, 101, 102, 103, 104, 105,
-        106, 107, 108, 109, 110, 111, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131,
-        132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149,
-        150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 170, 171, 172, 173, 174, 175,
-        180, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206,
-        207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224,
-        225, 226, 227, 228, 229, 230,
+        106, 107, 108, 109, 110, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
+        133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150,
+        151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 170, 171, 172, 173, 174, 175, 180,
+        190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207,
+        208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225,
+        226, 227, 228, 229, 230,
     ];
     let mut i = 0;
     while i < valid.len() {
@@ -217,6 +219,34 @@ impl Opcode {
         }
     }
 
+    /// Decode the frozen VOS capability-runtime ISA.
+    ///
+    /// In addition to opcode 3, capability-manifest artifacts predate the
+    /// v0.8 removal of `sbrk` and the resulting unary-opcode renumbering.
+    /// Keep that translation here, never in the standard decoder used by SPI
+    /// programs or Refine inner machines.
+    #[inline(always)]
+    pub(crate) fn from_runtime_byte(byte: u8) -> Option<Self> {
+        match byte {
+            3 => Some(Self::Ecall),
+            // The removed private `sbrk` instruction always trapped. Decode
+            // it to the runtime's synthetic panic operation without exposing
+            // `sbrk` as part of the public standard opcode enum.
+            101 => Some(Self::Invalid),
+            102 => Some(Self::CountSetBits64),
+            103 => Some(Self::CountSetBits32),
+            104 => Some(Self::LeadingZeroBits64),
+            105 => Some(Self::LeadingZeroBits32),
+            106 => Some(Self::TrailingZeroBits64),
+            107 => Some(Self::TrailingZeroBits32),
+            108 => Some(Self::SignExtend8),
+            109 => Some(Self::SignExtend16),
+            110 => Some(Self::ZeroExtend16),
+            111 => Some(Self::ReverseBytes),
+            _ => Self::from_byte(byte),
+        }
+    }
+
     /// Instruction category determining the argument format.
     pub fn category(self) -> InstructionCategory {
         let b = self as u8;
@@ -229,7 +259,7 @@ impl Opcode {
             50..=62 => InstructionCategory::OneRegOneImm,
             70..=73 => InstructionCategory::OneRegTwoImm,
             80..=90 => InstructionCategory::OneRegImmOffset,
-            100..=111 => InstructionCategory::TwoReg,
+            100..=110 => InstructionCategory::TwoReg,
             120..=161 => InstructionCategory::TwoRegOneImm,
             170..=175 => InstructionCategory::TwoRegOneOffset,
             180 => InstructionCategory::TwoRegTwoImm,
@@ -249,9 +279,6 @@ impl Opcode {
             self,
             Opcode::Trap
                 | Opcode::Fallthrough
-                | Opcode::Unlikely
-                | Opcode::Ecall
-                | Opcode::Ecalli
                 | Opcode::Jump
                 | Opcode::JumpInd
                 | Opcode::LoadImmJump
@@ -273,6 +300,15 @@ impl Opcode {
                 | Opcode::BranchGtUImm
                 | Opcode::BranchGtSImm
         )
+    }
+
+    /// Capability-runtime block boundary predicate.
+    ///
+    /// Opcode 3 exits to that runtime and must therefore provide a resumable
+    /// post-instruction entry. The standard Gray Paper set remains available
+    /// through [`Self::is_terminator`].
+    pub(crate) fn is_runtime_terminator(self) -> bool {
+        self.is_terminator() || self == Self::Ecall
     }
 }
 
@@ -343,7 +379,7 @@ static CATEGORY_LUT: [InstructionCategory; 256] = {
     }
     // TwoReg
     i = 100;
-    while i <= 111 {
+    while i <= 110 {
         t[i] = InstructionCategory::TwoReg;
         i += 1;
     }
@@ -409,6 +445,12 @@ pub fn decode_opcode_fast(b: u8) -> Option<(Opcode, InstructionCategory)> {
     }
 }
 
+/// [`decode_opcode_fast`] plus the capability-runtime opcode 3 extension.
+#[inline(always)]
+pub(crate) fn decode_runtime_opcode_fast(b: u8) -> Option<(Opcode, InstructionCategory)> {
+    Opcode::from_runtime_byte(b).map(|opcode| (opcode, opcode.category()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,15 +461,40 @@ mod tests {
         assert_eq!(Opcode::from_byte(1), Some(Opcode::Fallthrough));
         assert_eq!(Opcode::from_byte(10), Some(Opcode::Ecalli));
         assert_eq!(Opcode::from_byte(40), Some(Opcode::Jump));
+        assert_eq!(Opcode::from_byte(100), Some(Opcode::MoveReg));
+        assert_eq!(Opcode::from_byte(101), Some(Opcode::CountSetBits64));
+        assert_eq!(Opcode::from_byte(110), Some(Opcode::ReverseBytes));
         assert_eq!(Opcode::from_byte(200), Some(Opcode::Add64));
         assert_eq!(Opcode::from_byte(230), Some(Opcode::MinU));
     }
 
     #[test]
     fn test_invalid_opcodes() {
-        assert_eq!(Opcode::from_byte(2), Some(Opcode::Unlikely)); // JAR v0.8.0
+        assert_eq!(Opcode::from_byte(2), Some(Opcode::Unlikely));
+        assert_eq!(Opcode::from_byte(3), None);
+        assert_eq!(Opcode::from_runtime_byte(3), Some(Opcode::Ecall));
+        assert_eq!(Opcode::from_byte(111), None);
+        assert_eq!(Opcode::from_byte(254), None);
         assert_eq!(Opcode::from_byte(15), None);
         assert_eq!(Opcode::from_byte(255), None);
+    }
+
+    #[test]
+    fn capability_runtime_renumbering_is_private() {
+        assert_eq!(Opcode::from_runtime_byte(101), Some(Opcode::Invalid));
+        assert_eq!(Opcode::from_runtime_byte(102), Some(Opcode::CountSetBits64));
+        assert_eq!(Opcode::from_runtime_byte(111), Some(Opcode::ReverseBytes));
+    }
+
+    #[test]
+    fn graypaper_terminator_set_excludes_markers_and_host_calls() {
+        assert!(!Opcode::Unlikely.is_terminator());
+        assert!(!Opcode::Ecalli.is_terminator());
+        assert!(!Opcode::Ecall.is_terminator());
+        assert!(Opcode::Trap.is_terminator());
+        assert!(Opcode::Fallthrough.is_terminator());
+        assert!(Opcode::Jump.is_terminator());
+        assert!(Opcode::Ecall.is_runtime_terminator());
     }
 
     #[test]

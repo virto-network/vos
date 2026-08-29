@@ -6,6 +6,11 @@
 //! basic-block strictness of branches/djumps, and gas under the
 //! per-instruction model (`GasModel::PerInstruction` — a flat 1 gas per
 //! instruction, the model the gp072 Lean variants pin).
+//! The historical unary family exercises the frozen capability-manifest ISA,
+//! which retains the GP 0.7.2 numbering. Other families use the strict
+//! executor. Current Gray Paper v0.8.0 unary opcodes have a separate explicit
+//! interpreter/recompiler parity gate below; these files are not re-labelled
+//! as v0.8 vectors.
 //!
 //! Provenance: every case is synthesized by the hand-written table in this
 //! file — code bytes, bitmask, and *expected outcomes* are all hand-derived
@@ -56,12 +61,13 @@
 //!
 //! Re-bless (regenerates the corpus from the table below):
 //! ```bash
-//! JAVM_BLESS_PVM_VECTORS=1 cargo test -p vos_pvm --test pvm_vectors
+//! VOS_PVM_BLESS_VECTORS=1 cargo test -p vos-pvm --test pvm_vectors
 //! ```
 
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use vos_pvm::gas_cost::DEFAULT_MEM_CYCLES;
+use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::{Interpreter, PERM_NONE, PERM_RO, PERM_RW};
 use vos_pvm::{ExitReason, GasModel, IsaMode, PVM_HALT_ADDR};
 
@@ -1292,6 +1298,14 @@ fn perms_of(v: &Vector) -> Vec<u8> {
     perms
 }
 
+fn isa_mode_for_vector(v: &Vector) -> IsaMode {
+    if v.name.starts_with("unary_") {
+        IsaMode::Jar
+    } else {
+        IsaMode::Conformance
+    }
+}
+
 /// Run `v` on the interpreter under the given gas model. Returns the exit
 /// and the machine for post-state inspection.
 fn run_interpreter(v: &Vector, model: GasModel) -> (ExitReason, Interpreter) {
@@ -1309,7 +1323,7 @@ fn run_interpreter(v: &Vector, model: GasModel) -> (ExitReason, Interpreter) {
         v.gas,
         DEFAULT_MEM_CYCLES,
     );
-    vm.isa_mode = IsaMode::Conformance;
+    vm.set_isa_mode(isa_mode_for_vector(v));
     vm.set_gas_model(model);
     vm.set_page_perms(perms_of(v));
     vm.set_pc(v.initial_pc);
@@ -1360,7 +1374,7 @@ fn check_recompiler(name: &str, v: &Vector) {
             rw_data: vec![],
         }),
         DEFAULT_MEM_CYCLES,
-        IsaMode::Conformance,
+        isa_mode_for_vector(v),
     )
     .unwrap_or_else(|e| panic!("{name}: recompile failed: {e}"));
     for (addr, bytes) in &v.memory {
@@ -1410,6 +1424,78 @@ fn check_recompiler(name: &str, v: &Vector) {
 }
 
 // --- tests ---
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn graypaper_v080_unary_table_executes_identically_on_both_backends() {
+    use vos_pvm::recompiler::{DataLayout, RecompiledPvm};
+
+    let cases = [
+        (Opcode::CountSetBits64, 0xf0f0, 8),
+        (Opcode::CountSetBits32, 0xffff_ffff_0000_00ff, 8),
+        (Opcode::LeadingZeroBits64, 1, 63),
+        (Opcode::LeadingZeroBits32, 1, 31),
+        (Opcode::TrailingZeroBits64, 1u64 << 63, 63),
+        (Opcode::TrailingZeroBits32, 1u64 << 32, 32),
+        (Opcode::SignExtend8, 0x80, 0xffff_ffff_ffff_ff80),
+        (Opcode::SignExtend16, 0x8000, 0xffff_ffff_ffff_8000),
+        (Opcode::ZeroExtend16, 0xffff_8000, 0x8000),
+        (
+            Opcode::ReverseBytes,
+            0x0102_0304_0506_0708,
+            0x0807_0605_0403_0201,
+        ),
+    ];
+
+    assert_eq!(cases[0].0 as u8, 101);
+    assert_eq!(cases.last().unwrap().0 as u8, 110);
+
+    for (opcode, input, expected) in cases {
+        // unary r4 <- r3; ecalli 7 gives both backends a resumable exit at
+        // which the recompiler guarantees its register file is synchronized.
+        let code = vec![opcode as u8, 0x34, Opcode::Ecalli as u8, 7];
+        let bitmask = vec![1, 0, 1, 0];
+        let mut regs = [0u64; 13];
+        regs[3] = input;
+
+        let mut interpreter = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            regs,
+            vec![],
+            GAS,
+            DEFAULT_MEM_CYCLES,
+        );
+        interpreter.set_isa_mode(IsaMode::Conformance);
+        let (interpreter_exit, _) = interpreter.run();
+        assert_eq!(interpreter_exit, ExitReason::HostCall(7), "{opcode:?}");
+        assert_eq!(interpreter.registers[4], expected, "{opcode:?}");
+
+        let mut recompiler = RecompiledPvm::new_with_mode(
+            &code,
+            bitmask,
+            vec![],
+            regs,
+            GAS,
+            Some(DataLayout {
+                mem_size: 0,
+                arg_start: 0,
+                arg_data: vec![],
+                ro_start: 0,
+                ro_data: vec![],
+                rw_start: 0,
+                rw_data: vec![],
+            }),
+            DEFAULT_MEM_CYCLES,
+            IsaMode::Conformance,
+        )
+        .unwrap();
+        assert_eq!(recompiler.run(), ExitReason::HostCall(7), "{opcode:?}");
+        assert_eq!(recompiler.registers()[4], expected, "{opcode:?}");
+        assert_eq!(recompiler.gas(), interpreter.gas, "{opcode:?} gas");
+    }
+}
 
 /// The checked-in corpus is byte-identical to what the generator table
 /// produces. Set `VOS_PVM_BLESS_VECTORS=1` to (re)write the files; stale

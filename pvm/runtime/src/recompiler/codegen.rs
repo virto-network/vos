@@ -141,7 +141,6 @@ pub struct HelperFns {
     pub mem_write_u16: u64,
     pub mem_write_u32: u64,
     pub mem_write_u64: u64,
-    pub sbrk_helper: u64,
 }
 
 /// Tracks what a PVM register was last set to, for peephole optimization.
@@ -168,6 +167,9 @@ pub struct Compiler {
     label_base: u32,
     /// Gas block start PCs discovered during compilation (for dispatch table).
     gas_block_pcs: Vec<u32>,
+    /// Host-call continuation PCs which need dispatch entries but must not
+    /// start a fresh gas block (ecalli is not in Gray Paper set T).
+    resume_pcs: Vec<u32>,
     /// Label for the exit sequence.
     exit_label: Label,
     /// Label for the shared out-of-gas exit (sets EXIT_OOG + jumps to exit).
@@ -239,6 +241,7 @@ impl Compiler {
         Self {
             label_base,
             gas_block_pcs: Vec::with_capacity(1024),
+            resume_pcs: Vec::with_capacity(1024),
             asm,
             exit_label,
             oog_label,
@@ -286,6 +289,10 @@ impl Compiler {
         // Tracks whether the next instruction starts a new gas block.
         // True initially for PC=0.
         let mut next_is_gas_start = true;
+        // Host calls resume at their following instruction without splitting
+        // the surrounding gas block. The JIT still needs a dispatch entry for
+        // that continuation because the embedder returns through the kernel.
+        let mut next_is_resume_start = false;
 
         // Find first instruction start
         let mut pc: usize = 0;
@@ -320,6 +327,8 @@ impl Compiler {
             let raw_byte = unsafe { *code_ptr.add(pc) };
             let is_gas_start = next_is_gas_start;
             next_is_gas_start = false;
+            let is_resume_start = next_is_resume_start;
+            next_is_resume_start = false;
 
             // Fast skip for Fallthrough (op 1): produces zero native code but
             // IS a terminator, so the next instruction starts a new gas block.
@@ -331,6 +340,8 @@ impl Compiler {
                 let skip = crate::interpreter::skip_for_bitmask(bitmask, pc);
                 if is_gas_start {
                     self.emit_gas_block_start(pc, &mut pending_gas, &mut gas_sim);
+                } else if is_resume_start {
+                    self.emit_resume_start(pc);
                 }
                 gas_sim.feed(&crate::gas_cost::FastCost {
                     cycles: 2,
@@ -347,7 +358,11 @@ impl Compiler {
             }
 
             // Combined opcode validation + category lookup in a single array access.
-            let (opcode, category) = match crate::instruction::decode_opcode_fast(raw_byte) {
+            let decoded = match self.isa_mode {
+                crate::IsaMode::Jar => crate::instruction::decode_runtime_opcode_fast(raw_byte),
+                crate::IsaMode::Conformance => crate::instruction::decode_opcode_fast(raw_byte),
+            };
+            let (opcode, category) = match decoded {
                 Some(oc) => oc,
                 None => {
                     // An invalid opcode at a gas-block start must still open a
@@ -509,13 +524,19 @@ impl Compiler {
             // Gas block boundary: discovered inline via next_is_gas_start flag.
             if is_gas_start {
                 self.emit_gas_block_start(pc, &mut pending_gas, &mut gas_sim);
+            } else if is_resume_start {
+                self.emit_resume_start(pc);
             }
 
             let is_terminator = {
+                let gas_opcode = match (self.isa_mode, raw_byte) {
+                    (crate::IsaMode::Jar, 101) => 254,
+                    _ => opcode as u8,
+                };
                 // Fast path: feed gas simulator directly from register bytes,
                 // skipping FastCost struct construction and bitmask iteration.
                 let (term, needs_full) = crate::gas_cost::feed_gas_direct(
-                    opcode as u8,
+                    gas_opcode,
                     raw_ra,
                     raw_rb,
                     reg_byte2 & 0x0F,
@@ -525,7 +546,7 @@ impl Compiler {
                 if needs_full {
                     // Slow path for branches/overlap/move: use full FastCost
                     let fc = crate::gas_cost::fast_cost_lut_regs(
-                        opcode as u8,
+                        gas_opcode,
                         &decoded_args,
                         pc,
                         code,
@@ -622,6 +643,9 @@ impl Compiler {
             if is_terminator {
                 next_is_gas_start = true;
             }
+            if opcode == Opcode::Ecalli {
+                next_is_resume_start = true;
+            }
 
             pc += 1 + skip;
         }
@@ -657,6 +681,12 @@ impl Compiler {
         let mut dispatch_table = vec![panic_offset; table_len];
         // gas_block_pcs was populated inline during the single-pass loop.
         for &pvm_pc in self.gas_block_pcs.iter() {
+            let label = Label(self.label_base + pvm_pc);
+            if let Some(offset) = self.asm.label_offset(label) {
+                dispatch_table[pvm_pc as usize] = offset as i32;
+            }
+        }
+        for &pvm_pc in self.resume_pcs.iter() {
             let label = Label(self.label_base + pvm_pc);
             if let Some(offset) = self.asm.label_offset(label) {
                 dispatch_table[pvm_pc as usize] = offset as i32;
@@ -1164,6 +1194,16 @@ impl Compiler {
         *pending_gas = Some((stub_label, pc as u32, patch_offset));
     }
 
+    /// Bind a host-call continuation without flushing or recharging the
+    /// current gas block.
+    fn emit_resume_start(&mut self, pc: usize) {
+        self.asm.bind_label(self.label_for_pc(pc as u32));
+        self.resume_pcs.push(pc as u32);
+        // Host handling may replace register values before resumption.
+        self.invalidate_all_regs();
+        self.last_add_cf = None;
+    }
+
     /// Update reg_defs after compiling an instruction.
     /// Opcodes that produce trackable patterns update positively;
     /// all others invalidate the destination register.
@@ -1349,8 +1389,8 @@ impl Compiler {
                         // GAS: φ[7] = remaining gas
                         self.asm.mov_load64(REG_MAP[7], CTX, CTX_GAS);
 
-                        // Continue to next basic block (ecalli is a terminator,
-                        // so next_pc is always a gas block start).
+                        // Resume after the host call without charging again:
+                        // ecalli is not in the Gray Paper terminator set T.
                         let next_label = self.label_for_pc(next_pc);
                         self.asm.jmp_label(next_label);
 
@@ -1546,11 +1586,6 @@ impl Compiler {
                     let ra_reg = REG_MAP[*ra];
                     self.asm.mov_rr(REG_MAP[*rd], ra_reg);
                 }
-            }
-            Opcode::Sbrk => {
-                // JAR v0.8.0: sbrk removed from ISA, replaced by grow_heap hostcall
-                self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
-                self.emit_exit(EXIT_PANIC, 0);
             }
             Opcode::CountSetBits64 => {
                 if let Args::TwoReg { rd, ra } = args {

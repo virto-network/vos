@@ -12,8 +12,8 @@
 //! where `o` = read-only data, `w` = read-write data, `z` = additional zeroed
 //! heap pages, `s` = stack size in bytes, `z_j` = the jump-table entry width
 //! in bytes, `Eₙ(·)` is a fixed-width little-endian integer, and `E(·)` is
-//! the JAM natural (GP eq C.1). No metadata prefix is emitted — the result is
-//! a bare program blob (`parse_standard_program` accepts both forms).
+//! the standard natural encoding. No metadata prefix is emitted or accepted:
+//! the result is one canonical bare program blob.
 
 pub use vos_pvm_program::encode_nat;
 

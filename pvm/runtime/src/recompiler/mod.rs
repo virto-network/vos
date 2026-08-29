@@ -215,15 +215,21 @@ pub fn compile_code(
         mem_write_u16: mem_write_u16 as *const () as u64,
         mem_write_u32: mem_write_u32 as *const () as u64,
         mem_write_u64: mem_write_u64_fn as *const () as u64,
-        sbrk_helper: sbrk_helper as *const () as u64,
     };
 
     // GP basic-block starts ({0} ∪ post-terminator): the only valid
     // branch/djump landing sites. Same computation as the interpreter.
-    let block_starts: Vec<u8> = crate::interpreter::compute_basic_block_starts(code, bitmask)
-        .into_iter()
-        .map(u8::from)
-        .collect();
+    let block_starts: Vec<u8> = match isa_mode {
+        crate::IsaMode::Jar => {
+            crate::interpreter::compute_runtime_basic_block_starts(code, bitmask)
+        }
+        crate::IsaMode::Conformance => {
+            crate::interpreter::compute_basic_block_starts(code, bitmask)
+        }
+    }
+    .into_iter()
+    .map(u8::from)
+    .collect();
 
     let compiler = Compiler::new(
         &block_starts,
@@ -586,77 +592,6 @@ extern "sysv64" fn mem_write_u64_fn(ctx: *mut JitContext, addr: u32, value: u64)
     1
 }
 
-/// Sbrk helper. ctx: *mut JitContext, size: u64 → result in return.
-extern "sysv64" fn sbrk_helper(ctx: *mut JitContext, size: u64) -> u64 {
-    // SAFETY: valid JitContext pointer from JIT code; see group comment on mem_read_u8.
-    let ctx = unsafe { &mut *ctx };
-    let ps = crate::PVM_PAGE_SIZE;
-
-    if size > u32::MAX as u64 {
-        return 0;
-    }
-    if size == 0 {
-        // Query: return current heap top
-        return ctx.heap_top as u64;
-    }
-
-    let size_u32 = size as u32;
-    let old_top = ctx.heap_top;
-    let new_top = (old_top as u64) + (size_u32 as u64);
-
-    if new_top > (u32::MAX as u64) + 1 {
-        return 0;
-    }
-
-    let new_top_u32 = new_top as u32;
-
-    // Check max_heap_pages limit
-    if ctx.max_heap_pages > 0 {
-        let max_top = ctx.heap_base as u64 + (ctx.max_heap_pages as u64) * (ps as u64);
-        if new_top > max_top {
-            return 0;
-        }
-    }
-
-    // Map any pages in [old_top, new_top) that aren't mapped yet
-    let start_page = old_top / ps;
-    let end_page = if new_top_u32 == 0 {
-        u32::MAX / ps
-    } else {
-        (new_top_u32 - 1) / ps
-    };
-    let perms = ctx.flat_perms as *mut u8;
-    for p in start_page..=end_page {
-        // SAFETY: p is a valid page index within the permission table (bounded by address space).
-        unsafe {
-            if *perms.add(p as usize) == 0 {
-                *perms.add(p as usize) = 2; // read-write
-            }
-        }
-    }
-
-    // Make newly accessible pages PROT_READ|PROT_WRITE.
-    if !ctx.flat_buf.is_null() {
-        let old_page = (old_top as usize).div_ceil(4096);
-        let new_page = (new_top_u32 as usize).div_ceil(4096);
-        if new_page > old_page {
-            // SAFETY: flat_buf points to guest memory base; page range is within the mmap region.
-            unsafe {
-                let start = ctx.flat_buf.add(old_page * 4096);
-                let len = (new_page - old_page) * 4096;
-                libc::mprotect(
-                    start as *mut libc::c_void,
-                    len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                );
-            }
-        }
-    }
-
-    ctx.heap_top = new_top_u32;
-    old_top as u64
-}
-
 /// Recompiled PVM instance.
 pub struct RecompiledPvm {
     /// Native code buffer.
@@ -780,10 +715,17 @@ impl RecompiledPvm {
 
         // GP basic-block starts ({0} ∪ post-terminator): the only valid
         // branch/djump landing sites. Same computation as the interpreter.
-        let block_starts: Vec<u8> = crate::interpreter::compute_basic_block_starts(code, &bitmask)
-            .into_iter()
-            .map(u8::from)
-            .collect();
+        let block_starts: Vec<u8> = match isa_mode {
+            crate::IsaMode::Jar => {
+                crate::interpreter::compute_runtime_basic_block_starts(code, &bitmask)
+            }
+            crate::IsaMode::Conformance => {
+                crate::interpreter::compute_basic_block_starts(code, &bitmask)
+            }
+        }
+        .into_iter()
+        .map(u8::from)
+        .collect();
 
         // Set up pointers
         ctx.jt_ptr = jump_table.as_ptr();
@@ -809,7 +751,6 @@ impl RecompiledPvm {
             mem_write_u16: mem_write_u16 as *const () as u64,
             mem_write_u32: mem_write_u32 as *const () as u64,
             mem_write_u64: mem_write_u64_fn as *const () as u64,
-            sbrk_helper: sbrk_helper as *const () as u64,
         };
 
         let _t2 = std::time::Instant::now();
@@ -1316,6 +1257,30 @@ mod tests {
         .expect("compilation should succeed");
         let exit = pvm.run();
         assert_eq!(exit, ExitReason::HostCall(42));
+    }
+
+    #[test]
+    fn ecalli_resume_dispatches_without_starting_a_new_gas_block() {
+        // ecalli(42); trap. The complete block is charged before ecalli and
+        // resuming at the trap must not charge a second block.
+        let code = vec![10, 42, 0];
+        let bitmask = vec![1, 0, 1];
+        let mut pvm = RecompiledPvm::new_with_mode(
+            &code,
+            bitmask,
+            vec![],
+            [0; 13],
+            1_000,
+            Some(test_layout()),
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
+        )
+        .expect("compilation should succeed");
+
+        assert_eq!(pvm.run(), ExitReason::HostCall(42));
+        let after_host_call = pvm.gas();
+        assert_eq!(pvm.run(), ExitReason::Panic);
+        assert_eq!(pvm.gas(), after_host_call);
     }
 
     #[test]

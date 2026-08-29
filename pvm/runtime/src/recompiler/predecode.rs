@@ -125,11 +125,6 @@ pub fn predecode(code: &[u8], bitmask: &[u8], jump_table: &[u32]) -> Vec<PreDeco
         if instr.opcode.is_terminator() && i + 1 < instrs.len() {
             is_gas_start[i + 1] = true;
         }
-
-        // Ecalli: next instruction is a re-entry point
-        if matches!(instr.opcode, Opcode::Ecalli) && i + 1 < instrs.len() {
-            is_gas_start[i + 1] = true;
-        }
     }
 
     // --- Mark gas block start flags on instructions ---
@@ -213,11 +208,6 @@ pub fn compute_gas_blocks(code: &[u8], bitmask: &[u8], jump_table: &[u32]) -> Ve
             if op.is_terminator() && next_pc < code.len() {
                 gas_starts[next_pc] = true;
             }
-
-            // Post-ecalli
-            if matches!(op, Opcode::Ecalli) && next_pc < code.len() {
-                gas_starts[next_pc] = true;
-            }
         }
 
         pc = next_pc;
@@ -299,17 +289,14 @@ mod tests {
     }
 
     #[test]
-    fn test_predecode_gas_block_after_ecalli() {
+    fn test_predecode_keeps_ecalli_inside_its_basic_block() {
         // ecalli(10) 0; load_imm(51) r0, 1
         let code = vec![10, 0, 51, 0, 1];
         let bitmask = vec![1, 0, 1, 0, 0];
 
         let instrs = predecode(&code, &bitmask, &[]);
         assert_eq!(instrs.len(), 2);
-        assert!(
-            instrs[1].is_gas_block_start,
-            "post-ecalli should be gas block start"
-        );
+        assert!(!instrs[1].is_gas_block_start);
     }
 
     #[test]

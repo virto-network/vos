@@ -190,6 +190,16 @@ mod tests {
         assert!(parse_standard_program(&valid).is_some());
         let invalid = standard_blob(&[], &[], 0, 0, &[0xff], &[1]);
         assert!(parse_standard_program(&invalid).is_none());
+        let runtime_extension = standard_blob(&[], &[], 0, 0, &[3], &[1]);
+        assert!(
+            parse_standard_program(&runtime_extension).is_none(),
+            "opcode 3 is not in the Gray Paper v0.8.0 opcode set"
+        );
+        let retired_unary_number = standard_blob(&[], &[], 0, 0, &[111], &[1]);
+        assert!(
+            parse_standard_program(&retired_unary_number).is_none(),
+            "opcode 111 is not in the Gray Paper v0.8.0 opcode set"
+        );
     }
 
     #[test]

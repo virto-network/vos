@@ -58,6 +58,12 @@ pub struct MethodMeta {
     pub explicit: bool,
 }
 
+/// Marker emitted only by `#[messages(agent)]`. `#[actor(agent)]` requires
+/// this trait so the signed AgentActor entry cannot be built with unrestricted
+/// service-style handler bodies.
+#[doc(hidden)]
+pub trait AgentMessageSet {}
+
 /// Complete compile-time schema encoded into `.vos_agent`.
 pub struct SchemaMeta {
     /// Whether the actor declares host-backed `#[storage]` fields. This is
@@ -164,31 +170,15 @@ impl ParsedSchema {
                 lanes
             }
         });
-        let lanes = self.lanes();
-        let has_local = lanes.contains(StateLane::Local);
-        let has_shared = lanes.contains(StateLane::Linear) || lanes.contains(StateLane::Merge);
-        if has_local && has_shared {
-            // Local state is replica-private. Mixing it into the same actor
-            // instance as replicated state would let a handler's decoded
-            // object graph observe or mutate two durability domains before
-            // either transition is committed.
-            return false;
-        }
-        if has_local
-            && self
-                .methods
-                .iter()
-                .any(|method| !matches!(method.mode, MethodMode::Local | MethodMode::LocalQuery))
-        {
-            return false;
-        }
-        let mixed_shared =
-            field_lanes.contains(StateLane::Linear) && field_lanes.contains(StateLane::Merge);
-        !mixed_shared
-            || self
-                .methods
-                .iter()
-                .all(|method| method.mode.write_lane().is_none() || method.explicit)
+        let mixed = field_lanes.bits().count_ones() > 1;
+        !mixed
+            || self.methods.iter().all(|method| {
+                method.explicit
+                    || matches!(
+                        method.mode,
+                        MethodMode::Query | MethodMode::LinearizableQuery | MethodMode::LocalQuery
+                    )
+            })
     }
 
     pub fn method(&self, name: &str) -> Option<&ParsedMethod> {
@@ -477,6 +467,16 @@ mod tests {
         assert!(!parsed.validate());
         parsed.methods[0].explicit = true;
         assert!(parsed.validate());
+
+        parsed.methods[0] = ParsedMethod {
+            name: "read".into(),
+            mode: MethodMode::Query,
+            explicit: false,
+        };
+        assert!(
+            parsed.validate(),
+            "an immutable shared query has one unambiguous lane view"
+        );
     }
 
     #[test]
@@ -540,38 +540,41 @@ mod tests {
     }
 
     #[test]
-    fn local_state_cannot_mix_with_replicated_lanes_or_shared_methods() {
+    fn mixed_local_and_shared_state_uses_mode_specific_read_contracts() {
         let local_field = ParsedField {
             name: "cache".into(),
             codec: "String".into(),
             persistence: FieldPersistence::State(StateLane::Local),
         };
-        let mut parsed = ParsedSchema {
+        let parsed = ParsedSchema {
             entry: ExecutionEntryKind::AgentActor,
             uses_storage: false,
-            fields: vec![local_field.clone()],
-            methods: vec![ParsedMethod {
-                name: "cache".into(),
-                mode: MethodMode::Local,
-                explicit: true,
-            }],
+            fields: vec![
+                local_field,
+                ParsedField {
+                    name: "shared".into(),
+                    codec: "u64".into(),
+                    persistence: FieldPersistence::State(StateLane::Linear),
+                },
+            ],
+            methods: vec![
+                ParsedMethod {
+                    name: "cache".into(),
+                    mode: MethodMode::Local,
+                    explicit: true,
+                },
+                ParsedMethod {
+                    name: "read".into(),
+                    mode: MethodMode::Query,
+                    explicit: false,
+                },
+            ],
         };
         assert!(parsed.validate());
-
-        parsed.methods.push(ParsedMethod {
-            name: "read".into(),
-            mode: MethodMode::Query,
-            explicit: false,
-        });
-        assert!(!parsed.validate());
-
-        parsed.methods.pop();
-        parsed.fields.push(ParsedField {
-            name: "shared".into(),
-            codec: "u64".into(),
-            persistence: FieldPersistence::State(StateLane::Linear),
-        });
-        assert!(!parsed.validate());
+        assert!(MethodMode::Local.can_read(StateLane::Linear));
+        assert!(MethodMode::Local.can_read(StateLane::Local));
+        assert!(MethodMode::Query.can_read(StateLane::Linear));
+        assert!(!MethodMode::Query.can_read(StateLane::Local));
     }
 
     #[test]

@@ -6,7 +6,9 @@ use core::cell::UnsafeCell;
 /// decode and re-encode a complete durable state transition. Both arenas are
 /// zero-initialized static data (`.bss`), so their size affects the declared
 /// memory/gas budget rather than the PVM artifact bytes.
-#[cfg(any(feature = "service-runtime", feature = "agent-runtime"))]
+#[cfg(feature = "agent-runtime")]
+const HEAP_SIZE: usize = 32 * 1024 * 1024;
+#[cfg(all(feature = "service-runtime", not(feature = "agent-runtime")))]
 const HEAP_SIZE: usize = 8 * 1024 * 1024;
 #[cfg(not(any(feature = "service-runtime", feature = "agent-runtime")))]
 const HEAP_SIZE: usize = 256 * 1024;

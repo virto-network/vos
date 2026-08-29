@@ -65,9 +65,9 @@ pub fn link_elf_with_argument_pages(
 
 /// Link a RISC-V rv64em ELF binary into a GP standard-program (SPI) blob —
 /// the format `vos_pvm::spi::parse_standard_program` consumes and
-/// `vos_pvm::refine::execute_with` runs. Same translation as [`link_elf`],
-/// re-containered; see [`linker::link_elf_spi`] for the field derivation and
-/// the guest link-address requirements.
+/// `vos_pvm::refine::execute_with` runs. See [`linker::link_elf_spi`] for the
+/// standard-program data-pointer rules, field derivation, and guest
+/// link-address requirements.
 pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
     linker::link_elf_spi(elf_data)
 }
@@ -576,7 +576,9 @@ pub fn ensure_branch_targets_are_block_starts(
     bitmask: &mut Vec<u8>,
     jump_table: &mut [u32],
 ) {
-    let terminators: &[u8] = &[0, 1, 2, 10, 40, 50, 80, 180];
+    // Gray Paper v0.8.0 set T, plus opcode 3 for the VOS capability-runtime
+    // extension. `unlikely` (2) and `ecalli` (10) stay inside their block.
+    let terminators: &[u8] = &[0, 1, 3, 40, 50, 80, 180];
     let is_terminator = |op: u8| -> bool {
         terminators.contains(&op) || (81..=90).contains(&op) || (170..=175).contains(&op)
     };

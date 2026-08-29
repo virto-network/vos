@@ -1,6 +1,6 @@
 //! Stable management ABI between a node and an agent-runtime PVM.
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 use super::AgentRuntime;
 use super::execution::{
@@ -169,6 +169,9 @@ impl ServiceWire for RuntimeExecutionCall {
         encoder.fixed(&super::RUNTIME_ABI_ID.0);
         encode_runtime_state(&mut encoder, &self.state);
         encode_actor_invocation(&mut encoder, &self.invocation);
+        encoder.bytes(&self.authority.encode());
+        encoder.u64(self.observed_slot);
+        encoder.bool(self.recovery_only);
         encoder.bytes(&self.actor_pvm);
         encode_blob(&mut encoder, &self.actor_schema.reference);
         encoder.bytes(&self.actor_schema.bytes);
@@ -183,6 +186,9 @@ impl ServiceWire for RuntimeExecutionCall {
         let call = Self {
             state: decode_runtime_state(decoder)?,
             invocation: decode_actor_invocation(decoder)?,
+            authority: super::authority::ActorInvocationReceipt::decode(&decoder.bytes()?)?,
+            observed_slot: decoder.u64()?,
+            recovery_only: decoder.bool()?,
             actor_pvm: {
                 // Borrow first so the protocol limit remains at the allocation
                 // boundary and oversized guest input is never copied.
@@ -216,20 +222,27 @@ impl ServiceWire for RuntimeExecutionCall {
         call.invocation
             .validate()
             .map_err(|_| DecodeError::NonCanonical)?;
-        if call.actor_pvm.is_empty()
-            || call.actor_pvm.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
-            || ProgramId::of_pvm(&call.actor_pvm) != call.invocation.program
-            || !call
+        let artifacts_absent = call.actor_pvm.is_empty()
+            && call.actor_schema.reference.hash == Hash::ZERO
+            && call.actor_schema.reference.len == 0
+            && call.actor_schema.bytes.is_empty()
+            && call.actor_policies.reference.hash == Hash::ZERO
+            && call.actor_policies.reference.len == 0
+            && call.actor_policies.bytes.is_empty();
+        let artifacts_valid = !call.actor_pvm.is_empty()
+            && call.actor_pvm.len() <= super::execution::MAX_EXECUTION_PROGRAM_BYTES
+            && ProgramId::of_pvm(&call.actor_pvm) == call.invocation.program
+            && call
                 .actor_schema
                 .reference
                 .matches(&call.actor_schema.bytes)
-            || super::schema::decode(&call.actor_schema.bytes).is_none()
-            || !call
+            && super::schema::decode(&call.actor_schema.bytes).is_some()
+            && call
                 .actor_policies
                 .reference
                 .matches(&call.actor_policies.bytes)
-            || crate::service::PackageRolePolicies::decode(&call.actor_policies.bytes).is_err()
-        {
+            && crate::service::PackageRolePolicies::decode(&call.actor_policies.bytes).is_ok();
+        if (call.recovery_only && !artifacts_absent) || (!call.recovery_only && !artifacts_valid) {
             return Err(DecodeError::NonCanonical);
         }
         Ok(call)
@@ -309,6 +322,7 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
         encode_blob(encoder, &actor.record.agent_schema);
         encode_blob(encoder, &actor.record.role_policies);
         encoder.fixed(&actor.record.state_layout.0);
+        super::contract::encode_actor_contract(encoder, actor.record.contract);
         encode_requirements(encoder, actor.record.requirements);
         encode_debt(encoder, actor.debt);
     });
@@ -334,6 +348,21 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
             }
         }
     });
+    encoder.option(&state.control_authority_slot, |encoder, slot| {
+        encoder.u64(*slot)
+    });
+    encoder.list(
+        &state
+            .invocation_results
+            .iter()
+            .filter(|result| result.storage == super::InvocationResultStorage::Control)
+            .collect::<Vec<_>>(),
+        |encoder, result| {
+            encoder.fixed(&result.invocation.0);
+            encoder.fixed(&result.request.0);
+            encode_execution_reply(encoder, &result.reply);
+        },
+    );
     RuntimeState {
         control,
         linear: encode_standard_lane(state, StateLane::Linear),
@@ -371,6 +400,7 @@ pub fn decode_standard_runtime_state(
                 agent_schema: decode_blob(decoder)?,
                 role_policies: decode_blob(decoder)?,
                 state_layout: Hash(decoder.fixed()?),
+                contract: super::contract::decode_actor_contract(decoder)?,
                 requirements: decode_requirements(decoder)?,
             },
             debt: decode_debt(decoder)?,
@@ -392,16 +422,55 @@ pub fn decode_standard_runtime_state(
             },
         })
     })?;
+    let control_authority_slot = decoder.option(Decoder::u64)?;
+    let mut invocation_results = decoder.list(|decoder| {
+        let invocation = crate::service::InvocationId(decoder.fixed()?);
+        let request = Hash(decoder.fixed()?);
+        let reply = decode_execution_reply(decoder)?;
+        if invocation == crate::service::InvocationId::ZERO
+            || request == Hash::ZERO
+            || reply.invocation != invocation
+            || reply.mode.result_storage() != super::InvocationResultStorage::Control
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(StandardInvocationResult {
+            invocation,
+            request,
+            reply,
+            storage: super::InvocationResultStorage::Control,
+        })
+    })?;
+    if invocation_results
+        .windows(2)
+        .any(|pair| pair[0].invocation >= pair[1].invocation)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
     if !decoder.exhausted() {
         return Err(DecodeError::TrailingBytes);
     }
-    let mut invocation_results = Vec::new();
+    let mut lane_revisions = super::standard::StandardLaneRevisions::default();
     for (lane, bytes) in [
         (StateLane::Linear, state.linear.as_slice()),
         (StateLane::Merge, state.merge.as_slice()),
         (StateLane::Local, state.local.as_slice()),
     ] {
         let decoded = decode_standard_lane(bytes, lane)?;
+        match lane {
+            StateLane::Linear => {
+                lane_revisions.linear = decoded.revision;
+                lane_revisions.linear_authority_slot = decoded.authority_slot;
+            }
+            StateLane::Merge => {
+                lane_revisions.merge = decoded.revision;
+                lane_revisions.merge_authority_slot = decoded.authority_slot;
+            }
+            StateLane::Local => {
+                lane_revisions.local = decoded.revision;
+                lane_revisions.local_authority_slot = decoded.authority_slot;
+            }
+        }
         if decoded.values.len() != actors.len() {
             return Err(DecodeError::NonCanonical);
         }
@@ -428,6 +497,8 @@ pub fn decode_standard_runtime_state(
         config,
         actors,
         invocation_results,
+        lane_revisions,
+        control_authority_slot,
         authority_slot_high_water,
         authority_sequence_high_water,
         authority_dispositions,
@@ -441,6 +512,19 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
     let mut encoder = Encoder(&mut output);
     encoder.fixed(&super::RUNTIME_ABI_ID.0);
     encoder.u8(lane as u8);
+    encoder.u64(match lane {
+        StateLane::Linear => state.lane_revisions.linear,
+        StateLane::Merge => state.lane_revisions.merge,
+        StateLane::Local => state.lane_revisions.local,
+    });
+    encoder.option(
+        &match lane {
+            StateLane::Linear => state.lane_revisions.linear_authority_slot,
+            StateLane::Merge => state.lane_revisions.merge_authority_slot,
+            StateLane::Local => state.lane_revisions.local_authority_slot,
+        },
+        |encoder, slot| encoder.u64(*slot),
+    );
     encoder.list(&state.actors, |encoder, actor| {
         encoder.fixed(&actor.record.entry.actor.0);
         let value = match lane {
@@ -454,7 +538,7 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
         &state
             .invocation_results
             .iter()
-            .filter(|result| result.reply.lane == Some(lane))
+            .filter(|result| result.storage == super::InvocationResultStorage::Lane(lane))
             .collect::<Vec<_>>(),
         |encoder, result| {
             encoder.fixed(&result.invocation.0);
@@ -466,6 +550,8 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
 }
 
 struct DecodedStandardLane {
+    revision: u64,
+    authority_slot: Option<u64>,
     values: Vec<(ActorId, Option<Vec<u8>>)>,
     invocation_results: Vec<StandardInvocationResult>,
 }
@@ -480,6 +566,8 @@ fn decode_standard_lane(
     {
         return Err(DecodeError::InvalidPlatform);
     }
+    let revision = decoder.u64()?;
+    let authority_slot = decoder.option(Decoder::u64)?;
     let values = decoder.list(|decoder| {
         let actor = ActorId(decoder.fixed()?);
         let value = decoder.option(|decoder| {
@@ -508,7 +596,7 @@ fn decode_standard_lane(
         if invocation == crate::service::InvocationId::ZERO
             || request == Hash::ZERO
             || reply.invocation != invocation
-            || reply.lane != Some(expected_lane)
+            || reply.mode.result_storage() != super::InvocationResultStorage::Lane(expected_lane)
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -516,6 +604,7 @@ fn decode_standard_lane(
             invocation,
             request,
             reply,
+            storage: super::InvocationResultStorage::Lane(expected_lane),
         })
     })?;
     if invocation_results
@@ -526,6 +615,8 @@ fn decode_standard_lane(
         return Err(DecodeError::NonCanonical);
     }
     Ok(DecodedStandardLane {
+        revision,
+        authority_slot,
         values,
         invocation_results,
     })
@@ -553,43 +644,57 @@ pub fn apply_standard_execution(
     let state = decode_standard_runtime_state(&original_state)?;
     let mut runtime =
         StandardAgentRuntime::restore(state).map_err(|_| DecodeError::NonCanonical)?;
-    let result = runtime
-        .validate_execution_schema(&call.invocation, &call.actor_schema)
-        .and_then(|()| runtime.authorize_execution(&call.invocation, &call.actor_policies));
-    let mut result = match result {
-        Ok(false) => Ok(ActorExecutionReply {
-            invocation: call.invocation.invocation,
-            actor: call.invocation.actor,
-            deployment: call.invocation.deployment,
-            lane: call.invocation.mode.write_lane(),
-            status: ActorExecutionStatus::Forbidden,
-            reply: Vec::new(),
-            gas_remaining: call.invocation.gas,
-        }),
+    let authority = runtime.verify_invocation_authority(&call.invocation, &call.authority);
+    let mut result = match authority {
         Err(error) => Err(error),
-        Ok(true) => match runtime.recover_execution(&call.invocation) {
+        Ok(()) => match runtime.recover_execution(&call.invocation, call.observed_slot) {
             Ok(Some(reply)) => Ok(reply),
             Err(error) => Err(error),
-            Ok(None) => runtime
-                .prepare_execution_state(&call.invocation)
-                .and_then(|actor_state| {
-                    super::execution::run_inner_actor(
-                        &call.invocation,
-                        &call.actor_pvm,
-                        &actor_state,
-                    )
-                    .and_then(|(reply, next_state)| {
-                        if reply.status == ActorExecutionStatus::Done {
-                            runtime.commit_execution(
-                                &call.invocation,
-                                &reply,
-                                &actor_state,
-                                next_state,
-                            )?;
-                        }
-                        Ok(reply)
-                    })
+            Ok(None) if call.recovery_only => Err(ActorExecutionError::InvalidAvailability),
+            Ok(None) => match runtime
+                .validate_execution_schema(&call.invocation, &call.actor_schema)
+                .and_then(|()| runtime.authorize_execution(&call.invocation, &call.actor_policies))
+            {
+                Err(error) => Err(error),
+                Ok(false) => Ok(ActorExecutionReply {
+                    invocation: call.invocation.invocation,
+                    actor: call.invocation.actor,
+                    deployment: call.invocation.deployment,
+                    mode: call.invocation.mode,
+                    lane: call.invocation.mode.write_lane(),
+                    status: ActorExecutionStatus::Forbidden,
+                    reply: Vec::new(),
+                    gas_remaining: call.invocation.gas,
+                    observation: super::execution::ActorObservation::default(),
                 }),
+                Ok(true) => runtime
+                    .validate_unseen_invocation_slot(
+                        &call.invocation,
+                        &call.authority,
+                        call.observed_slot,
+                    )
+                    .and_then(|()| runtime.prepare_execution_state(&call.invocation))
+                    .and_then(|before| {
+                        let actor_state = before.visible_for(call.invocation.mode);
+                        super::execution::run_inner_actor(
+                            &call.invocation,
+                            &call.actor_pvm,
+                            &actor_state,
+                        )
+                        .and_then(|(mut reply, next_state)| {
+                            if reply.status == ActorExecutionStatus::Done {
+                                runtime.commit_execution(
+                                    &call.invocation,
+                                    &mut reply,
+                                    &before,
+                                    next_state,
+                                    call.observed_slot,
+                                )?;
+                            }
+                            Ok(reply)
+                        })
+                    }),
+            },
         },
     };
     let state = if result.is_ok() {
@@ -706,6 +811,9 @@ fn decode_actor_invocation(decoder: &mut Decoder<'_>) -> Result<ActorInvocation,
 
 fn encode_invocation_auth(encoder: &mut Encoder<'_>, auth: &ActorInvocationAuth) {
     crate::service::encode_origin(encoder, auth.origin);
+    encoder.option(&auth.principal, |encoder, principal| {
+        encoder.fixed(&principal.0)
+    });
     encoder.option(&auth.origin_service, crate::service::encode_service);
     encoder.option(&auth.space_role, |encoder, role| encoder.u8(*role));
     encoder.option(&auth.actor_role, |encoder, role| encoder.u8(*role));
@@ -717,6 +825,7 @@ fn encode_invocation_auth(encoder: &mut Encoder<'_>, auth: &ActorInvocationAuth)
 fn decode_invocation_auth(decoder: &mut Decoder<'_>) -> Result<ActorInvocationAuth, DecodeError> {
     let auth = ActorInvocationAuth {
         origin: crate::service::decode_origin(decoder)?,
+        principal: decoder.option(|decoder| Ok(crate::service::PrincipalId(decoder.fixed()?)))?,
         origin_service: decoder.option(crate::service::decode_service)?,
         space_role: decoder.option(Decoder::u8)?,
         actor_role: decoder.option(Decoder::u8)?,
@@ -731,10 +840,20 @@ fn encode_execution_reply(encoder: &mut Encoder<'_>, reply: &ActorExecutionReply
     encoder.fixed(&reply.invocation.0);
     encoder.fixed(&reply.actor.0);
     encoder.fixed(&reply.deployment.0);
+    encoder.u8(encode_method_mode(reply.mode));
     encoder.option(&reply.lane, |encoder, lane| encoder.u8(*lane as u8));
     encoder.u8(reply.status as u8);
     encoder.bytes(&reply.reply);
     encoder.u64(reply.gas_remaining);
+    encoder.option(&reply.observation.linear_revision, |encoder, revision| {
+        encoder.u64(*revision)
+    });
+    encoder.option(&reply.observation.merge_frontier, |encoder, frontier| {
+        encoder.fixed(&frontier.0)
+    });
+    encoder.option(&reply.observation.local_revision, |encoder, revision| {
+        encoder.u64(*revision)
+    });
 }
 
 fn decode_execution_reply(decoder: &mut Decoder<'_>) -> Result<ActorExecutionReply, DecodeError> {
@@ -742,6 +861,7 @@ fn decode_execution_reply(decoder: &mut Decoder<'_>) -> Result<ActorExecutionRep
         invocation: crate::service::InvocationId(decoder.fixed()?),
         actor: ActorId(decoder.fixed()?),
         deployment: DeploymentId(decoder.fixed()?),
+        mode: decode_method_mode(decoder.u8()?)?,
         lane: decoder.option(|decoder| decode_state_lane(decoder.u8()?))?,
         status: match decoder.u8()? {
             0 => ActorExecutionStatus::Done,
@@ -758,10 +878,16 @@ fn decode_execution_reply(decoder: &mut Decoder<'_>) -> Result<ActorExecutionRep
             bytes.to_vec()
         },
         gas_remaining: decoder.u64()?,
+        observation: super::execution::ActorObservation {
+            linear_revision: decoder.option(Decoder::u64)?,
+            merge_frontier: decoder.option(|decoder| Ok(Hash(decoder.fixed()?)))?,
+            local_revision: decoder.option(Decoder::u64)?,
+        },
     };
     if reply.invocation == crate::service::InvocationId::ZERO
         || reply.actor == ActorId::ZERO
         || reply.deployment == DeploymentId::ZERO
+        || reply.lane != reply.mode.write_lane()
         || reply.reply.len() > super::execution::MAX_EXECUTION_REPLY_BYTES
     {
         return Err(DecodeError::NonCanonical);
@@ -787,6 +913,9 @@ fn encode_execution_error(encoder: &mut Encoder<'_>, error: ActorExecutionError)
         }
         ActorExecutionError::DivergentInvocation => encoder.u8(11),
         ActorExecutionError::ResultCapacity => encoder.u8(12),
+        ActorExecutionError::InvalidAuthorization => encoder.u8(13),
+        ActorExecutionError::AuthorityExpired => encoder.u8(14),
+        ActorExecutionError::AuthoritySlotRegressed => encoder.u8(15),
     }
 }
 
@@ -805,6 +934,9 @@ fn decode_execution_error(decoder: &mut Decoder<'_>) -> Result<ActorExecutionErr
         10 => ActorExecutionError::UnsupportedHostCall(decoder.u32()?),
         11 => ActorExecutionError::DivergentInvocation,
         12 => ActorExecutionError::ResultCapacity,
+        13 => ActorExecutionError::InvalidAuthorization,
+        14 => ActorExecutionError::AuthorityExpired,
+        15 => ActorExecutionError::AuthoritySlotRegressed,
         _ => return Err(DecodeError::InvalidTag),
     })
 }
@@ -860,6 +992,7 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             encode_blob(encoder, &install.agent_schema);
             encode_blob(encoder, &install.role_policies);
             encoder.fixed(&install.state_layout.0);
+            super::contract::encode_actor_contract(encoder, install.contract);
             encode_requirements(encoder, install.requirements);
         }
         LifecycleRequest::UpgradeActor(upgrade) => {
@@ -873,6 +1006,7 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             encode_blob(encoder, &upgrade.agent_schema);
             encode_blob(encoder, &upgrade.role_policies);
             encoder.fixed(&upgrade.state_layout.0);
+            super::contract::encode_actor_contract(encoder, upgrade.contract);
             encode_requirements(encoder, upgrade.requirements);
         }
         LifecycleRequest::Suspend(actor) => {
@@ -886,10 +1020,12 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
         LifecycleRequest::AcknowledgeInvocation {
             invocation,
             request,
+            authority,
         } => {
             encoder.u8(8);
             encoder.fixed(&invocation.0);
             encoder.fixed(&request.0);
+            encoder.bytes(&authority.encode());
         }
         LifecycleRequest::RemoveLeaf {
             actor,
@@ -905,7 +1041,7 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             to_program,
             producer,
             package,
-            abi,
+            contract,
             capabilities,
         } => {
             encoder.u8(7);
@@ -914,17 +1050,13 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             encoder.fixed(&to_program.0);
             encoder.fixed(&producer.0);
             encode_blob(encoder, package);
-            encoder.fixed(&abi.0);
+            super::contract::encode_runtime_contract(encoder, *contract);
             encode_capabilities(encoder, *capabilities);
         }
         LifecycleRequest::Authorized { admission, request } => {
             encoder.u8(9);
-            encoder.fixed(&admission.authority.0);
-            encoder.fixed(&admission.credential.0);
-            encoder.u64(admission.sequence);
+            encoder.bytes(&admission.receipt.encode());
             encoder.u64(admission.observed_slot);
-            encoder.fixed(&admission.claim.0);
-            encoder.fixed(&admission.operation.0);
             encode_request(encoder, request);
         }
     }
@@ -951,6 +1083,7 @@ fn decode_request_at_depth(
             agent_schema: decode_blob(decoder)?,
             role_policies: decode_blob(decoder)?,
             state_layout: Hash(decoder.fixed()?),
+            contract: super::contract::decode_actor_contract(decoder)?,
             requirements: decode_requirements(decoder)?,
         })),
         3 => Ok(LifecycleRequest::UpgradeActor(super::UpgradeActor {
@@ -963,6 +1096,7 @@ fn decode_request_at_depth(
             agent_schema: decode_blob(decoder)?,
             role_policies: decode_blob(decoder)?,
             state_layout: Hash(decoder.fixed()?),
+            contract: super::contract::decode_actor_contract(decoder)?,
             requirements: decode_requirements(decoder)?,
         })),
         4 => Ok(LifecycleRequest::Suspend(ActorId(decoder.fixed()?))),
@@ -977,34 +1111,25 @@ fn decode_request_at_depth(
             to_program: ProgramId(decoder.fixed()?),
             producer: ProducerId(decoder.fixed()?),
             package: decode_blob(decoder)?,
-            abi: Hash(decoder.fixed()?),
+            contract: super::contract::decode_runtime_contract(decoder)?,
             capabilities: decode_capabilities(decoder)?,
         }),
         8 => Ok(LifecycleRequest::AcknowledgeInvocation {
             invocation: crate::service::InvocationId(decoder.fixed()?),
             request: Hash(decoder.fixed()?),
+            authority: Box::new(super::authority::ActorInvocationReceipt::decode(
+                &decoder.bytes()?,
+            )?),
         }),
         9 => {
             if authorized_depth != 0 {
                 return Err(DecodeError::NonCanonical);
             }
             let admission = super::LifecycleAuthorityAdmission {
-                authority: Hash(decoder.fixed()?),
-                credential: crate::service::CredentialId(decoder.fixed()?),
-                sequence: decoder.u64()?,
+                receipt: super::authority::AgentAuthorityReceipt::decode(&decoder.bytes()?)?,
                 observed_slot: decoder.u64()?,
-                claim: Hash(decoder.fixed()?),
-                operation: Hash(decoder.fixed()?),
             };
             let request = decode_request_at_depth(decoder, 1)?;
-            if admission.authority == Hash::ZERO
-                || admission.credential == crate::service::CredentialId::ZERO
-                || admission.sequence == 0
-                || admission.claim == Hash::ZERO
-                || admission.operation == Hash::ZERO
-            {
-                return Err(DecodeError::NonCanonical);
-            }
             Ok(LifecycleRequest::Authorized {
                 admission,
                 request: alloc::boxed::Box::new(request),
@@ -1116,8 +1241,10 @@ fn decode_error(decoder: &mut Decoder<'_>) -> Result<LifecycleError, DecodeError
 
 fn encode_config(encoder: &mut Encoder<'_>, config: &AgentConfig) {
     encode_identity(encoder, &config.identity);
+    encoder.fixed(&config.creation_nonce.0);
     super::authority::encode_binding(encoder, &config.authority);
     encode_blob(encoder, &config.runtime_package);
+    super::contract::encode_runtime_contract(encoder, config.runtime_contract);
     encode_capabilities(encoder, config.capabilities);
     encoder.list(&config.replicas, |encoder, replica| {
         encoder.fixed(&replica.node.0);
@@ -1129,8 +1256,10 @@ fn encode_config(encoder: &mut Encoder<'_>, config: &AgentConfig) {
 fn decode_config(decoder: &mut Decoder<'_>) -> Result<AgentConfig, DecodeError> {
     let config = AgentConfig {
         identity: decode_identity(decoder)?,
+        creation_nonce: Hash(decoder.fixed()?),
         authority: super::authority::decode_binding(decoder)?,
         runtime_package: decode_blob(decoder)?,
+        runtime_contract: super::contract::decode_runtime_contract(decoder)?,
         capabilities: decode_capabilities(decoder)?,
         replicas: decoder.list(|decoder| {
             Ok(AgentReplica {
@@ -1313,31 +1442,47 @@ fn decode_debt(decoder: &mut Decoder<'_>) -> Result<ActorLifecycleDebt, DecodeEr
 mod tests {
     use super::*;
     use alloc::vec;
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    fn authority_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x41; 32])
+    }
+
+    fn authority_binding() -> crate::agent::authority::AgentAuthorityBinding {
+        let public_key = crate::agent::authority::ed25519_public_key_wire(
+            authority_key().verifying_key().to_bytes(),
+        );
+        crate::agent::authority::AgentAuthorityBinding {
+            agent: AgentId([11; 32]),
+            actor: ActorId([12; 32]),
+            deployment: DeploymentId([13; 32]),
+            program: ProgramId([14; 32]),
+            producer: ProducerId::of_public_key(&public_key),
+            public_key,
+        }
+    }
 
     fn config() -> AgentConfig {
         let owner = PrincipalId([1; 32]);
+        let space = SpaceId([2; 32]);
+        let creation_nonce = Hash([0x15; 32]);
         AgentConfig {
             identity: AgentIdentity {
-                space: SpaceId([2; 32]),
-                agent: AgentId([3; 32]),
+                space,
+                agent: AgentId::derive(space, owner, &creation_nonce.0),
                 owner,
                 profile: AgentProfile::Shared,
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([6; 32]),
             },
-            authority: crate::agent::authority::AgentAuthorityBinding {
-                agent: AgentId([11; 32]),
-                actor: ActorId([12; 32]),
-                deployment: DeploymentId([13; 32]),
-                program: ProgramId([14; 32]),
-                producer: ProducerId::of_public_key(b"authority-key"),
-                public_key: b"authority-key".to_vec(),
-            },
+            creation_nonce,
+            authority: authority_binding(),
             runtime_package: BlobRef {
                 hash: Hash([7; 32]),
                 len: 100,
             },
+            runtime_contract: crate::agent::contract::RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities::standard(),
             replicas: vec![
                 AgentReplica {
@@ -1371,21 +1516,33 @@ mod tests {
 
     #[test]
     fn lifecycle_wire_rejects_nested_authorized_envelopes() {
+        let config = config();
+        let request = LifecycleRequest::Suspend(ActorId([0x35; 32]));
         let admission = super::super::LifecycleAuthorityAdmission {
-            authority: Hash([0x31; 32]),
-            credential: crate::service::CredentialId([0x32; 32]),
-            sequence: 1,
+            receipt: crate::agent::authority::AgentAuthorityReceipt {
+                claim: crate::agent::authority::AgentAuthorityClaim {
+                    authority: config.authority,
+                    space: config.identity.space,
+                    agent: config.identity.agent,
+                    principal: config.identity.owner,
+                    credential: crate::service::CredentialId([0x32; 32]),
+                    capability: CapabilityId::named("actor.lifecycle"),
+                    operation: request.commitment(),
+                    sequence: 1,
+                    valid_from: 0,
+                    valid_until: 20,
+                },
+                signature: vec![0; crate::agent::authority::ED25519_SIGNATURE_BYTES],
+            },
             observed_slot: 10,
-            claim: Hash([0x33; 32]),
-            operation: Hash([0x34; 32]),
         };
         let call = RuntimeCall {
             state: RuntimeState::default(),
             request: LifecycleRequest::Authorized {
-                admission,
+                admission: admission.clone(),
                 request: alloc::boxed::Box::new(LifecycleRequest::Authorized {
                     admission,
-                    request: alloc::boxed::Box::new(LifecycleRequest::Suspend(ActorId([0x35; 32]))),
+                    request: alloc::boxed::Box::new(request),
                 }),
             },
         };
@@ -1456,6 +1613,20 @@ mod tests {
             task_dependencies: vec![],
         }
         .encode();
+        let invocation = ActorInvocation {
+            invocation: crate::service::InvocationId([1; 32]),
+            actor: ActorId([2; 32]),
+            deployment: DeploymentId([3; 32]),
+            program: ProgramId::of_pvm(&actor_pvm),
+            mode: MethodMode::Linear,
+            auth: ActorInvocationAuth::anonymous(),
+            message: vec![0x41],
+            availability: vec![RuntimeBlob {
+                reference: BlobRef::of_bytes(&state),
+                bytes: state,
+            }],
+            gas: 1_000_000,
+        };
         let call = RuntimeExecutionCall {
             state: RuntimeState {
                 control: vec![0x11],
@@ -1463,20 +1634,23 @@ mod tests {
                 merge: vec![0x13],
                 local: vec![0x14],
             },
-            invocation: ActorInvocation {
-                invocation: crate::service::InvocationId([1; 32]),
-                actor: ActorId([2; 32]),
-                deployment: DeploymentId([3; 32]),
-                program: ProgramId::of_pvm(&actor_pvm),
-                mode: MethodMode::Linear,
-                auth: ActorInvocationAuth::anonymous(),
-                message: vec![0x41],
-                availability: vec![RuntimeBlob {
-                    reference: BlobRef::of_bytes(&state),
-                    bytes: state,
-                }],
-                gas: 1_000_000,
+            recovery_only: false,
+            authority: crate::agent::authority::ActorInvocationReceipt {
+                claim: crate::agent::authority::ActorInvocationClaim {
+                    authority: authority_binding(),
+                    space: SpaceId([0x61; 32]),
+                    agent: AgentId([0x62; 32]),
+                    principal: None,
+                    credential: None,
+                    authorization: invocation.authorization_message(),
+                    auth: invocation.auth.clone(),
+                    valid_from: 0,
+                    valid_until: 20,
+                },
+                signature: vec![0; crate::agent::authority::ED25519_SIGNATURE_BYTES],
             },
+            observed_slot: 10,
+            invocation,
             actor_pvm,
             actor_schema: RuntimeBlob {
                 reference: BlobRef::of_bytes(&schema),
@@ -1498,6 +1672,7 @@ mod tests {
             mode: MethodMode::Linear,
             auth: ActorInvocationAuth {
                 origin: crate::service::Origin::Anonymous,
+                principal: None,
                 origin_service: None,
                 space_role: None,
                 actor_role: Some(1),
@@ -1580,9 +1755,35 @@ mod tests {
 
     #[test]
     fn standard_runtime_state_survives_independent_calls() {
+        let config = config();
+        let request = LifecycleRequest::Create(config.clone());
+        let claim = crate::agent::authority::AgentAuthorityClaim {
+            authority: config.authority.clone(),
+            space: config.identity.space,
+            agent: config.identity.agent,
+            principal: config.identity.owner,
+            credential: crate::service::CredentialId([0x72; 32]),
+            capability: CapabilityId::named(
+                crate::agent::authority::CAPABILITY_AGENT_CREATE_SHARED,
+            ),
+            operation: request.commitment(),
+            sequence: 1,
+            valid_from: 0,
+            valid_until: 10,
+        };
+        let signature = authority_key()
+            .sign(&claim.signing_message().0)
+            .to_bytes()
+            .to_vec();
         let created = apply_standard(RuntimeCall {
             state: RuntimeState::default(),
-            request: LifecycleRequest::Create(config()),
+            request: LifecycleRequest::Authorized {
+                admission: super::super::LifecycleAuthorityAdmission {
+                    receipt: crate::agent::authority::AgentAuthorityReceipt { claim, signature },
+                    observed_slot: 1,
+                },
+                request: Box::new(request),
+            },
         })
         .unwrap();
         assert!(matches!(created.result, Ok(LifecycleReply::Created(_))));

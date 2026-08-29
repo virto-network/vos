@@ -869,7 +869,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         first_await_ordinal,
         active_actor_mask,
     );
-    ctx.__set_origin(origin, origin_service);
+    ctx.__set_origin(origin, None, origin_service);
     ctx.set_caller_roles(space_role, actor_role);
 
     assert_eq!(
@@ -1085,9 +1085,9 @@ pub fn run_refine<A: super::Actor>() {
     let linear = decode_lane(&linear_item).expect("invalid linear agent lane");
     let merge = decode_lane(&merge_item).expect("invalid merge agent lane");
     let local = decode_lane(&local_item).expect("invalid local agent lane");
-    let linear_was_fresh = linear.is_some_and(<[u8]>::is_empty);
-    let merge_was_fresh = merge.is_some_and(<[u8]>::is_empty);
-    let local_was_fresh = local.is_some_and(<[u8]>::is_empty);
+    let linear_was_fresh_or_absent = linear.is_none_or(<[u8]>::is_empty);
+    let merge_was_fresh_or_absent = merge.is_none_or(<[u8]>::is_empty);
+    let local_was_fresh_or_absent = local.is_none_or(<[u8]>::is_empty);
     let mut actor =
         A::__load_agent_state(linear, merge, local).expect("invalid field-wise agent state");
     // Snapshot canonical field frames, rather than the host's fresh empty
@@ -1119,7 +1119,11 @@ pub fn run_refine<A: super::Actor>() {
         crate::service::Origin::System => super::auth::Caller::System,
     };
     ctx.set_caller(caller);
-    ctx.__set_origin(control.auth.origin, control.auth.origin_service);
+    ctx.__set_origin(
+        control.auth.origin,
+        control.auth.principal,
+        control.auth.origin_service,
+    );
     ctx.set_caller_roles(control.auth.space_role, control.auth.actor_role);
     ctx.set_caller_capability(control.auth.capability);
 
@@ -1187,13 +1191,13 @@ pub fn run_refine<A: super::Actor>() {
     // method did not own. The host can therefore enforce exact byte equality
     // even on the first invocation, while the owned lane becomes initialized
     // by its first successful mutation.
-    if write_lane != Some(crate::agent::StateLane::Linear) && linear_was_fresh {
+    if write_lane != Some(crate::agent::StateLane::Linear) && linear_was_fresh_or_absent {
         linear.clear();
     }
-    if write_lane != Some(crate::agent::StateLane::Merge) && merge_was_fresh {
+    if write_lane != Some(crate::agent::StateLane::Merge) && merge_was_fresh_or_absent {
         merge.clear();
     }
-    if write_lane != Some(crate::agent::StateLane::Local) && local_was_fresh {
+    if write_lane != Some(crate::agent::StateLane::Local) && local_was_fresh_or_absent {
         local.clear();
     }
 

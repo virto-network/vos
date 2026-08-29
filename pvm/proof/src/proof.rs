@@ -126,14 +126,20 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///        sortedness proof relies on. AIR column counts change, so older
 ///        verifiers must reject. Version 9 was already assigned to the
 ///        Poseidon2-M31 PCS variant of format 8.
+///   12 — Gray Paper v0.8.0 unary-opcode table: removes the retired `sbrk`
+///        opcode and renumbers CountSetBits64 through ReverseBytes from
+///        102..=111 to 101..=110. Program identities and opcode-bound CPU
+///        traces change, so v10 native-channel proofs must be rejected.
+///        Version 11 was the Poseidon2-M31 PCS variant of format 10.
+///   13 — Poseidon2-M31 PCS variant of format 12.
 #[cfg(not(feature = "poseidon2-channel"))]
-pub const PROOF_FORMAT_VERSION: u32 = 10;
+pub const PROOF_FORMAT_VERSION: u32 = 12;
 /// Native recursion: the PCS commit hash + Fiat-Shamir
 /// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
 /// become `P2Hash` digests — a different wire format. A Blake2s verifier
-/// (v10) and a Poseidon2-M31 verifier (v11) therefore reject each other's proofs.
+/// (v12) and a Poseidon2-M31 verifier (v13) therefore reject each other's proofs.
 #[cfg(feature = "poseidon2-channel")]
-pub const PROOF_FORMAT_VERSION: u32 = 11;
+pub const PROOF_FORMAT_VERSION: u32 = 13;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.

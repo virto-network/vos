@@ -66,10 +66,11 @@ const PARAM_XOR_256: u64 = 0x0101_0020;
 
 /// Domain tag prepended as the full first 128-byte block of a leaf hash.
 ///
-/// This byte string is part of proof formats 10 and 11. Its historical crate
-/// name is intentional: moving the prover must not change committed roots.
+/// This byte string was introduced in proof formats 10 and 11 and remains
+/// stable in formats 12 and 13. Its historical crate name is intentional:
+/// moving the prover must not change committed roots.
 const TAG_LEAF: &[u8] = b"zkpvm/page-merkle/leaf/v1";
-/// Stable inner-node domain for proof formats 10 and 11; see `TAG_LEAF`.
+/// Stable inner-node domain for proof formats 10 through 13; see `TAG_LEAF`.
 const TAG_NODE: &[u8] = b"zkpvm/page-merkle/node/v1";
 
 const BLOCK: usize = 128;
@@ -677,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_v10_v11_page_domains_are_stable() {
+    fn page_domains_remain_stable_across_v10_through_v13() {
         assert_eq!(
             leaf_hash(&[0u8; PAGE_SIZE]),
             hex_to_32("fd2c1ac593371c52c7fb0dc8fce568b2edea3cc192ca663a07fed4cd714f8fa3"),

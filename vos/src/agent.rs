@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 
 pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
 pub mod authority;
+pub mod contract;
 #[cfg(feature = "std")]
 pub mod driver;
 pub mod execution;
@@ -24,12 +25,12 @@ pub mod schema;
 pub mod standard;
 pub mod wire;
 use crate::service::{
-    ActorId, AgentId, BlobRef, CredentialId, DeploymentId, Hash, NodeId, PrincipalId, ProducerId,
-    ProgramId, SpaceId,
+    ActorId, AgentId, BlobRef, DeploymentId, Hash, NodeId, PrincipalId, ProducerId, ProgramId,
+    SpaceId,
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829v9");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829r1");
 
 /// Program identity of the bundled standard runtime artifact.
 pub const STANDARD_RUNTIME_PROGRAM_ID: ProgramId = ProgramId([
@@ -82,6 +83,16 @@ pub enum StateLane {
     Local = 2,
 }
 
+/// Guest-owned durable component retaining one exact invocation result.
+/// Ordinary coherent queries span Linear and Merge snapshots, so their
+/// disposition belongs to topology-neutral control state rather than either
+/// data lane. Other modes retain the result with their consistency lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvocationResultStorage {
+    Control,
+    Lane(StateLane),
+}
+
 /// Complete persistence classification of an actor field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldPersistence {
@@ -104,11 +115,10 @@ pub enum MethodMode {
     LocalQuery,
     /// Mutate linear state and read a pinned merge frontier.
     Linear,
-    /// Mutate merge state while reading the same pinned linear snapshot used
-    /// to authorize and order the causal change. Local state is inaccessible.
+    /// Mutate and read Merge state only.
     Merge,
-    /// Mutate only this replica's local state. Local actors cannot declare
-    /// replicated lanes, so no shared state is visible in this mode.
+    /// Mutate this replica's Local state while reading immutable Linear and
+    /// Merge snapshots selected by the agent.
     Local,
 }
 
@@ -123,6 +133,20 @@ impl MethodMode {
             Self::Query | Self::LinearizableQuery | Self::LocalQuery => None,
         }
     }
+
+    /// Durable component which owns the exact result disposition. This is
+    /// distinct from [`Self::write_lane`]: query execution never mutates
+    /// actor state.
+    pub const fn result_storage(self) -> InvocationResultStorage {
+        match self {
+            Self::Query => InvocationResultStorage::Control,
+            Self::LinearizableQuery | Self::Linear => {
+                InvocationResultStorage::Lane(StateLane::Linear)
+            }
+            Self::Merge => InvocationResultStorage::Lane(StateLane::Merge),
+            Self::LocalQuery | Self::Local => InvocationResultStorage::Lane(StateLane::Local),
+        }
+    }
 }
 
 impl MethodMode {
@@ -131,9 +155,9 @@ impl MethodMode {
             Self::Query | Self::LinearizableQuery => {
                 matches!(lane, StateLane::Linear | StateLane::Merge)
             }
-            Self::LocalQuery | Self::Local => matches!(lane, StateLane::Local),
+            Self::LocalQuery | Self::Local => true,
             Self::Linear => matches!(lane, StateLane::Linear | StateLane::Merge),
-            Self::Merge => matches!(lane, StateLane::Linear | StateLane::Merge),
+            Self::Merge => matches!(lane, StateLane::Merge),
         }
     }
 
@@ -234,29 +258,35 @@ pub struct RuntimeCapabilities {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackageKind {
     Actor {
+        contract: contract::ActorPackageContract,
         requirements: RuntimeRequirements,
     },
     AgentRuntime {
-        abi: Hash,
+        contract: contract::RuntimePackageContract,
         capabilities: RuntimeCapabilities,
     },
 }
 
 impl PackageKind {
-    pub fn is_compatible_with(self, runtime: RuntimeCapabilities) -> bool {
+    pub fn is_compatible_with(
+        self,
+        runtime_contract: contract::RuntimePackageContract,
+        runtime: RuntimeCapabilities,
+    ) -> bool {
         match self {
-            Self::Actor { requirements } => runtime.satisfies(requirements),
-            Self::AgentRuntime { abi, .. } => abi.0 == RUNTIME_ABI_ID.0,
+            Self::Actor {
+                contract,
+                requirements,
+            } => runtime_contract.supports(contract) && runtime.satisfies(requirements),
+            Self::AgentRuntime { contract, .. } => contract.is_valid(),
         }
     }
 }
 
 impl RuntimeCapabilities {
-    /// Conservative directory bound for the bundled 8-MiB runtime. Actor
-    /// records are repeated across the independently durable lane indexes;
-    /// claiming a larger count would make a valid directory exceed the
-    /// runtime-image limit before it reached its advertised capacity.
-    pub const STANDARD_MAX_ACTORS: u32 = 256;
+    /// Standard agent policy. The separately signed runtime-state byte limit
+    /// still bounds aggregate directory and actor state.
+    pub const STANDARD_MAX_ACTORS: u32 = contract::STANDARD_MAX_ACTORS;
 
     pub const fn standard() -> Self {
         Self {
@@ -333,6 +363,7 @@ pub struct InstallActor {
     pub agent_schema: BlobRef,
     pub role_policies: BlobRef,
     pub state_layout: Hash,
+    pub contract: contract::ActorPackageContract,
     pub requirements: RuntimeRequirements,
 }
 
@@ -348,6 +379,7 @@ pub struct UpgradeActor {
     pub agent_schema: BlobRef,
     pub role_policies: BlobRef,
     pub state_layout: Hash,
+    pub contract: contract::ActorPackageContract,
     pub requirements: RuntimeRequirements,
 }
 
@@ -360,6 +392,7 @@ pub struct ActorRecord {
     pub agent_schema: BlobRef,
     pub role_policies: BlobRef,
     pub state_layout: Hash,
+    pub contract: contract::ActorPackageContract,
     pub requirements: RuntimeRequirements,
 }
 
@@ -405,6 +438,7 @@ pub enum LifecycleRequest {
     AcknowledgeInvocation {
         invocation: crate::service::InvocationId,
         request: Hash,
+        authority: Box<authority::ActorInvocationReceipt>,
     },
     RemoveLeaf {
         actor: ActorId,
@@ -416,10 +450,10 @@ pub enum LifecycleRequest {
         to_program: ProgramId,
         producer: ProducerId,
         package: BlobRef,
-        abi: Hash,
+        contract: contract::RuntimePackageContract,
         capabilities: RuntimeCapabilities,
     },
-    /// Host-authenticated lifecycle operation. The bundled runtime consumes
+    /// Authority-signed lifecycle operation. The bundled runtime verifies
     /// its sequence exactly once and retains a bounded durable disposition so
     /// retries cannot reapply an older transition after later operations.
     Authorized {
@@ -428,24 +462,15 @@ pub enum LifecycleRequest {
     },
 }
 
-/// Signature-verified authority identity admitted by the trusted host.
-///
-/// Signature bytes remain outside deterministic runtime state. `claim`
-/// commits to every signed claim field, including validity bounds, principal,
-/// capability, and operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Complete authority evidence admitted at one canonical logical slot.
+/// Signature verification and claim binding occur again inside the guest.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LifecycleAuthorityAdmission {
-    pub authority: Hash,
-    pub credential: CredentialId,
-    /// Binding-global authority sequence. Hosts authenticate the signed claim;
-    /// runtimes consume this one monotone namespace across credential changes.
-    pub sequence: u64,
+    pub receipt: authority::AgentAuthorityReceipt,
     /// Trusted logical slot observed by the host while verifying this claim.
     /// The runtime persists a monotone high-water so a regressed clock cannot
     /// reopen an older receipt's validity window after restart.
     pub observed_slot: u64,
-    pub claim: Hash,
-    pub operation: Hash,
 }
 
 impl LifecycleRequest {
@@ -522,10 +547,14 @@ pub enum AgentConfigError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentConfig {
     pub identity: AgentIdentity,
+    /// Caller-selected, authority-signed creation nonce used to derive the
+    /// globally stable AgentId from `(space, owner, nonce)`.
+    pub creation_nonce: Hash,
     /// Exact system-authority deployment allowed to issue lifecycle receipts
     /// for this agent.
     pub authority: authority::AgentAuthorityBinding,
     pub runtime_package: BlobRef,
+    pub runtime_contract: contract::RuntimePackageContract,
     pub capabilities: RuntimeCapabilities,
     pub replicas: Vec<AgentReplica>,
 }
@@ -535,13 +564,19 @@ impl AgentConfig {
         if self.identity.space == SpaceId::ZERO
             || self.identity.agent == AgentId::ZERO
             || self.identity.owner == PrincipalId::ZERO
+            || self.creation_nonce == Hash::ZERO
+            || AgentId::derive(
+                self.identity.space,
+                self.identity.owner,
+                &self.creation_nonce.0,
+            ) != self.identity.agent
         {
             return Err(AgentConfigError::InvalidIdentity);
         }
         if !self.authority.validate() {
             return Err(AgentConfigError::InvalidIdentity);
         }
-        if self.capabilities.max_actors == 0 {
+        if self.capabilities.max_actors == 0 || !self.runtime_contract.is_valid() {
             return Err(AgentConfigError::InvalidRuntimeCapacity);
         }
         if self.identity.runtime_deployment == DeploymentId::ZERO
@@ -604,6 +639,18 @@ impl AgentConfig {
 mod tests {
     use super::*;
 
+    fn authority_binding() -> authority::AgentAuthorityBinding {
+        let public_key = authority::ed25519_public_key_wire([0x41; 32]);
+        authority::AgentAuthorityBinding {
+            agent: AgentId([10; 32]),
+            actor: ActorId([11; 32]),
+            deployment: DeploymentId([12; 32]),
+            program: ProgramId([13; 32]),
+            producer: ProducerId::of_public_key(&public_key),
+            public_key,
+        }
+    }
+
     #[test]
     fn private_profile_rejects_linear_state() {
         assert!(!AgentProfile::Private.supports(StateLane::Linear));
@@ -617,9 +664,9 @@ mod tests {
         assert!(MethodMode::Linear.can_read(StateLane::Merge));
         assert!(MethodMode::Linear.can_write(StateLane::Linear));
         assert!(!MethodMode::Linear.can_write(StateLane::Merge));
-        assert!(MethodMode::Merge.can_read(StateLane::Linear));
+        assert!(!MethodMode::Merge.can_read(StateLane::Linear));
         assert!(MethodMode::Merge.can_write(StateLane::Merge));
-        assert!(!MethodMode::Local.can_read(StateLane::Linear));
+        assert!(MethodMode::Local.can_read(StateLane::Linear));
         assert!(MethodMode::Local.can_write(StateLane::Local));
         assert!(!MethodMode::Query.can_write(StateLane::Linear));
         assert!(!MethodMode::Query.can_read(StateLane::Local));
@@ -650,20 +697,21 @@ mod tests {
         }));
         assert!(
             PackageKind::Actor {
+                contract: contract::ActorPackageContract::canonical(),
                 requirements: RuntimeRequirements {
                     lanes: LaneSet::of(StateLane::Merge),
                     scheduling: false,
                     proofs: false,
                 },
             }
-            .is_compatible_with(standard)
+            .is_compatible_with(contract::RuntimePackageContract::canonical(), standard)
         );
         assert!(
             PackageKind::AgentRuntime {
-                abi: RUNTIME_ABI_ID,
+                contract: contract::RuntimePackageContract::canonical(),
                 capabilities: standard,
             }
-            .is_compatible_with(standard)
+            .is_compatible_with(contract::RuntimePackageContract::canonical(), standard)
         );
     }
 
@@ -681,24 +729,20 @@ mod tests {
     #[test]
     fn private_agents_accept_only_owner_nodes() {
         let owner = PrincipalId([1; 32]);
+        let space = SpaceId([2; 32]);
+        let creation_nonce = Hash([0x15; 32]);
         let mut config = AgentConfig {
             identity: AgentIdentity {
-                space: SpaceId([2; 32]),
-                agent: AgentId([3; 32]),
+                space,
+                agent: AgentId::derive(space, owner, &creation_nonce.0),
                 owner,
                 profile: AgentProfile::Private,
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([8; 32]),
             },
-            authority: authority::AgentAuthorityBinding {
-                agent: AgentId([10; 32]),
-                actor: ActorId([11; 32]),
-                deployment: DeploymentId([12; 32]),
-                program: ProgramId([13; 32]),
-                producer: ProducerId::of_public_key(b"authority-key"),
-                public_key: b"authority-key".to_vec(),
-            },
+            creation_nonce,
+            authority: authority_binding(),
             capabilities: RuntimeCapabilities {
                 lanes: LaneSet::of(StateLane::Merge).union(LaneSet::of(StateLane::Local)),
                 scheduling: false,
@@ -709,6 +753,7 @@ mod tests {
                 hash: Hash([9; 32]),
                 len: 100,
             },
+            runtime_contract: contract::RuntimePackageContract::canonical(),
             replicas: vec![AgentReplica {
                 node: NodeId([6; 32]),
                 principal: owner,
@@ -726,28 +771,25 @@ mod tests {
     #[test]
     fn shared_linear_agents_require_a_voter() {
         let owner = PrincipalId([1; 32]);
+        let space = SpaceId([2; 32]);
+        let creation_nonce = Hash([0x16; 32]);
         let mut config = AgentConfig {
             identity: AgentIdentity {
-                space: SpaceId([2; 32]),
-                agent: AgentId([3; 32]),
+                space,
+                agent: AgentId::derive(space, owner, &creation_nonce.0),
                 owner,
                 profile: AgentProfile::Shared,
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([6; 32]),
             },
-            authority: authority::AgentAuthorityBinding {
-                agent: AgentId([7; 32]),
-                actor: ActorId([8; 32]),
-                deployment: DeploymentId([9; 32]),
-                program: ProgramId([10; 32]),
-                producer: ProducerId::of_public_key(b"authority-key"),
-                public_key: b"authority-key".to_vec(),
-            },
+            creation_nonce,
+            authority: authority_binding(),
             runtime_package: BlobRef {
                 hash: Hash([11; 32]),
                 len: 100,
             },
+            runtime_contract: contract::RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities::standard(),
             replicas: vec![AgentReplica {
                 node: NodeId([12; 32]),

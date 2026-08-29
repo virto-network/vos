@@ -1,14 +1,13 @@
-//! SPI parser conformance against a real GP service preimage.
+//! SPI parser conformance against a real service program.
 //!
-//! The `gp072_*` accumulate vectors store service code as a standard-program
-//! blob (metadata prefix + GP memory layout). This test pulls the real
-//! `test-service` preimage out of a shared vector and asserts the parser
-//! recovers exactly the fields an independent byte-level decode found.
+//! The archived vector wraps its program in the retired metadata-prefixed
+//! container. The fixture helper extracts its bare program explicitly; the
+//! production parser accepts only that one canonical generation.
 
 use vos_pvm::spi::parse_standard_program;
 
 /// Extract the first service preimage blob from a gp072 accumulate input.
-fn service_preimage() -> Vec<u8> {
+fn historical_service_preimage() -> Vec<u8> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/",
@@ -26,9 +25,21 @@ fn service_preimage() -> Vec<u8> {
         .collect()
 }
 
+fn service_program() -> Vec<u8> {
+    let blob = historical_service_preimage();
+    let (metadata_len, consumed) = vos_pvm::spi::read_nat(&blob, 0).expect("metadata length");
+    let program_start = consumed + usize::try_from(metadata_len).expect("metadata length fits");
+    blob[program_start..].to_vec()
+}
+
 #[test]
-fn parses_real_service_preimage() {
-    let blob = service_preimage();
+fn rejects_historical_metadata_prefixed_preimage() {
+    assert!(parse_standard_program(&historical_service_preimage()).is_none());
+}
+
+#[test]
+fn parses_canonical_program_from_real_service_preimage() {
+    let blob = service_program();
     let prog = parse_standard_program(&blob).expect("standard program parses");
 
     // Values independently decoded from the raw bytes:
@@ -56,8 +67,8 @@ fn parses_real_service_preimage() {
 /// it runs deterministically up to its first hostcall (`ecalli 1`), which
 /// surfaces as an undispatched `HostCall` exit for the embedder to handle.
 #[test]
-fn refine_harness_starts_real_service_preimage() {
-    let blob = service_preimage();
+fn refine_harness_starts_canonical_real_service_program() {
+    let blob = service_program();
     let inv = vos_pvm::refine::execute(&blob, &[], 10_000_000).expect("service preimage loads");
     assert_eq!(
         inv.exit,
@@ -81,10 +92,10 @@ fn refine_harness_starts_real_service_preimage() {
 /// every mapped region. This is the shape a 32-bit embedder (which
 /// `MemoryModel::Auto` puts on the sparse path) executes.
 #[test]
-fn refine_flat_and_sparse_agree_on_real_service_preimage() {
+fn refine_flat_and_sparse_agree_on_canonical_real_service_program() {
     use vos_pvm::refine::MemoryModel;
 
-    let blob = service_preimage();
+    let blob = service_program();
     let f = vos_pvm::refine::execute_with(&blob, &[], 10_000_000, MemoryModel::Flat).expect("flat");
     let s =
         vos_pvm::refine::execute_with(&blob, &[], 10_000_000, MemoryModel::Sparse).expect("sparse");

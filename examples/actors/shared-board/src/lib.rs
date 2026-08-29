@@ -45,6 +45,7 @@ const BOARD_SPACE_ROLE_MAP: vos::SpaceRoleMap<BoardRole> = vos::SpaceRoleMap {
 };
 
 #[actor(
+    agent,
     role = BoardRole,
     default_role = BoardRole::Viewer,
     space_role_map = BOARD_SPACE_ROLE_MAP
@@ -61,7 +62,7 @@ fn bounded_note_index(index: u32, len: usize) -> usize {
     core::cmp::min(index as usize, len)
 }
 
-#[messages]
+#[messages(agent)]
 impl Board {
     fn new() -> Self {
         Self {
@@ -78,13 +79,14 @@ impl Board {
         self.title = title;
     }
 
-    #[msg]
+    #[msg(query)]
     fn title(&self) -> String {
         self.title.clone()
     }
 
     #[msg(merge)]
     fn add_task(&mut self, id: u64, text: String) -> String {
+        let accepted = text.clone();
         self.tasks
             .insert(id, text)
             .expect("one stable operation per slice");
@@ -92,10 +94,7 @@ impl Board {
         self.edits
             .increment(1)
             .expect("one stable operation per slice");
-        // Merge handlers see the pinned Linear snapshot selected by the
-        // agent, so causal work can be interpreted against ordered policy or
-        // configuration without moving that configuration into the CRDT.
-        self.title.clone()
+        accepted
     }
 
     #[msg(merge)]
@@ -109,7 +108,7 @@ impl Board {
             .expect("one stable operation per slice");
     }
 
-    #[msg]
+    #[msg(query)]
     fn edit_count(&self) -> i64 {
         self.edits.value()
     }

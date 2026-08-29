@@ -1,27 +1,40 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use ed25519_dalek::{Signer as _, SigningKey};
 use vos::Encode as _;
-use vos::agent::authority::{AgentAuthorityBinding, AgentAuthorityClaim, AgentAuthorityReceipt};
+use vos::agent::authority::{
+    ActorInvocationClaim, ActorInvocationReceipt, AgentAuthorityBinding, AgentAuthorityClaim,
+    AgentAuthorityReceipt, ed25519_public_key_wire,
+};
+use vos::agent::contract::{ActorPackageContract, RuntimePackageContract};
 use vos::agent::driver::{
-    AgentDriver, AgentDriverError, AgentImage, AgentImageStore, AgentTrustProvider,
+    AgentDriver, AgentDriverError, AgentImage, AgentImageStore, AgentTrustProvider, FileAgentStore,
     MemoryAgentStore,
 };
 use vos::agent::execution::{
     ActorExecutionError, ActorExecutionStatus, ActorInvocation, ActorInvocationAuth,
-    ActorInvocationVerificationError, MAX_EXECUTION_GAS,
+    MAX_EXECUTION_GAS, RuntimeBlob, RuntimeExecutionCall, RuntimeExecutionReturn,
 };
 use vos::agent::host::AgentHost;
 use vos::agent::package::{Package, PackageManifest, PackageSignatureVerifier};
-use vos::agent::wire::{RuntimeCall, RuntimeReturn, RuntimeState, decode_standard_runtime_state};
+use vos::agent::standard::{
+    StandardActorState, StandardLaneRevisions, StandardLaneState, StandardRuntimeState,
+};
+use vos::agent::wire::{
+    RuntimeCall, RuntimeReturn, RuntimeState, decode_standard_runtime_state,
+    encode_standard_runtime_state,
+};
 use vos::agent::{
-    ActorEntry, AgentConfig, AgentIdentity, AgentProfile, AgentReplica, InstallActor, LaneSet,
+    ActorEntry, ActorLifecycleDebt, ActorRecord, AgentConfig, AgentIdentity, AgentProfile,
+    AgentReplica, FieldPersistence, InstallActor, LaneSet, LifecycleAuthorityAdmission,
     LifecycleReply, LifecycleRequest, MethodMode, ReplicaRole, RuntimeCapabilities,
-    RuntimeRequirements, STANDARD_RUNTIME_PROGRAM_ID,
+    RuntimeRequirements, STANDARD_RUNTIME_PROGRAM_ID, StateLane,
 };
 use vos::service::{
     ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, DeploymentSignature, Hash,
-    InvocationId, MethodPolicy, NodeId, PackageRolePolicies, PrincipalId, ProducerId, ProgramId,
-    ServiceWire, SpaceId, artifact_hash, task_dependencies_hash,
+    InvocationId, MethodPolicy, NodeId, Origin, PackageRolePolicies, PrincipalId, ProducerId,
+    ProgramId, ServiceWire, SpaceId, SubjectId, artifact_hash, task_dependencies_hash,
 };
 use vos_pvm::ExitReason;
 use vos_pvm::refine_host::RefineContext;
@@ -29,8 +42,8 @@ use vos_pvm::refine_host::RefineContext;
 const AGENT_RUNTIME_PVM: &[u8] = include_bytes!("../../vosx/blobs/agent_runtime.pvm");
 const GAS: u64 = 1_000_000_000;
 
-const TEST_INVOCATION_AUTHORITY_KEY: &[u8] = b"vos-agent-test-invocation-authority";
 const TEST_PACKAGE_KEY: &[u8] = b"vos-agent-test-package-key";
+const TEST_AUTHORITY_SEED: [u8; 32] = [0x42; 32];
 
 struct TestTrust;
 
@@ -39,27 +52,29 @@ impl AgentTrustProvider for TestTrust {
         Some(1)
     }
 
-    fn verify_authority(&self, _: &AgentAuthorityBinding, _: &[u8], _: &[u8]) -> bool {
-        true
+    fn authority_for_space(&self, space: SpaceId) -> Option<AgentAuthorityBinding> {
+        (space == SpaceId([2; 32])).then(authority_binding)
     }
 
-    fn verify_invocation(
-        &self,
-        agent: &AgentConfig,
-        authorization_message: &[u8],
-        evidence: &[u8],
-    ) -> bool {
-        Hash::digest(
-            b"vos/agent/test-invocation-authorization",
-            &[
-                TEST_INVOCATION_AUTHORITY_KEY,
-                &agent.identity.space.0,
-                &agent.identity.agent.0,
-                &agent.authority.commitment().0,
-                authorization_message,
-            ],
-        )
-        .0 == evidence
+    fn verify_package(&self, agent: &AgentConfig, package: &Package) -> bool {
+        package.deployment_signature.public_key == TEST_PACKAGE_KEY
+            && package.deployment_signature.producer == ProducerId::of_public_key(TEST_PACKAGE_KEY)
+            && package.deployment_signature.signature == package_signature(package)
+            && agent.identity.space == SpaceId([2; 32])
+    }
+}
+
+struct ClockTrust {
+    slot: Arc<AtomicU64>,
+}
+
+impl AgentTrustProvider for ClockTrust {
+    fn current_logical_slot(&self) -> Option<u64> {
+        Some(self.slot.load(Ordering::SeqCst))
+    }
+
+    fn authority_for_space(&self, space: SpaceId) -> Option<AgentAuthorityBinding> {
+        (space == SpaceId([2; 32])).then(authority_binding)
     }
 
     fn verify_package(&self, agent: &AgentConfig, package: &Package) -> bool {
@@ -74,17 +89,49 @@ fn trust() -> Arc<dyn AgentTrustProvider> {
     Arc::new(TestTrust)
 }
 
-fn invocation_evidence(config: &AgentConfig, invocation: &ActorInvocation) -> Hash {
-    Hash::digest(
-        b"vos/agent/test-invocation-authorization",
-        &[
-            TEST_INVOCATION_AUTHORITY_KEY,
-            &config.identity.space.0,
-            &config.identity.agent.0,
-            &config.authority.commitment().0,
-            &invocation.authorization_message().0,
-        ],
-    )
+fn clock_trust(initial_slot: u64) -> (Arc<AtomicU64>, Arc<dyn AgentTrustProvider>) {
+    let slot = Arc::new(AtomicU64::new(initial_slot));
+    let trust: Arc<dyn AgentTrustProvider> = Arc::new(ClockTrust { slot: slot.clone() });
+    (slot, trust)
+}
+
+fn authority_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&TEST_AUTHORITY_SEED)
+}
+
+fn authority_binding() -> AgentAuthorityBinding {
+    let key = authority_signing_key();
+    let public_key = ed25519_public_key_wire(key.verifying_key().to_bytes());
+    AgentAuthorityBinding {
+        agent: AgentId([8; 32]),
+        actor: ActorId([9; 32]),
+        deployment: DeploymentId([10; 32]),
+        program: ProgramId([11; 32]),
+        producer: ProducerId::of_public_key(&public_key),
+        public_key,
+    }
+}
+
+fn invocation_receipt(
+    config: &AgentConfig,
+    invocation: &ActorInvocation,
+) -> ActorInvocationReceipt {
+    let key = authority_signing_key();
+    let claim = ActorInvocationClaim {
+        authority: config.authority.clone(),
+        space: config.identity.space,
+        agent: config.identity.agent,
+        principal: invocation.auth.principal,
+        credential: invocation.auth.principal.map(|_| CredentialId([0x72; 32])),
+        authorization: invocation.authorization_message(),
+        auth: invocation.auth.clone(),
+        valid_from: 1,
+        valid_until: 2,
+    };
+    ActorInvocationReceipt {
+        signature: key.sign(&claim.signing_message().0).to_bytes().to_vec(),
+        claim,
+    }
 }
 
 fn package_signature(package: &Package) -> Vec<u8> {
@@ -105,7 +152,7 @@ fn runtime_package() -> Package {
             platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             kind: vos::agent::PackageKind::AgentRuntime {
-                abi: vos::agent::RUNTIME_ABI_ID,
+                contract: RuntimePackageContract::canonical(),
                 capabilities: RuntimeCapabilities::standard(),
             },
             program: STANDARD_RUNTIME_PROGRAM_ID,
@@ -149,35 +196,55 @@ fn creation_receipt(config: &AgentConfig) -> AgentAuthorityReceipt {
     )
 }
 
+fn authorized_request(
+    config: &AgentConfig,
+    request: LifecycleRequest,
+    capability: &str,
+    sequence: u64,
+) -> LifecycleRequest {
+    let receipt = lifecycle_receipt(config, capability, &request, sequence);
+    LifecycleRequest::Authorized {
+        admission: LifecycleAuthorityAdmission {
+            receipt,
+            observed_slot: 1,
+        },
+        request: Box::new(request),
+    }
+}
+
 fn lifecycle_receipt(
     config: &AgentConfig,
     capability: &str,
     request: &LifecycleRequest,
     sequence: u64,
 ) -> AgentAuthorityReceipt {
+    let key = authority_signing_key();
+    let claim = AgentAuthorityClaim {
+        authority: config.authority.clone(),
+        space: config.identity.space,
+        agent: config.identity.agent,
+        principal: config.identity.owner,
+        credential: CredentialId([0x71; 32]),
+        capability: CapabilityId::named(capability),
+        operation: request.commitment(),
+        sequence,
+        valid_from: 1,
+        valid_until: 2,
+    };
     AgentAuthorityReceipt {
-        claim: AgentAuthorityClaim {
-            authority: config.authority.clone(),
-            space: config.identity.space,
-            agent: config.identity.agent,
-            principal: config.identity.owner,
-            credential: CredentialId([0x71; 32]),
-            capability: CapabilityId::named(capability),
-            operation: request.commitment(),
-            sequence,
-            valid_from: 1,
-            valid_until: 2,
-        },
-        signature: vec![1],
+        signature: key.sign(&claim.signing_message().0).to_bytes().to_vec(),
+        claim,
     }
 }
 
-fn config_for(agent: AgentId) -> AgentConfig {
+fn config_for(creation_nonce: Hash) -> AgentConfig {
     let owner = PrincipalId([1; 32]);
+    let space = SpaceId([2; 32]);
+    let agent = AgentId::derive(space, owner, &creation_nonce.0);
     let runtime = runtime_package();
     AgentConfig {
         identity: AgentIdentity {
-            space: SpaceId([2; 32]),
+            space,
             agent,
             owner,
             profile: AgentProfile::Local,
@@ -185,15 +252,10 @@ fn config_for(agent: AgentId) -> AgentConfig {
             runtime_program: runtime.manifest.program,
             runtime_producer: runtime.deployment_signature.producer,
         },
-        authority: vos::agent::authority::AgentAuthorityBinding {
-            agent: AgentId([8; 32]),
-            actor: ActorId([9; 32]),
-            deployment: DeploymentId([10; 32]),
-            program: ProgramId([11; 32]),
-            producer: ProducerId::of_public_key(b"authority-key"),
-            public_key: b"authority-key".to_vec(),
-        },
+        creation_nonce,
+        authority: authority_binding(),
         runtime_package: BlobRef::of_bytes(&runtime.encode()),
+        runtime_contract: RuntimePackageContract::canonical(),
         capabilities: RuntimeCapabilities::standard(),
         replicas: vec![AgentReplica {
             node: NodeId([7; 32]),
@@ -204,7 +266,7 @@ fn config_for(agent: AgentId) -> AgentConfig {
 }
 
 fn config() -> AgentConfig {
-    config_for(AgentId([3; 32]))
+    config_for(Hash([3; 32]))
 }
 
 fn invoke(call: RuntimeCall) -> RuntimeReturn {
@@ -232,6 +294,21 @@ fn invoke(call: RuntimeCall) -> RuntimeReturn {
         .expect("decode runtime return")
 }
 
+fn invoke_execution(call: RuntimeExecutionCall) -> RuntimeExecutionReturn {
+    let invocation = RefineContext::load(AGENT_RUNTIME_PVM, &call.encode(), GAS)
+        .expect("load bundled agent runtime")
+        .run();
+    assert_eq!(
+        invocation.exit,
+        ExitReason::Halt,
+        "agent execution runtime exited at instruction counter {} with registers {:?}",
+        invocation.pc,
+        invocation.registers,
+    );
+    RuntimeExecutionReturn::decode(&invocation.output().expect("valid output window"))
+        .expect("decode runtime execution return")
+}
+
 #[test]
 fn bundled_runtime_identity_is_pinned() {
     assert_eq!(
@@ -243,9 +320,23 @@ fn bundled_runtime_identity_is_pinned() {
 #[test]
 fn bundled_runtime_persists_an_empty_agent_between_invocations() {
     let config = config();
+    let create = LifecycleRequest::Create(config.clone());
+    let rejected = invoke(RuntimeCall {
+        state: RuntimeState::default(),
+        request: create.clone(),
+    });
+    assert_eq!(
+        rejected.result,
+        Err(vos::agent::LifecycleError::InvalidRequest)
+    );
     let created = invoke(RuntimeCall {
         state: RuntimeState::default(),
-        request: LifecycleRequest::Create(config.clone()),
+        request: authorized_request(
+            &config,
+            create,
+            vos::agent::authority::CAPABILITY_AGENT_CREATE_LOCAL,
+            1,
+        ),
     });
     assert_eq!(
         created.result,
@@ -413,10 +504,10 @@ fn multi_agent_host_discovers_empty_agents_after_restart() {
         std::env::temp_dir().join(format!("vos-agent-host-{}-{unique}", std::process::id()));
     let _remove = RemoveOnDrop(directory.clone());
     let mut host = AgentHost::open(&directory, trust()).expect("open empty agent host");
-    let first = AgentId([0x31; 32]);
-    let second = AgentId([0x32; 32]);
-    let first_config = config_for(first);
-    let second_config = config_for(second);
+    let first_config = config_for(Hash([0x31; 32]));
+    let second_config = config_for(Hash([0x32; 32]));
+    let first = first_config.identity.agent;
+    let second = second_config.identity.agent;
     host.create(
         first_config.clone(),
         runtime_package(),
@@ -459,16 +550,297 @@ fn static_actor_pvm() -> Vec<u8> {
     actor.build_standard()
 }
 
-#[test]
-fn installed_actor_executes_inside_the_bundled_runtime() {
+static LANE_PROBE_FIELDS: [vos::agent::schema::FieldMeta; 3] = [
+    vos::agent::schema::FieldMeta {
+        name: "linear",
+        codec: "u8",
+        persistence: FieldPersistence::State(StateLane::Linear),
+    },
+    vos::agent::schema::FieldMeta {
+        name: "merge",
+        codec: "u8",
+        persistence: FieldPersistence::State(StateLane::Merge),
+    },
+    vos::agent::schema::FieldMeta {
+        name: "local",
+        codec: "u8",
+        persistence: FieldPersistence::State(StateLane::Local),
+    },
+];
+
+static LANE_PROBE_LINEAR: [vos::agent::schema::MethodMeta; 1] = [vos::agent::schema::MethodMeta {
+    name: "probe",
+    mode: MethodMode::Linear,
+    explicit: true,
+}];
+static LANE_PROBE_MERGE: [vos::agent::schema::MethodMeta; 1] = [vos::agent::schema::MethodMeta {
+    name: "probe",
+    mode: MethodMode::Merge,
+    explicit: true,
+}];
+static LANE_PROBE_QUERY: [vos::agent::schema::MethodMeta; 1] = [vos::agent::schema::MethodMeta {
+    name: "probe",
+    mode: MethodMode::Query,
+    explicit: true,
+}];
+static LANE_PROBE_LOCAL: [vos::agent::schema::MethodMeta; 1] = [vos::agent::schema::MethodMeta {
+    name: "probe",
+    mode: MethodMode::Local,
+    explicit: true,
+}];
+
+/// Hand-assembled actor which copies one raw FETCH item into its reply. Its
+/// output shape is valid both for the restricted method and for the control
+/// method which owns the probed lane.
+fn lane_probe_actor(target: StateLane, linear: u8, merge: u8) -> Vec<u8> {
+    use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+    let (linear_state, target_fetch) = match target {
+        StateLane::Linear => (Vec::new(), 0),
+        StateLane::Local => (vec![linear], 2),
+        StateLane::Merge => panic!("Merge is visible to every mode in this regression"),
+    };
+    let merge_state = vec![merge];
+    let mut output = vec![vos::actors::STATUS_DONE];
+    output.extend_from_slice(&(linear_state.len() as u32).to_le_bytes());
+    output.extend_from_slice(&(merge_state.len() as u32).to_le_bytes());
+    output.extend_from_slice(&0u32.to_le_bytes());
+    output.extend_from_slice(&linear_state);
+    output.extend_from_slice(&merge_state);
+    let reply_offset = output.len();
+    output.extend_from_slice(&[0xee, 0xee]);
+    let output_len = output.len();
+    let scratch_offset = output.len();
+    output.extend_from_slice(&[0; 2]);
+
+    let rw_base = 2 * u64::from(vos_pvm::PVM_ZONE_SIZE);
+    let mut actor = Assembler::new();
+    actor.set_rw_data(output);
+    for _ in 0..target_fetch {
+        actor
+            .load_imm_64(Reg::A0, rw_base + scratch_offset as u64)
+            .load_imm_64(Reg::A1, 2)
+            .ecalli(vos::abi::hostcall::FETCH);
+    }
+    actor
+        .load_imm_64(Reg::A0, rw_base + reply_offset as u64)
+        .load_imm_64(Reg::A1, 2)
+        .ecalli(vos::abi::hostcall::FETCH)
+        .load_imm_64(Reg::A0, rw_base)
+        .load_imm_64(Reg::A1, output_len as u64)
+        .jump_ind(Reg::RA, 0);
+    actor.build_standard()
+}
+
+fn lane_probe_call(
+    actor_pvm: Vec<u8>,
+    mode: MethodMode,
+    invocation_byte: u8,
+    linear: u8,
+    merge: u8,
+    local: u8,
+) -> RuntimeExecutionCall {
     let config = config();
+    let program = ProgramId::of_pvm(&actor_pvm);
+    let actor = ActorId::top_level(config.identity.agent, "lane-probe");
+    let deployment = DeploymentId([0xa1; 32]);
+    let methods = match mode {
+        MethodMode::Linear => &LANE_PROBE_LINEAR,
+        MethodMode::Merge => &LANE_PROBE_MERGE,
+        MethodMode::Query => &LANE_PROBE_QUERY,
+        MethodMode::Local => &LANE_PROBE_LOCAL,
+        _ => panic!("unexpected lane-probe mode"),
+    };
+    let (schema, schema_len) =
+        vos::agent::schema::encode::<1024>(&vos::agent::schema::SchemaMeta {
+            uses_storage: false,
+            fields: &LANE_PROBE_FIELDS,
+            methods,
+        });
+    let schema = schema[..schema_len].to_vec();
+    let parsed_schema = vos::agent::schema::decode(&schema).unwrap();
+    let schema_reference = BlobRef::of_bytes(&schema);
+    let policies = PackageRolePolicies {
+        methods: vec![MethodPolicy {
+            method: "probe".into(),
+            schema: Hash([0xa2; 32]),
+            policy: vos::service::public_policy_hash(),
+            public: true,
+            attested: false,
+            space_role: None,
+            capability: None,
+            actor_role: None,
+        }],
+        task_dependencies: Vec::new(),
+    }
+    .encode();
+    let policy_reference = BlobRef::of_bytes(&policies);
+    let package = BlobRef::of_bytes(b"signed-lane-probe-package");
+    let requirements = RuntimeRequirements {
+        lanes: LaneSet::ALL,
+        scheduling: false,
+        proofs: false,
+    };
+    let entry = ActorEntry {
+        actor,
+        name: "lane-probe".into(),
+        parent: None,
+        deployment,
+        program,
+        package: package.clone(),
+        agent_schema: schema_reference.clone(),
+        role_policies: policy_reference.clone(),
+        state_layout: parsed_schema.state_layout_hash(),
+        lanes: LaneSet::ALL,
+        suspended: false,
+    };
+    let state = encode_standard_runtime_state(&StandardRuntimeState {
+        config: Some(config.clone()),
+        actors: vec![StandardActorState {
+            record: ActorRecord {
+                entry,
+                producer: ProducerId([0xa3; 32]),
+                package,
+                agent_schema: schema_reference.clone(),
+                role_policies: policy_reference.clone(),
+                state_layout: parsed_schema.state_layout_hash(),
+                contract: ActorPackageContract::canonical(),
+                requirements,
+            },
+            debt: ActorLifecycleDebt::default(),
+            lane_state: StandardLaneState {
+                linear: Some(vec![linear]),
+                merge: Some(vec![merge]),
+                local: Some(vec![local]),
+            },
+        }],
+        lane_revisions: StandardLaneRevisions {
+            linear: 1,
+            merge: 1,
+            local: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let mut message = vec![vos::value::TAG_DYNAMIC];
+    message.extend_from_slice(&vos::value::Msg::new("probe").encode());
+    let invocation = ActorInvocation {
+        invocation: InvocationId([invocation_byte; 32]),
+        actor,
+        deployment,
+        program,
+        mode,
+        auth: ActorInvocationAuth::anonymous(),
+        message,
+        availability: Vec::new(),
+        gas: 10_000_000,
+    };
+    let authority = invocation_receipt(&config, &invocation);
+    RuntimeExecutionCall {
+        state,
+        invocation,
+        authority,
+        observed_slot: 1,
+        recovery_only: false,
+        actor_pvm,
+        actor_schema: RuntimeBlob {
+            reference: schema_reference,
+            bytes: schema,
+        },
+        actor_policies: RuntimeBlob {
+            reference: policy_reference,
+            bytes: policies,
+        },
+    }
+}
+
+#[test]
+fn bundled_runtime_hides_unreadable_lanes_from_hostile_actor_pvms() {
+    const LINEAR_SECRET: u8 = 0x71;
+    const MERGE_STATE: u8 = 0x72;
+    const LOCAL_SECRET: u8 = 0x73;
+    const SENTINEL: u8 = 0xee;
+
+    for (target, control_mode, restricted_mode, base, secret) in [
+        (
+            StateLane::Linear,
+            MethodMode::Linear,
+            MethodMode::Merge,
+            0xb0,
+            LINEAR_SECRET,
+        ),
+        (
+            StateLane::Local,
+            MethodMode::Local,
+            MethodMode::Query,
+            0xc0,
+            LOCAL_SECRET,
+        ),
+    ] {
+        let actor_pvm = lane_probe_actor(target, LINEAR_SECRET, MERGE_STATE);
+
+        // Control: the program really exfiltrates the selected FETCH item
+        // when the method contract permits that lane to reach the actor.
+        let control = invoke_execution(lane_probe_call(
+            actor_pvm.clone(),
+            control_mode,
+            base,
+            LINEAR_SECRET,
+            MERGE_STATE,
+            LOCAL_SECRET,
+        ));
+        let control = control.result.expect("control invocation completes");
+        assert_eq!(control.status, ActorExecutionStatus::Done);
+        assert_eq!(control.reply, vec![1, secret]);
+
+        // The same hostile PVM cannot recover the byte when the selected
+        // method mode hides the lane at the outer-runtime boundary.
+        let restricted = invoke_execution(lane_probe_call(
+            actor_pvm,
+            restricted_mode,
+            base + 1,
+            LINEAR_SECRET,
+            MERGE_STATE,
+            LOCAL_SECRET,
+        ));
+        let restricted = restricted
+            .result
+            .expect("restricted invocation completes with projected state");
+        assert_eq!(restricted.status, ActorExecutionStatus::Done);
+        assert_eq!(restricted.reply, vec![0, SENTINEL]);
+    }
+}
+
+#[test]
+fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
+    struct RemoveOnDrop(std::path::PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "vos-agent-runtime-evidence-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let _remove = RemoveOnDrop(directory.clone());
+    let image_path = directory.join("agent.image");
+
+    let config = config();
+    let (slot, trust) = clock_trust(1);
     let actor_pvm = static_actor_pvm();
     let program = ProgramId::of_pvm(&actor_pvm);
     let driver = AgentDriver::create(
         runtime_package(),
         config.clone(),
-        MemoryAgentStore::default(),
-        trust(),
+        FileAgentStore::new(&image_path),
+        trust.clone(),
         &creation_receipt(&config),
     )
     .expect("create agent");
@@ -481,26 +853,45 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
             codec: "u8",
             persistence: vos::agent::FieldPersistence::State(vos::agent::StateLane::Linear),
         }],
-        methods: &[vos::agent::schema::MethodMeta {
-            name: "increment",
-            mode: MethodMode::Linear,
-            explicit: false,
-        }],
+        methods: &[
+            vos::agent::schema::MethodMeta {
+                name: "increment",
+                mode: MethodMode::Linear,
+                explicit: false,
+            },
+            vos::agent::schema::MethodMeta {
+                name: "read",
+                mode: MethodMode::Query,
+                explicit: true,
+            },
+        ],
     });
     let schema = schema[..schema_len].to_vec();
     let parsed_schema = vos::agent::schema::decode(&schema).unwrap();
     let schema_reference = BlobRef::of_bytes(&schema);
     let policies = PackageRolePolicies {
-        methods: vec![MethodPolicy {
-            method: "increment".into(),
-            schema: Hash([0x61; 32]),
-            policy: vos::service::public_policy_hash(),
-            public: true,
-            attested: false,
-            space_role: None,
-            capability: None,
-            actor_role: None,
-        }],
+        methods: vec![
+            MethodPolicy {
+                method: "increment".into(),
+                schema: Hash([0x61; 32]),
+                policy: vos::service::public_policy_hash(),
+                public: true,
+                attested: false,
+                space_role: None,
+                capability: None,
+                actor_role: None,
+            },
+            MethodPolicy {
+                method: "read".into(),
+                schema: Hash([0x62; 32]),
+                policy: vos::service::public_policy_hash(),
+                public: true,
+                attested: false,
+                space_role: None,
+                capability: None,
+                actor_role: None,
+            },
+        ],
         task_dependencies: Vec::new(),
     }
     .encode();
@@ -520,21 +911,64 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
         lanes: LaneSet::of(vos::agent::StateLane::Linear),
         suspended: false,
     };
-    let installed = invoke(RuntimeCall {
-        state: driver.image().runtime_state.clone(),
-        request: LifecycleRequest::Install(InstallActor {
-            entry: installed_entry.clone(),
-            producer: ProducerId([0x55; 32]),
-            package: package_reference.clone(),
-            agent_schema: schema_reference.clone(),
-            role_policies: policy_reference.clone(),
-            state_layout: parsed_schema.state_layout_hash(),
-            requirements: RuntimeRequirements {
-                lanes: LaneSet::of(vos::agent::StateLane::Linear),
-                scheduling: false,
-                proofs: false,
+    let install = LifecycleRequest::Install(InstallActor {
+        entry: installed_entry.clone(),
+        producer: ProducerId([0x55; 32]),
+        package: package_reference.clone(),
+        agent_schema: schema_reference.clone(),
+        role_policies: policy_reference.clone(),
+        state_layout: parsed_schema.state_layout_hash(),
+        contract: ActorPackageContract::canonical(),
+        requirements: RuntimeRequirements {
+            lanes: LaneSet::of(vos::agent::StateLane::Linear),
+            scheduling: false,
+            proofs: false,
+        },
+    });
+    let preinstall_state = driver.image().runtime_state.clone();
+    let raw = invoke(RuntimeCall {
+        state: preinstall_state.clone(),
+        request: install.clone(),
+    });
+    assert_eq!(
+        raw.result,
+        Err(vos::agent::LifecycleError::InvalidRequest),
+        "raw lifecycle mutations must never reach the bundled runtime"
+    );
+    assert_eq!(raw.state, preinstall_state);
+
+    let mut forged_lifecycle = lifecycle_receipt(
+        &config,
+        vos::agent::authority::CAPABILITY_ACTOR_INSTALL,
+        &install,
+        2,
+    );
+    forged_lifecycle.signature[0] ^= 1;
+    let forged = invoke(RuntimeCall {
+        state: preinstall_state.clone(),
+        request: LifecycleRequest::Authorized {
+            admission: LifecycleAuthorityAdmission {
+                receipt: forged_lifecycle,
+                observed_slot: 1,
             },
-        }),
+            request: Box::new(install.clone()),
+        },
+    });
+    assert_eq!(
+        forged.result,
+        Err(vos::agent::LifecycleError::InvalidRequest),
+        "the guest must reject a forged lifecycle receipt"
+    );
+    assert_eq!(forged.state, preinstall_state);
+
+    let installed = invoke(RuntimeCall {
+        state: preinstall_state,
+        request: authorized_request(
+            &config,
+            install,
+            vos::agent::authority::CAPABILITY_ACTOR_INSTALL,
+            2,
+        ),
     });
     assert_eq!(
         installed.result,
@@ -564,7 +998,7 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
             },
         )
         .expect("commit installed runtime fixture");
-    let mut driver = AgentDriver::open(store, trust()).expect("open installed agent");
+    let mut driver = AgentDriver::open(store, trust.clone()).expect("open installed agent");
 
     let dynamic_increment = || {
         let mut message = vec![vos::value::TAG_DYNAMIC];
@@ -585,11 +1019,11 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
         availability: Vec::new(),
         gas: 10_000_000,
     };
-    let forged_evidence = forged_claim.authorization_message();
+    let forged_receipt = invocation_receipt(&driver.image().config, &forged_claim);
     assert_eq!(
-        driver.invoke(forged_claim, &forged_evidence.0),
-        Err(AgentDriverError::InvocationVerification(
-            ActorInvocationVerificationError::InvalidInvocation(ActorExecutionError::InvalidInput),
+        driver.invoke(forged_claim, &forged_receipt),
+        Err(AgentDriverError::Execution(
+            ActorExecutionError::InvalidInput
         ))
     );
     assert_eq!(driver.image(), &original);
@@ -604,11 +1038,11 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
         availability: Vec::new(),
         gas: MAX_EXECUTION_GAS + 1,
     };
-    let excessive_gas_evidence = excessive_gas.authorization_message();
+    let excessive_gas_receipt = invocation_receipt(&driver.image().config, &excessive_gas);
     assert_eq!(
-        driver.invoke(excessive_gas, &excessive_gas_evidence.0),
-        Err(AgentDriverError::InvocationVerification(
-            ActorInvocationVerificationError::InvalidInvocation(ActorExecutionError::InvalidInput),
+        driver.invoke(excessive_gas, &excessive_gas_receipt),
+        Err(AgentDriverError::Execution(
+            ActorExecutionError::InvalidInput
         ))
     );
     assert_eq!(driver.image(), &original);
@@ -619,14 +1053,47 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
         deployment,
         program,
         mode: MethodMode::Linear,
-        auth: ActorInvocationAuth::anonymous(),
+        auth: ActorInvocationAuth {
+            origin: Origin::Member(SubjectId([0x67; 32])),
+            principal: Some(config.identity.owner),
+            origin_service: None,
+            space_role: None,
+            actor_role: None,
+            capability: None,
+        },
         message: dynamic_increment(),
         availability: Vec::new(),
         gas: 10_000_000,
     };
-    let evidence = invocation_evidence(&driver.image().config, &invocation);
+    let mut forged_receipt = invocation_receipt(&driver.image().config, &invocation);
+    forged_receipt.signature[0] ^= 1;
+    let before_forged_execution = driver.image().runtime_state.clone();
+    let forged_execution = invoke_execution(RuntimeExecutionCall {
+        state: before_forged_execution.clone(),
+        invocation: invocation.clone(),
+        authority: forged_receipt,
+        observed_slot: 1,
+        recovery_only: false,
+        actor_pvm: actor_pvm.clone(),
+        actor_schema: RuntimeBlob {
+            reference: schema_reference.clone(),
+            bytes: schema.clone(),
+        },
+        actor_policies: RuntimeBlob {
+            reference: policy_reference.clone(),
+            bytes: policies.clone(),
+        },
+    });
+    assert_eq!(
+        forged_execution.result,
+        Err(ActorExecutionError::InvalidAuthorization),
+        "the bundled guest must verify invocation evidence independently"
+    );
+    assert_eq!(forged_execution.state, before_forged_execution);
+
+    let receipt = invocation_receipt(&driver.image().config, &invocation);
     let reply = driver
-        .invoke(invocation, &evidence.0)
+        .invoke(invocation.clone(), &receipt)
         .expect("invoke actor");
     assert_eq!(reply.status, ActorExecutionStatus::Done);
     assert_eq!(reply.reply, vec![0x63]);
@@ -639,4 +1106,107 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
     );
     assert!(state.actors[0].lane_state.merge.as_deref() == Some(&[][..]));
     assert!(state.actors[0].lane_state.local.as_deref() == Some(&[][..]));
+
+    let dynamic_read = || {
+        let mut message = vec![vos::value::TAG_DYNAMIC];
+        message.extend_from_slice(&vos::value::Msg::new("read").encode());
+        message
+    };
+    let query = ActorInvocation {
+        invocation: InvocationId([0x68; 32]),
+        actor,
+        deployment,
+        program,
+        mode: MethodMode::Query,
+        auth: invocation.auth.clone(),
+        message: dynamic_read(),
+        availability: Vec::new(),
+        gas: 10_000_000,
+    };
+    let query_receipt = invocation_receipt(&driver.image().config, &query);
+    let query_reply = driver
+        .invoke(query.clone(), &query_receipt)
+        .expect("execute exact query");
+    assert_eq!(query_reply.status, ActorExecutionStatus::Done);
+    assert_eq!(query_reply.reply, vec![0x63]);
+    assert_eq!(query_reply.observation.linear_revision, Some(1));
+    assert_eq!(driver.image().revision, 4);
+
+    let mut mutation = invocation.clone();
+    mutation.invocation = InvocationId([0x69; 32]);
+    let mutation_receipt = invocation_receipt(&driver.image().config, &mutation);
+    let mutation_reply = driver
+        .invoke(mutation, &mutation_receipt)
+        .expect("commit an intervening mutation");
+    assert_eq!(mutation_reply.observation.linear_revision, Some(2));
+    assert_eq!(driver.image().revision, 5);
+
+    let mut later_query = query.clone();
+    later_query.invocation = InvocationId([0x6a; 32]);
+    let later_receipt = invocation_receipt(&driver.image().config, &later_query);
+    let later_reply = driver
+        .invoke(later_query, &later_receipt)
+        .expect("query the newer observation");
+    assert_eq!(later_reply.observation.linear_revision, Some(2));
+    assert_ne!(later_reply.observation, query_reply.observation);
+
+    let store = driver.into_store();
+    slot.store(40, Ordering::SeqCst);
+    let mut driver = AgentDriver::open(store, trust).expect("reopen after the receipt expires");
+    let recovered = driver
+        .invoke(query.clone(), &query_receipt)
+        .expect("recover exact query after response loss");
+    assert_eq!(recovered, query_reply);
+
+    // A reopened driver which can no longer resolve the actor artifacts must
+    // select recovery-only execution and return the guest-owned disposition.
+    // It may not use that path to execute unseen work.
+    let mut artifact_store = FileAgentStore::new(&image_path);
+    artifact_store.remove_program(program).unwrap();
+    artifact_store.remove_actor_schema(deployment).unwrap();
+    artifact_store.remove_actor_policies(deployment).unwrap();
+    let recovery_revision = driver.image().revision;
+    let recovered_without_artifacts = driver
+        .invoke(query.clone(), &query_receipt)
+        .expect("recover without historical actor artifacts");
+    assert_eq!(recovered_without_artifacts, query_reply);
+    assert_eq!(driver.image().revision, recovery_revision);
+
+    let mut unseen = query.clone();
+    unseen.invocation = InvocationId([0x6b; 32]);
+    let unseen_receipt = invocation_receipt(&driver.image().config, &unseen);
+    assert_eq!(
+        driver.invoke(unseen, &unseen_receipt),
+        Err(AgentDriverError::Execution(
+            ActorExecutionError::InvalidAvailability
+        ))
+    );
+    assert_eq!(driver.image().revision, recovery_revision);
+
+    driver
+        .acknowledge_invocation(query.clone(), &query_receipt)
+        .expect("acknowledge the delivered exact result");
+    let acknowledged = decode_standard_runtime_state(&driver.image().runtime_state).unwrap();
+    assert!(
+        acknowledged
+            .invocation_results
+            .iter()
+            .all(|result| result.invocation != query.invocation)
+    );
+    assert!(driver.catalog_cleanup_pending());
+
+    artifact_store.put_program(program, &actor_pvm).unwrap();
+    artifact_store
+        .put_actor_schema(deployment, &schema_reference, &schema)
+        .unwrap();
+    artifact_store
+        .put_actor_policies(deployment, &policy_reference, &policies)
+        .unwrap();
+    assert_eq!(
+        driver.invoke(query, &query_receipt),
+        Err(AgentDriverError::Execution(
+            ActorExecutionError::AuthorityExpired
+        )),
+        "acknowledgement retires the exact result; an expired receipt cannot re-execute it"
+    );
 }

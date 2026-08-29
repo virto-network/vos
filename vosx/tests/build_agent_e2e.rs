@@ -2,7 +2,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
-use vos::agent::authority::{AgentAuthorityBinding, AgentAuthorityClaim, AgentAuthorityReceipt};
+use ed25519_dalek::{Signer as _, SigningKey};
+use vos::agent::authority::{
+    ActorInvocationClaim, ActorInvocationReceipt, AgentAuthorityBinding, AgentAuthorityClaim,
+    AgentAuthorityReceipt, ed25519_public_key_wire,
+};
+use vos::agent::contract::RuntimePackageContract;
 use vos::agent::driver::{AgentDriver, AgentDriverError, AgentTrustProvider, FileAgentStore};
 use vos::agent::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
@@ -24,8 +29,8 @@ const AGENT_RUNTIME_PVM: &[u8] = include_bytes!("../blobs/agent_runtime.pvm");
 
 struct TempDir(PathBuf);
 
-const TEST_INVOCATION_AUTHORITY_KEY: &[u8] = b"vos-agent-test-invocation-authority";
 const TEST_RUNTIME_PACKAGE_KEY: &[u8] = b"vos-agent-e2e-runtime-package-key";
+const TEST_AUTHORITY_SEED: [u8; 32] = [0x43; 32];
 
 struct TestTrust;
 
@@ -34,27 +39,22 @@ impl AgentTrustProvider for TestTrust {
         Some(15)
     }
 
-    fn verify_authority(&self, _: &AgentAuthorityBinding, _: &[u8], _: &[u8]) -> bool {
-        true
-    }
-
-    fn verify_invocation(
-        &self,
-        agent: &AgentConfig,
-        authorization_message: &[u8],
-        evidence: &[u8],
-    ) -> bool {
-        vos::service::Hash::digest(
-            b"vos/agent/test-invocation-authorization",
-            &[
-                TEST_INVOCATION_AUTHORITY_KEY,
-                &agent.identity.space.0,
-                &agent.identity.agent.0,
-                &agent.authority.commitment().0,
-                authorization_message,
-            ],
-        )
-        .0 == evidence
+    fn authority_for_space(&self, space: SpaceId) -> Option<AgentAuthorityBinding> {
+        match space {
+            SpaceId(value) if value == [3; 32] => Some(authority_binding(
+                AgentId([7; 32]),
+                ActorId([8; 32]),
+                DeploymentId([9; 32]),
+                vos::service::ProgramId([10; 32]),
+            )),
+            SpaceId(value) if value == [0x33; 32] => Some(authority_binding(
+                AgentId([0x36; 32]),
+                ActorId([0x37; 32]),
+                DeploymentId([0x38; 32]),
+                vos::service::ProgramId([0x39; 32]),
+            )),
+            _ => None,
+        }
     }
 
     fn verify_package(&self, agent: &AgentConfig, package: &Package) -> bool {
@@ -100,7 +100,7 @@ fn runtime_package() -> Package {
             platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             kind: vos::agent::PackageKind::AgentRuntime {
-                abi: vos::agent::RUNTIME_ABI_ID,
+                contract: RuntimePackageContract::canonical(),
                 capabilities: RuntimeCapabilities::standard(),
             },
             program: STANDARD_RUNTIME_PROGRAM_ID,
@@ -127,33 +127,64 @@ fn runtime_package() -> Package {
     package
 }
 
-fn invocation_evidence(config: &AgentConfig, invocation: &ActorInvocation) -> vos::service::Hash {
-    vos::service::Hash::digest(
-        b"vos/agent/test-invocation-authorization",
-        &[
-            TEST_INVOCATION_AUTHORITY_KEY,
-            &config.identity.space.0,
-            &config.identity.agent.0,
-            &config.authority.commitment().0,
-            &invocation.authorization_message().0,
-        ],
-    )
+fn authority_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&TEST_AUTHORITY_SEED)
+}
+
+fn authority_binding(
+    agent: AgentId,
+    actor: ActorId,
+    deployment: DeploymentId,
+    program: vos::service::ProgramId,
+) -> AgentAuthorityBinding {
+    let key = authority_signing_key();
+    let public_key = ed25519_public_key_wire(key.verifying_key().to_bytes());
+    AgentAuthorityBinding {
+        agent,
+        actor,
+        deployment,
+        program,
+        producer: ProducerId::of_public_key(&public_key),
+        public_key,
+    }
+}
+
+fn invocation_receipt(
+    config: &AgentConfig,
+    invocation: &ActorInvocation,
+) -> ActorInvocationReceipt {
+    let key = authority_signing_key();
+    let claim = ActorInvocationClaim {
+        authority: config.authority.clone(),
+        space: config.identity.space,
+        agent: config.identity.agent,
+        principal: invocation.auth.principal,
+        credential: invocation.auth.principal.map(|_| CredentialId([0x34; 32])),
+        authorization: invocation.authorization_message(),
+        auth: invocation.auth.clone(),
+        valid_from: 10,
+        valid_until: 20,
+    };
+    ActorInvocationReceipt {
+        signature: key.sign(&claim.signing_message().0).to_bytes().to_vec(),
+        claim,
+    }
 }
 
 fn invoke(
     driver: &mut AgentDriver<FileAgentStore>,
     invocation: ActorInvocation,
 ) -> Result<ActorExecutionReply, AgentDriverError> {
-    let evidence = invocation_evidence(&driver.image().config, &invocation);
-    driver.invoke(invocation, &evidence.0)
+    let receipt = invocation_receipt(&driver.image().config, &invocation);
+    driver.invoke(invocation, &receipt)
 }
 
 fn acknowledge(
     driver: &mut AgentDriver<FileAgentStore>,
     invocation: ActorInvocation,
 ) -> Result<(), AgentDriverError> {
-    let evidence = invocation_evidence(&driver.image().config, &invocation);
-    driver.acknowledge_invocation(invocation, &evidence.0)
+    let receipt = invocation_receipt(&driver.image().config, &invocation);
+    driver.acknowledge_invocation(invocation, &receipt)
 }
 
 fn authority_receipt(
@@ -162,33 +193,33 @@ fn authority_receipt(
     capability: &str,
     sequence: u64,
 ) -> AgentAuthorityReceipt {
+    let key = authority_signing_key();
+    let claim = AgentAuthorityClaim {
+        authority: config.authority.clone(),
+        space: config.identity.space,
+        agent: config.identity.agent,
+        principal: config.identity.owner,
+        credential: CredentialId([0x33; 32]),
+        capability: CapabilityId::named(capability),
+        operation: request.commitment(),
+        sequence,
+        valid_from: 10,
+        valid_until: 20,
+    };
     AgentAuthorityReceipt {
-        claim: AgentAuthorityClaim {
-            authority: config.authority.clone(),
-            space: config.identity.space,
-            agent: config.identity.agent,
-            principal: config.identity.owner,
-            credential: CredentialId([0x33; 32]),
-            capability: CapabilityId::named(capability),
-            operation: request.commitment(),
-            sequence,
-            valid_from: 10,
-            valid_until: 20,
-        },
-        signature: vec![1],
+        signature: key.sign(&claim.signing_message().0).to_bytes().to_vec(),
+        claim,
     }
 }
 
 fn creation_receipt(config: &AgentConfig) -> AgentAuthorityReceipt {
     let request = LifecycleRequest::Create(config.clone());
-    let mut receipt = authority_receipt(
+    authority_receipt(
         config,
         &request,
         vos::agent::authority::CAPABILITY_AGENT_CREATE_LOCAL,
         1,
-    );
-    receipt.claim.credential = CredentialId([0x32; 32]);
-    receipt
+    )
 }
 
 impl TempDir {
@@ -278,11 +309,13 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
     );
 
     let owner = PrincipalId([1; 32]);
-    let agent = AgentId([2; 32]);
+    let space = SpaceId([3; 32]);
+    let creation_nonce = Hash([2; 32]);
+    let agent = AgentId::derive(space, owner, &creation_nonce.0);
     let runtime = runtime_package();
     let agent_config = AgentConfig {
         identity: AgentIdentity {
-            space: SpaceId([3; 32]),
+            space,
             agent,
             owner,
             profile: AgentProfile::Local,
@@ -290,15 +323,15 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
             runtime_program: runtime.manifest.program,
             runtime_producer: runtime.deployment_signature.producer,
         },
-        authority: vos::agent::authority::AgentAuthorityBinding {
-            agent: AgentId([7; 32]),
-            actor: ActorId([8; 32]),
-            deployment: DeploymentId([9; 32]),
-            program: vos::service::ProgramId([10; 32]),
-            producer: ProducerId::of_public_key(b"authority-key"),
-            public_key: b"authority-key".to_vec(),
-        },
+        creation_nonce,
+        authority: authority_binding(
+            AgentId([7; 32]),
+            ActorId([8; 32]),
+            DeploymentId([9; 32]),
+            vos::service::ProgramId([10; 32]),
+        ),
         runtime_package: BlobRef::of_bytes(&runtime.encode()),
+        runtime_contract: RuntimePackageContract::canonical(),
         capabilities: RuntimeCapabilities::standard(),
         replicas: vec![AgentReplica {
             node: NodeId([6; 32]),
@@ -336,7 +369,14 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
         deployment,
         program: package.manifest.program,
         mode: vos::agent::MethodMode::Linear,
-        auth: ActorInvocationAuth::anonymous(),
+        auth: ActorInvocationAuth {
+            origin: Origin::Member(SubjectId([0x11; 32])),
+            principal: Some(owner),
+            origin_service: None,
+            space_role: None,
+            actor_role: None,
+            capability: None,
+        },
         message: dynamic_message("increment", "by", 2),
         availability: Vec::new(),
         gas: 1_000_000_000,
@@ -447,7 +487,7 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
         .expect("build the mixed actor package");
     assert!(status.success());
 
-    let status = Command::new(env!("CARGO_BIN_EXE_vosx"))
+    let isolation = Command::new(env!("CARGO_BIN_EXE_vosx"))
         .args([
             "agent",
             "build",
@@ -457,9 +497,15 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
         .arg(&out)
         .env("XDG_CONFIG_HOME", temp.0.join("isolation-config"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .status()
-        .expect("build the cross-lane adversarial fixture");
-    assert!(status.success());
+        .output()
+        .expect("reject the cross-lane adversarial fixture");
+    assert!(!isolation.status.success());
+    let isolation_error = String::from_utf8_lossy(&isolation.stderr);
+    assert!(
+        isolation_error.contains("no field `linear`")
+            && isolation_error.contains("no field `private`"),
+        "lane-specific views must reject both Merge→Linear and Query→Local access: {isolation_error}"
+    );
 
     let package_bytes = std::fs::read(out.join("Board.vos")).unwrap();
     assert_eq!(package_bytes.get(..4), Some(b"VOSK".as_slice()));
@@ -480,11 +526,13 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
         .expect("set_title carries the signed moderator gate");
 
     let owner = PrincipalId([0x31; 32]);
-    let agent = AgentId([0x32; 32]);
+    let space = SpaceId([0x33; 32]);
+    let creation_nonce = Hash([0x32; 32]);
+    let agent = AgentId::derive(space, owner, &creation_nonce.0);
     let runtime = runtime_package();
     let agent_config = AgentConfig {
         identity: AgentIdentity {
-            space: SpaceId([0x33; 32]),
+            space,
             agent,
             owner,
             profile: AgentProfile::Local,
@@ -492,15 +540,15 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
             runtime_program: runtime.manifest.program,
             runtime_producer: runtime.deployment_signature.producer,
         },
-        authority: vos::agent::authority::AgentAuthorityBinding {
-            agent: AgentId([0x36; 32]),
-            actor: ActorId([0x37; 32]),
-            deployment: DeploymentId([0x38; 32]),
-            program: vos::service::ProgramId([0x39; 32]),
-            producer: ProducerId::of_public_key(b"mixed-authority-key"),
-            public_key: b"mixed-authority-key".to_vec(),
-        },
+        creation_nonce,
+        authority: authority_binding(
+            AgentId([0x36; 32]),
+            ActorId([0x37; 32]),
+            DeploymentId([0x38; 32]),
+            vos::service::ProgramId([0x39; 32]),
+        ),
         runtime_package: BlobRef::of_bytes(&runtime.encode()),
+        runtime_contract: RuntimePackageContract::canonical(),
         capabilities: RuntimeCapabilities::standard(),
         replicas: vec![AgentReplica {
             node: NodeId([0x3a; 32]),
@@ -532,24 +580,6 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
         .install_actor(&receipt, "board".into(), None, &package)
         .unwrap();
 
-    let escape_package = Package::decode(
-        &std::fs::read(out.join("LaneEscape.vos")).expect("cross-lane fixture package"),
-    )
-    .unwrap();
-    escape_package.validate().unwrap();
-    let escape_actor = ActorId::top_level(agent, "lane-escape");
-    let escape_install = driver
-        .actor_install_request("lane-escape".into(), None, &escape_package)
-        .unwrap();
-    let escape_receipt = authority_receipt(
-        &agent_config,
-        &escape_install,
-        vos::agent::authority::CAPABILITY_ACTOR_INSTALL,
-        3,
-    );
-    driver
-        .install_actor(&escape_receipt, "lane-escape".into(), None, &escape_package)
-        .unwrap();
     let installed = driver.image().runtime_state.clone();
 
     let invocation = |id: u8, mode, message| ActorInvocation {
@@ -558,7 +588,14 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
         deployment,
         program: package.manifest.program,
         mode,
-        auth: ActorInvocationAuth::anonymous(),
+        auth: ActorInvocationAuth {
+            origin: Origin::Member(SubjectId([0x3b; 32])),
+            principal: Some(owner),
+            origin_service: None,
+            space_role: None,
+            actor_role: None,
+            capability: None,
+        },
         message,
         availability: Vec::new(),
         gas: 1_000_000_000,
@@ -572,24 +609,6 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
     assert_eq!(
         invoke(&mut driver, anonymous_title).unwrap().status,
         ActorExecutionStatus::Forbidden
-    );
-    assert_eq!(driver.image().runtime_state, installed);
-
-    let escape = ActorInvocation {
-        invocation: InvocationId([0x4a; 32]),
-        actor: escape_actor,
-        deployment: escape_package.deployment_id(),
-        program: escape_package.manifest.program,
-        mode: MethodMode::Merge,
-        auth: ActorInvocationAuth::anonymous(),
-        message: dynamic_no_args("escape"),
-        availability: Vec::new(),
-        gas: 1_000_000_000,
-    };
-    assert_eq!(
-        invoke(&mut driver, escape).unwrap().status,
-        ActorExecutionStatus::Panicked,
-        "fresh Linear state cannot be changed by a Merge handler"
     );
     assert_eq!(driver.image().runtime_state, installed);
 
@@ -614,6 +633,7 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
     );
     set_title.auth = ActorInvocationAuth {
         origin: Origin::Member(SubjectId([0x3b; 32])),
+        principal: Some(vos::service::PrincipalId([0x3c; 32])),
         origin_service: None,
         space_role: None,
         actor_role: Some(moderator_role),
@@ -658,17 +678,14 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
     assert_eq!(driver.image().revision, revision);
     assert_eq!(driver.image().runtime_state, after_linear);
 
-    let add_task = invocation(
-        0x45,
-        MethodMode::Merge,
-        dynamic_task(1, "A task large enough to cross the FETCH probe".repeat(32)),
-    );
+    let task_text = "A task large enough to cross the FETCH probe".repeat(32);
+    let add_task = invocation(0x45, MethodMode::Merge, dynamic_task(1, task_text.clone()));
     let add_task_reply = invoke(&mut driver, add_task.clone()).unwrap();
     assert_eq!(add_task_reply.status, ActorExecutionStatus::Done);
     assert_eq!(
         vos::value::Value::decode(&add_task_reply.reply).as_str(),
-        Some("Agent architecture"),
-        "Merge execution reads the non-default pinned Linear lane"
+        Some(task_text.as_str()),
+        "Merge execution can return only data available through its Merge view"
     );
     let after_merge = driver.image().runtime_state.clone();
     assert_eq!(after_merge.linear, after_linear.linear);
@@ -678,11 +695,22 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
     let after_merge = driver.image().runtime_state.clone();
 
     let edit_count = invocation(0x46, MethodMode::Query, dynamic_no_args("edit_count"));
+    let edit_count_reply = invoke(&mut driver, edit_count.clone()).unwrap();
     assert_eq!(
-        vos::value::Value::decode(&invoke(&mut driver, edit_count).unwrap().reply,).as_i64(),
+        vos::value::Value::decode(&edit_count_reply.reply).as_i64(),
         Some(1)
     );
-    assert_eq!(driver.image().runtime_state, after_merge);
+    assert_eq!(
+        invoke(&mut driver, edit_count.clone()).unwrap(),
+        edit_count_reply,
+        "a coherent query retry returns its guest-owned exact result"
+    );
+    let after_query = driver.image().runtime_state.clone();
+    assert_ne!(after_query.control, after_merge.control);
+    assert_eq!(after_query.linear, after_merge.linear);
+    assert_eq!(after_query.merge, after_merge.merge);
+    assert_eq!(after_query.local, after_merge.local);
+    acknowledge(&mut driver, edit_count).unwrap();
 
     let committed_revision = driver.image().revision;
 

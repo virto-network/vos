@@ -41,7 +41,8 @@ pub fn run(path: PathBuf, crdt: bool, target: ProjectTarget) -> anyhow::Result<(
         match (target, crdt) {
             (ProjectTarget::Service, true) => service_crdt_source(&crate_name),
             (ProjectTarget::Agent, true) => agent_crdt_source(&crate_name),
-            (_, false) => counter_source(&crate_name),
+            (ProjectTarget::Service, false) => counter_source(&crate_name, false),
+            (ProjectTarget::Agent, false) => counter_source(&crate_name, true),
         },
     )?;
     println!("created {}", path.display());
@@ -85,18 +86,24 @@ panic = "abort"
     )
 }
 
-fn counter_source(name: &str) -> String {
+fn counter_source(name: &str, agent: bool) -> String {
+    let actor_attribute = if agent { "#[actor(agent)]" } else { "#[actor]" };
+    let messages_attribute = if agent {
+        "#[messages(agent)]"
+    } else {
+        "#[messages]"
+    };
     format!(
         r#"//! {name}: an actor with linear state.
 
 use vos::prelude::*;
 
-#[actor]
+{actor_attribute}
 pub struct Counter {{
     count: u64,
 }}
 
-#[messages]
+{messages_attribute}
 impl Counter {{
     fn new() -> Self {{
         Self {{ count: 0 }}
@@ -174,7 +181,7 @@ fn agent_crdt_source(name: &str) -> String {
 
 use vos::prelude::*;
 
-#[actor]
+#[actor(agent)]
 pub struct SharedBoard {{
     title: crdt::Value<String>,
     tasks: crdt::Map<u64, String>,
@@ -182,7 +189,7 @@ pub struct SharedBoard {{
     edits: crdt::Counter,
 }}
 
-#[messages]
+#[messages(agent)]
 impl SharedBoard {{
     fn new() -> Self {{
         Self {{
@@ -320,7 +327,7 @@ mod tests {
         assert!(
             !cargo_toml("x", ProjectTarget::Service).contains(r#"features = ["macros", "pvm"]"#)
         );
-        assert!(!counter_source("x").contains("#![no_std]"));
+        assert!(!counter_source("x", false).contains("#![no_std]"));
         assert!(service_crdt_source("x").contains("#[actor(crdt)]"));
     }
 
@@ -332,12 +339,16 @@ mod tests {
         assert!(AGENT_CONFIG.contains("-Clink-arg=-Tpvm.ld"));
         assert!(cargo_toml("x", ProjectTarget::Agent).contains(r#"features = ["macros", "pvm"]"#));
         assert!(PVM_LINKER_SCRIPT.contains("SIZEOF(.rodata)"));
+        let source = counter_source("x", true);
+        assert!(source.contains("#[actor(agent)]"));
+        assert!(source.contains("#[messages(agent)]"));
     }
 
     #[test]
     fn merge_template_uses_the_signed_agent_lane_surface() {
         let source = agent_crdt_source("x");
-        assert!(source.contains("#[actor]"));
+        assert!(source.contains("#[actor(agent)]"));
+        assert!(source.contains("#[messages(agent)]"));
         assert!(source.contains("#[msg(merge)]"));
         assert!(source.contains("crdt::Value<String>"));
         assert!(!source.contains("#[actor(crdt)]"));

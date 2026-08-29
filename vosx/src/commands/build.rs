@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, anyhow, bail};
+use vos::agent::contract::ActorPackageContract;
 use vos::agent::package::{
     Package as AgentPackage, PackageManifest as AgentPackageManifest, actor_runtime_requirements,
 };
@@ -281,7 +282,10 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
                     name: name.clone(),
                     platform: vos::service::PLATFORM_ID,
                     execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
-                    kind: PackageKind::Actor { requirements },
+                    kind: PackageKind::Actor {
+                        contract: ActorPackageContract::canonical(),
+                        requirements,
+                    },
                     program: actor_program,
                     interfaces_hash: artifact_hash(b"interfaces", &interfaces),
                     role_policies_hash: artifact_hash(b"role-policies", &role_policies),
@@ -1196,7 +1200,7 @@ mod tests {
                 .unwrap();
         assert!(matches!(
             package.manifest.kind,
-            PackageKind::Actor { requirements }
+            PackageKind::Actor { requirements, .. }
                 if requirements.lanes == LaneSet::NONE
         ));
         assert_eq!(package.manifest.program, ProgramId::of_pvm(&actor_pvm));

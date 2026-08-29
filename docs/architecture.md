@@ -83,3 +83,24 @@ accepted transitions are ordered and exchanged, not what an actor is.
 Packages, programs, proofs, and state artifacts are content-addressed. Human
 names are catalog labels. Durable work binds the exact hashes and deployment
 identities it used, so a label change cannot silently change execution.
+
+## Signed agent contracts
+
+Actor packages and agent-runtime packages are independently signed. An actor
+does not pin one runtime program; it declares the actor ABI and capabilities it
+needs. A runtime declares an inclusive actor-ABI range, the canonical lifecycle
+and control-schema identities it implements, resource ceilings, and its state
+migration policy.
+
+```mermaid
+flowchart LR
+    Actor[Actor package<br/>actor ABI + required capabilities]
+    Runtime[Runtime package<br/>ABI range + control schema<br/>limits + migration policy]
+    Actor -->|ABI in range and requirements satisfied| Runtime
+```
+
+The standard runtime accepts the canonical actor ABI, supports a directory of
+up to 4,096 actors, and implements no state-migration protocol. Actor count is
+separate from the signed state-image byte ceiling: reaching either limit fails
+closed. Unknown ABI ranges, control schemas, or migration policies are rejected
+before installation.

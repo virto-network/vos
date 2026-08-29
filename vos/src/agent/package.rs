@@ -1,13 +1,20 @@
 //! Signed packages for actors and agent runtimes.
 //!
-//! Actor packages state what they need; they never pin the runtime that will
-//! host them. Agent-runtime packages bind the stable lifecycle ABI and state
-//! lane capabilities they implement.
+//! Actor packages state the actor ABI and capabilities they need; they never
+//! pin the runtime that will host them. Agent-runtime packages bind the stable
+//! lifecycle ABI, supported actor-ABI range, canonical control schema,
+//! resource ceilings, migration policy, and capabilities they implement.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::{LaneSet, PackageKind, RUNTIME_ABI_ID, RuntimeCapabilities, RuntimeRequirements};
+#[cfg(test)]
+use super::contract::{ActorAbiRange, ActorPackageContract};
+use super::contract::{
+    RuntimeMigrationPolicy, RuntimePackageContract, decode_actor_contract, decode_runtime_contract,
+    encode_actor_contract, encode_runtime_contract,
+};
+use super::{LaneSet, PackageKind, RuntimeCapabilities, RuntimeRequirements};
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{DeploymentId, Hash, ProducerId, ProgramId};
 use crate::service::{
@@ -31,6 +38,21 @@ pub const MAX_PACKAGE_DIAGNOSTICS_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PACKAGE_NAME_BYTES: usize = crate::service::MAX_ACTOR_NAME_BYTES;
 const MAX_PACKAGE_SIGNING_KEY_BYTES: usize = 4 * 1024;
 const MAX_PACKAGE_SIGNATURE_BYTES: usize = 4 * 1024;
+
+fn is_valid_program(program: &[u8]) -> bool {
+    // Production package admission runs in a std host, where the selected
+    // executor's opcode and instruction-boundary checks are available. Guest
+    // runtimes retain the portable structural check; they only observe
+    // packages that a host has already admitted.
+    #[cfg(feature = "std")]
+    {
+        vos_pvm::spi::parse_standard_program(program).is_some()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        vos_pvm_program::parse_standard_program(program).is_some()
+    }
+}
 
 /// Derive the runtime features authenticated by an actor package.
 ///
@@ -94,7 +116,12 @@ pub enum PackageError {
     DependenciesHashMismatch,
     InvalidActorArtifacts,
     InvalidRuntimeArtifacts,
+    InvalidActorAbi,
     InvalidRuntimeAbi,
+    InvalidRuntimeActorAbiRange,
+    InvalidRuntimeControlSchema,
+    InvalidRuntimeResources,
+    UnsupportedRuntimeMigration,
     InvalidRuntimeCapacity,
     UnsupportedActorEntry,
     UnsupportedActorConstructor,
@@ -157,7 +184,7 @@ impl Package {
         {
             return Err(PackageError::ArtifactsTooLarge);
         }
-        if vos_pvm_program::parse_standard_program(&self.pvm).is_none() {
+        if !is_valid_program(&self.pvm) {
             return Err(PackageError::InvalidProgram);
         }
         if ProgramId::of_pvm(&self.pvm) != self.manifest.program {
@@ -188,11 +215,17 @@ impl Package {
         }
 
         match self.manifest.kind {
-            PackageKind::Actor { .. } => self.validate_actor_artifacts()?,
-            PackageKind::AgentRuntime { abi, capabilities } => {
-                if abi != RUNTIME_ABI_ID {
-                    return Err(PackageError::InvalidRuntimeAbi);
+            PackageKind::Actor { contract, .. } => {
+                if !contract.is_valid() {
+                    return Err(PackageError::InvalidActorAbi);
                 }
+                self.validate_actor_artifacts()?;
+            }
+            PackageKind::AgentRuntime {
+                contract,
+                capabilities,
+            } => {
+                validate_runtime_contract(contract)?;
                 if capabilities.max_actors == 0 {
                     return Err(PackageError::InvalidRuntimeCapacity);
                 }
@@ -229,6 +262,7 @@ impl Package {
             || self.task_dependencies.iter().any(|dependency| {
                 dependency.pvm.is_empty()
                     || dependency.pvm.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
+                    || !is_valid_program(&dependency.pvm)
                     || ProgramId::of_pvm(&dependency.pvm) != dependency.binding.program
                     || Hash(crate::provable::task_blob_hash(&dependency.pvm))
                         != dependency.binding.task
@@ -273,7 +307,7 @@ impl Package {
         }
         if actor_runtime_requirements(&agent_schema, &metadata, !self.task_dependencies.is_empty())
             != match self.manifest.kind {
-                PackageKind::Actor { requirements } => requirements,
+                PackageKind::Actor { requirements, .. } => requirements,
                 PackageKind::AgentRuntime { .. } => {
                     return Err(PackageError::InvalidActorArtifacts);
                 }
@@ -544,13 +578,20 @@ fn decode_manifest(decoder: &mut Decoder<'_>) -> Result<PackageManifest, DecodeE
 
 fn encode_kind(encoder: &mut Encoder<'_>, kind: PackageKind) {
     match kind {
-        PackageKind::Actor { requirements } => {
+        PackageKind::Actor {
+            contract,
+            requirements,
+        } => {
             encoder.u8(0);
+            encode_actor_contract(encoder, contract);
             encode_requirements(encoder, requirements);
         }
-        PackageKind::AgentRuntime { abi, capabilities } => {
+        PackageKind::AgentRuntime {
+            contract,
+            capabilities,
+        } => {
             encoder.u8(1);
-            encoder.fixed(&abi.0);
+            encode_runtime_contract(encoder, contract);
             encode_capabilities(encoder, capabilities);
         }
     }
@@ -559,14 +600,34 @@ fn encode_kind(encoder: &mut Encoder<'_>, kind: PackageKind) {
 fn decode_kind(decoder: &mut Decoder<'_>) -> Result<PackageKind, DecodeError> {
     match decoder.u8()? {
         0 => Ok(PackageKind::Actor {
+            contract: decode_actor_contract(decoder)?,
             requirements: decode_requirements(decoder)?,
         }),
         1 => Ok(PackageKind::AgentRuntime {
-            abi: Hash(decoder.fixed()?),
+            contract: decode_runtime_contract(decoder)?,
             capabilities: decode_capabilities(decoder)?,
         }),
         _ => Err(DecodeError::InvalidTag),
     }
+}
+
+fn validate_runtime_contract(contract: RuntimePackageContract) -> Result<(), PackageError> {
+    if contract.lifecycle_abi != super::RUNTIME_ABI_ID {
+        return Err(PackageError::InvalidRuntimeAbi);
+    }
+    if !contract.actor_abis.is_valid() {
+        return Err(PackageError::InvalidRuntimeActorAbiRange);
+    }
+    if contract.control_schema != super::contract::CONTROL_SCHEMA_ID {
+        return Err(PackageError::InvalidRuntimeControlSchema);
+    }
+    if !contract.resources.is_valid() {
+        return Err(PackageError::InvalidRuntimeResources);
+    }
+    if !matches!(contract.migration, RuntimeMigrationPolicy::None) {
+        return Err(PackageError::UnsupportedRuntimeMigration);
+    }
+    Ok(())
 }
 
 fn encode_requirements(encoder: &mut Encoder<'_>, requirements: RuntimeRequirements) {
@@ -709,7 +770,7 @@ mod tests {
                 platform: crate::service::PLATFORM_ID,
                 execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
                 kind: PackageKind::AgentRuntime {
-                    abi: RUNTIME_ABI_ID,
+                    contract: RuntimePackageContract::canonical(),
                     capabilities: RuntimeCapabilities::standard(),
                 },
                 program: ProgramId::of_pvm(&pvm),
@@ -767,7 +828,10 @@ mod tests {
                 name: "counter".into(),
                 platform: crate::service::PLATFORM_ID,
                 execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
-                kind: PackageKind::Actor { requirements },
+                kind: PackageKind::Actor {
+                    contract: ActorPackageContract::canonical(),
+                    requirements,
+                },
                 program: ProgramId::of_pvm(&pvm),
                 interfaces_hash: artifact_hash(b"interfaces", &generated_interfaces),
                 role_policies_hash: artifact_hash(b"role-policies", &role_policies),
@@ -827,6 +891,25 @@ mod tests {
     }
 
     #[test]
+    fn package_rejects_structural_programs_the_executor_cannot_run() {
+        let mut package = runtime_package();
+        package.pvm = vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
+            ro_data: Vec::new(),
+            rw_data: Vec::new(),
+            heap_pages: 0,
+            stack_size: vos_pvm_program::PAGE_SIZE,
+            code: vos_pvm_program::CodeBlob {
+                jump_table: Vec::new(),
+                code: vec![0xff],
+                bitmask: vec![1],
+            },
+        })
+        .unwrap();
+        package.manifest.program = ProgramId::of_pvm(&package.pvm);
+        assert_eq!(package.validate(), Err(PackageError::InvalidProgram));
+    }
+
+    #[test]
     fn package_decoder_rejects_oversized_envelope_before_fields() {
         let mut bytes = Vec::with_capacity(MAX_ENCODED_PACKAGE_BYTES + 37);
         bytes.extend_from_slice(&Package::MAGIC);
@@ -836,15 +919,17 @@ mod tests {
     }
 
     #[test]
-    fn runtime_abi_and_capacity_are_signed_and_checked() {
+    fn runtime_contract_and_capacity_are_signed_and_checked() {
         let mut package = runtime_package();
+        let mut contract = RuntimePackageContract::canonical();
+        contract.lifecycle_abi = Hash([9; 32]);
         package.manifest.kind = PackageKind::AgentRuntime {
-            abi: Hash([9; 32]),
+            contract,
             capabilities: RuntimeCapabilities::standard(),
         };
         assert_eq!(package.validate(), Err(PackageError::InvalidRuntimeAbi));
         package.manifest.kind = PackageKind::AgentRuntime {
-            abi: RUNTIME_ABI_ID,
+            contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities {
                 max_actors: 0,
                 ..RuntimeCapabilities::standard()
@@ -853,6 +938,85 @@ mod tests {
         assert_eq!(
             package.validate(),
             Err(PackageError::InvalidRuntimeCapacity)
+        );
+
+        let mut contract = RuntimePackageContract::canonical();
+        contract.actor_abis = ActorAbiRange {
+            minimum: 2,
+            maximum: 1,
+        };
+        package.manifest.kind = PackageKind::AgentRuntime {
+            contract,
+            capabilities: RuntimeCapabilities::standard(),
+        };
+        assert_eq!(
+            package.validate(),
+            Err(PackageError::InvalidRuntimeActorAbiRange)
+        );
+
+        let mut contract = RuntimePackageContract::canonical();
+        contract.control_schema = Hash([7; 32]);
+        package.manifest.kind = PackageKind::AgentRuntime {
+            contract,
+            capabilities: RuntimeCapabilities::standard(),
+        };
+        assert_eq!(
+            package.validate(),
+            Err(PackageError::InvalidRuntimeControlSchema)
+        );
+
+        let mut contract = RuntimePackageContract::canonical();
+        contract.resources.max_runtime_state_bytes = 0;
+        package.manifest.kind = PackageKind::AgentRuntime {
+            contract,
+            capabilities: RuntimeCapabilities::standard(),
+        };
+        assert_eq!(
+            package.validate(),
+            Err(PackageError::InvalidRuntimeResources)
+        );
+    }
+
+    #[test]
+    fn actor_abi_is_signed_and_checked_against_the_runtime_range() {
+        let mut package = actor_package(
+            &ACTOR_META,
+            &ACTOR_SCHEMA,
+            super::super::schema::ExecutionEntryKind::AgentActor,
+        );
+        let canonical_id = package.deployment_id();
+        let requirements = match package.manifest.kind {
+            PackageKind::Actor { requirements, .. } => requirements,
+            PackageKind::AgentRuntime { .. } => unreachable!(),
+        };
+        package.manifest.kind = PackageKind::Actor {
+            contract: ActorPackageContract { actor_abi: 2 },
+            requirements,
+        };
+        assert_ne!(package.deployment_id(), canonical_id);
+        assert!(!package.manifest.kind.is_compatible_with(
+            RuntimePackageContract::canonical(),
+            RuntimeCapabilities::standard()
+        ));
+
+        package.manifest.kind = PackageKind::Actor {
+            contract: ActorPackageContract { actor_abi: 0 },
+            requirements,
+        };
+        assert_eq!(package.validate(), Err(PackageError::InvalidActorAbi));
+    }
+
+    #[test]
+    fn package_decoder_rejects_unknown_migration_policy() {
+        let mut bytes = Vec::new();
+        encode_runtime_contract(
+            &mut Encoder(&mut bytes),
+            RuntimePackageContract::canonical(),
+        );
+        *bytes.last_mut().unwrap() = 1;
+        assert_eq!(
+            decode_runtime_contract(&mut Decoder::new(&bytes)),
+            Err(DecodeError::InvalidTag)
         );
     }
 
@@ -864,8 +1028,14 @@ mod tests {
             scheduling: false,
             proofs: true,
         };
-        let kind = PackageKind::Actor { requirements };
-        assert!(!kind.is_compatible_with(RuntimeCapabilities::standard()));
+        let kind = PackageKind::Actor {
+            contract: ActorPackageContract::canonical(),
+            requirements,
+        };
+        assert!(!kind.is_compatible_with(
+            RuntimePackageContract::canonical(),
+            RuntimeCapabilities::standard()
+        ));
         assert_ne!(package.manifest.program, ProgramId([0; 32]));
     }
 
@@ -879,16 +1049,16 @@ mod tests {
         assert!(matches!(
             attested.manifest.kind,
             PackageKind::Actor {
-                requirements: RuntimeRequirements { proofs: true, .. }
+                requirements: RuntimeRequirements { proofs: true, .. },
+                ..
             }
         ));
-        assert!(
-            !attested
-                .manifest
-                .kind
-                .is_compatible_with(RuntimeCapabilities::standard())
-        );
+        assert!(!attested.manifest.kind.is_compatible_with(
+            RuntimePackageContract::canonical(),
+            RuntimeCapabilities::standard()
+        ));
         attested.manifest.kind = PackageKind::Actor {
+            contract: ActorPackageContract::canonical(),
             requirements: RuntimeRequirements {
                 lanes: LaneSet::of(super::super::StateLane::Linear),
                 scheduling: false,
@@ -911,15 +1081,16 @@ mod tests {
                 requirements: RuntimeRequirements {
                     scheduling: true,
                     ..
-                }
+                },
+                ..
             }
         ));
-        assert!(
-            !job.manifest
-                .kind
-                .is_compatible_with(RuntimeCapabilities::standard())
-        );
+        assert!(!job.manifest.kind.is_compatible_with(
+            RuntimePackageContract::canonical(),
+            RuntimeCapabilities::standard()
+        ));
         job.manifest.kind = PackageKind::Actor {
+            contract: ActorPackageContract::canonical(),
             requirements: RuntimeRequirements {
                 lanes: LaneSet::of(super::super::StateLane::Linear),
                 scheduling: false,

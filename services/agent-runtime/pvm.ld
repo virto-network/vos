@@ -14,9 +14,9 @@ SECTIONS
      * making 0x60000 the first canonical read-write address. */
     .data 0x60000 : { *(.data .data.* .sdata .sdata.*) }
     .bss ALIGN(0x1000) : { *(.bss .bss.* .sbss .sbss.* COMMON) }
-    /* Keep translated code outside the infrastructure heap's ELF range.
-     * Standard-program code has its own instruction address space. */
-    .text 0x900000 : { *(.text .text.* .init .init.*) }
+    /* Keep translated code outside the 32 MiB infrastructure heap's ELF
+     * range. Standard-program code has its own instruction address space. */
+    .text 0x3000000 : { *(.text .text.* .init .init.*) }
 
     /DISCARD/ : { *(.eh_frame .eh_frame_hdr .comment .riscv.attributes) }
 }

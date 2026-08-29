@@ -145,20 +145,28 @@ impl StandardProgram {
 pub fn read_nat(data: &[u8], offset: usize) -> Option<(u64, usize)> {
     let header = *data.get(offset)?;
     let length = header.leading_ones() as usize;
-    if length == 0 {
-        return Some((u64::from(header), 1));
-    }
-    if length >= 8 {
+    let (value, consumed) = if length == 0 {
+        (u64::from(header), 1)
+    } else if length >= 8 {
         let bytes = data.get(offset + 1..offset + 9)?;
-        return Some((u64::from_le_bytes(bytes.try_into().ok()?), 9));
-    }
-    let bytes = data.get(offset + 1..offset + 1 + length)?;
-    let mut low = 0u64;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        low |= u64::from(byte) << (8 * index);
-    }
-    let top = u64::from(header) & ((1u64 << (8 - length)) - 1);
-    Some((low | (top << (8 * length)), 1 + length))
+        (u64::from_le_bytes(bytes.try_into().ok()?), 9)
+    } else {
+        let bytes = data.get(offset + 1..offset + 1 + length)?;
+        let mut low = 0u64;
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            low |= u64::from(byte) << (8 * index);
+        }
+        let top = u64::from(header) & ((1u64 << (8 - length)) - 1);
+        (low | (top << (8 * length)), 1 + length)
+    };
+
+    // The wire has exactly one representation for each natural. Rejecting a
+    // wider-than-necessary length class prevents distinct program bytes from
+    // decoding to the same executable image.
+    let canonical_length = (0usize..8)
+        .find(|candidate| value < 1u64 << (7 * (*candidate as u32 + 1)))
+        .unwrap_or(8);
+    (length == canonical_length).then_some((value, consumed))
 }
 
 /// Encode a standard variable-length natural.
@@ -205,6 +213,13 @@ fn pack_bitmask(bitmask: &[u8]) -> Vec<u8> {
     packed
 }
 
+fn copy_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    output.try_reserve_exact(bytes.len()).ok()?;
+    output.extend_from_slice(bytes);
+    Some(output)
+}
+
 pub fn parse_compact_code_blob(data: &[u8]) -> Option<CodeBlob> {
     let (jump_len, jump_nat_len) = read_nat(data, 0)?;
     let mut offset = jump_nat_len;
@@ -218,20 +233,39 @@ pub fn parse_compact_code_blob(data: &[u8]) -> Option<CodeBlob> {
     let jump_len = usize::try_from(jump_len).ok()?;
     let code_len = usize::try_from(code_len).ok()?;
 
-    let mut jump_table = Vec::with_capacity(jump_len);
+    // Prove that every declared item is present before reserving from an
+    // attacker-controlled count. In particular, a tiny blob declaring
+    // u64::MAX jump entries must fail here rather than panic in the allocator.
+    let jump_bytes = jump_len.checked_mul(width)?;
+    let jump_end = offset.checked_add(jump_bytes)?;
+    let code_end = jump_end.checked_add(code_len)?;
+    let packed_len = code_len.div_ceil(8);
+    let packed_end = code_end.checked_add(packed_len)?;
+    if packed_end != data.len() {
+        return None;
+    }
+
+    let mut jump_table = Vec::new();
+    jump_table.try_reserve_exact(jump_len).ok()?;
     for _ in 0..jump_len {
         jump_table.push(u32::try_from(read_le(data, offset, width)?).ok()?);
         offset = offset.checked_add(width)?;
     }
-    let code_end = offset.checked_add(code_len)?;
-    let code = data.get(offset..code_end)?.to_vec();
-    offset = code_end;
-    let packed_len = code_len.div_ceil(8);
-    if offset.checked_add(packed_len)? != data.len() {
+    if usize::from(entry_size(&jump_table)) != width {
         return None;
     }
+    let code = copy_bytes(data.get(offset..code_end)?)?;
+    offset = code_end;
     let packed = data.get(offset..)?;
-    let mut bitmask = vec![0; code_len];
+    if let Some(last) = packed.last()
+        && code_len % 8 != 0
+        && last & !((1u8 << (code_len % 8)) - 1) != 0
+    {
+        return None;
+    }
+    let mut bitmask = Vec::new();
+    bitmask.try_reserve_exact(code_len).ok()?;
+    bitmask.resize(code_len, 0);
     for index in 0..code_len {
         bitmask[index] = (packed[index / 8] >> (index % 8)) & 1;
     }
@@ -260,27 +294,7 @@ pub fn build_compact_code_blob(code: &CodeBlob) -> Option<Vec<u8>> {
     Some(output)
 }
 
-fn strip_metadata(blob: &[u8]) -> &[u8] {
-    if blob.len() < 14 {
-        return blob;
-    }
-    if let Some(ro_size) = read_le(blob, 0, 3)
-        && ro_size + 14 <= blob.len() as u64
-    {
-        return blob;
-    }
-    if let Some((metadata_len, consumed)) = read_nat(blob, 0)
-        && let Ok(metadata_len) = usize::try_from(metadata_len)
-        && let Some(skip) = consumed.checked_add(metadata_len)
-        && skip < blob.len()
-    {
-        return &blob[skip..];
-    }
-    blob
-}
-
 pub fn parse_standard_program(blob: &[u8]) -> Option<StandardProgram> {
-    let blob = strip_metadata(blob);
     if blob.len() < 15 {
         return None;
     }
@@ -290,10 +304,10 @@ pub fn parse_standard_program(blob: &[u8]) -> Option<StandardProgram> {
     let stack_size = u32::try_from(read_le(blob, 8, 3)?).ok()?;
     let mut offset = 11usize;
     let ro_end = offset.checked_add(ro_size)?;
-    let ro_data = blob.get(offset..ro_end)?.to_vec();
+    let ro_data = copy_bytes(blob.get(offset..ro_end)?)?;
     offset = ro_end;
     let rw_end = offset.checked_add(rw_size)?;
-    let rw_data = blob.get(offset..rw_end)?.to_vec();
+    let rw_data = copy_bytes(blob.get(offset..rw_end)?)?;
     offset = rw_end;
     let code_len = usize::try_from(read_le(blob, offset, 4)?).ok()?;
     offset = offset.checked_add(4)?;
@@ -380,6 +394,48 @@ mod tests {
         let mut bytes = build_standard_program(&sample()).unwrap();
         bytes.push(0);
         assert!(parse_standard_program(&bytes).is_none());
+    }
+
+    #[test]
+    fn obsolete_metadata_prefix_is_rejected() {
+        let program = build_standard_program(&sample()).unwrap();
+        let mut prefixed = vec![3, 1, 2, 3];
+        prefixed.extend_from_slice(&program);
+        assert!(parse_standard_program(&prefixed).is_none());
+    }
+
+    #[test]
+    fn noncanonical_naturals_are_rejected() {
+        assert_eq!(read_nat(&[0x80, 0x01], 0), None);
+        assert_eq!(read_nat(&[0xff, 1, 0, 0, 0, 0, 0, 0, 0], 0), None);
+    }
+
+    #[test]
+    fn impossible_jump_table_size_is_rejected_without_allocating() {
+        let mut bytes = vec![0xff];
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        bytes.extend_from_slice(&[1, 0]);
+        assert!(parse_compact_code_blob(&bytes).is_none());
+    }
+
+    #[test]
+    fn unused_bitmask_bits_are_rejected() {
+        let code = CodeBlob {
+            jump_table: Vec::new(),
+            code: vec![0],
+            bitmask: vec![1],
+        };
+        let mut bytes = build_compact_code_blob(&code).unwrap();
+        *bytes.last_mut().unwrap() |= 0x80;
+        assert!(parse_compact_code_blob(&bytes).is_none());
+    }
+
+    #[test]
+    fn nonminimal_jump_entry_width_is_rejected() {
+        // One jump-table entry with value 1 fits in one byte. Encoding it in
+        // two bytes would otherwise decode to the same CodeBlob.
+        let bytes = [1, 2, 1, 1, 0, 0, 1];
+        assert!(parse_compact_code_blob(&bytes).is_none());
     }
 
     proptest! {

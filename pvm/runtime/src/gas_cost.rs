@@ -303,10 +303,11 @@ fn instruction_cost(code: &[u8], bitmask: &[u8], pc: usize) -> InstrCost {
 
     match opcode {
         // No-arg
-        0 => mkt(2, 1, ExecUnits::NONE, e, e),   // trap
-        1 => mkt(2, 1, ExecUnits::NONE, e, e),   // fallthrough
-        2 => mkt(40, 1, ExecUnits::NONE, e, e),  // unlikely
-        10 => mkt(100, 4, ExecUnits::ALU, e, e), // ecalli
+        0 => mkt(2, 1, ExecUnits::NONE, e, e),  // trap
+        1 => mkt(2, 1, ExecUnits::NONE, e, e),  // fallthrough
+        2 => mk(40, 1, ExecUnits::NONE, e, e),  // unlikely
+        3 => mkt(100, 4, ExecUnits::ALU, e, e), // runtime ecall extension
+        10 => mk(100, 4, ExecUnits::ALU, e, e), // ecalli
 
         // Control flow
         40 => mkt(15, 1, ExecUnits::ALU, e, e), // jump
@@ -357,8 +358,8 @@ fn instruction_cost(code: &[u8], bitmask: &[u8], pc: usize) -> InstrCost {
             is_move_reg: true,
         },
 
-        // sbrk (101): removed in jar080, but cost it anyway for simulation
-        101 => mk(2, 1, ExecUnits::NONE, e, e),
+        // Frozen capability-manifest `sbrk`, normalized to private opcode 254.
+        254 => mk(2, 1, ExecUnits::NONE, e, e),
 
         // Branches (reg + imm + offset)
         81..=90 => {
@@ -394,7 +395,7 @@ fn instruction_cost(code: &[u8], bitmask: &[u8], pc: usize) -> InstrCost {
         }
 
         // ALU 2-op imm 64-bit
-        132 | 133 | 134 | 149 | 151 | 152 | 153 | 158 | 110 => {
+        132 | 133 | 134 | 149 | 151 | 152 | 153 | 158 => {
             let dc = if dst_overlaps_src(ra, &r1(rb)) { 1 } else { 2 };
             mk(1, dc, ExecUnits::ALU, r1(ra), r1(rb))
         }
@@ -404,12 +405,10 @@ fn instruction_cost(code: &[u8], bitmask: &[u8], pc: usize) -> InstrCost {
             mk(2, dc, ExecUnits::ALU, r1(ra), r1(rb))
         }
 
-        // Trivial 2-op 1-cycle: popcount, clz, sign_extend, zero_extend
-        102 | 103 | 104 | 105 | 108 | 109 => mk(1, 1, ExecUnits::ALU, r1(ra), r1(rb)),
+        // Trivial 2-op 1-cycle: popcount, clz, sign/zero extend, reverse bytes.
+        101 | 102 | 103 | 104 | 107 | 108 | 109 | 110 => mk(1, 1, ExecUnits::ALU, r1(ra), r1(rb)),
         // Trivial 2-op 2-cycle: ctz
-        106 | 107 => mk(2, 1, ExecUnits::ALU, r1(ra), r1(rb)),
-        // reverse_bytes
-        111 => mk(1, 1, ExecUnits::ALU, r1(ra), r1(rb)),
+        105 | 106 => mk(2, 1, ExecUnits::ALU, r1(ra), r1(rb)),
 
         // Shifts 64-bit 3-reg
         207 | 208 | 209 | 220 | 222 => {
@@ -872,8 +871,9 @@ fn instruction_cost_fast(
     match opcode {
         0 => mkt(2, 1, ExecUnits::NONE, e, e),
         1 => mkt(2, 1, ExecUnits::NONE, e, e),
-        2 => mkt(40, 1, ExecUnits::NONE, e, e),
-        10 => mkt(100, 4, ExecUnits::ALU, e, e),
+        2 => mk(40, 1, ExecUnits::NONE, e, e),
+        3 => mkt(100, 4, ExecUnits::ALU, e, e),
+        10 => mk(100, 4, ExecUnits::ALU, e, e),
         40 => mkt(15, 1, ExecUnits::ALU, e, e),
         80 => mkt(15, 1, ExecUnits::ALU, r1(ra), e),
         50 => mkt(22, 1, ExecUnits::ALU, e, e),
@@ -895,7 +895,7 @@ fn instruction_cost_fast(
             is_terminator: false,
             is_move_reg: true,
         },
-        101 => mk(2, 1, ExecUnits::NONE, e, e),
+        254 => mk(2, 1, ExecUnits::NONE, e, e),
         81..=90 => {
             // Use pre-decoded offset for branch target
             let target = match instr.args {
@@ -929,7 +929,7 @@ fn instruction_cost_fast(
             };
             mk(2, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
         }
-        132 | 133 | 134 | 149 | 151 | 152 | 153 | 158 | 110 => {
+        132 | 133 | 134 | 149 | 151 | 152 | 153 | 158 => {
             let dc = if dst_overlaps_src(ra, &r1(rb)) { 1 } else { 2 };
             mk(1, dc, ExecUnits::ALU, r1(ra), r1(rb))
         }
@@ -937,9 +937,8 @@ fn instruction_cost_fast(
             let dc = if dst_overlaps_src(ra, &r1(rb)) { 2 } else { 3 };
             mk(2, dc, ExecUnits::ALU, r1(ra), r1(rb))
         }
-        102 | 103 | 104 | 105 | 108 | 109 => mk(1, 1, ExecUnits::ALU, r1(ra), r1(rb)),
-        106 | 107 => mk(2, 1, ExecUnits::ALU, r1(ra), r1(rb)),
-        111 => mk(1, 1, ExecUnits::ALU, r1(ra), r1(rb)),
+        101 | 102 | 103 | 104 | 107 | 108 | 109 | 110 => mk(1, 1, ExecUnits::ALU, r1(ra), r1(rb)),
+        105 | 106 => mk(2, 1, ExecUnits::ALU, r1(ra), r1(rb)),
         207 | 208 | 209 | 220 | 222 => {
             let dc = if rb == ra { 2 } else { 3 };
             mk(1, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
@@ -1101,7 +1100,7 @@ pub fn fast_cost_from_raw(
 
     let opcode = opcode_byte;
     match opcode {
-        // No-arg terminators
+        // No-arg instruction costs (unlikely is not in set T).
         0 => FastCost {
             cycles: 2,
             decode_slots: 1,
@@ -1126,19 +1125,27 @@ pub fn fast_cost_from_raw(
             exec_unit: EU_NONE,
             src_mask: 0,
             dst_mask: 0,
-            is_terminator: true,
+            is_terminator: false,
             is_move_reg: false,
         },
-        // Ecall (3) and Ecalli (10): same cost shape. Ecall is a terminator
-        // (management-op / dynamic-CALL exit) — kept in sync with GAS_COST_LUT
-        // t[3] so the interpreter's block-gas computation matches the JIT.
-        3 | 10 => FastCost {
+        // Opcode 3 is the capability-runtime extension and exits to that
+        // runtime. Standard ecalli (10) is not in Gray Paper set T.
+        3 => FastCost {
             cycles: 100,
             decode_slots: 4,
             exec_unit: EU_ALU,
             src_mask: 0,
             dst_mask: 0,
             is_terminator: true,
+            is_move_reg: false,
+        },
+        10 => FastCost {
+            cycles: 100,
+            decode_slots: 4,
+            exec_unit: EU_ALU,
+            src_mask: 0,
+            dst_mask: 0,
+            is_terminator: false,
             is_move_reg: false,
         },
 
@@ -1269,7 +1276,8 @@ pub fn fast_cost_from_raw(
             is_move_reg: true,
         },
 
-        101 => FastCost {
+        // Frozen capability-manifest `sbrk`, normalized to private opcode 254.
+        254 => FastCost {
             cycles: 2,
             decode_slots: 1,
             exec_unit: EU_NONE,
@@ -1337,7 +1345,7 @@ pub fn fast_cost_from_raw(
             }
         }
         // ALU 2-op imm 64-bit
-        132 | 133 | 134 | 149 | 151 | 152 | 153 | 158 | 110 => {
+        132 | 133 | 134 | 149 | 151 | 152 | 153 | 158 => {
             let dc = if dst_src_overlap(ra, r1(rb)) { 1 } else { 2 };
             FastCost {
                 cycles: 1,
@@ -1363,7 +1371,7 @@ pub fn fast_cost_from_raw(
             }
         }
         // Trivial 2-op: popcount, clz, sign_extend, zero_extend, reverse_bytes
-        102 | 103 | 104 | 105 | 108 | 109 | 111 => FastCost {
+        101 | 102 | 103 | 104 | 107 | 108 | 109 | 110 => FastCost {
             cycles: 1,
             decode_slots: 1,
             exec_unit: EU_ALU,
@@ -1373,7 +1381,7 @@ pub fn fast_cost_from_raw(
             is_move_reg: false,
         },
         // ctz
-        106 | 107 => FastCost {
+        105 | 106 => FastCost {
             cycles: 2,
             decode_slots: 1,
             exec_unit: EU_ALU,
@@ -1679,7 +1687,7 @@ pub fn fast_cost_from_decoded(
 
     let opcode = opcode_byte;
     match opcode {
-        // No-arg terminators
+        // No-arg instruction costs (unlikely is not in set T).
         0 => FastCost {
             cycles: 2,
             decode_slots: 1,
@@ -1704,19 +1712,27 @@ pub fn fast_cost_from_decoded(
             exec_unit: EU_NONE,
             src_mask: 0,
             dst_mask: 0,
-            is_terminator: true,
+            is_terminator: false,
             is_move_reg: false,
         },
-        // Ecall (3) and Ecalli (10): same cost shape. Ecall is a terminator
-        // (management-op / dynamic-CALL exit) — kept in sync with GAS_COST_LUT
-        // t[3] so the interpreter's block-gas computation matches the JIT.
-        3 | 10 => FastCost {
+        // Opcode 3 is the capability-runtime extension and exits to that
+        // runtime. Standard ecalli (10) is not in Gray Paper set T.
+        3 => FastCost {
             cycles: 100,
             decode_slots: 4,
             exec_unit: EU_ALU,
             src_mask: 0,
             dst_mask: 0,
             is_terminator: true,
+            is_move_reg: false,
+        },
+        10 => FastCost {
+            cycles: 100,
+            decode_slots: 4,
+            exec_unit: EU_ALU,
+            src_mask: 0,
+            dst_mask: 0,
+            is_terminator: false,
             is_move_reg: false,
         },
 
@@ -1847,7 +1863,8 @@ pub fn fast_cost_from_decoded(
             is_move_reg: true,
         },
 
-        101 => FastCost {
+        // Frozen capability-manifest `sbrk`, normalized to private opcode 254.
+        254 => FastCost {
             cycles: 2,
             decode_slots: 1,
             exec_unit: EU_NONE,
@@ -1913,7 +1930,7 @@ pub fn fast_cost_from_decoded(
             }
         }
         // ALU 2-op imm 64-bit
-        132 | 133 | 134 | 149 | 151 | 152 | 153 | 158 | 110 => {
+        132 | 133 | 134 | 149 | 151 | 152 | 153 | 158 => {
             let dc = if dst_src_overlap(ra, r1(rb)) { 1 } else { 2 };
             FastCost {
                 cycles: 1,
@@ -1939,7 +1956,7 @@ pub fn fast_cost_from_decoded(
             }
         }
         // Trivial 2-op: popcount, clz, sign_extend, zero_extend, reverse_bytes
-        102 | 103 | 104 | 105 | 108 | 109 | 111 => FastCost {
+        101 | 102 | 103 | 104 | 107 | 108 | 109 | 110 => FastCost {
             cycles: 1,
             decode_slots: 1,
             exec_unit: EU_ALU,
@@ -1949,7 +1966,7 @@ pub fn fast_cost_from_decoded(
             is_move_reg: false,
         },
         // ctz
-        106 | 107 => FastCost {
+        105 | 106 => FastCost {
             cycles: 2,
             decode_slots: 1,
             exec_unit: EU_ALU,
@@ -2273,16 +2290,16 @@ const fn gc_ov(
 static GAS_COST_LUT: [GasCostEntry; 256] = {
     let d = gc(1, 1, EU_NONE, 0, 0, 0); // default
     let mut t = [d; 256];
-    // No-arg terminators
+    // No-arg instruction costs. Only trap/fallthrough are in standard set T.
     t[0] = gc(2, 1, EU_NONE, 0, 0, F_TERM);
     t[1] = gc(2, 1, EU_NONE, 0, 0, F_TERM);
-    t[2] = gc(40, 1, EU_NONE, 0, 0, F_TERM);
-    // Ecall (3): jar management-op/dynamic-CALL exit — a terminator like
-    // Ecalli. Missing F_TERM here meant post-Ecall PCs never became gas-block
+    t[2] = gc(40, 1, EU_NONE, 0, 0, 0);
+    // Ecall (3): capability-runtime management-op/dynamic-CALL exit. Missing
+    // F_TERM here meant post-Ecall PCs never became gas-block
     // starts, so the JIT had no dispatch entry to resume at after the kernel
     // handled the ecall (re-entry dispatched to offset 0 = the prologue).
     t[3] = gc(100, 4, EU_ALU, 0, 0, F_TERM);
-    t[10] = gc(100, 4, EU_ALU, 0, 0, F_TERM);
+    t[10] = gc(100, 4, EU_ALU, 0, 0, 0);
     // Control flow
     t[40] = gc(15, 1, EU_ALU, 0, 0, F_TERM);
     t[80] = gc(15, 1, EU_ALU, 0, 1, F_TERM); // dst=ra
@@ -2325,7 +2342,8 @@ static GAS_COST_LUT: [GasCostEntry; 256] = {
     t[20] = gc(1, 2, EU_NONE, 0, 1, 0);
     // move_reg
     t[100] = gc(0, 1, EU_NONE, 2, 1, F_MOVE); // src=rb, dst=ra
-    t[101] = gc(2, 1, EU_NONE, 0, 0, 0); // nop
+    // Frozen capability-manifest `sbrk` after private normalization.
+    t[254] = gc(2, 1, EU_NONE, 0, 0, 0);
     // Branches (reg+imm+offset) — needs branch_cost
     i = 81;
     while i <= 90 {
@@ -2358,7 +2376,6 @@ static GAS_COST_LUT: [GasCostEntry; 256] = {
         t[152] = e;
         t[153] = e;
         t[158] = e;
-        t[110] = e;
     }
     // ALU 2-op imm 32-bit
     {
@@ -2372,17 +2389,18 @@ static GAS_COST_LUT: [GasCostEntry; 256] = {
     // Trivial 2-op (src=rb, dst=ra)
     {
         let e = gc(1, 1, EU_ALU, 2, 1, 0);
+        t[101] = e;
         t[102] = e;
         t[103] = e;
         t[104] = e;
-        t[105] = e;
+        t[107] = e;
         t[108] = e;
         t[109] = e;
-        t[111] = e;
+        t[110] = e;
     }
     // ctz
+    t[105] = gc(2, 1, EU_ALU, 2, 1, 0);
     t[106] = gc(2, 1, EU_ALU, 2, 1, 0);
-    t[107] = gc(2, 1, EU_ALU, 2, 1, 0);
     // Shifts 64-bit 3-reg (src=rb|rd, dst=ra, shift overlap: rb==ra)
     {
         let e = gc_ov(1, 2, 3, EU_ALU, 4, 1, F_SHIFT_OVERLAP);

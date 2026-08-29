@@ -2,7 +2,9 @@
 
 use alloc::vec::Vec;
 
-use crate::inner::{InnerError, InnerExit, InnerMachines, InvokeState, PageMode, gas, host_call};
+use crate::inner::{
+    InnerError, InnerExit, InnerMachines, InvokeState, MAX_INNER_MACHINES, PageMode, gas, host_call,
+};
 use crate::refine::{Invocation, Machine, MemoryModel, RefineError};
 use crate::{ExitReason, Gas, PVM_REGISTER_COUNT};
 
@@ -89,6 +91,14 @@ impl RefineContext {
         if let Err(exit) = self.charge(cost) {
             return exit;
         }
+        // Gray Paper v0.8.0 checks the invocation-wide machine limit before
+        // inspecting the caller-supplied program range. At capacity even an
+        // unreadable outer pointer therefore returns FULL, rather than
+        // panicking while trying to read a program that cannot be installed.
+        if self.inner.len() >= MAX_INNER_MACHINES {
+            self.outer.registers_mut()[7] = result::FULL;
+            return Dispatch::Continue;
+        }
         let Some(program) = self.read_outer(address, len, false) else {
             return Dispatch::Exit(ExitReason::Panic);
         };
@@ -115,24 +125,29 @@ impl RefineContext {
         let Some((outer_address, len)) = self.outer_range(outer_address, len, true) else {
             return Dispatch::Exit(ExitReason::Panic);
         };
-        let status = match (u32::try_from(id), u32::try_from(inner_address)) {
-            (Ok(id), Ok(inner_address)) => match self.inner.peek(id, inner_address, len) {
-                Ok(bytes) => {
-                    if !self
-                        .outer
-                        .memory_mut()
-                        .write_bytes_checked(outer_address, &bytes)
-                    {
-                        return Dispatch::Exit(ExitReason::Panic);
+        let status = match u32::try_from(id) {
+            Ok(id) if self.inner.contains(id) => match (len == 0)
+                .then_some(0)
+                .or_else(|| u32::try_from(inner_address).ok())
+            {
+                Some(inner_address) => match self.inner.peek(id, inner_address, len) {
+                    Ok(bytes) => {
+                        if !self
+                            .outer
+                            .memory_mut()
+                            .write_bytes_checked(outer_address, &bytes)
+                        {
+                            return Dispatch::Exit(ExitReason::Panic);
+                        }
+                        result::OK
                     }
-                    result::OK
-                }
-                Err(InnerError::Unknown) => result::WHO,
-                Err(InnerError::OutOfBounds) => result::OOB,
-                Err(_) => result::HUH,
+                    Err(InnerError::Unknown) => result::WHO,
+                    Err(InnerError::OutOfBounds) => result::OOB,
+                    Err(_) => result::HUH,
+                },
+                None => result::OOB,
             },
-            (Err(_), _) => result::WHO,
-            (_, Err(_)) => result::OOB,
+            _ => result::WHO,
         };
         self.outer.registers_mut()[7] = status;
         Dispatch::Continue
@@ -149,15 +164,21 @@ impl RefineContext {
         let Some(bytes) = self.read_outer(outer_address, len, false) else {
             return Dispatch::Exit(ExitReason::Panic);
         };
-        let status = match (u32::try_from(id), u32::try_from(inner_address)) {
-            (Ok(id), Ok(inner_address)) => match self.inner.poke(id, inner_address, &bytes) {
-                Ok(()) => result::OK,
-                Err(InnerError::Unknown) => result::WHO,
-                Err(InnerError::OutOfBounds) => result::OOB,
-                Err(_) => result::HUH,
+        let status = match u32::try_from(id) {
+            Ok(id) if self.inner.contains(id) => match bytes
+                .is_empty()
+                .then_some(0)
+                .or_else(|| u32::try_from(inner_address).ok())
+            {
+                Some(inner_address) => match self.inner.poke(id, inner_address, &bytes) {
+                    Ok(()) => result::OK,
+                    Err(InnerError::Unknown) => result::WHO,
+                    Err(InnerError::OutOfBounds) => result::OOB,
+                    Err(_) => result::HUH,
+                },
+                None => result::OOB,
             },
-            (Err(_), _) => result::WHO,
-            (_, Err(_)) => result::OOB,
+            _ => result::WHO,
         };
         self.outer.registers_mut()[7] = status;
         Dispatch::Continue
@@ -321,6 +342,7 @@ impl RefineContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vos_pvm_program::{CodeBlob, build_compact_code_blob};
 
     fn standard_program(args_code: &[u8], starts: &[usize]) -> Vec<u8> {
         let mut packed = alloc::vec![0u8; args_code.len().div_ceil(8)];
@@ -359,9 +381,80 @@ mod tests {
     }
 
     #[test]
+    fn machine_rejects_runtime_only_opcode_three_as_huh() {
+        let runtime_only = build_compact_code_blob(&CodeBlob {
+            jump_table: Vec::new(),
+            code: vec![3],
+            bitmask: vec![1],
+        })
+        .unwrap();
+        // machine(9), then jump_ind r0 to the halt address.
+        let outer = standard_program(&[10, 9, 50, 0], &[0, 2]);
+        let invocation = RefineContext::load(&outer, &runtime_only, 1_000_000)
+            .unwrap()
+            .run();
+
+        assert_eq!(invocation.exit, ExitReason::Halt);
+        assert_eq!(invocation.registers[7], result::HUH);
+    }
+
+    #[test]
     fn unknown_host_call_is_returned_to_the_embedder() {
         let outer = standard_program(&[10, 77, 0], &[0, 2]);
         let invocation = RefineContext::load(&outer, &[], 1_000_000).unwrap().run();
         assert_eq!(invocation.exit, ExitReason::HostCall(77));
+    }
+
+    #[test]
+    fn machine_reports_full_before_reading_an_invalid_outer_pointer() {
+        let outer = standard_program(&[0], &[0]);
+        let mut context = RefineContext::load(&outer, &[], 10_000_000).unwrap();
+        let inner = inner_program();
+        for expected in 0..MAX_INNER_MACHINES as u32 {
+            assert_eq!(context.inner.create(&inner, 0), Ok(expected));
+        }
+        let registers = context.outer.registers_mut();
+        registers[7] = u64::MAX;
+        registers[8] = 1;
+        registers[9] = 0;
+
+        assert!(matches!(context.machine(), Dispatch::Continue));
+        assert_eq!(context.outer.registers()[7], result::FULL);
+    }
+
+    #[test]
+    fn peek_and_poke_report_unknown_machine_before_inner_address_overflow() {
+        let outer = standard_program(&[0], &[0]);
+        let mut context = RefineContext::load(&outer, &[], 10_000_000).unwrap();
+        let outer_address = context.outer.registers()[1] - 1;
+
+        for operation in [RefineContext::peek, RefineContext::poke] {
+            let registers = context.outer.registers_mut();
+            registers[7] = 0; // no machine zero exists
+            registers[8] = outer_address;
+            registers[9] = u64::MAX;
+            registers[10] = 1;
+
+            assert!(matches!(operation(&mut context), Dispatch::Continue));
+            assert_eq!(context.outer.registers()[7], result::WHO);
+        }
+    }
+
+    #[test]
+    fn peek_and_poke_accept_empty_inner_range_above_u32_max() {
+        let outer = standard_program(&[0], &[0]);
+        let mut context = RefineContext::load(&outer, &[], 10_000_000).unwrap();
+        let id = context.inner.create(&inner_program(), 0).unwrap();
+
+        for operation in [RefineContext::peek, RefineContext::poke] {
+            let registers = context.outer.registers_mut();
+            registers[7] = u64::from(id);
+            registers[8] = u64::MAX;
+            registers[9] = u64::from(u32::MAX) + 1;
+            registers[10] = 0;
+
+            assert!(matches!(operation(&mut context), Dispatch::Continue));
+            assert_eq!(context.outer.registers()[7], result::OK);
+        }
     }
 }

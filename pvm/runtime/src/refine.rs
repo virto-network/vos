@@ -198,7 +198,7 @@ impl Machine {
         }
 
         let code = prog.code;
-        let mut interp = Interpreter::with_memory(
+        let mut interp = Interpreter::with_memory_and_mode(
             code.code,
             code.bitmask,
             code.jump_table,
@@ -206,8 +206,8 @@ impl Machine {
             mem,
             gas - init_gas,
             mem_cycles,
+            IsaMode::Conformance,
         );
-        interp.isa_mode = IsaMode::Conformance;
         interp.set_page_perms(page_perms);
 
         Ok(Self {
@@ -313,11 +313,11 @@ impl Invocation {
 /// selecting the memory representation automatically
 /// ([`MemoryModel::Auto`]).
 ///
-/// Parses `spi_blob` (stripping any metadata prefix), builds the GP memory
-/// image and register file for `args`, charges the kernel's per-page init
-/// gas, and runs the interpreter from instruction counter 0 (the refine
-/// entry) until it exits. No hostcalls are handled: an `ecalli` ends the
-/// invocation with [`ExitReason::HostCall`].
+/// Parses the canonical bare `spi_blob`, builds the GP memory image and
+/// register file for `args`, charges the kernel's per-page init gas, and runs
+/// the interpreter from instruction counter 0 (the refine entry) until it
+/// exits. Metadata-prefixed predecessor blobs are rejected. No hostcalls are
+/// handled: an `ecalli` ends the invocation with [`ExitReason::HostCall`].
 pub fn execute(spi_blob: &[u8], args: &[u8], gas: Gas) -> Result<Invocation, RefineError> {
     execute_with(spi_blob, args, gas, MemoryModel::Auto)
 }
@@ -547,17 +547,21 @@ mod tests {
     }
 
     #[test]
-    fn ecall_panics_under_conformance() {
-        // Opcode 3 (Ecall) is the jar capability surface; the SPI path runs
-        // graypaper-strict, so it must panic rather than exit Ecall.
+    fn ecall_is_rejected_by_the_standard_program_decoder() {
+        // Opcode 3 is the VOS capability-runtime extension and is not in the
+        // Gray Paper v0.8.0 opcode set U.
         let blob = build_standard_program(&[], &[], 0, 4096, &[3], &[1]);
-        let inv = execute(&blob, &[], 1_000_000).expect("executes");
-        assert_eq!(inv.exit, ExitReason::Panic);
+        assert!(matches!(
+            execute(&blob, &[], 1_000_000),
+            Err(RefineError::InvalidBlob)
+        ));
     }
 
     #[test]
     fn ecalli_surfaces_as_hostcall_untouched() {
-        let blob = build_standard_program(&[], &[], 0, 4096, &[10, 42], &[1, 0]);
+        // A standard program still needs a terminating instruction after the
+        // host-call continuation.
+        let blob = build_standard_program(&[], &[], 0, 4096, &[10, 42, 0], &[1, 0, 1]);
         let inv = execute(&blob, &ARGS, 1_000_000).expect("executes");
         assert_eq!(inv.exit, ExitReason::HostCall(42));
         // No dispatch happened: the GP argument registers are untouched.

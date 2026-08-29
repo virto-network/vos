@@ -221,12 +221,22 @@ impl<'a> Decoder<'a> {
         if len > MAX_ITEMS {
             return Err(DecodeError::LimitExceeded);
         }
-        // Every successfully decoded item must consume input in consensus
-        // wires. Bound the eager reservation by the bytes actually present so
-        // a tiny envelope cannot force a `len * size_of::<T>()` allocation.
-        let mut values = Vec::with_capacity(len.min(self.remaining()));
+        // Do not reserve from a caller-declared count. Even bounding that
+        // count by the remaining byte length is unsafe for a large `T`: a
+        // tiny malformed envelope could multiply a few input bytes into an
+        // enormous `Vec<T>` allocation before decoding its first item.
+        // Grow only after one complete, input-consuming item was proved.
+        let mut values = Vec::new();
         for _ in 0..len {
-            values.push(decode(self)?);
+            let before = self.remaining();
+            let value = decode(self)?;
+            if self.remaining() >= before {
+                return Err(DecodeError::NonCanonical);
+            }
+            values
+                .try_reserve(1)
+                .map_err(|_| DecodeError::LimitExceeded)?;
+            values.push(value);
         }
         Ok(values)
     }
@@ -256,5 +266,15 @@ mod tests {
         let mut decoder = Decoder::new(&bytes);
         let result: Result<Vec<u8>, _> = decoder.list(|decoder| decoder.u8());
         assert_eq!(result, Err(DecodeError::LimitExceeded));
+    }
+
+    #[test]
+    fn list_items_must_consume_wire_input() {
+        let bytes = 1u32.to_le_bytes();
+        let mut decoder = Decoder::new(&bytes);
+        assert!(matches!(
+            decoder.list(|_| Ok(LargeItem([0; 256]))),
+            Err(DecodeError::NonCanonical)
+        ));
     }
 }

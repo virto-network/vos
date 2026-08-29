@@ -39,6 +39,9 @@ pub struct Context<A: Actor> {
     /// Typed service origin. Service code sets it from the authenticated work
     /// envelope. Raw control-plane calls never synthesize an actor identity.
     origin: crate::service::Origin,
+    /// Authority-authenticated application principal. This is independent
+    /// from the transport subject or causal source actor carried by `origin`.
+    principal: Option<crate::service::PrincipalId>,
     /// Exact root service which authenticated an actor origin. `None` for
     /// every non-actor origin and for control-plane callers which cannot supply a
     /// complete causal source identity.
@@ -137,6 +140,7 @@ impl<A: Actor> Context<A> {
             invocation_id: crate::service::InvocationId::ZERO,
             caller: Caller::Unauthenticated,
             origin: crate::service::Origin::Anonymous,
+            principal: None,
             origin_service: None,
             space_role: None,
             capability: None,
@@ -325,6 +329,7 @@ impl<A: Actor> Context<A> {
     /// each invocation sees the right caller — Context outlives
     /// individual invocations, so this is a per-call slot.
     pub fn set_caller(&mut self, caller: Caller) {
+        self.principal = None;
         self.origin_service = None;
         self.origin = match &caller {
             Caller::Unauthenticated => crate::service::Origin::Anonymous,
@@ -343,13 +348,20 @@ impl<A: Actor> Context<A> {
         self.origin
     }
 
+    /// Authority-authenticated application principal for this invocation.
+    pub fn principal(&self) -> Option<crate::service::PrincipalId> {
+        self.principal
+    }
+
     #[doc(hidden)]
     pub fn __set_origin(
         &mut self,
         origin: crate::service::Origin,
+        principal: Option<crate::service::PrincipalId>,
         origin_service: Option<crate::service::ServiceIdentity>,
     ) {
         self.origin = origin;
+        self.principal = principal;
         self.origin_service = origin_service;
     }
 
@@ -2161,6 +2173,7 @@ mod tests {
         assert_eq!(ctx.resolve_external_actor("package-label"), None);
         ctx.__set_origin(
             crate::service::Origin::Actor(actor),
+            Some(crate::service::PrincipalId([7; 32])),
             Some(ctx.external_actors[0].service.clone()),
         );
         assert!(ctx.external_actor_origin_matches("private-age"));
@@ -2169,13 +2182,18 @@ mod tests {
         colliding_service.root_service = crate::service::RootServiceId([9; 32]);
         ctx.__set_origin(
             crate::service::Origin::Actor(actor),
+            Some(crate::service::PrincipalId([7; 32])),
             Some(colliding_service),
         );
         assert!(
             !ctx.external_actor_origin_matches("private-age"),
             "the same actor id under another root is not the installed peer"
         );
-        ctx.__set_origin(crate::service::Origin::Actor(actor), None);
+        ctx.__set_origin(
+            crate::service::Origin::Actor(actor),
+            Some(crate::service::PrincipalId([7; 32])),
+            None,
+        );
         assert!(
             !ctx.external_actor_origin_matches("private-age"),
             "an actor origin without causal service identity fails closed"
@@ -2185,6 +2203,7 @@ mod tests {
         control_plane.external_actors = ctx.external_actors;
         control_plane.__set_origin(
             crate::service::Origin::Actor(actor),
+            Some(crate::service::PrincipalId([7; 32])),
             Some(control_plane.external_actors[0].service.clone()),
         );
         assert!(!control_plane.external_actor_origin_matches("private-age"));

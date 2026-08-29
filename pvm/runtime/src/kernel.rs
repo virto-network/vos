@@ -2356,7 +2356,7 @@ impl InvocationKernel {
         interp.pc = vm.pc;
         interp.heap_base = vm.heap_base();
         interp.heap_top = vm.heap_top();
-        interp.isa_mode = self.isa_mode;
+        interp.set_isa_mode(self.isa_mode);
         interp.set_page_perms(page_perms);
 
         let (exit, _gas_used) = match observer {

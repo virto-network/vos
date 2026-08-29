@@ -221,7 +221,10 @@ pub struct TracingPvm {
 }
 
 impl TracingPvm {
-    pub fn new(pvm: Interpreter) -> Self {
+    pub fn new(mut pvm: Interpreter) -> Self {
+        // The AIR proves the public Gray Paper machine, never the frozen
+        // capability-manifest opcode profile used by the frozen host kernel.
+        pvm.set_isa_mode(vos_pvm::IsaMode::Conformance);
         Self {
             pvm,
             steps: Vec::new(),
@@ -297,7 +300,7 @@ impl TracingPvm {
 
         let reg_write = (0..PVM_REGISTER_COUNT).find(|&i| regs_before[i] != regs_after[i]);
         // One interpreter step writes at most one register (every opcode
-        // arm is a single assignment; Sbrk panics) — the invariant that
+        // arm is a single assignment) — the invariant that
         // makes `RegWrite` the whole register-file delta. Verify rather
         // than assume: a second changed index would be silently lost.
         if let Some(i) = reg_write {
