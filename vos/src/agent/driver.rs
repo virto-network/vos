@@ -649,6 +649,12 @@ impl<S: AgentImageStore> AgentDriver<S> {
             return Ok(reply);
         }
         validate_execution_transition(&self.image.runtime_state, &output.state, mode)?;
+        if output.state == self.image.runtime_state {
+            // The runtime recovered an exact durable invocation result. A
+            // retry is observationally successful but is not a new agent
+            // revision.
+            return Ok(reply);
+        }
 
         let next = AgentImage {
             revision: self
@@ -663,6 +669,24 @@ impl<S: AgentImageStore> AgentDriver<S> {
         self.store.commit(Some(self.image.revision), &next)?;
         self.image = next;
         Ok(reply)
+    }
+
+    /// Retire a durable exact-result record after its response has reached
+    /// the caller. Until this explicit acknowledgement, retries remain
+    /// recoverable across process restart.
+    pub fn acknowledge_invocation(
+        &mut self,
+        invocation: &ActorInvocation,
+    ) -> Result<(), AgentDriverError> {
+        let reply = self.lifecycle(LifecycleRequest::AcknowledgeInvocation {
+            invocation: invocation.invocation,
+            request: invocation.commitment(),
+        })?;
+        if reply == LifecycleReply::InvocationAcknowledged(invocation.invocation) {
+            Ok(())
+        } else {
+            Err(AgentDriverError::InvalidRuntime)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

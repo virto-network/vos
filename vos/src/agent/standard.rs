@@ -14,9 +14,11 @@ use super::{
     LifecycleError, LifecycleReply, LifecycleRequest, RUNTIME_ABI_ID, RuntimeRequirements,
     StateLane,
 };
-use crate::service::{ActorId, AgentId, DeploymentId, Hash, ProducerId, ProgramId};
+use crate::service::{ActorId, AgentId, DeploymentId, Hash, InvocationId, ProducerId, ProgramId};
 
 pub const MAX_DIRECTORY_PAGE: u16 = 256;
+pub const MAX_INVOCATION_RESULTS_PER_LANE: usize = 256;
+pub const MAX_INVOCATION_RESULT_BYTES_PER_LANE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct ManagedActor {
@@ -30,6 +32,7 @@ struct ManagedActor {
 pub struct StandardAgentRuntime {
     config: Option<AgentConfig>,
     actors: BTreeMap<ActorId, ManagedActor>,
+    invocation_results: BTreeMap<InvocationId, StandardInvocationResult>,
 }
 
 /// Canonical persisted state of the bundled runtime.
@@ -37,6 +40,14 @@ pub struct StandardAgentRuntime {
 pub struct StandardRuntimeState {
     pub config: Option<AgentConfig>,
     pub actors: Vec<StandardActorState>,
+    pub invocation_results: Vec<StandardInvocationResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandardInvocationResult {
+    pub invocation: InvocationId,
+    pub request: Hash,
+    pub reply: super::execution::ActorExecutionReply,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +72,7 @@ impl StandardAgentRuntime {
         Self {
             config: None,
             actors: BTreeMap::new(),
+            invocation_results: BTreeMap::new(),
         }
     }
 
@@ -96,12 +108,13 @@ impl StandardAgentRuntime {
                     lane_state: actor.lane_state.clone(),
                 })
                 .collect(),
+            invocation_results: self.invocation_results.values().cloned().collect(),
         }
     }
 
     pub fn restore(state: StandardRuntimeState) -> Result<Self, LifecycleError> {
         let Some(config) = state.config else {
-            return if state.actors.is_empty() {
+            return if state.actors.is_empty() && state.invocation_results.is_empty() {
                 Ok(Self::new())
             } else {
                 Err(LifecycleError::InvalidRequest)
@@ -112,6 +125,10 @@ impl StandardAgentRuntime {
             .windows(2)
             .any(|pair| pair[0].record.entry.actor >= pair[1].record.entry.actor)
             || state.actors.iter().any(|actor| actor.debt.children != 0)
+            || state
+                .invocation_results
+                .windows(2)
+                .any(|pair| pair[0].invocation >= pair[1].invocation)
         {
             return Err(LifecycleError::InvalidRequest);
         }
@@ -155,6 +172,24 @@ impl StandardAgentRuntime {
         }
         for actor in suspended {
             runtime.set_suspended(actor, true)?;
+        }
+        for result in state.invocation_results {
+            if result.invocation == InvocationId::ZERO
+                || result.reply.invocation != result.invocation
+                || result.request == Hash::ZERO
+                || result.reply.status != super::execution::ActorExecutionStatus::Done
+                || !runtime.actors.contains_key(&result.reply.actor)
+            {
+                return Err(LifecycleError::InvalidRequest);
+            }
+            runtime.invocation_results.insert(result.invocation, result);
+        }
+        for lane in [StateLane::Linear, StateLane::Merge, StateLane::Local] {
+            if runtime.invocation_result_count(lane) > MAX_INVOCATION_RESULTS_PER_LANE
+                || runtime.invocation_result_bytes(lane) > MAX_INVOCATION_RESULT_BYTES_PER_LANE
+            {
+                return Err(LifecycleError::InvalidRequest);
+            }
         }
         Ok(runtime)
     }
@@ -286,6 +321,23 @@ impl StandardAgentRuntime {
     }
 
     #[cfg(feature = "pvm")]
+    pub(crate) fn recover_execution(
+        &self,
+        invocation: &super::execution::ActorInvocation,
+    ) -> Result<Option<super::execution::ActorExecutionReply>, super::execution::ActorExecutionError>
+    {
+        use super::execution::ActorExecutionError;
+        invocation.validate()?;
+        let Some(result) = self.invocation_results.get(&invocation.invocation) else {
+            return Ok(None);
+        };
+        if result.request != invocation.commitment() {
+            return Err(ActorExecutionError::DivergentInvocation);
+        }
+        Ok(Some(result.reply.clone()))
+    }
+
+    #[cfg(feature = "pvm")]
     pub(crate) fn prepare_execution_state(
         &self,
         invocation: &super::execution::ActorInvocation,
@@ -317,6 +369,11 @@ impl StandardAgentRuntime {
         if !config.identity.profile.supports(lane) || !actor.record.entry.lanes.contains(lane) {
             return Err(ActorExecutionError::UnsupportedMethod);
         }
+        if self.invocation_result_count(lane) >= MAX_INVOCATION_RESULTS_PER_LANE
+            || self.invocation_result_bytes(lane) >= MAX_INVOCATION_RESULT_BYTES_PER_LANE
+        {
+            return Err(ActorExecutionError::ResultCapacity);
+        }
         let (value, initial) = actor.lane_state.select(lane, &actor.record.initial_state);
         match value {
             Some(bytes) => Ok((lane, bytes.clone())),
@@ -329,9 +386,10 @@ impl StandardAgentRuntime {
     }
 
     #[cfg(feature = "pvm")]
-    pub(crate) fn commit_execution_state(
+    pub(crate) fn commit_execution(
         &mut self,
-        actor: crate::service::ActorId,
+        invocation: &super::execution::ActorInvocation,
+        reply: &super::execution::ActorExecutionReply,
         lane: StateLane,
         state: Vec<u8>,
     ) -> Result<(), super::execution::ActorExecutionError> {
@@ -339,12 +397,52 @@ impl StandardAgentRuntime {
         if state.len() > MAX_EXECUTION_STATE_BYTES {
             return Err(ActorExecutionError::InvalidActorOutput);
         }
+        if reply.invocation != invocation.invocation
+            || reply.actor != invocation.actor
+            || reply.deployment != invocation.deployment
+            || reply.lane != lane
+            || self.invocation_results.contains_key(&invocation.invocation)
+        {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
+        if self.invocation_result_count(lane) >= MAX_INVOCATION_RESULTS_PER_LANE
+            || self
+                .invocation_result_bytes(lane)
+                .saturating_add(reply.reply.len())
+                > MAX_INVOCATION_RESULT_BYTES_PER_LANE
+        {
+            return Err(ActorExecutionError::ResultCapacity);
+        }
         let actor = self
             .actors
-            .get_mut(&actor)
+            .get_mut(&reply.actor)
             .ok_or(ActorExecutionError::NotFound)?;
         *actor.lane_state.select_mut(lane) = Some(state);
+        self.invocation_results.insert(
+            invocation.invocation,
+            StandardInvocationResult {
+                invocation: invocation.invocation,
+                request: invocation.commitment(),
+                reply: reply.clone(),
+            },
+        );
         Ok(())
+    }
+
+    fn invocation_result_count(&self, lane: StateLane) -> usize {
+        self.invocation_results
+            .values()
+            .filter(|result| result.reply.lane == lane)
+            .count()
+    }
+
+    fn invocation_result_bytes(&self, lane: StateLane) -> usize {
+        self.invocation_results
+            .values()
+            .filter(|result| result.reply.lane == lane)
+            .fold(0usize, |total, result| {
+                total.saturating_add(result.reply.reply.len())
+            })
     }
 
     fn validate_restored_lane_state(
@@ -440,6 +538,22 @@ impl StandardAgentRuntime {
         } else {
             Ok(LifecycleReply::Resumed(actor.record.entry.clone()))
         }
+    }
+
+    fn acknowledge_invocation(
+        &mut self,
+        invocation: InvocationId,
+        request: Hash,
+    ) -> Result<LifecycleReply, LifecycleError> {
+        let result = self
+            .invocation_results
+            .get(&invocation)
+            .ok_or(LifecycleError::NotFound)?;
+        if result.request != request {
+            return Err(LifecycleError::InvalidRequest);
+        }
+        self.invocation_results.remove(&invocation);
+        Ok(LifecycleReply::InvocationAcknowledged(invocation))
     }
 
     fn remove_leaf(
@@ -584,6 +698,10 @@ impl AgentRuntime for StandardAgentRuntime {
             LifecycleRequest::UpgradeActor(upgrade) => self.upgrade_actor(upgrade),
             LifecycleRequest::Suspend(actor) => self.set_suspended(actor, true),
             LifecycleRequest::Resume(actor) => self.set_suspended(actor, false),
+            LifecycleRequest::AcknowledgeInvocation {
+                invocation,
+                request,
+            } => self.acknowledge_invocation(invocation, request),
             LifecycleRequest::RemoveLeaf {
                 actor,
                 expected_deployment,
@@ -618,6 +736,15 @@ impl AgentRuntime for StandardAgentRuntime {
                 .count(),
         )
         .unwrap_or(u32::MAX);
+        debt.lifecycle_operations = debt.lifecycle_operations.saturating_add(
+            u32::try_from(
+                self.invocation_results
+                    .values()
+                    .filter(|result| result.reply.actor == actor)
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
+        );
         Ok(debt)
     }
 }

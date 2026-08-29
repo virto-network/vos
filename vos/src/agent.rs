@@ -26,12 +26,12 @@ use crate::service::{
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829v4");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829v5");
 
 /// Program identity of the bundled standard runtime artifact.
 pub const STANDARD_RUNTIME_PROGRAM_ID: ProgramId = ProgramId([
-    0xd4, 0x80, 0xd2, 0x4c, 0xee, 0x55, 0x0f, 0x57, 0x07, 0xbd, 0xb7, 0x75, 0x2f, 0x7f, 0x6a, 0x0b,
-    0xdc, 0x6f, 0x79, 0x93, 0x9f, 0x07, 0x18, 0xb6, 0x84, 0x83, 0xac, 0xd5, 0xb1, 0xdb, 0xe8, 0x2d,
+    0xbc, 0x1d, 0x15, 0x04, 0xcc, 0x64, 0xb2, 0xb9, 0xa6, 0xa9, 0x23, 0xaf, 0xc8, 0x4d, 0x03, 0xab,
+    0xbd, 0xfa, 0x11, 0x92, 0x8e, 0x6d, 0xb6, 0x64, 0x5b, 0x7f, 0x24, 0xc9, 0xac, 0xfa, 0xe5, 0xaa,
 ]);
 
 /// Immutable storage and publication profile of an agent.
@@ -365,6 +365,13 @@ pub enum LifecycleRequest {
     UpgradeActor(UpgradeActor),
     Suspend(ActorId),
     Resume(ActorId),
+    /// Retire one durable exact-result record after the caller has received
+    /// it. The request commitment prevents an unrelated invocation holder
+    /// from deleting another result.
+    AcknowledgeInvocation {
+        invocation: crate::service::InvocationId,
+        request: Hash,
+    },
     RemoveLeaf {
         actor: ActorId,
         expected_deployment: DeploymentId,
@@ -402,6 +409,7 @@ pub enum LifecycleReply {
     Upgraded(ActorEntry),
     Suspended(ActorEntry),
     Resumed(ActorEntry),
+    InvocationAcknowledged(crate::service::InvocationId),
     Removed(ActorId),
     RuntimeUpgraded(AgentIdentity),
 }

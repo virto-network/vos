@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use vos::agent::driver::{AgentDriver, FileAgentStore};
-use vos::agent::execution::{ActorExecutionStatus, ActorInvocation};
+use vos::agent::driver::{AgentDriver, AgentDriverError, FileAgentStore};
+use vos::agent::execution::{ActorExecutionError, ActorExecutionStatus, ActorInvocation};
 use vos::agent::package::{Ed25519PackageVerifier, Package};
 use vos::agent::{
     ActorInitialState, AgentConfig, AgentIdentity, AgentProfile, AgentReplica, PackageKind,
@@ -109,32 +109,52 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
         )
         .unwrap();
 
-    for (index, (by, expected)) in [(2, 2), (3, 5)].into_iter().enumerate() {
-        let reply = driver
-            .invoke(ActorInvocation {
-                invocation: InvocationId([0x20 + index as u8; 32]),
-                actor,
-                deployment,
-                program: package.manifest.program,
-                mode: vos::agent::MethodMode::Linear,
-                message: dynamic_message("increment", "by", by),
-                availability: Vec::new(),
-                gas: 1_000_000_000,
-            })
-            .unwrap();
-        assert_eq!(reply.status, ActorExecutionStatus::Done);
-        assert_eq!(
-            vos::value::Value::decode(&reply.reply).as_u64(),
-            Some(expected)
-        );
-        if index == 0 {
-            drop(driver);
-            driver = AgentDriver::create_or_open(
-                AGENT_RUNTIME_PVM.to_vec(),
-                agent_config.clone(),
-                FileAgentStore::new(&image),
-            )
-            .expect("reopen agent with its durable actor catalog");
-        }
-    }
+    let first = ActorInvocation {
+        invocation: InvocationId([0x20; 32]),
+        actor,
+        deployment,
+        program: package.manifest.program,
+        mode: vos::agent::MethodMode::Linear,
+        message: dynamic_message("increment", "by", 2),
+        availability: Vec::new(),
+        gas: 1_000_000_000,
+    };
+    let first_reply = driver.invoke(first.clone()).unwrap();
+    assert_eq!(first_reply.status, ActorExecutionStatus::Done);
+    assert_eq!(
+        vos::value::Value::decode(&first_reply.reply).as_u64(),
+        Some(2)
+    );
+    let committed_revision = driver.image().revision;
+
+    drop(driver);
+    let mut driver = AgentDriver::create_or_open(
+        AGENT_RUNTIME_PVM.to_vec(),
+        agent_config.clone(),
+        FileAgentStore::new(&image),
+    )
+    .expect("reopen agent with its durable actor catalog");
+    assert_eq!(driver.invoke(first.clone()).unwrap(), first_reply);
+    assert_eq!(driver.image().revision, committed_revision);
+
+    let mut divergent = first.clone();
+    divergent.message = dynamic_message("increment", "by", 99);
+    assert_eq!(
+        driver.invoke(divergent),
+        Err(AgentDriverError::Execution(
+            ActorExecutionError::DivergentInvocation
+        ))
+    );
+
+    driver.acknowledge_invocation(&first).unwrap();
+    let second = ActorInvocation {
+        invocation: InvocationId([0x21; 32]),
+        message: dynamic_message("increment", "by", 3),
+        ..first
+    };
+    let second_reply = driver.invoke(second).unwrap();
+    assert_eq!(
+        vos::value::Value::decode(&second_reply.reply).as_u64(),
+        Some(5)
+    );
 }

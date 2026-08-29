@@ -8,7 +8,8 @@ use super::execution::{
     RuntimeExecutionCall, RuntimeExecutionReturn,
 };
 use super::standard::{
-    StandardActorState, StandardAgentRuntime, StandardLaneState, StandardRuntimeState,
+    StandardActorState, StandardAgentRuntime, StandardInvocationResult, StandardLaneState,
+    StandardRuntimeState,
 };
 use super::{
     ActorDirectoryPage, ActorEntry, ActorInitialState, ActorLifecycleDebt, AgentConfig,
@@ -259,16 +260,17 @@ pub fn decode_standard_runtime_state(
     if !decoder.exhausted() {
         return Err(DecodeError::TrailingBytes);
     }
+    let mut invocation_results = Vec::new();
     for (lane, bytes) in [
         (StateLane::Linear, state.linear.as_slice()),
         (StateLane::Merge, state.merge.as_slice()),
         (StateLane::Local, state.local.as_slice()),
     ] {
-        let values = decode_standard_lane(bytes, lane)?;
-        if values.len() != actors.len() {
+        let decoded = decode_standard_lane(bytes, lane)?;
+        if decoded.values.len() != actors.len() {
             return Err(DecodeError::NonCanonical);
         }
-        for (actor, (id, value)) in actors.iter_mut().zip(values) {
+        for (actor, (id, value)) in actors.iter_mut().zip(decoded.values) {
             if actor.record.entry.actor != id {
                 return Err(DecodeError::NonCanonical);
             }
@@ -278,8 +280,20 @@ pub fn decode_standard_runtime_state(
                 StateLane::Local => actor.lane_state.local = value,
             }
         }
+        invocation_results.extend(decoded.invocation_results);
     }
-    let state = StandardRuntimeState { config, actors };
+    invocation_results.sort_unstable_by_key(|result| result.invocation);
+    if invocation_results
+        .windows(2)
+        .any(|pair| pair[0].invocation >= pair[1].invocation)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    let state = StandardRuntimeState {
+        config,
+        actors,
+        invocation_results,
+    };
     StandardAgentRuntime::restore(state.clone()).map_err(|_| DecodeError::NonCanonical)?;
     Ok(state)
 }
@@ -298,13 +312,30 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
         };
         encoder.option(value, |encoder, bytes| encoder.bytes(bytes));
     });
+    encoder.list(
+        &state
+            .invocation_results
+            .iter()
+            .filter(|result| result.reply.lane == lane)
+            .collect::<Vec<_>>(),
+        |encoder, result| {
+            encoder.fixed(&result.invocation.0);
+            encoder.fixed(&result.request.0);
+            encode_execution_reply(encoder, &result.reply);
+        },
+    );
     output
+}
+
+struct DecodedStandardLane {
+    values: Vec<(ActorId, Option<Vec<u8>>)>,
+    invocation_results: Vec<StandardInvocationResult>,
 }
 
 fn decode_standard_lane(
     bytes: &[u8],
     expected_lane: StateLane,
-) -> Result<Vec<(ActorId, Option<Vec<u8>>)>, DecodeError> {
+) -> Result<DecodedStandardLane, DecodeError> {
     let mut decoder = Decoder::new(bytes);
     if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID
         || decode_state_lane(decoder.u8()?)? != expected_lane
@@ -323,10 +354,37 @@ fn decode_standard_lane(
         }
         Ok((actor, value))
     })?;
-    if values.windows(2).any(|pair| pair[0].0 >= pair[1].0) || !decoder.exhausted() {
+    if values.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(DecodeError::NonCanonical);
     }
-    Ok(values)
+    let invocation_results = decoder.list(|decoder| {
+        let invocation = crate::service::InvocationId(decoder.fixed()?);
+        let request = Hash(decoder.fixed()?);
+        let reply = decode_execution_reply(decoder)?;
+        if invocation == crate::service::InvocationId::ZERO
+            || request == Hash::ZERO
+            || reply.invocation != invocation
+            || reply.lane != expected_lane
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(StandardInvocationResult {
+            invocation,
+            request,
+            reply,
+        })
+    })?;
+    if invocation_results
+        .windows(2)
+        .any(|pair| pair[0].invocation >= pair[1].invocation)
+        || !decoder.exhausted()
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(DecodedStandardLane {
+        values,
+        invocation_results,
+    })
 }
 
 /// Apply one management call with the bundled deterministic runtime.
@@ -351,18 +409,27 @@ pub fn apply_standard_execution(
     let state = decode_standard_runtime_state(&original_state)?;
     let mut runtime =
         StandardAgentRuntime::restore(state).map_err(|_| DecodeError::NonCanonical)?;
-    let result =
-        runtime
-            .prepare_execution_state(&call.invocation)
-            .and_then(|(lane, actor_state)| {
-                super::execution::run_inner_actor(&call.invocation, &call.actor_pvm, &actor_state)
+    let result = match runtime.recover_execution(&call.invocation) {
+        Ok(Some(reply)) => Ok(reply),
+        Err(error) => Err(error),
+        Ok(None) => {
+            runtime
+                .prepare_execution_state(&call.invocation)
+                .and_then(|(lane, actor_state)| {
+                    super::execution::run_inner_actor(
+                        &call.invocation,
+                        &call.actor_pvm,
+                        &actor_state,
+                    )
                     .and_then(|(reply, next_state)| {
                         if reply.status == ActorExecutionStatus::Done {
-                            runtime.commit_execution_state(reply.actor, lane, next_state)?;
+                            runtime.commit_execution(&call.invocation, &reply, lane, next_state)?;
                         }
                         Ok(reply)
                     })
-            });
+                })
+        }
+    };
     let state = if result.is_ok() {
         encode_standard_runtime_state(&runtime.snapshot())
     } else {
@@ -471,6 +538,8 @@ fn encode_execution_error(encoder: &mut Encoder<'_>, error: ActorExecutionError)
             encoder.u8(10);
             encoder.u32(id);
         }
+        ActorExecutionError::DivergentInvocation => encoder.u8(11),
+        ActorExecutionError::ResultCapacity => encoder.u8(12),
     }
 }
 
@@ -487,6 +556,8 @@ fn decode_execution_error(decoder: &mut Decoder<'_>) -> Result<ActorExecutionErr
         8 => ActorExecutionError::InvalidInput,
         9 => ActorExecutionError::InvalidActorOutput,
         10 => ActorExecutionError::UnsupportedHostCall(decoder.u32()?),
+        11 => ActorExecutionError::DivergentInvocation,
+        12 => ActorExecutionError::ResultCapacity,
         _ => return Err(DecodeError::InvalidTag),
     })
 }
@@ -558,6 +629,14 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             encoder.u8(5);
             encoder.fixed(&actor.0);
         }
+        LifecycleRequest::AcknowledgeInvocation {
+            invocation,
+            request,
+        } => {
+            encoder.u8(8);
+            encoder.fixed(&invocation.0);
+            encoder.fixed(&request.0);
+        }
         LifecycleRequest::RemoveLeaf {
             actor,
             expected_deployment,
@@ -625,6 +704,10 @@ fn decode_request(decoder: &mut Decoder<'_>) -> Result<LifecycleRequest, DecodeE
             abi: Hash(decoder.fixed()?),
             capabilities: decode_capabilities(decoder)?,
         }),
+        8 => Ok(LifecycleRequest::AcknowledgeInvocation {
+            invocation: crate::service::InvocationId(decoder.fixed()?),
+            request: Hash(decoder.fixed()?),
+        }),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -663,6 +746,10 @@ fn encode_reply(encoder: &mut Encoder<'_>, reply: &LifecycleReply) {
             encoder.u8(7);
             encode_identity(encoder, identity);
         }
+        LifecycleReply::InvocationAcknowledged(invocation) => {
+            encoder.u8(8);
+            encoder.fixed(&invocation.0);
+        }
     }
 }
 
@@ -676,6 +763,9 @@ fn decode_reply(decoder: &mut Decoder<'_>) -> Result<LifecycleReply, DecodeError
         5 => Ok(LifecycleReply::Resumed(decode_entry(decoder)?)),
         6 => Ok(LifecycleReply::Removed(ActorId(decoder.fixed()?))),
         7 => Ok(LifecycleReply::RuntimeUpgraded(decode_identity(decoder)?)),
+        8 => Ok(LifecycleReply::InvocationAcknowledged(
+            crate::service::InvocationId(decoder.fixed()?),
+        )),
         _ => Err(DecodeError::InvalidTag),
     }
 }

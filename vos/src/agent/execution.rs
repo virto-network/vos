@@ -7,7 +7,8 @@
 use alloc::vec::Vec;
 
 use super::{MethodMode, StateLane};
-use crate::service::{ActorId, BlobRef, DeploymentId, InvocationId, ProgramId};
+use crate::service::wire::Encoder;
+use crate::service::{ActorId, BlobRef, DeploymentId, Hash, InvocationId, ProgramId};
 
 pub const MAX_EXECUTION_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_EXECUTION_REPLY_BYTES: usize = 1024 * 1024;
@@ -67,6 +68,8 @@ pub enum ActorExecutionError {
     InvalidAvailability,
     InvalidInput,
     InvalidActorOutput,
+    DivergentInvocation,
+    ResultCapacity,
     UnsupportedHostCall(u32),
 }
 
@@ -89,6 +92,33 @@ pub struct RuntimeExecutionReturn {
 }
 
 impl ActorInvocation {
+    /// Stable identity of every execution-significant caller field. Program
+    /// bytes are excluded because the host resolves them by `program` from
+    /// its authenticated catalog.
+    pub fn commitment(&self) -> Hash {
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder(&mut bytes);
+        encoder.fixed(&self.invocation.0);
+        encoder.fixed(&self.actor.0);
+        encoder.fixed(&self.deployment.0);
+        encoder.fixed(&self.program.0);
+        encoder.u8(match self.mode {
+            super::MethodMode::Query => 0,
+            super::MethodMode::LinearizableQuery => 1,
+            super::MethodMode::Linear => 2,
+            super::MethodMode::Merge => 3,
+            super::MethodMode::Local => 4,
+        });
+        encoder.bytes(&self.message);
+        encoder.list(&self.availability, |encoder, blob| {
+            encoder.fixed(&blob.reference.hash.0);
+            encoder.u64(blob.reference.len);
+            encoder.bytes(&blob.bytes);
+        });
+        encoder.u64(self.gas);
+        Hash::digest(b"vos/agent/invocation", &[&bytes])
+    }
+
     pub fn validate(&self) -> Result<(), ActorExecutionError> {
         if self.invocation == InvocationId::ZERO
             || self.actor == ActorId::ZERO
