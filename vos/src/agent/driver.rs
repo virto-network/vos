@@ -22,11 +22,11 @@ use super::execution::{
 use super::package::{PackageError, VerifiedPackage};
 use super::wire::{RuntimeCall, RuntimeReturn, RuntimeState};
 use super::{
-    ActorEntry, ActorInitialState, AgentConfig, AgentConfigError, InstallActor, LifecycleError,
-    LifecycleReply, LifecycleRequest, PackageKind, RUNTIME_ABI_ID, RuntimeCapabilities,
+    ActorEntry, ActorInitialState, AgentConfig, AgentConfigError, AgentIdentity, InstallActor,
+    LifecycleError, LifecycleReply, LifecycleRequest, PackageKind, RUNTIME_ABI_ID,
 };
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
-use crate::service::{ActorId, BlobRef, CapabilityId, DeploymentId, Hash, ProducerId, ProgramId};
+use crate::service::{ActorId, BlobRef, CapabilityId, DeploymentId, Hash, ProgramId};
 
 pub const DEFAULT_MANAGEMENT_GAS: Gas = 1_000_000_000;
 pub const MAX_RUNTIME_STATE_BYTES: usize = 16 * 1024 * 1024;
@@ -639,6 +639,154 @@ impl<S: AgentImageStore> AgentDriver<S> {
         }
     }
 
+    pub fn actor_upgrade_request(
+        &self,
+        actor: ActorId,
+        from_deployment: DeploymentId,
+        package: &VerifiedPackage,
+    ) -> Result<LifecycleRequest, AgentDriverError> {
+        let package = package.package();
+        let PackageKind::Actor { requirements } = package.manifest.kind else {
+            return Err(AgentDriverError::Package(PackageError::WrongKind));
+        };
+        Ok(LifecycleRequest::UpgradeActor(super::UpgradeActor {
+            actor,
+            from_deployment,
+            to_deployment: package.deployment_id(),
+            to_program: package.manifest.program,
+            producer: package.deployment_signature.producer,
+            package: BlobRef::of_bytes(&package.encode()),
+            requirements,
+        }))
+    }
+
+    pub fn upgrade_actor(
+        &mut self,
+        authority: &VerifiedAgentAuthorityReceipt,
+        actor: ActorId,
+        from_deployment: DeploymentId,
+        package: &VerifiedPackage,
+    ) -> Result<ActorEntry, AgentDriverError> {
+        let request = self.actor_upgrade_request(actor, from_deployment, package)?;
+        self.authorize(
+            authority,
+            super::authority::CAPABILITY_ACTOR_UPGRADE,
+            &request,
+        )?;
+        let LifecycleRequest::UpgradeActor(upgrade) = request else {
+            return Err(AgentDriverError::InvalidRuntime);
+        };
+        let package = package.package();
+        let package_bytes = package.encode();
+        let package_reference = upgrade.package.clone();
+        let created_package = self.store.put_package(&package_reference, &package_bytes)?;
+        let created_program = match self
+            .store
+            .put_program(package.manifest.program, &package.pvm)
+        {
+            Ok(created) => created,
+            Err(error) => {
+                if created_package {
+                    let _ = self.store.remove_package(&package_reference);
+                }
+                return Err(error.into());
+            }
+        };
+        let reply = self.lifecycle(LifecycleRequest::UpgradeActor(upgrade));
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                if matches!(error, AgentDriverError::Lifecycle(_)) {
+                    if created_program {
+                        let _ = self.store.remove_program(package.manifest.program);
+                    }
+                    if created_package {
+                        let _ = self.store.remove_package(&package_reference);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        match reply {
+            LifecycleReply::Upgraded(entry)
+                if entry.actor == actor && entry.deployment == package.deployment_id() =>
+            {
+                Ok(entry)
+            }
+            _ => Err(AgentDriverError::InvalidRuntime),
+        }
+    }
+
+    pub fn suspend_actor(
+        &mut self,
+        authority: &VerifiedAgentAuthorityReceipt,
+        actor: ActorId,
+    ) -> Result<ActorEntry, AgentDriverError> {
+        self.authorized_actor_lifecycle(authority, LifecycleRequest::Suspend(actor))
+    }
+
+    pub fn resume_actor(
+        &mut self,
+        authority: &VerifiedAgentAuthorityReceipt,
+        actor: ActorId,
+    ) -> Result<ActorEntry, AgentDriverError> {
+        self.authorized_actor_lifecycle(authority, LifecycleRequest::Resume(actor))
+    }
+
+    fn authorized_actor_lifecycle(
+        &mut self,
+        authority: &VerifiedAgentAuthorityReceipt,
+        request: LifecycleRequest,
+    ) -> Result<ActorEntry, AgentDriverError> {
+        self.authorize(
+            authority,
+            super::authority::CAPABILITY_ACTOR_LIFECYCLE,
+            &request,
+        )?;
+        match self.lifecycle(request)? {
+            LifecycleReply::Suspended(entry) | LifecycleReply::Resumed(entry) => Ok(entry),
+            _ => Err(AgentDriverError::InvalidRuntime),
+        }
+    }
+
+    pub fn remove_actor(
+        &mut self,
+        authority: &VerifiedAgentAuthorityReceipt,
+        actor: ActorId,
+        expected_deployment: DeploymentId,
+    ) -> Result<(), AgentDriverError> {
+        let request = LifecycleRequest::RemoveLeaf {
+            actor,
+            expected_deployment,
+        };
+        self.authorize(
+            authority,
+            super::authority::CAPABILITY_ACTOR_LIFECYCLE,
+            &request,
+        )?;
+        match self.lifecycle(request)? {
+            LifecycleReply::Removed(removed) if removed == actor => Ok(()),
+            _ => Err(AgentDriverError::InvalidRuntime),
+        }
+    }
+
+    fn authorize(
+        &self,
+        authority: &VerifiedAgentAuthorityReceipt,
+        capability: &str,
+        request: &LifecycleRequest,
+    ) -> Result<(), AgentDriverError> {
+        authorize_lifecycle(
+            authority,
+            &self.image.config.authority,
+            self.image.config.identity.space,
+            self.image.config.identity.agent,
+            CapabilityId::named(capability),
+            request,
+        )?;
+        Ok(())
+    }
+
     /// Execute one authenticated actor invocation through this agent's
     /// runtime. Actor failures are typed replies and do not commit runtime
     /// state; deterministic runtime validation failures are driver errors.
@@ -728,31 +876,55 @@ impl<S: AgentImageStore> AgentDriver<S> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    pub fn runtime_upgrade_request(
+        &self,
+        package: &VerifiedPackage,
+    ) -> Result<LifecycleRequest, AgentDriverError> {
+        let package = package.package();
+        let PackageKind::AgentRuntime { abi, capabilities } = package.manifest.kind else {
+            return Err(AgentDriverError::Package(PackageError::WrongKind));
+        };
+        Ok(LifecycleRequest::UpgradeRuntime {
+            from_deployment: self.image.config.identity.runtime_deployment,
+            to_deployment: package.deployment_id(),
+            to_program: package.manifest.program,
+            producer: package.deployment_signature.producer,
+            package: BlobRef::of_bytes(&package.encode()),
+            abi,
+            capabilities,
+        })
+    }
+
     pub fn upgrade_runtime(
         &mut self,
-        new_runtime_pvm: Vec<u8>,
-        from_deployment: DeploymentId,
-        to_deployment: DeploymentId,
-        producer: ProducerId,
-        package: BlobRef,
-        capabilities: RuntimeCapabilities,
-    ) -> Result<LifecycleReply, AgentDriverError> {
-        let to_program = ProgramId::of_pvm(&new_runtime_pvm);
+        authority: &VerifiedAgentAuthorityReceipt,
+        package: &VerifiedPackage,
+    ) -> Result<AgentIdentity, AgentDriverError> {
+        let request = self.runtime_upgrade_request(package)?;
+        self.authorize(
+            authority,
+            super::authority::CAPABILITY_AGENT_RUNTIME_UPGRADE,
+            &request,
+        )?;
+        let LifecycleRequest::UpgradeRuntime {
+            to_deployment,
+            to_program,
+            producer,
+            package: package_reference,
+            capabilities,
+            ..
+        } = request.clone()
+        else {
+            return Err(AgentDriverError::InvalidRuntime);
+        };
+        let package = package.package();
+        let new_runtime_pvm = package.pvm.clone();
         let output = execute_runtime(
             &self.runtime_pvm,
             self.management_gas,
             RuntimeCall {
                 state: self.image.runtime_state.clone(),
-                request: LifecycleRequest::UpgradeRuntime {
-                    from_deployment,
-                    to_deployment,
-                    to_program,
-                    producer,
-                    package: package.clone(),
-                    abi: RUNTIME_ABI_ID,
-                    capabilities,
-                },
+                request,
             },
         )?;
         let reply = output.result.map_err(AgentDriverError::Lifecycle)?;
@@ -783,9 +955,13 @@ impl<S: AgentImageStore> AgentDriver<S> {
             return Err(AgentDriverError::InvalidRuntime);
         }
 
+        let package_bytes = package.encode();
+        self.store.put_package(&package_reference, &package_bytes)?;
+        self.store.put_program(to_program, &new_runtime_pvm)?;
+
         let mut config = self.image.config.clone();
         config.identity = identity.clone();
-        config.runtime_package = package;
+        config.runtime_package = package_reference;
         config.capabilities = capabilities;
         let next = AgentImage {
             revision: self
@@ -800,7 +976,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         self.store.commit(Some(self.image.revision), &next)?;
         self.runtime_pvm = new_runtime_pvm;
         self.image = next;
-        Ok(reply)
+        Ok(identity.clone())
     }
 
     pub fn into_store(self) -> S {

@@ -20,7 +20,7 @@ use super::{
     ActorDirectoryPage, ActorEntry, ActorInitialState, AgentConfig, AgentIdentity, AgentProfile,
     LifecycleRequest,
 };
-use crate::service::{ActorId, AgentId, CapabilityId, ProgramId};
+use crate::service::{ActorId, AgentId, CapabilityId, DeploymentId, ProgramId};
 
 const IMAGE_SUFFIX: &str = ".agent-image";
 
@@ -218,6 +218,74 @@ impl<R: RuntimeSource> AgentHost<R> {
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?
             .install_actor(authority, name, parent, package, initial_state)
+            .map_err(Into::into)
+    }
+
+    pub fn upgrade_actor(
+        &mut self,
+        agent: AgentId,
+        authority: &VerifiedAgentAuthorityReceipt,
+        actor: ActorId,
+        from_deployment: DeploymentId,
+        package: &VerifiedPackage,
+    ) -> Result<ActorEntry, AgentHostError> {
+        self.agents
+            .get_mut(&agent)
+            .ok_or(AgentHostError::AgentNotFound)?
+            .upgrade_actor(authority, actor, from_deployment, package)
+            .map_err(Into::into)
+    }
+
+    pub fn suspend_actor(
+        &mut self,
+        agent: AgentId,
+        authority: &VerifiedAgentAuthorityReceipt,
+        actor: ActorId,
+    ) -> Result<ActorEntry, AgentHostError> {
+        self.agents
+            .get_mut(&agent)
+            .ok_or(AgentHostError::AgentNotFound)?
+            .suspend_actor(authority, actor)
+            .map_err(Into::into)
+    }
+
+    pub fn resume_actor(
+        &mut self,
+        agent: AgentId,
+        authority: &VerifiedAgentAuthorityReceipt,
+        actor: ActorId,
+    ) -> Result<ActorEntry, AgentHostError> {
+        self.agents
+            .get_mut(&agent)
+            .ok_or(AgentHostError::AgentNotFound)?
+            .resume_actor(authority, actor)
+            .map_err(Into::into)
+    }
+
+    pub fn remove_actor(
+        &mut self,
+        agent: AgentId,
+        authority: &VerifiedAgentAuthorityReceipt,
+        actor: ActorId,
+        expected_deployment: DeploymentId,
+    ) -> Result<(), AgentHostError> {
+        self.agents
+            .get_mut(&agent)
+            .ok_or(AgentHostError::AgentNotFound)?
+            .remove_actor(authority, actor, expected_deployment)
+            .map_err(Into::into)
+    }
+
+    pub fn upgrade_runtime(
+        &mut self,
+        agent: AgentId,
+        authority: &VerifiedAgentAuthorityReceipt,
+        package: &VerifiedPackage,
+    ) -> Result<AgentIdentity, AgentHostError> {
+        self.agents
+            .get_mut(&agent)
+            .ok_or(AgentHostError::AgentNotFound)?
+            .upgrade_runtime(authority, package)
             .map_err(Into::into)
     }
 

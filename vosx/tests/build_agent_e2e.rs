@@ -6,8 +6,8 @@ use vos::agent::driver::{AgentDriver, AgentDriverError, FileAgentStore};
 use vos::agent::execution::{ActorExecutionError, ActorExecutionStatus, ActorInvocation};
 use vos::agent::package::{Ed25519PackageVerifier, Package};
 use vos::agent::{
-    ActorInitialState, AgentConfig, AgentIdentity, AgentProfile, AgentReplica, PackageKind,
-    ReplicaRole, RuntimeCapabilities, STANDARD_RUNTIME_PROGRAM_ID,
+    ActorInitialState, AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LifecycleRequest,
+    PackageKind, ReplicaRole, RuntimeCapabilities, STANDARD_RUNTIME_PROGRAM_ID,
 };
 use vos::service::{
     ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, InvocationId, NodeId,
@@ -25,6 +25,31 @@ impl AgentAuthorityVerifier for TestAuthorityVerifier {
     fn verify(&self, _: &vos::agent::authority::AgentAuthorityBinding, _: &[u8], _: &[u8]) -> bool {
         true
     }
+}
+
+fn authority_receipt(
+    config: &AgentConfig,
+    request: &LifecycleRequest,
+    capability: &str,
+    sequence: u64,
+) -> vos::agent::authority::VerifiedAgentAuthorityReceipt {
+    AgentAuthorityReceipt {
+        claim: AgentAuthorityClaim {
+            authority: config.authority.clone(),
+            space: config.identity.space,
+            agent: config.identity.agent,
+            principal: config.identity.owner,
+            credential: CredentialId([0x33; 32]),
+            capability: CapabilityId::named(capability),
+            operation: request.commitment(),
+            sequence,
+            valid_from: 10,
+            valid_until: 20,
+        },
+        signature: vec![1],
+    }
+    .verify(&config.authority, 15, &TestAuthorityVerifier)
+    .unwrap()
 }
 
 impl TempDir {
@@ -121,23 +146,12 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
     let install = driver
         .actor_install_request("counter".into(), None, &verified, initial_state.clone())
         .unwrap();
-    let receipt = AgentAuthorityReceipt {
-        claim: AgentAuthorityClaim {
-            authority: agent_config.authority.clone(),
-            space: agent_config.identity.space,
-            agent,
-            principal: owner,
-            credential: CredentialId([0x33; 32]),
-            capability: CapabilityId::named(vos::agent::authority::CAPABILITY_ACTOR_INSTALL),
-            operation: install.commitment(),
-            sequence: 1,
-            valid_from: 10,
-            valid_until: 20,
-        },
-        signature: vec![1],
-    }
-    .verify(&agent_config.authority, 15, &TestAuthorityVerifier)
-    .unwrap();
+    let receipt = authority_receipt(
+        &agent_config,
+        &install,
+        vos::agent::authority::CAPABILITY_ACTOR_INSTALL,
+        1,
+    );
     driver
         .install_actor(&receipt, "counter".into(), None, &verified, initial_state)
         .unwrap();
@@ -185,9 +199,41 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
         message: dynamic_message("increment", "by", 3),
         ..first
     };
-    let second_reply = driver.invoke(second).unwrap();
+    let second_reply = driver.invoke(second.clone()).unwrap();
     assert_eq!(
         vos::value::Value::decode(&second_reply.reply).as_u64(),
         Some(5)
     );
+    driver.acknowledge_invocation(&second).unwrap();
+
+    let suspend = LifecycleRequest::Suspend(actor);
+    let receipt = authority_receipt(
+        &agent_config,
+        &suspend,
+        vos::agent::authority::CAPABILITY_ACTOR_LIFECYCLE,
+        2,
+    );
+    assert!(driver.suspend_actor(&receipt, actor).unwrap().suspended);
+
+    let resume = LifecycleRequest::Resume(actor);
+    let receipt = authority_receipt(
+        &agent_config,
+        &resume,
+        vos::agent::authority::CAPABILITY_ACTOR_LIFECYCLE,
+        3,
+    );
+    assert!(!driver.resume_actor(&receipt, actor).unwrap().suspended);
+
+    let remove = LifecycleRequest::RemoveLeaf {
+        actor,
+        expected_deployment: deployment,
+    };
+    let receipt = authority_receipt(
+        &agent_config,
+        &remove,
+        vos::agent::authority::CAPABILITY_ACTOR_LIFECYCLE,
+        4,
+    );
+    driver.remove_actor(&receipt, actor, deployment).unwrap();
+    assert!(driver.inspect(None, 16).unwrap().entries.is_empty());
 }
