@@ -1,8 +1,7 @@
 use vos::agent::driver::{AgentDriver, MemoryAgentStore};
 use vos::agent::execution::{ActorExecutionStatus, ActorInvocation};
 use vos::agent::host::AgentHost;
-use vos::agent::standard::StandardRuntimeState;
-use vos::agent::wire::{RuntimeCall, RuntimeReturn};
+use vos::agent::wire::{RuntimeCall, RuntimeReturn, RuntimeState, decode_standard_runtime_state};
 use vos::agent::{
     ActorEntry, ActorInitialState, AgentConfig, AgentIdentity, AgentProfile, AgentReplica,
     InstallActor, LaneSet, LifecycleReply, LifecycleRequest, MethodMode, ReplicaRole,
@@ -84,7 +83,7 @@ fn bundled_runtime_identity_is_pinned() {
 fn bundled_runtime_persists_an_empty_agent_between_invocations() {
     let config = config();
     let created = invoke(RuntimeCall {
-        state: Vec::new(),
+        state: RuntimeState::default(),
         request: LifecycleRequest::Create(config.clone()),
     });
     assert_eq!(
@@ -249,9 +248,11 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
     assert_eq!(reply.reply, vec![0x63]);
     assert_eq!(driver.image().revision, 3);
 
-    let state = StandardRuntimeState::decode(&driver.image().runtime_state).unwrap();
+    let state = decode_standard_runtime_state(&driver.image().runtime_state).unwrap();
     assert_eq!(
         state.actors[0].lane_state.linear.as_deref(),
         Some(&[0x2a][..])
     );
+    assert!(state.actors[0].lane_state.merge.as_deref() == Some(&[][..]));
+    assert!(state.actors[0].lane_state.local.as_deref() == Some(&[][..]));
 }

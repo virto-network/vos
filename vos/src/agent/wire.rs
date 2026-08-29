@@ -24,14 +24,25 @@ use crate::service::{
 /// One management call. Runtime-owned state is opaque to the node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeCall {
-    pub state: Vec<u8>,
+    pub state: RuntimeState,
     pub request: LifecycleRequest,
+}
+
+/// Runtime-owned state split only at the replication boundary. The node does
+/// not interpret any component, but can order and persist each component with
+/// the consistency semantics promised by its lane.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeState {
+    pub control: Vec<u8>,
+    pub linear: Vec<u8>,
+    pub merge: Vec<u8>,
+    pub local: Vec<u8>,
 }
 
 /// Deterministic result of one management call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeReturn {
-    pub state: Vec<u8>,
+    pub state: RuntimeState,
     pub result: Result<LifecycleReply, LifecycleError>,
 }
 
@@ -41,7 +52,7 @@ impl ServiceWire for RuntimeCall {
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
         encoder.fixed(&super::RUNTIME_ABI_ID.0);
-        encoder.bytes(&self.state);
+        encode_runtime_state(&mut encoder, &self.state);
         encode_request(&mut encoder, &self.request);
     }
 
@@ -50,7 +61,7 @@ impl ServiceWire for RuntimeCall {
             return Err(DecodeError::InvalidPlatform);
         }
         Ok(Self {
-            state: decoder.bytes()?,
+            state: decode_runtime_state(decoder)?,
             request: decode_request(decoder)?,
         })
     }
@@ -79,7 +90,7 @@ impl ServiceWire for RuntimeReturn {
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
         encoder.fixed(&super::RUNTIME_ABI_ID.0);
-        encoder.bytes(&self.state);
+        encode_runtime_state(&mut encoder, &self.state);
         match &self.result {
             Ok(reply) => {
                 encoder.bool(true);
@@ -96,7 +107,7 @@ impl ServiceWire for RuntimeReturn {
         if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID {
             return Err(DecodeError::InvalidPlatform);
         }
-        let state = decoder.bytes()?;
+        let state = decode_runtime_state(decoder)?;
         let result = if decoder.bool()? {
             Ok(decode_reply(decoder)?)
         } else {
@@ -112,7 +123,7 @@ impl ServiceWire for RuntimeExecutionCall {
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
         encoder.fixed(&super::RUNTIME_ABI_ID.0);
-        encoder.bytes(&self.state);
+        encode_runtime_state(&mut encoder, &self.state);
         encode_actor_invocation(&mut encoder, &self.invocation);
     }
 
@@ -121,7 +132,7 @@ impl ServiceWire for RuntimeExecutionCall {
             return Err(DecodeError::InvalidPlatform);
         }
         let call = Self {
-            state: decoder.bytes()?,
+            state: decode_runtime_state(decoder)?,
             invocation: decode_actor_invocation(decoder)?,
         };
         call.invocation
@@ -137,7 +148,7 @@ impl ServiceWire for RuntimeExecutionReturn {
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
         encoder.fixed(&super::RUNTIME_ABI_ID.0);
-        encoder.bytes(&self.state);
+        encode_runtime_state(&mut encoder, &self.state);
         match &self.result {
             Ok(reply) => {
                 encoder.bool(true);
@@ -154,7 +165,7 @@ impl ServiceWire for RuntimeExecutionReturn {
         if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID {
             return Err(DecodeError::InvalidPlatform);
         }
-        let state = decoder.bytes()?;
+        let state = decode_runtime_state(decoder)?;
         let result = if decoder.bool()? {
             Ok(decode_execution_reply(decoder)?)
         } else {
@@ -164,61 +175,160 @@ impl ServiceWire for RuntimeExecutionReturn {
     }
 }
 
-impl ServiceWire for StandardRuntimeState {
-    const MAGIC: [u8; 4] = *b"AGST";
-
-    fn encode_body(&self, output: &mut Vec<u8>) {
-        let mut encoder = Encoder(output);
-        encoder.fixed(&super::RUNTIME_ABI_ID.0);
-        encoder.option(&self.config, encode_config);
-        encoder.list(&self.actors, |encoder, actor| {
-            encode_entry(encoder, &actor.record.entry);
-            encoder.fixed(&actor.record.producer.0);
-            encode_blob(encoder, &actor.record.package);
-            encode_initial_state(encoder, &actor.record.initial_state);
-            encode_requirements(encoder, actor.record.requirements);
-            encode_debt(encoder, actor.debt);
-            encode_lane_state(encoder, &actor.lane_state);
-        });
+impl RuntimeState {
+    pub fn is_empty(&self) -> bool {
+        self.control.is_empty()
+            && self.linear.is_empty()
+            && self.merge.is_empty()
+            && self.local.is_empty()
     }
 
-    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID {
-            return Err(DecodeError::InvalidPlatform);
+    pub fn component(&self, lane: StateLane) -> &[u8] {
+        match lane {
+            StateLane::Linear => &self.linear,
+            StateLane::Merge => &self.merge,
+            StateLane::Local => &self.local,
         }
-        let state = StandardRuntimeState {
-            config: decoder.option(decode_config)?,
-            actors: decoder.list(|decoder| {
-                Ok(StandardActorState {
-                    record: super::ActorRecord {
-                        entry: decode_entry(decoder)?,
-                        producer: ProducerId(decoder.fixed()?),
-                        package: decode_blob(decoder)?,
-                        initial_state: decode_initial_state(decoder)?,
-                        requirements: decode_requirements(decoder)?,
-                    },
-                    debt: decode_debt(decoder)?,
-                    lane_state: decode_lane_state(decoder)?,
-                })
-            })?,
-        };
-        StandardAgentRuntime::restore(state.clone()).map_err(|_| DecodeError::NonCanonical)?;
-        Ok(state)
     }
+}
+
+/// Encode the standard runtime's policy state and three actor-state lanes as
+/// independently durable opaque components.
+pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeState {
+    let mut control = Vec::new();
+    let mut encoder = Encoder(&mut control);
+    encoder.fixed(&super::RUNTIME_ABI_ID.0);
+    encoder.option(&state.config, encode_config);
+    encoder.list(&state.actors, |encoder, actor| {
+        encode_entry(encoder, &actor.record.entry);
+        encoder.fixed(&actor.record.producer.0);
+        encode_blob(encoder, &actor.record.package);
+        encode_initial_state(encoder, &actor.record.initial_state);
+        encode_requirements(encoder, actor.record.requirements);
+        encode_debt(encoder, actor.debt);
+    });
+    RuntimeState {
+        control,
+        linear: encode_standard_lane(state, StateLane::Linear),
+        merge: encode_standard_lane(state, StateLane::Merge),
+        local: encode_standard_lane(state, StateLane::Local),
+    }
+}
+
+/// Decode all opaque standard-runtime components and enforce that their actor
+/// keysets agree exactly with the control directory.
+pub fn decode_standard_runtime_state(
+    state: &RuntimeState,
+) -> Result<StandardRuntimeState, DecodeError> {
+    if state.is_empty() {
+        return Ok(StandardRuntimeState::default());
+    }
+    if state.control.is_empty()
+        || state.linear.is_empty()
+        || state.merge.is_empty()
+        || state.local.is_empty()
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    let mut decoder = Decoder::new(&state.control);
+    if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID {
+        return Err(DecodeError::InvalidPlatform);
+    }
+    let config = decoder.option(decode_config)?;
+    let mut actors = decoder.list(|decoder| {
+        Ok(StandardActorState {
+            record: super::ActorRecord {
+                entry: decode_entry(decoder)?,
+                producer: ProducerId(decoder.fixed()?),
+                package: decode_blob(decoder)?,
+                initial_state: decode_initial_state(decoder)?,
+                requirements: decode_requirements(decoder)?,
+            },
+            debt: decode_debt(decoder)?,
+            lane_state: StandardLaneState::default(),
+        })
+    })?;
+    if !decoder.exhausted() {
+        return Err(DecodeError::TrailingBytes);
+    }
+    for (lane, bytes) in [
+        (StateLane::Linear, state.linear.as_slice()),
+        (StateLane::Merge, state.merge.as_slice()),
+        (StateLane::Local, state.local.as_slice()),
+    ] {
+        let values = decode_standard_lane(bytes, lane)?;
+        if values.len() != actors.len() {
+            return Err(DecodeError::NonCanonical);
+        }
+        for (actor, (id, value)) in actors.iter_mut().zip(values) {
+            if actor.record.entry.actor != id {
+                return Err(DecodeError::NonCanonical);
+            }
+            match lane {
+                StateLane::Linear => actor.lane_state.linear = value,
+                StateLane::Merge => actor.lane_state.merge = value,
+                StateLane::Local => actor.lane_state.local = value,
+            }
+        }
+    }
+    let state = StandardRuntimeState { config, actors };
+    StandardAgentRuntime::restore(state.clone()).map_err(|_| DecodeError::NonCanonical)?;
+    Ok(state)
+}
+
+fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut encoder = Encoder(&mut output);
+    encoder.fixed(&super::RUNTIME_ABI_ID.0);
+    encoder.u8(lane as u8);
+    encoder.list(&state.actors, |encoder, actor| {
+        encoder.fixed(&actor.record.entry.actor.0);
+        let value = match lane {
+            StateLane::Linear => &actor.lane_state.linear,
+            StateLane::Merge => &actor.lane_state.merge,
+            StateLane::Local => &actor.lane_state.local,
+        };
+        encoder.option(value, |encoder, bytes| encoder.bytes(bytes));
+    });
+    output
+}
+
+fn decode_standard_lane(
+    bytes: &[u8],
+    expected_lane: StateLane,
+) -> Result<Vec<(ActorId, Option<Vec<u8>>)>, DecodeError> {
+    let mut decoder = Decoder::new(bytes);
+    if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID
+        || decode_state_lane(decoder.u8()?)? != expected_lane
+    {
+        return Err(DecodeError::InvalidPlatform);
+    }
+    let values = decoder.list(|decoder| {
+        let actor = ActorId(decoder.fixed()?);
+        let value = decoder.option(Decoder::bytes)?;
+        if actor == ActorId::ZERO
+            || value
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > super::execution::MAX_EXECUTION_STATE_BYTES)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok((actor, value))
+    })?;
+    if values.windows(2).any(|pair| pair[0].0 >= pair[1].0) || !decoder.exhausted() {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(values)
 }
 
 /// Apply one management call with the bundled deterministic runtime.
 pub fn apply_standard(call: RuntimeCall) -> Result<RuntimeReturn, DecodeError> {
-    let state = if call.state.is_empty() {
-        StandardRuntimeState::default()
-    } else {
-        StandardRuntimeState::decode(&call.state)?
-    };
+    let state = decode_standard_runtime_state(&call.state)?;
     let mut runtime =
         StandardAgentRuntime::restore(state).map_err(|_| DecodeError::NonCanonical)?;
     let result = runtime.apply(call.request);
     Ok(RuntimeReturn {
-        state: runtime.snapshot().encode(),
+        state: encode_standard_runtime_state(&runtime.snapshot()),
         result,
     })
 }
@@ -230,7 +340,7 @@ pub fn apply_standard_execution(
     call: RuntimeExecutionCall,
 ) -> Result<RuntimeExecutionReturn, DecodeError> {
     let original_state = call.state;
-    let state = StandardRuntimeState::decode(&original_state)?;
+    let state = decode_standard_runtime_state(&original_state)?;
     let mut runtime =
         StandardAgentRuntime::restore(state).map_err(|_| DecodeError::NonCanonical)?;
     let result =
@@ -247,11 +357,27 @@ pub fn apply_standard_execution(
                 )
             });
     let state = if result.is_ok() {
-        runtime.snapshot().encode()
+        encode_standard_runtime_state(&runtime.snapshot())
     } else {
         original_state
     };
     Ok(RuntimeExecutionReturn { state, result })
+}
+
+fn encode_runtime_state(encoder: &mut Encoder<'_>, state: &RuntimeState) {
+    encoder.bytes(&state.control);
+    encoder.bytes(&state.linear);
+    encoder.bytes(&state.merge);
+    encoder.bytes(&state.local);
+}
+
+fn decode_runtime_state(decoder: &mut Decoder<'_>) -> Result<RuntimeState, DecodeError> {
+    Ok(RuntimeState {
+        control: decoder.bytes()?,
+        linear: decoder.bytes()?,
+        merge: decoder.bytes()?,
+        local: decoder.bytes()?,
+    })
 }
 
 fn encode_actor_invocation(encoder: &mut Encoder<'_>, invocation: &ActorInvocation) {
@@ -705,28 +831,6 @@ fn decode_initial_state(decoder: &mut Decoder<'_>) -> Result<ActorInitialState, 
     })
 }
 
-fn encode_lane_state(encoder: &mut Encoder<'_>, state: &StandardLaneState) {
-    encoder.option(&state.linear, |encoder, bytes| encoder.bytes(bytes));
-    encoder.option(&state.merge, |encoder, bytes| encoder.bytes(bytes));
-    encoder.option(&state.local, |encoder, bytes| encoder.bytes(bytes));
-}
-
-fn decode_lane_state(decoder: &mut Decoder<'_>) -> Result<StandardLaneState, DecodeError> {
-    let state = StandardLaneState {
-        linear: decoder.option(Decoder::bytes)?,
-        merge: decoder.option(Decoder::bytes)?,
-        local: decoder.option(Decoder::bytes)?,
-    };
-    if [&state.linear, &state.merge, &state.local]
-        .into_iter()
-        .flatten()
-        .any(|bytes| bytes.len() > super::execution::MAX_EXECUTION_STATE_BYTES)
-    {
-        return Err(DecodeError::NonCanonical);
-    }
-    Ok(state)
-}
-
 fn encode_blob(encoder: &mut Encoder<'_>, blob: &BlobRef) {
     encoder.fixed(&blob.hash.0);
     encoder.u64(blob.len);
@@ -835,7 +939,12 @@ mod tests {
     #[test]
     fn lifecycle_call_round_trips_with_opaque_runtime_state() {
         let call = RuntimeCall {
-            state: vec![11, 12, 13],
+            state: RuntimeState {
+                control: vec![11],
+                linear: vec![12],
+                merge: vec![13],
+                local: vec![14],
+            },
             request: LifecycleRequest::Create(config()),
         };
         let encoded = call.encode();
@@ -847,7 +956,12 @@ mod tests {
         let actor_pvm = vec![0x21, 0x22, 0x23];
         let state = vec![0x31, 0x32];
         let call = RuntimeExecutionCall {
-            state: vec![0x11, 0x12],
+            state: RuntimeState {
+                control: vec![0x11],
+                linear: vec![0x12],
+                merge: vec![0x13],
+                local: vec![0x14],
+            },
             invocation: ActorInvocation {
                 invocation: crate::service::InvocationId([1; 32]),
                 actor: ActorId([2; 32]),
@@ -878,7 +992,12 @@ mod tests {
             lifecycle_operations: 7,
         };
         let output = RuntimeReturn {
-            state: vec![8],
+            state: RuntimeState {
+                control: vec![8],
+                linear: vec![9],
+                merge: vec![10],
+                local: vec![11],
+            },
             result: Err(LifecycleError::Busy(debt)),
         };
         assert_eq!(RuntimeReturn::decode(&output.encode()).unwrap(), output);
@@ -887,7 +1006,7 @@ mod tests {
     #[test]
     fn unsorted_replica_configuration_is_noncanonical() {
         let mut call = RuntimeCall {
-            state: Vec::new(),
+            state: RuntimeState::default(),
             request: LifecycleRequest::Create(config()),
         };
         let LifecycleRequest::Create(config) = &mut call.request else {
@@ -903,7 +1022,7 @@ mod tests {
     #[test]
     fn standard_runtime_state_survives_independent_calls() {
         let created = apply_standard(RuntimeCall {
-            state: Vec::new(),
+            state: RuntimeState::default(),
             request: LifecycleRequest::Create(config()),
         })
         .unwrap();

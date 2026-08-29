@@ -16,7 +16,7 @@ use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
     RuntimeExecutionCall, RuntimeExecutionReturn,
 };
-use super::wire::{RuntimeCall, RuntimeReturn};
+use super::wire::{RuntimeCall, RuntimeReturn, RuntimeState};
 use super::{
     AgentConfig, AgentConfigError, LifecycleError, LifecycleReply, LifecycleRequest,
     RUNTIME_ABI_ID, RuntimeCapabilities,
@@ -33,7 +33,7 @@ pub struct AgentImage {
     pub revision: u64,
     pub runtime_program: ProgramId,
     pub config: AgentConfig,
-    pub runtime_state: Vec<u8>,
+    pub runtime_state: RuntimeState,
 }
 
 impl ServiceWire for AgentImage {
@@ -45,7 +45,10 @@ impl ServiceWire for AgentImage {
         encoder.u64(self.revision);
         encoder.fixed(&self.runtime_program.0);
         encoder.bytes(&self.config.encode());
-        encoder.bytes(&self.runtime_state);
+        encoder.bytes(&self.runtime_state.control);
+        encoder.bytes(&self.runtime_state.linear);
+        encoder.bytes(&self.runtime_state.merge);
+        encoder.bytes(&self.runtime_state.local);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -56,12 +59,17 @@ impl ServiceWire for AgentImage {
             revision: decoder.u64()?,
             runtime_program: ProgramId(decoder.fixed()?),
             config: AgentConfig::decode(&decoder.bytes()?)?,
-            runtime_state: decoder.bytes()?,
+            runtime_state: RuntimeState {
+                control: decoder.bytes()?,
+                linear: decoder.bytes()?,
+                merge: decoder.bytes()?,
+                local: decoder.bytes()?,
+            },
         };
         if image.revision == 0
             || image.runtime_program == ProgramId::ZERO
             || image.runtime_state.is_empty()
-            || image.runtime_state.len() > MAX_RUNTIME_STATE_BYTES
+            || runtime_state_size(&image.runtime_state) > MAX_RUNTIME_STATE_BYTES
             || image.config.validate().is_err()
             || image.config.identity.runtime_program != image.runtime_program
         {
@@ -263,7 +271,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             &runtime_pvm,
             DEFAULT_MANAGEMENT_GAS,
             RuntimeCall {
-                state: Vec::new(),
+                state: RuntimeState::default(),
                 request: LifecycleRequest::Create(config.clone()),
             },
         )?;
@@ -356,6 +364,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let expected_invocation = invocation.invocation;
         let expected_actor = invocation.actor;
         let expected_deployment = invocation.deployment;
+        let mode = invocation.mode;
         let outer_gas = self.management_gas.saturating_add(invocation.gas);
         let output: RuntimeExecutionReturn = execute_runtime_wire(
             &self.runtime_pvm,
@@ -388,6 +397,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             }
             return Ok(reply);
         }
+        validate_execution_transition(&self.image.runtime_state, &output.state, mode)?;
 
         let next = AgentImage {
             revision: self
@@ -505,12 +515,47 @@ impl<S: AgentImageStore> AgentDriver<S> {
     }
 }
 
-fn validate_state_size(state: &[u8]) -> Result<(), AgentDriverError> {
-    if state.is_empty() || state.len() > MAX_RUNTIME_STATE_BYTES {
+fn runtime_state_size(state: &RuntimeState) -> usize {
+    state
+        .control
+        .len()
+        .saturating_add(state.linear.len())
+        .saturating_add(state.merge.len())
+        .saturating_add(state.local.len())
+}
+
+fn validate_state_size(state: &RuntimeState) -> Result<(), AgentDriverError> {
+    if state.is_empty() || runtime_state_size(state) > MAX_RUNTIME_STATE_BYTES {
         Err(AgentDriverError::RuntimeStateTooLarge)
     } else {
         Ok(())
     }
+}
+
+fn validate_execution_transition(
+    prior: &RuntimeState,
+    next: &RuntimeState,
+    mode: super::MethodMode,
+) -> Result<(), AgentDriverError> {
+    let Some(write_lane) = mode.write_lane() else {
+        return if next == prior {
+            Ok(())
+        } else {
+            Err(AgentDriverError::InvalidRuntime)
+        };
+    };
+    if next.control != prior.control
+        || [
+            super::StateLane::Linear,
+            super::StateLane::Merge,
+            super::StateLane::Local,
+        ]
+        .into_iter()
+        .any(|lane| lane != write_lane && next.component(lane) != prior.component(lane))
+    {
+        return Err(AgentDriverError::InvalidRuntime);
+    }
+    Ok(())
 }
 
 fn execute_runtime(
@@ -549,7 +594,7 @@ mod tests {
             revision: 1,
             runtime_program: ProgramId([1; 32]),
             config: invalid_config(),
-            runtime_state: Vec::new(),
+            runtime_state: RuntimeState::default(),
         }
         .encode();
         assert!(AgentImage::decode(&bytes).is_err());

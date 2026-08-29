@@ -74,14 +74,14 @@ pub enum ActorExecutionError {
 /// Complete runtime execution call. `state` is opaque to the node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeExecutionCall {
-    pub state: Vec<u8>,
+    pub state: super::wire::RuntimeState,
     pub invocation: ActorInvocation,
 }
 
 /// Complete deterministic runtime execution result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeExecutionReturn {
-    pub state: Vec<u8>,
+    pub state: super::wire::RuntimeState,
     pub result: Result<ActorExecutionReply, ActorExecutionError>,
 }
 

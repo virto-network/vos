@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail, ensure};
-use vos::agent::wire::{RuntimeCall, RuntimeReturn};
+use vos::agent::wire::{RuntimeCall, RuntimeReturn, RuntimeState};
 use vos::agent::{LifecycleError, LifecycleRequest};
 use vos::service::{ProgramId, ServiceWire};
 use vos_pvm::ExitReason;
@@ -54,7 +54,7 @@ fn canonical_agent_runtime_pvm(elf: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 fn validate_agent_runtime_pvm(pvm: &[u8]) -> anyhow::Result<()> {
     let probe = RuntimeCall {
-        state: Vec::new(),
+        state: RuntimeState::default(),
         request: LifecycleRequest::Inspect {
             after: None,
             limit: 1,
