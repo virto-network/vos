@@ -12,6 +12,8 @@ use alloc::vec::Vec;
 pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
 #[cfg(feature = "std")]
 pub mod driver;
+#[cfg(feature = "std")]
+pub mod host;
 #[cfg(feature = "pvm")]
 pub mod machine;
 pub mod package;
@@ -402,6 +404,7 @@ pub trait AgentRuntime {
 /// Structural validation of immutable agent configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentConfigError {
+    InvalidIdentity,
     NoReplicas,
     DuplicateReplica,
     ReplicaOrder,
@@ -424,6 +427,12 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     pub fn validate(&self) -> Result<(), AgentConfigError> {
+        if self.identity.space == SpaceId::ZERO
+            || self.identity.agent == AgentId::ZERO
+            || self.identity.owner == PrincipalId::ZERO
+        {
+            return Err(AgentConfigError::InvalidIdentity);
+        }
         if self.capabilities.max_actors == 0 {
             return Err(AgentConfigError::InvalidRuntimeCapacity);
         }
