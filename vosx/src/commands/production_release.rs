@@ -1,10 +1,12 @@
 //! Build and verify one self-describing production artifact directory.
 //!
 //! `vos-service.pvm` is the consensus program all hosts execute. The canonical
-//! `space-authority.pvm` is the authority identity sealed into new
-//! production spaces. A release must carry these exact pins
-//! together; selecting either artifact from a developer build directory would
-//! make a deployment unreproducible or an existing space impossible to open.
+//! `space-authority.pvm` is the authority identity sealed into new production
+//! spaces. `agent-runtime.pvm` is the standard runtime installed for agents
+//! that do not select a compatible custom runtime. A release must carry these
+//! exact pins together; selecting an artifact from a developer build directory
+//! would make a deployment unreproducible or an existing space impossible to
+//! open.
 
 use std::fs;
 use std::io::Read;
@@ -21,12 +23,13 @@ const RELEASE_FORMAT: &str = "VOS-RELEASE";
 const MANIFEST_FILE: &str = "manifest.json";
 const SERVICE_FILE: &str = "vos-service.pvm";
 const AUTHORITY_FILE: &str = "space-authority.pvm";
+const AGENT_RUNTIME_FILE: &str = "agent-runtime.pvm";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum ReleaseCommand {
-    /// Create a new directory containing both pinned PVMs and their manifest.
+    /// Create a new directory containing the pinned PVMs and their manifest.
     Bundle {
         /// Committed/freshly reproduced canonical `vos-service.pvm`.
         #[arg(long)]
@@ -50,6 +53,7 @@ struct ReleaseManifest {
     execution_semantics: String,
     service: ReleaseArtifact,
     authority: ReleaseArtifact,
+    agent_runtime: ReleaseArtifact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,7 +91,9 @@ fn bundle(service_path: &Path, output: &Path) -> anyhow::Result<()> {
     let authority = bundled::space_authority_pvm()
         .context("this vosx build does not contain the frozen production authority")?;
     validate_authority(authority)?;
-    let manifest = manifest_for(&service, authority);
+    let agent_runtime = bundled::agent_runtime_pvm();
+    validate_agent_runtime(agent_runtime)?;
+    let manifest = manifest_for(&service, authority, agent_runtime);
 
     let parent = nonempty_parent(output);
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -98,16 +104,19 @@ fn bundle(service_path: &Path, output: &Path) -> anyhow::Result<()> {
     let mut guard = PartialDirectory(Some(output.to_path_buf()));
     fs::write(output.join(SERVICE_FILE), &service).context("write pinned service PVM")?;
     fs::write(output.join(AUTHORITY_FILE), authority).context("write canonical authority PVM")?;
+    fs::write(output.join(AGENT_RUNTIME_FILE), agent_runtime)
+        .context("write canonical agent runtime PVM")?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).context("encode release manifest")?;
     fs::write(output.join(MANIFEST_FILE), manifest_bytes).context("write release manifest")?;
     verify(output).context("verify staged production release")?;
     guard.0 = None;
-    println!(
-        "bundled production service artifacts at {}",
-        output.display()
-    );
+    println!("bundled production artifacts at {}", output.display());
     println!("  service_program_id = {}", manifest.service.program_id);
     println!("  authority_program_id = {}", manifest.authority.program_id);
+    println!(
+        "  agent_runtime_program_id = {}",
+        manifest.agent_runtime.program_id
+    );
     Ok(())
 }
 
@@ -129,9 +138,12 @@ fn verify(directory: &Path) -> anyhow::Result<ReleaseManifest> {
         serde_json::from_slice(&manifest_bytes).context("decode production release manifest")?;
     let service = read_regular_bounded(&directory.join(SERVICE_FILE), MAX_ARTIFACT_BYTES)?;
     let authority = read_regular_bounded(&directory.join(AUTHORITY_FILE), MAX_ARTIFACT_BYTES)?;
+    let agent_runtime =
+        read_regular_bounded(&directory.join(AGENT_RUNTIME_FILE), MAX_ARTIFACT_BYTES)?;
     validate_service(&service)?;
     validate_authority(&authority)?;
-    let expected = manifest_for(&service, &authority);
+    validate_agent_runtime(&agent_runtime)?;
+    let expected = manifest_for(&service, &authority, &agent_runtime);
     if manifest != expected {
         bail!("release manifest does not describe the exact pinned artifacts");
     }
@@ -161,13 +173,30 @@ fn validate_authority(bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn manifest_for(service: &[u8], authority: &[u8]) -> ReleaseManifest {
+fn validate_agent_runtime(bytes: &[u8]) -> anyhow::Result<()> {
+    let canonical = bundled::agent_runtime_pvm();
+    if bytes != canonical {
+        bail!("agent runtime PVM does not match the canonical release bytes");
+    }
+    let actual = ProgramId::of_pvm(bytes);
+    if actual != vos::agent::STANDARD_RUNTIME_PROGRAM_ID {
+        bail!(
+            "agent runtime PVM has program {}, expected protocol pin {}",
+            hex::encode(actual.0),
+            hex::encode(vos::agent::STANDARD_RUNTIME_PROGRAM_ID.0),
+        );
+    }
+    Ok(())
+}
+
+fn manifest_for(service: &[u8], authority: &[u8], agent_runtime: &[u8]) -> ReleaseManifest {
     ReleaseManifest {
         format: RELEASE_FORMAT.into(),
         platform: hex::encode(vos::service::PLATFORM_ID.0),
         execution_semantics: hex::encode(vos::service::EXECUTION_SEMANTICS_ID.0),
         service: artifact(SERVICE_FILE, service),
         authority: artifact(AUTHORITY_FILE, authority),
+        agent_runtime: artifact(AGENT_RUNTIME_FILE, agent_runtime),
     }
 }
 
@@ -246,7 +275,7 @@ fn normalize_release_directory(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn verify_directory_shape(directory: &Path) -> anyhow::Result<()> {
-    let mut seen = [false; 3];
+    let mut seen = [false; 4];
     let mut count = 0usize;
     for entry in fs::read_dir(directory)
         .with_context(|| format!("read release directory {}", directory.display()))?
@@ -255,7 +284,7 @@ fn verify_directory_shape(directory: &Path) -> anyhow::Result<()> {
         count += 1;
         if count > seen.len() {
             bail!(
-                "release directory must contain exactly {MANIFEST_FILE}, {SERVICE_FILE}, and {AUTHORITY_FILE}",
+                "release directory must contain exactly {MANIFEST_FILE}, {SERVICE_FILE}, {AUTHORITY_FILE}, and {AGENT_RUNTIME_FILE}",
             );
         }
         let name = entry.file_name();
@@ -263,6 +292,7 @@ fn verify_directory_shape(directory: &Path) -> anyhow::Result<()> {
             Some(MANIFEST_FILE) => 0,
             Some(SERVICE_FILE) => 1,
             Some(AUTHORITY_FILE) => 2,
+            Some(AGENT_RUNTIME_FILE) => 3,
             Some(_) => bail!("release directory contains an unexpected entry"),
             None => bail!("release contains a non-UTF-8 file name"),
         };
@@ -272,7 +302,7 @@ fn verify_directory_shape(directory: &Path) -> anyhow::Result<()> {
     }
     if count != seen.len() || !seen.into_iter().all(|present| present) {
         bail!(
-            "release directory must contain exactly {MANIFEST_FILE}, {SERVICE_FILE}, and {AUTHORITY_FILE}",
+            "release directory must contain exactly {MANIFEST_FILE}, {SERVICE_FILE}, {AUTHORITY_FILE}, and {AGENT_RUNTIME_FILE}",
         );
     }
     Ok(())
@@ -331,13 +361,18 @@ mod tests {
     }
 
     #[test]
-    fn manifest_binds_platform_and_both_artifacts() {
-        let manifest = manifest_for(b"service", b"authority");
+    fn manifest_binds_platform_and_all_artifacts() {
+        let manifest = manifest_for(b"service", b"authority", b"agent runtime");
         assert_eq!(manifest.format, RELEASE_FORMAT);
         assert_eq!(manifest.platform, hex::encode(vos::service::PLATFORM_ID.0));
         assert_eq!(manifest.service.file, SERVICE_FILE);
         assert_eq!(manifest.authority.file, AUTHORITY_FILE);
+        assert_eq!(manifest.agent_runtime.file, AGENT_RUNTIME_FILE);
         assert_ne!(manifest.service.blake2b_256, manifest.authority.blake2b_256);
+        assert_ne!(
+            manifest.authority.blake2b_256,
+            manifest.agent_runtime.blake2b_256
+        );
     }
 
     #[test]
@@ -349,6 +384,22 @@ mod tests {
     fn bundled_authority_matches_the_runtime_release_pins() {
         let authority = bundled::space_authority_pvm().expect("bundled authority");
         validate_authority(authority).expect("build-time and runtime authority pins must agree");
+    }
+
+    #[test]
+    fn agent_runtime_pin_rejects_changed_bytes() {
+        assert!(validate_agent_runtime(b"not the canonical agent runtime").is_err());
+    }
+
+    #[test]
+    fn bundled_agent_runtime_matches_the_protocol_release_pin() {
+        let runtime = bundled::agent_runtime_pvm();
+        validate_agent_runtime(runtime)
+            .expect("build-time and protocol agent-runtime pins must agree");
+        assert_eq!(
+            ProgramId::of_pvm(runtime),
+            vos::agent::STANDARD_RUNTIME_PROGRAM_ID
+        );
     }
 
     #[cfg(unix)]
@@ -375,7 +426,13 @@ mod tests {
     #[test]
     fn directory_scan_rejects_the_first_surplus_entry() {
         let temp = TestDir::new("surplus");
-        for name in [MANIFEST_FILE, SERVICE_FILE, AUTHORITY_FILE, "surplus"] {
+        for name in [
+            MANIFEST_FILE,
+            SERVICE_FILE,
+            AUTHORITY_FILE,
+            AGENT_RUNTIME_FILE,
+            "surplus",
+        ] {
             fs::write(temp.0.join(name), b"x").expect("write test entry");
         }
         assert!(verify_directory_shape(&temp.0).is_err());

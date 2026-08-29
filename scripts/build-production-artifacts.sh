@@ -3,9 +3,9 @@ set -euo pipefail
 
 mode=${1:-all}
 case "$mode" in
-    all | service | authority | registry | clerk | clerk-test) ;;
+    all | service | agent-runtime | authority | registry | clerk | clerk-test) ;;
     *)
-        echo "usage: $0 [all|service|authority|registry|clerk|clerk-test] [clerk-signer-key]" >&2
+        echo "usage: $0 [all|service|agent-runtime|authority|registry|clerk|clerk-test] [clerk-signer-key]" >&2
         exit 2
         ;;
 esac
@@ -35,6 +35,10 @@ host_toolchain=$(manifest_value host_toolchain)
 service_elf_digest=$(manifest_value service_elf_blake2b_256)
 service_pvm_digest=$(manifest_value service_pvm_blake2b_256)
 service_program=$(manifest_value service_program_id)
+agent_runtime_source_revision=$(manifest_value agent_runtime_source_revision)
+agent_runtime_elf_digest=$(manifest_value agent_runtime_elf_blake2b_256)
+agent_runtime_pvm_digest=$(manifest_value agent_runtime_pvm_blake2b_256)
+agent_runtime_program=$(manifest_value agent_runtime_program_id)
 authority_pvm_digest=$(manifest_value authority_pvm_blake2b_256)
 authority_program=$(manifest_value authority_program_id)
 registry_elf_digest=$(manifest_value registry_elf_blake2b_256)
@@ -44,6 +48,8 @@ clerk_task=$(manifest_value clerk_task_hash)
 for value in \
     "$source_revision" "$guest_toolchain" "$host_toolchain" \
     "$service_elf_digest" "$service_pvm_digest" "$service_program" \
+    "$agent_runtime_source_revision" "$agent_runtime_elf_digest" \
+    "$agent_runtime_pvm_digest" "$agent_runtime_program" \
     "$authority_pvm_digest" "$authority_program" \
     "$registry_elf_digest" \
     "$clerk_program" "$clerk_deployment" "$clerk_task"
@@ -54,6 +60,7 @@ do
     fi
 done
 if [[ ! $source_revision =~ ^[0-9a-f]{40}$ ]] \
+    || [[ ! $agent_runtime_source_revision =~ ^[0-9a-f]{40}$ ]] \
     || [[ ! $guest_toolchain =~ ^[A-Za-z0-9._-]+$ ]] \
     || [[ ! $host_toolchain =~ ^[A-Za-z0-9._-]+$ ]]
 then
@@ -62,6 +69,8 @@ then
 fi
 for digest in \
     "$service_elf_digest" "$service_pvm_digest" "$service_program" \
+    "$agent_runtime_elf_digest" "$agent_runtime_pvm_digest" \
+    "$agent_runtime_program" \
     "$authority_pvm_digest" "$authority_program" \
     "$registry_elf_digest" \
     "$clerk_program" "$clerk_deployment" "$clerk_task"
@@ -75,12 +84,20 @@ git -C "$repository_root" cat-file -e "${source_revision}^{commit}" 2>/dev/null 
     echo "pinned service source revision $source_revision is unavailable; fetch complete repository history" >&2
     exit 1
 }
+git -C "$repository_root" cat-file -e "${agent_runtime_source_revision}^{commit}" 2>/dev/null || {
+    echo "pinned agent-runtime source revision $agent_runtime_source_revision is unavailable; fetch complete repository history" >&2
+    exit 1
+}
 rustup run "$guest_toolchain" rustc --version >/dev/null
 rustup run "$host_toolchain" rustc --version >/dev/null
 
 build_root=$(mktemp -d "${TMPDIR:-/tmp}/vos-artifacts.XXXXXX")
+agent_build_root=
 cleanup() {
     rm -rf -- "$build_root"
+    if [[ -n $agent_build_root ]]; then
+        rm -rf -- "$agent_build_root"
+    fi
 }
 trap cleanup EXIT
 
@@ -150,6 +167,71 @@ if [[ $mode == all || $mode == service ]]; then
     install -m 0644 \
         "$fresh_service_pvm" \
         "$artifact_root/vos-service.pvm"
+fi
+
+if [[ $mode == all || $mode == agent-runtime ]]; then
+    # The standard agent runtime has its own immutable source boundary. It was
+    # introduced after the other production artifacts, so reproducing it from
+    # their older common source revision would silently verify the working-tree
+    # binary instead of the source that actually defines it.
+    agent_build_root=$(mktemp -d "${TMPDIR:-/tmp}/vos-agent-runtime.XXXXXX")
+    git -C "$repository_root" archive --format=tar "$agent_runtime_source_revision" \
+        | tar -xf - -C "$agent_build_root"
+    mkdir "$agent_build_root/.git"
+    sed -i "s/+nightly/+${guest_toolchain}/g" \
+        "$agent_build_root/vosx/src/commands/build.rs"
+
+    agent_cache_root="$repository_root/target/pinned-production-build/$agent_runtime_source_revision"
+    mkdir -p "$agent_cache_root"
+    (
+        cd "$agent_build_root"
+        CARGO_TARGET_DIR="$agent_cache_root/host" \
+            cargo "+$host_toolchain" build -p vosx
+    )
+    agent_pinned_vosx="$agent_cache_root/host/debug/vosx"
+
+    (
+        cd "$agent_build_root/services/agent-runtime"
+        CARGO_TARGET_DIR="$agent_cache_root/runtime" cargo "+$guest_toolchain" actor
+    )
+    agent_runtime_elf="$agent_cache_root/runtime/riscv64em-vos/release/agent_runtime.elf"
+    actual_agent_runtime_elf_digest=$(b2sum -l 256 "$agent_runtime_elf")
+    actual_agent_runtime_elf_digest=${actual_agent_runtime_elf_digest%% *}
+    if [[ $actual_agent_runtime_elf_digest != "$agent_runtime_elf_digest" ]]; then
+        echo "pinned agent-runtime ELF digest mismatch: expected $agent_runtime_elf_digest, got $actual_agent_runtime_elf_digest" >&2
+        exit 1
+    fi
+
+    fresh_agent_runtime_pvm="$agent_build_root/agent-runtime.pvm"
+    agent_runtime_log="$agent_build_root/agent-runtime-pvm.log"
+    "$agent_pinned_vosx" agent-runtime-pvm "$agent_runtime_elf" \
+        --out "$fresh_agent_runtime_pvm" | tee "$agent_runtime_log"
+    if ! grep -Fq "agent_runtime_program_id = $agent_runtime_program" "$agent_runtime_log"; then
+        echo "pinned agent-runtime ProgramId missing from transpiler output: $agent_runtime_program" >&2
+        exit 1
+    fi
+    actual_agent_runtime_pvm_digest=$(b2sum -l 256 "$fresh_agent_runtime_pvm")
+    actual_agent_runtime_pvm_digest=${actual_agent_runtime_pvm_digest%% *}
+    if [[ $actual_agent_runtime_pvm_digest != "$agent_runtime_pvm_digest" ]]; then
+        echo "fresh agent-runtime PVM digest mismatch: expected $agent_runtime_pvm_digest, got $actual_agent_runtime_pvm_digest" >&2
+        exit 1
+    fi
+    if ! cmp -s "$fresh_agent_runtime_pvm" "$repository_root/vosx/blobs/agent_runtime.pvm"; then
+        if [[ ${VOS_REPIN_ARTIFACTS:-0} != 1 ]]; then
+            echo "fresh pinned agent-runtime PVM differs from the committed artifact" >&2
+            echo "set VOS_REPIN_ARTIFACTS=1 only for an intentional reviewed repin" >&2
+            exit 1
+        fi
+        install -m 0644 \
+            "$fresh_agent_runtime_pvm" \
+            "$repository_root/vosx/blobs/agent_runtime.pvm"
+    fi
+    install -m 0644 \
+        "$agent_runtime_elf" \
+        "$artifact_root/agent_runtime.elf"
+    install -m 0644 \
+        "$fresh_agent_runtime_pvm" \
+        "$artifact_root/agent-runtime.pvm"
 fi
 
 if [[ $mode == all || $mode == registry ]]; then

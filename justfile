@@ -135,10 +135,15 @@ build-authority-upgrade-candidate:
 build-authority-release:
     scripts/build-production-artifacts.sh authority
 
-# Assemble the two protocol-pinned production PVMs with a strict manifest.
+# Reproduce the standard agent runtime from its separately pinned source
+# revision and require exact identity with the committed release artifact.
+build-agent-runtime-release:
+    scripts/build-production-artifacts.sh agent-runtime
+
+# Assemble the three protocol-pinned production PVMs with a strict manifest.
 # The command refuses to replace an existing directory so a release operator
 # cannot silently mutate an artifact set that has already been distributed.
-package-production-release out="target/production-release": build-authority-release
+package-production-release out="target/production-release": build-authority-release build-agent-runtime-release
     cargo run -p vosx -- release bundle \
       --service-pvm services/vos-service/vos-service.pvm --out "{{out}}"
     cargo run -p vosx -- release verify "{{out}}"

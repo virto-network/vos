@@ -97,4 +97,5 @@ cargo run -p vosx -- release verify target/production-release
 ```
 
 Release verification rejects symlinks, special files, extra files, digest
-mismatches, and non-reproducible PVM output.
+mismatches, and non-reproducible PVM output. The bundle contains the consensus
+service, canonical space authority, and standard multi-actor runtime.
