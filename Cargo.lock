@@ -7600,6 +7600,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "libloading",
  "libp2p",
  "log",

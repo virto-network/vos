@@ -2,41 +2,22 @@
 //!
 //! An [`AgentHost`] owns one filesystem directory and any number of agent
 //! runtime instances. Each image remains independently replaceable and is
-//! addressed by its full [`AgentId`]. Runtime programs come from an explicit
-//! content-addressed source; reopening never substitutes a default runtime.
+//! addressed by its full [`AgentId`]. Runtime packages and programs live in
+//! each image's mandatory content-addressed catalog closure.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use super::authority::{
-    CAPABILITY_AGENT_CREATE_LOCAL, CAPABILITY_AGENT_CREATE_PRIVATE, CAPABILITY_AGENT_CREATE_SHARED,
-    VerifiedAgentAuthorityReceipt, authorize_lifecycle,
-};
-use super::driver::{AgentDriver, AgentDriverError, AgentImageStore, FileAgentStore};
+use super::authority::AgentAuthorityReceipt;
+use super::driver::{AgentDriver, AgentDriverError, AgentTrustProvider, FileAgentStore};
 use super::execution::{ActorExecutionReply, ActorInvocation};
-use super::package::VerifiedPackage;
-use super::{
-    ActorDirectoryPage, ActorEntry, ActorInitialState, AgentConfig, AgentIdentity, AgentProfile,
-    LifecycleRequest,
-};
-use crate::service::{ActorId, AgentId, CapabilityId, DeploymentId, ProgramId};
+use super::package::Package;
+use super::{ActorDirectoryPage, ActorEntry, AgentConfig, AgentIdentity};
+use crate::service::{ActorId, AgentId, DeploymentId};
 
 const IMAGE_SUFFIX: &str = ".agent-image";
-
-/// Exact runtime-program lookup used while creating or reopening agents.
-pub trait RuntimeSource {
-    fn runtime(&self, program: ProgramId) -> Option<Vec<u8>>;
-}
-
-impl<F> RuntimeSource for F
-where
-    F: Fn(ProgramId) -> Option<Vec<u8>>,
-{
-    fn runtime(&self, program: ProgramId) -> Option<Vec<u8>> {
-        self(program)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentHostError {
@@ -44,7 +25,6 @@ pub enum AgentHostError {
     InvalidImageName,
     DuplicateAgent,
     AgentNotFound,
-    RuntimeUnavailable(ProgramId),
     IdentityMismatch,
     Driver(AgentDriverError),
 }
@@ -64,19 +44,22 @@ impl From<AgentDriverError> for AgentHostError {
 }
 
 /// One process-local owner of a directory of durable agents.
-pub struct AgentHost<R> {
+pub struct AgentHost {
     root: PathBuf,
-    runtimes: R,
     agents: BTreeMap<AgentId, AgentDriver<FileAgentStore>>,
+    trust: Arc<dyn AgentTrustProvider>,
 }
 
-impl<R: RuntimeSource> AgentHost<R> {
+impl AgentHost {
     /// Open every canonical image in `root`.
     ///
     /// Runtime state is validated by executing the exact runtime named in the
     /// image. A missing runtime or malformed image fails the complete open;
     /// the host never exposes a partially recovered directory.
-    pub fn open(root: impl Into<PathBuf>, runtimes: R) -> Result<Self, AgentHostError> {
+    pub fn open(
+        root: impl Into<PathBuf>,
+        trust: Arc<dyn AgentTrustProvider>,
+    ) -> Result<Self, AgentHostError> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(|_| AgentHostError::Unavailable)?;
         let mut discovered = Vec::new();
@@ -105,23 +88,16 @@ impl<R: RuntimeSource> AgentHost<R> {
         let mut agents = BTreeMap::new();
         for (agent, path) in discovered {
             let store = FileAgentStore::new(path);
-            let image = store
-                .load()
-                .map_err(|error| AgentHostError::Driver(AgentDriverError::Store(error)))?
-                .ok_or(AgentHostError::InvalidImageName)?;
-            if image.config.identity.agent != agent {
+            let driver = AgentDriver::open(store, trust.clone())?;
+            if driver.image().config.identity.agent != agent {
                 return Err(AgentHostError::IdentityMismatch);
             }
-            let runtime = runtimes
-                .runtime(image.runtime_program)
-                .ok_or(AgentHostError::RuntimeUnavailable(image.runtime_program))?;
-            let driver = AgentDriver::create_or_open(runtime, image.config, store)?;
             agents.insert(agent, driver);
         }
         Ok(Self {
             root,
-            runtimes,
             agents,
+            trust,
         })
     }
 
@@ -154,42 +130,56 @@ impl<R: RuntimeSource> AgentHost<R> {
     pub fn create(
         &mut self,
         config: AgentConfig,
-        authority: &VerifiedAgentAuthorityReceipt,
-    ) -> Result<&AgentIdentity, AgentHostError> {
-        let capability = match config.identity.profile {
-            AgentProfile::Local => CAPABILITY_AGENT_CREATE_LOCAL,
-            AgentProfile::Shared => CAPABILITY_AGENT_CREATE_SHARED,
-            AgentProfile::Private => CAPABILITY_AGENT_CREATE_PRIVATE,
-        };
-        authorize_lifecycle(
-            authority,
-            &config.authority,
-            config.identity.space,
-            config.identity.agent,
-            CapabilityId::named(capability),
-            &LifecycleRequest::Create(config.clone()),
-        )
-        .map_err(|error| AgentHostError::Driver(AgentDriverError::Authority(error)))?;
+        runtime_package: Package,
+        authority: &AgentAuthorityReceipt,
+    ) -> Result<AgentIdentity, AgentHostError> {
         let agent = config.identity.agent;
-        if self.agents.contains_key(&agent) || self.image_path(agent).exists() {
-            return Err(AgentHostError::DuplicateAgent);
+        if self.agents.contains_key(&agent) {
+            self.agents
+                .get_mut(&agent)
+                .expect("agent presence checked above")
+                .retry_create(&config, &runtime_package, authority)?;
+            return Ok(self
+                .agents
+                .get(&agent)
+                .expect("agent presence checked above")
+                .image()
+                .config
+                .identity
+                .clone());
         }
-        let runtime = self
-            .runtimes
-            .runtime(config.identity.runtime_program)
-            .ok_or(AgentHostError::RuntimeUnavailable(
-                config.identity.runtime_program,
-            ))?;
-        let store = FileAgentStore::new(self.image_path(agent));
-        let driver = AgentDriver::create_or_open(runtime, config, store)?;
+        let path = self.image_path(agent);
+        if path.exists() {
+            // A prior Create may have reached the atomic image rename before
+            // its final directory sync (or before the caller received the
+            // response). Reopen the exact durable closure and recover only
+            // the same authority disposition; mismatched or corrupt images
+            // still fail closed.
+            let mut driver = AgentDriver::open(FileAgentStore::new(&path), self.trust.clone())?;
+            if driver.image().config.identity.agent != agent {
+                return Err(AgentHostError::IdentityMismatch);
+            }
+            let identity = driver.retry_create(&config, &runtime_package, authority)?;
+            self.agents.insert(agent, driver);
+            return Ok(identity);
+        }
+        let store = FileAgentStore::new(path);
+        let driver = AgentDriver::create(
+            runtime_package,
+            config,
+            store,
+            self.trust.clone(),
+            authority,
+        )?;
         self.agents.insert(agent, driver);
-        Ok(&self
+        Ok(self
             .agents
             .get(&agent)
             .expect("agent was inserted above")
             .image()
             .config
-            .identity)
+            .identity
+            .clone())
     }
 
     pub fn inspect(
@@ -208,26 +198,25 @@ impl<R: RuntimeSource> AgentHost<R> {
     pub fn install_actor(
         &mut self,
         agent: AgentId,
-        authority: &VerifiedAgentAuthorityReceipt,
+        authority: &AgentAuthorityReceipt,
         name: String,
         parent: Option<ActorId>,
-        package: &VerifiedPackage,
-        initial_state: ActorInitialState,
+        package: &Package,
     ) -> Result<ActorEntry, AgentHostError> {
         self.agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?
-            .install_actor(authority, name, parent, package, initial_state)
+            .install_actor(authority, name, parent, package)
             .map_err(Into::into)
     }
 
     pub fn upgrade_actor(
         &mut self,
         agent: AgentId,
-        authority: &VerifiedAgentAuthorityReceipt,
+        authority: &AgentAuthorityReceipt,
         actor: ActorId,
         from_deployment: DeploymentId,
-        package: &VerifiedPackage,
+        package: &Package,
     ) -> Result<ActorEntry, AgentHostError> {
         self.agents
             .get_mut(&agent)
@@ -239,7 +228,7 @@ impl<R: RuntimeSource> AgentHost<R> {
     pub fn suspend_actor(
         &mut self,
         agent: AgentId,
-        authority: &VerifiedAgentAuthorityReceipt,
+        authority: &AgentAuthorityReceipt,
         actor: ActorId,
     ) -> Result<ActorEntry, AgentHostError> {
         self.agents
@@ -252,7 +241,7 @@ impl<R: RuntimeSource> AgentHost<R> {
     pub fn resume_actor(
         &mut self,
         agent: AgentId,
-        authority: &VerifiedAgentAuthorityReceipt,
+        authority: &AgentAuthorityReceipt,
         actor: ActorId,
     ) -> Result<ActorEntry, AgentHostError> {
         self.agents
@@ -265,7 +254,7 @@ impl<R: RuntimeSource> AgentHost<R> {
     pub fn remove_actor(
         &mut self,
         agent: AgentId,
-        authority: &VerifiedAgentAuthorityReceipt,
+        authority: &AgentAuthorityReceipt,
         actor: ActorId,
         expected_deployment: DeploymentId,
     ) -> Result<(), AgentHostError> {
@@ -279,13 +268,14 @@ impl<R: RuntimeSource> AgentHost<R> {
     pub fn upgrade_runtime(
         &mut self,
         agent: AgentId,
-        authority: &VerifiedAgentAuthorityReceipt,
-        package: &VerifiedPackage,
+        authority: &AgentAuthorityReceipt,
+        from_deployment: DeploymentId,
+        package: &Package,
     ) -> Result<AgentIdentity, AgentHostError> {
         self.agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?
-            .upgrade_runtime(authority, package)
+            .upgrade_runtime(authority, from_deployment, package)
             .map_err(Into::into)
     }
 
@@ -293,11 +283,25 @@ impl<R: RuntimeSource> AgentHost<R> {
         &mut self,
         agent: AgentId,
         invocation: ActorInvocation,
+        evidence: &[u8],
     ) -> Result<ActorExecutionReply, AgentHostError> {
         self.agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?
-            .invoke(invocation)
+            .invoke(invocation, evidence)
+            .map_err(Into::into)
+    }
+
+    pub fn acknowledge_invocation(
+        &mut self,
+        agent: AgentId,
+        invocation: ActorInvocation,
+        evidence: &[u8],
+    ) -> Result<(), AgentHostError> {
+        self.agents
+            .get_mut(&agent)
+            .ok_or(AgentHostError::AgentNotFound)?
+            .acknowledge_invocation(invocation, evidence)
             .map_err(Into::into)
     }
 
@@ -305,10 +309,6 @@ impl<R: RuntimeSource> AgentHost<R> {
         self.agents
             .get(&agent)
             .map(|driver| driver.image().revision)
-    }
-
-    pub fn into_runtime_source(self) -> R {
-        self.runtimes
     }
 
     fn image_path(&self, agent: AgentId) -> PathBuf {

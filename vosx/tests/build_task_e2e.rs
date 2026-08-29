@@ -3,7 +3,18 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use vos::service::{ServiceWire, VosPackage};
+use vos::agent::MethodMode;
+use vos::agent::package::Package;
+use vos::agent::schema::{MethodMeta as AgentMethodMeta, SchemaMeta};
+use vos::metadata::{ActorMeta, MessageMeta};
+use vos::service::ServiceWire;
+
+/// The standard-agent SPI identity is deliberately distinct from the
+/// service-runtime Task identity used by Clerk's production package.
+const AGENT_CLERK_APPLY_TASK_HASH: [u8; 32] = [
+    0x2a, 0xa4, 0xa9, 0x97, 0xe9, 0xe1, 0x63, 0x91, 0xcd, 0xc6, 0xc0, 0xf2, 0x89, 0x86, 0xce, 0xa4,
+    0xa8, 0xe5, 0x8e, 0x8a, 0xc2, 0x82, 0x88, 0x50, 0x83, 0xe1, 0x05, 0x4a, 0x51, 0x3f, 0xc5, 0x76,
+];
 
 struct TempDir(PathBuf);
 
@@ -39,17 +50,65 @@ fn build_accepts_the_canonical_binary_task_project() {
     let vosx = PathBuf::from(env!("CARGO_BIN_EXE_vosx"));
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repository = crate_root.parent().expect("vosx lives in the workspace");
-    let actor = crate_root.join("blobs/space_registry.elf");
     let task = repository.join("tests/fixtures/provable/clerk-apply");
+    let input = TempDir::new("task-project-actor");
     let output = TempDir::new("task-project-output");
     let config = TempDir::new("task-project-config");
     let task_target = TempDir::new("task-project-target");
 
+    let mut actor = vos_pvm_compiler::assembler::Assembler::new();
+    actor.trap();
+    let actor_pvm = actor.build_standard();
+    let actor_path = input.path().join("actor.pvm");
+    let metadata_path = input.path().join("actor.meta");
+    let agent_schema_path = input.path().join("actor.agent");
+    std::fs::write(&actor_path, actor_pvm).expect("write actor PVM");
+
+    const META: ActorMeta = ActorMeta {
+        actor_name: "task-project-e2e",
+        messages: &[MessageMeta {
+            name: "value",
+            is_query: true,
+            fields: &[],
+            returns: "u64",
+            doc: "",
+            timeout_ms: 0,
+            mode: 0,
+            attested: false,
+            capability: None,
+            space_role: None,
+            actor_role: None,
+        }],
+        constructor: &[],
+        cli_methods: &[],
+        doc: "",
+        crdt: false,
+        provable: false,
+    };
+    let (metadata, metadata_len) = vos::metadata::encode::<512>(&META);
+    std::fs::write(&metadata_path, &metadata[..metadata_len]).expect("write actor metadata");
+    const AGENT_SCHEMA: SchemaMeta = SchemaMeta {
+        uses_storage: false,
+        fields: &[],
+        methods: &[AgentMethodMeta {
+            name: "value",
+            mode: MethodMode::Query,
+            explicit: false,
+        }],
+    };
+    let (agent_schema, agent_schema_len) = vos::agent::schema::encode::<512>(&AGENT_SCHEMA);
+    std::fs::write(&agent_schema_path, &agent_schema[..agent_schema_len])
+        .expect("write agent schema");
+
     let built = Command::new(vosx)
-        .arg("build")
-        .arg(&actor)
+        .args(["agent", "build"])
+        .arg(&actor_path)
         .args(["--name", "task-project-e2e", "--task"])
         .arg(&task)
+        .arg("--schemas")
+        .arg(&metadata_path)
+        .arg("--agent-schema")
+        .arg(&agent_schema_path)
         .arg("--out-dir")
         .arg(output.path())
         .env("XDG_CONFIG_HOME", config.path())
@@ -66,21 +125,20 @@ fn build_accepts_the_canonical_binary_task_project() {
 
     let bytes =
         std::fs::read(output.path().join("task-project-e2e.vos")).expect("read generated package");
-    let package = VosPackage::decode(&bytes).expect("decode generated package");
+    assert_eq!(bytes.get(..4), Some(b"VOSK".as_slice()));
+    let package = Package::decode(&bytes).expect("decode generated package");
     package.validate().expect("generated package is canonical");
     assert_eq!(package.task_dependencies.len(), 1);
     assert_eq!(
-        package.task_dependencies[0].binding.task.0,
-        clerk_ledger::CLERK_APPLY_TASK_HASH,
-        "the package builder and Clerk actor must agree on the immutable Task identity",
+        package.task_dependencies[0].binding.task.0, AGENT_CLERK_APPLY_TASK_HASH,
+        "the agent package builder must preserve the immutable SPI Task identity",
     );
     assert_eq!(
         package.task_dependencies[0].binding.witness_capacity,
         16 * 1024
     );
     assert!(
-        String::from_utf8_lossy(&built.stdout)
-            .contains(&hex::encode(clerk_ledger::CLERK_APPLY_TASK_HASH)),
+        String::from_utf8_lossy(&built.stdout).contains(&hex::encode(AGENT_CLERK_APPLY_TASK_HASH)),
         "build output exposes the dependency pin for release/review tooling",
     );
 }

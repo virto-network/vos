@@ -23,6 +23,40 @@ use super::run::RunResult;
 /// - `dispatch` → forwards to `msg.deliver(self, ctx)`
 /// - `on_start` → forwards to `start` handler if one is defined
 ///
+/// Agent state fields must be named so their names and lane codecs can be
+/// authenticated by the signed package schema. A unit struct is the explicit
+/// stateless shape and remains fully supported:
+///
+/// ```
+/// use vos::prelude::*;
+///
+/// #[actor]
+/// struct Health;
+///
+/// #[messages]
+/// impl Health {
+///     fn new() -> Self {
+///         Self
+///     }
+///
+///     #[msg]
+///     fn ready(&self) -> bool {
+///         true
+///     }
+/// }
+///
+/// let _ = <Health as vos::Actor>::create();
+/// ```
+///
+/// Tuple fields have no stable field names and are rejected at compile time:
+///
+/// ```compile_fail
+/// use vos::actor;
+///
+/// #[actor]
+/// struct Coordinates(u64, u64);
+/// ```
+///
 /// ## Without macros
 ///
 /// Add rkyv derives manually and implement `Actor`:
@@ -116,6 +150,13 @@ pub trait Actor: Sized + Encode + Decode {
     #[doc(hidden)]
     const STATE_SCHEMA_LEGACY_FINGERPRINTS: &'static [u64] = &[];
 
+    /// Conventional execution lane for an unannotated `&mut self` handler.
+    /// The actor macro derives this from its fields. Mixed-lane packages must
+    /// annotate every mutating method explicitly, so this value is used only
+    /// for single-lane actors and source-compatible ordinary actors.
+    #[doc(hidden)]
+    const DEFAULT_MUTATION_MODE: crate::agent::MethodMode = crate::agent::MethodMode::Linear;
+
     /// Create a fresh actor instance with default state.
     /// Any initialization data should arrive as a regular message.
     fn create() -> Self;
@@ -140,6 +181,33 @@ pub trait Actor: Sized + Encode + Decode {
     #[doc(hidden)]
     fn __merge_crdt(&mut self, _other: &Self) -> Result<(), crate::crdt::Error> {
         Ok(())
+    }
+
+    /// Reconstruct the actor from independently persisted agent lanes. Manual
+    /// Actor implementations keep a linear whole-state fallback; `#[actor]`
+    /// generates field-wise loading for all three lanes.
+    #[doc(hidden)]
+    fn __load_agent_state(
+        linear: Option<&[u8]>,
+        _merge: Option<&[u8]>,
+        _local: Option<&[u8]>,
+    ) -> Option<Self> {
+        match linear {
+            Some(bytes) if !bytes.is_empty() => Self::try_decode(bytes),
+            _ => Some(Self::create()),
+        }
+    }
+
+    /// Encode one independently persisted agent lane. Generated actors emit a
+    /// declaration-ordered field sequence; manual actors use whole-state
+    /// linear persistence.
+    #[doc(hidden)]
+    fn __save_agent_lane(&self, lane: crate::agent::StateLane) -> alloc::vec::Vec<u8> {
+        if lane == crate::agent::StateLane::Linear {
+            self.encode()
+        } else {
+            alloc::vec::Vec::new()
+        }
     }
 
     /// Whether any `#[storage(committed)]` field exists. A committed

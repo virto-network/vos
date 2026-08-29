@@ -48,13 +48,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
-name = "counter-upgrade-fixture"
-version = "0.1.0"
-dependencies = [
- "vos",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -167,6 +160,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "service-counter"
+version = "0.1.0"
+dependencies = [
+ "vos",
 ]
 
 [[package]]

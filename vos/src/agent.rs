@@ -4,6 +4,7 @@
 //! more actors and has one immutable storage/replication profile. Actor fields
 //! select state lanes; methods select the lane they may mutate.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 #[cfg(test)]
 use alloc::vec;
@@ -19,20 +20,21 @@ pub mod host;
 #[cfg(feature = "pvm")]
 pub mod machine;
 pub mod package;
+pub mod schema;
 pub mod standard;
 pub mod wire;
 use crate::service::{
-    ActorId, AgentId, BlobRef, DeploymentId, Hash, NodeId, PrincipalId, ProducerId, ProgramId,
-    SpaceId,
+    ActorId, AgentId, BlobRef, CredentialId, DeploymentId, Hash, NodeId, PrincipalId, ProducerId,
+    ProgramId, SpaceId,
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829v6");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829v9");
 
 /// Program identity of the bundled standard runtime artifact.
 pub const STANDARD_RUNTIME_PROGRAM_ID: ProgramId = ProgramId([
-    0x4c, 0x1f, 0xf9, 0x23, 0x24, 0x26, 0xf1, 0xa0, 0x09, 0x0c, 0x0e, 0xa2, 0x68, 0x8c, 0xab, 0x95,
-    0x84, 0x43, 0xea, 0xa6, 0x4e, 0x58, 0xdf, 0x2f, 0xbc, 0x00, 0xd2, 0x1a, 0x77, 0xf5, 0xc4, 0x55,
+    0x63, 0xf2, 0x72, 0x9d, 0x95, 0x32, 0xd6, 0xf2, 0x1c, 0x26, 0xd2, 0xf7, 0x78, 0x15, 0x69, 0x3d,
+    0xb9, 0x6f, 0x53, 0x0b, 0xeb, 0xf8, 0x40, 0x96, 0x26, 0x3a, 0x3f, 0x22, 0xcc, 0x0e, 0xdb, 0x42,
 ]);
 
 /// Immutable storage and publication profile of an agent.
@@ -43,10 +45,14 @@ pub enum AgentProfile {
     /// replication is configured.
     Local = 0,
     /// Published to the space. Linear state uses consensus, merge state uses
-    /// causal replication, and local state remains per replica.
+    /// causal replication, and local state remains per replica. This profile
+    /// requires a replicated host adapter; the process-local `AgentDriver`
+    /// rejects it rather than weakening Merge into replacement semantics.
     Shared = 1,
     /// Unpublished, owner-node-only causal replication. Linear state is not
-    /// available in the initial private profile.
+    /// available in the initial private profile. This likewise requires an
+    /// owner-authenticated causal host adapter and is not accepted by the
+    /// process-local driver.
     Private = 2,
 }
 
@@ -89,16 +95,20 @@ pub enum FieldPersistence {
 /// Execution mode of a generated actor method.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodMode {
-    /// Replica-coherent snapshot query; writes are forbidden.
+    /// Replica-coherent query over shared Linear and Merge state; writes are
+    /// forbidden and replica-local fields are hidden.
     Query,
     /// Query after a linear read barrier.
     LinearizableQuery,
+    /// Same-replica query which may additionally observe Local state.
+    LocalQuery,
     /// Mutate linear state and read a pinned merge frontier.
     Linear,
-    /// Mutate merge state. Linear and local state are inaccessible.
+    /// Mutate merge state while reading the same pinned linear snapshot used
+    /// to authorize and order the causal change. Local state is inaccessible.
     Merge,
-    /// Mutate only this replica's local state while reading immutable lane
-    /// snapshots.
+    /// Mutate only this replica's local state. Local actors cannot declare
+    /// replicated lanes, so no shared state is visible in this mode.
     Local,
 }
 
@@ -110,7 +120,7 @@ impl MethodMode {
             Self::Linear => Some(StateLane::Linear),
             Self::Merge => Some(StateLane::Merge),
             Self::Local => Some(StateLane::Local),
-            Self::Query | Self::LinearizableQuery => None,
+            Self::Query | Self::LinearizableQuery | Self::LocalQuery => None,
         }
     }
 }
@@ -118,9 +128,12 @@ impl MethodMode {
 impl MethodMode {
     pub const fn can_read(self, lane: StateLane) -> bool {
         match self {
-            Self::Query | Self::LinearizableQuery | Self::Local => true,
+            Self::Query | Self::LinearizableQuery => {
+                matches!(lane, StateLane::Linear | StateLane::Merge)
+            }
+            Self::LocalQuery | Self::Local => matches!(lane, StateLane::Local),
             Self::Linear => matches!(lane, StateLane::Linear | StateLane::Merge),
-            Self::Merge => matches!(lane, StateLane::Merge),
+            Self::Merge => matches!(lane, StateLane::Linear | StateLane::Merge),
         }
     }
 
@@ -239,13 +252,21 @@ impl PackageKind {
 }
 
 impl RuntimeCapabilities {
-    pub const STANDARD_MAX_ACTORS: u32 = 4096;
+    /// Conservative directory bound for the bundled 8-MiB runtime. Actor
+    /// records are repeated across the independently durable lane indexes;
+    /// claiming a larger count would make a valid directory exceed the
+    /// runtime-image limit before it reached its advertised capacity.
+    pub const STANDARD_MAX_ACTORS: u32 = 256;
 
     pub const fn standard() -> Self {
         Self {
             lanes: LaneSet::ALL,
             scheduling: false,
-            proofs: true,
+            // Recorded/provable Tasks need a separate private-witness and
+            // proof-result ABI. The standard AGEX runtime currently exports
+            // only state lanes and a typed reply, so it must fail closed on
+            // packages which require proof execution.
+            proofs: false,
             max_actors: Self::STANDARD_MAX_ACTORS,
         }
     }
@@ -278,6 +299,20 @@ pub struct ActorEntry {
     pub parent: Option<ActorId>,
     pub deployment: DeploymentId,
     pub program: ProgramId,
+    /// Exact signed package which selected this deployment. Exposing the
+    /// reference lets the host reconcile catalog ownership without treating
+    /// a process-local package cache as authority.
+    pub package: BlobRef,
+    /// Exact signed execution schema selected by this deployment. Directory
+    /// inspection exposes the commitment so a host can authenticate the
+    /// deployment-keyed schema sidecar before publishing an actor route.
+    pub agent_schema: BlobRef,
+    /// Exact canonical method-policy artifact selected by the signed
+    /// package. The agent runtime, rather than application actor code,
+    /// enforces this policy before dispatch.
+    pub role_policies: BlobRef,
+    /// State-layout commitment derived from `agent_schema`.
+    pub state_layout: Hash,
     pub lanes: LaneSet,
     pub suspended: bool,
 }
@@ -289,22 +324,15 @@ pub struct ActorDirectoryPage {
     pub next: Option<ActorId>,
 }
 
-/// Initial lane roots carried by an actor installation. Local bytes are
-/// supplied independently on each replica and therefore have no shared root.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ActorInitialState {
-    pub linear: Option<BlobRef>,
-    pub merge: Option<BlobRef>,
-    pub local: Option<BlobRef>,
-}
-
 /// Canonical install request consumed by an agent runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallActor {
     pub entry: ActorEntry,
     pub producer: ProducerId,
     pub package: BlobRef,
-    pub initial_state: ActorInitialState,
+    pub agent_schema: BlobRef,
+    pub role_policies: BlobRef,
+    pub state_layout: Hash,
     pub requirements: RuntimeRequirements,
 }
 
@@ -317,6 +345,9 @@ pub struct UpgradeActor {
     pub to_program: ProgramId,
     pub producer: ProducerId,
     pub package: BlobRef,
+    pub agent_schema: BlobRef,
+    pub role_policies: BlobRef,
+    pub state_layout: Hash,
     pub requirements: RuntimeRequirements,
 }
 
@@ -326,7 +357,9 @@ pub struct ActorRecord {
     pub entry: ActorEntry,
     pub producer: ProducerId,
     pub package: BlobRef,
-    pub initial_state: ActorInitialState,
+    pub agent_schema: BlobRef,
+    pub role_policies: BlobRef,
+    pub state_layout: Hash,
     pub requirements: RuntimeRequirements,
 }
 
@@ -386,6 +419,33 @@ pub enum LifecycleRequest {
         abi: Hash,
         capabilities: RuntimeCapabilities,
     },
+    /// Host-authenticated lifecycle operation. The bundled runtime consumes
+    /// its sequence exactly once and retains a bounded durable disposition so
+    /// retries cannot reapply an older transition after later operations.
+    Authorized {
+        admission: LifecycleAuthorityAdmission,
+        request: Box<LifecycleRequest>,
+    },
+}
+
+/// Signature-verified authority identity admitted by the trusted host.
+///
+/// Signature bytes remain outside deterministic runtime state. `claim`
+/// commits to every signed claim field, including validity bounds, principal,
+/// capability, and operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LifecycleAuthorityAdmission {
+    pub authority: Hash,
+    pub credential: CredentialId,
+    /// Binding-global authority sequence. Hosts authenticate the signed claim;
+    /// runtimes consume this one monotone namespace across credential changes.
+    pub sequence: u64,
+    /// Trusted logical slot observed by the host while verifying this claim.
+    /// The runtime persists a monotone high-water so a regressed clock cannot
+    /// reopen an older receipt's validity window after restart.
+    pub observed_slot: u64,
+    pub claim: Hash,
+    pub operation: Hash,
 }
 
 impl LifecycleRequest {
@@ -415,6 +475,9 @@ pub enum LifecycleError {
     Busy(ActorLifecycleDebt),
     DirectoryFull,
     InvalidRequest,
+    AuthoritySequenceRegressed,
+    AuthoritySequenceConflict,
+    AuthoritySlotRegressed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -448,6 +511,7 @@ pub enum AgentConfigError {
     ReplicaOrder,
     UnsupportedLane,
     InvalidLocalReplicaSet,
+    NoSharedVoter,
     InvalidPrivateReplicaRole,
     InvalidPrivateReplicaOwner,
     InvalidRuntimeCapacity,
@@ -497,6 +561,17 @@ impl AgentConfig {
         if self.identity.profile == AgentProfile::Local && self.replicas.len() != 1 {
             return Err(AgentConfigError::InvalidLocalReplicaSet);
         }
+        if self.identity.profile == AgentProfile::Shared
+            && !self
+                .replicas
+                .iter()
+                .any(|replica| replica.role == ReplicaRole::Voter)
+        {
+            // Linear state and lifecycle control require a consensus writer.
+            // An observer-only Shared descriptor could otherwise be accepted
+            // even though no replica is allowed to advance it.
+            return Err(AgentConfigError::NoSharedVoter);
+        }
         for pair in self.replicas.windows(2) {
             if pair[0].node == pair[1].node {
                 return Err(AgentConfigError::DuplicateReplica);
@@ -542,21 +617,31 @@ mod tests {
         assert!(MethodMode::Linear.can_read(StateLane::Merge));
         assert!(MethodMode::Linear.can_write(StateLane::Linear));
         assert!(!MethodMode::Linear.can_write(StateLane::Merge));
-        assert!(!MethodMode::Merge.can_read(StateLane::Linear));
+        assert!(MethodMode::Merge.can_read(StateLane::Linear));
         assert!(MethodMode::Merge.can_write(StateLane::Merge));
-        assert!(MethodMode::Local.can_read(StateLane::Linear));
+        assert!(!MethodMode::Local.can_read(StateLane::Linear));
         assert!(MethodMode::Local.can_write(StateLane::Local));
         assert!(!MethodMode::Query.can_write(StateLane::Linear));
+        assert!(!MethodMode::Query.can_read(StateLane::Local));
+        assert!(MethodMode::LocalQuery.can_read(StateLane::Local));
     }
 
     #[test]
     fn runtime_requirements_are_checked_without_actor_count_coupling() {
         let standard = RuntimeCapabilities::standard();
-        assert_eq!(standard.max_actors, 4096);
-        assert!(standard.satisfies(RuntimeRequirements {
+        assert_eq!(
+            standard.max_actors,
+            RuntimeCapabilities::STANDARD_MAX_ACTORS
+        );
+        assert!(!standard.satisfies(RuntimeRequirements {
             lanes: LaneSet::of(StateLane::Linear).union(LaneSet::of(StateLane::Merge)),
             scheduling: false,
             proofs: true,
+        }));
+        assert!(standard.satisfies(RuntimeRequirements {
+            lanes: LaneSet::of(StateLane::Linear).union(LaneSet::of(StateLane::Merge)),
+            scheduling: false,
+            proofs: false,
         }));
         assert!(!standard.satisfies(RuntimeRequirements {
             lanes: LaneSet::NONE,
@@ -636,6 +721,49 @@ mod tests {
             config.validate(),
             Err(AgentConfigError::InvalidPrivateReplicaOwner)
         );
+    }
+
+    #[test]
+    fn shared_linear_agents_require_a_voter() {
+        let owner = PrincipalId([1; 32]);
+        let mut config = AgentConfig {
+            identity: AgentIdentity {
+                space: SpaceId([2; 32]),
+                agent: AgentId([3; 32]),
+                owner,
+                profile: AgentProfile::Shared,
+                runtime_deployment: DeploymentId([4; 32]),
+                runtime_program: ProgramId([5; 32]),
+                runtime_producer: ProducerId([6; 32]),
+            },
+            authority: authority::AgentAuthorityBinding {
+                agent: AgentId([7; 32]),
+                actor: ActorId([8; 32]),
+                deployment: DeploymentId([9; 32]),
+                program: ProgramId([10; 32]),
+                producer: ProducerId::of_public_key(b"authority-key"),
+                public_key: b"authority-key".to_vec(),
+            },
+            runtime_package: BlobRef {
+                hash: Hash([11; 32]),
+                len: 100,
+            },
+            capabilities: RuntimeCapabilities::standard(),
+            replicas: vec![AgentReplica {
+                node: NodeId([12; 32]),
+                principal: owner,
+                role: ReplicaRole::Observer,
+            }],
+        };
+        assert_eq!(config.validate(), Err(AgentConfigError::NoSharedVoter));
+        config.capabilities.lanes = LaneSet::of(StateLane::Merge);
+        assert_eq!(
+            config.validate(),
+            Err(AgentConfigError::NoSharedVoter),
+            "the lifecycle control lane is ordered even for a Merge-only package set"
+        );
+        config.replicas[0].role = ReplicaRole::Voter;
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[test]

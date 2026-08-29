@@ -608,11 +608,12 @@ impl Drop for TestProductionTrustSidecar {
 }
 
 fn counter_package_fixture(output_dir: &Path) -> PathBuf {
-    let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/actors/target/riscv64em-vos/release/counter.elf");
+    let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../tests/fixtures/actors/service-counter/target/riscv64em-vos/release/service_counter.elf",
+    );
     assert!(
         actor_elf.is_file(),
-        "build the public counter first: `just build-examples` ({})",
+        "build the service counter first: `just build-registry-fixtures` ({})",
         actor_elf.display(),
     );
     let build_data = output_dir.join("build-data");
@@ -971,11 +972,13 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
     let dist = TempDir::new("root-dist");
     let upgrade_dist = TempDir::new("root-upgrade-dist");
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let actor_elf = workspace.join("examples/actors/target/riscv64em-vos/release/counter.elf");
+    let actor_elf = workspace.join(
+        "tests/fixtures/actors/service-counter/target/riscv64em-vos/release/service_counter.elf",
+    );
     let committed_service_pvm = workspace.join("services/vos-service/vos-service.pvm");
     assert!(
         actor_elf.is_file(),
-        "build the service daemon actor first: `cd examples/actors && cargo +nightly actor -p counter`",
+        "build the service daemon actor first: `just build-daemon-root-artifacts`",
     );
     assert!(
         committed_service_pvm.is_file(),

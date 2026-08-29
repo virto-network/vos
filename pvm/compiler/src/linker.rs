@@ -265,8 +265,7 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
     }
     let heap_pages = u16::try_from(heap_pages).map_err(|_| {
         TranspileError::InvalidSection(format!(
-            "SPI: heap page count {} exceeds the E2 field width",
-            heap_pages,
+            "SPI: heap page count {heap_pages} exceeds the E2 field width",
         ))
     })?;
 

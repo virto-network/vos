@@ -54,6 +54,7 @@ pub use contracts::{
     RoleCredentialVerificationRequest, ServiceGenesis, ServiceIdentity, ServiceInstallReceipt,
     TaskDependency, Transition, WorkEnvelope, WorkInputId, WorkflowOperation,
 };
+pub(crate) use contracts::{decode_origin, decode_service, encode_origin, encode_service};
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStore, ProofVerification, ReceiptVerification,
     execute_canonical_guest_accumulate, execute_guest_accumulate,

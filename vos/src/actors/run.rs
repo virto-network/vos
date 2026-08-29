@@ -1016,54 +1016,224 @@ const fn pvm_page_size_for_guest() -> usize {
 
 /// Refine-only actor lifecycle — PVM refine phase (PC=0).
 ///
-/// The runtime splits invoke input into separate FETCH items:
-///   FETCH 1: `[state_bytes]` (empty on first invocation)
-///   FETCH 2+: message bytes
+/// The agent runtime splits invoke input into separate FETCH items:
+///   FETCH 1: linear lane (`0` = absent, `1 || lane` = present)
+///   FETCH 2: merge lane
+///   FETCH 3: local lane
+///   FETCH 4: host-private invocation control
+///   FETCH 5: one dynamic message
 ///
-/// Output: `[status:u8][state_len:u32 LE][state_bytes]`
+/// Output: `[status:u8][linear_len:u32][merge_len:u32][local_len:u32]`
+/// followed by the three lane images and the typed reply.
 #[cfg(feature = "pvm")]
 pub fn run_refine<A: super::Actor>() {
     use super::context::ServiceId;
-    use super::lifecycle::{self, BUF_SIZE, DispatchResult};
+    use super::lifecycle;
+    use crate::service::wire::ServiceWire as _;
 
-    // FETCH 1: state
-    let mut buf = [0u8; BUF_SIZE];
-    let n = lifecycle::fetch_raw(&mut buf);
-    let state = if n > 0 { Some(&buf[..n]) } else { None };
-    let mut actor = lifecycle::load_or_create::<A>(state);
-
-    let mut ctx = super::Context::new(ServiceId(0));
-
-    // FETCH 2+: messages
-    loop {
-        let n = lifecycle::fetch_raw(&mut buf);
-        if n == 0 {
-            break;
+    fn fetch_owned(limit: usize) -> Option<alloc::vec::Vec<u8>> {
+        // Most control items and freshly-created lanes are tiny. Keeping a
+        // full BUF_SIZE probe alive for each of the three lanes needlessly
+        // consumes the actor's bounded heap before dispatch even begins.
+        // FETCH reports the complete item length without consuming an item
+        // that did not fit, so a small probe followed by one exact retry is
+        // both safe and substantially cheaper.
+        const PROBE_BYTES: usize = 256;
+        let mut bytes = alloc::vec![0u8; core::cmp::min(limit, PROBE_BYTES)];
+        let mut len = crate::abi::pvm::ecall::ecall2(
+            crate::abi::hostcall::FETCH,
+            bytes.as_mut_ptr() as u64,
+            bytes.len() as u64,
+        );
+        let required = usize::try_from(len).ok().filter(|len| *len <= limit)?;
+        if required > bytes.len() {
+            bytes.resize(required, 0);
+            len = crate::abi::pvm::ecall::ecall2(
+                crate::abi::hostcall::FETCH,
+                bytes.as_mut_ptr() as u64,
+                bytes.len() as u64,
+            );
+            if usize::try_from(len).ok()? != required {
+                return None;
+            }
         }
-        let result = lifecycle::dispatch_one::<A>(&buf[..n], &mut actor, &mut ctx);
-        if matches!(result, DispatchResult::Yielded | DispatchResult::Stopped) {
-            break;
+        let len = usize::try_from(len).ok()?;
+        bytes.truncate(len);
+        Some(bytes)
+    }
+
+    fn decode_lane(input: &[u8]) -> Option<Option<&[u8]>> {
+        match input {
+            [0] => Some(None),
+            [1, bytes @ ..] => Some(Some(bytes)),
+            _ => None,
         }
     }
 
+    const LANE_ITEM_CAPACITY: usize = crate::agent::execution::MAX_EXECUTION_STATE_BYTES + 1;
+    let linear_item = fetch_owned(LANE_ITEM_CAPACITY).expect("missing linear agent lane");
+    let merge_item = fetch_owned(LANE_ITEM_CAPACITY).expect("missing merge agent lane");
+    let local_item = fetch_owned(LANE_ITEM_CAPACITY).expect("missing local agent lane");
+    let _encoded_state_len = [&linear_item, &merge_item, &local_item]
+        .into_iter()
+        .try_fold(0usize, |total, item| {
+            let payload = item.len().checked_sub(1)?;
+            total.checked_add(payload)
+        })
+        .filter(|len| *len <= crate::agent::execution::MAX_EXECUTION_STATE_TOTAL_BYTES)
+        .expect("agent state exceeds the execution aggregate cap");
+    let linear = decode_lane(&linear_item).expect("invalid linear agent lane");
+    let merge = decode_lane(&merge_item).expect("invalid merge agent lane");
+    let local = decode_lane(&local_item).expect("invalid local agent lane");
+    let linear_was_fresh = linear.is_some_and(<[u8]>::is_empty);
+    let merge_was_fresh = merge.is_some_and(<[u8]>::is_empty);
+    let local_was_fresh = local.is_some_and(<[u8]>::is_empty);
+    let mut actor =
+        A::__load_agent_state(linear, merge, local).expect("invalid field-wise agent state");
+    // Snapshot canonical field frames, rather than the host's fresh empty
+    // sentinels, before application code runs. This is the only point that can
+    // distinguish an untouched constructor default from a handler mutating a
+    // different lane during its first invocation.
+    let before_linear = actor.__save_agent_lane(crate::agent::StateLane::Linear);
+    let before_merge = actor.__save_agent_lane(crate::agent::StateLane::Merge);
+    let before_local = actor.__save_agent_lane(crate::agent::StateLane::Local);
+    // The actor owns decoded field values now. Release the encoded input
+    // frames before dispatch so the 256-KiB application heap is available to
+    // the handler rather than retaining a second complete state image.
+    drop(linear_item);
+    drop(merge_item);
+    drop(local_item);
+
+    let mut ctx = super::Context::new(ServiceId(0));
+
+    let control = fetch_owned(512).expect("missing agent invocation control");
+    let control = crate::agent::wire::ActorDispatchControl::decode(&control)
+        .expect("invalid agent invocation control");
+    let invocation = control.invocation;
+    let mode = control.mode;
+    ctx.__set_actor_id(control.actor);
+    let caller = match control.auth.origin {
+        crate::service::Origin::Anonymous => super::auth::Caller::Unauthenticated,
+        crate::service::Origin::Member(subject) => super::auth::Caller::Member(subject),
+        crate::service::Origin::Actor(_) => super::auth::Caller::Actor(ServiceId(0)),
+        crate::service::Origin::System => super::auth::Caller::System,
+    };
+    ctx.set_caller(caller);
+    ctx.__set_origin(control.auth.origin, control.auth.origin_service);
+    ctx.set_caller_roles(control.auth.space_role, control.auth.actor_role);
+    ctx.set_caller_capability(control.auth.capability);
+
+    let message = fetch_owned(crate::agent::execution::MAX_EXECUTION_MESSAGE_BYTES)
+        .expect("missing agent message");
+    if message.is_empty() {
+        panic!("empty agent message");
+    }
+    let mut dispatch =
+        || lifecycle::dispatch_one_with_invocation::<A>(&message, &mut actor, &mut ctx, invocation);
+    let result = if mode == crate::agent::MethodMode::Merge {
+        crate::crdt::with_change(crate::crdt::ChangeId::from(invocation), || {
+            core::result::Result::Ok(dispatch())
+        })
+        .expect("invalid merge change scope")
+    } else {
+        dispatch()
+    };
+    if matches!(result, lifecycle::DispatchResult::Skipped) {
+        panic!("agent message does not match its signed method schema");
+    }
+    drop(dispatch);
+    drop(message);
+    if ctx.__has_unexported_agent_effects() {
+        panic!("actor requested effects unsupported by this agent runtime");
+    }
+    let extra = fetch_owned(1).expect("agent fetch terminator");
+    assert!(
+        extra.is_empty(),
+        "agent invocation contains multiple messages"
+    );
+
     let status = lifecycle::exit_status::<A>(&ctx);
 
-    // Pack output: [status:u8][state_len:u32][state...][reply...]
+    let mut linear = actor.__save_agent_lane(crate::agent::StateLane::Linear);
+    let mut merge = actor.__save_agent_lane(crate::agent::StateLane::Merge);
+    let mut local = actor.__save_agent_lane(crate::agent::StateLane::Local);
+    let write_lane = mode.write_lane();
+    for (lane, before, after) in [
+        (
+            crate::agent::StateLane::Linear,
+            before_linear.as_slice(),
+            linear.as_slice(),
+        ),
+        (
+            crate::agent::StateLane::Merge,
+            before_merge.as_slice(),
+            merge.as_slice(),
+        ),
+        (
+            crate::agent::StateLane::Local,
+            before_local.as_slice(),
+            local.as_slice(),
+        ),
+    ] {
+        assert!(
+            Some(lane) == write_lane || before == after,
+            "actor mutated a state lane not owned by its signed method mode"
+        );
+    }
+    drop(before_linear);
+    drop(before_merge);
+    drop(before_local);
+    // Preserve the runtime's canonical fresh sentinel for every lane this
+    // method did not own. The host can therefore enforce exact byte equality
+    // even on the first invocation, while the owned lane becomes initialized
+    // by its first successful mutation.
+    if write_lane != Some(crate::agent::StateLane::Linear) && linear_was_fresh {
+        linear.clear();
+    }
+    if write_lane != Some(crate::agent::StateLane::Merge) && merge_was_fresh {
+        merge.clear();
+    }
+    if write_lane != Some(crate::agent::StateLane::Local) && local_was_fresh {
+        local.clear();
+    }
+
+    // Pack output: status, three lane lengths/bytes, then reply.
     // Drop temporaries and ctx eagerly — halt_with_output is `-> !`
     // so destructors never run; without explicit drops the Vecs leak
     // on every invocation.
     let out = {
-        let state = lifecycle::save_state::<A>(&actor, &ctx);
+        drop(actor);
         let reply_bytes = ctx.take_reply_bytes();
         drop(ctx);
-        let sl = (state.len() as u32).to_le_bytes();
-        let mut out = alloc::vec![0u8; 1 + 4 + state.len() + reply_bytes.len()];
+        let state_len = linear
+            .len()
+            .checked_add(merge.len())
+            .and_then(|len| len.checked_add(local.len()))
+            .filter(|len| *len <= crate::agent::execution::MAX_EXECUTION_STATE_TOTAL_BYTES)
+            .expect("agent state exceeds the execution aggregate cap");
+        assert!(
+            reply_bytes.len() <= crate::agent::execution::MAX_EXECUTION_REPLY_BYTES,
+            "agent reply exceeds the execution cap"
+        );
+        let linear_len = (linear.len() as u32).to_le_bytes();
+        let merge_len = (merge.len() as u32).to_le_bytes();
+        let local_len = (local.len() as u32).to_le_bytes();
+        let mut out = alloc::vec![
+            0u8;
+            1 + 12 + state_len + reply_bytes.len()
+        ];
         out[0] = status[0];
-        out[1..5].copy_from_slice(&sl);
-        out[5..5 + state.len()].copy_from_slice(&state);
-        out[5 + state.len()..].copy_from_slice(&reply_bytes);
+        out[1..5].copy_from_slice(&linear_len);
+        out[5..9].copy_from_slice(&merge_len);
+        out[9..13].copy_from_slice(&local_len);
+        let linear_end = 13 + linear.len();
+        let merge_end = linear_end + merge.len();
+        let local_end = merge_end + local.len();
+        out[13..linear_end].copy_from_slice(&linear);
+        out[linear_end..merge_end].copy_from_slice(&merge);
+        out[merge_end..local_end].copy_from_slice(&local);
+        out[local_end..].copy_from_slice(&reply_bytes);
         out
-        // state, reply_bytes dropped here
     };
     halt_with_output(&out);
 }

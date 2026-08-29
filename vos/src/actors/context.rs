@@ -1503,16 +1503,29 @@ impl<A: Actor> Context<A> {
     ///   pending vectors for `run_refine_service` to drain into the
     ///   refine output payload — the host absorbs that payload and
     ///   applies the effects natively.
-    /// - **Non-service builds**: effects are dropped (invoked actors
-    ///   don't have a host commit stage to flush to).
-    pub fn flush_effects(&mut self) {
-        #[cfg(not(feature = "service"))]
-        {
-            self.pending_writes.clear();
-            self.pending_tells.clear();
-            self.pending_provides.clear();
-            self.pending_spawns.clear();
-        }
+    /// - **Non-service builds**: this is a no-op. The enclosing agent runtime
+    ///   must either encode a supported effect batch or reject the dispatch;
+    ///   silently dropping an effect would report a transition that never
+    ///   happened.
+    pub fn flush_effects(&mut self) {}
+
+    /// Whether a non-service actor requested effects that the standard agent
+    /// execution ABI does not yet carry. The agent entry fails the complete
+    /// call closed instead of acknowledging and discarding them.
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn __has_unexported_agent_effects(&self) -> bool {
+        !self.pending_writes.is_empty()
+            || !self.pending_tells.is_empty()
+            || !self.pending_provides.is_empty()
+            || !self.pending_spawns.is_empty()
+            || !self.pending_actor_calls.is_empty()
+            || !self.pending_actor_spawns.is_empty()
+            || self.stop_requested
+            || self.self_schedule
+            || self.checkpoint.is_some()
+            || self.host_io_request.is_some()
+            || self.host_io_result.is_some()
     }
 
     // ── Refine output packing (framework-internal) ───────────────────

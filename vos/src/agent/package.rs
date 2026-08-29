@@ -15,6 +15,43 @@ use crate::service::{
     artifact_hash, task_dependencies_hash,
 };
 
+/// Maximum complete canonical agent-package wire. Packages cross transport
+/// and durable catalog boundaries, so accepting the generic 64-MiB service
+/// wire limit here would permit a single package to monopolize both.
+pub const MAX_ENCODED_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum generated public interface artifact.
+pub const MAX_PACKAGE_INTERFACES_BYTES: usize = 256 * 1024;
+/// Maximum public actor metadata/schema artifact. The agent-specific state
+/// schema has its own stricter [`super::schema::MAX_ENCODED_BYTES`] bound.
+pub const MAX_PACKAGE_SCHEMAS_BYTES: usize = 256 * 1024;
+/// Maximum aggregate executable bytes across signed Task dependencies.
+pub const MAX_PACKAGE_TASK_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum aggregate optional ELF and source-map diagnostics.
+pub const MAX_PACKAGE_DIAGNOSTICS_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PACKAGE_NAME_BYTES: usize = crate::service::MAX_ACTOR_NAME_BYTES;
+const MAX_PACKAGE_SIGNING_KEY_BYTES: usize = 4 * 1024;
+const MAX_PACKAGE_SIGNATURE_BYTES: usize = 4 * 1024;
+
+/// Derive the runtime features authenticated by an actor package.
+///
+/// State lanes live in the agent schema, while proof and scheduler use are
+/// part of the public method contract. Keeping the derivation here gives the
+/// builder and package verifier one fail-closed rule: callers cannot sign a
+/// weaker requirement set than the actor metadata actually needs.
+pub fn actor_runtime_requirements(
+    schema: &super::schema::ParsedSchema,
+    metadata: &crate::metadata::ParsedMeta,
+    has_task_dependencies: bool,
+) -> RuntimeRequirements {
+    RuntimeRequirements {
+        lanes: schema.lanes(),
+        scheduling: metadata.messages.iter().any(|message| message.mode != 0),
+        proofs: metadata.provable
+            || has_task_dependencies
+            || metadata.messages.iter().any(|message| message.attested),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageManifest {
     pub name: String,
@@ -25,6 +62,7 @@ pub struct PackageManifest {
     pub interfaces_hash: Hash,
     pub role_policies_hash: Hash,
     pub schemas_hash: Hash,
+    pub agent_schema_hash: Hash,
     pub dependencies_hash: Hash,
 }
 
@@ -35,6 +73,7 @@ pub struct Package {
     pub generated_interfaces: Vec<u8>,
     pub role_policies: Vec<u8>,
     pub schemas: Vec<u8>,
+    pub agent_schema: Vec<u8>,
     pub task_dependencies: Vec<PackageTaskDependency>,
     pub diagnostics: Option<PackageDiagnostics>,
     pub deployment_signature: DeploymentSignature,
@@ -51,11 +90,17 @@ pub enum PackageError {
     InterfaceHashMismatch,
     PolicyHashMismatch,
     SchemaHashMismatch,
+    AgentSchemaHashMismatch,
     DependenciesHashMismatch,
     InvalidActorArtifacts,
     InvalidRuntimeArtifacts,
     InvalidRuntimeAbi,
     InvalidRuntimeCapacity,
+    UnsupportedActorEntry,
+    UnsupportedActorConstructor,
+    UnsupportedConstantState,
+    UnsupportedActorStorage,
+    ArtifactsTooLarge,
     MissingSignature,
     ProducerIdMismatch,
     InvalidSignature,
@@ -78,11 +123,39 @@ impl Package {
         if self.manifest.execution_semantics != crate::service::EXECUTION_SEMANTICS_ID {
             return Err(PackageError::WrongExecutionSemantics);
         }
-        if self.manifest.name.is_empty() {
+        if self.manifest.name.is_empty() || self.manifest.name.len() > MAX_PACKAGE_NAME_BYTES {
             return Err(PackageError::EmptyName);
         }
         if self.pvm.is_empty() {
             return Err(PackageError::EmptyProgram);
+        }
+        let task_bytes = self
+            .task_dependencies
+            .iter()
+            .try_fold(0usize, |total, dependency| {
+                total.checked_add(dependency.pvm.len())
+            });
+        let diagnostic_bytes = self.diagnostics.as_ref().map_or(Some(0), |diagnostics| {
+            diagnostics
+                .elf
+                .as_ref()
+                .map_or(0, |bytes| bytes.len())
+                .checked_add(
+                    diagnostics
+                        .source_map
+                        .as_ref()
+                        .map_or(0, |bytes| bytes.len()),
+                )
+        });
+        if self.pvm.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
+            || self.generated_interfaces.len() > MAX_PACKAGE_INTERFACES_BYTES
+            || self.schemas.len() > MAX_PACKAGE_SCHEMAS_BYTES
+            || task_bytes.is_none_or(|bytes| bytes > MAX_PACKAGE_TASK_BYTES)
+            || diagnostic_bytes.is_none_or(|bytes| bytes > MAX_PACKAGE_DIAGNOSTICS_BYTES)
+            || self.deployment_signature.public_key.len() > MAX_PACKAGE_SIGNING_KEY_BYTES
+            || self.deployment_signature.signature.len() > MAX_PACKAGE_SIGNATURE_BYTES
+        {
+            return Err(PackageError::ArtifactsTooLarge);
         }
         if vos_pvm_program::parse_standard_program(&self.pvm).is_none() {
             return Err(PackageError::InvalidProgram);
@@ -98,8 +171,17 @@ impl Package {
         {
             return Err(PackageError::PolicyHashMismatch);
         }
+        if self.role_policies.len() > super::execution::MAX_EXECUTION_POLICY_BYTES {
+            return Err(PackageError::InvalidActorArtifacts);
+        }
         if artifact_hash(b"schemas", &self.schemas) != self.manifest.schemas_hash {
             return Err(PackageError::SchemaHashMismatch);
+        }
+        if artifact_hash(b"agent-schema", &self.agent_schema) != self.manifest.agent_schema_hash {
+            return Err(PackageError::AgentSchemaHashMismatch);
+        }
+        if self.agent_schema.len() > super::schema::MAX_ENCODED_BYTES {
+            return Err(PackageError::InvalidActorArtifacts);
         }
         if task_dependencies_hash(&self.task_dependencies) != self.manifest.dependencies_hash {
             return Err(PackageError::DependenciesHashMismatch);
@@ -114,7 +196,10 @@ impl Package {
                 if capabilities.max_actors == 0 {
                     return Err(PackageError::InvalidRuntimeCapacity);
                 }
-                if !self.role_policies.is_empty() || !self.task_dependencies.is_empty() {
+                if !self.role_policies.is_empty()
+                    || !self.agent_schema.is_empty()
+                    || !self.task_dependencies.is_empty()
+                {
                     return Err(PackageError::InvalidRuntimeArtifacts);
                 }
             }
@@ -127,6 +212,11 @@ impl Package {
         {
             return Err(PackageError::ProducerIdMismatch);
         }
+        // Component checks above run first so this exact wire-size check never
+        // allocates an attacker-selected generic-service-wire amount.
+        if self.encode().len() > MAX_ENCODED_PACKAGE_BYTES {
+            return Err(PackageError::ArtifactsTooLarge);
+        }
         Ok(())
     }
 
@@ -138,6 +228,7 @@ impl Package {
                 .any(|pair| pair[0].binding.task >= pair[1].binding.task)
             || self.task_dependencies.iter().any(|dependency| {
                 dependency.pvm.is_empty()
+                    || dependency.pvm.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
                     || ProgramId::of_pvm(&dependency.pvm) != dependency.binding.program
                     || Hash(crate::provable::task_blob_hash(&dependency.pvm))
                         != dependency.binding.task
@@ -154,6 +245,49 @@ impl Package {
         }
         let metadata =
             crate::metadata::decode(&self.schemas).ok_or(PackageError::InvalidActorArtifacts)?;
+        let agent_schema =
+            super::schema::decode(&self.agent_schema).ok_or(PackageError::InvalidActorArtifacts)?;
+        if agent_schema.entry != super::schema::ExecutionEntryKind::AgentActor {
+            return Err(PackageError::UnsupportedActorEntry);
+        }
+        if agent_schema.uses_storage {
+            // The standard runtime has no durable row-witness/effect channel.
+            // The signed bit makes this a typed pre-install refusal instead
+            // of letting a host ECALL fail after actor code has started.
+            return Err(PackageError::UnsupportedActorStorage);
+        }
+        // The initial runtime creates actors through `Actor::create()` and
+        // has no authenticated installation-config channel. Accepting a
+        // constructor payload or constant field would silently replace its
+        // value with `new()` on every lane hydration, so reject both shapes
+        // until that lifecycle contract exists.
+        if !metadata.constructor.is_empty() {
+            return Err(PackageError::UnsupportedActorConstructor);
+        }
+        if agent_schema
+            .fields
+            .iter()
+            .any(|field| field.persistence == super::FieldPersistence::Constant)
+        {
+            return Err(PackageError::UnsupportedConstantState);
+        }
+        if actor_runtime_requirements(&agent_schema, &metadata, !self.task_dependencies.is_empty())
+            != match self.manifest.kind {
+                PackageKind::Actor { requirements } => requirements,
+                PackageKind::AgentRuntime { .. } => {
+                    return Err(PackageError::InvalidActorArtifacts);
+                }
+            }
+            || agent_schema.methods.len() != metadata.messages.len()
+            || agent_schema.methods.iter().zip(&metadata.messages).any(
+                |(agent_method, public_method)| {
+                    agent_method.name != public_method.name
+                        || (agent_method.mode.write_lane().is_none() != public_method.is_query)
+                },
+            )
+        {
+            return Err(PackageError::InvalidActorArtifacts);
+        }
         let policies = PackageRolePolicies::decode(&self.role_policies)
             .map_err(|_| PackageError::InvalidActorArtifacts)?;
         let mut expected = PackageRolePolicies::from_metadata(&metadata)
@@ -182,11 +316,15 @@ impl Package {
         self.deployment_id().0
     }
 
-    /// Validate package structure and authenticate the producer signature.
-    pub fn verify<V: PackageSignatureVerifier>(
-        self,
+    /// Offline structural and producer-signature check.
+    ///
+    /// This result is intentionally not a durable-admission capability. Agent
+    /// drivers repeat package verification through their owned
+    /// `AgentTrustProvider`, bound to the complete target `AgentConfig`.
+    pub fn verify_signature<V: PackageSignatureVerifier>(
+        &self,
         verifier: &V,
-    ) -> Result<VerifiedPackage, PackageError> {
+    ) -> Result<(), PackageError> {
         self.validate()?;
         if !verifier.verify(
             &self.deployment_signature.public_key,
@@ -195,7 +333,7 @@ impl Package {
         ) {
             return Err(PackageError::InvalidSignature);
         }
-        Ok(VerifiedPackage(self))
+        Ok(())
     }
 }
 
@@ -204,20 +342,6 @@ impl Package {
 /// then require a separate authority receipt for the lifecycle operation.
 pub trait PackageSignatureVerifier {
     fn verify(&self, public_key: &[u8], message: &[u8], signature: &[u8]) -> bool;
-}
-
-/// Package whose content and producer signature have both been checked.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedPackage(Package);
-
-impl VerifiedPackage {
-    pub fn package(&self) -> &Package {
-        &self.0
-    }
-
-    pub fn into_package(self) -> Package {
-        self.0
-    }
 }
 
 /// Default host verifier for the protobuf-encoded Ed25519 public keys emitted
@@ -245,6 +369,7 @@ impl ServiceWire for Package {
         encoder.bytes(&self.generated_interfaces);
         encoder.bytes(&self.role_policies);
         encoder.bytes(&self.schemas);
+        encoder.bytes(&self.agent_schema);
         encoder.list(&self.task_dependencies, |encoder, dependency| {
             encoder.fixed(&dependency.binding.task.0);
             encoder.fixed(&dependency.binding.program.0);
@@ -264,12 +389,23 @@ impl ServiceWire for Package {
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        if decoder.remaining() > MAX_ENCODED_PACKAGE_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
         let manifest = decode_manifest(decoder)?;
-        let pvm = decoder.bytes()?;
-        let generated_interfaces = decoder.bytes()?;
-        let role_policies = decoder.bytes()?;
-        let schemas = decoder.bytes()?;
-        let task_dependencies = decoder.list(|decoder| {
+        let pvm = decode_bounded_bytes(decoder, super::execution::MAX_EXECUTION_PROGRAM_BYTES)?;
+        let generated_interfaces = decode_bounded_bytes(decoder, MAX_PACKAGE_INTERFACES_BYTES)?;
+        let role_policies =
+            decode_bounded_bytes(decoder, super::execution::MAX_EXECUTION_POLICY_BYTES)?;
+        let schemas = decode_bounded_bytes(decoder, MAX_PACKAGE_SCHEMAS_BYTES)?;
+        let agent_schema = decode_bounded_bytes(decoder, super::schema::MAX_ENCODED_BYTES)?;
+        let dependency_count = decoder.u32()? as usize;
+        if dependency_count > crate::service::MAX_PACKAGE_TASK_DEPENDENCIES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let mut task_bytes = 0usize;
+        let mut borrowed_tasks = Vec::with_capacity(dependency_count);
+        for _ in 0..dependency_count {
             let binding = crate::service::TaskDependency {
                 task: Hash(decoder.fixed()?),
                 program: ProgramId(decoder.fixed()?),
@@ -285,38 +421,93 @@ impl ServiceWire for Package {
             {
                 return Err(DecodeError::NonCanonical);
             }
-            Ok(PackageTaskDependency {
+            let pvm = decoder.bytes_ref()?;
+            task_bytes = task_bytes
+                .checked_add(pvm.len())
+                .ok_or(DecodeError::LimitExceeded)?;
+            if pvm.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
+                || task_bytes > MAX_PACKAGE_TASK_BYTES
+            {
+                return Err(DecodeError::LimitExceeded);
+            }
+            borrowed_tasks.push((binding, pvm));
+        }
+        // The small binding table may be allocated while parsing, but no Task
+        // bytecode is copied until the complete aggregate has been checked.
+        let task_dependencies = borrowed_tasks
+            .into_iter()
+            .map(|(binding, pvm)| PackageTaskDependency {
                 binding,
-                pvm: decoder.bytes()?,
+                pvm: pvm.to_vec(),
             })
-        })?;
-        if task_dependencies.len() > crate::service::MAX_PACKAGE_TASK_DEPENDENCIES
-            || task_dependencies
-                .windows(2)
-                .any(|pair| pair[0].binding.task >= pair[1].binding.task)
+            .collect::<Vec<_>>();
+        if task_dependencies
+            .windows(2)
+            .any(|pair| pair[0].binding.task >= pair[1].binding.task)
         {
             return Err(DecodeError::NonCanonical);
         }
+        let diagnostics = if decoder.bool()? {
+            let mut diagnostic_bytes = 0usize;
+            let elf = decode_bounded_optional_bytes_ref(
+                decoder,
+                MAX_PACKAGE_DIAGNOSTICS_BYTES,
+                &mut diagnostic_bytes,
+            )?;
+            let source_map = decode_bounded_optional_bytes_ref(
+                decoder,
+                MAX_PACKAGE_DIAGNOSTICS_BYTES,
+                &mut diagnostic_bytes,
+            )?;
+            Some(PackageDiagnostics {
+                elf: elf.map(<[u8]>::to_vec),
+                source_map: source_map.map(<[u8]>::to_vec),
+            })
+        } else {
+            None
+        };
         Ok(Self {
             manifest,
             pvm,
             generated_interfaces,
             role_policies,
             schemas,
+            agent_schema,
             task_dependencies,
-            diagnostics: decoder.option(|decoder| {
-                Ok(PackageDiagnostics {
-                    elf: decoder.option(Decoder::bytes)?,
-                    source_map: decoder.option(Decoder::bytes)?,
-                })
-            })?,
+            diagnostics,
             deployment_signature: DeploymentSignature {
                 producer: ProducerId(decoder.fixed()?),
-                public_key: decoder.bytes()?,
-                signature: decoder.bytes()?,
+                public_key: decode_bounded_bytes(decoder, MAX_PACKAGE_SIGNING_KEY_BYTES)?,
+                signature: decode_bounded_bytes(decoder, MAX_PACKAGE_SIGNATURE_BYTES)?,
             },
         })
     }
+}
+
+fn decode_bounded_bytes(decoder: &mut Decoder<'_>, limit: usize) -> Result<Vec<u8>, DecodeError> {
+    let bytes = decoder.bytes_ref()?;
+    if bytes.len() > limit {
+        return Err(DecodeError::LimitExceeded);
+    }
+    Ok(bytes.to_vec())
+}
+
+fn decode_bounded_optional_bytes_ref<'a>(
+    decoder: &mut Decoder<'a>,
+    aggregate_limit: usize,
+    aggregate: &mut usize,
+) -> Result<Option<&'a [u8]>, DecodeError> {
+    if !decoder.bool()? {
+        return Ok(None);
+    }
+    let bytes = decoder.bytes_ref()?;
+    *aggregate = aggregate
+        .checked_add(bytes.len())
+        .ok_or(DecodeError::LimitExceeded)?;
+    if *aggregate > aggregate_limit {
+        return Err(DecodeError::LimitExceeded);
+    }
+    Ok(Some(bytes))
 }
 
 fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifest) {
@@ -328,12 +519,17 @@ fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifest) {
     encoder.fixed(&manifest.interfaces_hash.0);
     encoder.fixed(&manifest.role_policies_hash.0);
     encoder.fixed(&manifest.schemas_hash.0);
+    encoder.fixed(&manifest.agent_schema_hash.0);
     encoder.fixed(&manifest.dependencies_hash.0);
 }
 
 fn decode_manifest(decoder: &mut Decoder<'_>) -> Result<PackageManifest, DecodeError> {
+    let name = decoder.bytes_ref()?;
+    if name.len() > MAX_PACKAGE_NAME_BYTES {
+        return Err(DecodeError::LimitExceeded);
+    }
     Ok(PackageManifest {
-        name: decoder.string()?,
+        name: String::from_utf8(name.to_vec()).map_err(|_| DecodeError::InvalidUtf8)?,
         platform: Hash(decoder.fixed()?),
         execution_semantics: Hash(decoder.fixed()?),
         kind: decode_kind(decoder)?,
@@ -341,6 +537,7 @@ fn decode_manifest(decoder: &mut Decoder<'_>) -> Result<PackageManifest, DecodeE
         interfaces_hash: Hash(decoder.fixed()?),
         role_policies_hash: Hash(decoder.fixed()?),
         schemas_hash: Hash(decoder.fixed()?),
+        agent_schema_hash: Hash(decoder.fixed()?),
         dependencies_hash: Hash(decoder.fixed()?),
     })
 }
@@ -407,6 +604,82 @@ mod tests {
     use super::*;
     use alloc::vec;
 
+    const ACTOR_META: crate::metadata::ActorMeta = crate::metadata::ActorMeta {
+        actor_name: "counter",
+        messages: &[crate::metadata::MessageMeta {
+            name: "increment",
+            is_query: false,
+            fields: &[],
+            returns: "u64",
+            doc: "",
+            timeout_ms: 0,
+            mode: 0,
+            attested: false,
+            space_role: None,
+            actor_role: None,
+            capability: None,
+        }],
+        constructor: &[],
+        cli_methods: &[],
+        doc: "",
+        crdt: false,
+        provable: false,
+    };
+
+    const CONSTRUCTOR_META: crate::metadata::ActorMeta = crate::metadata::ActorMeta {
+        constructor: &[crate::metadata::FieldMeta {
+            name: "initial",
+            ty: "u64",
+        }],
+        ..ACTOR_META
+    };
+
+    const ATTESTED_META: crate::metadata::ActorMeta = crate::metadata::ActorMeta {
+        messages: &[crate::metadata::MessageMeta {
+            attested: true,
+            ..ACTOR_META.messages[0]
+        }],
+        ..ACTOR_META
+    };
+
+    const JOB_META: crate::metadata::ActorMeta = crate::metadata::ActorMeta {
+        messages: &[crate::metadata::MessageMeta {
+            mode: 1,
+            ..ACTOR_META.messages[0]
+        }],
+        ..ACTOR_META
+    };
+
+    const ACTOR_SCHEMA: super::super::schema::SchemaMeta = super::super::schema::SchemaMeta {
+        uses_storage: false,
+        fields: &[super::super::schema::FieldMeta {
+            name: "count",
+            codec: "counter::u64",
+            persistence: super::super::FieldPersistence::State(super::super::StateLane::Linear),
+        }],
+        methods: &[super::super::schema::MethodMeta {
+            name: "increment",
+            mode: super::super::MethodMode::Linear,
+            explicit: false,
+        }],
+    };
+
+    const CONSTANT_SCHEMA: super::super::schema::SchemaMeta = super::super::schema::SchemaMeta {
+        uses_storage: false,
+        fields: &[super::super::schema::FieldMeta {
+            name: "unit",
+            codec: "counter::String",
+            persistence: super::super::FieldPersistence::Constant,
+        }],
+        methods: ACTOR_SCHEMA.methods,
+    };
+
+    const STORAGE_SCHEMA: super::super::schema::SchemaMeta = super::super::schema::SchemaMeta {
+        uses_storage: true,
+        fields: ACTOR_SCHEMA.fields,
+        methods: ACTOR_SCHEMA.methods,
+    };
+
     fn signature() -> DeploymentSignature {
         DeploymentSignature {
             producer: ProducerId::of_public_key(b"producer"),
@@ -443,12 +716,70 @@ mod tests {
                 interfaces_hash: artifact_hash(b"interfaces", &interfaces),
                 role_policies_hash: artifact_hash(b"role-policies", &[]),
                 schemas_hash: artifact_hash(b"schemas", &schemas),
+                agent_schema_hash: artifact_hash(b"agent-schema", &[]),
                 dependencies_hash: task_dependencies_hash(&[]),
             },
             pvm,
             generated_interfaces: interfaces,
             role_policies: Vec::new(),
             schemas,
+            agent_schema: Vec::new(),
+            task_dependencies: Vec::new(),
+            diagnostics: None,
+            deployment_signature: signature(),
+        }
+    }
+
+    fn actor_package(
+        metadata: &'static crate::metadata::ActorMeta,
+        schema: &'static super::super::schema::SchemaMeta,
+        entry: super::super::schema::ExecutionEntryKind,
+    ) -> Package {
+        let pvm = vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
+            ro_data: Vec::new(),
+            rw_data: Vec::new(),
+            heap_pages: 0,
+            stack_size: vos_pvm_program::PAGE_SIZE,
+            code: vos_pvm_program::CodeBlob {
+                jump_table: Vec::new(),
+                code: vec![0],
+                bitmask: vec![1],
+            },
+        })
+        .unwrap();
+        let (schema_bytes, schema_len) = crate::metadata::encode::<1024>(metadata);
+        let schemas = schema_bytes[..schema_len].to_vec();
+        let parsed_metadata = crate::metadata::decode(&schemas).unwrap();
+        let role_policies = PackageRolePolicies::from_metadata(&parsed_metadata)
+            .unwrap()
+            .encode();
+        let (agent_bytes, agent_len) =
+            super::super::schema::encode_with_entry::<1024>(schema, entry);
+        let agent_schema = agent_bytes[..agent_len].to_vec();
+        let requirements = actor_runtime_requirements(
+            &super::super::schema::decode(&agent_schema).unwrap(),
+            &parsed_metadata,
+            false,
+        );
+        let generated_interfaces = b"counter-interface".to_vec();
+        Package {
+            manifest: PackageManifest {
+                name: "counter".into(),
+                platform: crate::service::PLATFORM_ID,
+                execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+                kind: PackageKind::Actor { requirements },
+                program: ProgramId::of_pvm(&pvm),
+                interfaces_hash: artifact_hash(b"interfaces", &generated_interfaces),
+                role_policies_hash: artifact_hash(b"role-policies", &role_policies),
+                schemas_hash: artifact_hash(b"schemas", &schemas),
+                agent_schema_hash: artifact_hash(b"agent-schema", &agent_schema),
+                dependencies_hash: task_dependencies_hash(&[]),
+            },
+            pvm,
+            generated_interfaces,
+            role_policies,
+            schemas,
+            agent_schema,
             task_dependencies: Vec::new(),
             diagnostics: None,
             deployment_signature: signature(),
@@ -461,6 +792,47 @@ mod tests {
         package.validate().unwrap();
         let bytes = package.encode();
         assert_eq!(Package::decode(&bytes).unwrap(), package);
+    }
+
+    #[test]
+    fn package_artifact_limits_apply_before_deeper_validation() {
+        let mut package = runtime_package();
+        package.generated_interfaces = vec![0; MAX_PACKAGE_INTERFACES_BYTES + 1];
+        assert_eq!(package.validate(), Err(PackageError::ArtifactsTooLarge));
+
+        let mut package = runtime_package();
+        package.diagnostics = Some(PackageDiagnostics {
+            elf: Some(vec![0; MAX_PACKAGE_DIAGNOSTICS_BYTES]),
+            source_map: Some(vec![0]),
+        });
+        assert_eq!(package.validate(), Err(PackageError::ArtifactsTooLarge));
+
+        let mut package = actor_package(
+            &ACTOR_META,
+            &ACTOR_SCHEMA,
+            super::super::schema::ExecutionEntryKind::AgentActor,
+        );
+        package.task_dependencies = (0..4_u8)
+            .map(|index| PackageTaskDependency {
+                binding: crate::service::TaskDependency {
+                    task: Hash([index + 1; 32]),
+                    program: ProgramId([index + 1; 32]),
+                    witness_address: 1,
+                    witness_capacity: 1,
+                },
+                pvm: vec![index; MAX_PACKAGE_TASK_BYTES / 4 + 1],
+            })
+            .collect();
+        assert_eq!(package.validate(), Err(PackageError::ArtifactsTooLarge));
+    }
+
+    #[test]
+    fn package_decoder_rejects_oversized_envelope_before_fields() {
+        let mut bytes = Vec::with_capacity(MAX_ENCODED_PACKAGE_BYTES + 37);
+        bytes.extend_from_slice(&Package::MAGIC);
+        bytes.extend_from_slice(&crate::service::PLATFORM_ID.0);
+        bytes.resize(MAX_ENCODED_PACKAGE_BYTES + 37, 0);
+        assert_eq!(Package::decode(&bytes), Err(DecodeError::LimitExceeded));
     }
 
     #[test]
@@ -493,12 +865,119 @@ mod tests {
             proofs: true,
         };
         let kind = PackageKind::Actor { requirements };
-        assert!(kind.is_compatible_with(RuntimeCapabilities::standard()));
+        assert!(!kind.is_compatible_with(RuntimeCapabilities::standard()));
         assert_ne!(package.manifest.program, ProgramId([0; 32]));
     }
 
     #[test]
-    fn verified_package_requires_the_signature_trust_seam() {
+    fn signed_requirements_include_attestation_and_scheduling_contracts() {
+        let mut attested = actor_package(
+            &ATTESTED_META,
+            &ACTOR_SCHEMA,
+            super::super::schema::ExecutionEntryKind::AgentActor,
+        );
+        assert!(matches!(
+            attested.manifest.kind,
+            PackageKind::Actor {
+                requirements: RuntimeRequirements { proofs: true, .. }
+            }
+        ));
+        assert!(
+            !attested
+                .manifest
+                .kind
+                .is_compatible_with(RuntimeCapabilities::standard())
+        );
+        attested.manifest.kind = PackageKind::Actor {
+            requirements: RuntimeRequirements {
+                lanes: LaneSet::of(super::super::StateLane::Linear),
+                scheduling: false,
+                proofs: false,
+            },
+        };
+        assert_eq!(
+            attested.validate(),
+            Err(PackageError::InvalidActorArtifacts)
+        );
+
+        let mut job = actor_package(
+            &JOB_META,
+            &ACTOR_SCHEMA,
+            super::super::schema::ExecutionEntryKind::AgentActor,
+        );
+        assert!(matches!(
+            job.manifest.kind,
+            PackageKind::Actor {
+                requirements: RuntimeRequirements {
+                    scheduling: true,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            !job.manifest
+                .kind
+                .is_compatible_with(RuntimeCapabilities::standard())
+        );
+        job.manifest.kind = PackageKind::Actor {
+            requirements: RuntimeRequirements {
+                lanes: LaneSet::of(super::super::StateLane::Linear),
+                scheduling: false,
+                proofs: false,
+            },
+        };
+        assert_eq!(job.validate(), Err(PackageError::InvalidActorArtifacts));
+    }
+
+    #[test]
+    fn actor_packages_reject_non_agent_entry_abis() {
+        for entry in [
+            super::super::schema::ExecutionEntryKind::ServiceActor,
+            super::super::schema::ExecutionEntryKind::Task,
+        ] {
+            let package = actor_package(&ACTOR_META, &ACTOR_SCHEMA, entry);
+            assert_eq!(package.validate(), Err(PackageError::UnsupportedActorEntry));
+        }
+    }
+
+    #[test]
+    fn actor_packages_fail_closed_on_unimplemented_install_configuration() {
+        let constructor = actor_package(
+            &CONSTRUCTOR_META,
+            &ACTOR_SCHEMA,
+            super::super::schema::ExecutionEntryKind::AgentActor,
+        );
+        assert_eq!(
+            constructor.validate(),
+            Err(PackageError::UnsupportedActorConstructor)
+        );
+
+        let constant = actor_package(
+            &ACTOR_META,
+            &CONSTANT_SCHEMA,
+            super::super::schema::ExecutionEntryKind::AgentActor,
+        );
+        assert_eq!(
+            constant.validate(),
+            Err(PackageError::UnsupportedConstantState)
+        );
+    }
+
+    #[test]
+    fn actor_packages_reject_signed_storage_use_before_install() {
+        let storage = actor_package(
+            &ACTOR_META,
+            &STORAGE_SCHEMA,
+            super::super::schema::ExecutionEntryKind::AgentActor,
+        );
+        assert_eq!(
+            storage.validate(),
+            Err(PackageError::UnsupportedActorStorage)
+        );
+    }
+
+    #[test]
+    fn offline_signature_check_requires_the_selected_trust_seam() {
         struct Verifier(bool);
         impl PackageSignatureVerifier for Verifier {
             fn verify(&self, _: &[u8], _: &[u8], _: &[u8]) -> bool {
@@ -507,9 +986,9 @@ mod tests {
         }
 
         assert_eq!(
-            runtime_package().verify(&Verifier(false)),
+            runtime_package().verify_signature(&Verifier(false)),
             Err(PackageError::InvalidSignature)
         );
-        assert!(runtime_package().verify(&Verifier(true)).is_ok());
+        assert!(runtime_package().verify_signature(&Verifier(true)).is_ok());
     }
 }

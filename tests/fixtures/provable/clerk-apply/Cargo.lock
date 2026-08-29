@@ -378,6 +378,7 @@ dependencies = [
  "log",
  "rkyv",
  "vos-macros",
+ "vos-pvm-program",
 ]
 
 [[package]]
@@ -388,6 +389,10 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "vos-pvm-program"
+version = "0.1.0"
 
 [[package]]
 name = "zeroize"

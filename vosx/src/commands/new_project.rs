@@ -1,10 +1,16 @@
-//! `vosx new` service actor scaffolding.
+//! Actor scaffolding for the service and standard-agent runtimes.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 
-pub fn run(path: PathBuf, crdt: bool) -> anyhow::Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectTarget {
+    Service,
+    Agent,
+}
+
+pub fn run(path: PathBuf, crdt: bool, target: ProjectTarget) -> anyhow::Result<()> {
     if path.exists() {
         bail!("{} already exists", path.display());
     }
@@ -17,16 +23,25 @@ pub fn run(path: PathBuf, crdt: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all(path.join("src"))
         .with_context(|| format!("create {}", path.display()))?;
     std::fs::create_dir_all(path.join(".cargo"))?;
-    std::fs::write(path.join("Cargo.toml"), cargo_toml(name))?;
-    std::fs::write(path.join(".cargo/config.toml"), CONFIG)?;
+    std::fs::write(path.join("Cargo.toml"), cargo_toml(name, target))?;
+    std::fs::write(
+        path.join(".cargo/config.toml"),
+        match target {
+            ProjectTarget::Service => SERVICE_CONFIG,
+            ProjectTarget::Agent => AGENT_CONFIG,
+        },
+    )?;
+    if target == ProjectTarget::Agent {
+        std::fs::write(path.join("pvm.ld"), PVM_LINKER_SCRIPT)?;
+    }
     std::fs::write(path.join("rust-toolchain.toml"), TOOLCHAIN)?;
     std::fs::write(path.join("riscv64em-vos.json"), TARGET)?;
     std::fs::write(
         path.join("src/lib.rs"),
-        if crdt {
-            crdt_source(&crate_name)
-        } else {
-            counter_source(&crate_name)
+        match (target, crdt) {
+            (ProjectTarget::Service, true) => service_crdt_source(&crate_name),
+            (ProjectTarget::Agent, true) => agent_crdt_source(&crate_name),
+            (_, false) => counter_source(&crate_name),
         },
     )?;
     println!("created {}", path.display());
@@ -34,7 +49,11 @@ pub fn run(path: PathBuf, crdt: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cargo_toml(name: &str) -> String {
+fn cargo_toml(name: &str, target: ProjectTarget) -> String {
+    let guest_feature = match target {
+        ProjectTarget::Service => "service",
+        ProjectTarget::Agent => "pvm",
+    };
     format!(
         r#"[workspace]
 
@@ -51,7 +70,7 @@ bin = []
 crate-type = ["rlib", "cdylib"]
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-vos = {{ version = "{}", default-features = false, features = ["macros", "service"] }}
+vos = {{ version = "{}", default-features = false, features = ["macros", "{guest_feature}"] }}
 
 [target.'cfg(not(target_arch = "riscv64"))'.dependencies]
 vos = {{ version = "{}", default-features = false, features = ["macros", "extension"] }}
@@ -68,7 +87,7 @@ panic = "abort"
 
 fn counter_source(name: &str) -> String {
     format!(
-        r#"//! {name}: an ordinary local actor.
+        r#"//! {name}: an actor with linear state.
 
 use vos::prelude::*;
 
@@ -98,7 +117,7 @@ impl Counter {{
     )
 }
 
-fn crdt_source(name: &str) -> String {
+fn service_crdt_source(name: &str) -> String {
     format!(
         r#"//! {name}: an explicitly convergent shared actor.
 
@@ -149,12 +168,63 @@ impl SharedBoard {{
     )
 }
 
+fn agent_crdt_source(name: &str) -> String {
+    format!(
+        r#"//! {name}: an actor whose state can merge across replicas.
+
+use vos::prelude::*;
+
+#[actor]
+pub struct SharedBoard {{
+    title: crdt::Value<String>,
+    tasks: crdt::Map<u64, String>,
+    notes: crdt::Text,
+    edits: crdt::Counter,
+}}
+
+#[messages]
+impl SharedBoard {{
+    fn new() -> Self {{
+        Self {{
+            title: crdt::Value::default(),
+            tasks: crdt::Map::default(),
+            notes: crdt::Text::default(),
+            edits: crdt::Counter::default(),
+        }}
+    }}
+
+    #[msg(merge)]
+    fn set_title(&mut self, title: String) {{
+        self.title
+            .set(title)
+            .expect("CRDT mutations in actor methods have stable operation identities");
+    }}
+
+    #[msg(merge)]
+    fn add_task(&mut self, id: u64, text: String) {{
+        self.tasks
+            .insert(id, text)
+            .expect("CRDT mutations in actor methods have stable operation identities");
+        self.edits
+            .increment(1)
+            .expect("CRDT mutations in actor methods have stable operation identities");
+    }}
+
+    #[msg]
+    fn edit_count(&self) -> i64 {{
+        self.edits.value()
+    }}
+}}
+"#,
+    )
+}
+
 const TOOLCHAIN: &str = r#"[toolchain]
 channel = "nightly"
 components = ["rust-src"]
 "#;
 
-const CONFIG: &str = r#"[target.riscv64em-vos]
+const SERVICE_CONFIG: &str = r#"[target.riscv64em-vos]
 rustflags = [
     "-Zunstable-options",
     "-Zcrate-attr=no_std",
@@ -169,6 +239,45 @@ actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -
 
 [unstable]
 json-target-spec = true
+"#;
+
+const AGENT_CONFIG: &str = r#"[target.riscv64em-vos]
+rustflags = [
+    "-Zunstable-options",
+    "-Zcrate-attr=no_std",
+    "-Zcrate-attr=no_main",
+    "-Zremap-cwd-prefix=.",
+    "-Aduplicate-macro-attributes",
+    "-Aunused-attributes",
+    "-Clink-arg=-Tpvm.ld",
+]
+
+[alias]
+actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-vos.json"
+
+[unstable]
+json-target-spec = true
+"#;
+
+const PVM_LINKER_SCRIPT: &str = r#"/* Canonical standard-agent actor layout.
+ *
+ * Read-only and read-write data occupy distinct GP zones. The read-write
+ * base follows the complete read-only image instead of assuming a fixed
+ * maximum size.
+ */
+
+ENTRY(_start)
+
+SECTIONS
+{
+    .rodata 0x10000 : { *(.rodata .rodata.* .srodata .srodata.*) }
+    .data (0x20000 + ((SIZEOF(.rodata) + 0xffff) & ~0xffff)) :
+        { *(.data .data.* .sdata .sdata.*) }
+    .bss ALIGN(0x1000) : { *(.bss .bss.* .sbss .sbss.* COMMON) }
+    .text 0x900000 : { *(.text .text.* .init .init.*) }
+
+    /DISCARD/ : { *(.eh_frame .eh_frame_hdr .comment .riscv.attributes) }
+}
 "#;
 
 const TARGET: &str = r#"{
@@ -200,11 +309,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn templates_inject_platform_crate_attributes() {
-        assert!(CONFIG.contains("-Zcrate-attr=no_std"));
-        assert!(CONFIG.contains("-Zcrate-attr=no_main"));
-        assert!(CONFIG.contains("-Zremap-cwd-prefix=."));
+    fn service_template_preserves_the_service_build_surface() {
+        assert!(SERVICE_CONFIG.contains("-Zcrate-attr=no_std"));
+        assert!(SERVICE_CONFIG.contains("-Zcrate-attr=no_main"));
+        assert!(SERVICE_CONFIG.contains("-Zremap-cwd-prefix=."));
+        assert!(!SERVICE_CONFIG.contains("-Clink-arg=-Tpvm.ld"));
+        assert!(
+            cargo_toml("x", ProjectTarget::Service).contains(r#"features = ["macros", "service"]"#)
+        );
+        assert!(
+            !cargo_toml("x", ProjectTarget::Service).contains(r#"features = ["macros", "pvm"]"#)
+        );
         assert!(!counter_source("x").contains("#![no_std]"));
-        assert!(crdt_source("x").contains("#[actor(crdt)]"));
+        assert!(service_crdt_source("x").contains("#[actor(crdt)]"));
+    }
+
+    #[test]
+    fn agent_template_uses_the_standard_program_layout() {
+        assert!(AGENT_CONFIG.contains("-Zcrate-attr=no_std"));
+        assert!(AGENT_CONFIG.contains("-Zcrate-attr=no_main"));
+        assert!(AGENT_CONFIG.contains("-Zremap-cwd-prefix=."));
+        assert!(AGENT_CONFIG.contains("-Clink-arg=-Tpvm.ld"));
+        assert!(cargo_toml("x", ProjectTarget::Agent).contains(r#"features = ["macros", "pvm"]"#));
+        assert!(PVM_LINKER_SCRIPT.contains("SIZEOF(.rodata)"));
+    }
+
+    #[test]
+    fn merge_template_uses_the_signed_agent_lane_surface() {
+        let source = agent_crdt_source("x");
+        assert!(source.contains("#[actor]"));
+        assert!(source.contains("#[msg(merge)]"));
+        assert!(source.contains("crdt::Value<String>"));
+        assert!(!source.contains("#[actor(crdt)]"));
+        assert!(!source.contains("#[crdt(const)]"));
+        assert!(!source.contains("#[crdt(skip)]"));
     }
 }

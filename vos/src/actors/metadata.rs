@@ -964,6 +964,13 @@ mod decode {
         find_elf_section(elf_data, b".vos_meta").map(|s| s.to_vec())
     }
 
+    /// Raw bytes of a named ELF section. Agent packaging uses this for the
+    /// separate `.vos_agent` execution contract while the public actor schema
+    /// remains byte-stable and independently consumable.
+    pub fn raw_named_section_from_elf(elf_data: &[u8], name: &[u8]) -> Option<Vec<u8>> {
+        find_elf_section(elf_data, name).map(|section| section.to_vec())
+    }
+
     /// Find a named section in a 64-bit little-endian ELF.
     fn find_elf_section<'a>(elf: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
         if elf.len() < 64 {

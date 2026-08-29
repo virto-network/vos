@@ -1,10 +1,3 @@
-/* Canonical standard-PVM actor layout.
- *
- * Read-only and read-write data occupy distinct GP zones. Actor stacks and
- * arguments are mapped separately by the agent runtime; code has its own
- * instruction address space.
- */
-
 ENTRY(_start)
 
 SECTIONS

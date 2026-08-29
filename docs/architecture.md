@@ -1,8 +1,10 @@
 # Architecture
 
 A space is an operator-controlled network. Its registry names packages,
-actors, nodes, and grants. Each installed package creates a root service that
-owns one actor tree and one durable state image.
+actors, nodes, and grants. The production service path creates one root service
+and actor tree per installed `VOSP` package. The agent foundation hosts many
+actors inside one runtime and stores each actor's Linear, Merge, and Local
+state separately; `VOSK` publication is the next node-integration boundary.
 
 ```mermaid
 flowchart TB
@@ -15,11 +17,20 @@ flowchart TB
             Children[Child actors]
             Store[(State image)]
         end
+        subgraph Agent
+            Runtime[Agent runtime]
+            Many[Zero or more actors]
+            Lanes[(State lanes)]
+        end
         Registry --> Service
+        Registry --> Runtime
         Authority --> Service
+        Authority --> Runtime
         Service --> Actor
         Actor --> Children
         Service --> Store
+        Runtime --> Many
+        Many --> Lanes
     end
 ```
 
@@ -42,9 +53,11 @@ sequenceDiagram
     Service-->>Client: committed result
 ```
 
-The host proposes work, but the generic service guest validates package
-identity, method policy, credentials, causal state, effects, and transition
-shape before state changes become durable.
+The host proposes work, but the guest runtime validates package identity,
+method policy, credentials, state ownership, effects, and transition shape
+before state changes become durable. The production diagram currently follows
+the generic service path; the standard agent runtime applies the same rule to
+its actor directory and state lanes.
 
 Ingress adapters are node infrastructure. HTTP serves machine clients. SSH
 serves the built-in semantic space application used by people. Both terminate
@@ -60,7 +73,9 @@ instead serve bounded typed requests from actors; they do not own listeners.
 | Raft | nodes need one total order | voter quorum |
 | CRDT | nodes accept concurrent work | causal merge |
 
-All modes execute the same package and actor API. Consistency changes how
+Service roots currently provide all three modes. The process-local agent
+driver provides Local execution and fails closed for Shared/Private profiles
+until their consensus and causal adapters land. Consistency changes how
 accepted transitions are ordered and exchanged, not what an actor is.
 
 ## Content identity

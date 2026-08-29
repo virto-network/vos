@@ -5,6 +5,7 @@
 
 use proc_macro::TokenStream;
 use quote::{ToTokens, format_ident, quote};
+use syn::spanned::Spanned;
 use syn::{FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType, parse_macro_input};
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -314,7 +315,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Validation and code generation strip framework-owned field attributes;
     // retain the declared form for the persistence fingerprint.
     let state_schema = input.clone();
-    let crdt_fields = match prepare_crdt_fields(&mut input, parsed.crdt) {
+    let state_fields = match prepare_state_fields(&mut input, parsed.crdt) {
         Ok(fields) => fields,
         Err(error) => return error.to_compile_error().into(),
     };
@@ -383,16 +384,9 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[rkyv(crate = vos::rkyv)]
             #vis struct #name #impl_generics #where_clause;
         },
-        syn::Fields::Unnamed(f) => quote! {
-            #( #attrs )*
-            #[derive(
-                vos::rkyv::Archive,
-                vos::rkyv::Serialize,
-                vos::rkyv::Deserialize,
-            )]
-            #[rkyv(crate = vos::rkyv)]
-            #vis struct #name #impl_generics #f #where_clause;
-        },
+        syn::Fields::Unnamed(_) => {
+            unreachable!("prepare_state_fields rejects tuple actor structs")
+        }
     };
 
     // PVM entry-point block — emitted only on riscv64 actor builds
@@ -429,6 +423,32 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         },
     };
+    let agent_field_metas = state_fields.fields.iter().map(|field| {
+        let name = field.ident.to_string();
+        let ty = &field.ty;
+        let persistence = field.persistence.tokens();
+        quote! {
+            vos::agent::schema::FieldMeta {
+                name: #name,
+                // Source spelling alone lets two modules reuse an alias name
+                // for different codecs. Include its declaration context in
+                // the signed layout identity. Explicit state migration is
+                // still required when the meaning of that named codec changes.
+                codec: concat!(module_path!(), "::", stringify!(#ty)),
+                persistence: #persistence,
+            }
+        }
+    });
+    let agent_entry_kind = if parsed.task_buf.is_some() {
+        quote! { vos::agent::schema::ExecutionEntryKind::Task }
+    } else {
+        // This constant comes from the actor's `vos` dependency, whose
+        // selected `service` or `pvm` feature is the ABI actually compiled
+        // into the guest. The proc-macro crate cannot observe downstream
+        // feature selection and must not guess it here.
+        quote! { vos::ACTOR_EXECUTION_ENTRY_KIND }
+    };
+    let agent_uses_storage = !storage_fields.is_empty();
     let pvm_entries = quote! {
         #entry
 
@@ -444,6 +464,28 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         static _VOS_META: [u8; __VOS_ACTOR_META_ENCODED.1] = {
             let (src, len) = __VOS_ACTOR_META_ENCODED;
             let mut out = [0u8; __VOS_ACTOR_META_ENCODED.1];
+            let mut i = 0;
+            while i < len { out[i] = src[i]; i += 1; }
+            out
+        };
+
+        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+        const __VOS_AGENT_SCHEMA_ENCODED: ([u8; 16384], usize) =
+            vos::agent::schema::encode_with_entry::<16384>(
+                &vos::agent::schema::SchemaMeta {
+                    uses_storage: #agent_uses_storage,
+                    fields: &[ #( #agent_field_metas ),* ],
+                    methods: <#msg_enum>::AGENT_METHODS,
+                },
+                #agent_entry_kind,
+            );
+
+        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+        #[unsafe(link_section = ".vos_agent")]
+        #[used]
+        static _VOS_AGENT_SCHEMA: [u8; __VOS_AGENT_SCHEMA_ENCODED.1] = {
+            let (src, len) = __VOS_AGENT_SCHEMA_ENCODED;
+            let mut out = [0u8; __VOS_AGENT_SCHEMA_ENCODED.1];
             let mut i = 0;
             while i < len { out[i] = src[i]; i += 1; }
             out
@@ -479,11 +521,11 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    let init_crdt_fields = if crdt_fields.replicated.is_empty() {
+    let init_crdt_fields = if state_fields.merge.is_empty() {
         quote! {}
     } else {
         let actor_name = name.to_string();
-        let inits = crdt_fields.replicated.iter().map(|ident| {
+        let inits = state_fields.merge.iter().map(|ident| {
             let field_name = ident.to_string();
             quote! {
                 vos::crdt::Field::__vos_init(&mut self.#ident, #actor_name, #field_name);
@@ -497,13 +539,13 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    let merge_crdt = if !crdt {
+    let merge_crdt = if state_fields.merge.is_empty() {
         quote! {}
     } else {
-        let merge_fields = crdt_fields.replicated.iter().map(|ident| {
+        let merge_fields = state_fields.merge.iter().map(|ident| {
             quote! { merged.#ident.merge(&other.#ident)?; }
         });
-        let check_constants = crdt_fields.constants.iter().map(|ident| {
+        let check_constants = state_fields.constants.iter().map(|ident| {
             quote! {
                 if vos::Encode::encode(&self.#ident) != vos::Encode::encode(&other.#ident) {
                     return core::result::Result::Err(vos::crdt::Error::ConstMismatch);
@@ -522,6 +564,75 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
                 *self = merged;
                 <Self as vos::Actor>::__init_crdt_fields(self);
                 core::result::Result::Ok(())
+            }
+        }
+    };
+
+    let lane_fields = |lane: PersistencePlan| {
+        state_fields
+            .fields
+            .iter()
+            .filter(|field| field.persistence == lane)
+            .map(|field| field.ident.clone())
+            .collect::<Vec<_>>()
+    };
+    let linear_fields = lane_fields(PersistencePlan::Linear);
+    let merge_fields = lane_fields(PersistencePlan::Merge);
+    let local_fields = lane_fields(PersistencePlan::Local);
+    let load_lane = |argument: &syn::Ident, fields: &[syn::Ident]| {
+        let count = fields.len() as u16;
+        quote! {
+            if let Some(bytes) = #argument.filter(|bytes| !bytes.is_empty()) {
+                let mut reader = vos::lifecycle::AgentLaneReader::new(bytes, #count)?;
+                #( actor.#fields = reader.read()?; )*
+                if !reader.finish() {
+                    return None;
+                }
+            }
+        }
+    };
+    let linear_argument = format_ident!("linear");
+    let merge_argument = format_ident!("merge");
+    let local_argument = format_ident!("local");
+    let load_linear = load_lane(&linear_argument, &linear_fields);
+    let load_merge = load_lane(&merge_argument, &merge_fields);
+    let load_local = load_lane(&local_argument, &local_fields);
+    let save_lane = |fields: &[syn::Ident]| {
+        let count = fields.len() as u16;
+        quote! {
+            let mut writer = vos::lifecycle::AgentLaneWriter::new(#count);
+            #( writer.push(&self.#fields); )*
+            writer.finish()
+        }
+    };
+    let save_linear = save_lane(&linear_fields);
+    let save_merge = save_lane(&merge_fields);
+    let save_local = save_lane(&local_fields);
+    let agent_state = quote! {
+        #[doc(hidden)]
+        fn __load_agent_state(
+            #linear_argument: Option<&[u8]>,
+            #merge_argument: Option<&[u8]>,
+            #local_argument: Option<&[u8]>,
+        ) -> Option<Self> {
+            let mut actor = Self::create();
+            #load_linear
+            #load_merge
+            #load_local
+            <Self as vos::Actor>::__init_storage(&mut actor);
+            <Self as vos::Actor>::__init_crdt_fields(&mut actor);
+            Some(actor)
+        }
+
+        #[doc(hidden)]
+        fn __save_agent_lane(
+            &self,
+            lane: vos::agent::StateLane,
+        ) -> alloc::vec::Vec<u8> {
+            match lane {
+                vos::agent::StateLane::Linear => { #save_linear }
+                vos::agent::StateLane::Merge => { #save_merge }
+                vos::agent::StateLane::Local => { #save_local }
             }
         }
     };
@@ -551,6 +662,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     };
+    let default_mutation_mode = state_fields.default_mutation_mode.tokens();
 
     let expanded = quote! {
         #struct_def
@@ -582,6 +694,9 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             const STATE_SCHEMA_FINGERPRINT: u64 = #state_fingerprint;
             const STATE_SCHEMA_LEGACY_FINGERPRINTS: &'static [u64] = &[#legacy_state_fingerprint];
 
+            #[doc(hidden)]
+            const DEFAULT_MUTATION_MODE: vos::agent::MethodMode = #default_mutation_mode;
+
             fn create() -> Self {
                 Self::__vos_create()
             }
@@ -591,6 +706,8 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             #init_crdt_fields
 
             #merge_crdt
+
+            #agent_state
 
             #committed_root
 
@@ -689,6 +806,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut attested_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut required_space_role_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut required_capability_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut agent_method_metas: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
     let mut constructor_params: Vec<(syn::Ident, syn::Type)> = Vec::new();
     // One entry per `#[msg]`: the data the host-Client emission
@@ -726,6 +844,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         let mut space_role_expr: Option<syn::Expr> = None;
         let mut capability: Option<syn::LitStr> = None;
         let mut is_attested = false;
+        let mut execution_mode: Option<syn::Ident> = None;
         // `#[msg(timeout_ms = N)]` — per-handler invoke timeout in ms
         // (0 = client default), recorded in `.vos_meta` so the dispatcher
         // waits long enough for a legitimately slow handler.
@@ -751,6 +870,22 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if meta.path.is_ident("attested") {
                     is_attested = true;
                     return Ok(());
+                }
+                for name in [
+                    "query",
+                    "linearizable",
+                    "local_query",
+                    "linear",
+                    "merge",
+                    "local",
+                ] {
+                    if meta.path.is_ident(name) {
+                        if execution_mode.is_some() {
+                            return Err(meta.error("select exactly one actor execution mode"));
+                        }
+                        execution_mode = Some(syn::Ident::new(name, meta.path.span()));
+                        return Ok(());
+                    }
                 }
                 if meta.path.is_ident("role") {
                     let value = meta.value()?;
@@ -837,6 +972,37 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         let is_query = match method.sig.inputs.first() {
             Some(FnArg::Receiver(r)) => r.mutability.is_none(),
             _ => false,
+        };
+        let explicit_execution_mode = execution_mode.is_some();
+        let agent_execution_mode = match execution_mode.as_ref().map(ToString::to_string) {
+            Some(mode) if mode == "query" && is_query => {
+                quote! { vos::agent::MethodMode::Query }
+            }
+            Some(mode) if mode == "linearizable" && is_query => {
+                quote! { vos::agent::MethodMode::LinearizableQuery }
+            }
+            Some(mode) if mode == "local_query" && is_query => {
+                quote! { vos::agent::MethodMode::LocalQuery }
+            }
+            Some(mode) if mode == "linear" && !is_query => {
+                quote! { vos::agent::MethodMode::Linear }
+            }
+            Some(mode) if mode == "merge" && !is_query => {
+                quote! { vos::agent::MethodMode::Merge }
+            }
+            Some(mode) if mode == "local" && !is_query => {
+                quote! { vos::agent::MethodMode::Local }
+            }
+            Some(_) => {
+                return syn::Error::new_spanned(
+                    &method.sig,
+                    "query/linearizable modes require &self; linear/merge/local modes require &mut self",
+                )
+                .to_compile_error()
+                .into();
+            }
+            None if is_query => quote! { vos::agent::MethodMode::Query },
+            None => quote! { <#actor_name as vos::Actor>::DEFAULT_MUTATION_MODE },
         };
 
         // Collect parameters (skip self, skip Context)
@@ -1174,6 +1340,13 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Metadata
         let msg_name_str = method_name.to_string();
+        agent_method_metas.push(quote! {
+            vos::agent::schema::MethodMeta {
+                name: #msg_name_str,
+                mode: #agent_execution_mode,
+                explicit: #explicit_execution_mode,
+            }
+        });
         // First paragraph of the handler's `///` doc → MessageMeta.doc.
         let method_doc = first_doc_paragraph(&method.attrs);
         // Dispatch mode byte: 1 for `#[msg(job)]`, else 0 (sync).
@@ -1442,6 +1615,10 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         impl #enum_name {
+            #[doc(hidden)]
+            pub const AGENT_METHODS: &'static [vos::agent::schema::MethodMeta] =
+                &[ #( #agent_method_metas ),* ];
+
             pub const META: vos::metadata::ActorMeta = vos::metadata::ActorMeta {
                 actor_name: #actor_name_str,
                 messages: &[ #( #meta_messages ),* ],
@@ -2158,41 +2335,123 @@ fn parse_actor_attrs(attr: proc_macro2::TokenStream) -> syn::Result<ActorAttrs> 
     Ok(out)
 }
 
-/// Strip and validate `#[crdt(const)]` / `#[crdt(skip)]` field annotations.
-/// Plain mutable fields on a CRDT actor are rejected with application-facing
-/// guidance instead of silently becoming last-writer-wins command replay.
+/// Persistence plan emitted into the signed `.vos_agent` schema.
 #[derive(Default)]
-struct CrdtFieldPlan {
-    replicated: Vec<syn::Ident>,
+struct StateFieldPlan {
+    fields: Vec<StateField>,
+    merge: Vec<syn::Ident>,
     constants: Vec<syn::Ident>,
+    default_mutation_mode: MethodModePlan,
 }
 
-fn prepare_crdt_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<CrdtFieldPlan> {
+struct StateField {
+    ident: syn::Ident,
+    ty: syn::Type,
+    persistence: PersistencePlan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistencePlan {
+    Linear,
+    Merge,
+    Local,
+    Constant,
+    Skipped,
+}
+
+impl PersistencePlan {
+    fn tokens(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Linear => quote! {
+                vos::agent::FieldPersistence::State(vos::agent::StateLane::Linear)
+            },
+            Self::Merge => quote! {
+                vos::agent::FieldPersistence::State(vos::agent::StateLane::Merge)
+            },
+            Self::Local => quote! {
+                vos::agent::FieldPersistence::State(vos::agent::StateLane::Local)
+            },
+            Self::Constant => quote! { vos::agent::FieldPersistence::Constant },
+            Self::Skipped => quote! { vos::agent::FieldPersistence::Skipped },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+enum MethodModePlan {
+    #[default]
+    Linear,
+    Merge,
+    Local,
+}
+
+impl MethodModePlan {
+    fn tokens(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Linear => quote! { vos::agent::MethodMode::Linear },
+            Self::Merge => quote! { vos::agent::MethodMode::Merge },
+            Self::Local => quote! { vos::agent::MethodMode::Local },
+        }
+    }
+}
+
+/// Strip and validate field persistence annotations. Plain fields select the
+/// linear lane, `crdt::*` fields select the merge lane, and `#[state(local)]`
+/// selects replica-local state. Constants and skipped fields are not mutable
+/// durable lanes.
+fn prepare_state_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<StateFieldPlan> {
     let syn::Fields::Named(named) = &mut input.fields else {
-        if is_crdt && !matches!(input.fields, syn::Fields::Unit) {
+        if !matches!(input.fields, syn::Fields::Unit) {
             return Err(syn::Error::new_spanned(
                 &input.fields,
-                "#[actor(crdt)] requires named fields so each replicated field has explicit semantics",
+                "#[actor] tuple structs are unsupported: use named fields so every persisted field has an explicit signed lane codec, or a unit struct for a stateless actor",
             ));
         }
-        return Ok(CrdtFieldPlan::default());
+        return Ok(StateFieldPlan::default());
     };
 
-    let mut plan = CrdtFieldPlan::default();
+    let mut plan = StateFieldPlan::default();
+    let mut has_linear = false;
+    let mut has_merge = false;
+    let mut has_local = false;
     for field in &mut named.named {
+        let is_storage = field
+            .attrs
+            .iter()
+            .any(|attr| attr.path().is_ident("storage"));
+        if is_storage {
+            if let Some(attribute) = field
+                .attrs
+                .iter()
+                .find(|attr| attr.path().is_ident("state") || attr.path().is_ident("crdt"))
+            {
+                return Err(syn::Error::new_spanned(
+                    attribute,
+                    "#[storage] handles live outside agent state lanes and cannot also use #[state(...)] or #[crdt(...)]",
+                ));
+            }
+            continue;
+        }
         let mut is_const = false;
         let mut is_skip = false;
+        let mut is_local = false;
+        let mut is_merge = false;
+        let mut is_linear = false;
         let mut crdt_attr = None;
+        let mut state_attr = None;
         field.attrs.retain(|attr| {
             if attr.path().is_ident("crdt") {
                 crdt_attr = Some(attr.clone());
+                false
+            } else if attr.path().is_ident("state") {
+                state_attr = Some(attr.clone());
                 false
             } else {
                 true
             }
         });
 
-        if let Some(attr) = crdt_attr {
+        if let Some(attr) = &crdt_attr {
             if !is_crdt {
                 return Err(syn::Error::new_spanned(
                     attr,
@@ -2216,14 +2475,64 @@ fn prepare_crdt_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<Crd
                     "a CRDT field cannot be both const and skip",
                 ));
             }
-            if is_skip {
-                field
-                    .attrs
-                    .push(syn::parse_quote!(#[rkyv(with = vos::rkyv::with::Skip)]));
+        }
+
+        if let Some(attr) = &state_attr {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("local") {
+                    is_local = true;
+                    Ok(())
+                } else if meta.path.is_ident("merge") {
+                    is_merge = true;
+                    Ok(())
+                } else if meta.path.is_ident("linear") {
+                    is_linear = true;
+                    Ok(())
+                } else if meta.path.is_ident("const") {
+                    is_const = true;
+                    Ok(())
+                } else if meta.path.is_ident("skip") {
+                    is_skip = true;
+                    Ok(())
+                } else {
+                    Err(meta.error(
+                        "expected #[state(linear)], #[state(merge)], #[state(local)], #[state(const)], or #[state(skip)]",
+                    ))
+                }
+            })?;
+            if usize::from(is_linear)
+                + usize::from(is_merge)
+                + usize::from(is_local)
+                + usize::from(is_const)
+                + usize::from(is_skip)
+                != 1
+            {
+                return Err(syn::Error::new_spanned(
+                    &field.ty,
+                    "a state field must select exactly one persistence class",
+                ));
             }
         }
 
-        if is_crdt && !is_const && !is_skip && !is_crdt_field_type(&field.ty) {
+        if crdt_attr.is_some() && state_attr.is_some() {
+            return Err(syn::Error::new_spanned(
+                &field.ty,
+                "use one field persistence annotation, not both #[crdt(...)] and #[state(...)]",
+            ));
+        }
+        if is_skip {
+            field
+                .attrs
+                .push(syn::parse_quote!(#[rkyv(with = vos::rkyv::with::Skip)]));
+        }
+
+        if is_crdt
+            && !is_const
+            && !is_skip
+            && !is_merge
+            && !is_linear
+            && !is_crdt_field_type(&field.ty)
+        {
             let name = field
                 .ident
                 .as_ref()
@@ -2236,14 +2545,38 @@ fn prepare_crdt_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<Crd
                 ),
             ));
         }
-        if is_crdt && is_const {
-            plan.constants
-                .push(field.ident.clone().expect("named CRDT field"));
-        } else if is_crdt && !is_skip {
-            plan.replicated
-                .push(field.ident.clone().expect("named CRDT field"));
-        }
+
+        let ident = field.ident.clone().expect("named actor field");
+        let persistence = if is_skip {
+            PersistencePlan::Skipped
+        } else if is_const {
+            plan.constants.push(ident.clone());
+            PersistencePlan::Constant
+        } else if is_local {
+            has_local = true;
+            PersistencePlan::Local
+        } else if is_merge || (!is_linear && is_crdt_field_type(&field.ty)) {
+            has_merge = true;
+            plan.merge.push(ident.clone());
+            PersistencePlan::Merge
+        } else {
+            has_linear = true;
+            PersistencePlan::Linear
+        };
+        plan.fields.push(StateField {
+            ident,
+            ty: field.ty.clone(),
+            persistence,
+        });
     }
+
+    plan.default_mutation_mode = if has_merge && !has_linear && !has_local {
+        MethodModePlan::Merge
+    } else if has_local && !has_linear && !has_merge {
+        MethodModePlan::Local
+    } else {
+        MethodModePlan::Linear
+    };
     Ok(plan)
 }
 
@@ -2251,12 +2584,108 @@ fn is_crdt_field_type(ty: &syn::Type) -> bool {
     let syn::Type::Path(path) = ty else {
         return false;
     };
-    path.path.segments.last().is_some_and(|segment| {
-        matches!(
-            segment.ident.to_string().as_str(),
-            "Value" | "Map" | "Set" | "List" | "Text" | "Counter"
-        )
-    })
+    let mut segments = path.path.segments.iter().rev();
+    let Some(kind) = segments.next() else {
+        return false;
+    };
+    let is_known = matches!(
+        kind.ident.to_string().as_str(),
+        "Value" | "Map" | "Set" | "List" | "Text" | "Counter"
+    );
+    is_known
+        && segments
+            .next()
+            .is_some_and(|segment| segment.ident == "crdt")
+}
+
+#[cfg(test)]
+mod agent_schema_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_lanes_override_syntactic_type_classification() {
+        let mut actor: ItemStruct = syn::parse_quote! {
+            struct Mixed {
+                #[state(merge)]
+                merge: CustomMergeCodec,
+                #[state(linear)]
+                linear: some::crdt::Counter,
+            }
+        };
+        let plan = prepare_state_fields(&mut actor, false).unwrap();
+        assert_eq!(plan.fields.len(), 2);
+        assert_eq!(plan.fields[0].persistence, PersistencePlan::Merge);
+        assert_eq!(plan.fields[1].persistence, PersistencePlan::Linear);
+    }
+
+    #[test]
+    fn only_qualified_crdt_types_are_inferred_as_merge_state() {
+        let qualified: syn::Type = syn::parse_quote!(some::crdt::Counter);
+        let direct: syn::Type = syn::parse_quote!(Counter);
+        let unrelated: syn::Type = syn::parse_quote!(other::Counter);
+        assert!(is_crdt_field_type(&qualified));
+        assert!(!is_crdt_field_type(&direct));
+        assert!(!is_crdt_field_type(&unrelated));
+    }
+
+    #[test]
+    fn storage_handles_are_not_agent_lane_fields() {
+        let mut actor: ItemStruct = syn::parse_quote! {
+            struct Stored {
+                #[storage(prefix = "items/")]
+                items: vos::StorageMap<String, String>,
+                count: u64,
+            }
+        };
+        let plan = prepare_state_fields(&mut actor, false).unwrap();
+        assert_eq!(plan.fields.len(), 1);
+        assert_eq!(plan.fields[0].ident, "count");
+        assert!(
+            actor
+                .fields
+                .iter()
+                .next()
+                .unwrap()
+                .attrs
+                .iter()
+                .any(|attr| attr.path().is_ident("storage"))
+        );
+    }
+
+    #[test]
+    fn storage_handles_cannot_claim_a_second_persistence_class() {
+        let mut actor: ItemStruct = syn::parse_quote! {
+            struct Stored {
+                #[storage]
+                #[state(linear)]
+                items: vos::StorageMap<String, String>,
+            }
+        };
+        assert!(prepare_state_fields(&mut actor, false).is_err());
+    }
+
+    #[test]
+    fn tuple_actor_state_is_rejected_instead_of_silently_omitted() {
+        let mut actor: ItemStruct = syn::parse_quote! {
+            struct Coordinates(u64, u64);
+        };
+        let error = match prepare_state_fields(&mut actor, false) {
+            Ok(_) => panic!("tuple actor state was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("tuple structs are unsupported"));
+    }
+
+    #[test]
+    fn unit_actor_is_an_explicit_zero_field_state_shape() {
+        let mut actor: ItemStruct = syn::parse_quote! {
+            struct Health;
+        };
+        let plan = prepare_state_fields(&mut actor, false).unwrap();
+        assert!(plan.fields.is_empty());
+        assert!(plan.merge.is_empty());
+        assert!(plan.constants.is_empty());
+    }
 }
 
 /// Default `__VOS_WITNESS` capacity for `#[actor(task)]` blobs.

@@ -1,15 +1,18 @@
-//! Build a canonical standard-PVM actor and its signed `.vos` package.
+//! Build canonical actor PVMs and signed `.vos` packages.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, anyhow, bail};
-use vos::agent::package::{Package, PackageManifest};
-use vos::agent::{LaneSet, PackageKind, RuntimeRequirements, StateLane};
+use vos::agent::package::{
+    Package as AgentPackage, PackageManifest as AgentPackageManifest, actor_runtime_requirements,
+};
+use vos::agent::{LaneSet, PackageKind, StateLane};
 use vos::service::{
-    DeploymentSignature, PackageDiagnostics, PackageRolePolicies, PackageTaskDependency,
-    ProducerId, ProgramId, ServiceWire, TaskDependency, artifact_hash, task_dependencies_hash,
+    DeploymentSignature, PackageDiagnostics, PackageManifest as ServicePackageManifest,
+    PackageRolePolicies, PackageTaskDependency, ProducerId, ProgramId, ServiceWire, TaskDependency,
+    VosPackage, artifact_hash, task_dependencies_hash,
 };
 
 const RUSTC_WRAPPER_MODE: &str = "VOSX_CANONICAL_RUSTC_WRAPPER";
@@ -36,13 +39,23 @@ impl RustcUnitIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuildTarget {
+    /// The established service package consumed by `vosx space publish`.
+    Service,
+    /// A standard-agent actor package consumed by the agent driver.
+    Agent,
+}
+
 pub struct Args {
+    pub target: BuildTarget,
     pub program: PathBuf,
     pub name: Option<String>,
     pub out_dir: PathBuf,
     pub interfaces: Option<PathBuf>,
     pub role_policies: Option<PathBuf>,
     pub schemas: Option<PathBuf>,
+    pub agent_schema: Option<PathBuf>,
     pub source_map: Option<PathBuf>,
     pub tasks: Vec<PathBuf>,
     pub include_elf: bool,
@@ -58,17 +71,46 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     let program = resolve_program_input(&args.program)?;
     let input = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
     let is_pvm = program.extension().and_then(|x| x.to_str()) == Some("pvm");
+    if is_pvm && args.target == BuildTarget::Agent {
+        if args.schemas.is_none() {
+            bail!(
+                "{} is an agent PVM without authenticated actor metadata; pass --schemas with exact .vos_meta bytes",
+                program.display()
+            );
+        }
+        if args.agent_schema.is_none() {
+            bail!(
+                "{} is an agent PVM without its execution schema; pass --agent-schema with exact .vos_agent bytes",
+                program.display()
+            );
+        }
+    }
+    if is_pvm && args.target == BuildTarget::Service && args.agent_schema.is_none() {
+        bail!(
+            "{} is a PVM without its authenticated service-entry marker; pass the canonical service actor ELF or project directory",
+            program.display()
+        );
+    }
     let actor_pvm = if is_pvm {
         input.clone()
     } else {
-        vos_pvm_compiler::link_elf_spi(&input)
-            .map_err(|error| anyhow!("transpile {}: {error:?}", program.display()))?
+        match args.target {
+            BuildTarget::Service => vos_pvm_compiler::link_elf(&input),
+            BuildTarget::Agent => vos_pvm_compiler::link_elf_spi(&input),
+        }
+        .map_err(|error| anyhow!("transpile {}: {error:?}", program.display()))?
     };
     if actor_pvm.is_empty() {
         bail!("{} produced an empty PVM", program.display());
     }
-    vos_pvm::spi::parse_standard_program(&actor_pvm)
-        .ok_or_else(|| anyhow!("{} is not a canonical standard PVM", program.display()))?;
+    match args.target {
+        BuildTarget::Service => vos::service::validate_actor_program_layout(&actor_pvm)
+            .map_err(|error| anyhow!("invalid canonical actor PVM capability layout: {error}"))?,
+        BuildTarget::Agent => {
+            vos_pvm::spi::parse_standard_program(&actor_pvm)
+                .ok_or_else(|| anyhow!("{} is not a canonical standard PVM", program.display()))?;
+        }
+    }
 
     let schemas = match args.schemas.as_deref() {
         Some(path) => std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
@@ -77,25 +119,81 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     };
     let actor_metadata = vos::metadata::decode(&schemas).ok_or_else(|| {
         anyhow!(
-            "{} has no valid service actor schema; build from its ELF or pass --schemas with exact .vos_meta bytes",
+            "{} has no valid actor metadata; build from its ELF or pass --schemas with exact .vos_meta bytes",
             program.display()
         )
     })?;
-    if args.crdt && !actor_metadata.crdt {
-        bail!(
-            "{} is an ordinary actor; use #[actor(crdt)] instead of forcing --crdt",
-            program.display(),
-        );
-    }
-    let crdt = actor_metadata.crdt || args.crdt;
-    let requirements = RuntimeRequirements {
-        lanes: LaneSet::of(if crdt {
-            StateLane::Merge
-        } else {
-            StateLane::Linear
-        }),
-        scheduling: false,
-        proofs: actor_metadata.provable,
+    let embedded_execution_schema =
+        (!is_pvm).then(|| vos::agent::schema::raw_section_from_elf(&input).unwrap_or_default());
+    let (agent_schema, requirements, service_crdt) = match args.target {
+        BuildTarget::Service => {
+            if args.crdt && !actor_metadata.crdt {
+                bail!(
+                    "{} is an ordinary actor; use #[actor(crdt)] instead of forcing --crdt",
+                    program.display(),
+                );
+            }
+            let execution_schema = match args.agent_schema.as_deref() {
+                Some(path) => {
+                    let supplied =
+                        std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+                    if embedded_execution_schema
+                        .as_ref()
+                        .is_some_and(|embedded| *embedded != supplied)
+                    {
+                        bail!(
+                            "{} does not match the actor ELF's embedded .vos_agent schema",
+                            path.display()
+                        );
+                    }
+                    supplied
+                }
+                None => embedded_execution_schema.unwrap_or_default(),
+            };
+            require_execution_entry(
+                &execution_schema,
+                vos::agent::schema::ExecutionEntryKind::ServiceActor,
+                &program,
+            )?;
+            (Vec::new(), None, actor_metadata.crdt || args.crdt)
+        }
+        BuildTarget::Agent => {
+            let agent_schema = match args.agent_schema.as_deref() {
+                Some(path) => {
+                    let supplied =
+                        std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+                    if embedded_execution_schema
+                        .as_ref()
+                        .is_some_and(|embedded| *embedded != supplied)
+                    {
+                        bail!(
+                            "{} does not match the actor ELF's embedded .vos_agent schema",
+                            path.display()
+                        );
+                    }
+                    supplied
+                }
+                None if !is_pvm => embedded_execution_schema.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let parsed_agent_schema = require_execution_entry(
+                &agent_schema,
+                vos::agent::schema::ExecutionEntryKind::AgentActor,
+                &program,
+            )?;
+            let requirements = actor_runtime_requirements(
+                &parsed_agent_schema,
+                &actor_metadata,
+                !args.tasks.is_empty(),
+            );
+            if args.crdt && requirements.lanes != LaneSet::of(StateLane::Merge) {
+                bail!(
+                    "{} is not a merge-only actor; field types now derive lanes and --crdt cannot override them",
+                    program.display(),
+                );
+            }
+            (agent_schema, Some(requirements), false)
+        }
     };
     let name = args
         .name
@@ -105,7 +203,7 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     let mut task_dependencies = args
         .tasks
         .iter()
-        .map(|input| build_task_dependency(input))
+        .map(|input| build_task_dependency(input, args.target))
         .collect::<anyhow::Result<Vec<_>>>()?;
     task_dependencies.sort_by_key(|dependency| dependency.binding.task);
     if task_dependencies
@@ -139,37 +237,78 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
 
     let public_key = keypair.public().encode_protobuf();
     let producer = ProducerId::of_public_key(&public_key);
-    let mut package = Package {
-        manifest: PackageManifest {
-            name: name.clone(),
-            platform: vos::service::PLATFORM_ID,
-            execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
-            kind: PackageKind::Actor { requirements },
-            program: actor_program,
-            interfaces_hash: artifact_hash(b"interfaces", &interfaces),
-            role_policies_hash: artifact_hash(b"role-policies", &role_policies),
-            schemas_hash: artifact_hash(b"schemas", &schemas),
-            dependencies_hash: task_dependencies_hash(&task_dependencies),
-        },
-        pvm: actor_pvm.clone(),
-        generated_interfaces: interfaces,
-        role_policies,
-        schemas,
-        task_dependencies,
-        diagnostics: (args.include_elf || !source_map.is_empty()).then_some(PackageDiagnostics {
-            elf: (args.include_elf && !is_pvm).then_some(input),
-            source_map: (!source_map.is_empty()).then_some(source_map),
-        }),
-        deployment_signature: DeploymentSignature {
-            producer,
-            public_key,
-            signature: vec![0],
-        },
+    let diagnostics = (args.include_elf || !source_map.is_empty()).then_some(PackageDiagnostics {
+        elf: (args.include_elf && !is_pvm).then_some(input),
+        source_map: (!source_map.is_empty()).then_some(source_map),
+    });
+    let (package_bytes, deployment_id) = match args.target {
+        BuildTarget::Service => {
+            let mut package = VosPackage {
+                manifest: ServicePackageManifest {
+                    name: name.clone(),
+                    platform: vos::service::PLATFORM_ID,
+                    execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+                    service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
+                    actor_program,
+                    crdt: service_crdt,
+                    interfaces_hash: artifact_hash(b"interfaces", &interfaces),
+                    role_policies_hash: artifact_hash(b"role-policies", &role_policies),
+                    schemas_hash: artifact_hash(b"schemas", &schemas),
+                    task_dependencies_hash: task_dependencies_hash(&task_dependencies),
+                },
+                actor_pvm: actor_pvm.clone(),
+                generated_interfaces: interfaces,
+                role_policies,
+                schemas,
+                task_dependencies: task_dependencies.clone(),
+                diagnostics,
+                deployment_signature: DeploymentSignature {
+                    producer,
+                    public_key,
+                    signature: vec![0],
+                },
+            };
+            package.deployment_signature.signature = keypair
+                .sign(&package.signing_message())
+                .map_err(|error| anyhow!("sign deployment: {error}"))?;
+            package.validate()?;
+            (package.encode(), package.deployment_id())
+        }
+        BuildTarget::Agent => {
+            let requirements = requirements.expect("agent requirements were derived");
+            let mut package = AgentPackage {
+                manifest: AgentPackageManifest {
+                    name: name.clone(),
+                    platform: vos::service::PLATFORM_ID,
+                    execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+                    kind: PackageKind::Actor { requirements },
+                    program: actor_program,
+                    interfaces_hash: artifact_hash(b"interfaces", &interfaces),
+                    role_policies_hash: artifact_hash(b"role-policies", &role_policies),
+                    schemas_hash: artifact_hash(b"schemas", &schemas),
+                    agent_schema_hash: artifact_hash(b"agent-schema", &agent_schema),
+                    dependencies_hash: task_dependencies_hash(&task_dependencies),
+                },
+                pvm: actor_pvm.clone(),
+                generated_interfaces: interfaces,
+                role_policies,
+                schemas,
+                agent_schema,
+                task_dependencies: task_dependencies.clone(),
+                diagnostics,
+                deployment_signature: DeploymentSignature {
+                    producer,
+                    public_key,
+                    signature: vec![0],
+                },
+            };
+            package.deployment_signature.signature = keypair
+                .sign(&package.signing_message())
+                .map_err(|error| anyhow!("sign deployment: {error}"))?;
+            package.validate()?;
+            (package.encode(), package.deployment_id())
+        }
     };
-    package.deployment_signature.signature = keypair
-        .sign(&package.signing_message())
-        .map_err(|error| anyhow!("sign deployment: {error}"))?;
-    package.validate()?;
 
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("create {}", args.out_dir.display()))?;
@@ -177,17 +316,14 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     let package_path = args.out_dir.join(format!("{name}.vos"));
     std::fs::write(&pvm_path, actor_pvm)
         .with_context(|| format!("write {}", pvm_path.display()))?;
-    std::fs::write(&package_path, package.encode())
+    std::fs::write(&package_path, package_bytes)
         .with_context(|| format!("write {}", package_path.display()))?;
 
     println!("built {}", package_path.display());
     println!("  actor_pvm    = {}", pvm_path.display());
     println!("  program_id   = {}", hex::encode(actor_program.0));
-    println!(
-        "  deployment_id = {}",
-        hex::encode(package.deployment_id().0)
-    );
-    for (index, dependency) in package.task_dependencies.iter().enumerate() {
+    println!("  deployment_id = {}", hex::encode(deployment_id.0));
+    for (index, dependency) in task_dependencies.iter().enumerate() {
         println!(
             "  task[{index}]      = {}",
             hex::encode(dependency.binding.task.0)
@@ -196,7 +332,32 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     Ok(())
 }
 
-fn build_task_dependency(input: &Path) -> anyhow::Result<PackageTaskDependency> {
+fn require_execution_entry(
+    schema: &[u8],
+    expected: vos::agent::schema::ExecutionEntryKind,
+    program: &Path,
+) -> anyhow::Result<vos::agent::schema::ParsedSchema> {
+    let parsed = vos::agent::schema::decode(schema).ok_or_else(|| {
+        anyhow!(
+            "{} has no valid authenticated execution schema",
+            program.display()
+        )
+    })?;
+    if parsed.entry != expected {
+        bail!(
+            "{} was compiled for {:?}, but this build requires {:?}",
+            program.display(),
+            parsed.entry,
+            expected,
+        );
+    }
+    Ok(parsed)
+}
+
+fn build_task_dependency(
+    input: &Path,
+    target: BuildTarget,
+) -> anyhow::Result<PackageTaskDependency> {
     let program = resolve_task_input(input)?;
     if program.extension().and_then(|extension| extension.to_str()) == Some("pvm") {
         bail!(
@@ -205,8 +366,17 @@ fn build_task_dependency(input: &Path) -> anyhow::Result<PackageTaskDependency> 
         );
     }
     let elf = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
-    let pvm = vos_pvm_compiler::link_elf_spi(&elf)
-        .map_err(|error| anyhow!("transpile Task {}: {error:?}", program.display()))?;
+    let execution_schema = vos::agent::schema::raw_section_from_elf(&elf).unwrap_or_default();
+    require_execution_entry(
+        &execution_schema,
+        vos::agent::schema::ExecutionEntryKind::Task,
+        &program,
+    )?;
+    let pvm = match target {
+        BuildTarget::Service => vos_pvm_compiler::link_elf(&elf),
+        BuildTarget::Agent => vos_pvm_compiler::link_elf_spi(&elf),
+    }
+    .map_err(|error| anyhow!("transpile Task {}: {error:?}", program.display()))?;
     if pvm.is_empty() {
         bail!("{} produced an empty Task PVM", program.display());
     }
@@ -898,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_builds_emit_one_identical_actor_pvm_and_package() {
+    fn repeated_agent_builds_emit_one_identical_actor_pvm_and_package() {
         use vos::metadata::{ActorMeta, MessageMeta};
 
         const META: ActorMeta = ActorMeta {
@@ -928,15 +1098,32 @@ mod tests {
         actor.trap();
         let actor_pvm = actor.build_standard();
         let (metadata, metadata_len) = vos::metadata::encode::<512>(&META);
+        const AGENT_SCHEMA: vos::agent::schema::SchemaMeta = vos::agent::schema::SchemaMeta {
+            uses_storage: false,
+            fields: &[],
+            methods: &[vos::agent::schema::MethodMeta {
+                name: "value",
+                mode: vos::agent::MethodMode::Query,
+                explicit: false,
+            }],
+        };
+        let (agent_schema, agent_schema_len) = vos::agent::schema::encode::<512>(&AGENT_SCHEMA);
         std::fs::write(temp.0.join("actor.pvm"), &actor_pvm).unwrap();
         std::fs::write(temp.0.join("actor.meta"), &metadata[..metadata_len]).unwrap();
+        std::fs::write(
+            temp.0.join("actor.agent"),
+            &agent_schema[..agent_schema_len],
+        )
+        .unwrap();
         let build_args = |out_dir| Args {
+            target: BuildTarget::Agent,
             program: temp.0.join("actor.pvm"),
             name: None,
             out_dir,
             interfaces: None,
             role_policies: None,
             schemas: Some(temp.0.join("actor.meta")),
+            agent_schema: Some(temp.0.join("actor.agent")),
             source_map: None,
             tasks: vec![],
             include_elf: false,
@@ -945,6 +1132,49 @@ mod tests {
         let first = temp.0.join("first");
         let second = temp.0.join("second");
         let signer = libp2p::identity::Keypair::generate_ed25519();
+
+        let missing_metadata = run_with_signer(
+            Args {
+                target: BuildTarget::Agent,
+                program: temp.0.join("actor.pvm"),
+                name: None,
+                out_dir: temp.0.join("missing-metadata"),
+                interfaces: None,
+                role_policies: None,
+                schemas: None,
+                agent_schema: Some(temp.0.join("actor.agent")),
+                source_map: None,
+                tasks: vec![],
+                include_elf: false,
+                crdt: false,
+            },
+            &signer,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing_metadata.contains("pass --schemas with exact .vos_meta bytes"));
+        let missing_execution_schema = run_with_signer(
+            Args {
+                target: BuildTarget::Agent,
+                program: temp.0.join("actor.pvm"),
+                name: None,
+                out_dir: temp.0.join("missing-agent-schema"),
+                interfaces: None,
+                role_policies: None,
+                schemas: Some(temp.0.join("actor.meta")),
+                agent_schema: None,
+                source_map: None,
+                tasks: vec![],
+                include_elf: false,
+                crdt: false,
+            },
+            &signer,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing_execution_schema.contains("pass --agent-schema with exact .vos_agent bytes")
+        );
 
         run_with_signer(build_args(first.clone()), &signer).unwrap();
         run_with_signer(build_args(second.clone()), &signer).unwrap();
@@ -962,15 +1192,159 @@ mod tests {
             std::fs::read(second.join("deterministic-counter.vos")).unwrap(),
         );
         let package =
-            Package::decode(&std::fs::read(first.join("deterministic-counter.vos")).unwrap())
+            AgentPackage::decode(&std::fs::read(first.join("deterministic-counter.vos")).unwrap())
                 .unwrap();
         assert!(matches!(
             package.manifest.kind,
             PackageKind::Actor { requirements }
-                if requirements.lanes == LaneSet::of(StateLane::Linear)
+                if requirements.lanes == LaneSet::NONE
         ));
         assert_eq!(package.manifest.program, ProgramId::of_pvm(&actor_pvm));
         assert!(!first.join("deterministic-counter.attestation.pvm").exists());
         assert_eq!(std::fs::read_dir(first).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn top_level_service_build_emits_the_publishable_package_format() {
+        use vos::metadata::{ActorMeta, MessageMeta};
+
+        const META: ActorMeta = ActorMeta {
+            actor_name: "service-counter",
+            messages: &[MessageMeta {
+                name: "value",
+                is_query: true,
+                fields: &[],
+                returns: "u64",
+                doc: "",
+                timeout_ms: 0,
+                mode: 0,
+                attested: false,
+                capability: None,
+                space_role: None,
+                actor_role: None,
+            }],
+            constructor: &[],
+            cli_methods: &[],
+            doc: "",
+            crdt: false,
+            provable: false,
+        };
+        const SCHEMA: vos::agent::schema::SchemaMeta = vos::agent::schema::SchemaMeta {
+            uses_storage: false,
+            fields: &[],
+            methods: &[vos::agent::schema::MethodMeta {
+                name: "value",
+                mode: vos::agent::MethodMode::Query,
+                explicit: false,
+            }],
+        };
+
+        let temp = TempDir::new("service-format");
+        let output = temp.0.join("dist");
+        let signer = libp2p::identity::Keypair::generate_ed25519();
+        let mut actor = vos_pvm_compiler::assembler::Assembler::new();
+        actor.trap();
+        let actor_pvm = actor.build();
+        let (metadata, metadata_len) = vos::metadata::encode::<512>(&META);
+        let (schema, schema_len) = vos::agent::schema::encode_with_entry::<512>(
+            &SCHEMA,
+            vos::agent::schema::ExecutionEntryKind::ServiceActor,
+        );
+        std::fs::write(temp.0.join("actor.pvm"), &actor_pvm).unwrap();
+        std::fs::write(temp.0.join("actor.meta"), &metadata[..metadata_len]).unwrap();
+        std::fs::write(temp.0.join("actor.agent"), &schema[..schema_len]).unwrap();
+
+        run_with_signer(
+            Args {
+                target: BuildTarget::Service,
+                program: temp.0.join("actor.pvm"),
+                name: None,
+                out_dir: output.clone(),
+                interfaces: None,
+                role_policies: None,
+                schemas: Some(temp.0.join("actor.meta")),
+                agent_schema: Some(temp.0.join("actor.agent")),
+                source_map: None,
+                tasks: vec![],
+                include_elf: false,
+                crdt: false,
+            },
+            &signer,
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(output.join("service-counter.vos")).unwrap();
+        assert_eq!(bytes.get(..4), Some(b"VOSP".as_slice()));
+        let package = VosPackage::decode(&bytes).unwrap();
+        assert_eq!(
+            package.manifest.actor_program,
+            ProgramId::of_pvm(&actor_pvm)
+        );
+        assert_eq!(
+            package.manifest.service_program,
+            vos::service::VOS_SERVICE_PROGRAM_ID
+        );
+    }
+
+    #[test]
+    fn execution_entry_markers_reject_cross_packaging() {
+        const SCHEMA: vos::agent::schema::SchemaMeta = vos::agent::schema::SchemaMeta {
+            uses_storage: false,
+            fields: &[],
+            methods: &[vos::agent::schema::MethodMeta {
+                name: "get",
+                mode: vos::agent::MethodMode::Query,
+                explicit: false,
+            }],
+        };
+        let encoded = |entry| {
+            let (bytes, len) = vos::agent::schema::encode_with_entry::<512>(&SCHEMA, entry);
+            bytes[..len].to_vec()
+        };
+        let path = Path::new("actor.elf");
+        let service = encoded(vos::agent::schema::ExecutionEntryKind::ServiceActor);
+        let agent = encoded(vos::agent::schema::ExecutionEntryKind::AgentActor);
+        let task = encoded(vos::agent::schema::ExecutionEntryKind::Task);
+
+        assert!(
+            require_execution_entry(
+                &service,
+                vos::agent::schema::ExecutionEntryKind::ServiceActor,
+                path,
+            )
+            .is_ok()
+        );
+        assert!(
+            require_execution_entry(
+                &agent,
+                vos::agent::schema::ExecutionEntryKind::AgentActor,
+                path,
+            )
+            .is_ok()
+        );
+        assert!(
+            require_execution_entry(&task, vos::agent::schema::ExecutionEntryKind::Task, path,)
+                .is_ok()
+        );
+        assert!(
+            require_execution_entry(
+                &agent,
+                vos::agent::schema::ExecutionEntryKind::ServiceActor,
+                path,
+            )
+            .is_err()
+        );
+        assert!(
+            require_execution_entry(
+                &service,
+                vos::agent::schema::ExecutionEntryKind::AgentActor,
+                path,
+            )
+            .is_err()
+        );
+        assert!(
+            require_execution_entry(&agent, vos::agent::schema::ExecutionEntryKind::Task, path,)
+                .is_err()
+        );
     }
 }

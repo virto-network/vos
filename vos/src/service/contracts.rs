@@ -5251,7 +5251,7 @@ fn decode_rejection(d: &mut Decoder<'_>) -> Result<AccumulationRejection, Decode
     }
 }
 
-pub(super) fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentity) {
+pub(crate) fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentity) {
     e.fixed(&value.space.0);
     e.fixed(&value.root_service.0);
     e.fixed(&value.deployment.0);
@@ -5262,7 +5262,7 @@ pub(super) fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentity) {
     e.u64(value.gas_schedule.accumulate);
 }
 
-pub(super) fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentity, DecodeError> {
+pub(crate) fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentity, DecodeError> {
     let value = ServiceIdentity {
         space: SpaceId(d.fixed()?),
         root_service: RootServiceId(d.fixed()?),
@@ -5310,7 +5310,7 @@ fn decode_base(d: &mut Decoder<'_>) -> Result<ConsistencyBase, DecodeError> {
     }
 }
 
-fn encode_origin(e: &mut Encoder<'_>, value: Origin) {
+pub(crate) fn encode_origin(e: &mut Encoder<'_>, value: Origin) {
     match value {
         Origin::Anonymous => e.u8(0),
         Origin::Member(id) => {
@@ -5325,7 +5325,7 @@ fn encode_origin(e: &mut Encoder<'_>, value: Origin) {
     }
 }
 
-fn decode_origin(d: &mut Decoder<'_>) -> Result<Origin, DecodeError> {
+pub(crate) fn decode_origin(d: &mut Decoder<'_>) -> Result<Origin, DecodeError> {
     match d.u8()? {
         0 => Ok(Origin::Anonymous),
         1 => Ok(Origin::Member(SubjectId(d.fixed()?))),

@@ -1,8 +1,7 @@
-/* Canonical standard-PVM actor layout.
+/* Canonical standard-PVM layout for a large proof Task.
  *
- * Read-only and read-write data occupy distinct GP zones. Actor stacks and
- * arguments are mapped separately by the agent runtime; code has its own
- * instruction address space.
+ * The read-write base is derived from the final read-only size, matching the
+ * standard-program layout instead of relying on a stale fixed address.
  */
 
 ENTRY(_start)

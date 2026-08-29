@@ -24,18 +24,19 @@ build-wasm:
     cd tests/fixtures/wasm/echo; cargo build --target wasm32-unknown-unknown --release
 
 # Build the service and the actors used by examples and integration tests.
-build-pvm: build-agent-runtime-candidate build-vos-service build-examples build-registry-fixtures
+build-pvm: verify-agent-runtime-release build-vos-service build-examples build-registry-fixtures
 
-# Build the four public service examples (private-age + age-gate is one scenario).
+# Build the public PVM examples. The native age-gate verifier is covered by
+# `test-examples` instead of being compiled as an actor.
 build-examples:
     cd examples/actors; cargo +nightly actor -p counter
     cd examples/actors; cargo +nightly actor -p workflow
     cd examples/actors; cargo +nightly actor -p private-age
-    cd examples/actors; cargo +nightly actor -p age-gate
     cd examples/actors; cargo +nightly actor -p shared-board
 
 # Build only programs consumed by package/registry integration tests.
 build-registry-fixtures:
+    cd tests/fixtures/actors/service-counter; cargo +nightly actor
     cd tests/fixtures/actors/crdt-counter; cargo +nightly actor
 
 # Build the protocol-pinned generic VOS service guest.
@@ -44,7 +45,7 @@ build-vos-service:
 
 # Build the package/service pair consumed by the physical daemon-root test.
 build-daemon-root-artifacts: build-vos-service
-    cd examples/actors; cargo +nightly actor -p counter
+    cd tests/fixtures/actors/service-counter; cargo +nightly actor
     cd vos/tests/fixtures/counter-upgrade; cargo +nightly actor
 
 # Build every guest consumed by the physical service gate.
@@ -107,6 +108,12 @@ build-agent-runtime-candidate:
       --out target/agent-runtime-candidate.pvm
     @echo "candidate PVM: target/agent-runtime-candidate.pvm"
 
+# Require current source and the pinned toolchain to reproduce the exact
+# standard runtime bundled in vosx. Candidate generation stays separate so a
+# reviewed repin can inspect the new identity before replacing the artifact.
+verify-agent-runtime-release: build-agent-runtime-candidate
+    cmp target/agent-runtime-candidate.pvm vosx/blobs/agent_runtime.pvm
+
 # Refresh the bundled registry from the pinned source and toolchain.
 refresh-bundled-registry:
     VOS_REPIN_ARTIFACTS=1 scripts/build-production-artifacts.sh registry
@@ -156,7 +163,6 @@ test-examples:
     cd examples/actors; cargo +nightly actor -p counter
     cd examples/actors; cargo +nightly actor -p workflow
     cd examples/actors; cargo +nightly actor -p private-age
-    cd examples/actors; cargo +nightly actor -p age-gate
     cd examples/actors; cargo +nightly actor -p shared-board
 
 # Run extension tests.

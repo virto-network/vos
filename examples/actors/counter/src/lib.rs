@@ -1,4 +1,5 @@
-//! Ordinary state uses Local or Raft consistency without CRDT overhead.
+//! Minimal Local agent state without CRDT overhead. A future replicated host
+//! adapter can govern the same Linear lane with consensus.
 
 use vos::prelude::*;
 

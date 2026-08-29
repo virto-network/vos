@@ -5,31 +5,192 @@
 //! runtime is therefore free to change those internals while preserving the
 //! stable lifecycle ABI.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::string::String;
+use std::sync::Arc;
 
 use vos_pvm::refine_host::RefineContext;
 use vos_pvm::{ExitReason, Gas};
 
-use super::authority::{AuthorityError, VerifiedAgentAuthorityReceipt, authorize_lifecycle};
+use super::authority::{
+    AgentAuthorityBinding, AgentAuthorityReceipt, AgentAuthorityVerifier, AuthorityError,
+    authorize_lifecycle,
+};
+pub use super::execution::MAX_RUNTIME_STATE_BYTES;
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
-    RuntimeExecutionCall, RuntimeExecutionReturn,
+    ActorInvocationVerificationError, ActorInvocationVerifier, RuntimeBlob, RuntimeExecutionCall,
+    RuntimeExecutionReturn,
 };
-use super::package::{PackageError, VerifiedPackage};
+use super::package::{Package, PackageError};
 use super::wire::{RuntimeCall, RuntimeReturn, RuntimeState};
 use super::{
-    ActorEntry, ActorInitialState, AgentConfig, AgentConfigError, AgentIdentity, InstallActor,
-    LifecycleError, LifecycleReply, LifecycleRequest, PackageKind, RUNTIME_ABI_ID,
+    ActorEntry, AgentConfig, AgentConfigError, AgentIdentity, AgentProfile, InstallActor,
+    LifecycleAuthorityAdmission, LifecycleError, LifecycleReply, LifecycleRequest, PackageKind,
+    RUNTIME_ABI_ID,
 };
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{ActorId, BlobRef, CapabilityId, DeploymentId, Hash, ProgramId};
 
 pub const DEFAULT_MANAGEMENT_GAS: Gas = 1_000_000_000;
-pub const MAX_RUNTIME_STATE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Driver-owned source of current logical time and authority decisions.
+/// Public callers submit evidence; they cannot select either the clock or
+/// verifier used at the durable admission boundary.
+pub trait AgentTrustProvider: Send + Sync {
+    fn current_logical_slot(&self) -> Option<u64>;
+    fn verify_authority(
+        &self,
+        authority: &AgentAuthorityBinding,
+        message: &[u8],
+        signature: &[u8],
+    ) -> bool;
+    fn verify_invocation(
+        &self,
+        agent: &AgentConfig,
+        authorization_message: &[u8],
+        evidence: &[u8],
+    ) -> bool;
+
+    /// Authenticate a signed package for this complete target agent.
+    /// Durable APIs accept raw packages and always cross this driver-owned
+    /// trust boundary themselves.
+    fn verify_package(&self, agent: &AgentConfig, package: &Package) -> bool;
+}
+
+struct TrustAuthorityVerifier<'a>(&'a dyn AgentTrustProvider);
+
+impl AgentAuthorityVerifier for TrustAuthorityVerifier<'_> {
+    fn verify(&self, authority: &AgentAuthorityBinding, message: &[u8], signature: &[u8]) -> bool {
+        self.0.verify_authority(authority, message, signature)
+    }
+}
+
+struct TrustInvocationVerifier<'a> {
+    trust: &'a dyn AgentTrustProvider,
+    agent: &'a AgentConfig,
+}
+
+impl ActorInvocationVerifier for TrustInvocationVerifier<'_> {
+    fn verify(&self, authorization_message: &[u8], evidence: &[u8]) -> bool {
+        self.trust
+            .verify_invocation(self.agent, authorization_message, evidence)
+    }
+}
+/// Maximum canonical configuration embedded in one image. Replica and
+/// authority lists are protocol-bounded independently; this outer limit keeps
+/// their decoder from allocating the generic service-wire maximum first.
+pub const MAX_AGENT_CONFIG_BYTES: usize = 64 * 1024;
+/// Maximum complete persisted image, including the fixed envelope and
+/// length-prefix overhead around the bounded config and runtime state.
+pub const MAX_AGENT_IMAGE_BYTES: usize = MAX_AGENT_CONFIG_BYTES + MAX_RUNTIME_STATE_BYTES + 1024;
+const MAX_AGENT_IMAGE_REPLICAS: usize = 512;
+
+/// Complete guest-owned catalog provenance for one committed agent image.
+///
+/// Runtime and actor artifacts are mandatory. Reopening always reconstructs
+/// the runtime from this exact content-addressed closure; it never substitutes
+/// a process-local default executable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentCatalogReferences {
+    pub runtime_package: BlobRef,
+    pub runtime_program: ProgramId,
+    pub actors: Vec<ActorEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeploymentArtifacts {
+    package: BlobRef,
+    program: ProgramId,
+    schema: BlobRef,
+    policies: BlobRef,
+}
+
+#[derive(Clone, Debug)]
+struct CatalogKeep {
+    required_packages: BTreeMap<Hash, BlobRef>,
+    retained_packages: BTreeSet<Hash>,
+    required_programs: BTreeSet<ProgramId>,
+    retained_programs: BTreeSet<ProgramId>,
+    schemas: BTreeMap<DeploymentId, BlobRef>,
+    policies: BTreeMap<DeploymentId, BlobRef>,
+}
+
+impl CatalogKeep {
+    fn from_references(references: &AgentCatalogReferences) -> Result<Self, AgentStoreError> {
+        if references.runtime_package.hash == Hash::ZERO
+            || references.runtime_package.len == 0
+            || references.runtime_program == ProgramId::ZERO
+        {
+            return Err(AgentStoreError::Corrupt);
+        }
+
+        let mut deployments = BTreeMap::<DeploymentId, DeploymentArtifacts>::new();
+        for actor in &references.actors {
+            if actor.deployment == DeploymentId::ZERO
+                || actor.program == ProgramId::ZERO
+                || actor.package.hash == Hash::ZERO
+                || actor.package.len == 0
+                || actor.agent_schema.hash == Hash::ZERO
+                || actor.agent_schema.len == 0
+                || actor.role_policies.hash == Hash::ZERO
+                || actor.role_policies.len == 0
+            {
+                return Err(AgentStoreError::Corrupt);
+            }
+            let artifacts = DeploymentArtifacts {
+                package: actor.package.clone(),
+                program: actor.program,
+                schema: actor.agent_schema.clone(),
+                policies: actor.role_policies.clone(),
+            };
+            match deployments.get(&actor.deployment) {
+                Some(existing) if existing != &artifacts => return Err(AgentStoreError::Corrupt),
+                Some(_) => {}
+                None => {
+                    deployments.insert(actor.deployment, artifacts);
+                }
+            }
+        }
+
+        let mut required_packages = BTreeMap::<Hash, BlobRef>::new();
+        required_packages.insert(
+            references.runtime_package.hash,
+            references.runtime_package.clone(),
+        );
+        let mut required_programs = BTreeSet::from([references.runtime_program]);
+        let mut schemas = BTreeMap::new();
+        let mut policies = BTreeMap::new();
+        for (deployment, artifacts) in deployments {
+            match required_packages.get(&artifacts.package.hash) {
+                Some(existing) if existing != &artifacts.package => {
+                    return Err(AgentStoreError::Corrupt);
+                }
+                Some(_) => {}
+                None => {
+                    required_packages.insert(artifacts.package.hash, artifacts.package.clone());
+                }
+            }
+            required_programs.insert(artifacts.program);
+            schemas.insert(deployment, artifacts.schema);
+            policies.insert(deployment, artifacts.policies);
+        }
+
+        let retained_packages = required_packages.keys().copied().collect::<BTreeSet<_>>();
+        let retained_programs = required_programs.clone();
+        Ok(Self {
+            required_packages,
+            retained_packages,
+            required_programs,
+            retained_programs,
+            schemas,
+            policies,
+        })
+    }
+}
 
 /// One atomically persisted agent revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,21 +220,44 @@ impl ServiceWire for AgentImage {
         if Hash(decoder.fixed()?) != RUNTIME_ABI_ID {
             return Err(DecodeError::InvalidPlatform);
         }
+        let revision = decoder.u64()?;
+        let runtime_program = ProgramId(decoder.fixed()?);
+        let config_bytes = decoder.bytes_ref()?;
+        if config_bytes.len() > MAX_AGENT_CONFIG_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let config = AgentConfig::decode(config_bytes)?;
+        // Borrow every component first and check their aggregate before any
+        // potentially large Vec is allocated.
+        let control = decoder.bytes_ref()?;
+        let linear = decoder.bytes_ref()?;
+        let merge = decoder.bytes_ref()?;
+        let local = decoder.bytes_ref()?;
+        let runtime_bytes = [control, linear, merge, local]
+            .into_iter()
+            .try_fold(0usize, |total, component| {
+                total.checked_add(component.len())
+            })
+            .ok_or(DecodeError::LimitExceeded)?;
+        if runtime_bytes > MAX_RUNTIME_STATE_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
         let image = Self {
-            revision: decoder.u64()?,
-            runtime_program: ProgramId(decoder.fixed()?),
-            config: AgentConfig::decode(&decoder.bytes()?)?,
+            revision,
+            runtime_program,
+            config,
             runtime_state: RuntimeState {
-                control: decoder.bytes()?,
-                linear: decoder.bytes()?,
-                merge: decoder.bytes()?,
-                local: decoder.bytes()?,
+                control: control.to_vec(),
+                linear: linear.to_vec(),
+                merge: merge.to_vec(),
+                local: local.to_vec(),
             },
         };
         if image.revision == 0
             || image.runtime_program == ProgramId::ZERO
             || image.runtime_state.is_empty()
             || runtime_state_size(&image.runtime_state) > MAX_RUNTIME_STATE_BYTES
+            || image.config.replicas.len() > MAX_AGENT_IMAGE_REPLICAS
             || image.config.validate().is_err()
             || image.config.identity.runtime_program != image.runtime_program
         {
@@ -98,7 +282,14 @@ impl core::fmt::Display for AgentStoreError {
 
 impl std::error::Error for AgentStoreError {}
 
-/// Compare-and-replace persistence used by Local and replicated drivers.
+/// Compare-and-replace persistence used by the process-local agent driver.
+///
+/// Replicated profiles need a different adapter: Shared agents must order
+/// control/Linear transitions through consensus and materialize Merge changes
+/// through an authenticated causal DAG, while Private agents need the same
+/// causal machinery with an owner-node membership gate. Feeding either
+/// profile through this whole-image CAS would silently turn Merge into
+/// last-writer-wins replacement.
 pub trait AgentImageStore {
     fn load(&self) -> Result<Option<AgentImage>, AgentStoreError>;
     fn commit(
@@ -110,18 +301,60 @@ pub trait AgentImageStore {
     /// Persist a canonical signed package before its lifecycle transition is
     /// made durable. Returns `true` when this call created the artifact.
     fn put_package(&mut self, reference: &BlobRef, bytes: &[u8]) -> Result<bool, AgentStoreError>;
+    fn load_package(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, AgentStoreError>;
     fn remove_package(&mut self, reference: &BlobRef) -> Result<(), AgentStoreError>;
+
+    /// Persist the signed agent schema under the deployment that selected it.
+    /// Deployment-keyed lookup avoids conflating separately signed packages
+    /// which happen to reuse one executable ProgramId.
+    fn put_actor_schema(
+        &mut self,
+        deployment: DeploymentId,
+        reference: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<bool, AgentStoreError>;
+    fn load_actor_schema(
+        &self,
+        deployment: DeploymentId,
+    ) -> Result<Option<RuntimeBlob>, AgentStoreError>;
+    fn remove_actor_schema(&mut self, deployment: DeploymentId) -> Result<(), AgentStoreError>;
+
+    /// Persist and resolve the exact canonical method policies selected by a
+    /// signed deployment. The runtime authenticates this sidecar against its
+    /// guest-owned reference before dispatching application code.
+    fn put_actor_policies(
+        &mut self,
+        deployment: DeploymentId,
+        reference: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<bool, AgentStoreError>;
+    fn load_actor_policies(
+        &self,
+        deployment: DeploymentId,
+    ) -> Result<Option<RuntimeBlob>, AgentStoreError>;
+    fn remove_actor_policies(&mut self, deployment: DeploymentId) -> Result<(), AgentStoreError>;
 
     /// Persist and resolve executable actor bytes by their exact ProgramId.
     fn put_program(&mut self, program: ProgramId, bytes: &[u8]) -> Result<bool, AgentStoreError>;
     fn load_program(&self, program: ProgramId) -> Result<Option<Vec<u8>>, AgentStoreError>;
     fn remove_program(&mut self, program: ProgramId) -> Result<(), AgentStoreError>;
+
+    /// Authenticate every artifact referenced by the committed guest
+    /// directory, then retire all unreferenced catalog artifacts. The
+    /// validation phase must complete before any deletion so corruption can
+    /// never turn cleanup into loss of an otherwise recoverable image.
+    fn reconcile_catalog(
+        &mut self,
+        references: &AgentCatalogReferences,
+    ) -> Result<(), AgentStoreError>;
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryAgentStore {
     image: Option<AgentImage>,
     packages: BTreeMap<Hash, Vec<u8>>,
+    schemas: BTreeMap<DeploymentId, RuntimeBlob>,
+    policies: BTreeMap<DeploymentId, RuntimeBlob>,
     programs: BTreeMap<ProgramId, Vec<u8>>,
 }
 
@@ -141,6 +374,7 @@ impl AgentImageStore for MemoryAgentStore {
         expected_revision: Option<u64>,
         image: &AgentImage,
     ) -> Result<(), AgentStoreError> {
+        encode_valid_image(image)?;
         if self.image.as_ref().map(|image| image.revision) != expected_revision {
             return Err(AgentStoreError::Conflict);
         }
@@ -149,10 +383,18 @@ impl AgentImageStore for MemoryAgentStore {
     }
 
     fn put_package(&mut self, reference: &BlobRef, bytes: &[u8]) -> Result<bool, AgentStoreError> {
-        if !reference.matches(bytes) {
+        if bytes.len() > super::package::MAX_ENCODED_PACKAGE_BYTES || !reference.matches(bytes) {
             return Err(AgentStoreError::Corrupt);
         }
         put_memory_artifact(&mut self.packages, reference.hash, bytes)
+    }
+
+    fn load_package(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, AgentStoreError> {
+        match self.packages.get(&reference.hash) {
+            Some(bytes) if reference.matches(bytes) => Ok(Some(bytes.clone())),
+            Some(_) => Err(AgentStoreError::Corrupt),
+            None => Ok(None),
+        }
     }
 
     fn remove_package(&mut self, reference: &BlobRef) -> Result<(), AgentStoreError> {
@@ -160,8 +402,93 @@ impl AgentImageStore for MemoryAgentStore {
         Ok(())
     }
 
+    fn put_actor_schema(
+        &mut self,
+        deployment: DeploymentId,
+        reference: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<bool, AgentStoreError> {
+        if deployment == DeploymentId::ZERO
+            || !reference.matches(bytes)
+            || super::schema::decode(bytes).is_none()
+        {
+            return Err(AgentStoreError::Corrupt);
+        }
+        if let Some(existing) = self.schemas.get(&deployment) {
+            return if existing.reference == *reference && existing.bytes == bytes {
+                Ok(false)
+            } else {
+                Err(AgentStoreError::Corrupt)
+            };
+        }
+        self.schemas.insert(
+            deployment,
+            RuntimeBlob {
+                reference: reference.clone(),
+                bytes: bytes.to_vec(),
+            },
+        );
+        Ok(true)
+    }
+
+    fn load_actor_schema(
+        &self,
+        deployment: DeploymentId,
+    ) -> Result<Option<RuntimeBlob>, AgentStoreError> {
+        Ok(self.schemas.get(&deployment).cloned())
+    }
+
+    fn remove_actor_schema(&mut self, deployment: DeploymentId) -> Result<(), AgentStoreError> {
+        self.schemas.remove(&deployment);
+        Ok(())
+    }
+
+    fn put_actor_policies(
+        &mut self,
+        deployment: DeploymentId,
+        reference: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<bool, AgentStoreError> {
+        if deployment == DeploymentId::ZERO
+            || bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES
+            || !reference.matches(bytes)
+            || crate::service::PackageRolePolicies::decode(bytes).is_err()
+        {
+            return Err(AgentStoreError::Corrupt);
+        }
+        if let Some(existing) = self.policies.get(&deployment) {
+            return if existing.reference == *reference && existing.bytes == bytes {
+                Ok(false)
+            } else {
+                Err(AgentStoreError::Corrupt)
+            };
+        }
+        self.policies.insert(
+            deployment,
+            RuntimeBlob {
+                reference: reference.clone(),
+                bytes: bytes.to_vec(),
+            },
+        );
+        Ok(true)
+    }
+
+    fn load_actor_policies(
+        &self,
+        deployment: DeploymentId,
+    ) -> Result<Option<RuntimeBlob>, AgentStoreError> {
+        Ok(self.policies.get(&deployment).cloned())
+    }
+
+    fn remove_actor_policies(&mut self, deployment: DeploymentId) -> Result<(), AgentStoreError> {
+        self.policies.remove(&deployment);
+        Ok(())
+    }
+
     fn put_program(&mut self, program: ProgramId, bytes: &[u8]) -> Result<bool, AgentStoreError> {
-        if ProgramId::of_pvm(bytes) != program {
+        if bytes.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
+            || ProgramId::of_pvm(bytes) != program
+        {
             return Err(AgentStoreError::Corrupt);
         }
         put_memory_artifact(&mut self.programs, program, bytes)
@@ -173,6 +500,62 @@ impl AgentImageStore for MemoryAgentStore {
 
     fn remove_program(&mut self, program: ProgramId) -> Result<(), AgentStoreError> {
         self.programs.remove(&program);
+        Ok(())
+    }
+
+    fn reconcile_catalog(
+        &mut self,
+        references: &AgentCatalogReferences,
+    ) -> Result<(), AgentStoreError> {
+        let keep = CatalogKeep::from_references(references)?;
+
+        // Authenticate every mandatory artifact before changing any map.
+        for (hash, reference) in &keep.required_packages {
+            let bytes = self.packages.get(hash).ok_or(AgentStoreError::Corrupt)?;
+            if !reference.matches(bytes) {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
+        for program in &keep.required_programs {
+            let bytes = self.programs.get(program).ok_or(AgentStoreError::Corrupt)?;
+            if ProgramId::of_pvm(bytes) != *program {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
+        for (deployment, reference) in &keep.schemas {
+            let blob = self
+                .schemas
+                .get(deployment)
+                .ok_or(AgentStoreError::Corrupt)?;
+            if blob.reference != *reference
+                || !reference.matches(&blob.bytes)
+                || super::schema::decode(&blob.bytes).is_none()
+            {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
+        for (deployment, reference) in &keep.policies {
+            let blob = self
+                .policies
+                .get(deployment)
+                .ok_or(AgentStoreError::Corrupt)?;
+            if blob.reference != *reference
+                || !reference.matches(&blob.bytes)
+                || blob.bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES
+                || crate::service::PackageRolePolicies::decode(&blob.bytes).is_err()
+            {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
+
+        self.packages
+            .retain(|hash, _| keep.retained_packages.contains(hash));
+        self.programs
+            .retain(|program, _| keep.retained_programs.contains(program));
+        self.schemas
+            .retain(|deployment, _| keep.schemas.contains_key(deployment));
+        self.policies
+            .retain(|deployment, _| keep.policies.contains_key(deployment));
         Ok(())
     }
 }
@@ -210,15 +593,23 @@ impl FileAgentStore {
         &self.path
     }
 
+    fn catalog_root(&self) -> PathBuf {
+        self.path.with_extension("agent-catalog")
+    }
+
     fn read_image(&self) -> Result<Option<AgentImage>, AgentStoreError> {
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(AgentStoreError::Unavailable),
+        // A crash can leave a fully synced staging image. Validate it on open
+        // even though promotion remains tied to a matching future CAS; a
+        // partial, oversized, special, or symlink stage must never be silently
+        // truncated by the next commit.
+        if let Some(staged) =
+            self.read_bounded_regular(&self.path.with_extension("next"), MAX_AGENT_IMAGE_BYTES)?
+        {
+            AgentImage::decode(&staged).map_err(|_| AgentStoreError::Corrupt)?;
+        }
+        let Some(bytes) = self.read_bounded_regular(&self.path, MAX_AGENT_IMAGE_BYTES)? else {
+            return Ok(None);
         };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|_| AgentStoreError::Unavailable)?;
         AgentImage::decode(&bytes)
             .map(Some)
             .map_err(|_| AgentStoreError::Corrupt)
@@ -232,38 +623,183 @@ impl FileAgentStore {
     }
 
     fn catalog_path(&self, kind: &str, id: &[u8; 32], suffix: &str) -> PathBuf {
-        self.path
-            .with_extension("agent-catalog")
+        self.catalog_root()
             .join(kind)
             .join(format!("{}.{suffix}", encode_hex(id)))
     }
 
-    fn put_artifact(&self, path: &Path, bytes: &[u8]) -> Result<bool, AgentStoreError> {
-        match std::fs::read(path) {
-            Ok(existing) => {
-                return if existing == bytes {
-                    Ok(false)
-                } else {
-                    Err(AgentStoreError::Corrupt)
-                };
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
+    fn read_bounded_regular(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, AgentStoreError> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(_) => return Err(AgentStoreError::Unavailable),
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(AgentStoreError::Corrupt);
+        }
+        if metadata.len() > max_bytes as u64 {
+            return Err(AgentStoreError::Corrupt);
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let mut file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(AgentStoreError::Corrupt),
+        };
+        let opened = file.metadata().map_err(|_| AgentStoreError::Unavailable)?;
+        if !opened.file_type().is_file() || opened.len() > max_bytes as u64 {
+            return Err(AgentStoreError::Corrupt);
+        }
+        let mut bytes = Vec::with_capacity(opened.len() as usize);
+        Read::by_ref(&mut file)
+            .take((max_bytes as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| AgentStoreError::Unavailable)?;
+        if bytes.len() > max_bytes {
+            return Err(AgentStoreError::Corrupt);
+        }
+        Ok(Some(bytes))
+    }
+
+    fn read_regular_artifact(&self, path: &Path) -> Result<Option<Vec<u8>>, AgentStoreError> {
+        self.read_bounded_regular(path, super::package::MAX_ENCODED_PACKAGE_BYTES)
+    }
+
+    fn validate_catalog_shape(&self) -> Result<(), AgentStoreError> {
+        let root = self.catalog_root();
+        let metadata = match std::fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(AgentStoreError::Unavailable),
+        };
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(AgentStoreError::Corrupt);
+        }
+        let entries = std::fs::read_dir(&root).map_err(|_| AgentStoreError::Unavailable)?;
+        for entry in entries {
+            let entry = entry.map_err(|_| AgentStoreError::Unavailable)?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Err(AgentStoreError::Corrupt);
+            };
+            if !matches!(
+                name.as_str(),
+                "packages" | "programs" | "schemas" | "policies"
+            ) {
+                return Err(AgentStoreError::Corrupt);
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|_| AgentStoreError::Unavailable)?;
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_directory(
+        &self,
+        kind: &str,
+        retained: &BTreeSet<PathBuf>,
+    ) -> Result<(), AgentStoreError> {
+        let directory = self.catalog_root().join(kind);
+        let metadata = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(AgentStoreError::Unavailable),
+        };
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(AgentStoreError::Corrupt);
+        }
+
+        let mut changed = false;
+        for entry in std::fs::read_dir(&directory).map_err(|_| AgentStoreError::Unavailable)? {
+            let entry = entry.map_err(|_| AgentStoreError::Unavailable)?;
+            if !retained.contains(&entry.path()) {
+                std::fs::remove_file(entry.path()).map_err(|_| AgentStoreError::Unavailable)?;
+                changed = true;
+            }
+        }
+        if changed {
+            File::open(directory)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| AgentStoreError::Unavailable)?;
+        }
+        Ok(())
+    }
+
+    fn validate_catalog_directory(&self, kind: &str) -> Result<(), AgentStoreError> {
+        let directory = self.catalog_root().join(kind);
+        let metadata = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(AgentStoreError::Unavailable),
+        };
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(AgentStoreError::Corrupt);
+        }
+        for entry in std::fs::read_dir(directory).map_err(|_| AgentStoreError::Unavailable)? {
+            let entry = entry.map_err(|_| AgentStoreError::Unavailable)?;
+            let file_type = entry
+                .file_type()
+                .map_err(|_| AgentStoreError::Unavailable)?;
+            if !file_type.is_file() || file_type.is_symlink() {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
+        Ok(())
+    }
+
+    fn put_artifact(&self, path: &Path, bytes: &[u8]) -> Result<bool, AgentStoreError> {
+        if bytes.len() > super::package::MAX_ENCODED_PACKAGE_BYTES {
+            return Err(AgentStoreError::Corrupt);
+        }
+        if let Some(existing) = self.read_regular_artifact(path)? {
+            return if existing == bytes {
+                Ok(false)
+            } else {
+                Err(AgentStoreError::Corrupt)
+            };
         }
         let parent = path.parent().ok_or(AgentStoreError::Unavailable)?;
+        let catalog_root = self.catalog_root();
+        if let Ok(metadata) = std::fs::symlink_metadata(&catalog_root)
+            && (!metadata.file_type().is_dir() || metadata.file_type().is_symlink())
+        {
+            return Err(AgentStoreError::Corrupt);
+        }
         std::fs::create_dir_all(parent).map_err(|_| AgentStoreError::Unavailable)?;
+        for directory in [&catalog_root, parent] {
+            let metadata =
+                std::fs::symlink_metadata(directory).map_err(|_| AgentStoreError::Unavailable)?;
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
         let next = path.with_extension("next");
-        match std::fs::read(&next) {
-            Ok(staged) if staged == bytes => {
+        match self.read_regular_artifact(&next)? {
+            Some(staged) if staged == bytes => {
+                if self.read_regular_artifact(path)?.is_some() {
+                    return Err(AgentStoreError::Conflict);
+                }
                 std::fs::rename(&next, path).map_err(|_| AgentStoreError::Unavailable)?;
                 File::open(parent)
                     .and_then(|directory| directory.sync_all())
                     .map_err(|_| AgentStoreError::Unavailable)?;
                 return Ok(true);
             }
-            Ok(_) => return Err(AgentStoreError::Corrupt),
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(_) => return Err(AgentStoreError::Unavailable),
+            Some(_) => return Err(AgentStoreError::Corrupt),
+            None => {}
         }
         let mut file = OpenOptions::new()
             .write(true)
@@ -273,7 +809,15 @@ impl FileAgentStore {
         let result = file
             .write_all(bytes)
             .and_then(|()| file.sync_all())
-            .and_then(|()| std::fs::rename(&next, path))
+            .and_then(|()| {
+                if std::fs::symlink_metadata(path).is_ok() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::AlreadyExists,
+                        "agent catalog artifact appeared during staging",
+                    ));
+                }
+                std::fs::rename(&next, path)
+            })
             .and_then(|()| File::open(parent)?.sync_all());
         if result.is_err() {
             let _ = std::fs::remove_file(&next);
@@ -308,31 +852,59 @@ impl AgentImageStore for FileAgentStore {
         expected_revision: Option<u64>,
         image: &AgentImage,
     ) -> Result<(), AgentStoreError> {
+        let bytes = encode_valid_image(image)?;
         if self.read_image()?.as_ref().map(|image| image.revision) != expected_revision {
             return Err(AgentStoreError::Conflict);
         }
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        if let Ok(metadata) = std::fs::symlink_metadata(parent)
+            && (!metadata.file_type().is_dir() || metadata.file_type().is_symlink())
         {
+            return Err(AgentStoreError::Corrupt);
+        }
+        if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|_| AgentStoreError::Unavailable)?;
         }
+        let parent_metadata =
+            std::fs::symlink_metadata(parent).map_err(|_| AgentStoreError::Unavailable)?;
+        if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
+            return Err(AgentStoreError::Corrupt);
+        }
         let next = self.path.with_extension("next");
-        let bytes = image.encode();
+        if let Some(staged) = self.read_bounded_regular(&next, MAX_AGENT_IMAGE_BYTES)? {
+            if staged == bytes {
+                if self.read_image()?.as_ref().map(|image| image.revision) != expected_revision {
+                    return Err(AgentStoreError::Conflict);
+                }
+                std::fs::rename(&next, &self.path).map_err(|_| AgentStoreError::Unavailable)?;
+                return self.sync_parent();
+            }
+            // A prior writer may have crashed after syncing a different,
+            // otherwise canonical candidate. The current CAS still compares
+            // against the durable image, so replacing this regular staging
+            // file is safe. Special files and links were rejected above.
+            AgentImage::decode(&staged).map_err(|_| AgentStoreError::Corrupt)?;
+            std::fs::remove_file(&next).map_err(|_| AgentStoreError::Unavailable)?;
+            self.sync_parent()?;
+        }
         let mut file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&next)
             .map_err(|_| AgentStoreError::Unavailable)?;
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|_| AgentStoreError::Unavailable)?;
+        if self.read_image()?.as_ref().map(|image| image.revision) != expected_revision {
+            let _ = std::fs::remove_file(&next);
+            return Err(AgentStoreError::Conflict);
+        }
         std::fs::rename(&next, &self.path).map_err(|_| AgentStoreError::Unavailable)?;
         self.sync_parent()
     }
 
     fn put_package(&mut self, reference: &BlobRef, bytes: &[u8]) -> Result<bool, AgentStoreError> {
-        if !reference.matches(bytes) {
+        if bytes.len() > super::package::MAX_ENCODED_PACKAGE_BYTES || !reference.matches(bytes) {
             return Err(AgentStoreError::Corrupt);
         }
         self.put_artifact(
@@ -341,12 +913,100 @@ impl AgentImageStore for FileAgentStore {
         )
     }
 
+    fn load_package(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, AgentStoreError> {
+        let path = self.catalog_path("packages", &reference.hash.0, "vos");
+        match self.read_regular_artifact(&path)? {
+            Some(bytes) if reference.matches(&bytes) => Ok(Some(bytes)),
+            Some(_) => Err(AgentStoreError::Corrupt),
+            None => Ok(None),
+        }
+    }
+
     fn remove_package(&mut self, reference: &BlobRef) -> Result<(), AgentStoreError> {
         self.remove_artifact(&self.catalog_path("packages", &reference.hash.0, "vos"))
     }
 
+    fn put_actor_schema(
+        &mut self,
+        deployment: DeploymentId,
+        reference: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<bool, AgentStoreError> {
+        if deployment == DeploymentId::ZERO
+            || !reference.matches(bytes)
+            || super::schema::decode(bytes).is_none()
+        {
+            return Err(AgentStoreError::Corrupt);
+        }
+        self.put_artifact(&self.catalog_path("schemas", &deployment.0, "agent"), bytes)
+    }
+
+    fn load_actor_schema(
+        &self,
+        deployment: DeploymentId,
+    ) -> Result<Option<RuntimeBlob>, AgentStoreError> {
+        let path = self.catalog_path("schemas", &deployment.0, "agent");
+        match self.read_bounded_regular(&path, super::schema::MAX_ENCODED_BYTES)? {
+            Some(bytes) if super::schema::decode(&bytes).is_some() => Ok(Some(RuntimeBlob {
+                reference: BlobRef::of_bytes(&bytes),
+                bytes,
+            })),
+            Some(_) => Err(AgentStoreError::Corrupt),
+            None => Ok(None),
+        }
+    }
+
+    fn remove_actor_schema(&mut self, deployment: DeploymentId) -> Result<(), AgentStoreError> {
+        self.remove_artifact(&self.catalog_path("schemas", &deployment.0, "agent"))
+    }
+
+    fn put_actor_policies(
+        &mut self,
+        deployment: DeploymentId,
+        reference: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<bool, AgentStoreError> {
+        if deployment == DeploymentId::ZERO
+            || bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES
+            || !reference.matches(bytes)
+            || crate::service::PackageRolePolicies::decode(bytes).is_err()
+        {
+            return Err(AgentStoreError::Corrupt);
+        }
+        self.put_artifact(
+            &self.catalog_path("policies", &deployment.0, "roles"),
+            bytes,
+        )
+    }
+
+    fn load_actor_policies(
+        &self,
+        deployment: DeploymentId,
+    ) -> Result<Option<RuntimeBlob>, AgentStoreError> {
+        let path = self.catalog_path("policies", &deployment.0, "roles");
+        match self.read_bounded_regular(&path, super::execution::MAX_EXECUTION_POLICY_BYTES)? {
+            Some(bytes)
+                if bytes.len() <= super::execution::MAX_EXECUTION_POLICY_BYTES
+                    && crate::service::PackageRolePolicies::decode(&bytes).is_ok() =>
+            {
+                Ok(Some(RuntimeBlob {
+                    reference: BlobRef::of_bytes(&bytes),
+                    bytes,
+                }))
+            }
+            Some(_) => Err(AgentStoreError::Corrupt),
+            None => Ok(None),
+        }
+    }
+
+    fn remove_actor_policies(&mut self, deployment: DeploymentId) -> Result<(), AgentStoreError> {
+        self.remove_artifact(&self.catalog_path("policies", &deployment.0, "roles"))
+    }
+
     fn put_program(&mut self, program: ProgramId, bytes: &[u8]) -> Result<bool, AgentStoreError> {
-        if ProgramId::of_pvm(bytes) != program {
+        if bytes.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
+            || ProgramId::of_pvm(bytes) != program
+        {
             return Err(AgentStoreError::Corrupt);
         }
         self.put_artifact(&self.catalog_path("programs", &program.0, "pvm"), bytes)
@@ -354,16 +1014,95 @@ impl AgentImageStore for FileAgentStore {
 
     fn load_program(&self, program: ProgramId) -> Result<Option<Vec<u8>>, AgentStoreError> {
         let path = self.catalog_path("programs", &program.0, "pvm");
-        match std::fs::read(path) {
-            Ok(bytes) if ProgramId::of_pvm(&bytes) == program => Ok(Some(bytes)),
-            Ok(_) => Err(AgentStoreError::Corrupt),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(_) => Err(AgentStoreError::Unavailable),
+        match self.read_bounded_regular(&path, super::execution::MAX_EXECUTION_PROGRAM_BYTES)? {
+            Some(bytes) if ProgramId::of_pvm(&bytes) == program => Ok(Some(bytes)),
+            Some(_) => Err(AgentStoreError::Corrupt),
+            None => Ok(None),
         }
     }
 
     fn remove_program(&mut self, program: ProgramId) -> Result<(), AgentStoreError> {
         self.remove_artifact(&self.catalog_path("programs", &program.0, "pvm"))
+    }
+
+    fn reconcile_catalog(
+        &mut self,
+        references: &AgentCatalogReferences,
+    ) -> Result<(), AgentStoreError> {
+        let keep = CatalogKeep::from_references(references)?;
+        self.validate_catalog_shape()?;
+        for kind in ["packages", "programs", "schemas", "policies"] {
+            self.validate_catalog_directory(kind)?;
+        }
+
+        // Authenticate all mandatory actor artifacts before deleting any
+        // unowned file. Referenced special files and symlinks fail closed.
+        for (hash, reference) in &keep.required_packages {
+            let path = self.catalog_path("packages", &hash.0, "vos");
+            let bytes = self
+                .read_regular_artifact(&path)?
+                .ok_or(AgentStoreError::Corrupt)?;
+            if !reference.matches(&bytes) {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
+        for program in &keep.required_programs {
+            let path = self.catalog_path("programs", &program.0, "pvm");
+            let bytes = self
+                .read_regular_artifact(&path)?
+                .ok_or(AgentStoreError::Corrupt)?;
+            if ProgramId::of_pvm(&bytes) != *program {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
+        for (deployment, reference) in &keep.schemas {
+            let path = self.catalog_path("schemas", &deployment.0, "agent");
+            let bytes = self
+                .read_regular_artifact(&path)?
+                .ok_or(AgentStoreError::Corrupt)?;
+            if !reference.matches(&bytes) || super::schema::decode(&bytes).is_none() {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
+        for (deployment, reference) in &keep.policies {
+            let path = self.catalog_path("policies", &deployment.0, "roles");
+            let bytes = self
+                .read_regular_artifact(&path)?
+                .ok_or(AgentStoreError::Corrupt)?;
+            if bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES
+                || !reference.matches(&bytes)
+                || crate::service::PackageRolePolicies::decode(&bytes).is_err()
+            {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
+
+        let retained_packages = keep
+            .retained_packages
+            .iter()
+            .map(|hash| self.catalog_path("packages", &hash.0, "vos"))
+            .collect::<BTreeSet<_>>();
+        let retained_programs = keep
+            .retained_programs
+            .iter()
+            .map(|program| self.catalog_path("programs", &program.0, "pvm"))
+            .collect::<BTreeSet<_>>();
+        let retained_schemas = keep
+            .schemas
+            .keys()
+            .map(|deployment| self.catalog_path("schemas", &deployment.0, "agent"))
+            .collect::<BTreeSet<_>>();
+        let retained_policies = keep
+            .policies
+            .keys()
+            .map(|deployment| self.catalog_path("policies", &deployment.0, "roles"))
+            .collect::<BTreeSet<_>>();
+
+        self.reconcile_directory("packages", &retained_packages)?;
+        self.reconcile_directory("programs", &retained_programs)?;
+        self.reconcile_directory("schemas", &retained_schemas)?;
+        self.reconcile_directory("policies", &retained_policies)?;
+        Ok(())
     }
 }
 
@@ -380,14 +1119,28 @@ fn encode_hex(bytes: &[u8; 32]) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentDriverError {
     InvalidConfig(AgentConfigError),
+    /// This process-local driver deliberately supports only Local agents.
+    /// Shared and Private profiles require their replication adapters rather
+    /// than whole-image compare-and-replace persistence.
+    UnsupportedProfile(AgentProfile),
     RuntimeProgramMismatch,
     InvalidRuntime,
-    RuntimeExit { reason: ExitReason, pc: u32 },
+    TrustUnavailable,
+    RuntimeExit {
+        reason: ExitReason,
+        pc: u32,
+    },
     RuntimeOutput,
     RuntimeStateTooLarge,
+    PackageUnavailable(Hash),
     ProgramUnavailable(ProgramId),
+    SchemaUnavailable(DeploymentId),
+    SchemaMismatch(DeploymentId),
+    PolicyUnavailable(DeploymentId),
+    PolicyMismatch(DeploymentId),
     Lifecycle(LifecycleError),
     Execution(ActorExecutionError),
+    InvocationVerification(ActorInvocationVerificationError),
     Package(PackageError),
     Authority(AuthorityError),
     Store(AgentStoreError),
@@ -413,46 +1166,125 @@ impl From<AuthorityError> for AgentDriverError {
     }
 }
 
-/// One loaded agent. Calls are serialized by mutable access; replication
-/// adapters order calls before they reach this driver.
+fn verify_trusted_package(
+    trust: &dyn AgentTrustProvider,
+    config: &AgentConfig,
+    package: &Package,
+) -> Result<(), AgentDriverError> {
+    package.validate().map_err(AgentDriverError::Package)?;
+    if !trust.verify_package(config, package) {
+        return Err(AgentDriverError::Package(PackageError::InvalidSignature));
+    }
+    Ok(())
+}
+
+fn verify_runtime_package_binding(
+    trust: &dyn AgentTrustProvider,
+    config: &AgentConfig,
+    package: &Package,
+) -> Result<(), AgentDriverError> {
+    verify_trusted_package(trust, config, package)?;
+    let PackageKind::AgentRuntime { abi, capabilities } = package.manifest.kind else {
+        return Err(AgentDriverError::Package(PackageError::WrongKind));
+    };
+    let package_bytes = package.encode();
+    if abi != RUNTIME_ABI_ID
+        || config.identity.runtime_deployment != package.deployment_id()
+        || config.identity.runtime_program != package.manifest.program
+        || config.identity.runtime_producer != package.deployment_signature.producer
+        || config.runtime_package != BlobRef::of_bytes(&package_bytes)
+        || config.capabilities != capabilities
+    {
+        return Err(AgentDriverError::RuntimeProgramMismatch);
+    }
+    Ok(())
+}
+
+fn verify_authority_admission(
+    trust: &dyn AgentTrustProvider,
+    receipt: &AgentAuthorityReceipt,
+    config: &AgentConfig,
+    capability: &str,
+    request: &LifecycleRequest,
+) -> Result<LifecycleAuthorityAdmission, AgentDriverError> {
+    let current_slot = trust
+        .current_logical_slot()
+        .ok_or(AgentDriverError::TrustUnavailable)?;
+    let verified = receipt.clone().verify(
+        &config.authority,
+        current_slot,
+        &TrustAuthorityVerifier(trust),
+    )?;
+    authorize_lifecycle(
+        &verified,
+        &config.authority,
+        config.identity.space,
+        config.identity.agent,
+        CapabilityId::named(capability),
+        request,
+        current_slot,
+    )?;
+    let claim = verified.claim();
+    Ok(LifecycleAuthorityAdmission {
+        authority: config.authority.commitment(),
+        credential: claim.credential,
+        sequence: claim.sequence,
+        observed_slot: current_slot,
+        claim: claim.signing_message(),
+        operation: claim.operation,
+    })
+}
+
+/// One loaded process-local agent. Calls are serialized by mutable access.
+///
+/// The driver is intentionally restricted to [`AgentProfile::Local`]. A
+/// replicated adapter cannot safely wrap this type after the fact because a
+/// committed image contains independently governed control, Linear, Merge,
+/// and Local components. See [`AgentImageStore`] for the required split.
 pub struct AgentDriver<S> {
     runtime_pvm: Vec<u8>,
     image: AgentImage,
     store: S,
     management_gas: Gas,
+    catalog_cleanup_pending: bool,
+    trust: Arc<dyn AgentTrustProvider>,
 }
 
 impl<S: AgentImageStore> AgentDriver<S> {
-    pub fn create_or_open(
-        runtime_pvm: Vec<u8>,
+    /// Create a new agent and durably consume its signed creation sequence
+    /// before exposing the image.
+    pub fn create(
+        runtime_package: Package,
         config: AgentConfig,
         mut store: S,
+        trust: Arc<dyn AgentTrustProvider>,
+        authority: &AgentAuthorityReceipt,
     ) -> Result<Self, AgentDriverError> {
         config.validate().map_err(AgentDriverError::InvalidConfig)?;
-        let runtime_program = ProgramId::of_pvm(&runtime_pvm);
-        if runtime_program != config.identity.runtime_program {
-            return Err(AgentDriverError::RuntimeProgramMismatch);
+        validate_process_local_profile(config.identity.profile)?;
+        verify_runtime_package_binding(trust.as_ref(), &config, &runtime_package)?;
+        let runtime_pvm = runtime_package.pvm.clone();
+        let runtime_program = runtime_package.manifest.program;
+        if store.load()?.is_some() {
+            return Err(AgentDriverError::Store(AgentStoreError::Conflict));
         }
-        if let Some(image) = store.load()? {
-            if image.runtime_program != runtime_program || image.config != config {
-                return Err(AgentDriverError::RuntimeProgramMismatch);
-            }
-            let driver = Self {
-                runtime_pvm,
-                image,
-                store,
-                management_gas: DEFAULT_MANAGEMENT_GAS,
-            };
-            driver.validate_loaded_state()?;
-            return Ok(driver);
-        }
-
+        let request = LifecycleRequest::Create(config.clone());
+        let admission = verify_authority_admission(
+            trust.as_ref(),
+            authority,
+            &config,
+            super::authority::CAPABILITY_AGENT_CREATE_LOCAL,
+            &request,
+        )?;
         let output = execute_runtime(
             &runtime_pvm,
             DEFAULT_MANAGEMENT_GAS,
             RuntimeCall {
                 state: RuntimeState::default(),
-                request: LifecycleRequest::Create(config.clone()),
+                request: LifecycleRequest::Authorized {
+                    admission,
+                    request: Box::new(request),
+                },
             },
         )?;
         if output.result != Ok(LifecycleReply::Created(config.identity.clone())) {
@@ -465,13 +1297,64 @@ impl<S: AgentImageStore> AgentDriver<S> {
             config,
             runtime_state: output.state,
         };
+        let package_bytes = runtime_package.encode();
+        let package_reference = image.config.runtime_package.clone();
+        let created_package = store.put_package(&package_reference, &package_bytes)?;
+        if let Err(error) = store.put_program(runtime_program, &runtime_pvm) {
+            if created_package {
+                let _ = store.remove_package(&package_reference);
+            }
+            return Err(error.into());
+        }
         store.commit(None, &image)?;
-        Ok(Self {
+        let mut driver = Self {
             runtime_pvm,
             image,
             store,
             management_gas: DEFAULT_MANAGEMENT_GAS,
-        })
+            catalog_cleanup_pending: false,
+            trust,
+        };
+        // The image is already durable. Catalog pruning is cleanup debt and
+        // must never turn a successful Create into a caller-visible failure.
+        driver.reconcile_catalog_after_commit();
+        Ok(driver)
+    }
+
+    /// Open an existing agent. Creation is intentionally separate so an
+    /// absent image can never be initialized without a durable authority
+    /// disposition.
+    pub fn open(store: S, trust: Arc<dyn AgentTrustProvider>) -> Result<Self, AgentDriverError> {
+        let image = store.load()?.ok_or(AgentStoreError::Unavailable)?;
+        image
+            .config
+            .validate()
+            .map_err(AgentDriverError::InvalidConfig)?;
+        validate_process_local_profile(image.config.identity.profile)?;
+        let package_bytes = store.load_package(&image.config.runtime_package)?.ok_or(
+            AgentDriverError::PackageUnavailable(image.config.runtime_package.hash),
+        )?;
+        let runtime_package = Package::decode(&package_bytes)
+            .map_err(|_| AgentDriverError::Package(PackageError::InvalidRuntimeArtifacts))?;
+        verify_runtime_package_binding(trust.as_ref(), &image.config, &runtime_package)?;
+        let runtime_pvm = store
+            .load_program(image.runtime_program)?
+            .ok_or(AgentDriverError::ProgramUnavailable(image.runtime_program))?;
+        if runtime_pvm != runtime_package.pvm
+            || image.runtime_program != runtime_package.manifest.program
+        {
+            return Err(AgentDriverError::RuntimeProgramMismatch);
+        }
+        let mut driver = Self {
+            runtime_pvm,
+            image,
+            store,
+            management_gas: DEFAULT_MANAGEMENT_GAS,
+            catalog_cleanup_pending: false,
+            trust,
+        };
+        driver.reconcile_catalog()?;
+        Ok(driver)
     }
 
     pub fn image(&self) -> &AgentImage {
@@ -482,6 +1365,28 @@ impl<S: AgentImageStore> AgentDriver<S> {
         self.management_gas = gas;
     }
 
+    /// Whether a post-commit catalog cleanup needs to be retried. Cleanup
+    /// failure never rewrites an already committed lifecycle disposition;
+    /// callers can surface this as a health condition and retry explicitly.
+    pub const fn catalog_cleanup_pending(&self) -> bool {
+        self.catalog_cleanup_pending
+    }
+
+    /// Authenticate the committed directory's complete artifact closure and
+    /// prune every unreferenced catalog entry.
+    pub fn reconcile_catalog(&mut self) -> Result<(), AgentDriverError> {
+        let references = self.catalog_references()?;
+        self.store.reconcile_catalog(&references)?;
+        self.catalog_cleanup_pending = false;
+        Ok(())
+    }
+
+    fn reconcile_catalog_after_commit(&mut self) {
+        if self.reconcile_catalog().is_err() {
+            self.catalog_cleanup_pending = true;
+        }
+    }
+
     fn lifecycle(&mut self, request: LifecycleRequest) -> Result<LifecycleReply, AgentDriverError> {
         if matches!(request, LifecycleRequest::Create(_)) {
             return Err(AgentDriverError::Lifecycle(LifecycleError::AlreadyCreated));
@@ -490,6 +1395,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
         }
         let read_only = matches!(request, LifecycleRequest::Inspect { .. });
+        let authorized = matches!(request, LifecycleRequest::Authorized { .. });
         let output = execute_runtime(
             &self.runtime_pvm,
             self.management_gas,
@@ -501,7 +1407,12 @@ impl<S: AgentImageStore> AgentDriver<S> {
         match output.result {
             Err(error) => {
                 if output.state != self.image.runtime_state {
-                    return Err(AgentDriverError::InvalidRuntime);
+                    if !authorized {
+                        return Err(AgentDriverError::InvalidRuntime);
+                    }
+                    validate_state_size(&output.state)?;
+                    self.commit_runtime_state(output.state)?;
+                    self.reconcile_catalog_after_commit();
                 }
                 Err(AgentDriverError::Lifecycle(error))
             }
@@ -513,21 +1424,59 @@ impl<S: AgentImageStore> AgentDriver<S> {
                     }
                     return Ok(reply);
                 }
-                let next_revision = self
-                    .image
-                    .revision
-                    .checked_add(1)
-                    .ok_or(AgentDriverError::InvalidRuntime)?;
-                let next = AgentImage {
-                    revision: next_revision,
-                    runtime_program: self.image.runtime_program,
-                    config: self.image.config.clone(),
-                    runtime_state: output.state,
-                };
-                self.store.commit(Some(self.image.revision), &next)?;
-                self.image = next;
+                if authorized && output.state == self.image.runtime_state {
+                    return Ok(reply);
+                }
+                self.commit_runtime_state(output.state)?;
+                self.reconcile_catalog_after_commit();
                 Ok(reply)
             }
+        }
+    }
+
+    fn commit_runtime_state(
+        &mut self,
+        runtime_state: RuntimeState,
+    ) -> Result<(), AgentDriverError> {
+        let next_revision = self
+            .image
+            .revision
+            .checked_add(1)
+            .ok_or(AgentDriverError::InvalidRuntime)?;
+        let next = AgentImage {
+            revision: next_revision,
+            runtime_program: self.image.runtime_program,
+            config: self.image.config.clone(),
+            runtime_state,
+        };
+        self.store.commit(Some(self.image.revision), &next)?;
+        self.image = next;
+        Ok(())
+    }
+
+    /// Recover the exact durable creation disposition after response loss.
+    pub fn retry_create(
+        &mut self,
+        config: &AgentConfig,
+        runtime_package: &Package,
+        authority: &AgentAuthorityReceipt,
+    ) -> Result<AgentIdentity, AgentDriverError> {
+        if config != &self.image.config {
+            return Err(AgentDriverError::RuntimeProgramMismatch);
+        }
+        verify_runtime_package_binding(self.trust.as_ref(), config, runtime_package)?;
+        let request = LifecycleRequest::Create(config.clone());
+        let admission = self.authorize(
+            authority,
+            super::authority::CAPABILITY_AGENT_CREATE_LOCAL,
+            &request,
+        )?;
+        match self.lifecycle(LifecycleRequest::Authorized {
+            admission,
+            request: Box::new(request),
+        })? {
+            LifecycleReply::Created(identity) if identity == config.identity => Ok(identity),
+            _ => Err(AgentDriverError::InvalidRuntime),
         }
     }
 
@@ -548,10 +1497,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
         &self,
         name: String,
         parent: Option<ActorId>,
-        package: &VerifiedPackage,
-        initial_state: ActorInitialState,
+        package: &Package,
     ) -> Result<LifecycleRequest, AgentDriverError> {
-        let package = package.package();
+        verify_trusted_package(self.trust.as_ref(), &self.image.config, package)?;
         let PackageKind::Actor { requirements } = package.manifest.kind else {
             return Err(AgentDriverError::Package(PackageError::WrongKind));
         };
@@ -559,6 +1507,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
             Some(parent) => ActorId::owned_child(parent, &name),
             None => ActorId::top_level(self.image.config.identity.agent, &name),
         };
+        let agent_schema = super::schema::decode(&package.agent_schema).ok_or(
+            AgentDriverError::Package(PackageError::InvalidActorArtifacts),
+        )?;
         Ok(LifecycleRequest::Install(InstallActor {
             entry: ActorEntry {
                 actor,
@@ -566,39 +1517,43 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 parent,
                 deployment: package.deployment_id(),
                 program: package.manifest.program,
+                package: BlobRef::of_bytes(&package.encode()),
+                agent_schema: BlobRef::of_bytes(&package.agent_schema),
+                role_policies: BlobRef::of_bytes(&package.role_policies),
+                state_layout: agent_schema.state_layout_hash(),
                 lanes: requirements.lanes,
                 suspended: false,
             },
             producer: package.deployment_signature.producer,
             package: BlobRef::of_bytes(&package.encode()),
-            initial_state,
+            agent_schema: BlobRef::of_bytes(&package.agent_schema),
+            role_policies: BlobRef::of_bytes(&package.role_policies),
+            state_layout: agent_schema.state_layout_hash(),
             requirements,
         }))
     }
 
     pub fn install_actor(
         &mut self,
-        authority: &VerifiedAgentAuthorityReceipt,
+        authority: &AgentAuthorityReceipt,
         name: String,
         parent: Option<ActorId>,
-        package: &VerifiedPackage,
-        initial_state: ActorInitialState,
+        package: &Package,
     ) -> Result<ActorEntry, AgentDriverError> {
-        let request = self.actor_install_request(name, parent, package, initial_state)?;
-        authorize_lifecycle(
+        let request = self.actor_install_request(name, parent, package)?;
+        let admission = self.authorize(
             authority,
-            &self.image.config.authority,
-            self.image.config.identity.space,
-            self.image.config.identity.agent,
-            CapabilityId::named(super::authority::CAPABILITY_ACTOR_INSTALL),
+            super::authority::CAPABILITY_ACTOR_INSTALL,
             &request,
         )?;
         let LifecycleRequest::Install(install) = request else {
             return Err(AgentDriverError::InvalidRuntime);
         };
-        let package = package.package();
         let entry = install.entry.clone();
         let package_reference = install.package.clone();
+        let schema_reference = install.agent_schema.clone();
+        let policy_reference = install.role_policies.clone();
+        let deployment = install.entry.deployment;
         let package_bytes = package.encode();
         let created_package = self.store.put_package(&package_reference, &package_bytes)?;
         let created_program = match self
@@ -613,7 +1568,45 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 return Err(error.into());
             }
         };
-        let reply = self.lifecycle(LifecycleRequest::Install(install));
+        let created_schema =
+            match self
+                .store
+                .put_actor_schema(deployment, &schema_reference, &package.agent_schema)
+            {
+                Ok(created) => created,
+                Err(error) => {
+                    if created_program {
+                        let _ = self.store.remove_program(package.manifest.program);
+                    }
+                    if created_package {
+                        let _ = self.store.remove_package(&package_reference);
+                    }
+                    return Err(error.into());
+                }
+            };
+        let created_policies = match self.store.put_actor_policies(
+            deployment,
+            &policy_reference,
+            &package.role_policies,
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                if created_schema {
+                    let _ = self.store.remove_actor_schema(deployment);
+                }
+                if created_program {
+                    let _ = self.store.remove_program(package.manifest.program);
+                }
+                if created_package {
+                    let _ = self.store.remove_package(&package_reference);
+                }
+                return Err(error.into());
+            }
+        };
+        let reply = self.lifecycle(LifecycleRequest::Authorized {
+            admission,
+            request: Box::new(LifecycleRequest::Install(install)),
+        });
         let reply = match reply {
             Ok(reply) => reply,
             Err(error) => {
@@ -623,6 +1616,12 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 // have reached durable storage before a directory sync error,
                 // and deleting its program would make that image unusable.
                 if matches!(error, AgentDriverError::Lifecycle(_)) {
+                    if created_policies {
+                        let _ = self.store.remove_actor_policies(deployment);
+                    }
+                    if created_schema {
+                        let _ = self.store.remove_actor_schema(deployment);
+                    }
                     if created_program {
                         let _ = self.store.remove_program(package.manifest.program);
                     }
@@ -633,6 +1632,10 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 return Err(error);
             }
         };
+        // Exact receipt recovery may return a historical Install disposition
+        // without committing current directory state. Retire any artifacts
+        // staged only to reconstruct that request.
+        self.reconcile_catalog_after_commit();
         match reply {
             LifecycleReply::Installed(installed) if installed == entry => Ok(installed),
             _ => Err(AgentDriverError::InvalidRuntime),
@@ -643,12 +1646,15 @@ impl<S: AgentImageStore> AgentDriver<S> {
         &self,
         actor: ActorId,
         from_deployment: DeploymentId,
-        package: &VerifiedPackage,
+        package: &Package,
     ) -> Result<LifecycleRequest, AgentDriverError> {
-        let package = package.package();
+        verify_trusted_package(self.trust.as_ref(), &self.image.config, package)?;
         let PackageKind::Actor { requirements } = package.manifest.kind else {
             return Err(AgentDriverError::Package(PackageError::WrongKind));
         };
+        let agent_schema = super::schema::decode(&package.agent_schema).ok_or(
+            AgentDriverError::Package(PackageError::InvalidActorArtifacts),
+        )?;
         Ok(LifecycleRequest::UpgradeActor(super::UpgradeActor {
             actor,
             from_deployment,
@@ -656,19 +1662,22 @@ impl<S: AgentImageStore> AgentDriver<S> {
             to_program: package.manifest.program,
             producer: package.deployment_signature.producer,
             package: BlobRef::of_bytes(&package.encode()),
+            agent_schema: BlobRef::of_bytes(&package.agent_schema),
+            role_policies: BlobRef::of_bytes(&package.role_policies),
+            state_layout: agent_schema.state_layout_hash(),
             requirements,
         }))
     }
 
     pub fn upgrade_actor(
         &mut self,
-        authority: &VerifiedAgentAuthorityReceipt,
+        authority: &AgentAuthorityReceipt,
         actor: ActorId,
         from_deployment: DeploymentId,
-        package: &VerifiedPackage,
+        package: &Package,
     ) -> Result<ActorEntry, AgentDriverError> {
         let request = self.actor_upgrade_request(actor, from_deployment, package)?;
-        self.authorize(
+        let admission = self.authorize(
             authority,
             super::authority::CAPABILITY_ACTOR_UPGRADE,
             &request,
@@ -676,9 +1685,11 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let LifecycleRequest::UpgradeActor(upgrade) = request else {
             return Err(AgentDriverError::InvalidRuntime);
         };
-        let package = package.package();
         let package_bytes = package.encode();
         let package_reference = upgrade.package.clone();
+        let schema_reference = upgrade.agent_schema.clone();
+        let policy_reference = upgrade.role_policies.clone();
+        let deployment = upgrade.to_deployment;
         let created_package = self.store.put_package(&package_reference, &package_bytes)?;
         let created_program = match self
             .store
@@ -692,11 +1703,55 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 return Err(error.into());
             }
         };
-        let reply = self.lifecycle(LifecycleRequest::UpgradeActor(upgrade));
+        let created_schema =
+            match self
+                .store
+                .put_actor_schema(deployment, &schema_reference, &package.agent_schema)
+            {
+                Ok(created) => created,
+                Err(error) => {
+                    if created_program {
+                        let _ = self.store.remove_program(package.manifest.program);
+                    }
+                    if created_package {
+                        let _ = self.store.remove_package(&package_reference);
+                    }
+                    return Err(error.into());
+                }
+            };
+        let created_policies = match self.store.put_actor_policies(
+            deployment,
+            &policy_reference,
+            &package.role_policies,
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                if created_schema {
+                    let _ = self.store.remove_actor_schema(deployment);
+                }
+                if created_program {
+                    let _ = self.store.remove_program(package.manifest.program);
+                }
+                if created_package {
+                    let _ = self.store.remove_package(&package_reference);
+                }
+                return Err(error.into());
+            }
+        };
+        let reply = self.lifecycle(LifecycleRequest::Authorized {
+            admission,
+            request: Box::new(LifecycleRequest::UpgradeActor(upgrade)),
+        });
         let reply = match reply {
             Ok(reply) => reply,
             Err(error) => {
                 if matches!(error, AgentDriverError::Lifecycle(_)) {
+                    if created_policies {
+                        let _ = self.store.remove_actor_policies(deployment);
+                    }
+                    if created_schema {
+                        let _ = self.store.remove_actor_schema(deployment);
+                    }
                     if created_program {
                         let _ = self.store.remove_program(package.manifest.program);
                     }
@@ -707,6 +1762,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 return Err(error);
             }
         };
+        self.reconcile_catalog_after_commit();
         match reply {
             LifecycleReply::Upgraded(entry)
                 if entry.actor == actor && entry.deployment == package.deployment_id() =>
@@ -719,7 +1775,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
 
     pub fn suspend_actor(
         &mut self,
-        authority: &VerifiedAgentAuthorityReceipt,
+        authority: &AgentAuthorityReceipt,
         actor: ActorId,
     ) -> Result<ActorEntry, AgentDriverError> {
         self.authorized_actor_lifecycle(authority, LifecycleRequest::Suspend(actor))
@@ -727,7 +1783,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
 
     pub fn resume_actor(
         &mut self,
-        authority: &VerifiedAgentAuthorityReceipt,
+        authority: &AgentAuthorityReceipt,
         actor: ActorId,
     ) -> Result<ActorEntry, AgentDriverError> {
         self.authorized_actor_lifecycle(authority, LifecycleRequest::Resume(actor))
@@ -735,15 +1791,18 @@ impl<S: AgentImageStore> AgentDriver<S> {
 
     fn authorized_actor_lifecycle(
         &mut self,
-        authority: &VerifiedAgentAuthorityReceipt,
+        authority: &AgentAuthorityReceipt,
         request: LifecycleRequest,
     ) -> Result<ActorEntry, AgentDriverError> {
-        self.authorize(
+        let admission = self.authorize(
             authority,
             super::authority::CAPABILITY_ACTOR_LIFECYCLE,
             &request,
         )?;
-        match self.lifecycle(request)? {
+        match self.lifecycle(LifecycleRequest::Authorized {
+            admission,
+            request: Box::new(request),
+        })? {
             LifecycleReply::Suspended(entry) | LifecycleReply::Resumed(entry) => Ok(entry),
             _ => Err(AgentDriverError::InvalidRuntime),
         }
@@ -751,7 +1810,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
 
     pub fn remove_actor(
         &mut self,
-        authority: &VerifiedAgentAuthorityReceipt,
+        authority: &AgentAuthorityReceipt,
         actor: ActorId,
         expected_deployment: DeploymentId,
     ) -> Result<(), AgentDriverError> {
@@ -759,12 +1818,15 @@ impl<S: AgentImageStore> AgentDriver<S> {
             actor,
             expected_deployment,
         };
-        self.authorize(
+        let admission = self.authorize(
             authority,
             super::authority::CAPABILITY_ACTOR_LIFECYCLE,
             &request,
         )?;
-        match self.lifecycle(request)? {
+        match self.lifecycle(LifecycleRequest::Authorized {
+            admission,
+            request: Box::new(request),
+        })? {
             LifecycleReply::Removed(removed) if removed == actor => Ok(()),
             _ => Err(AgentDriverError::InvalidRuntime),
         }
@@ -772,19 +1834,17 @@ impl<S: AgentImageStore> AgentDriver<S> {
 
     fn authorize(
         &self,
-        authority: &VerifiedAgentAuthorityReceipt,
+        authority: &AgentAuthorityReceipt,
         capability: &str,
         request: &LifecycleRequest,
-    ) -> Result<(), AgentDriverError> {
-        authorize_lifecycle(
+    ) -> Result<LifecycleAuthorityAdmission, AgentDriverError> {
+        verify_authority_admission(
+            self.trust.as_ref(),
             authority,
-            &self.image.config.authority,
-            self.image.config.identity.space,
-            self.image.config.identity.agent,
-            CapabilityId::named(capability),
+            &self.image.config,
+            capability,
             request,
-        )?;
-        Ok(())
+        )
     }
 
     /// Execute one authenticated actor invocation through this agent's
@@ -793,7 +1853,35 @@ impl<S: AgentImageStore> AgentDriver<S> {
     pub fn invoke(
         &mut self,
         invocation: ActorInvocation,
+        evidence: &[u8],
     ) -> Result<ActorExecutionReply, AgentDriverError> {
+        let verified = invocation
+            .verify(
+                evidence,
+                &TrustInvocationVerifier {
+                    trust: self.trust.as_ref(),
+                    agent: &self.image.config,
+                },
+            )
+            .map_err(AgentDriverError::InvocationVerification)?;
+        self.invoke_raw(verified.into_inner())
+    }
+
+    /// Execute the raw runtime invocation after the public verification seam
+    /// has sealed it. Replicated host adapters in this crate may reuse this
+    /// deterministic path only after independently verifying their ordered
+    /// authorization sidecar.
+    pub(crate) fn invoke_raw(
+        &mut self,
+        invocation: ActorInvocation,
+    ) -> Result<ActorExecutionReply, AgentDriverError> {
+        if self.catalog_cleanup_pending {
+            let _ = self.reconcile_catalog();
+        }
+        // Validate at the trusted host boundary before resolving artifacts or
+        // adding caller-selected gas to the outer runtime budget. The guest
+        // repeats this check when decoding the execution wire.
+        invocation.validate().map_err(AgentDriverError::Execution)?;
         let expected_invocation = invocation.invocation;
         let expected_actor = invocation.actor;
         let expected_deployment = invocation.deployment;
@@ -803,6 +1891,14 @@ impl<S: AgentImageStore> AgentDriver<S> {
             .store
             .load_program(invocation.program)?
             .ok_or(AgentDriverError::ProgramUnavailable(invocation.program))?;
+        let actor_schema = self
+            .store
+            .load_actor_schema(invocation.deployment)?
+            .ok_or(AgentDriverError::SchemaUnavailable(invocation.deployment))?;
+        let actor_policies = self
+            .store
+            .load_actor_policies(invocation.deployment)?
+            .ok_or(AgentDriverError::PolicyUnavailable(invocation.deployment))?;
         let output: RuntimeExecutionReturn = execute_runtime_wire(
             &self.runtime_pvm,
             outer_gas,
@@ -810,6 +1906,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 state: self.image.runtime_state.clone(),
                 invocation,
                 actor_pvm,
+                actor_schema,
+                actor_policies,
             }
             .encode(),
         )?;
@@ -863,8 +1961,19 @@ impl<S: AgentImageStore> AgentDriver<S> {
     /// recoverable across process restart.
     pub fn acknowledge_invocation(
         &mut self,
-        invocation: &ActorInvocation,
+        invocation: ActorInvocation,
+        evidence: &[u8],
     ) -> Result<(), AgentDriverError> {
+        let invocation = invocation
+            .verify(
+                evidence,
+                &TrustInvocationVerifier {
+                    trust: self.trust.as_ref(),
+                    agent: &self.image.config,
+                },
+            )
+            .map_err(AgentDriverError::InvocationVerification)?;
+        let invocation = invocation.invocation();
         let reply = self.lifecycle(LifecycleRequest::AcknowledgeInvocation {
             invocation: invocation.invocation,
             request: invocation.commitment(),
@@ -878,30 +1987,54 @@ impl<S: AgentImageStore> AgentDriver<S> {
 
     pub fn runtime_upgrade_request(
         &self,
-        package: &VerifiedPackage,
+        from_deployment: DeploymentId,
+        package: &Package,
     ) -> Result<LifecycleRequest, AgentDriverError> {
-        let package = package.package();
+        self.runtime_upgrade_details(from_deployment, package)
+            .map(|(request, _)| request)
+    }
+
+    fn runtime_upgrade_details(
+        &self,
+        from_deployment: DeploymentId,
+        package: &Package,
+    ) -> Result<(LifecycleRequest, AgentConfig), AgentDriverError> {
+        // Structural validation precedes deriving the target descriptor. The
+        // trust provider then authenticates the package against that complete
+        // post-upgrade descriptor, not merely its producer key.
+        package.validate().map_err(AgentDriverError::Package)?;
         let PackageKind::AgentRuntime { abi, capabilities } = package.manifest.kind else {
             return Err(AgentDriverError::Package(PackageError::WrongKind));
         };
-        Ok(LifecycleRequest::UpgradeRuntime {
-            from_deployment: self.image.config.identity.runtime_deployment,
+        let package_reference = BlobRef::of_bytes(&package.encode());
+        let mut target = self.image.config.clone();
+        target.identity.runtime_deployment = package.deployment_id();
+        target.identity.runtime_program = package.manifest.program;
+        target.identity.runtime_producer = package.deployment_signature.producer;
+        target.runtime_package = package_reference.clone();
+        target.capabilities = capabilities;
+        target.validate().map_err(AgentDriverError::InvalidConfig)?;
+        verify_runtime_package_binding(self.trust.as_ref(), &target, package)?;
+        let request = LifecycleRequest::UpgradeRuntime {
+            from_deployment,
             to_deployment: package.deployment_id(),
             to_program: package.manifest.program,
             producer: package.deployment_signature.producer,
-            package: BlobRef::of_bytes(&package.encode()),
+            package: package_reference,
             abi,
             capabilities,
-        })
+        };
+        Ok((request, target))
     }
 
     pub fn upgrade_runtime(
         &mut self,
-        authority: &VerifiedAgentAuthorityReceipt,
-        package: &VerifiedPackage,
+        authority: &AgentAuthorityReceipt,
+        from_deployment: DeploymentId,
+        package: &Package,
     ) -> Result<AgentIdentity, AgentDriverError> {
-        let request = self.runtime_upgrade_request(package)?;
-        self.authorize(
+        let (request, target_config) = self.runtime_upgrade_details(from_deployment, package)?;
+        let admission = self.authorize(
             authority,
             super::authority::CAPABILITY_AGENT_RUNTIME_UPGRADE,
             &request,
@@ -917,17 +2050,29 @@ impl<S: AgentImageStore> AgentDriver<S> {
         else {
             return Err(AgentDriverError::InvalidRuntime);
         };
-        let package = package.package();
         let new_runtime_pvm = package.pvm.clone();
         let output = execute_runtime(
             &self.runtime_pvm,
             self.management_gas,
             RuntimeCall {
                 state: self.image.runtime_state.clone(),
-                request,
+                request: LifecycleRequest::Authorized {
+                    admission,
+                    request: Box::new(request),
+                },
             },
         )?;
-        let reply = output.result.map_err(AgentDriverError::Lifecycle)?;
+        let reply = match output.result {
+            Ok(reply) => reply,
+            Err(error) => {
+                if output.state != self.image.runtime_state {
+                    validate_state_size(&output.state)?;
+                    self.commit_runtime_state(output.state)?;
+                    self.reconcile_catalog_after_commit();
+                }
+                return Err(AgentDriverError::Lifecycle(error));
+            }
+        };
         let LifecycleReply::RuntimeUpgraded(identity) = &reply else {
             return Err(AgentDriverError::InvalidRuntime);
         };
@@ -955,14 +2100,31 @@ impl<S: AgentImageStore> AgentDriver<S> {
             return Err(AgentDriverError::InvalidRuntime);
         }
 
-        let package_bytes = package.encode();
-        self.store.put_package(&package_reference, &package_bytes)?;
-        self.store.put_program(to_program, &new_runtime_pvm)?;
+        if self.image.config == target_config && output.state == self.image.runtime_state {
+            // Exact response-loss recovery of an already committed upgrade.
+            // The current image and mandatory catalog closure already name
+            // these bytes, so no second revision is created.
+            return Ok(identity.clone());
+        }
+        if output.state == self.image.runtime_state {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
 
-        let mut config = self.image.config.clone();
-        config.identity = identity.clone();
-        config.runtime_package = package_reference;
-        config.capabilities = capabilities;
+        let package_bytes = package.encode();
+        let created_package = self.store.put_package(&package_reference, &package_bytes)?;
+        if let Err(error) = self.store.put_program(to_program, &new_runtime_pvm) {
+            if created_package {
+                let _ = self.store.remove_package(&package_reference);
+            }
+            return Err(error.into());
+        }
+
+        if target_config.identity != *identity
+            || target_config.runtime_package != package_reference
+            || target_config.capabilities != capabilities
+        {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
         let next = AgentImage {
             revision: self
                 .image
@@ -970,12 +2132,13 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 .checked_add(1)
                 .ok_or(AgentDriverError::InvalidRuntime)?,
             runtime_program: to_program,
-            config,
+            config: target_config,
             runtime_state: output.state,
         };
         self.store.commit(Some(self.image.revision), &next)?;
         self.runtime_pvm = new_runtime_pvm;
         self.image = next;
+        self.reconcile_catalog_after_commit();
         Ok(identity.clone())
     }
 
@@ -983,8 +2146,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
         self.store
     }
 
-    fn validate_loaded_state(&self) -> Result<(), AgentDriverError> {
+    fn catalog_references(&self) -> Result<AgentCatalogReferences, AgentDriverError> {
         validate_state_size(&self.image.runtime_state)?;
+        let mut actors = Vec::new();
         let mut after = None;
         loop {
             let output = execute_runtime(
@@ -1005,16 +2169,58 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 return Err(AgentDriverError::InvalidRuntime);
             }
             for actor in &page.entries {
-                self.store
-                    .load_program(actor.program)?
-                    .ok_or(AgentDriverError::ProgramUnavailable(actor.program))?;
+                validate_loaded_actor(&self.store, actor)?;
             }
+            actors.extend(page.entries);
             let Some(next) = page.next else {
                 break;
             };
             after = Some(next);
         }
+        Ok(AgentCatalogReferences {
+            runtime_package: self.image.config.runtime_package.clone(),
+            runtime_program: self.image.runtime_program,
+            actors,
+        })
+    }
+}
+
+fn validate_loaded_actor<S: AgentImageStore>(
+    store: &S,
+    actor: &ActorEntry,
+) -> Result<(), AgentDriverError> {
+    store
+        .load_program(actor.program)?
+        .ok_or(AgentDriverError::ProgramUnavailable(actor.program))?;
+    let schema_blob = store
+        .load_actor_schema(actor.deployment)?
+        .ok_or(AgentDriverError::SchemaUnavailable(actor.deployment))?;
+    let schema = super::schema::decode(&schema_blob.bytes)
+        .ok_or(AgentDriverError::SchemaMismatch(actor.deployment))?;
+    let policy_blob = store
+        .load_actor_policies(actor.deployment)?
+        .ok_or(AgentDriverError::PolicyUnavailable(actor.deployment))?;
+    if schema_blob.reference != actor.agent_schema
+        || !actor.agent_schema.matches(&schema_blob.bytes)
+        || schema.state_layout_hash() != actor.state_layout
+        || schema.lanes() != actor.lanes
+    {
+        return Err(AgentDriverError::SchemaMismatch(actor.deployment));
+    }
+    if policy_blob.reference != actor.role_policies
+        || !actor.role_policies.matches(&policy_blob.bytes)
+        || crate::service::PackageRolePolicies::decode(&policy_blob.bytes).is_err()
+    {
+        return Err(AgentDriverError::PolicyMismatch(actor.deployment));
+    }
+    Ok(())
+}
+
+fn validate_process_local_profile(profile: AgentProfile) -> Result<(), AgentDriverError> {
+    if profile == AgentProfile::Local {
         Ok(())
+    } else {
+        Err(AgentDriverError::UnsupportedProfile(profile))
     }
 }
 
@@ -1025,6 +2231,30 @@ fn runtime_state_size(state: &RuntimeState) -> usize {
         .saturating_add(state.linear.len())
         .saturating_add(state.merge.len())
         .saturating_add(state.local.len())
+}
+
+fn encode_valid_image(image: &AgentImage) -> Result<Vec<u8>, AgentStoreError> {
+    if image.revision == 0
+        || image.runtime_program == ProgramId::ZERO
+        || image.config.replicas.len() > MAX_AGENT_IMAGE_REPLICAS
+        || image.config.validate().is_err()
+        || image.config.identity.runtime_program != image.runtime_program
+        || image.runtime_state.is_empty()
+        || image
+            .runtime_state
+            .encoded_len()
+            .is_none_or(|bytes| bytes > MAX_RUNTIME_STATE_BYTES)
+    {
+        return Err(AgentStoreError::Corrupt);
+    }
+    if image.config.encode().len() > MAX_AGENT_CONFIG_BYTES {
+        return Err(AgentStoreError::Corrupt);
+    }
+    let bytes = image.encode();
+    if bytes.len() > MAX_AGENT_IMAGE_BYTES || AgentImage::decode(&bytes).is_err() {
+        return Err(AgentStoreError::Corrupt);
+    }
+    Ok(bytes)
 }
 
 fn validate_state_size(state: &RuntimeState) -> Result<(), AgentDriverError> {
@@ -1090,6 +2320,248 @@ fn execute_runtime_wire<T: ServiceWire>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct CatalogFixture {
+        entry: ActorEntry,
+        package_bytes: Vec<u8>,
+        program_bytes: Vec<u8>,
+        schema_bytes: Vec<u8>,
+        policy_bytes: Vec<u8>,
+    }
+
+    impl CatalogFixture {
+        fn new(seed: u8, actor: ActorId) -> Self {
+            let (schema_bytes, schema_len) =
+                super::super::schema::encode::<512>(&super::super::schema::SchemaMeta {
+                    uses_storage: false,
+                    fields: &[super::super::schema::FieldMeta {
+                        name: "value",
+                        codec: "u64",
+                        persistence: super::super::FieldPersistence::State(
+                            super::super::StateLane::Linear,
+                        ),
+                    }],
+                    methods: &[super::super::schema::MethodMeta {
+                        name: "increment",
+                        mode: super::super::MethodMode::Linear,
+                        explicit: true,
+                    }],
+                });
+            let schema_bytes = schema_bytes[..schema_len].to_vec();
+            let schema = super::super::schema::decode(&schema_bytes).unwrap();
+            let policy_bytes = crate::service::PackageRolePolicies {
+                methods: Vec::new(),
+                task_dependencies: Vec::new(),
+            }
+            .encode();
+            let package_bytes = vec![b'V', b'O', b'S', seed];
+            let program_bytes = vec![seed; 16];
+            let deployment = DeploymentId([seed; 32]);
+            Self {
+                entry: ActorEntry {
+                    actor,
+                    name: format!("actor-{seed}"),
+                    parent: None,
+                    deployment,
+                    program: ProgramId::of_pvm(&program_bytes),
+                    package: BlobRef::of_bytes(&package_bytes),
+                    agent_schema: BlobRef::of_bytes(&schema_bytes),
+                    role_policies: BlobRef::of_bytes(&policy_bytes),
+                    state_layout: schema.state_layout_hash(),
+                    lanes: schema.lanes(),
+                    suspended: false,
+                },
+                package_bytes,
+                program_bytes,
+                schema_bytes,
+                policy_bytes,
+            }
+        }
+
+        fn put<S: AgentImageStore>(&self, store: &mut S) {
+            store
+                .put_package(&self.entry.package, &self.package_bytes)
+                .unwrap();
+            store
+                .put_program(self.entry.program, &self.program_bytes)
+                .unwrap();
+            store
+                .put_actor_schema(
+                    self.entry.deployment,
+                    &self.entry.agent_schema,
+                    &self.schema_bytes,
+                )
+                .unwrap();
+            store
+                .put_actor_policies(
+                    self.entry.deployment,
+                    &self.entry.role_policies,
+                    &self.policy_bytes,
+                )
+                .unwrap();
+        }
+    }
+
+    fn catalog_references(actors: Vec<ActorEntry>) -> AgentCatalogReferences {
+        AgentCatalogReferences {
+            runtime_package: BlobRef::of_bytes(b"host-supplied-runtime-package"),
+            runtime_program: ProgramId::of_pvm(b"host-supplied-runtime-program"),
+            actors,
+        }
+    }
+
+    fn put_runtime_catalog<S: AgentImageStore>(store: &mut S) {
+        let package = b"host-supplied-runtime-package";
+        let program = b"host-supplied-runtime-program";
+        store
+            .put_package(&BlobRef::of_bytes(package), package)
+            .unwrap();
+        store
+            .put_program(ProgramId::of_pvm(program), program)
+            .unwrap();
+    }
+
+    #[test]
+    fn whole_image_driver_fails_closed_for_replicated_profiles() {
+        assert_eq!(
+            validate_process_local_profile(super::super::AgentProfile::Local),
+            Ok(())
+        );
+        for profile in [
+            super::super::AgentProfile::Shared,
+            super::super::AgentProfile::Private,
+        ] {
+            assert_eq!(
+                validate_process_local_profile(profile),
+                Err(AgentDriverError::UnsupportedProfile(profile))
+            );
+        }
+
+        let mut shared = invalid_config();
+        shared.identity.profile = super::super::AgentProfile::Shared;
+        shared.replicas = vec![super::super::AgentReplica {
+            node: crate::service::NodeId([11; 32]),
+            principal: crate::service::PrincipalId([12; 32]),
+            role: super::super::ReplicaRole::Voter,
+        }];
+        assert_eq!(shared.validate(), Ok(()));
+        assert_eq!(
+            validate_process_local_profile(shared.identity.profile),
+            Err(AgentDriverError::UnsupportedProfile(
+                super::super::AgentProfile::Shared
+            ))
+        );
+    }
+
+    #[test]
+    fn authority_admission_uses_the_provider_slot_for_expiry() {
+        struct TrustAt(u64);
+        impl AgentTrustProvider for TrustAt {
+            fn current_logical_slot(&self) -> Option<u64> {
+                Some(self.0)
+            }
+
+            fn verify_authority(&self, _: &AgentAuthorityBinding, _: &[u8], _: &[u8]) -> bool {
+                true
+            }
+
+            fn verify_invocation(&self, _: &AgentConfig, _: &[u8], _: &[u8]) -> bool {
+                false
+            }
+
+            fn verify_package(&self, _: &AgentConfig, _: &Package) -> bool {
+                false
+            }
+        }
+
+        let config = invalid_config();
+        let request = LifecycleRequest::Suspend(ActorId([0x42; 32]));
+        let receipt = AgentAuthorityReceipt {
+            claim: super::super::authority::AgentAuthorityClaim {
+                authority: config.authority.clone(),
+                space: config.identity.space,
+                agent: config.identity.agent,
+                principal: config.identity.owner,
+                credential: crate::service::CredentialId([0x43; 32]),
+                capability: CapabilityId::named(
+                    super::super::authority::CAPABILITY_ACTOR_LIFECYCLE,
+                ),
+                operation: request.commitment(),
+                sequence: 1,
+                valid_from: 10,
+                valid_until: 19,
+            },
+            signature: vec![1],
+        };
+        assert_eq!(
+            verify_authority_admission(
+                &TrustAt(20),
+                &receipt,
+                &config,
+                super::super::authority::CAPABILITY_ACTOR_LIFECYCLE,
+                &request,
+            ),
+            Err(AgentDriverError::Authority(AuthorityError::Expired))
+        );
+        let admitted = verify_authority_admission(
+            &TrustAt(19),
+            &receipt,
+            &config,
+            super::super::authority::CAPABILITY_ACTOR_LIFECYCLE,
+            &request,
+        )
+        .unwrap();
+        assert_eq!(admitted.observed_slot, 19);
+    }
+
+    #[test]
+    fn invocation_trust_receives_the_complete_target_agent_config() {
+        struct ConfigBoundTrust(AgentConfig);
+        impl AgentTrustProvider for ConfigBoundTrust {
+            fn current_logical_slot(&self) -> Option<u64> {
+                Some(1)
+            }
+
+            fn verify_authority(&self, _: &AgentAuthorityBinding, _: &[u8], _: &[u8]) -> bool {
+                false
+            }
+
+            fn verify_invocation(
+                &self,
+                agent: &AgentConfig,
+                message: &[u8],
+                evidence: &[u8],
+            ) -> bool {
+                agent == &self.0 && message == b"message" && evidence == b"evidence"
+            }
+
+            fn verify_package(&self, _: &AgentConfig, _: &Package) -> bool {
+                false
+            }
+        }
+
+        let expected = invalid_config();
+        let trust = ConfigBoundTrust(expected.clone());
+        assert!(
+            TrustInvocationVerifier {
+                trust: &trust,
+                agent: &expected,
+            }
+            .verify(b"message", b"evidence")
+        );
+        let mut other = expected.clone();
+        other.identity.space = crate::service::SpaceId([0x55; 32]);
+        assert!(
+            !TrustInvocationVerifier {
+                trust: &trust,
+                agent: &other,
+            }
+            .verify(b"message", b"evidence")
+        );
+    }
 
     #[test]
     fn image_wire_rejects_empty_runtime_state() {
@@ -1101,6 +2573,431 @@ mod tests {
         }
         .encode();
         assert!(AgentImage::decode(&bytes).is_err());
+    }
+
+    fn valid_image(revision: u64) -> AgentImage {
+        let mut config = invalid_config();
+        config.replicas = vec![super::super::AgentReplica {
+            node: crate::service::NodeId([0x21; 32]),
+            principal: config.identity.owner,
+            role: super::super::ReplicaRole::Voter,
+        }];
+        assert_eq!(config.validate(), Ok(()));
+        AgentImage {
+            revision,
+            runtime_program: config.identity.runtime_program,
+            config,
+            runtime_state: RuntimeState {
+                control: vec![1],
+                linear: vec![2],
+                merge: vec![3],
+                local: vec![4],
+            },
+        }
+    }
+
+    #[test]
+    fn image_wire_checks_lane_aggregate_before_accepting_it() {
+        let mut image = valid_image(1);
+        image.runtime_state.control = vec![1; MAX_RUNTIME_STATE_BYTES / 2];
+        image.runtime_state.linear = vec![2; MAX_RUNTIME_STATE_BYTES / 2 + 1];
+        assert_eq!(
+            AgentImage::decode(&image.encode()),
+            Err(DecodeError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn file_image_store_resumes_only_an_exact_regular_stage() {
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "vos-agent-image-resume-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("agent.image");
+        let mut store = FileAgentStore::new(&path);
+        let first = valid_image(1);
+        store.commit(None, &first).unwrap();
+
+        let second = valid_image(2);
+        std::fs::write(path.with_extension("next"), second.encode()).unwrap();
+        store.commit(Some(1), &second).unwrap();
+        assert_eq!(store.load().unwrap(), Some(second.clone()));
+
+        std::fs::write(path.with_extension("next"), valid_image(3).encode()).unwrap();
+        let fourth = valid_image(4);
+        store
+            .commit(Some(2), &fourth)
+            .expect("a different canonical crash stage is replaceable");
+        assert_eq!(store.load().unwrap(), Some(fourth));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_staging_never_follows_preseeded_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "vos-agent-image-symlink-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("agent.image");
+        let external = directory.join("external");
+        std::fs::write(&external, b"must remain unchanged").unwrap();
+        let mut store = FileAgentStore::new(&path);
+        let first = valid_image(1);
+        store.commit(None, &first).unwrap();
+
+        let next = path.with_extension("next");
+        symlink(&external, &next).unwrap();
+        assert_eq!(
+            store.commit(Some(1), &valid_image(2)),
+            Err(AgentStoreError::Corrupt)
+        );
+        assert_eq!(std::fs::read(&external).unwrap(), b"must remain unchanged");
+        std::fs::remove_file(&next).unwrap();
+        assert_eq!(store.load().unwrap(), Some(first));
+
+        let package = b"signed package";
+        let reference = BlobRef::of_bytes(package);
+        let artifact = store.catalog_path("packages", &reference.hash.0, "vos");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        symlink(&external, artifact.with_extension("next")).unwrap();
+        assert_eq!(
+            store.put_package(&reference, package),
+            Err(AgentStoreError::Corrupt)
+        );
+        assert_eq!(std::fs::read(&external).unwrap(), b"must remain unchanged");
+
+        std::fs::remove_file(artifact.with_extension("next")).unwrap();
+        symlink(&external, &artifact).unwrap();
+        assert_eq!(
+            store.put_package(&reference, package),
+            Err(AgentStoreError::Corrupt)
+        );
+        assert_eq!(std::fs::read(&external).unwrap(), b"must remain unchanged");
+
+        std::fs::remove_file(&path).unwrap();
+        symlink(&external, &path).unwrap();
+        assert_eq!(store.load(), Err(AgentStoreError::Corrupt));
+        assert_eq!(std::fs::read(&external).unwrap(), b"must remain unchanged");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_image_store_rejects_nonregular_and_oversized_images() {
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "vos-agent-image-shape-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let special = directory.join("special.image");
+        std::fs::create_dir(&special).unwrap();
+        assert_eq!(
+            FileAgentStore::new(&special).load(),
+            Err(AgentStoreError::Corrupt)
+        );
+
+        let oversized = directory.join("oversized.image");
+        let file = File::create(&oversized).unwrap();
+        file.set_len((MAX_AGENT_IMAGE_BYTES + 1) as u64).unwrap();
+        assert_eq!(
+            FileAgentStore::new(&oversized).load(),
+            Err(AgentStoreError::Corrupt)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn loaded_actor_requires_exact_schema_sidecar_provenance() {
+        let (schema_bytes, schema_len) =
+            super::super::schema::encode::<512>(&super::super::schema::SchemaMeta {
+                uses_storage: false,
+                fields: &[super::super::schema::FieldMeta {
+                    name: "value",
+                    codec: "u64",
+                    persistence: super::super::FieldPersistence::State(
+                        super::super::StateLane::Linear,
+                    ),
+                }],
+                methods: &[super::super::schema::MethodMeta {
+                    name: "increment",
+                    mode: super::super::MethodMode::Linear,
+                    explicit: true,
+                }],
+            });
+        let schema_bytes = &schema_bytes[..schema_len];
+        let schema = super::super::schema::decode(schema_bytes).unwrap();
+        let schema_reference = BlobRef::of_bytes(schema_bytes);
+        let policy_bytes = crate::service::PackageRolePolicies {
+            methods: Vec::new(),
+            task_dependencies: Vec::new(),
+        }
+        .encode();
+        let policy_reference = BlobRef::of_bytes(&policy_bytes);
+        let package_reference = BlobRef::of_bytes(b"signed-package");
+        let deployment = DeploymentId([0x31; 32]);
+        let program_bytes = b"actor-pvm";
+        let program = ProgramId::of_pvm(program_bytes);
+        let actor = ActorEntry {
+            actor: ActorId([0x32; 32]),
+            name: "counter".into(),
+            parent: None,
+            deployment,
+            program,
+            package: package_reference,
+            agent_schema: schema_reference.clone(),
+            role_policies: policy_reference.clone(),
+            state_layout: schema.state_layout_hash(),
+            lanes: schema.lanes(),
+            suspended: false,
+        };
+        let mut store = MemoryAgentStore::default();
+        store.put_program(program, program_bytes).unwrap();
+        store
+            .put_actor_schema(deployment, &schema_reference, schema_bytes)
+            .unwrap();
+        store
+            .put_actor_policies(deployment, &policy_reference, &policy_bytes)
+            .unwrap();
+        assert_eq!(validate_loaded_actor(&store, &actor), Ok(()));
+
+        let mut missing_policy = store.clone();
+        missing_policy.policies.remove(&deployment);
+        assert_eq!(
+            validate_loaded_actor(&missing_policy, &actor),
+            Err(AgentDriverError::PolicyUnavailable(deployment))
+        );
+
+        let corrupt_policy = b"not-canonical-role-policies".to_vec();
+        let corrupt_reference = BlobRef::of_bytes(&corrupt_policy);
+        let mut corrupt_store = store.clone();
+        corrupt_store.policies.insert(
+            deployment,
+            RuntimeBlob {
+                reference: corrupt_reference.clone(),
+                bytes: corrupt_policy,
+            },
+        );
+        let mut corrupt_actor = actor.clone();
+        corrupt_actor.role_policies = corrupt_reference;
+        assert_eq!(
+            validate_loaded_actor(&corrupt_store, &corrupt_actor),
+            Err(AgentDriverError::PolicyMismatch(deployment))
+        );
+
+        let mut wrong_reference = actor.clone();
+        wrong_reference.agent_schema.hash = Hash([0x33; 32]);
+        assert_eq!(
+            validate_loaded_actor(&store, &wrong_reference),
+            Err(AgentDriverError::SchemaMismatch(deployment))
+        );
+
+        let mut wrong_layout = actor;
+        wrong_layout.state_layout = Hash([0x34; 32]);
+        assert_eq!(
+            validate_loaded_actor(&store, &wrong_layout),
+            Err(AgentDriverError::SchemaMismatch(deployment))
+        );
+    }
+
+    #[test]
+    fn memory_catalog_reconciles_failed_staging_upgrade_and_shared_removal() {
+        let old_a = CatalogFixture::new(0x41, ActorId([0x51; 32]));
+        let mut old_b = CatalogFixture::new(0x41, ActorId([0x52; 32]));
+        old_b.entry.name = "second-shared-actor".into();
+        let new_a = CatalogFixture::new(0x42, old_a.entry.actor);
+        let mut new_b = CatalogFixture::new(0x42, old_b.entry.actor);
+        new_b.entry.name = old_b.entry.name.clone();
+        let failed_stage = CatalogFixture::new(0x43, ActorId([0x53; 32]));
+        let mut store = MemoryAgentStore::default();
+        put_runtime_catalog(&mut store);
+
+        old_a.put(&mut store);
+        failed_stage.put(&mut store);
+        store
+            .reconcile_catalog(&catalog_references(vec![
+                old_a.entry.clone(),
+                old_b.entry.clone(),
+            ]))
+            .unwrap();
+        assert_eq!(store.packages.len(), 2, "failed package staging is pruned");
+        assert_eq!(store.programs.len(), 2, "failed program staging is pruned");
+        assert_eq!(store.schemas.len(), 1, "failed schema staging is pruned");
+        assert_eq!(store.policies.len(), 1, "failed policy staging is pruned");
+
+        new_a.put(&mut store);
+        store
+            .reconcile_catalog(&catalog_references(vec![
+                new_a.entry.clone(),
+                old_b.entry.clone(),
+            ]))
+            .unwrap();
+        assert_eq!(store.packages.len(), 3);
+        assert_eq!(store.programs.len(), 3);
+
+        store
+            .reconcile_catalog(&catalog_references(vec![
+                new_a.entry.clone(),
+                new_b.entry.clone(),
+            ]))
+            .unwrap();
+        assert_eq!(store.packages.len(), 2, "last old deployment was upgraded");
+        assert_eq!(store.programs.len(), 2);
+        assert_eq!(store.schemas.len(), 1);
+        assert_eq!(store.policies.len(), 1);
+
+        store
+            .reconcile_catalog(&catalog_references(vec![new_a.entry.clone()]))
+            .unwrap();
+        assert_eq!(
+            store.packages.len(),
+            2,
+            "one shared actor still owns artifacts"
+        );
+        store
+            .reconcile_catalog(&catalog_references(Vec::new()))
+            .unwrap();
+        assert_eq!(store.packages.len(), 1, "runtime package remains owned");
+        assert_eq!(store.programs.len(), 1, "runtime program remains owned");
+        assert!(store.schemas.is_empty());
+        assert!(store.policies.is_empty());
+    }
+
+    #[test]
+    fn memory_catalog_validates_live_closure_before_pruning() {
+        let live = CatalogFixture::new(0x61, ActorId([0x71; 32]));
+        let orphan = CatalogFixture::new(0x62, ActorId([0x72; 32]));
+        let mut store = MemoryAgentStore::default();
+        put_runtime_catalog(&mut store);
+        live.put(&mut store);
+        orphan.put(&mut store);
+        store
+            .packages
+            .insert(live.entry.package.hash, b"corrupt".to_vec());
+
+        assert_eq!(
+            store.reconcile_catalog(&catalog_references(vec![live.entry.clone()])),
+            Err(AgentStoreError::Corrupt)
+        );
+        assert!(
+            store.packages.contains_key(&orphan.entry.package.hash),
+            "validation failure must not start pruning unrelated recovery data"
+        );
+        assert!(store.programs.contains_key(&orphan.entry.program));
+        assert!(store.schemas.contains_key(&orphan.entry.deployment));
+        assert!(store.policies.contains_key(&orphan.entry.deployment));
+    }
+
+    #[test]
+    fn physical_file_catalog_reconciles_crash_staging_and_shared_ownership() {
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "vos-agent-catalog-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let image = directory.join("agent.image");
+        let mut store = FileAgentStore::new(&image);
+        put_runtime_catalog(&mut store);
+        let shared_a = CatalogFixture::new(0x81, ActorId([0x91; 32]));
+        let mut shared_b = CatalogFixture::new(0x81, ActorId([0x92; 32]));
+        shared_b.entry.name = "second-shared-actor".into();
+        let orphan = CatalogFixture::new(0x82, ActorId([0x93; 32]));
+        shared_a.put(&mut store);
+        orphan.put(&mut store);
+
+        let interrupted = store
+            .catalog_path("packages", &[0xa1; 32], "vos")
+            .with_extension("next");
+        std::fs::create_dir_all(interrupted.parent().unwrap()).unwrap();
+        std::fs::write(&interrupted, b"partial failed stage").unwrap();
+
+        store
+            .reconcile_catalog(&catalog_references(vec![
+                shared_a.entry.clone(),
+                shared_b.entry.clone(),
+            ]))
+            .unwrap();
+        assert!(!interrupted.exists(), "crash-left staging file is retired");
+        assert!(
+            store
+                .load_program(shared_a.entry.program)
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.load_program(orphan.entry.program).unwrap().is_none());
+        assert!(
+            store
+                .load_actor_schema(orphan.entry.deployment)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_actor_policies(orphan.entry.deployment)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .read_regular_artifact(&store.catalog_path(
+                    "packages",
+                    &orphan.entry.package.hash.0,
+                    "vos"
+                ))
+                .unwrap()
+                .is_none()
+        );
+
+        store
+            .reconcile_catalog(&catalog_references(vec![shared_a.entry.clone()]))
+            .unwrap();
+        assert!(
+            store
+                .load_program(shared_a.entry.program)
+                .unwrap()
+                .is_some()
+        );
+        store
+            .reconcile_catalog(&catalog_references(Vec::new()))
+            .unwrap();
+        assert!(
+            store
+                .load_program(shared_a.entry.program)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_actor_schema(shared_a.entry.deployment)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_actor_policies(shared_a.entry.deployment)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .read_regular_artifact(&store.catalog_path(
+                    "packages",
+                    &shared_a.entry.package.hash.0,
+                    "vos"
+                ))
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn invalid_config() -> AgentConfig {

@@ -16,8 +16,76 @@ use super::{
     run::RunResult,
     value::{FromDynamic, TAG_DYNAMIC},
 };
-#[cfg(feature = "pvm")]
 use alloc::vec::Vec;
+
+/// Canonical field sequence for one agent state lane. Field names and types
+/// are authenticated by the signed agent schema, so the durable lane stores
+/// only declaration-ordered value archives.
+#[doc(hidden)]
+pub struct AgentLaneWriter {
+    bytes: Vec<u8>,
+}
+
+impl AgentLaneWriter {
+    pub fn new(fields: u16) -> Self {
+        Self {
+            bytes: fields.to_le_bytes().to_vec(),
+        }
+    }
+
+    pub fn push<T: super::codec::Encode>(&mut self, value: &T) {
+        let value = value.encode();
+        let len = u32::try_from(value.len()).expect("agent field exceeds the lane wire limit");
+        self.bytes.extend_from_slice(&len.to_le_bytes());
+        self.bytes.extend_from_slice(&value);
+    }
+
+    pub fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Validating reader paired with [`AgentLaneWriter`].
+#[doc(hidden)]
+pub struct AgentLaneReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    remaining: u16,
+}
+
+impl<'a> AgentLaneReader<'a> {
+    pub fn new(bytes: &'a [u8], expected_fields: u16) -> Option<Self> {
+        let count = u16::from_le_bytes(bytes.get(..2)?.try_into().ok()?);
+        (count == expected_fields).then_some(Self {
+            bytes,
+            position: 2,
+            remaining: count,
+        })
+    }
+
+    pub fn read<T: super::codec::Decode>(&mut self) -> Option<T> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let len = u32::from_le_bytes(
+            self.bytes
+                .get(self.position..self.position + 4)?
+                .try_into()
+                .ok()?,
+        ) as usize;
+        self.position += 4;
+        let value = self
+            .bytes
+            .get(self.position..self.position.checked_add(len)?)?;
+        self.position += len;
+        self.remaining -= 1;
+        T::try_decode(value)
+    }
+
+    pub fn finish(self) -> bool {
+        self.remaining == 0 && self.position == self.bytes.len()
+    }
+}
 
 /// Buffer size for guest hostcall data exchange — the fixed buffer the actor
 /// dispatch loop reads each queued FETCH item into. A host that enqueues an

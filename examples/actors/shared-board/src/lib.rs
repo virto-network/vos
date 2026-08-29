@@ -2,19 +2,59 @@
 
 use vos::prelude::*;
 
-#[actor(crdt)]
+/// Board-local permissions. Viewers may read and contribute mergeable work;
+/// moderators additionally control the linear title.
+#[derive(
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
+#[rkyv(crate = vos::rkyv)]
+#[repr(u8)]
+pub enum BoardRole {
+    Viewer = 0,
+    Moderator = 1,
+}
+
+impl vos::RoleByte for BoardRole {
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Viewer),
+            1 => Some(Self::Moderator),
+            _ => None,
+        }
+    }
+
+    fn as_byte(self) -> u8 {
+        self as u8
+    }
+}
+
+const BOARD_SPACE_ROLE_MAP: vos::SpaceRoleMap<BoardRole> = vos::SpaceRoleMap {
+    admin: Some(BoardRole::Moderator),
+    developer: Some(BoardRole::Moderator),
+    member: Some(BoardRole::Viewer),
+    guest: Some(BoardRole::Viewer),
+};
+
+#[actor(
+    role = BoardRole,
+    default_role = BoardRole::Viewer,
+    space_role_map = BOARD_SPACE_ROLE_MAP
+)]
 pub struct Board {
-    title: crdt::Value<String>,
+    title: String,
     tasks: crdt::Map<u64, String>,
     order: crdt::List<u64>,
     notes: crdt::Text,
     edits: crdt::Counter,
-
-    #[crdt(const)]
-    space: [u8; 32],
-
-    #[crdt(skip)]
-    cached_summary: Option<String>,
 }
 
 fn bounded_note_index(index: u32, len: usize) -> usize {
@@ -25,25 +65,26 @@ fn bounded_note_index(index: u32, len: usize) -> usize {
 impl Board {
     fn new() -> Self {
         Self {
-            title: crdt::Value::default(),
+            title: String::new(),
             tasks: crdt::Map::default(),
             order: crdt::List::default(),
             notes: crdt::Text::default(),
             edits: crdt::Counter::default(),
-            space: [0; 32],
-            cached_summary: None,
         }
     }
 
-    #[msg]
+    #[msg(linear, role = BoardRole::Moderator)]
     fn set_title(&mut self, title: String) {
-        self.title
-            .set(title)
-            .expect("one stable operation per slice");
+        self.title = title;
     }
 
     #[msg]
-    fn add_task(&mut self, id: u64, text: String) {
+    fn title(&self) -> String {
+        self.title.clone()
+    }
+
+    #[msg(merge)]
+    fn add_task(&mut self, id: u64, text: String) -> String {
         self.tasks
             .insert(id, text)
             .expect("one stable operation per slice");
@@ -51,9 +92,13 @@ impl Board {
         self.edits
             .increment(1)
             .expect("one stable operation per slice");
+        // Merge handlers see the pinned Linear snapshot selected by the
+        // agent, so causal work can be interpreted against ordered policy or
+        // configuration without moving that configuration into the CRDT.
+        self.title.clone()
     }
 
-    #[msg]
+    #[msg(merge)]
     fn insert_note(&mut self, index: u32, text: String) {
         let index = bounded_note_index(index, self.notes.len());
         self.notes

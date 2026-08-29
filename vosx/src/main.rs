@@ -9,7 +9,7 @@
 //! `space up <recipe.toml>` on a space's first boot — or via
 //! `space apply` against an already-running space.
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args as ClapArgs, CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
 mod blob_store;
@@ -70,36 +70,19 @@ enum Command {
     /// Create a minimal service actor project.
     New {
         path: PathBuf,
-        /// Scaffold an explicitly convergent actor using VOS CRDT fields.
+        /// Scaffold an explicitly convergent service actor.
         #[arg(long)]
         crdt: bool,
     },
-    /// Build one canonical actor PVM and signed `.vos` package.
+    /// Build one canonical service actor PVM and signed `.vos` package.
     Build {
-        /// Actor project directory, ELF (transpiled once), or canonical `.pvm`.
-        program: PathBuf,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long, default_value = "dist")]
-        out_dir: PathBuf,
-        #[arg(long)]
-        interfaces: Option<PathBuf>,
-        #[arg(long)]
-        role_policies: Option<PathBuf>,
-        #[arg(long)]
-        schemas: Option<PathBuf>,
-        #[arg(long)]
-        source_map: Option<PathBuf>,
-        /// Canonical Task project directory or ELF dependency. May be
-        /// repeated; each dependency must export `__VOS_WITNESS`.
-        #[arg(long = "task")]
-        tasks: Vec<PathBuf>,
-        /// Retain the input ELF as non-authoritative diagnostics.
-        #[arg(long)]
-        include_elf: bool,
-        /// For raw PVM input only; ELF builds derive this from `#[actor(crdt)]`.
-        #[arg(long)]
-        crdt: bool,
+        #[command(flatten)]
+        options: BuildOptions,
+    },
+    /// Build and scaffold packages for the standard agent runtime.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
     },
     /// Transpile and validate the protocol-pinned generic service PVM.
     ServicePvm {
@@ -154,6 +137,81 @@ enum Command {
         /// of plain text. Pipe into `jq` for scripting.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(ClapArgs)]
+struct BuildOptions {
+    /// Actor project directory or ELF.
+    program: PathBuf,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long, default_value = "dist")]
+    out_dir: PathBuf,
+    #[arg(long)]
+    interfaces: Option<PathBuf>,
+    #[arg(long)]
+    role_policies: Option<PathBuf>,
+    /// Exact `.vos_meta` bytes. Required with an already-linked PVM in
+    /// `agent build`.
+    #[arg(long)]
+    schemas: Option<PathBuf>,
+    #[arg(long)]
+    source_map: Option<PathBuf>,
+    /// Canonical Task project directory or ELF dependency. May be repeated;
+    /// each dependency must export `__VOS_WITNESS`.
+    #[arg(long = "task")]
+    tasks: Vec<PathBuf>,
+    /// Retain the input ELF as non-authoritative diagnostics.
+    #[arg(long)]
+    include_elf: bool,
+    /// Require the target's convergent-only actor form.
+    #[arg(long)]
+    crdt: bool,
+}
+
+impl BuildOptions {
+    fn into_build_args(
+        self,
+        target: commands::build::BuildTarget,
+        agent_schema: Option<PathBuf>,
+    ) -> commands::build::Args {
+        commands::build::Args {
+            target,
+            program: self.program,
+            name: self.name,
+            out_dir: self.out_dir,
+            interfaces: self.interfaces,
+            role_policies: self.role_policies,
+            schemas: self.schemas,
+            agent_schema,
+            source_map: self.source_map,
+            tasks: self.tasks,
+            include_elf: self.include_elf,
+            crdt: self.crdt,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// Create a minimal actor project for the standard agent runtime.
+    New {
+        path: PathBuf,
+        /// Scaffold an actor whose state uses only the merge lane.
+        #[arg(long)]
+        crdt: bool,
+    },
+    /// Build one standard-agent actor PVM and signed `VOSK` package. PROGRAM
+    /// may be a project, an ELF, or a canonical PVM accompanied by both
+    /// `--schemas` and `--agent-schema`.
+    Build {
+        #[command(flatten)]
+        options: BuildOptions,
+        /// Exact `.vos_agent` bytes when PROGRAM is an already-linked PVM.
+        /// Pass the matching `.vos_meta` bytes with `--schemas` as well.
+        #[arg(long)]
+        agent_schema: Option<PathBuf>,
     },
 }
 
@@ -240,37 +298,42 @@ fn main() {
 
     match cli.command {
         Some(Command::New { path, crdt }) => {
-            if let Err(error) = commands::new_project::run(path, crdt) {
-                report_error(error);
-            }
-        }
-        Some(Command::Build {
-            program,
-            name,
-            out_dir,
-            interfaces,
-            role_policies,
-            schemas,
-            source_map,
-            tasks,
-            include_elf,
-            crdt,
-        }) => {
-            if let Err(error) = commands::build::run(commands::build::Args {
-                program,
-                name,
-                out_dir,
-                interfaces,
-                role_policies,
-                schemas,
-                source_map,
-                tasks,
-                include_elf,
+            if let Err(error) = commands::new_project::run(
+                path,
                 crdt,
-            }) {
+                commands::new_project::ProjectTarget::Service,
+            ) {
                 report_error(error);
             }
         }
+        Some(Command::Build { options }) => {
+            if let Err(error) = commands::build::run(
+                options.into_build_args(commands::build::BuildTarget::Service, None),
+            ) {
+                report_error(error);
+            }
+        }
+        Some(Command::Agent { command }) => match command {
+            AgentCommand::New { path, crdt } => {
+                if let Err(error) = commands::new_project::run(
+                    path,
+                    crdt,
+                    commands::new_project::ProjectTarget::Agent,
+                ) {
+                    report_error(error);
+                }
+            }
+            AgentCommand::Build {
+                options,
+                agent_schema,
+            } => {
+                if let Err(error) = commands::build::run(
+                    options.into_build_args(commands::build::BuildTarget::Agent, agent_schema),
+                ) {
+                    report_error(error);
+                }
+            }
+        },
         Some(Command::ServicePvm { elf, out }) => {
             if let Err(error) = commands::service_pvm::run(&elf, out) {
                 report_error(error);
@@ -376,6 +439,7 @@ fn should_dynamic_dispatch(argv: &[String]) -> bool {
     const BUILTIN_VERBS: &[&str] = &[
         "new",
         "build",
+        "agent",
         "service-pvm",
         "agent-runtime-pvm",
         "release",
@@ -493,7 +557,9 @@ mod routing_tests {
         for v in [
             "new",
             "build",
+            "agent",
             "service-pvm",
+            "agent-runtime-pvm",
             "release",
             "space",
             "zk",

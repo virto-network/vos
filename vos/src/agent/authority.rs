@@ -3,7 +3,9 @@
 //! Package signatures authenticate software producers. Authority receipts
 //! independently authenticate who may mutate one agent. A receipt is scoped
 //! to one exact lifecycle request and therefore cannot be replayed for a
-//! different actor, package, profile, or runtime.
+//! different actor, package, profile, or runtime. Receipt sequences share one
+//! monotone namespace across the complete authority binding; rotating the
+//! caller credential does not reset replay protection.
 
 use alloc::vec::Vec;
 
@@ -45,6 +47,16 @@ impl AgentAuthorityBinding {
             && self.public_key.len() <= MAX_AUTHORITY_PUBLIC_KEY_BYTES
             && ProducerId::of_public_key(&self.public_key) == self.producer
     }
+
+    /// Stable identity of the complete authority deployment selected by an
+    /// agent. Lifecycle replay state is keyed by this commitment rather than
+    /// by a short actor or producer identifier.
+    pub fn commitment(&self) -> Hash {
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder(&mut bytes);
+        encode_binding(&mut encoder, self);
+        Hash::digest(b"vos/agent/authority-binding", &[&bytes])
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +68,10 @@ pub struct AgentAuthorityClaim {
     pub credential: CredentialId,
     pub capability: CapabilityId,
     pub operation: Hash,
+    /// Strictly monotone sequence allocated across this complete authority
+    /// binding. It is not a per-credential nonce: changing credentials never
+    /// resets the sequence, so the agent can keep one bounded replay journal
+    /// without retaining every credential ever used.
     pub sequence: u64,
     pub valid_from: u64,
     pub valid_until: u64,
@@ -199,6 +215,12 @@ pub enum AuthorityError {
     InvalidSignature,
 }
 
+/// Bind a verified claim to one lifecycle operation at the node's current
+/// durable logical slot.
+///
+/// `current_slot` is a trusted host observation, not caller input. The
+/// operation must not be queued after this check without carrying that same
+/// admitted authority record into the runtime transition.
 pub fn authorize_lifecycle(
     receipt: &VerifiedAgentAuthorityReceipt,
     authority: &AgentAuthorityBinding,
@@ -206,6 +228,7 @@ pub fn authorize_lifecycle(
     agent: AgentId,
     capability: CapabilityId,
     request: &LifecycleRequest,
+    current_slot: u64,
 ) -> Result<(), AuthorityError> {
     let claim = receipt.claim();
     if claim.authority != *authority {
@@ -222,6 +245,12 @@ pub fn authorize_lifecycle(
     }
     if claim.operation != request.commitment() {
         return Err(AuthorityError::WrongOperation);
+    }
+    // Verification authenticates the signature, but a verified value may be
+    // retained by its caller. Recheck validity at the trusted admission slot
+    // immediately before the operation enters durable runtime state.
+    if current_slot < claim.valid_from || current_slot > claim.valid_until {
+        return Err(AuthorityError::Expired);
     }
     Ok(())
 }
@@ -307,6 +336,7 @@ mod tests {
                 AgentId([6; 32]),
                 CapabilityId::named("actor.lifecycle"),
                 &request,
+                15,
             ),
             Ok(())
         );
@@ -318,8 +348,22 @@ mod tests {
                 AgentId([6; 32]),
                 CapabilityId::named("actor.lifecycle"),
                 &LifecycleRequest::Resume(ActorId([9; 32])),
+                15,
             ),
             Err(AuthorityError::WrongOperation)
+        );
+
+        assert_eq!(
+            authorize_lifecycle(
+                &verified,
+                &binding(),
+                SpaceId([5; 32]),
+                AgentId([6; 32]),
+                CapabilityId::named("actor.lifecycle"),
+                &request,
+                21,
+            ),
+            Err(AuthorityError::Expired)
         );
     }
 }

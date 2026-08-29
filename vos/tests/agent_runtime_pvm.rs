@@ -1,19 +1,27 @@
-use vos::agent::authority::{
-    AgentAuthorityClaim, AgentAuthorityReceipt, AgentAuthorityVerifier,
-    VerifiedAgentAuthorityReceipt,
+use std::sync::Arc;
+
+use vos::Encode as _;
+use vos::agent::authority::{AgentAuthorityBinding, AgentAuthorityClaim, AgentAuthorityReceipt};
+use vos::agent::driver::{
+    AgentDriver, AgentDriverError, AgentImage, AgentImageStore, AgentTrustProvider,
+    MemoryAgentStore,
 };
-use vos::agent::driver::{AgentDriver, AgentImage, AgentImageStore, MemoryAgentStore};
-use vos::agent::execution::{ActorExecutionStatus, ActorInvocation};
+use vos::agent::execution::{
+    ActorExecutionError, ActorExecutionStatus, ActorInvocation, ActorInvocationAuth,
+    ActorInvocationVerificationError, MAX_EXECUTION_GAS,
+};
 use vos::agent::host::AgentHost;
+use vos::agent::package::{Package, PackageManifest, PackageSignatureVerifier};
 use vos::agent::wire::{RuntimeCall, RuntimeReturn, RuntimeState, decode_standard_runtime_state};
 use vos::agent::{
-    ActorEntry, ActorInitialState, AgentConfig, AgentIdentity, AgentProfile, AgentReplica,
-    InstallActor, LaneSet, LifecycleReply, LifecycleRequest, MethodMode, ReplicaRole,
-    RuntimeCapabilities, RuntimeRequirements, STANDARD_RUNTIME_PROGRAM_ID,
+    ActorEntry, AgentConfig, AgentIdentity, AgentProfile, AgentReplica, InstallActor, LaneSet,
+    LifecycleReply, LifecycleRequest, MethodMode, ReplicaRole, RuntimeCapabilities,
+    RuntimeRequirements, STANDARD_RUNTIME_PROGRAM_ID,
 };
 use vos::service::{
-    ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, Hash, InvocationId,
-    NodeId, PrincipalId, ProducerId, ProgramId, ServiceWire, SpaceId,
+    ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, DeploymentSignature, Hash,
+    InvocationId, MethodPolicy, NodeId, PackageRolePolicies, PrincipalId, ProducerId, ProgramId,
+    ServiceWire, SpaceId, artifact_hash, task_dependencies_hash,
 };
 use vos_pvm::ExitReason;
 use vos_pvm::refine_host::RefineContext;
@@ -21,16 +29,132 @@ use vos_pvm::refine_host::RefineContext;
 const AGENT_RUNTIME_PVM: &[u8] = include_bytes!("../../vosx/blobs/agent_runtime.pvm");
 const GAS: u64 = 1_000_000_000;
 
-struct AcceptAuthority;
+const TEST_INVOCATION_AUTHORITY_KEY: &[u8] = b"vos-agent-test-invocation-authority";
+const TEST_PACKAGE_KEY: &[u8] = b"vos-agent-test-package-key";
 
-impl AgentAuthorityVerifier for AcceptAuthority {
-    fn verify(&self, _: &vos::agent::authority::AgentAuthorityBinding, _: &[u8], _: &[u8]) -> bool {
+struct TestTrust;
+
+impl AgentTrustProvider for TestTrust {
+    fn current_logical_slot(&self) -> Option<u64> {
+        Some(1)
+    }
+
+    fn verify_authority(&self, _: &AgentAuthorityBinding, _: &[u8], _: &[u8]) -> bool {
         true
+    }
+
+    fn verify_invocation(
+        &self,
+        agent: &AgentConfig,
+        authorization_message: &[u8],
+        evidence: &[u8],
+    ) -> bool {
+        Hash::digest(
+            b"vos/agent/test-invocation-authorization",
+            &[
+                TEST_INVOCATION_AUTHORITY_KEY,
+                &agent.identity.space.0,
+                &agent.identity.agent.0,
+                &agent.authority.commitment().0,
+                authorization_message,
+            ],
+        )
+        .0 == evidence
+    }
+
+    fn verify_package(&self, agent: &AgentConfig, package: &Package) -> bool {
+        package.deployment_signature.public_key == TEST_PACKAGE_KEY
+            && package.deployment_signature.producer == ProducerId::of_public_key(TEST_PACKAGE_KEY)
+            && package.deployment_signature.signature == package_signature(package)
+            && agent.identity.space == SpaceId([2; 32])
     }
 }
 
-fn creation_receipt(config: &AgentConfig) -> VerifiedAgentAuthorityReceipt {
+fn trust() -> Arc<dyn AgentTrustProvider> {
+    Arc::new(TestTrust)
+}
+
+fn invocation_evidence(config: &AgentConfig, invocation: &ActorInvocation) -> Hash {
+    Hash::digest(
+        b"vos/agent/test-invocation-authorization",
+        &[
+            TEST_INVOCATION_AUTHORITY_KEY,
+            &config.identity.space.0,
+            &config.identity.agent.0,
+            &config.authority.commitment().0,
+            &invocation.authorization_message().0,
+        ],
+    )
+}
+
+fn package_signature(package: &Package) -> Vec<u8> {
+    Hash::digest(
+        b"vos/agent/test-package-signature",
+        &[TEST_PACKAGE_KEY, &package.signing_message()],
+    )
+    .0
+    .to_vec()
+}
+
+fn runtime_package() -> Package {
+    let interfaces = b"agent-runtime-lifecycle".to_vec();
+    let schemas = b"agent-runtime-state".to_vec();
+    let mut package = Package {
+        manifest: PackageManifest {
+            name: "standard-agent-runtime".into(),
+            platform: vos::service::PLATFORM_ID,
+            execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+            kind: vos::agent::PackageKind::AgentRuntime {
+                abi: vos::agent::RUNTIME_ABI_ID,
+                capabilities: RuntimeCapabilities::standard(),
+            },
+            program: STANDARD_RUNTIME_PROGRAM_ID,
+            interfaces_hash: artifact_hash(b"interfaces", &interfaces),
+            role_policies_hash: artifact_hash(b"role-policies", &[]),
+            schemas_hash: artifact_hash(b"schemas", &schemas),
+            agent_schema_hash: artifact_hash(b"agent-schema", &[]),
+            dependencies_hash: task_dependencies_hash(&[]),
+        },
+        pvm: AGENT_RUNTIME_PVM.to_vec(),
+        generated_interfaces: interfaces,
+        role_policies: Vec::new(),
+        schemas,
+        agent_schema: Vec::new(),
+        task_dependencies: Vec::new(),
+        diagnostics: None,
+        deployment_signature: DeploymentSignature {
+            producer: ProducerId::of_public_key(TEST_PACKAGE_KEY),
+            public_key: TEST_PACKAGE_KEY.to_vec(),
+            signature: Vec::new(),
+        },
+    };
+    package.deployment_signature.signature = package_signature(&package);
+    package
+}
+
+fn replacement_runtime_package() -> Package {
+    let mut package = runtime_package();
+    package.manifest.name = "custom-agent-runtime".into();
+    package.deployment_signature.signature = package_signature(&package);
+    package
+}
+
+fn creation_receipt(config: &AgentConfig) -> AgentAuthorityReceipt {
     let request = LifecycleRequest::Create(config.clone());
+    lifecycle_receipt(
+        config,
+        vos::agent::authority::CAPABILITY_AGENT_CREATE_LOCAL,
+        &request,
+        1,
+    )
+}
+
+fn lifecycle_receipt(
+    config: &AgentConfig,
+    capability: &str,
+    request: &LifecycleRequest,
+    sequence: u64,
+) -> AgentAuthorityReceipt {
     AgentAuthorityReceipt {
         claim: AgentAuthorityClaim {
             authority: config.authority.clone(),
@@ -38,29 +162,28 @@ fn creation_receipt(config: &AgentConfig) -> VerifiedAgentAuthorityReceipt {
             agent: config.identity.agent,
             principal: config.identity.owner,
             credential: CredentialId([0x71; 32]),
-            capability: CapabilityId::named(vos::agent::authority::CAPABILITY_AGENT_CREATE_LOCAL),
+            capability: CapabilityId::named(capability),
             operation: request.commitment(),
-            sequence: 1,
+            sequence,
             valid_from: 1,
             valid_until: 2,
         },
         signature: vec![1],
     }
-    .verify(&config.authority, 1, &AcceptAuthority)
-    .unwrap()
 }
 
 fn config_for(agent: AgentId) -> AgentConfig {
     let owner = PrincipalId([1; 32]);
+    let runtime = runtime_package();
     AgentConfig {
         identity: AgentIdentity {
             space: SpaceId([2; 32]),
             agent,
             owner,
             profile: AgentProfile::Local,
-            runtime_deployment: DeploymentId([4; 32]),
-            runtime_program: STANDARD_RUNTIME_PROGRAM_ID,
-            runtime_producer: ProducerId([5; 32]),
+            runtime_deployment: runtime.deployment_id(),
+            runtime_program: runtime.manifest.program,
+            runtime_producer: runtime.deployment_signature.producer,
         },
         authority: vos::agent::authority::AgentAuthorityBinding {
             agent: AgentId([8; 32]),
@@ -70,10 +193,7 @@ fn config_for(agent: AgentId) -> AgentConfig {
             producer: ProducerId::of_public_key(b"authority-key"),
             public_key: b"authority-key".to_vec(),
         },
-        runtime_package: BlobRef {
-            hash: Hash([6; 32]),
-            len: AGENT_RUNTIME_PVM.len() as u64,
-        },
+        runtime_package: BlobRef::of_bytes(&runtime.encode()),
         capabilities: RuntimeCapabilities::standard(),
         replicas: vec![AgentReplica {
             node: NodeId([7; 32]),
@@ -152,10 +272,12 @@ fn bundled_runtime_persists_an_empty_agent_between_invocations() {
 #[test]
 fn host_driver_atomically_creates_and_reopens_an_empty_agent() {
     let config = config();
-    let mut driver = AgentDriver::create_or_open(
-        AGENT_RUNTIME_PVM.to_vec(),
+    let mut driver = AgentDriver::create(
+        runtime_package(),
         config.clone(),
         MemoryAgentStore::default(),
+        trust(),
+        &creation_receipt(&config),
     )
     .expect("create agent");
     assert_eq!(driver.image().revision, 1);
@@ -169,9 +291,109 @@ fn host_driver_atomically_creates_and_reopens_an_empty_agent() {
     assert_eq!(driver.image().revision, 1, "inspection is not a commit");
 
     let store = driver.into_store();
-    let reopened = AgentDriver::create_or_open(AGENT_RUNTIME_PVM.to_vec(), config, store)
-        .expect("reopen agent");
+    let reopened = AgentDriver::open(store, trust()).expect("reopen agent");
     assert_eq!(reopened.image().revision, 1);
+}
+
+#[test]
+fn durable_creation_ignores_caller_selected_package_verifiers() {
+    struct PermissiveVerifier;
+    impl PackageSignatureVerifier for PermissiveVerifier {
+        fn verify(&self, _: &[u8], _: &[u8], _: &[u8]) -> bool {
+            true
+        }
+    }
+
+    let mut package = runtime_package();
+    package.deployment_signature.signature = vec![0xff];
+    assert!(
+        package.verify_signature(&PermissiveVerifier).is_ok(),
+        "an offline caller can select a permissive verifier"
+    );
+    let mut config = config();
+    config.runtime_package = BlobRef::of_bytes(&package.encode());
+    assert!(matches!(
+        AgentDriver::create(
+            package,
+            config.clone(),
+            MemoryAgentStore::default(),
+            trust(),
+            &creation_receipt(&config),
+        ),
+        Err(AgentDriverError::Package(
+            vos::agent::package::PackageError::InvalidSignature
+        ))
+    ));
+}
+
+#[test]
+fn reopen_requires_the_exact_runtime_catalog_closure() {
+    let config = config();
+    let driver = AgentDriver::create(
+        runtime_package(),
+        config.clone(),
+        MemoryAgentStore::default(),
+        trust(),
+        &creation_receipt(&config),
+    )
+    .expect("create agent");
+    let store = driver.into_store();
+
+    let mut missing_package = store.clone();
+    missing_package
+        .remove_package(&config.runtime_package)
+        .unwrap();
+    assert!(matches!(
+        AgentDriver::open(missing_package, trust()),
+        Err(AgentDriverError::PackageUnavailable(hash)) if hash == config.runtime_package.hash
+    ));
+
+    let mut missing_program = store.clone();
+    missing_program
+        .remove_program(config.identity.runtime_program)
+        .unwrap();
+    assert!(matches!(
+        AgentDriver::open(missing_program, trust()),
+        Err(AgentDriverError::ProgramUnavailable(program))
+            if program == config.identity.runtime_program
+    ));
+
+    AgentDriver::open(store, trust()).expect("complete closure reopens");
+}
+
+#[test]
+fn custom_runtime_upgrade_is_catalogued_and_reopens_without_a_host_source() {
+    let config = config();
+    let mut driver = AgentDriver::create(
+        runtime_package(),
+        config.clone(),
+        MemoryAgentStore::default(),
+        trust(),
+        &creation_receipt(&config),
+    )
+    .expect("create agent");
+    let replacement = replacement_runtime_package();
+    let request = driver
+        .runtime_upgrade_request(config.identity.runtime_deployment, &replacement)
+        .expect("construct exact runtime upgrade");
+    let receipt = lifecycle_receipt(
+        &config,
+        vos::agent::authority::CAPABILITY_AGENT_RUNTIME_UPGRADE,
+        &request,
+        2,
+    );
+    let identity = driver
+        .upgrade_runtime(&receipt, config.identity.runtime_deployment, &replacement)
+        .expect("upgrade runtime");
+    assert_eq!(identity.runtime_deployment, replacement.deployment_id());
+    assert_eq!(
+        driver.image().config.runtime_package,
+        BlobRef::of_bytes(&replacement.encode())
+    );
+
+    let store = driver.into_store();
+    let reopened = AgentDriver::open(store, trust()).expect("reopen upgraded runtime");
+    assert_eq!(reopened.image().config.identity, identity);
 }
 
 #[test]
@@ -190,18 +412,23 @@ fn multi_agent_host_discovers_empty_agents_after_restart() {
     let directory =
         std::env::temp_dir().join(format!("vos-agent-host-{}-{unique}", std::process::id()));
     let _remove = RemoveOnDrop(directory.clone());
-    let runtime = |program: ProgramId| {
-        (program == STANDARD_RUNTIME_PROGRAM_ID).then(|| AGENT_RUNTIME_PVM.to_vec())
-    };
-    let mut host = AgentHost::open(&directory, runtime).expect("open empty agent host");
+    let mut host = AgentHost::open(&directory, trust()).expect("open empty agent host");
     let first = AgentId([0x31; 32]);
     let second = AgentId([0x32; 32]);
     let first_config = config_for(first);
     let second_config = config_for(second);
-    host.create(first_config.clone(), &creation_receipt(&first_config))
-        .expect("create first agent");
-    host.create(second_config.clone(), &creation_receipt(&second_config))
-        .expect("create second agent");
+    host.create(
+        first_config.clone(),
+        runtime_package(),
+        &creation_receipt(&first_config),
+    )
+    .expect("create first agent");
+    host.create(
+        second_config.clone(),
+        runtime_package(),
+        &creation_receipt(&second_config),
+    )
+    .expect("create second agent");
     assert_eq!(host.len(), 2);
     assert_eq!(
         host.identities()
@@ -211,7 +438,7 @@ fn multi_agent_host_discovers_empty_agents_after_restart() {
     );
     drop(host);
 
-    let reopened = AgentHost::open(&directory, runtime).expect("reopen agent host");
+    let reopened = AgentHost::open(&directory, trust()).expect("reopen agent host");
     assert_eq!(reopened.len(), 2);
     assert_eq!(reopened.revision(first), Some(1));
     assert_eq!(reopened.revision(second), Some(1));
@@ -220,8 +447,9 @@ fn multi_agent_host_discovers_empty_agents_after_restart() {
 fn static_actor_pvm() -> Vec<u8> {
     use vos_pvm_compiler::assembler::{Assembler, Reg};
 
-    // Actor output: Done, one byte of next state, then one reply byte.
-    let output = vec![0, 1, 0, 0, 0, 0x2a, 0x63];
+    // Actor output: Done, linear/merge/local lengths, one linear-state byte,
+    // then one reply byte.
+    let output = vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a, 0x63];
     let mut actor = Assembler::new();
     actor
         .set_rw_data(output.clone())
@@ -236,20 +464,59 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
     let config = config();
     let actor_pvm = static_actor_pvm();
     let program = ProgramId::of_pvm(&actor_pvm);
-    let driver = AgentDriver::create_or_open(
-        AGENT_RUNTIME_PVM.to_vec(),
+    let driver = AgentDriver::create(
+        runtime_package(),
         config.clone(),
         MemoryAgentStore::default(),
+        trust(),
+        &creation_receipt(&config),
     )
     .expect("create agent");
     let actor = ActorId::top_level(config.identity.agent, "counter");
     let deployment = DeploymentId([0x44; 32]);
+    let (schema, schema_len) = vos::agent::schema::encode::<512>(&vos::agent::schema::SchemaMeta {
+        uses_storage: false,
+        fields: &[vos::agent::schema::FieldMeta {
+            name: "value",
+            codec: "u8",
+            persistence: vos::agent::FieldPersistence::State(vos::agent::StateLane::Linear),
+        }],
+        methods: &[vos::agent::schema::MethodMeta {
+            name: "increment",
+            mode: MethodMode::Linear,
+            explicit: false,
+        }],
+    });
+    let schema = schema[..schema_len].to_vec();
+    let parsed_schema = vos::agent::schema::decode(&schema).unwrap();
+    let schema_reference = BlobRef::of_bytes(&schema);
+    let policies = PackageRolePolicies {
+        methods: vec![MethodPolicy {
+            method: "increment".into(),
+            schema: Hash([0x61; 32]),
+            policy: vos::service::public_policy_hash(),
+            public: true,
+            attested: false,
+            space_role: None,
+            capability: None,
+            actor_role: None,
+        }],
+        task_dependencies: Vec::new(),
+    }
+    .encode();
+    let policy_reference = BlobRef::of_bytes(&policies);
+    let package_bytes = b"signed-counter-package";
+    let package_reference = BlobRef::of_bytes(package_bytes);
     let installed_entry = ActorEntry {
         actor,
         name: "counter".into(),
         parent: None,
         deployment,
         program,
+        package: package_reference.clone(),
+        agent_schema: schema_reference.clone(),
+        role_policies: policy_reference.clone(),
+        state_layout: parsed_schema.state_layout_hash(),
         lanes: LaneSet::of(vos::agent::StateLane::Linear),
         suspended: false,
     };
@@ -258,12 +525,10 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
         request: LifecycleRequest::Install(InstallActor {
             entry: installed_entry.clone(),
             producer: ProducerId([0x55; 32]),
-            package: BlobRef::of_bytes(b"signed-counter-package"),
-            initial_state: ActorInitialState {
-                linear: None,
-                merge: None,
-                local: None,
-            },
+            package: package_reference.clone(),
+            agent_schema: schema_reference.clone(),
+            role_policies: policy_reference.clone(),
+            state_layout: parsed_schema.state_layout_hash(),
             requirements: RuntimeRequirements {
                 lanes: LaneSet::of(vos::agent::StateLane::Linear),
                 scheduling: false,
@@ -277,8 +542,17 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
     );
     let mut store = driver.into_store();
     store
+        .put_package(&package_reference, package_bytes)
+        .expect("catalog actor package");
+    store
         .put_program(program, &actor_pvm)
         .expect("catalog actor program");
+    store
+        .put_actor_schema(deployment, &schema_reference, &schema)
+        .expect("catalog actor schema");
+    store
+        .put_actor_policies(deployment, &policy_reference, &policies)
+        .expect("catalog actor policies");
     store
         .commit(
             Some(1),
@@ -290,20 +564,69 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
             },
         )
         .expect("commit installed runtime fixture");
-    let mut driver = AgentDriver::create_or_open(AGENT_RUNTIME_PVM.to_vec(), config, store)
-        .expect("open installed agent");
+    let mut driver = AgentDriver::open(store, trust()).expect("open installed agent");
 
+    let dynamic_increment = || {
+        let mut message = vec![vos::value::TAG_DYNAMIC];
+        message.extend_from_slice(&vos::value::Msg::new("increment").encode());
+        message
+    };
+    let original = driver.image().clone();
+    let mut anonymous_with_role = ActorInvocationAuth::anonymous();
+    anonymous_with_role.actor_role = Some(1);
+    let forged_claim = ActorInvocation {
+        invocation: InvocationId([0x64; 32]),
+        actor,
+        deployment,
+        program,
+        mode: MethodMode::Linear,
+        auth: anonymous_with_role,
+        message: dynamic_increment(),
+        availability: Vec::new(),
+        gas: 10_000_000,
+    };
+    let forged_evidence = forged_claim.authorization_message();
+    assert_eq!(
+        driver.invoke(forged_claim, &forged_evidence.0),
+        Err(AgentDriverError::InvocationVerification(
+            ActorInvocationVerificationError::InvalidInvocation(ActorExecutionError::InvalidInput),
+        ))
+    );
+    assert_eq!(driver.image(), &original);
+    let excessive_gas = ActorInvocation {
+        invocation: InvocationId([0x65; 32]),
+        actor,
+        deployment,
+        program,
+        mode: MethodMode::Linear,
+        auth: ActorInvocationAuth::anonymous(),
+        message: dynamic_increment(),
+        availability: Vec::new(),
+        gas: MAX_EXECUTION_GAS + 1,
+    };
+    let excessive_gas_evidence = excessive_gas.authorization_message();
+    assert_eq!(
+        driver.invoke(excessive_gas, &excessive_gas_evidence.0),
+        Err(AgentDriverError::InvocationVerification(
+            ActorInvocationVerificationError::InvalidInvocation(ActorExecutionError::InvalidInput),
+        ))
+    );
+    assert_eq!(driver.image(), &original);
+
+    let invocation = ActorInvocation {
+        invocation: InvocationId([0x66; 32]),
+        actor,
+        deployment,
+        program,
+        mode: MethodMode::Linear,
+        auth: ActorInvocationAuth::anonymous(),
+        message: dynamic_increment(),
+        availability: Vec::new(),
+        gas: 10_000_000,
+    };
+    let evidence = invocation_evidence(&driver.image().config, &invocation);
     let reply = driver
-        .invoke(ActorInvocation {
-            invocation: InvocationId([0x66; 32]),
-            actor,
-            deployment,
-            program,
-            mode: MethodMode::Linear,
-            message: vec![0x77],
-            availability: Vec::new(),
-            gas: 10_000_000,
-        })
+        .invoke(invocation, &evidence.0)
         .expect("invoke actor");
     assert_eq!(reply.status, ActorExecutionStatus::Done);
     assert_eq!(reply.reply, vec![0x63]);

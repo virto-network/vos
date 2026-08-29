@@ -4,22 +4,22 @@ use alloc::vec::Vec;
 
 use super::AgentRuntime;
 use super::execution::{
-    ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation, RuntimeBlob,
-    RuntimeExecutionCall, RuntimeExecutionReturn,
+    ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
+    ActorInvocationAuth, RuntimeBlob, RuntimeExecutionCall, RuntimeExecutionReturn,
 };
 use super::standard::{
-    StandardActorState, StandardAgentRuntime, StandardInvocationResult, StandardLaneState,
-    StandardRuntimeState,
+    StandardActorState, StandardAgentRuntime, StandardAuthorityDisposition,
+    StandardInvocationResult, StandardLaneState, StandardRuntimeState,
 };
 use super::{
-    ActorDirectoryPage, ActorEntry, ActorInitialState, ActorLifecycleDebt, AgentConfig,
-    AgentIdentity, AgentProfile, AgentReplica, LaneSet, LifecycleError, LifecycleReply,
-    LifecycleRequest, MethodMode, ReplicaRole, RuntimeCapabilities, RuntimeRequirements, StateLane,
+    ActorDirectoryPage, ActorEntry, ActorLifecycleDebt, AgentConfig, AgentIdentity, AgentProfile,
+    AgentReplica, LaneSet, LifecycleError, LifecycleReply, LifecycleRequest, MethodMode,
+    ReplicaRole, RuntimeCapabilities, RuntimeRequirements, StateLane,
 };
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{
-    ActorId, AgentId, BlobRef, DeploymentId, Hash, NodeId, PrincipalId, ProducerId, ProgramId,
-    SpaceId,
+    ActorId, AgentId, BlobRef, CapabilityId, DeploymentId, Hash, NodeId, PrincipalId, ProducerId,
+    ProgramId, SpaceId,
 };
 
 /// One management call. Runtime-owned state is opaque to the node.
@@ -27,6 +27,49 @@ use crate::service::{
 pub struct RuntimeCall {
     pub state: RuntimeState,
     pub request: LifecycleRequest,
+}
+
+/// Private runtime-to-actor dispatch control. Unlike the dynamic application
+/// message, these bytes are constructed only after the runtime has validated
+/// the signed method schema and authenticated invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActorDispatchControl {
+    pub invocation: crate::service::InvocationId,
+    pub actor: ActorId,
+    pub mode: MethodMode,
+    pub auth: ActorInvocationAuth,
+}
+
+impl ServiceWire for ActorDispatchControl {
+    const MAGIC: [u8; 4] = *b"AGDC";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&super::RUNTIME_ABI_ID.0);
+        encoder.fixed(&self.invocation.0);
+        encoder.fixed(&self.actor.0);
+        encoder.u8(encode_method_mode(self.mode));
+        encode_invocation_auth(&mut encoder, &self.auth);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID {
+            return Err(DecodeError::InvalidPlatform);
+        }
+        let value = Self {
+            invocation: crate::service::InvocationId(decoder.fixed()?),
+            actor: ActorId(decoder.fixed()?),
+            mode: decode_method_mode(decoder.u8()?)?,
+            auth: decode_invocation_auth(decoder)?,
+        };
+        if value.invocation == crate::service::InvocationId::ZERO
+            || value.actor == ActorId::ZERO
+            || !value.auth.validate()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
 }
 
 /// Runtime-owned state split only at the replication boundary. The node does
@@ -127,6 +170,10 @@ impl ServiceWire for RuntimeExecutionCall {
         encode_runtime_state(&mut encoder, &self.state);
         encode_actor_invocation(&mut encoder, &self.invocation);
         encoder.bytes(&self.actor_pvm);
+        encode_blob(&mut encoder, &self.actor_schema.reference);
+        encoder.bytes(&self.actor_schema.bytes);
+        encode_blob(&mut encoder, &self.actor_policies.reference);
+        encoder.bytes(&self.actor_policies.bytes);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -136,7 +183,35 @@ impl ServiceWire for RuntimeExecutionCall {
         let call = Self {
             state: decode_runtime_state(decoder)?,
             invocation: decode_actor_invocation(decoder)?,
-            actor_pvm: decoder.bytes()?,
+            actor_pvm: {
+                // Borrow first so the protocol limit remains at the allocation
+                // boundary and oversized guest input is never copied.
+                let bytes = decoder.bytes_ref()?;
+                if bytes.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES {
+                    return Err(DecodeError::LimitExceeded);
+                }
+                bytes.to_vec()
+            },
+            actor_schema: RuntimeBlob {
+                reference: decode_blob(decoder)?,
+                bytes: {
+                    let bytes = decoder.bytes_ref()?;
+                    if bytes.len() > super::schema::MAX_ENCODED_BYTES {
+                        return Err(DecodeError::LimitExceeded);
+                    }
+                    bytes.to_vec()
+                },
+            },
+            actor_policies: RuntimeBlob {
+                reference: decode_blob(decoder)?,
+                bytes: {
+                    let bytes = decoder.bytes_ref()?;
+                    if bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES {
+                        return Err(DecodeError::LimitExceeded);
+                    }
+                    bytes.to_vec()
+                },
+            },
         };
         call.invocation
             .validate()
@@ -144,6 +219,16 @@ impl ServiceWire for RuntimeExecutionCall {
         if call.actor_pvm.is_empty()
             || call.actor_pvm.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
             || ProgramId::of_pvm(&call.actor_pvm) != call.invocation.program
+            || !call
+                .actor_schema
+                .reference
+                .matches(&call.actor_schema.bytes)
+            || super::schema::decode(&call.actor_schema.bytes).is_none()
+            || !call
+                .actor_policies
+                .reference
+                .matches(&call.actor_policies.bytes)
+            || crate::service::PackageRolePolicies::decode(&call.actor_policies.bytes).is_err()
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -199,6 +284,15 @@ impl RuntimeState {
             StateLane::Local => &self.local,
         }
     }
+
+    /// Checked aggregate bytes owned by the opaque runtime image.
+    pub fn encoded_len(&self) -> Option<usize> {
+        self.control
+            .len()
+            .checked_add(self.linear.len())?
+            .checked_add(self.merge.len())?
+            .checked_add(self.local.len())
+    }
 }
 
 /// Encode the standard runtime's policy state and three actor-state lanes as
@@ -212,9 +306,33 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
         encode_entry(encoder, &actor.record.entry);
         encoder.fixed(&actor.record.producer.0);
         encode_blob(encoder, &actor.record.package);
-        encode_initial_state(encoder, &actor.record.initial_state);
+        encode_blob(encoder, &actor.record.agent_schema);
+        encode_blob(encoder, &actor.record.role_policies);
+        encoder.fixed(&actor.record.state_layout.0);
         encode_requirements(encoder, actor.record.requirements);
         encode_debt(encoder, actor.debt);
+    });
+    encoder.option(&state.authority_slot_high_water, |encoder, slot| {
+        encoder.u64(*slot)
+    });
+    encoder.option(&state.authority_sequence_high_water, |encoder, sequence| {
+        encoder.u64(*sequence)
+    });
+    encoder.list(&state.authority_dispositions, |encoder, disposition| {
+        encoder.fixed(&disposition.credential.0);
+        encoder.u64(disposition.sequence);
+        encoder.fixed(&disposition.claim.0);
+        encoder.fixed(&disposition.operation.0);
+        match &disposition.result {
+            Ok(reply) => {
+                encoder.bool(true);
+                encode_reply(encoder, reply);
+            }
+            Err(error) => {
+                encoder.bool(false);
+                encode_error(encoder, *error);
+            }
+        }
     });
     RuntimeState {
         control,
@@ -250,11 +368,28 @@ pub fn decode_standard_runtime_state(
                 entry: decode_entry(decoder)?,
                 producer: ProducerId(decoder.fixed()?),
                 package: decode_blob(decoder)?,
-                initial_state: decode_initial_state(decoder)?,
+                agent_schema: decode_blob(decoder)?,
+                role_policies: decode_blob(decoder)?,
+                state_layout: Hash(decoder.fixed()?),
                 requirements: decode_requirements(decoder)?,
             },
             debt: decode_debt(decoder)?,
             lane_state: StandardLaneState::default(),
+        })
+    })?;
+    let authority_slot_high_water = decoder.option(|decoder| decoder.u64())?;
+    let authority_sequence_high_water = decoder.option(|decoder| decoder.u64())?;
+    let authority_dispositions = decoder.list(|decoder| {
+        Ok(StandardAuthorityDisposition {
+            credential: crate::service::CredentialId(decoder.fixed()?),
+            sequence: decoder.u64()?,
+            claim: Hash(decoder.fixed()?),
+            operation: Hash(decoder.fixed()?),
+            result: if decoder.bool()? {
+                Ok(decode_reply(decoder)?)
+            } else {
+                Err(decode_error(decoder)?)
+            },
         })
     })?;
     if !decoder.exhausted() {
@@ -293,6 +428,9 @@ pub fn decode_standard_runtime_state(
         config,
         actors,
         invocation_results,
+        authority_slot_high_water,
+        authority_sequence_high_water,
+        authority_dispositions,
     };
     StandardAgentRuntime::restore(state.clone()).map_err(|_| DecodeError::NonCanonical)?;
     Ok(state)
@@ -316,7 +454,7 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
         &state
             .invocation_results
             .iter()
-            .filter(|result| result.reply.lane == lane)
+            .filter(|result| result.reply.lane == Some(lane))
             .collect::<Vec<_>>(),
         |encoder, result| {
             encoder.fixed(&result.invocation.0);
@@ -344,7 +482,13 @@ fn decode_standard_lane(
     }
     let values = decoder.list(|decoder| {
         let actor = ActorId(decoder.fixed()?);
-        let value = decoder.option(Decoder::bytes)?;
+        let value = decoder.option(|decoder| {
+            let bytes = decoder.bytes_ref()?;
+            if bytes.len() > super::execution::MAX_EXECUTION_STATE_BYTES {
+                return Err(DecodeError::LimitExceeded);
+            }
+            Ok(bytes.to_vec())
+        })?;
         if actor == ActorId::ZERO
             || value
                 .as_ref()
@@ -364,7 +508,7 @@ fn decode_standard_lane(
         if invocation == crate::service::InvocationId::ZERO
             || request == Hash::ZERO
             || reply.invocation != invocation
-            || reply.lane != expected_lane
+            || reply.lane != Some(expected_lane)
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -409,13 +553,26 @@ pub fn apply_standard_execution(
     let state = decode_standard_runtime_state(&original_state)?;
     let mut runtime =
         StandardAgentRuntime::restore(state).map_err(|_| DecodeError::NonCanonical)?;
-    let result = match runtime.recover_execution(&call.invocation) {
-        Ok(Some(reply)) => Ok(reply),
+    let result = runtime
+        .validate_execution_schema(&call.invocation, &call.actor_schema)
+        .and_then(|()| runtime.authorize_execution(&call.invocation, &call.actor_policies));
+    let mut result = match result {
+        Ok(false) => Ok(ActorExecutionReply {
+            invocation: call.invocation.invocation,
+            actor: call.invocation.actor,
+            deployment: call.invocation.deployment,
+            lane: call.invocation.mode.write_lane(),
+            status: ActorExecutionStatus::Forbidden,
+            reply: Vec::new(),
+            gas_remaining: call.invocation.gas,
+        }),
         Err(error) => Err(error),
-        Ok(None) => {
-            runtime
+        Ok(true) => match runtime.recover_execution(&call.invocation) {
+            Ok(Some(reply)) => Ok(reply),
+            Err(error) => Err(error),
+            Ok(None) => runtime
                 .prepare_execution_state(&call.invocation)
-                .and_then(|(lane, actor_state)| {
+                .and_then(|actor_state| {
                     super::execution::run_inner_actor(
                         &call.invocation,
                         &call.actor_pvm,
@@ -423,15 +580,29 @@ pub fn apply_standard_execution(
                     )
                     .and_then(|(reply, next_state)| {
                         if reply.status == ActorExecutionStatus::Done {
-                            runtime.commit_execution(&call.invocation, &reply, lane, next_state)?;
+                            runtime.commit_execution(
+                                &call.invocation,
+                                &reply,
+                                &actor_state,
+                                next_state,
+                            )?;
                         }
                         Ok(reply)
                     })
-                })
-        }
+                }),
+        },
     };
     let state = if result.is_ok() {
-        encode_standard_runtime_state(&runtime.snapshot())
+        let candidate = encode_standard_runtime_state(&runtime.snapshot());
+        if candidate
+            .encoded_len()
+            .is_none_or(|len| len > super::execution::MAX_RUNTIME_STATE_BYTES)
+        {
+            result = Err(ActorExecutionError::ResultCapacity);
+            original_state
+        } else {
+            candidate
+        }
     } else {
         original_state
     };
@@ -446,11 +617,35 @@ fn encode_runtime_state(encoder: &mut Encoder<'_>, state: &RuntimeState) {
 }
 
 fn decode_runtime_state(decoder: &mut Decoder<'_>) -> Result<RuntimeState, DecodeError> {
+    let mut remaining = super::execution::MAX_RUNTIME_STATE_BYTES;
+    let control = decoder.bytes_ref()?;
+    if control.len() > remaining {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let control = control.to_vec();
+    remaining -= control.len();
+    let linear = decoder.bytes_ref()?;
+    if linear.len() > remaining {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let linear = linear.to_vec();
+    remaining -= linear.len();
+    let merge = decoder.bytes_ref()?;
+    if merge.len() > remaining {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let merge = merge.to_vec();
+    remaining -= merge.len();
+    let local = decoder.bytes_ref()?;
+    if local.len() > remaining {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let local = local.to_vec();
     Ok(RuntimeState {
-        control: decoder.bytes()?,
-        linear: decoder.bytes()?,
-        merge: decoder.bytes()?,
-        local: decoder.bytes()?,
+        control,
+        linear,
+        merge,
+        local,
     })
 }
 
@@ -460,6 +655,7 @@ fn encode_actor_invocation(encoder: &mut Encoder<'_>, invocation: &ActorInvocati
     encoder.fixed(&invocation.deployment.0);
     encoder.fixed(&invocation.program.0);
     encoder.u8(encode_method_mode(invocation.mode));
+    encode_invocation_auth(encoder, &invocation.auth);
     encoder.bytes(&invocation.message);
     encoder.list(&invocation.availability, |encoder, blob| {
         encode_blob(encoder, &blob.reference);
@@ -469,28 +665,73 @@ fn encode_actor_invocation(encoder: &mut Encoder<'_>, invocation: &ActorInvocati
 }
 
 fn decode_actor_invocation(decoder: &mut Decoder<'_>) -> Result<ActorInvocation, DecodeError> {
+    let invocation = crate::service::InvocationId(decoder.fixed()?);
+    let actor = ActorId(decoder.fixed()?);
+    let deployment = DeploymentId(decoder.fixed()?);
+    let program = ProgramId(decoder.fixed()?);
+    let mode = decode_method_mode(decoder.u8()?)?;
+    let auth = decode_invocation_auth(decoder)?;
+    let message = {
+        let bytes = decoder.bytes_ref()?;
+        if bytes.len() > super::execution::MAX_EXECUTION_MESSAGE_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        bytes.to_vec()
+    };
+    let mut availability_remaining = super::execution::MAX_EXECUTION_AVAILABILITY_BYTES;
+    let availability = decoder.list(|decoder| {
+        let reference = decode_blob(decoder)?;
+        let bytes = decoder.bytes_ref()?;
+        if bytes.len() > availability_remaining {
+            return Err(DecodeError::LimitExceeded);
+        }
+        availability_remaining -= bytes.len();
+        Ok(RuntimeBlob {
+            reference,
+            bytes: bytes.to_vec(),
+        })
+    })?;
     Ok(ActorInvocation {
-        invocation: crate::service::InvocationId(decoder.fixed()?),
-        actor: ActorId(decoder.fixed()?),
-        deployment: DeploymentId(decoder.fixed()?),
-        program: ProgramId(decoder.fixed()?),
-        mode: decode_method_mode(decoder.u8()?)?,
-        message: decoder.bytes()?,
-        availability: decoder.list(|decoder| {
-            Ok(RuntimeBlob {
-                reference: decode_blob(decoder)?,
-                bytes: decoder.bytes()?,
-            })
-        })?,
+        invocation,
+        actor,
+        deployment,
+        program,
+        mode,
+        auth,
+        message,
+        availability,
         gas: decoder.u64()?,
     })
+}
+
+fn encode_invocation_auth(encoder: &mut Encoder<'_>, auth: &ActorInvocationAuth) {
+    crate::service::encode_origin(encoder, auth.origin);
+    encoder.option(&auth.origin_service, crate::service::encode_service);
+    encoder.option(&auth.space_role, |encoder, role| encoder.u8(*role));
+    encoder.option(&auth.actor_role, |encoder, role| encoder.u8(*role));
+    encoder.option(&auth.capability, |encoder, capability| {
+        encoder.fixed(&capability.0)
+    });
+}
+
+fn decode_invocation_auth(decoder: &mut Decoder<'_>) -> Result<ActorInvocationAuth, DecodeError> {
+    let auth = ActorInvocationAuth {
+        origin: crate::service::decode_origin(decoder)?,
+        origin_service: decoder.option(crate::service::decode_service)?,
+        space_role: decoder.option(Decoder::u8)?,
+        actor_role: decoder.option(Decoder::u8)?,
+        capability: decoder.option(|decoder| Ok(CapabilityId(decoder.fixed()?)))?,
+    };
+    auth.validate()
+        .then_some(auth)
+        .ok_or(DecodeError::NonCanonical)
 }
 
 fn encode_execution_reply(encoder: &mut Encoder<'_>, reply: &ActorExecutionReply) {
     encoder.fixed(&reply.invocation.0);
     encoder.fixed(&reply.actor.0);
     encoder.fixed(&reply.deployment.0);
-    encoder.u8(reply.lane as u8);
+    encoder.option(&reply.lane, |encoder, lane| encoder.u8(*lane as u8));
     encoder.u8(reply.status as u8);
     encoder.bytes(&reply.reply);
     encoder.u64(reply.gas_remaining);
@@ -501,7 +742,7 @@ fn decode_execution_reply(decoder: &mut Decoder<'_>) -> Result<ActorExecutionRep
         invocation: crate::service::InvocationId(decoder.fixed()?),
         actor: ActorId(decoder.fixed()?),
         deployment: DeploymentId(decoder.fixed()?),
-        lane: decode_state_lane(decoder.u8()?)?,
+        lane: decoder.option(|decoder| decode_state_lane(decoder.u8()?))?,
         status: match decoder.u8()? {
             0 => ActorExecutionStatus::Done,
             1 => ActorExecutionStatus::Forbidden,
@@ -509,7 +750,13 @@ fn decode_execution_reply(decoder: &mut Decoder<'_>) -> Result<ActorExecutionRep
             3 => ActorExecutionStatus::OutOfGas,
             _ => return Err(DecodeError::InvalidTag),
         },
-        reply: decoder.bytes()?,
+        reply: {
+            let bytes = decoder.bytes_ref()?;
+            if bytes.len() > super::execution::MAX_EXECUTION_REPLY_BYTES {
+                return Err(DecodeError::LimitExceeded);
+            }
+            bytes.to_vec()
+        },
         gas_remaining: decoder.u64()?,
     };
     if reply.invocation == crate::service::InvocationId::ZERO
@@ -566,9 +813,10 @@ const fn encode_method_mode(mode: MethodMode) -> u8 {
     match mode {
         MethodMode::Query => 0,
         MethodMode::LinearizableQuery => 1,
-        MethodMode::Linear => 2,
-        MethodMode::Merge => 3,
-        MethodMode::Local => 4,
+        MethodMode::LocalQuery => 2,
+        MethodMode::Linear => 3,
+        MethodMode::Merge => 4,
+        MethodMode::Local => 5,
     }
 }
 
@@ -576,9 +824,10 @@ fn decode_method_mode(value: u8) -> Result<MethodMode, DecodeError> {
     match value {
         0 => Ok(MethodMode::Query),
         1 => Ok(MethodMode::LinearizableQuery),
-        2 => Ok(MethodMode::Linear),
-        3 => Ok(MethodMode::Merge),
-        4 => Ok(MethodMode::Local),
+        2 => Ok(MethodMode::LocalQuery),
+        3 => Ok(MethodMode::Linear),
+        4 => Ok(MethodMode::Merge),
+        5 => Ok(MethodMode::Local),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -608,7 +857,9 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             encode_entry(encoder, &install.entry);
             encoder.fixed(&install.producer.0);
             encode_blob(encoder, &install.package);
-            encode_initial_state(encoder, &install.initial_state);
+            encode_blob(encoder, &install.agent_schema);
+            encode_blob(encoder, &install.role_policies);
+            encoder.fixed(&install.state_layout.0);
             encode_requirements(encoder, install.requirements);
         }
         LifecycleRequest::UpgradeActor(upgrade) => {
@@ -619,6 +870,9 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             encoder.fixed(&upgrade.to_program.0);
             encoder.fixed(&upgrade.producer.0);
             encode_blob(encoder, &upgrade.package);
+            encode_blob(encoder, &upgrade.agent_schema);
+            encode_blob(encoder, &upgrade.role_policies);
+            encoder.fixed(&upgrade.state_layout.0);
             encode_requirements(encoder, upgrade.requirements);
         }
         LifecycleRequest::Suspend(actor) => {
@@ -663,10 +917,27 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             encoder.fixed(&abi.0);
             encode_capabilities(encoder, *capabilities);
         }
+        LifecycleRequest::Authorized { admission, request } => {
+            encoder.u8(9);
+            encoder.fixed(&admission.authority.0);
+            encoder.fixed(&admission.credential.0);
+            encoder.u64(admission.sequence);
+            encoder.u64(admission.observed_slot);
+            encoder.fixed(&admission.claim.0);
+            encoder.fixed(&admission.operation.0);
+            encode_request(encoder, request);
+        }
     }
 }
 
 fn decode_request(decoder: &mut Decoder<'_>) -> Result<LifecycleRequest, DecodeError> {
+    decode_request_at_depth(decoder, 0)
+}
+
+fn decode_request_at_depth(
+    decoder: &mut Decoder<'_>,
+    authorized_depth: u8,
+) -> Result<LifecycleRequest, DecodeError> {
     match decoder.u8()? {
         0 => Ok(LifecycleRequest::Create(decode_config(decoder)?)),
         1 => Ok(LifecycleRequest::Inspect {
@@ -677,7 +948,9 @@ fn decode_request(decoder: &mut Decoder<'_>) -> Result<LifecycleRequest, DecodeE
             entry: decode_entry(decoder)?,
             producer: ProducerId(decoder.fixed()?),
             package: decode_blob(decoder)?,
-            initial_state: decode_initial_state(decoder)?,
+            agent_schema: decode_blob(decoder)?,
+            role_policies: decode_blob(decoder)?,
+            state_layout: Hash(decoder.fixed()?),
             requirements: decode_requirements(decoder)?,
         })),
         3 => Ok(LifecycleRequest::UpgradeActor(super::UpgradeActor {
@@ -687,6 +960,9 @@ fn decode_request(decoder: &mut Decoder<'_>) -> Result<LifecycleRequest, DecodeE
             to_program: ProgramId(decoder.fixed()?),
             producer: ProducerId(decoder.fixed()?),
             package: decode_blob(decoder)?,
+            agent_schema: decode_blob(decoder)?,
+            role_policies: decode_blob(decoder)?,
+            state_layout: Hash(decoder.fixed()?),
             requirements: decode_requirements(decoder)?,
         })),
         4 => Ok(LifecycleRequest::Suspend(ActorId(decoder.fixed()?))),
@@ -708,6 +984,32 @@ fn decode_request(decoder: &mut Decoder<'_>) -> Result<LifecycleRequest, DecodeE
             invocation: crate::service::InvocationId(decoder.fixed()?),
             request: Hash(decoder.fixed()?),
         }),
+        9 => {
+            if authorized_depth != 0 {
+                return Err(DecodeError::NonCanonical);
+            }
+            let admission = super::LifecycleAuthorityAdmission {
+                authority: Hash(decoder.fixed()?),
+                credential: crate::service::CredentialId(decoder.fixed()?),
+                sequence: decoder.u64()?,
+                observed_slot: decoder.u64()?,
+                claim: Hash(decoder.fixed()?),
+                operation: Hash(decoder.fixed()?),
+            };
+            let request = decode_request_at_depth(decoder, 1)?;
+            if admission.authority == Hash::ZERO
+                || admission.credential == crate::service::CredentialId::ZERO
+                || admission.sequence == 0
+                || admission.claim == Hash::ZERO
+                || admission.operation == Hash::ZERO
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(LifecycleRequest::Authorized {
+                admission,
+                request: alloc::boxed::Box::new(request),
+            })
+        }
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -786,6 +1088,9 @@ fn encode_error(encoder: &mut Encoder<'_>, error: LifecycleError) {
         }
         LifecycleError::DirectoryFull => 8,
         LifecycleError::InvalidRequest => 9,
+        LifecycleError::AuthoritySequenceRegressed => 10,
+        LifecycleError::AuthoritySequenceConflict => 11,
+        LifecycleError::AuthoritySlotRegressed => 12,
     };
     encoder.u8(tag);
 }
@@ -802,6 +1107,9 @@ fn decode_error(decoder: &mut Decoder<'_>) -> Result<LifecycleError, DecodeError
         7 => LifecycleError::Busy(decode_debt(decoder)?),
         8 => LifecycleError::DirectoryFull,
         9 => LifecycleError::InvalidRequest,
+        10 => LifecycleError::AuthoritySequenceRegressed,
+        11 => LifecycleError::AuthoritySequenceConflict,
+        12 => LifecycleError::AuthoritySlotRegressed,
         _ => return Err(DecodeError::InvalidTag),
     })
 }
@@ -873,6 +1181,10 @@ fn encode_entry(encoder: &mut Encoder<'_>, entry: &ActorEntry) {
     encoder.option(&entry.parent, |encoder, parent| encoder.fixed(&parent.0));
     encoder.fixed(&entry.deployment.0);
     encoder.fixed(&entry.program.0);
+    encode_blob(encoder, &entry.package);
+    encode_blob(encoder, &entry.agent_schema);
+    encode_blob(encoder, &entry.role_policies);
+    encoder.fixed(&entry.state_layout.0);
     encoder.u8(entry.lanes.bits());
     encoder.bool(entry.suspended);
 }
@@ -884,10 +1196,25 @@ fn decode_entry(decoder: &mut Decoder<'_>) -> Result<ActorEntry, DecodeError> {
         parent: decoder.option(|decoder| Ok(ActorId(decoder.fixed()?)))?,
         deployment: DeploymentId(decoder.fixed()?),
         program: ProgramId(decoder.fixed()?),
+        package: decode_blob(decoder)?,
+        agent_schema: decode_blob(decoder)?,
+        role_policies: decode_blob(decoder)?,
+        state_layout: Hash(decoder.fixed()?),
         lanes: decode_lanes(decoder)?,
         suspended: decoder.bool()?,
     };
-    if entry.name.is_empty() || entry.name.len() > crate::service::MAX_ACTOR_NAME_BYTES {
+    if entry.name.is_empty()
+        || entry.name.len() > crate::service::MAX_ACTOR_NAME_BYTES
+        || entry.package.hash == Hash::ZERO
+        || entry.package.len == 0
+        || entry.agent_schema.hash == Hash::ZERO
+        || entry.agent_schema.len == 0
+        || entry.agent_schema.len > super::schema::MAX_ENCODED_BYTES as u64
+        || entry.role_policies.hash == Hash::ZERO
+        || entry.role_policies.len == 0
+        || entry.role_policies.len > super::execution::MAX_EXECUTION_POLICY_BYTES as u64
+        || entry.state_layout == Hash::ZERO
+    {
         return Err(DecodeError::NonCanonical);
     }
     Ok(entry)
@@ -912,20 +1239,6 @@ fn decode_directory_page(decoder: &mut Decoder<'_>) -> Result<ActorDirectoryPage
         return Err(DecodeError::NonCanonical);
     }
     Ok(ActorDirectoryPage { entries, next })
-}
-
-fn encode_initial_state(encoder: &mut Encoder<'_>, state: &ActorInitialState) {
-    encoder.option(&state.linear, encode_blob);
-    encoder.option(&state.merge, encode_blob);
-    encoder.option(&state.local, encode_blob);
-}
-
-fn decode_initial_state(decoder: &mut Decoder<'_>) -> Result<ActorInitialState, DecodeError> {
-    Ok(ActorInitialState {
-        linear: decoder.option(decode_blob)?,
-        merge: decoder.option(decode_blob)?,
-        local: decoder.option(decode_blob)?,
-    })
 }
 
 fn encode_blob(encoder: &mut Encoder<'_>, blob: &BlobRef) {
@@ -1057,9 +1370,92 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_wire_rejects_nested_authorized_envelopes() {
+        let admission = super::super::LifecycleAuthorityAdmission {
+            authority: Hash([0x31; 32]),
+            credential: crate::service::CredentialId([0x32; 32]),
+            sequence: 1,
+            observed_slot: 10,
+            claim: Hash([0x33; 32]),
+            operation: Hash([0x34; 32]),
+        };
+        let call = RuntimeCall {
+            state: RuntimeState::default(),
+            request: LifecycleRequest::Authorized {
+                admission,
+                request: alloc::boxed::Box::new(LifecycleRequest::Authorized {
+                    admission,
+                    request: alloc::boxed::Box::new(LifecycleRequest::Suspend(ActorId([0x35; 32]))),
+                }),
+            },
+        };
+        assert_eq!(
+            RuntimeCall::decode(&call.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn directory_round_trip_preserves_schema_provenance() {
+        let package = BlobRef {
+            hash: Hash([0x26; 32]),
+            len: 124,
+        };
+        let role_policies = BlobRef {
+            hash: Hash([0x27; 32]),
+            len: 125,
+        };
+        let entry = ActorEntry {
+            actor: ActorId([0x21; 32]),
+            name: "counter".into(),
+            parent: None,
+            deployment: DeploymentId([0x22; 32]),
+            program: ProgramId([0x23; 32]),
+            package,
+            agent_schema: BlobRef {
+                hash: Hash([0x24; 32]),
+                len: 123,
+            },
+            role_policies,
+            state_layout: Hash([0x25; 32]),
+            lanes: LaneSet::of(StateLane::Linear),
+            suspended: false,
+        };
+        let returned = RuntimeReturn {
+            state: RuntimeState {
+                control: vec![1],
+                linear: vec![2],
+                merge: vec![3],
+                local: vec![4],
+            },
+            result: Ok(LifecycleReply::Directory(ActorDirectoryPage {
+                entries: vec![entry.clone()],
+                next: Some(entry.actor),
+            })),
+        };
+        assert_eq!(RuntimeReturn::decode(&returned.encode()).unwrap(), returned);
+    }
+
+    #[test]
     fn actor_execution_call_round_trips_with_content_addressed_inputs() {
         let actor_pvm = vec![0x21, 0x22, 0x23];
         let state = vec![0x31, 0x32];
+        let (schema, schema_len) =
+            crate::agent::schema::encode::<512>(&crate::agent::schema::SchemaMeta {
+                uses_storage: false,
+                fields: &[],
+                methods: &[crate::agent::schema::MethodMeta {
+                    name: "call",
+                    mode: MethodMode::Linear,
+                    explicit: true,
+                }],
+            });
+        let schema = schema[..schema_len].to_vec();
+        let policies = crate::service::PackageRolePolicies {
+            methods: vec![],
+            task_dependencies: vec![],
+        }
+        .encode();
         let call = RuntimeExecutionCall {
             state: RuntimeState {
                 control: vec![0x11],
@@ -1073,6 +1469,7 @@ mod tests {
                 deployment: DeploymentId([3; 32]),
                 program: ProgramId::of_pvm(&actor_pvm),
                 mode: MethodMode::Linear,
+                auth: ActorInvocationAuth::anonymous(),
                 message: vec![0x41],
                 availability: vec![RuntimeBlob {
                     reference: BlobRef::of_bytes(&state),
@@ -1081,8 +1478,65 @@ mod tests {
                 gas: 1_000_000,
             },
             actor_pvm,
+            actor_schema: RuntimeBlob {
+                reference: BlobRef::of_bytes(&schema),
+                bytes: schema,
+            },
+            actor_policies: RuntimeBlob {
+                reference: BlobRef::of_bytes(&policies),
+                bytes: policies,
+            },
         };
         assert_eq!(RuntimeExecutionCall::decode(&call.encode()).unwrap(), call);
+    }
+
+    #[test]
+    fn private_dispatch_wire_rejects_anonymous_role_claims() {
+        let control = ActorDispatchControl {
+            invocation: crate::service::InvocationId([0x41; 32]),
+            actor: ActorId([0x42; 32]),
+            mode: MethodMode::Linear,
+            auth: ActorInvocationAuth {
+                origin: crate::service::Origin::Anonymous,
+                origin_service: None,
+                space_role: None,
+                actor_role: Some(1),
+                capability: None,
+            },
+        };
+        assert_eq!(
+            ActorDispatchControl::decode(&control.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn runtime_state_wire_enforces_its_aggregate_guest_budget() {
+        let exact = RuntimeCall {
+            state: RuntimeState {
+                control: vec![1; super::super::execution::MAX_RUNTIME_STATE_BYTES / 2],
+                linear: vec![2; super::super::execution::MAX_RUNTIME_STATE_BYTES / 2],
+                merge: Vec::new(),
+                local: Vec::new(),
+            },
+            request: LifecycleRequest::Inspect {
+                after: None,
+                limit: 1,
+            },
+        };
+        assert_eq!(RuntimeCall::decode(&exact.encode()).unwrap(), exact);
+
+        let oversized = RuntimeCall {
+            state: RuntimeState {
+                local: vec![3],
+                ..exact.state
+            },
+            request: exact.request,
+        };
+        assert_eq!(
+            RuntimeCall::decode(&oversized.encode()),
+            Err(DecodeError::LimitExceeded)
+        );
     }
 
     #[test]
