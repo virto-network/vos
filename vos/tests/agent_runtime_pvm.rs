@@ -1,4 +1,8 @@
-use vos::agent::driver::{AgentDriver, AgentImageStore, MemoryAgentStore};
+use vos::agent::authority::{
+    AgentAuthorityClaim, AgentAuthorityReceipt, AgentAuthorityVerifier,
+    VerifiedAgentAuthorityReceipt,
+};
+use vos::agent::driver::{AgentDriver, AgentImage, AgentImageStore, MemoryAgentStore};
 use vos::agent::execution::{ActorExecutionStatus, ActorInvocation};
 use vos::agent::host::AgentHost;
 use vos::agent::wire::{RuntimeCall, RuntimeReturn, RuntimeState, decode_standard_runtime_state};
@@ -8,14 +12,43 @@ use vos::agent::{
     RuntimeCapabilities, RuntimeRequirements, STANDARD_RUNTIME_PROGRAM_ID,
 };
 use vos::service::{
-    ActorId, AgentId, BlobRef, DeploymentId, Hash, InvocationId, NodeId, PrincipalId, ProducerId,
-    ProgramId, ServiceWire, SpaceId,
+    ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, Hash, InvocationId,
+    NodeId, PrincipalId, ProducerId, ProgramId, ServiceWire, SpaceId,
 };
 use vos_pvm::ExitReason;
 use vos_pvm::refine_host::RefineContext;
 
 const AGENT_RUNTIME_PVM: &[u8] = include_bytes!("../../vosx/blobs/agent_runtime.pvm");
 const GAS: u64 = 1_000_000_000;
+
+struct AcceptAuthority;
+
+impl AgentAuthorityVerifier for AcceptAuthority {
+    fn verify(&self, _: &vos::agent::authority::AgentAuthorityBinding, _: &[u8], _: &[u8]) -> bool {
+        true
+    }
+}
+
+fn creation_receipt(config: &AgentConfig) -> VerifiedAgentAuthorityReceipt {
+    let request = LifecycleRequest::Create(config.clone());
+    AgentAuthorityReceipt {
+        claim: AgentAuthorityClaim {
+            authority: config.authority.clone(),
+            space: config.identity.space,
+            agent: config.identity.agent,
+            principal: config.identity.owner,
+            credential: CredentialId([0x71; 32]),
+            capability: CapabilityId::named(vos::agent::authority::CAPABILITY_AGENT_CREATE_LOCAL),
+            operation: request.commitment(),
+            sequence: 1,
+            valid_from: 1,
+            valid_until: 2,
+        },
+        signature: vec![1],
+    }
+    .verify(&config.authority, 1, &AcceptAuthority)
+    .unwrap()
+}
 
 fn config_for(agent: AgentId) -> AgentConfig {
     let owner = PrincipalId([1; 32]);
@@ -28,6 +61,14 @@ fn config_for(agent: AgentId) -> AgentConfig {
             runtime_deployment: DeploymentId([4; 32]),
             runtime_program: STANDARD_RUNTIME_PROGRAM_ID,
             runtime_producer: ProducerId([5; 32]),
+        },
+        authority: vos::agent::authority::AgentAuthorityBinding {
+            agent: AgentId([8; 32]),
+            actor: ActorId([9; 32]),
+            deployment: DeploymentId([10; 32]),
+            program: ProgramId([11; 32]),
+            producer: ProducerId::of_public_key(b"authority-key"),
+            public_key: b"authority-key".to_vec(),
         },
         runtime_package: BlobRef {
             hash: Hash([6; 32]),
@@ -119,16 +160,11 @@ fn host_driver_atomically_creates_and_reopens_an_empty_agent() {
     .expect("create agent");
     assert_eq!(driver.image().revision, 1);
     assert_eq!(
-        driver
-            .lifecycle(LifecycleRequest::Inspect {
-                after: None,
-                limit: 16,
-            })
-            .expect("inspect agent"),
-        LifecycleReply::Directory(vos::agent::ActorDirectoryPage {
+        driver.inspect(None, 16).expect("inspect agent"),
+        vos::agent::ActorDirectoryPage {
             entries: Vec::new(),
             next: None,
-        })
+        }
     );
     assert_eq!(driver.image().revision, 1, "inspection is not a commit");
 
@@ -160,8 +196,11 @@ fn multi_agent_host_discovers_empty_agents_after_restart() {
     let mut host = AgentHost::open(&directory, runtime).expect("open empty agent host");
     let first = AgentId([0x31; 32]);
     let second = AgentId([0x32; 32]);
-    host.create(config_for(first)).expect("create first agent");
-    host.create(config_for(second))
+    let first_config = config_for(first);
+    let second_config = config_for(second);
+    host.create(first_config.clone(), &creation_receipt(&first_config))
+        .expect("create first agent");
+    host.create(second_config.clone(), &creation_receipt(&second_config))
         .expect("create second agent");
     assert_eq!(host.len(), 2);
     assert_eq!(
@@ -197,25 +236,27 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
     let config = config();
     let actor_pvm = static_actor_pvm();
     let program = ProgramId::of_pvm(&actor_pvm);
-    let mut store = MemoryAgentStore::default();
-    store
-        .put_program(program, &actor_pvm)
-        .expect("catalog actor program");
-    let mut driver = AgentDriver::create_or_open(AGENT_RUNTIME_PVM.to_vec(), config.clone(), store)
-        .expect("create agent");
+    let driver = AgentDriver::create_or_open(
+        AGENT_RUNTIME_PVM.to_vec(),
+        config.clone(),
+        MemoryAgentStore::default(),
+    )
+    .expect("create agent");
     let actor = ActorId::top_level(config.identity.agent, "counter");
     let deployment = DeploymentId([0x44; 32]);
-    driver
-        .lifecycle(LifecycleRequest::Install(InstallActor {
-            entry: ActorEntry {
-                actor,
-                name: "counter".into(),
-                parent: None,
-                deployment,
-                program,
-                lanes: LaneSet::of(vos::agent::StateLane::Linear),
-                suspended: false,
-            },
+    let installed_entry = ActorEntry {
+        actor,
+        name: "counter".into(),
+        parent: None,
+        deployment,
+        program,
+        lanes: LaneSet::of(vos::agent::StateLane::Linear),
+        suspended: false,
+    };
+    let installed = invoke(RuntimeCall {
+        state: driver.image().runtime_state.clone(),
+        request: LifecycleRequest::Install(InstallActor {
+            entry: installed_entry.clone(),
             producer: ProducerId([0x55; 32]),
             package: BlobRef::of_bytes(b"signed-counter-package"),
             initial_state: ActorInitialState {
@@ -228,8 +269,29 @@ fn installed_actor_executes_inside_the_bundled_runtime() {
                 scheduling: false,
                 proofs: false,
             },
-        }))
-        .expect("install actor");
+        }),
+    });
+    assert_eq!(
+        installed.result,
+        Ok(LifecycleReply::Installed(installed_entry))
+    );
+    let mut store = driver.into_store();
+    store
+        .put_program(program, &actor_pvm)
+        .expect("catalog actor program");
+    store
+        .commit(
+            Some(1),
+            &AgentImage {
+                revision: 2,
+                runtime_program: STANDARD_RUNTIME_PROGRAM_ID,
+                config: config.clone(),
+                runtime_state: installed.state,
+            },
+        )
+        .expect("commit installed runtime fixture");
+    let mut driver = AgentDriver::create_or_open(AGENT_RUNTIME_PVM.to_vec(), config, store)
+        .expect("open installed agent");
 
     let reply = driver
         .invoke(ActorInvocation {

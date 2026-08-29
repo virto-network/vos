@@ -10,6 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
+pub mod authority;
 #[cfg(feature = "std")]
 pub mod driver;
 pub mod execution;
@@ -26,12 +27,12 @@ use crate::service::{
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829v5");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829v6");
 
 /// Program identity of the bundled standard runtime artifact.
 pub const STANDARD_RUNTIME_PROGRAM_ID: ProgramId = ProgramId([
-    0xbc, 0x1d, 0x15, 0x04, 0xcc, 0x64, 0xb2, 0xb9, 0xa6, 0xa9, 0x23, 0xaf, 0xc8, 0x4d, 0x03, 0xab,
-    0xbd, 0xfa, 0x11, 0x92, 0x8e, 0x6d, 0xb6, 0x64, 0x5b, 0x7f, 0x24, 0xc9, 0xac, 0xfa, 0xe5, 0xaa,
+    0x4c, 0x1f, 0xf9, 0x23, 0x24, 0x26, 0xf1, 0xa0, 0x09, 0x0c, 0x0e, 0xa2, 0x68, 0x8c, 0xab, 0x95,
+    0x84, 0x43, 0xea, 0xa6, 0x4e, 0x58, 0xdf, 0x2f, 0xbc, 0x00, 0xd2, 0x1a, 0x77, 0xf5, 0xc4, 0x55,
 ]);
 
 /// Immutable storage and publication profile of an agent.
@@ -387,6 +388,21 @@ pub enum LifecycleRequest {
     },
 }
 
+impl LifecycleRequest {
+    /// Stable commitment used by authority receipts. It includes the runtime
+    /// ABI and every request field, but no mutable runtime state.
+    pub fn commitment(&self) -> Hash {
+        let call = wire::RuntimeCall {
+            state: wire::RuntimeState::default(),
+            request: self.clone(),
+        };
+        Hash::digest(
+            b"vos/agent/lifecycle-operation",
+            &[&crate::service::wire::ServiceWire::encode(&call)],
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecycleError {
     NotCreated,
@@ -442,6 +458,9 @@ pub enum AgentConfigError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentConfig {
     pub identity: AgentIdentity,
+    /// Exact system-authority deployment allowed to issue lifecycle receipts
+    /// for this agent.
+    pub authority: authority::AgentAuthorityBinding,
     pub runtime_package: BlobRef,
     pub capabilities: RuntimeCapabilities,
     pub replicas: Vec<AgentReplica>,
@@ -453,6 +472,9 @@ impl AgentConfig {
             || self.identity.agent == AgentId::ZERO
             || self.identity.owner == PrincipalId::ZERO
         {
+            return Err(AgentConfigError::InvalidIdentity);
+        }
+        if !self.authority.validate() {
             return Err(AgentConfigError::InvalidIdentity);
         }
         if self.capabilities.max_actors == 0 {
@@ -583,6 +605,14 @@ mod tests {
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([8; 32]),
+            },
+            authority: authority::AgentAuthorityBinding {
+                agent: AgentId([10; 32]),
+                actor: ActorId([11; 32]),
+                deployment: DeploymentId([12; 32]),
+                program: ProgramId([13; 32]),
+                producer: ProducerId::of_public_key(b"authority-key"),
+                public_key: b"authority-key".to_vec(),
             },
             capabilities: RuntimeCapabilities {
                 lanes: LaneSet::of(StateLane::Merge).union(LaneSet::of(StateLane::Local)),

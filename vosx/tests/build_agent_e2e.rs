@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use vos::agent::authority::{AgentAuthorityClaim, AgentAuthorityReceipt, AgentAuthorityVerifier};
 use vos::agent::driver::{AgentDriver, AgentDriverError, FileAgentStore};
 use vos::agent::execution::{ActorExecutionError, ActorExecutionStatus, ActorInvocation};
 use vos::agent::package::{Ed25519PackageVerifier, Package};
@@ -9,14 +10,22 @@ use vos::agent::{
     ReplicaRole, RuntimeCapabilities, STANDARD_RUNTIME_PROGRAM_ID,
 };
 use vos::service::{
-    ActorId, AgentId, BlobRef, DeploymentId, InvocationId, NodeId, PrincipalId, ProducerId,
-    ServiceWire, SpaceId,
+    ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, InvocationId, NodeId,
+    PrincipalId, ProducerId, ServiceWire, SpaceId,
 };
 use vos::{Decode, Encode};
 
 const AGENT_RUNTIME_PVM: &[u8] = include_bytes!("../blobs/agent_runtime.pvm");
 
 struct TempDir(PathBuf);
+
+struct TestAuthorityVerifier;
+
+impl AgentAuthorityVerifier for TestAuthorityVerifier {
+    fn verify(&self, _: &vos::agent::authority::AgentAuthorityBinding, _: &[u8], _: &[u8]) -> bool {
+        true
+    }
+}
 
 impl TempDir {
     fn new(label: &str) -> Self {
@@ -79,6 +88,14 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
             runtime_program: STANDARD_RUNTIME_PROGRAM_ID,
             runtime_producer: ProducerId([5; 32]),
         },
+        authority: vos::agent::authority::AgentAuthorityBinding {
+            agent: AgentId([7; 32]),
+            actor: ActorId([8; 32]),
+            deployment: DeploymentId([9; 32]),
+            program: vos::service::ProgramId([10; 32]),
+            producer: ProducerId::of_public_key(b"authority-key"),
+            public_key: b"authority-key".to_vec(),
+        },
         runtime_package: BlobRef::of_bytes(AGENT_RUNTIME_PVM),
         capabilities: RuntimeCapabilities::standard(),
         replicas: vec![AgentReplica {
@@ -96,17 +113,33 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
     .unwrap();
     let actor = ActorId::top_level(agent, "counter");
     let deployment = package.deployment_id();
+    let initial_state = ActorInitialState {
+        linear: None,
+        merge: None,
+        local: None,
+    };
+    let install = driver
+        .actor_install_request("counter".into(), None, &verified, initial_state.clone())
+        .unwrap();
+    let receipt = AgentAuthorityReceipt {
+        claim: AgentAuthorityClaim {
+            authority: agent_config.authority.clone(),
+            space: agent_config.identity.space,
+            agent,
+            principal: owner,
+            credential: CredentialId([0x33; 32]),
+            capability: CapabilityId::named(vos::agent::authority::CAPABILITY_ACTOR_INSTALL),
+            operation: install.commitment(),
+            sequence: 1,
+            valid_from: 10,
+            valid_until: 20,
+        },
+        signature: vec![1],
+    }
+    .verify(&agent_config.authority, 15, &TestAuthorityVerifier)
+    .unwrap();
     driver
-        .install_actor(
-            "counter".into(),
-            None,
-            &verified,
-            ActorInitialState {
-                linear: None,
-                merge: None,
-                local: None,
-            },
-        )
+        .install_actor(&receipt, "counter".into(), None, &verified, initial_state)
         .unwrap();
 
     let first = ActorInvocation {

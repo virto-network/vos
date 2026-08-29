@@ -9,10 +9,18 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::authority::{
+    CAPABILITY_AGENT_CREATE_LOCAL, CAPABILITY_AGENT_CREATE_PRIVATE, CAPABILITY_AGENT_CREATE_SHARED,
+    VerifiedAgentAuthorityReceipt, authorize_lifecycle,
+};
 use super::driver::{AgentDriver, AgentDriverError, AgentImageStore, FileAgentStore};
 use super::execution::{ActorExecutionReply, ActorInvocation};
-use super::{AgentConfig, AgentIdentity, LifecycleReply, LifecycleRequest};
-use crate::service::{AgentId, ProgramId};
+use super::package::VerifiedPackage;
+use super::{
+    ActorDirectoryPage, ActorEntry, ActorInitialState, AgentConfig, AgentIdentity, AgentProfile,
+    LifecycleRequest,
+};
+use crate::service::{ActorId, AgentId, CapabilityId, ProgramId};
 
 const IMAGE_SUFFIX: &str = ".agent-image";
 
@@ -143,7 +151,25 @@ impl<R: RuntimeSource> AgentHost<R> {
     }
 
     /// Create a durable empty agent with its explicitly selected runtime.
-    pub fn create(&mut self, config: AgentConfig) -> Result<&AgentIdentity, AgentHostError> {
+    pub fn create(
+        &mut self,
+        config: AgentConfig,
+        authority: &VerifiedAgentAuthorityReceipt,
+    ) -> Result<&AgentIdentity, AgentHostError> {
+        let capability = match config.identity.profile {
+            AgentProfile::Local => CAPABILITY_AGENT_CREATE_LOCAL,
+            AgentProfile::Shared => CAPABILITY_AGENT_CREATE_SHARED,
+            AgentProfile::Private => CAPABILITY_AGENT_CREATE_PRIVATE,
+        };
+        authorize_lifecycle(
+            authority,
+            &config.authority,
+            config.identity.space,
+            config.identity.agent,
+            CapabilityId::named(capability),
+            &LifecycleRequest::Create(config.clone()),
+        )
+        .map_err(|error| AgentHostError::Driver(AgentDriverError::Authority(error)))?;
         let agent = config.identity.agent;
         if self.agents.contains_key(&agent) || self.image_path(agent).exists() {
             return Err(AgentHostError::DuplicateAgent);
@@ -166,15 +192,32 @@ impl<R: RuntimeSource> AgentHost<R> {
             .identity)
     }
 
-    pub fn lifecycle(
+    pub fn inspect(
         &mut self,
         agent: AgentId,
-        request: LifecycleRequest,
-    ) -> Result<LifecycleReply, AgentHostError> {
+        after: Option<ActorId>,
+        limit: u16,
+    ) -> Result<ActorDirectoryPage, AgentHostError> {
         self.agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?
-            .lifecycle(request)
+            .inspect(after, limit)
+            .map_err(Into::into)
+    }
+
+    pub fn install_actor(
+        &mut self,
+        agent: AgentId,
+        authority: &VerifiedAgentAuthorityReceipt,
+        name: String,
+        parent: Option<ActorId>,
+        package: &VerifiedPackage,
+        initial_state: ActorInitialState,
+    ) -> Result<ActorEntry, AgentHostError> {
+        self.agents
+            .get_mut(&agent)
+            .ok_or(AgentHostError::AgentNotFound)?
+            .install_actor(authority, name, parent, package, initial_state)
             .map_err(Into::into)
     }
 

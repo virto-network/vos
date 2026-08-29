@@ -776,6 +776,14 @@ mod tests {
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([17; 32]),
             },
+            authority: crate::agent::authority::AgentAuthorityBinding {
+                agent: AgentId([18; 32]),
+                actor: ActorId([19; 32]),
+                deployment: DeploymentId([21; 32]),
+                program: ProgramId([22; 32]),
+                producer: ProducerId::of_public_key(b"authority-key"),
+                public_key: b"authority-key".to_vec(),
+            },
             capabilities: RuntimeCapabilities {
                 max_actors,
                 ..RuntimeCapabilities::standard()

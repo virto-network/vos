@@ -808,6 +808,7 @@ fn decode_error(decoder: &mut Decoder<'_>) -> Result<LifecycleError, DecodeError
 
 fn encode_config(encoder: &mut Encoder<'_>, config: &AgentConfig) {
     encode_identity(encoder, &config.identity);
+    super::authority::encode_binding(encoder, &config.authority);
     encode_blob(encoder, &config.runtime_package);
     encode_capabilities(encoder, config.capabilities);
     encoder.list(&config.replicas, |encoder, replica| {
@@ -820,6 +821,7 @@ fn encode_config(encoder: &mut Encoder<'_>, config: &AgentConfig) {
 fn decode_config(decoder: &mut Decoder<'_>) -> Result<AgentConfig, DecodeError> {
     let config = AgentConfig {
         identity: decode_identity(decoder)?,
+        authority: super::authority::decode_binding(decoder)?,
         runtime_package: decode_blob(decoder)?,
         capabilities: decode_capabilities(decoder)?,
         replicas: decoder.list(|decoder| {
@@ -1010,6 +1012,14 @@ mod tests {
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([6; 32]),
+            },
+            authority: crate::agent::authority::AgentAuthorityBinding {
+                agent: AgentId([11; 32]),
+                actor: ActorId([12; 32]),
+                deployment: DeploymentId([13; 32]),
+                program: ProgramId([14; 32]),
+                producer: ProducerId::of_public_key(b"authority-key"),
+                public_key: b"authority-key".to_vec(),
             },
             runtime_package: BlobRef {
                 hash: Hash([7; 32]),

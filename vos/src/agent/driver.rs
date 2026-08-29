@@ -14,6 +14,7 @@ use std::string::String;
 use vos_pvm::refine_host::RefineContext;
 use vos_pvm::{ExitReason, Gas};
 
+use super::authority::{AuthorityError, VerifiedAgentAuthorityReceipt, authorize_lifecycle};
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
     RuntimeExecutionCall, RuntimeExecutionReturn,
@@ -25,7 +26,7 @@ use super::{
     LifecycleReply, LifecycleRequest, PackageKind, RUNTIME_ABI_ID, RuntimeCapabilities,
 };
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
-use crate::service::{ActorId, BlobRef, DeploymentId, Hash, ProducerId, ProgramId};
+use crate::service::{ActorId, BlobRef, CapabilityId, DeploymentId, Hash, ProducerId, ProgramId};
 
 pub const DEFAULT_MANAGEMENT_GAS: Gas = 1_000_000_000;
 pub const MAX_RUNTIME_STATE_BYTES: usize = 16 * 1024 * 1024;
@@ -388,6 +389,7 @@ pub enum AgentDriverError {
     Lifecycle(LifecycleError),
     Execution(ActorExecutionError),
     Package(PackageError),
+    Authority(AuthorityError),
     Store(AgentStoreError),
 }
 
@@ -402,6 +404,12 @@ impl std::error::Error for AgentDriverError {}
 impl From<AgentStoreError> for AgentDriverError {
     fn from(error: AgentStoreError) -> Self {
         Self::Store(error)
+    }
+}
+
+impl From<AuthorityError> for AgentDriverError {
+    fn from(error: AuthorityError) -> Self {
+        Self::Authority(error)
     }
 }
 
@@ -474,10 +482,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         self.management_gas = gas;
     }
 
-    pub fn lifecycle(
-        &mut self,
-        request: LifecycleRequest,
-    ) -> Result<LifecycleReply, AgentDriverError> {
+    fn lifecycle(&mut self, request: LifecycleRequest) -> Result<LifecycleReply, AgentDriverError> {
         if matches!(request, LifecycleRequest::Create(_)) {
             return Err(AgentDriverError::Lifecycle(LifecycleError::AlreadyCreated));
         }
@@ -526,16 +531,26 @@ impl<S: AgentImageStore> AgentDriver<S> {
         }
     }
 
-    /// Install one signature-verified actor package. Package-derived identity,
-    /// program, producer, and runtime requirements are never accepted as
-    /// parallel caller-controlled fields.
-    pub fn install_actor(
+    pub fn inspect(
         &mut self,
+        after: Option<ActorId>,
+        limit: u16,
+    ) -> Result<super::ActorDirectoryPage, AgentDriverError> {
+        match self.lifecycle(LifecycleRequest::Inspect { after, limit })? {
+            LifecycleReply::Directory(page) => Ok(page),
+            _ => Err(AgentDriverError::InvalidRuntime),
+        }
+    }
+
+    /// Construct the exact lifecycle operation an authority must approve for
+    /// this signed package and target location.
+    pub fn actor_install_request(
+        &self,
         name: String,
         parent: Option<ActorId>,
         package: &VerifiedPackage,
         initial_state: ActorInitialState,
-    ) -> Result<ActorEntry, AgentDriverError> {
+    ) -> Result<LifecycleRequest, AgentDriverError> {
         let package = package.package();
         let PackageKind::Actor { requirements } = package.manifest.kind else {
             return Err(AgentDriverError::Package(PackageError::WrongKind));
@@ -544,17 +559,47 @@ impl<S: AgentImageStore> AgentDriver<S> {
             Some(parent) => ActorId::owned_child(parent, &name),
             None => ActorId::top_level(self.image.config.identity.agent, &name),
         };
-        let entry = ActorEntry {
-            actor,
-            name,
-            parent,
-            deployment: package.deployment_id(),
-            program: package.manifest.program,
-            lanes: requirements.lanes,
-            suspended: false,
+        Ok(LifecycleRequest::Install(InstallActor {
+            entry: ActorEntry {
+                actor,
+                name,
+                parent,
+                deployment: package.deployment_id(),
+                program: package.manifest.program,
+                lanes: requirements.lanes,
+                suspended: false,
+            },
+            producer: package.deployment_signature.producer,
+            package: BlobRef::of_bytes(&package.encode()),
+            initial_state,
+            requirements,
+        }))
+    }
+
+    pub fn install_actor(
+        &mut self,
+        authority: &VerifiedAgentAuthorityReceipt,
+        name: String,
+        parent: Option<ActorId>,
+        package: &VerifiedPackage,
+        initial_state: ActorInitialState,
+    ) -> Result<ActorEntry, AgentDriverError> {
+        let request = self.actor_install_request(name, parent, package, initial_state)?;
+        authorize_lifecycle(
+            authority,
+            &self.image.config.authority,
+            self.image.config.identity.space,
+            self.image.config.identity.agent,
+            CapabilityId::named(super::authority::CAPABILITY_ACTOR_INSTALL),
+            &request,
+        )?;
+        let LifecycleRequest::Install(install) = request else {
+            return Err(AgentDriverError::InvalidRuntime);
         };
+        let package = package.package();
+        let entry = install.entry.clone();
+        let package_reference = install.package.clone();
         let package_bytes = package.encode();
-        let package_reference = BlobRef::of_bytes(&package_bytes);
         let created_package = self.store.put_package(&package_reference, &package_bytes)?;
         let created_program = match self
             .store
@@ -568,13 +613,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 return Err(error.into());
             }
         };
-        let reply = self.lifecycle(LifecycleRequest::Install(InstallActor {
-            entry: entry.clone(),
-            producer: package.deployment_signature.producer,
-            package: package_reference.clone(),
-            initial_state,
-            requirements,
-        }));
+        let reply = self.lifecycle(LifecycleRequest::Install(install));
         let reply = match reply {
             Ok(reply) => reply,
             Err(error) => {
@@ -900,6 +939,14 @@ mod tests {
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([1; 32]),
                 runtime_producer: ProducerId([5; 32]),
+            },
+            authority: crate::agent::authority::AgentAuthorityBinding {
+                agent: AgentId([7; 32]),
+                actor: ActorId([8; 32]),
+                deployment: DeploymentId([9; 32]),
+                program: ProgramId([10; 32]),
+                producer: ProducerId::of_public_key(b"authority-key"),
+                public_key: b"authority-key".to_vec(),
             },
             runtime_package: BlobRef {
                 hash: Hash([6; 32]),
