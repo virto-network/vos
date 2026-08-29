@@ -182,7 +182,7 @@ pub use service::{
 #[cfg(feature = "extension")]
 pub use actors::exec::{TaskFut, TaskState, TaskTable, task_waker};
 #[cfg(feature = "pvm")]
-pub use actors::run_refine_entry;
+pub use actors::{run_actor_entry, run_refine_entry};
 #[cfg(feature = "service")]
 pub use actors::{run_nested_actor_entry, run_task_entry};
 #[cfg(feature = "macros")]

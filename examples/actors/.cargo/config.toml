@@ -6,6 +6,7 @@ rustflags = [
     "-Zremap-cwd-prefix=.",
     "-Aduplicate-macro-attributes",
     "-Aunused-attributes",
+    "-Clink-arg=-Tpvm.ld",
 ]
 
 [alias]

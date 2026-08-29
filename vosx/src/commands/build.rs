@@ -1,14 +1,15 @@
-//! Build a canonical actor PVM and its signed `.vos` service package.
+//! Build a canonical standard-PVM actor and its signed `.vos` package.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, anyhow, bail};
+use vos::agent::package::{Package, PackageManifest};
+use vos::agent::{LaneSet, PackageKind, RuntimeRequirements, StateLane};
 use vos::service::{
-    DeploymentSignature, PackageDiagnostics, PackageManifest, PackageRolePolicies,
-    PackageTaskDependency, ProducerId, ProgramId, ServiceWire, TaskDependency, VosPackage,
-    artifact_hash, task_dependencies_hash,
+    DeploymentSignature, PackageDiagnostics, PackageRolePolicies, PackageTaskDependency,
+    ProducerId, ProgramId, ServiceWire, TaskDependency, artifact_hash, task_dependencies_hash,
 };
 
 const RUSTC_WRAPPER_MODE: &str = "VOSX_CANONICAL_RUSTC_WRAPPER";
@@ -60,14 +61,14 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     let actor_pvm = if is_pvm {
         input.clone()
     } else {
-        vos_pvm_compiler::link_elf(&input)
+        vos_pvm_compiler::link_elf_spi(&input)
             .map_err(|error| anyhow!("transpile {}: {error:?}", program.display()))?
     };
     if actor_pvm.is_empty() {
         bail!("{} produced an empty PVM", program.display());
     }
-    vos::service::validate_actor_program_layout(&actor_pvm)
-        .map_err(|error| anyhow!("invalid canonical actor PVM capability layout: {error}"))?;
+    vos_pvm::spi::parse_standard_program(&actor_pvm)
+        .ok_or_else(|| anyhow!("{} is not a canonical standard PVM", program.display()))?;
 
     let schemas = match args.schemas.as_deref() {
         Some(path) => std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
@@ -87,6 +88,15 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
         );
     }
     let crdt = actor_metadata.crdt || args.crdt;
+    let requirements = RuntimeRequirements {
+        lanes: LaneSet::of(if crdt {
+            StateLane::Merge
+        } else {
+            StateLane::Linear
+        }),
+        scheduling: false,
+        proofs: actor_metadata.provable,
+    };
     let name = args
         .name
         .unwrap_or_else(|| actor_metadata.actor_name.clone());
@@ -125,25 +135,23 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
         None => generated_role_policies,
     };
     let source_map = read_optional(args.source_map.as_deref())?;
-    let service_program = vos::service::VOS_SERVICE_PROGRAM_ID;
     let actor_program = ProgramId::of_pvm(&actor_pvm);
 
     let public_key = keypair.public().encode_protobuf();
     let producer = ProducerId::of_public_key(&public_key);
-    let mut package = VosPackage {
+    let mut package = Package {
         manifest: PackageManifest {
             name: name.clone(),
             platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
-            service_program,
-            actor_program,
-            crdt,
+            kind: PackageKind::Actor { requirements },
+            program: actor_program,
             interfaces_hash: artifact_hash(b"interfaces", &interfaces),
             role_policies_hash: artifact_hash(b"role-policies", &role_policies),
             schemas_hash: artifact_hash(b"schemas", &schemas),
-            task_dependencies_hash: task_dependencies_hash(&task_dependencies),
+            dependencies_hash: task_dependencies_hash(&task_dependencies),
         },
-        actor_pvm: actor_pvm.clone(),
+        pvm: actor_pvm.clone(),
         generated_interfaces: interfaces,
         role_policies,
         schemas,
@@ -197,7 +205,7 @@ fn build_task_dependency(input: &Path) -> anyhow::Result<PackageTaskDependency> 
         );
     }
     let elf = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
-    let pvm = vos_pvm_compiler::link_elf(&elf)
+    let pvm = vos_pvm_compiler::link_elf_spi(&elf)
         .map_err(|error| anyhow!("transpile Task {}: {error:?}", program.display()))?;
     if pvm.is_empty() {
         bail!("{} produced an empty Task PVM", program.display());
@@ -916,7 +924,9 @@ mod tests {
         };
 
         let temp = TempDir::new("deterministic");
-        let actor_pvm = vos_pvm_compiler::assembler::Assembler::new().build();
+        let mut actor = vos_pvm_compiler::assembler::Assembler::new();
+        actor.trap();
+        let actor_pvm = actor.build_standard();
         let (metadata, metadata_len) = vos::metadata::encode::<512>(&META);
         std::fs::write(temp.0.join("actor.pvm"), &actor_pvm).unwrap();
         std::fs::write(temp.0.join("actor.meta"), &metadata[..metadata_len]).unwrap();
@@ -951,6 +961,15 @@ mod tests {
             std::fs::read(first.join("deterministic-counter.vos")).unwrap(),
             std::fs::read(second.join("deterministic-counter.vos")).unwrap(),
         );
+        let package =
+            Package::decode(&std::fs::read(first.join("deterministic-counter.vos")).unwrap())
+                .unwrap();
+        assert!(matches!(
+            package.manifest.kind,
+            PackageKind::Actor { requirements }
+                if requirements.lanes == LaneSet::of(StateLane::Linear)
+        ));
+        assert_eq!(package.manifest.program, ProgramId::of_pvm(&actor_pvm));
         assert!(!first.join("deterministic-counter.attestation.pvm").exists());
         assert_eq!(std::fs::read_dir(first).unwrap().count(), 2);
     }

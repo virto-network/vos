@@ -11,7 +11,7 @@ bin = []
 crate-type = ["rlib", "cdylib"]
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-vos = { workspace = true, features = ["macros", "service"] }
+vos = { workspace = true, features = ["macros", "pvm"] }
 
 [target.'cfg(not(target_arch = "riscv64"))'.dependencies]
 vos = { workspace = true, features = ["macros", "extension"] }

@@ -73,6 +73,22 @@ pub fn run_refine_entry<A: Actor>() {
     run::run_refine::<A>()
 }
 
+/// Canonical actor entry. Transitional service guests retain their nested
+/// marker, while standard agent actors have one kernel-free refine entry.
+#[cfg(feature = "service")]
+pub fn run_actor_entry<A: Actor>(a0: u64, a1: u64, a2: u64, a3: u64) {
+    if a3 == crate::service::NESTED_ACTOR_CALL_MAGIC {
+        run_nested_actor_entry::<A>(a0, a1, a2)
+    } else {
+        run_refine_entry::<A>()
+    }
+}
+
+#[cfg(all(feature = "pvm", not(feature = "service")))]
+pub fn run_actor_entry<A: Actor>(_a0: u64, _a1: u64, _a2: u64, _a3: u64) {
+    run_refine_entry::<A>()
+}
+
 /// service platform refine entry (PC=0) for **Task** blobs: input is the
 /// witness-delivered `(state, msg)` at `witness_ptr` instead of
 /// READ/FETCH — see [`run::run_task_service`]. Emitted as `_start` by

@@ -74,7 +74,7 @@ enum Command {
         #[arg(long)]
         crdt: bool,
     },
-    /// Build one canonical actor PVM and signed `.vos` service package.
+    /// Build one canonical actor PVM and signed `.vos` package.
     Build {
         /// Actor project directory, ELF (transpiled once), or canonical `.pvm`.
         program: PathBuf,

@@ -168,7 +168,7 @@ fn ecall_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
 // and never from actor code — actors only ever see
 // `blake2b_hash`.
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(all(not(target_arch = "riscv64"), feature = "std"))]
 const BLAKE2B_IV: [u64; 8] = [
     0x6A09E667F3BCC908,
     0xBB67AE8584CAA73B,
@@ -202,7 +202,7 @@ const BLAKE2B_IV: [u64; 8] = [
 /// ECALL_BLAKE2B_COMPRESS handler is the one and only caller;
 /// every other path goes through `blake2b_hash` and uses
 /// `blake2b_simd` directly.
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(all(not(target_arch = "riscv64"), feature = "std"))]
 pub(crate) fn host_compress_block(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     let mut h_words = [0u64; 8];
     for i in 0..8 {
@@ -218,7 +218,7 @@ pub(crate) fn host_compress_block(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: b
     }
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(all(not(target_arch = "riscv64"), feature = "std"))]
 fn compress_inner(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8] {
     const SIGMA: [[usize; 16]; 12] = [
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
