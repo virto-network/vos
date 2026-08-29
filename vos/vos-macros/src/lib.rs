@@ -2397,8 +2397,41 @@ impl MethodModePlan {
 
 /// Strip and validate field persistence annotations. Plain fields select the
 /// linear lane, `crdt::*` fields select the merge lane, and `#[state(local)]`
-/// selects replica-local state. Constants and skipped fields are not mutable
-/// durable lanes.
+/// selects replica-local state. An existing `#[rkyv(with = ...::Skip)]` is the
+/// service/extension spelling of the same transient-state contract as
+/// `#[state(skip)]`; both are omitted from agent lanes. Constants and skipped
+/// fields are not mutable durable lanes.
+fn has_rkyv_skip(field: &syn::Field) -> bool {
+    field.attrs.iter().any(|attr| {
+        let syn::Meta::List(list) = &attr.meta else {
+            return false;
+        };
+        if !list.path.is_ident("rkyv") {
+            return false;
+        }
+        let Ok(items) = list.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) else {
+            return false;
+        };
+        items.iter().any(|item| {
+            let syn::Meta::NameValue(value) = item else {
+                return false;
+            };
+            if !value.path.is_ident("with") {
+                return false;
+            }
+            let syn::Expr::Path(path) = &value.value else {
+                return false;
+            };
+            path.path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "Skip")
+        })
+    })
+}
+
 fn prepare_state_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<StateFieldPlan> {
     let syn::Fields::Named(named) = &mut input.fields else {
         if !matches!(input.fields, syn::Fields::Unit) {
@@ -2433,7 +2466,8 @@ fn prepare_state_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<St
             continue;
         }
         let mut is_const = false;
-        let mut is_skip = false;
+        let rkyv_skip = has_rkyv_skip(field);
+        let mut is_skip = rkyv_skip;
         let mut is_local = false;
         let mut is_merge = false;
         let mut is_linear = false;
@@ -2520,7 +2554,7 @@ fn prepare_state_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<St
                 "use one field persistence annotation, not both #[crdt(...)] and #[state(...)]",
             ));
         }
-        if is_skip {
+        if is_skip && !rkyv_skip {
             field
                 .attrs
                 .push(syn::parse_quote!(#[rkyv(with = vos::rkyv::with::Skip)]));
@@ -2662,6 +2696,30 @@ mod agent_schema_tests {
             }
         };
         assert!(prepare_state_fields(&mut actor, false).is_err());
+    }
+
+    #[test]
+    fn existing_rkyv_skip_is_a_transient_agent_field_without_duplicate_attrs() {
+        let mut actor: ItemStruct = syn::parse_quote! {
+            struct NativeExtension {
+                durable: u64,
+                #[rkyv(with = vos::rkyv::with::Skip)]
+                runtime: NativeRuntime,
+            }
+        };
+        let plan = prepare_state_fields(&mut actor, false).unwrap();
+        assert_eq!(plan.fields.len(), 2);
+        assert_eq!(plan.fields[0].persistence, PersistencePlan::Linear);
+        assert_eq!(plan.fields[1].persistence, PersistencePlan::Skipped);
+        let runtime = actor.fields.iter().nth(1).unwrap();
+        assert_eq!(
+            runtime
+                .attrs
+                .iter()
+                .filter(|attr| attr.path().is_ident("rkyv"))
+                .count(),
+            1
+        );
     }
 
     #[test]

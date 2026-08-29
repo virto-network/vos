@@ -219,6 +219,7 @@ dependencies = [
  "log",
  "rkyv",
  "vos-macros",
+ "vos-pvm-program",
 ]
 
 [[package]]
@@ -229,6 +230,10 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "vos-pvm-program"
+version = "0.1.0"
 
 [[package]]
 name = "workflow-fixture"
