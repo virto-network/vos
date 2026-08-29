@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 use vos_pvm::refine_host::RefineContext;
 use vos_pvm::{ExitReason, Gas};
 
+use super::execution::{
+    ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
+    RuntimeExecutionCall, RuntimeExecutionReturn,
+};
 use super::wire::{RuntimeCall, RuntimeReturn};
 use super::{
     AgentConfig, AgentConfigError, LifecycleError, LifecycleReply, LifecycleRequest,
@@ -203,6 +207,7 @@ pub enum AgentDriverError {
     RuntimeOutput,
     RuntimeStateTooLarge,
     Lifecycle(LifecycleError),
+    Execution(ActorExecutionError),
     Store(AgentStoreError),
 }
 
@@ -341,6 +346,64 @@ impl<S: AgentImageStore> AgentDriver<S> {
         }
     }
 
+    /// Execute one authenticated actor invocation through this agent's
+    /// runtime. Actor failures are typed replies and do not commit runtime
+    /// state; deterministic runtime validation failures are driver errors.
+    pub fn invoke(
+        &mut self,
+        invocation: ActorInvocation,
+    ) -> Result<ActorExecutionReply, AgentDriverError> {
+        let expected_invocation = invocation.invocation;
+        let expected_actor = invocation.actor;
+        let expected_deployment = invocation.deployment;
+        let outer_gas = self.management_gas.saturating_add(invocation.gas);
+        let output: RuntimeExecutionReturn = execute_runtime_wire(
+            &self.runtime_pvm,
+            outer_gas,
+            &RuntimeExecutionCall {
+                state: self.image.runtime_state.clone(),
+                invocation,
+            }
+            .encode(),
+        )?;
+        let reply = match output.result {
+            Ok(reply) => reply,
+            Err(error) => {
+                if output.state != self.image.runtime_state {
+                    return Err(AgentDriverError::InvalidRuntime);
+                }
+                return Err(AgentDriverError::Execution(error));
+            }
+        };
+        if reply.invocation != expected_invocation
+            || reply.actor != expected_actor
+            || reply.deployment != expected_deployment
+        {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        validate_state_size(&output.state)?;
+        if reply.status != ActorExecutionStatus::Done {
+            if output.state != self.image.runtime_state {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            return Ok(reply);
+        }
+
+        let next = AgentImage {
+            revision: self
+                .image
+                .revision
+                .checked_add(1)
+                .ok_or(AgentDriverError::InvalidRuntime)?,
+            runtime_program: self.image.runtime_program,
+            config: self.image.config.clone(),
+            runtime_state: output.state,
+        };
+        self.store.commit(Some(self.image.revision), &next)?;
+        self.image = next;
+        Ok(reply)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn upgrade_runtime(
         &mut self,
@@ -455,7 +518,15 @@ fn execute_runtime(
     gas: Gas,
     call: RuntimeCall,
 ) -> Result<RuntimeReturn, AgentDriverError> {
-    let invocation = RefineContext::load(runtime_pvm, &call.encode(), gas)
+    execute_runtime_wire(runtime_pvm, gas, &call.encode())
+}
+
+fn execute_runtime_wire<T: ServiceWire>(
+    runtime_pvm: &[u8],
+    gas: Gas,
+    input: &[u8],
+) -> Result<T, AgentDriverError> {
+    let invocation = RefineContext::load(runtime_pvm, input, gas)
         .map_err(|_| AgentDriverError::InvalidRuntime)?
         .run();
     if invocation.exit != ExitReason::Halt {
@@ -465,7 +536,7 @@ fn execute_runtime(
         });
     }
     let output = invocation.output().ok_or(AgentDriverError::RuntimeOutput)?;
-    RuntimeReturn::decode(&output).map_err(|_| AgentDriverError::RuntimeOutput)
+    T::decode(&output).map_err(|_| AgentDriverError::RuntimeOutput)
 }
 
 #[cfg(test)]

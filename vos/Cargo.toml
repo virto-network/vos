@@ -106,6 +106,7 @@ getrandom = { version = "0.2", optional = true }
 cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["signing"], optional = true }
 rand_chacha = { version = "0.3", default-features = false, optional = true }
 zeroize = { version = "1", default-features = false, optional = true }
+blake2b_simd = { version = "1", default-features = false }
 ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
 dlmalloc = { version = "0.2", optional = true, features = ["global"] }
 redb = { version = "2", optional = true }
@@ -150,14 +151,9 @@ s4-server = { git = "https://codeberg.org/Virto/s4.git", rev = "70f90315ae590310
 futures-executor = { version = "0.3", default-features = false, features = ["std"], optional = true }
 futures-channel = { version = "0.3", default-features = false, features = ["alloc", "std"], optional = true }
 
-# Backs `vos::crypto::blake2b` on every non-riscv64 target —
-# host code, extensions, wasm guests. PVM (riscv64) actors hit
-# the host via ECALL_BLAKE2B_COMPRESS and never link this dep.
-# Target-conditional so the riscv64 actor build doesn't even
-# compile blake2b_simd. `default-features = false` keeps it
-# usable from no_std (extension / wasm).
-[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
-blake2b_simd = { version = "1", default-features = false }
+# `blake2b_simd` is no_std. Ordinary PVM actors use the accelerated ECALL,
+# while the infrastructure agent runtime links this software backend so it
+# needs no private outer-host crypto operation.
 
 [dev-dependencies]
 # Built-in PVM actor — host tests need the typed `SpaceRegistryRef`

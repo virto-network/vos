@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::driver::{AgentDriver, AgentDriverError, AgentImageStore, FileAgentStore};
+use super::execution::{ActorExecutionReply, ActorInvocation};
 use super::{AgentConfig, AgentIdentity, LifecycleReply, LifecycleRequest};
 use crate::service::{AgentId, ProgramId};
 
@@ -174,6 +175,18 @@ impl<R: RuntimeSource> AgentHost<R> {
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?
             .lifecycle(request)
+            .map_err(Into::into)
+    }
+
+    pub fn invoke(
+        &mut self,
+        agent: AgentId,
+        invocation: ActorInvocation,
+    ) -> Result<ActorExecutionReply, AgentHostError> {
+        self.agents
+            .get_mut(&agent)
+            .ok_or(AgentHostError::AgentNotFound)?
+            .invoke(invocation)
             .map_err(Into::into)
     }
 

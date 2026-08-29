@@ -351,7 +351,28 @@ impl Assembler {
 
     // ===== Blob building =====
 
-    /// Finalize and produce the standard program blob.
+    /// Finalize and produce the standard PVM program container used by agent
+    /// runtimes and other kernel-free executors.
+    pub fn build_standard(&self) -> Vec<u8> {
+        vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
+            ro_data: self.ro_data.clone(),
+            rw_data: self.rw_data.clone(),
+            heap_pages: self.heap_pages,
+            stack_size: self
+                .stack_pages
+                .checked_mul(vos_pvm_program::PAGE_SIZE)
+                .expect("assembled stack size fits u32"),
+            code: vos_pvm_program::CodeBlob {
+                jump_table: self.jump_table.clone(),
+                code: self.code.clone(),
+                bitmask: self.bitmask.clone(),
+            },
+        })
+        .expect("assembled standard program is canonical")
+    }
+
+    /// Finalize and produce the transitional capability-manifest container.
+    /// New agent actors use [`Self::build_standard`].
     pub fn build(&self) -> Vec<u8> {
         emitter::build_service_program(
             &self.code,

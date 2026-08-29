@@ -12,6 +12,7 @@ use core::ops::Bound::{Excluded, Unbounded};
 use super::{
     ActorEntry, ActorLifecycleDebt, ActorRecord, AgentConfig, AgentConfigError, AgentRuntime,
     LifecycleError, LifecycleReply, LifecycleRequest, RUNTIME_ABI_ID, RuntimeRequirements,
+    StateLane,
 };
 use crate::service::{ActorId, AgentId, DeploymentId, Hash, ProducerId, ProgramId};
 
@@ -22,6 +23,7 @@ struct ManagedActor {
     record: ActorRecord,
     /// Non-structural durable work. Child debt is derived from the directory.
     debt: ActorLifecycleDebt,
+    lane_state: StandardLaneState,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -41,6 +43,17 @@ pub struct StandardRuntimeState {
 pub struct StandardActorState {
     pub record: ActorRecord,
     pub debt: ActorLifecycleDebt,
+    pub lane_state: StandardLaneState,
+}
+
+/// Runtime-owned bytes for each durable actor lane. `None` means the signed
+/// initial content reference has not been hydrated yet; `Some([])` is a
+/// canonical fresh lane.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StandardLaneState {
+    pub linear: Option<Vec<u8>>,
+    pub merge: Option<Vec<u8>>,
+    pub local: Option<Vec<u8>>,
 }
 
 impl StandardAgentRuntime {
@@ -80,6 +93,7 @@ impl StandardAgentRuntime {
                 .map(|actor| StandardActorState {
                     record: actor.record.clone(),
                     debt: actor.debt,
+                    lane_state: actor.lane_state.clone(),
                 })
                 .collect(),
         }
@@ -132,6 +146,12 @@ impl StandardAgentRuntime {
                 requirements: actor.record.requirements,
             })?;
             runtime.set_lifecycle_debt(actor_id, actor.debt)?;
+            runtime.validate_restored_lane_state(actor_id, &actor.lane_state)?;
+            runtime
+                .actors
+                .get_mut(&actor_id)
+                .expect("the actor was installed above")
+                .lane_state = actor.lane_state;
         }
         for actor in suspended {
             runtime.set_suspended(actor, true)?;
@@ -247,6 +267,7 @@ impl StandardAgentRuntime {
             }
         }
         let entry = install.entry.clone();
+        let lane_state = StandardLaneState::for_install(&install);
         self.actors.insert(
             entry.actor,
             ManagedActor {
@@ -258,9 +279,107 @@ impl StandardAgentRuntime {
                     requirements: install.requirements,
                 },
                 debt: ActorLifecycleDebt::default(),
+                lane_state,
             },
         );
         Ok(LifecycleReply::Installed(entry))
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn prepare_execution_state(
+        &self,
+        invocation: &super::execution::ActorInvocation,
+    ) -> Result<(StateLane, Vec<u8>), super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+
+        invocation.validate()?;
+        let config = self
+            .config
+            .as_ref()
+            .ok_or(ActorExecutionError::NotCreated)?;
+        let actor = self
+            .actors
+            .get(&invocation.actor)
+            .ok_or(ActorExecutionError::NotFound)?;
+        if actor.record.entry.suspended {
+            return Err(ActorExecutionError::Suspended);
+        }
+        if actor.record.entry.deployment != invocation.deployment {
+            return Err(ActorExecutionError::StaleDeployment);
+        }
+        if actor.record.entry.program != invocation.program {
+            return Err(ActorExecutionError::WrongProgram);
+        }
+        let lane = invocation
+            .mode
+            .write_lane()
+            .ok_or(ActorExecutionError::UnsupportedMethod)?;
+        if !config.identity.profile.supports(lane) || !actor.record.entry.lanes.contains(lane) {
+            return Err(ActorExecutionError::UnsupportedMethod);
+        }
+        let (value, initial) = actor.lane_state.select(lane, &actor.record.initial_state);
+        match value {
+            Some(bytes) => Ok((lane, bytes.clone())),
+            None => initial
+                .as_ref()
+                .and_then(|reference| invocation.available(reference))
+                .map(|bytes| (lane, bytes.to_vec()))
+                .ok_or(ActorExecutionError::MissingState),
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn commit_execution_state(
+        &mut self,
+        actor: crate::service::ActorId,
+        lane: StateLane,
+        state: Vec<u8>,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::{ActorExecutionError, MAX_EXECUTION_STATE_BYTES};
+        if state.len() > MAX_EXECUTION_STATE_BYTES {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
+        let actor = self
+            .actors
+            .get_mut(&actor)
+            .ok_or(ActorExecutionError::NotFound)?;
+        *actor.lane_state.select_mut(lane) = Some(state);
+        Ok(())
+    }
+
+    fn validate_restored_lane_state(
+        &self,
+        actor: crate::service::ActorId,
+        state: &StandardLaneState,
+    ) -> Result<(), LifecycleError> {
+        let actor = self.actors.get(&actor).ok_or(LifecycleError::NotFound)?;
+        for (lane, value, initial) in [
+            (
+                StateLane::Linear,
+                &state.linear,
+                &actor.record.initial_state.linear,
+            ),
+            (
+                StateLane::Merge,
+                &state.merge,
+                &actor.record.initial_state.merge,
+            ),
+            (
+                StateLane::Local,
+                &state.local,
+                &actor.record.initial_state.local,
+            ),
+        ] {
+            if value
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > super::execution::MAX_EXECUTION_STATE_BYTES)
+                || (value.is_none() && initial.is_none())
+                || (!actor.record.entry.lanes.contains(lane) && value.as_deref() != Some(&[][..]))
+            {
+                return Err(LifecycleError::InvalidRequest);
+            }
+        }
+        Ok(())
     }
 
     fn upgrade_actor(
@@ -278,6 +397,12 @@ impl StandardAgentRuntime {
             .ok_or(LifecycleError::NotFound)?;
         if actor.record.entry.deployment != upgrade.from_deployment {
             return Err(LifecycleError::StaleDeployment);
+        }
+        if actor.record.requirements.lanes != upgrade.requirements.lanes {
+            // Lane-shape migration needs an explicit runtime migration
+            // payload. Reinterpreting existing bytes under a new lane set is
+            // never a safe package-only upgrade.
+            return Err(LifecycleError::UnsupportedLane);
         }
         if upgrade.to_deployment == DeploymentId::ZERO || upgrade.to_program == ProgramId::ZERO {
             return Err(LifecycleError::InvalidRequest);
@@ -378,6 +503,57 @@ impl StandardAgentRuntime {
         config.runtime_package = package;
         config.capabilities = capabilities;
         Ok(LifecycleReply::RuntimeUpgraded(config.identity.clone()))
+    }
+}
+
+impl StandardLaneState {
+    fn for_install(install: &super::InstallActor) -> Self {
+        fn pending_or_empty(
+            declared: bool,
+            initial: &Option<crate::service::BlobRef>,
+        ) -> Option<Vec<u8>> {
+            if declared && initial.is_some() {
+                None
+            } else {
+                Some(Vec::new())
+            }
+        }
+        Self {
+            linear: pending_or_empty(
+                install.requirements.lanes.contains(StateLane::Linear),
+                &install.initial_state.linear,
+            ),
+            merge: pending_or_empty(
+                install.requirements.lanes.contains(StateLane::Merge),
+                &install.initial_state.merge,
+            ),
+            local: pending_or_empty(
+                install.requirements.lanes.contains(StateLane::Local),
+                &install.initial_state.local,
+            ),
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn select<'a>(
+        &'a self,
+        lane: StateLane,
+        initial: &'a super::ActorInitialState,
+    ) -> (&'a Option<Vec<u8>>, &'a Option<crate::service::BlobRef>) {
+        match lane {
+            StateLane::Linear => (&self.linear, &initial.linear),
+            StateLane::Merge => (&self.merge, &initial.merge),
+            StateLane::Local => (&self.local, &initial.local),
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn select_mut(&mut self, lane: StateLane) -> &mut Option<Vec<u8>> {
+        match lane {
+            StateLane::Linear => &mut self.linear,
+            StateLane::Merge => &mut self.merge,
+            StateLane::Local => &mut self.local,
+        }
     }
 }
 

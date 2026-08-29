@@ -3,11 +3,17 @@
 use alloc::vec::Vec;
 
 use super::AgentRuntime;
-use super::standard::{StandardActorState, StandardAgentRuntime, StandardRuntimeState};
+use super::execution::{
+    ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation, RuntimeBlob,
+    RuntimeExecutionCall, RuntimeExecutionReturn,
+};
+use super::standard::{
+    StandardActorState, StandardAgentRuntime, StandardLaneState, StandardRuntimeState,
+};
 use super::{
     ActorDirectoryPage, ActorEntry, ActorInitialState, ActorLifecycleDebt, AgentConfig,
     AgentIdentity, AgentProfile, AgentReplica, LaneSet, LifecycleError, LifecycleReply,
-    LifecycleRequest, ReplicaRole, RuntimeCapabilities, RuntimeRequirements,
+    LifecycleRequest, MethodMode, ReplicaRole, RuntimeCapabilities, RuntimeRequirements, StateLane,
 };
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{
@@ -100,6 +106,64 @@ impl ServiceWire for RuntimeReturn {
     }
 }
 
+impl ServiceWire for RuntimeExecutionCall {
+    const MAGIC: [u8; 4] = *b"AGEX";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&super::RUNTIME_ABI_ID.0);
+        encoder.bytes(&self.state);
+        encode_actor_invocation(&mut encoder, &self.invocation);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID {
+            return Err(DecodeError::InvalidPlatform);
+        }
+        let call = Self {
+            state: decoder.bytes()?,
+            invocation: decode_actor_invocation(decoder)?,
+        };
+        call.invocation
+            .validate()
+            .map_err(|_| DecodeError::NonCanonical)?;
+        Ok(call)
+    }
+}
+
+impl ServiceWire for RuntimeExecutionReturn {
+    const MAGIC: [u8; 4] = *b"AGER";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&super::RUNTIME_ABI_ID.0);
+        encoder.bytes(&self.state);
+        match &self.result {
+            Ok(reply) => {
+                encoder.bool(true);
+                encode_execution_reply(&mut encoder, reply);
+            }
+            Err(error) => {
+                encoder.bool(false);
+                encode_execution_error(&mut encoder, *error);
+            }
+        }
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID {
+            return Err(DecodeError::InvalidPlatform);
+        }
+        let state = decoder.bytes()?;
+        let result = if decoder.bool()? {
+            Ok(decode_execution_reply(decoder)?)
+        } else {
+            Err(decode_execution_error(decoder)?)
+        };
+        Ok(Self { state, result })
+    }
+}
+
 impl ServiceWire for StandardRuntimeState {
     const MAGIC: [u8; 4] = *b"AGST";
 
@@ -114,6 +178,7 @@ impl ServiceWire for StandardRuntimeState {
             encode_initial_state(encoder, &actor.record.initial_state);
             encode_requirements(encoder, actor.record.requirements);
             encode_debt(encoder, actor.debt);
+            encode_lane_state(encoder, &actor.lane_state);
         });
     }
 
@@ -133,6 +198,7 @@ impl ServiceWire for StandardRuntimeState {
                         requirements: decode_requirements(decoder)?,
                     },
                     debt: decode_debt(decoder)?,
+                    lane_state: decode_lane_state(decoder)?,
                 })
             })?,
         };
@@ -155,6 +221,173 @@ pub fn apply_standard(call: RuntimeCall) -> Result<RuntimeReturn, DecodeError> {
         state: runtime.snapshot().encode(),
         result,
     })
+}
+
+/// Execute one actor call with the bundled runtime. Failed calls always return
+/// the byte-identical prior runtime state.
+#[cfg(feature = "pvm")]
+pub fn apply_standard_execution(
+    call: RuntimeExecutionCall,
+) -> Result<RuntimeExecutionReturn, DecodeError> {
+    let original_state = call.state;
+    let state = StandardRuntimeState::decode(&original_state)?;
+    let mut runtime =
+        StandardAgentRuntime::restore(state).map_err(|_| DecodeError::NonCanonical)?;
+    let result =
+        runtime
+            .prepare_execution_state(&call.invocation)
+            .and_then(|(lane, actor_state)| {
+                super::execution::run_inner_actor(&call.invocation, &actor_state).and_then(
+                    |(reply, next_state)| {
+                        if reply.status == ActorExecutionStatus::Done {
+                            runtime.commit_execution_state(reply.actor, lane, next_state)?;
+                        }
+                        Ok(reply)
+                    },
+                )
+            });
+    let state = if result.is_ok() {
+        runtime.snapshot().encode()
+    } else {
+        original_state
+    };
+    Ok(RuntimeExecutionReturn { state, result })
+}
+
+fn encode_actor_invocation(encoder: &mut Encoder<'_>, invocation: &ActorInvocation) {
+    encoder.fixed(&invocation.invocation.0);
+    encoder.fixed(&invocation.actor.0);
+    encoder.fixed(&invocation.deployment.0);
+    encoder.fixed(&invocation.program.0);
+    encoder.u8(encode_method_mode(invocation.mode));
+    encoder.bytes(&invocation.message);
+    encoder.bytes(&invocation.actor_pvm);
+    encoder.list(&invocation.availability, |encoder, blob| {
+        encode_blob(encoder, &blob.reference);
+        encoder.bytes(&blob.bytes);
+    });
+    encoder.u64(invocation.gas);
+}
+
+fn decode_actor_invocation(decoder: &mut Decoder<'_>) -> Result<ActorInvocation, DecodeError> {
+    Ok(ActorInvocation {
+        invocation: crate::service::InvocationId(decoder.fixed()?),
+        actor: ActorId(decoder.fixed()?),
+        deployment: DeploymentId(decoder.fixed()?),
+        program: ProgramId(decoder.fixed()?),
+        mode: decode_method_mode(decoder.u8()?)?,
+        message: decoder.bytes()?,
+        actor_pvm: decoder.bytes()?,
+        availability: decoder.list(|decoder| {
+            Ok(RuntimeBlob {
+                reference: decode_blob(decoder)?,
+                bytes: decoder.bytes()?,
+            })
+        })?,
+        gas: decoder.u64()?,
+    })
+}
+
+fn encode_execution_reply(encoder: &mut Encoder<'_>, reply: &ActorExecutionReply) {
+    encoder.fixed(&reply.invocation.0);
+    encoder.fixed(&reply.actor.0);
+    encoder.fixed(&reply.deployment.0);
+    encoder.u8(reply.lane as u8);
+    encoder.u8(reply.status as u8);
+    encoder.bytes(&reply.reply);
+    encoder.u64(reply.gas_remaining);
+}
+
+fn decode_execution_reply(decoder: &mut Decoder<'_>) -> Result<ActorExecutionReply, DecodeError> {
+    let reply = ActorExecutionReply {
+        invocation: crate::service::InvocationId(decoder.fixed()?),
+        actor: ActorId(decoder.fixed()?),
+        deployment: DeploymentId(decoder.fixed()?),
+        lane: decode_state_lane(decoder.u8()?)?,
+        status: match decoder.u8()? {
+            0 => ActorExecutionStatus::Done,
+            1 => ActorExecutionStatus::Forbidden,
+            2 => ActorExecutionStatus::Panicked,
+            3 => ActorExecutionStatus::OutOfGas,
+            _ => return Err(DecodeError::InvalidTag),
+        },
+        reply: decoder.bytes()?,
+        gas_remaining: decoder.u64()?,
+    };
+    if reply.invocation == crate::service::InvocationId::ZERO
+        || reply.actor == ActorId::ZERO
+        || reply.deployment == DeploymentId::ZERO
+        || reply.reply.len() > super::execution::MAX_EXECUTION_REPLY_BYTES
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(reply)
+}
+
+fn encode_execution_error(encoder: &mut Encoder<'_>, error: ActorExecutionError) {
+    match error {
+        ActorExecutionError::NotCreated => encoder.u8(0),
+        ActorExecutionError::NotFound => encoder.u8(1),
+        ActorExecutionError::Suspended => encoder.u8(2),
+        ActorExecutionError::StaleDeployment => encoder.u8(3),
+        ActorExecutionError::WrongProgram => encoder.u8(4),
+        ActorExecutionError::UnsupportedMethod => encoder.u8(5),
+        ActorExecutionError::MissingState => encoder.u8(6),
+        ActorExecutionError::InvalidAvailability => encoder.u8(7),
+        ActorExecutionError::InvalidInput => encoder.u8(8),
+        ActorExecutionError::InvalidActorOutput => encoder.u8(9),
+        ActorExecutionError::UnsupportedHostCall(id) => {
+            encoder.u8(10);
+            encoder.u32(id);
+        }
+    }
+}
+
+fn decode_execution_error(decoder: &mut Decoder<'_>) -> Result<ActorExecutionError, DecodeError> {
+    Ok(match decoder.u8()? {
+        0 => ActorExecutionError::NotCreated,
+        1 => ActorExecutionError::NotFound,
+        2 => ActorExecutionError::Suspended,
+        3 => ActorExecutionError::StaleDeployment,
+        4 => ActorExecutionError::WrongProgram,
+        5 => ActorExecutionError::UnsupportedMethod,
+        6 => ActorExecutionError::MissingState,
+        7 => ActorExecutionError::InvalidAvailability,
+        8 => ActorExecutionError::InvalidInput,
+        9 => ActorExecutionError::InvalidActorOutput,
+        10 => ActorExecutionError::UnsupportedHostCall(decoder.u32()?),
+        _ => return Err(DecodeError::InvalidTag),
+    })
+}
+
+const fn encode_method_mode(mode: MethodMode) -> u8 {
+    match mode {
+        MethodMode::Query => 0,
+        MethodMode::LinearizableQuery => 1,
+        MethodMode::Linear => 2,
+        MethodMode::Merge => 3,
+        MethodMode::Local => 4,
+    }
+}
+
+fn decode_method_mode(value: u8) -> Result<MethodMode, DecodeError> {
+    match value {
+        0 => Ok(MethodMode::Query),
+        1 => Ok(MethodMode::LinearizableQuery),
+        2 => Ok(MethodMode::Linear),
+        3 => Ok(MethodMode::Merge),
+        4 => Ok(MethodMode::Local),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn decode_state_lane(value: u8) -> Result<StateLane, DecodeError> {
+    match value {
+        0 => Ok(StateLane::Linear),
+        1 => Ok(StateLane::Merge),
+        2 => Ok(StateLane::Local),
+        _ => Err(DecodeError::InvalidTag),
+    }
 }
 
 fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
@@ -472,6 +705,28 @@ fn decode_initial_state(decoder: &mut Decoder<'_>) -> Result<ActorInitialState, 
     })
 }
 
+fn encode_lane_state(encoder: &mut Encoder<'_>, state: &StandardLaneState) {
+    encoder.option(&state.linear, |encoder, bytes| encoder.bytes(bytes));
+    encoder.option(&state.merge, |encoder, bytes| encoder.bytes(bytes));
+    encoder.option(&state.local, |encoder, bytes| encoder.bytes(bytes));
+}
+
+fn decode_lane_state(decoder: &mut Decoder<'_>) -> Result<StandardLaneState, DecodeError> {
+    let state = StandardLaneState {
+        linear: decoder.option(Decoder::bytes)?,
+        merge: decoder.option(Decoder::bytes)?,
+        local: decoder.option(Decoder::bytes)?,
+    };
+    if [&state.linear, &state.merge, &state.local]
+        .into_iter()
+        .flatten()
+        .any(|bytes| bytes.len() > super::execution::MAX_EXECUTION_STATE_BYTES)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(state)
+}
+
 fn encode_blob(encoder: &mut Encoder<'_>, blob: &BlobRef) {
     encoder.fixed(&blob.hash.0);
     encoder.u64(blob.len);
@@ -585,6 +840,30 @@ mod tests {
         };
         let encoded = call.encode();
         assert_eq!(RuntimeCall::decode(&encoded).unwrap(), call);
+    }
+
+    #[test]
+    fn actor_execution_call_round_trips_with_content_addressed_inputs() {
+        let actor_pvm = vec![0x21, 0x22, 0x23];
+        let state = vec![0x31, 0x32];
+        let call = RuntimeExecutionCall {
+            state: vec![0x11, 0x12],
+            invocation: ActorInvocation {
+                invocation: crate::service::InvocationId([1; 32]),
+                actor: ActorId([2; 32]),
+                deployment: DeploymentId([3; 32]),
+                program: ProgramId::of_pvm(&actor_pvm),
+                mode: MethodMode::Linear,
+                message: vec![0x41],
+                actor_pvm,
+                availability: vec![RuntimeBlob {
+                    reference: BlobRef::of_bytes(&state),
+                    bytes: state,
+                }],
+                gas: 1_000_000,
+            },
+        };
+        assert_eq!(RuntimeExecutionCall::decode(&call.encode()).unwrap(), call);
     }
 
     #[test]

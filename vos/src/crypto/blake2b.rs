@@ -19,7 +19,7 @@
 //! would silently lose the high half and produce a divergent
 //! digest. Not a practical concern — matches `vos-pvm-precompiles`.
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(target_arch = "riscv64", not(feature = "agent-runtime")))]
 use crate::abi::pvm::ecall::VOS_OBJECT_CAP;
 
 /// Blake2b compression precompile. Its ID matches `vos-pvm-precompiles`,
@@ -37,11 +37,14 @@ pub const ECALL_BLAKE2B_COMPRESS: u32 = 100;
 /// in-tree reference impl is reachable from this path.
 pub fn blake2b_hash<const OUT_LEN: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; OUT_LEN] {
     assert!(OUT_LEN >= 1 && OUT_LEN <= 64);
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(all(target_arch = "riscv64", not(feature = "agent-runtime")))]
     {
         hash_via_ecall::<OUT_LEN>(domain, parts)
     }
-    #[cfg(not(target_arch = "riscv64"))]
+    // The infrastructure runtime deliberately has no private outer-host ABI.
+    // Hashing here is ordinary deterministic guest computation so its only
+    // outer host calls are standard PVM machine management (9..=14).
+    #[cfg(any(not(target_arch = "riscv64"), feature = "agent-runtime"))]
     {
         hash_via_simd::<OUT_LEN>(domain, parts)
     }
@@ -51,7 +54,7 @@ pub fn blake2b_hash<const OUT_LEN: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8
 /// Used by every non-riscv64 caller — workers, host code,
 /// wasm guests — and (transitively) by the host kernel
 /// handler for the riscv64 ECALL.
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(any(not(target_arch = "riscv64"), feature = "agent-runtime"))]
 fn hash_via_simd<const N: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; N] {
     let mut state = blake2b_simd::Params::new().hash_length(N).to_state();
     state.update(domain);
@@ -68,7 +71,7 @@ fn hash_via_simd<const N: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; N] {
 /// keeps the blake2b chaining state on its stack; each 128B
 /// message block is handed to the host with the current
 /// counter and finalize flag.
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(target_arch = "riscv64", not(feature = "agent-runtime")))]
 fn hash_via_ecall<const N: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; N] {
     // Parameter block: byte 0 = digest_length, byte 1 = key_length (0),
     // byte 2 = fanout (1), byte 3 = depth (1), bytes 4–7 = leaf_length (0).
@@ -122,7 +125,7 @@ fn hash_via_ecall<const N: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; N] {
     out
 }
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(target_arch = "riscv64", not(feature = "agent-runtime")))]
 fn ecall_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     let h_ptr = h.as_mut_ptr() as u64;
     let m_ptr = m.as_ptr() as u64;
@@ -179,7 +182,7 @@ const BLAKE2B_IV: [u64; 8] = [
 
 // On riscv64 the param-block init in `hash_via_ecall` needs
 // the IV constants too.
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(target_arch = "riscv64", not(feature = "agent-runtime")))]
 const BLAKE2B_IV: [u64; 8] = [
     0x6A09E667F3BCC908,
     0xBB67AE8584CAA73B,

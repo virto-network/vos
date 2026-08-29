@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
 #[cfg(feature = "std")]
 pub mod driver;
+pub mod execution;
 #[cfg(feature = "std")]
 pub mod host;
 #[cfg(feature = "pvm")]
@@ -25,12 +26,12 @@ use crate::service::{
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829!!");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829v2");
 
 /// Program identity of the bundled standard runtime artifact.
 pub const STANDARD_RUNTIME_PROGRAM_ID: ProgramId = ProgramId([
-    0x85, 0x39, 0x98, 0x96, 0xb8, 0x89, 0xb3, 0x1c, 0xbc, 0xaf, 0x0d, 0x5e, 0x92, 0x06, 0x10, 0x6e,
-    0x1a, 0xbf, 0xde, 0x8e, 0xfa, 0xcd, 0x98, 0xaa, 0x30, 0x18, 0x0f, 0x87, 0x05, 0x85, 0x84, 0xcd,
+    0xe2, 0xad, 0x6a, 0xf1, 0xfa, 0xc3, 0x6b, 0xb1, 0xdc, 0x29, 0x21, 0xf3, 0x6b, 0x0f, 0x30, 0x31,
+    0xb8, 0x55, 0xdc, 0x72, 0x88, 0x21, 0x54, 0xc1, 0x6c, 0xdd, 0x1a, 0x1d, 0x57, 0x37, 0x30, 0x7b,
 ]);
 
 /// Immutable storage and publication profile of an agent.
@@ -98,6 +99,19 @@ pub enum MethodMode {
     /// Mutate only this replica's local state while reading immutable lane
     /// snapshots.
     Local,
+}
+
+impl MethodMode {
+    /// The one lane a mutating method owns. Queries read snapshots without
+    /// owning a write lane.
+    pub const fn write_lane(self) -> Option<StateLane> {
+        match self {
+            Self::Linear => Some(StateLane::Linear),
+            Self::Merge => Some(StateLane::Merge),
+            Self::Local => Some(StateLane::Local),
+            Self::Query | Self::LinearizableQuery => None,
+        }
+    }
 }
 
 impl MethodMode {

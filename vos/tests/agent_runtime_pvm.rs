@@ -1,13 +1,16 @@
 use vos::agent::driver::{AgentDriver, MemoryAgentStore};
+use vos::agent::execution::{ActorExecutionStatus, ActorInvocation};
 use vos::agent::host::AgentHost;
+use vos::agent::standard::StandardRuntimeState;
 use vos::agent::wire::{RuntimeCall, RuntimeReturn};
 use vos::agent::{
-    AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LifecycleReply, LifecycleRequest,
-    ReplicaRole, RuntimeCapabilities, STANDARD_RUNTIME_PROGRAM_ID,
+    ActorEntry, ActorInitialState, AgentConfig, AgentIdentity, AgentProfile, AgentReplica,
+    InstallActor, LaneSet, LifecycleReply, LifecycleRequest, MethodMode, ReplicaRole,
+    RuntimeCapabilities, RuntimeRequirements, STANDARD_RUNTIME_PROGRAM_ID,
 };
 use vos::service::{
-    AgentId, BlobRef, DeploymentId, Hash, NodeId, PrincipalId, ProducerId, ProgramId, ServiceWire,
-    SpaceId,
+    ActorId, AgentId, BlobRef, DeploymentId, Hash, InvocationId, NodeId, PrincipalId, ProducerId,
+    ProgramId, ServiceWire, SpaceId,
 };
 use vos_pvm::ExitReason;
 use vos_pvm::refine_host::RefineContext;
@@ -174,4 +177,81 @@ fn multi_agent_host_discovers_empty_agents_after_restart() {
     assert_eq!(reopened.len(), 2);
     assert_eq!(reopened.revision(first), Some(1));
     assert_eq!(reopened.revision(second), Some(1));
+}
+
+fn static_actor_pvm() -> Vec<u8> {
+    use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+    // Actor output: Done, one byte of next state, then one reply byte.
+    let output = vec![0, 1, 0, 0, 0, 0x2a, 0x63];
+    let mut actor = Assembler::new();
+    actor
+        .set_rw_data(output.clone())
+        .load_imm_64(Reg::A0, 2 * u64::from(vos_pvm::PVM_ZONE_SIZE))
+        .load_imm_64(Reg::A1, output.len() as u64)
+        .jump_ind(Reg::RA, 0);
+    actor.build_standard()
+}
+
+#[test]
+fn installed_actor_executes_inside_the_bundled_runtime() {
+    let config = config();
+    let mut driver = AgentDriver::create_or_open(
+        AGENT_RUNTIME_PVM.to_vec(),
+        config.clone(),
+        MemoryAgentStore::default(),
+    )
+    .expect("create agent");
+    let actor_pvm = static_actor_pvm();
+    let program = ProgramId::of_pvm(&actor_pvm);
+    let actor = ActorId::top_level(config.identity.agent, "counter");
+    let deployment = DeploymentId([0x44; 32]);
+    driver
+        .lifecycle(LifecycleRequest::Install(InstallActor {
+            entry: ActorEntry {
+                actor,
+                name: "counter".into(),
+                parent: None,
+                deployment,
+                program,
+                lanes: LaneSet::of(vos::agent::StateLane::Linear),
+                suspended: false,
+            },
+            producer: ProducerId([0x55; 32]),
+            package: BlobRef::of_bytes(b"signed-counter-package"),
+            initial_state: ActorInitialState {
+                linear: None,
+                merge: None,
+                local: None,
+            },
+            requirements: RuntimeRequirements {
+                lanes: LaneSet::of(vos::agent::StateLane::Linear),
+                scheduling: false,
+                proofs: false,
+            },
+        }))
+        .expect("install actor");
+
+    let reply = driver
+        .invoke(ActorInvocation {
+            invocation: InvocationId([0x66; 32]),
+            actor,
+            deployment,
+            program,
+            mode: MethodMode::Linear,
+            message: vec![0x77],
+            actor_pvm,
+            availability: Vec::new(),
+            gas: 10_000_000,
+        })
+        .expect("invoke actor");
+    assert_eq!(reply.status, ActorExecutionStatus::Done);
+    assert_eq!(reply.reply, vec![0x63]);
+    assert_eq!(driver.image().revision, 3);
+
+    let state = StandardRuntimeState::decode(&driver.image().runtime_state).unwrap();
+    assert_eq!(
+        state.actors[0].lane_state.linear.as_deref(),
+        Some(&[0x2a][..])
+    );
 }
