@@ -210,7 +210,8 @@ items the earlier draft of this file listed have all been closed:
   RotR32 + RotR32Imm `[36]`, RotR64ImmAlt + RotR32ImmAlt `[40]`.
 - BitManip: CountSetBits 32/64 `[33]`, LeadingZeroBits +
   TrailingZeroBits 32/64 `[34]`. The retired Sbrk opcode was removed from
-  the standard AIR in proof format 12.
+  the standard AIR beginning in proof format 12 and remains absent in the
+  current profile-bound format 14.
 - Smaller: 32-bit shift ShiftAmount uniqueness `[37]`;
   is_write discriminator forge tests `[39]`.
 

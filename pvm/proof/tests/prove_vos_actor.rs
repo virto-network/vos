@@ -150,56 +150,11 @@ fn analyze_register_dedup(name: &str, gas: u64) {
     let Some(blob) = load_actor_blob(name) else {
         return;
     };
-    let parsed = program::parse_blob(&blob).expect("parse blob");
-    let mut code_data = None;
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Code {
-            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-            break;
-        }
-    }
-    let code_blob = program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
     let (interp, flat_mem) = interpreter_from_blob(&blob, gas);
 
     let mut tracing = TracingPvm::new(interp);
     let _exit = tracing.run_with_vos_stubs();
-    let blake2b_calls: Vec<_> = tracing.blake2b_calls().to_vec();
-    let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
-    let ristretto_calls: Vec<_> = tracing.ristretto_calls().to_vec();
-    let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
-    let ristretto_add_records = tracing.ristretto_add_records.clone();
-    let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
-    let scalar_reduce_records = tracing.scalar_reduce_wide_records.clone();
-    let scalar_reduce_mem_ops = tracing.scalar_reduce_wide_mem_ops.clone();
-    let scalar_binop_records = tracing.scalar_binop_records.clone();
-    let scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
-    let steps = tracing.into_trace();
-
-    let mut side_note =
-        vos_pvm_proof::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
-            .with_memory(flat_mem)
-            .with_jump_table(code_blob.jump_table.to_vec());
-
-    for c in &blake2b_calls {
-        side_note
-            .blake2b_calls
-            .push(vos_pvm_proof::chips::blake2b::Blake2bCall {
-                h: c.h,
-                m: c.m,
-                t: c.t,
-                f: c.f,
-            });
-    }
-    side_note.blake2b_mem_ops = blake2b_mem_ops;
-    side_note.ristretto_calls = ristretto_calls;
-    side_note.ristretto_mem_ops = ristretto_mem_ops;
-    side_note.ristretto_add_calls = ristretto_add_records;
-    side_note.ristretto_add_mem_ops = ristretto_add_mem_ops;
-    side_note.scalar_reduce_wide_calls = scalar_reduce_records;
-    side_note.scalar_reduce_wide_mem_ops = scalar_reduce_mem_ops;
-    side_note.scalar_binop_calls = scalar_binop_records;
-    side_note.scalar_binop_mem_ops = scalar_binop_mem_ops;
-    side_note.ingest_ristretto_boundary();
+    let side_note = tracing.into_side_note().with_memory(flat_mem);
 
     let report = vos_pvm_proof::chips::register_memory::analyze_dedup(&side_note);
 
@@ -255,56 +210,11 @@ fn analyze_memory_dedup(name: &str, gas: u64) {
     let Some(blob) = load_actor_blob(name) else {
         return;
     };
-    let parsed = program::parse_blob(&blob).expect("parse blob");
-    let mut code_data = None;
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Code {
-            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-            break;
-        }
-    }
-    let code_blob = program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
     let (interp, flat_mem) = interpreter_from_blob(&blob, gas);
 
     let mut tracing = TracingPvm::new(interp);
     let _exit = tracing.run_with_vos_stubs();
-    let blake2b_calls: Vec<_> = tracing.blake2b_calls().to_vec();
-    let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
-    let ristretto_calls: Vec<_> = tracing.ristretto_calls().to_vec();
-    let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
-    let ristretto_add_records = tracing.ristretto_add_records.clone();
-    let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
-    let scalar_reduce_records = tracing.scalar_reduce_wide_records.clone();
-    let scalar_reduce_mem_ops = tracing.scalar_reduce_wide_mem_ops.clone();
-    let scalar_binop_records = tracing.scalar_binop_records.clone();
-    let scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
-    let steps = tracing.into_trace();
-
-    let mut side_note =
-        vos_pvm_proof::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
-            .with_memory(flat_mem)
-            .with_jump_table(code_blob.jump_table.to_vec());
-
-    for c in &blake2b_calls {
-        side_note
-            .blake2b_calls
-            .push(vos_pvm_proof::chips::blake2b::Blake2bCall {
-                h: c.h,
-                m: c.m,
-                t: c.t,
-                f: c.f,
-            });
-    }
-    side_note.blake2b_mem_ops = blake2b_mem_ops;
-    side_note.ristretto_calls = ristretto_calls;
-    side_note.ristretto_mem_ops = ristretto_mem_ops;
-    side_note.ristretto_add_calls = ristretto_add_records;
-    side_note.ristretto_add_mem_ops = ristretto_add_mem_ops;
-    side_note.scalar_reduce_wide_calls = scalar_reduce_records;
-    side_note.scalar_reduce_wide_mem_ops = scalar_reduce_mem_ops;
-    side_note.scalar_binop_calls = scalar_binop_records;
-    side_note.scalar_binop_mem_ops = scalar_binop_mem_ops;
-    side_note.ingest_ristretto_boundary();
+    let side_note = tracing.into_side_note().with_memory(flat_mem);
 
     let report = vos_pvm_proof::chips::memory::analyze_dedup(&side_note);
 
@@ -377,33 +287,15 @@ fn profile_hash_variant(name: &str) {
         },
     };
 
-    let parsed = program::parse_blob(&blob).expect("parse blob");
-    let mut code_data = None;
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Code {
-            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-            break;
-        }
-    }
-    let code_blob = program::parse_code_blob(&code_data.expect("CODE")).expect("parse code");
     let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
 
     let mut tracing = TracingPvm::new(interp);
     let _exit = tracing.run();
-    let steps = tracing.into_trace();
-
-    let n = steps.len();
-
-    let mut side_note = vos_pvm_proof::SideNote::new(
-        steps.clone(),
-        code_blob.code.to_vec(),
-        code_blob.bitmask.to_vec(),
-    )
-    .with_memory(flat_mem)
-    .with_jump_table(code_blob.jump_table.to_vec());
+    let mut side_note = tracing.into_side_note().with_memory(flat_mem);
+    let n = side_note.steps.len();
 
     let mut counts = std::collections::HashMap::new();
-    for s in &steps {
+    for s in &side_note.steps {
         *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
     }
     let mut sorted: Vec<_> = counts.into_iter().collect();
@@ -461,7 +353,8 @@ fn debug_blake2s_prefix() {
     let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
     let mut tracing = TracingPvm::new(interp);
     let _exit = tracing.run();
-    let steps = tracing.into_trace();
+    let mut full_side_note = tracing.into_side_note().with_memory(flat_mem);
+    let steps = full_side_note.steps.clone();
     eprintln!("blake2s: {} total steps", steps.len());
 
     let config = vos_pvm_proof::PcsConfig {
@@ -479,7 +372,8 @@ fn debug_blake2s_prefix() {
             code_blob.code.to_vec(),
             code_blob.bitmask.to_vec(),
         )
-        .with_memory(flat_mem.clone())
+        .with_isa_mode(full_side_note.isa_mode)
+        .with_memory(full_side_note.initial_memory.clone())
         .with_jump_table(code_blob.jump_table.to_vec());
         let ok = vos_pvm_proof::prove_with_config(&mut sn, config).is_ok();
         eprintln!("  {n:>5} steps: {}", if ok { "OK" } else { "FAIL" });
@@ -489,14 +383,7 @@ fn debug_blake2s_prefix() {
     }
     // Try the full trace
     eprintln!("Trying full trace ({} steps):", steps.len());
-    let mut sn = vos_pvm_proof::SideNote::new(
-        steps.clone(),
-        code_blob.code.to_vec(),
-        code_blob.bitmask.to_vec(),
-    )
-    .with_memory(flat_mem)
-    .with_jump_table(code_blob.jump_table.to_vec());
-    match vos_pvm_proof::prove_with_config(&mut sn, config) {
+    match vos_pvm_proof::prove_with_config(&mut full_side_note, config) {
         Ok(proof) => {
             // Use a permissive policy matching the test config —
             // STANDARD floor would trip on pow_bits=5 / fri_log_blowup=0.
@@ -505,7 +392,7 @@ fn debug_blake2s_prefix() {
                 min_fri_queries: 3,
                 min_fri_log_blowup: 0,
             };
-            vos_pvm_proof::verify_with_pcs_policy(proof, &sn, &policy).expect("verify");
+            vos_pvm_proof::verify_with_pcs_policy(proof, &full_side_note, &policy).expect("verify");
             eprintln!("  PASS!");
         }
         Err(e) => {
@@ -524,24 +411,11 @@ fn prove_diverse() {
             return;
         }
     };
-    let parsed = program::parse_blob(&blob).expect("parse blob");
-    let mut code_data = None;
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Code {
-            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-            break;
-        }
-    }
-    let code_blob = program::parse_code_blob(&code_data.expect("CODE")).expect("parse code");
     let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
     let mut tracing = TracingPvm::new(interp);
     let _exit = tracing.run();
-    let steps = tracing.into_trace();
-    eprintln!("Diverse: {} steps", steps.len());
-    let mut side_note =
-        vos_pvm_proof::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
-            .with_memory(flat_mem)
-            .with_jump_table(code_blob.jump_table.to_vec());
+    let mut side_note = tracing.into_side_note().with_memory(flat_mem);
+    eprintln!("Diverse: {} steps", side_note.steps.len());
     let t = std::time::Instant::now();
     match prove(&mut side_note) {
         Ok(p) => {
@@ -662,24 +536,9 @@ fn prove_blake2b_precompile() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _exit = tracing.run_with_precompiles();
-    let steps = tracing.trace();
-    let blake2b_records = tracing.blake2b_records.clone();
-    let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
-
-    let mut side_note = vos_pvm_proof::SideNote::new(steps, code, bitmask).with_memory(flat_mem);
-    for rec in &blake2b_records {
-        side_note
-            .blake2b_calls
-            .push(vos_pvm_proof::chips::blake2b::Blake2bCall {
-                h: rec.h,
-                m: rec.m,
-                t: rec.t,
-                f: rec.f,
-            });
-    }
-    side_note.blake2b_mem_ops = blake2b_mem_ops;
+    let mut side_note = tracing.into_side_note().with_memory(flat_mem);
 
     let config = vos_pvm_proof::PcsConfig {
         pow_bits: 5,
@@ -1374,7 +1233,7 @@ fn ristretto_scalar_mult_via_ecall_tracing() {
 
     let pvm =
         vos_pvm::interpreter::Interpreter::new(code, bitmask, vec![], regs, flat_mem, 10_000, 25);
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run_with_precompiles();
     eprintln!(
         "Exit: {exit:?}, steps: {}, ristretto_calls: {}",
@@ -1484,7 +1343,7 @@ fn prove_blake2b_via_ecall() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run_with_precompiles();
     eprintln!(
         "Exit: {exit:?}, steps: {}, blake2b_calls: {}",
@@ -1586,7 +1445,7 @@ fn prove_ristretto_via_ecall_boundary() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.ristretto_records.len(), 1);
 
@@ -1667,7 +1526,7 @@ fn prove_ristretto_identity_via_ecall_comb() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.ristretto_records.len(), 1);
     // The traced output is the canonical identity encoding.
@@ -1747,7 +1606,7 @@ fn prove_ristretto_point_add_via_ecall_boundary() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.ristretto_add_records.len(), 1);
 
@@ -1811,7 +1670,7 @@ fn prove_scalar_reduce_wide_via_ecall_boundary() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.scalar_reduce_wide_records.len(), 1);
 
@@ -1880,7 +1739,7 @@ fn prove_scalar_mul_mod_l_via_ecall() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.scalar_binop_records.len(), 1);
 
@@ -1955,7 +1814,7 @@ fn prove_scalar_mul_then_add_mod_l() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.scalar_binop_records.len(), 2);
 
@@ -2030,7 +1889,7 @@ fn prove_scalar_mult_then_point_add() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.ristretto_records.len(), 1);
     assert_eq!(tracing.ristretto_add_records.len(), 1);
@@ -2103,7 +1962,7 @@ fn prove_two_ristretto_scalar_mult_ecalls() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.ristretto_records.len(), 2);
 
@@ -2175,7 +2034,7 @@ fn prove_scalar_mul_chained_add() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.scalar_binop_records.len(), 2);
 

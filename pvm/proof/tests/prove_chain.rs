@@ -62,7 +62,7 @@ fn prove_chain_verifies_as_canonical_chain() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     assert_eq!(tracing.run(), vos_pvm::ExitReason::Trap);
     let all_steps = tracing.into_trace();
     assert_eq!(all_steps.len(), 7);

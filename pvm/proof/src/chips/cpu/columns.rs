@@ -19,8 +19,14 @@ pub enum Column {
     Pc,
     #[size = 4]
     NextPc,
+    /// Exact encoded opcode byte. Its semantic decoding is authenticated by
+    /// the adjacent ISA profile and ProgramMemory-derived flag bytes.
     #[size = 1]
     Opcode,
+    /// 0 = standard Gray Paper v0.8, 1 = frozen capability-manifest ISA.
+    /// Authenticated by the ProgramMemory lookup on every real row.
+    #[size = 1]
+    IsaProfile,
     #[size = 1]
     SkipLen,
     /// Carry chain for sequential PC addition: next_pc = pc + 1 + skip_len

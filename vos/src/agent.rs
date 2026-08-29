@@ -32,6 +32,16 @@ use crate::service::{
 /// Stable lifecycle contract implemented by every agent runtime.
 pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829r1");
 
+/// Consensus-visible execution semantics for standard-PVM agent packages.
+///
+/// This is intentionally distinct from [`crate::service::EXECUTION_SEMANTICS_ID`]:
+/// the transitional Service package path executes the frozen
+/// capability-manifest profile, while Agent Actor and AgentRuntime packages
+/// execute the standard SPI profile. A semantics change in one profile must
+/// not silently accept—or unnecessarily invalidate—packages for the other
+/// profile.
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r01");
+
 /// Program identity of the bundled standard runtime artifact.
 pub const STANDARD_RUNTIME_PROGRAM_ID: ProgramId = ProgramId([
     0x81, 0xf8, 0xa1, 0xf9, 0x68, 0xf4, 0xfd, 0xb6, 0x3c, 0x8f, 0x27, 0x3d, 0x82, 0x24, 0xc5, 0xcc,

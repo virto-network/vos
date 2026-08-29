@@ -50,7 +50,8 @@ pub enum ReleaseCommand {
 struct ReleaseManifest {
     format: String,
     platform: String,
-    execution_semantics: String,
+    service_execution_semantics: String,
+    agent_execution_semantics: String,
     service: ReleaseArtifact,
     authority: ReleaseArtifact,
     agent_runtime: ReleaseArtifact,
@@ -70,10 +71,11 @@ pub fn run(command: ReleaseCommand) -> anyhow::Result<()> {
         ReleaseCommand::Bundle { service_pvm, out } => bundle(&service_pvm, &out),
         ReleaseCommand::Verify { directory } => verify(&directory).map(|manifest| {
             println!(
-                "verified {} (platform {}, semantics {})",
+                "verified {} (platform {}, service semantics {}, agent semantics {})",
                 directory.display(),
                 manifest.platform,
-                manifest.execution_semantics,
+                manifest.service_execution_semantics,
+                manifest.agent_execution_semantics,
             );
         }),
     }
@@ -193,7 +195,8 @@ fn manifest_for(service: &[u8], authority: &[u8], agent_runtime: &[u8]) -> Relea
     ReleaseManifest {
         format: RELEASE_FORMAT.into(),
         platform: hex::encode(vos::service::PLATFORM_ID.0),
-        execution_semantics: hex::encode(vos::service::EXECUTION_SEMANTICS_ID.0),
+        service_execution_semantics: hex::encode(vos::service::EXECUTION_SEMANTICS_ID.0),
+        agent_execution_semantics: hex::encode(vos::agent::EXECUTION_SEMANTICS_ID.0),
         service: artifact(SERVICE_FILE, service),
         authority: artifact(AUTHORITY_FILE, authority),
         agent_runtime: artifact(AGENT_RUNTIME_FILE, agent_runtime),
@@ -365,6 +368,18 @@ mod tests {
         let manifest = manifest_for(b"service", b"authority", b"agent runtime");
         assert_eq!(manifest.format, RELEASE_FORMAT);
         assert_eq!(manifest.platform, hex::encode(vos::service::PLATFORM_ID.0));
+        assert_eq!(
+            manifest.service_execution_semantics,
+            hex::encode(vos::service::EXECUTION_SEMANTICS_ID.0),
+        );
+        assert_eq!(
+            manifest.agent_execution_semantics,
+            hex::encode(vos::agent::EXECUTION_SEMANTICS_ID.0),
+        );
+        assert_ne!(
+            manifest.service_execution_semantics,
+            manifest.agent_execution_semantics,
+        );
         assert_eq!(manifest.service.file, SERVICE_FILE);
         assert_eq!(manifest.authority.file, AUTHORITY_FILE);
         assert_eq!(manifest.agent_runtime.file, AGENT_RUNTIME_FILE);
@@ -372,6 +387,26 @@ mod tests {
         assert_ne!(
             manifest.authority.blake2b_256,
             manifest.agent_runtime.blake2b_256
+        );
+    }
+
+    #[test]
+    fn release_manifest_has_no_single_semantics_fallback() {
+        let manifest = manifest_for(b"service", b"authority", b"agent runtime");
+        let mut value = serde_json::to_value(manifest)
+            .expect("serialize manifest")
+            .as_object()
+            .expect("manifest object")
+            .clone();
+        value.remove("service_execution_semantics");
+        value.remove("agent_execution_semantics");
+        value.insert(
+            "execution_semantics".into(),
+            serde_json::Value::String(hex::encode(vos::service::EXECUTION_SEMANTICS_ID.0)),
+        );
+        assert!(
+            serde_json::from_value::<ReleaseManifest>(serde_json::Value::Object(value)).is_err(),
+            "the former one-profile release schema must not be accepted",
         );
     }
 

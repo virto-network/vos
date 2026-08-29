@@ -59,7 +59,7 @@ pub fn trace_until_trap(
         DEFAULT_GAS,
         DEFAULT_MAX_STEPS,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Trap, "expected Trap exit");
     tracing.into_trace()

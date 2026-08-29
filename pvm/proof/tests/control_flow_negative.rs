@@ -39,7 +39,7 @@ fn trace_branch_eq(
         10_000,
         25,
     );
-    let mut tr = TracingPvm::new(pvm);
+    let mut tr = TracingPvm::new_conformance(pvm);
     let _ = tr.run();
     (code, bitmask, tr.into_trace())
 }
@@ -82,7 +82,7 @@ fn trace_branch(
         10_000,
         25,
     );
-    let mut tr = TracingPvm::new(pvm);
+    let mut tr = TracingPvm::new_conformance(pvm);
     let _ = tr.run();
     (code, bitmask, tr.into_trace())
 }

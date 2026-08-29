@@ -1,0 +1,48 @@
+{
+  "expected": {
+    "blocks": [
+      {
+        "gas": 1,
+        "pc": 0
+      },
+      {
+        "gas": 1,
+        "pc": 4
+      },
+      {
+        "gas": 1,
+        "pc": 5
+      }
+    ],
+    "first": {
+      "remaining_gas": 99,
+      "status": "panic"
+    },
+    "resume": null
+  },
+  "initial": {
+    "gas": 100,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "branch_negative_out_of_code_target_is_zero_extended_short",
+  "program": {
+    "bitmask": "0x31",
+    "code": "0x511200ff0100"
+  },
+  "rule": "single-pass-block-gas",
+  "spec": "gray-paper-0.8.0"
+}

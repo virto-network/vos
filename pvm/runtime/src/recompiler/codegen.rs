@@ -542,6 +542,7 @@ impl Compiler {
                     reg_byte2 & 0x0F,
                     &mut gas_sim,
                     self.mem_cycles,
+                    self.isa_mode,
                 );
                 if needs_full {
                     // Slow path for branches/overlap/move: use full FastCost
@@ -555,6 +556,7 @@ impl Compiler {
                         raw_rb,
                         reg_byte2 & 0x0F,
                         self.mem_cycles,
+                        self.isa_mode,
                     );
                     gas_sim.feed(&fc);
                     fc.is_terminator
@@ -842,6 +844,7 @@ impl Compiler {
                 code,
                 bitmask,
                 self.mem_cycles,
+                self.isa_mode,
             );
             gas_sim.feed(&fc);
         }
@@ -950,6 +953,7 @@ impl Compiler {
             code,
             bitmask,
             self.mem_cycles,
+            self.isa_mode,
         );
         gas_sim.feed(&fc);
 

@@ -555,10 +555,11 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // ── ProgramMemory consumer (prover-side, 2 paired, 31 limbs) ──
+    // ── ProgramMemory consumer (prover-side, 2 paired, 32 limbs) ──
     {
         let prog_mem: &ProgramMemoryLookupElements = lookup_elements.as_ref();
         let pc = crate::trace::original_base_column!(component_trace, Column::Pc);
+        let isa_profile = crate::trace::original_base_column!(component_trace, Column::IsaProfile);
         let opcode = crate::trace::original_base_column!(component_trace, Column::Opcode);
         let skip_len = crate::trace::original_base_column!(component_trace, Column::SkipLen);
         let reg_a = crate::trace::original_base_column!(component_trace, Column::RegA);
@@ -578,6 +579,7 @@ pub(super) fn generate_interaction_trace(
         let is_pad_col = crate::trace::original_base_column!(component_trace, Column::IsPadding);
 
         let mut tuple: Vec<_> = pc.to_vec();
+        tuple.push(isa_profile[0].clone());
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
         tuple.push(reg_a[0].clone());

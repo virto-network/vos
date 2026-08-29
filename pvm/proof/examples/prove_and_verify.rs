@@ -54,7 +54,7 @@ fn main() {
         10_000,                     // gas budget
         25,                         // max steps
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
     assert_eq!(exit, ExitReason::Trap, "expected Trap exit");
     let steps = tracing.into_trace();

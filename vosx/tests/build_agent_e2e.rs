@@ -98,7 +98,7 @@ fn runtime_package() -> Package {
         manifest: PackageManifest {
             name: "standard-agent-runtime".into(),
             platform: vos::service::PLATFORM_ID,
-            execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+            execution_semantics: vos::agent::EXECUTION_SEMANTICS_ID,
             kind: vos::agent::PackageKind::AgentRuntime {
                 contract: RuntimePackageContract::canonical(),
                 capabilities: RuntimeCapabilities::standard(),

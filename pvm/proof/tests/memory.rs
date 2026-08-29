@@ -54,7 +54,7 @@ fn prove_store_only() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Trap);
     let steps = tracing.into_trace();
@@ -105,7 +105,7 @@ fn prove_store_and_load_u8() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Trap);
 
@@ -165,7 +165,7 @@ fn prove_store_and_load_u64() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Trap);
 
@@ -221,7 +221,7 @@ fn prove_store_load_u64_crossing_page_boundaries() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Trap);
 
@@ -278,7 +278,7 @@ fn prove_multiple_stores_same_addr() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
     eprintln!("exit: {exit:?}");
 
@@ -348,7 +348,7 @@ fn prove_store_imm_u8_then_load() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     assert_eq!(tracing.run(), vos_pvm::ExitReason::Trap);
     let steps = tracing.into_trace();
 
@@ -398,7 +398,7 @@ fn prove_store_load_with_alu() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Trap);
 

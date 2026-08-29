@@ -826,7 +826,10 @@ fn retrace_io_hash(pvm_blob: &[u8], witness_bytes: &[u8], witness_addr: usize) -
             let address = u32::try_from(witness_addr + index).ok()?;
             interp.write_u8(address, byte).ok()?;
         }
-        let mut tracing = vos_pvm_proof::core::tracing::TracingPvm::new(interp);
+        // `interpreter_from_blob` accepts the authenticated transitional
+        // capability-manifest container, whose frozen unary numbering is the
+        // same service-Task profile used by the live executor.
+        let mut tracing = vos_pvm_proof::core::tracing::TracingPvm::new_capability_manifest(interp);
         // The proof crate pins its own `vos_pvm` revision, so its ExitReason is a
         // different type than vos's — compare the Debug form. The
         // Recorded Tasks terminate only through the dedicated HALT address.
@@ -1752,6 +1755,25 @@ mod record_tests {
     //! `vos/tests/elf_integration.rs`.
     use super::*;
 
+    /// A capability-manifest Task whose raw opcode 102 computes 40 under the
+    /// frozen capability profile but 8 under standard v0.8. It copies the
+    /// result into the first io-hash register before halting.
+    fn capability_profile_probe() -> Vec<u8> {
+        let input = 0xffff_ffff_0000_00ffu64;
+        let mut code = vec![20, 3]; // load_imm_64 r3, input
+        code.extend_from_slice(&input.to_le_bytes());
+        code.extend_from_slice(&[102, 0x31]); // raw 102: r1 <- op(r3)
+        code.extend_from_slice(&[100, 0x19]); // move r9 <- r1
+        code.extend_from_slice(&[20, 2]); // load_imm_64 r2, HALT
+        code.extend_from_slice(&vos_pvm::PVM_HALT_ADDR.to_le_bytes());
+        code.extend_from_slice(&[50, 2, 0, 0, 0, 0]); // jump_ind r2, 0
+        let mut bitmask = vec![0; code.len()];
+        for pc in [0usize, 10, 12, 14, 24] {
+            bitmask[pc] = 1;
+        }
+        vos_pvm::program::build_simple_blob(&code, &bitmask, &[])
+    }
+
     /// A ProvableRecord satisfying its internal binding equation, plus
     /// a matching ProofRecordEntry over `blob`'s content-address.
     fn consistent_entry(blob: &[u8]) -> ProofRecordEntry {
@@ -1818,6 +1840,24 @@ mod record_tests {
         // The full pre-flight fails soft on an unparseable blob (the
         // re-trace yields None) rather than panicking.
         assert!(!record_preflight(&blob, &entry, 0));
+    }
+
+    #[test]
+    fn preflight_retrace_matches_live_capability_unary_profile() {
+        use vos_pvm::kernel::{InvocationKernel, KernelResult};
+
+        let blob = capability_profile_probe();
+        let mut live = InvocationKernel::new(&blob, &[], TRACE_GAS).expect("live Task kernel");
+        assert!(matches!(live.run(), KernelResult::Halt));
+        assert_eq!(live.active_reg(9), 40, "live frozen-profile result");
+
+        let retraced = retrace_io_hash(&blob, &[], 0).expect("prover preflight retrace");
+        let mut live_io = [0u8; 32];
+        for (index, register) in (9..13).map(|index| live.active_reg(index)).enumerate() {
+            live_io[index * 8..index * 8 + 8].copy_from_slice(&register.to_le_bytes());
+        }
+        assert_eq!(retraced, live_io);
+        assert_eq!(u64::from_le_bytes(retraced[..8].try_into().unwrap()), 40);
     }
 
     #[test]
@@ -1981,7 +2021,7 @@ mod test_trace {
             10_000,
             25,
         );
-        let mut tracing = TracingPvm::new(pvm);
+        let mut tracing = TracingPvm::new_conformance(pvm);
         assert_eq!(tracing.run(), vos_pvm::ExitReason::Trap);
         SideNote::new(tracing.into_trace(), code, bitmask).with_memory(mem)
     }

@@ -191,6 +191,10 @@ pub struct RistrettoMemOp {
 
 pub struct TracingPvm {
     pub pvm: Interpreter,
+    /// Instruction profile used both by the interpreter and by witness
+    /// decoding. This is carried into the proof side note so the public
+    /// program commitment binds the same semantics.
+    isa_mode: vos_pvm::IsaMode,
     /// Recorded steps in compact form — the register-file snapshots are
     /// reconstructible from `initial_regs` + the per-step [`RegWrite`]s
     /// (see [`CompactStep`]), so a multi-million-step trace holds ~2.6×
@@ -221,12 +225,39 @@ pub struct TracingPvm {
 }
 
 impl TracingPvm {
-    pub fn new(mut pvm: Interpreter) -> Self {
-        // The AIR proves the public Gray Paper machine, never the frozen
-        // capability-manifest opcode profile used by the frozen host kernel.
-        pvm.set_isa_mode(vos_pvm::IsaMode::Conformance);
+    /// Trace an initialized interpreter without changing its ISA profile.
+    ///
+    /// This preservation is security-critical for interpreters returned by
+    /// container adapters: feeding a capability-manifest interpreter through
+    /// this general constructor must not silently switch it to standard v0.8.
+    pub fn new(pvm: Interpreter) -> Self {
+        let isa_mode = pvm.isa_mode();
+        Self::new_with_isa_mode(pvm, isa_mode)
+    }
+
+    /// Trace a canonical standard PVM program under the Gray Paper v0.8 ISA.
+    pub fn new_conformance(pvm: Interpreter) -> Self {
+        Self::new_with_isa_mode(pvm, vos_pvm::IsaMode::Conformance)
+    }
+
+    /// Trace a transitional capability-manifest program under its frozen
+    /// execution profile. Prefer this named constructor at container
+    /// boundaries so callers do not need to manufacture a profile tag.
+    pub fn new_capability_manifest(pvm: Interpreter) -> Self {
+        Self::new_with_isa_mode(pvm, vos_pvm::IsaMode::Jar)
+    }
+
+    /// Trace under an explicitly selected ISA profile.
+    ///
+    /// Capability-manifest Tasks must use [`vos_pvm::IsaMode::Jar`]; their
+    /// frozen unary numbering differs from the standard v0.8 table. Blob
+    /// entry points select this from the authenticated container rather than
+    /// accepting a caller-provided guess.
+    pub fn new_with_isa_mode(mut pvm: Interpreter, isa_mode: vos_pvm::IsaMode) -> Self {
+        pvm.set_isa_mode(isa_mode);
         Self {
             pvm,
+            isa_mode,
             steps: Vec::new(),
             initial_regs: None,
             last_regs: [0u64; PVM_REGISTER_COUNT],
@@ -242,6 +273,11 @@ impl TracingPvm {
             scalar_binop_mem_ops: Vec::new(),
             timestamp: 1, // 0 is reserved for initial memory entries
         }
+    }
+
+    /// The profile whose semantics this trace records.
+    pub fn isa_mode(&self) -> vos_pvm::IsaMode {
+        self.isa_mode
     }
 
     /// Execute a single step, recording the witness.
@@ -273,7 +309,7 @@ impl TracingPvm {
         } else {
             0
         };
-        let opcode = Opcode::from_byte(opcode_byte).unwrap_or(Opcode::Trap);
+        let opcode = Opcode::from_byte_in_mode(opcode_byte, self.isa_mode).unwrap_or(Opcode::Trap);
         let skip_len = compute_skip(&self.pvm.bitmask, pc_before as usize);
         let category = opcode.category();
         let decoded_args = args::decode_args(
@@ -797,9 +833,56 @@ impl TracingPvm {
     }
 
     /// Consume and return the recorded trace as full steps.
+    ///
+    /// This is an analysis-level escape hatch: the returned steps do not carry
+    /// the interpreter's ISA profile or precompile records. Proof-building
+    /// callers should use [`Self::into_side_note`] so a capability-manifest
+    /// trace cannot silently fall back to the standard profile.
     pub fn into_trace(self) -> Vec<PvmStep> {
         let regs = self.initial_regs();
         expand_steps(&self.steps, regs)
+    }
+
+    /// Consume this trace into a proof [`crate::SideNote`], preserving the
+    /// interpreter's ISA profile and every recorded precompile boundary.
+    ///
+    /// Program bytes, instruction starts, jump table, and profile come from the
+    /// interpreter itself, so a caller cannot accidentally pair the recorded
+    /// steps with a different static program view. Initial memory remains
+    /// explicit because the interpreter contains the post-execution image;
+    /// attach the saved entering image with `SideNote::with_memory`.
+    /// Keeping profile transfer inside this consuming operation prevents the
+    /// unsafe `into_trace()` followed by profile-defaulting `SideNote::new()`
+    /// pattern at capability-container boundaries.
+    pub fn into_side_note(self) -> crate::SideNote {
+        let code = self.pvm.code.clone();
+        let bitmask = self.pvm.bitmask.clone();
+        let jump_table = self.pvm.jump_table.clone();
+        let steps = self.trace();
+        let mut side_note = crate::SideNote::new(steps, code, bitmask)
+            .with_isa_mode(self.isa_mode)
+            .with_jump_table(jump_table);
+        side_note.blake2b_calls = self
+            .blake2b_records
+            .into_iter()
+            .map(|record| crate::chips::blake2b::Blake2bCall {
+                h: record.h,
+                m: record.m,
+                t: record.t,
+                f: record.f,
+            })
+            .collect();
+        side_note.blake2b_mem_ops = self.blake2b_mem_ops;
+        side_note.ristretto_calls = self.ristretto_records;
+        side_note.ristretto_mem_ops = self.ristretto_mem_ops;
+        side_note.ristretto_add_calls = self.ristretto_add_records;
+        side_note.ristretto_add_mem_ops = self.ristretto_add_mem_ops;
+        side_note.scalar_reduce_wide_calls = self.scalar_reduce_wide_records;
+        side_note.scalar_reduce_wide_mem_ops = self.scalar_reduce_wide_mem_ops;
+        side_note.scalar_binop_calls = self.scalar_binop_records;
+        side_note.scalar_binop_mem_ops = self.scalar_binop_mem_ops;
+        side_note.ingest_ristretto_boundary();
+        side_note
     }
 
     /// Consume and return the compact trace: the recorded steps plus the

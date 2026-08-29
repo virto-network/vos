@@ -592,6 +592,53 @@ pub fn prove_canonical(
     Ok(proof)
 }
 
+/// Measure the public program commitment for an already-pinned canonical
+/// component profile without materializing main/interaction traces or a FRI
+/// proof.
+///
+/// The preprocessed tree is witness-independent by protocol: it contains the
+/// authenticated program tables, fixed lookup tables, and their exact
+/// per-component heights. Catalog maintenance can therefore re-pin an AIR
+/// change without allocating the (potentially multi-gigabyte) canonical main
+/// trace. `log_sizes` must be the complete component profile emitted by a
+/// canonical measurement; partial profiles are rejected.
+pub fn program_commitment_for_profile(
+    side_note: &SideNote,
+    log_sizes: &[u32],
+) -> Option<crate::program_id::ProgramCommitment> {
+    install_thread_pool();
+    let components = super::all_components();
+    if log_sizes.len() != components.len() || log_sizes.contains(&0) {
+        return None;
+    }
+
+    let config = production_pcs_config_mobile();
+    let max_constraint_log_degree_bound = components
+        .iter()
+        .zip(log_sizes)
+        .map(|(component, &log_size)| component.max_constraint_log_degree_bound(log_size))
+        .max()?;
+    let twiddles = ProverBackend::precompute_twiddles(
+        CanonicCoset::new(max_constraint_log_degree_bound + config.fri_config.log_blowup_factor)
+            .circle_domain()
+            .half_coset,
+    );
+    let channel = &mut ProverChannel::default();
+    let mut scheme =
+        CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(config, &twiddles);
+    for &log_size in log_sizes {
+        channel.mix_u64(u64::from(log_size));
+    }
+    let mut tree_builder = scheme.tree_builder();
+    for (component, &log_size) in components.iter().zip(log_sizes) {
+        tree_builder.extend_evals(for_commit(
+            component.generate_preprocessed_trace(log_size, side_note),
+        ));
+    }
+    tree_builder.commit(channel);
+    scheme.roots().first().copied()
+}
+
 /// Prove a segment chain in memory: derive the canonical forcing profile over
 /// `bounds` (so every window shares ONE program commitment) and prove each
 /// window to that shape. Returns `(profile, per-segment proofs in order)`.

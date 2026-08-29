@@ -1,0 +1,40 @@
+{
+  "expected": {
+    "blocks": [
+      {
+        "gas": 177,
+        "pc": 0
+      }
+    ],
+    "first": {
+      "remaining_gas": 323,
+      "status": "trap"
+    },
+    "resume": null
+  },
+  "initial": {
+    "gas": 500,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "three_register_destination_dependency_chain",
+  "program": {
+    "bitmask": "0x4902",
+    "code": "0xcb1002cb3204cb540600"
+  },
+  "rule": "single-pass-block-gas",
+  "spec": "gray-paper-0.8.0"
+}

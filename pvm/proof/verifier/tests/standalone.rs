@@ -26,7 +26,7 @@ fn standalone_verify_add64() {
         1000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
@@ -56,7 +56,7 @@ fn standalone_verify_rejects_wrong_commitment() {
         1000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
@@ -92,7 +92,7 @@ fn standalone_verify_rejects_format_version_mismatch() {
         1000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
@@ -134,7 +134,7 @@ fn standalone_verify_rejects_weak_pcs_config() {
         1000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
@@ -176,7 +176,7 @@ fn standalone_verify_accepts_weak_pcs_config_with_relaxed_policy() {
         1000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
@@ -222,7 +222,7 @@ fn standalone_verify_rejects_oversized_log_size() {
         1000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
@@ -259,7 +259,7 @@ fn standalone_verify_rejects_zero_format_version() {
         1000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 

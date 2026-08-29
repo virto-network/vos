@@ -762,7 +762,7 @@ fn load_imm_forged_result_rejected() {
         10_000,
         25,
     );
-    let mut tr = TracingPvm::new(pvm);
+    let mut tr = TracingPvm::new_conformance(pvm);
     let _ = tr.run();
     let mut steps = tr.into_trace();
     assert_eq!(steps[0].regs_after[2], 12345);

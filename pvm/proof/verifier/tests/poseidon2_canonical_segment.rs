@@ -68,7 +68,7 @@ fn canonical_segment_proof() -> vos_pvm_proof::Proof {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     assert_eq!(tracing.run(), vos_pvm::ExitReason::Trap);
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 7);

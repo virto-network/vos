@@ -301,6 +301,14 @@ impl Interpreter {
         self.gas_model
     }
 
+    /// The instruction-set profile installed in this interpreter.
+    ///
+    /// Proof adapters use this to preserve authenticated container semantics
+    /// when an initialized interpreter crosses the tracing API boundary.
+    pub fn isa_mode(&self) -> crate::IsaMode {
+        self.isa_mode
+    }
+
     /// Select the instruction-set profile and rebuild all decoded state that
     /// depends on opcode validity, block boundaries, or opcode gas costs.
     ///
@@ -2764,10 +2772,7 @@ fn compute_bb_starts_inner(
 
 #[inline(always)]
 fn opcode_for_mode(byte: u8, isa_mode: crate::IsaMode) -> Option<Opcode> {
-    match isa_mode {
-        crate::IsaMode::Jar => Opcode::from_runtime_byte(byte),
-        crate::IsaMode::Conformance => Opcode::from_byte(byte),
-    }
+    Opcode::from_byte_in_mode(byte, isa_mode)
 }
 
 #[inline(always)]
@@ -2848,6 +2853,7 @@ fn compute_block_gas_costs(
             code,
             bitmask,
             mem_cycles,
+            isa_mode,
         );
         sim.feed(&fc);
 

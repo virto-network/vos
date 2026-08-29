@@ -95,7 +95,7 @@ fuzz_target!(|input: FuzzInput| {
         100_000,
         MAX_STEPS,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _exit = tracing.run();
     let steps = tracing.into_trace();
     if steps.is_empty() {

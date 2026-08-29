@@ -132,14 +132,21 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///        traces change, so v10 native-channel proofs must be rejected.
 ///        Version 11 was the Poseidon2-M31 PCS variant of format 10.
 ///   13 — Poseidon2-M31 PCS variant of format 12.
+///   14 — ISA-profile-bound program memory. Every authenticated instruction
+///        tuple now carries the container-derived profile (standard v0.8 or
+///        frozen capability manifest), and opcode decoding uses that profile.
+///        This prevents valid service Tasks from being reinterpreted under
+///        the shifted v0.8 unary table during proof tracing. CpuChip and
+///        ProgramMemoryChip each gain one column/lookup limb.
+///   15 — Poseidon2-M31 PCS variant of format 14.
 #[cfg(not(feature = "poseidon2-channel"))]
-pub const PROOF_FORMAT_VERSION: u32 = 12;
+pub const PROOF_FORMAT_VERSION: u32 = 14;
 /// Native recursion: the PCS commit hash + Fiat-Shamir
 /// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
 /// become `P2Hash` digests — a different wire format. A Blake2s verifier
-/// (v12) and a Poseidon2-M31 verifier (v13) therefore reject each other's proofs.
+/// (v14) and a Poseidon2-M31 verifier (v15) therefore reject each other's proofs.
 #[cfg(feature = "poseidon2-channel")]
-pub const PROOF_FORMAT_VERSION: u32 = 13;
+pub const PROOF_FORMAT_VERSION: u32 = 15;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.

@@ -56,7 +56,7 @@ fn trace_store_load(value: u8, addr: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmStep>) {
         10_000,
         25,
     );
-    let mut tr = TracingPvm::new(pvm);
+    let mut tr = TracingPvm::new_conformance(pvm);
     let exit = tr.run();
     assert_eq!(exit, vos_pvm::ExitReason::Trap);
     let steps = tr.into_trace();
@@ -187,7 +187,7 @@ fn trace_store_load_u64(value: u64, addr: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmStep
         10_000,
         25,
     );
-    let mut tr = TracingPvm::new(pvm);
+    let mut tr = TracingPvm::new_conformance(pvm);
     let exit = tr.run();
     assert_eq!(exit, vos_pvm::ExitReason::Trap);
     let steps = tr.into_trace();

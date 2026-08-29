@@ -37,7 +37,7 @@ fn trace_reverse_bytes_program() -> (Vec<u8>, Vec<u8>, Vec<vos_pvm_proof::core::
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Trap);
     (code, bitmask, tracing.into_trace())
@@ -48,8 +48,38 @@ fn prove_program(
     bitmask: &[u8],
     steps: Vec<vos_pvm_proof::core::step::PvmStep>,
 ) -> vos_pvm_proof::Proof {
-    let mut side_note = SideNote::new(steps, code.to_vec(), bitmask.to_vec());
+    prove_program_with_mode(code, bitmask, steps, vos_pvm::IsaMode::Conformance)
+}
+
+fn prove_program_with_mode(
+    code: &[u8],
+    bitmask: &[u8],
+    steps: Vec<vos_pvm_proof::core::step::PvmStep>,
+    isa_mode: vos_pvm::IsaMode,
+) -> vos_pvm_proof::Proof {
+    let mut side_note =
+        SideNote::new(steps, code.to_vec(), bitmask.to_vec()).with_isa_mode(isa_mode);
     prove(&mut side_note).expect("proving failed")
+}
+
+fn trace_raw_program(
+    code: Vec<u8>,
+    bitmask: Vec<u8>,
+    regs: [u64; PVM_REGISTER_COUNT],
+    isa_mode: vos_pvm::IsaMode,
+) -> (vos_pvm::ExitReason, Vec<vos_pvm_proof::core::step::PvmStep>) {
+    let pvm = Interpreter::new(
+        code,
+        bitmask,
+        vec![],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10_000,
+        25,
+    );
+    let mut tracing = TracingPvm::new_with_isa_mode(pvm, isa_mode);
+    let exit = tracing.run();
+    (exit, tracing.into_trace())
 }
 
 #[test]
@@ -95,7 +125,7 @@ fn different_programs_have_different_commitments() {
         10_000,
         25,
     );
-    let mut tr_b = TracingPvm::new(pvm_b);
+    let mut tr_b = TracingPvm::new_conformance(pvm_b);
     let _ = tr_b.run();
     let proof_b = prove_program(&code_b, &bitmask_b, tr_b.into_trace());
     let h_b = program_commitment_of_proof(&proof_b);
@@ -125,7 +155,7 @@ fn verify_standalone_rejects_proof_for_different_program() {
         10_000,
         25,
     );
-    let mut tr_b = TracingPvm::new(pvm_b);
+    let mut tr_b = TracingPvm::new_conformance(pvm_b);
     let _ = tr_b.run();
     let proof_b = prove_program(&code_b, &bitmask_b, tr_b.into_trace());
     let hash_b = program_commitment_of_proof(&proof_b);
@@ -135,4 +165,79 @@ fn verify_standalone_rejects_proof_for_different_program() {
         res.is_err(),
         "proof of A must not verify against B's commitment"
     );
+}
+
+#[test]
+fn capability_profile_matches_live_unary_semantics_and_is_commitment_bound() {
+    // Encoded byte 102 is CountSetBits64 in the frozen capability profile,
+    // but CountSetBits32 in standard v0.8. The low word has 8 set bits and
+    // the high word has 32, making the divergent result visible (40 vs 8).
+    let code = vec![102, 0x01, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 1];
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0xffff_ffff_0000_00ff;
+
+    let (jar_exit, jar_steps) =
+        trace_raw_program(code.clone(), bitmask.clone(), regs, vos_pvm::IsaMode::Jar);
+    assert_eq!(jar_exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(jar_steps[0].regs_after[1], 40);
+
+    let (standard_exit, standard_steps) = trace_raw_program(
+        code.clone(),
+        bitmask.clone(),
+        regs,
+        vos_pvm::IsaMode::Conformance,
+    );
+    assert_eq!(standard_exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(standard_steps[0].regs_after[1], 8);
+
+    let jar_proof = prove_program_with_mode(&code, &bitmask, jar_steps, vos_pvm::IsaMode::Jar);
+    let standard_proof = prove_program_with_mode(
+        &code,
+        &bitmask,
+        standard_steps,
+        vos_pvm::IsaMode::Conformance,
+    );
+    let jar_commitment = program_commitment_of_proof(&jar_proof);
+    let standard_commitment = program_commitment_of_proof(&standard_proof);
+    assert_ne!(jar_commitment, standard_commitment);
+    verify_standalone(jar_proof, standard_commitment)
+        .expect_err("a Jar trace must not verify against the standard profile commitment");
+}
+
+#[test]
+fn invalid_opcode_bytes_do_not_alias_canonical_trap_commitments() {
+    let regs = [0u64; PVM_REGISTER_COUNT];
+    let bitmask = vec![1];
+    let (_, invalid_steps) = trace_raw_program(
+        vec![77],
+        bitmask.clone(),
+        regs,
+        vos_pvm::IsaMode::Conformance,
+    );
+    let (_, trap_steps) = trace_raw_program(
+        vec![Opcode::Trap as u8],
+        bitmask.clone(),
+        regs,
+        vos_pvm::IsaMode::Conformance,
+    );
+    let invalid_proof = prove_program(&[77], &bitmask, invalid_steps);
+    let trap_proof = prove_program(&[Opcode::Trap as u8], &bitmask, trap_steps);
+    let invalid_commitment = program_commitment_of_proof(&invalid_proof);
+    let trap_commitment = program_commitment_of_proof(&trap_proof);
+    assert_ne!(invalid_commitment, trap_commitment);
+    verify_standalone(invalid_proof, trap_commitment)
+        .expect_err("an invalid raw opcode must not alias canonical Trap");
+}
+
+#[test]
+fn profile_only_measurement_matches_canonical_proof_commitment() {
+    let (code, bitmask, steps) = trace_reverse_bytes_program();
+    let mut proven = SideNote::new(steps.clone(), code.clone(), bitmask.clone());
+    let proof = vos_pvm_proof::prove_canonical(&mut proven, &[]).expect("canonical proof");
+    let measured_side_note = SideNote::new(steps, code, bitmask);
+    let measured =
+        vos_pvm_proof::program_commitment_for_profile(&measured_side_note, &proof.log_sizes)
+            .expect("profile-only program commitment");
+    assert_eq!(measured, program_commitment_of_proof(&proof));
 }

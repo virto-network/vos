@@ -34,25 +34,44 @@ use vos_pvm_proof::{
     SideNote, program_commitment_hex, program_commitment_of_proof, prove, prove_mobile,
 };
 
+const VOUCHER_CHECK_ELF: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/voucher-check/target/riscv64em-vos/release/voucher-check.elf",
+);
+const VOUCHER_CHECK_CATALOG: &str = include_str!("../fixtures/voucher-check/catalog.toml");
+const VOUCHER_CHECK_PIN_ID: &str =
+    "06482de863e4bfacc8255cb2d1154767442373f5a8d5b2cc9bdb8b6329e1dd5b";
+const VOUCHER_CHECK_BLOB_HASH: &str =
+    "5866fc11e48309aa97d87ce6c6c8469088a88c484a4f7fb9691c7c82fc50dd55";
+const VOUCHER_CHECK_COMMITMENT: &str =
+    "94eca0756b65f4727f91dca0306e8301615865410af2c45f03dd64c0334d3865";
+const VOUCHER_CHECK_PROFILE: [u32; 32] = [
+    15, 15, 16, 18, 9, 6, 4, 17, 4, 4, 4, 18, 12, 8, 8, 6, 8, 8, 8, 14, 13, 13, 12, 4, 7, 10, 11,
+    6, 5, 6, 5, 16,
+];
+const VOUCHER_CHECK_IMAGE_ROOT: &str =
+    "1ca7b5f557e618131b2c71840c0c95fe6115621de864011269393d5096185ec1";
+
+fn load_voucher_check_catalog() -> vos::zk::ProvableCatalog {
+    vos::zk::ProvableCatalog::from_toml_str(VOUCHER_CHECK_CATALOG)
+        .expect("parse voucher-check catalog through the production API")
+}
+
+fn load_voucher_check_elf() -> Option<Vec<u8>> {
+    match std::fs::read(VOUCHER_CHECK_ELF) {
+        Ok(elf) => Some(elf),
+        Err(_) => {
+            eprintln!("SKIP: voucher-check ELF not built. Run:\n  just build-voucher-check");
+            None
+        }
+    }
+}
+
 /// Load the voucher-check actor's ELF and transpile to a PVM blob.
 /// Skips the test (prints SKIP and returns None) when the ELF is
 /// missing, matching the convention used by `elf_integration.rs`.
 fn load_voucher_check_blob() -> Option<Vec<u8>> {
-    // CARGO_MANIFEST_DIR is `<repo>/pvm/proof`; up two levels to the repo root.
-    // (`prove_vos_actor.rs` uses `/../../examples/...` which resolves
-    // to a sibling worktree when run from a git worktree like
-    // `.wt_alt/` — two levels is the correct relative path either way.)
-    let elf_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/fixtures/voucher-check/target/riscv64em-vos/release/voucher-check.elf",
-    );
-    let elf = match std::fs::read(elf_path) {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!("SKIP: voucher-check ELF not built. Run:\n  just build-voucher-check");
-            return None;
-        }
-    };
+    let elf = load_voucher_check_elf()?;
     Some(vos_pvm_compiler::link_elf(&elf).expect("transpile voucher-check ELF"))
 }
 
@@ -205,6 +224,88 @@ fn voucher_check_program_commitment_is_deterministic() {
     assert_eq!(
         hash_a, hash_b,
         "two proofs of the same actor blob must commit to the same program hash"
+    );
+}
+
+#[test]
+fn voucher_check_catalog_is_a_valid_production_pin() {
+    let catalog = load_voucher_check_catalog();
+    assert_eq!(catalog.programs.len(), 1, "fixture must contain one pin");
+    let pin = catalog
+        .require_pin("voucher-check", VOUCHER_CHECK_PIN_ID)
+        .expect("exact voucher-check pin");
+
+    assert_eq!(pin.id, pin.content_id(), "pin identity must be canonical");
+    assert_eq!(pin.blob_hash, VOUCHER_CHECK_BLOB_HASH);
+    assert_eq!(pin.commitments, [VOUCHER_CHECK_COMMITMENT]);
+    assert_eq!(pin.commitments_bytes().expect("commitment hex").len(), 1);
+    assert_eq!(pin.allowlist_concat().expect("allowlist").len(), 32);
+    assert_eq!(pin.canonical_profile, VOUCHER_CHECK_PROFILE);
+    assert_eq!(pin.canonical_profile.len(), vos_pvm_proof::chip_idx::COUNT);
+    assert_eq!(pin.seg_steps, 32_000);
+    assert_eq!(pin.page_budget, 8);
+    assert_eq!(pin.witness_addr, 699_776);
+    assert_eq!(pin.unpatched_image_root, VOUCHER_CHECK_IMAGE_ROOT);
+    pin.unpatched_image_root_bytes().expect("image-root hex");
+}
+
+#[test]
+fn voucher_check_catalog_matches_built_artifact() {
+    let Some(elf) = load_voucher_check_elf() else {
+        return;
+    };
+    let blob = vos_pvm_compiler::link_elf(&elf).expect("transpile voucher-check ELF");
+    let pin = load_voucher_check_catalog()
+        .require_pin("voucher-check", VOUCHER_CHECK_PIN_ID)
+        .expect("exact voucher-check pin")
+        .clone();
+
+    assert_eq!(
+        vos::zk::bytes_to_hex(&vos::provable::task_blob_hash(&blob)),
+        pin.blob_hash,
+        "catalog blob_hash must name the transpiled fixture"
+    );
+    assert_eq!(
+        vos::zk::witness_addr(&elf),
+        Some(pin.witness_addr),
+        "catalog witness address must match the ELF symbol"
+    );
+
+    let side_note = side_note_for_trace(&blob, 100_000_000);
+    assert_eq!(
+        vos::zk::bytes_to_hex(&vos_pvm_proof::page_merkle::image_root(
+            &side_note.initial_memory
+        )),
+        pin.unpatched_image_root,
+        "catalog image root must match the transpiled fixture"
+    );
+}
+
+/// Release-maintenance gate for the checked-in canonical catalog. The
+/// commitment depends only on the authenticated program/profile
+/// preprocessed trace, so a bare execution is sufficient to re-measure it;
+/// no production witness is needed. Kept ignored because the canonical proof
+/// is intentionally heavyweight.
+#[test]
+#[ignore = "heavy canonical catalog re-measurement"]
+fn voucher_check_catalog_commitment_matches_current_air() {
+    let Some(blob) = load_voucher_check_blob() else {
+        return;
+    };
+    let catalog = load_voucher_check_catalog();
+    let pin = catalog
+        .require_pin("voucher-check", VOUCHER_CHECK_PIN_ID)
+        .expect("exact voucher-check pin");
+
+    let side_note = side_note_for_trace(&blob, 100_000_000);
+    let commitment =
+        vos_pvm_proof::program_commitment_for_profile(&side_note, &pin.canonical_profile)
+            .expect("measure catalog-shaped voucher-check commitment");
+    let got = commitment.to_string();
+    assert_eq!(
+        pin.commitments,
+        [got.clone()],
+        "catalog commitment is stale; current AIR commitment is {got}"
     );
 }
 

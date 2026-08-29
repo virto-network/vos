@@ -7722,6 +7722,7 @@ dependencies = [
  "serde",
  "stwo",
  "stwo-constraint-framework",
+ "vos",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-pvm-proof-derive",

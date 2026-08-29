@@ -281,7 +281,7 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
                 manifest: AgentPackageManifest {
                     name: name.clone(),
                     platform: vos::service::PLATFORM_ID,
-                    execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+                    execution_semantics: vos::agent::EXECUTION_SEMANTICS_ID,
                     kind: PackageKind::Actor {
                         contract: ActorPackageContract::canonical(),
                         requirements,
@@ -1203,6 +1203,10 @@ mod tests {
             PackageKind::Actor { requirements, .. }
                 if requirements.lanes == LaneSet::NONE
         ));
+        assert_eq!(
+            package.manifest.execution_semantics,
+            vos::agent::EXECUTION_SEMANTICS_ID,
+        );
         assert_eq!(package.manifest.program, ProgramId::of_pvm(&actor_pvm));
         assert!(!first.join("deterministic-counter.attestation.pvm").exists());
         assert_eq!(std::fs::read_dir(first).unwrap().count(), 2);
@@ -1280,6 +1284,10 @@ mod tests {
         let bytes = std::fs::read(output.join("service-counter.vos")).unwrap();
         assert_eq!(bytes.get(..4), Some(b"VOSP".as_slice()));
         let package = VosPackage::decode(&bytes).unwrap();
+        assert_eq!(
+            package.manifest.execution_semantics,
+            vos::service::EXECUTION_SEMANTICS_ID,
+        );
         assert_eq!(
             package.manifest.actor_program,
             ProgramId::of_pvm(&actor_pvm)

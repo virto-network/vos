@@ -94,7 +94,7 @@ fn measure() {
         gas,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     assert_eq!(
         tracing.run(),
         vos_pvm::ExitReason::Trap,

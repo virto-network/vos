@@ -1,0 +1,56 @@
+{
+  "backends": [
+    "interpreter",
+    "recompiler"
+  ],
+  "expected": {
+    "gas": 98,
+    "memory": [],
+    "pc": 3,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0xfffffffffffffffe",
+      "0x7",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "trap"
+  },
+  "family": "alu32",
+  "initial": {
+    "gas": 100,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x7",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "alu32_neg_add_imm_32",
+  "program": {
+    "bitmask": "0x09",
+    "code": "0x8d320500",
+    "jump_table": []
+  },
+  "spec": "gray-paper-0.8.0"
+}

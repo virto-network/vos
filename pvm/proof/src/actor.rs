@@ -42,6 +42,12 @@ use crate::side_note::CompactTrace;
 ///
 /// Returns `None` if the blob isn't parseable or lacks a CODE cap.
 pub fn interpreter_from_blob(blob: &[u8], gas: u64) -> Option<(Interpreter, Vec<u8>)> {
+    // This adapter parses only the transitional capability-manifest
+    // container. Its encoded instructions therefore use the frozen Jar
+    // profile, not the standard v0.8 numbering.
+    if !vos_pvm::spi::is_jar_manifest(blob) {
+        return None;
+    }
     let parsed = program::parse_blob(blob)?;
 
     let mut code_data = None;
@@ -182,6 +188,7 @@ pub fn trace_blob_compact_with_patches(
     Some(CompactTrace {
         steps,
         initial_regs,
+        isa_mode: vos_pvm::IsaMode::Jar,
         code: setup.code,
         bitmask: setup.bitmask,
         initial_memory: setup.initial_memory,
@@ -229,6 +236,7 @@ pub fn trace_stream_with_patches(
     let setup = trace_setup(blob, gas, patches)?;
     Some(TraceStream::new(
         TracingSource::new(setup.tracing),
+        vos_pvm::IsaMode::Jar,
         setup.code,
         setup.bitmask,
         setup.jump_table,
@@ -281,10 +289,77 @@ fn trace_setup(blob: &[u8], gas: u64, patches: &[(usize, &[u8])]) -> Option<Trac
     }
 
     Some(TraceSetup {
-        tracing: TracingPvm::new(interp),
+        tracing: TracingPvm::new_capability_manifest(interp),
         initial_memory: flat_mem,
         code: code_blob.code.to_vec(),
         bitmask: code_blob.bitmask.to_vec(),
         jump_table: code_blob.jump_table.to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vos_pvm::kernel::{InvocationKernel, KernelResult};
+    use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+    const PROFILE_INPUT: u64 = 0xffff_ffff_0000_00ff;
+
+    fn capability_profile_unary_blob() -> Vec<u8> {
+        let mut assembler = Assembler::new();
+        assembler.load_imm_64(Reg::T1, PROFILE_INPUT);
+        assembler.emit_raw(102, true);
+        assembler.emit_raw(0x31, false); // rd=1, ra=3
+        assembler
+            .load_imm_64(Reg::T0, vos_pvm::PVM_HALT_ADDR)
+            .jump_ind(Reg::T0, 0);
+        assembler.build()
+    }
+
+    #[test]
+    fn capability_manifest_trace_matches_live_kernel_unary_profile() {
+        // Raw 102 is CountSetBits64 in the frozen capability profile and
+        // CountSetBits32 in standard v0.8. Build the exact manifest the live
+        // service Task kernel consumes, then require the blob-derived proof
+        // tracer to produce the same result (40, not the standard result 8).
+        let blob = capability_profile_unary_blob();
+
+        let mut live = InvocationKernel::new(&blob, &[], 100_000).expect("live Task kernel");
+        assert!(matches!(live.run(), KernelResult::Halt));
+        assert_eq!(live.active_reg(1), 40);
+
+        let (interpreter, _) =
+            interpreter_from_blob(&blob, 100_000).expect("proof tracer accepts the same manifest");
+        // The public general constructor must preserve the Jar profile carried
+        // by `interpreter_from_blob`; callers cannot accidentally erase it.
+        let mut tracing = TracingPvm::new(interpreter);
+        assert_eq!(tracing.run(), vos_pvm::ExitReason::Halt);
+        assert_eq!(tracing.pvm.registers[1], live.active_reg(1));
+        assert_eq!(tracing.isa_mode(), vos_pvm::IsaMode::Jar);
+
+        let side_note = tracing.into_side_note();
+        assert_eq!(side_note.isa_mode, vos_pvm::IsaMode::Jar);
+        assert_eq!(side_note.steps[1].regs_after[1], 40);
+    }
+
+    #[test]
+    fn capability_profile_survives_compact_and_stream_windows() {
+        let blob = capability_profile_unary_blob();
+
+        let compact = trace_blob_compact(&blob, 100_000).expect("compact capability trace");
+        assert_eq!(compact.isa_mode, vos_pvm::IsaMode::Jar);
+        let mut cursor = crate::segment::CompactSegmentCursor::new(&compact);
+        let compact_window = cursor.side_note(0, compact.steps.len());
+        assert_eq!(compact_window.isa_mode, vos_pvm::IsaMode::Jar);
+        assert_eq!(compact_window.steps[1].regs_after[1], 40);
+
+        // A two-step first window ends immediately after raw opcode 102, so
+        // this also checks that the online path executes and materializes the
+        // frozen capability semantics rather than merely copying a static tag.
+        let mut stream = trace_stream(&blob, 100_000, 2, 0).expect("stream capability trace");
+        assert_eq!(stream.next_window(), Some((0, 2)));
+        let streamed_window = stream.side_note();
+        assert_eq!(streamed_window.isa_mode, vos_pvm::IsaMode::Jar);
+        assert_eq!(streamed_window.steps[1].regs_after[1], 40);
+    }
 }

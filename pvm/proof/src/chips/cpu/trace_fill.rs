@@ -55,7 +55,20 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, step.timestamp, Column::Timestamp);
         trace.fill_columns_bytes(row, &step.pc.to_le_bytes(), Column::Pc);
         trace.fill_columns_bytes(row, &step.next_pc.to_le_bytes(), Column::NextPc);
-        trace.fill_columns(row, step.opcode as u8, Column::Opcode);
+        // Commit the exact encoded byte, not the semantic enum. Jar unaries
+        // deliberately use shifted bytes, and invalid bytes must not alias
+        // canonical Trap in the public program commitment.
+        let encoded_opcode = side_note
+            .code
+            .get(step.pc as usize)
+            .copied()
+            .unwrap_or_default();
+        trace.fill_columns(row, encoded_opcode, Column::Opcode);
+        trace.fill_columns(
+            row,
+            crate::side_note::isa_profile_tag(side_note.isa_mode),
+            Column::IsaProfile,
+        );
         trace.fill_columns(row, step.skip_len as u8, Column::SkipLen);
         // 8-byte immediate witness for the ProgramMemory lookup.
         trace.fill_columns_bytes(row, &step.imm.to_le_bytes(), Column::ImmBytes);

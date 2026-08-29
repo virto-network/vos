@@ -273,7 +273,7 @@ fn harness_cpuchip_isolated_add64() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Trap);
     let steps = tracing.into_trace();
@@ -368,7 +368,7 @@ fn harness_ristretto_isolated() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _exit = tracing.run_with_precompiles();
     assert_eq!(tracing.ristretto_records.len(), 1);
     // Confirm the ECALL detector classified the non-basepoint correctly —
@@ -689,7 +689,7 @@ fn fixed_base_real_side_note(scalars: &[curve25519_dalek::scalar::Scalar]) -> Si
         1_000_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run_with_precompiles();
     assert_eq!(
         tracing.ristretto_records.len(),
@@ -1281,7 +1281,7 @@ fn harness_cpuchip_debug_add64() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Trap);
     let steps = tracing.into_trace();

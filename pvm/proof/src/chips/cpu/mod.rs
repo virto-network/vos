@@ -2275,7 +2275,7 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // Program-memory consumer (pc + opcode + regs + imm
+        // Program-memory consumer (pc + ISA profile + opcode + regs + imm
         //                          + 6 packed flag bytes
         //                          + imm_y + branch_target)
         //
@@ -2294,6 +2294,7 @@ impl BuiltInComponent for CpuChip {
         // multiplicity column.
         {
             let pc = crate::trace::trace_eval!(trace_eval, Column::Pc);
+            let isa_profile = crate::trace::trace_eval!(trace_eval, Column::IsaProfile);
             let opcode = crate::trace::trace_eval!(trace_eval, Column::Opcode);
             let skip_len = crate::trace::trace_eval!(trace_eval, Column::SkipLen);
             let reg_a = crate::trace::trace_eval!(trace_eval, Column::RegA);
@@ -2311,6 +2312,7 @@ impl BuiltInComponent for CpuChip {
                 crate::trace::trace_eval!(trace_eval, Column::BranchTarget);
 
             let mut tuple: Vec<E::F> = pc.to_vec();
+            tuple.push(isa_profile[0].clone());
             tuple.push(opcode[0].clone());
             tuple.push(skip_len[0].clone());
             tuple.push(reg_a[0].clone());

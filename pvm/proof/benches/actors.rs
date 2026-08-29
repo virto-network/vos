@@ -30,7 +30,6 @@ fn main() {
 #[cfg(feature = "prover")]
 mod imp {
     use vos_pvm::interpreter::Interpreter;
-    use vos_pvm::program::{self, CapEntryType};
 
     use vos_pvm_proof::core::tracing::TracingPvm;
     use vos_pvm_proof::{
@@ -191,16 +190,6 @@ mod imp {
         let Some(blob) = load_actor_blob(name) else {
             return;
         };
-        let parsed = program::parse_blob(&blob).expect("parse blob");
-        let mut code_data = None;
-        for entry in &parsed.caps {
-            if entry.cap_type == CapEntryType::Code {
-                code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-                break;
-            }
-        }
-        let code_blob =
-            program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
         let (interp, flat_mem) = interpreter_from_blob(&blob, gas);
 
         let t0 = std::time::Instant::now();
@@ -210,39 +199,35 @@ mod imp {
         // their on_start handler under the bare interpreter.  Pure-compute
         // actors with no hostcalls behave the same as `run()`.
         let exit = tracing.run_with_vos_stubs();
-        // Precompile ECALL records — capture before consuming `tracing`.
-        let blake2b_calls: Vec<_> = tracing.blake2b_calls().to_vec();
-        let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
-        let ristretto_calls: Vec<_> = tracing.ristretto_calls().to_vec();
-        let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
-        let ristretto_add_records = tracing.ristretto_add_records.clone();
-        let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
-        let scalar_reduce_records = tracing.scalar_reduce_wide_records.clone();
-        let scalar_reduce_mem_ops = tracing.scalar_reduce_wide_mem_ops.clone();
-        let scalar_binop_records = tracing.scalar_binop_records.clone();
-        let scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
-        let steps = tracing.into_trace();
+        let precompile_counts = (
+            tracing.blake2b_records.len(),
+            tracing.ristretto_records.len(),
+            tracing.ristretto_add_records.len(),
+            tracing.scalar_reduce_wide_records.len(),
+            tracing.scalar_binop_records.len(),
+        );
+        let mut side_note = tracing.into_side_note().with_memory(flat_mem);
         let trace_time = t0.elapsed();
 
         eprintln!("=== {name} actor ===");
         eprintln!(
             "PVM: {} steps in {trace_time:?}, exit={exit:?}",
-            steps.len()
+            side_note.steps.len()
         );
         eprintln!(
             "Precompile ECALLs: blake2b={}, ristretto_scalar_mult={}, ristretto_point_add={}, scalar_reduce_wide={}, scalar_binop={}",
-            blake2b_calls.len(),
-            ristretto_calls.len(),
-            ristretto_add_records.len(),
-            scalar_reduce_records.len(),
-            scalar_binop_records.len(),
+            precompile_counts.0,
+            precompile_counts.1,
+            precompile_counts.2,
+            precompile_counts.3,
+            precompile_counts.4,
         );
 
         // Opcode stats
         let mut mem_ops = 0u32;
         let mut branches = 0u32;
         let mut counts = std::collections::HashMap::new();
-        for s in &steps {
+        for s in &side_note.steps {
             *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
             if s.mem_read.is_some() || s.mem_write.is_some() {
                 mem_ops += 1;
@@ -257,36 +242,6 @@ mod imp {
         for (op, count) in sorted.iter().take(8) {
             eprintln!("  {op}: {count}");
         }
-
-        let mut side_note = vos_pvm_proof::SideNote::new(
-            steps,
-            code_blob.code.to_vec(),
-            code_blob.bitmask.to_vec(),
-        )
-        .with_memory(flat_mem)
-        .with_jump_table(code_blob.jump_table.to_vec());
-
-        // Install precompile ECALL records on side_note.
-        for c in &blake2b_calls {
-            side_note
-                .blake2b_calls
-                .push(vos_pvm_proof::chips::blake2b::Blake2bCall {
-                    h: c.h,
-                    m: c.m,
-                    t: c.t,
-                    f: c.f,
-                });
-        }
-        side_note.blake2b_mem_ops = blake2b_mem_ops;
-        side_note.ristretto_calls = ristretto_calls;
-        side_note.ristretto_mem_ops = ristretto_mem_ops;
-        side_note.ristretto_add_calls = ristretto_add_records;
-        side_note.ristretto_add_mem_ops = ristretto_add_mem_ops;
-        side_note.scalar_reduce_wide_calls = scalar_reduce_records;
-        side_note.scalar_reduce_wide_mem_ops = scalar_reduce_mem_ops;
-        side_note.scalar_binop_calls = scalar_binop_records;
-        side_note.scalar_binop_mem_ops = scalar_binop_mem_ops;
-        side_note.ingest_ristretto_boundary();
 
         eprintln!("\nProve (96-bit security):");
         let (proof, _) = prove_profiled(&mut side_note).expect("proving failed");
@@ -303,67 +258,19 @@ mod imp {
         let Some(blob) = load_actor_blob(name) else {
             return;
         };
-        let parsed = program::parse_blob(&blob).expect("parse blob");
-        let mut code_data = None;
-        for entry in &parsed.caps {
-            if entry.cap_type == CapEntryType::Code {
-                code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-                break;
-            }
-        }
-        let code_blob =
-            program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
         let (interp, flat_mem) = interpreter_from_blob(&blob, gas);
 
         let t0 = std::time::Instant::now();
         let mut tracing = TracingPvm::new(interp);
         let exit = tracing.run_with_vos_stubs();
-        let blake2b_calls: Vec<_> = tracing.blake2b_calls().to_vec();
-        let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
-        let ristretto_calls: Vec<_> = tracing.ristretto_calls().to_vec();
-        let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
-        let ristretto_add_records = tracing.ristretto_add_records.clone();
-        let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
-        let scalar_reduce_records = tracing.scalar_reduce_wide_records.clone();
-        let scalar_reduce_mem_ops = tracing.scalar_reduce_wide_mem_ops.clone();
-        let scalar_binop_records = tracing.scalar_binop_records.clone();
-        let scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
-        let steps = tracing.into_trace();
+        let mut side_note = tracing.into_side_note().with_memory(flat_mem);
         let trace_time = t0.elapsed();
 
         eprintln!("=== {name} actor (custom PcsConfig) ===");
         eprintln!(
             "PVM: {} steps in {trace_time:?}, exit={exit:?}",
-            steps.len()
+            side_note.steps.len()
         );
-
-        let mut side_note = vos_pvm_proof::SideNote::new(
-            steps,
-            code_blob.code.to_vec(),
-            code_blob.bitmask.to_vec(),
-        )
-        .with_memory(flat_mem)
-        .with_jump_table(code_blob.jump_table.to_vec());
-        for c in &blake2b_calls {
-            side_note
-                .blake2b_calls
-                .push(vos_pvm_proof::chips::blake2b::Blake2bCall {
-                    h: c.h,
-                    m: c.m,
-                    t: c.t,
-                    f: c.f,
-                });
-        }
-        side_note.blake2b_mem_ops = blake2b_mem_ops;
-        side_note.ristretto_calls = ristretto_calls;
-        side_note.ristretto_mem_ops = ristretto_mem_ops;
-        side_note.ristretto_add_calls = ristretto_add_records;
-        side_note.ristretto_add_mem_ops = ristretto_add_mem_ops;
-        side_note.scalar_reduce_wide_calls = scalar_reduce_records;
-        side_note.scalar_reduce_wide_mem_ops = scalar_reduce_mem_ops;
-        side_note.scalar_binop_calls = scalar_binop_records;
-        side_note.scalar_binop_mem_ops = scalar_binop_mem_ops;
-        side_note.ingest_ristretto_boundary();
 
         eprintln!("\nProve:");
         let (proof, _) =
@@ -383,36 +290,24 @@ mod imp {
         let Some(blob) = load_fibonacci_blob() else {
             return;
         };
-        let parsed = program::parse_blob(&blob).expect("failed to parse JAR blob");
-
-        let mut code_data = None;
-        for entry in &parsed.caps {
-            if entry.cap_type == CapEntryType::Code {
-                code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-                break;
-            }
-        }
-        let code_data = code_data.expect("no CODE capability in blob");
-        let code_blob = program::parse_code_blob(&code_data).expect("failed to parse code blob");
-
         let (interp, _flat_mem) = interpreter_from_blob(&blob, 10_000_000);
         let t0 = std::time::Instant::now();
         let mut tracing = TracingPvm::new(interp);
         let exit = tracing.run();
-        let steps = tracing.into_trace();
+        let mut side_note = tracing.into_side_note();
         let trace_time = t0.elapsed();
 
         eprintln!("=== Fibonacci Actor Profile ===");
         eprintln!(
             "PVM execution: {} steps in {trace_time:?}, exit={exit:?}",
-            steps.len()
+            side_note.steps.len()
         );
 
         // Opcode distribution
         let mut counts = std::collections::HashMap::new();
         let mut mem_ops = 0u32;
         let mut branches = 0u32;
-        for s in &steps {
+        for s in &side_note.steps {
             *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
             if s.mem_read.is_some() || s.mem_write.is_some() {
                 mem_ops += 1;
@@ -427,13 +322,6 @@ mod imp {
         for (op, count) in sorted.iter().take(10) {
             eprintln!("  {op}: {count}");
         }
-
-        let mut side_note = vos_pvm_proof::SideNote::new(
-            steps,
-            code_blob.code.to_vec(),
-            code_blob.bitmask.to_vec(),
-        )
-        .with_jump_table(code_blob.jump_table.to_vec());
 
         eprintln!("\n=== Prove Pipeline Profile ===");
         let (proof, _profile) = prove_profiled(&mut side_note).expect("proving failed");
@@ -484,34 +372,24 @@ mod imp {
         let Some(blob) = load_actor_blob("hash-bench") else {
             return;
         };
-        let parsed = program::parse_blob(&blob).expect("parse blob");
-        let mut code_data = None;
-        for entry in &parsed.caps {
-            if entry.cap_type == CapEntryType::Code {
-                code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-                break;
-            }
-        }
-        let code_blob =
-            program::parse_code_blob(&code_data.expect("no CODE cap")).expect("parse code");
         let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
 
         let t0 = std::time::Instant::now();
         let mut tracing = TracingPvm::new(interp);
         let exit = tracing.run();
-        let steps = tracing.into_trace();
+        let mut side_note = tracing.into_side_note().with_memory(flat_mem);
         let trace_time = t0.elapsed();
 
         eprintln!("=== hash-bench (bare metal) ===");
         eprintln!(
             "PVM: {} steps in {trace_time:?}, exit={exit:?}",
-            steps.len()
+            side_note.steps.len()
         );
 
         let mut mem_ops = 0u32;
         let mut branches = 0u32;
         let mut counts = std::collections::HashMap::new();
-        for s in &steps {
+        for s in &side_note.steps {
             *counts.entry(format!("{:?}", s.opcode)).or_insert(0u32) += 1;
             if s.mem_read.is_some() || s.mem_write.is_some() {
                 mem_ops += 1;
@@ -526,14 +404,6 @@ mod imp {
         for (op, count) in sorted.iter().take(10) {
             eprintln!("  {op}: {count}");
         }
-
-        let mut side_note = vos_pvm_proof::SideNote::new(
-            steps,
-            code_blob.code.to_vec(),
-            code_blob.bitmask.to_vec(),
-        )
-        .with_memory(flat_mem)
-        .with_jump_table(code_blob.jump_table.to_vec());
 
         let t = std::time::Instant::now();
         let proof = prove(&mut side_note).expect("proving failed");
@@ -554,35 +424,20 @@ mod imp {
         let Some(blob) = load_actor_blob("hash-bench") else {
             return;
         };
-        let parsed = program::parse_blob(&blob).expect("parse blob");
-        let mut code_data = None;
-        for entry in &parsed.caps {
-            if entry.cap_type == CapEntryType::Code {
-                code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-                break;
-            }
-        }
-        let code_blob = program::parse_code_blob(&code_data.expect("CODE")).expect("parse code");
         let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
         let mut tracing = TracingPvm::new(interp);
         let _exit = tracing.run();
-        let all_steps = tracing.into_trace();
+        let full = tracing.into_side_note().with_memory(flat_mem);
 
-        let split = all_steps.len() / 2;
+        let split = full.steps.len() / 2;
         eprintln!(
             "=== Segmented proving: {} steps split at {} ===",
-            all_steps.len(),
+            full.steps.len(),
             split
         );
 
-        let code = code_blob.code.to_vec();
-        let bitmask = code_blob.bitmask.to_vec();
-
         // Segment 1: steps 0..split
-        let seg1_steps: Vec<_> = all_steps[..split].to_vec();
-        let mut seg1_sn = vos_pvm_proof::SideNote::new(seg1_steps, code.clone(), bitmask.clone())
-            .with_memory(flat_mem.clone())
-            .with_jump_table(code_blob.jump_table.to_vec());
+        let mut seg1_sn = vos_pvm_proof::segment::segment_side_note(&full, 0, split);
 
         let t = std::time::Instant::now();
         let proof1 = prove(&mut seg1_sn).expect("segment 1 proving failed");
@@ -596,31 +451,14 @@ mod imp {
             proof1.final_state.pc, proof1.final_state.timestamp
         );
 
-        // Compute final memory of segment 1 for segment 2's initial memory
-        let mut seg2_mem = flat_mem.clone();
-        for step in &all_steps[..split] {
-            if let Some(ref w) = step.mem_write {
-                let addr = w.address as usize;
-                let bytes = w.value.to_le_bytes();
-                let sz = w.size as usize;
-                if addr + sz > seg2_mem.len() {
-                    seg2_mem.resize(addr + sz, 0);
-                }
-                seg2_mem[addr..addr + sz].copy_from_slice(&bytes[..sz]);
-            }
-        }
-
         // Segment 2: steps split..end
-        let seg2_steps: Vec<_> = all_steps[split..].to_vec();
-        let mut seg2_sn = vos_pvm_proof::SideNote::new(seg2_steps, code.clone(), bitmask.clone())
-            .with_memory(seg2_mem)
-            .with_jump_table(code_blob.jump_table.to_vec());
+        let mut seg2_sn = vos_pvm_proof::segment::segment_side_note(&full, split, full.steps.len());
 
         let t = std::time::Instant::now();
         let proof2 = prove(&mut seg2_sn).expect("segment 2 proving failed");
         eprintln!(
             "Segment 2: {} steps, proved in {:?}",
-            all_steps.len() - split,
+            full.steps.len() - split,
             t.elapsed()
         );
         eprintln!(
@@ -765,27 +603,10 @@ mod imp {
             return;
         };
         let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
-        let parsed = program::parse_blob(&blob).expect("parse blob");
-        let mut code_data = None;
-        for entry in &parsed.caps {
-            if entry.cap_type == CapEntryType::Code {
-                code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-                break;
-            }
-        }
-        let code_blob = program::parse_code_blob(&code_data.expect("no CODE")).expect("parse code");
         let mut tracing = TracingPvm::new(interp);
         let _ = tracing.run_with_vos_stubs();
-        let steps = tracing.into_trace();
-        eprintln!("CpuChip baseline: {} PVM steps", steps.len());
-
-        let mut side_note = vos_pvm_proof::SideNote::new(
-            steps,
-            code_blob.code.to_vec(),
-            code_blob.bitmask.to_vec(),
-        )
-        .with_memory(flat_mem)
-        .with_jump_table(code_blob.jump_table.to_vec());
+        let mut side_note = tracing.into_side_note().with_memory(flat_mem);
+        eprintln!("CpuChip baseline: {} PVM steps", side_note.steps.len());
 
         // Push one private payment's worth of chip rows on top.
         let scalar_v: [u8; 32] = {

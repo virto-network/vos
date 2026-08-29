@@ -247,6 +247,21 @@ impl Opcode {
         }
     }
 
+    /// Decode an encoded opcode under the selected execution profile.
+    ///
+    /// Capability-manifest programs retain the frozen pre-v0.8 unary
+    /// numbering, while standard programs use the exact Gray Paper v0.8
+    /// table. Proof tooling uses this entry point so trace construction and
+    /// program-memory commitments cannot silently reinterpret a program
+    /// under a different profile than the live executor.
+    #[inline(always)]
+    pub fn from_byte_in_mode(byte: u8, isa_mode: crate::IsaMode) -> Option<Self> {
+        match isa_mode {
+            crate::IsaMode::Jar => Self::from_runtime_byte(byte),
+            crate::IsaMode::Conformance => Self::from_byte(byte),
+        }
+    }
+
     /// Instruction category determining the argument format.
     pub fn category(self) -> InstructionCategory {
         let b = self as u8;

@@ -147,7 +147,7 @@ impl Package {
         if self.manifest.platform != crate::service::PLATFORM_ID {
             return Err(PackageError::WrongPlatform);
         }
-        if self.manifest.execution_semantics != crate::service::EXECUTION_SEMANTICS_ID {
+        if self.manifest.execution_semantics != super::EXECUTION_SEMANTICS_ID {
             return Err(PackageError::WrongExecutionSemantics);
         }
         if self.manifest.name.is_empty() || self.manifest.name.len() > MAX_PACKAGE_NAME_BYTES {
@@ -768,7 +768,7 @@ mod tests {
             manifest: PackageManifest {
                 name: "standard".into(),
                 platform: crate::service::PLATFORM_ID,
-                execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
                 kind: PackageKind::AgentRuntime {
                     contract: RuntimePackageContract::canonical(),
                     capabilities: RuntimeCapabilities::standard(),
@@ -827,7 +827,7 @@ mod tests {
             manifest: PackageManifest {
                 name: "counter".into(),
                 platform: crate::service::PLATFORM_ID,
-                execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
                 kind: PackageKind::Actor {
                     contract: ActorPackageContract::canonical(),
                     requirements,
@@ -856,6 +856,24 @@ mod tests {
         package.validate().unwrap();
         let bytes = package.encode();
         assert_eq!(Package::decode(&bytes).unwrap(), package);
+    }
+
+    #[test]
+    fn standard_actor_and_runtime_packages_reject_service_semantics() {
+        let mut runtime = runtime_package();
+        runtime.manifest.execution_semantics = crate::service::EXECUTION_SEMANTICS_ID;
+        assert_eq!(
+            runtime.validate(),
+            Err(PackageError::WrongExecutionSemantics),
+        );
+
+        let mut actor = actor_package(
+            &ACTOR_META,
+            &ACTOR_SCHEMA,
+            super::super::schema::ExecutionEntryKind::AgentActor,
+        );
+        actor.manifest.execution_semantics = crate::service::EXECUTION_SEMANTICS_ID;
+        assert_eq!(actor.validate(), Err(PackageError::WrongExecutionSemantics),);
     }
 
     #[test]
