@@ -30,6 +30,8 @@
 //! Or directly:
 //!     cd pvm/proof/fixtures/voucher-check && cargo +nightly build --release
 
+use std::io::Read;
+
 use vos_pvm_proof::{
     SideNote, program_commitment_hex, program_commitment_of_proof, prove, prove_mobile,
 };
@@ -39,6 +41,8 @@ const VOUCHER_CHECK_ELF: &str = concat!(
     "/fixtures/voucher-check/target/riscv64em-vos/release/voucher-check.elf",
 );
 const VOUCHER_CHECK_CATALOG: &str = include_str!("../fixtures/voucher-check/catalog.toml");
+const VOUCHER_CHECK_RELEASE_PVM_GZ: &[u8] =
+    include_bytes!("../fixtures/voucher-check/voucher-check.pvm.gz");
 const VOUCHER_CHECK_PIN_ID: &str =
     "06482de863e4bfacc8255cb2d1154767442373f5a8d5b2cc9bdb8b6329e1dd5b";
 const VOUCHER_CHECK_BLOB_HASH: &str =
@@ -65,6 +69,25 @@ fn load_voucher_check_elf() -> Option<Vec<u8>> {
             None
         }
     }
+}
+
+/// Load the checked-in release PVM used by the production catalog.
+///
+/// This fixture is deliberately outside `target/` and included at compile
+/// time. A clean checkout therefore cannot skip the catalog/AIR identity gate:
+/// a missing or corrupt artifact is a test failure (or a compile failure), not
+/// an optional integration-test condition.
+fn load_voucher_check_release_blob() -> Vec<u8> {
+    let mut decoder = flate2::read::GzDecoder::new(VOUCHER_CHECK_RELEASE_PVM_GZ);
+    let mut blob = Vec::new();
+    decoder
+        .read_to_end(&mut blob)
+        .expect("decompress checked-in voucher-check release PVM");
+    assert!(
+        !blob.is_empty(),
+        "voucher-check release PVM must not be empty"
+    );
+    blob
 }
 
 /// Load the voucher-check actor's ELF and transpile to a PVM blob.
@@ -250,11 +273,24 @@ fn voucher_check_catalog_is_a_valid_production_pin() {
 }
 
 #[test]
-fn voucher_check_catalog_matches_built_artifact() {
-    let Some(elf) = load_voucher_check_elf() else {
-        return;
-    };
+#[ignore = "maintenance-only current-source candidate provenance check; run `just build-voucher-check` first"]
+fn voucher_check_current_source_candidate_matches_published_release() {
+    let elf = std::fs::read(VOUCHER_CHECK_ELF).unwrap_or_else(|error| {
+        panic!(
+            "read freshly-built voucher-check ELF at {VOUCHER_CHECK_ELF}: {error}; \
+             run `just build-voucher-check` first"
+        )
+    });
     let blob = vos_pvm_compiler::link_elf(&elf).expect("transpile voucher-check ELF");
+    let release_blob = load_voucher_check_release_blob();
+    assert_eq!(
+        vos::zk::bytes_to_hex(&vos::provable::task_blob_hash(&blob)),
+        vos::zk::bytes_to_hex(&vos::provable::task_blob_hash(&release_blob)),
+        "fresh voucher-check source build must reproduce the checked-in release PVM; \
+         fresh bytes={}, release bytes={}",
+        blob.len(),
+        release_blob.len(),
+    );
     let pin = load_voucher_check_catalog()
         .require_pin("voucher-check", VOUCHER_CHECK_PIN_ID)
         .expect("exact voucher-check pin")
@@ -281,21 +317,24 @@ fn voucher_check_catalog_matches_built_artifact() {
     );
 }
 
-/// Release-maintenance gate for the checked-in canonical catalog. The
-/// commitment depends only on the authenticated program/profile
-/// preprocessed trace, so a bare execution is sufficient to re-measure it;
-/// no production witness is needed. Kept ignored because the canonical proof
-/// is intentionally heavyweight.
+/// Mandatory release gate for the checked-in canonical catalog. The
+/// commitment depends only on the authenticated program/profile preprocessed
+/// trace, so a bare execution is sufficient to re-measure it; no production
+/// witness or full proof is needed. The exact release PVM is checked in above,
+/// making this gate deterministic in a clean checkout.
 #[test]
-#[ignore = "heavy canonical catalog re-measurement"]
 fn voucher_check_catalog_commitment_matches_current_air() {
-    let Some(blob) = load_voucher_check_blob() else {
-        return;
-    };
+    let blob = load_voucher_check_release_blob();
     let catalog = load_voucher_check_catalog();
     let pin = catalog
         .require_pin("voucher-check", VOUCHER_CHECK_PIN_ID)
         .expect("exact voucher-check pin");
+
+    assert_eq!(
+        vos::zk::bytes_to_hex(&vos::provable::task_blob_hash(&blob)),
+        pin.blob_hash,
+        "checked-in release PVM must be the blob named by the production catalog"
+    );
 
     let side_note = side_note_for_trace(&blob, 100_000_000);
     let commitment =

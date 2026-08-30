@@ -2022,7 +2022,7 @@ mod test_trace {
             25,
         );
         let mut tracing = TracingPvm::new_conformance(pvm);
-        assert_eq!(tracing.run(), vos_pvm::ExitReason::Trap);
+        assert_eq!(tracing.run(), vos_pvm::ExitReason::Panic);
         SideNote::new(tracing.into_trace(), code, bitmask).with_memory(mem)
     }
 

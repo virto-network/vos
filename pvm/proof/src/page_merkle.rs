@@ -832,7 +832,7 @@ mod tests {
 
         let mut regs = [0u64; PVM_REGISTER_COUNT];
         regs[0] = 0x42; // value to store
-        regs[1] = 0x1000; // base address (page 1)
+        regs[1] = 0x1_0000; // first address above the protected low zone (page 16)
         let code = vec![
             Opcode::StoreIndU8 as u8,
             0x10,
@@ -859,13 +859,16 @@ mod tests {
             25,
         );
         let mut tr = TracingPvm::new_conformance(pvm);
-        assert_eq!(tr.run(), vos_pvm::ExitReason::Trap);
+        assert_eq!(tr.run(), vos_pvm::ExitReason::Panic);
         let steps = tr.into_trace();
         let sn = crate::side_note::SideNote::new(steps, code, bitmask);
 
-        // The store/load both hit address 0x1000 → page 1.
+        // The store/load both hit address 0x1_0000 → page 16.
         let pages = touched_pages(&sn);
-        assert!(pages.contains(&1), "expected page 1 (addr 0x1000) touched");
+        assert!(
+            pages.contains(&16),
+            "expected page 16 (addr 0x1_0000) touched"
+        );
 
         // Page count must equal the ledger's own distinct 4096-byte page count.
         let report = crate::chips::memory::analyze_dedup(&sn);

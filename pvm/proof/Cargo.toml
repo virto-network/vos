@@ -90,6 +90,10 @@ curve25519-dalek = { version = "4.1", default-features = false, features = ["all
 # WITNESS_BUFFER region — exercises the per-voucher proof path.
 cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["viewing-keys", "voucher", "helpers"] }
 rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck", "little_endian", "pointer_width_32"] }
+# The canonical voucher-check PVM is stored gzip-compressed so the mandatory
+# catalog/AIR release gate is independent of an ignored Cargo target tree
+# without adding nearly a megabyte of opaque fixture bytes to the checkout.
+flate2 = "1"
 
 # Both examples demonstrate the prover end-to-end; mark them
 # prover-only so a verifier-only build (`--no-default-features`) skips

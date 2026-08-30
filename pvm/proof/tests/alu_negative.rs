@@ -40,7 +40,7 @@ fn trace_cmov_imm(
     let mut regs = [0u64; vos_pvm::PVM_REGISTER_COUNT];
     regs[0] = 99; // old destination value
     regs[1] = cond;
-    let steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     (steps, code, bitmask)
 }
 

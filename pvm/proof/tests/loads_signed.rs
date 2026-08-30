@@ -54,7 +54,7 @@ fn load_i8_negative_sign_extends() {
         25,
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
-    assert_eq!(tracing.run(), ExitReason::Trap);
+    assert_eq!(tracing.run(), ExitReason::Panic);
     let steps = tracing.into_trace();
 
     // Sign-extended -128 as u64 = 0xFFFFFFFFFFFFFF80.
@@ -96,7 +96,7 @@ fn load_i16_negative_sign_extends() {
         25,
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
-    assert_eq!(tracing.run(), ExitReason::Trap);
+    assert_eq!(tracing.run(), ExitReason::Panic);
     let steps = tracing.into_trace();
 
     assert_eq!(steps[1].regs_after[2], 0xFFFF_FFFF_FFFF_8000);
@@ -137,7 +137,7 @@ fn load_i32_negative_sign_extends() {
         25,
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
-    assert_eq!(tracing.run(), ExitReason::Trap);
+    assert_eq!(tracing.run(), ExitReason::Panic);
     let steps = tracing.into_trace();
 
     assert_eq!(steps[1].regs_after[2], 0xFFFF_FFFF_8000_0000);
@@ -179,7 +179,7 @@ fn load_i8_positive_zero_extends() {
         25,
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
-    assert_eq!(tracing.run(), ExitReason::Trap);
+    assert_eq!(tracing.run(), ExitReason::Panic);
     let steps = tracing.into_trace();
 
     assert_eq!(steps[1].regs_after[2], 0x42);
@@ -224,7 +224,7 @@ fn load_i8_negative_forged_high_byte_rejected() {
         25,
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
-    assert_eq!(tracing.run(), ExitReason::Trap);
+    assert_eq!(tracing.run(), ExitReason::Panic);
     let mut steps = tracing.into_trace();
 
     // Forge regs_after to clear the topmost sign-extension byte

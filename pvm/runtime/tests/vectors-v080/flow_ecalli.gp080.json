@@ -7,7 +7,7 @@
     "gas": 99,
     "host_call": 7,
     "memory": [],
-    "pc": 2,
+    "pc": 0,
     "regs": [
       "0x0",
       "0x0",

@@ -109,7 +109,7 @@ fn register_side_note() -> SideNote {
         25,
     );
     let mut tr = TracingPvm::new_conformance(pvm);
-    assert_eq!(tr.run(), vos_pvm::ExitReason::Trap);
+    assert_eq!(tr.run(), vos_pvm::ExitReason::Panic);
     let steps: Vec<PvmStep> = tr.into_trace();
     assert_eq!(steps[0].regs_after[2], 12);
     assert_eq!(steps[1].regs_before[2], 12);
@@ -217,7 +217,7 @@ fn memory_side_note() -> SideNote {
         25,
     );
     let mut tr = TracingPvm::new_conformance(pvm);
-    assert_eq!(tr.run(), vos_pvm::ExitReason::Trap);
+    assert_eq!(tr.run(), vos_pvm::ExitReason::Panic);
     let steps: Vec<PvmStep> = tr.into_trace();
     assert_eq!(steps[1].regs_after[2], 0x42);
     let mut sn = SideNote::new(steps, code, bitmask);

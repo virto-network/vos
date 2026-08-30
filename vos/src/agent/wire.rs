@@ -909,7 +909,7 @@ fn encode_execution_error(encoder: &mut Encoder<'_>, error: ActorExecutionError)
         ActorExecutionError::InvalidActorOutput => encoder.u8(9),
         ActorExecutionError::UnsupportedHostCall(id) => {
             encoder.u8(10);
-            encoder.u32(id);
+            encoder.u64(id);
         }
         ActorExecutionError::DivergentInvocation => encoder.u8(11),
         ActorExecutionError::ResultCapacity => encoder.u8(12),
@@ -931,7 +931,7 @@ fn decode_execution_error(decoder: &mut Decoder<'_>) -> Result<ActorExecutionErr
         7 => ActorExecutionError::InvalidAvailability,
         8 => ActorExecutionError::InvalidInput,
         9 => ActorExecutionError::InvalidActorOutput,
-        10 => ActorExecutionError::UnsupportedHostCall(decoder.u32()?),
+        10 => ActorExecutionError::UnsupportedHostCall(decoder.u64()?),
         11 => ActorExecutionError::DivergentInvocation,
         12 => ActorExecutionError::ResultCapacity,
         13 => ActorExecutionError::InvalidAuthorization,
@@ -1662,6 +1662,18 @@ mod tests {
             },
         };
         assert_eq!(RuntimeExecutionCall::decode(&call.encode()).unwrap(), call);
+    }
+
+    #[test]
+    fn execution_error_preserves_a_wide_host_identifier() {
+        let returned = RuntimeExecutionReturn {
+            state: RuntimeState::default(),
+            result: Err(ActorExecutionError::UnsupportedHostCall(u64::MAX)),
+        };
+        assert_eq!(
+            RuntimeExecutionReturn::decode(&returned.encode()).unwrap(),
+            returned
+        );
     }
 
     #[test]

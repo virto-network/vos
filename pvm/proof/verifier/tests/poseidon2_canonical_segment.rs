@@ -2,7 +2,7 @@
 
 //! D1 backend spike (P5.0 / native-recursion Stage-0).
 //!
-//! GATE: ONE real 31-component **canonical** segment (the `prove_canonical`
+//! GATE: ONE real full-component **canonical** segment (the `prove_canonical`
 //! path) proves+verifies end-to-end under the Poseidon2-M31 PCS — the
 //! M31-algebraic Merkle commitment AND the M31-algebraic Fiat-Shamir transcript
 //! (no Blake2s on commit or transcript). `program_commitment_of_proof` returns
@@ -29,7 +29,7 @@ use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::{SideNote, program_commitment_of_proof, prove_canonical};
 use vos_pvm_proof_verifier::{PcsPolicy, verify_standalone_with_pcs_policy};
 
-/// Prove a small but genuine program as ONE full 31-component canonical segment.
+/// Prove a small but genuine program as one full canonical segment.
 fn canonical_segment_proof() -> vos_pvm_proof::Proof {
     // Six chained Add64s + Trap (7 steps) — the `chain_standalone` program.
     let code = vec![
@@ -69,12 +69,12 @@ fn canonical_segment_proof() -> vos_pvm_proof::Proof {
         25,
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
-    assert_eq!(tracing.run(), vos_pvm::ExitReason::Trap);
+    assert_eq!(tracing.run(), vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 7);
 
     let mut sn = SideNote::new(steps, code, bitmask).with_memory(initial_memory);
-    // Canonical proving = the FULL 31-component mask. The empty profile proves
+    // Canonical proving = the full component mask. The empty profile proves
     // each chip at its natural size — sufficient for a single self-consistent
     // segment (the multi-segment `{C_0,C_1}` re-bake that needs a uniform
     // profile is P5.1).
@@ -85,16 +85,20 @@ fn canonical_segment_proof() -> vos_pvm_proof::Proof {
 fn poseidon2_canonical_segment_round_trip() {
     let proof = canonical_segment_proof();
 
-    // The full canonical AIR: all 31 components present.
+    // The full canonical AIR: every component is present.
+    assert!(
+        (1..=u32::BITS as usize).contains(&vos_pvm_proof::chip_idx::COUNT),
+        "component_mask must represent between 1 and 32 components"
+    );
+    let expected_component_mask = u32::MAX >> (u32::BITS as usize - vos_pvm_proof::chip_idx::COUNT);
     assert_eq!(
         proof.num_components,
         vos_pvm_proof::chip_idx::COUNT,
-        "canonical proof must carry all 31 components"
+        "canonical proof must carry every component"
     );
     assert_eq!(
-        proof.component_mask,
-        (1u32 << vos_pvm_proof::chip_idx::COUNT) - 1,
-        "canonical mask must be the full 31-bit set"
+        proof.component_mask, expected_component_mask,
+        "canonical mask must contain every component"
     );
 
     // The program commitment is the preprocessed-trace Merkle root, now a

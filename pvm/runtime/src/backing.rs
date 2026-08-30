@@ -19,6 +19,14 @@ use crate::cap::Access;
 
 /// 4GB virtual address space per CODE cap window.
 pub const CODE_WINDOW_SIZE: usize = 1 << 32;
+/// One permission byte per 4 KiB guest page.
+pub const CODE_WINDOW_PERMS_SIZE: usize = CODE_WINDOW_SIZE / PVM_PAGE_SIZE as usize;
+/// Writable page containing the native JIT context immediately before RAM.
+pub const CODE_WINDOW_CTX_SIZE: usize = 4096;
+/// Metadata prefix shared by standalone and kernel JIT windows.
+pub const CODE_WINDOW_HEADER_SIZE: usize = CODE_WINDOW_PERMS_SIZE + CODE_WINDOW_CTX_SIZE;
+/// Inaccessible native page after the 32-bit guest address space.
+pub const CODE_WINDOW_GUARD_SIZE: usize = 4096;
 
 // ─── Linux x86-64: memfd + mmap ───────────────────────────────────────────
 
@@ -114,6 +122,18 @@ impl BackingStore {
         page_count: u32,
         access: Access,
     ) -> bool {
+        let Some(end_page) = base_page.checked_add(page_count) else {
+            return false;
+        };
+        let Some(end_backing) = backing_offset.checked_add(page_count) else {
+            return false;
+        };
+        if end_page as usize > CODE_WINDOW_PERMS_SIZE || end_backing > self.total_pages {
+            return false;
+        }
+        if page_count == 0 {
+            return true;
+        }
         // SAFETY: caller guarantees window_base is a valid 4GB mmap region.
         unsafe {
             let addr = window_base.add(base_page as usize * PVM_PAGE_SIZE as usize);
@@ -132,7 +152,21 @@ impl BackingStore {
                 self.fd,
                 offset,
             );
-            result != libc::MAP_FAILED
+            if result == libc::MAP_FAILED {
+                return false;
+            }
+
+            // The permission table is part of the same CodeWindow mapping,
+            // immediately before its JIT context. Updating it only after the
+            // guest mmap succeeds keeps generated software preflights in
+            // lockstep with the hardware page protections.
+            let perms = window_base.sub(CODE_WINDOW_HEADER_SIZE);
+            let encoded = match access {
+                Access::RO => 1,
+                Access::RW => 2,
+            };
+            core::ptr::write_bytes(perms.add(base_page as usize), encoded, page_count as usize);
+            true
         }
     }
 
@@ -141,6 +175,15 @@ impl BackingStore {
     /// # Safety
     /// `window_base` must point to a valid 4GB mmap region.
     pub unsafe fn unmap_pages(window_base: *mut u8, base_page: u32, page_count: u32) -> bool {
+        let Some(end_page) = base_page.checked_add(page_count) else {
+            return false;
+        };
+        if end_page as usize > CODE_WINDOW_PERMS_SIZE {
+            return false;
+        }
+        if page_count == 0 {
+            return true;
+        }
         // SAFETY: caller guarantees window_base is a valid 4GB mmap region.
         unsafe {
             let addr = window_base.add(base_page as usize * PVM_PAGE_SIZE as usize);
@@ -154,7 +197,12 @@ impl BackingStore {
                 -1,
                 0,
             );
-            result != libc::MAP_FAILED
+            if result == libc::MAP_FAILED {
+                return false;
+            }
+            let perms = window_base.sub(CODE_WINDOW_HEADER_SIZE);
+            core::ptr::write_bytes(perms.add(base_page as usize), 0, page_count as usize);
+            true
         }
     }
 
@@ -326,25 +374,23 @@ impl BackingStore {
 
 // ─── CodeWindow ───────────────────────────────────────────────────────────
 
-/// Size of the JitContext page placed before the guest memory base.
-const CTX_PAGE: usize = 4096;
-
 /// A virtual address space window for a CODE cap.
 ///
-/// On Linux x86-64: a full 4GB mmap region with a CTX page prefix.
+/// On Linux x86-64: a full 4GB mmap region with a permission-table and CTX
+/// prefix plus an inaccessible trailing guard page.
 /// On other platforms: a heap-allocated buffer sized to `total_pages`.
 ///
 /// Layout (both platforms):
 /// ```text
-/// [CTX page (4KB, RW)] [guest memory region]
-/// ^                     ^
-/// ctx_ptr()             base()  ← R15 in JIT code
+/// [permissions (1MiB)] [CTX (4KiB)] [guest memory] [guard]
+/// ^                     ^           ^
+/// perms()               ctx_ptr()   base()  ← R15 in JIT code
 /// ```
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub struct CodeWindow {
     /// Base of the entire mmap'd region (CTX page).
     region: *mut u8,
-    /// Total region size (CTX_PAGE + CODE_WINDOW_SIZE).
+    /// Total region size including metadata and the trailing guard.
     region_size: usize,
     /// Guest memory base (region + CTX_PAGE). This is R15 in JIT code.
     base: *mut u8,
@@ -354,7 +400,7 @@ pub struct CodeWindow {
 impl CodeWindow {
     /// Allocate a new 4GB window with CTX page.
     pub fn new(_total_pages: u32) -> Option<Self> {
-        let region_size = CTX_PAGE + CODE_WINDOW_SIZE;
+        let region_size = CODE_WINDOW_HEADER_SIZE + CODE_WINDOW_SIZE + CODE_WINDOW_GUARD_SIZE;
         // SAFETY: MAP_ANONYMOUS | MAP_NORESERVE allocates virtual address space only.
         let region = unsafe {
             libc::mmap(
@@ -371,12 +417,13 @@ impl CodeWindow {
         }
         let region = region as *mut u8;
 
-        // Make CTX page writable (for JitContext)
-        // SAFETY: region points to the start of the mmap, CTX_PAGE is within bounds.
+        // Make the permission table and CTX page writable. Guest RAM and the
+        // trailing guard remain PROT_NONE until BackingStore maps pages.
+        // SAFETY: the header lies wholly within the fresh mapping.
         unsafe {
             if libc::mprotect(
                 region as *mut libc::c_void,
-                CTX_PAGE,
+                CODE_WINDOW_HEADER_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
             ) != 0
             {
@@ -385,8 +432,8 @@ impl CodeWindow {
             }
         }
 
-        // SAFETY: CTX_PAGE < region_size, so add is in-bounds.
-        let base = unsafe { region.add(CTX_PAGE) };
+        // SAFETY: the header is strictly smaller than the complete mapping.
+        let base = unsafe { region.add(CODE_WINDOW_HEADER_SIZE) };
 
         Some(Self {
             region,
@@ -402,6 +449,12 @@ impl CodeWindow {
 
     /// Pointer to the JitContext page (base - CTX_PAGE).
     pub fn ctx_ptr(&self) -> *mut u8 {
+        // SAFETY: base follows the complete header and the CTX is its final page.
+        unsafe { self.base.sub(CODE_WINDOW_CTX_SIZE) }
+    }
+
+    /// Pointer to the page-permission table (one byte per guest page).
+    pub fn perms(&self) -> *mut u8 {
         self.region
     }
 }
@@ -428,23 +481,31 @@ pub struct CodeWindow {
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 impl CodeWindow {
     /// Allocate a buffer large enough for `total_pages` guest pages
-    /// plus one CTX page prefix.
+    /// plus the shared metadata prefix and trailing guard.
     pub fn new(total_pages: u32) -> Option<Self> {
-        let size = CTX_PAGE + total_pages as usize * PVM_PAGE_SIZE as usize;
+        let size = CODE_WINDOW_HEADER_SIZE
+            + total_pages as usize * PVM_PAGE_SIZE as usize
+            + CODE_WINDOW_GUARD_SIZE;
         Some(Self {
             buf: vec![0u8; size],
         })
     }
 
-    /// Guest memory base pointer (after the CTX page prefix).
+    /// Guest memory base pointer (after the metadata prefix).
     pub fn base(&self) -> *mut u8 {
-        // SAFETY: buf has at least CTX_PAGE bytes.
-        unsafe { self.buf.as_ptr().add(CTX_PAGE) as *mut u8 }
+        // SAFETY: buf has at least CODE_WINDOW_HEADER_SIZE bytes.
+        unsafe { self.buf.as_ptr().add(CODE_WINDOW_HEADER_SIZE) as *mut u8 }
     }
 
     /// Pointer to the CTX page (base - CTX_PAGE).
     pub fn ctx_ptr(&self) -> *mut u8 {
-        self.buf.as_ptr() as *mut u8
+        // SAFETY: the CTX is the final page of the metadata prefix.
+        unsafe { self.buf.as_ptr().add(CODE_WINDOW_PERMS_SIZE).cast_mut() }
+    }
+
+    /// Pointer to the page-permission table.
+    pub fn perms(&self) -> *mut u8 {
+        self.buf.as_ptr().cast_mut()
     }
 }
 
@@ -486,6 +547,35 @@ mod tests {
         assert_eq!(buf, [0xDE, 0xAD, 0xBE, 0xEF]);
 
         unsafe { assert!(BackingStore::unmap_pages(window.base(), 0, 2)) };
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn code_window_permissions_follow_high_page_mapping_lifecycle() {
+        let store = BackingStore::new(1).expect("BackingStore::new failed");
+        let window = CodeWindow::new(1).expect("CodeWindow::new failed");
+        let high_page = (CODE_WINDOW_PERMS_SIZE - 1) as u32;
+
+        // SAFETY: `perms()` covers exactly one byte per 32-bit guest page.
+        let permission = || unsafe { *window.perms().add(high_page as usize) };
+        assert_eq!(permission(), 0);
+
+        // SAFETY: the final guest page is within the CodeWindow and backing
+        // page zero exists for the complete lifetime of these mappings.
+        unsafe {
+            assert!(store.map_pages(window.base(), high_page, 0, 1, Access::RO));
+        }
+        assert_eq!(permission(), 1);
+
+        unsafe {
+            assert!(store.map_pages(window.base(), high_page, 0, 1, Access::RW));
+        }
+        assert_eq!(permission(), 2);
+
+        unsafe {
+            assert!(BackingStore::unmap_pages(window.base(), high_page, 1));
+        }
+        assert_eq!(permission(), 0);
     }
 
     #[test]

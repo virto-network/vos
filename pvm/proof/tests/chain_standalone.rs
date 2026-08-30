@@ -62,7 +62,7 @@ fn prove_two_segment_chain() -> (vos_pvm_proof::Proof, vos_pvm_proof::Proof) {
         25,
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
-    assert_eq!(tracing.run(), vos_pvm::ExitReason::Trap);
+    assert_eq!(tracing.run(), vos_pvm::ExitReason::Panic);
     let all_steps = tracing.into_trace();
     assert_eq!(all_steps.len(), 7);
 

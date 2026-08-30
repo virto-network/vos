@@ -87,8 +87,8 @@ fn refine_harness_starts_canonical_real_service_program() {
 }
 
 /// The flat and sparse memory representations are indistinguishable on the
-/// real gp072 service: same first-hostcall exit, the same pinned gas
-/// (10 702), the same register file, and the same logical memory around
+/// real gp072 service: same first-hostcall exit, the same v0.8 ROB-metered
+/// gas (10 743), the same register file, and the same logical memory around
 /// every mapped region. This is the shape a 32-bit embedder (which
 /// `MemoryModel::Auto` puts on the sparse path) executes.
 #[test]
@@ -102,7 +102,10 @@ fn refine_flat_and_sparse_agree_on_canonical_real_service_program() {
 
     assert_eq!(f.exit, vos_pvm::ExitReason::HostCall(1));
     assert_eq!(s.exit, f.exit, "exit agrees");
-    assert_eq!(f.gas_used, 10_702, "pinned gas for the service prologue");
+    assert_eq!(
+        f.gas_used, 10_743,
+        "pinned v0.8 ROB gas for the service prologue"
+    );
     assert_eq!(s.gas_used, f.gas_used, "gas agrees");
     assert_eq!(s.registers, f.registers, "registers agree");
     assert_eq!(s.memory().span(), f.memory().span(), "spans agree");

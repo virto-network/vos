@@ -43,9 +43,9 @@ pub fn two_reg_program(op: Opcode, rd: u8, ra: u8) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Run a program in the tracing interpreter and return the recorded steps.
-/// Asserts the program exits with `Trap` (the canonical happy-path
-/// terminator for these tests).
-pub fn trace_until_trap(
+/// Asserts the standard interpreter exits with `Panic` after recording the
+/// terminal opcode-0 (`Trap`) row.
+pub fn trace_until_opcode_zero(
     code: Vec<u8>,
     bitmask: Vec<u8>,
     regs: [u64; PVM_REGISTER_COUNT],
@@ -61,7 +61,11 @@ pub fn trace_until_trap(
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap, "expected Trap exit");
+    assert_eq!(
+        exit,
+        vos_pvm::ExitReason::Panic,
+        "expected standard Panic exit"
+    );
     tracing.into_trace()
 }
 
@@ -97,7 +101,7 @@ pub fn prove_two_reg(op: Opcode, rd: u8, ra: u8, input: u64, expected: u64) {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[ra as usize] = input;
     let (code, bitmask) = two_reg_program(op, rd, ra);
-    let steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
     assert_eq!(
         steps[0].regs_after[rd as usize], expected,
@@ -114,7 +118,7 @@ pub fn forge_two_reg_result(op: Opcode, rd: u8, ra: u8, input: u64, forged: u64)
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[ra as usize] = input;
     let (code, bitmask) = two_reg_program(op, rd, ra);
-    let mut steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let mut steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
     steps[0].regs_after[rd as usize] = forged;
     prove_and_verify(steps, &code, &bitmask);
@@ -133,7 +137,7 @@ where
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[ra as usize] = input;
     let (code, bitmask) = two_reg_program(op, rd, ra);
-    let mut steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let mut steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
     mutate(&mut steps[0]);
     prove_and_verify(steps, &code, &bitmask);
@@ -169,7 +173,7 @@ pub fn prove_three_reg(
     regs[ra as usize] = input_a;
     regs[rb as usize] = input_b;
     let (code, bitmask) = three_reg_program(op, rd, ra, rb);
-    let steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
     assert_eq!(
         steps[0].regs_after[rd as usize], expected,
@@ -193,7 +197,7 @@ pub fn forge_three_reg_result(
     regs[ra as usize] = input_a;
     regs[rb as usize] = input_b;
     let (code, bitmask) = three_reg_program(op, rd, ra, rb);
-    let mut steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let mut steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
     steps[0].regs_after[rd as usize] = forged;
     prove_and_verify(steps, &code, &bitmask);

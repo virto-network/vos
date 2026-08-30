@@ -797,6 +797,29 @@ impl Assembler {
         self.flush_instbuf(ib);
     }
 
+    /// movq xmm0, r64. XMM0 is caller-saved and is not part of the guest
+    /// register file, making it a fault-safe temporary for 64-bit immediates.
+    pub fn movq_xmm0_r64(&mut self, src: Reg) {
+        let mut ib = InstBuf::new();
+        ib.push(0x66);
+        ib.push(0x48 | src.hi());
+        ib.push(0x0F);
+        ib.push(0x6E);
+        ib.push(0xC0 | src.lo());
+        self.flush_instbuf(ib);
+    }
+
+    /// movq qword [base + index], xmm0.
+    pub fn movq_store64_sib_xmm0(&mut self, base: Reg, index: Reg) {
+        let mut ib = InstBuf::new();
+        ib.push(0x66);
+        ib.push(0x48 | (index.hi() << 1) | base.hi());
+        ib.push(0x0F);
+        ib.push(0x7E);
+        Self::modrm_sib_base_index_ib(&mut ib, 0, base, index);
+        self.flush_instbuf(ib);
+    }
+
     /// mov dword [base + index], imm32
     pub fn mov_store32_sib_imm(&mut self, base: Reg, index: Reg, imm: i32) {
         let mut ib = InstBuf::new();
@@ -883,6 +906,18 @@ impl Assembler {
         ib.push(0xBC); // mod=10, reg=/7(CMP), rm=100(SIB)
         ib.push((index.lo() << 3) | base.lo());
         ib.push_i32(disp);
+        ib.push(imm);
+        self.flush_instbuf(ib);
+    }
+
+    /// cmp byte [base + disp32], imm8.
+    pub fn cmp_byte_mem_disp32(&mut self, base: Reg, disp: i32, imm: u8) {
+        let mut ib = InstBuf::new();
+        if base.needs_rex() {
+            ib.push(0x41 | base.hi());
+        }
+        ib.push(0x80);
+        Self::modrm_disp_ib(&mut ib, 7, base, disp);
         ib.push(imm);
         self.flush_instbuf(ib);
     }
@@ -1083,6 +1118,34 @@ impl Assembler {
         ib.push(0x39);
         Self::modrm_disp_ib(&mut ib, src.lo(), base, disp);
         self.flush_instbuf(ib);
+    }
+
+    /// cmp qword [base + disp], reg64 (unsigned users select the condition).
+    pub fn cmp_mem64_r(&mut self, base: Reg, disp: i32, src: Reg) {
+        let mut ib = InstBuf::new();
+        ib.push(0x48 | (src.hi() << 2) | base.hi());
+        ib.push(0x39);
+        Self::modrm_disp_ib(&mut ib, src.lo(), base, disp);
+        self.flush_instbuf(ib);
+    }
+
+    /// sub qword [base + disp], reg64.
+    pub fn sub_mem64_r(&mut self, base: Reg, disp: i32, src: Reg) {
+        let mut ib = InstBuf::new();
+        ib.push(0x48 | (src.hi() << 2) | base.hi());
+        ib.push(0x29);
+        Self::modrm_disp_ib(&mut ib, src.lo(), base, disp);
+        self.flush_instbuf(ib);
+    }
+
+    /// cmp qword [base + disp32], sign-extended imm32.
+    /// Always uses disp32 encoding so callers can patch the immediate after
+    /// pipeline simulation has finalized a block's cost.
+    pub fn cmp_mem64_imm32(&mut self, base: Reg, disp: i32, imm: i32) {
+        self.rex_w_b(base);
+        self.emit(0x81);
+        self.modrm_disp32(7, base, disp);
+        self.emit_i32(imm);
     }
 
     /// sub qword [base + disp32], sign-extended imm32.

@@ -2208,7 +2208,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 return Err(AgentDriverError::InvalidRuntime);
             }
             for actor in &page.entries {
-                validate_loaded_actor(&self.store, actor)?;
+                validate_loaded_actor(&self.store, self.trust.as_ref(), &self.image.config, actor)?;
             }
             actors.extend(page.entries);
             let Some(next) = page.next else {
@@ -2226,9 +2226,60 @@ impl<S: AgentImageStore> AgentDriver<S> {
 
 fn validate_loaded_actor<S: AgentImageStore>(
     store: &S,
+    trust: &dyn AgentTrustProvider,
+    config: &AgentConfig,
     actor: &ActorEntry,
 ) -> Result<(), AgentDriverError> {
-    store
+    let package_bytes = store
+        .load_package(&actor.package)?
+        .ok_or(AgentDriverError::PackageUnavailable(actor.package.hash))?;
+    let package = Package::decode(&package_bytes)
+        .map_err(|_| AgentDriverError::Package(PackageError::InvalidActorArtifacts))?;
+    verify_trusted_package(trust, config, &package)?;
+    let PackageKind::Actor {
+        contract,
+        requirements,
+    } = package.manifest.kind
+    else {
+        return Err(AgentDriverError::Package(PackageError::WrongKind));
+    };
+    if !config.runtime_contract.supports(contract) {
+        return Err(AgentDriverError::Package(PackageError::InvalidActorAbi));
+    }
+    if !config.capabilities.satisfies(requirements) {
+        return Err(AgentDriverError::Package(
+            PackageError::InvalidActorArtifacts,
+        ));
+    }
+
+    let artifacts = load_actor_artifacts(store, actor)?;
+    if package.deployment_id() != actor.deployment
+        || package.manifest.program != actor.program
+        || package.pvm != artifacts.program
+        || BlobRef::of_bytes(&package.agent_schema) != actor.agent_schema
+        || BlobRef::of_bytes(&package.role_policies) != actor.role_policies
+        || artifacts.schema.bytes != package.agent_schema
+        || artifacts.policies.bytes != package.role_policies
+        || requirements.lanes != actor.lanes
+    {
+        return Err(AgentDriverError::Package(
+            PackageError::InvalidActorArtifacts,
+        ));
+    }
+    Ok(())
+}
+
+struct LoadedActorArtifacts {
+    program: Vec<u8>,
+    schema: RuntimeBlob,
+    policies: RuntimeBlob,
+}
+
+fn load_actor_artifacts<S: AgentImageStore>(
+    store: &S,
+    actor: &ActorEntry,
+) -> Result<LoadedActorArtifacts, AgentDriverError> {
+    let program = store
         .load_program(actor.program)?
         .ok_or(AgentDriverError::ProgramUnavailable(actor.program))?;
     let schema_blob = store
@@ -2252,7 +2303,11 @@ fn validate_loaded_actor<S: AgentImageStore>(
     {
         return Err(AgentDriverError::PolicyMismatch(actor.deployment));
     }
-    Ok(())
+    Ok(LoadedActorArtifacts {
+        program,
+        schema: schema_blob,
+        policies: policy_blob,
+    })
 }
 
 fn validate_process_local_profile(profile: AgentProfile) -> Result<(), AgentDriverError> {
@@ -2780,12 +2835,12 @@ mod tests {
         store
             .put_actor_policies(deployment, &policy_reference, &policy_bytes)
             .unwrap();
-        assert_eq!(validate_loaded_actor(&store, &actor), Ok(()));
+        assert_eq!(load_actor_artifacts(&store, &actor).map(|_| ()), Ok(()));
 
         let mut missing_policy = store.clone();
         missing_policy.policies.remove(&deployment);
         assert_eq!(
-            validate_loaded_actor(&missing_policy, &actor),
+            load_actor_artifacts(&missing_policy, &actor).map(|_| ()),
             Err(AgentDriverError::PolicyUnavailable(deployment))
         );
 
@@ -2802,21 +2857,21 @@ mod tests {
         let mut corrupt_actor = actor.clone();
         corrupt_actor.role_policies = corrupt_reference;
         assert_eq!(
-            validate_loaded_actor(&corrupt_store, &corrupt_actor),
+            load_actor_artifacts(&corrupt_store, &corrupt_actor).map(|_| ()),
             Err(AgentDriverError::PolicyMismatch(deployment))
         );
 
         let mut wrong_reference = actor.clone();
         wrong_reference.agent_schema.hash = Hash([0x33; 32]);
         assert_eq!(
-            validate_loaded_actor(&store, &wrong_reference),
+            load_actor_artifacts(&store, &wrong_reference).map(|_| ()),
             Err(AgentDriverError::SchemaMismatch(deployment))
         );
 
         let mut wrong_layout = actor;
         wrong_layout.state_layout = Hash([0x34; 32]);
         assert_eq!(
-            validate_loaded_actor(&store, &wrong_layout),
+            load_actor_artifacts(&store, &wrong_layout).map(|_| ()),
             Err(AgentDriverError::SchemaMismatch(deployment))
         );
     }

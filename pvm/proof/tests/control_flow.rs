@@ -76,7 +76,7 @@ fn prove_unconditional_jump() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap); // Trap
+    assert_eq!(exit, vos_pvm::ExitReason::Panic); // Trap
 
     let steps = tracing.into_trace();
     // Should be: Jump(pc=0→3), Add64(pc=3), Trap(pc=6)
@@ -119,7 +119,7 @@ fn prove_fallthrough() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 3); // Fallthrough, Add64, Trap
@@ -200,7 +200,7 @@ fn prove_unlikely() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     assert_eq!(steps[0].opcode, Opcode::Unlikely);
@@ -601,7 +601,7 @@ fn prove_branch_eq_taken() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 2); // BranchEq → Trap
@@ -617,17 +617,20 @@ fn prove_branch_eq_not_taken() {
     regs[0] = 42;
     regs[1] = 99; // not equal → fall through
 
-    // BranchEq at pc=0, falls through to pc=5 (sequential)
-    // Sequential next_pc = pc + 1 + skip = 0 + 1 + 4 = 5
+    // BranchEq at pc=0, falls through to pc=5 (sequential).
+    // Standard v0.8 validates both successors before choosing one, so keep
+    // the untaken target at the separate valid instruction start pc=6.
+    // Sequential next_pc = pc + 1 + skip = 0 + 1 + 4 = 5.
     let code = vec![
         Opcode::BranchEq as u8, // offset 0
         0x10,                   // ra=0, rb=1
-        10,
+        6,
         0,
-        0,                  // offset (irrelevant since not taken)
-        Opcode::Trap as u8, // offset 5
+        0,                  // signed_offset = 6 (valid alternate target pc=6)
+        Opcode::Trap as u8, // fallthrough at pc=5
+        Opcode::Trap as u8, // alternate target at pc=6
     ];
-    let bitmask = vec![1, 0, 0, 0, 0, 1];
+    let bitmask = vec![1, 0, 0, 0, 0, 1, 1];
 
     let pvm = Interpreter::new(
         code.clone(),
@@ -640,7 +643,7 @@ fn prove_branch_eq_not_taken() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 2); // BranchEq (not taken) → Trap
@@ -709,7 +712,7 @@ fn prove_loop_add() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     // 3 iterations × 3 instructions + Trap = 10 steps

@@ -279,7 +279,7 @@ pub enum ActorExecutionError {
     InvalidAuthorization,
     AuthorityExpired,
     AuthoritySlotRegressed,
-    UnsupportedHostCall(u32),
+    UnsupportedHostCall(u64),
 }
 
 /// Complete runtime execution call. `state` is opaque to the node.
@@ -540,8 +540,8 @@ pub(crate) fn run_inner_actor(
                 }
                 let registers = *machine.registers();
                 let (result0, result1) = match id {
-                    hostcall::GAS => (gas, 0),
-                    hostcall::FETCH => {
+                    value if value == u64::from(hostcall::GAS) => (gas, 0),
+                    value if value == u64::from(hostcall::FETCH) => {
                         let address = u32::try_from(registers[7])
                             .map_err(|_| ActorExecutionError::InvalidInput)?;
                         let capacity = usize::try_from(registers[8])
@@ -570,9 +570,9 @@ pub(crate) fn run_inner_actor(
                     // The standard loader maps the program-declared heap up
                     // front. This call is therefore an accounting seam, not
                     // permission to mutate pages outside that declaration.
-                    hostcall::GROW_HEAP => (error::HOST_OK, 0),
+                    value if value == u64::from(hostcall::GROW_HEAP) => (error::HOST_OK, 0),
                     #[cfg(feature = "agent-runtime")]
-                    crate::crypto::ECALL_BLAKE2B_COMPRESS => {
+                    value if value == u64::from(crate::crypto::ECALL_BLAKE2B_COMPRESS) => {
                         if !host_budget.blake2b_compression() {
                             return Ok((
                                 terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
@@ -605,7 +605,7 @@ pub(crate) fn run_inner_actor(
                     }
                     // Guest diagnostics never cross the deterministic runtime
                     // boundary. Validate the readable window, then discard it.
-                    hostcall::DEBUG_WRITE => {
+                    value if value == u64::from(hostcall::DEBUG_WRITE) => {
                         let address = u32::try_from(registers[7])
                             .map_err(|_| ActorExecutionError::InvalidInput)?;
                         let len = usize::try_from(registers[8])

@@ -17,7 +17,8 @@
 //! - Owned by the caller (kernel or standalone harness); JIT code reads/writes
 //!   fields at known offsets via `[r15 + OFFSET]` addressing
 //! - `regs[0..13]`: PVM registers, synced to/from `VmInstance` on context switch
-//! - `gas`: signed i64; JIT subtracts per-basic-block costs and exits on negative
+//! - `gas`: the full unsigned Gray Paper gas domain; generated code compares
+//!   before subtracting so an underfunded block leaves it unchanged
 //! - `flat_buf` / `flat_perms`: pointers into the backing store's mmap'd 4GB
 //!   CODE window (Harvard architecture, shared across VMs using the same CODE cap)
 //! - `original_bitmap`: synced from the active VM's `CapTable` before each segment
@@ -34,7 +35,6 @@
 
 pub mod asm;
 pub mod codegen;
-pub mod predecode;
 pub mod signal;
 
 use crate::ExitReason;
@@ -47,12 +47,20 @@ use codegen::{Compiler, HelperFns};
 pub struct JitContext {
     /// PVM registers (offset 0, 13 × 8 = 104 bytes).
     pub regs: [u64; 13],
-    /// Gas counter (offset 104). Signed to detect underflow.
-    pub gas: i64,
-    /// Exit reason code (offset 112).
+    /// Gas counter (offset 104), spanning the complete `u64` domain.
+    pub gas: u64,
+    /// Whether the gas block containing `entry_pc` has already been funded.
+    pub gas_charged: u32,
+    /// A standard host call is suspended at its causing instruction.
+    pub host_pending: u32,
+    /// Sequential successor committed by explicit host acknowledgement.
+    pub host_resume_pc: u32,
+    /// Number of entries in the external dispatch table.
+    pub dispatch_len: u32,
+    /// Exit reason code.
     pub exit_reason: u32,
-    /// Exit argument (offset 116) — host call ID, page fault addr, etc.
-    pub exit_arg: u32,
+    /// Exit argument — full-width host-call ID or zero-extended page address.
+    pub exit_arg: u64,
     /// Heap base address (offset 120).
     pub heap_base: u32,
     /// Current heap top (offset 124).
@@ -189,12 +197,91 @@ impl Drop for NativeCode {
 pub struct CompiledCode {
     pub native_code: NativeCode,
     pub dispatch_table: Vec<i32>,
+    pub fault_resume_offsets: Vec<i32>,
+    /// Containing gas-block start for each externally enterable PC.
+    pub gas_block_start_by_pc: Vec<u32>,
+    /// Pipeline cost indexed by gas-block start PC (including the sentinel).
+    pub block_gas_costs: Vec<u32>,
     pub trap_table: Vec<(u32, u32)>,
     pub exit_label_offset: u32,
     /// Strict basic-block starts ({0} ∪ post-terminator), one byte per code
     /// byte position. The runtime djump validation reads this through
     /// `JitContext.bb_starts`.
     pub block_starts: Vec<u8>,
+}
+
+/// Validate and prepare one externally requested native entry.
+///
+/// Standard mode may enter any decoded instruction. A fresh entry funds the
+/// complete containing gas block, then uses the post-charge native label;
+/// host/fault continuations carry `gas_charged=1` and use the same label
+/// without a second deduction. Invalid PCs are rejected before any table
+/// indexing or guest-state mutation.
+pub(crate) fn prepare_external_entry(
+    ctx: &mut JitContext,
+    instruction_offsets: &[i32],
+    gas_block_start_by_pc: &[u32],
+    block_gas_costs: &[u32],
+    isa_mode: crate::IsaMode,
+) -> Option<(u32, u64)> {
+    if isa_mode == crate::IsaMode::Conformance && ctx.host_pending != 0 {
+        ctx.pc = ctx.entry_pc;
+        ctx.exit_reason = codegen::EXIT_HOST_CALL;
+        return Some((ctx.exit_reason, ctx.exit_arg));
+    }
+
+    let pc = ctx.entry_pc as usize;
+    let valid_offset = instruction_offsets
+        .get(pc)
+        .copied()
+        .filter(|offset| *offset >= 0);
+    let block_start = gas_block_start_by_pc
+        .get(pc)
+        .copied()
+        .filter(|start| *start != u32::MAX);
+    let Some(offset) = valid_offset else {
+        ctx.pc = if isa_mode == crate::IsaMode::Conformance {
+            0
+        } else {
+            ctx.entry_pc
+        };
+        ctx.exit_reason = codegen::EXIT_PANIC;
+        ctx.exit_arg = 0;
+        return Some((ctx.exit_reason, 0));
+    };
+    let Some(block_start) = block_start else {
+        ctx.pc = if isa_mode == crate::IsaMode::Conformance {
+            0
+        } else {
+            ctx.entry_pc
+        };
+        ctx.exit_reason = codegen::EXIT_PANIC;
+        ctx.exit_arg = 0;
+        return Some((ctx.exit_reason, 0));
+    };
+
+    if isa_mode == crate::IsaMode::Conformance {
+        if ctx.gas_charged == 0 {
+            let Some(cost) = block_gas_costs.get(block_start as usize).copied() else {
+                ctx.pc = 0;
+                ctx.exit_reason = codegen::EXIT_PANIC;
+                ctx.exit_arg = 0;
+                return Some((ctx.exit_reason, 0));
+            };
+            if ctx.gas < u64::from(cost) {
+                ctx.pc = ctx.entry_pc;
+                ctx.exit_reason = codegen::EXIT_OOG;
+                ctx.exit_arg = 0;
+                return Some((ctx.exit_reason, 0));
+            }
+            ctx.gas -= u64::from(cost);
+            ctx.gas_charged = 1;
+        }
+        // `fast_reentry` stores native_offset + 1 so zero remains the
+        // unambiguous regular-dispatch sentinel.
+        ctx.fast_reentry = (offset as u32).saturating_add(1);
+    }
+    None
 }
 
 /// Compile PVM code to native x86-64 without creating an execution context.
@@ -206,6 +293,7 @@ pub fn compile_code(
     mem_cycles: u8,
     isa_mode: crate::IsaMode,
 ) -> Result<CompiledCode, String> {
+    let mem_cycles = crate::mem_cycles_for_mode(mem_cycles, isa_mode);
     let helpers = HelperFns {
         mem_read_u8: mem_read_u8 as *const () as u64,
         mem_read_u16: mem_read_u16 as *const () as u64,
@@ -256,6 +344,9 @@ pub fn compile_code(
     Ok(CompiledCode {
         native_code,
         dispatch_table,
+        fault_resume_offsets: result.fault_resume_offsets,
+        gas_block_start_by_pc: result.gas_block_start_by_pc,
+        block_gas_costs: result.block_gas_costs,
         trap_table: result.trap_table,
         exit_label_offset: result.exit_label_offset,
         block_starts,
@@ -270,7 +361,7 @@ unsafe impl Sync for NativeCode {}
 /// Flat memory backing buffer for inline JIT memory access.
 ///
 /// Contiguous mmap layout (R15 = guest memory base = region + HEADER_SIZE):
-///   [perm table, 1MB] [JitContext page, 4KB] [guest memory, 4GB]
+///   [perm table, 1MB] [JitContext page, 4KB] [guest memory, 4GB] [guard, 4KB]
 ///   ^                  ^                      ^
 ///   region             ctx_ptr                 R15 (buf)
 ///
@@ -300,15 +391,16 @@ struct FlatMemory {
     perms: *mut u8,
 }
 
-const FLAT_BUF_SIZE: usize = 1 << 32; // 4GB virtual
-const NUM_PAGES: usize = 1 << 20; // 2^20 = 1M pages
-const CTX_PAGE: usize = 4096; // JitContext page
-const HEADER_SIZE: usize = NUM_PAGES + CTX_PAGE; // perms + ctx page before guest mem
+const FLAT_BUF_SIZE: usize = crate::backing::CODE_WINDOW_SIZE;
+const NUM_PAGES: usize = crate::backing::CODE_WINDOW_PERMS_SIZE;
+const CTX_PAGE: usize = crate::backing::CODE_WINDOW_CTX_SIZE;
+const HEADER_SIZE: usize = crate::backing::CODE_WINDOW_HEADER_SIZE;
+const TRAILING_GUARD_SIZE: usize = crate::backing::CODE_WINDOW_GUARD_SIZE;
 
 impl FlatMemory {
     /// Create a flat memory from a data layout.
     fn new(layout: &DataLayout) -> Option<Self> {
-        let region_size = HEADER_SIZE + FLAT_BUF_SIZE;
+        let region_size = HEADER_SIZE + FLAT_BUF_SIZE + TRAILING_GUARD_SIZE;
         // SAFETY: mmap with MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE allocates virtual pages.
         // MAP_FAILED checked below.
         let region = unsafe {
@@ -362,6 +454,20 @@ impl FlatMemory {
                     buf.add(layout.rw_start as usize),
                     layout.rw_data.len(),
                 );
+            }
+
+            // A generated scalar access must never reach this page: the
+            // cyclic-wide slow path classifies it before issuing a native
+            // load/store. Keep a hardware guard as defense in depth so an
+            // omitted emitter cannot access an adjacent host mapping.
+            if libc::mprotect(
+                buf.add(FLAT_BUF_SIZE) as *mut libc::c_void,
+                TRAILING_GUARD_SIZE,
+                libc::PROT_NONE,
+            ) != 0
+            {
+                libc::munmap(region as *mut libc::c_void, region_size);
+                return None;
             }
         }
 
@@ -439,12 +545,8 @@ fn flat_check_perm(ctx: &JitContext, addr: u32, len: u32, min_perm: u8) -> bool 
     if ctx.flat_perms.is_null() {
         return false;
     }
-    let start_page = addr as usize / 4096;
-    let end_page = (addr as usize + len as usize - 1) / 4096;
-    for p in start_page..=end_page {
-        if p >= NUM_PAGES {
-            return false;
-        }
+    for offset in 0..len {
+        let p = addr.wrapping_add(offset) as usize / 4096;
         // SAFETY: p is bounds-checked against NUM_PAGES above; flat_perms is valid for NUM_PAGES.
         let perm = unsafe { *ctx.flat_perms.add(p) };
         if perm < min_perm {
@@ -456,24 +558,26 @@ fn flat_check_perm(ctx: &JitContext, addr: u32, len: u32, min_perm: u8) -> bool 
 
 /// Read from flat buffer. Caller must have checked permissions.
 unsafe fn flat_read(ctx: &JitContext, addr: u32, len: usize) -> u64 {
-    // SAFETY: caller verified permissions via flat_check_perm; addr..+len is within flat_buf.
-    unsafe {
-        let ptr = ctx.flat_buf.add(addr as usize);
-        match len {
-            1 => *ptr as u64,
-            2 => u16::from_le_bytes([*ptr, *ptr.add(1)]) as u64,
-            4 => u32::from_le_bytes([*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3)]) as u64,
-            8 => u64::from_le_bytes(std::ptr::read_unaligned(ptr as *const [u8; 8])),
-            _ => 0,
-        }
+    // SAFETY: caller verified every cyclic byte through flat_check_perm.
+    let mut value = 0u64;
+    for offset in 0..len {
+        let byte_addr = addr.wrapping_add(offset as u32);
+        // SAFETY: a u32 offset is always within the exact 4 GiB guest mmap.
+        let byte = unsafe { *ctx.flat_buf.add(byte_addr as usize) };
+        value |= u64::from(byte) << (offset * 8);
     }
+    value
 }
 
 /// Write to flat buffer. Caller must have checked permissions.
 unsafe fn flat_write(ctx: &JitContext, addr: u32, bytes: &[u8]) {
-    // SAFETY: caller verified permissions via flat_check_perm; addr..+len is within flat_buf.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ctx.flat_buf.add(addr as usize), bytes.len());
+    // SAFETY: caller verified every cyclic byte through flat_check_perm.
+    for (offset, byte) in bytes.iter().copied().enumerate() {
+        let byte_addr = addr.wrapping_add(offset as u32);
+        // SAFETY: a u32 offset is always within the exact 4 GiB guest mmap.
+        unsafe {
+            *ctx.flat_buf.add(byte_addr as usize) = byte;
+        }
     }
 }
 
@@ -491,7 +595,7 @@ extern "sysv64" fn mem_read_u8(ctx: *mut JitContext, addr: u32) -> u64 {
         return unsafe { flat_read(ctx, addr, 1) };
     }
     ctx.exit_reason = 3;
-    ctx.exit_arg = addr;
+    ctx.exit_arg = u64::from(addr);
     0
 }
 
@@ -503,7 +607,7 @@ extern "sysv64" fn mem_read_u16(ctx: *mut JitContext, addr: u32) -> u64 {
         return unsafe { flat_read(ctx, addr, 2) };
     }
     ctx.exit_reason = 3;
-    ctx.exit_arg = addr;
+    ctx.exit_arg = u64::from(addr);
     0
 }
 
@@ -515,7 +619,7 @@ extern "sysv64" fn mem_read_u32(ctx: *mut JitContext, addr: u32) -> u64 {
         return unsafe { flat_read(ctx, addr, 4) };
     }
     ctx.exit_reason = 3;
-    ctx.exit_arg = addr;
+    ctx.exit_arg = u64::from(addr);
     0
 }
 
@@ -527,7 +631,7 @@ extern "sysv64" fn mem_read_u64_fn(ctx: *mut JitContext, addr: u32) -> u64 {
         return unsafe { flat_read(ctx, addr, 8) };
     }
     ctx.exit_reason = 3;
-    ctx.exit_arg = addr;
+    ctx.exit_arg = u64::from(addr);
     0
 }
 
@@ -543,7 +647,7 @@ extern "sysv64" fn mem_write_u8(ctx: *mut JitContext, addr: u32, value: u64) -> 
         return 0;
     }
     ctx.exit_reason = 3;
-    ctx.exit_arg = addr;
+    ctx.exit_arg = u64::from(addr);
     1
 }
 
@@ -558,7 +662,7 @@ extern "sysv64" fn mem_write_u16(ctx: *mut JitContext, addr: u32, value: u64) ->
         return 0;
     }
     ctx.exit_reason = 3;
-    ctx.exit_arg = addr;
+    ctx.exit_arg = u64::from(addr);
     1
 }
 
@@ -573,7 +677,7 @@ extern "sysv64" fn mem_write_u32(ctx: *mut JitContext, addr: u32, value: u64) ->
         return 0;
     }
     ctx.exit_reason = 3;
-    ctx.exit_arg = addr;
+    ctx.exit_arg = u64::from(addr);
     1
 }
 
@@ -588,7 +692,7 @@ extern "sysv64" fn mem_write_u64_fn(ctx: *mut JitContext, addr: u32, value: u64)
         return 0;
     }
     ctx.exit_reason = 3;
-    ctx.exit_arg = addr;
+    ctx.exit_arg = u64::from(addr);
     1
 }
 
@@ -607,6 +711,14 @@ pub struct RecompiledPvm {
     _initial_gas: Gas,
     /// Dispatch table: PVM PC → native code offset (-1 = invalid).
     dispatch_table: Vec<i32>,
+    /// Native instruction-entry offsets used by the signal handler for a
+    /// one-shot standard page-fault retry.
+    _fault_resume_offsets: Vec<i32>,
+    /// Containing block and cost metadata used to validate/charge arbitrary
+    /// external entry before native table dispatch.
+    _gas_block_start_by_pc: Vec<u32>,
+    _block_gas_costs: Vec<u32>,
+    isa_mode: crate::IsaMode,
     /// Cached debug flag.
     debug: bool,
     /// Flat memory for inline JIT access.
@@ -654,6 +766,7 @@ impl RecompiledPvm {
         mem_cycles: u8,
         isa_mode: crate::IsaMode,
     ) -> Result<Self, String> {
+        let mem_cycles = crate::mem_cycles_for_mode(mem_cycles, isa_mode);
         let debug = {
             use std::sync::atomic::{AtomicU8, Ordering};
             static CACHED: AtomicU8 = AtomicU8::new(0); // 0=unchecked, 1=false, 2=true
@@ -685,7 +798,11 @@ impl RecompiledPvm {
         unsafe {
             ctx_raw.write(JitContext {
                 regs: registers,
-                gas: gas as i64,
+                gas,
+                gas_charged: 0,
+                host_pending: 0,
+                host_resume_pc: 0,
+                dispatch_len: 0,
 
                 exit_reason: 0,
                 exit_arg: 0,
@@ -801,6 +918,9 @@ impl RecompiledPvm {
 
         // Signal-based bounds checking: build trap table and install guard pages.
         let trap_table = compile_result.trap_table;
+        let fault_resume_offsets = compile_result.fault_resume_offsets;
+        let gas_block_start_by_pc = compile_result.gas_block_start_by_pc;
+        let block_gas_costs = compile_result.block_gas_costs;
         let signal_state = {
             signal::ensure_installed();
             let ss = Box::new(signal::SignalState {
@@ -811,6 +931,8 @@ impl RecompiledPvm {
                 ctx_ptr: ctx_raw,
                 trap_table_ptr: trap_table.as_ptr(),
                 trap_table_len: trap_table.len(),
+                fault_resume_offsets_ptr: fault_resume_offsets.as_ptr(),
+                fault_resume_offsets_len: fault_resume_offsets.len(),
             });
             Some(ss)
         };
@@ -834,6 +956,10 @@ impl RecompiledPvm {
             _jump_table: jump_table,
             _initial_gas: gas,
             dispatch_table,
+            _fault_resume_offsets: fault_resume_offsets,
+            _gas_block_start_by_pc: gas_block_start_by_pc,
+            _block_gas_costs: block_gas_costs,
+            isa_mode,
             debug,
             flat_memory: Some(flat_memory),
             signal_state,
@@ -842,6 +968,7 @@ impl RecompiledPvm {
 
         // Set dispatch_table pointer (must point to the Vec's data in Self)
         result.ctx_mut().dispatch_table = result.dispatch_table.as_ptr();
+        result.ctx_mut().dispatch_len = result.dispatch_table.len() as u32;
 
         Ok(result)
     }
@@ -862,6 +989,35 @@ impl RecompiledPvm {
     /// modify registers/memory as needed, then call run() again (entry_pc is set
     /// automatically for re-entry).
     pub fn run(&mut self) -> ExitReason {
+        let prepared = {
+            let ctx = self.ctx_mut() as *mut JitContext;
+            // SAFETY: the context pointer belongs to `self`; the metadata
+            // slices are immutable and disjoint from its mmap page.
+            unsafe {
+                prepare_external_entry(
+                    &mut *ctx,
+                    &self._fault_resume_offsets,
+                    &self._gas_block_start_by_pc,
+                    &self._block_gas_costs,
+                    self.isa_mode,
+                )
+            }
+        };
+        if let Some((reason, arg)) = prepared {
+            return match reason {
+                0 => ExitReason::Halt,
+                1 => ExitReason::Panic,
+                2 => ExitReason::OutOfGas,
+                3 => ExitReason::PageFault(
+                    u32::try_from(arg).expect("JIT page-fault arguments are 32-bit addresses"),
+                ),
+                4 => ExitReason::HostCall(arg),
+                6 => ExitReason::Ecall,
+                7 => ExitReason::Trap,
+                _ => ExitReason::Panic,
+            };
+        }
+
         if self.debug {
             tracing::debug!(
                 entry_pc = self.ctx().entry_pc,
@@ -904,14 +1060,15 @@ impl RecompiledPvm {
         // (OOG fallback, gas correction) are in separate methods to
         // avoid bloating the function and hurting instruction cache.
         match self.ctx().exit_reason {
-            4 => {
-                self.ctx_mut().entry_pc = self.ctx().pc;
-                ExitReason::HostCall(self.ctx().exit_arg)
-            }
+            // The compiled ecalli path has already separated the externally
+            // visible causing PC from the continuation entry PC.
+            4 => ExitReason::HostCall(self.ctx().exit_arg),
             0 => self.handle_halt_exit(),
             1 => self.handle_panic_exit(),
             2 => self.handle_oog_exit(),
             3 => self.handle_page_fault_exit(),
+            6 => ExitReason::Ecall,
+            7 => ExitReason::Trap,
             _ => ExitReason::Panic,
         }
     }
@@ -930,14 +1087,20 @@ impl RecompiledPvm {
 
     #[cold]
     fn handle_page_fault_exit(&mut self) -> ExitReason {
-        ExitReason::PageFault(self.ctx().exit_arg)
+        // Re-entry consumes the one-shot native cursor installed by the
+        // signal handler. Keep the architectural counter at the causing
+        // instruction for the external GP boundary.
+        self.ctx_mut().entry_pc = self.ctx().pc;
+        ExitReason::PageFault(
+            u32::try_from(self.ctx().exit_arg)
+                .expect("JIT page-fault arguments are 32-bit addresses"),
+        )
     }
 
     #[cold]
     fn handle_oog_exit(&mut self) -> ExitReason {
-        // JAR v0.8.0 pipeline gas: the full block cost is always the correct
-        // charge. The gas subtraction already happened in the JIT code —
-        // just return OOG. No interpreter fallback needed.
+        // The profile-specific JIT stub has already applied the selected OOG
+        // gas contract before returning here.
         self.ctx_mut().entry_pc = self.ctx().pc;
         ExitReason::OutOfGas
     }
@@ -953,7 +1116,7 @@ impl RecompiledPvm {
 
     /// Access remaining gas.
     pub fn gas(&self) -> u64 {
-        self.ctx().gas.max(0) as u64
+        self.ctx().gas
     }
 
     /// Read a byte directly from the flat buffer.
@@ -1021,7 +1184,10 @@ impl RecompiledPvm {
             Some(f) => f,
             None => return false,
         };
-        for (i, &byte) in data.iter().enumerate() {
+        // Validate the complete cyclic range before changing a byte. Besides
+        // matching guest-store atomicity this keeps test/host seeding from
+        // leaving a prefix behind when a later page is read-only.
+        for i in 0..data.len() {
             let a = addr.wrapping_add(i as u32);
             let page = a as usize / 4096;
             if page >= NUM_PAGES {
@@ -1032,6 +1198,9 @@ impl RecompiledPvm {
             if perm < 2 {
                 return false;
             }
+        }
+        for (i, &byte) in data.iter().enumerate() {
+            let a = addr.wrapping_add(i as u32);
             // SAFETY: permission check passed; a is within the mmap'd guest memory.
             unsafe {
                 *fm.buf.add(a as usize) = byte;
@@ -1108,11 +1277,38 @@ impl RecompiledPvm {
     pub fn set_pc(&mut self, pc: u32) {
         self.ctx_mut().entry_pc = pc;
         self.ctx_mut().pc = pc;
+        self.ctx_mut().fast_reentry = 0;
+        self.ctx_mut().gas_charged = 0;
+        self.ctx_mut().host_pending = 0;
+    }
+
+    /// Commit the successor of the currently surfaced standard host call.
+    /// Rerunning before this acknowledgement reproduces the same host exit.
+    pub fn acknowledge_host_call(&mut self) -> bool {
+        if self.isa_mode != crate::IsaMode::Conformance || self.ctx().host_pending == 0 {
+            return false;
+        }
+        let resume_pc = self.ctx().host_resume_pc;
+        let ctx = self.ctx_mut();
+        ctx.host_pending = 0;
+        ctx.entry_pc = resume_pc;
+        ctx.pc = resume_pc;
+        ctx.fast_reentry = 0;
+        // A standard host exit can only surface after the containing block
+        // has been funded.  Acknowledgement advances within that same block,
+        // so preserve the funded marker just like Interpreter and VmInstance.
+        ctx.gas_charged = 1;
+        true
+    }
+
+    /// Compatibility spelling shared with the interpreter API.
+    pub fn resume_after_host_call(&mut self) -> bool {
+        self.acknowledge_host_call()
     }
 
     /// Set gas.
     pub fn set_gas(&mut self, gas: Gas) {
-        self.ctx_mut().gas = gas as i64;
+        self.ctx_mut().gas = gas;
     }
 
     /// Set a single PVM register.
@@ -1157,6 +1353,10 @@ mod tests {
         let ctx = JitContext {
             regs: [0; 13],
             gas: 0,
+            gas_charged: 0,
+            host_pending: 0,
+            host_resume_pc: 0,
+            dispatch_len: 0,
             exit_reason: 0,
             exit_arg: 0,
             heap_base: 0,
@@ -1236,7 +1436,72 @@ mod tests {
         )
         .expect("compilation should succeed");
         let exit = pvm.run();
-        assert_eq!(exit, ExitReason::Panic);
+        assert_eq!(exit, ExitReason::Trap);
+    }
+
+    #[test]
+    fn opcode_zero_exit_is_profile_specific() {
+        for (code, bitmask, source) in [
+            (vec![0], vec![1], "explicit"),
+            (vec![], vec![], "end sentinel"),
+        ] {
+            for (isa_mode, expected) in [
+                (crate::IsaMode::Jar, ExitReason::Trap),
+                (crate::IsaMode::Conformance, ExitReason::Panic),
+            ] {
+                let mut pvm = RecompiledPvm::new_with_mode(
+                    &code,
+                    bitmask.clone(),
+                    vec![],
+                    [0; 13],
+                    1_000,
+                    Some(test_layout()),
+                    crate::gas_cost::DEFAULT_MEM_CYCLES,
+                    isa_mode,
+                )
+                .expect("compilation should succeed");
+                assert_eq!(pvm.run(), expected, "{isa_mode:?} {source}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_opcode_panics_in_both_profiles() {
+        for isa_mode in [crate::IsaMode::Jar, crate::IsaMode::Conformance] {
+            let mut pvm = RecompiledPvm::new_with_mode(
+                &[u8::MAX],
+                vec![1],
+                vec![],
+                [0; 13],
+                1_000,
+                Some(test_layout()),
+                crate::gas_cost::DEFAULT_MEM_CYCLES,
+                isa_mode,
+            )
+            .expect("compilation should succeed");
+            assert_eq!(pvm.run(), ExitReason::Panic, "{isa_mode:?}");
+        }
+    }
+
+    #[test]
+    fn private_ecall_exit_is_profile_specific() {
+        for (isa_mode, expected) in [
+            (crate::IsaMode::Jar, ExitReason::Ecall),
+            (crate::IsaMode::Conformance, ExitReason::Panic),
+        ] {
+            let mut pvm = RecompiledPvm::new_with_mode(
+                &[crate::instruction::Opcode::Ecall as u8],
+                vec![1],
+                vec![],
+                [0; 13],
+                1_000,
+                Some(test_layout()),
+                crate::gas_cost::DEFAULT_MEM_CYCLES,
+                isa_mode,
+            )
+            .expect("compilation should succeed");
+            assert_eq!(pvm.run(), expected, "{isa_mode:?}");
+        }
     }
 
     #[test]
@@ -1279,8 +1544,312 @@ mod tests {
 
         assert_eq!(pvm.run(), ExitReason::HostCall(42));
         let after_host_call = pvm.gas();
+        assert_eq!(pvm.run(), ExitReason::HostCall(42));
+        assert_eq!(pvm.gas(), after_host_call);
+        assert!(pvm.acknowledge_host_call());
         assert_eq!(pvm.run(), ExitReason::Panic);
         assert_eq!(pvm.gas(), after_host_call);
+    }
+
+    #[test]
+    fn standard_external_entries_use_unsigned_atomic_block_funding() {
+        use crate::interpreter::Interpreter;
+
+        // ecalli(7) and its implicit panic successor share one standard gas
+        // block.  Exercise counters above the signed range so the native
+        // compare-before-subtract sequence cannot regress to signed Jcc.
+        let code = vec![10, 7, 0];
+        let bitmask = vec![1, 0, 1];
+        let mut cost_probe = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            [0; 13],
+            vec![],
+            0,
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+        );
+        cost_probe.set_isa_mode(crate::IsaMode::Conformance);
+        cost_probe.set_gas_model(crate::GasModel::BlockPipeline);
+        let block_cost = u64::from(cost_probe.block_gas_costs[0]);
+
+        for initial_gas in [1u64 << 63, u64::MAX] {
+            let mut interpreter = Interpreter::new(
+                code.clone(),
+                bitmask.clone(),
+                vec![],
+                [0; 13],
+                vec![],
+                initial_gas,
+                crate::gas_cost::DEFAULT_MEM_CYCLES,
+            );
+            interpreter.set_isa_mode(crate::IsaMode::Conformance);
+            interpreter.set_gas_model(crate::GasModel::BlockPipeline);
+            assert_eq!(interpreter.run().0, ExitReason::HostCall(7));
+            assert_eq!(interpreter.gas, initial_gas - block_cost);
+            assert_eq!(interpreter.run().0, ExitReason::HostCall(7));
+            assert_eq!(interpreter.gas, initial_gas - block_cost);
+            assert!(interpreter.resume_after_host_call());
+            assert_eq!(interpreter.run().0, ExitReason::Panic);
+            assert_eq!(interpreter.gas, initial_gas - block_cost);
+
+            let mut recompiled = RecompiledPvm::new_with_mode(
+                &code,
+                bitmask.clone(),
+                vec![],
+                [0; 13],
+                initial_gas,
+                Some(test_layout()),
+                crate::gas_cost::DEFAULT_MEM_CYCLES,
+                crate::IsaMode::Conformance,
+            )
+            .expect("compilation should succeed");
+            assert_eq!(recompiled.run(), ExitReason::HostCall(7));
+            assert_eq!(recompiled.gas(), initial_gas - block_cost);
+            signal::SIGNAL_STATE.with(|cell| assert!(cell.get().is_null()));
+            assert_eq!(recompiled.run(), ExitReason::HostCall(7));
+            assert_eq!(recompiled.gas(), initial_gas - block_cost);
+            assert!(recompiled.acknowledge_host_call());
+            assert_eq!(recompiled.run(), ExitReason::Panic);
+            assert_eq!(recompiled.gas(), initial_gas - block_cost);
+            signal::SIGNAL_STATE.with(|cell| assert!(cell.get().is_null()));
+        }
+
+        // Insufficient funding is observationally atomic: neither backend
+        // executes the first instruction nor modifies the gas counter.
+        let insufficient = block_cost - 1;
+        let mut interpreter = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            [0; 13],
+            vec![],
+            insufficient,
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+        );
+        interpreter.set_isa_mode(crate::IsaMode::Conformance);
+        interpreter.set_gas_model(crate::GasModel::BlockPipeline);
+        assert_eq!(interpreter.run().0, ExitReason::OutOfGas);
+        assert_eq!(interpreter.gas, insufficient);
+
+        let mut recompiled = RecompiledPvm::new_with_mode(
+            &code,
+            bitmask.clone(),
+            vec![],
+            [0; 13],
+            insufficient,
+            Some(test_layout()),
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
+        )
+        .expect("compilation should succeed");
+        assert_eq!(recompiled.run(), ExitReason::OutOfGas);
+        assert_eq!(recompiled.gas(), insufficient);
+
+        // A fresh mid-block entry must fund the containing block.  The same
+        // PC reached through explicit host acknowledgement remains funded.
+        let fresh_gas = block_cost + 9;
+        let mut interpreter = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            [0; 13],
+            vec![],
+            fresh_gas,
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+        );
+        interpreter.set_isa_mode(crate::IsaMode::Conformance);
+        interpreter.set_gas_model(crate::GasModel::BlockPipeline);
+        interpreter.set_pc(2);
+        assert_eq!(interpreter.run().0, ExitReason::Panic);
+        assert_eq!(interpreter.gas, 9);
+
+        let mut recompiled = RecompiledPvm::new_with_mode(
+            &code,
+            bitmask,
+            vec![],
+            [0; 13],
+            fresh_gas,
+            Some(test_layout()),
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
+        )
+        .expect("compilation should succeed");
+        recompiled.set_pc(2);
+        assert_eq!(recompiled.run(), ExitReason::Panic);
+        assert_eq!(recompiled.gas(), 9);
+    }
+
+    #[test]
+    fn standard_invalid_external_entry_panics_without_state_or_charge() {
+        use crate::interpreter::Interpreter;
+
+        // LoadImm has two argument bytes followed by an explicit standard
+        // panic.  Argument bytes and out-of-range PCs are never valid entry
+        // points, even with an exhausted gas counter.
+        let code = vec![51, 2, 9, 0];
+        let bitmask = vec![1, 0, 0, 1];
+        let initial_regs = core::array::from_fn(|index| 0x1000 + index as u64);
+        let invalid_pcs = [1, 2, code.len() as u32 + 1, u32::MAX];
+
+        for gas in [0, 500] {
+            for invalid_pc in invalid_pcs {
+                let mut interpreter = Interpreter::new(
+                    code.clone(),
+                    bitmask.clone(),
+                    vec![],
+                    initial_regs,
+                    vec![0; 4096],
+                    gas,
+                    crate::gas_cost::DEFAULT_MEM_CYCLES,
+                );
+                interpreter.set_isa_mode(crate::IsaMode::Conformance);
+                interpreter.set_gas_model(crate::GasModel::BlockPipeline);
+                interpreter.write_u8(128, 0xA5).unwrap();
+                let memory_before = interpreter.flat_mem().to_vec();
+                interpreter.set_pc(invalid_pc);
+                assert_eq!(interpreter.run().0, ExitReason::Panic, "pc={invalid_pc}");
+                assert_eq!(interpreter.pc, 0, "pc={invalid_pc}");
+                assert_eq!(interpreter.gas, gas, "pc={invalid_pc}");
+                assert_eq!(interpreter.registers, initial_regs, "pc={invalid_pc}");
+                assert_eq!(interpreter.flat_mem(), memory_before, "pc={invalid_pc}");
+
+                let layout = DataLayout {
+                    mem_size: 4096,
+                    arg_start: 0,
+                    arg_data: vec![],
+                    ro_start: 0,
+                    ro_data: vec![],
+                    rw_start: 0,
+                    rw_data: vec![0; 4096],
+                };
+                let mut recompiled = RecompiledPvm::new_with_mode(
+                    &code,
+                    bitmask.clone(),
+                    vec![],
+                    initial_regs,
+                    gas,
+                    Some(layout),
+                    crate::gas_cost::DEFAULT_MEM_CYCLES,
+                    crate::IsaMode::Conformance,
+                )
+                .expect("compilation should succeed");
+                assert!(recompiled.write_byte(128, 0xA5));
+                let memory_before = recompiled.read_bytes(0, 4096).unwrap();
+                recompiled.set_pc(invalid_pc);
+                assert_eq!(recompiled.run(), ExitReason::Panic, "pc={invalid_pc}");
+                assert_eq!(recompiled.pc(), 0, "pc={invalid_pc}");
+                assert_eq!(recompiled.gas(), gas, "pc={invalid_pc}");
+                assert_eq!(recompiled.registers(), &initial_regs, "pc={invalid_pc}");
+                assert_eq!(
+                    recompiled.read_bytes(0, 4096).unwrap(),
+                    memory_before,
+                    "pc={invalid_pc}"
+                );
+                signal::SIGNAL_STATE.with(|cell| assert!(cell.get().is_null()));
+            }
+        }
+    }
+
+    #[test]
+    fn standard_fresh_mid_block_entry_has_no_predecessor_assumptions() {
+        use crate::interpreter::Interpreter;
+
+        // A predecessor LoadImm names 0x10000, while the fresh entry supplies
+        // 0x11000 in r2. Constant/address propagation must not leak across the
+        // externally enterable instruction boundary.
+        let code = vec![
+            51, 2, 0, 0, 1, 0, // LoadImm r2, 0x10000
+            128, 0x23, 0, 0, 0, 0, // LoadIndU32 r3, [r2]
+            0, // standard panic
+        ];
+        let mut bitmask = vec![0; code.len()];
+        bitmask[0] = 1;
+        bitmask[6] = 1;
+        bitmask[12] = 1;
+        let mut registers = [0; 13];
+        registers[2] = 0x1_1000;
+        let mut memory = vec![0; 0x1_2000];
+        memory[0x1_0000..0x1_0004].copy_from_slice(&0xAAAA_AAAAu32.to_le_bytes());
+        memory[0x1_1000..0x1_1004].copy_from_slice(&0xBBBB_BBBBu32.to_le_bytes());
+
+        let mut interpreter = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            registers,
+            memory.clone(),
+            1_000,
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+        );
+        interpreter.set_isa_mode(crate::IsaMode::Conformance);
+        interpreter.set_gas_model(crate::GasModel::BlockPipeline);
+        interpreter.set_pc(6);
+        assert_eq!(interpreter.run().0, ExitReason::Panic);
+        assert_eq!(interpreter.registers[3], 0xBBBB_BBBB);
+
+        let layout = DataLayout {
+            mem_size: memory.len() as u32,
+            arg_start: 0,
+            arg_data: vec![],
+            ro_start: 0,
+            ro_data: vec![],
+            rw_start: 0,
+            rw_data: memory,
+        };
+        let mut recompiled = RecompiledPvm::new_with_mode(
+            &code,
+            bitmask,
+            vec![],
+            registers,
+            1_000,
+            Some(layout),
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
+        )
+        .unwrap();
+        recompiled.set_pc(6);
+        assert_eq!(recompiled.run(), ExitReason::Panic);
+        assert_eq!(recompiled.registers()[3], 0xBBBB_BBBB);
+        assert_eq!(recompiled.gas(), interpreter.gas);
+
+        // Likewise, a fresh SetLtU cannot consume carry flags from the Add64
+        // that merely precedes it in code generation order.
+        let code = vec![200, 0x10, 2, 216, 0x02, 3, 0];
+        let bitmask = vec![1, 0, 0, 1, 0, 0, 1];
+        let mut registers = [0; 13];
+        registers[0] = 1;
+        registers[2] = 0;
+        let mut interpreter = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            registers,
+            vec![],
+            1_000,
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+        );
+        interpreter.set_isa_mode(crate::IsaMode::Conformance);
+        interpreter.set_gas_model(crate::GasModel::BlockPipeline);
+        interpreter.set_pc(3);
+        assert_eq!(interpreter.run().0, ExitReason::Panic);
+        assert_eq!(interpreter.registers[3], 1);
+
+        let mut recompiled = RecompiledPvm::new_with_mode(
+            &code,
+            bitmask,
+            vec![],
+            registers,
+            1_000,
+            Some(test_layout()),
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
+        )
+        .unwrap();
+        recompiled.set_pc(3);
+        assert_eq!(recompiled.run(), ExitReason::Panic);
+        assert_eq!(recompiled.registers()[3], 1);
+        assert_eq!(recompiled.gas(), interpreter.gas);
     }
 
     #[test]
@@ -1301,7 +1870,7 @@ mod tests {
         .expect("compilation should succeed");
         let exit = pvm.run();
         assert_eq!(pvm.registers()[0], 123);
-        assert_eq!(exit, ExitReason::Panic);
+        assert_eq!(exit, ExitReason::Trap);
     }
 
     #[test]
@@ -1348,6 +1917,291 @@ mod tests {
         .expect("compilation should succeed");
         let exit = pvm.run();
         assert_eq!(exit, ExitReason::OutOfGas);
+    }
+
+    #[test]
+    fn rejected_scaled_index_near_match_does_not_double_charge_peeked_ops() {
+        use crate::interpreter::Interpreter;
+
+        // The first three adds satisfy the scaled-index prefix, but DIV is
+        // not a load/store and must reject the fusion without touching gas.
+        let code = vec![
+            200, 0x00, 1, // add64 r1 <- r0, r0
+            200, 0x11, 1, // add64 r1 <- r1, r1
+            200, 0x12, 3, // add64 r3 <- r2, r1
+            203, 0x54, 6, // div_u64 r6 <- r4, r5 (near-match rejection)
+            0, // standard opcode zero => panic
+        ];
+        let bitmask = vec![1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1];
+        let initial_gas = 1_000;
+
+        let mut interpreter = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            [0; 13],
+            vec![],
+            initial_gas,
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+        );
+        interpreter.set_isa_mode(crate::IsaMode::Conformance);
+        let expected_cost = u64::from(interpreter.block_gas_costs[0]);
+        let (interpreter_exit, _) = interpreter.run();
+
+        let mut recompiled = RecompiledPvm::new_with_mode(
+            &code,
+            bitmask,
+            vec![],
+            [0; 13],
+            initial_gas,
+            Some(test_layout()),
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
+        )
+        .expect("compilation should succeed");
+        let recompiled_exit = recompiled.run();
+
+        assert_eq!(interpreter_exit, ExitReason::Panic);
+        assert_eq!(recompiled_exit, interpreter_exit);
+        assert_eq!(expected_cost, 62, "hand-derived v0.8 pipeline cost");
+        assert_eq!(interpreter.gas, initial_gas - expected_cost);
+        assert_eq!(recompiled.gas(), interpreter.gas);
+    }
+
+    #[test]
+    fn standard_implicit_trap_is_charged_in_exactly_one_block() {
+        use crate::interpreter::Interpreter;
+
+        // unlikely is not in T: implicit opcode 0 joins its open block.
+        let code = vec![2];
+        let bitmask = vec![1];
+        let initial_gas = 100;
+        let mut interpreter = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            [0; 13],
+            vec![],
+            initial_gas,
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+        );
+        interpreter.set_isa_mode(crate::IsaMode::Conformance);
+        assert_eq!(interpreter.block_gas_costs[0], 40);
+        assert_eq!(interpreter.run().0, ExitReason::Panic);
+        assert_eq!(interpreter.gas, 60);
+
+        let mut recompiled = RecompiledPvm::new_with_mode(
+            &code,
+            bitmask,
+            vec![],
+            [0; 13],
+            initial_gas,
+            Some(test_layout()),
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
+        )
+        .expect("compilation should succeed");
+        assert_eq!(recompiled.run(), ExitReason::Panic);
+        assert_eq!(recompiled.gas(), interpreter.gas);
+
+        // ecalli is not in T. Its resumed falloff must not charge the implicit
+        // panic a second time after the enclosing block was prepaid.
+        let code = vec![10, 7];
+        let bitmask = vec![1, 0];
+        let initial_gas = 150;
+        let mut interpreter = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            [0; 13],
+            vec![],
+            initial_gas,
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+        );
+        interpreter.set_isa_mode(crate::IsaMode::Conformance);
+        assert_eq!(interpreter.block_gas_costs[0], 100);
+        assert_eq!(interpreter.run().0, ExitReason::HostCall(7));
+        assert_eq!(interpreter.gas, 50);
+        assert!(interpreter.resume_after_host_call());
+        assert_eq!(interpreter.run().0, ExitReason::Panic);
+        assert_eq!(interpreter.gas, 50);
+
+        let mut recompiled = RecompiledPvm::new_with_mode(
+            &code,
+            bitmask,
+            vec![],
+            [0; 13],
+            initial_gas,
+            Some(test_layout()),
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
+        )
+        .expect("compilation should succeed");
+        assert_eq!(recompiled.run(), ExitReason::HostCall(7));
+        assert_eq!(recompiled.gas(), 50);
+        assert!(recompiled.acknowledge_host_call());
+        assert_eq!(recompiled.run(), ExitReason::Panic);
+        assert_eq!(recompiled.gas(), 50);
+    }
+
+    #[test]
+    fn standard_static_successors_are_validated_before_branch_selection() {
+        use crate::interpreter::Interpreter;
+
+        let mut unequal = [0u64; 13];
+        unequal[2] = 1;
+        let cases = [
+            // Opcode 1 is sjump(next): end-of-code is not in varpi.
+            ("final fallthrough", vec![1], vec![1], [0; 13], 2),
+            // The fallthrough is invalid even though the condition selects
+            // the valid target at pc 0.
+            (
+                "unselected invalid fallthrough",
+                vec![81, 0x12, 0, 0],
+                vec![1, 0, 0, 0],
+                [0; 13],
+                1,
+            ),
+            // The same invalid fallthrough is rejected when selected.
+            (
+                "selected invalid fallthrough",
+                vec![81, 0x12, 0, 0],
+                vec![1, 0, 0, 0],
+                unequal,
+                1,
+            ),
+            // pc 127 is invalid even though the condition selects the valid
+            // fallthrough at pc 4.
+            (
+                "unselected invalid target",
+                vec![81, 0x12, 0, 127, 1, 0],
+                vec![1, 0, 0, 0, 1, 1],
+                unequal,
+                1,
+            ),
+            // A selected invalid target is rejected by the same precheck.
+            (
+                "selected invalid target",
+                vec![81, 0x12, 0, 127, 1, 0],
+                vec![1, 0, 0, 0, 1, 1],
+                [0; 13],
+                1,
+            ),
+        ];
+
+        for (name, code, bitmask, registers, expected_cost) in cases {
+            let initial_gas = 100;
+
+            let mut fast = Interpreter::new(
+                code.clone(),
+                bitmask.clone(),
+                vec![],
+                registers,
+                vec![],
+                initial_gas,
+                crate::gas_cost::DEFAULT_MEM_CYCLES,
+            );
+            fast.set_isa_mode(crate::IsaMode::Conformance);
+            fast.set_gas_model(crate::GasModel::BlockPipeline);
+            assert_eq!(fast.block_gas_costs[0], expected_cost, "{name}: cost");
+            assert_eq!(fast.run().0, ExitReason::Panic, "{name}: fast exit");
+            assert_eq!(fast.pc, 0, "{name}: fast pc");
+            assert_eq!(fast.gas, initial_gas - u64::from(expected_cost));
+
+            let mut stepping = Interpreter::new(
+                code.clone(),
+                bitmask.clone(),
+                vec![],
+                registers,
+                vec![],
+                initial_gas,
+                crate::gas_cost::DEFAULT_MEM_CYCLES,
+            );
+            stepping.set_isa_mode(crate::IsaMode::Conformance);
+            stepping.set_gas_model(crate::GasModel::BlockPipeline);
+            stepping.tracing_enabled = true;
+            assert_eq!(stepping.run().0, ExitReason::Panic, "{name}: stepping exit");
+            assert_eq!(stepping.pc, fast.pc, "{name}: stepping pc");
+            assert_eq!(stepping.gas, fast.gas, "{name}: stepping gas");
+
+            let mut recompiled = RecompiledPvm::new_with_mode(
+                &code,
+                bitmask,
+                vec![],
+                registers,
+                initial_gas,
+                Some(test_layout()),
+                crate::gas_cost::DEFAULT_MEM_CYCLES,
+                crate::IsaMode::Conformance,
+            )
+            .expect("compilation should succeed");
+            assert_eq!(
+                recompiled.run(),
+                ExitReason::Panic,
+                "{name}: recompiler exit"
+            );
+            assert_eq!(recompiled.pc(), fast.pc, "{name}: recompiler pc");
+            assert_eq!(recompiled.gas(), fast.gas, "{name}: recompiler gas");
+        }
+    }
+
+    #[test]
+    fn standard_high_byte_destination_and_truncated_operands_have_exact_gas_parity() {
+        use crate::interpreter::Interpreter;
+
+        // div_u64's complete rD byte 0x10 clamps to r12. The truncated
+        // branch reads zero-extended r0/r0, so it is independent of that
+        // producer. The 60-cycle DIV dominates the one-cycle branch.
+        let code = vec![203, 0x21, 0x10, 170];
+        let bitmask = vec![1, 0, 0, 1];
+        let initial_gas = 100;
+
+        let mut fast = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            [0; 13],
+            vec![],
+            initial_gas,
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+        );
+        fast.set_isa_mode(crate::IsaMode::Conformance);
+        fast.set_gas_model(crate::GasModel::BlockPipeline);
+        assert_eq!(fast.block_gas_costs[0], 60);
+        assert_eq!(fast.run().0, ExitReason::Panic);
+        assert_eq!(fast.pc, 0);
+        assert_eq!(fast.gas, 40);
+
+        let mut stepping = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            [0; 13],
+            vec![],
+            initial_gas,
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+        );
+        stepping.set_isa_mode(crate::IsaMode::Conformance);
+        stepping.set_gas_model(crate::GasModel::BlockPipeline);
+        stepping.tracing_enabled = true;
+        assert_eq!(stepping.run().0, ExitReason::Panic);
+        assert_eq!(stepping.pc, fast.pc);
+        assert_eq!(stepping.gas, fast.gas);
+
+        let mut recompiled = RecompiledPvm::new_with_mode(
+            &code,
+            bitmask,
+            vec![],
+            [0; 13],
+            initial_gas,
+            Some(test_layout()),
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
+        )
+        .expect("compilation should succeed");
+        assert_eq!(recompiled.run(), ExitReason::Panic);
+        assert_eq!(recompiled.pc(), fast.pc);
+        assert_eq!(recompiled.gas(), fast.gas);
     }
 
     #[test]

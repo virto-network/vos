@@ -39,7 +39,7 @@ fn trace_reverse_bytes_program() -> (Vec<u8>, Vec<u8>, Vec<vos_pvm_proof::core::
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     (code, bitmask, tracing.into_trace())
 }
 
@@ -188,7 +188,7 @@ fn capability_profile_matches_live_unary_semantics_and_is_commitment_bound() {
         regs,
         vos_pvm::IsaMode::Conformance,
     );
-    assert_eq!(standard_exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(standard_exit, vos_pvm::ExitReason::Panic);
     assert_eq!(standard_steps[0].regs_after[1], 8);
 
     let jar_proof = prove_program_with_mode(&code, &bitmask, jar_steps, vos_pvm::IsaMode::Jar);
@@ -203,6 +203,29 @@ fn capability_profile_matches_live_unary_semantics_and_is_commitment_bound() {
     assert_ne!(jar_commitment, standard_commitment);
     verify_standalone(jar_proof, standard_commitment)
         .expect_err("a Jar trace must not verify against the standard profile commitment");
+}
+
+#[test]
+fn proof_tracer_preserves_profile_specific_opcode_zero_exit() {
+    let code = vec![Opcode::Trap as u8];
+    let bitmask = vec![1];
+    let regs = [0u64; PVM_REGISTER_COUNT];
+
+    let (jar_exit, jar_steps) =
+        trace_raw_program(code.clone(), bitmask.clone(), regs, vos_pvm::IsaMode::Jar);
+    let (standard_exit, standard_steps) =
+        trace_raw_program(code, bitmask, regs, vos_pvm::IsaMode::Conformance);
+
+    assert_eq!(jar_exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(standard_exit, vos_pvm::ExitReason::Panic);
+    for steps in [&jar_steps, &standard_steps] {
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].opcode, Opcode::Trap);
+        assert!(
+            steps[0].exit,
+            "opcode zero must remain a terminal trace row"
+        );
+    }
 }
 
 #[test]

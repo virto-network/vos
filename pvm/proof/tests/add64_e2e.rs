@@ -35,7 +35,7 @@ fn prove_verify_add64() {
 
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap); // Trap = Panic
+    assert_eq!(exit, vos_pvm::ExitReason::Panic); // standard opcode 0 => Panic
 
     let steps = tracing.into_trace();
     eprintln!("Steps: {}", steps.len());

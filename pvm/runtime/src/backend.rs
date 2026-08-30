@@ -31,6 +31,9 @@ pub struct InterpreterProgram {
     pub basic_block_starts: Vec<bool>,
     /// Per-gas-block costs (indexed by block start PC).
     pub block_gas_costs: Vec<u32>,
+    /// For every externally enterable PC, the start of the gas block that
+    /// contains it (`u32::MAX` for non-instruction byte positions).
+    pub gas_block_start_by_pc: Vec<u32>,
     /// Instruction bytecode (kept for step/trace fallback).
     pub code: Vec<u8>,
     /// Opcode bitmask.
@@ -117,6 +120,7 @@ pub fn compile(
     backend: PvmBackend,
     isa_mode: crate::IsaMode,
 ) -> Result<CompiledProgram, alloc::string::String> {
+    let mem_cycles = crate::mem_cycles_for_mode(mem_cycles, isa_mode);
     match resolve_backend(backend) {
         ResolvedBackend::Interpreter => {
             // Bind the decoder and block boundaries to the selected ISA at

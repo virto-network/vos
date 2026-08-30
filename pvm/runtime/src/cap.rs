@@ -130,6 +130,59 @@ impl DataCap {
         self.mapped_bitmap.iter().any(|&b| b != 0)
     }
 
+    /// Return the exact contiguous runs represented by the page bitmap.
+    ///
+    /// Reconstructing a native CODE window must not widen a sparse mapping
+    /// to the capability's full range: doing so would make pages accessible
+    /// in the JIT that remain unmapped in the interpreter. Runs are expressed
+    /// as `(page_offset, page_count)` relative to this DATA capability.
+    pub fn mapped_runs(&self) -> Vec<(u32, u32)> {
+        let mut runs = Vec::new();
+        let mut page = 0;
+        while page < self.page_count {
+            while page < self.page_count && !self.is_page_mapped(page) {
+                page += 1;
+            }
+            if page == self.page_count {
+                break;
+            }
+            let start = page;
+            while page < self.page_count && self.is_page_mapped(page) {
+                page += 1;
+            }
+            runs.push((start, page - start));
+        }
+        runs
+    }
+
+    /// Replace the address-space mapping with a previously captured exact
+    /// bitmap. Used only when an exclusive IPC capability returns to its
+    /// caller. Rejects a bitmap that cannot canonically describe this cap.
+    pub fn restore_mapping(
+        &mut self,
+        base_offset: u32,
+        access: Access,
+        mapped_bitmap: Vec<u8>,
+    ) -> bool {
+        let expected_len = (self.page_count as usize).div_ceil(8);
+        if mapped_bitmap.len() != expected_len {
+            return false;
+        }
+        if let Some(last) = mapped_bitmap.last()
+            && !self.page_count.is_multiple_of(8)
+        {
+            let used = self.page_count % 8;
+            let unused_mask = !((1u8 << used) - 1);
+            if last & unused_mask != 0 {
+                return false;
+            }
+        }
+        self.base_offset = Some(base_offset);
+        self.access = Some(access);
+        self.mapped_bitmap = mapped_bitmap;
+        true
+    }
+
     /// Map pages \[page_offset..page_offset+page_count) with the given base and access.
     /// First MAP sets base_offset and access; subsequent calls assert they match.
     /// Returns true on success.
@@ -244,6 +297,8 @@ pub struct CodeCap {
     pub program_hash: [u8; 32],
     /// Compiled program — interpreter or recompiler backend.
     pub compiled: crate::backend::CompiledProgram,
+    /// Canonical instruction bytes used to validate portable retry markers.
+    pub code: Vec<u8>,
     /// PVM jump table (for dynamic jump resolution).
     pub jump_table: Vec<u32>,
     /// PVM bitmask (basic block starts).
@@ -534,6 +589,7 @@ mod tests {
         assert!(data.is_page_mapped(7));
         assert!(data.is_page_mapped(8));
         assert_eq!(data.mapped_page_count(), 5);
+        assert_eq!(data.mapped_runs(), vec![(2, 3), (7, 2)]);
 
         // Different base fails
         assert!(!data.map_pages(0x2000, Access::RW, 0, 1));
@@ -544,6 +600,13 @@ mod tests {
         assert!(!data.is_page_mapped(3));
         assert!(!data.is_page_mapped(4));
         assert_eq!(data.mapped_page_count(), 3);
+        assert_eq!(data.mapped_runs(), vec![(2, 1), (7, 2)]);
+
+        let exact = data.mapped_bitmap.clone();
+        data.unmap_all();
+        assert!(data.restore_mapping(0x1000, Access::RW, exact));
+        assert_eq!(data.mapped_runs(), vec![(2, 1), (7, 2)]);
+        assert!(!data.restore_mapping(0x1000, Access::RW, vec![0xff, 0xff]));
     }
 
     #[test]

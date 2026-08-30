@@ -80,6 +80,14 @@ build-actors: (build-actor "space-registry") \
 build-voucher-check:
     cd pvm/proof/fixtures/voucher-check; cargo +nightly build --release
 
+# Re-measure every production voucher catalog identity, including its
+# ISA-profile-bound AIR commitment. The exact released PVM is checked in in
+# compressed form, so this never consults an ignored target directory or
+# silently substitutes a current-source candidate for the published artifact.
+verify-voucher-check-release:
+    cargo test -p vos-pvm-proof --test voucher_check_smoke \
+      voucher_check_catalog_ -- --test-threads=1
+
 # Build the flagship Task and a signed package for physical tests. The signer
 # is deliberately ephemeral: tests assert the pinned content identity, never
 # treat this wrapper as a production release artifact.
@@ -143,7 +151,7 @@ build-agent-runtime-release:
 # Assemble the three protocol-pinned production PVMs with a strict manifest.
 # The command refuses to replace an existing directory so a release operator
 # cannot silently mutate an artifact set that has already been distributed.
-package-production-release out="target/production-release": build-authority-release build-agent-runtime-release
+package-production-release out="target/production-release": build-authority-release build-agent-runtime-release verify-voucher-check-release
     cargo run -p vosx -- release bundle \
       --service-pvm services/vos-service/vos-service.pvm --out "{{out}}"
     cargo run -p vosx -- release verify "{{out}}"
@@ -180,6 +188,12 @@ test-extensions: build-extensions build-workflow-fixture
 test-pvm: build-test-artifacts
     cargo test -p vos --test service_pvm -- --nocapture --test-threads=1
 
+# Run the checked-in Gray Paper v0.8 semantic and ROB-gas corpus on both
+# runtime backends. This is intentionally an integration test, so workspace
+# `--lib` checks do not cover it implicitly.
+test-pvm-vectors:
+    cargo test -p vos-pvm --test pvm_vectors
+
 # Run the signed-package → daemon → offline backup → fresh-directory restore
 # → durable-reopen release-operations acceptance path.
 test-daemon-root: build-daemon-root-artifacts
@@ -207,7 +221,7 @@ test-one name: build-extensions
     cargo test -p vos {{name}} -- --nocapture
 
 # Run the full PVM proof test suite.
-test-pvm-proof:
+test-pvm-proof: verify-voucher-check-release
     cargo test -p vos-pvm-proof
 
 # Run only the fast PVM proof tests.
@@ -250,6 +264,8 @@ check-all:
         -A clippy::result_unit_err \
         -A clippy::manual_async_fn
     cargo test --workspace --lib
+    just test-pvm-vectors
+    just verify-voucher-check-release
     just build-pvm
     just build-pvm-test-artifacts
     cargo test -p vos --test service_pvm -- --nocapture --test-threads=1

@@ -56,7 +56,7 @@ fn prove_store_only() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 2);
     assert!(steps[0].mem_write.is_some());
@@ -107,7 +107,7 @@ fn prove_store_and_load_u8() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 3); // Store, Load, Trap
@@ -167,7 +167,7 @@ fn prove_store_and_load_u64() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     assert_eq!(steps[1].regs_after[2], 0xDEAD_BEEF_CAFE_BABE);
@@ -223,7 +223,7 @@ fn prove_store_load_u64_crossing_page_boundaries() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     // The store really crossed the boundary, and the load read it back.
@@ -291,7 +291,7 @@ fn prove_multiple_stores_same_addr() {
             &s.regs_after[..4]
         );
     }
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     assert_eq!(steps.len(), 4);
     assert_eq!(steps[2].regs_after[2], 20); // should read the second write
 
@@ -349,7 +349,7 @@ fn prove_store_imm_u8_then_load() {
         25,
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
-    assert_eq!(tracing.run(), vos_pvm::ExitReason::Trap);
+    assert_eq!(tracing.run(), vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
 
     assert_eq!(steps[1].regs_after[2], 0x42);
@@ -400,7 +400,7 @@ fn prove_store_load_with_alu() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 4);

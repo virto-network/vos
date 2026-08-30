@@ -41,7 +41,7 @@ fn traced_program() -> (Vec<PvmStep>, Vec<u8>, Vec<u8>) {
     regs[1] = 5;
     regs[2] = 7;
     let (code, bitmask) = three_reg_program(Opcode::Add64, 9, 1, 2);
-    let steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     (steps, code, bitmask)
 }
 

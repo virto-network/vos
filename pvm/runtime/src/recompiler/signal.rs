@@ -27,6 +27,10 @@ pub struct SignalState {
     /// Points into the CompiledCode's trap_table (lives as long as the `Arc<CodeCap>`).
     pub trap_table_ptr: *const (u32, u32),
     pub trap_table_len: usize,
+    /// Dense PVM-PC → native retry offset table. Entries are `-1` when no
+    /// fault retry is valid at that byte position.
+    pub fault_resume_offsets_ptr: *const i32,
+    pub fault_resume_offsets_len: usize,
 }
 
 // SAFETY: SignalState is only accessed by the owning thread (set before JIT call,
@@ -178,8 +182,17 @@ unsafe extern "C" fn sigsegv_handler(
 
         // Write trap info into JitContext.
         ctx.exit_reason = EXIT_PAGE_FAULT;
-        ctx.exit_arg = guest_addr;
+        ctx.exit_arg = u64::from(guest_addr);
         ctx.pc = pvm_pc;
+        ctx.fast_reentry = 0;
+        if (pvm_pc as usize) < state.fault_resume_offsets_len {
+            let offset = *state.fault_resume_offsets_ptr.add(pvm_pc as usize);
+            if offset >= 0 {
+                // Zero means no fast re-entry; store offset+1 as a one-shot
+                // native instruction cursor consumed by the prologue.
+                ctx.fast_reentry = (offset as u32).saturating_add(1);
+            }
+        }
 
         // Redirect execution to exit_label (saves regs + ret to Rust).
         cx.uc_mcontext.gregs[libc::REG_RIP as usize] = state.exit_label_addr as i64;

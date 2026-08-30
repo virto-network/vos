@@ -3029,7 +3029,15 @@ mod tests {
         let snapshot = kernel
             .snapshot()
             .expect("snapshot at flushed call boundary");
-        assert_ne!(snapshot.pending_call.resume_pc, 0, "resume PC is not entry");
+        assert_ne!(
+            snapshot
+                .pending_call
+                .as_ref()
+                .expect("suspended runtime has a pending protocol call")
+                .resume_pc,
+            0,
+            "resume PC is not entry"
+        );
         snapshot
     }
 

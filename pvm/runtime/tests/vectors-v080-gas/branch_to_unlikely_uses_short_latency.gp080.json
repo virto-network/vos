@@ -6,13 +6,13 @@
         "pc": 0
       },
       {
-        "gas": 37,
+        "gas": 40,
         "pc": 4
       }
     ],
     "first": {
-      "remaining_gas": 62,
-      "status": "trap"
+      "remaining_gas": 59,
+      "status": "panic"
     },
     "resume": null
   },
@@ -39,6 +39,6 @@
     "bitmask": "0x31",
     "code": "0x511200040200"
   },
-  "rule": "single-pass-block-gas",
+  "rule": "gray-paper-v0.8-rob-block-gas",
   "spec": "gray-paper-0.8.0"
 }

@@ -145,11 +145,21 @@ fn verify(directory: &Path) -> anyhow::Result<ReleaseManifest> {
     validate_service(&service)?;
     validate_authority(&authority)?;
     validate_agent_runtime(&agent_runtime)?;
-    let expected = manifest_for(&service, &authority, &agent_runtime);
-    if manifest != expected {
+    validate_manifest(&manifest, &service, &authority, &agent_runtime)?;
+    Ok(manifest)
+}
+
+fn validate_manifest(
+    manifest: &ReleaseManifest,
+    service: &[u8],
+    authority: &[u8],
+    agent_runtime: &[u8],
+) -> anyhow::Result<()> {
+    let expected = manifest_for(service, authority, agent_runtime);
+    if manifest != &expected {
         bail!("release manifest does not describe the exact pinned artifacts");
     }
-    Ok(manifest)
+    Ok(())
 }
 
 fn validate_service(bytes: &[u8]) -> anyhow::Result<()> {
@@ -407,6 +417,16 @@ mod tests {
         assert!(
             serde_json::from_value::<ReleaseManifest>(serde_json::Value::Object(value)).is_err(),
             "the former one-profile release schema must not be accepted",
+        );
+    }
+
+    #[test]
+    fn release_manifest_rejects_the_pre_rob_agent_semantics() {
+        let mut manifest = manifest_for(b"service", b"authority", b"agent runtime");
+        manifest.agent_execution_semantics = hex::encode(*b"vos-pvm-41d31e6-standard-gas-r01");
+        assert!(
+            validate_manifest(&manifest, b"service", b"authority", b"agent runtime").is_err(),
+            "a release produced for the retired gas scheduler must fail closed",
         );
     }
 

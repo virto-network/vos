@@ -11,7 +11,7 @@
         "contents": "0x7f"
       }
     ],
-    "pc": 4,
+    "pc": 0,
     "regs": [
       "0x0",
       "0x0",
@@ -27,7 +27,7 @@
       "0x0",
       "0x0"
     ],
-    "status": "trap"
+    "status": "panic"
   },
   "family": "store",
   "initial": {

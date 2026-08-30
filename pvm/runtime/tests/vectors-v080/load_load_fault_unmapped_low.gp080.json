@@ -6,7 +6,6 @@
   "expected": {
     "gas": 99,
     "memory": [],
-    "page_fault_address": 0,
     "pc": 0,
     "regs": [
       "0x0",
@@ -23,7 +22,7 @@
       "0x0",
       "0x0"
     ],
-    "status": "page_fault"
+    "status": "panic"
   },
   "family": "load",
   "initial": {

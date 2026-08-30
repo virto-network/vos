@@ -65,7 +65,7 @@ fn trace_two_step(rv0: u64, rv1: u64) -> (Vec<u8>, Vec<u8>, Vec<PvmStep>) {
     );
     let mut tr = TracingPvm::new_conformance(pvm);
     let exit = tr.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tr.into_trace();
     assert_eq!(steps.len(), 3, "expected Add, Add, Trap");
     assert_eq!(steps[0].opcode, Opcode::Add64);

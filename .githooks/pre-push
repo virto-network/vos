@@ -9,6 +9,12 @@ set -euo pipefail
 echo "→ pre-push: workspace tests"
 cargo test --workspace --lib --quiet
 
+echo "→ pre-push: Gray Paper v0.8 semantic and ROB-gas corpus"
+just test-pvm-vectors
+
+echo "→ pre-push: canonical voucher catalog"
+just verify-voucher-check-release
+
 echo "→ pre-push: build PVM actors"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT

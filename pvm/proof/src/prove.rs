@@ -522,6 +522,56 @@ fn backfill_final_regs(side_note: &mut SideNote) {
     }
 }
 
+/// Reject memory witnesses that cannot represent a completed PVM memory
+/// instruction before any page-boundary construction or trace allocation.
+///
+/// A faulting instruction is present in the execution trace so its terminal
+/// PC/gas state can be observed, but it performed no memory access. The CPU
+/// AIR currently models only completed load/store transitions: opcode-bound
+/// flags require the canonical width and the ordinary successor PC. Trying to
+/// encode a page fault or low-zone exception as a zero-width access would
+/// therefore fail only late in STARK proving. Fail closed here instead.
+///
+/// Wrapped wide accesses are also outside the current proof contract. The
+/// MemoryChip ledger decomposes addresses cyclically for panic-free witness
+/// handling, while CpuChip's four-limb lookup has no fifth carry. Reject such
+/// hand-built witnesses canonically instead of admitting backend-dependent
+/// overflow or an unbalanced lookup.
+fn validate_memory_witnesses(side_note: &SideNote) -> Result<(), ProvingError> {
+    const ADDRESS_SPACE_SIZE: u64 = 1u64 << 32;
+
+    for step in &side_note.steps {
+        let flags = crate::chips::cpu::classify::classify_opcode(step.opcode);
+        let expected_size = if flags.is_mem_size_1 {
+            Some(1)
+        } else if flags.is_mem_size_2 {
+            Some(2)
+        } else if flags.is_mem_size_4 {
+            Some(4)
+        } else if flags.is_mem_size_8 {
+            Some(8)
+        } else {
+            None
+        };
+
+        let access = match (flags.is_load, flags.is_store) {
+            (true, false) if step.mem_write.is_none() => step.mem_read.as_ref(),
+            (false, true) if step.mem_read.is_none() => step.mem_write.as_ref(),
+            (false, false) if step.mem_read.is_none() && step.mem_write.is_none() => continue,
+            _ => return Err(ProvingError::ConstraintsNotSatisfied),
+        };
+        let (Some(access), Some(expected_size)) = (access, expected_size) else {
+            return Err(ProvingError::ConstraintsNotSatisfied);
+        };
+        if access.size != expected_size
+            || u64::from(access.address) + u64::from(access.size) > ADDRESS_SPACE_SIZE
+        {
+            return Err(ProvingError::ConstraintsNotSatisfied);
+        }
+    }
+    Ok(())
+}
+
 fn prove_impl(
     side_note: &mut SideNote,
     config: PcsConfig,
@@ -556,7 +606,8 @@ pub fn prove_with_explicit_components(
 /// Canonical-shape proving (federation wire-through W0).
 ///
 /// Proves with the FULL `BASE_COMPONENTS` set present (constant
-/// `component_mask`, all 31 bits) and every forcing-set chip's main trace
+/// `component_mask`, all [`chip_idx::COUNT`](crate::chip_idx::COUNT) bits) and
+/// every forcing-set chip's main trace
 /// padded up to the per-chip floor in `min_log_sizes` (indexed by
 /// [`chip_idx`](crate::chip_idx)), so the preprocessed-trace commitment —
 /// the program identity — is identical for every segment of a program
@@ -863,6 +914,11 @@ fn prove_impl_with_components_overridden(
     min_log_sizes: &[u32],
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     use std::time::Instant;
+
+    // This must precede memory-page ingestion and every component trace
+    // allocation: malformed/fault traces are a caller-boundary error, not an
+    // expensive attempt at an unsatisfiable proof.
+    validate_memory_witnesses(side_note)?;
 
     // RegisterMemoryBoundaryChip needs `initial_regs`
     // populated.

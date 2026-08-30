@@ -6,13 +6,17 @@
         "pc": 0
       },
       {
-        "gas": 37,
+        "gas": 40,
         "pc": 4
+      },
+      {
+        "gas": 2,
+        "pc": 6
       }
     ],
     "first": {
-      "remaining_gas": 62,
-      "status": "trap"
+      "remaining_gas": 57,
+      "status": "panic"
     },
     "resume": null
   },
@@ -36,9 +40,9 @@
   },
   "name": "branch_fallthrough_unlikely_target_likely_is_short",
   "program": {
-    "bitmask": "0x3101",
-    "code": "0x511200050233050100"
+    "bitmask": "0x7102",
+    "code": "0x51120006020133050100"
   },
-  "rule": "single-pass-block-gas",
+  "rule": "gray-paper-v0.8-rob-block-gas",
   "spec": "gray-paper-0.8.0"
 }

@@ -22,7 +22,7 @@ pub enum InnerExit {
     Halt,
     Panic,
     Fault(u32),
-    Host(u32),
+    Host(u64),
     OutOfGas,
     InvalidResult(u64),
 }
@@ -85,9 +85,7 @@ impl ActorMachine {
             2 => u32::try_from(detail)
                 .map(InnerExit::Fault)
                 .unwrap_or(InnerExit::InvalidResult(status)),
-            3 => u32::try_from(detail)
-                .map(InnerExit::Host)
-                .unwrap_or(InnerExit::InvalidResult(status)),
+            3 => InnerExit::Host(detail),
             4 => InnerExit::OutOfGas,
             other => InnerExit::InvalidResult(other),
         }

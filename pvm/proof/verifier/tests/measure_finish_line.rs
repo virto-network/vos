@@ -6,7 +6,7 @@
 //!      `prove_canonical`, swept over segment size via `STEPS`.
 //!
 //! A straight-line Add64 chain of `STEPS` instructions traps at the end and is
-//! proven as ONE canonical 31-component segment, so `STEPS` is a direct knob on
+//! proven as one full canonical segment, so `STEPS` is a direct knob on
 //! single-segment trace size (the `SEG_STEPS` knob, but applied to a
 //! one-segment program — `prove_canonical` proves the whole trace as one
 //! segment).
@@ -97,8 +97,8 @@ fn measure() {
     let mut tracing = TracingPvm::new_conformance(pvm);
     assert_eq!(
         tracing.run(),
-        vos_pvm::ExitReason::Trap,
-        "program must Trap"
+        vos_pvm::ExitReason::Panic,
+        "standard program must Panic on opcode 0"
     );
     let trace = tracing.into_trace();
     let actual_steps = trace.len();
@@ -107,8 +107,8 @@ fn measure() {
 
     // SHAPE=natural → `prove_mobile` (only the chips this trace activates, at
     // natural sizes — the Track-A direct-on-chain path, which does NOT recurse
-    // and so needs no canonical 31-chip shape). Default → `prove_canonical`
-    // (all 31 chips forced, the Track-B / federation-allowlist shape).
+    // and so needs no full canonical shape). Default → `prove_canonical`
+    // (all chips forced, the Track-B / federation-allowlist shape).
     let natural = std::env::var("SHAPE").as_deref() == Ok("natural");
     let shape = if natural { "natural" } else { "canonical" };
 

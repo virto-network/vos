@@ -2097,12 +2097,13 @@ mod tests {
         ];
         let bitmask = vec![1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1];
         let mut regs = [0u64; NUM_REGS];
-        regs[7] = 0x1000; // h_ptr — strides by φ[11] per Add64
-        regs[8] = 0x100; // m_ptr — fixed
+        let h_base = u64::from(vos_pvm::PVM_ZONE_SIZE);
+        regs[7] = h_base; // h_ptr — strides by φ[11] per Add64
+        regs[8] = h_base + 0x4000; // m_ptr — fixed
         regs[9] = 0; // t_low
         regs[10] = 1; // f flag
         regs[11] = 0x1000; // page stride
-        let flat_mem = vec![0u8; 0x8000];
+        let flat_mem = vec![0u8; h_base as usize + 0x5000];
         let interp = || {
             Interpreter::new(
                 code.clone(),
@@ -2189,7 +2190,7 @@ mod tests {
             );
             let out0 = windows[0].blake2b_mem_ops[0].out_bytes;
             assert_eq!(
-                windows.last().unwrap().initial_memory[0x1000..0x1040],
+                windows.last().unwrap().initial_memory[h_base as usize..h_base as usize + 0x40],
                 out0,
                 "a later window's entering image must carry window 0's blake2b output"
             );

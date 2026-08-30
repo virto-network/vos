@@ -12,7 +12,7 @@
 //! A trivial AIR is deliberate: the FRI-verify + Poseidon2 Merkle-decommit +
 //! OODS machinery (what dominates the on-chain verify cost) is independent of
 //! constraint count, so this yields a representative settlement-verify proof
-//! without the full 31-chip segment AIR.
+//! without the full canonical segment AIR.
 
 use num_traits::One;
 use stwo::core::air::Component;

@@ -44,6 +44,7 @@ const GAS: u64 = 1_000_000_000;
 
 const TEST_PACKAGE_KEY: &[u8] = b"vos-agent-test-package-key";
 const TEST_AUTHORITY_SEED: [u8; 32] = [0x42; 32];
+const PRE_ROB_AGENT_SEMANTICS: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r01");
 
 struct TestTrust;
 
@@ -182,6 +183,112 @@ fn runtime_package() -> Package {
 fn replacement_runtime_package() -> Package {
     let mut package = runtime_package();
     package.manifest.name = "custom-agent-runtime".into();
+    package.deployment_signature.signature = package_signature(&package);
+    package
+}
+
+fn counter_actor_package(execution_semantics: Hash) -> Package {
+    use vos::metadata::{ActorMeta, MessageMeta};
+
+    const META: ActorMeta = ActorMeta {
+        actor_name: "counter",
+        messages: &[
+            MessageMeta {
+                name: "increment",
+                is_query: false,
+                fields: &[],
+                returns: "u8",
+                doc: "",
+                timeout_ms: 0,
+                mode: 0,
+                attested: false,
+                space_role: None,
+                actor_role: None,
+                capability: None,
+            },
+            MessageMeta {
+                name: "read",
+                is_query: true,
+                fields: &[],
+                returns: "u8",
+                doc: "",
+                timeout_ms: 0,
+                mode: 0,
+                attested: false,
+                space_role: None,
+                actor_role: None,
+                capability: None,
+            },
+        ],
+        constructor: &[],
+        cli_methods: &[],
+        doc: "",
+        crdt: false,
+        provable: false,
+    };
+    const SCHEMA: vos::agent::schema::SchemaMeta = vos::agent::schema::SchemaMeta {
+        uses_storage: false,
+        fields: &[vos::agent::schema::FieldMeta {
+            name: "value",
+            codec: "u8",
+            persistence: vos::agent::FieldPersistence::State(vos::agent::StateLane::Linear),
+        }],
+        methods: &[
+            vos::agent::schema::MethodMeta {
+                name: "increment",
+                mode: MethodMode::Linear,
+                explicit: false,
+            },
+            vos::agent::schema::MethodMeta {
+                name: "read",
+                mode: MethodMode::Query,
+                explicit: true,
+            },
+        ],
+    };
+
+    let pvm = static_actor_pvm();
+    let (metadata, metadata_len) = vos::metadata::encode::<1024>(&META);
+    let metadata = metadata[..metadata_len].to_vec();
+    let parsed_metadata = vos::metadata::decode(&metadata).expect("decode counter metadata");
+    let (agent_schema, agent_schema_len) = vos::agent::schema::encode::<1024>(&SCHEMA);
+    let agent_schema = agent_schema[..agent_schema_len].to_vec();
+    let parsed_schema = vos::agent::schema::decode(&agent_schema).expect("decode counter schema");
+    let role_policies = PackageRolePolicies::from_metadata(&parsed_metadata)
+        .expect("derive counter policies")
+        .encode();
+    let requirements =
+        vos::agent::package::actor_runtime_requirements(&parsed_schema, &parsed_metadata, false);
+    let interfaces = Vec::new();
+    let mut package = Package {
+        manifest: PackageManifest {
+            name: "counter".into(),
+            platform: vos::service::PLATFORM_ID,
+            execution_semantics,
+            kind: vos::agent::PackageKind::Actor {
+                contract: ActorPackageContract::canonical(),
+                requirements,
+            },
+            program: ProgramId::of_pvm(&pvm),
+            interfaces_hash: artifact_hash(b"interfaces", &interfaces),
+            role_policies_hash: artifact_hash(b"role-policies", &role_policies),
+            schemas_hash: artifact_hash(b"schemas", &metadata),
+            agent_schema_hash: artifact_hash(b"agent-schema", &agent_schema),
+            dependencies_hash: task_dependencies_hash(&[]),
+        },
+        pvm,
+        generated_interfaces: interfaces,
+        role_policies,
+        schemas: metadata,
+        agent_schema,
+        task_dependencies: Vec::new(),
+        diagnostics: None,
+        deployment_signature: DeploymentSignature {
+            producer: ProducerId::of_public_key(TEST_PACKAGE_KEY),
+            public_key: TEST_PACKAGE_KEY.to_vec(),
+            signature: Vec::new(),
+        },
+    };
     package.deployment_signature.signature = package_signature(&package);
     package
 }
@@ -450,6 +557,145 @@ fn reopen_requires_the_exact_runtime_catalog_closure() {
     ));
 
     AgentDriver::open(store, trust()).expect("complete closure reopens");
+}
+
+#[test]
+fn reopen_rejects_the_pre_rob_runtime_package() {
+    let config = config();
+    let driver = AgentDriver::create(
+        runtime_package(),
+        config.clone(),
+        MemoryAgentStore::default(),
+        trust(),
+        &creation_receipt(&config),
+    )
+    .expect("create current agent");
+    let mut store = driver.into_store();
+
+    let mut legacy_runtime = runtime_package();
+    legacy_runtime.manifest.execution_semantics = PRE_ROB_AGENT_SEMANTICS;
+    legacy_runtime.deployment_signature.signature = package_signature(&legacy_runtime);
+    let legacy_bytes = legacy_runtime.encode();
+    let legacy_reference = BlobRef::of_bytes(&legacy_bytes);
+    store
+        .put_package(&legacy_reference, &legacy_bytes)
+        .expect("stage legacy runtime package");
+
+    let mut image = store.load().unwrap().expect("current image");
+    image.config.identity.runtime_deployment = legacy_runtime.deployment_id();
+    image.config.identity.runtime_program = legacy_runtime.manifest.program;
+    image.config.identity.runtime_producer = legacy_runtime.deployment_signature.producer;
+    image.config.runtime_package = legacy_reference;
+    store
+        .commit(Some(image.revision), &image)
+        .expect("commit legacy runtime reference");
+
+    assert!(matches!(
+        AgentDriver::open(store, trust()),
+        Err(AgentDriverError::Package(
+            vos::agent::package::PackageError::WrongExecutionSemantics
+        ))
+    ));
+}
+
+#[test]
+fn reopen_rejects_a_pre_rob_actor_package_in_the_catalog_closure() {
+    let config = config();
+    let driver = AgentDriver::create(
+        runtime_package(),
+        config.clone(),
+        MemoryAgentStore::default(),
+        trust(),
+        &creation_receipt(&config),
+    )
+    .expect("create current agent");
+
+    let legacy_actor = counter_actor_package(PRE_ROB_AGENT_SEMANTICS);
+    let package_bytes = legacy_actor.encode();
+    let package_reference = BlobRef::of_bytes(&package_bytes);
+    let schema_reference = BlobRef::of_bytes(&legacy_actor.agent_schema);
+    let policy_reference = BlobRef::of_bytes(&legacy_actor.role_policies);
+    let parsed_schema = vos::agent::schema::decode(&legacy_actor.agent_schema).unwrap();
+    let vos::agent::PackageKind::Actor {
+        contract,
+        requirements,
+    } = legacy_actor.manifest.kind
+    else {
+        unreachable!("counter fixture is an actor package")
+    };
+    let entry = ActorEntry {
+        actor: ActorId::top_level(config.identity.agent, "legacy-counter"),
+        name: "legacy-counter".into(),
+        parent: None,
+        deployment: legacy_actor.deployment_id(),
+        program: legacy_actor.manifest.program,
+        package: package_reference.clone(),
+        agent_schema: schema_reference.clone(),
+        role_policies: policy_reference.clone(),
+        state_layout: parsed_schema.state_layout_hash(),
+        lanes: requirements.lanes,
+        suspended: false,
+    };
+    let install = LifecycleRequest::Install(InstallActor {
+        entry: entry.clone(),
+        producer: legacy_actor.deployment_signature.producer,
+        package: package_reference.clone(),
+        agent_schema: schema_reference.clone(),
+        role_policies: policy_reference.clone(),
+        state_layout: entry.state_layout,
+        contract,
+        requirements,
+    });
+    let installed = invoke(RuntimeCall {
+        state: driver.image().runtime_state.clone(),
+        request: authorized_request(
+            &config,
+            install,
+            vos::agent::authority::CAPABILITY_ACTOR_INSTALL,
+            2,
+        ),
+    });
+    assert_eq!(installed.result, Ok(LifecycleReply::Installed(entry)));
+
+    let mut store = driver.into_store();
+    store
+        .put_package(&package_reference, &package_bytes)
+        .expect("stage legacy actor package");
+    store
+        .put_program(legacy_actor.manifest.program, &legacy_actor.pvm)
+        .expect("stage legacy actor program");
+    store
+        .put_actor_schema(
+            legacy_actor.deployment_id(),
+            &schema_reference,
+            &legacy_actor.agent_schema,
+        )
+        .expect("stage legacy actor schema");
+    store
+        .put_actor_policies(
+            legacy_actor.deployment_id(),
+            &policy_reference,
+            &legacy_actor.role_policies,
+        )
+        .expect("stage legacy actor policies");
+    store
+        .commit(
+            Some(1),
+            &AgentImage {
+                revision: 2,
+                runtime_program: STANDARD_RUNTIME_PROGRAM_ID,
+                config,
+                runtime_state: installed.state,
+            },
+        )
+        .expect("commit legacy actor directory");
+
+    assert!(matches!(
+        AgentDriver::open(store, trust()),
+        Err(AgentDriverError::Package(
+            vos::agent::package::PackageError::WrongExecutionSemantics
+        ))
+    ));
 }
 
 #[test]
@@ -834,8 +1080,11 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
 
     let config = config();
     let (slot, trust) = clock_trust(1);
-    let actor_pvm = static_actor_pvm();
-    let program = ProgramId::of_pvm(&actor_pvm);
+    let package = counter_actor_package(vos::agent::EXECUTION_SEMANTICS_ID);
+    let package_bytes = package.encode();
+    let package_reference = BlobRef::of_bytes(&package_bytes);
+    let actor_pvm = package.pvm.clone();
+    let program = package.manifest.program;
     let driver = AgentDriver::create(
         runtime_package(),
         config.clone(),
@@ -845,59 +1094,19 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
     )
     .expect("create agent");
     let actor = ActorId::top_level(config.identity.agent, "counter");
-    let deployment = DeploymentId([0x44; 32]);
-    let (schema, schema_len) = vos::agent::schema::encode::<512>(&vos::agent::schema::SchemaMeta {
-        uses_storage: false,
-        fields: &[vos::agent::schema::FieldMeta {
-            name: "value",
-            codec: "u8",
-            persistence: vos::agent::FieldPersistence::State(vos::agent::StateLane::Linear),
-        }],
-        methods: &[
-            vos::agent::schema::MethodMeta {
-                name: "increment",
-                mode: MethodMode::Linear,
-                explicit: false,
-            },
-            vos::agent::schema::MethodMeta {
-                name: "read",
-                mode: MethodMode::Query,
-                explicit: true,
-            },
-        ],
-    });
-    let schema = schema[..schema_len].to_vec();
+    let deployment = package.deployment_id();
+    let schema = package.agent_schema.clone();
     let parsed_schema = vos::agent::schema::decode(&schema).unwrap();
     let schema_reference = BlobRef::of_bytes(&schema);
-    let policies = PackageRolePolicies {
-        methods: vec![
-            MethodPolicy {
-                method: "increment".into(),
-                schema: Hash([0x61; 32]),
-                policy: vos::service::public_policy_hash(),
-                public: true,
-                attested: false,
-                space_role: None,
-                capability: None,
-                actor_role: None,
-            },
-            MethodPolicy {
-                method: "read".into(),
-                schema: Hash([0x62; 32]),
-                policy: vos::service::public_policy_hash(),
-                public: true,
-                attested: false,
-                space_role: None,
-                capability: None,
-                actor_role: None,
-            },
-        ],
-        task_dependencies: Vec::new(),
-    }
-    .encode();
+    let policies = package.role_policies.clone();
     let policy_reference = BlobRef::of_bytes(&policies);
-    let package_bytes = b"signed-counter-package";
-    let package_reference = BlobRef::of_bytes(package_bytes);
+    let vos::agent::PackageKind::Actor {
+        contract,
+        requirements,
+    } = package.manifest.kind
+    else {
+        unreachable!("counter fixture is an actor package")
+    };
     let installed_entry = ActorEntry {
         actor,
         name: "counter".into(),
@@ -913,17 +1122,13 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
     };
     let install = LifecycleRequest::Install(InstallActor {
         entry: installed_entry.clone(),
-        producer: ProducerId([0x55; 32]),
+        producer: package.deployment_signature.producer,
         package: package_reference.clone(),
         agent_schema: schema_reference.clone(),
         role_policies: policy_reference.clone(),
         state_layout: parsed_schema.state_layout_hash(),
-        contract: ActorPackageContract::canonical(),
-        requirements: RuntimeRequirements {
-            lanes: LaneSet::of(vos::agent::StateLane::Linear),
-            scheduling: false,
-            proofs: false,
-        },
+        contract,
+        requirements,
     });
     let preinstall_state = driver.image().runtime_state.clone();
     let raw = invoke(RuntimeCall {
@@ -976,7 +1181,7 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
     );
     let mut store = driver.into_store();
     store
-        .put_package(&package_reference, package_bytes)
+        .put_package(&package_reference, &package_bytes)
         .expect("catalog actor package");
     store
         .put_program(program, &actor_pvm)

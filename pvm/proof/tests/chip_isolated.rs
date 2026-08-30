@@ -275,7 +275,7 @@ fn harness_cpuchip_isolated_add64() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
 
     let mut side_note = SideNote::new(steps, code, bitmask);
@@ -1283,7 +1283,7 @@ fn harness_cpuchip_debug_add64() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
 
     let mut side_note = SideNote::new(steps, code, bitmask);

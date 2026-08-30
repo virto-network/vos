@@ -4,9 +4,10 @@
     "recompiler"
   ],
   "expected": {
-    "gas": 98,
+    "gas": 99,
+    "host_call": 18446744073709551615,
     "memory": [],
-    "pc": 1,
+    "pc": 0,
     "regs": [
       "0x0",
       "0x0",
@@ -22,7 +23,7 @@
       "0x0",
       "0x0"
     ],
-    "status": "trap"
+    "status": "host_call"
   },
   "family": "flow",
   "initial": {
@@ -46,10 +47,10 @@
       "0x0"
     ]
   },
-  "name": "flow_fall_off_end_traps",
+  "name": "flow_ecalli_negative_one_is_u64",
   "program": {
     "bitmask": "0x01",
-    "code": "0x01",
+    "code": "0x0aff",
     "jump_table": []
   },
   "spec": "gray-paper-0.8.0"

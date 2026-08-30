@@ -145,7 +145,11 @@ fn decompose_access(
     let bytes = value.to_le_bytes();
     (0..size as usize)
         .map(|i| MemEntry {
-            address: address + i as u32,
+            // PVM memory is cyclic over 32-bit addresses. A successful wide
+            // access is decomposed with the same modulo-2^32 arithmetic as
+            // execution rather than relying on profile-dependent overflow
+            // checks or debug/release integer behavior.
+            address: address.wrapping_add(i as u32),
             value: bytes[i],
             timestamp,
             is_write,
@@ -311,6 +315,25 @@ impl BuiltInComponent for MemoryChip {
         ));
 
         eval.finalize_logup();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_access_decomposition_wraps_in_u32_domain() {
+        let entries = decompose_access(u32::MAX - 2, 0x0807_0605_0403_0201, 7, false, 8);
+        let addresses: Vec<_> = entries.iter().map(|entry| entry.address).collect();
+        assert_eq!(
+            addresses,
+            [u32::MAX - 2, u32::MAX - 1, u32::MAX, 0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.value).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
     }
 }
 

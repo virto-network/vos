@@ -4,14 +4,6 @@
       {
         "gas": 1,
         "pc": 0
-      },
-      {
-        "gas": 1,
-        "pc": 4
-      },
-      {
-        "gas": 1,
-        "pc": 5
       }
     ],
     "first": {
@@ -38,11 +30,11 @@
       "0x0"
     ]
   },
-  "name": "branch_negative_out_of_code_target_is_zero_extended_short",
+  "name": "branch_invalid_fallthrough_panics_when_target_selected",
   "program": {
-    "bitmask": "0x31",
-    "code": "0x511200ff0100"
+    "bitmask": "0x01",
+    "code": "0x51120000"
   },
-  "rule": "single-pass-block-gas",
+  "rule": "gray-paper-v0.8-rob-block-gas",
   "spec": "gray-paper-0.8.0"
 }

@@ -22,7 +22,7 @@
       "0x0",
       "0x0"
     ],
-    "status": "trap"
+    "status": "panic"
   },
   "family": "flow",
   "initial": {
@@ -46,10 +46,10 @@
       "0x0"
     ]
   },
-  "name": "flow_trap",
+  "name": "flow_fall_off_end_panics",
   "program": {
     "bitmask": "0x01",
-    "code": "0x00",
+    "code": "0x01",
     "jump_table": []
   },
   "spec": "gray-paper-0.8.0"

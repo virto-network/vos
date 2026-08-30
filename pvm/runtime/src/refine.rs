@@ -2,7 +2,7 @@
 //!
 //! [`execute`] loads a GP standard-program blob exactly the way
 //! `InvocationKernel::new_standard` does — same memory image, page
-//! permissions, register file, `mem_cycles` tier, and per-page init-gas
+//! permissions, register file, standard memory latency, and per-page init-gas
 //! charge — but runs it on the plain [`Interpreter`] with no capability
 //! microkernel and no hostcall dispatch. The whole path is `no_std`, so an
 //! embedder (e.g. a wasm32 runtime) can perform pure refine invocations:
@@ -25,13 +25,11 @@
 //!   refine / is-authorized entry point).
 //! - ISA: [`crate::IsaMode::Conformance`], like the kernel's SPI path —
 //!   opcode 3 (`Ecall`, the jar capability surface) panics.
-//! - `mem_cycles` (the load/store gas tier) derives from the total mapped
-//!   page count via [`compute_mem_cycles`], exactly like the kernel's
-//!   `compute_mem_cycles(header.memory_pages)`. Block gas costs — and
-//!   therefore gas consumption — depend on it, so the tier is part of the
-//!   semantic contract. Both it and the init charge derive from *declared*
-//!   pages, never from allocated bytes, so they are independent of the
-//!   memory representation.
+//! - Standard load/store latency is the fixed 25 cycles specified by Gray
+//!   Paper v0.8.0, independently of declared page count. Page-tier latency is
+//!   confined to the capability/JAR service profile. The init charge still
+//!   derives from *declared* mapped pages, never from allocated bytes, so it
+//!   is independent of the memory representation.
 //! - Gas: [`GAS_PER_PAGE`] is charged per mapped page up front (the
 //!   kernel's init charge); a budget below that charge fails with
 //!   [`RefineError::OutOfGas`] before executing anything. `gas_used`
@@ -51,10 +49,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::interpreter::{Interpreter, Memory, PERM_NONE, PERM_RO, PERM_RW};
-use crate::spi::parse_standard_program;
+use crate::spi::{deblob, parse_standard_program};
 use crate::{
     ExitReason, GAS_PER_PAGE, Gas, IsaMode, PVM_INIT_INPUT_SIZE, PVM_PAGE_SIZE, PVM_REGISTER_COUNT,
-    compute_mem_cycles,
+    STANDARD_MEM_CYCLES,
 };
 
 /// Why [`execute`] could not run the program at all. Exits of a program
@@ -129,9 +127,64 @@ pub struct Invocation {
 pub struct Machine {
     initial_gas: Gas,
     interp: Interpreter,
+    terminal_exit: Option<ExitReason>,
 }
 
 impl Machine {
+    /// Construct the full Gray Paper Ψ boundary from a canonical compact PVM
+    /// blob and an explicit architectural state.
+    ///
+    /// A failed `deblob(blob, initial_pc)` is represented as an immediate
+    /// [`ExitReason::Panic`]. It charges no gas, preserves the gas-funded flag,
+    /// all registers, memory bytes and permissions, and normalizes only the
+    /// final instruction counter to zero as full Ψ requires.
+    pub fn from_pvm_blob(
+        pvm_blob: &[u8],
+        initial_pc: u64,
+        gas: Gas,
+        gas_charged: bool,
+        registers: [u64; PVM_REGISTER_COUNT],
+        memory: Memory,
+    ) -> Self {
+        let (program, pc, terminal_exit) = match deblob(pvm_blob, initial_pc) {
+            Some(program) => (
+                program,
+                u32::try_from(initial_pc).expect("deblob accepted a 32-bit code index"),
+                None,
+            ),
+            None => (
+                // This executable is never entered. It gives the rejected
+                // machine an ordinary Interpreter owner for the unchanged
+                // register/RAM state without attempting to predecode the
+                // attacker-controlled blob.
+                crate::program::ParsedCodeBlob {
+                    jump_table: Vec::new(),
+                    code: vec![0],
+                    bitmask: vec![1],
+                },
+                0,
+                Some(ExitReason::Panic),
+            ),
+        };
+        let mut interp = Interpreter::with_memory_and_mode(
+            program.code,
+            program.bitmask,
+            program.jump_table,
+            registers,
+            memory,
+            gas,
+            STANDARD_MEM_CYCLES,
+            IsaMode::Conformance,
+        );
+        interp.set_pc(pc);
+        interp.restore_boundary_state(gas_charged, None);
+        Self {
+            initial_gas: gas,
+            interp,
+            terminal_exit,
+        }
+    }
+
     /// Load a standard program using the automatically selected memory
     /// representation.
     pub fn load(spi_blob: &[u8], args: &[u8], gas: Gas) -> Result<Self, RefineError> {
@@ -156,7 +209,7 @@ impl Machine {
 
         let page = PVM_PAGE_SIZE as u64;
         let total_pages: u64 = regions.iter().map(|r| r.size / page).sum();
-        let mem_cycles = compute_mem_cycles(total_pages as u32);
+        let mem_cycles = STANDARD_MEM_CYCLES;
         let init_gas = total_pages * GAS_PER_PAGE;
         if gas < init_gas {
             return Err(RefineError::OutOfGas);
@@ -213,16 +266,28 @@ impl Machine {
         Ok(Self {
             initial_gas: gas,
             interp,
+            terminal_exit: None,
         })
     }
 
     /// Run until the next PVM exit.
     pub fn resume(&mut self) -> ExitReason {
+        if let Some(exit) = &self.terminal_exit {
+            return exit.clone();
+        }
+        // Resuming is the host's explicit advancement past a previously
+        // surfaced ecalli. The first call is a no-op here.
+        self.interp.resume_after_host_call();
         self.interp.run().0
     }
 
     pub fn gas_remaining(&self) -> Gas {
         self.interp.gas
+    }
+
+    /// Whether the block containing the current counter is already funded.
+    pub fn gas_charged(&self) -> bool {
+        self.interp.gas_charged
     }
 
     /// Charge host-call gas. Returns `false` without wrapping when the
@@ -260,6 +325,10 @@ impl Machine {
 
     /// Consume the machine and retain its final state for inspection.
     pub fn finish(mut self, exit: ExitReason) -> Invocation {
+        // Machine-produced Halt/Panic exits have already applied full Ψ's
+        // PC-zero normalization. Do not normalize a host-owner-generated
+        // failure here: failed/unknown dispatch retains the causing ecalli
+        // counter because no successful continuation occurred.
         Invocation {
             exit,
             gas_used: self.initial_gas.saturating_sub(self.interp.gas),
@@ -350,17 +419,7 @@ mod tests {
         code: &[u8],
         bitmask: &[u8],
     ) -> Vec<u8> {
-        assert!(code.len() < 128, "test code must fit a 1-byte nat");
-        // Code sub-blob, compact deblob: E(|j|=0) ‖ z=1 ‖ E(|c|) ‖ code ‖ bitmask.
-        let mut cb = vec![0u8, 1u8, code.len() as u8];
-        cb.extend_from_slice(code);
-        let mut packed = vec![0u8; code.len().div_ceil(8)];
-        for (i, &b) in bitmask.iter().enumerate() {
-            if b != 0 {
-                packed[i / 8] |= 1 << (i % 8);
-            }
-        }
-        cb.extend_from_slice(&packed);
+        let cb = build_pvm_blob(code, bitmask);
 
         let mut blob = Vec::new();
         blob.extend_from_slice(&(ro.len() as u32).to_le_bytes()[..3]); // E₃(|o|)
@@ -371,6 +430,22 @@ mod tests {
         blob.extend_from_slice(rw);
         blob.extend_from_slice(&(cb.len() as u32).to_le_bytes()); // E₄(|c|)
         blob.extend_from_slice(&cb);
+        blob
+    }
+
+    fn build_pvm_blob(code: &[u8], bitmask: &[u8]) -> Vec<u8> {
+        assert!(code.len() < 128, "test code must fit a 1-byte nat");
+        assert_eq!(code.len(), bitmask.len());
+        // E(|j|=0) ‖ z=1 ‖ E(|c|) ‖ code ‖ packed bitmask.
+        let mut blob = vec![0u8, 1u8, code.len() as u8];
+        blob.extend_from_slice(code);
+        let mut packed = vec![0u8; code.len().div_ceil(8)];
+        for (i, &b) in bitmask.iter().enumerate() {
+            if b != 0 {
+                packed[i / 8] |= 1 << (i % 8);
+            }
+        }
+        blob.extend_from_slice(&packed);
         blob
     }
 
@@ -400,11 +475,11 @@ mod tests {
         build_standard_program(&[], &[], 1, 4096, &code, &bits)
     }
 
-    /// A program that trips a page fault in the unmapped low gap:
-    /// `φ3 ← 0x1000; φ4 ← u64[φ3]` — page 1 sits below the ro zone.
+    /// A program that trips a page fault in the first unmapped page at or
+    /// above the standard 64 KiB access boundary.
     fn fault_gap_blob() -> Vec<u8> {
         let (mut code, mut bits) = (Vec::new(), Vec::new());
-        asm(&mut code, &mut bits, &[51, 3, 0x00, 0x10]); // load_imm φ3 = 0x1000
+        asm(&mut code, &mut bits, &[51, 3, 0x00, 0x00, 0x01]); // φ3 = 0x10000
         asm(&mut code, &mut bits, &[130, 4 + 16 * 3]); // load_ind_u64 φ4, [φ3+0]
         asm(&mut code, &mut bits, &[0]); // trap (unreached)
         build_standard_program(&[], &[], 1, 4096, &code, &bits)
@@ -539,10 +614,10 @@ mod tests {
     }
 
     #[test]
-    fn trap_surfaces_as_trap() {
+    fn opcode_zero_surfaces_as_standard_panic() {
         let blob = build_standard_program(&[], &[], 0, 4096, &[0], &[1]);
         let inv = execute(&blob, &[], 1_000_000).expect("executes");
-        assert_eq!(inv.exit, ExitReason::Trap);
+        assert_eq!(inv.exit, ExitReason::Panic);
         assert_eq!(inv.output(), None);
     }
 
@@ -569,6 +644,29 @@ mod tests {
         assert_eq!(inv.registers[7], arg_base);
         assert_eq!(inv.registers[8], ARGS.len() as u64);
         assert_eq!(inv.output(), None, "no output without a halt");
+    }
+
+    #[test]
+    fn nonzero_host_exit_retains_cause_and_resumes_at_successor() {
+        let (mut code, mut bits) = (Vec::new(), Vec::new());
+        asm(&mut code, &mut bits, &[51, 2, 9]); // prior posterior state
+        asm(&mut code, &mut bits, &[10, 42]); // host at pc 3
+        asm(&mut code, &mut bits, &[0]); // resumed standard panic
+        let blob = build_standard_program(&[], &[], 0, 4096, &code, &bits);
+
+        let first = execute(&blob, &[], 1_000_000).expect("executes to host boundary");
+        assert_eq!(first.exit, ExitReason::HostCall(42));
+        assert_eq!(first.pc, 3);
+        assert_eq!(first.registers[2], 9);
+
+        let mut machine = Machine::load(&blob, &[], 1_000_000).expect("loads resumable machine");
+        assert_eq!(machine.resume(), ExitReason::HostCall(42));
+        let after_host = machine.gas_remaining();
+        assert_eq!(machine.resume(), ExitReason::Panic);
+        assert_eq!(machine.gas_remaining(), after_host);
+        let final_state = machine.finish(ExitReason::Panic);
+        assert_eq!(final_state.pc, 0);
+        assert_eq!(final_state.registers[2], 9);
     }
 
     #[test]
@@ -601,6 +699,91 @@ mod tests {
             execute(&[0xFF; 4], &[], 1_000_000).unwrap_err(),
             RefineError::InvalidBlob
         );
+    }
+
+    #[test]
+    fn full_psi_deblob_failures_panic_without_changing_state() {
+        let valid = build_pvm_blob(&[10, 7, 0], &[1, 0, 1]);
+        let mut unused_high_bit = valid.clone();
+        *unused_high_bit.last_mut().unwrap() |= 0x80;
+        let cases = [
+            ("truncated", vec![0xff, 0]),
+            ("unused bitmask high bit", unused_high_bit),
+            ("initial bit unset", build_pvm_blob(&[0], &[0])),
+            ("trailing non-terminator", build_pvm_blob(&[2], &[1])),
+        ];
+        let registers =
+            core::array::from_fn(|index| 0x1111_0000_0000_0000u64.wrapping_add(index as u64));
+        let bytes: Vec<u8> = (0..2 * PVM_PAGE_SIZE as usize)
+            .map(|index| (index as u8).wrapping_mul(17).wrapping_add(3))
+            .collect();
+        let permissions = vec![PERM_RO, PERM_RW];
+
+        for gas_charged in [false, true] {
+            for (name, blob, pc) in cases
+                .iter()
+                .map(|(name, blob)| (*name, blob.as_slice(), 0u64))
+                .chain([
+                    ("operand entry", valid.as_slice(), 1),
+                    ("end entry", valid.as_slice(), 3),
+                    ("wide entry", valid.as_slice(), u64::from(u32::MAX) + 1),
+                ])
+            {
+                let mut memory = Memory::flat(bytes.clone());
+                memory.set_page_perms(permissions.clone());
+                let mut machine =
+                    Machine::from_pvm_blob(blob, pc, 0xfeed_beef, gas_charged, registers, memory);
+
+                assert_eq!(machine.gas_remaining(), 0xfeed_beef, "{name}: gas");
+                assert_eq!(machine.gas_charged(), gas_charged, "{name}: funded flag");
+                assert_eq!(*machine.registers(), registers, "{name}: registers");
+                assert_eq!(
+                    machine.memory().page_perms(),
+                    permissions,
+                    "{name}: permissions"
+                );
+                let mut actual = vec![0; bytes.len()];
+                machine.memory().read_bytes(0, &mut actual);
+                assert_eq!(actual, bytes, "{name}: memory before exit");
+
+                let exit = machine.resume();
+                assert_eq!(exit, ExitReason::Panic, "{name}: full Ψ exit");
+                let invocation = machine.finish(exit);
+                assert_eq!(invocation.pc, 0, "{name}: final counter");
+                assert_eq!(invocation.gas_used, 0, "{name}: no charge");
+                assert_eq!(invocation.registers, registers, "{name}: final registers");
+                assert_eq!(invocation.memory().page_perms(), permissions);
+                let mut actual = vec![0; bytes.len()];
+                invocation.memory().read_bytes(0, &mut actual);
+                assert_eq!(actual, bytes, "{name}: final memory");
+            }
+        }
+    }
+
+    #[test]
+    fn standard_ecalli_identifier_is_full_sign_extended_register() {
+        let cases: &[(&[u8], u64)] = &[
+            (&[0xff], u64::MAX),
+            (&[0x00, 0x00, 0x00, 0x80], 0xffff_ffff_8000_0000),
+            (&[0xff, 0xff, 0xff, 0x7f], 0x7fff_ffff),
+        ];
+        let registers = core::array::from_fn(|index| 0xa500 + index as u64);
+        for (immediate, expected) in cases {
+            let mut code = vec![10];
+            code.extend_from_slice(immediate);
+            code.push(0);
+            let mut bitmask = vec![1];
+            bitmask.extend(core::iter::repeat_n(0, immediate.len()));
+            bitmask.push(1);
+            let blob = build_pvm_blob(&code, &bitmask);
+            let memory = Memory::flat(vec![0x5a; PVM_PAGE_SIZE as usize]);
+            let mut machine = Machine::from_pvm_blob(&blob, 0, 1_000, false, registers, memory);
+            assert_eq!(machine.resume(), ExitReason::HostCall(*expected));
+            assert_eq!(*machine.registers(), registers);
+            let mut actual = vec![0; PVM_PAGE_SIZE as usize];
+            machine.memory().read_bytes(0, &mut actual);
+            assert_eq!(actual, vec![0x5a; PVM_PAGE_SIZE as usize]);
+        }
     }
 
     #[test]
@@ -670,8 +853,8 @@ mod tests {
     #[test]
     fn page_fault_page_base_agrees() {
         let (f, s) = assert_flat_sparse_parity(&fault_gap_blob(), &[], 1_000_000).unwrap();
-        assert_eq!(f.exit, ExitReason::PageFault(0x1000));
-        assert_eq!(s.exit, ExitReason::PageFault(0x1000));
+        assert_eq!(f.exit, ExitReason::PageFault(0x10000));
+        assert_eq!(s.exit, ExitReason::PageFault(0x10000));
     }
 
     /// A write to the read-only argument region faults with the argument

@@ -64,14 +64,14 @@ impl RefineContext {
         &self.inner
     }
 
-    fn dispatch(&mut self, id: u32) -> Dispatch {
+    fn dispatch(&mut self, id: u64) -> Dispatch {
         match id {
-            host_call::MACHINE => self.machine(),
-            host_call::PEEK => self.peek(),
-            host_call::POKE => self.poke(),
-            host_call::PAGES => self.pages(),
-            host_call::INVOKE => self.invoke(),
-            host_call::EXPUNGE => self.expunge(),
+            value if value == u64::from(host_call::MACHINE) => self.machine(),
+            value if value == u64::from(host_call::PEEK) => self.peek(),
+            value if value == u64::from(host_call::POKE) => self.poke(),
+            value if value == u64::from(host_call::PAGES) => self.pages(),
+            value if value == u64::from(host_call::INVOKE) => self.invoke(),
+            value if value == u64::from(host_call::EXPUNGE) => self.expunge(),
             _ => Dispatch::Exit(ExitReason::HostCall(id)),
         }
     }
@@ -290,7 +290,7 @@ impl RefineContext {
             InnerExit::Halt => (0, None),
             InnerExit::Panic => (1, None),
             InnerExit::Fault(address) => (2, Some(address as u64)),
-            InnerExit::Host(id) => (3, Some(id as u64)),
+            InnerExit::Host(id) => (3, Some(id)),
             InnerExit::OutOfGas => (4, None),
         };
         let registers = self.outer.registers_mut();
@@ -400,9 +400,22 @@ mod tests {
 
     #[test]
     fn unknown_host_call_is_returned_to_the_embedder() {
-        let outer = standard_program(&[10, 77, 0], &[0, 2]);
+        let outer = standard_program(&[51, 2, 9, 10, 77, 0], &[0, 3, 5]);
         let invocation = RefineContext::load(&outer, &[], 1_000_000).unwrap().run();
         assert_eq!(invocation.exit, ExitReason::HostCall(77));
+        assert_eq!(invocation.pc, 3, "unknown host call stays on its cause");
+        assert_eq!(invocation.registers[2], 9);
+    }
+
+    #[test]
+    fn failed_host_dispatch_does_not_advance_the_outer_counter() {
+        // Load an unmapped source range, then call machine(9) at pc 8.
+        // Dispatch fails before Continue, so the owner must retain that
+        // ecalli counter rather than exposing its pc-10 successor.
+        let outer = standard_program(&[51, 7, 0, 0, 3, 51, 8, 1, 10, 9, 0], &[0, 5, 8, 10]);
+        let invocation = RefineContext::load(&outer, &[], 1_000_000).unwrap().run();
+        assert_eq!(invocation.exit, ExitReason::Panic);
+        assert_eq!(invocation.pc, 8);
     }
 
     #[test]

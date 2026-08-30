@@ -53,17 +53,16 @@
 //! - `bitmask` is packed 1 bit per code byte, LSB-first (deblob packing).
 //! - `regs` are 13 `0x…` hex strings (φ0..φ12); addresses/gas are numbers.
 //! - `status` ∈ halt | trap | panic | out_of_gas | page_fault | host_call.
-//!   `trap` is jar's deliberate-opcode-0 exit; GP folds it into panic ☇,
-//!   which is also what the recompiler reports — the recompiler leg
-//!   therefore folds trap→panic. Vectors whose outcome depends on the gas
+//!   `trap` is the transitional JAR profile's deliberate-opcode-0 exit;
+//!   standard v0.8 vectors require the exact panic ☇ result. Vectors whose
+//!   outcome depends on the gas
 //!   model (out-of-gas cases) list only the interpreter backend.
 //! - `expected.gas` is the REMAINING gas under the per-instruction model.
-//! - `expected.pc` is checked on the interpreter only (the recompiler does
-//!   not define pc equivalence on every exit; the fuzz harness does not
-//!   compare it either). Registers are compared on the recompiler at
-//!   halt/host-call exits, matching the fuzz harness's contract (the JIT
-//!   keeps registers in host registers mid-block, so fault exits do not
-//!   guarantee a synced file).
+//! - `expected.pc` is checked on the interpreter and, for every valid
+//!   standard-profile program, on the recompiler. Full v0.8 Ψ normalizes
+//!   halt/panic to zero and retains the causing counter for host/fault/OOG.
+//!   Standard registers, counters and every mapped memory byte are compared
+//!   corpus-wide at all exits, including panic, fault and out-of-gas.
 //!
 //! Re-bless (regenerates the corpus from the table below):
 //! ```bash
@@ -74,7 +73,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use vos_pvm::gas_cost::DEFAULT_MEM_CYCLES;
 use vos_pvm::instruction::{InstructionCategory, Opcode};
-use vos_pvm::interpreter::{Interpreter, PERM_NONE, PERM_RO, PERM_RW};
+use vos_pvm::interpreter::{Interpreter, Memory, PERM_NONE, PERM_RO, PERM_RW};
 use vos_pvm::{ExitReason, GasModel, IsaMode, PVM_HALT_ADDR};
 
 /// Base of the read-only page every memory case maps.
@@ -86,11 +85,11 @@ const PAGE: u32 = 4096;
 /// Default gas budget for funded cases.
 const GAS: u64 = 100;
 /// Reviewed cardinality of the complete v0.8 semantic transition corpus.
-const V080_CASE_COUNT: usize = 172;
+const V080_CASE_COUNT: usize = 173;
 /// The three per-instruction OOG cases intentionally do not run on the JIT.
-const V080_RECOMPILER_CASE_COUNT: usize = 169;
+const V080_RECOMPILER_CASE_COUNT: usize = 170;
 /// Reviewed cardinality of the independently derived block-gas oracle.
-const V080_BLOCK_GAS_CASE_COUNT: usize = 13;
+const V080_BLOCK_GAS_CASE_COUNT: usize = 16;
 
 /// The 16 seed bytes at `RO_BASE`: 0x81..=0x90 (high bits set, so
 /// zero- vs sign-extension of loads is observable).
@@ -378,8 +377,9 @@ fn corpus() -> Vec<Case> {
         c.exp_gas = GAS - 2;
         v.push(c);
 
-        // ecalli exits HostCall(imm) with pc already advanced; the exiting
-        // instruction is charged.
+        // The historical per-instruction/JAR adapter exposes its already-
+        // advanced host-call PC; the v0.8 corpus below rewrites this to the
+        // causing instruction counter required by full Ψ.
         let mut c = base("flow", "ecalli", asm(&[&[10, 7]]));
         c.exp_status = ExitReason::HostCall(7);
         c.exp_pc = 2;
@@ -1113,6 +1113,14 @@ fn v080_corpus() -> Vec<Case> {
         .filter(|case| case.family != "unary")
         .collect();
 
+    // A.5.2 decodes an immediate as a signed machine register. The single
+    // byte 0xff therefore crosses the host boundary as 2^64-1, rather than
+    // being narrowed to the historical JAR u32 host-slot representation.
+    let mut wide_host = base("flow", "ecalli_negative_one_is_u64", asm(&[&[10, 0xff]]));
+    wide_host.exp_status = ExitReason::HostCall(u64::MAX);
+    wide_host.exp_gas = GAS - 1;
+    v.push(wide_host);
+
     // Appendix A.5.9 after v0.8.0 removed sbrk: the unary operations occupy
     // bytes 101..=110. Keep boundary inputs that distinguish 32/64-bit views,
     // zero handling, signed extension, and byte order.
@@ -1366,6 +1374,44 @@ fn v080_corpus() -> Vec<Case> {
         0xffff_ffff_8000_0000,
     ));
 
+    // The shared historical constructors terminate ordinary cases with
+    // opcode 0 and therefore record the transitional JAR `Trap` result.
+    // Gray Paper v0.8 classifies the same instruction as panic (☇); keep
+    // that distinction explicit in the standard corpus instead of folding
+    // backend results in the runner.
+    for case in &mut v {
+        match case.name.as_str() {
+            "flow_trap" => case.name = "flow_opcode_zero_panics".into(),
+            "flow_fall_off_end_traps" => {
+                case.name = "flow_fall_off_end_panics".into();
+                // v0.8 defines opcode 1 as sjump(next). End-of-code is not
+                // in varpi, so it panics at pc 0 after one instruction charge.
+                case.exp_pc = 0;
+                case.exp_gas = GAS - 1;
+            }
+            "flow_empty_program_traps" => case.name = "flow_empty_program_panics".into(),
+            // Standard A.15 classifies every address below 2^16 as panic
+            // before consulting page accessibility. The historical JAR
+            // corpus intentionally retains its PageFault(0) behavior.
+            "load_load_fault_unmapped_low" => {
+                case.exp_status = ExitReason::Panic;
+                case.exp_pc = 0;
+            }
+            _ => {}
+        }
+        if case.exp_status == ExitReason::Trap {
+            case.exp_status = ExitReason::Panic;
+        }
+        match case.exp_status {
+            // Full Ψ normalizes final counters to zero.
+            ExitReason::Halt | ExitReason::Panic => case.exp_pc = 0,
+            // The sole host-call vector begins its ecalli at PC 0. Standard
+            // Ψ returns that causing counter; the host advances on resume.
+            ExitReason::HostCall(_) => case.exp_pc = 0,
+            _ => {}
+        }
+    }
+
     v
 }
 
@@ -1408,64 +1454,90 @@ fn block_gas_case(
 
 /// Frozen v0.8.0 block-gas oracle cases.
 ///
-/// Derivations use the release's single-pass rule: four decode slots per
-/// cycle; an instruction begins in the current cycle while a slot remains;
-/// completion is `max(decode_cycle, source_ready) + latency`; a block costs
-/// `max(max_completion - 3, 1)`. Blocks begin only at pc 0 and immediately
+/// Derivations follow the priority loop in Gray Paper v0.8.0 equations
+/// A.49--A.57: whole-instruction decode into a 32-entry ROB, oldest-ready
+/// dispatch (at most five starts per cycle), persistent execution-unit
+/// occupancy, and in-order retirement. A block costs
+/// `max(simulation_cycles - 3, 1)`. Blocks begin only at pc 0 and immediately
 /// after members of [`V080_TERMINATORS`]. The numerical derivations are noted
 /// beside each case and stored in `tests/vectors-v080-gas`.
 fn v080_block_gas_corpus() -> Vec<BlockGasCase> {
     let mut cases = Vec::new();
 
     // unlikely(40 cycles), ecalli(100), and trap are one block because only
-    // trap belongs to T. max_completion=100, hence cost=97. Resuming after
+    // trap belongs to T. Whole-slot decode delays ecalli by one cycle, so the
+    // converged block cost is 101. Resuming after
     // ecalli must not charge the already-funded block again.
     let mut c = block_gas_case(
         "unlikely_ecalli_share_one_block",
         asm(&[&[2], &[10, 7], &[0]]),
-        100,
-        &[(0, 97)],
+        200,
+        &[(0, 101)],
         ExitReason::HostCall(7),
-        3,
+        99,
     );
-    c.resume = Some((ExitReason::Trap, 3));
+    c.resume = Some((ExitReason::Panic, 99));
     cases.push(c);
 
-    // fallthrough is in T: its one-instruction block costs 1. The following
-    // unlikely+trap block has max_completion=40 and costs 37.
+    // fallthrough is in T: its isolated two-cycle block costs 2. The following
+    // unlikely+trap block converges with cost 40.
     cases.push(block_gas_case(
         "fallthrough_splits_before_unlikely",
         asm(&[&[1], &[2], &[0]]),
         100,
-        &[(0, 1), (1, 37)],
-        ExitReason::Trap,
-        62,
+        &[(0, 2), (1, 40)],
+        ExitReason::Panic,
+        58,
     ));
 
     // Three chained div_u_64 operations write r2, r4, r6 and consume those
-    // destinations in the next operation. Their completion times are
-    // 60 -> 120 -> 180, so the single block costs 177. This catches the
+    // destinations in the next operation. The dependency and the single DIV
+    // unit serialize all three, giving a converged block cost of 180. This catches the
     // tempting but incorrect interpretation of encoded rA as the destination;
     // Appendix A.5.13 makes rD the destination.
     cases.push(block_gas_case(
         "three_register_destination_dependency_chain",
         asm(&[&[203, 0x10, 2], &[203, 0x32, 4], &[203, 0x54, 6], &[0]]),
         500,
-        &[(0, 177)],
-        ExitReason::Trap,
-        323,
+        &[(0, 180)],
+        ExitReason::Panic,
+        320,
+    ));
+
+    // These divisions share no registers, but the virtual CPU has one DIV
+    // unit. It remains occupied for all 60 execution cycles, so the second
+    // division cannot overlap the first and the block costs 120.
+    cases.push(block_gas_case(
+        "independent_divisions_serialize_on_div_unit",
+        asm(&[&[203, 0x10, 2], &[203, 0x54, 6], &[0]]),
+        200,
+        &[(0, 120)],
+        ExitReason::Panic,
+        80,
+    ));
+
+    // load_imm consumes one of four decode slots. The following four-slot DIV
+    // cannot partially enter the remaining three slots and waits for the next
+    // cycle's reset. Its otherwise-independent block therefore costs 61.
+    cases.push(block_gas_case(
+        "four_slot_instruction_waits_after_partial_decode",
+        asm(&[&[51, 0, 0], &[203, 0x32, 4], &[0]]),
+        100,
+        &[(0, 61)],
+        ExitReason::Panic,
+        39,
     ));
 
     // Absolute load completes at 25; the following add consumes its r2
     // destination and completes at 26. The complete block therefore costs
-    // 23 even though execution faults on the first instruction.
+    // 26 even though execution faults on the first instruction.
     cases.push(block_gas_case(
         "memory_fault_charges_dependent_tail",
         asm(&[&[58, 2, 0, 0, 3], &[200, 0x32, 4], &[0]]),
         100,
-        &[(0, 23)],
+        &[(0, 26)],
         ExitReason::PageFault(0x30000),
-        77,
+        74,
     ));
 
     // The same block with insufficient funding reports OOG before attempting
@@ -1473,55 +1545,57 @@ fn v080_block_gas_corpus() -> Vec<BlockGasCase> {
     cases.push(block_gas_case(
         "out_of_gas_precedes_memory_fault",
         asm(&[&[58, 2, 0, 0, 3], &[200, 0x32, 4], &[0]]),
-        22,
-        &[(0, 23)],
+        25,
+        &[(0, 26)],
         ExitReason::OutOfGas,
-        22,
+        25,
     ));
 
     // Four one-slot unlikely instructions decode in cycle 0; the fifth and
-    // sixth decode in cycle 1. max_completion=41, hence block cost=38.
+    // sixth decode in cycle 1. The second decode cohort completes one cycle
+    // later, hence block cost 41 after pipeline convergence.
     cases.push(block_gas_case(
         "decode_width_rolls_after_four_slots",
         asm(&[&[2], &[2], &[2], &[2], &[2], &[2], &[0]]),
         100,
-        &[(0, 38)],
-        ExitReason::Trap,
-        62,
+        &[(0, 41)],
+        ExitReason::Panic,
+        59,
     ));
 
     // A branch aimed at unlikely has latency 1; the following unlikely+trap
-    // block costs 37. The target is also the required post-branch block start.
+    // block costs 40. The target is also the required post-branch block start.
     cases.push(block_gas_case(
         "branch_to_unlikely_uses_short_latency",
         asm(&[&[81, 0x12, 0, 4], &[2], &[0]]),
         100,
-        &[(0, 1), (4, 37)],
-        ExitReason::Trap,
-        62,
+        &[(0, 1), (4, 40)],
+        ExitReason::Panic,
+        59,
     ));
 
-    // A branch to an ordinary instruction has latency 20 (cost 17); its
-    // load_imm+trap target block costs the minimum 1.
+    // A branch to an ordinary instruction has latency/cost 20; its
+    // load_imm+trap target block costs 2.
     cases.push(block_gas_case(
         "branch_to_likely_target_uses_long_latency",
         asm(&[&[81, 0x12, 0, 4], &[51, 5, 1], &[0]]),
         100,
-        &[(0, 17), (4, 1)],
-        ExitReason::Trap,
-        82,
+        &[(0, 20), (4, 2)],
+        ExitReason::Panic,
+        78,
     ));
 
-    // The explicit target (load_imm at pc 5) is ordinary, but the sequential
+    // The explicit target (load_imm at pc 6) is ordinary, but the sequential
     // byte is unlikely. v0.8's `b` equation tests both bytes, so the branch is
-    // short. Make the condition false to execute the auditable fallthrough.
+    // short. The fallthrough at pc 5 makes pc 6 a valid block target. Make the
+    // condition false to execute the auditable fallthrough path.
     let mut c = block_gas_case(
         "branch_fallthrough_unlikely_target_likely_is_short",
-        asm(&[&[81, 0x12, 0, 5], &[2], &[51, 5, 1], &[0]]),
+        asm(&[&[81, 0x12, 0, 6], &[2], &[1], &[51, 5, 1], &[0]]),
         100,
-        &[(0, 1), (4, 37)],
-        ExitReason::Trap,
-        62,
+        &[(0, 1), (4, 40), (6, 2)],
+        ExitReason::Panic,
+        57,
     );
     c.regs[2] = 1;
     cases.push(c);
@@ -1534,47 +1608,55 @@ fn v080_block_gas_corpus() -> Vec<BlockGasCase> {
         "branch_target_unlikely_fallthrough_likely_is_short",
         asm(&[&[81, 0x12, 0, 5], &[1], &[2], &[0]]),
         100,
-        &[(0, 1), (4, 1), (5, 37)],
-        ExitReason::Trap,
-        62,
+        &[(0, 1), (4, 2), (5, 40)],
+        ExitReason::Panic,
+        59,
     ));
 
-    // Instruction data is zero-extended. A sequential position exactly one
-    // past the code therefore reads as trap (0), making this false branch
-    // short even though its in-code explicit target byte is ordinary. The
-    // implicit trap reached at pc 4 costs one more unit after the recorded
-    // in-code branch block.
-    let mut c = block_gas_case(
-        "branch_beyond_end_fallthrough_is_zero_extended_short",
+    // The target is pc 0 and therefore valid, but the sequential successor is
+    // beyond varpi. v0.8 validates both successors before selecting the valid
+    // target, so this panics at the branch after its short one-gas block.
+    cases.push(block_gas_case(
+        "branch_invalid_fallthrough_panics_when_target_selected",
         asm(&[&[81, 0x12, 0, 0]]),
         100,
         &[(0, 1)],
-        ExitReason::Trap,
-        98,
-    );
-    c.regs[2] = 1;
-    cases.push(c);
-
-    // The same zero-extension applies to a positive explicit target beyond
-    // the code. Fallthrough is an ordinary terminator byte, so only the
-    // out-of-code target makes this branch short.
-    cases.push(block_gas_case(
-        "branch_positive_out_of_code_target_is_zero_extended_short",
-        asm(&[&[81, 0x12, 0, 127], &[1], &[0]]),
-        100,
-        &[(0, 1), (4, 1), (5, 1)],
         ExitReason::Panic,
         99,
     ));
 
-    // A negative decoded target wraps to a high machine address before the
-    // zero-extended byte read. It is still outside instruction data and thus
-    // reads as trap (0), independently of the ordinary fallthrough byte.
+    // The same invalid sequential successor is rejected before selecting it.
+    let mut c = block_gas_case(
+        "branch_invalid_fallthrough_panics_when_fallthrough_selected",
+        asm(&[&[81, 0x12, 0, 0]]),
+        100,
+        &[(0, 1)],
+        ExitReason::Panic,
+        99,
+    );
+    c.regs[2] = 1;
+    cases.push(c);
+
+    // A positive explicit target beyond varpi is rejected even when the
+    // condition selects the valid sequential successor.
+    let mut c = block_gas_case(
+        "branch_invalid_target_panics_when_fallthrough_selected",
+        asm(&[&[81, 0x12, 0, 127], &[1], &[0]]),
+        100,
+        &[(0, 1), (4, 2), (5, 2)],
+        ExitReason::Panic,
+        99,
+    );
+    c.regs[2] = 1;
+    cases.push(c);
+
+    // A negative decoded target wraps to a high machine address outside
+    // varpi and is likewise rejected when the condition selects it.
     cases.push(block_gas_case(
-        "branch_negative_out_of_code_target_is_zero_extended_short",
+        "branch_invalid_target_panics_when_target_selected",
         asm(&[&[81, 0x12, 0, 0xff], &[1], &[0]]),
         100,
-        &[(0, 1), (4, 1), (5, 1)],
+        &[(0, 1), (4, 2), (5, 2)],
         ExitReason::Panic,
         99,
     ));
@@ -1742,7 +1824,7 @@ fn block_gas_to_json(case: &BlockGasCase) -> Value {
     json!({
         "name": case.name,
         "spec": "gray-paper-0.8.0",
-        "rule": "single-pass-block-gas",
+        "rule": "gray-paper-v0.8-rob-block-gas",
         "program": {
             "code": hex_bytes(&case.code),
             "bitmask": hex_bytes(&pack_bitmask(&case.bitmask)),
@@ -1797,7 +1879,7 @@ fn from_json(v: &Value) -> Vector {
         "page_fault" => {
             ExitReason::PageFault(exp["page_fault_address"].as_u64().expect("fault addr") as u32)
         }
-        "host_call" => ExitReason::HostCall(exp["host_call"].as_u64().expect("host id") as u32),
+        "host_call" => ExitReason::HostCall(exp["host_call"].as_u64().expect("host id")),
         other => panic!("unknown status {other}"),
     };
     Vector {
@@ -1855,9 +1937,7 @@ fn exit_from_json(value: &Value) -> ExitReason {
                 .as_u64()
                 .expect("page fault address") as u32,
         ),
-        "host_call" => {
-            ExitReason::HostCall(value["host_call"].as_u64().expect("host call id") as u32)
-        }
+        "host_call" => ExitReason::HostCall(value["host_call"].as_u64().expect("host call id")),
         other => panic!("unknown exit status {other}"),
     }
 }
@@ -1943,10 +2023,14 @@ fn perms_of(v: &Vector) -> Vec<u8> {
 }
 
 fn isa_mode_for_vector(v: &Vector) -> IsaMode {
-    if v.name.starts_with("unary_") {
-        IsaMode::Jar
-    } else {
+    // The gp072 corpus is retained through the transitional JAR adapter.
+    // Its one explicit private-opcode exclusion case intentionally selects
+    // the strict decoder; the independently versioned v0.8 corpus below is
+    // always run in Conformance mode.
+    if v.name == "flow_ecall_panics_under_conformance" {
         IsaMode::Conformance
+    } else {
+        IsaMode::Jar
     }
 }
 
@@ -1988,15 +2072,6 @@ fn check_interpreter(name: &str, v: &Vector, isa_mode: IsaMode) {
     }
 }
 
-/// GP folds jar's deliberate trap (opcode 0) into the panic exit ☇, and
-/// that is what the recompiler reports; fold for cross-backend checks.
-fn fold_trap(exit: &ExitReason) -> ExitReason {
-    match exit {
-        ExitReason::Trap => ExitReason::Panic,
-        other => other.clone(),
-    }
-}
-
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn check_recompiler(name: &str, v: &Vector, isa_mode: IsaMode) {
     use vos_pvm::recompiler::{DataLayout, RecompiledPvm};
@@ -2028,16 +2103,7 @@ fn check_recompiler(name: &str, v: &Vector, isa_mode: IsaMode) {
     jit.set_pc(v.initial_pc);
     let exit = jit.run();
 
-    assert_eq!(
-        fold_trap(&exit),
-        fold_trap(&v.exp_status),
-        "{name}: recompiler exit (trap folds to GP panic)"
-    );
-    // Registers are only guaranteed synced at resumable/graceful exits
-    // (halt, host call) — the fuzz harness's contract.
-    if matches!(v.exp_status, ExitReason::Halt | ExitReason::HostCall(_)) {
-        assert_eq!(*jit.registers(), v.exp_regs, "{name}: recompiler registers");
-    }
+    assert_eq!(exit, v.exp_status, "{name}: recompiler exit");
     for (addr, want) in &v.exp_memory {
         let got = jit
             .read_bytes(*addr, want.len() as u32)
@@ -2046,25 +2112,160 @@ fn check_recompiler(name: &str, v: &Vector, isa_mode: IsaMode) {
     }
 
     // Differential gas anchor: under the block model the interpreter and
-    // the recompiler must charge identically (the deterministic slice of
-    // the fuzz harness's parity contract). Gas is compared at graceful
-    // exits; classification must agree everywhere.
-    let (block_exit, block_vm) = run_interpreter(v, GasModel::BlockSinglePass, isa_mode);
+    // the recompiler must charge identically at every terminal boundary.
+    // In particular, panic and page-fault exits are part of standard v0.8
+    // metering and must not be masked by exit-only parity.
+    let (block_exit, block_vm) = run_interpreter(v, GasModel::BlockPipeline, isa_mode);
     assert_eq!(
-        fold_trap(&block_exit),
-        fold_trap(&exit),
+        block_exit, exit,
         "{name}: block-gas interpreter and recompiler classify identically"
     );
-    if matches!(
-        block_exit,
-        ExitReason::Halt | ExitReason::Trap | ExitReason::HostCall(_)
-    ) {
+    let has_only_profile_opcodes = v
+        .code
+        .iter()
+        .enumerate()
+        .filter(|(pc, _)| v.bitmask.get(*pc) == Some(&1))
+        .all(|(_, byte)| Opcode::from_byte_in_mode(*byte, isa_mode).is_some());
+    if isa_mode == IsaMode::Conformance && has_only_profile_opcodes {
+        assert_eq!(jit.pc(), v.exp_pc, "{name}: standard recompiler exit pc");
+        assert_eq!(
+            *jit.registers(),
+            block_vm.registers,
+            "{name}: complete standard register state"
+        );
+        assert_eq!(
+            *jit.registers(),
+            v.exp_regs,
+            "{name}: standard registers match the reviewed oracle"
+        );
+        // Compare every byte on every mapped page, not only the explicitly
+        // changed slices listed by the vector. This catches partial faulting
+        // stores and accidental writes on panic/OOG paths.
+        const CHUNK: u32 = 64 * 1024;
+        for (base, len, _) in &v.page_map {
+            let mut offset = 0u32;
+            while offset < *len {
+                let count = (*len - offset).min(CHUNK);
+                let address = base.checked_add(offset).expect("mapped range address");
+                let jit_bytes = jit
+                    .read_bytes(address, count)
+                    .unwrap_or_else(|| panic!("{name}: mapped memory at {address:#x}"));
+                let mut interpreter_bytes = vec![0; count as usize];
+                block_vm
+                    .memory()
+                    .read_bytes(address, &mut interpreter_bytes);
+                assert_eq!(
+                    jit_bytes, interpreter_bytes,
+                    "{name}: complete mapped memory at {address:#x}"
+                );
+                offset += count;
+            }
+        }
+    }
+    if has_only_profile_opcodes {
         assert_eq!(
             jit.gas(),
             block_vm.gas,
             "{name}: block-gas consumption (interpreter vs recompiler)"
         );
     }
+}
+
+fn exact_state_interpreter(
+    code: &[u8],
+    bitmask: &[u8],
+    registers: [u64; 13],
+    memory: Vec<u8>,
+    gas: u64,
+    isa_mode: IsaMode,
+) -> Interpreter {
+    let mut vm = Interpreter::new(
+        code.to_vec(),
+        bitmask.to_vec(),
+        vec![],
+        registers,
+        memory,
+        gas,
+        DEFAULT_MEM_CYCLES,
+    );
+    vm.set_isa_mode(isa_mode);
+    vm.set_gas_model(GasModel::BlockPipeline);
+    vm
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn exact_state_recompiler(
+    code: &[u8],
+    bitmask: &[u8],
+    registers: [u64; 13],
+    memory_span: u32,
+    gas: u64,
+    isa_mode: IsaMode,
+) -> vos_pvm::recompiler::RecompiledPvm {
+    use vos_pvm::recompiler::{DataLayout, RecompiledPvm};
+
+    RecompiledPvm::new_with_mode(
+        code,
+        bitmask.to_vec(),
+        vec![],
+        registers,
+        gas,
+        Some(DataLayout {
+            mem_size: memory_span,
+            arg_start: 0,
+            arg_data: vec![],
+            ro_start: 0,
+            ro_data: vec![],
+            rw_start: 0,
+            rw_data: vec![],
+        }),
+        DEFAULT_MEM_CYCLES,
+        isa_mode,
+    )
+    .expect("compile exact-state regression")
+}
+
+/// Standard-memory harness spanning the complete 32-bit guest address
+/// space without allocating a 4 GiB host buffer.
+fn cyclic_sparse_interpreter(
+    code: &[u8],
+    bitmask: &[u8],
+    registers: [u64; 13],
+    gas: u64,
+    isa_mode: IsaMode,
+) -> Interpreter {
+    let mut vm = Interpreter::with_memory(
+        code.to_vec(),
+        bitmask.to_vec(),
+        vec![],
+        registers,
+        Memory::sparse(1u64 << 32),
+        gas,
+        DEFAULT_MEM_CYCLES,
+    );
+    vm.set_isa_mode(isa_mode);
+    vm.set_gas_model(GasModel::BlockPipeline);
+    vm
+}
+
+fn cyclic_permissions(high: u8) -> Vec<u8> {
+    let mut permissions = vec![PERM_NONE; 1 << 20];
+    // Deliberately map the low page: standard execution must still panic on
+    // the initialization zone rather than trusting embedder permissions.
+    permissions[0] = PERM_RW;
+    permissions[(1 << 20) - 1] = high;
+    permissions
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn cyclic_recompiler(
+    code: &[u8],
+    bitmask: &[u8],
+    registers: [u64; 13],
+    gas: u64,
+    isa_mode: IsaMode,
+) -> vos_pvm::recompiler::RecompiledPvm {
+    exact_state_recompiler(code, bitmask, registers, u32::MAX, gas, isa_mode)
 }
 
 // --- tests ---
@@ -2354,6 +2555,9 @@ fn graypaper_v080_interpreter_satisfies_every_vector() {
 /// remaining gas are then checked from the JSON contract.
 #[test]
 fn graypaper_v080_block_gas_matches_checked_in_oracle() {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use vos_pvm::recompiler::{DataLayout, RecompiledPvm};
+
     let dir = v080_gas_vectors_dir();
     let mut files: Vec<_> = std::fs::read_dir(&dir)
         .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
@@ -2381,7 +2585,7 @@ fn graypaper_v080_block_gas_matches_checked_in_oracle() {
         );
         assert_eq!(
             value["rule"].as_str(),
-            Some("single-pass-block-gas"),
+            Some("gray-paper-v0.8-rob-block-gas"),
             "{file}: gas rule identity"
         );
 
@@ -2407,7 +2611,7 @@ fn graypaper_v080_block_gas_matches_checked_in_oracle() {
 
         let mut vm = Interpreter::new(
             code.clone(),
-            bitmask,
+            bitmask.clone(),
             vec![],
             regs,
             vec![],
@@ -2415,7 +2619,7 @@ fn graypaper_v080_block_gas_matches_checked_in_oracle() {
             DEFAULT_MEM_CYCLES,
         );
         vm.set_isa_mode(IsaMode::Conformance);
-        vm.set_gas_model(GasModel::BlockSinglePass);
+        vm.set_gas_model(GasModel::BlockPipeline);
 
         for pc in 0..code.len() {
             let expected = blocks.iter().find(|(start, _)| *start as usize == pc);
@@ -2442,6 +2646,10 @@ fn graypaper_v080_block_gas_matches_checked_in_oracle() {
 
         if !value["expected"]["resume"].is_null() {
             let resume = &value["expected"]["resume"];
+            assert!(
+                vm.resume_after_host_call(),
+                "{file}: resume follows a standard host call"
+            );
             let (exit, _) = vm.run();
             assert_eq!(exit, exit_from_json(resume), "{file}: resume exit");
             assert_eq!(
@@ -2450,6 +2658,812 @@ fn graypaper_v080_block_gas_matches_checked_in_oracle() {
                 "{file}: resume remaining gas"
             );
         }
+
+        // The checked-in oracle is also a backend-parity gate. It includes
+        // panic, page-fault, out-of-gas, and resumable host-call boundaries,
+        // so every independently reviewed ROB judgement is consumed by both
+        // implementations rather than merely by the interpreter.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let memory_span = 0x40000u32;
+            let mut jit = RecompiledPvm::new_with_mode(
+                &code,
+                bitmask,
+                vec![],
+                regs,
+                gas,
+                Some(DataLayout {
+                    mem_size: memory_span,
+                    arg_start: 0,
+                    arg_data: vec![],
+                    ro_start: 0,
+                    ro_data: vec![],
+                    rw_start: 0,
+                    rw_data: vec![],
+                }),
+                DEFAULT_MEM_CYCLES,
+                IsaMode::Conformance,
+            )
+            .unwrap_or_else(|error| panic!("{file}: recompile oracle: {error}"));
+            jit.set_page_perms(&vec![PERM_NONE; (memory_span / PAGE) as usize]);
+
+            let exit = jit.run();
+            assert_eq!(exit, exit_from_json(first), "{file}: JIT first exit");
+            assert_eq!(
+                jit.gas(),
+                first["remaining_gas"].as_u64().expect("remaining gas"),
+                "{file}: JIT first remaining gas"
+            );
+
+            if !value["expected"]["resume"].is_null() {
+                let resume = &value["expected"]["resume"];
+                assert!(
+                    jit.acknowledge_host_call(),
+                    "{file}: JIT resume follows a standard host call"
+                );
+                let exit = jit.run();
+                assert_eq!(exit, exit_from_json(resume), "{file}: JIT resume exit");
+                assert_eq!(
+                    jit.gas(),
+                    resume["remaining_gas"].as_u64().expect("resume gas"),
+                    "{file}: JIT resume remaining gas"
+                );
+            }
+        }
+    }
+}
+
+/// A program declaring more than 2,048 pages selects the 50-cycle VOS page
+/// tier. That tier must remain observable under the capability/JAR profile,
+/// while standard v0.8 execution stays at its fixed 25-cycle memory latency.
+#[test]
+fn high_page_memory_latency_is_profile_scoped() {
+    let high_page_tier = vos_pvm::compute_mem_cycles(2_049);
+    assert_eq!(
+        high_page_tier, 50,
+        "regression must cross the first VOS tier"
+    );
+    let (code, bitmask) = asm(&[&[58, 2, 0, 0, 3], &[0]]);
+
+    let make_vm = |isa_mode, mem_cycles| {
+        let mut vm = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            [0; 13],
+            vec![0; 0x40000],
+            100,
+            mem_cycles,
+        );
+        vm.set_isa_mode(isa_mode);
+        vm.set_gas_model(GasModel::BlockPipeline);
+        vm.set_page_perms(vec![PERM_NONE; 0x40000 / PAGE as usize]);
+        vm
+    };
+
+    let standard_baseline = make_vm(IsaMode::Conformance, DEFAULT_MEM_CYCLES);
+    let mut standard_high_pages = make_vm(IsaMode::Conformance, high_page_tier);
+    let jar_baseline = make_vm(IsaMode::Jar, DEFAULT_MEM_CYCLES);
+    let jar_high_pages = make_vm(IsaMode::Jar, high_page_tier);
+
+    assert_eq!(standard_high_pages.mem_cycles, DEFAULT_MEM_CYCLES);
+    assert_eq!(standard_high_pages.block_gas_costs[0], 25);
+    assert_eq!(
+        standard_high_pages.block_gas_costs, standard_baseline.block_gas_costs,
+        "declared page count cannot change standard v0.8 gas"
+    );
+    assert_ne!(
+        jar_high_pages.block_gas_costs, jar_baseline.block_gas_costs,
+        "the VOS service profile retains its page-tier gas contract"
+    );
+
+    let (exit, _) = standard_high_pages.run();
+    assert_eq!(exit, ExitReason::PageFault(0x30000));
+    assert_eq!(standard_high_pages.gas, 75, "standard load block costs 25");
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        use vos_pvm::recompiler::{DataLayout, RecompiledPvm};
+
+        let mut jit = RecompiledPvm::new_with_mode(
+            &code,
+            bitmask,
+            vec![],
+            [0; 13],
+            100,
+            Some(DataLayout {
+                mem_size: 0x40000,
+                arg_start: 0,
+                arg_data: vec![],
+                ro_start: 0,
+                ro_data: vec![],
+                rw_start: 0,
+                rw_data: vec![],
+            }),
+            high_page_tier,
+            IsaMode::Conformance,
+        )
+        .expect("compile high-page standard regression");
+        jit.set_page_perms(&vec![PERM_NONE; 0x40000 / PAGE as usize]);
+        assert_eq!(jit.run(), exit);
+        assert_eq!(jit.gas(), standard_high_pages.gas);
+    }
+}
+
+/// Full standard Ψ exposes the causing counter for retryable exits, but
+/// normalizes successful halt and panic to zero. Host continuation is an
+/// explicit transition and does not fund the surrounding block twice.
+#[test]
+fn v080_external_exit_counters_and_host_resume_are_exact() {
+    // A posterior register write is retained even though the following
+    // nonzero opcode-0 instruction panics and normalizes the final PC.
+    let (panic_code, panic_bits) = asm(&[&[51, 2, 9], &[0]]);
+    let mut interpreter = exact_state_interpreter(
+        &panic_code,
+        &panic_bits,
+        [0; 13],
+        vec![],
+        100,
+        IsaMode::Conformance,
+    );
+    assert_eq!(interpreter.run().0, ExitReason::Panic);
+    assert_eq!(interpreter.pc, 0);
+    assert_eq!(interpreter.registers[2], 9);
+
+    // The transitional profile remains distinct: opcode zero is Trap and
+    // retains its causing PC.
+    let mut jar =
+        exact_state_interpreter(&panic_code, &panic_bits, [0; 13], vec![], 100, IsaMode::Jar);
+    assert_eq!(jar.run().0, ExitReason::Trap);
+    assert_eq!(jar.pc, 3);
+
+    // A jump-indirect at a nonzero PC exits successfully through the halt
+    // sentinel. Full standard Ψ still returns PC zero.
+    let (halt_code, halt_bits) = asm(&[&[1], &[50, 2]]);
+    let mut halt_regs = [0; 13];
+    halt_regs[2] = PVM_HALT_ADDR;
+    let mut interpreter = exact_state_interpreter(
+        &halt_code,
+        &halt_bits,
+        halt_regs,
+        vec![],
+        100,
+        IsaMode::Conformance,
+    );
+    assert_eq!(interpreter.run().0, ExitReason::Halt);
+    assert_eq!(interpreter.pc, 0);
+
+    // ecalli is at PC 3. The external host boundary exposes 3, then the
+    // explicit resume enters PC 5 without charging the prepaid block again.
+    let (host_code, host_bits) = asm(&[&[51, 2, 9], &[10, 7], &[0]]);
+    let mut interpreter = exact_state_interpreter(
+        &host_code,
+        &host_bits,
+        [0; 13],
+        vec![],
+        200,
+        IsaMode::Conformance,
+    );
+    assert_eq!(interpreter.run().0, ExitReason::HostCall(7));
+    assert_eq!(interpreter.pc, 3);
+    assert_eq!(interpreter.registers[2], 9);
+    let host_gas = interpreter.gas;
+    assert!(interpreter.resume_after_host_call());
+    assert_eq!(interpreter.run().0, ExitReason::Panic);
+    assert_eq!(interpreter.pc, 0);
+    assert_eq!(interpreter.gas, host_gas);
+
+    let mut jar =
+        exact_state_interpreter(&host_code, &host_bits, [0; 13], vec![], 200, IsaMode::Jar);
+    assert_eq!(jar.run().0, ExitReason::HostCall(7));
+    assert_eq!(jar.pc, 5, "JAR retains its advanced host-call counter");
+
+    // The first fallthrough block is funded, but the block beginning at PC
+    // 1 is not. OOG exposes that cause and preserves pre-instruction state.
+    let (oog_code, oog_bits) = asm(&[&[1], &[51, 2, 9], &[0]]);
+    let mut oog_regs = [0; 13];
+    oog_regs[2] = 77;
+    let mut interpreter = exact_state_interpreter(
+        &oog_code,
+        &oog_bits,
+        oog_regs,
+        vec![],
+        2,
+        IsaMode::Conformance,
+    );
+    assert_eq!(interpreter.run().0, ExitReason::OutOfGas);
+    assert_eq!(interpreter.pc, 1);
+    assert_eq!(interpreter.gas, 0);
+    assert_eq!(interpreter.registers[2], 77);
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let mut jit = exact_state_recompiler(
+            &panic_code,
+            &panic_bits,
+            [0; 13],
+            PAGE,
+            100,
+            IsaMode::Conformance,
+        );
+        assert_eq!(jit.run(), ExitReason::Panic);
+        assert_eq!(jit.pc(), 0);
+        assert_eq!(jit.registers()[2], 9);
+
+        let mut jit = exact_state_recompiler(
+            &halt_code,
+            &halt_bits,
+            halt_regs,
+            PAGE,
+            100,
+            IsaMode::Conformance,
+        );
+        assert_eq!(jit.run(), ExitReason::Halt);
+        assert_eq!(jit.pc(), 0);
+
+        let mut jit = exact_state_recompiler(
+            &host_code,
+            &host_bits,
+            [0; 13],
+            PAGE,
+            200,
+            IsaMode::Conformance,
+        );
+        assert_eq!(jit.run(), ExitReason::HostCall(7));
+        assert_eq!(jit.pc(), 3);
+        assert_eq!(jit.registers()[2], 9);
+        let host_gas = jit.gas();
+        assert_eq!(jit.run(), ExitReason::HostCall(7));
+        assert_eq!(jit.gas(), host_gas);
+        assert!(jit.acknowledge_host_call());
+        assert_eq!(jit.run(), ExitReason::Panic);
+        assert_eq!(jit.pc(), 0);
+        assert_eq!(jit.gas(), host_gas);
+
+        let mut jit = exact_state_recompiler(
+            &oog_code,
+            &oog_bits,
+            oog_regs,
+            PAGE,
+            2,
+            IsaMode::Conformance,
+        );
+        assert_eq!(jit.run(), ExitReason::OutOfGas);
+        assert_eq!(jit.pc(), 1);
+        assert_eq!(jit.gas(), 0);
+        assert_eq!(jit.registers()[2], 77);
+    }
+}
+
+/// The standard machine exposes the complete sign-extended immediate as the
+/// host identifier. The transitional JAR profile deliberately retains its
+/// frozen zero-extended-u32 projection so existing Service traces and
+/// capability dispatch remain byte-for-byte compatible.
+#[test]
+fn ecalli_identifier_width_is_profile_scoped() {
+    let cases: &[(&[u8], u64, u64)] = &[
+        (&[0xff], u64::MAX, u64::from(u32::MAX)),
+        (
+            &[0x00, 0x00, 0x00, 0x80],
+            0xffff_ffff_8000_0000,
+            0x8000_0000,
+        ),
+        (&[0xff, 0xff, 0xff, 0x7f], 0x7fff_ffff, 0x7fff_ffff),
+    ];
+    let registers = core::array::from_fn(|index| 0x5a00 + index as u64);
+
+    for (immediate, standard_id, jar_id) in cases {
+        let mut code = vec![10];
+        code.extend_from_slice(immediate);
+        code.push(0);
+        let mut bitmask = vec![1];
+        bitmask.extend(core::iter::repeat_n(0, immediate.len()));
+        bitmask.push(1);
+
+        let mut standard = exact_state_interpreter(
+            &code,
+            &bitmask,
+            registers,
+            vec![0xa5; PAGE as usize],
+            1_000,
+            IsaMode::Conformance,
+        );
+        assert_eq!(standard.run().0, ExitReason::HostCall(*standard_id));
+        assert_eq!(standard.registers, registers);
+        let mut actual = vec![0; PAGE as usize];
+        standard.memory().read_bytes(0, &mut actual);
+        assert_eq!(actual, vec![0xa5; PAGE as usize]);
+
+        let mut jar = exact_state_interpreter(
+            &code,
+            &bitmask,
+            registers,
+            vec![0xa5; PAGE as usize],
+            1_000,
+            IsaMode::Jar,
+        );
+        assert_eq!(jar.run().0, ExitReason::HostCall(*jar_id));
+        assert_eq!(jar.registers, registers);
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let mut standard = exact_state_recompiler(
+                &code,
+                &bitmask,
+                registers,
+                PAGE,
+                1_000,
+                IsaMode::Conformance,
+            );
+            assert_eq!(standard.run(), ExitReason::HostCall(*standard_id));
+            assert_eq!(*standard.registers(), registers);
+
+            let mut jar =
+                exact_state_recompiler(&code, &bitmask, registers, PAGE, 1_000, IsaMode::Jar);
+            assert_eq!(jar.run(), ExitReason::HostCall(*jar_id));
+            assert_eq!(*jar.registers(), registers);
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn rem_u32_zero_divisor_jit_result_is_profile_scoped() {
+    let (code, bitmask) = asm(&[&[Opcode::RemU32 as u8, 0x32, 4], &[0]]);
+    let cases = [(0x1_0000_0007, 7), (0x8000_0000, 0xffff_ffff_8000_0000)];
+
+    for (dividend, standard_result) in cases {
+        let mut registers = [0; 13];
+        registers[2] = dividend;
+
+        let mut interpreter = exact_state_interpreter(
+            &code,
+            &bitmask,
+            registers,
+            vec![],
+            1_000,
+            IsaMode::Conformance,
+        );
+        assert_eq!(interpreter.run().0, ExitReason::Panic);
+        assert_eq!(interpreter.registers[4], standard_result);
+
+        let mut standard = exact_state_recompiler(
+            &code,
+            &bitmask,
+            registers,
+            PAGE,
+            1_000,
+            IsaMode::Conformance,
+        );
+        assert_eq!(standard.run(), ExitReason::Panic);
+        assert_eq!(standard.registers()[4], standard_result);
+
+        let mut jar = exact_state_recompiler(&code, &bitmask, registers, PAGE, 1_000, IsaMode::Jar);
+        assert_eq!(jar.run(), ExitReason::Trap);
+        assert_eq!(
+            jar.registers()[4],
+            dividend,
+            "frozen JAR/JIT copies the complete dividend on zero divisor"
+        );
+    }
+}
+
+/// Standard addresses below 2^16 panic before consulting page permissions,
+/// even if the embedder maps those bytes. JAR retains its legacy mapped-low
+/// memory behavior.
+#[test]
+fn v080_low_zone_panics_before_a_mapped_memory_access() {
+    let (code, bitmask) = asm(&[&[58, 3, 0, 0, 0], &[0]]);
+    let mut registers = [0; 13];
+    registers[3] = 77;
+    let mut memory = vec![0; PAGE as usize];
+    memory[0] = 0xab;
+
+    let mut interpreter = exact_state_interpreter(
+        &code,
+        &bitmask,
+        registers,
+        memory.clone(),
+        100,
+        IsaMode::Conformance,
+    );
+    interpreter.set_page_perms(vec![PERM_RW]);
+    assert_eq!(interpreter.run().0, ExitReason::Panic);
+    assert_eq!(interpreter.pc, 0);
+    assert_eq!(interpreter.registers[3], 77);
+
+    let mut jar = exact_state_interpreter(&code, &bitmask, registers, memory, 100, IsaMode::Jar);
+    jar.set_page_perms(vec![PERM_RW]);
+    assert_eq!(jar.run().0, ExitReason::Trap);
+    assert_eq!(jar.registers[3], 0xab);
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let mut jit =
+            exact_state_recompiler(&code, &bitmask, registers, PAGE, 100, IsaMode::Conformance);
+        assert!(jit.write_bytes(0, &[0xab]));
+        jit.set_page_perms(&[PERM_RW]);
+        assert_eq!(jit.run(), ExitReason::Panic);
+        assert_eq!(jit.pc(), 0);
+        assert_eq!(jit.registers()[3], 77);
+
+        let mut jit = exact_state_recompiler(&code, &bitmask, registers, PAGE, 100, IsaMode::Jar);
+        assert!(jit.write_bytes(0, &[0xab]));
+        jit.set_page_perms(&[PERM_RW]);
+        assert_eq!(jit.run(), ExitReason::Trap);
+        assert_eq!(jit.registers()[3], 0xab);
+    }
+}
+
+/// Wide accesses are ordered over their raw integer indices before each byte
+/// address is reduced modulo 2^32. An inaccessible high tail therefore faults
+/// before the later wrapped low-zone byte; an accessible high tail reaches
+/// that low byte and panics even when page zero was mapped by the embedder.
+#[test]
+fn v080_cyclic_wide_access_orders_high_tail_before_low_zone() {
+    const ADDRESS: u32 = 0xffff_fffc;
+    const SENTINEL: u64 = 0xfeed_face_cafe_beef;
+    let (code, bitmask) = asm(&[&[130, 2 + 16 * 3], &[0]]); // load_ind_u64 r2,[r3]
+    let mut registers = [0; 13];
+    registers[2] = SENTINEL;
+    registers[3] = u64::from(ADDRESS);
+
+    for (high_perm, expected) in [
+        (PERM_RW, ExitReason::Panic),
+        (PERM_RO, ExitReason::Panic),
+        (PERM_NONE, ExitReason::PageFault(0xffff_f000)),
+    ] {
+        let permissions = cyclic_permissions(high_perm);
+        let mut interpreter =
+            cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        interpreter.set_page_perms(permissions.clone());
+        assert_eq!(
+            interpreter.run().0,
+            expected,
+            "interpreter perm={high_perm}"
+        );
+        assert_eq!(interpreter.registers[2], SENTINEL);
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Conformance);
+            jit.set_page_perms(&permissions);
+            assert_eq!(jit.run(), expected, "JIT perm={high_perm}");
+            assert_eq!(jit.registers()[2], SENTINEL);
+            assert_eq!(jit.gas(), interpreter.gas);
+        }
+    }
+
+    // The transitional profile remains safe and backend-identical without
+    // changing its old overflowing-range classification.
+    for (high_perm, expected) in [
+        (PERM_RW, ExitReason::PageFault(0)),
+        (PERM_NONE, ExitReason::PageFault(0xffff_f000)),
+    ] {
+        let permissions = cyclic_permissions(high_perm);
+        let mut interpreter =
+            cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Jar);
+        interpreter.set_page_perms(permissions.clone());
+        assert_eq!(interpreter.run().0, expected);
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Jar);
+            jit.set_page_perms(&permissions);
+            assert_eq!(jit.run(), expected);
+        }
+    }
+}
+
+/// A wrapped store validates its complete ordered access before mutation.
+/// Repeated high-page faults and the eventual repaired-page retry all reuse
+/// the already funded gas block.
+#[test]
+fn v080_cyclic_store_is_atomic_and_retry_does_not_recharge() {
+    const ADDRESS: u32 = 0xffff_fffc;
+    const VALUE: u64 = 0x1122_3344_5566_7788;
+    const OLD: [u8; 8] = [0xa0, 0xa1, 0xa2, 0xa3, 0xb0, 0xb1, 0xb2, 0xb3];
+    let (code, bitmask) = asm(&[&[123, 2 + 16 * 3], &[0]]); // store_ind_u64 [r3],r2
+    let mut registers = [0; 13];
+    registers[2] = VALUE;
+    registers[3] = u64::from(ADDRESS);
+
+    let read_interpreter = |vm: &Interpreter| {
+        let mut bytes = [0; 8];
+        vm.memory().read_bytes(ADDRESS, &mut bytes[..4]);
+        vm.memory().read_bytes(0, &mut bytes[4..]);
+        bytes
+    };
+
+    let mut interpreter =
+        cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+    interpreter.memory_mut().init_copy(ADDRESS, &OLD[..4]);
+    interpreter.memory_mut().init_copy(0, &OLD[4..]);
+    interpreter.set_page_perms(cyclic_permissions(PERM_NONE));
+    assert_eq!(interpreter.run().0, ExitReason::PageFault(0xffff_f000));
+    let funded_gas = interpreter.gas;
+    assert_eq!(read_interpreter(&interpreter), OLD);
+    assert_eq!(interpreter.run().0, ExitReason::PageFault(0xffff_f000));
+    assert_eq!(interpreter.gas, funded_gas, "repeated fault stays funded");
+    interpreter.set_page_perms(cyclic_permissions(PERM_RW));
+    assert_eq!(interpreter.run().0, ExitReason::Panic);
+    assert_eq!(
+        interpreter.gas, funded_gas,
+        "fault-to-panic retry stays funded"
+    );
+    assert_eq!(
+        read_interpreter(&interpreter),
+        OLD,
+        "store is failure-atomic"
+    );
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        assert!(jit.write_bytes(ADDRESS, &OLD));
+        jit.set_page_perms(&cyclic_permissions(PERM_NONE));
+        assert_eq!(jit.run(), ExitReason::PageFault(0xffff_f000));
+        let jit_funded_gas = jit.gas();
+        assert_eq!(jit.run(), ExitReason::PageFault(0xffff_f000));
+        assert_eq!(jit.gas(), jit_funded_gas);
+        jit.set_page_perms(&cyclic_permissions(PERM_RW));
+        assert_eq!(jit.read_bytes(ADDRESS, 8).as_deref(), Some(&OLD[..]));
+        assert_eq!(jit.run(), ExitReason::Panic);
+        assert_eq!(jit.gas(), jit_funded_gas);
+        assert_eq!(jit.gas(), funded_gas);
+        assert_eq!(jit.read_bytes(ADDRESS, 8).as_deref(), Some(&OLD[..]));
+    }
+
+    // Gas funding precedes memory validation and is itself atomic on OOG.
+    let probe = cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+    let insufficient = u64::from(probe.block_gas_costs[0]) - 1;
+    let mut interpreter = cyclic_sparse_interpreter(
+        &code,
+        &bitmask,
+        registers,
+        insufficient,
+        IsaMode::Conformance,
+    );
+    interpreter.set_page_perms(cyclic_permissions(PERM_NONE));
+    assert_eq!(interpreter.run().0, ExitReason::OutOfGas);
+    assert_eq!(interpreter.gas, insufficient);
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let mut jit = cyclic_recompiler(
+            &code,
+            &bitmask,
+            registers,
+            insufficient,
+            IsaMode::Conformance,
+        );
+        jit.set_page_perms(&cyclic_permissions(PERM_NONE));
+        assert_eq!(jit.run(), ExitReason::OutOfGas);
+        assert_eq!(jit.gas(), insufficient);
+    }
+}
+
+/// Exact top-of-space boundaries catch unsigned and off-by-one errors in the
+/// native overflow branch for every scalar load width.
+#[test]
+fn v080_cyclic_load_width_boundaries_are_exact() {
+    const SENTINEL: u64 = 0xfeed_face_cafe_beef;
+    const HIGH: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    for (opcode, width) in [(124u8, 1usize), (126, 2), (128, 4), (130, 8)] {
+        let (code, bitmask) = asm(&[&[opcode, 2 + 16 * 3], &[0]]);
+        let safe_addr = u32::MAX - (width as u32 - 1);
+        let mut registers = [0; 13];
+        registers[2] = SENTINEL;
+        registers[3] = u64::from(safe_addr);
+
+        let mut interpreter =
+            cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        interpreter.memory_mut().init_copy(u32::MAX - 7, &HIGH);
+        interpreter.set_page_perms(cyclic_permissions(PERM_RO));
+        assert_eq!(interpreter.run().0, ExitReason::Panic);
+        let mut expected_bytes = [0u8; 8];
+        expected_bytes[..width].copy_from_slice(&HIGH[8 - width..]);
+        let expected = u64::from_le_bytes(expected_bytes);
+        assert_eq!(interpreter.registers[2], expected, "safe width {width}");
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Conformance);
+            assert!(jit.write_bytes(u32::MAX - 7, &HIGH));
+            jit.set_page_perms(&cyclic_permissions(PERM_RO));
+            assert_eq!(jit.run(), ExitReason::Panic);
+            assert_eq!(jit.registers()[2], expected, "JIT safe width {width}");
+        }
+
+        if width > 1 {
+            registers[3] = u64::from(safe_addr + 1);
+            let mut interpreter =
+                cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+            interpreter.set_page_perms(cyclic_permissions(PERM_RO));
+            assert_eq!(interpreter.run().0, ExitReason::Panic);
+            assert_eq!(interpreter.registers[2], SENTINEL, "wrapped width {width}");
+
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                let mut jit =
+                    cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Conformance);
+                jit.set_page_perms(&cyclic_permissions(PERM_RO));
+                assert_eq!(jit.run(), ExitReason::Panic);
+                assert_eq!(jit.registers()[2], SENTINEL, "JIT wrapped width {width}");
+            }
+        }
+    }
+}
+
+/// Run all distinct JIT memory emitters in a child process. If any family
+/// misses the cyclic guard, a native access past the 4 GiB mapping can kill
+/// only the child and this test reports a deterministic failure.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn v080_cyclic_jit_memory_families_stay_inside_native_window() {
+    const CHILD_ENV: &str = "VOS_PVM_CYCLIC_MEMORY_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "v080_cyclic_jit_memory_families_stay_inside_native_window",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn cyclic-memory child");
+        assert!(status.success(), "cyclic-memory child exited {status}");
+        return;
+    }
+
+    const ADDRESS: u32 = 0xffff_fffe;
+    const A: [u8; 4] = ADDRESS.to_le_bytes();
+    const OLD: [u8; 4] = [0xa1, 0xa2, 0xb1, 0xb2];
+    let programs = [
+        asm(&[&[58, 2, A[0], A[1], A[2], A[3]], &[0]]), // direct load
+        asm(&[&[62, 2, A[0], A[1], A[2], A[3]], &[0]]), // direct store
+        asm(&[
+            &[33, 4, A[0], A[1], A[2], A[3], 0x78, 0x56, 0x34, 0x12],
+            &[0],
+        ]),
+        asm(&[&[130, 2 + 16 * 3], &[0]]), // indirect load
+        asm(&[&[123, 2 + 16 * 3], &[0]]), // indirect store
+        asm(&[&[73, 2, 0x78, 0x56, 0x34, 0x12], &[0]]), // store imm indirect
+    ];
+    let mut registers = [0; 13];
+    registers[2] = u64::from(ADDRESS);
+    registers[3] = u64::from(ADDRESS);
+    let fault_permissions = cyclic_permissions(PERM_NONE);
+    let mapped_permissions = cyclic_permissions(PERM_RW);
+
+    for (family, (code, bitmask)) in programs.into_iter().enumerate() {
+        let mut interpreter =
+            cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        interpreter.set_page_perms(fault_permissions.clone());
+        assert_eq!(
+            interpreter.run().0,
+            ExitReason::PageFault(0xffff_f000),
+            "interpreter family {family}"
+        );
+
+        let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        jit.set_page_perms(&fault_permissions);
+        assert_eq!(
+            jit.run(),
+            ExitReason::PageFault(0xffff_f000),
+            "JIT family {family}"
+        );
+        assert_eq!(jit.gas(), interpreter.gas, "family {family} gas");
+
+        // With the high tail accessible, all six emitters must classify the
+        // subsequently wrapped low-zone byte as Panic before executing the
+        // load/store. Register and memory state therefore remain unchanged.
+        let mut interpreter =
+            cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        interpreter.memory_mut().init_copy(ADDRESS, &OLD[..2]);
+        interpreter.memory_mut().init_copy(0, &OLD[2..]);
+        interpreter.set_page_perms(mapped_permissions.clone());
+        assert_eq!(
+            interpreter.run().0,
+            ExitReason::Panic,
+            "mapped interpreter family {family}"
+        );
+        assert_eq!(
+            interpreter.registers, registers,
+            "family {family} registers"
+        );
+        let mut interpreter_bytes = [0; 4];
+        interpreter
+            .memory()
+            .read_bytes(ADDRESS, &mut interpreter_bytes[..2]);
+        interpreter
+            .memory()
+            .read_bytes(0, &mut interpreter_bytes[2..]);
+        assert_eq!(interpreter_bytes, OLD, "family {family} memory");
+
+        let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        assert!(jit.write_bytes(ADDRESS, &OLD));
+        jit.set_page_perms(&mapped_permissions);
+        assert_eq!(jit.run(), ExitReason::Panic, "mapped JIT family {family}");
+        assert_eq!(*jit.registers(), registers, "JIT family {family} registers");
+        assert_eq!(
+            jit.read_bytes(ADDRESS, OLD.len() as u32).as_deref(),
+            Some(&OLD[..]),
+            "JIT family {family} memory"
+        );
+        assert_eq!(jit.gas(), interpreter.gas, "mapped family {family} gas");
+    }
+}
+
+/// A faulting cross-page store has no partial effect. After the missing page
+/// is mapped, retry begins at the same causing PC after the already-paid gas
+/// charge and completes exactly once.
+#[test]
+fn v080_page_fault_retry_preserves_state_and_does_not_recharge() {
+    const STORE_ADDR: u32 = 0x30ffc;
+    const MEMORY_SPAN: u32 = 0x32000;
+    const VALUE: u64 = 0x1122_3344_5566_7788;
+
+    let address = STORE_ADDR.to_le_bytes();
+    let store = [62, 2, address[0], address[1], address[2]];
+    let (code, bitmask) = asm(&[&[1], &store, &[0]]);
+    let mut registers = [0; 13];
+    registers[2] = VALUE;
+    let old = [0x55; 8];
+    let new = VALUE.to_le_bytes();
+    let mut memory = vec![0; MEMORY_SPAN as usize];
+    memory[STORE_ADDR as usize..STORE_ADDR as usize + old.len()].copy_from_slice(&old);
+    let mut fault_perms = vec![PERM_NONE; (MEMORY_SPAN / PAGE) as usize];
+    fault_perms[(STORE_ADDR / PAGE) as usize] = PERM_RW;
+    let mut repaired_perms = fault_perms.clone();
+    repaired_perms[(STORE_ADDR / PAGE + 1) as usize] = PERM_RW;
+
+    let mut interpreter = exact_state_interpreter(
+        &code,
+        &bitmask,
+        registers,
+        memory,
+        100,
+        IsaMode::Conformance,
+    );
+    interpreter.set_page_perms(fault_perms.clone());
+    assert_eq!(interpreter.run().0, ExitReason::PageFault(0x31000));
+    assert_eq!(interpreter.pc, 1);
+    assert_eq!(interpreter.gas, 73);
+    assert_eq!(interpreter.registers, registers);
+    interpreter.set_page_perms(repaired_perms.clone());
+    let mut bytes = [0; 8];
+    interpreter.memory().read_bytes(STORE_ADDR, &mut bytes);
+    assert_eq!(bytes, old, "faulting store has no partial effect");
+    assert_eq!(interpreter.run().0, ExitReason::Panic);
+    assert_eq!(interpreter.pc, 0);
+    assert_eq!(interpreter.gas, 73, "retry does not recharge the block");
+    interpreter.memory().read_bytes(STORE_ADDR, &mut bytes);
+    assert_eq!(bytes, new);
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let mut jit = exact_state_recompiler(
+            &code,
+            &bitmask,
+            registers,
+            MEMORY_SPAN,
+            100,
+            IsaMode::Conformance,
+        );
+        assert!(jit.write_bytes(STORE_ADDR, &old));
+        jit.set_page_perms(&fault_perms);
+        assert_eq!(jit.run(), ExitReason::PageFault(0x31000));
+        assert_eq!(jit.pc(), 1);
+        assert_eq!(jit.gas(), 73);
+        assert_eq!(*jit.registers(), registers);
+
+        jit.set_page_perms(&repaired_perms);
+        assert_eq!(jit.read_bytes(STORE_ADDR, 8).as_deref(), Some(&old[..]));
+        assert_eq!(jit.run(), ExitReason::Panic);
+        assert_eq!(jit.pc(), 0);
+        assert_eq!(jit.gas(), 73, "JIT retry does not recharge the block");
+        assert_eq!(jit.read_bytes(STORE_ADDR, 8).as_deref(), Some(&new[..]));
     }
 }
 

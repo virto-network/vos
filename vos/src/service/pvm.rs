@@ -304,7 +304,11 @@ impl RefineTraceRecorder {
             }
             Some(vos_pvm::ExitReason::HostCall(id)) => {
                 self.state.update(&[6]);
-                self.u32(*id);
+                // The frozen JAR profile projects every decoded immediate to
+                // a zero-extended u32 before this observer runs. Retain its
+                // historical four-byte commitment; Standard execution keeps
+                // the full sign-extended identifier instead.
+                self.u32(u32::try_from(*id).expect("JAR host-call projection"));
             }
             Some(vos_pvm::ExitReason::Ecall) => {
                 self.state.update(&[7]);
@@ -1682,7 +1686,11 @@ impl ServicePvm {
             )?;
             let snapshot = KernelSnapshot::from_bytes(&continuation.kernel_snapshot)
                 .map_err(|_| ServicePvmError::InvalidContinuation)?;
-            if snapshot.pending_call.slot != crate::abi::hostcall::SUSPEND as u8 {
+            if snapshot
+                .pending_call
+                .as_ref()
+                .is_none_or(|call| call.slot != crate::abi::hostcall::SUSPEND as u8)
+            {
                 return Err(ServicePvmError::InvalidContinuation);
             }
             // Restore the exact dormant-program layout captured by this
@@ -2428,7 +2436,11 @@ fn capture_checkpoint(
     let snapshot = kernel
         .snapshot()
         .map_err(|_| ServicePvmError::SnapshotFailed)?;
-    if snapshot.pending_call.slot != crate::abi::hostcall::SUSPEND as u8 {
+    if snapshot
+        .pending_call
+        .as_ref()
+        .is_none_or(|call| call.slot != crate::abi::hostcall::SUSPEND as u8)
+    {
         return Err(ServicePvmError::SnapshotFailed);
     }
     let suspended_actors = suspended_actor_stack(&snapshot, actor_runtime)?;
@@ -2954,6 +2966,41 @@ mod tests {
 
     const SYNTHETIC_SERVICE_GAS: u64 = 10_000_000;
     use vos_pvm_compiler::assembler::Reg;
+
+    #[test]
+    fn jar_raw_ff_host_call_keeps_the_four_byte_service_trace_commitment() {
+        let mut vm = vos_pvm::interpreter::Interpreter::new(
+            vec![10, 0xff],
+            vec![1, 0],
+            vec![],
+            [0; vos_pvm::PVM_REGISTER_COUNT],
+            vec![],
+            1_000,
+            25,
+        );
+        vm.set_isa_mode(vos_pvm::IsaMode::Jar);
+        let exit = vm.run().0;
+        assert_eq!(exit, vos_pvm::ExitReason::HostCall(u64::from(u32::MAX)));
+
+        let blank = || RefineTraceRecorder {
+            state: blake2b_simd::Params::new().hash_length(32).to_state(),
+            instruction_count: 0,
+            protocol_call_count: 0,
+            vm_switch_count: 0,
+            previous_vm: None,
+            code_hashes: BTreeSet::new(),
+        };
+        let mut actual = blank();
+        actual.exit(Some(&exit));
+        let mut historical = blank();
+        historical.state.update(&[6]);
+        historical.u32(u32::MAX);
+        assert_eq!(
+            actual.finish().commitment,
+            historical.finish().commitment,
+            "the frozen Service trace commits HostCall as tag plus four LE bytes"
+        );
+    }
 
     #[test]
     fn device_signer_seed_derivation_is_stable_and_redacted() {

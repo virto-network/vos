@@ -94,7 +94,7 @@ fn side_note() -> SideNote {
         25,
     );
     let mut tr = TracingPvm::new_conformance(pvm);
-    assert_eq!(tr.run(), vos_pvm::ExitReason::Trap);
+    assert_eq!(tr.run(), vos_pvm::ExitReason::Panic);
     let steps: Vec<PvmStep> = tr.into_trace();
 
     let mut sn = SideNote::new(steps, code, bitmask);

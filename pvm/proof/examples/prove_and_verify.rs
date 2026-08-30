@@ -56,7 +56,7 @@ fn main() {
     );
     let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, ExitReason::Trap, "expected Trap exit");
+    assert_eq!(exit, ExitReason::Panic, "expected standard Panic exit");
     let steps = tracing.into_trace();
     println!(
         "Traced {} step(s); regs[2] = {}",

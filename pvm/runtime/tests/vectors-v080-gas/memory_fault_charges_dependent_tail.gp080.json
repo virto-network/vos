@@ -2,13 +2,13 @@
   "expected": {
     "blocks": [
       {
-        "gas": 23,
+        "gas": 26,
         "pc": 0
       }
     ],
     "first": {
       "page_fault_address": 196608,
-      "remaining_gas": 77,
+      "remaining_gas": 74,
       "status": "page_fault"
     },
     "resume": null
@@ -36,6 +36,6 @@
     "bitmask": "0x2101",
     "code": "0x3a02000003c8320400"
   },
-  "rule": "single-pass-block-gas",
+  "rule": "gray-paper-v0.8-rob-block-gas",
   "spec": "gray-paper-0.8.0"
 }

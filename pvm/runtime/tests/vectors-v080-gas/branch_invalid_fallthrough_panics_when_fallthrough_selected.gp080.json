@@ -1,0 +1,40 @@
+{
+  "expected": {
+    "blocks": [
+      {
+        "gas": 1,
+        "pc": 0
+      }
+    ],
+    "first": {
+      "remaining_gas": 99,
+      "status": "panic"
+    },
+    "resume": null
+  },
+  "initial": {
+    "gas": 100,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x1",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "branch_invalid_fallthrough_panics_when_fallthrough_selected",
+  "program": {
+    "bitmask": "0x01",
+    "code": "0x51120000"
+  },
+  "rule": "gray-paper-v0.8-rob-block-gas",
+  "spec": "gray-paper-0.8.0"
+}

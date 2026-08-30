@@ -18,6 +18,7 @@ use vos_pvm::interpreter::Interpreter;
 
 use vos_pvm_proof::core::step::PvmStep;
 use vos_pvm_proof::core::tracing::TracingPvm;
+use vos_pvm_proof::{SideNote, prove};
 
 /// Build a Store-then-Load program: store regs[0]'s low byte at addr=regs[1],
 /// then load that byte into regs[2].  Trap follows.
@@ -41,10 +42,12 @@ fn store_load_program() -> (Vec<u8>, Vec<u8>) {
     (code, bitmask)
 }
 
-fn trace_store_load(value: u8, addr: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmStep>) {
+fn trace_store_load(value: u8, addr_offset: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmStep>) {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = value as u64;
-    regs[1] = addr as u64;
+    // Keep the historical compact offsets while placing proof fixtures above
+    // the v0.8 protected low zone.
+    regs[1] = u64::from(vos_pvm::PVM_ZONE_SIZE + addr_offset);
     let memory = vec![0u8; 4 * 1024 * 1024];
     let (code, bitmask) = store_load_program();
     let pvm = Interpreter::new(
@@ -58,7 +61,7 @@ fn trace_store_load(value: u8, addr: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmStep>) {
     );
     let mut tr = TracingPvm::new_conformance(pvm);
     let exit = tr.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tr.into_trace();
     assert_eq!(steps.len(), 3);
     (code, bitmask, steps)
@@ -172,10 +175,10 @@ fn store_load_u64_program() -> (Vec<u8>, Vec<u8>) {
     (code, bitmask)
 }
 
-fn trace_store_load_u64(value: u64, addr: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmStep>) {
+fn trace_store_load_u64(value: u64, addr_offset: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmStep>) {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = value;
-    regs[1] = addr as u64;
+    regs[1] = u64::from(vos_pvm::PVM_ZONE_SIZE + addr_offset);
     let memory = vec![0u8; 4 * 1024 * 1024];
     let (code, bitmask) = store_load_u64_program();
     let pvm = Interpreter::new(
@@ -189,7 +192,7 @@ fn trace_store_load_u64(value: u64, addr: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmStep
     );
     let mut tr = TracingPvm::new_conformance(pvm);
     let exit = tr.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tr.into_trace();
     assert_eq!(steps.len(), 3);
     (code, bitmask, steps)
@@ -276,4 +279,50 @@ fn load_injects_mem_write_rejected() {
         size: r.size,
     });
     prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn faulting_memory_step_is_rejected_before_proof_construction() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[1] = 2 * vos_pvm::PVM_ZONE_SIZE as u64;
+    let code = vec![Opcode::LoadIndU64 as u8, 0x10, 0, 0, 0, 0];
+    let bitmask = vec![1, 0, 0, 0, 0, 0];
+    let initial_memory = vec![0u8; vos_pvm::PVM_ZONE_SIZE as usize];
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        initial_memory.clone(),
+        10_000,
+        25,
+    );
+    let mut tracing = TracingPvm::new_conformance(pvm);
+    assert_eq!(
+        tracing.run(),
+        vos_pvm::ExitReason::PageFault(2 * vos_pvm::PVM_ZONE_SIZE)
+    );
+    let steps = tracing.into_trace();
+    assert!(steps[0].mem_read.is_none());
+
+    let mut side_note = SideNote::new(steps, code, bitmask).with_memory(initial_memory);
+    assert!(prove(&mut side_note).is_err());
+    assert!(
+        side_note.memory_pages.is_none(),
+        "fault trace must fail before page-boundary witness construction"
+    );
+}
+
+#[test]
+fn wrapped_wide_mem_access_is_rejected_before_proof_construction() {
+    let (code, bitmask, mut steps) =
+        trace_store_load_u64(0x8877_6655_4433_2211, 2 * vos_pvm::PVM_ZONE_SIZE);
+    steps[0].mem_write.as_mut().expect("store access").address = u32::MAX - 3;
+
+    let mut side_note = SideNote::new(steps, code, bitmask).with_memory(vec![0u8; 4 * 1024 * 1024]);
+    assert!(prove(&mut side_note).is_err());
+    assert!(
+        side_note.memory_pages.is_none(),
+        "wrapped access must fail before page-boundary witness construction"
+    );
 }

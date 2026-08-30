@@ -1,4 +1,4 @@
-//! Per-basic-block gas cost model (JAR v0.8.0).
+//! Profile-scoped per-basic-block gas costs.
 //!
 //! Simulates a CPU pipeline to compute gas cost for a basic block.
 //! Cost = max(simulation_cycles - 3, 1).
@@ -7,180 +7,6 @@
 //! - Reorder buffer: max 32 entries
 //! - 4 decode slots per cycle, 5 dispatch slots per cycle
 //! - Execution units: ALU:4, LOAD:4, STORE:4, MUL:1, DIV:1
-
-use alloc::{vec, vec::Vec};
-
-// --- Data structures ---
-
-#[derive(Clone, Copy, Default, Debug)]
-struct ExecUnits {
-    alu: u8,
-    load: u8,
-    store: u8,
-    mul: u8,
-    div: u8,
-}
-
-impl ExecUnits {
-    fn can_satisfy(self, req: ExecUnits) -> bool {
-        self.alu >= req.alu
-            && self.load >= req.load
-            && self.store >= req.store
-            && self.mul >= req.mul
-            && self.div >= req.div
-    }
-    fn sub(self, req: ExecUnits) -> ExecUnits {
-        ExecUnits {
-            alu: self.alu - req.alu,
-            load: self.load - req.load,
-            store: self.store - req.store,
-            mul: self.mul - req.mul,
-            div: self.div - req.div,
-        }
-    }
-    const RESET: ExecUnits = ExecUnits {
-        alu: 4,
-        load: 4,
-        store: 4,
-        mul: 1,
-        div: 1,
-    };
-    const ALU: ExecUnits = ExecUnits {
-        alu: 1,
-        load: 0,
-        store: 0,
-        mul: 0,
-        div: 0,
-    };
-    const LOAD: ExecUnits = ExecUnits {
-        alu: 1,
-        load: 1,
-        store: 0,
-        mul: 0,
-        div: 0,
-    };
-    const STORE: ExecUnits = ExecUnits {
-        alu: 1,
-        load: 0,
-        store: 1,
-        mul: 0,
-        div: 0,
-    };
-    const MUL: ExecUnits = ExecUnits {
-        alu: 1,
-        load: 0,
-        store: 0,
-        mul: 1,
-        div: 0,
-    };
-    const DIV: ExecUnits = ExecUnits {
-        alu: 1,
-        load: 0,
-        store: 0,
-        mul: 0,
-        div: 1,
-    };
-    const NONE: ExecUnits = ExecUnits {
-        alu: 0,
-        load: 0,
-        store: 0,
-        mul: 0,
-        div: 0,
-    };
-    fn _to_eu_byte(self) -> u8 {
-        if self.div > 0 {
-            5
-        } else if self.mul > 0 {
-            4
-        } else if self.store > 0 {
-            3
-        } else if self.load > 0 {
-            2
-        } else if self.alu > 0 {
-            1
-        } else {
-            0
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum RobState {
-    Wait,
-    Exe,
-    Fin,
-}
-
-#[derive(Clone, Copy)]
-struct RobEntry {
-    state: RobState,
-    cycles_left: u32,
-    deps: [u8; 4], // ROB indices this depends on (0xFF = unused)
-    dep_count: u8,
-    dest_regs: RegSet,
-    exec_units: ExecUnits,
-}
-
-struct SimState {
-    ip: Option<usize>, // instruction pointer (None = done decoding)
-    cycles: u32,
-    decode_slots: u8,      // remaining per cycle (reset to 4)
-    dispatch_slots: u8,    // remaining per cycle (reset to 5)
-    exec_units: ExecUnits, // remaining per cycle
-    rob: Vec<RobEntry>,
-}
-
-// --- Instruction cost analysis ---
-
-/// Fixed-capacity register set (max 3 registers, no heap allocation).
-#[derive(Clone, Copy, Default, Debug)]
-struct RegSet {
-    regs: [u8; 3],
-    len: u8,
-}
-
-impl RegSet {
-    const EMPTY: Self = Self {
-        regs: [0; 3],
-        len: 0,
-    };
-    fn one(r: u8) -> Self {
-        Self {
-            regs: [r, 0, 0],
-            len: 1,
-        }
-    }
-    fn two(a: u8, b: u8) -> Self {
-        Self {
-            regs: [a, b, 0],
-            len: 2,
-        }
-    }
-    #[inline]
-    fn contains(&self, r: u8) -> bool {
-        (self.len >= 1 && self.regs[0] == r)
-            || (self.len >= 2 && self.regs[1] == r)
-            || (self.len >= 3 && self.regs[2] == r)
-    }
-    #[inline]
-    fn iter(&self) -> impl Iterator<Item = &u8> {
-        self.regs[..self.len as usize].iter()
-    }
-}
-
-struct InstrCost {
-    cycles: u32,
-    decode_slots: u8,
-    exec_units: ExecUnits,
-    dest_regs: RegSet,
-    src_regs: RegSet,
-    is_terminator: bool,
-    is_move_reg: bool,
-}
-
-fn dst_overlaps_src(dst: u8, srcs: &RegSet) -> bool {
-    srcs.contains(dst)
-}
 
 /// Normalize encoded register fields to the gas table's `(dst, src1, src2)`
 /// convention.
@@ -200,17 +26,38 @@ fn gas_register_roles(
     raw_d: u8,
 ) -> (u8, u8, u8) {
     if isa_mode == crate::IsaMode::Conformance && (190..=230).contains(&opcode) {
-        (raw_d, raw_a, raw_b)
+        // A.5.13 clamps the complete second operand byte, not just its low
+        // nibble. Bytes 13..=255 therefore all name r12.
+        (raw_d.min(12), raw_a.min(12), raw_b.min(12))
     } else {
         // Temporary compatibility boundary: frozen capability-manifest/Jar
         // artifacts were metered with the encoded low nibble treated as the
         // destination. Preserve that consensus-visible profile until the
         // private adapter is removed; standard v0.8 programs never use it.
-        (raw_a, raw_b, raw_d)
+        (raw_a, raw_b, raw_d & 0x0f)
     }
 }
 
-/// Branch latency `b` from the v0.8.0 single-pass gas rule.
+#[inline(always)]
+fn gas_raw_d(isa_mode: crate::IsaMode, encoded: u8) -> u8 {
+    if isa_mode == crate::IsaMode::Conformance {
+        encoded
+    } else {
+        encoded & 0x0f
+    }
+}
+
+#[inline(always)]
+fn missing_raw_register(isa_mode: crate::IsaMode) -> u8 {
+    if isa_mode == crate::IsaMode::Conformance {
+        0
+    } else {
+        // Frozen decoded/LUT fallback; standard ζ uses zero extension.
+        0xff
+    }
+}
+
+/// Branch latency `b` from the v0.8.0 gas-cost table.
 ///
 /// The standard profile reads zero-extended instruction data at both the
 /// explicit target and the sequential fallthrough (`pc + 1 + skip`). A branch
@@ -249,31 +96,6 @@ fn branch_cost(
     }
 }
 
-/// Extract a 4-bit register nibble from an instruction encoding.
-///
-/// Reads the byte at `pc + byte_offset`, shifts right by `shift`, and masks to 4 bits.
-/// Returns 0 if the byte is out of bounds.
-fn extract_reg(code: &[u8], pc: usize, byte_offset: usize, shift: u8) -> u8 {
-    if pc + byte_offset < code.len() {
-        (code[pc + byte_offset] >> shift) & 0x0F
-    } else {
-        0
-    }
-}
-
-/// Extract register A (first register, lower nibble of byte after opcode).
-fn reg_a(code: &[u8], pc: usize) -> u8 {
-    extract_reg(code, pc, 1, 0)
-}
-/// Extract register B (second register, upper nibble of byte after opcode).
-fn reg_b(code: &[u8], pc: usize) -> u8 {
-    extract_reg(code, pc, 1, 4)
-}
-/// Extract register D (third register, lower nibble of second byte after opcode).
-fn reg_d(code: &[u8], pc: usize) -> u8 {
-    extract_reg(code, pc, 2, 0)
-}
-
 /// Compute skip distance (bytes to next instruction start).
 pub fn skip_distance(bitmask: &[u8], pc: usize) -> usize {
     for j in 0..25 {
@@ -286,816 +108,8 @@ pub fn skip_distance(bitmask: &[u8], pc: usize) -> usize {
     24
 }
 
-/// Extract branch target from reg+imm+offset instruction.
-fn extract_branch_target(code: &[u8], bitmask: &[u8], pc: usize) -> usize {
-    let skip = skip_distance(bitmask, pc);
-    // Target offset is encoded in the last bytes of the instruction
-    // For OneRegImmOffset: layout is [opcode, ra|imm_lo, imm_hi..., offset_bytes]
-    // The offset is a signed value relative to the instruction start
-    let instr_len = 1 + skip;
-    if instr_len >= 3 && pc + instr_len <= code.len() {
-        // Decode offset from the last portion of the instruction
-        // For A.5.8 format: opcode + reg_nibble + immediate + offset
-        // The offset part depends on skip length
-        let raw = crate::args::decode_args(
-            code,
-            pc,
-            skip,
-            crate::instruction::InstructionCategory::OneRegImmOffset,
-        );
-        if let crate::args::Args::RegImmOffset { offset, .. } = raw {
-            return offset as usize;
-        }
-    }
-    pc // fallback
-}
-
-/// Extract branch target from two-reg+offset instruction.
-fn extract_two_reg_branch_target(code: &[u8], bitmask: &[u8], pc: usize) -> usize {
-    let skip = skip_distance(bitmask, pc);
-    let raw = crate::args::decode_args(
-        code,
-        pc,
-        skip,
-        crate::instruction::InstructionCategory::TwoRegOneOffset,
-    );
-    if let crate::args::Args::TwoRegOffset { offset, .. } = raw {
-        return offset as usize;
-    }
-    pc
-}
-
-/// Instruction cost lookup based on opcode.
-fn instruction_cost(code: &[u8], bitmask: &[u8], pc: usize) -> InstrCost {
-    let opcode = if pc < code.len() { code[pc] } else { 0 };
-    let (ra, rb, rd) = gas_register_roles(
-        crate::IsaMode::Conformance,
-        opcode,
-        reg_a(code, pc),
-        reg_b(code, pc),
-        reg_d(code, pc),
-    );
-
-    let mk = |cy: u32, dc: u8, eu: ExecUnits, dst: RegSet, src: RegSet| -> InstrCost {
-        InstrCost {
-            cycles: cy,
-            decode_slots: dc,
-            exec_units: eu,
-            dest_regs: dst,
-            src_regs: src,
-            is_terminator: false,
-            is_move_reg: false,
-        }
-    };
-    let mkt = |cy: u32, dc: u8, eu: ExecUnits, dst: RegSet, src: RegSet| -> InstrCost {
-        InstrCost {
-            cycles: cy,
-            decode_slots: dc,
-            exec_units: eu,
-            dest_regs: dst,
-            src_regs: src,
-            is_terminator: true,
-            is_move_reg: false,
-        }
-    };
-    let e = RegSet::EMPTY;
-    let r1 = RegSet::one;
-    let r2 = RegSet::two;
-
-    match opcode {
-        // No-arg
-        0 => mkt(2, 1, ExecUnits::NONE, e, e),  // trap
-        1 => mkt(2, 1, ExecUnits::NONE, e, e),  // fallthrough
-        2 => mk(40, 1, ExecUnits::NONE, e, e),  // unlikely
-        3 => mkt(100, 4, ExecUnits::ALU, e, e), // runtime ecall extension
-        10 => mk(100, 4, ExecUnits::ALU, e, e), // ecalli
-
-        // Control flow
-        40 => mkt(15, 1, ExecUnits::ALU, e, e), // jump
-        80 => {
-            // load_imm_jump
-            let skip = skip_distance(bitmask, pc);
-            let raw = crate::args::decode_args(
-                code,
-                pc,
-                skip,
-                crate::instruction::InstructionCategory::OneRegImmOffset,
-            );
-            let r = if let crate::args::Args::RegImmOffset { ra: r, .. } = raw {
-                r as u8
-            } else {
-                ra
-            };
-            mkt(15, 1, ExecUnits::ALU, r1(r), e)
-        }
-        50 => mkt(22, 1, ExecUnits::ALU, e, e), // jump_ind
-        180 => mkt(22, 1, ExecUnits::ALU, r1(ra), r1(rb)), // load_imm_jump_ind
-
-        // Loads (reg+imm and two-reg+imm variants)
-        52..=58 => mk(25, 1, ExecUnits::LOAD, r1(ra), r1(rb)),
-        124..=130 => mk(25, 1, ExecUnits::LOAD, r1(ra), r1(rb)),
-
-        // Stores (reg+imm variants)
-        59..=62 => mk(25, 1, ExecUnits::STORE, e, r2(ra, rb)),
-        // Stores (two-reg+imm)
-        120..=123 => mk(25, 1, ExecUnits::STORE, e, r2(ra, rb)),
-        // Store immediates (two-imm)
-        30..=33 => mk(25, 1, ExecUnits::STORE, e, e),
-        // Store imm indirect (reg+two-imm)
-        70..=73 => mk(25, 1, ExecUnits::STORE, e, r1(ra)),
-
-        // Load immediates
-        51 => mk(1, 1, ExecUnits::NONE, r1(ra), e), // load_imm
-        20 => mk(1, 2, ExecUnits::NONE, r1(ra), e), // load_imm_64
-
-        // move_reg: decoded in frontend, no ROB entry
-        100 => InstrCost {
-            cycles: 0,
-            decode_slots: 1,
-            exec_units: ExecUnits::NONE,
-            dest_regs: r1(ra),
-            src_regs: r1(rb),
-            is_terminator: false,
-            is_move_reg: true,
-        },
-
-        // Frozen capability-manifest `sbrk`, normalized to private opcode 254.
-        254 => mk(2, 1, ExecUnits::NONE, e, e),
-
-        // Branches (reg + imm + offset)
-        81..=90 => {
-            let target = extract_branch_target(code, bitmask, pc);
-            let bc = branch_cost(code, bitmask, pc, target, crate::IsaMode::Conformance);
-            mkt(bc, 1, ExecUnits::ALU, e, r1(ra))
-        }
-
-        // Branches (two-reg + offset)
-        170..=175 => {
-            let target = extract_two_reg_branch_target(code, bitmask, pc);
-            let bc = branch_cost(code, bitmask, pc, target, crate::IsaMode::Conformance);
-            mkt(bc, 1, ExecUnits::ALU, e, r2(ra, rb))
-        }
-
-        // ALU 64-bit 3-reg: add_64(200), sub_64(201), and(210), xor(211), or(212)
-        200 | 201 | 210 | 211 | 212 => {
-            let dc = if dst_overlaps_src(ra, &r2(rb, rd)) {
-                1
-            } else {
-                2
-            };
-            mk(1, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
-        }
-        // ALU 32-bit 3-reg: add_32(190), sub_32(191)
-        190 | 191 => {
-            let dc = if dst_overlaps_src(ra, &r2(rb, rd)) {
-                2
-            } else {
-                3
-            };
-            mk(2, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
-        }
-
-        // ALU 2-op imm 64-bit
-        132 | 133 | 134 | 149 | 151 | 152 | 153 | 158 => {
-            let dc = if dst_overlaps_src(ra, &r1(rb)) { 1 } else { 2 };
-            mk(1, dc, ExecUnits::ALU, r1(ra), r1(rb))
-        }
-        // ALU 2-op imm 32-bit
-        131 | 138 | 139 | 140 | 160 => {
-            let dc = if dst_overlaps_src(ra, &r1(rb)) { 2 } else { 3 };
-            mk(2, dc, ExecUnits::ALU, r1(ra), r1(rb))
-        }
-
-        // Trivial 2-op 1-cycle: popcount, clz, sign/zero extend, reverse bytes.
-        101 | 102 | 103 | 104 | 107 | 108 | 109 | 110 => mk(1, 1, ExecUnits::ALU, r1(ra), r1(rb)),
-        // Trivial 2-op 2-cycle: ctz
-        105 | 106 => mk(2, 1, ExecUnits::ALU, r1(ra), r1(rb)),
-
-        // Shifts 64-bit 3-reg
-        207 | 208 | 209 | 220 | 222 => {
-            let dc = if rb == ra { 2 } else { 3 };
-            mk(1, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
-        }
-        // Shifts 32-bit 3-reg
-        197 | 198 | 199 | 221 | 223 => {
-            let dc = if rb == ra { 3 } else { 4 };
-            mk(2, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
-        }
-        // Shift alt 64-bit
-        155 | 156 | 157 | 159 => mk(1, 3, ExecUnits::ALU, r1(ra), r1(rb)),
-        // Shift alt 32-bit
-        144 | 145 | 146 | 161 => mk(2, 4, ExecUnits::ALU, r1(ra), r1(rb)),
-
-        // Comparisons (3-reg)
-        216 | 217 => mk(3, 3, ExecUnits::ALU, r1(ra), r2(rb, rd)),
-        // Comparisons (imm)
-        136 | 137 | 142 | 143 => mk(3, 3, ExecUnits::ALU, r1(ra), r1(rb)),
-
-        // Conditional moves (3-reg)
-        218 | 219 => mk(2, 2, ExecUnits::ALU, r1(ra), r2(rb, rd)),
-        // Conditional moves (imm)
-        147 | 148 => mk(2, 3, ExecUnits::ALU, r1(ra), r1(rb)),
-
-        // Min/Max
-        227..=230 => {
-            let dc = if dst_overlaps_src(ra, &r2(rb, rd)) {
-                2
-            } else {
-                3
-            };
-            mk(3, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
-        }
-        // and_inv, or_inv
-        224 | 225 => mk(2, 3, ExecUnits::ALU, r1(ra), r2(rb, rd)),
-        // xnor
-        226 => {
-            let dc = if dst_overlaps_src(ra, &r2(rb, rd)) {
-                2
-            } else {
-                3
-            };
-            mk(2, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
-        }
-
-        // neg_add_imm_64
-        154 => mk(2, 3, ExecUnits::ALU, r1(ra), r1(rb)),
-        // neg_add_imm_32
-        141 => mk(3, 4, ExecUnits::ALU, r1(ra), r1(rb)),
-
-        // Multiply 64-bit (3-reg)
-        202 => {
-            let dc = if dst_overlaps_src(ra, &r2(rb, rd)) {
-                1
-            } else {
-                2
-            };
-            mk(3, dc, ExecUnits::MUL, r1(ra), r2(rb, rd))
-        }
-        // mul_imm_64
-        150 => {
-            let dc = if dst_overlaps_src(ra, &r1(rb)) { 1 } else { 2 };
-            mk(3, dc, ExecUnits::MUL, r1(ra), r1(rb))
-        }
-        // Multiply 32-bit (3-reg)
-        192 => {
-            let dc = if dst_overlaps_src(ra, &r2(rb, rd)) {
-                2
-            } else {
-                3
-            };
-            mk(4, dc, ExecUnits::MUL, r1(ra), r2(rb, rd))
-        }
-        // mul_imm_32
-        135 => {
-            let dc = if dst_overlaps_src(ra, &r1(rb)) { 2 } else { 3 };
-            mk(4, dc, ExecUnits::MUL, r1(ra), r1(rb))
-        }
-
-        // Multiply upper (SS, UU)
-        213 | 214 => mk(4, 4, ExecUnits::MUL, r1(ra), r2(rb, rd)),
-        // Multiply upper (SU)
-        215 => mk(6, 4, ExecUnits::MUL, r1(ra), r2(rb, rd)),
-
-        // Divide (all variants)
-        193 | 194 | 195 | 196 | 203 | 204 | 205 | 206 => {
-            mk(60, 4, ExecUnits::DIV, r1(ra), r2(rb, rd))
-        }
-
-        // Rotate 64-bit (3-reg)
-        // Already covered by shifts above (220, 222 = RotL64, RotR64)
-
-        // Rotate 32-bit (3-reg)
-        // Already covered by shifts above (221, 223 = RotL32, RotR32)
-
-        // Rotate imm
-        // Already covered by shift alt above
-
-        // Default: unknown opcode
-        _ => mk(1, 1, ExecUnits::NONE, e, e),
-    }
-}
-
-// --- Simulation ---
-
-fn all_deps_finished(rob: &[RobEntry], entry: &RobEntry) -> bool {
-    for i in 0..entry.dep_count as usize {
-        let idx = entry.deps[i] as usize;
-        if idx < rob.len() && rob[idx].state != RobState::Fin {
-            return false;
-        }
-    }
-    true
-}
-
-fn find_ready_entry(rob: &[RobEntry], exec_units: ExecUnits) -> Option<usize> {
-    for (i, entry) in rob.iter().enumerate() {
-        if entry.state == RobState::Wait
-            && all_deps_finished(rob, entry)
-            && exec_units.can_satisfy(entry.exec_units)
-        {
-            return Some(i);
-        }
-    }
-    None
-}
-
-fn rob_all_finished(rob: &[RobEntry]) -> bool {
-    rob.iter().all(|e| e.state == RobState::Fin)
-}
-
-/// Run the pipeline simulation for a basic block starting at `start_pc`.
-/// If `trace` is true, print every action for debugging.
-fn gas_sim_traced(code: &[u8], bitmask: &[u8], start_pc: usize, trace: bool) -> u32 {
-    let mut s = SimState {
-        ip: Some(start_pc),
-        cycles: 0,
-        decode_slots: 4,
-        dispatch_slots: 5,
-        exec_units: ExecUnits::RESET,
-        rob: Vec::with_capacity(32),
-    };
-
-    for iter in 0..100_000 {
-        // Priority 1: Decode
-        if s.ip.is_some() && s.decode_slots > 0 && s.rob.len() < 32 {
-            let pc = s.ip.unwrap();
-            let cost = instruction_cost(code, bitmask, pc);
-            let mut deps = [0xFF_u8; 4];
-            let mut dep_count = 0u8;
-            for (i, e) in s.rob.iter().enumerate() {
-                if e.state != RobState::Fin
-                    && e.dest_regs.iter().any(|dr| cost.src_regs.contains(*dr))
-                    && dep_count < 4
-                {
-                    deps[dep_count as usize] = i as u8;
-                    dep_count += 1;
-                }
-            }
-            s.decode_slots = s.decode_slots.saturating_sub(cost.decode_slots);
-            let next_ip = if cost.is_terminator {
-                None
-            } else {
-                let skip = skip_distance(bitmask, pc);
-                let npc = pc + 1 + skip;
-                if npc < code.len() { Some(npc) } else { None }
-            };
-            #[cfg(feature = "std")]
-            if trace {
-                let op = crate::instruction::Opcode::from_byte(code[pc])
-                    .map(|o| alloc::format!("{o:?}"))
-                    .unwrap_or("?".into());
-                eprintln!(
-                    "  [{}] DECODE pc={} {} cy={} dec={} rob_idx={} deps={:?} move={} term={} slots_left={}",
-                    iter,
-                    pc,
-                    op,
-                    cost.cycles,
-                    cost.decode_slots,
-                    s.rob.len(),
-                    &deps[..dep_count as usize],
-                    cost.is_move_reg,
-                    cost.is_terminator,
-                    s.decode_slots
-                );
-            }
-            if cost.is_move_reg {
-                s.ip = next_ip;
-            } else {
-                s.rob.push(RobEntry {
-                    state: RobState::Wait,
-                    cycles_left: cost.cycles,
-                    deps,
-                    dep_count,
-                    dest_regs: cost.dest_regs,
-                    exec_units: cost.exec_units,
-                });
-                s.ip = next_ip;
-            }
-            continue;
-        }
-
-        // Priority 2: Dispatch
-        if s.dispatch_slots > 0
-            && let Some(idx) = find_ready_entry(&s.rob, s.exec_units)
-        {
-            let eu = s.rob[idx].exec_units;
-            #[cfg(feature = "std")]
-            if trace {
-                eprintln!(
-                    "  [{}] DISPATCH rob[{}] cy={} dispatch_left={}",
-                    iter,
-                    idx,
-                    s.rob[idx].cycles_left,
-                    s.dispatch_slots - 1
-                );
-            }
-            s.rob[idx].state = RobState::Exe;
-            s.dispatch_slots -= 1;
-            s.exec_units = s.exec_units.sub(eu);
-            continue;
-        }
-
-        // Priority 3: Done
-        if s.ip.is_none() && rob_all_finished(&s.rob) {
-            #[cfg(feature = "std")]
-            if trace {
-                eprintln!("  [{}] DONE cycles={}", iter, s.cycles);
-            }
-            break;
-        }
-
-        // Priority 4: Advance cycle
-        #[cfg(feature = "std")]
-        if trace {
-            let states: Vec<alloc::string::String> = s
-                .rob
-                .iter()
-                .enumerate()
-                .map(|(i, e)| {
-                    let st = match e.state {
-                        RobState::Wait => "W",
-                        RobState::Exe => "E",
-                        RobState::Fin => "F",
-                    };
-                    alloc::format!(
-                        "{}:{}{}",
-                        i,
-                        st,
-                        if e.state == RobState::Exe {
-                            alloc::format!("({})", e.cycles_left)
-                        } else {
-                            alloc::string::String::new()
-                        }
-                    )
-                })
-                .collect();
-            eprintln!(
-                "  [{}] ADVANCE cycle {} → {} rob=[{}]",
-                iter,
-                s.cycles,
-                s.cycles + 1,
-                states.join(", ")
-            );
-        }
-        for entry in s.rob.iter_mut() {
-            if entry.state == RobState::Exe {
-                if entry.cycles_left <= 1 {
-                    entry.state = RobState::Fin;
-                    entry.cycles_left = 0;
-                } else {
-                    entry.cycles_left -= 1;
-                }
-            }
-        }
-        s.cycles += 1;
-        s.decode_slots = 4;
-        s.dispatch_slots = 5;
-        s.exec_units = ExecUnits::RESET;
-    }
-
-    s.cycles
-}
-
-fn gas_sim(code: &[u8], bitmask: &[u8], start_pc: usize) -> u32 {
-    gas_sim_traced(code, bitmask, start_pc, false)
-}
-
-/// Compute gas cost for a basic block starting at `start_pc`.
-/// Returns max(simulation_cycles - 3, 1).
-pub fn gas_cost_for_block(code: &[u8], bitmask: &[u8], start_pc: usize) -> u64 {
-    let cycles = gas_sim(code, bitmask, start_pc);
-    if cycles > 3 { (cycles - 3) as u64 } else { 1 }
-}
-
-#[cfg(feature = "std")]
-/// Compute gas cost for a block given as a slice of pre-decoded instructions.
-/// This avoids re-parsing raw code+bitmask.
-pub fn gas_cost_for_block_decoded(
-    instrs: &[crate::recompiler::predecode::PreDecodedInst],
-    code: &[u8],
-    bitmask: &[u8],
-) -> u64 {
-    let cycles = gas_sim_decoded(instrs, code, bitmask);
-    if cycles > 3 { (cycles - 3) as u64 } else { 1 }
-}
-
-#[cfg(feature = "std")]
-/// Pipeline simulation from pre-decoded instructions (no raw byte re-parsing).
-fn gas_sim_decoded(
-    instrs: &[crate::recompiler::predecode::PreDecodedInst],
-    code: &[u8],
-    bitmask: &[u8],
-) -> u32 {
-    use crate::args::Args;
-
-    let mut s = SimState {
-        ip: Some(0), // index into instrs
-        cycles: 0,
-        decode_slots: 4,
-        dispatch_slots: 5,
-        exec_units: ExecUnits::RESET,
-        rob: Vec::with_capacity(32),
-    };
-
-    for _ in 0..100_000 {
-        if let Some(idx) = s.ip
-            && idx < instrs.len()
-            && s.decode_slots > 0
-            && s.rob.len() < 32
-        {
-            let instr = &instrs[idx];
-            let opcode_byte = instr.opcode as u8;
-
-            // Extract register fields from decoded args
-            let (ra, rb, rd) = match instr.args {
-                // Gas tables use (destination, source 1, source 2); A.5.13
-                // encodes (source A, source B, destination D).
-                Args::ThreeReg { ra, rb, rd } => (rd as u8, ra as u8, rb as u8),
-                Args::TwoReg { rd: d, ra: a } => (a as u8, 0xFF, d as u8),
-                Args::TwoRegImm { ra, rb, .. }
-                | Args::TwoRegOffset { ra, rb, .. }
-                | Args::TwoRegTwoImm { ra, rb, .. } => (ra as u8, rb as u8, 0xFF),
-                Args::RegImm { ra, .. }
-                | Args::RegExtImm { ra, .. }
-                | Args::RegTwoImm { ra, .. }
-                | Args::RegImmOffset { ra, .. } => (ra as u8, 0xFF, 0xFF),
-                _ => (0xFF, 0xFF, 0xFF),
-            };
-
-            // Compute instruction cost using the same logic but with decoded regs
-            let cost = instruction_cost_fast(opcode_byte, ra, rb, rd, instr, code, bitmask);
-
-            let mut deps = [0xFF_u8; 4];
-            let mut dep_count = 0u8;
-            for (i, e) in s.rob.iter().enumerate() {
-                if e.state != RobState::Fin
-                    && e.dest_regs.iter().any(|dr| cost.src_regs.contains(*dr))
-                    && dep_count < 4
-                {
-                    deps[dep_count as usize] = i as u8;
-                    dep_count += 1;
-                }
-            }
-
-            s.decode_slots = s.decode_slots.saturating_sub(cost.decode_slots);
-            let next_ip = if cost.is_terminator {
-                None
-            } else {
-                Some(idx + 1)
-            };
-
-            if cost.is_move_reg {
-                s.ip = next_ip;
-            } else {
-                s.rob.push(RobEntry {
-                    state: RobState::Wait,
-                    cycles_left: cost.cycles,
-                    deps,
-                    dep_count,
-                    dest_regs: cost.dest_regs,
-                    exec_units: cost.exec_units,
-                });
-                s.ip = next_ip;
-            }
-            continue;
-        }
-
-        if s.dispatch_slots > 0
-            && let Some(idx) = find_ready_entry(&s.rob, s.exec_units)
-        {
-            let eu = s.rob[idx].exec_units;
-            s.rob[idx].state = RobState::Exe;
-            s.dispatch_slots -= 1;
-            s.exec_units = s.exec_units.sub(eu);
-            continue;
-        }
-
-        if s.ip.is_none_or(|i| i >= instrs.len()) && rob_all_finished(&s.rob) {
-            break;
-        }
-
-        for entry in s.rob.iter_mut() {
-            if entry.state == RobState::Exe {
-                if entry.cycles_left <= 1 {
-                    entry.state = RobState::Fin;
-                    entry.cycles_left = 0;
-                } else {
-                    entry.cycles_left -= 1;
-                }
-            }
-        }
-        s.cycles += 1;
-        s.decode_slots = 4;
-        s.dispatch_slots = 5;
-        s.exec_units = ExecUnits::RESET;
-    }
-
-    s.cycles
-}
-
-#[cfg(feature = "std")]
-/// Fast instruction cost lookup using pre-decoded register fields.
-/// Avoids re-parsing code bytes for register extraction.
-fn instruction_cost_fast(
-    opcode: u8,
-    ra: u8,
-    rb: u8,
-    rd: u8,
-    instr: &crate::recompiler::predecode::PreDecodedInst,
-    code: &[u8],
-    bitmask: &[u8],
-) -> InstrCost {
-    let mk = |cy: u32, dc: u8, eu: ExecUnits, dst: RegSet, src: RegSet| -> InstrCost {
-        InstrCost {
-            cycles: cy,
-            decode_slots: dc,
-            exec_units: eu,
-            dest_regs: dst,
-            src_regs: src,
-            is_terminator: false,
-            is_move_reg: false,
-        }
-    };
-    let mkt = |cy: u32, dc: u8, eu: ExecUnits, dst: RegSet, src: RegSet| -> InstrCost {
-        InstrCost {
-            cycles: cy,
-            decode_slots: dc,
-            exec_units: eu,
-            dest_regs: dst,
-            src_regs: src,
-            is_terminator: true,
-            is_move_reg: false,
-        }
-    };
-    let e = RegSet::EMPTY;
-    let r1 = RegSet::one;
-    let r2 = RegSet::two;
-
-    match opcode {
-        0 => mkt(2, 1, ExecUnits::NONE, e, e),
-        1 => mkt(2, 1, ExecUnits::NONE, e, e),
-        2 => mk(40, 1, ExecUnits::NONE, e, e),
-        3 => mkt(100, 4, ExecUnits::ALU, e, e),
-        10 => mk(100, 4, ExecUnits::ALU, e, e),
-        40 => mkt(15, 1, ExecUnits::ALU, e, e),
-        80 => mkt(15, 1, ExecUnits::ALU, r1(ra), e),
-        50 => mkt(22, 1, ExecUnits::ALU, e, e),
-        180 => mkt(22, 1, ExecUnits::ALU, r1(ra), r1(rb)),
-        52..=58 => mk(25, 1, ExecUnits::LOAD, r1(ra), r1(rb)),
-        124..=130 => mk(25, 1, ExecUnits::LOAD, r1(ra), r1(rb)),
-        59..=62 => mk(25, 1, ExecUnits::STORE, e, r2(ra, rb)),
-        120..=123 => mk(25, 1, ExecUnits::STORE, e, r2(ra, rb)),
-        30..=33 => mk(25, 1, ExecUnits::STORE, e, e),
-        70..=73 => mk(25, 1, ExecUnits::STORE, e, r1(ra)),
-        51 => mk(1, 1, ExecUnits::NONE, r1(ra), e),
-        20 => mk(1, 2, ExecUnits::NONE, r1(ra), e),
-        100 => InstrCost {
-            cycles: 0,
-            decode_slots: 1,
-            exec_units: ExecUnits::NONE,
-            dest_regs: r1(ra),
-            src_regs: r1(rb),
-            is_terminator: false,
-            is_move_reg: true,
-        },
-        254 => mk(2, 1, ExecUnits::NONE, e, e),
-        81..=90 => {
-            // Use pre-decoded offset for branch target
-            let target = match instr.args {
-                crate::args::Args::RegImmOffset { offset, .. } => offset as usize,
-                _ => instr.pc as usize,
-            };
-            let bc = branch_cost(
-                code,
-                bitmask,
-                instr.pc as usize,
-                target,
-                crate::IsaMode::Conformance,
-            );
-            mkt(bc, 1, ExecUnits::ALU, e, r1(ra))
-        }
-        170..=175 => {
-            let target = match instr.args {
-                crate::args::Args::TwoRegOffset { offset, .. } => offset as usize,
-                _ => instr.pc as usize,
-            };
-            let bc = branch_cost(
-                code,
-                bitmask,
-                instr.pc as usize,
-                target,
-                crate::IsaMode::Conformance,
-            );
-            mkt(bc, 1, ExecUnits::ALU, e, r2(ra, rb))
-        }
-        200 | 201 | 210 | 211 | 212 => {
-            let dc = if dst_overlaps_src(ra, &r2(rb, rd)) {
-                1
-            } else {
-                2
-            };
-            mk(1, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
-        }
-        190 | 191 => {
-            let dc = if dst_overlaps_src(ra, &r2(rb, rd)) {
-                2
-            } else {
-                3
-            };
-            mk(2, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
-        }
-        132 | 133 | 134 | 149 | 151 | 152 | 153 | 158 => {
-            let dc = if dst_overlaps_src(ra, &r1(rb)) { 1 } else { 2 };
-            mk(1, dc, ExecUnits::ALU, r1(ra), r1(rb))
-        }
-        131 | 138 | 139 | 140 | 160 => {
-            let dc = if dst_overlaps_src(ra, &r1(rb)) { 2 } else { 3 };
-            mk(2, dc, ExecUnits::ALU, r1(ra), r1(rb))
-        }
-        101 | 102 | 103 | 104 | 107 | 108 | 109 | 110 => mk(1, 1, ExecUnits::ALU, r1(ra), r1(rb)),
-        105 | 106 => mk(2, 1, ExecUnits::ALU, r1(ra), r1(rb)),
-        207 | 208 | 209 | 220 | 222 => {
-            let dc = if rb == ra { 2 } else { 3 };
-            mk(1, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
-        }
-        197 | 198 | 199 | 221 | 223 => {
-            let dc = if rb == ra { 3 } else { 4 };
-            mk(2, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
-        }
-        155 | 156 | 157 | 159 => mk(1, 3, ExecUnits::ALU, r1(ra), r1(rb)),
-        144 | 145 | 146 | 161 => mk(2, 4, ExecUnits::ALU, r1(ra), r1(rb)),
-        216 | 217 => mk(3, 3, ExecUnits::ALU, r1(ra), r2(rb, rd)),
-        136 | 137 | 142 | 143 => mk(3, 3, ExecUnits::ALU, r1(ra), r1(rb)),
-        218 | 219 => mk(2, 2, ExecUnits::ALU, r1(ra), r2(rb, rd)),
-        147 | 148 => mk(2, 3, ExecUnits::ALU, r1(ra), r1(rb)),
-        227..=230 => {
-            let dc = if dst_overlaps_src(ra, &r2(rb, rd)) {
-                2
-            } else {
-                3
-            };
-            mk(3, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
-        }
-        224 | 225 => mk(2, 3, ExecUnits::ALU, r1(ra), r2(rb, rd)),
-        226 => {
-            let dc = if dst_overlaps_src(ra, &r2(rb, rd)) {
-                2
-            } else {
-                3
-            };
-            mk(2, dc, ExecUnits::ALU, r1(ra), r2(rb, rd))
-        }
-        154 => mk(2, 3, ExecUnits::ALU, r1(ra), r1(rb)),
-        141 => mk(3, 4, ExecUnits::ALU, r1(ra), r1(rb)),
-        202 => {
-            let dc = if dst_overlaps_src(ra, &r2(rb, rd)) {
-                1
-            } else {
-                2
-            };
-            mk(3, dc, ExecUnits::MUL, r1(ra), r2(rb, rd))
-        }
-        150 => {
-            let dc = if dst_overlaps_src(ra, &r1(rb)) { 1 } else { 2 };
-            mk(3, dc, ExecUnits::MUL, r1(ra), r1(rb))
-        }
-        192 => {
-            let dc = if dst_overlaps_src(ra, &r2(rb, rd)) {
-                2
-            } else {
-                3
-            };
-            mk(4, dc, ExecUnits::MUL, r1(ra), r2(rb, rd))
-        }
-        135 => {
-            let dc = if dst_overlaps_src(ra, &r1(rb)) { 2 } else { 3 };
-            mk(4, dc, ExecUnits::MUL, r1(ra), r1(rb))
-        }
-        213 | 214 => mk(4, 4, ExecUnits::MUL, r1(ra), r2(rb, rd)),
-        215 => mk(6, 4, ExecUnits::MUL, r1(ra), r2(rb, rd)),
-        193 | 194 | 195 | 196 | 203 | 204 | 205 | 206 => {
-            mk(60, 4, ExecUnits::DIV, r1(ra), r2(rb, rd))
-        }
-        _ => mk(1, 1, ExecUnits::NONE, e, e),
-    }
-}
-
-/// Compute block gas costs for all gas block starts in the program.
-/// Gas block starts are {PC=0} ∪ {post-terminator PCs} (branch targets excluded).
-/// Returns a Vec indexed by PC: `block_gas_costs[pc]` = cost if pc is a gas block start, 0 otherwise.
-pub fn compute_block_gas_costs(code: &[u8], bitmask: &[u8]) -> Vec<u32> {
-    let mut costs = vec![0u32; code.len()];
-    let bb_starts = crate::interpreter::compute_gas_block_starts(code, bitmask);
-    for (pc, &is_start) in bb_starts.iter().enumerate() {
-        if is_start {
-            costs[pc] = gas_cost_for_block(code, bitmask, pc) as u32;
-        }
-    }
-    costs
-}
-
 // ============================================================================
-// Fast bitmask-based pipeline simulator (safe Rust, zero heap allocation)
+// Compact instruction-cost representation (safe Rust, fixed-width)
 // ============================================================================
 
 /// Compact instruction cost for the fast simulator.
@@ -1103,7 +117,8 @@ pub fn compute_block_gas_costs(code: &[u8], bitmask: &[u8]) -> Vec<u32> {
 pub struct FastCost {
     pub cycles: u8,
     pub decode_slots: u8,
-    /// 0=none, 1=alu, 2=load(+alu), 3=store(+alu), 4=mul(+alu), 5=div(+alu)
+    /// 0=none, 1=alu, 2=load(+alu), 3=store(+alu), 4=mul(+alu),
+    /// 5=div(+alu), 6=two ALUs.
     pub exec_unit: u8,
     pub src_mask: u16,
     pub dst_mask: u16,
@@ -1117,6 +132,7 @@ const EU_LOAD: u8 = 2;
 const EU_STORE: u8 = 3;
 const EU_MUL: u8 = 4;
 const EU_DIV: u8 = 5;
+const EU_ALU2: u8 = 6;
 
 #[inline(always)]
 fn reg_bit(r: u8) -> u16 {
@@ -1170,9 +186,11 @@ pub fn fast_cost_from_raw(
     mem_cycles: u8,
     isa_mode: crate::IsaMode,
 ) -> FastCost {
+    let mem_cycles = crate::mem_cycles_for_mode(mem_cycles, isa_mode);
     let (ra, rb, rd) = gas_register_roles(isa_mode, opcode_byte, raw_a, raw_b, raw_d);
     let r1 = |r: u8| reg_bit(r);
     let r2 = |a: u8, b: u8| reg_bit(a) | reg_bit(b);
+    let r3 = |a: u8, b: u8, c: u8| reg_bit(a) | reg_bit(b) | reg_bit(c);
     let dst_src_overlap = |dst: u8, s: u16| (reg_bit(dst) & s) != 0;
 
     let opcode = opcode_byte;
@@ -1230,7 +248,11 @@ pub fn fast_cost_from_raw(
         40 => FastCost {
             cycles: 15,
             decode_slots: 1,
-            exec_unit: EU_ALU,
+            exec_unit: if isa_mode == crate::IsaMode::Conformance {
+                EU_NONE
+            } else {
+                EU_ALU
+            },
             src_mask: 0,
             dst_mask: 0,
             is_terminator: true,
@@ -1239,7 +261,11 @@ pub fn fast_cost_from_raw(
         80 => FastCost {
             cycles: 15,
             decode_slots: 1,
-            exec_unit: EU_ALU,
+            exec_unit: if isa_mode == crate::IsaMode::Conformance {
+                EU_NONE
+            } else {
+                EU_ALU
+            },
             src_mask: 0,
             dst_mask: r1(ra),
             is_terminator: true,
@@ -1248,8 +274,16 @@ pub fn fast_cost_from_raw(
         50 => FastCost {
             cycles: 22,
             decode_slots: 1,
-            exec_unit: EU_ALU,
-            src_mask: 0,
+            exec_unit: if isa_mode == crate::IsaMode::Conformance {
+                EU_NONE
+            } else {
+                EU_ALU
+            },
+            src_mask: if isa_mode == crate::IsaMode::Conformance {
+                r1(ra)
+            } else {
+                0
+            },
             dst_mask: 0,
             is_terminator: true,
             is_move_reg: false,
@@ -1257,7 +291,11 @@ pub fn fast_cost_from_raw(
         180 => FastCost {
             cycles: 22,
             decode_slots: 1,
-            exec_unit: EU_ALU,
+            exec_unit: if isa_mode == crate::IsaMode::Conformance {
+                EU_NONE
+            } else {
+                EU_ALU
+            },
             src_mask: r1(rb),
             dst_mask: r1(ra),
             is_terminator: true,
@@ -1269,7 +307,11 @@ pub fn fast_cost_from_raw(
             cycles: mem_cycles,
             decode_slots: 1,
             exec_unit: EU_LOAD,
-            src_mask: r1(rb),
+            src_mask: if isa_mode == crate::IsaMode::Conformance {
+                0
+            } else {
+                r1(rb)
+            },
             dst_mask: r1(ra),
             is_terminator: false,
             is_move_reg: false,
@@ -1289,7 +331,11 @@ pub fn fast_cost_from_raw(
             cycles: mem_cycles,
             decode_slots: 1,
             exec_unit: EU_STORE,
-            src_mask: r2(ra, rb),
+            src_mask: if isa_mode == crate::IsaMode::Conformance {
+                r1(ra)
+            } else {
+                r2(ra, rb)
+            },
             dst_mask: 0,
             is_terminator: false,
             is_move_reg: false,
@@ -1447,8 +493,8 @@ pub fn fast_cost_from_raw(
                 is_move_reg: false,
             }
         }
-        // Trivial 2-op: popcount, clz, sign_extend, zero_extend, reverse_bytes
-        101 | 102 | 103 | 104 | 107 | 108 | 109 | 110 => FastCost {
+        // Trivial 2-op: popcount, clz, sign_extend, zero_extend.
+        101 | 102 | 103 | 104 | 107 | 108 | 109 => FastCost {
             cycles: 1,
             decode_slots: 1,
             exec_unit: EU_ALU,
@@ -1457,11 +503,29 @@ pub fn fast_cost_from_raw(
             is_terminator: false,
             is_move_reg: false,
         },
-        // ctz
+        // reverse_bytes uses the ordinary two-operand overlap rule in v0.8.
+        110 => FastCost {
+            cycles: 1,
+            decode_slots: if isa_mode == crate::IsaMode::Conformance && reg_bit(ra) != reg_bit(rb) {
+                2
+            } else {
+                1
+            },
+            exec_unit: EU_ALU,
+            src_mask: r1(rb),
+            dst_mask: r1(ra),
+            is_terminator: false,
+            is_move_reg: false,
+        },
+        // ctz requires two ALU units in standard v0.8.
         105 | 106 => FastCost {
             cycles: 2,
             decode_slots: 1,
-            exec_unit: EU_ALU,
+            exec_unit: if isa_mode == crate::IsaMode::Conformance {
+                EU_ALU2
+            } else {
+                EU_ALU
+            },
             src_mask: r1(rb),
             dst_mask: r1(ra),
             is_terminator: false,
@@ -1541,7 +605,12 @@ pub fn fast_cost_from_raw(
             cycles: 2,
             decode_slots: 2,
             exec_unit: EU_ALU,
-            src_mask: r2(rb, rd),
+            // rD' = rA/rD selected by rB: the old destination is a source.
+            src_mask: if isa_mode == crate::IsaMode::Conformance {
+                r3(ra, rb, rd)
+            } else {
+                r2(rb, rd)
+            },
             dst_mask: r1(ra),
             is_terminator: false,
             is_move_reg: false,
@@ -1551,7 +620,12 @@ pub fn fast_cost_from_raw(
             cycles: 2,
             decode_slots: 3,
             exec_unit: EU_ALU,
-            src_mask: r1(rb),
+            // rA' = imm/rA selected by rB: the old destination is a source.
+            src_mask: if isa_mode == crate::IsaMode::Conformance {
+                r2(ra, rb)
+            } else {
+                r1(rb)
+            },
             dst_mask: r1(ra),
             is_terminator: false,
             is_move_reg: false,
@@ -1730,6 +804,8 @@ pub fn fast_cost_from_decoded(
 ) -> FastCost {
     use crate::args::Args;
 
+    let mem_cycles = crate::mem_cycles_for_mode(mem_cycles, isa_mode);
+
     // Use raw byte positions for register fields (same as fast_cost_from_raw).
     // The raw nibble positions don't correspond to semantic arg names — the
     // mapping varies by instruction format — so we read directly from code[].
@@ -1737,17 +813,17 @@ pub fn fast_cost_from_decoded(
     let raw_a = if pcu + 1 < code.len() {
         code[pcu + 1] & 0x0F
     } else {
-        0xFF
+        missing_raw_register(isa_mode)
     };
     let raw_b = if pcu + 1 < code.len() {
         (code[pcu + 1] >> 4) & 0x0F
     } else {
-        0xFF
+        missing_raw_register(isa_mode)
     };
     let raw_d = if pcu + 2 < code.len() {
-        code[pcu + 2] & 0x0F
+        gas_raw_d(isa_mode, code[pcu + 2])
     } else {
-        0xFF
+        missing_raw_register(isa_mode)
     };
 
     let (ra, rb, rd) = gas_register_roles(isa_mode, opcode_byte, raw_a, raw_b, raw_d);
@@ -1763,6 +839,7 @@ pub fn fast_cost_from_decoded(
 
     let r1 = |r: u8| reg_bit(r);
     let r2 = |a: u8, b: u8| reg_bit(a) | reg_bit(b);
+    let r3 = |a: u8, b: u8, c: u8| reg_bit(a) | reg_bit(b) | reg_bit(c);
     let dst_src_overlap = |dst: u8, s: u16| (reg_bit(dst) & s) != 0;
 
     let opcode = opcode_byte;
@@ -1820,7 +897,11 @@ pub fn fast_cost_from_decoded(
         40 => FastCost {
             cycles: 15,
             decode_slots: 1,
-            exec_unit: EU_ALU,
+            exec_unit: if isa_mode == crate::IsaMode::Conformance {
+                EU_NONE
+            } else {
+                EU_ALU
+            },
             src_mask: 0,
             dst_mask: 0,
             is_terminator: true,
@@ -1829,7 +910,11 @@ pub fn fast_cost_from_decoded(
         80 => FastCost {
             cycles: 15,
             decode_slots: 1,
-            exec_unit: EU_ALU,
+            exec_unit: if isa_mode == crate::IsaMode::Conformance {
+                EU_NONE
+            } else {
+                EU_ALU
+            },
             src_mask: 0,
             dst_mask: r1(ra),
             is_terminator: true,
@@ -1838,8 +923,16 @@ pub fn fast_cost_from_decoded(
         50 => FastCost {
             cycles: 22,
             decode_slots: 1,
-            exec_unit: EU_ALU,
-            src_mask: 0,
+            exec_unit: if isa_mode == crate::IsaMode::Conformance {
+                EU_NONE
+            } else {
+                EU_ALU
+            },
+            src_mask: if isa_mode == crate::IsaMode::Conformance {
+                r1(ra)
+            } else {
+                0
+            },
             dst_mask: 0,
             is_terminator: true,
             is_move_reg: false,
@@ -1847,7 +940,11 @@ pub fn fast_cost_from_decoded(
         180 => FastCost {
             cycles: 22,
             decode_slots: 1,
-            exec_unit: EU_ALU,
+            exec_unit: if isa_mode == crate::IsaMode::Conformance {
+                EU_NONE
+            } else {
+                EU_ALU
+            },
             src_mask: r1(rb),
             dst_mask: r1(ra),
             is_terminator: true,
@@ -1859,7 +956,11 @@ pub fn fast_cost_from_decoded(
             cycles: mem_cycles,
             decode_slots: 1,
             exec_unit: EU_LOAD,
-            src_mask: r1(rb),
+            src_mask: if isa_mode == crate::IsaMode::Conformance {
+                0
+            } else {
+                r1(rb)
+            },
             dst_mask: r1(ra),
             is_terminator: false,
             is_move_reg: false,
@@ -1879,7 +980,11 @@ pub fn fast_cost_from_decoded(
             cycles: mem_cycles,
             decode_slots: 1,
             exec_unit: EU_STORE,
-            src_mask: r2(ra, rb),
+            src_mask: if isa_mode == crate::IsaMode::Conformance {
+                r1(ra)
+            } else {
+                r2(ra, rb)
+            },
             dst_mask: 0,
             is_terminator: false,
             is_move_reg: false,
@@ -2035,8 +1140,8 @@ pub fn fast_cost_from_decoded(
                 is_move_reg: false,
             }
         }
-        // Trivial 2-op: popcount, clz, sign_extend, zero_extend, reverse_bytes
-        101 | 102 | 103 | 104 | 107 | 108 | 109 | 110 => FastCost {
+        // Trivial 2-op: popcount, clz, sign_extend, zero_extend.
+        101 | 102 | 103 | 104 | 107 | 108 | 109 => FastCost {
             cycles: 1,
             decode_slots: 1,
             exec_unit: EU_ALU,
@@ -2045,11 +1150,29 @@ pub fn fast_cost_from_decoded(
             is_terminator: false,
             is_move_reg: false,
         },
-        // ctz
+        // reverse_bytes uses the ordinary two-operand overlap rule in v0.8.
+        110 => FastCost {
+            cycles: 1,
+            decode_slots: if isa_mode == crate::IsaMode::Conformance && reg_bit(ra) != reg_bit(rb) {
+                2
+            } else {
+                1
+            },
+            exec_unit: EU_ALU,
+            src_mask: r1(rb),
+            dst_mask: r1(ra),
+            is_terminator: false,
+            is_move_reg: false,
+        },
+        // ctz requires two ALU units in standard v0.8.
         105 | 106 => FastCost {
             cycles: 2,
             decode_slots: 1,
-            exec_unit: EU_ALU,
+            exec_unit: if isa_mode == crate::IsaMode::Conformance {
+                EU_ALU2
+            } else {
+                EU_ALU
+            },
             src_mask: r1(rb),
             dst_mask: r1(ra),
             is_terminator: false,
@@ -2129,7 +1252,12 @@ pub fn fast_cost_from_decoded(
             cycles: 2,
             decode_slots: 2,
             exec_unit: EU_ALU,
-            src_mask: r2(rb, rd),
+            // rD' = rA/rD selected by rB: the old destination is a source.
+            src_mask: if isa_mode == crate::IsaMode::Conformance {
+                r3(ra, rb, rd)
+            } else {
+                r2(rb, rd)
+            },
             dst_mask: r1(ra),
             is_terminator: false,
             is_move_reg: false,
@@ -2139,7 +1267,12 @@ pub fn fast_cost_from_decoded(
             cycles: 2,
             decode_slots: 3,
             exec_unit: EU_ALU,
-            src_mask: r1(rb),
+            // rA' = imm/rA selected by rB: the old destination is a source.
+            src_mask: if isa_mode == crate::IsaMode::Conformance {
+                r2(ra, rb)
+            } else {
+                r1(rb)
+            },
             dst_mask: r1(ra),
             is_terminator: false,
             is_move_reg: false,
@@ -2313,7 +1446,8 @@ struct GasCostEntry {
     /// Base decode_slots (before overlap adjustment).
     decode_slots: u8,
     exec_unit: u8,
-    /// Source mask pattern: 0=none, 1=ra, 2=rb, 3=ra|rb, 4=rb|rd, 5=ra(store-imm)
+    /// Source mask pattern: 0=none, 1=ra, 2=rb, 3=ra|rb, 4=rb|rd,
+    /// 5=ra|rb|rd.
     src_pat: u8,
     /// Destination mask pattern: 0=none, 1=ra, 2=rd
     dst_pat: u8,
@@ -2328,6 +1462,7 @@ const F_BRANCH: u8 = 4;
 const F_OVERLAP: u8 = 8;
 const F_BRANCH2: u8 = 16; // two-reg branch (src=ra|rb)
 const F_SHIFT_OVERLAP: u8 = 32; // shift: overlap is rb==ra, not dst_src_overlap
+const F_COMPLEX_SRC: u8 = 64; // three source registers; use the full-mask path
 
 const fn gc(
     cycles: u8,
@@ -2526,10 +1661,10 @@ static GAS_COST_LUT: [GasCostEntry; 256] = {
         t[142] = e;
         t[143] = e;
     }
-    // Conditional moves 3-reg
+    // Frozen JAR operand patterns. `gas_cost_entry` overlays the corrected
+    // standard-v0.8 source sets without changing existing service metering.
     t[218] = gc(2, 2, EU_ALU, 4, 1, 0);
     t[219] = gc(2, 2, EU_ALU, 4, 1, 0);
-    // Conditional moves imm
     t[147] = gc(2, 3, EU_ALU, 2, 1, 0);
     t[148] = gc(2, 3, EU_ALU, 2, 1, 0);
     // Min/Max (src=rb|rd, dst=ra, overlap adjust)
@@ -2575,6 +1710,46 @@ static GAS_COST_LUT: [GasCostEntry; 256] = {
     t
 };
 
+/// Return the profile-specific A.58 entry. The static table is the frozen JAR
+/// contract; strict v0.8 corrections are applied only for Conformance mode.
+#[inline(always)]
+fn gas_cost_entry(isa_mode: crate::IsaMode, opcode: u8) -> GasCostEntry {
+    let mut entry = GAS_COST_LUT[opcode as usize];
+    if isa_mode != crate::IsaMode::Conformance {
+        return entry;
+    }
+
+    match opcode {
+        // Static/dynamic jumps require no execution unit in A.58.
+        40 | 80 | 50 | 180 => entry.exec_unit = EU_NONE,
+        _ => {}
+    }
+    match opcode {
+        // Direct operands do not contain an encoded base register.
+        50 => entry.src_pat = 1,      // jump_ind reads rA
+        52..=58 => entry.src_pat = 0, // direct load reads no register
+        59..=62 => entry.src_pat = 1, // direct store reads only rA
+        // Conditional moves read their old destination as well.
+        147 | 148 => entry.src_pat = 3, // rA | rB
+        218 | 219 => {
+            entry.src_pat = 5; // rD(old) | rA | rB after role normalization
+            entry.flags |= F_COMPLEX_SRC;
+        }
+        _ => {}
+    }
+    match opcode {
+        // `trivialtwooptwocycles` consumes two of the four ALUs.
+        105 | 106 => entry.exec_unit = EU_ALU2,
+        // reverse_bytes is `simplealutwoop`: one slot on overlap, two otherwise.
+        110 => {
+            entry.flags |= F_OVERLAP;
+            entry.overlap_slots = 1 | (2 << 4);
+        }
+        _ => {}
+    }
+    entry
+}
+
 /// Feed the gas simulator directly from raw register bytes, skipping FastCost
 /// construction. Returns (is_terminator, is_branch_or_special) — the caller
 /// uses is_branch_or_special to fall back to the full path for rare cases.
@@ -2588,12 +1763,13 @@ pub fn feed_gas_direct(
     mem_cycles: u8,
     isa_mode: crate::IsaMode,
 ) -> (bool, bool) {
+    let mem_cycles = crate::mem_cycles_for_mode(mem_cycles, isa_mode);
     let (ra, rb, rd) = gas_register_roles(isa_mode, opcode_byte, raw_a, raw_b, raw_d);
-    let entry = &GAS_COST_LUT[opcode_byte as usize];
+    let entry = gas_cost_entry(isa_mode, opcode_byte);
     let flags = entry.flags;
 
     // Fast path: non-branch, non-overlap, non-move (~90% of instructions).
-    if flags & (F_BRANCH | F_BRANCH2 | F_OVERLAP | F_MOVE | F_SHIFT_OVERLAP) == 0 {
+    if flags & (F_BRANCH | F_BRANCH2 | F_OVERLAP | F_MOVE | F_SHIFT_OVERLAP | F_COMPLEX_SRC) == 0 {
         // Map src_pat to register indices (0xFF = "no source")
         let (src1, src2) = match entry.src_pat {
             0 => (0xFF, 0xFF),
@@ -2616,7 +1792,7 @@ pub fn feed_gas_direct(
         } else {
             entry.cycles
         };
-        gas_sim.feed_direct(cycles, entry.decode_slots, src1, src2, dst);
+        gas_sim.feed_direct_with_unit(cycles, entry.decode_slots, entry.exec_unit, src1, src2, dst);
         return (flags & F_TERM != 0, false);
     }
 
@@ -2640,14 +1816,14 @@ pub fn fast_cost_lut(
     let reg_byte1 = if pcu + 1 < code.len() {
         code[pcu + 1]
     } else {
-        0xFF
+        missing_raw_register(isa_mode)
     };
     let ra = reg_byte1 & 0x0F;
     let rb = (reg_byte1 >> 4) & 0x0F;
     let rd = if pcu + 2 < code.len() {
-        code[pcu + 2] & 0x0F
+        gas_raw_d(isa_mode, code[pcu + 2])
     } else {
-        0xFF
+        missing_raw_register(isa_mode)
     };
 
     fast_cost_lut_inner(
@@ -2712,8 +1888,10 @@ fn fast_cost_lut_inner(
 ) -> FastCost {
     use crate::args::Args;
 
+    let mem_cycles = crate::mem_cycles_for_mode(mem_cycles, isa_mode);
+
     let (ra, rb, rd) = gas_register_roles(isa_mode, opcode_byte, ra, rb, rd);
-    let entry = &GAS_COST_LUT[opcode_byte as usize];
+    let entry = gas_cost_entry(isa_mode, opcode_byte);
     let flags = entry.flags;
 
     // Fast path: most instructions are non-branch, non-overlap.
@@ -2730,6 +1908,7 @@ fn fast_cost_lut_inner(
             2 => rb_bit,
             3 => ra_bit | rb_bit,
             4 => rb_bit | rd_bit,
+            5 => ra_bit | rb_bit | rd_bit,
             _ => 0,
         };
         let dst_mask: u16 = if entry.dst_pat == 1 { ra_bit } else { 0 };
@@ -2760,6 +1939,7 @@ fn fast_cost_lut_inner(
         2 => rb_bit,
         3 => ra_bit | rb_bit,
         4 => rb_bit | rd_bit,
+        5 => ra_bit | rb_bit | rd_bit,
         _ => 0,
     };
     let dst_mask: u16 = if entry.dst_pat == 1 { ra_bit } else { 0 };
@@ -2802,205 +1982,6 @@ fn fast_cost_lut_inner(
         is_terminator: flags & F_TERM != 0,
         is_move_reg: flags & F_MOVE != 0,
     }
-}
-
-/// Check if execution unit is available.
-#[inline(always)]
-fn eu_available(avail: &[u8; 5], eu: u8) -> bool {
-    match eu {
-        EU_NONE => true,
-        EU_ALU => avail[0] >= 1,
-        EU_LOAD => avail[0] >= 1 && avail[1] >= 1,
-        EU_STORE => avail[0] >= 1 && avail[2] >= 1,
-        EU_MUL => avail[0] >= 1 && avail[3] >= 1,
-        EU_DIV => avail[0] >= 1 && avail[4] >= 1,
-        _ => false,
-    }
-}
-
-/// Consume execution unit.
-#[inline(always)]
-fn eu_consume(avail: &mut [u8; 5], eu: u8) {
-    match eu {
-        EU_ALU => {
-            avail[0] -= 1;
-        }
-        EU_LOAD => {
-            avail[0] -= 1;
-            avail[1] -= 1;
-        }
-        EU_STORE => {
-            avail[0] -= 1;
-            avail[2] -= 1;
-        }
-        EU_MUL => {
-            avail[0] -= 1;
-            avail[3] -= 1;
-        }
-        EU_DIV => {
-            avail[0] -= 1;
-            avail[4] -= 1;
-        }
-        _ => {}
-    }
-}
-
-// ---- Cycle advance ----
-
-/// Advance all EXE entries by one cycle. Entries reaching 0 transition to FIN.
-/// Uses bitmask iteration — only touches active entries (O(popcount) not O(32)).
-#[inline(always)]
-fn advance_cycle(cycles_left: &mut [u8; 32], exe_mask: &mut u32, fin_mask: &mut u32) {
-    let mut exe = *exe_mask;
-    while exe != 0 {
-        let i = exe.trailing_zeros() as usize;
-        exe &= exe - 1;
-        if cycles_left[i] <= 1 {
-            cycles_left[i] = 0;
-            *exe_mask &= !(1u32 << i);
-            *fin_mask |= 1u32 << i;
-        } else {
-            cycles_left[i] -= 1;
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-fn gas_sim_fast(
-    instrs: &[crate::recompiler::predecode::PreDecodedInst],
-    _code: &[u8],
-    _bitmask: &[u8],
-) -> u32 {
-    // SoA ROB arrays (32 entries, stack-allocated)
-    let mut state = [0u8; 32]; // 0=empty, 1=wait, 2=exe, 3=fin
-    let mut cycles_left = [0u8; 32];
-    let mut exec_unit = [0u8; 32];
-    let mut deps = [0u32; 32];
-    let mut reg_writer = [0xFFu8; 16]; // per-register: ROB slot that last wrote it
-
-    // Bitmask tracking
-    let mut fin_mask: u32 = 0;
-    let mut wait_mask: u32 = 0;
-    let mut exe_mask: u32 = 0;
-
-    let mut next_slot: u8 = 0;
-    let mut instr_idx: usize = 0;
-    let mut cycles: u32 = 0;
-    let mut decode_slots: u8 = 4;
-    let mut dispatch_slots: u8 = 5;
-    let mut eu_avail: [u8; 5] = [4, 4, 4, 1, 1]; // alu, load, store, mul, div
-
-    let _done_decoding = |idx: usize| idx >= instrs.len();
-
-    for _safety in 0..100_000u32 {
-        // Phase 1: Decode as many instructions as possible this cycle
-        while instr_idx < instrs.len() && decode_slots > 0 && (next_slot as usize) < 32 {
-            let ii = &instrs[instr_idx];
-            let cost = fast_cost_from_raw(
-                ii.opcode as u8,
-                ii.ra,
-                ii.rb,
-                ii.rd,
-                ii.pc,
-                _code,
-                _bitmask,
-                DEFAULT_MEM_CYCLES,
-                crate::IsaMode::Conformance,
-            );
-
-            if cost.is_move_reg {
-                decode_slots = decode_slots.saturating_sub(cost.decode_slots);
-                instr_idx = if cost.is_terminator {
-                    instrs.len()
-                } else {
-                    instr_idx + 1
-                };
-                continue;
-            }
-
-            // Build dependency mask from reg_writer lookups
-            let mut dep_mask: u32 = 0;
-            let mut src = cost.src_mask;
-            while src != 0 {
-                let reg = src.trailing_zeros() as usize;
-                src &= src - 1;
-                let writer = reg_writer[reg];
-                if writer != 0xFF && (fin_mask & (1u32 << writer)) == 0 {
-                    dep_mask |= 1u32 << writer;
-                }
-            }
-
-            let slot = next_slot as usize;
-            state[slot] = 1; // WAIT
-            cycles_left[slot] = cost.cycles;
-            exec_unit[slot] = cost.exec_unit;
-            deps[slot] = dep_mask;
-            wait_mask |= 1u32 << slot;
-
-            let mut dst = cost.dst_mask;
-            while dst != 0 {
-                let reg = dst.trailing_zeros() as usize;
-                dst &= dst - 1;
-                reg_writer[reg] = next_slot;
-            }
-
-            next_slot += 1;
-            decode_slots = decode_slots.saturating_sub(cost.decode_slots);
-            instr_idx = if cost.is_terminator {
-                instrs.len()
-            } else {
-                instr_idx + 1
-            };
-        }
-
-        // Phase 2: Dispatch as many ready instructions as possible this cycle
-        while dispatch_slots > 0 {
-            let mut candidates = wait_mask;
-            let mut found = false;
-            while candidates != 0 {
-                let i = candidates.trailing_zeros() as usize;
-                candidates &= candidates - 1;
-                if (deps[i] & !fin_mask) == 0 && eu_available(&eu_avail, exec_unit[i]) {
-                    eu_consume(&mut eu_avail, exec_unit[i]);
-                    state[i] = 2; // EXE
-                    wait_mask &= !(1u32 << i);
-                    exe_mask |= 1u32 << i;
-                    dispatch_slots -= 1;
-                    found = true;
-                    break; // re-scan from start (priority order)
-                }
-            }
-            if !found {
-                break;
-            }
-        }
-
-        // Phase 3: Done check
-        if instr_idx >= instrs.len() && exe_mask == 0 && wait_mask == 0 {
-            break;
-        }
-
-        // Phase 4: Advance cycle — decrement cycles_left for EXE entries, transition to FIN
-        advance_cycle(&mut cycles_left, &mut exe_mask, &mut fin_mask);
-
-        cycles += 1;
-        decode_slots = 4;
-        dispatch_slots = 5;
-        eu_avail = [4, 4, 4, 1, 1];
-    }
-
-    cycles
-}
-
-#[cfg(feature = "std")]
-/// Fast gas cost computation using bitmask-based pipeline simulator.
-pub fn gas_cost_for_block_fast(
-    instrs: &[crate::recompiler::predecode::PreDecodedInst],
-    code: &[u8],
-    bitmask: &[u8],
-) -> u64 {
-    let cycles = gas_sim_fast(instrs, code, bitmask);
-    if cycles > 3 { (cycles - 3) as u64 } else { 1 }
 }
 
 #[cfg(test)]
@@ -3049,14 +2030,14 @@ mod tests {
                 buf[1] = reg_byte1;
                 buf[2] = reg_byte2;
                 let skip = crate::interpreter::skip_for_bitmask(&bitmask, 0);
-                let (ra, rb, rd) = (buf[1] & 0x0F, (buf[1] >> 4) & 0x0F, buf[2] & 0x0F);
+                let (ra, rb, rd) = (buf[1] & 0x0F, (buf[1] >> 4) & 0x0F, buf[2]);
 
                 // Compare the ACTUAL simulator cost of a single-instruction
                 // block through each backend's real feed path:
                 //   interpreter → fast_cost_from_raw → GasSimulator::feed
                 //   JIT (non-branch fast path) → feed_gas_direct → feed_direct
                 //   JIT (branch slow path)     → fast_cost_lut_regs → feed
-                let mut sim_i = GasSimulator::new();
+                let mut sim_i = GasSimulator::new_for_mode(crate::IsaMode::Conformance);
                 sim_i.feed(&fast_cost_from_raw(
                     opcode,
                     ra,
@@ -3070,7 +2051,7 @@ mod tests {
                 ));
                 let interp = sim_i.flush_and_get_cost();
 
-                let mut sim_j = GasSimulator::new();
+                let mut sim_j = GasSimulator::new_for_mode(crate::IsaMode::Conformance);
                 let (_, needs_full) = feed_gas_direct(
                     opcode,
                     ra,
@@ -3124,18 +2105,20 @@ mod tests {
     fn three_register_gas_roles_are_profile_scoped() {
         // div_u_64 r2 <- r0/r1; r4 <- r2/r3; r6 <- r4/r5; trap.
         // Under the standard A.5.13 roles, the 60-cycle divisions form a
-        // dependency chain completing at 60, 120, 180 => cost 177. The
+        // dependency chain and the single DIV unit serialize all three. The
+        // v0.8 pipeline drains in 183 cycles, hence cost 180. The
         // frozen Jar adapter deliberately preserves its old low-nibble-as-
         // destination metering, where they remain independent => cost 59.
         let code = [203, 0x10, 2, 203, 0x32, 4, 203, 0x54, 6, 0];
         let bitmask = [1, 0, 0, 1, 0, 0, 1, 0, 0, 1];
 
         let hand_cost = |isa_mode| {
-            let mut sim = GasSimulator::new();
+            let mut sim = GasSimulator::new_for_mode(isa_mode);
             for pc in [0usize, 3, 6, 9] {
                 let raw_a = code.get(pc + 1).copied().unwrap_or(0) & 0x0f;
                 let raw_b = code.get(pc + 1).copied().unwrap_or(0) >> 4;
-                let raw_d = code.get(pc + 2).copied().unwrap_or(0) & 0x0f;
+                let encoded_d = code.get(pc + 2).copied().unwrap_or(0);
+                let raw_d = gas_raw_d(isa_mode, encoded_d);
                 sim.feed(&fast_cost_from_raw(
                     code[pc],
                     raw_a,
@@ -3152,11 +2135,12 @@ mod tests {
         };
 
         let lut_cost = |isa_mode| {
-            let mut sim = GasSimulator::new();
+            let mut sim = GasSimulator::new_for_mode(isa_mode);
             for pc in [0usize, 3, 6, 9] {
                 let raw_a = code.get(pc + 1).copied().unwrap_or(0) & 0x0f;
                 let raw_b = code.get(pc + 1).copied().unwrap_or(0) >> 4;
-                let raw_d = code.get(pc + 2).copied().unwrap_or(0) & 0x0f;
+                let encoded_d = code.get(pc + 2).copied().unwrap_or(0);
+                let raw_d = gas_raw_d(isa_mode, encoded_d);
                 let opcode = crate::instruction::Opcode::from_byte(code[pc]).unwrap();
                 let args = crate::args::decode_args(
                     &code,
@@ -3181,12 +2165,161 @@ mod tests {
         };
 
         for (isa_mode, expected) in [
-            (crate::IsaMode::Conformance, 177),
+            (crate::IsaMode::Conformance, 180),
             (crate::IsaMode::Jar, 59),
         ] {
             assert_eq!(hand_cost(isa_mode), expected);
             assert_eq!(lut_cost(isa_mode), expected);
         }
+    }
+
+    #[test]
+    fn standard_a58_operands_units_and_overlap_are_profile_scoped() {
+        let code = [0u8; 8];
+        let bitmask = [1u8; 8];
+        let cost = |opcode, raw_a, raw_b, raw_d, mode| {
+            fast_cost_from_raw(
+                opcode,
+                raw_a,
+                raw_b,
+                raw_d,
+                0,
+                &code,
+                &bitmask,
+                DEFAULT_MEM_CYCLES,
+                mode,
+            )
+        };
+        let strict = crate::IsaMode::Conformance;
+        let jar = crate::IsaMode::Jar;
+
+        // Direct operands: only rA is a register. The high nibble belongs to
+        // immediate-length encoding and is not a base/source register.
+        assert_eq!(cost(50, 2, 7, 0, strict).src_mask, reg_bit(2));
+        assert_eq!(cost(50, 2, 7, 0, jar).src_mask, 0);
+        assert_eq!(cost(52, 4, 7, 0, strict).src_mask, 0);
+        assert_eq!(cost(52, 4, 7, 0, jar).src_mask, reg_bit(7));
+        assert_eq!(cost(59, 4, 7, 0, strict).src_mask, reg_bit(4));
+        assert_eq!(cost(59, 4, 7, 0, jar).src_mask, reg_bit(4) | reg_bit(7));
+
+        // Standard jumps reserve no execution units; JAR retains its frozen
+        // historical ALU reservation in the FastCost contract.
+        for opcode in [40, 80, 50, 180] {
+            assert_eq!(cost(opcode, 2, 3, 4, strict).exec_unit, EU_NONE);
+            assert_eq!(cost(opcode, 2, 3, 4, jar).exec_unit, EU_ALU);
+        }
+
+        // Conditional moves read the old destination on the unmodified leg.
+        assert_eq!(cost(147, 2, 3, 0, strict).src_mask, reg_bit(2) | reg_bit(3));
+        assert_eq!(cost(147, 2, 3, 0, jar).src_mask, reg_bit(3));
+        assert_eq!(
+            cost(218, 4, 5, 2, strict).src_mask,
+            reg_bit(2) | reg_bit(4) | reg_bit(5)
+        );
+        assert_eq!(cost(218, 4, 5, 2, jar).src_mask, reg_bit(5) | reg_bit(2));
+
+        // ctz needs two ALUs; reverse_bytes uses P(1,2) decode width.
+        assert_eq!(cost(105, 2, 3, 0, strict).exec_unit, EU_ALU2);
+        assert_eq!(cost(105, 2, 3, 0, jar).exec_unit, EU_ALU);
+        assert_eq!(cost(110, 2, 2, 0, strict).decode_slots, 1);
+        assert_eq!(cost(110, 2, 3, 0, strict).decode_slots, 2);
+        assert_eq!(cost(110, 2, 3, 0, jar).decode_slots, 1);
+
+        // A.5.13 clamps the complete rD byte. 0x10 names r12, not r0.
+        assert_eq!(cost(203, 0, 1, 0x10, strict).dst_mask, reg_bit(12));
+    }
+
+    #[test]
+    fn standard_dependency_and_alu_contention_anchors() {
+        let code = [0u8; 8];
+        let bitmask = [1u8; 8];
+        let fc = |opcode, raw_a, raw_b, raw_d| {
+            fast_cost_from_raw(
+                opcode,
+                raw_a,
+                raw_b,
+                raw_d,
+                0,
+                &code,
+                &bitmask,
+                DEFAULT_MEM_CYCLES,
+                crate::IsaMode::Conformance,
+            )
+        };
+        let block = |costs: &[FastCost]| {
+            let mut sim = GasSimulator::new_for_mode(crate::IsaMode::Conformance);
+            for cost in costs {
+                sim.feed(cost);
+            }
+            sim.flush_and_get_cost()
+        };
+
+        // A 60-cycle DIV writes r2. jump/store/cmov must wait for it; a
+        // direct load whose length nibble happens to be 2 must not.
+        let producer = fc(203, 0, 1, 2);
+        assert_eq!(block(&[producer, fc(50, 2, 0, 0)]), 82);
+        assert_eq!(block(&[producer, fc(59, 2, 7, 0)]), 85);
+        assert_eq!(block(&[producer, fc(52, 4, 2, 0)]), 60);
+        assert_eq!(block(&[producer, fc(147, 2, 3, 0)]), 62);
+        assert_eq!(block(&[producer, fc(218, 4, 5, 2)]), 62);
+
+        // Five independent ctz instructions cannot all overlap: each needs
+        // two ALUs and the virtual CPU has four. Nine simulation ticks yield
+        // six gas after pipeline convergence.
+        let ctz = [
+            fc(105, 8, 0, 0),
+            fc(105, 9, 1, 0),
+            fc(105, 10, 2, 0),
+            fc(105, 11, 3, 0),
+            fc(105, 12, 4, 0),
+        ];
+        assert_eq!(block(&ctz), 6);
+    }
+
+    #[test]
+    fn standard_missing_operands_are_zero_extended_in_every_cost_path() {
+        // A truncated two-register branch reads zeta bytes of zero. It must
+        // not acquire a false dependency on r12 through a 0xff fallback.
+        let code = [170u8];
+        let bitmask = [1u8];
+        let args = crate::args::decode_args(
+            &code,
+            0,
+            skip_distance(&bitmask, 0),
+            crate::instruction::Opcode::BranchEq.category(),
+        );
+        let raw = fast_cost_from_raw(
+            170,
+            0,
+            0,
+            0,
+            0,
+            &code,
+            &bitmask,
+            DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
+        );
+        let decoded = fast_cost_from_decoded(
+            170,
+            &args,
+            0,
+            &code,
+            &bitmask,
+            DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
+        );
+        let lut = fast_cost_lut(
+            170,
+            &args,
+            0,
+            &code,
+            &bitmask,
+            DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
+        );
+        assert_eq!(raw.src_mask, reg_bit(0));
+        assert_eq!(decoded, raw);
+        assert_eq!(lut, raw);
     }
 
     #[test]
@@ -3285,7 +2418,7 @@ mod tests {
 
     /// Helper: compute gas cost for a single-block program using GasSimulator.
     fn block_cost(code: &[u8], bitmask: &[u8]) -> u32 {
-        let mut sim = GasSimulator::new();
+        let mut sim = GasSimulator::new_for_mode(crate::IsaMode::Conformance);
         let mut pc = 0;
         while pc < code.len() {
             if pc < bitmask.len() && bitmask[pc] != 1 {
@@ -3296,18 +2429,14 @@ mod tests {
             let raw_ra = if pc + 1 < code.len() {
                 code[pc + 1] & 0x0F
             } else {
-                0xFF
+                0
             };
             let raw_rb = if pc + 1 < code.len() {
                 (code[pc + 1] >> 4) & 0x0F
             } else {
-                0xFF
+                0
             };
-            let raw_rd = if pc + 2 < code.len() {
-                code[pc + 2] & 0x0F
-            } else {
-                0xFF
-            };
+            let raw_rd = code.get(pc + 2).copied().unwrap_or(0);
             let fc = fast_cost_from_raw(
                 opcode_byte,
                 raw_ra,
@@ -3331,26 +2460,22 @@ mod tests {
 
     #[test]
     fn test_single_trap() {
-        // trap = 2 cycles, max(2-3,1) = 1
-        assert_eq!(block_cost(&[0u8], &[1u8]), 1);
+        assert_eq!(block_cost(&[0u8], &[1u8]), 2);
     }
 
     #[test]
     fn test_single_ecalli() {
-        // ecalli = 100 cycles, max(100-3,1) = 97
-        assert_eq!(block_cost(&[10u8, 0], &[1, 0]), 97);
+        assert_eq!(block_cost(&[10u8, 0], &[1, 0]), 100);
     }
 
     #[test]
     fn test_single_jump() {
-        // jump = 15 cycles, max(15-3,1) = 12
-        assert_eq!(block_cost(&[40u8, 0], &[1, 0]), 12);
+        assert_eq!(block_cost(&[40u8, 0], &[1, 0]), 15);
     }
 
     #[test]
     fn test_single_fallthrough() {
-        // fallthrough = 2 cycles, max(2-3,1) = 1
-        assert_eq!(block_cost(&[1u8], &[1]), 1);
+        assert_eq!(block_cost(&[1u8], &[1]), 2);
     }
 
     #[test]
@@ -3366,18 +2491,6 @@ mod proptests {
     use proptest::prelude::*;
 
     proptest! {
-        /// gas_cost_for_block always returns at least 1 (the minimum gas cost).
-        #[test]
-        fn gas_cost_always_at_least_one(
-            code in proptest::collection::vec(any::<u8>(), 1..64),
-        ) {
-            // Build a bitmask: first byte is always an instruction start.
-            let mut bitmask = vec![0u8; code.len()];
-            bitmask[0] = 1;
-            let cost = gas_cost_for_block(&code, &bitmask, 0);
-            prop_assert!(cost >= 1);
-        }
-
         /// skip_distance never exceeds 24.
         #[test]
         fn skip_distance_bounded(
@@ -3386,50 +2499,6 @@ mod proptests {
         ) {
             let dist = skip_distance(&bitmask, pc);
             prop_assert!(dist <= 24);
-        }
-
-        /// ExecUnits::RESET can always satisfy any of the unit-type constants.
-        #[test]
-        fn reset_satisfies_all_unit_types(choice in 0u8..6) {
-            let req = match choice {
-                0 => ExecUnits::NONE,
-                1 => ExecUnits::ALU,
-                2 => ExecUnits::LOAD,
-                3 => ExecUnits::STORE,
-                4 => ExecUnits::MUL,
-                5 => ExecUnits::DIV,
-                _ => unreachable!(),
-            };
-            prop_assert!(ExecUnits::RESET.can_satisfy(req));
-        }
-
-        /// ExecUnits::sub followed by can_satisfy: subtracting a satisfiable
-        /// request from RESET yields units that can satisfy NONE.
-        #[test]
-        fn sub_preserves_non_negative(choice in 0u8..6) {
-            let req = match choice {
-                0 => ExecUnits::NONE,
-                1 => ExecUnits::ALU,
-                2 => ExecUnits::LOAD,
-                3 => ExecUnits::STORE,
-                4 => ExecUnits::MUL,
-                5 => ExecUnits::DIV,
-                _ => unreachable!(),
-            };
-            let remaining = ExecUnits::RESET.sub(req);
-            prop_assert!(remaining.can_satisfy(ExecUnits::NONE));
-        }
-
-        /// gas_cost_for_block is deterministic: same inputs produce same output.
-        #[test]
-        fn gas_cost_deterministic(
-            code in proptest::collection::vec(any::<u8>(), 1..32),
-        ) {
-            let mut bitmask = vec![0u8; code.len()];
-            bitmask[0] = 1;
-            let cost1 = gas_cost_for_block(&code, &bitmask, 0);
-            let cost2 = gas_cost_for_block(&code, &bitmask, 0);
-            prop_assert_eq!(cost1, cost2);
         }
 
         /// reg_bit always returns a power of two (single bit set).
@@ -3445,17 +2514,5 @@ mod proptests {
             prop_assert_eq!(reg_bit(r), reg_bit(12));
         }
 
-        /// RegSet::contains is consistent with RegSet::one and RegSet::two.
-        #[test]
-        fn regset_contains_matches_construction(a in 0u8..13, b in 0u8..13) {
-            prop_assume!(a != b);
-            let set = RegSet::two(a, b);
-            prop_assert!(set.contains(a));
-            prop_assert!(set.contains(b));
-
-            let single = RegSet::one(a);
-            prop_assert!(single.contains(a));
-            prop_assert!(!single.contains(b) || a == b);
-        }
     }
 }

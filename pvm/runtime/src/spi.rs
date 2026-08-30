@@ -45,9 +45,18 @@ pub fn parse_compact_code_blob(data: &[u8]) -> Option<ParsedCodeBlob> {
 }
 
 /// Validate an executable code blob and its initial instruction counter.
-pub fn validate_code_blob(program: &ParsedCodeBlob, initial_pc: u32) -> bool {
+///
+/// The external counter is a full PVM register. Values outside the host's
+/// index domain are invalid rather than truncated.
+pub fn validate_code_blob(program: &ParsedCodeBlob, initial_pc: u64) -> bool {
     let code = &program.code;
     let bitmask = &program.bitmask;
+    // Runtime counters are u32 even on a 64-bit host. Establish that domain
+    // here so full Ψ remains total for arbitrarily large caller-provided
+    // registers instead of relying on a later infallible conversion.
+    let Ok(initial_pc) = u32::try_from(initial_pc) else {
+        return false;
+    };
     let initial_pc = initial_pc as usize;
     if code.is_empty()
         || bitmask.len() != code.len()
@@ -78,6 +87,17 @@ pub fn validate_code_blob(program: &ParsedCodeBlob, initial_pc: u32) -> bool {
         }
         pc = next;
     }
+}
+
+/// Full Gray Paper `deblob(program, initial_pc)` boundary.
+///
+/// This combines canonical compact decoding, whole-program validation and
+/// initial-instruction validation. Callers implementing full Ψ must turn a
+/// `None` result into a no-charge panic over the unchanged input state;
+/// callers implementing Ω_M retain its specified `HUH` mapping.
+pub fn deblob(data: &[u8], initial_pc: u64) -> Option<ParsedCodeBlob> {
+    let program = parse_compact_code_blob(data)?;
+    validate_code_blob(&program, initial_pc).then_some(program)
 }
 
 /// Parse and executor-validate a standard program.
@@ -200,6 +220,16 @@ mod tests {
             parse_standard_program(&retired_unary_number).is_none(),
             "opcode 111 is not in the Gray Paper v0.8.0 opcode set"
         );
+    }
+
+    #[test]
+    fn validator_rejects_a_counter_outside_the_runtime_pc_domain() {
+        let executable = ParsedCodeBlob {
+            jump_table: Vec::new(),
+            code: vec![0],
+            bitmask: vec![1],
+        };
+        assert!(!validate_code_blob(&executable, u64::from(u32::MAX) + 1));
     }
 
     #[test]

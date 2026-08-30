@@ -30,7 +30,7 @@ use crate::service::{
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829r1");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829r2");
 
 /// Consensus-visible execution semantics for standard-PVM agent packages.
 ///
@@ -39,8 +39,11 @@ pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829r1");
 /// capability-manifest profile, while Agent Actor and AgentRuntime packages
 /// execute the standard SPI profile. A semantics change in one profile must
 /// not silently accept—or unnecessarily invalidate—packages for the other
-/// profile.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r01");
+/// profile. Generation `r02` binds the full v0.8 reorder-buffer gas scheduler,
+/// full-Ψ deblob/entry failure boundary, and sign-extended 64-bit `ecalli`
+/// identifiers; `r01` used the retired register-ready approximation and is
+/// incompatible.
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r02");
 
 /// Program identity of the bundled standard runtime artifact.
 pub const STANDARD_RUNTIME_PROGRAM_ID: ProgramId = ProgramId([

@@ -877,6 +877,27 @@ mod tests {
     }
 
     #[test]
+    fn standard_packages_reject_the_pre_rob_metering_generation() {
+        const PRE_ROB_METERING: crate::service::Hash =
+            crate::service::Hash(*b"vos-pvm-41d31e6-standard-gas-r01");
+
+        let mut runtime = runtime_package();
+        runtime.manifest.execution_semantics = PRE_ROB_METERING;
+        assert_eq!(
+            runtime.validate(),
+            Err(PackageError::WrongExecutionSemantics),
+        );
+
+        let mut actor = actor_package(
+            &ACTOR_META,
+            &ACTOR_SCHEMA,
+            super::super::schema::ExecutionEntryKind::AgentActor,
+        );
+        actor.manifest.execution_semantics = PRE_ROB_METERING;
+        assert_eq!(actor.validate(), Err(PackageError::WrongExecutionSemantics));
+    }
+
+    #[test]
     fn package_artifact_limits_apply_before_deeper_validation() {
         let mut package = runtime_package();
         package.generated_interfaces = vec![0; MAX_PACKAGE_INTERFACES_BYTES + 1];

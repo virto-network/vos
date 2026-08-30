@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use crate::gas_cost::DEFAULT_MEM_CYCLES;
 use crate::interpreter::{Interpreter, Memory, PERM_NONE, PERM_RO, PERM_RW};
 use crate::program::ParsedCodeBlob;
-use crate::spi::{parse_compact_code_blob, validate_code_blob};
+use crate::spi::deblob;
 use crate::{ExitReason, Gas, IsaMode, PVM_PAGE_SIZE, PVM_REGISTER_COUNT};
 
 /// Maximum live inner machines in one Refine invocation.
@@ -115,7 +115,7 @@ pub enum InnerExit {
     Halt,
     Panic,
     Fault(u32),
-    Host(u32),
+    Host(u64),
     OutOfGas,
 }
 
@@ -189,10 +189,9 @@ impl InnerMachines {
         if self.machines.len() >= MAX_INNER_MACHINES {
             return Err(InnerError::Full);
         }
-        let program = parse_compact_code_blob(program_blob).ok_or(InnerError::Invalid)?;
-        if !validate_code_blob(&program, initial_pc) {
-            return Err(InnerError::Invalid);
-        }
+        // Ω_M maps a failed deblob to HUH; unlike full Ψ it does not create
+        // a machine which immediately panics.
+        let program = deblob(program_blob, u64::from(initial_pc)).ok_or(InnerError::Invalid)?;
         let id = (0..MAX_INNER_MACHINES as u32)
             .find(|id| !self.machines.contains_key(id))
             .expect("a free ID exists below the machine limit");
@@ -287,7 +286,12 @@ impl InnerMachines {
             }
             ExitReason::OutOfGas => InnerExit::OutOfGas,
             ExitReason::PageFault(address) => InnerExit::Fault(address),
-            ExitReason::HostCall(id) => InnerExit::Host(id),
+            ExitReason::HostCall(id) => {
+                // Ω_K returns the host exit but persists the successor PC in
+                // the inner machine immediately. Fault/OOG remain on cause.
+                assert!(vm.resume_after_host_call());
+                InnerExit::Host(id)
+            }
         };
         Ok(InvokeOutcome {
             exit,

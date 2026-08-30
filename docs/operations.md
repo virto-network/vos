@@ -89,6 +89,23 @@ not released yet, so the capability-role and SSH-shell cutover deliberately
 does not retain a decoder or conversion bridge for earlier development spaces.
 Recreate those spaces from packages and application exports.
 
+The standard Agent execution profile uses the same fail-closed rule. Agent
+Actor and AgentRuntime packages from the retired `standard-gas-r01` scheduler
+cannot be opened by an `r02` host. Besides the full v0.8 reorder-buffer
+scheduler, `r02` binds full-Ψ deblob/entry failures and sign-extended 64-bit
+`ecalli` identifiers. Rebuild those packages and recreate local development
+Agent images. The related lifecycle wire moved from
+`vos-agent-runtime-abi-20260829r1` to `vos-agent-runtime-abi-20260829r2`; an r2
+host deliberately rejects r1 runtime packages and persisted Agent images, so
+they must likewise be rebuilt or recreated. This cutover does not change the
+frozen Service/Jar execution identity or its canonical artifacts.
+
+Portable invocation continuations now use kernel snapshot version 5, which
+preserves sparse IPC DATA mappings exactly. Before upgrading a host, let every
+in-flight version-4 continuation drain; any remainder must be restarted from
+its durable invocation input. Version-5 hosts deliberately reject version-4
+snapshots and provide no compatibility decoder.
+
 ## Release artifacts
 
 ```bash
