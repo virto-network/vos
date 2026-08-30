@@ -47,7 +47,7 @@ fn trace_store_load(value: u8, addr_offset: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmSt
     regs[0] = value as u64;
     // Keep the historical compact offsets while placing proof fixtures above
     // the v0.8 protected low zone.
-    regs[1] = u64::from(vos_pvm::PVM_ZONE_SIZE + addr_offset);
+    regs[1] = u64::from(test_address(addr_offset));
     let memory = vec![0u8; 4 * 1024 * 1024];
     let (code, bitmask) = store_load_program();
     let pvm = Interpreter::new(
@@ -65,6 +65,10 @@ fn trace_store_load(value: u8, addr_offset: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmSt
     let steps = tr.into_trace();
     assert_eq!(steps.len(), 3);
     (code, bitmask, steps)
+}
+
+fn test_address(offset: u32) -> u32 {
+    vos_pvm::PVM_ZONE_SIZE + offset
 }
 
 #[test]
@@ -106,11 +110,11 @@ fn store_forged_value_rejected() {
 #[should_panic(expected = "failed")]
 fn load_forged_address_rejected() {
     // Forge the LOAD step's mem_read.address.  The original store at
-    // 0x1000 produces a ledger entry at 0x1000; the load's lookup at a
-    // different address won't find a match → logup imbalance.
+    // zone+0x1000 produces a ledger entry there; the load's lookup at a
+    // different above-zone address won't find a match → logup imbalance.
     let (code, bitmask, mut steps) = trace_store_load(0x42, 0x1000);
     if let Some(ref mut r) = steps[1].mem_read {
-        r.address = 0x2000; // honest = 0x1000
+        r.address = test_address(0x2000); // honest = zone+0x1000
     }
     prove_and_verify(steps, &code, &bitmask);
 }
@@ -118,8 +122,8 @@ fn load_forged_address_rejected() {
 #[test]
 #[should_panic(expected = "failed")]
 fn load_forged_read_value_rejected() {
-    // Isolated load-side forge: the load reads addr=0x1000 honestly, but
-    // we claim it returned 0xFF instead of the 0x42 we stored.  Update
+    // Isolated load-side forge: the load reads zone+0x1000 honestly, but we
+    // claim it returned 0xFF instead of the 0x42 we stored. Update
     // both mem_read.value AND regs_after[2] together so the per-byte
     // result-binding constraint (`is_load * mem_byte_active * (result -
     // mem_value) = 0`) stays satisfied — only the byte-level memory
@@ -137,14 +141,14 @@ fn load_forged_read_value_rejected() {
 #[should_panic(expected = "failed")]
 fn store_forged_address_rejected() {
     // Forge the STORE step's mem_write.address: claim we wrote 0x42 to
-    // 0x2000 instead of 0x1000.  The ledger now has (0x2000, 0x42)
-    // instead of the (0x1000, 0x42) that the load demands; the load's
-    // lookup at the honest 0x1000 finds the 0-init value but the
+    // zone+0x2000 instead of zone+0x1000. The ledger now has the former
+    // address instead of the latter that the load demands; the load's
+    // lookup at the honest address finds the 0-init value but the
     // load-result constraint binds it to the (forged) regs_after[2]=
     // 0x42 → mismatch.  Either way, prove+verify must fail.
     let (code, bitmask, mut steps) = trace_store_load(0x42, 0x1000);
     if let Some(ref mut w) = steps[0].mem_write {
-        w.address = 0x2000; // honest = 0x1000
+        w.address = test_address(0x2000); // honest = zone+0x1000
     }
     prove_and_verify(steps, &code, &bitmask);
 }
@@ -178,7 +182,7 @@ fn store_load_u64_program() -> (Vec<u8>, Vec<u8>) {
 fn trace_store_load_u64(value: u64, addr_offset: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmStep>) {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = value;
-    regs[1] = u64::from(vos_pvm::PVM_ZONE_SIZE + addr_offset);
+    regs[1] = u64::from(test_address(addr_offset));
     let memory = vec![0u8; 4 * 1024 * 1024];
     let (code, bitmask) = store_load_u64_program();
     let pvm = Interpreter::new(
@@ -203,6 +207,40 @@ fn store_load_u64_positive_smoke() {
     let (code, bitmask, steps) = trace_store_load_u64(0xDEAD_BEEF_CAFE_BABE, 0x2000);
     assert_eq!(steps[1].regs_after[2], 0xDEAD_BEEF_CAFE_BABE);
     prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn store_load_u64_at_exact_standard_zone_boundary() {
+    let (code, bitmask, steps) = trace_store_load_u64(0xDEAD_BEEF_CAFE_BABE, 0);
+    assert_eq!(
+        steps[0].mem_write.as_ref().expect("store access").address,
+        vos_pvm::PVM_ZONE_SIZE
+    );
+    assert_eq!(steps[1].regs_after[2], 0xDEAD_BEEF_CAFE_BABE);
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn forged_completed_standard_low_zone_access_is_rejected_by_air() {
+    let (code, bitmask, mut steps) = trace_store_load_u64(0xDEAD_BEEF_CAFE_BABE, 0);
+    let forged_address = vos_pvm::PVM_ZONE_SIZE - 8;
+    for step in &mut steps {
+        step.regs_before[1] = u64::from(forged_address);
+        step.regs_after[1] = u64::from(forged_address);
+        if let Some(read) = &mut step.mem_read {
+            read.address = forged_address;
+        }
+        if let Some(write) = &mut step.mem_write {
+            write.address = forged_address;
+        }
+    }
+
+    let mut side_note = SideNote::new(steps, code, bitmask);
+    assert!(prove(&mut side_note).is_err());
+    assert!(
+        side_note.memory_pages.is_some(),
+        "the low-zone forgery must reach and fail the proof constraints, not only host prevalidation"
+    );
 }
 
 #[test]
@@ -237,7 +275,7 @@ fn load_u64_forged_address_rejected() {
     // one byte position.
     let (code, bitmask, mut steps) = trace_store_load_u64(0xDEAD_BEEF_CAFE_BABE, 0x2000);
     if let Some(ref mut r) = steps[1].mem_read {
-        r.address = 0x3000; // honest = 0x2000
+        r.address = test_address(0x3000); // honest = zone+0x2000
     }
     prove_and_verify(steps, &code, &bitmask);
 }

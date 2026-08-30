@@ -1095,6 +1095,52 @@ pub enum Column {
     /// PowerOfTwo lookup multiplicity for the classic shift case.
     #[size = 1]
     IsShiftCNotRotrH,
+
+    /// Boolean disposition of a soft host-call row. One only when a
+    /// Standard-profile ECALLI was handled and acknowledged by the embedder;
+    /// zero for unhandled Standard calls and all frozen JAR host exits.
+    #[size = 1]
+    HostCallAcknowledged,
+    /// ProgramMemory-authenticated policy bit: one only for a Standard
+    /// ECALLI identifier implemented by the proof runtime's precompile or
+    /// VOS-stub handlers. An acknowledged row must have this bit set.
+    #[size = 1]
+    HostCallAllowed,
+    /// `IsaProfile · SoftHostExit + HostCallAcknowledged`. One for every
+    /// frozen JAR soft host exit and for acknowledged Standard ECALLI rows;
+    /// zero for unhandled Standard calls and non-host instructions. This
+    /// helper keeps the host-call PC constraints at degree two.
+    #[size = 1]
+    HostCallContinuesH,
+
+    /// `(1 - IsaProfile) · (IsLoad + IsStore)`: completed scalar-memory
+    /// instructions subject to the Standard v0.8 protected-zone rule.
+    #[size = 1]
+    IsStandardMemH,
+    /// Carry into the most-significant address byte for the final active byte:
+    /// `carry3[width - 1]`, selected by the authenticated width flags.
+    #[size = 1]
+    MemLastAddrCarryH,
+    /// `canonical_high_word · (256 - addr[3] - last_carry)`, where the
+    /// high word is derived from the authenticated byte-0 memory lookup.
+    /// Nonzero exactly when the base is at least 0x10000 and the final active
+    /// byte does not wrap through 2^32.
+    #[size = 1]
+    MemRangeProductH,
+    /// M31 inverse of `MemRangeProductH` when nonzero, otherwise zero.
+    #[size = 1]
+    MemRangeInv,
+    /// `MemRangeProductH · MemRangeInv`, lifted so the Standard-memory
+    /// validity gate remains within CpuChip's degree-two bound.
+    #[size = 1]
+    MemRangeTimesInvH,
+
+    /// ProgramMemory-authenticated exact cryptographic precompile dispatch
+    /// identifier (100 or 110..=114), or zero for lifecycle/VOS stubs and
+    /// non-precompile instructions. A continued host-call row must select
+    /// exactly the matching precompile call relation.
+    #[size = 1]
+    HostCallPrecompileDispatch,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

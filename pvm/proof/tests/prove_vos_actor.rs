@@ -8,6 +8,9 @@ use vos_pvm::program::{self, CapEntryType};
 use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::{prove, verify};
 
+const TEST_GUEST_BASE: u64 = vos_pvm::PVM_ZONE_SIZE as u64 + 0x1000;
+const TEST_GUEST_MEMORY_LEN: usize = vos_pvm::PVM_ZONE_SIZE as usize + 0x2000;
+
 /// Load fibonacci PVM blob (transpiled from ELF), or `None` when the
 /// fixture is absent so callers SKIP (print + return) rather than panic.
 /// Matches the skip-if-absent hygiene of `settle_run.rs`.
@@ -502,9 +505,9 @@ fn prove_blake2b_precompile() {
     let expected = blake2b_compress(&h, &m, 0, true);
     eprintln!("blake2b(empty) first word: {:#x}", expected[0]);
 
-    let h_addr: u64 = 0x1000;
-    let m_addr: u64 = 0x1040;
-    let mut flat_mem = vec![0u8; 0x2000];
+    let h_addr = TEST_GUEST_BASE;
+    let m_addr = TEST_GUEST_BASE + 0x40;
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     for i in 0..8 {
         flat_mem[h_addr as usize + i * 8..h_addr as usize + i * 8 + 8]
             .copy_from_slice(&h[i].to_le_bytes());
@@ -1194,12 +1197,12 @@ fn prove_ristretto_chip_field_mul_with_reduction() {
 fn ristretto_scalar_mult_via_ecall_tracing() {
     use vos_pvm_proof::core::tracing::ECALL_RISTRETTO_SCALAR_MULT;
 
-    // Lay out memory: scalar at 0x1000 (32 B), point at 0x1020 (32 B),
-    // output at 0x1040 (32 B).  Scalar is `2`, point is the canonical
+    // Lay out three 32-byte buffers above the protected low zone. Scalar is
+    // `2`, and the point is the canonical
     // basepoint compressed encoding so the expected output is `2*G`.
-    let scalar_addr: u64 = 0x1000;
-    let point_addr: u64 = 0x1020;
-    let output_addr: u64 = 0x1040;
+    let scalar_addr = TEST_GUEST_BASE;
+    let point_addr = TEST_GUEST_BASE + 0x20;
+    let output_addr = TEST_GUEST_BASE + 0x40;
 
     let scalar_bytes: [u8; 32] = {
         let mut s = [0u8; 32];
@@ -1209,7 +1212,7 @@ fn ristretto_scalar_mult_via_ecall_tracing() {
     let point_bytes: [u8; 32] =
         curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
 
-    let mut flat_mem = vec![0u8; 0x2000];
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
     flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&point_bytes);
 
@@ -1302,10 +1305,10 @@ fn prove_blake2b_via_ecall() {
         0x5BE0CD19137E2179,
     ];
 
-    // Lay out memory: h at 0x1000 (64 bytes), m at 0x1040 (128 bytes)
-    let h_addr: u64 = 0x1000;
-    let m_addr: u64 = 0x1040;
-    let mut flat_mem = vec![0u8; 0x2000];
+    // Lay out the h (64-byte) and m (128-byte) buffers above the low zone.
+    let h_addr = TEST_GUEST_BASE;
+    let m_addr = TEST_GUEST_BASE + 0x40;
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     for i in 0..8 {
         flat_mem[h_addr as usize + i * 8..h_addr as usize + i * 8 + 8]
             .copy_from_slice(&iv[i].to_le_bytes());
@@ -1411,13 +1414,13 @@ fn prove_blake2b_via_ecall() {
 fn prove_ristretto_via_ecall_boundary() {
     use vos_pvm_proof::core::tracing::ECALL_RISTRETTO_SCALAR_MULT;
 
-    let scalar_addr: u64 = 0x1000;
-    let point_addr: u64 = 0x1020;
-    let output_addr: u64 = 0x1040;
+    let scalar_addr = TEST_GUEST_BASE;
+    let point_addr = TEST_GUEST_BASE + 0x20;
+    let output_addr = TEST_GUEST_BASE + 0x40;
     let mut scalar_bytes = [0u8; 32];
     scalar_bytes[0] = 1;
     let point_bytes = [0u8; 32];
-    let mut flat_mem = vec![0u8; 0x2000];
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
     flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&point_bytes);
 
@@ -1492,13 +1495,13 @@ fn prove_ristretto_via_ecall_boundary() {
 fn prove_ristretto_identity_via_ecall_comb() {
     use vos_pvm_proof::core::tracing::ECALL_RISTRETTO_SCALAR_MULT;
 
-    let scalar_addr: u64 = 0x1000;
-    let point_addr: u64 = 0x1020;
-    let output_addr: u64 = 0x1040;
+    let scalar_addr = TEST_GUEST_BASE;
+    let point_addr = TEST_GUEST_BASE + 0x20;
+    let output_addr = TEST_GUEST_BASE + 0x40;
     // scalar = 0, point = basepoint ⇒ FixedBasepoint comb call for 0·G.
     let scalar_bytes = [0u8; 32];
     let point_bytes = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
-    let mut flat_mem = vec![0u8; 0x2000];
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
     flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&point_bytes);
 
@@ -1572,12 +1575,12 @@ fn prove_ristretto_identity_via_ecall_comb() {
 fn prove_ristretto_point_add_via_ecall_boundary() {
     use vos_pvm_proof::core::tracing::ECALL_RISTRETTO_POINT_ADD;
 
-    let p_addr: u64 = 0x1000;
-    let q_addr: u64 = 0x1020;
-    let output_addr: u64 = 0x1040;
+    let p_addr = TEST_GUEST_BASE;
+    let q_addr = TEST_GUEST_BASE + 0x20;
+    let output_addr = TEST_GUEST_BASE + 0x40;
     let p_bytes = [0u8; 32];
     let q_bytes = [0u8; 32];
-    let mut flat_mem = vec![0u8; 0x2000];
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     flat_mem[p_addr as usize..p_addr as usize + 32].copy_from_slice(&p_bytes);
     flat_mem[q_addr as usize..q_addr as usize + 32].copy_from_slice(&q_bytes);
 
@@ -1639,11 +1642,11 @@ fn prove_ristretto_point_add_via_ecall_boundary() {
 fn prove_scalar_reduce_wide_via_ecall_boundary() {
     use vos_pvm_proof::core::tracing::ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE;
 
-    let wide_addr: u64 = 0x1000;
-    let output_addr: u64 = 0x1040;
+    let wide_addr = TEST_GUEST_BASE;
+    let output_addr = TEST_GUEST_BASE + 0x40;
     let mut wide_bytes = [0u8; 64];
     wide_bytes[0] = 7;
-    let mut flat_mem = vec![0u8; 0x2000];
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     flat_mem[wide_addr as usize..wide_addr as usize + 64].copy_from_slice(&wide_bytes);
 
     let imm = ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE;
@@ -1703,14 +1706,14 @@ fn prove_scalar_reduce_wide_via_ecall_boundary() {
 fn prove_scalar_mul_mod_l_via_ecall() {
     use vos_pvm_proof::core::tracing::ECALL_SCALAR_MUL_MOD_L;
 
-    let a_addr: u64 = 0x1000;
-    let b_addr: u64 = 0x1020;
-    let output_addr: u64 = 0x1040;
+    let a_addr = TEST_GUEST_BASE;
+    let b_addr = TEST_GUEST_BASE + 0x20;
+    let output_addr = TEST_GUEST_BASE + 0x40;
     let mut a_bytes = [0u8; 32];
     a_bytes[0] = 7;
     let mut b_bytes = [0u8; 32];
     b_bytes[0] = 13;
-    let mut flat_mem = vec![0u8; 0x2000];
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     flat_mem[a_addr as usize..a_addr as usize + 32].copy_from_slice(&a_bytes);
     flat_mem[b_addr as usize..b_addr as usize + 32].copy_from_slice(&b_bytes);
 
@@ -1772,14 +1775,14 @@ fn prove_scalar_mul_mod_l_via_ecall() {
 fn prove_scalar_mul_then_add_mod_l() {
     use vos_pvm_proof::core::tracing::{ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_MUL_MOD_L};
 
-    let a_addr: u64 = 0x1000;
-    let b_addr: u64 = 0x1020;
-    let out_addr: u64 = 0x1040;
+    let a_addr = TEST_GUEST_BASE;
+    let b_addr = TEST_GUEST_BASE + 0x20;
+    let out_addr = TEST_GUEST_BASE + 0x40;
     let mut a_bytes = [0u8; 32];
     a_bytes[0] = 7;
     let mut b_bytes = [0u8; 32];
     b_bytes[0] = 13;
-    let mut flat_mem = vec![0u8; 0x2000];
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     flat_mem[a_addr as usize..a_addr as usize + 32].copy_from_slice(&a_bytes);
     flat_mem[b_addr as usize..b_addr as usize + 32].copy_from_slice(&b_bytes);
 
@@ -1848,13 +1851,13 @@ fn prove_scalar_mul_then_add_mod_l() {
 fn prove_scalar_mult_then_point_add() {
     use vos_pvm_proof::core::tracing::{ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT};
 
-    let scalar_addr: u64 = 0x1000;
-    let point_addr: u64 = 0x1020;
-    let a_addr: u64 = 0x1040;
+    let scalar_addr = TEST_GUEST_BASE;
+    let point_addr = TEST_GUEST_BASE + 0x20;
+    let a_addr = TEST_GUEST_BASE + 0x40;
     let mut scalar_bytes = [0u8; 32];
     scalar_bytes[0] = 1;
     let point_bytes = [0u8; 32];
-    let mut flat_mem = vec![0u8; 0x2000];
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
     flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&point_bytes);
 
@@ -1923,13 +1926,13 @@ fn prove_scalar_mult_then_point_add() {
 fn prove_two_ristretto_scalar_mult_ecalls() {
     use vos_pvm_proof::core::tracing::ECALL_RISTRETTO_SCALAR_MULT;
 
-    let scalar_addr: u64 = 0x1000;
-    let point_addr: u64 = 0x1020;
-    let output_addr: u64 = 0x1040;
+    let scalar_addr = TEST_GUEST_BASE;
+    let point_addr = TEST_GUEST_BASE + 0x20;
+    let output_addr = TEST_GUEST_BASE + 0x40;
     let mut scalar_bytes = [0u8; 32];
     scalar_bytes[0] = 1;
     let point_bytes = [0u8; 32];
-    let mut flat_mem = vec![0u8; 0x2000];
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
     flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&point_bytes);
 
@@ -1992,14 +1995,14 @@ fn prove_two_ristretto_scalar_mult_ecalls() {
 #[test]
 fn prove_scalar_mul_chained_add() {
     use vos_pvm_proof::core::tracing::{ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_MUL_MOD_L};
-    let a_addr: u64 = 0x1000;
-    let b_addr: u64 = 0x1020;
-    let out_addr: u64 = 0x1040;
+    let a_addr = TEST_GUEST_BASE;
+    let b_addr = TEST_GUEST_BASE + 0x20;
+    let out_addr = TEST_GUEST_BASE + 0x40;
     let mut a_bytes = [0u8; 32];
     a_bytes[0] = 7;
     let mut b_bytes = [0u8; 32];
     b_bytes[0] = 13;
-    let mut flat_mem = vec![0u8; 0x2000];
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     flat_mem[a_addr as usize..a_addr as usize + 32].copy_from_slice(&a_bytes);
     flat_mem[b_addr as usize..b_addr as usize + 32].copy_from_slice(&b_bytes);
 

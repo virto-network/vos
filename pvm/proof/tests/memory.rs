@@ -3,10 +3,13 @@
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
 // Memory is now flat_mem in Interpreter
-use vos_pvm::PVM_REGISTER_COUNT;
+use vos_pvm::{PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
 
 use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::{prove, verify};
+
+const TEST_MEMORY_ADDR: u64 = PVM_ZONE_SIZE as u64 + 0x1000;
+const TEST_MEMORY_ADDR_U64: u64 = PVM_ZONE_SIZE as u64 + 0x2000;
 
 fn prove_and_verify(steps: Vec<vos_pvm_proof::core::step::PvmStep>, code: &[u8], bitmask: &[u8]) {
     for (i, s) in steps.iter().enumerate() {
@@ -30,7 +33,7 @@ fn prove_store_only() {
     // Just a store followed by trap
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 42;
-    regs[1] = 0x1000;
+    regs[1] = TEST_MEMORY_ADDR;
 
     let memory = vec![0u8; 4 * 1024 * 1024];
 
@@ -71,7 +74,7 @@ fn prove_store_and_load_u8() {
     //   Trap
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 42; // value to store
-    regs[1] = 0x1000; // base address
+    regs[1] = TEST_MEMORY_ADDR; // base address
 
     let memory = vec![0u8; 4 * 1024 * 1024];
 
@@ -115,13 +118,13 @@ fn prove_store_and_load_u8() {
     // Verify memory was traced
     assert!(steps[0].mem_write.is_some());
     let w = steps[0].mem_write.as_ref().unwrap();
-    assert_eq!(w.address, 0x1000);
+    assert_eq!(w.address, TEST_MEMORY_ADDR as u32);
     assert_eq!(w.value, 42);
     assert_eq!(w.size, 1);
 
     assert!(steps[1].mem_read.is_some());
     let r = steps[1].mem_read.as_ref().unwrap();
-    assert_eq!(r.address, 0x1000);
+    assert_eq!(r.address, TEST_MEMORY_ADDR as u32);
     assert_eq!(r.value, 42);
     assert_eq!(r.size, 1);
 
@@ -135,7 +138,7 @@ fn prove_store_and_load_u8() {
 fn prove_store_and_load_u64() {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 0xDEAD_BEEF_CAFE_BABE;
-    regs[1] = 0x2000;
+    regs[1] = TEST_MEMORY_ADDR_U64;
 
     let memory = vec![0u8; 4 * 1024 * 1024];
 
@@ -240,7 +243,7 @@ fn prove_multiple_stores_same_addr() {
     // Write twice to the same address, then read
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 10; // first value
-    regs[1] = 0x1000; // address
+    regs[1] = TEST_MEMORY_ADDR; // address
     regs[3] = 20; // second value
 
     let memory = vec![0u8; 4 * 1024 * 1024];
@@ -302,7 +305,7 @@ fn prove_multiple_stores_same_addr() {
 
 #[test]
 fn prove_store_imm_u8_then_load() {
-    // StoreImmU8 (TwoImm direct): mem[imm_x=0x1000] = imm_y=0x42.
+    // StoreImmU8 (TwoImm direct): mem[imm_x=TEST_MEMORY_ADDR] = imm_y=0x42.
     // Then read back via LoadIndU8.  The AIR binds:
     //   - MemAddr = ImmBytes[0..4] (= imm_x), via the widened
     //     `IsLoadDirect+IsStoreDirect+IsStoreImmDirect` gate.
@@ -314,17 +317,16 @@ fn prove_store_imm_u8_then_load() {
     // For our 6-byte payload after opcode (lx_byte + 4 + 1):
     //   skip_len = 6.
     let mut regs = [0u64; PVM_REGISTER_COUNT];
-    regs[1] = 0x1000; // base for the load
+    regs[1] = TEST_MEMORY_ADDR; // base for the load
 
     let memory = vec![0u8; 4 * 1024 * 1024];
 
-    let code = vec![
+    let mut code = vec![
         Opcode::StoreImmU8 as u8, // 30
         4,                        // lx_byte: imm_x is 4 bytes
-        0x00,
-        0x10,
-        0x00,
-        0x00, // imm_x = 0x1000 LE
+    ];
+    code.extend_from_slice(&(TEST_MEMORY_ADDR as u32).to_le_bytes());
+    code.extend_from_slice(&[
         0x42, // imm_y = 0x42
         Opcode::LoadIndU8 as u8,
         0x12,
@@ -333,7 +335,7 @@ fn prove_store_imm_u8_then_load() {
         0,
         0,
         Opcode::Trap as u8,
-    ];
+    ]);
     // Bitmask: instruction 0 is 7 bytes (opcode + 6 payload),
     //          instruction 1 is 6 bytes (opcode + 5 payload),
     //          instruction 2 is 1 byte.
@@ -360,12 +362,12 @@ fn prove_store_imm_u8_then_load() {
 fn prove_store_load_with_alu() {
     // ALU + memory mixed: compute a value, store it, load it back
     // φ[2] = φ[0] + φ[1] = 150
-    // mem[0x1000] = φ[2]
-    // φ[3] = mem[0x1000]
+    // mem[TEST_MEMORY_ADDR] = φ[2]
+    // φ[3] = mem[TEST_MEMORY_ADDR]
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 100;
     regs[1] = 50;
-    regs[4] = 0x1000; // address register
+    regs[4] = TEST_MEMORY_ADDR; // address register
 
     let memory = vec![0u8; 4 * 1024 * 1024];
 

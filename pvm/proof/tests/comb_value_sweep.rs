@@ -37,6 +37,9 @@ use vos_pvm_proof::{
     verify_with_explicit_components,
 };
 
+const TEST_GUEST_BASE: u64 = vos_pvm::PVM_ZONE_SIZE as u64 + 0x1000;
+const TEST_GUEST_MEMORY_LEN: usize = vos_pvm::PVM_ZONE_SIZE as usize + 0x4000;
+
 /// Build a full-system `SideNote` for one FIXED-BASE `scalar·G` ECALL by
 /// running a REAL PVM trace (mirrors chip_isolated.rs's
 /// `fixed_base_real_side_note`): a `LoadImm φ[7]=scalar_ptr` retargets the
@@ -51,10 +54,10 @@ fn fixed_base_real_side_note(scalar: curve25519_dalek::scalar::Scalar) -> SideNo
     use vos_pvm::interpreter::Interpreter;
     use vos_pvm_proof::core::tracing::{ECALL_RISTRETTO_SCALAR_MULT, ScalarMultKind, TracingPvm};
 
-    let point_addr: u64 = 0x1000;
-    let output_addr: u64 = 0x1020;
-    let scalar_base: u64 = 0x1040;
-    let mut flat_mem = vec![0u8; 0x4000];
+    let point_addr = TEST_GUEST_BASE;
+    let output_addr = TEST_GUEST_BASE + 0x20;
+    let scalar_base = TEST_GUEST_BASE + 0x40;
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     let basepoint = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
     flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&basepoint);
     flat_mem[scalar_base as usize..scalar_base as usize + 32].copy_from_slice(&scalar.to_bytes());

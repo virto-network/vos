@@ -17,6 +17,9 @@ use vos_pvm_proof::{
     prove_with_explicit_components, verify_with_explicit_components,
 };
 
+const TEST_GUEST_BASE: u64 = vos_pvm::PVM_ZONE_SIZE as u64 + 0x1000;
+const TEST_GUEST_MEMORY_LEN: usize = vos_pvm::PVM_ZONE_SIZE as usize + 0x4000;
+
 /// Minimal bound-1-only configuration.  These chips all declare
 /// `LOG_CONSTRAINT_DEGREE_BOUND = 1` (default) so they work on the v2.x
 /// lifted protocol without any rewrites.
@@ -319,10 +322,10 @@ fn harness_ristretto_isolated() {
     use vos_pvm_proof::core::tracing::{ECALL_RISTRETTO_SCALAR_MULT, TracingPvm};
 
     // Lay out 32-byte buffers in flat_mem at known addresses.
-    let scalar_addr: u64 = 0x1000;
-    let point_addr: u64 = 0x1020;
-    let output_addr: u64 = 0x1040;
-    let mut flat_mem = vec![0u8; 0x2000];
+    let scalar_addr = TEST_GUEST_BASE;
+    let point_addr = TEST_GUEST_BASE + 0x20;
+    let output_addr = TEST_GUEST_BASE + 0x40;
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     // scalar = 2
     let mut scalar_bytes = [0u8; 32];
     scalar_bytes[0] = 2;
@@ -635,10 +638,10 @@ fn fixed_base_real_side_note(scalars: &[curve25519_dalek::scalar::Scalar]) -> Si
     use vos_pvm::interpreter::Interpreter;
     use vos_pvm_proof::core::tracing::{ECALL_RISTRETTO_SCALAR_MULT, ScalarMultKind, TracingPvm};
 
-    let point_addr: u64 = 0x1000;
-    let output_addr: u64 = 0x1020;
-    let scalar_base: u64 = 0x1040;
-    let mut flat_mem = vec![0u8; 0x4000];
+    let point_addr = TEST_GUEST_BASE;
+    let output_addr = TEST_GUEST_BASE + 0x20;
+    let scalar_base = TEST_GUEST_BASE + 0x40;
+    let mut flat_mem = vec![0u8; TEST_GUEST_MEMORY_LEN];
     let basepoint = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
     flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&basepoint);
     for (i, s) in scalars.iter().enumerate() {

@@ -25,9 +25,9 @@
 //! Run with: `cargo test -p vos-pvm-proof --features debug-internals --test
 //! ledger_readconsistency_gate`.
 
-use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
+use vos_pvm::{PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
 
 use vos_pvm_proof::AirColumn;
 use vos_pvm_proof::SideNote;
@@ -40,6 +40,8 @@ use vos_pvm_proof::trace::component::ComponentTrace;
 
 use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::BaseField;
+
+const TEST_MEMORY_ADDR: u64 = PVM_ZONE_SIZE as u64 + 0x1000;
 
 /// Drive a chip's row-by-row `AssertEvaluator` over `trace` (regenerating a
 /// self-consistent interaction trace + claimed sum from the — possibly
@@ -183,14 +185,14 @@ fn register_forged_read_value_is_rejected() {
 
 // ── RAM ledger ──────────────────────────────────────────────────────────────
 
-/// StoreIndU8 `0x42 → [0x1000]` (write at ts=1), then LoadIndU8 `[0x1000]`
-/// (read 0x42 at ts=2).  Address 0x1000 is write-first, so the byte ledger is
-/// `[(0x1000,0x42,ts1,W), (0x1000,0x42,ts2,R)]`.
+/// StoreIndU8 `0x42 → [TEST_MEMORY_ADDR]` (write at ts=1), then LoadIndU8
+/// `[TEST_MEMORY_ADDR]` (read 0x42 at ts=2). The address is write-first, so the
+/// byte ledger contains the matching write/read pair.
 fn memory_side_note() -> SideNote {
     use vos_pvm_proof::core::step::PvmStep;
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 0x42; // value
-    regs[1] = 0x1000; // base address
+    regs[1] = TEST_MEMORY_ADDR; // base address
     let code = vec![
         Opcode::StoreIndU8 as u8,
         0x10,
@@ -249,11 +251,14 @@ fn memory_forged_read_value_is_rejected() {
     assert_chip(&chip, &trace, &side_note)
         .expect("honest RAM-ledger trace must satisfy all constraints");
 
-    // Locate the load row (addr byte1=0x10 ⇒ 0x1000, IsWrite=0, real,
+    // Locate the load row at the above-zone test address (IsWrite=0, real,
     // Value=0x42).
+    let address = (TEST_MEMORY_ADDR as u32).to_le_bytes();
     let read_row = find_row(&trace, |at| {
-        at(addr) == BaseField::from(0u32)
-            && at(addr + 1) == BaseField::from(0x10u32)
+        at(addr) == BaseField::from(address[0] as u32)
+            && at(addr + 1) == BaseField::from(address[1] as u32)
+            && at(addr + 2) == BaseField::from(address[2] as u32)
+            && at(addr + 3) == BaseField::from(address[3] as u32)
             && at(is_write) == BaseField::from(0u32)
             && at(is_padding) == BaseField::from(0u32)
             && at(value) == BaseField::from(0x42u32)
@@ -261,7 +266,7 @@ fn memory_forged_read_value_is_rejected() {
     assert_eq!(
         trace.original_trace[prev_value].as_slice()[read_row],
         BaseField::from(0x42u32),
-        "honest [0x1000] load row must carry prev_value = 0x42 (the prior store)"
+        "honest above-zone load row must carry prev_value = 0x42 (the prior store)"
     );
 
     // Forge: claim the load returned 0x99 with prev_value:=0x99.
@@ -272,7 +277,7 @@ fn memory_forged_read_value_is_rejected() {
     let res = assert_chip(&chip, &trace, &side_note);
     assert!(
         res.is_err(),
-        "SOUNDNESS GAP: a [0x1000] load forged to 0x99 (with prev_value:=0x99) \
+        "SOUNDNESS GAP: an above-zone load forged to 0x99 (with prev_value:=0x99) \
          while the prior ledger row stores 0x42 was ACCEPTED by MemoryChip — \
          read consistency is vacuous cross-row."
     );

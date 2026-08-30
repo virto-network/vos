@@ -44,11 +44,11 @@ const VOUCHER_CHECK_CATALOG: &str = include_str!("../fixtures/voucher-check/cata
 const VOUCHER_CHECK_RELEASE_PVM_GZ: &[u8] =
     include_bytes!("../fixtures/voucher-check/voucher-check.pvm.gz");
 const VOUCHER_CHECK_PIN_ID: &str =
-    "06482de863e4bfacc8255cb2d1154767442373f5a8d5b2cc9bdb8b6329e1dd5b";
+    "1211f4dbca7dbe9cd0ba2fb4727bbae9367839bdee9068436db075556c6610b1";
 const VOUCHER_CHECK_BLOB_HASH: &str =
     "5866fc11e48309aa97d87ce6c6c8469088a88c484a4f7fb9691c7c82fc50dd55";
 const VOUCHER_CHECK_COMMITMENT: &str =
-    "94eca0756b65f4727f91dca0306e8301615865410af2c45f03dd64c0334d3865";
+    "da3aa6bf01a3ddf438ae135522dc2e6800437110af6a6db0d7636dfc57acb494";
 const VOUCHER_CHECK_PROFILE: [u32; 32] = [
     15, 15, 16, 18, 9, 6, 4, 17, 4, 4, 4, 18, 12, 8, 8, 6, 8, 8, 8, 14, 13, 13, 12, 4, 7, 10, 11,
     6, 5, 6, 5, 16,

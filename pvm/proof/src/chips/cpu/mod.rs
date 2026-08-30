@@ -304,6 +304,69 @@ impl BuiltInComponent for CpuChip {
         let f256 = E::F::from(BaseField::from(256u32));
         let f255 = E::F::from(BaseField::from(255u32));
 
+        // ── Standard v0.8 scalar-memory address validity ──
+        //
+        // A completed Standard load/store must touch no address below the
+        // 64-KiB initialization zone.  With scalar widths in {1,2,4,8}, this
+        // is equivalent to both:
+        //   1. the base high word is nonzero (`addr >= 0x1_0000`), and
+        //   2. the final active byte does not wrap through 2^32.
+        //
+        // We prove both predicates with one nonzero product.  `last_carry`
+        // is the carry into address byte 3 while adding `width - 1`; hence
+        // `256 - addr[3] - last_carry` is zero exactly on top-of-u32 wrap.
+        // The product is at most 65535 * 256, strictly below the M31 modulus,
+        // so it cannot vanish by field reduction.  Jar is deliberately
+        // excluded to preserve its frozen low-address behavior.
+        {
+            let isa_profile = crate::trace::trace_eval!(trace_eval, Column::IsaProfile);
+            let is_load_mem = crate::trace::trace_eval!(trace_eval, Column::IsLoad);
+            let is_standard_mem_h = crate::trace::trace_eval!(trace_eval, Column::IsStandardMemH);
+            let last_carry_h = crate::trace::trace_eval!(trace_eval, Column::MemLastAddrCarryH);
+            let range_product_h = crate::trace::trace_eval!(trace_eval, Column::MemRangeProductH);
+            let range_inv = crate::trace::trace_eval!(trace_eval, Column::MemRangeInv);
+            let range_times_inv_h =
+                crate::trace::trace_eval!(trace_eval, Column::MemRangeTimesInvH);
+            let mem_addr_guard = crate::trace::trace_eval!(trace_eval, Column::MemAddr);
+            let carry2_guard = crate::trace::trace_eval!(trace_eval, Column::MemByteAddrCarry2);
+            let carry3_guard = crate::trace::trace_eval!(trace_eval, Column::MemByteAddrCarry3);
+            let size1_guard = crate::trace::trace_eval!(trace_eval, Column::IsMemSize1);
+            let size2_guard = crate::trace::trace_eval!(trace_eval, Column::IsMemSize2);
+            let size4_guard = crate::trace::trace_eval!(trace_eval, Column::IsMemSize4);
+            let size8_guard = crate::trace::trace_eval!(trace_eval, Column::IsMemSize8);
+
+            let is_memory = is_load_mem[0].clone() + is_store_e();
+            eval.add_constraint(
+                is_standard_mem_h[0].clone() - (E::F::one() - isa_profile[0].clone()) * is_memory,
+            );
+
+            let selected_last_carry = size1_guard[0].clone() * carry3_guard[0].clone()
+                + size2_guard[0].clone() * carry3_guard[1].clone()
+                + size4_guard[0].clone() * carry3_guard[3].clone()
+                + size8_guard[0].clone() * carry3_guard[7].clone();
+            eval.add_constraint(last_carry_h[0].clone() - selected_last_carry);
+
+            // Derive the high word from the canonical byte-0 memory-lookup
+            // address, rather than the raw MemAddr limbs. Indirect-address
+            // addition constrains those limbs algebraically but does not
+            // range-check them individually. The byte-0 lookup contributes
+            //   b2 = MemAddr[2] + carry2[0] - 256*carry3[0]
+            //   b3 = MemAddr[3] + carry3[0]
+            // so b2 + 256*b3 simplifies to the expression below while still
+            // being authenticated by the canonical MemoryChip ledger tuple.
+            let high_word = mem_addr_guard[2].clone()
+                + carry2_guard[0].clone()
+                + f256.clone() * mem_addr_guard[3].clone();
+            let no_wrap_factor = f256.clone() - mem_addr_guard[3].clone() - last_carry_h[0].clone();
+            eval.add_constraint(range_product_h[0].clone() - high_word * no_wrap_factor);
+            eval.add_constraint(
+                range_times_inv_h[0].clone() - range_product_h[0].clone() * range_inv[0].clone(),
+            );
+            eval.add_constraint(
+                is_standard_mem_h[0].clone() * (range_times_inv_h[0].clone() - E::F::one()),
+            );
+        }
+
         // ── Selector helpers (Add/Sub/Mul-sign-ext) ──
         let is_add_64_h = crate::trace::trace_eval!(trace_eval, Column::IsAdd64bitH);
         let is_add_32_h = crate::trace::trace_eval!(trace_eval, Column::IsAdd32bitH);
@@ -1639,6 +1702,108 @@ impl BuiltInComponent for CpuChip {
             );
         }
 
+        // ── Soft host-call continuation ──
+        //
+        // IsExit also covers Trap and dynamic jumps. Subtracting their
+        // authenticated per-opcode flags leaves exactly Ecalli (and the
+        // frozen JAR-only Ecall opcode). Standard host calls either remain
+        // at their cause PC and terminate the trace, or carry an explicit,
+        // policy-authorized acknowledgment and advance sequentially. JAR
+        // soft exits always retain their historical sequential PC.
+        //
+        // HostCallContinuesH = IsaProfile * soft_host + acknowledged keeps
+        // every constraint at degree two: the two summands are disjoint
+        // because an acknowledgment is forbidden in the JAR profile.
+        {
+            let is_exit = crate::trace::trace_eval!(trace_eval, Column::IsExit);
+            let is_trap = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
+            let is_jump_ind = crate::trace::trace_eval!(trace_eval, Column::IsJumpInd);
+            let is_load_imm_jump_ind =
+                crate::trace::trace_eval!(trace_eval, Column::IsLoadImmJumpInd);
+            let isa_profile = crate::trace::trace_eval!(trace_eval, Column::IsaProfile);
+            let acknowledged = crate::trace::trace_eval!(trace_eval, Column::HostCallAcknowledged);
+            let allowed = crate::trace::trace_eval!(trace_eval, Column::HostCallAllowed);
+            let continues = crate::trace::trace_eval!(trace_eval, Column::HostCallContinuesH);
+            let precompile_dispatch =
+                crate::trace::trace_eval!(trace_eval, Column::HostCallPrecompileDispatch);
+            let is_blake = crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
+            let is_110 = crate::trace::trace_eval!(trace_eval, Column::Is110Ecall);
+            let is_111 = crate::trace::trace_eval!(trace_eval, Column::Is111Ecall);
+            let is_112 = crate::trace::trace_eval!(trace_eval, Column::Is112Ecall);
+            let is_113 = crate::trace::trace_eval!(trace_eval, Column::Is113Ecall);
+            let is_114 = crate::trace::trace_eval!(trace_eval, Column::Is114Ecall);
+            let pc = crate::trace::trace_eval!(trace_eval, Column::Pc);
+            let next_pc = crate::trace::trace_eval!(trace_eval, Column::NextPc);
+            let skip_len = crate::trace::trace_eval!(trace_eval, Column::SkipLen);
+            let pc_carry = crate::trace::trace_eval!(trace_eval, Column::PcCarry);
+
+            let soft_host = is_exit[0].clone()
+                - is_trap[0].clone()
+                - is_jump_ind[0].clone()
+                - is_load_imm_jump_ind[0].clone();
+
+            eval.add_constraint(acknowledged[0].clone() * (E::F::one() - acknowledged[0].clone()));
+            eval.add_constraint(continues[0].clone() * (E::F::one() - continues[0].clone()));
+            // The ProgramMemory-authenticated policy bit implies both the
+            // Standard profile and a supported ECALLI identifier.
+            eval.add_constraint(acknowledged[0].clone() * (E::F::one() - allowed[0].clone()));
+            eval.add_constraint(acknowledged[0].clone() * (E::F::one() - soft_host.clone()));
+            eval.add_constraint(acknowledged[0].clone() * isa_profile[0].clone());
+            eval.add_constraint(
+                continues[0].clone()
+                    - isa_profile[0].clone() * soft_host.clone()
+                    - acknowledged[0].clone(),
+            );
+
+            // ProgramMemory commits the exact cryptographic dispatch ID.
+            // A continued host call selects at most one precompile relation,
+            // and its weighted selector must equal that authenticated ID.
+            // Dispatch zero is the lifecycle/VOS-stub class, which therefore
+            // continues without a cryptographic call row. Standard calls that
+            // remain unacknowledged and terminal select no relation; JAR's
+            // historical continued precompile behavior remains bound too.
+            let precompile_selector_sum = is_blake[0].clone()
+                + is_110[0].clone()
+                + is_111[0].clone()
+                + is_112[0].clone()
+                + is_113[0].clone()
+                + is_114[0].clone();
+            eval.add_constraint(
+                precompile_selector_sum.clone() * (E::F::one() - precompile_selector_sum.clone()),
+            );
+            let selected_dispatch = is_blake[0].clone() * E::F::from(BaseField::from(100u32))
+                + is_110[0].clone() * E::F::from(BaseField::from(110u32))
+                + is_111[0].clone() * E::F::from(BaseField::from(111u32))
+                + is_112[0].clone() * E::F::from(BaseField::from(112u32))
+                + is_113[0].clone() * E::F::from(BaseField::from(113u32))
+                + is_114[0].clone() * E::F::from(BaseField::from(114u32));
+            eval.add_constraint(
+                selected_dispatch - continues[0].clone() * precompile_dispatch[0].clone(),
+            );
+
+            let seq_pc = [
+                pc[0].clone() + E::F::one() + skip_len[0].clone()
+                    - pc_carry[0].clone() * f256.clone(),
+                pc[1].clone() + pc_carry[0].clone() - pc_carry[1].clone() * f256.clone(),
+                pc[2].clone() + pc_carry[1].clone() - pc_carry[2].clone() * f256.clone(),
+                pc[3].clone() + pc_carry[2].clone(),
+            ];
+            for i in 0..4 {
+                eval.add_constraint(
+                    soft_host.clone() * (next_pc[i].clone() - pc[i].clone())
+                        - continues[0].clone() * (seq_pc[i].clone() - pc[i].clone()),
+                );
+            }
+
+            // A Standard host call not acknowledged by the committed proof
+            // runtime is a real exit, so it cannot be followed by another
+            // real row. Acknowledged rows may end a segment at resume_pc.
+            let is_padding_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
+            eval.add_constraint(
+                (soft_host - continues[0].clone()) * (E::F::one() - is_padding_next[0].clone()),
+            );
+        }
+
         // ════════════════════════════════════════════════════════════════════
         // Range256 checks for result byte limbs
         // ════════════════════════════════════════════════════════════════════
@@ -2301,6 +2466,7 @@ impl BuiltInComponent for CpuChip {
             let reg_b = crate::trace::trace_eval!(trace_eval, Column::RegB);
             let reg_d = crate::trace::trace_eval!(trace_eval, Column::RegD);
             let imm = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
+            let host_call_allowed = crate::trace::trace_eval!(trace_eval, Column::HostCallAllowed);
             let fb0 = crate::trace::trace_eval!(trace_eval, Column::FlagByte0);
             let fb1 = crate::trace::trace_eval!(trace_eval, Column::FlagByte1);
             let fb2 = crate::trace::trace_eval!(trace_eval, Column::FlagByte2);
@@ -2310,6 +2476,8 @@ impl BuiltInComponent for CpuChip {
             let imm_y_for_lookup = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let branch_target_for_lookup =
                 crate::trace::trace_eval!(trace_eval, Column::BranchTarget);
+            let host_call_precompile_dispatch =
+                crate::trace::trace_eval!(trace_eval, Column::HostCallPrecompileDispatch);
 
             let mut tuple: Vec<E::F> = pc.to_vec();
             tuple.push(isa_profile[0].clone());
@@ -2319,6 +2487,7 @@ impl BuiltInComponent for CpuChip {
             tuple.push(reg_b[0].clone());
             tuple.push(reg_d[0].clone());
             tuple.extend_from_slice(&imm);
+            tuple.push(host_call_allowed[0].clone());
             tuple.push(fb0[0].clone());
             tuple.push(fb1[0].clone());
             tuple.push(fb2[0].clone());
@@ -2335,6 +2504,7 @@ impl BuiltInComponent for CpuChip {
             // to BranchTarget for those (see decode_branch_target's default
             // arm), so the lookup balances without gating.
             tuple.extend_from_slice(&branch_target_for_lookup);
+            tuple.push(host_call_precompile_dispatch[0].clone());
 
             // Paired emissions; ProgramMemoryChip's mult = 2·count_at_pc.
             eval.add_to_relation(RelationEntry::new(

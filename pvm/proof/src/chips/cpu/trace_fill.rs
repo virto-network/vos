@@ -72,6 +72,23 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, step.skip_len as u8, Column::SkipLen);
         // 8-byte immediate witness for the ProgramMemory lookup.
         trace.fill_columns_bytes(row, &step.imm.to_le_bytes(), Column::ImmBytes);
+        let host_call_allowed = side_note.isa_mode == vos_pvm::IsaMode::Conformance
+            && step.opcode == crate::core::opcode::Opcode::Ecalli
+            && crate::core::ecall::is_proof_host_call_allowed(step.imm);
+        trace.fill_columns(row, host_call_allowed, Column::HostCallAllowed);
+        let host_call_precompile_dispatch = if matches!(
+            step.opcode,
+            crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
+        ) {
+            crate::core::ecall::proof_precompile_dispatch_id(step.imm)
+        } else {
+            0
+        };
+        trace.fill_columns(
+            row,
+            host_call_precompile_dispatch,
+            Column::HostCallPrecompileDispatch,
+        );
         // charge ProgramMemoryChip for this step's instruction
         // fetch.  Two consumer emissions per step (paired) → producer
         // multiplicity = 2 · count_at_pc.
@@ -1243,6 +1260,50 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns_bytes(row, &c3, Column::MemByteAddrCarry3);
         }
 
+        // Standard-v0.8 protected-zone / top-wrap witness.  The AIR selects
+        // the carry for the authenticated opcode width, so derive the same
+        // final-byte offset from classification rather than trusting
+        // `MemAccess::size` here.
+        let is_standard_mem = side_note.isa_mode == vos_pvm::IsaMode::Conformance
+            && (flags.is_load || flags.is_store);
+        trace.fill_columns(row, is_standard_mem, Column::IsStandardMemH);
+        let address = mem.map(|m| m.address).unwrap_or(0);
+        let last_offset = if flags.is_mem_size_1 {
+            0u32
+        } else if flags.is_mem_size_2 {
+            1
+        } else if flags.is_mem_size_4 {
+            3
+        } else if flags.is_mem_size_8 {
+            7
+        } else {
+            0
+        };
+        // MemByteAddrCarry3 is the carry INTO byte 3 from the lower 24 bits,
+        // not the final carry out of the u32 address.  Keep this helper
+        // identical to the AIR-selected carry column.
+        let last_carry = ((u64::from(address & 0x00ff_ffff) + u64::from(last_offset)) >> 24) as u8;
+        trace.fill_columns(row, last_carry, Column::MemLastAddrCarryH);
+
+        // The two factors are bounded by 65535 and 256 respectively, so the
+        // integer product is already the canonical M31 representative.
+        let high_word = address >> 16;
+        let no_wrap_factor = 256 - (address >> 24) - u32::from(last_carry);
+        let range_product = high_word * no_wrap_factor;
+        let range_product_f = stwo::core::fields::m31::BaseField::from(range_product);
+        let range_inv_f = if range_product == 0 {
+            stwo::core::fields::m31::BaseField::from(0u32)
+        } else {
+            range_product_f.inverse()
+        };
+        trace.fill_columns_base_field(row, &[range_product_f], Column::MemRangeProductH);
+        trace.fill_columns_base_field(row, &[range_inv_f], Column::MemRangeInv);
+        trace.fill_columns_base_field(
+            row,
+            &[range_product_f * range_inv_f],
+            Column::MemRangeTimesInvH,
+        );
+
         // NextTimestamp = timestamp + 1
         trace.fill_columns(row, step.timestamp + 1, Column::NextTimestamp);
         fill_ts_carry(&mut trace, row, step.timestamp);
@@ -1263,18 +1324,23 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // semantics) to avoid renaming across files, at the cost of a
         // little local confusion (the column comments below carry the
         // slot's actual semantic meaning).
-        let is_blake_ecall = matches!(
-            step.opcode,
-            crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
-        ) && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
+        let precompile_continues =
+            side_note.isa_mode == vos_pvm::IsaMode::Jar || step.host_call_acknowledged;
+        let is_blake_ecall = precompile_continues
+            && matches!(
+                step.opcode,
+                crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
+            )
+            && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
         trace.fill_columns(row, is_blake_ecall, Column::IsBlakeEcall);
         // Ristretto ECALL gates: one boolean per id.
         // Same imm-match shape as IsBlakeEcall; the operand pointers reuse the
         // Phi10/Phi11/Phi12 slots (= regs_before[7,8,9]) filled below.
-        let is_ecall = matches!(
-            step.opcode,
-            crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
-        );
+        let is_ecall = precompile_continues
+            && matches!(
+                step.opcode,
+                crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
+            );
         trace.fill_columns(
             row,
             is_ecall && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64,
@@ -1821,6 +1887,25 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             row,
             is_shift_constrained && no_rotr,
             Column::IsShiftCNotRotrH,
+        );
+
+        // ── Soft host-call disposition ──
+        // Standard ECALLI retains its cause PC until the proof runtime
+        // handles it; JAR Ecall/Ecalli keep the frozen already-advanced PC.
+        // The AIR authenticates the opcode class/profile and the static
+        // HostCallAllowed policy bit before accepting this acknowledgment.
+        let soft_host_exit =
+            flags.is_exit && !flags.is_trap && !flags.is_jump_ind && !flags.is_load_imm_jump_ind;
+        trace.fill_columns(
+            row,
+            step.host_call_acknowledged,
+            Column::HostCallAcknowledged,
+        );
+        trace.fill_columns(
+            row,
+            side_note.isa_mode == vos_pvm::IsaMode::Jar && soft_host_exit
+                || step.host_call_acknowledged,
+            Column::HostCallContinuesH,
         );
     }
 

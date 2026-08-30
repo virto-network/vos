@@ -1476,6 +1476,7 @@ mod tests {
             gas_after: 0,
             gas_charged: 0,
             next_pc: 0,
+            host_call_acknowledged: false,
             exit: false,
         }
     }

@@ -12,11 +12,13 @@ mod common;
 use common::*;
 
 use vos_pvm::ExitReason;
-use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
+use vos_pvm::{PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
 
 use vos_pvm_proof::core::tracing::TracingPvm;
+
+const TEST_MEMORY_ADDR: u64 = PVM_ZONE_SIZE as u64 + 0x1000;
 
 #[test]
 fn load_i8_negative_sign_extends() {
@@ -24,7 +26,7 @@ fn load_i8_negative_sign_extends() {
     // and read it back via LoadIndI8.
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 0x80;
-    regs[1] = 0x1000;
+    regs[1] = TEST_MEMORY_ADDR;
     let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
@@ -66,7 +68,7 @@ fn load_i8_negative_sign_extends() {
 fn load_i16_negative_sign_extends() {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 0x8000; // low 16 = -32768 (i16)
-    regs[1] = 0x1000;
+    regs[1] = TEST_MEMORY_ADDR;
     let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
@@ -107,7 +109,7 @@ fn load_i16_negative_sign_extends() {
 fn load_i32_negative_sign_extends() {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 0x8000_0000; // low 32 = INT32_MIN
-    regs[1] = 0x1000;
+    regs[1] = TEST_MEMORY_ADDR;
     let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
@@ -149,7 +151,7 @@ fn load_i8_positive_zero_extends() {
     // Sanity: positive byte loads with zero sign extension.
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 0x42;
-    regs[1] = 0x1000;
+    regs[1] = TEST_MEMORY_ADDR;
     let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
@@ -194,7 +196,7 @@ fn load_i8_negative_forged_high_byte_rejected() {
     // detected by the inactive-byte sign-extension constraint.
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 0x80;
-    regs[1] = 0x1000;
+    regs[1] = TEST_MEMORY_ADDR;
     let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![

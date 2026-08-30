@@ -26,9 +26,9 @@
 //! Run with: `cargo test -p vos-pvm-proof --features debug-internals --test
 //! memory_merkle_gate`.
 
-use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
+use vos_pvm::{PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
 
 use vos_pvm_proof::AirColumn;
 use vos_pvm_proof::SideNote;
@@ -40,6 +40,9 @@ use vos_pvm_proof::trace::component::ComponentTrace;
 
 use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::BaseField;
+
+const TEST_MEMORY_ADDR: u64 = PVM_ZONE_SIZE as u64 + 0x1000;
+const TEST_MEMORY_PAGE: u32 = TEST_MEMORY_ADDR as u32 / 4096;
 
 /// Regenerate a self-consistent interaction trace + claimed sum from the
 /// (possibly tampered) main trace and run the chip's row-by-row
@@ -77,16 +80,16 @@ fn find_row(trace: &ComponentTrace, pred: impl Fn(&dyn Fn(usize) -> BaseField) -
         .expect("no row matched the search predicate")
 }
 
-/// Trace `StoreIndU8 0x42 → [0x1000]` (page 1) + Trap, then ingest the
+/// Trace `StoreIndU8 0x42 → [TEST_MEMORY_ADDR]` + Trap, then ingest the
 /// memory-page Merkle payload exactly as the prove path does.  The resulting
-/// SideNote lists pages {0, 1} with a real multiproof (merge rows carrying
-/// witness siblings) and a MemoryChip ledger holding the per-page `ts=0`
-/// boundary writes + closing reads.
+/// SideNote lists page 0 and the above-zone test page with a real multiproof
+/// (merge rows carrying witness siblings) and a MemoryChip ledger holding the
+/// per-page `ts=0` boundary writes + closing reads.
 fn paged_side_note() -> SideNote {
     use vos_pvm_proof::core::step::PvmStep;
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 0x42; // value
-    regs[1] = 0x1000; // base address → page 1
+    regs[1] = TEST_MEMORY_ADDR;
     let code = vec![
         Opcode::StoreIndU8 as u8,
         0x10,
@@ -221,11 +224,14 @@ fn omitted_touched_page_rejected() {
         .as_mut()
         .map(|p| {
             let before = p.pages.len();
-            p.pages.retain(|pg| pg.page_idx != 1);
+            p.pages.retain(|pg| pg.page_idx != TEST_MEMORY_PAGE);
             before != p.pages.len()
         })
         .unwrap_or(false);
-    assert!(dropped, "expected the store to list page 1 as touched");
+    assert!(
+        dropped,
+        "expected the store to list the above-zone test page as touched"
+    );
 
     let forged = chip.generate_component_trace_immut(&sn);
     let res = assert_chip(&chip, &forged, &sn);

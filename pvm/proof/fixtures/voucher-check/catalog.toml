@@ -1,9 +1,9 @@
 [[program]]
 name = "voucher-check"
-id = "06482de863e4bfacc8255cb2d1154767442373f5a8d5b2cc9bdb8b6329e1dd5b"
+id = "1211f4dbca7dbe9cd0ba2fb4727bbae9367839bdee9068436db075556c6610b1"
 blob_hash = "5866fc11e48309aa97d87ce6c6c8469088a88c484a4f7fb9691c7c82fc50dd55"
 commitments = [
-    "94eca0756b65f4727f91dca0306e8301615865410af2c45f03dd64c0334d3865",
+    "da3aa6bf01a3ddf438ae135522dc2e6800437110af6a6db0d7636dfc57acb494",
 ]
 canonical_profile = [
     15,

@@ -392,6 +392,7 @@ impl TracingPvm {
             gas_after,
             gas_charged,
             next_pc,
+            host_call_acknowledged: false,
             exit,
         });
 
@@ -543,12 +544,46 @@ impl TracingPvm {
     /// no-op there. Keeping this after the handler prevents failed or unknown
     /// host calls from being consumed accidentally.
     fn acknowledge_handled_host_call(&mut self) {
+        let pending = self.pvm.pending_host_call();
+        if let Some(call) = pending {
+            assert!(
+                crate::core::ecall::is_proof_host_call_allowed(call.id),
+                "proof tracer attempted to acknowledge unsupported host call {}",
+                call.id,
+            );
+        }
         let resumed = self.pvm.resume_after_host_call();
         assert_eq!(
             resumed,
             self.isa_mode == vos_pvm::IsaMode::Conformance,
             "handled host-call continuation disagrees with the tracer ISA profile",
         );
+
+        if resumed {
+            let call = pending.expect("a resumed standard host call must have pending evidence");
+            let step = self
+                .steps
+                .last_mut()
+                .expect("a handled host call must have a recorded instruction");
+            assert_eq!(
+                (step.pc, step.next_pc),
+                (call.cause_pc, call.cause_pc),
+                "standard host-call row does not expose its unacknowledged cause PC",
+            );
+            assert_eq!(
+                self.pvm.pc, call.resume_pc,
+                "standard host-call acknowledgment selected the wrong resume PC",
+            );
+
+            // `step()` records the architectural state at the host boundary,
+            // where standard ECALLI deliberately retains the cause PC. Once
+            // this embedder handles and acknowledges the call, the proof row
+            // must instead produce the committed continuation consumed by the
+            // following row. Calls that are propagated never reach this path
+            // and therefore keep the cause PC as their observable boundary.
+            step.next_pc = call.resume_pc;
+            step.host_call_acknowledged = true;
+        }
     }
 
     fn handle_blake2b_ecall(&mut self) {
@@ -1633,8 +1668,50 @@ mod tests {
         assert_eq!(tracing.step_with_vos_stubs(), None);
         assert_eq!(tracing.pvm.pc, 2, "handled call must advance exactly once");
         assert!(tracing.pvm.pending_host_call().is_none());
+        assert_eq!(
+            tracing.trace()[0].next_pc,
+            2,
+            "acknowledged row must produce the continuation PC",
+        );
+        assert!(
+            tracing.trace()[0].host_call_acknowledged,
+            "acknowledgment disposition must survive compact expansion",
+        );
         assert_eq!(tracing.step_with_vos_stubs(), Some(ExitReason::Panic));
         assert_eq!(tracing.num_steps(), 2, "execution must not replay ecalli");
+    }
+
+    #[test]
+    fn unknown_standard_host_call_retains_cause_pc_in_trace() {
+        let code = vec![Opcode::Ecalli as u8, 11, Opcode::Trap as u8];
+        let bitmask = vec![1, 0, 1];
+        let pvm = Interpreter::new(
+            code,
+            bitmask,
+            vec![],
+            [0; PVM_REGISTER_COUNT],
+            vec![0; vos_pvm::PVM_ZONE_SIZE as usize],
+            10_000,
+            25,
+        );
+        let mut tracing = TracingPvm::new_conformance(pvm);
+
+        assert_eq!(tracing.run_with_vos_stubs(), ExitReason::HostCall(11));
+        assert_eq!(tracing.pvm.pc, 0, "unhandled call must remain pending");
+        assert_eq!(
+            tracing.pvm.pending_host_call(),
+            Some(vos_pvm::PendingHostCall {
+                id: 11,
+                cause_pc: 0,
+                resume_pc: 2,
+            }),
+        );
+        let trace = tracing.into_trace();
+        assert_eq!(trace.len(), 1);
+        assert_eq!(
+            trace[0].next_pc, 0,
+            "unhandled row must expose the cause PC",
+        );
     }
 
     #[test]

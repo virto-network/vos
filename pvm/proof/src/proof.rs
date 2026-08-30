@@ -139,14 +139,26 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///        the shifted v0.8 unary table during proof tracing. CpuChip and
 ///        ProgramMemoryChip each gain one column/lookup limb.
 ///   15 — Poseidon2-M31 PCS variant of format 14.
+///   16 — Standard host-call continuation and scalar-memory address binding.
+///        CpuChip commits whether a policy-supported ECALLI was acknowledged,
+///        constrains handled/cause PCs across segment boundaries, and binds the
+///        supported-call policy through ProgramMemory. ProgramMemory also
+///        authenticates the exact cryptographic precompile dispatch ID; every
+///        continued precompile row must select exactly that handler-call
+///        relation, while lifecycle/VOS stubs select none. This widens the
+///        program-memory tuple from 33 to 34 limbs. Standard load/store rows
+///        also prove that their full scalar range stays outside the protected
+///        low 64 KiB and does not wrap through 2^32. CPU/ProgramMemory columns
+///        and the program-memory lookup tuple change, so older proofs reject.
+///   17 — Poseidon2-M31 PCS variant of format 16.
 #[cfg(not(feature = "poseidon2-channel"))]
-pub const PROOF_FORMAT_VERSION: u32 = 14;
+pub const PROOF_FORMAT_VERSION: u32 = 16;
 /// Native recursion: the PCS commit hash + Fiat-Shamir
 /// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
 /// become `P2Hash` digests — a different wire format. A Blake2s verifier
-/// (v14) and a Poseidon2-M31 verifier (v15) therefore reject each other's proofs.
+/// (v16) and a Poseidon2-M31 verifier (v17) therefore reject each other's proofs.
 #[cfg(feature = "poseidon2-channel")]
-pub const PROOF_FORMAT_VERSION: u32 = 15;
+pub const PROOF_FORMAT_VERSION: u32 = 17;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.
