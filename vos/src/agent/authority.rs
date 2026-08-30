@@ -446,7 +446,10 @@ mod tests {
 
     #[test]
     fn receipt_binds_the_exact_lifecycle_operation() {
-        let request = LifecycleRequest::Suspend(ActorId([9; 32]));
+        let request = LifecycleRequest::Suspend {
+            actor: ActorId([9; 32]),
+            expected_deployment: DeploymentId([10; 32]),
+        };
         let key = SigningKey::from_bytes(&[0x42; 32]);
         let claim = AgentAuthorityClaim {
             authority: binding(&key),
@@ -469,8 +472,22 @@ mod tests {
             receipt
         );
         assert_eq!(receipt.verify_guest_signature(&binding(&key)), Ok(()));
+        let mut wrong_deployment = receipt.clone();
+        wrong_deployment.claim.operation = LifecycleRequest::Suspend {
+            actor: ActorId([9; 32]),
+            expected_deployment: DeploymentId([11; 32]),
+        }
+        .commitment();
+        assert_eq!(
+            wrong_deployment.verify_guest_signature(&binding(&key)),
+            Err(AuthorityError::InvalidSignature)
+        );
         let mut forged = receipt;
-        forged.claim.operation = LifecycleRequest::Resume(ActorId([9; 32])).commitment();
+        forged.claim.operation = LifecycleRequest::Resume {
+            actor: ActorId([9; 32]),
+            expected_deployment: DeploymentId([10; 32]),
+        }
+        .commitment();
         assert_eq!(
             forged.verify_guest_signature(&binding(&key)),
             Err(AuthorityError::InvalidSignature)

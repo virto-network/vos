@@ -7590,6 +7590,7 @@ dependencies = [
  "clerk-witness",
  "dlmalloc",
  "ed25519-dalek 2.2.0",
+ "fs2",
  "futures-channel",
  "futures-executor",
  "futures-lite",

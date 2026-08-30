@@ -426,7 +426,10 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
     );
     acknowledge(&mut driver, second).unwrap();
 
-    let suspend = LifecycleRequest::Suspend(actor);
+    let suspend = LifecycleRequest::Suspend {
+        actor,
+        expected_deployment: deployment,
+    };
     let receipt = authority_receipt(
         &agent_config,
         &suspend,
@@ -435,7 +438,10 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
     );
     assert!(driver.suspend_actor(&receipt, actor).unwrap().suspended);
 
-    let resume = LifecycleRequest::Resume(actor);
+    let resume = LifecycleRequest::Resume {
+        actor,
+        expected_deployment: deployment,
+    };
     let receipt = authority_receipt(
         &agent_config,
         &resume,

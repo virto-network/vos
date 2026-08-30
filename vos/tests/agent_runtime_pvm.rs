@@ -16,7 +16,9 @@ use vos::agent::execution::{
     ActorExecutionError, ActorExecutionStatus, ActorInvocation, ActorInvocationAuth,
     MAX_EXECUTION_GAS, RuntimeBlob, RuntimeExecutionCall, RuntimeExecutionReturn,
 };
-use vos::agent::host::AgentHost;
+use vos::agent::host::{
+    AgentHostControl, AgentHostError, AgentHostRootLease, AgentHostScope, PreparedLifecycleRequest,
+};
 use vos::agent::package::{Package, PackageManifest, PackageSignatureVerifier};
 use vos::agent::standard::{
     StandardActorState, StandardLaneRevisions, StandardLaneState, StandardRuntimeState,
@@ -334,6 +336,33 @@ fn lifecycle_receipt(
         credential: CredentialId([0x71; 32]),
         capability: CapabilityId::named(capability),
         operation: request.commitment(),
+        sequence,
+        valid_from: 1,
+        valid_until: 2,
+    };
+    AgentAuthorityReceipt {
+        signature: key.sign(&claim.signing_message().0).to_bytes().to_vec(),
+        claim,
+    }
+}
+
+fn prepared_lifecycle_receipt(
+    config: &AgentConfig,
+    prepared: &PreparedLifecycleRequest,
+    sequence: u64,
+) -> AgentAuthorityReceipt {
+    assert_eq!(prepared.authority(), &config.authority);
+    assert_eq!(prepared.space(), config.identity.space);
+    assert_eq!(prepared.agent(), config.identity.agent);
+    let key = authority_signing_key();
+    let claim = AgentAuthorityClaim {
+        authority: prepared.authority().clone(),
+        space: prepared.space(),
+        agent: prepared.agent(),
+        principal: config.identity.owner,
+        credential: CredentialId([0x71; 32]),
+        capability: prepared.capability(),
+        operation: prepared.operation(),
         sequence,
         valid_from: 1,
         valid_until: 2,
@@ -734,7 +763,7 @@ fn custom_runtime_upgrade_is_catalogued_and_reopens_without_a_host_source() {
 }
 
 #[test]
-fn multi_agent_host_discovers_empty_agents_after_restart() {
+fn bounded_agent_host_discovers_empty_agents_after_restart() {
     struct RemoveOnDrop(std::path::PathBuf);
     impl Drop for RemoveOnDrop {
         fn drop(&mut self) {
@@ -746,39 +775,262 @@ fn multi_agent_host_discovers_empty_agents_after_restart() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let directory =
-        std::env::temp_dir().join(format!("vos-agent-host-{}-{unique}", std::process::id()));
-    let _remove = RemoveOnDrop(directory.clone());
-    let mut host = AgentHost::open(&directory, trust()).expect("open empty agent host");
+    let base = std::env::temp_dir().join(format!("vos-agent-host-{}-{unique}", std::process::id()));
+    let directory = base.join("data");
+    let lock = base.join("owner.lock");
+    let _remove = RemoveOnDrop(base);
+    let scope = AgentHostScope {
+        space: SpaceId([2; 32]),
+        node: NodeId([7; 32]),
+    };
+    let control = AgentHostControl::open(
+        AgentHostRootLease::acquire(&directory, &lock, scope).unwrap(),
+        trust(),
+    )
+    .expect("open empty Local Agent host worker");
+    let handle = control.handle();
     let first_config = config_for(Hash([0x31; 32]));
     let second_config = config_for(Hash([0x32; 32]));
     let first = first_config.identity.agent;
     let second = second_config.identity.agent;
-    host.create(
-        first_config.clone(),
-        runtime_package(),
-        &creation_receipt(&first_config),
-    )
-    .expect("create first agent");
-    host.create(
-        second_config.clone(),
-        runtime_package(),
-        &creation_receipt(&second_config),
-    )
-    .expect("create second agent");
-    assert_eq!(host.len(), 2);
+    let mut wrong_node = first_config.clone();
+    wrong_node.replicas[0].node = NodeId([0x44; 32]);
     assert_eq!(
-        host.identities()
+        handle.prepare_create(wrong_node.clone(), runtime_package()),
+        Err(AgentHostError::ScopeMismatch)
+    );
+    assert_eq!(
+        handle.create(
+            wrong_node.clone(),
+            runtime_package(),
+            creation_receipt(&wrong_node),
+        ),
+        Err(AgentHostError::ScopeMismatch)
+    );
+    let first_prepared = handle
+        .prepare_create(first_config.clone(), runtime_package())
+        .expect("prepare exact first-agent creation");
+    assert_eq!(first_prepared.authority(), &first_config.authority);
+    assert_eq!(first_prepared.space(), first_config.identity.space);
+    assert_eq!(first_prepared.agent(), first);
+    assert_eq!(
+        first_prepared.capability(),
+        CapabilityId::named(vos::agent::authority::CAPABILITY_AGENT_CREATE_LOCAL)
+    );
+    assert_eq!(
+        first_prepared.operation(),
+        LifecycleRequest::Create(first_config.clone()).commitment()
+    );
+    handle
+        .create(
+            first_config.clone(),
+            runtime_package(),
+            creation_receipt(&first_config),
+        )
+        .expect("create first agent");
+    assert_eq!(
+        handle
+            .prepare_create(first_config.clone(), runtime_package())
+            .expect("prepare exact create retry"),
+        first_prepared,
+        "response-loss preparation derives the same signed operation"
+    );
+    let actor_package = counter_actor_package(vos::agent::EXECUTION_SEMANTICS_ID);
+    let install = handle
+        .prepare_actor_install(first, "counter".into(), None, actor_package.clone())
+        .expect("prepare actor install without mutating the image");
+    assert_eq!(
+        install.capability(),
+        CapabilityId::named(vos::agent::authority::CAPABILITY_ACTOR_INSTALL)
+    );
+    assert!(matches!(install.request(), LifecycleRequest::Install(_)));
+    assert_eq!(handle.revision(first).unwrap(), Some(1));
+    let installed = handle
+        .install_actor(
+            first,
+            prepared_lifecycle_receipt(&first_config, &install, 2),
+            "counter".into(),
+            None,
+            actor_package,
+        )
+        .expect("execute the exact prepared install");
+    let stale_suspend = handle
+        .prepare_actor_suspend(first, installed.actor)
+        .expect("prepare deployment-A actor suspension");
+    let stale_resume = handle
+        .prepare_actor_resume(first, installed.actor)
+        .expect("prepare deployment-A actor resumption");
+    assert_eq!(
+        stale_suspend.request(),
+        &LifecycleRequest::Suspend {
+            actor: installed.actor,
+            expected_deployment: installed.deployment,
+        }
+    );
+    assert_eq!(
+        stale_resume.request(),
+        &LifecycleRequest::Resume {
+            actor: installed.actor,
+            expected_deployment: installed.deployment,
+        }
+    );
+
+    let mut replacement_actor = counter_actor_package(vos::agent::EXECUTION_SEMANTICS_ID);
+    replacement_actor.manifest.name = "counter-v2".into();
+    replacement_actor.deployment_signature.signature = package_signature(&replacement_actor);
+    let upgrade = handle
+        .prepare_actor_upgrade(
+            first,
+            installed.actor,
+            installed.deployment,
+            replacement_actor.clone(),
+        )
+        .expect("prepare actor upgrade");
+    assert_eq!(handle.revision(first).unwrap(), Some(2));
+    let upgraded = handle
+        .upgrade_actor(
+            first,
+            prepared_lifecycle_receipt(&first_config, &upgrade, 3),
+            installed.actor,
+            installed.deployment,
+            replacement_actor,
+        )
+        .expect("execute exact prepared actor upgrade");
+
+    let suspend = handle
+        .prepare_actor_suspend(first, upgraded.actor)
+        .expect("prepare actor suspension");
+    let resume = handle
+        .prepare_actor_resume(first, upgraded.actor)
+        .expect("prepare actor resumption");
+    assert_eq!(
+        suspend.request(),
+        &LifecycleRequest::Suspend {
+            actor: upgraded.actor,
+            expected_deployment: upgraded.deployment,
+        }
+    );
+    assert_eq!(
+        resume.request(),
+        &LifecycleRequest::Resume {
+            actor: upgraded.actor,
+            expected_deployment: upgraded.deployment,
+        }
+    );
+    let remove = handle
+        .prepare_actor_remove(first, upgraded.actor, upgraded.deployment)
+        .expect("prepare deployment-bound actor removal");
+    let runtime_upgrade = handle
+        .prepare_runtime_upgrade(
+            first,
+            first_config.identity.runtime_deployment,
+            replacement_runtime_package(),
+        )
+        .expect("prepare runtime upgrade");
+    assert!(matches!(
+        remove.request(),
+        LifecycleRequest::RemoveLeaf { .. }
+    ));
+    assert!(matches!(
+        runtime_upgrade.request(),
+        LifecycleRequest::UpgradeRuntime { .. }
+    ));
+    assert_eq!(handle.revision(first).unwrap(), Some(3));
+    assert_eq!(
+        handle.suspend_actor(
+            first,
+            prepared_lifecycle_receipt(&first_config, &stale_suspend, 4),
+            upgraded.actor,
+        ),
+        Err(AgentHostError::Driver(AgentDriverError::Authority(
+            vos::agent::authority::AuthorityError::WrongOperation,
+        )))
+    );
+    assert_eq!(
+        handle.resume_actor(
+            first,
+            prepared_lifecycle_receipt(&first_config, &stale_resume, 4),
+            upgraded.actor,
+        ),
+        Err(AgentHostError::Driver(AgentDriverError::Authority(
+            vos::agent::authority::AuthorityError::WrongOperation,
+        )))
+    );
+    assert_eq!(
+        handle.revision(first).unwrap(),
+        Some(3),
+        "deployment-A lifecycle receipts cannot mutate deployment B"
+    );
+    handle
+        .suspend_actor(
+            first,
+            prepared_lifecycle_receipt(&first_config, &suspend, 4),
+            upgraded.actor,
+        )
+        .expect("execute exact prepared suspension");
+    handle
+        .resume_actor(
+            first,
+            prepared_lifecycle_receipt(&first_config, &resume, 5),
+            upgraded.actor,
+        )
+        .expect("execute exact prepared resumption");
+    handle
+        .create(
+            second_config.clone(),
+            runtime_package(),
+            creation_receipt(&second_config),
+        )
+        .expect("create second agent");
+    assert_eq!(handle.identities().unwrap().len(), 2);
+    assert_eq!(
+        handle
+            .identities()
+            .unwrap()
+            .into_iter()
             .map(|identity| identity.agent)
             .collect::<Vec<_>>(),
         vec![first, second]
     );
-    drop(host);
+    control.shutdown().expect("stop first Local Agent host");
+    assert_eq!(
+        handle.identities(),
+        Err(AgentHostError::WorkerStopped),
+        "a stopped generation cannot race the reopened image"
+    );
 
-    let reopened = AgentHost::open(&directory, trust()).expect("reopen agent host");
-    assert_eq!(reopened.len(), 2);
-    assert_eq!(reopened.revision(first), Some(1));
-    assert_eq!(reopened.revision(second), Some(1));
+    assert!(matches!(
+        AgentHostControl::open(
+            AgentHostRootLease::acquire(
+                &directory,
+                &lock,
+                AgentHostScope {
+                    space: scope.space,
+                    node: NodeId([0x44; 32]),
+                },
+            )
+            .unwrap(),
+            trust(),
+        ),
+        Err(AgentHostError::ScopeMismatch)
+    ));
+
+    let reopened = AgentHostControl::open(
+        AgentHostRootLease::acquire(&directory, &lock, scope).unwrap(),
+        trust(),
+    )
+    .expect("reopen Local Agent host");
+    let attached = reopened.handle();
+    assert_eq!(attached.identities().unwrap().len(), 2);
+    assert_eq!(attached.revision(first).unwrap(), Some(5));
+    assert_eq!(attached.revision(second).unwrap(), Some(1));
+    assert_eq!(attached.inspect(first, None, 8).unwrap().entries.len(), 1);
+    reopened.shutdown().expect("stop reopened Agent host");
+    assert_eq!(
+        attached.identities(),
+        Err(AgentHostError::WorkerStopped),
+        "the reopened Agent image owner is joined"
+    );
 }
 
 fn static_actor_pvm() -> Vec<u8> {

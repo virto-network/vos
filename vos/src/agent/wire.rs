@@ -1009,13 +1009,21 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             super::contract::encode_actor_contract(encoder, upgrade.contract);
             encode_requirements(encoder, upgrade.requirements);
         }
-        LifecycleRequest::Suspend(actor) => {
+        LifecycleRequest::Suspend {
+            actor,
+            expected_deployment,
+        } => {
             encoder.u8(4);
             encoder.fixed(&actor.0);
+            encoder.fixed(&expected_deployment.0);
         }
-        LifecycleRequest::Resume(actor) => {
+        LifecycleRequest::Resume {
+            actor,
+            expected_deployment,
+        } => {
             encoder.u8(5);
             encoder.fixed(&actor.0);
+            encoder.fixed(&expected_deployment.0);
         }
         LifecycleRequest::AcknowledgeInvocation {
             invocation,
@@ -1099,8 +1107,14 @@ fn decode_request_at_depth(
             contract: super::contract::decode_actor_contract(decoder)?,
             requirements: decode_requirements(decoder)?,
         })),
-        4 => Ok(LifecycleRequest::Suspend(ActorId(decoder.fixed()?))),
-        5 => Ok(LifecycleRequest::Resume(ActorId(decoder.fixed()?))),
+        4 => Ok(LifecycleRequest::Suspend {
+            actor: ActorId(decoder.fixed()?),
+            expected_deployment: DeploymentId(decoder.fixed()?),
+        }),
+        5 => Ok(LifecycleRequest::Resume {
+            actor: ActorId(decoder.fixed()?),
+            expected_deployment: DeploymentId(decoder.fixed()?),
+        }),
         6 => Ok(LifecycleRequest::RemoveLeaf {
             actor: ActorId(decoder.fixed()?),
             expected_deployment: DeploymentId(decoder.fixed()?),
@@ -1515,9 +1529,46 @@ mod tests {
     }
 
     #[test]
+    fn suspend_and_resume_wire_bind_the_expected_deployment() {
+        let state = RuntimeState {
+            control: vec![11],
+            linear: vec![12],
+            merge: vec![13],
+            local: vec![14],
+        };
+        let actor = ActorId([0x31; 32]);
+        let expected_deployment = DeploymentId([0x32; 32]);
+        for request in [
+            LifecycleRequest::Suspend {
+                actor,
+                expected_deployment,
+            },
+            LifecycleRequest::Resume {
+                actor,
+                expected_deployment,
+            },
+        ] {
+            let call = RuntimeCall {
+                state: state.clone(),
+                request,
+            };
+            let encoded = call.encode();
+            assert_eq!(RuntimeCall::decode(&encoded).unwrap(), call);
+            assert_eq!(
+                RuntimeCall::decode(&encoded[..encoded.len() - 32]),
+                Err(DecodeError::Truncated),
+                "the retired ActorId-only lifecycle wire is not accepted"
+            );
+        }
+    }
+
+    #[test]
     fn lifecycle_wire_rejects_nested_authorized_envelopes() {
         let config = config();
-        let request = LifecycleRequest::Suspend(ActorId([0x35; 32]));
+        let request = LifecycleRequest::Suspend {
+            actor: ActorId([0x35; 32]),
+            expected_deployment: DeploymentId([0x36; 32]),
+        };
         let admission = super::super::LifecycleAuthorityAdmission {
             receipt: crate::agent::authority::AgentAuthorityReceipt {
                 claim: crate::agent::authority::AgentAuthorityClaim {

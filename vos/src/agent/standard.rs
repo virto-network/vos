@@ -261,7 +261,7 @@ impl StandardAgentRuntime {
             let actor = pending.remove(index);
             let mut entry = actor.record.entry;
             if entry.suspended {
-                suspended.push(entry.actor);
+                suspended.push((entry.actor, entry.deployment));
                 entry.suspended = false;
             }
             let actor_id = entry.actor;
@@ -283,8 +283,8 @@ impl StandardAgentRuntime {
                 .expect("the actor was installed above")
                 .lane_state = actor.lane_state;
         }
-        for actor in suspended {
-            runtime.set_suspended(actor, true)?;
+        for (actor, expected_deployment) in suspended {
+            runtime.set_suspended(actor, expected_deployment, true)?;
         }
         for result in state.invocation_results {
             if result.invocation == InvocationId::ZERO
@@ -986,12 +986,16 @@ impl StandardAgentRuntime {
     fn set_suspended(
         &mut self,
         actor: ActorId,
+        expected_deployment: DeploymentId,
         suspended: bool,
     ) -> Result<LifecycleReply, LifecycleError> {
         let actor = self
             .actors
             .get_mut(&actor)
             .ok_or(LifecycleError::NotFound)?;
+        if actor.record.entry.deployment != expected_deployment {
+            return Err(LifecycleError::StaleDeployment);
+        }
         if actor.record.entry.suspended == suspended {
             return Err(LifecycleError::InvalidRequest);
         }
@@ -1104,24 +1108,9 @@ impl StandardAgentRuntime {
             (_, _) => &self.created()?.authority,
         };
         let claim = &admission.receipt.claim;
-        let required_capability = match &request {
-            LifecycleRequest::Create(config) => match config.identity.profile {
-                super::AgentProfile::Local => super::authority::CAPABILITY_AGENT_CREATE_LOCAL,
-                super::AgentProfile::Private => super::authority::CAPABILITY_AGENT_CREATE_PRIVATE,
-                super::AgentProfile::Shared => super::authority::CAPABILITY_AGENT_CREATE_SHARED,
-            },
-            LifecycleRequest::Install(_) => super::authority::CAPABILITY_ACTOR_INSTALL,
-            LifecycleRequest::UpgradeActor(_) => super::authority::CAPABILITY_ACTOR_UPGRADE,
-            LifecycleRequest::Suspend(_)
-            | LifecycleRequest::Resume(_)
-            | LifecycleRequest::RemoveLeaf { .. } => super::authority::CAPABILITY_ACTOR_LIFECYCLE,
-            LifecycleRequest::UpgradeRuntime { .. } => {
-                super::authority::CAPABILITY_AGENT_RUNTIME_UPGRADE
-            }
-            LifecycleRequest::Inspect { .. }
-            | LifecycleRequest::AcknowledgeInvocation { .. }
-            | LifecycleRequest::Authorized { .. } => return Err(LifecycleError::InvalidRequest),
-        };
+        let required_capability = request
+            .required_capability()
+            .ok_or(LifecycleError::InvalidRequest)?;
         let (space, agent) = match (&request, self.config.as_ref()) {
             (LifecycleRequest::Create(config), _) => (config.identity.space, config.identity.agent),
             (_, Some(config)) => (config.identity.space, config.identity.agent),
@@ -1241,8 +1230,14 @@ impl StandardAgentRuntime {
             }
             LifecycleRequest::Install(install) => self.install(install),
             LifecycleRequest::UpgradeActor(upgrade) => self.upgrade_actor(upgrade),
-            LifecycleRequest::Suspend(actor) => self.set_suspended(actor, true),
-            LifecycleRequest::Resume(actor) => self.set_suspended(actor, false),
+            LifecycleRequest::Suspend {
+                actor,
+                expected_deployment,
+            } => self.set_suspended(actor, expected_deployment, true),
+            LifecycleRequest::Resume {
+                actor,
+                expected_deployment,
+            } => self.set_suspended(actor, expected_deployment, false),
             LifecycleRequest::RemoveLeaf {
                 actor,
                 expected_deployment,
@@ -1321,8 +1316,8 @@ impl AgentRuntime for StandardAgentRuntime {
             LifecycleRequest::Create(_)
             | LifecycleRequest::Install(_)
             | LifecycleRequest::UpgradeActor(_)
-            | LifecycleRequest::Suspend(_)
-            | LifecycleRequest::Resume(_)
+            | LifecycleRequest::Suspend { .. }
+            | LifecycleRequest::Resume { .. }
             | LifecycleRequest::RemoveLeaf { .. }
             | LifecycleRequest::UpgradeRuntime { .. } => Err(LifecycleError::InvalidRequest),
         }
@@ -1461,6 +1456,20 @@ mod tests {
         }
     }
 
+    fn suspend(actor: ActorId, expected_deployment: DeploymentId) -> LifecycleRequest {
+        LifecycleRequest::Suspend {
+            actor,
+            expected_deployment,
+        }
+    }
+
+    fn resume(actor: ActorId, expected_deployment: DeploymentId) -> LifecycleRequest {
+        LifecycleRequest::Resume {
+            actor,
+            expected_deployment,
+        }
+    }
+
     #[cfg(feature = "pvm")]
     #[test]
     fn merge_receives_only_merge_state_and_cannot_return_hidden_linear() {
@@ -1578,8 +1587,8 @@ mod tests {
                 LifecycleRequest::UpgradeActor(_) => {
                     crate::agent::authority::CAPABILITY_ACTOR_UPGRADE
                 }
-                LifecycleRequest::Suspend(_)
-                | LifecycleRequest::Resume(_)
+                LifecycleRequest::Suspend { .. }
+                | LifecycleRequest::Resume { .. }
                 | LifecycleRequest::RemoveLeaf { .. } => {
                     crate::agent::authority::CAPABILITY_ACTOR_LIFECYCLE
                 }
@@ -1867,7 +1876,7 @@ mod tests {
                 3,
                 139,
                 3,
-                LifecycleRequest::Suspend(actor),
+                suspend(actor, deployment),
             )),
             Err(LifecycleError::AuthoritySlotRegressed)
         );
@@ -1878,7 +1887,7 @@ mod tests {
                 3,
                 150,
                 3,
-                LifecycleRequest::Suspend(actor),
+                suspend(actor, deployment),
             ))
             .unwrap();
         let mut regressed = invocation.clone();
@@ -1928,7 +1937,7 @@ mod tests {
             .unwrap();
         assert_eq!(installed, LifecycleReply::Installed(install.entry.clone()));
 
-        let suspend_request = LifecycleRequest::Suspend(actor);
+        let suspend_request = suspend(actor, deployment);
         let suspended = runtime
             .apply(authorized(
                 &config,
@@ -1948,7 +1957,7 @@ mod tests {
                 credential,
                 4,
                 4,
-                LifecycleRequest::Resume(actor),
+                resume(actor, deployment),
             ))
             .unwrap();
 
@@ -1960,7 +1969,7 @@ mod tests {
                 credential,
                 10,
                 10,
-                LifecycleRequest::Suspend(actor),
+                suspend(actor, deployment),
             ))
             .unwrap();
         assert_eq!(
@@ -1969,7 +1978,7 @@ mod tests {
                 credential,
                 9,
                 9,
-                LifecycleRequest::Resume(actor),
+                resume(actor, deployment),
             )),
             Err(LifecycleError::AuthoritySequenceRegressed)
         );
@@ -2013,7 +2022,7 @@ mod tests {
                 credential,
                 3,
                 0xee,
-                LifecycleRequest::Suspend(actor),
+                suspend(actor, deployment),
             )),
             Err(LifecycleError::AuthoritySequenceConflict)
         );
@@ -2025,6 +2034,7 @@ mod tests {
         let credential = CredentialId([0x54; 32]);
         let install = install(config.identity.agent, None, "counter");
         let actor = install.entry.actor;
+        let deployment = install.entry.deployment;
         let install_request = LifecycleRequest::Install(install.clone());
         let mut runtime = StandardAgentRuntime::new();
         create_authorized(&mut runtime, &config, 10).unwrap();
@@ -2050,7 +2060,7 @@ mod tests {
                 3,
                 19,
                 2,
-                LifecycleRequest::Suspend(actor),
+                suspend(actor, deployment),
             )),
             Err(LifecycleError::AuthoritySlotRegressed)
         );
@@ -2078,7 +2088,7 @@ mod tests {
                 3,
                 24,
                 2,
-                LifecycleRequest::Suspend(actor),
+                suspend(actor, deployment),
             )),
             Err(LifecycleError::AuthoritySlotRegressed)
         );
@@ -2095,7 +2105,8 @@ mod tests {
         let config = config(8);
         let target_install = install(config.identity.agent, None, "sequence-target");
         let target = target_install.entry.actor;
-        let request = LifecycleRequest::Suspend(target);
+        let target_deployment = target_install.entry.deployment;
+        let request = suspend(target, target_deployment);
         let mut runtime = StandardAgentRuntime::new();
         create_authorized(&mut runtime, &config, 1).unwrap();
 
@@ -2184,7 +2195,7 @@ mod tests {
     #[test]
     fn restore_requires_the_journal_tail_to_match_the_global_high_water() {
         let config = config(8);
-        let request = LifecycleRequest::Suspend(ActorId([0xb5; 32]));
+        let request = suspend(ActorId([0xb5; 32]), DeploymentId([0xb7; 32]));
         let mut runtime = StandardAgentRuntime::new();
         create_authorized(&mut runtime, &config, 1).unwrap();
         assert_eq!(
@@ -2638,6 +2649,79 @@ mod tests {
                 if entry.program == ProgramId([15; 32])
                     && entry.package.hash == Hash([16; 32])
                     && entry.role_policies.hash == Hash([18; 32])
+        ));
+    }
+
+    #[test]
+    fn suspend_and_resume_bind_the_current_actor_deployment() {
+        let config = config(10);
+        let agent = config.identity.agent;
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let installed = install(agent, None, "deployment-bound");
+        let actor = installed.entry.actor;
+        let deployment_a = installed.entry.deployment;
+        let deployment_b = DeploymentId([0x6e; 32]);
+        let program = installed.entry.program;
+        let requirements = installed.requirements;
+        let state_layout = installed.state_layout;
+        apply_authorized(&mut runtime, &config, LifecycleRequest::Install(installed)).unwrap();
+
+        let stale_suspend = suspend(actor, deployment_a);
+        let stale_resume = resume(actor, deployment_a);
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::UpgradeActor(UpgradeActor {
+                actor,
+                from_deployment: deployment_a,
+                to_deployment: deployment_b,
+                to_program: program,
+                producer: ProducerId([0x6f; 32]),
+                package: BlobRef {
+                    hash: Hash([0x70; 32]),
+                    len: 100,
+                },
+                agent_schema: BlobRef {
+                    hash: Hash([0x71; 32]),
+                    len: 100,
+                },
+                role_policies: BlobRef {
+                    hash: Hash([0x72; 32]),
+                    len: 100,
+                },
+                state_layout,
+                contract: crate::agent::contract::ActorPackageContract::canonical(),
+                requirements,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_authorized(&mut runtime, &config, stale_suspend),
+            Err(LifecycleError::StaleDeployment)
+        );
+        assert_eq!(
+            apply_authorized(&mut runtime, &config, stale_resume),
+            Err(LifecycleError::StaleDeployment)
+        );
+        assert_eq!(
+            runtime
+                .actor(actor)
+                .map(|entry| (entry.deployment, entry.suspended)),
+            Some((deployment_b, false)),
+            "stale lifecycle requests consume their authority sequence but do not mutate B"
+        );
+
+        assert!(matches!(
+            apply_authorized(&mut runtime, &config, suspend(actor, deployment_b)),
+            Ok(LifecycleReply::Suspended(entry))
+                if entry.deployment == deployment_b && entry.suspended
+        ));
+        assert!(matches!(
+            apply_authorized(&mut runtime, &config, resume(actor, deployment_b)),
+            Ok(LifecycleReply::Resumed(entry))
+                if entry.deployment == deployment_b && !entry.suspended
         ));
     }
 

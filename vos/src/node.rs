@@ -1314,6 +1314,11 @@ pub struct VosNode {
     /// it at its `blob_store` cache) so `vos` stays cache-agnostic — it only
     /// reads files by hash, never owns the cache. `None` serves nothing.
     pub(crate) program_blobs_dir: Option<std::path::PathBuf>,
+    /// Agent-native Local image owner. This is deliberately not represented
+    /// in `routes` or `invoke_routes`: those tables use the transitional
+    /// compact ServiceId namespace, while Agent-native control is addressed
+    /// exclusively by full AgentId / ActorId values and signed receipts.
+    local_agent_host: Option<crate::agent::host::AgentHostControl>,
 }
 
 /// Shared content-addressed proof-blob store. Cheap to clone; both
@@ -4775,6 +4780,7 @@ impl VosNode {
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,
             program_blobs_dir: None,
+            local_agent_host: None,
         }
     }
 
@@ -4802,6 +4808,37 @@ impl VosNode {
     pub fn with_program_blobs_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.program_blobs_dir = Some(dir.into());
         self
+    }
+
+    /// Attach the one Agent-native Local image owner for this node.
+    ///
+    /// This seals only process ownership and lifecycle. It does not publish a
+    /// route, mint authority evidence, or project an Agent into a legacy
+    /// [`ServiceId`]. This remains crate-private until a sealed production
+    /// authority adapter can construct it. A duplicate, stopped, or
+    /// post-shutdown attachment returns the incoming control unchanged so its
+    /// owner can shut it down explicitly.
+    #[allow(dead_code)] // Used by the sealed production authority adapter in the next slice.
+    pub(crate) fn attach_local_agent_host(
+        &mut self,
+        control: crate::agent::host::AgentHostControl,
+    ) -> Result<crate::agent::host::AgentHostHandle, Box<crate::agent::host::AgentHostControl>>
+    {
+        if self.local_agent_host.is_some()
+            || !control.is_running()
+            || self.shutdown.load(Ordering::Acquire)
+        {
+            return Err(Box::new(control));
+        }
+        let handle = control.handle();
+        self.local_agent_host = Some(control);
+        Ok(handle)
+    }
+
+    /// Clone the full-identity control handle for the attached Local host.
+    #[allow(dead_code)] // Kept crate-private until authenticated Agent ingress exists.
+    pub(crate) fn local_agent_host_handle(&self) -> Option<crate::agent::host::AgentHostHandle> {
+        self.local_agent_host.as_ref().map(|host| host.handle())
     }
 
     /// Insert `bytes` into the proof-blob store. Returns the
@@ -6965,6 +7002,13 @@ impl VosNode {
     pub fn run_until_idle(&mut self, threshold: Duration) {
         *self.last_activity.lock().unwrap() = Instant::now();
         loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            if self.local_agent_host_failed() {
+                self.signal_node_shutdown();
+                break;
+            }
             #[cfg(all(feature = "network", feature = "storage"))]
             self.publish_ready_service_raft_roots();
             match self.outbox_rx.recv_timeout(Duration::from_millis(50)) {
@@ -6980,6 +7024,11 @@ impl VosNode {
                         .agents
                         .iter()
                         .all(|h| h.join.as_ref().is_none_or(|j| j.is_finished()));
+                    let all_done = all_done
+                        && self
+                            .local_agent_host
+                            .as_ref()
+                            .is_none_or(|host| !host.is_running());
                     #[cfg(all(feature = "network", feature = "storage"))]
                     let all_done = all_done && !self.has_pending_service_raft_roots();
                     if all_done {
@@ -6987,6 +7036,10 @@ impl VosNode {
                     }
 
                     let idle = self.last_activity.lock().unwrap().elapsed();
+                    let idle = self
+                        .local_agent_host
+                        .as_ref()
+                        .map_or(idle, |host| idle.min(host.handle().idle_for()));
                     if idle >= threshold {
                         self.signal_node_shutdown();
                         break;
@@ -6995,6 +7048,7 @@ impl VosNode {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        self.signal_node_shutdown();
     }
 
     /// Run forever, only stopping when [`shutdown`](Self::shutdown)
@@ -7026,6 +7080,13 @@ impl VosNode {
     ///   to bootstrap the first agent.
     pub fn run_forever_with(&mut self, mut on_tick: impl FnMut(&mut Self)) {
         loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            if self.local_agent_host_failed() {
+                self.signal_node_shutdown();
+                break;
+            }
             #[cfg(all(feature = "network", feature = "storage"))]
             self.publish_ready_service_raft_roots();
             match self.outbox_rx.recv_timeout(Duration::from_millis(50)) {
@@ -7035,13 +7096,15 @@ impl VosNode {
                     on_tick(self);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if self.shutdown.load(Ordering::Relaxed) {
-                        break;
-                    }
                     let all_done = self
                         .agents
                         .iter()
                         .all(|h| h.join.as_ref().is_none_or(|j| j.is_finished()));
+                    let all_done = all_done
+                        && self
+                            .local_agent_host
+                            .as_ref()
+                            .is_none_or(|host| !host.is_running());
                     #[cfg(all(feature = "network", feature = "storage"))]
                     let all_done = all_done && !self.has_pending_service_raft_roots();
                     if all_done {
@@ -7052,6 +7115,10 @@ impl VosNode {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        // A raw shutdown handle only flips the node-wide atomic. Fan that
+        // terminal state out before returning so Agent-native and legacy
+        // workers cannot remain live in the gap before `collect` or Drop.
+        self.signal_node_shutdown();
     }
 
     /// Trigger an explicit node-wide shutdown. Threads notice on their next
@@ -7067,11 +7134,22 @@ impl VosNode {
     /// (network bridge, sync ticker) still reads the node-wide flag directly.
     fn signal_node_shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(host) = self.local_agent_host.as_ref() {
+            host.request_shutdown();
+        }
         if let Ok(map) = self.agent_shutdown.lock() {
             for flag in map.values() {
                 flag.store(true, Ordering::Relaxed);
             }
         }
+    }
+
+    fn local_agent_host_failed(&self) -> bool {
+        !self.shutdown.load(Ordering::Acquire)
+            && self
+                .local_agent_host
+                .as_ref()
+                .is_some_and(|host| !host.is_running())
     }
 
     /// Allocate (and register) this agent's own shutdown flag.
@@ -7960,7 +8038,31 @@ impl VosNode {
     /// `redb::Database::create` against the same file with
     /// "Database already open. Cannot acquire lock." Restart
     /// scenarios depend on this join happening.
-    pub fn collect(mut self) -> Vec<AgentResult> {
+    pub fn collect(self) -> Vec<AgentResult> {
+        let (results, agent_host_error) = self.collect_with_agent_host_status();
+        if let Some(error) = agent_host_error {
+            warn!(%error, "node: Local Agent host did not shut down cleanly");
+        }
+        results
+    }
+
+    /// Checked shutdown for Agent-native daemon owners.
+    ///
+    /// Unlike [`Self::collect`], an unexpected Local Agent-host worker panic
+    /// is returned to the process boundary instead of being reduced to a log
+    /// line. Legacy callers retain their existing vector result while the
+    /// sealed production Agent adapter must use this method.
+    pub fn collect_checked(self) -> Result<Vec<AgentResult>, crate::agent::host::AgentHostError> {
+        let (results, agent_host_error) = self.collect_with_agent_host_status();
+        match agent_host_error {
+            Some(error) => Err(error),
+            None => Ok(results),
+        }
+    }
+
+    fn collect_with_agent_host_status(
+        mut self,
+    ) -> (Vec<AgentResult>, Option<crate::agent::host::AgentHostError>) {
         // Fan the node-wide shutdown out to every per-agent flag
         // so agent threads polling their OWN flag exit cleanly.
         self.signal_node_shutdown();
@@ -7968,6 +8070,10 @@ impl VosNode {
         for thread in self.ingress_threads.drain(..) {
             let _ = thread.join();
         }
+        let agent_host_error = self
+            .local_agent_host
+            .take()
+            .and_then(|host| host.shutdown().err());
         #[cfg(all(feature = "network", feature = "storage"))]
         {
             for thread in self.pending_service_root_threads.drain(..) {
@@ -8012,7 +8118,7 @@ impl VosNode {
             let _ = h.join();
         }
 
-        agent_results
+        (agent_results, agent_host_error)
     }
 }
 
@@ -14474,6 +14580,224 @@ fn persist(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoAgentTrust;
+
+    impl crate::agent::driver::AgentTrustProvider for NoAgentTrust {
+        fn current_logical_slot(&self) -> Option<u64> {
+            None
+        }
+
+        fn authority_for_space(
+            &self,
+            _space: crate::service::SpaceId,
+        ) -> Option<crate::agent::authority::AgentAuthorityBinding> {
+            None
+        }
+
+        fn verify_package(
+            &self,
+            _agent: &crate::agent::AgentConfig,
+            _package: &crate::agent::package::Package,
+        ) -> bool {
+            false
+        }
+    }
+
+    struct RemoveAgentHostDirectory(std::path::PathBuf);
+
+    impl Drop for RemoveAgentHostDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn empty_agent_host_control(
+        suffix: &str,
+    ) -> (
+        crate::agent::host::AgentHostControl,
+        RemoveAgentHostDirectory,
+    ) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "vos-node-agent-host-{suffix}-{}-{unique}",
+            std::process::id()
+        ));
+        let remove = RemoveAgentHostDirectory(base.clone());
+        let lease = crate::agent::host::AgentHostRootLease::acquire(
+            base.join("data"),
+            base.join("owner.lock"),
+            crate::agent::host::AgentHostScope {
+                space: crate::service::SpaceId([0x31; 32]),
+                node: crate::service::NodeId([0x32; 32]),
+            },
+        )
+        .unwrap();
+        let control =
+            crate::agent::host::AgentHostControl::open(lease, Arc::new(NoAgentTrust)).unwrap();
+        (control, remove)
+    }
+
+    #[test]
+    fn local_agent_host_is_single_owner_and_keeps_an_empty_node_alive() {
+        let (control, _remove) = empty_agent_host_control("primary");
+        let (duplicate, _remove_duplicate) = empty_agent_host_control("duplicate");
+        let (stopped, _remove_stopped) = empty_agent_host_control("stopped");
+        stopped.request_shutdown();
+        let mut node = VosNode::new();
+        assert!(node.attach_local_agent_host(stopped).is_err());
+        let handle = node.attach_local_agent_host(control).unwrap();
+        assert!(node.attach_local_agent_host(duplicate).is_err());
+
+        let mut ticks = 0;
+        node.run_forever_with(|node| {
+            ticks += 1;
+            assert!(node.local_agent_host_handle().unwrap().identities().is_ok());
+            node.shutdown_handle().store(true, Ordering::Release);
+        });
+        assert_eq!(ticks, 1, "the Local Agent host kept the router alive");
+        assert!(
+            !handle.is_running(),
+            "the router epilogue fans a raw shutdown handle out to the Agent host"
+        );
+        node.collect();
+        assert_eq!(
+            handle.identities(),
+            Err(crate::agent::host::AgentHostError::WorkerStopped)
+        );
+    }
+
+    #[test]
+    fn checked_node_collection_surfaces_an_agent_host_worker_crash() {
+        let (control, _remove) = empty_agent_host_control("worker-crash");
+        let mut node = VosNode::new();
+        let handle = node.attach_local_agent_host(control).unwrap();
+        assert_eq!(
+            handle.crash_worker_for_test(),
+            Err(crate::agent::host::AgentHostError::WorkerStopped)
+        );
+        assert!(matches!(
+            node.collect_checked(),
+            Err(crate::agent::host::AgentHostError::WorkerPanicked)
+        ));
+    }
+
+    #[test]
+    fn agent_host_crash_stops_a_node_even_while_a_legacy_worker_is_live() {
+        let (control, _remove) = empty_agent_host_control("mixed-worker-crash");
+        let mut node = VosNode::new();
+        let handle = node.attach_local_agent_host(control).unwrap();
+        let shutdown = node.shutdown_handle();
+        let worker_shutdown = shutdown.clone();
+        node.agents.push(AgentHandle {
+            join: Some(thread::spawn(move || {
+                while !worker_shutdown.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                AgentResult {
+                    id: ServiceId(0x44),
+                    panics: 0,
+                    error: None,
+                }
+            })),
+        });
+
+        assert_eq!(
+            handle.crash_worker_for_test(),
+            Err(crate::agent::host::AgentHostError::WorkerStopped)
+        );
+        node.run_forever();
+        assert!(
+            shutdown.load(Ordering::Acquire),
+            "Agent-host failure must fan out before a live legacy worker can mask it"
+        );
+        assert!(matches!(
+            node.collect_checked(),
+            Err(crate::agent::host::AgentHostError::WorkerPanicked)
+        ));
+    }
+
+    #[test]
+    fn raw_shutdown_is_observed_before_draining_a_busy_outbox() {
+        let (control, _remove) = empty_agent_host_control("busy-shutdown");
+        let mut node = VosNode::new();
+        node.attach_local_agent_host(control).unwrap();
+        for _ in 0..256 {
+            node.outbox_tx
+                .send(Envelope {
+                    from: ServiceId(1),
+                    to: ServiceId(2),
+                    payload: Vec::new(),
+                    authenticated_source_peer: None,
+                    destination_peer: None,
+                })
+                .unwrap();
+        }
+        let mut ticks = 0;
+        node.run_forever_with(|node| {
+            ticks += 1;
+            node.shutdown_handle().store(true, Ordering::Release);
+        });
+        assert_eq!(
+            ticks, 1,
+            "shutdown must be checked before consuming another queued envelope"
+        );
+        node.collect_checked().unwrap();
+    }
+
+    #[test]
+    fn run_until_idle_fans_out_an_agent_host_crash_without_waiting_for_threshold() {
+        let (control, _remove) = empty_agent_host_control("idle-worker-crash");
+        let mut node = VosNode::new();
+        let handle = node.attach_local_agent_host(control).unwrap();
+        assert_eq!(
+            handle.crash_worker_for_test(),
+            Err(crate::agent::host::AgentHostError::WorkerStopped)
+        );
+        let started = Instant::now();
+        node.run_until_idle(Duration::from_secs(60));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(node.shutdown_handle().load(Ordering::Acquire));
+        assert!(matches!(
+            node.collect_checked(),
+            Err(crate::agent::host::AgentHostError::WorkerPanicked)
+        ));
+    }
+
+    #[test]
+    fn active_agent_host_work_defers_the_complete_node_idle_window() {
+        let (control, _remove) = empty_agent_host_control("active-idle-window");
+        let mut node = VosNode::new();
+        let handle = node.attach_local_agent_host(control).unwrap();
+        let (active_tx, active_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let worker_handle = handle.clone();
+        let request =
+            thread::spawn(move || worker_handle.block_worker_for_test(active_tx, release_rx));
+        active_rx.recv().unwrap();
+
+        let threshold = Duration::from_millis(100);
+        let held = Duration::from_millis(150);
+        let (release_go, release_go_rx) = mpsc::sync_channel(0);
+        let releaser = thread::spawn(move || {
+            release_go_rx.recv().unwrap();
+            thread::sleep(held);
+            release_tx.send(()).unwrap();
+        });
+        let started = Instant::now();
+        release_go.send(()).unwrap();
+        node.run_until_idle(threshold);
+        assert!(
+            started.elapsed() >= held + threshold - Duration::from_millis(10),
+            "idle shutdown must wait for active Agent work and then a fresh threshold"
+        );
+        releaser.join().unwrap();
+        assert_eq!(request.join().unwrap(), Ok(()));
+        node.collect_checked().unwrap();
+    }
 
     #[test]
     fn service_native_extension_dispatch_is_capability_gated_and_context_bound() {

@@ -30,7 +30,7 @@ use crate::service::{
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260829r2");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260831r3");
 
 /// Consensus-visible execution semantics for standard-PVM agent packages.
 ///
@@ -443,8 +443,14 @@ pub enum LifecycleRequest {
     },
     Install(InstallActor),
     UpgradeActor(UpgradeActor),
-    Suspend(ActorId),
-    Resume(ActorId),
+    Suspend {
+        actor: ActorId,
+        expected_deployment: DeploymentId,
+    },
+    Resume {
+        actor: ActorId,
+        expected_deployment: DeploymentId,
+    },
     /// Retire one durable exact-result record after the caller has received
     /// it. The request commitment prevents an unrelated invocation holder
     /// from deleting another result.
@@ -487,6 +493,31 @@ pub struct LifecycleAuthorityAdmission {
 }
 
 impl LifecycleRequest {
+    /// Authority capability which must sign this lifecycle operation.
+    ///
+    /// Keeping this mapping beside the canonical request prevents the host,
+    /// issuer, and standard runtime from drifting onto different policy
+    /// identities. Read-only and already-authorized envelope variants do not
+    /// accept a new lifecycle receipt.
+    pub const fn required_capability(&self) -> Option<&'static str> {
+        match self {
+            Self::Create(config) => Some(match config.identity.profile {
+                AgentProfile::Local => authority::CAPABILITY_AGENT_CREATE_LOCAL,
+                AgentProfile::Private => authority::CAPABILITY_AGENT_CREATE_PRIVATE,
+                AgentProfile::Shared => authority::CAPABILITY_AGENT_CREATE_SHARED,
+            }),
+            Self::Install(_) => Some(authority::CAPABILITY_ACTOR_INSTALL),
+            Self::UpgradeActor(_) => Some(authority::CAPABILITY_ACTOR_UPGRADE),
+            Self::Suspend { .. } | Self::Resume { .. } | Self::RemoveLeaf { .. } => {
+                Some(authority::CAPABILITY_ACTOR_LIFECYCLE)
+            }
+            Self::UpgradeRuntime { .. } => Some(authority::CAPABILITY_AGENT_RUNTIME_UPGRADE),
+            Self::Inspect { .. } | Self::AcknowledgeInvocation { .. } | Self::Authorized { .. } => {
+                None
+            }
+        }
+    }
+
     /// Stable commitment used by authority receipts. It includes the runtime
     /// ABI and every request field, but no mutable runtime state.
     pub fn commitment(&self) -> Hash {

@@ -1199,7 +1199,6 @@ fn verify_authority_admission(
     trust: &dyn AgentTrustProvider,
     receipt: &AgentAuthorityReceipt,
     config: &AgentConfig,
-    capability: &str,
     request: &LifecycleRequest,
 ) -> Result<LifecycleAuthorityAdmission, AgentDriverError> {
     let current_slot = trust
@@ -1216,6 +1215,9 @@ fn verify_authority_admission(
     if matches!(request, LifecycleRequest::Create(_)) && claim.principal != config.identity.owner {
         return Err(AgentDriverError::Authority(AuthorityError::WrongOperation));
     }
+    let capability = request
+        .required_capability()
+        .ok_or(AgentDriverError::InvalidRuntime)?;
     if claim.capability != CapabilityId::named(capability) {
         return Err(AgentDriverError::Authority(AuthorityError::WrongCapability));
     }
@@ -1244,6 +1246,20 @@ pub struct AgentDriver<S> {
 }
 
 impl<S: AgentImageStore> AgentDriver<S> {
+    /// Construct and validate the exact creation operation an authority must
+    /// approve before any image or catalog artifact is written.
+    pub(crate) fn create_request(
+        config: &AgentConfig,
+        runtime_package: &Package,
+        trust: &dyn AgentTrustProvider,
+    ) -> Result<LifecycleRequest, AgentDriverError> {
+        config.validate().map_err(AgentDriverError::InvalidConfig)?;
+        validate_process_local_profile(config.identity.profile)?;
+        verify_authority_anchor(trust, config)?;
+        verify_runtime_package_binding(trust, config, runtime_package)?;
+        Ok(LifecycleRequest::Create(config.clone()))
+    }
+
     /// Create a new agent and durably consume its signed creation sequence
     /// before exposing the image.
     pub fn create(
@@ -1253,23 +1269,13 @@ impl<S: AgentImageStore> AgentDriver<S> {
         trust: Arc<dyn AgentTrustProvider>,
         authority: &AgentAuthorityReceipt,
     ) -> Result<Self, AgentDriverError> {
-        config.validate().map_err(AgentDriverError::InvalidConfig)?;
-        validate_process_local_profile(config.identity.profile)?;
-        verify_authority_anchor(trust.as_ref(), &config)?;
-        verify_runtime_package_binding(trust.as_ref(), &config, &runtime_package)?;
+        let request = Self::create_request(&config, &runtime_package, trust.as_ref())?;
         let runtime_pvm = runtime_package.pvm.clone();
         let runtime_program = runtime_package.manifest.program;
         if store.load()?.is_some() {
             return Err(AgentDriverError::Store(AgentStoreError::Conflict));
         }
-        let request = LifecycleRequest::Create(config.clone());
-        let admission = verify_authority_admission(
-            trust.as_ref(),
-            authority,
-            &config,
-            super::authority::CAPABILITY_AGENT_CREATE_LOCAL,
-            &request,
-        )?;
+        let admission = verify_authority_admission(trust.as_ref(), authority, &config, &request)?;
         let output = execute_runtime(
             &runtime_pvm,
             DEFAULT_MANAGEMENT_GAS,
@@ -1459,14 +1465,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
         if config != &self.image.config {
             return Err(AgentDriverError::RuntimeProgramMismatch);
         }
-        verify_authority_anchor(self.trust.as_ref(), config)?;
-        verify_runtime_package_binding(self.trust.as_ref(), config, runtime_package)?;
-        let request = LifecycleRequest::Create(config.clone());
-        let admission = self.authorize(
-            authority,
-            super::authority::CAPABILITY_AGENT_CREATE_LOCAL,
-            &request,
-        )?;
+        let request = Self::create_request(config, runtime_package, self.trust.as_ref())?;
+        let admission = self.authorize(authority, &request)?;
         match self.lifecycle(LifecycleRequest::Authorized {
             admission,
             request: Box::new(request),
@@ -1495,6 +1495,12 @@ impl<S: AgentImageStore> AgentDriver<S> {
         parent: Option<ActorId>,
         package: &Package,
     ) -> Result<LifecycleRequest, AgentDriverError> {
+        if name.is_empty()
+            || name.len() > crate::service::MAX_ACTOR_NAME_BYTES
+            || parent == Some(ActorId::ZERO)
+        {
+            return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
+        }
         verify_trusted_package(self.trust.as_ref(), &self.image.config, package)?;
         let PackageKind::Actor {
             contract,
@@ -1545,11 +1551,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         package: &Package,
     ) -> Result<ActorEntry, AgentDriverError> {
         let request = self.actor_install_request(name, parent, package)?;
-        let admission = self.authorize(
-            authority,
-            super::authority::CAPABILITY_ACTOR_INSTALL,
-            &request,
-        )?;
+        let admission = self.authorize(authority, &request)?;
         let LifecycleRequest::Install(install) = request else {
             return Err(AgentDriverError::InvalidRuntime);
         };
@@ -1652,6 +1654,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
         from_deployment: DeploymentId,
         package: &Package,
     ) -> Result<LifecycleRequest, AgentDriverError> {
+        if actor == ActorId::ZERO || from_deployment == DeploymentId::ZERO {
+            return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
+        }
         verify_trusted_package(self.trust.as_ref(), &self.image.config, package)?;
         let PackageKind::Actor {
             contract,
@@ -1689,11 +1694,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         package: &Package,
     ) -> Result<ActorEntry, AgentDriverError> {
         let request = self.actor_upgrade_request(actor, from_deployment, package)?;
-        let admission = self.authorize(
-            authority,
-            super::authority::CAPABILITY_ACTOR_UPGRADE,
-            &request,
-        )?;
+        let admission = self.authorize(authority, &request)?;
         let LifecycleRequest::UpgradeActor(upgrade) = request else {
             return Err(AgentDriverError::InvalidRuntime);
         };
@@ -1790,7 +1791,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
         authority: &AgentAuthorityReceipt,
         actor: ActorId,
     ) -> Result<ActorEntry, AgentDriverError> {
-        self.authorized_actor_lifecycle(authority, LifecycleRequest::Suspend(actor))
+        let request = self.actor_suspend_request(actor)?;
+        self.authorized_actor_lifecycle(authority, request)
     }
 
     pub fn resume_actor(
@@ -1798,7 +1800,84 @@ impl<S: AgentImageStore> AgentDriver<S> {
         authority: &AgentAuthorityReceipt,
         actor: ActorId,
     ) -> Result<ActorEntry, AgentDriverError> {
-        self.authorized_actor_lifecycle(authority, LifecycleRequest::Resume(actor))
+        let request = self.actor_resume_request(actor)?;
+        self.authorized_actor_lifecycle(authority, request)
+    }
+
+    pub fn actor_suspend_request(
+        &self,
+        actor: ActorId,
+    ) -> Result<LifecycleRequest, AgentDriverError> {
+        Ok(LifecycleRequest::Suspend {
+            actor,
+            expected_deployment: self.actor_deployment(actor)?,
+        })
+    }
+
+    pub fn actor_resume_request(
+        &self,
+        actor: ActorId,
+    ) -> Result<LifecycleRequest, AgentDriverError> {
+        Ok(LifecycleRequest::Resume {
+            actor,
+            expected_deployment: self.actor_deployment(actor)?,
+        })
+    }
+
+    /// Resolve the current deployment through the runtime-owned directory.
+    /// The host cannot infer this from catalog sidecars: only the guest's
+    /// committed directory selects the deployment a lifecycle receipt must
+    /// bind. Inspection is read-only and every page must preserve the exact
+    /// runtime state.
+    fn actor_deployment(&self, actor: ActorId) -> Result<DeploymentId, AgentDriverError> {
+        if actor == ActorId::ZERO {
+            return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
+        }
+        let page_limit = usize::from(super::standard::MAX_DIRECTORY_PAGE);
+        let max_actors = usize::try_from(self.image.config.capabilities.max_actors)
+            .map_err(|_| AgentDriverError::InvalidRuntime)?;
+        let max_pages = max_actors.div_ceil(page_limit).saturating_add(1);
+        let mut after = None;
+        let mut seen = 0usize;
+        for _ in 0..max_pages {
+            let output = execute_runtime(
+                &self.runtime_pvm,
+                self.management_gas,
+                RuntimeCall {
+                    state: self.image.runtime_state.clone(),
+                    request: LifecycleRequest::Inspect {
+                        after,
+                        limit: super::standard::MAX_DIRECTORY_PAGE,
+                    },
+                },
+            )?;
+            if output.state != self.image.runtime_state {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            let page = match output.result {
+                Ok(LifecycleReply::Directory(page)) => page,
+                Ok(_) => return Err(AgentDriverError::InvalidRuntime),
+                Err(error) => return Err(AgentDriverError::Lifecycle(error)),
+            };
+            seen = validate_actor_directory_page(after, &page, page_limit, seen, max_actors)?;
+            if let Ok(index) = page
+                .entries
+                .binary_search_by_key(&actor, |entry| entry.actor)
+            {
+                return Ok(page.entries[index].deployment);
+            }
+            if page.entries.last().is_some_and(|entry| entry.actor > actor) {
+                return Err(AgentDriverError::Lifecycle(LifecycleError::NotFound));
+            }
+            let Some(next) = page.next else {
+                return Err(AgentDriverError::Lifecycle(LifecycleError::NotFound));
+            };
+            if after == Some(next) {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            after = Some(next);
+        }
+        Err(AgentDriverError::InvalidRuntime)
     }
 
     fn authorized_actor_lifecycle(
@@ -1806,18 +1885,23 @@ impl<S: AgentImageStore> AgentDriver<S> {
         authority: &AgentAuthorityReceipt,
         request: LifecycleRequest,
     ) -> Result<ActorEntry, AgentDriverError> {
-        let admission = self.authorize(
-            authority,
-            super::authority::CAPABILITY_ACTOR_LIFECYCLE,
-            &request,
-        )?;
-        match self.lifecycle(LifecycleRequest::Authorized {
+        let expected = match &request {
+            LifecycleRequest::Suspend {
+                actor,
+                expected_deployment,
+            } => (*actor, *expected_deployment, true),
+            LifecycleRequest::Resume {
+                actor,
+                expected_deployment,
+            } => (*actor, *expected_deployment, false),
+            _ => return Err(AgentDriverError::InvalidRuntime),
+        };
+        let admission = self.authorize(authority, &request)?;
+        let reply = self.lifecycle(LifecycleRequest::Authorized {
             admission,
             request: Box::new(request),
-        })? {
-            LifecycleReply::Suspended(entry) | LifecycleReply::Resumed(entry) => Ok(entry),
-            _ => Err(AgentDriverError::InvalidRuntime),
-        }
+        })?;
+        validate_actor_lifecycle_reply(expected, reply)
     }
 
     pub fn remove_actor(
@@ -1826,15 +1910,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
         actor: ActorId,
         expected_deployment: DeploymentId,
     ) -> Result<(), AgentDriverError> {
-        let request = LifecycleRequest::RemoveLeaf {
-            actor,
-            expected_deployment,
-        };
-        let admission = self.authorize(
-            authority,
-            super::authority::CAPABILITY_ACTOR_LIFECYCLE,
-            &request,
-        )?;
+        let request = Self::actor_remove_request(actor, expected_deployment)?;
+        let admission = self.authorize(authority, &request)?;
         match self.lifecycle(LifecycleRequest::Authorized {
             admission,
             request: Box::new(request),
@@ -1844,19 +1921,25 @@ impl<S: AgentImageStore> AgentDriver<S> {
         }
     }
 
+    pub fn actor_remove_request(
+        actor: ActorId,
+        expected_deployment: DeploymentId,
+    ) -> Result<LifecycleRequest, AgentDriverError> {
+        if actor == ActorId::ZERO || expected_deployment == DeploymentId::ZERO {
+            return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
+        }
+        Ok(LifecycleRequest::RemoveLeaf {
+            actor,
+            expected_deployment,
+        })
+    }
+
     fn authorize(
         &self,
         authority: &AgentAuthorityReceipt,
-        capability: &str,
         request: &LifecycleRequest,
     ) -> Result<LifecycleAuthorityAdmission, AgentDriverError> {
-        verify_authority_admission(
-            self.trust.as_ref(),
-            authority,
-            &self.image.config,
-            capability,
-            request,
-        )
+        verify_authority_admission(self.trust.as_ref(), authority, &self.image.config, request)
     }
 
     /// Execute one authenticated actor invocation through this agent's
@@ -2030,6 +2113,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
         from_deployment: DeploymentId,
         package: &Package,
     ) -> Result<(LifecycleRequest, AgentConfig), AgentDriverError> {
+        if from_deployment == DeploymentId::ZERO {
+            return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
+        }
         // Structural validation precedes deriving the target descriptor. The
         // trust provider then authenticates the package against that complete
         // post-upgrade descriptor, not merely its producer key.
@@ -2070,11 +2156,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         package: &Package,
     ) -> Result<AgentIdentity, AgentDriverError> {
         let (request, target_config) = self.runtime_upgrade_details(from_deployment, package)?;
-        let admission = self.authorize(
-            authority,
-            super::authority::CAPABILITY_AGENT_RUNTIME_UPGRADE,
-            &request,
-        )?;
+        let admission = self.authorize(authority, &request)?;
         let LifecycleRequest::UpgradeRuntime {
             to_deployment,
             to_program,
@@ -2403,6 +2485,65 @@ fn execute_runtime(
     execute_runtime_wire(runtime_pvm, gas, &call.encode())
 }
 
+fn validate_actor_directory_page(
+    after: Option<ActorId>,
+    page: &super::ActorDirectoryPage,
+    page_limit: usize,
+    seen: usize,
+    max_actors: usize,
+) -> Result<usize, AgentDriverError> {
+    let page_size_is_valid = page.entries.len() <= page_limit;
+    let ordered = !page
+        .entries
+        .windows(2)
+        .any(|pair| pair[0].actor >= pair[1].actor);
+    let starts_after_cursor = after.is_none_or(|cursor| {
+        page.entries
+            .first()
+            .is_none_or(|entry| entry.actor > cursor)
+    });
+    let next_is_canonical = match page.next {
+        Some(next) => {
+            page.entries.len() == page_limit
+                && page.entries.last().is_some_and(|entry| entry.actor == next)
+                && after.is_none_or(|cursor| next > cursor)
+        }
+        None => true,
+    };
+    let seen = seen
+        .checked_add(page.entries.len())
+        .ok_or(AgentDriverError::InvalidRuntime)?;
+    if page_size_is_valid
+        && ordered
+        && starts_after_cursor
+        && next_is_canonical
+        && seen <= max_actors
+    {
+        Ok(seen)
+    } else {
+        Err(AgentDriverError::InvalidRuntime)
+    }
+}
+
+fn validate_actor_lifecycle_reply(
+    expected: (ActorId, DeploymentId, bool),
+    reply: LifecycleReply,
+) -> Result<ActorEntry, AgentDriverError> {
+    let (expected_actor, expected_deployment, expected_suspended) = expected;
+    let entry = match (expected_suspended, reply) {
+        (true, LifecycleReply::Suspended(entry)) | (false, LifecycleReply::Resumed(entry)) => entry,
+        _ => return Err(AgentDriverError::InvalidRuntime),
+    };
+    if entry.actor == expected_actor
+        && entry.deployment == expected_deployment
+        && entry.suspended == expected_suspended
+    {
+        Ok(entry)
+    } else {
+        Err(AgentDriverError::InvalidRuntime)
+    }
+}
+
 fn execute_runtime_wire<T: ServiceWire>(
     runtime_pvm: &[u8],
     gas: Gas,
@@ -2529,6 +2670,100 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn actor_deployment_pagination_rejects_noncanonical_runtime_pages() {
+        let first = CatalogFixture::new(0x31, ActorId([0x41; 32])).entry;
+        let second = CatalogFixture::new(0x32, ActorId([0x42; 32])).entry;
+
+        let backwards = super::super::ActorDirectoryPage {
+            entries: vec![first.clone()],
+            next: None,
+        };
+        assert_eq!(
+            validate_actor_directory_page(Some(second.actor), &backwards, 2, 0, 2),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let unordered = super::super::ActorDirectoryPage {
+            entries: vec![second.clone(), first.clone()],
+            next: None,
+        };
+        assert_eq!(
+            validate_actor_directory_page(None, &unordered, 2, 0, 2),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let underfull_continuation = super::super::ActorDirectoryPage {
+            entries: vec![first.clone()],
+            next: Some(first.actor),
+        };
+        assert_eq!(
+            validate_actor_directory_page(None, &underfull_continuation, 2, 0, 2),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let oversized = super::super::ActorDirectoryPage {
+            entries: vec![first.clone(), second.clone()],
+            next: None,
+        };
+        assert_eq!(
+            validate_actor_directory_page(None, &oversized, 1, 0, 2),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let over_capacity = super::super::ActorDirectoryPage {
+            entries: vec![first, second],
+            next: None,
+        };
+        assert_eq!(
+            validate_actor_directory_page(None, &over_capacity, 2, 1, 2),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+    }
+
+    #[test]
+    fn actor_lifecycle_reply_must_match_the_sealed_request() {
+        let entry = CatalogFixture::new(0x51, ActorId([0x61; 32])).entry;
+        let suspend = (entry.actor, entry.deployment, true);
+        let resume = (entry.actor, entry.deployment, false);
+        let mut suspended = entry.clone();
+        suspended.suspended = true;
+
+        assert_eq!(
+            validate_actor_lifecycle_reply(suspend, LifecycleReply::Suspended(suspended.clone())),
+            Ok(suspended.clone())
+        );
+        assert_eq!(
+            validate_actor_lifecycle_reply(suspend, LifecycleReply::Resumed(suspended.clone())),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        assert_eq!(
+            validate_actor_lifecycle_reply(resume, LifecycleReply::Suspended(suspended.clone())),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let mut wrong_actor = suspended.clone();
+        wrong_actor.actor = ActorId([0x62; 32]);
+        assert_eq!(
+            validate_actor_lifecycle_reply(suspend, LifecycleReply::Suspended(wrong_actor)),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        let mut wrong_deployment = suspended.clone();
+        wrong_deployment.deployment = DeploymentId([0x63; 32]);
+        assert_eq!(
+            validate_actor_lifecycle_reply(suspend, LifecycleReply::Suspended(wrong_deployment)),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        assert_eq!(
+            validate_actor_lifecycle_reply(suspend, LifecycleReply::Suspended(entry.clone())),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        assert_eq!(
+            validate_actor_lifecycle_reply(resume, LifecycleReply::Resumed(entry.clone())),
+            Ok(entry)
+        );
     }
 
     fn catalog_references(actors: Vec<ActorEntry>) -> AgentCatalogReferences {
