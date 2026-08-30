@@ -94,11 +94,15 @@ Actor and AgentRuntime packages from the retired `standard-gas-r01` scheduler
 cannot be opened by an `r02` host. Besides the full v0.8 reorder-buffer
 scheduler, `r02` binds full-Ψ deblob/entry failures and sign-extended 64-bit
 `ecalli` identifiers. Rebuild those packages and recreate local development
-Agent images. The related lifecycle wire moved from
-`vos-agent-runtime-abi-20260829r1` to `vos-agent-runtime-abi-20260829r2`; an r2
-host deliberately rejects r1 runtime packages and persisted Agent images, so
-they must likewise be rebuilt or recreated. This cutover does not change the
-frozen Service/Jar execution identity or its canonical artifacts.
+Agent images. The related lifecycle wire first moved from
+`vos-agent-runtime-abi-20260829r1` to `vos-agent-runtime-abi-20260829r2`, then
+to `vos-agent-runtime-abi-20260831r3`. Generation r3 binds Suspend and Resume
+authority to the actor's exact expected deployment, so a receipt prepared
+before an actor upgrade cannot mutate its replacement. An r3 host deliberately
+rejects r1/r2 runtime packages and persisted Agent images; rebuild the runtime
+packages and recreate those images. Actor packages remain compatible because
+this cutover does not change the actor ABI or standard execution semantics.
+It also does not change the frozen Service execution identity or artifacts.
 
 Portable invocation continuations now use kernel snapshot version 5, which
 preserves sparse IPC DATA mappings exactly. Before upgrading a host, let every
