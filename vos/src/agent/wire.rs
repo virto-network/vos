@@ -694,8 +694,9 @@ pub fn apply_standard(call: RuntimeCall) -> Result<RuntimeReturn, DecodeError> {
     })
 }
 
-/// Execute one actor call with the bundled runtime. Failed calls always return
-/// the byte-identical prior runtime state.
+/// Execute one actor call with the bundled runtime. Deterministic exact
+/// outcomes advance only their owning result component's authority clock;
+/// admission failures and unavailable execution keep byte-identical state.
 #[cfg(feature = "pvm")]
 pub fn apply_standard_execution(
     call: RuntimeExecutionCall,
@@ -704,61 +705,94 @@ pub fn apply_standard_execution(
     let state = decode_standard_runtime_state(&original_state)?;
     let mut runtime =
         StandardAgentRuntime::restore(state).map_err(|_| DecodeError::NonCanonical)?;
-    let authority = runtime.verify_invocation_authority(&call.invocation, &call.authority);
-    let mut result = match authority {
-        Err(error) => Err(error),
-        Ok(()) => match runtime.recover_execution(&call.invocation, call.observed_slot) {
-            Ok(Some(reply)) => Ok(reply),
-            Err(error) => Err(error),
-            Ok(None) if call.recovery_only => Err(ActorExecutionError::InvalidAvailability),
-            Ok(None) => match runtime
-                .validate_execution_schema(&call.invocation, &call.actor_schema)
-                .and_then(|()| runtime.authorize_execution(&call.invocation, &call.actor_policies))
-            {
-                Err(error) => Err(error),
-                Ok(false) => Ok(ActorExecutionReply {
-                    invocation: call.invocation.invocation,
-                    actor: call.invocation.actor,
-                    incarnation: call.invocation.incarnation,
-                    deployment: call.invocation.deployment,
-                    mode: call.invocation.mode,
-                    lane: call.invocation.mode.write_lane(),
-                    status: ActorExecutionStatus::Forbidden,
-                    reply: Vec::new(),
-                    gas_remaining: call.invocation.gas,
-                    observation: super::execution::ActorObservation::default(),
-                }),
-                Ok(true) => runtime
-                    .validate_unseen_invocation_slot(
+    let (mut result, commit_candidate) = match call.invocation.validate() {
+        Err(error) => (Err(error), false),
+        Ok(()) => match runtime.verify_invocation_authority(&call.invocation, &call.authority) {
+            Err(error) => (Err(error), false),
+            Ok(()) => match runtime.validate_invocation_result_storage(&call.invocation) {
+                Err(error) => (Err(error), false),
+                Ok(()) => match runtime.recover_execution(&call.invocation, call.observed_slot) {
+                    Ok(Some(reply)) => (Ok(reply), true),
+                    Err(ActorExecutionError::DivergentInvocation) => {
+                        (Err(ActorExecutionError::DivergentInvocation), false)
+                    }
+                    unseen => match runtime.validate_unseen_invocation_slot(
                         &call.invocation,
                         &call.authority,
                         call.observed_slot,
-                    )
-                    .and_then(|()| runtime.prepare_execution_state(&call.invocation))
-                    .and_then(|before| {
-                        let actor_state = before.visible_for(call.invocation.mode);
-                        super::execution::run_inner_actor(
-                            &call.invocation,
-                            &call.actor_pvm,
-                            &actor_state,
-                        )
-                        .and_then(|(mut reply, next_state)| {
-                            if reply.status == ActorExecutionStatus::Done {
-                                runtime.commit_execution(
-                                    &call.invocation,
-                                    &mut reply,
-                                    &before,
-                                    next_state,
-                                    call.observed_slot,
-                                )?;
-                            }
-                            Ok(reply)
-                        })
-                    }),
+                    ) {
+                        Err(error) => (Err(error), false),
+                        Ok(()) => {
+                            let pristine = runtime.clone();
+                            let mut result = match unseen {
+                                Err(error) => Err(error),
+                                Ok(None) if call.recovery_only => {
+                                    Err(ActorExecutionError::InvalidAvailability)
+                                }
+                                Ok(None) => match runtime
+                                    .validate_execution_schema(&call.invocation, &call.actor_schema)
+                                    .and_then(|()| {
+                                        runtime.authorize_execution(
+                                            &call.invocation,
+                                            &call.actor_policies,
+                                        )
+                                    }) {
+                                    Err(error) => Err(error),
+                                    Ok(false) => Ok(ActorExecutionReply {
+                                        invocation: call.invocation.invocation,
+                                        actor: call.invocation.actor,
+                                        incarnation: call.invocation.incarnation,
+                                        deployment: call.invocation.deployment,
+                                        mode: call.invocation.mode,
+                                        lane: call.invocation.mode.write_lane(),
+                                        status: ActorExecutionStatus::Forbidden,
+                                        reply: Vec::new(),
+                                        gas_remaining: call.invocation.gas,
+                                        observation: super::execution::ActorObservation::default(),
+                                    }),
+                                    Ok(true) => {
+                                        runtime.prepare_execution_state(&call.invocation).and_then(
+                                            |before| {
+                                                let actor_state =
+                                                    before.visible_for(call.invocation.mode);
+                                                super::execution::run_inner_actor(
+                                                    &call.invocation,
+                                                    &call.actor_pvm,
+                                                    &actor_state,
+                                                )
+                                                .and_then(|(mut reply, next_state)| {
+                                                    if reply.status == ActorExecutionStatus::Done {
+                                                        runtime.commit_execution(
+                                                            &call.invocation,
+                                                            &mut reply,
+                                                            &before,
+                                                            next_state,
+                                                            call.observed_slot,
+                                                        )?;
+                                                    }
+                                                    Ok(reply)
+                                                })
+                                            },
+                                        )
+                                    }
+                                },
+                                Ok(Some(_)) => unreachable!("exact recovery returned above"),
+                            };
+                            let commit_candidate = finalize_unseen_standard_outcome(
+                                &mut runtime,
+                                pristine,
+                                &call.invocation,
+                                call.observed_slot,
+                                &mut result,
+                            );
+                            (result, commit_candidate)
+                        }
+                    },
+                },
             },
         },
     };
-    let state = if result.is_ok() {
+    let state = if commit_candidate {
         let candidate = encode_standard_runtime_state(&runtime.snapshot());
         if candidate
             .encoded_len()
@@ -773,6 +807,42 @@ pub fn apply_standard_execution(
         original_state
     };
     Ok(RuntimeExecutionReturn { state, result })
+}
+
+/// Finish a fresh, authenticated execution result. `Done` has already passed
+/// through `commit_execution`; every externally retained terminal/error result
+/// is instead rebased on `pristine` and consumes only its owning clock.
+#[cfg(feature = "pvm")]
+fn finalize_unseen_standard_outcome(
+    runtime: &mut StandardAgentRuntime,
+    pristine: StandardAgentRuntime,
+    invocation: &ActorInvocation,
+    observed_slot: u64,
+    result: &mut Result<ActorExecutionReply, ActorExecutionError>,
+) -> bool {
+    let external_exact = match result {
+        Ok(reply) => reply.status != ActorExecutionStatus::Done,
+        Err(error) => error.is_durable_exact_outcome(),
+    };
+    if external_exact {
+        // A failed Done commit may have changed a candidate lane before
+        // detecting a deterministic guest error. Discard every such candidate
+        // before advancing the sole permitted result-component clock.
+        *runtime = pristine;
+        return match runtime.commit_exact_outcome_clock(invocation, observed_slot) {
+            Ok(()) => true,
+            Err(error) => {
+                *result = Err(error);
+                false
+            }
+        };
+    }
+    if result.is_ok() {
+        true
+    } else {
+        *runtime = pristine;
+        false
+    }
 }
 
 fn encode_runtime_state(encoder: &mut Encoder<'_>, state: &RuntimeState) {
@@ -991,6 +1061,7 @@ pub(crate) fn encode_execution_error(encoder: &mut Encoder<'_>, error: ActorExec
         ActorExecutionError::AuthorityExpired => encoder.u8(14),
         ActorExecutionError::AuthoritySlotRegressed => encoder.u8(15),
         ActorExecutionError::StaleIncarnation => encoder.u8(16),
+        ActorExecutionError::UnsupportedResultStorage => encoder.u8(17),
     }
 }
 
@@ -1015,6 +1086,7 @@ pub(crate) fn decode_execution_error(
         14 => ActorExecutionError::AuthorityExpired,
         15 => ActorExecutionError::AuthoritySlotRegressed,
         16 => ActorExecutionError::StaleIncarnation,
+        17 => ActorExecutionError::UnsupportedResultStorage,
         _ => return Err(DecodeError::InvalidTag),
     })
 }
@@ -1725,6 +1797,233 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pvm")]
+    fn sparse_invocation(mode: MethodMode, id: u8) -> ActorInvocation {
+        let state = sparse_standard_state();
+        let actor = &state.actors[0].record;
+        ActorInvocation {
+            invocation: crate::service::InvocationId([id; 32]),
+            actor: actor.entry.actor,
+            incarnation: actor.state_generation,
+            deployment: actor.entry.deployment,
+            program: actor.entry.program,
+            mode,
+            auth: ActorInvocationAuth::anonymous(),
+            message: vec![1],
+            availability: Vec::new(),
+            gas: 100,
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn exact_reply(
+        invocation: &ActorInvocation,
+        status: ActorExecutionStatus,
+    ) -> ActorExecutionReply {
+        ActorExecutionReply {
+            invocation: invocation.invocation,
+            actor: invocation.actor,
+            incarnation: invocation.incarnation,
+            deployment: invocation.deployment,
+            mode: invocation.mode,
+            lane: invocation.mode.write_lane(),
+            status,
+            reply: vec![0xa5],
+            gas_remaining: 50,
+            observation: super::super::execution::ActorObservation::default(),
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn assert_only_result_component_changed(
+        before: &RuntimeState,
+        after: &RuntimeState,
+        mode: MethodMode,
+    ) {
+        let changed = [
+            before.control != after.control,
+            before.linear != after.linear,
+            before.merge != after.merge,
+            before.local != after.local,
+        ];
+        let expected = match mode.result_storage() {
+            super::super::InvocationResultStorage::Control => [true, false, false, false],
+            super::super::InvocationResultStorage::Lane(StateLane::Linear) => {
+                [false, true, false, false]
+            }
+            super::super::InvocationResultStorage::Lane(StateLane::Merge) => {
+                [false, false, true, false]
+            }
+            super::super::InvocationResultStorage::Lane(StateLane::Local) => {
+                [false, false, false, true]
+            }
+        };
+        assert_eq!(changed, expected, "{mode:?}");
+    }
+
+    #[cfg(feature = "pvm")]
+    fn exact_clock_successor(
+        before: &StandardRuntimeState,
+        mode: MethodMode,
+        observed_slot: u64,
+    ) -> StandardRuntimeState {
+        let mut expected = before.clone();
+        match mode.result_storage() {
+            super::super::InvocationResultStorage::Control => {
+                expected.control_authority_slot = Some(observed_slot);
+            }
+            super::super::InvocationResultStorage::Lane(StateLane::Linear) => {
+                expected.lane_revisions.linear_authority_slot = Some(observed_slot);
+            }
+            super::super::InvocationResultStorage::Lane(StateLane::Merge) => {
+                expected.lane_revisions.merge_authority_slot = Some(observed_slot);
+            }
+            super::super::InvocationResultStorage::Lane(StateLane::Local) => {
+                expected.lane_revisions.local_authority_slot = Some(observed_slot);
+            }
+        }
+        expected
+    }
+
+    #[cfg(feature = "pvm")]
+    fn signed_invocation_receipt(
+        config: &AgentConfig,
+        invocation: &ActorInvocation,
+        valid_from: u64,
+        valid_until: u64,
+    ) -> crate::agent::authority::ActorInvocationReceipt {
+        let claim = crate::agent::authority::ActorInvocationClaim {
+            authority: config.authority.clone(),
+            space: config.identity.space,
+            agent: config.identity.agent,
+            principal: None,
+            credential: None,
+            authorization: invocation.authorization_message(),
+            auth: invocation.auth.clone(),
+            valid_from,
+            valid_until,
+        };
+        crate::agent::authority::ActorInvocationReceipt {
+            signature: authority_key()
+                .sign(&claim.signing_message().0)
+                .to_bytes()
+                .to_vec(),
+            claim,
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn forbidden_execution_call(observed_slot: u64, valid_until: u64) -> RuntimeExecutionCall {
+        use crate::actors::codec::Encode as _;
+        use crate::actors::value::{Msg, TAG_DYNAMIC};
+        use crate::service::{MethodPolicy, method_authorization_policy_hash};
+
+        let mut state = sparse_standard_state();
+        let actor_pvm = vec![0x21, 0x22, 0x23];
+        let program = ProgramId::of_pvm(&actor_pvm);
+        let (schema, schema_len) =
+            crate::agent::schema::encode::<512>(&crate::agent::schema::SchemaMeta {
+                uses_storage: false,
+                fields: &[],
+                methods: &[crate::agent::schema::MethodMeta {
+                    name: "private_call",
+                    mode: MethodMode::Linear,
+                    explicit: true,
+                }],
+            });
+        let schema = schema[..schema_len].to_vec();
+        let parsed = crate::agent::schema::decode(&schema).unwrap();
+        let capability = CapabilityId::named("private.call");
+        let policies = crate::service::PackageRolePolicies {
+            methods: vec![MethodPolicy {
+                method: "private_call".into(),
+                schema: Hash([0x91; 32]),
+                policy: method_authorization_policy_hash(Some(capability), None, None).unwrap(),
+                public: false,
+                attested: false,
+                space_role: None,
+                capability: Some(capability),
+                actor_role: None,
+            }],
+            task_dependencies: Vec::new(),
+        }
+        .encode();
+        let schema_blob = RuntimeBlob {
+            reference: BlobRef::of_bytes(&schema),
+            bytes: schema,
+        };
+        let policy_blob = RuntimeBlob {
+            reference: BlobRef::of_bytes(&policies),
+            bytes: policies,
+        };
+        let actor = &mut state.actors[0].record;
+        actor.entry.program = program;
+        actor.entry.agent_schema = schema_blob.reference.clone();
+        actor.agent_schema = schema_blob.reference.clone();
+        actor.entry.role_policies = policy_blob.reference.clone();
+        actor.role_policies = policy_blob.reference.clone();
+        actor.entry.state_layout = parsed.state_layout_hash();
+        actor.state_layout = parsed.state_layout_hash();
+        actor.entry.lanes = parsed.lanes();
+        actor.requirements.lanes = parsed.lanes();
+        let mut message = vec![TAG_DYNAMIC];
+        message.extend_from_slice(&Msg::new("private_call").encode());
+        let invocation = ActorInvocation {
+            invocation: crate::service::InvocationId([0x92; 32]),
+            actor: actor.entry.actor,
+            incarnation: actor.state_generation,
+            deployment: actor.entry.deployment,
+            program,
+            mode: MethodMode::Linear,
+            auth: ActorInvocationAuth::anonymous(),
+            message,
+            availability: Vec::new(),
+            gas: 100,
+        };
+        let authority =
+            signed_invocation_receipt(state.config.as_ref().unwrap(), &invocation, 0, valid_until);
+        RuntimeExecutionCall {
+            state: encode_standard_runtime_state(&state),
+            invocation,
+            authority,
+            observed_slot,
+            recovery_only: false,
+            actor_pvm,
+            actor_schema: schema_blob,
+            actor_policies: policy_blob,
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn unsupported_result_storage_call(observed_slot: u64) -> RuntimeExecutionCall {
+        let mut call = forbidden_execution_call(observed_slot, observed_slot.saturating_add(10));
+        let mut state = decode_standard_runtime_state(&call.state).unwrap();
+        {
+            let config = state.config.as_mut().unwrap();
+            config.identity.profile = AgentProfile::Private;
+            config.capabilities.lanes =
+                LaneSet::of(StateLane::Merge).union(LaneSet::of(StateLane::Local));
+            for replica in &mut config.replicas {
+                replica.principal = config.identity.owner;
+                replica.role = ReplicaRole::Observer;
+            }
+        }
+        let actor = &mut state.actors[0].record;
+        actor.entry.lanes = LaneSet::of(StateLane::Merge);
+        actor.requirements.lanes = LaneSet::of(StateLane::Merge);
+        state.lane_state.linear.clear();
+        state.lane_revisions = Default::default();
+        call.invocation.mode = MethodMode::LinearizableQuery;
+        call.authority = signed_invocation_receipt(
+            state.config.as_ref().unwrap(),
+            &call.invocation,
+            0,
+            observed_slot.saturating_add(10),
+        );
+        call.state = encode_standard_runtime_state(&state);
+        call
+    }
+
     #[test]
     fn sparse_lane_state_round_trips_and_missing_is_the_only_empty_encoding() {
         let state = sparse_standard_state();
@@ -1747,6 +2046,302 @@ mod tests {
             Err(DecodeError::NonCanonical),
             "explicit empty and missing must never encode the same logical state"
         );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn exact_terminal_and_error_outcomes_commit_only_the_result_clock() {
+        let base = sparse_standard_state();
+        let before = encode_standard_runtime_state(&base);
+        let modes = [
+            MethodMode::Query,
+            MethodMode::LinearizableQuery,
+            MethodMode::Linear,
+            MethodMode::Merge,
+            MethodMode::LocalQuery,
+            MethodMode::Local,
+        ];
+
+        for (index, status) in [
+            ActorExecutionStatus::Forbidden,
+            ActorExecutionStatus::Panicked,
+            ActorExecutionStatus::OutOfGas,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mode = modes[index * 2];
+            let invocation = sparse_invocation(mode, 0xa0 + index as u8);
+            let pristine = StandardAgentRuntime::restore(base.clone()).unwrap();
+            let mut runtime = pristine.clone();
+            runtime.commit_exact_outcome_clock(&invocation, 99).unwrap();
+            let mut result = Ok(exact_reply(&invocation, status));
+            assert!(finalize_unseen_standard_outcome(
+                &mut runtime,
+                pristine,
+                &invocation,
+                40,
+                &mut result,
+            ));
+            let snapshot = runtime.snapshot();
+            assert_eq!(snapshot, exact_clock_successor(&base, mode, 40));
+            assert!(snapshot.invocation_results.is_empty());
+            assert_eq!(snapshot.lane_state, base.lane_state);
+            assert_eq!(
+                (
+                    snapshot.lane_revisions.linear,
+                    snapshot.lane_revisions.merge,
+                    snapshot.lane_revisions.local,
+                ),
+                (
+                    base.lane_revisions.linear,
+                    base.lane_revisions.merge,
+                    base.lane_revisions.local,
+                )
+            );
+            let after = encode_standard_runtime_state(&snapshot);
+            assert_only_result_component_changed(&before, &after, mode);
+            let reopened =
+                StandardAgentRuntime::restore(decode_standard_runtime_state(&after).unwrap())
+                    .unwrap();
+            assert_eq!(reopened.snapshot(), snapshot);
+        }
+
+        let durable_errors = [
+            ActorExecutionError::NotFound,
+            ActorExecutionError::StaleIncarnation,
+            ActorExecutionError::Suspended,
+            ActorExecutionError::StaleDeployment,
+            ActorExecutionError::WrongProgram,
+            ActorExecutionError::UnsupportedMethod,
+            ActorExecutionError::InvalidInput,
+            ActorExecutionError::InvalidActorOutput,
+            ActorExecutionError::UnsupportedHostCall(u64::MAX),
+        ];
+        for (index, error) in durable_errors.into_iter().enumerate() {
+            let mode = modes[index % modes.len()];
+            let invocation = sparse_invocation(mode, 0xb0 + index as u8);
+            let pristine = StandardAgentRuntime::restore(base.clone()).unwrap();
+            let mut runtime = pristine.clone();
+            runtime.commit_exact_outcome_clock(&invocation, 99).unwrap();
+            let mut result = Err(error);
+            assert!(finalize_unseen_standard_outcome(
+                &mut runtime,
+                pristine,
+                &invocation,
+                41,
+                &mut result,
+            ));
+            let snapshot = runtime.snapshot();
+            assert_eq!(
+                snapshot,
+                exact_clock_successor(&base, mode, 41),
+                "{error:?}"
+            );
+            assert!(snapshot.invocation_results.is_empty(), "{error:?}");
+            assert_eq!(snapshot.lane_state, base.lane_state, "{error:?}");
+            assert_only_result_component_changed(
+                &before,
+                &encode_standard_runtime_state(&snapshot),
+                mode,
+            );
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn done_keeps_its_guest_result_and_lane_commit() {
+        let base = sparse_standard_state();
+        let before_encoded = encode_standard_runtime_state(&base);
+        let invocation = sparse_invocation(MethodMode::Linear, 0xaf);
+        let mut runtime = StandardAgentRuntime::restore(base.clone()).unwrap();
+        let before = runtime.prepare_execution_state(&invocation).unwrap();
+        let mut after = before.visible_for(invocation.mode);
+        after.linear = Some(vec![0xd0]);
+        let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+        runtime
+            .commit_execution(&invocation, &mut reply, &before, after, 40)
+            .unwrap();
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.invocation_results.len(), 1);
+        assert_eq!(snapshot.invocation_results[0].reply, reply);
+        assert_eq!(
+            snapshot.lane_revisions.linear,
+            base.lane_revisions.linear + 1
+        );
+        assert_eq!(snapshot.lane_revisions.linear_authority_slot, Some(40));
+        assert_eq!(snapshot.lane_state.linear[0].value, vec![0xd0]);
+        assert_only_result_component_changed(
+            &before_encoded,
+            &encode_standard_runtime_state(&snapshot),
+            MethodMode::Linear,
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn unavailable_admission_and_inconsistent_errors_commit_nothing() {
+        let base = sparse_standard_state();
+        for (index, error) in [
+            ActorExecutionError::NotCreated,
+            ActorExecutionError::UnsupportedResultStorage,
+            ActorExecutionError::MissingState,
+            ActorExecutionError::InvalidAvailability,
+            ActorExecutionError::DivergentInvocation,
+            ActorExecutionError::ResultCapacity,
+            ActorExecutionError::InvalidAuthorization,
+            ActorExecutionError::AuthorityExpired,
+            ActorExecutionError::AuthoritySlotRegressed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let invocation = sparse_invocation(MethodMode::Linear, 0xc0 + index as u8);
+            let pristine = StandardAgentRuntime::restore(base.clone()).unwrap();
+            let mut runtime = pristine.clone();
+            runtime.commit_exact_outcome_clock(&invocation, 99).unwrap();
+            let mut result = Err(error);
+            assert!(!finalize_unseen_standard_outcome(
+                &mut runtime,
+                pristine,
+                &invocation,
+                42,
+                &mut result,
+            ));
+            assert_eq!(runtime.snapshot(), base, "{error:?}");
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn unsupported_result_storage_is_pre_admission_and_never_commits_a_clock() {
+        let call = unsupported_result_storage_call(43);
+        let before = call.state.clone();
+        let returned = apply_standard_execution(call).unwrap();
+        assert_eq!(
+            returned.result,
+            Err(ActorExecutionError::UnsupportedResultStorage)
+        );
+        assert_eq!(returned.state, before);
+        let decoded = decode_standard_runtime_state(&returned.state).unwrap();
+        assert_eq!(decoded.control_authority_slot, None);
+        assert_eq!(decoded.lane_revisions.linear_authority_slot, None);
+        assert_eq!(decoded.lane_revisions.merge_authority_slot, None);
+        assert_eq!(decoded.lane_revisions.local_authority_slot, None);
+        assert!(decoded.invocation_results.is_empty());
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn forbidden_checks_freshness_then_persists_its_clock_across_restart() {
+        let expired = forbidden_execution_call(31, 30);
+        let original = expired.state.clone();
+        let returned = apply_standard_execution(expired).unwrap();
+        assert_eq!(returned.result, Err(ActorExecutionError::AuthorityExpired));
+        assert_eq!(returned.state, original);
+
+        let admitted = forbidden_execution_call(30, 100);
+        let before = admitted.state.clone();
+        let returned = apply_standard_execution(admitted.clone()).unwrap();
+        assert!(matches!(
+            returned.result,
+            Ok(ActorExecutionReply {
+                status: ActorExecutionStatus::Forbidden,
+                ..
+            })
+        ));
+        assert_only_result_component_changed(&before, &returned.state, MethodMode::Linear);
+        let decoded = decode_standard_runtime_state(&returned.state).unwrap();
+        assert_eq!(
+            decoded,
+            exact_clock_successor(
+                &decode_standard_runtime_state(&before).unwrap(),
+                MethodMode::Linear,
+                30,
+            )
+        );
+        assert_eq!(decoded.lane_revisions.linear_authority_slot, Some(30));
+        assert!(decoded.invocation_results.is_empty());
+
+        let reopened = encode_standard_runtime_state(
+            &StandardAgentRuntime::restore(decoded).unwrap().snapshot(),
+        );
+        assert_eq!(reopened, returned.state);
+        let mut regressed = admitted;
+        regressed.state = reopened;
+        regressed.observed_slot = 29;
+        regressed.invocation.invocation = crate::service::InvocationId([0x93; 32]);
+        regressed.authority = signed_invocation_receipt(
+            sparse_standard_state().config.as_ref().unwrap(),
+            &regressed.invocation,
+            0,
+            100,
+        );
+        let prior = regressed.state.clone();
+        let returned = apply_standard_execution(regressed).unwrap();
+        assert_eq!(
+            returned.result,
+            Err(ActorExecutionError::AuthoritySlotRegressed)
+        );
+        assert_eq!(returned.state, prior);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn durable_target_errors_commit_a_clock_but_unavailable_and_auth_failures_do_not() {
+        let mut missing = forbidden_execution_call(20, 100);
+        missing.invocation.actor = ActorId([0xe1; 32]);
+        missing.authority = signed_invocation_receipt(
+            sparse_standard_state().config.as_ref().unwrap(),
+            &missing.invocation,
+            0,
+            100,
+        );
+        let before = missing.state.clone();
+        let returned = apply_standard_execution(missing).unwrap();
+        assert_eq!(returned.result, Err(ActorExecutionError::NotFound));
+        assert_only_result_component_changed(&before, &returned.state, MethodMode::Linear);
+        let decoded = decode_standard_runtime_state(&returned.state).unwrap();
+        assert_eq!(
+            decoded,
+            exact_clock_successor(
+                &decode_standard_runtime_state(&before).unwrap(),
+                MethodMode::Linear,
+                20,
+            )
+        );
+        assert_eq!(decoded.lane_revisions.linear_authority_slot, Some(20));
+        assert!(decoded.invocation_results.is_empty());
+
+        let mut unavailable = forbidden_execution_call(21, 100);
+        unavailable.recovery_only = true;
+        unavailable.actor_pvm.clear();
+        unavailable.actor_schema = RuntimeBlob {
+            reference: BlobRef {
+                hash: Hash::ZERO,
+                len: 0,
+            },
+            bytes: Vec::new(),
+        };
+        unavailable.actor_policies = unavailable.actor_schema.clone();
+        let before = unavailable.state.clone();
+        let returned = apply_standard_execution(unavailable).unwrap();
+        assert_eq!(
+            returned.result,
+            Err(ActorExecutionError::InvalidAvailability)
+        );
+        assert_eq!(returned.state, before);
+
+        let mut forged = forbidden_execution_call(22, 100);
+        forged.authority.signature[0] ^= 1;
+        let before = forged.state.clone();
+        let returned = apply_standard_execution(forged).unwrap();
+        assert_eq!(
+            returned.result,
+            Err(ActorExecutionError::InvalidAuthorization)
+        );
+        assert_eq!(returned.state, before);
     }
 
     #[test]
@@ -2008,15 +2603,37 @@ mod tests {
     }
 
     #[test]
-    fn execution_error_preserves_a_wide_host_identifier() {
-        let returned = RuntimeExecutionReturn {
-            state: RuntimeState::default(),
-            result: Err(ActorExecutionError::UnsupportedHostCall(u64::MAX)),
-        };
-        assert_eq!(
-            RuntimeExecutionReturn::decode(&returned.encode()).unwrap(),
-            returned
-        );
+    fn execution_errors_round_trip_every_tag_and_a_wide_host_identifier() {
+        for error in [
+            ActorExecutionError::NotCreated,
+            ActorExecutionError::NotFound,
+            ActorExecutionError::StaleIncarnation,
+            ActorExecutionError::Suspended,
+            ActorExecutionError::StaleDeployment,
+            ActorExecutionError::WrongProgram,
+            ActorExecutionError::UnsupportedMethod,
+            ActorExecutionError::UnsupportedResultStorage,
+            ActorExecutionError::MissingState,
+            ActorExecutionError::InvalidAvailability,
+            ActorExecutionError::InvalidInput,
+            ActorExecutionError::InvalidActorOutput,
+            ActorExecutionError::DivergentInvocation,
+            ActorExecutionError::ResultCapacity,
+            ActorExecutionError::InvalidAuthorization,
+            ActorExecutionError::AuthorityExpired,
+            ActorExecutionError::AuthoritySlotRegressed,
+            ActorExecutionError::UnsupportedHostCall(u64::MAX),
+        ] {
+            let returned = RuntimeExecutionReturn {
+                state: RuntimeState::default(),
+                result: Err(error),
+            };
+            assert_eq!(
+                RuntimeExecutionReturn::decode(&returned.encode()).unwrap(),
+                returned,
+                "{error:?}"
+            );
+        }
     }
 
     #[test]

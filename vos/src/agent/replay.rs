@@ -14,18 +14,26 @@ use super::committee::{
     RootAnchorRecord, SystemAgentGenesisAdmissionId, SystemAgentGenesisAdmissionRecord,
     SystemAgentGenesisEvidence, VerifiedSystemAgentGenesis,
 };
-use super::execution::MAX_RUNTIME_STATE_BYTES;
+use super::execution::{
+    ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, MAX_RUNTIME_STATE_BYTES,
+};
 #[cfg(feature = "std")]
 use super::invocation_index::InvocationIndexes;
 use super::journal::{
     AgentJournalGenesis, AgentJournalGenesisId, ArtifactClosure, ArtifactClosureId,
     CanonicalJournalRecord, CheckpointId, CheckpointLane, CheckpointManifest,
-    InvocationDisposition, InvocationIndexId, InvocationIndexManifest, InvocationOwnershipKey,
+    InvocationDisposition, InvocationIndexId, InvocationIndexManifest, InvocationOutcomeAnchor,
+    InvocationOutcomeId, InvocationOutcomeRecord, InvocationOutcomeRef, InvocationOwnershipKey,
     InvocationOwnershipScope, InvocationOwnershipValue, InvocationResultState, JournalHeads,
     JournalHeadsId, LaneCursor, LaneStateId, LaneStateManifest, LocalEntry, LocalEntryId,
     MergeEvent, MergeEventId, MergeFrontier, MergeFrontierId, MergeSeal, MergeSealId, OrderedBase,
     OrderedEntry, OrderedEntryId, PersistedLane, ReplayInput, ReplayOperation, RuntimeBinding,
     system_genesis_post_create_state_commitment,
+};
+#[cfg(feature = "std")]
+use super::journal::{
+    MAX_INVOCATION_INDEX_LIVE_ENTRIES, MAX_INVOCATION_INDEX_LOGICAL_ENTRIES,
+    MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES, MAX_INVOCATION_OUTCOME_BYTES,
 };
 #[cfg(feature = "std")]
 use super::journal_store::{
@@ -80,11 +88,10 @@ pub trait ReplaySource {
 
 /// Durable side products reported by an exact runtime transition.
 ///
-/// Merge replay must leave every field false. Its immediate response is the
-/// journal receipt/frontier produced by the host, never a guest-owned reply.
+/// None of these products has a content-addressed publication closure yet,
+/// so replay rejects every transition which attempts to emit one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReplayProducts {
-    pub durable_actor_reply: bool,
     pub effects: bool,
     pub calls: bool,
     pub schedules: bool,
@@ -93,7 +100,7 @@ pub struct ReplayProducts {
 
 impl ReplayProducts {
     pub const fn is_empty(self) -> bool {
-        !self.durable_actor_reply && !self.effects && !self.calls && !self.schedules && !self.proofs
+        !self.effects && !self.calls && !self.schedules && !self.proofs
     }
 }
 
@@ -129,6 +136,16 @@ const fn invocation_disposition(disposition: ReplayDisposition) -> InvocationDis
     }
 }
 
+const fn replay_disposition(disposition: InvocationDisposition) -> ReplayDisposition {
+    match disposition {
+        InvocationDisposition::Applied => ReplayDisposition::Applied,
+        InvocationDisposition::Rejected => ReplayDisposition::Rejected,
+        InvocationDisposition::Forbidden => ReplayDisposition::Forbidden,
+        InvocationDisposition::Panicked => ReplayDisposition::Panicked,
+        InvocationDisposition::OutOfGas => ReplayDisposition::OutOfGas,
+    }
+}
+
 /// Exact location of a replay input in journal truth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplayPosition {
@@ -158,6 +175,10 @@ pub enum ReplayPosition {
 pub struct ReplayTransition {
     pub state: RuntimeState,
     pub disposition: ReplayDisposition,
+    /// Exact actor result for `Invoke`; management and acknowledgement
+    /// transitions must leave this absent. Replay validates that the result
+    /// derives the separately reported disposition and is safe to retain.
+    pub result: Option<Result<ActorExecutionReply, ActorExecutionError>>,
     /// Runtime selected after this operation. It changes only after a
     /// successfully applied `UpgradeRuntime` management entry.
     pub next_runtime: RuntimeBinding,
@@ -191,18 +212,6 @@ pub trait ReplayExecutor {
         before: &RuntimeState,
         position: ReplayPosition,
     ) -> Result<(), Self::Error>;
-
-    /// Recover an already-retained invocation without entering application
-    /// code. The transition may advance only the owning result component's
-    /// deterministic authority-slot high-water and must reproduce an Applied
-    /// result under the same runtime. Replay calls this only after an
-    /// authenticated ownership lookup proves the request commitment exact.
-    fn recover_retained(
-        &mut self,
-        input: &ReplayInput,
-        before: &RuntimeState,
-        position: ReplayPosition,
-    ) -> Result<ReplayTransition, Self::Error>;
 
     fn execute(
         &mut self,
@@ -298,6 +307,10 @@ pub enum ReplayError<SourceError, ExecutorError> {
     CrossLaneMutation,
     TerminalMutation,
     ForbiddenMergeProducts,
+    /// Authenticated live invocation refused before any durable transition.
+    /// The caller may return this typed error without publishing a journal
+    /// entry or ownership leaf.
+    UncommittedInvocation(ActorExecutionError),
     InvocationOwnership(InvocationOwnershipError),
 }
 
@@ -346,6 +359,7 @@ impl<SourceError, ExecutorError> ReplayError<SourceError, ExecutorError> {
             Self::CrossLaneMutation => ReplayError::CrossLaneMutation,
             Self::TerminalMutation => ReplayError::TerminalMutation,
             Self::ForbiddenMergeProducts => ReplayError::ForbiddenMergeProducts,
+            Self::UncommittedInvocation(error) => ReplayError::UncommittedInvocation(error),
             Self::InvocationOwnership(error) => ReplayError::InvocationOwnership(error),
         }
     }
@@ -385,8 +399,37 @@ impl<SourceError, ExecutorError> ReplayError<SourceError, ExecutorError> {
             Self::CrossLaneMutation => ReplayError::CrossLaneMutation,
             Self::TerminalMutation => ReplayError::TerminalMutation,
             Self::ForbiddenMergeProducts => ReplayError::ForbiddenMergeProducts,
+            Self::UncommittedInvocation(error) => ReplayError::UncommittedInvocation(error),
             Self::InvocationOwnership(error) => ReplayError::InvocationOwnership(error),
         }
+    }
+}
+
+/// Only refusals which occur after receipt authentication but before any
+/// executable/durable admission may be returned as a normal nonpublication.
+/// Structural, ownership, authorization, and implementation-bug variants stay
+/// fail-closed.
+const fn is_uncommitted_refusal(error: ActorExecutionError) -> bool {
+    matches!(
+        error,
+        ActorExecutionError::UnsupportedResultStorage
+            | ActorExecutionError::MissingState
+            | ActorExecutionError::InvalidAvailability
+            | ActorExecutionError::ResultCapacity
+            | ActorExecutionError::AuthorityExpired
+            | ActorExecutionError::AuthoritySlotRegressed
+    )
+}
+
+/// A refusal is legal only for an input which has not crossed a heads CAS.
+/// Encountering one while rebuilding authenticated history proves the stored
+/// publication was impossible and is therefore corruption.
+fn historical_replay_error<SourceError, ExecutorError>(
+    error: ReplayError<SourceError, ExecutorError>,
+) -> ReplayError<SourceError, ExecutorError> {
+    match error {
+        ReplayError::UncommittedInvocation(_) => ReplayError::InvalidRecord,
+        error => error,
     }
 }
 
@@ -950,7 +993,7 @@ impl MergeFence {
 }
 
 /// Authenticate the exact Merge state and causal closure consumed by one
-/// ordered lifecycle mutation. The returned fence becomes effective when the
+/// ordered lifecycle or seal-only mutation. The returned fence becomes effective when the
 /// ordered entry itself is committed, regardless of whether guest policy
 /// applies or rejects the requested mutation.
 fn validate_management_fence_inner<S: ReplaySource, F>(
@@ -969,7 +1012,10 @@ where
     if entry.id() != entry_id
         || entry.genesis != merge.genesis
         || entry.merge_frontier != merge.frontier_id
-        || !matches!(entry.input.operation, ReplayOperation::Management { .. })
+        || !matches!(
+            entry.input.operation,
+            ReplayOperation::Management { .. } | ReplayOperation::SealMerge
+        )
     {
         return Err(ReplayError::InvalidFence);
     }
@@ -1043,11 +1089,21 @@ pub struct ReplayStep {
     state: RuntimeState,
     runtime: RuntimeBinding,
     outcome: ReplayStepOutcome,
+    result: Option<Result<ActorExecutionReply, ActorExecutionError>>,
     products: ReplayProducts,
     input: super::journal::ReplayInputId,
     position: ReplayPosition,
     ownership_delta: InvocationIndexDelta,
+    sealed_outcomes: Vec<ReplaySealedOutcome>,
     merge_authenticated: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MergeExecutionFact {
+    event: MergeEvent,
+    before: RuntimeState,
+    after: RuntimeState,
+    result: Option<Result<ActorExecutionReply, ActorExecutionError>>,
 }
 
 impl ReplayStep {
@@ -1067,9 +1123,14 @@ impl ReplayStep {
         self.products
     }
 
-    const fn execution_result(&self) -> ReplayExecutionResult {
+    pub fn result(&self) -> Option<&Result<ActorExecutionReply, ActorExecutionError>> {
+        self.result.as_ref()
+    }
+
+    fn execution_result(&self, expose_result: bool) -> ReplayExecutionResult {
         ReplayExecutionResult {
             outcome: self.outcome,
+            result: expose_result.then(|| self.result.clone()).flatten(),
             products: self.products,
             input: self.input,
             position: self.position,
@@ -1077,11 +1138,36 @@ impl ReplayStep {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InvocationIndexDelta {
-    None,
-    Insert { scope: InvocationOwnershipScope },
-    Acknowledge { scope: InvocationOwnershipScope },
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InvocationIndexDelta {
+    ordered: bool,
+    merge: bool,
+    local: bool,
+}
+
+impl InvocationIndexDelta {
+    const NONE: Self = Self {
+        ordered: false,
+        merge: false,
+        local: false,
+    };
+
+    const fn with(mut self, scope: InvocationOwnershipScope) -> Self {
+        match scope {
+            InvocationOwnershipScope::Ordered => self.ordered = true,
+            InvocationOwnershipScope::Merge => self.merge = true,
+            InvocationOwnershipScope::Local(_) => self.local = true,
+        }
+        self
+    }
+
+    const fn changed(self, scope: InvocationOwnershipScope) -> bool {
+        match scope {
+            InvocationOwnershipScope::Ordered => self.ordered,
+            InvocationOwnershipScope::Merge => self.merge,
+            InvocationOwnershipScope::Local(_) => self.local,
+        }
+    }
 }
 
 /// Exact immutable record(s) made durable before a sealed head publication.
@@ -1550,8 +1636,27 @@ pub struct ReplaySealedPublication {
     expected: JournalHeadsId,
     next: JournalHeads,
     anchor: ReplayPublicationAnchor,
+    outcomes: Vec<ReplaySealedOutcome>,
     checkpoint: Option<ReplaySealedCheckpoint>,
     fence_ancestry: FenceAncestryEvidence,
+}
+
+/// Exact input/outcome pair authenticated by replay and installed before the
+/// successor ownership root becomes visible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplaySealedOutcome {
+    record: InvocationOutcomeRecord,
+    input: ReplayInput,
+}
+
+impl ReplaySealedOutcome {
+    pub fn record(&self) -> &InvocationOutcomeRecord {
+        &self.record
+    }
+
+    pub fn input(&self) -> &ReplayInput {
+        &self.input
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1824,39 +1929,49 @@ impl ReplayMaterialization {
 
 /// One prepared CAS and the only successor materialization which may become
 /// usable if that CAS succeeds. `publish` consumes the session on every path;
-/// a conflict therefore discards all staged root IDs.
-pub struct ReplayPreparedPublication {
+/// a conflict therefore discards all staged root IDs. The exclusive store
+/// borrow binds every candidate index path and outcome staged during prepare
+/// to the exact store which performs the CAS; safe callers cannot transfer a
+/// prepared publication to another store or mutate that store in between.
+#[cfg(feature = "std")]
+pub struct ReplayPreparedPublication<'store, S: AgentJournalStore> {
+    store: &'store mut S,
     sealed: ReplaySealedPublication,
     successor: ReplayMaterialization,
-    execution: Option<ReplayExecutionResult>,
+    executions: Vec<ReplayExecutionResult>,
 }
 
 /// Authenticated execution facts carried by a prepared journal publication.
 /// The durable reply itself remains in the scoped invocation-result state of
 /// the returned successor materialization; these fields tell the driver
 /// exactly which result to recover without re-executing the input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayExecutionResult {
     outcome: ReplayStepOutcome,
+    result: Option<Result<ActorExecutionReply, ActorExecutionError>>,
     products: ReplayProducts,
     input: super::journal::ReplayInputId,
     position: ReplayPosition,
 }
 
 impl ReplayExecutionResult {
-    pub const fn outcome(self) -> ReplayStepOutcome {
+    pub const fn outcome(&self) -> ReplayStepOutcome {
         self.outcome
     }
 
-    pub const fn products(self) -> ReplayProducts {
+    pub fn result(&self) -> Option<&Result<ActorExecutionReply, ActorExecutionError>> {
+        self.result.as_ref()
+    }
+
+    pub const fn products(&self) -> ReplayProducts {
         self.products
     }
 
-    pub const fn input(self) -> super::journal::ReplayInputId {
+    pub const fn input(&self) -> super::journal::ReplayInputId {
         self.input
     }
 
-    pub const fn position(self) -> ReplayPosition {
+    pub const fn position(&self) -> ReplayPosition {
         self.position
     }
 }
@@ -1869,6 +1984,18 @@ pub struct ReplayCommittedRecovery {
     position: ReplayPosition,
 }
 
+/// Authenticated durable state of one scoped invocation identity. A retained
+/// result is loaded through the exact ownership root in `ReplayMaterialization`;
+/// decoded outcome bytes alone never confer this authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayInvocationRecovery {
+    NotCommitted,
+    Pending,
+    Retained(Result<ActorExecutionReply, ActorExecutionError>),
+    Acknowledged,
+    Divergent,
+}
+
 impl ReplayCommittedRecovery {
     pub const fn input(self) -> super::journal::ReplayInputId {
         self.input
@@ -1879,33 +2006,29 @@ impl ReplayCommittedRecovery {
     }
 }
 
-impl ReplayPreparedPublication {
-    pub const fn execution(&self) -> Option<ReplayExecutionResult> {
-        self.execution
-    }
-
-    #[cfg(feature = "std")]
-    pub fn publish<S: AgentJournalStore>(
+#[cfg(feature = "std")]
+impl<'store, S: AgentJournalStore> ReplayPreparedPublication<'store, S> {
+    pub fn publish(
         self,
-        store: &mut S,
     ) -> Result<
         (
             JournalPublication,
             ReplayMaterialization,
-            Option<ReplayExecutionResult>,
+            Vec<ReplayExecutionResult>,
         ),
         JournalStoreError,
     > {
-        let publication = store.publish(&self.sealed)?;
-        Ok((publication, self.successor, self.execution))
+        let publication = self.store.publish(&self.sealed)?;
+        Ok((publication, self.successor, self.executions))
     }
 }
 
 /// Preparing an exact anchor already visible at the authenticated head is an
 /// idempotent response-loss retry and performs no second CAS.
 #[allow(clippy::large_enum_variant)]
-pub enum ReplayPreparation {
-    Ready(ReplayPreparedPublication),
+#[cfg(feature = "std")]
+pub enum ReplayPreparation<'store, S: AgentJournalStore> {
+    Ready(ReplayPreparedPublication<'store, S>),
     AlreadyCommitted(ReplayCommittedRecovery),
 }
 
@@ -1926,6 +2049,10 @@ impl ReplaySealedPublication {
         self.checkpoint.as_ref()
     }
 
+    pub(crate) fn outcomes(&self) -> &[ReplaySealedOutcome] {
+        &self.outcomes
+    }
+
     pub(crate) const fn fence_ancestry(&self) -> &FenceAncestryEvidence {
         &self.fence_ancestry
     }
@@ -1937,6 +2064,15 @@ pub enum InvocationOwnershipError {
     Unavailable,
     Unauthenticated,
     Conflict,
+}
+
+/// Opaque live-admission evidence preloaded from the current authenticated
+/// manifest. A key-specific membership result is never interpreted until the
+/// caller receipt has been authenticated inside `ReplayMachine`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnseenInvocationAdmission {
+    Available,
+    AtCapacity(Result<bool, InvocationOwnershipError>),
 }
 
 /// Exact ownership index used across checkpoint compaction. Implementations
@@ -1956,6 +2092,31 @@ pub trait InvocationOwnership {
         value: InvocationOwnershipValue,
     ) -> Result<(), InvocationOwnershipError>;
 
+    /// Install and read back an immutable exact outcome before any ownership
+    /// root may reference it.
+    fn persist_outcome(
+        &mut self,
+        outcome: &InvocationOutcomeRecord,
+    ) -> Result<InvocationOutcomeRef, InvocationOwnershipError>;
+
+    /// Resolve the exact outcome authenticated by the current ownership leaf.
+    fn outcome(
+        &self,
+        key: InvocationOwnershipKey,
+    ) -> Result<Option<InvocationOutcomeRecord>, InvocationOwnershipError>;
+
+    /// Apply one strictly key-ordered set of transitions to exactly one scope
+    /// and expose only the final root.
+    fn record_batch(
+        &mut self,
+        scope: InvocationOwnershipScope,
+        values: &[(InvocationOwnershipKey, InvocationOwnershipValue)],
+    ) -> Result<(), InvocationOwnershipError>;
+
+    /// Authenticated number of Merge owners which are not yet finalized.
+    fn unfinalized(&self, scope: InvocationOwnershipScope)
+    -> Result<u64, InvocationOwnershipError>;
+
     /// Content identity of the currently staged authenticated index. Replay
     /// publication is unavailable until a non-empty index implementation can
     /// return its exact manifest ID.
@@ -1970,6 +2131,7 @@ pub trait InvocationOwnership {
 pub struct GenesisInvocationOwnership {
     genesis: AgentJournalGenesisId,
     entries: BTreeMap<InvocationOwnershipKey, InvocationOwnershipValue>,
+    outcomes: BTreeMap<InvocationOutcomeId, InvocationOutcomeRecord>,
 }
 
 impl InvocationOwnership for GenesisInvocationOwnership {
@@ -1989,13 +2151,19 @@ impl InvocationOwnership for GenesisInvocationOwnership {
             Some(existing) if *existing == value => Ok(()),
             Some(existing)
                 if existing.request_commitment == value.request_commitment
-                    && existing.result_state == InvocationResultState::Retained
-                    && value.result_state == InvocationResultState::Acknowledged
+                    && matches!(
+                        existing.result_state,
+                        InvocationResultState::Retained { .. }
+                    )
+                    && matches!(
+                        value.result_state,
+                        InvocationResultState::Acknowledged { .. }
+                    )
                     && existing.scope == value.scope
                     && existing.first_input == value.first_input
                     && existing.lane == value.lane
                     && existing.node == value.node
-                    && existing.disposition == value.disposition =>
+                    && existing.disposition() == value.disposition() =>
             {
                 self.entries.insert(key, value);
                 Ok(())
@@ -2006,6 +2174,97 @@ impl InvocationOwnership for GenesisInvocationOwnership {
                 Ok(())
             }
         }
+    }
+
+    fn persist_outcome(
+        &mut self,
+        outcome: &InvocationOutcomeRecord,
+    ) -> Result<InvocationOutcomeRef, InvocationOwnershipError> {
+        outcome
+            .validate()
+            .map_err(|_| InvocationOwnershipError::Unauthenticated)?;
+        let reference = InvocationOutcomeRef::for_record(outcome)
+            .map_err(|_| InvocationOwnershipError::Unauthenticated)?;
+        match self.outcomes.get(&reference.outcome) {
+            Some(existing) if existing == outcome => Ok(reference),
+            Some(_) => Err(InvocationOwnershipError::Conflict),
+            None => {
+                self.outcomes.insert(reference.outcome, outcome.clone());
+                Ok(reference)
+            }
+        }
+    }
+
+    fn outcome(
+        &self,
+        key: InvocationOwnershipKey,
+    ) -> Result<Option<InvocationOutcomeRecord>, InvocationOwnershipError> {
+        let Some(owner) = self.entries.get(&key) else {
+            return Ok(None);
+        };
+        let Some(reference) = owner.outcome() else {
+            return Ok(None);
+        };
+        let outcome = self
+            .outcomes
+            .get(&reference.outcome)
+            .ok_or(InvocationOwnershipError::Unavailable)?;
+        if !reference.authenticates(outcome)
+            || outcome.genesis != self.genesis
+            || outcome.key != key
+            || outcome.request_commitment != owner.request_commitment
+            || outcome.first_input != owner.first_input
+            || outcome.lane != owner.lane
+            || outcome.node != owner.node
+            || Some(outcome.disposition()) != owner.disposition()
+        {
+            return Err(InvocationOwnershipError::Unauthenticated);
+        }
+        Ok(Some(outcome.clone()))
+    }
+
+    fn record_batch(
+        &mut self,
+        scope: InvocationOwnershipScope,
+        values: &[(InvocationOwnershipKey, InvocationOwnershipValue)],
+    ) -> Result<(), InvocationOwnershipError> {
+        if values.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || values.iter().any(|(key, _)| key.scope != scope)
+        {
+            return Err(InvocationOwnershipError::Unauthenticated);
+        }
+        let mut candidate = self.entries.clone();
+        for (key, value) in values {
+            match candidate.get(key) {
+                Some(existing) if existing == value => {}
+                Some(existing)
+                    if existing.request_commitment == value.request_commitment
+                        && existing.scope == value.scope
+                        && existing.first_input == value.first_input
+                        && existing.lane == value.lane
+                        && existing.node == value.node =>
+                {
+                    candidate.insert(*key, *value);
+                }
+                Some(_) => return Err(InvocationOwnershipError::Conflict),
+                None => {
+                    candidate.insert(*key, *value);
+                }
+            }
+        }
+        self.entries = candidate;
+        Ok(())
+    }
+
+    fn unfinalized(
+        &self,
+        scope: InvocationOwnershipScope,
+    ) -> Result<u64, InvocationOwnershipError> {
+        Ok(self
+            .entries
+            .iter()
+            .filter(|(key, owner)| key.scope == scope && owner.is_unfinalized())
+            .count() as u64)
     }
 
     fn index_id(
@@ -2044,6 +2303,7 @@ impl ReplayMachine<GenesisInvocationOwnership> {
             ownership: GenesisInvocationOwnership {
                 genesis,
                 entries: BTreeMap::new(),
+                outcomes: BTreeMap::new(),
             },
             fence: None,
         })
@@ -2275,17 +2535,19 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         } else {
             ordered.runtime_history.insert(parent_base, parent_runtime);
         }
-        let step = self.apply(
-            executor,
-            &entry.input,
-            before,
-            ReplayPosition::Ordered {
-                id,
-                index: entry.index,
-                merge_frontier: entry.merge_frontier,
-                merge_seal: entry.merge_seal,
-            },
-        )?;
+        let step = self
+            .apply(
+                executor,
+                &entry.input,
+                before,
+                ReplayPosition::Ordered {
+                    id,
+                    index: entry.index,
+                    merge_frontier: entry.merge_frontier,
+                    merge_seal: entry.merge_seal,
+                },
+            )
+            .map_err(historical_replay_error)?;
         ordered.runtime_history.insert(
             OrderedBase {
                 index: entry.index,
@@ -2302,6 +2564,22 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         input: &ReplayInput,
         before: &RuntimeState,
         position: ReplayPosition,
+    ) -> Result<ReplayStep, ReplayError<SourceError, E::Error>> {
+        self.apply_with_unseen_capacity(executor, input, before, position, None)
+    }
+
+    /// Live preparation supplies a read-only capacity decision derived from
+    /// the exact authenticated scope manifest. Authentication and ownership
+    /// lookup still happen inside this method before the decision can be
+    /// observed, so a forged request cannot probe index occupancy. Existing
+    /// owners (retry, divergence, acknowledgement) never consume the reserve.
+    fn apply_with_unseen_capacity<E: ReplayExecutor, SourceError>(
+        &mut self,
+        executor: &mut E,
+        input: &ReplayInput,
+        before: &RuntimeState,
+        position: ReplayPosition,
+        unseen_admission: Option<UnseenInvocationAdmission>,
     ) -> Result<ReplayStep, ReplayError<SourceError, E::Error>> {
         if input.validate().is_err() {
             return Err(ReplayError::InvalidRecord);
@@ -2325,9 +2603,14 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         // particular, a forged receipt with an otherwise exact request
         // commitment cannot advance a journal position as a duplicate or
         // divergence without entering the executor's authenticated boundary.
-        executor
-            .authenticate(input, before, position)
-            .map_err(ReplayError::Executor)?;
+        // SealMerge is instead an ordered-log protocol unit with no caller
+        // receipt or application execution; its exact ordered position and
+        // referenced seal are authenticated by the publication closure.
+        if !matches!(input.operation, ReplayOperation::SealMerge) {
+            executor
+                .authenticate(input, before, position)
+                .map_err(ReplayError::Executor)?;
+        }
 
         if let ReplayPosition::Merge { id, .. } = position {
             if let Some(fence) = &self.fence {
@@ -2350,122 +2633,335 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 )
             });
         let mut prior_owner = None;
+        let mut retained_outcome = None;
+        let mut acknowledgement_outcome = None;
         let mut retained_recovery = false;
-        let mut ownership_delta = InvocationIndexDelta::None;
+        let mut replaying_pending_source = false;
+        let mut ownership_delta = InvocationIndexDelta::NONE;
+        let mut sealed_outcomes = Vec::new();
         if let Some((key, request, operation)) = invocation_owner {
             if let Some(seen) = self
                 .ownership
                 .lookup(key)
                 .map_err(ReplayError::InvocationOwnership)?
             {
-                if seen.validate().is_err()
-                    || seen.scope != key.scope
-                    || seen.lane != input.persisted_lane()
-                    || seen.node
-                        != match key.scope {
-                            InvocationOwnershipScope::Local(node) => Some(node),
-                            InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Merge => {
-                                None
-                            }
+                validate_owner_for_input(seen, key, input)
+                    .map_err(ReplayError::InvocationOwnership)?;
+                if seen.request_commitment != request {
+                    self.advance_noop_position(position, &execution_runtime);
+                    return Ok(noop_replay_step(
+                        input,
+                        before,
+                        execution_runtime,
+                        position,
+                        ReplayStepOutcome::DivergentInvocation,
+                    ));
+                }
+                prior_owner = Some(seen);
+                match (operation, seen.result_state) {
+                    (
+                        InvocationOwnershipOperation::Invoke,
+                        InvocationResultState::PendingMerge { source_event },
+                    ) => {
+                        let is_source = matches!(
+                            position,
+                            ReplayPosition::Merge { id, .. } if id == source_event
+                        );
+                        if is_source {
+                            replaying_pending_source = true;
+                        } else {
+                            self.advance_noop_position(position, &execution_runtime);
+                            return Ok(noop_replay_step(
+                                input,
+                                before,
+                                execution_runtime,
+                                position,
+                                ReplayStepOutcome::ExactDuplicate,
+                            ));
                         }
-                {
+                    }
+                    (
+                        InvocationOwnershipOperation::Invoke,
+                        InvocationResultState::Retained { .. },
+                    ) => {
+                        let outcome = self
+                            .ownership
+                            .outcome(key)
+                            .map_err(ReplayError::InvocationOwnership)?
+                            .ok_or(ReplayError::InvocationOwnership(
+                                InvocationOwnershipError::Unauthenticated,
+                            ))?;
+                        validate_retained_outcome(&outcome, self.genesis, key, seen, input)
+                            .map_err(ReplayError::InvocationOwnership)?;
+                        retained_outcome = Some(outcome);
+                        retained_recovery = true;
+                    }
+                    (
+                        InvocationOwnershipOperation::Invoke,
+                        InvocationResultState::PendingMergeAcknowledgement { .. },
+                    ) => {
+                        // The canonical acknowledgement may already have
+                        // removed an Applied guest result from provisional
+                        // Merge state. It is committed intent, not a second
+                        // opportunity to disclose or reconstruct the reply.
+                        self.advance_noop_position(position, &execution_runtime);
+                        return Ok(noop_replay_step(
+                            input,
+                            before,
+                            execution_runtime,
+                            position,
+                            ReplayStepOutcome::ExactDuplicate,
+                        ));
+                    }
+                    (
+                        InvocationOwnershipOperation::Invoke,
+                        InvocationResultState::Acknowledged { .. },
+                    )
+                    | (
+                        InvocationOwnershipOperation::Acknowledge,
+                        InvocationResultState::Acknowledged { .. }
+                        | InvocationResultState::PendingMergeAcknowledgement { .. },
+                    ) => {
+                        self.advance_noop_position(position, &execution_runtime);
+                        return Ok(noop_replay_step(
+                            input,
+                            before,
+                            execution_runtime,
+                            position,
+                            ReplayStepOutcome::ExactDuplicate,
+                        ));
+                    }
+                    (
+                        InvocationOwnershipOperation::Acknowledge,
+                        InvocationResultState::PendingMerge { .. },
+                    ) => {
+                        return Err(ReplayError::InvocationOwnership(
+                            InvocationOwnershipError::Unauthenticated,
+                        ));
+                    }
+                    (
+                        InvocationOwnershipOperation::Acknowledge,
+                        InvocationResultState::Retained { .. },
+                    ) => {
+                        let outcome = self
+                            .ownership
+                            .outcome(key)
+                            .map_err(ReplayError::InvocationOwnership)?
+                            .ok_or(ReplayError::InvocationOwnership(
+                                InvocationOwnershipError::Unauthenticated,
+                            ))?;
+                        validate_retained_outcome(&outcome, self.genesis, key, seen, input)
+                            .map_err(ReplayError::InvocationOwnership)?;
+                        acknowledgement_outcome = Some(outcome);
+                    }
+                }
+            } else {
+                if operation == InvocationOwnershipOperation::Acknowledge {
                     return Err(ReplayError::InvocationOwnership(
                         InvocationOwnershipError::Unauthenticated,
                     ));
                 }
-                prior_owner = Some(seen);
-                if seen.request_commitment != request {
-                    self.advance_noop_position(position, &execution_runtime);
-                    return Ok(ReplayStep {
-                        state: before.clone(),
-                        runtime: execution_runtime.clone(),
-                        outcome: ReplayStepOutcome::DivergentInvocation,
-                        products: ReplayProducts::default(),
-                        input: input.id(),
-                        position,
-                        ownership_delta: InvocationIndexDelta::None,
-                        merge_authenticated: false,
-                    });
+                match unseen_admission {
+                    Some(UnseenInvocationAdmission::AtCapacity(Ok(false))) => {
+                        return Err(ReplayError::UncommittedInvocation(
+                            ActorExecutionError::ResultCapacity,
+                        ));
+                    }
+                    Some(UnseenInvocationAdmission::AtCapacity(Err(error))) => {
+                        return Err(ReplayError::InvocationOwnership(error));
+                    }
+                    None
+                    | Some(UnseenInvocationAdmission::Available)
+                    | Some(UnseenInvocationAdmission::AtCapacity(Ok(true))) => {}
                 }
-                retained_recovery = operation == InvocationOwnershipOperation::Invoke
-                    && seen.result_state == InvocationResultState::Retained;
-                let duplicate = seen.result_state != InvocationResultState::Retained;
-                if duplicate {
-                    self.advance_noop_position(position, &execution_runtime);
-                    return Ok(ReplayStep {
-                        state: before.clone(),
-                        runtime: execution_runtime.clone(),
-                        outcome: ReplayStepOutcome::ExactDuplicate,
-                        products: ReplayProducts::default(),
-                        input: input.id(),
-                        position,
-                        ownership_delta: InvocationIndexDelta::None,
-                        merge_authenticated: false,
-                    });
-                }
-            } else if operation == InvocationOwnershipOperation::Acknowledge {
-                return Err(ReplayError::InvocationOwnership(
-                    InvocationOwnershipError::Unauthenticated,
-                ));
             }
         }
 
-        let transition = if retained_recovery {
-            executor.recover_retained(input, before, position)
+        let non_applied_ack = matches!(
+            (invocation_owner, prior_owner),
+            (
+                Some((_, _, InvocationOwnershipOperation::Acknowledge)),
+                Some(owner)
+            ) if owner.disposition() != Some(InvocationDisposition::Applied)
+        );
+        let transition = if non_applied_ack {
+            ReplayTransition {
+                state: before.clone(),
+                disposition: ReplayDisposition::Applied,
+                result: None,
+                next_runtime: execution_runtime.clone(),
+                products: ReplayProducts::default(),
+            }
+        } else if matches!(input.operation, ReplayOperation::SealMerge) {
+            ReplayTransition {
+                state: before.clone(),
+                disposition: ReplayDisposition::Applied,
+                result: None,
+                next_runtime: execution_runtime.clone(),
+                products: ReplayProducts::default(),
+            }
+        } else if retained_recovery {
+            retained_exact_transition(
+                input,
+                before,
+                &execution_runtime,
+                retained_outcome
+                    .as_ref()
+                    .ok_or(ReplayError::InvocationOwnership(
+                        InvocationOwnershipError::Unauthenticated,
+                    ))?,
+            )?
         } else {
-            executor.execute(input, before, position)
+            executor
+                .execute(input, before, position)
+                .map_err(ReplayError::Executor)?
+        };
+        if prior_owner.is_none()
+            && matches!(
+                invocation_owner,
+                Some((_, _, InvocationOwnershipOperation::Invoke))
+            )
+            && let Some(Err(error)) = transition.result.as_ref()
+            && is_uncommitted_refusal(*error)
+        {
+            if !transition.products.is_empty() {
+                return Err(ReplayError::ForbiddenMergeProducts);
+            }
+            if transition.state != *before
+                || transition.next_runtime != execution_runtime
+                || transition.disposition != ReplayDisposition::Rejected
+            {
+                return Err(ReplayError::TerminalMutation);
+            }
+            return Err(ReplayError::UncommittedInvocation(*error));
         }
-        .map_err(ReplayError::Executor)?;
         validate_runtime_state_bound(&transition.state)?;
-        validate_transition(input, before, &transition, position, &execution_runtime)?;
-        if retained_recovery && transition.disposition != ReplayDisposition::Applied {
+        validate_transition(
+            input,
+            before,
+            &transition,
+            position,
+            &execution_runtime,
+            retained_recovery,
+            non_applied_ack,
+            acknowledgement_outcome.as_ref(),
+        )?;
+        if retained_recovery
+            && let Some(outcome) = &retained_outcome
+            && transition.result.as_ref() != Some(&outcome.result)
+        {
             return Err(ReplayError::InvocationOwnership(
                 InvocationOwnershipError::Unauthenticated,
             ));
         }
         if let Some((key, request, operation)) = invocation_owner {
-            // The first durable disposition owns this identity even when
-            // execution is forbidden, panics, or runs out of gas.
             let value = match (operation, prior_owner) {
-                (InvocationOwnershipOperation::Invoke, None) => Some(InvocationOwnershipValue {
-                    scope: key.scope,
-                    request_commitment: request,
-                    first_input: input.id(),
-                    lane: input.persisted_lane(),
-                    node: match key.scope {
-                        InvocationOwnershipScope::Local(node) => Some(node),
-                        InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Merge => None,
-                    },
-                    disposition: invocation_disposition(transition.disposition),
-                    result_state: if transition.disposition == ReplayDisposition::Applied {
-                        InvocationResultState::Retained
-                    } else {
-                        InvocationResultState::Terminal
-                    },
-                }),
-                (InvocationOwnershipOperation::Acknowledge, Some(mut existing))
-                    if transition.disposition == ReplayDisposition::Applied =>
-                {
-                    existing.result_state = InvocationResultState::Acknowledged;
+                (InvocationOwnershipOperation::Invoke, None) => {
+                    let result_state = match position {
+                        ReplayPosition::Merge { id, .. } => {
+                            InvocationResultState::PendingMerge { source_event: id }
+                        }
+                        ReplayPosition::Ordered { .. } | ReplayPosition::Local { .. } => {
+                            let anchor = invocation_outcome_anchor(position).ok_or(
+                                ReplayError::InvocationOwnership(
+                                    InvocationOwnershipError::Unauthenticated,
+                                ),
+                            )?;
+                            let result = transition.result.clone().ok_or(
+                                ReplayError::InvocationOwnership(
+                                    InvocationOwnershipError::Unauthenticated,
+                                ),
+                            )?;
+                            let outcome = InvocationOutcomeRecord::from_runtime_states(
+                                self.genesis,
+                                key.scope,
+                                anchor,
+                                input,
+                                before,
+                                &transition.state,
+                                result,
+                            )
+                            .map_err(|_| {
+                                ReplayError::InvocationOwnership(
+                                    InvocationOwnershipError::Unauthenticated,
+                                )
+                            })?;
+                            outcome.validate_for(input).map_err(|_| {
+                                ReplayError::InvocationOwnership(
+                                    InvocationOwnershipError::Unauthenticated,
+                                )
+                            })?;
+                            let reference = self
+                                .ownership
+                                .persist_outcome(&outcome)
+                                .map_err(ReplayError::InvocationOwnership)?;
+                            sealed_outcomes.push(ReplaySealedOutcome {
+                                record: outcome.clone(),
+                                input: input.clone(),
+                            });
+                            InvocationResultState::Retained {
+                                disposition: outcome.disposition(),
+                                outcome: reference,
+                            }
+                        }
+                        ReplayPosition::Genesis => {
+                            return Err(ReplayError::InvalidPosition);
+                        }
+                    };
+                    Some(InvocationOwnershipValue {
+                        scope: key.scope,
+                        request_commitment: request,
+                        first_input: input.id(),
+                        lane: input.persisted_lane(),
+                        node: match key.scope {
+                            InvocationOwnershipScope::Local(node) => Some(node),
+                            InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Merge => {
+                                None
+                            }
+                        },
+                        result_state,
+                    })
+                }
+                (InvocationOwnershipOperation::Acknowledge, Some(mut existing)) => {
+                    let disposition =
+                        existing
+                            .disposition()
+                            .ok_or(ReplayError::InvocationOwnership(
+                                InvocationOwnershipError::Unauthenticated,
+                            ))?;
+                    existing.result_state = match (key.scope, position, existing.result_state) {
+                        (
+                            InvocationOwnershipScope::Merge,
+                            ReplayPosition::Merge { id, .. },
+                            InvocationResultState::Retained { outcome, .. },
+                        ) => InvocationResultState::PendingMergeAcknowledgement {
+                            acknowledgement_event: id,
+                            disposition,
+                            outcome,
+                        },
+                        (
+                            InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Local(_),
+                            _,
+                            InvocationResultState::Retained { .. },
+                        ) => InvocationResultState::Acknowledged { disposition },
+                        _ => {
+                            return Err(ReplayError::InvocationOwnership(
+                                InvocationOwnershipError::Unauthenticated,
+                            ));
+                        }
+                    };
                     Some(existing)
                 }
+                (InvocationOwnershipOperation::Invoke, Some(_)) if replaying_pending_source => None,
                 (InvocationOwnershipOperation::Invoke, Some(_)) => None,
                 (InvocationOwnershipOperation::Acknowledge, None) => {
                     return Err(ReplayError::InvocationOwnership(
                         InvocationOwnershipError::Unauthenticated,
                     ));
                 }
-                (InvocationOwnershipOperation::Acknowledge, _) => None,
             };
             if let Some(value) = value {
-                ownership_delta = match operation {
-                    InvocationOwnershipOperation::Invoke => {
-                        InvocationIndexDelta::Insert { scope: key.scope }
-                    }
-                    InvocationOwnershipOperation::Acknowledge => {
-                        InvocationIndexDelta::Acknowledge { scope: key.scope }
-                    }
-                };
+                ownership_delta = ownership_delta.with(key.scope);
                 self.ownership
                     .record(key, value)
                     .map_err(ReplayError::InvocationOwnership)?;
@@ -2491,10 +2987,12 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             } else {
                 ReplayStepOutcome::Applied(transition.disposition)
             },
+            result: transition.result,
             products: transition.products,
             input: input.id(),
             position,
             ownership_delta,
+            sealed_outcomes,
             merge_authenticated: false,
         })
     }
@@ -2506,6 +3004,18 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         id: MergeEventId,
         event: &MergeEvent,
         before: &RuntimeState,
+    ) -> Result<ReplayStep, ReplayError<SourceError, E::Error>> {
+        self.verify_and_apply_merge_with_unseen_capacity(executor, ordered, id, event, before, None)
+    }
+
+    fn verify_and_apply_merge_with_unseen_capacity<E: ReplayExecutor, SourceError>(
+        &mut self,
+        executor: &mut E,
+        ordered: &OrderedReplay,
+        id: MergeEventId,
+        event: &MergeEvent,
+        before: &RuntimeState,
+        unseen_admission: Option<UnseenInvocationAdmission>,
     ) -> Result<ReplayStep, ReplayError<SourceError, E::Error>> {
         validate_runtime_state_bound(before)?;
         if event.validate().is_err()
@@ -2537,15 +3047,17 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                         .cloned()
                         .ok_or(ReplayError::InvalidOrderedBase)?,
                     outcome: ReplayStepOutcome::ExactDuplicate,
+                    result: None,
                     products: ReplayProducts::default(),
                     input: event.input.id(),
                     position,
-                    ownership_delta: InvocationIndexDelta::None,
+                    ownership_delta: InvocationIndexDelta::NONE,
+                    sealed_outcomes: Vec::new(),
                     merge_authenticated: true,
                 });
             }
         }
-        let mut step = self.apply(
+        let mut step = self.apply_with_unseen_capacity(
             executor,
             &event.input,
             before,
@@ -2554,6 +3066,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 causal_height: event.causal_height,
                 ordered_base: event.ordered_base,
             },
+            unseen_admission,
         )?;
         step.merge_authenticated = true;
         Ok(step)
@@ -2568,6 +3081,255 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             self.runtime = runtime.clone();
             self.runtime_history.insert(base, runtime.clone());
         }
+    }
+
+    fn validate_direct_outcomes(
+        &self,
+        input: &ReplayInput,
+        before: &RuntimeState,
+        step: &ReplayStep,
+        scope: InvocationOwnershipScope,
+        anchor: InvocationOutcomeAnchor,
+    ) -> Result<Vec<ReplaySealedOutcome>, ReplayValidationError> {
+        let newly_executed = matches!(input.operation, ReplayOperation::Invoke { .. })
+            && matches!(step.outcome, ReplayStepOutcome::Applied(_));
+        let direct = step
+            .sealed_outcomes
+            .iter()
+            .filter(|outcome| outcome.record.key.scope == scope)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !newly_executed {
+            return if direct.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(ReplayError::InvalidRecord)
+            };
+        }
+        let result = step.result.clone().ok_or(ReplayError::InvalidRecord)?;
+        let record = InvocationOutcomeRecord::from_runtime_states(
+            self.genesis,
+            scope,
+            anchor,
+            input,
+            before,
+            &step.state,
+            result,
+        )
+        .map_err(|_| ReplayError::InvalidRecord)?;
+        let expected = ReplaySealedOutcome {
+            record,
+            input: input.clone(),
+        };
+        if direct.as_slice() != [expected.clone()] {
+            return Err(ReplayError::InvalidRecord);
+        }
+        Ok(vec![expected])
+    }
+
+    fn finalize_merge_outcomes(
+        &mut self,
+        finalizing_entry: OrderedEntryId,
+        seal: MergeSealId,
+        facts: &BTreeMap<MergeEventId, MergeExecutionFact>,
+    ) -> Result<
+        (
+            InvocationIndexDelta,
+            Vec<ReplaySealedOutcome>,
+            Vec<ReplayExecutionResult>,
+        ),
+        ReplayValidationError,
+    > {
+        if finalizing_entry == OrderedEntryId::ZERO || seal == MergeSealId::ZERO {
+            return Err(ReplayError::InvalidFence);
+        }
+
+        // Build the complete final net mutation before persisting anything.
+        // The BTreeMap order is the canonical ownership-key batch order and
+        // also the order in which newly public results are returned.
+        let mut transitions = BTreeMap::new();
+        let mut outcome_candidates = BTreeMap::new();
+        let mut executions = BTreeMap::new();
+        for (event_id, fact) in facts {
+            if fact.event.validate().is_err() || fact.event.id() != *event_id {
+                return Err(ReplayError::InvalidRecord);
+            }
+            let Some((invocation, request, operation)) = invocation_identity(&fact.event.input)
+            else {
+                continue;
+            };
+            let key = InvocationOwnershipKey {
+                scope: InvocationOwnershipScope::Merge,
+                invocation,
+            };
+            let Some(mut owner) = self
+                .ownership
+                .lookup(key)
+                .map_err(ReplayError::InvocationOwnership)?
+            else {
+                return Err(ReplayError::InvocationOwnership(
+                    InvocationOwnershipError::Unauthenticated,
+                ));
+            };
+            validate_owner_for_input(owner, key, &fact.event.input)
+                .map_err(ReplayError::InvocationOwnership)?;
+            if owner.request_commitment != request {
+                continue;
+            }
+
+            match (operation, owner.result_state) {
+                (
+                    InvocationOwnershipOperation::Invoke,
+                    InvocationResultState::PendingMerge { source_event },
+                ) if source_event == *event_id && owner.first_input == fact.event.input.id() => {
+                    let result = fact.result.clone().ok_or(ReplayError::InvalidRecord)?;
+                    let record = InvocationOutcomeRecord::from_runtime_states(
+                        self.genesis,
+                        InvocationOwnershipScope::Merge,
+                        InvocationOutcomeAnchor::Merge {
+                            source_event: *event_id,
+                            finalizing_entry,
+                            seal,
+                        },
+                        &fact.event.input,
+                        &fact.before,
+                        &fact.after,
+                        result.clone(),
+                    )
+                    .map_err(|_| ReplayError::InvalidRecord)?;
+                    record
+                        .validate_for_genesis(self.genesis, &fact.event.input)
+                        .map_err(|_| ReplayError::InvalidRecord)?;
+                    let reference = InvocationOutcomeRef::for_record(&record)
+                        .map_err(|_| ReplayError::InvalidRecord)?;
+                    owner.result_state = InvocationResultState::Retained {
+                        disposition: record.disposition(),
+                        outcome: reference,
+                    };
+                    owner.validate().map_err(|_| ReplayError::InvalidRecord)?;
+                    if transitions.insert(key, owner).is_some()
+                        || outcome_candidates.insert(key, record.clone()).is_some()
+                        || executions
+                            .insert(
+                                key,
+                                ReplayExecutionResult {
+                                    outcome: ReplayStepOutcome::Applied(replay_disposition(
+                                        record.disposition(),
+                                    )),
+                                    result: Some(result),
+                                    products: ReplayProducts::default(),
+                                    input: fact.event.input.id(),
+                                    position: ReplayPosition::Merge {
+                                        id: *event_id,
+                                        causal_height: fact.event.causal_height,
+                                        ordered_base: fact.event.ordered_base,
+                                    },
+                                },
+                            )
+                            .is_some()
+                    {
+                        return Err(ReplayError::InvalidRecord);
+                    }
+                }
+                (
+                    InvocationOwnershipOperation::Acknowledge,
+                    InvocationResultState::PendingMergeAcknowledgement {
+                        acknowledgement_event,
+                        disposition,
+                        ..
+                    },
+                ) if acknowledgement_event == *event_id => {
+                    let outcome = self
+                        .ownership
+                        .outcome(key)
+                        .map_err(ReplayError::InvocationOwnership)?
+                        .ok_or(ReplayError::InvocationOwnership(
+                            InvocationOwnershipError::Unauthenticated,
+                        ))?;
+                    validate_retained_outcome(
+                        &outcome,
+                        self.genesis,
+                        key,
+                        owner,
+                        &fact.event.input,
+                    )
+                    .map_err(ReplayError::InvocationOwnership)?;
+                    owner.result_state = InvocationResultState::Acknowledged { disposition };
+                    owner.validate().map_err(|_| ReplayError::InvalidRecord)?;
+                    if transitions.insert(key, owner).is_some() {
+                        return Err(ReplayError::InvalidRecord);
+                    }
+                }
+                // An alias event or already-finalized owner contributes no
+                // second transition. Exact source/ack inclusion is enforced
+                // below by requiring that no authenticated unfinalized owner
+                // remains after this batch.
+                _ => {}
+            }
+        }
+
+        let mut sealed_outcomes = Vec::with_capacity(outcome_candidates.len());
+        for (key, record) in &outcome_candidates {
+            let reference = self
+                .ownership
+                .persist_outcome(record)
+                .map_err(ReplayError::InvocationOwnership)?;
+            if transitions.get(key).and_then(|owner| owner.outcome()) != Some(reference) {
+                return Err(ReplayError::InvocationOwnership(
+                    InvocationOwnershipError::Unauthenticated,
+                ));
+            }
+            let fact = facts
+                .get(&match record.anchor {
+                    InvocationOutcomeAnchor::Merge { source_event, .. } => source_event,
+                    InvocationOutcomeAnchor::Ordered { .. }
+                    | InvocationOutcomeAnchor::Local { .. } => {
+                        return Err(ReplayError::InvalidRecord);
+                    }
+                })
+                .ok_or(ReplayError::InvalidRecord)?;
+            sealed_outcomes.push(ReplaySealedOutcome {
+                record: record.clone(),
+                input: fact.event.input.clone(),
+            });
+        }
+        let batch = transitions.into_iter().collect::<Vec<_>>();
+        if !batch.is_empty() {
+            self.ownership
+                .record_batch(InvocationOwnershipScope::Merge, &batch)
+                .map_err(ReplayError::InvocationOwnership)?;
+            for (key, expected) in &batch {
+                if self
+                    .ownership
+                    .lookup(*key)
+                    .map_err(ReplayError::InvocationOwnership)?
+                    != Some(*expected)
+                {
+                    return Err(ReplayError::InvocationOwnership(
+                        InvocationOwnershipError::Unauthenticated,
+                    ));
+                }
+            }
+        }
+        if self
+            .ownership
+            .unfinalized(InvocationOwnershipScope::Merge)
+            .map_err(ReplayError::InvocationOwnership)?
+            != 0
+        {
+            return Err(ReplayError::InvocationOwnership(
+                InvocationOwnershipError::Unauthenticated,
+            ));
+        }
+        Ok((
+            if batch.is_empty() {
+                InvocationIndexDelta::NONE
+            } else {
+                InvocationIndexDelta::NONE.with(InvocationOwnershipScope::Merge)
+            },
+            sealed_outcomes,
+            executions.into_values().collect(),
+        ))
     }
 
     /// Mint the only authority accepted by storage for an ordered CAS.
@@ -2638,11 +3400,57 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             return Err(ReplayError::InvalidFence);
         }
         self.validate_publication_indexes(current, &next, step.ownership_delta)?;
+        let mut outcomes = self.validate_direct_outcomes(
+            &entry.input,
+            &materialization.state,
+            step,
+            InvocationOwnershipScope::Ordered,
+            InvocationOutcomeAnchor::Ordered { entry: id },
+        )?;
+        for outcome in &step.sealed_outcomes {
+            if outcome.record.key.scope == InvocationOwnershipScope::Ordered {
+                continue;
+            }
+            let Some(seal) = entry.merge_seal else {
+                return Err(ReplayError::InvalidRecord);
+            };
+            let InvocationOutcomeAnchor::Merge {
+                source_event,
+                finalizing_entry,
+                seal: outcome_seal,
+            } = outcome.record.anchor
+            else {
+                return Err(ReplayError::InvalidRecord);
+            };
+            let key = outcome.record.key;
+            let owner = self
+                .ownership
+                .lookup(key)
+                .map_err(ReplayError::InvocationOwnership)?
+                .ok_or(ReplayError::InvocationOwnership(
+                    InvocationOwnershipError::Unauthenticated,
+                ))?;
+            if key.scope != InvocationOwnershipScope::Merge
+                || source_event == MergeEventId::ZERO
+                || finalizing_entry != id
+                || outcome_seal != seal
+                || outcome
+                    .record
+                    .validate_for_genesis(self.genesis, &outcome.input)
+                    .is_err()
+                || owner.outcome() != InvocationOutcomeRef::for_record(&outcome.record).ok()
+                || owner.disposition() != Some(outcome.record.disposition())
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
+            outcomes.push(outcome.clone());
+        }
         let fence_ancestry = successor_fence_ancestry(materialization, &next, false, Some(entry))?;
         Ok(ReplaySealedPublication {
             expected: current.id(),
             next,
             anchor: ReplayPublicationAnchor::Ordered(entry.clone()),
+            outcomes,
             checkpoint: None,
             fence_ancestry,
         })
@@ -2704,11 +3512,22 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             return Err(ReplayError::InvalidRecord);
         }
         self.validate_publication_indexes(current, &next, step.ownership_delta)?;
+        let outcomes = self.validate_direct_outcomes(
+            &entry.input,
+            &materialization.state,
+            step,
+            InvocationOwnershipScope::Local(entry.node),
+            InvocationOutcomeAnchor::Local { entry: id },
+        )?;
+        if outcomes.len() != step.sealed_outcomes.len() {
+            return Err(ReplayError::InvalidRecord);
+        }
         let fence_ancestry = successor_fence_ancestry(materialization, &next, false, None)?;
         Ok(ReplaySealedPublication {
             expected: current.id(),
             next,
             anchor: ReplayPublicationAnchor::Local(entry.clone()),
+            outcomes,
             checkpoint: None,
             fence_ancestry,
         })
@@ -2759,6 +3578,9 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         {
             return Err(ReplayError::InvalidRecord);
         }
+        if !step.sealed_outcomes.is_empty() {
+            return Err(ReplayError::InvalidRecord);
+        }
         self.validate_publication_indexes(current, &next, step.ownership_delta)?;
         let fence_ancestry = successor_fence_ancestry(materialization, &next, false, None)?;
         Ok(ReplaySealedPublication {
@@ -2768,6 +3590,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 event: event.clone(),
                 frontier: replay.frontier.clone(),
             },
+            outcomes: Vec::new(),
             checkpoint: None,
             fence_ancestry,
         })
@@ -2788,13 +3611,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 .ownership
                 .index_id(scope)
                 .map_err(ReplayError::InvocationOwnership)?;
-            let changed = matches!(
-                delta,
-                InvocationIndexDelta::Insert {
-                    scope: changed,
-                } | InvocationIndexDelta::Acknowledge { scope: changed }
-                    if changed == scope
-            );
+            let changed = delta.changed(scope);
             let old = invocation_index_at(current, scope).ok_or(ReplayError::ScopeMismatch)?;
             let new = invocation_index_at(next, scope).ok_or(ReplayError::ScopeMismatch)?;
             if (changed && (staged == old || new != staged))
@@ -2985,8 +3802,10 @@ fn validate_position<SourceError, ExecutorError>(
             matches!(
                 input.persisted_lane(),
                 PersistedLane::Control | PersistedLane::Linear
-            ) && (matches!(input.operation, ReplayOperation::Management { .. })
-                == merge_seal.is_some())
+            ) && (matches!(
+                input.operation,
+                ReplayOperation::Management { .. } | ReplayOperation::SealMerge
+            ) == merge_seal.is_some())
         }
         ReplayPosition::Merge { .. } => input.persisted_lane() == PersistedLane::Merge,
         ReplayPosition::Local { .. } => input.persisted_lane() == PersistedLane::Local,
@@ -3018,7 +3837,7 @@ fn invocation_identity(
             invocation.commitment(),
             InvocationOwnershipOperation::Acknowledge,
         )),
-        ReplayOperation::Management { .. } => None,
+        ReplayOperation::Management { .. } | ReplayOperation::SealMerge => None,
     }
 }
 
@@ -3036,12 +3855,171 @@ fn invocation_ownership_key(
     InvocationOwnershipKey { scope, invocation }
 }
 
+fn validate_owner_for_input(
+    owner: InvocationOwnershipValue,
+    key: InvocationOwnershipKey,
+    input: &ReplayInput,
+) -> Result<(), InvocationOwnershipError> {
+    let Some((invocation, _, _)) = invocation_identity(input) else {
+        return Err(InvocationOwnershipError::Unauthenticated);
+    };
+    let expected_node = match key.scope {
+        InvocationOwnershipScope::Local(node) => Some(node),
+        InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Merge => None,
+    };
+    if key.validate().is_err()
+        || owner.validate().is_err()
+        || owner.scope != key.scope
+        || key.invocation != invocation
+        || owner.lane != input.persisted_lane()
+        || owner.node != expected_node
+    {
+        return Err(InvocationOwnershipError::Unauthenticated);
+    }
+    Ok(())
+}
+
+fn validate_retained_outcome(
+    outcome: &InvocationOutcomeRecord,
+    genesis: AgentJournalGenesisId,
+    key: InvocationOwnershipKey,
+    owner: InvocationOwnershipValue,
+    input: &ReplayInput,
+) -> Result<(), InvocationOwnershipError> {
+    let invocation = match &input.operation {
+        ReplayOperation::Invoke { invocation, .. }
+        | ReplayOperation::Acknowledge { invocation, .. } => invocation,
+        ReplayOperation::Management { .. } | ReplayOperation::SealMerge => {
+            return Err(InvocationOwnershipError::Unauthenticated);
+        }
+    };
+    let Some(reference) = owner.outcome() else {
+        return Err(InvocationOwnershipError::Unauthenticated);
+    };
+    if outcome.validate().is_err()
+        || outcome.genesis != genesis
+        || outcome.key != key
+        || outcome.request_commitment != owner.request_commitment
+        || outcome.first_input != owner.first_input
+        || outcome.lane != owner.lane
+        || outcome.node != owner.node
+        || outcome.request_commitment != invocation.commitment()
+        || !outcome.request.matches_invocation(invocation)
+        || outcome.disposition()
+            != owner
+                .disposition()
+                .ok_or(InvocationOwnershipError::Unauthenticated)?
+        || !reference.authenticates(outcome)
+    {
+        return Err(InvocationOwnershipError::Unauthenticated);
+    }
+    Ok(())
+}
+
+const fn invocation_outcome_anchor(position: ReplayPosition) -> Option<InvocationOutcomeAnchor> {
+    match position {
+        ReplayPosition::Ordered { id, .. } => Some(InvocationOutcomeAnchor::Ordered { entry: id }),
+        ReplayPosition::Local { id, .. } => Some(InvocationOutcomeAnchor::Local { entry: id }),
+        ReplayPosition::Genesis | ReplayPosition::Merge { .. } => None,
+    }
+}
+
+fn noop_replay_step(
+    input: &ReplayInput,
+    before: &RuntimeState,
+    runtime: RuntimeBinding,
+    position: ReplayPosition,
+    outcome: ReplayStepOutcome,
+) -> ReplayStep {
+    ReplayStep {
+        state: before.clone(),
+        runtime,
+        outcome,
+        result: None,
+        products: ReplayProducts::default(),
+        input: input.id(),
+        position,
+        ownership_delta: InvocationIndexDelta::NONE,
+        sealed_outcomes: Vec::new(),
+        merge_authenticated: false,
+    }
+}
+
+/// Rebuild the sole legal successor for an authenticated retained outcome.
+///
+/// Retained recovery is journal work, not application execution: the exact
+/// result is already authenticated by the ownership leaf and outcome object.
+/// The only state mutation is the owning physical component's monotone
+/// authority-slot high-water. A later runtime capability downgrade must not
+/// strand an already-committed terminal/error outcome, so this path is gated
+/// by the immutable profile rather than the current package capabilities.
+/// Unseen work still enters `ReplayExecutor::execute` and therefore retains
+/// the ordinary current-capability preflight. In particular, a Private agent
+/// can never acquire or recover a Linear clock because its profile has never
+/// supported that component.
+fn advance_historical_result_clock(
+    state: &mut super::standard::StandardRuntimeState,
+    storage: InvocationResultStorage,
+    observed_slot: u64,
+) -> Result<(), ()> {
+    let profile = state.config.as_ref().ok_or(())?.identity.profile;
+    let advance = |current: &mut Option<u64>| {
+        *current = Some((*current).map_or(observed_slot, |slot| slot.max(observed_slot)));
+    };
+    match storage {
+        InvocationResultStorage::Control => advance(&mut state.control_authority_slot),
+        InvocationResultStorage::Lane(lane) => {
+            if !profile.supports(lane) {
+                return Err(());
+            }
+            match lane {
+                StateLane::Linear => advance(&mut state.lane_revisions.linear_authority_slot),
+                StateLane::Merge => advance(&mut state.lane_revisions.merge_authority_slot),
+                StateLane::Local => advance(&mut state.lane_revisions.local_authority_slot),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn retained_exact_transition<SourceError, ExecutorError>(
+    input: &ReplayInput,
+    before: &RuntimeState,
+    runtime: &RuntimeBinding,
+    outcome: &InvocationOutcomeRecord,
+) -> Result<ReplayTransition, ReplayError<SourceError, ExecutorError>> {
+    let ReplayOperation::Invoke {
+        invocation,
+        observed_slot,
+        ..
+    } = &input.operation
+    else {
+        return Err(ReplayError::InvalidPosition);
+    };
+    let mut state =
+        decode_standard_runtime_state(before).map_err(|_| ReplayError::InvalidRecord)?;
+    StandardAgentRuntime::restore(state.clone()).map_err(|_| ReplayError::InvalidRecord)?;
+    advance_historical_result_clock(&mut state, invocation.mode.result_storage(), *observed_slot)
+        .map_err(|_| ReplayError::TerminalMutation)?;
+    StandardAgentRuntime::restore(state.clone()).map_err(|_| ReplayError::TerminalMutation)?;
+    Ok(ReplayTransition {
+        state: encode_standard_runtime_state(&state),
+        disposition: replay_disposition(outcome.disposition()),
+        result: Some(outcome.result.clone()),
+        next_runtime: runtime.clone(),
+        products: ReplayProducts::default(),
+    })
+}
+
 fn validate_transition<SourceError, ExecutorError>(
     input: &ReplayInput,
     before: &RuntimeState,
     transition: &ReplayTransition,
     position: ReplayPosition,
     current_runtime: &RuntimeBinding,
+    retained_recovery: bool,
+    synthetic_acknowledgement: bool,
+    acknowledgement_outcome: Option<&InvocationOutcomeRecord>,
 ) -> Result<(), ReplayError<SourceError, ExecutorError>> {
     // Runtime side products are not yet content-addressed members of the
     // journal CAS. Accepting them here would make a crash able to lose or
@@ -3049,26 +4027,258 @@ fn validate_transition<SourceError, ExecutorError>(
     if !transition.products.is_empty() {
         return Err(ReplayError::ForbiddenMergeProducts);
     }
-    let invocation_rejected = transition.disposition == ReplayDisposition::Rejected
-        && !matches!(input.operation, ReplayOperation::Management { .. });
-    if transition.disposition.is_terminal_noop() || invocation_rejected {
-        if transition.state != *before
-            || transition.next_runtime != *current_runtime
-            || !transition.products.is_empty()
+    match &input.operation {
+        ReplayOperation::Invoke { invocation, .. } => {
+            let result = transition
+                .result
+                .as_ref()
+                .ok_or(ReplayError::InvalidRecord)?;
+            let clock_only = retained_recovery
+                || !matches!(
+                    result,
+                    Ok(reply) if reply.status == ActorExecutionStatus::Done
+                );
+            let expected_disposition = match result {
+                Ok(reply) => {
+                    if super::wire::validate_execution_reply(reply).is_err()
+                        || reply.invocation != invocation.invocation
+                        || reply.actor != invocation.actor
+                        || reply.incarnation != invocation.incarnation
+                        || reply.deployment != invocation.deployment
+                        || reply.mode != invocation.mode
+                        || reply.gas_remaining > invocation.gas
+                    {
+                        return Err(ReplayError::InvalidRecord);
+                    }
+                    match reply.status {
+                        ActorExecutionStatus::Done => ReplayDisposition::Applied,
+                        ActorExecutionStatus::Forbidden => ReplayDisposition::Forbidden,
+                        ActorExecutionStatus::Panicked => ReplayDisposition::Panicked,
+                        ActorExecutionStatus::OutOfGas => ReplayDisposition::OutOfGas,
+                    }
+                }
+                Err(error) if error.is_durable_exact_outcome() => ReplayDisposition::Rejected,
+                Err(_) => return Err(ReplayError::InvalidRecord),
+            };
+            if transition.disposition != expected_disposition
+                || transition.next_runtime != *current_runtime
+            {
+                return Err(ReplayError::TerminalMutation);
+            }
+            validate_standard_invocation_successor(
+                input,
+                before,
+                &transition.state,
+                result,
+                retained_recovery,
+                clock_only,
+            )?;
+            validate_lane_mutation(
+                input,
+                before,
+                &transition.state,
+                transition.disposition,
+                position,
+            )?;
+        }
+        ReplayOperation::Acknowledge { .. } => {
+            if transition.result.is_some()
+                || transition.disposition != ReplayDisposition::Applied
+                || transition.next_runtime != *current_runtime
+            {
+                return Err(ReplayError::TerminalMutation);
+            }
+            validate_standard_acknowledgement_successor(
+                input,
+                before,
+                &transition.state,
+                synthetic_acknowledgement,
+                acknowledgement_outcome.ok_or(ReplayError::InvalidRecord)?,
+            )?;
+            validate_lane_mutation(
+                input,
+                before,
+                &transition.state,
+                transition.disposition,
+                position,
+            )?;
+        }
+        ReplayOperation::Management { .. } => {
+            if transition.result.is_some() {
+                return Err(ReplayError::InvalidManagementTransition);
+            }
+            validate_runtime_successor(input, transition, current_runtime)?;
+            validate_lane_mutation(
+                input,
+                before,
+                &transition.state,
+                transition.disposition,
+                position,
+            )?;
+        }
+        ReplayOperation::SealMerge => {
+            if transition.state != *before
+                || transition.result.is_some()
+                || transition.disposition != ReplayDisposition::Applied
+                || transition.next_runtime != *current_runtime
+            {
+                return Err(ReplayError::TerminalMutation);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_standard_invocation_successor<SourceError, ExecutorError>(
+    input: &ReplayInput,
+    before: &RuntimeState,
+    after: &RuntimeState,
+    result: &Result<ActorExecutionReply, ActorExecutionError>,
+    retained_recovery: bool,
+    clock_only: bool,
+) -> Result<(), ReplayError<SourceError, ExecutorError>> {
+    let ReplayOperation::Invoke {
+        invocation,
+        observed_slot,
+        ..
+    } = &input.operation
+    else {
+        return Err(ReplayError::InvalidPosition);
+    };
+    let decoded_before =
+        decode_standard_runtime_state(before).map_err(|_| ReplayError::InvalidRecord)?;
+    let decoded_after =
+        decode_standard_runtime_state(after).map_err(|_| ReplayError::InvalidRecord)?;
+    let mut runtime = StandardAgentRuntime::restore(decoded_before.clone())
+        .map_err(|_| ReplayError::InvalidRecord)?;
+    StandardAgentRuntime::restore(decoded_after.clone()).map_err(|_| ReplayError::InvalidRecord)?;
+    if !retained_recovery {
+        runtime
+            .validate_invocation_result_storage(invocation)
+            .map_err(|_| ReplayError::InvalidRecord)?;
+    }
+
+    let scope = invocation.mode.invocation_scope();
+    let before_result = decoded_before
+        .invocation_results
+        .iter()
+        .find(|record| record.scope == scope && record.invocation == invocation.invocation);
+    let after_result = decoded_after
+        .invocation_results
+        .iter()
+        .find(|record| record.scope == scope && record.invocation == invocation.invocation);
+    let matches_reply = |record: &super::standard::StandardInvocationResult,
+                         reply: &ActorExecutionReply| {
+        record.scope == scope
+            && record.invocation == invocation.invocation
+            && record.incarnation == invocation.incarnation
+            && record.request == invocation.commitment()
+            && record.reply == *reply
+            && record.storage == invocation.mode.result_storage()
+    };
+    match result {
+        Ok(reply) if reply.status == ActorExecutionStatus::Done => {
+            if (retained_recovery
+                && before_result.is_none_or(|record| !matches_reply(record, reply)))
+                || (!retained_recovery && before_result.is_some())
+                || after_result.is_none_or(|record| !matches_reply(record, reply))
+            {
+                return Err(ReplayError::TerminalMutation);
+            }
+        }
+        Ok(_) | Err(_) => {
+            if before_result.is_some() || after_result.is_some() {
+                return Err(ReplayError::TerminalMutation);
+            }
+        }
+    }
+    if clock_only {
+        let expected = if retained_recovery {
+            let mut expected = decoded_before;
+            advance_historical_result_clock(
+                &mut expected,
+                invocation.mode.result_storage(),
+                *observed_slot,
+            )
+            .map_err(|_| ReplayError::TerminalMutation)?;
+            StandardAgentRuntime::restore(expected.clone())
+                .map_err(|_| ReplayError::TerminalMutation)?;
+            expected
+        } else {
+            runtime
+                .commit_exact_outcome_clock(invocation, *observed_slot)
+                .map_err(|_| ReplayError::TerminalMutation)?;
+            runtime.snapshot()
+        };
+        if encode_standard_runtime_state(&expected) != *after {
+            return Err(ReplayError::TerminalMutation);
+        }
+    }
+    Ok(())
+}
+
+fn validate_standard_acknowledgement_successor<SourceError, ExecutorError>(
+    input: &ReplayInput,
+    before: &RuntimeState,
+    after: &RuntimeState,
+    synthetic: bool,
+    outcome: &InvocationOutcomeRecord,
+) -> Result<(), ReplayError<SourceError, ExecutorError>> {
+    let ReplayOperation::Acknowledge { invocation, .. } = &input.operation else {
+        return Err(ReplayError::InvalidPosition);
+    };
+    let decoded_before =
+        decode_standard_runtime_state(before).map_err(|_| ReplayError::InvalidRecord)?;
+    let decoded_after =
+        decode_standard_runtime_state(after).map_err(|_| ReplayError::InvalidRecord)?;
+    StandardAgentRuntime::restore(decoded_before.clone())
+        .map_err(|_| ReplayError::InvalidRecord)?;
+    StandardAgentRuntime::restore(decoded_after.clone()).map_err(|_| ReplayError::InvalidRecord)?;
+    let scope = invocation.mode.invocation_scope();
+    let exact = |record: &super::standard::StandardInvocationResult,
+                 reply: &ActorExecutionReply| {
+        record.scope == scope
+            && record.invocation == invocation.invocation
+            && record.incarnation == invocation.incarnation
+            && record.request == invocation.commitment()
+            && record.reply == *reply
+            && record.storage == invocation.mode.result_storage()
+    };
+    if synthetic {
+        if before != after
+            || decoded_before
+                .invocation_results
+                .iter()
+                .any(|record| record.scope == scope && record.invocation == invocation.invocation)
         {
             return Err(ReplayError::TerminalMutation);
         }
-    } else {
-        validate_runtime_successor(input, transition, current_runtime)?;
-        validate_lane_mutation(
-            input,
-            before,
-            &transition.state,
-            transition.disposition,
-            position,
-        )?;
+        return Ok(());
     }
-
+    let Ok(reply) = &outcome.result else {
+        return Err(ReplayError::InvalidRecord);
+    };
+    if reply.status != ActorExecutionStatus::Done {
+        return Err(ReplayError::InvalidRecord);
+    }
+    let Some(before_record) = decoded_before
+        .invocation_results
+        .iter()
+        .find(|record| record.scope == scope && record.invocation == invocation.invocation)
+    else {
+        return Err(ReplayError::TerminalMutation);
+    };
+    if !exact(before_record, reply) {
+        return Err(ReplayError::TerminalMutation);
+    }
+    let mut expected = decoded_before;
+    expected
+        .invocation_results
+        .retain(|record| !(record.scope == scope && record.invocation == invocation.invocation));
+    if encode_standard_runtime_state(&expected) != *after {
+        return Err(ReplayError::TerminalMutation);
+    }
     Ok(())
 }
 
@@ -3284,6 +4494,8 @@ mod aggregate {
 
     pub(crate) type MaterializeError<ResolverError, ExecutorError> =
         ReplayError<ReplayMaterializationSourceError<ResolverError>, ExecutorError>;
+    pub(crate) type RecoveryError =
+        MaterializeError<core::convert::Infallible, core::convert::Infallible>;
 
     struct ReplayBase {
         state: RuntimeState,
@@ -4013,7 +5225,10 @@ mod aggregate {
             head: entry.parent,
         };
         if entry.merge_seal != Some(dependency.id)
-            || !matches!(entry.input.operation, ReplayOperation::Management { .. })
+            || !matches!(
+                entry.input.operation,
+                ReplayOperation::Management { .. } | ReplayOperation::SealMerge
+            )
             || dependency.seal.genesis != entry.genesis
             || dependency.seal.frontier != frontier
             || dependency.seal.ordered_base != parent
@@ -4096,14 +5311,26 @@ mod aggregate {
         let mut current_ancestry = base.merge_ancestry;
         let mut local_revision = base.local_revision;
         let mut local_head = base.local_head;
+        let mut merge_facts = BTreeMap::new();
+
+        if InvocationOwnership::unfinalized(&machine.ownership, InvocationOwnershipScope::Merge)
+            .map_err(ReplayError::InvocationOwnership)?
+            != 0
+        {
+            return Err(ReplayError::InvocationOwnership(
+                InvocationOwnershipError::Unauthenticated,
+            ));
+        }
 
         if let Some(input) = base.genesis_input {
-            let step = machine.apply::<_, ReplayMaterializationSourceError<R::Error>>(
-                executor,
-                &input,
-                &state,
-                ReplayPosition::Genesis,
-            )?;
+            let step = machine
+                .apply::<_, ReplayMaterializationSourceError<R::Error>>(
+                    executor,
+                    &input,
+                    &state,
+                    ReplayPosition::Genesis,
+                )
+                .map_err(historical_replay_error)?;
             state = step.state;
             validate_runtime_state_bound(&state)?;
             if step.runtime != input.runtime {
@@ -4157,7 +5384,22 @@ mod aggregate {
                             .verify_and_apply_merge::<
                                 E,
                                 ReplayMaterializationSourceError<R::Error>,
-                            >(executor, &plan.ordered, *id, event, &before)?;
+                            >(executor, &plan.ordered, *id, event, &before)
+                            .map_err(historical_replay_error)?;
+                        if merge_facts
+                            .insert(
+                                *id,
+                                MergeExecutionFact {
+                                    event: event.clone(),
+                                    before,
+                                    after: step.state.clone(),
+                                    result: step.result.clone(),
+                                },
+                            )
+                            .is_some()
+                        {
+                            return Err(ReplayError::InvalidRecord);
+                        }
                         state.merge = step.state.merge;
                         validate_runtime_state_bound(&state)?;
                     }
@@ -4194,18 +5436,20 @@ mod aggregate {
                         merge: state.merge.clone(),
                         local: state.local.clone(),
                     };
-                    let step = machine.apply::<_, ReplayMaterializationSourceError<R::Error>>(
-                        executor,
-                        &entry.input,
-                        &before,
-                        ReplayPosition::Local {
-                            id,
-                            node: entry.node,
-                            revision: entry.revision,
-                            ordered_base: entry.ordered_base,
-                            merge_frontier: entry.merge_frontier,
-                        },
-                    )?;
+                    let step = machine
+                        .apply::<_, ReplayMaterializationSourceError<R::Error>>(
+                            executor,
+                            &entry.input,
+                            &before,
+                            ReplayPosition::Local {
+                                id,
+                                node: entry.node,
+                                revision: entry.revision,
+                                ordered_base: entry.ordered_base,
+                                merge_frontier: entry.merge_frontier,
+                            },
+                        )
+                        .map_err(historical_replay_error)?;
                     state.local = step.state.local;
                     validate_runtime_state_bound(&state)?;
                     local_revision = entry.revision;
@@ -4234,17 +5478,24 @@ mod aggregate {
                         None if entry.merge_seal.is_none() => None,
                         None => return Err(ReplayError::InvalidFence),
                     };
-                    let step = machine.apply::<_, ReplayMaterializationSourceError<R::Error>>(
-                        executor,
-                        &entry.input,
-                        &state,
-                        ReplayPosition::Ordered {
-                            id,
-                            index: entry.index,
-                            merge_frontier: entry.merge_frontier,
-                            merge_seal: entry.merge_seal,
-                        },
-                    )?;
+                    if let Some(seal) = entry.merge_seal {
+                        machine
+                            .finalize_merge_outcomes(id, seal, &merge_facts)
+                            .map_err(lift_validation)?;
+                    }
+                    let step = machine
+                        .apply::<_, ReplayMaterializationSourceError<R::Error>>(
+                            executor,
+                            &entry.input,
+                            &state,
+                            ReplayPosition::Ordered {
+                                id,
+                                index: entry.index,
+                                merge_frontier: entry.merge_frontier,
+                                merge_seal: entry.merge_seal,
+                            },
+                        )
+                        .map_err(historical_replay_error)?;
                     state = step.state;
                     validate_runtime_state_bound(&state)?;
                     current_ordered = OrderedBase {
@@ -4279,11 +5530,15 @@ mod aggregate {
                             InvocationOwnershipScope::Merge,
                         )
                         .map_err(ReplayError::InvocationOwnership)?;
+                        merge_facts.clear();
                     }
                 }
             }
         }
 
+        let merge_unfinalized =
+            InvocationOwnership::unfinalized(&machine.ownership, InvocationOwnershipScope::Merge)
+                .map_err(ReplayError::InvocationOwnership)?;
         let ids = machine
             .ownership_ids(heads.node)
             .map_err(ReplayError::InvocationOwnership)?;
@@ -4310,6 +5565,17 @@ mod aggregate {
                     && base.head == Some(fence.ordered_head)
                     && seal == fence.seal => {}
             _ => return Err(ReplayError::InvalidFence),
+        }
+        if merge_unfinalized != 0 {
+            validate_merge_finalizer_capacity(
+                &plan.suffix_budget,
+                heads.genesis,
+                &heads.runtime,
+                current_ordered,
+                current_frontier,
+                &state.merge,
+            )
+            .map_err(lift_validation)?;
         }
         let fence = machine.fence.clone();
         drop(machine);
@@ -4456,6 +5722,413 @@ mod aggregate {
         Ok(())
     }
 
+    fn outcome_anchor_input<S>(
+        store: &S,
+        genesis: AgentJournalGenesisId,
+        outcome: &InvocationOutcomeRecord,
+    ) -> Result<ReplayInput, RecoveryError>
+    where
+        S: AgentJournalStore,
+    {
+        let input = match outcome.anchor {
+            InvocationOutcomeAnchor::Ordered { entry } => {
+                let record: OrderedEntry = require_record(store, entry)?;
+                if record.validate().is_err() || record.id() != entry || record.genesis != genesis {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                record.input
+            }
+            InvocationOutcomeAnchor::Local { entry } => {
+                let record: LocalEntry = require_record(store, entry)?;
+                if record.validate().is_err()
+                    || record.id() != entry
+                    || record.genesis != genesis
+                    || record.node != outcome.node.ok_or(ReplayError::InvalidRecord)?
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                record.input
+            }
+            InvocationOutcomeAnchor::Merge {
+                source_event,
+                finalizing_entry,
+                seal,
+            } => {
+                let source: MergeEvent = require_record(store, source_event)?;
+                let finalizer: OrderedEntry = require_record(store, finalizing_entry)?;
+                let sealed: MergeSeal = require_record(store, seal)?;
+                let finalizer_base = OrderedBase {
+                    index: finalizer
+                        .index
+                        .checked_sub(1)
+                        .ok_or(ReplayError::InvalidRecord)?,
+                    head: finalizer.parent,
+                };
+                if source.validate().is_err()
+                    || source.id() != source_event
+                    || finalizer.validate().is_err()
+                    || finalizer.id() != finalizing_entry
+                    || sealed.validate().is_err()
+                    || sealed.id() != seal
+                    || source.genesis != genesis
+                    || finalizer.genesis != genesis
+                    || sealed.genesis != genesis
+                    || finalizer.merge_seal != Some(seal)
+                    || sealed.frontier != finalizer.merge_frontier
+                    || sealed.ordered_base != finalizer_base
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                source.input
+            }
+        };
+        if input.id() != outcome.first_input || outcome.validate_for(&input).is_err() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        Ok(input)
+    }
+
+    fn recovery_position_matches_outcome_anchor(
+        position: ReplayPosition,
+        anchor: InvocationOutcomeAnchor,
+    ) -> bool {
+        matches!(
+            (position, anchor),
+            (
+                ReplayPosition::Ordered { id, .. },
+                InvocationOutcomeAnchor::Ordered { entry }
+            ) if id == entry
+        ) || matches!(
+            (position, anchor),
+            (
+                ReplayPosition::Local { id, .. },
+                InvocationOutcomeAnchor::Local { entry }
+            ) if id == entry
+        ) || matches!(
+            (position, anchor),
+            (
+                ReplayPosition::Merge { id, .. },
+                InvocationOutcomeAnchor::Merge { source_event, .. }
+            ) if id == source_event
+        )
+    }
+
+    /// Whether the caller position is part of the exact journal closure
+    /// authenticated by the current durable heads. Merely resolving a valid
+    /// content-addressed object is insufficient: stores intentionally permit
+    /// objects to be staged before their heads CAS.
+    fn recovery_position_is_reachable(
+        materialization: &ReplayMaterialization,
+        position: ReplayPosition,
+    ) -> bool {
+        match position {
+            ReplayPosition::Ordered { id, .. } => {
+                materialization.heads.ordered_head == Some(id)
+                    || materialization.suffix_budget.ordered.contains(&id)
+            }
+            ReplayPosition::Merge { id, .. } => materialization.merge_ancestry.contains(&id),
+            ReplayPosition::Local { id, .. } => {
+                materialization.heads.local_head == Some(id)
+                    || materialization.suffix_budget.local.contains(&id)
+            }
+            ReplayPosition::Genesis => false,
+        }
+    }
+
+    /// Recover a committed response through its exact content-addressed
+    /// journal anchor and the invocation index authenticated by current
+    /// durable heads.
+    ///
+    /// This is intentionally independent of historical runtime snapshots.
+    /// A checkpoint may compact the transition's pre-state while retaining a
+    /// live outcome and its journal anchors. The exact caller-provided input
+    /// and position act only as a nondisclosing lookup capability: malformed,
+    /// missing, or non-byte-identical anchors return `NotCommitted` before an
+    /// ownership leaf or result is exposed. Existing authenticated objects
+    /// which fail their own canonical invariants remain hard corruption.
+    pub(crate) fn recover_invocation<S>(
+        store: &mut S,
+        materialization: &ReplayMaterialization,
+        input: &ReplayInput,
+        position: ReplayPosition,
+    ) -> Result<ReplayInvocationRecovery, RecoveryError>
+    where
+        S: AgentJournalStore,
+    {
+        require_current_materialization(store, materialization)?;
+        if input.validate().is_err()
+            || validate_position::<
+                ReplayMaterializationSourceError<core::convert::Infallible>,
+                core::convert::Infallible,
+            >(input, position)
+            .is_err()
+        {
+            return Ok(ReplayInvocationRecovery::NotCommitted);
+        }
+        let (invocation, operation) = match &input.operation {
+            ReplayOperation::Invoke { invocation, .. } => {
+                (invocation, InvocationOwnershipOperation::Invoke)
+            }
+            ReplayOperation::Acknowledge { invocation, .. } => {
+                (invocation, InvocationOwnershipOperation::Acknowledge)
+            }
+            ReplayOperation::Management { .. } | ReplayOperation::SealMerge => {
+                return Err(ReplayError::InvalidPosition);
+            }
+        };
+        let (scope, committed_input) = match position {
+            ReplayPosition::Genesis => return Err(ReplayError::InvalidPosition),
+            ReplayPosition::Ordered {
+                id,
+                index,
+                merge_frontier,
+                merge_seal,
+            } => {
+                let Some(entry): Option<OrderedEntry> =
+                    AgentJournalStore::get(store, id).map_err(journal)?
+                else {
+                    return Ok(ReplayInvocationRecovery::NotCommitted);
+                };
+                if entry.validate().is_err() || entry.id() != id {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                if entry.genesis != materialization.heads.genesis
+                    || entry.index != index
+                    || entry.merge_frontier != merge_frontier
+                    || entry.merge_seal != merge_seal
+                {
+                    return Ok(ReplayInvocationRecovery::NotCommitted);
+                }
+                (InvocationOwnershipScope::Ordered, entry.input)
+            }
+            ReplayPosition::Merge {
+                id,
+                causal_height,
+                ordered_base,
+            } => {
+                let Some(event): Option<MergeEvent> =
+                    AgentJournalStore::get(store, id).map_err(journal)?
+                else {
+                    return Ok(ReplayInvocationRecovery::NotCommitted);
+                };
+                if event.validate().is_err() || event.id() != id {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                if event.genesis != materialization.heads.genesis
+                    || event.causal_height != causal_height
+                    || event.ordered_base != ordered_base
+                {
+                    return Ok(ReplayInvocationRecovery::NotCommitted);
+                }
+                (InvocationOwnershipScope::Merge, event.input)
+            }
+            ReplayPosition::Local {
+                id,
+                node,
+                revision,
+                ordered_base,
+                merge_frontier,
+            } => {
+                let Some(entry): Option<LocalEntry> =
+                    AgentJournalStore::get(store, id).map_err(journal)?
+                else {
+                    return Ok(ReplayInvocationRecovery::NotCommitted);
+                };
+                if entry.validate().is_err() || entry.id() != id {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                if entry.genesis != materialization.heads.genesis
+                    || entry.node != node
+                    || entry.revision != revision
+                    || entry.ordered_base != ordered_base
+                    || entry.merge_frontier != merge_frontier
+                {
+                    return Ok(ReplayInvocationRecovery::NotCommitted);
+                }
+                (InvocationOwnershipScope::Local(node), entry.input)
+            }
+        };
+        if committed_input != *input {
+            return Ok(ReplayInvocationRecovery::NotCommitted);
+        }
+        let position_reachable = recovery_position_is_reachable(materialization, position);
+        if matches!(scope, InvocationOwnershipScope::Local(node) if node != materialization.heads.node)
+        {
+            return Ok(ReplayInvocationRecovery::NotCommitted);
+        }
+        let expected_lane = result_lane(invocation.mode.result_storage());
+        let expected_node = match scope {
+            InvocationOwnershipScope::Local(node) => Some(node),
+            InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Merge => None,
+        };
+        let key = InvocationOwnershipKey {
+            scope,
+            invocation: invocation.invocation,
+        };
+        let indexes = InvocationIndexes::open(
+            store,
+            materialization.heads.ordered_invocations,
+            materialization.heads.merge_invocations,
+            materialization.heads.local_invocations,
+        )
+        .map_err(|_| ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated))?;
+        let Some(owner) =
+            InvocationOwnership::lookup(&indexes, key).map_err(ReplayError::InvocationOwnership)?
+        else {
+            return Ok(ReplayInvocationRecovery::NotCommitted);
+        };
+        // A staged object which lost (or has not yet attempted) its heads CAS
+        // is not a recovery capability. The sole exception is a retained
+        // result requested through its permanent authenticated outcome anchor;
+        // checkpoint/GC may legitimately prune that anchor from the live
+        // suffix while keeping it reachable from the ownership outcome.
+        let mut authenticated_outcome = None;
+        if !position_reachable {
+            if operation == InvocationOwnershipOperation::Acknowledge
+                || !matches!(owner.result_state, InvocationResultState::Retained { .. })
+            {
+                return Ok(ReplayInvocationRecovery::NotCommitted);
+            }
+            let outcome = InvocationOwnership::outcome(&indexes, key)
+                .map_err(ReplayError::InvocationOwnership)?
+                .ok_or(ReplayError::InvocationOwnership(
+                    InvocationOwnershipError::Unauthenticated,
+                ))?;
+            if !recovery_position_matches_outcome_anchor(position, outcome.anchor) {
+                return Ok(ReplayInvocationRecovery::NotCommitted);
+            }
+            authenticated_outcome = Some(outcome);
+        }
+        if owner.validate().is_err()
+            || owner.scope != scope
+            || owner.lane != expected_lane
+            || owner.node != expected_node
+        {
+            return Err(ReplayError::InvocationOwnership(
+                InvocationOwnershipError::Unauthenticated,
+            ));
+        }
+        if owner.request_commitment != invocation.commitment() {
+            return Ok(if position_reachable {
+                ReplayInvocationRecovery::Divergent
+            } else {
+                ReplayInvocationRecovery::NotCommitted
+            });
+        }
+        match owner.result_state {
+            InvocationResultState::PendingMerge { source_event } => {
+                let exact_source = operation == InvocationOwnershipOperation::Invoke
+                    && matches!(position, ReplayPosition::Merge { id, .. } if id == source_event)
+                    && materialization.merge_ancestry.contains(&source_event);
+                Ok(if position_reachable && exact_source {
+                    ReplayInvocationRecovery::Pending
+                } else {
+                    ReplayInvocationRecovery::NotCommitted
+                })
+            }
+            InvocationResultState::PendingMergeAcknowledgement {
+                acknowledgement_event,
+                ..
+            } => {
+                let Some(position_event) = (match position {
+                    ReplayPosition::Merge { id, .. } => Some(id),
+                    ReplayPosition::Genesis
+                    | ReplayPosition::Ordered { .. }
+                    | ReplayPosition::Local { .. } => None,
+                }) else {
+                    return Ok(ReplayInvocationRecovery::NotCommitted);
+                };
+                if !position_reachable
+                    || !materialization
+                        .merge_ancestry
+                        .contains(&acknowledgement_event)
+                {
+                    return Ok(ReplayInvocationRecovery::NotCommitted);
+                }
+                let exact_event = match operation {
+                    InvocationOwnershipOperation::Acknowledge => {
+                        position_event == acknowledgement_event
+                    }
+                    InvocationOwnershipOperation::Invoke => {
+                        let outcome = InvocationOwnership::outcome(&indexes, key)
+                            .map_err(ReplayError::InvocationOwnership)?
+                            .ok_or(ReplayError::InvocationOwnership(
+                                InvocationOwnershipError::Unauthenticated,
+                            ))?;
+                        validate_retained_outcome(
+                            &outcome,
+                            materialization.heads.genesis,
+                            key,
+                            owner,
+                            input,
+                        )
+                        .map_err(ReplayError::InvocationOwnership)?;
+                        let first_input =
+                            outcome_anchor_input(store, materialization.heads.genesis, &outcome)?;
+                        first_input == *input
+                            && matches!(
+                                outcome.anchor,
+                                InvocationOutcomeAnchor::Merge { source_event, .. }
+                                    if position_event == source_event
+                                        && materialization.merge_ancestry.contains(&source_event)
+                            )
+                    }
+                };
+                Ok(if exact_event {
+                    ReplayInvocationRecovery::Pending
+                } else {
+                    ReplayInvocationRecovery::NotCommitted
+                })
+            }
+            InvocationResultState::Retained { .. } => {
+                if operation == InvocationOwnershipOperation::Acknowledge {
+                    return Ok(ReplayInvocationRecovery::NotCommitted);
+                }
+                let outcome = match authenticated_outcome {
+                    Some(outcome) => outcome,
+                    None => InvocationOwnership::outcome(&indexes, key)
+                        .map_err(ReplayError::InvocationOwnership)?
+                        .ok_or(ReplayError::InvocationOwnership(
+                            InvocationOwnershipError::Unauthenticated,
+                        ))?,
+                };
+                let reference = owner.outcome().ok_or(ReplayError::InvocationOwnership(
+                    InvocationOwnershipError::Unauthenticated,
+                ))?;
+                let first_input =
+                    outcome_anchor_input(store, materialization.heads.genesis, &outcome)?;
+                if !position_reachable
+                    && !recovery_position_matches_outcome_anchor(position, outcome.anchor)
+                {
+                    return Ok(ReplayInvocationRecovery::NotCommitted);
+                }
+                if outcome.validate().is_err()
+                    || outcome.genesis != materialization.heads.genesis
+                    || outcome.key != key
+                    || outcome.request_commitment != owner.request_commitment
+                    || outcome.first_input != owner.first_input
+                    || outcome.lane != owner.lane
+                    || outcome.node != owner.node
+                    || !outcome.request.matches_invocation(invocation)
+                    || outcome.validate_for(&first_input).is_err()
+                    || outcome.disposition()
+                        != owner.disposition().ok_or(ReplayError::InvocationOwnership(
+                            InvocationOwnershipError::Unauthenticated,
+                        ))?
+                    || !reference.authenticates(&outcome)
+                {
+                    return Err(ReplayError::InvocationOwnership(
+                        InvocationOwnershipError::Unauthenticated,
+                    ));
+                }
+                Ok(ReplayInvocationRecovery::Retained(outcome.result))
+            }
+            InvocationResultState::Acknowledged { .. } => {
+                Ok(ReplayInvocationRecovery::Acknowledged)
+            }
+        }
+    }
+
     fn successor_artifacts<S, ResolverError, E>(
         store: &S,
         heads: &JournalHeads,
@@ -4472,12 +6145,104 @@ mod aggregate {
         Ok(artifacts)
     }
 
-    pub(crate) fn prepare_ordered<S, E>(
-        store: &mut S,
+    /// Read-only worst-case admission for one invocation owner. Existing
+    /// members remain admissible at the ceiling; this matters for Merge,
+    /// whose canonical rebuild begins at the sealed boundary rather than the
+    /// current provisional index. The decision remains opaque until
+    /// ReplayMachine authenticates the receipt, and a false result is
+    /// consulted only when the reconstructed lookup proves the request is
+    /// unseen.
+    fn has_unseen_invocation_capacity<S, ResolverError, ExecutorError>(
+        indexes: &InvocationIndexes<'_, S>,
+        input: &ReplayInput,
+        position: ReplayPosition,
+    ) -> Result<UnseenInvocationAdmission, MaterializeError<ResolverError, ExecutorError>>
+    where
+        S: AgentJournalStore,
+    {
+        let ReplayOperation::Invoke { invocation, .. } = &input.operation else {
+            return Ok(UnseenInvocationAdmission::Available);
+        };
+        let key = invocation_ownership_key(position, invocation.invocation);
+        let scope = key.scope;
+        let manifest = indexes.manifest(scope).map_err(|_| {
+            ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated)
+        })?;
+        let live = manifest.entries.checked_sub(manifest.tombstones).ok_or(
+            ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated),
+        )?;
+        let reserved = manifest
+            .reserved_outcome_bytes
+            .checked_add(MAX_INVOCATION_OUTCOME_BYTES as u64);
+        let has_capacity = manifest.entries < MAX_INVOCATION_INDEX_LOGICAL_ENTRIES
+            && live < MAX_INVOCATION_INDEX_LIVE_ENTRIES
+            && reserved.is_some_and(|bytes| bytes <= MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES);
+        if has_capacity {
+            return Ok(UnseenInvocationAdmission::Available);
+        }
+        let current_member = indexes
+            .lookup(key)
+            .map(|owner| owner.is_some())
+            .map_err(|_| InvocationOwnershipError::Unauthenticated);
+        Ok(UnseenInvocationAdmission::AtCapacity(current_member))
+    }
+
+    /// Prove that the current suffix can still publish the one ordered
+    /// maintenance entry required to finalize pending Merge ownership.
+    ///
+    /// Both content IDs embedded below are fixed-width. The eventual
+    /// post-Merge state can change their values but cannot change the encoded
+    /// size charged here, so this is an exact, non-executing reservation.
+    fn validate_merge_finalizer_capacity(
+        budget: &ReplaySuffixBudget,
+        genesis: AgentJournalGenesisId,
+        runtime: &RuntimeBinding,
+        ordered_base: OrderedBase,
+        frontier: MergeFrontierId,
+        merge_state: &[u8],
+    ) -> Result<(), ReplayValidationError> {
+        let reserved_merge_state =
+            derive_lane_state::<core::convert::Infallible, core::convert::Infallible>(
+                genesis,
+                runtime.clone(),
+                PersistedLane::Merge,
+                LaneCursor::Merge { frontier },
+                merge_state,
+            )?;
+        let reserved_seal = MergeSeal {
+            genesis,
+            frontier,
+            ordered_base,
+            merge_state: reserved_merge_state.id(),
+        };
+        let reserved_finalizer = OrderedEntry {
+            genesis,
+            index: ordered_base
+                .index
+                .checked_add(1)
+                .ok_or(ReplayError::ReplayLimit)?,
+            parent: ordered_base.head,
+            merge_frontier: frontier,
+            merge_seal: Some(reserved_seal.id()),
+            input: ReplayInput {
+                runtime: runtime.clone(),
+                operation: ReplayOperation::SealMerge,
+            },
+        };
+        if reserved_seal.validate().is_err() || reserved_finalizer.validate().is_err() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let mut reserved = budget.clone();
+        reserved.ordered(reserved_finalizer.id(), &reserved_finalizer)?;
+        reserved.seal(&reserved_seal)
+    }
+
+    pub(crate) fn prepare_ordered<'store, S, E>(
+        store: &'store mut S,
         executor: &mut E,
         materialization: &ReplayMaterialization,
         entry: &OrderedEntry,
-    ) -> Result<ReplayPreparation, MaterializeError<core::convert::Infallible, E::Error>>
+    ) -> Result<ReplayPreparation<'store, S>, MaterializeError<core::convert::Infallible, E::Error>>
     where
         S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
         E: ReplayExecutor,
@@ -4527,15 +6292,163 @@ mod aggregate {
                 .seal(&dependency.seal)
                 .map_err(lift_validation)?;
         }
+        let mut canonical_merge_events = Vec::new();
+        if entry.merge_seal.is_some() {
+            for event_id in materialization
+                .merge_ancestry
+                .difference(&materialization.merge_boundary_ancestry)
+            {
+                let event: MergeEvent = require_record(store, *event_id)?;
+                if event.validate().is_err()
+                    || event.id() != *event_id
+                    || event.genesis != current.genesis
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                canonical_merge_events.push((*event_id, event));
+            }
+            canonical_merge_events
+                .sort_unstable_by_key(|(event_id, event)| (event.causal_height, *event_id));
+        }
+        let mut snapshots = materialization.ordered_snapshots.clone();
+        let starting_merge_index = if entry.merge_seal.is_some() {
+            materialization.merge_boundary_invocations
+        } else {
+            current.merge_invocations
+        };
         let indexes = InvocationIndexes::open(
             store,
             current.ordered_invocations,
-            current.merge_invocations,
+            starting_merge_index,
             current.local_invocations,
         )
         .map_err(|_| ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated))?;
-        let mut machine = ReplayMachine::from_materialization(materialization, indexes)
+        if entry.merge_seal.is_none()
+            && InvocationOwnership::unfinalized(&indexes, InvocationOwnershipScope::Merge)
+                .map_err(ReplayError::InvocationOwnership)?
+                != 0
+        {
+            validate_merge_finalizer_capacity(
+                &suffix_budget,
+                current.genesis,
+                &current.runtime,
+                OrderedBase {
+                    index: entry.index,
+                    head: Some(id),
+                },
+                current.merge_frontier,
+                &materialization.state.merge,
+            )
+            .map_err(lift_validation)?;
+        }
+        let unseen_capacity = has_unseen_invocation_capacity(
+            &indexes,
+            &entry.input,
+            ReplayPosition::Ordered {
+                id,
+                index: entry.index,
+                merge_frontier: entry.merge_frontier,
+                merge_seal: entry.merge_seal,
+            },
+        )?;
+        let mut machine = if entry.merge_seal.is_some() {
+            ReplayMachine {
+                genesis: current.genesis,
+                runtime: current.runtime.clone(),
+                runtime_history: materialization
+                    .ordered_snapshots
+                    .iter()
+                    .map(|(base, snapshot)| (*base, snapshot.runtime.clone()))
+                    .collect(),
+                ownership: indexes,
+                fence: materialization.fence.clone(),
+            }
+        } else {
+            ReplayMachine::from_materialization(materialization, indexes)
+                .map_err(ReplayError::InvocationOwnership)?
+        };
+        let mut finalized_outcomes = Vec::new();
+        let mut finalized_executions = Vec::new();
+        let mut finalized_delta = InvocationIndexDelta::NONE;
+        if let Some(seal) = entry.merge_seal {
+            if InvocationOwnership::unfinalized(&machine.ownership, InvocationOwnershipScope::Merge)
+                .map_err(ReplayError::InvocationOwnership)?
+                != 0
+            {
+                return Err(ReplayError::InvocationOwnership(
+                    InvocationOwnershipError::Unauthenticated,
+                ));
+            }
+            let ordered = OrderedReplay {
+                genesis: current.genesis,
+                checkpoint: materialization.ordered_base(),
+                base: materialization.ordered_base(),
+                entries: Vec::new(),
+                runtime_history: BTreeMap::new(),
+            };
+            let mut merge_state = materialization.merge_boundary_state.clone();
+            let mut facts = BTreeMap::new();
+            for (event_id, event) in &canonical_merge_events {
+                let snapshot = snapshots
+                    .get(&event.ordered_base)
+                    .cloned()
+                    .ok_or(ReplayError::UnavailableOrderedBase)?;
+                if snapshot.runtime != event.input.runtime {
+                    return Err(ReplayError::RuntimeMismatch);
+                }
+                machine
+                    .runtime_history
+                    .insert(event.ordered_base, snapshot.runtime.clone());
+                let before = RuntimeState {
+                    control: snapshot.control,
+                    linear: snapshot.linear,
+                    merge: merge_state.clone(),
+                    local: materialization.state.local.clone(),
+                };
+                let replayed = machine
+                    .verify_and_apply_merge::<
+                        E,
+                        ReplayMaterializationSourceError<core::convert::Infallible>,
+                    >(executor, &ordered, *event_id, event, &before)
+                    .map_err(historical_replay_error)?;
+                merge_state = replayed.state.merge.clone();
+                if facts
+                    .insert(
+                        *event_id,
+                        MergeExecutionFact {
+                            event: event.clone(),
+                            before,
+                            after: replayed.state.clone(),
+                            result: replayed.result.clone(),
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+            }
+            if merge_state != materialization.state.merge
+                || InvocationOwnership::index_id(
+                    &machine.ownership,
+                    InvocationOwnershipScope::Merge,
+                )
+                .map_err(ReplayError::InvocationOwnership)?
+                    != current.merge_invocations
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
+            let unfinalized = InvocationOwnership::unfinalized(
+                &machine.ownership,
+                InvocationOwnershipScope::Merge,
+            )
             .map_err(ReplayError::InvocationOwnership)?;
+            if matches!(entry.input.operation, ReplayOperation::SealMerge) && unfinalized == 0 {
+                return Err(ReplayError::InvalidFence);
+            }
+            (finalized_delta, finalized_outcomes, finalized_executions) = machine
+                .finalize_merge_outcomes(id, seal, &facts)
+                .map_err(lift_validation)?;
+        }
         let next_fence = match fence_dependency.as_ref() {
             Some(dependency) => Some(authenticate_action_fence(
                 dependency,
@@ -4548,8 +6461,11 @@ mod aggregate {
             None if entry.merge_seal.is_none() => None,
             None => return Err(ReplayError::InvalidFence),
         };
-        let step = machine
-            .apply::<_, ReplayMaterializationSourceError<core::convert::Infallible>>(
+        let mut step = machine
+            .apply_with_unseen_capacity::<
+                _,
+                ReplayMaterializationSourceError<core::convert::Infallible>,
+            >(
                 executor,
                 &entry.input,
                 &materialization.state,
@@ -4559,7 +6475,12 @@ mod aggregate {
                     merge_frontier: entry.merge_frontier,
                     merge_seal: entry.merge_seal,
                 },
+                Some(unseen_capacity),
             )?;
+        step.ownership_delta.ordered |= finalized_delta.ordered;
+        step.ownership_delta.merge |= finalized_delta.merge;
+        step.ownership_delta.local |= finalized_delta.local;
+        step.sealed_outcomes.extend(finalized_outcomes);
         if let Some(fence) = next_fence {
             machine.install_fence(fence)?;
         }
@@ -4588,9 +6509,9 @@ mod aggregate {
         let fence_ancestry = sealed.fence_ancestry.clone();
         let fence = machine.fence.clone();
         drop(machine);
-        let execution = step.execution_result();
+        let mut executions = vec![step.execution_result(true)];
+        executions.extend(finalized_executions);
 
-        let mut snapshots = materialization.ordered_snapshots.clone();
         snapshots
             .insert(
                 OrderedBase {
@@ -4631,6 +6552,7 @@ mod aggregate {
             )
         };
         Ok(ReplayPreparation::Ready(ReplayPreparedPublication {
+            store,
             sealed,
             successor: ReplayMaterialization {
                 heads_id: next.id(),
@@ -4649,16 +6571,16 @@ mod aggregate {
                 replay_boundary: materialization.replay_boundary,
                 fence_ancestry,
             },
-            execution: Some(execution),
+            executions,
         }))
     }
 
-    pub(crate) fn prepare_local<S, E>(
-        store: &mut S,
+    pub(crate) fn prepare_local<'store, S, E>(
+        store: &'store mut S,
         executor: &mut E,
         materialization: &ReplayMaterialization,
         entry: &LocalEntry,
-    ) -> Result<ReplayPreparation, MaterializeError<core::convert::Infallible, E::Error>>
+    ) -> Result<ReplayPreparation<'store, S>, MaterializeError<core::convert::Infallible, E::Error>>
     where
         S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
         E: ReplayExecutor,
@@ -4709,20 +6631,40 @@ mod aggregate {
             current.local_invocations,
         )
         .map_err(|_| ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated))?;
+        if InvocationOwnership::unfinalized(&indexes, InvocationOwnershipScope::Merge)
+            .map_err(ReplayError::InvocationOwnership)?
+            != 0
+        {
+            validate_merge_finalizer_capacity(
+                &suffix_budget,
+                current.genesis,
+                &current.runtime,
+                materialization.ordered_base(),
+                current.merge_frontier,
+                &materialization.state.merge,
+            )
+            .map_err(lift_validation)?;
+        }
+        let position = ReplayPosition::Local {
+            id,
+            node: entry.node,
+            revision: entry.revision,
+            ordered_base: entry.ordered_base,
+            merge_frontier: entry.merge_frontier,
+        };
+        let unseen_capacity = has_unseen_invocation_capacity(&indexes, &entry.input, position)?;
         let mut machine = ReplayMachine::from_materialization(materialization, indexes)
             .map_err(ReplayError::InvocationOwnership)?;
         let step = machine
-            .apply::<_, ReplayMaterializationSourceError<core::convert::Infallible>>(
+            .apply_with_unseen_capacity::<
+                _,
+                ReplayMaterializationSourceError<core::convert::Infallible>,
+            >(
                 executor,
                 &entry.input,
                 &materialization.state,
-                ReplayPosition::Local {
-                    id,
-                    node: entry.node,
-                    revision: entry.revision,
-                    ordered_base: entry.ordered_base,
-                    merge_frontier: entry.merge_frontier,
-                },
+                position,
+                Some(unseen_capacity),
             )?;
         let (ordered_invocations, merge_invocations, local_invocations) = machine
             .ownership_ids(current.node)
@@ -4738,13 +6680,14 @@ mod aggregate {
             .map_err(lift_validation)?;
         let fence_ancestry = sealed.fence_ancestry.clone();
         drop(machine);
-        let execution = step.execution_result();
+        let execution = step.execution_result(true);
         let mut state = materialization.state.clone();
         state.local = step.state.local;
         validate_runtime_state_bound(&state)?;
         let artifacts =
             successor_artifacts::<S, core::convert::Infallible, E>(store, &next, &state)?;
         Ok(ReplayPreparation::Ready(ReplayPreparedPublication {
+            store,
             sealed,
             successor: ReplayMaterialization {
                 heads_id: next.id(),
@@ -4763,17 +6706,17 @@ mod aggregate {
                 replay_boundary: materialization.replay_boundary,
                 fence_ancestry,
             },
-            execution: Some(execution),
+            executions: vec![execution],
         }))
     }
 
-    pub(crate) fn prepare_merge<S, E, R>(
-        store: &mut S,
+    pub(crate) fn prepare_merge<'store, S, E, R>(
+        store: &'store mut S,
         executor: &mut E,
         resolver: &R,
         materialization: &ReplayMaterialization,
         event: &MergeEvent,
-    ) -> Result<ReplayPreparation, MaterializeError<R::Error, E::Error>>
+    ) -> Result<ReplayPreparation<'store, S>, MaterializeError<R::Error, E::Error>>
     where
         S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
         E: ReplayExecutor,
@@ -4893,6 +6836,21 @@ mod aggregate {
         let mut suffix_budget = materialization.suffix_budget.clone();
         suffix_budget.merge(id, event).map_err(lift_validation)?;
         suffix_budget.frontier(&frontier).map_err(lift_validation)?;
+
+        // Importing a Merge event creates work which cannot be checkpointed
+        // until an ordered SealMerge entry finalizes it. Reserve that protocol
+        // entry before authenticating or executing the source, so a successful
+        // Merge CAS can never consume the last suffix capacity and strand
+        // itself.
+        validate_merge_finalizer_capacity(
+            &suffix_budget,
+            current.genesis,
+            &current.runtime,
+            materialization.ordered_base(),
+            frontier.id(),
+            &materialization.state.merge,
+        )
+        .map_err(lift_validation)?;
         let mut ancestry = materialization.merge_ancestry.clone();
         ancestry.insert(id);
         let replay = MergeReplay {
@@ -4926,6 +6884,31 @@ mod aggregate {
         canonical_events
             .sort_unstable_by_key(|(event_id, retained)| (retained.causal_height, *event_id));
 
+        // The canonical rebuild starts from the sealed Merge boundary, but
+        // admission capacity belongs to the current authenticated Merge
+        // index. In particular, every still-pending event after that boundary
+        // already owns one live slot and reserves the maximum outcome size.
+        // Read the current manifest before borrowing the boundary index and
+        // consult this decision only for the newly imported event; retained
+        // events are historical replay and must never turn corruption into a
+        // live quota refusal.
+        let imported_position = ReplayPosition::Merge {
+            id,
+            causal_height: event.causal_height,
+            ordered_base: event.ordered_base,
+        };
+        let unseen_capacity = {
+            let current_indexes = InvocationIndexes::open(
+                store,
+                current.ordered_invocations,
+                current.merge_invocations,
+                current.local_invocations,
+            )
+            .map_err(|_| {
+                ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated)
+            })?;
+            has_unseen_invocation_capacity(&current_indexes, &event.input, imported_position)?
+        };
         let mut snapshots = materialization.ordered_snapshots.clone();
         let indexes = InvocationIndexes::open(
             store,
@@ -4976,9 +6959,28 @@ mod aggregate {
                 local: materialization.state.local.clone(),
             };
             let step = machine
-                .verify_and_apply_merge::<E, ReplayMaterializationSourceError<R::Error>>(
-                    executor, &ordered, *event_id, retained, &before,
-                )?;
+                .verify_and_apply_merge_with_unseen_capacity::<
+                    E,
+                    ReplayMaterializationSourceError<R::Error>,
+                >(
+                    executor,
+                    &ordered,
+                    *event_id,
+                    retained,
+                    &before,
+                    if *event_id == id {
+                        Some(unseen_capacity)
+                    } else {
+                        None
+                    },
+                )
+                .map_err(|error| {
+                    if *event_id == id {
+                        error
+                    } else {
+                        historical_replay_error(error)
+                    }
+                })?;
             state.merge = step.state.merge.clone();
             validate_runtime_state_bound(&state)?;
             if *event_id == id {
@@ -5006,7 +7008,6 @@ mod aggregate {
             .map_err(lift_validation)?;
         let fence_ancestry = sealed.fence_ancestry.clone();
         drop(machine);
-        let execution = step.execution_result();
         let artifacts = successor_artifacts::<S, R::Error, E>(store, &next, &state)?;
         let mut next_roots = materialization
             .merge_roots
@@ -5022,6 +7023,7 @@ mod aggregate {
         });
         next_roots.sort_unstable_by_key(|root| root.id);
         Ok(ReplayPreparation::Ready(ReplayPreparedPublication {
+            store,
             sealed,
             successor: ReplayMaterialization {
                 heads_id: next.id(),
@@ -5040,7 +7042,11 @@ mod aggregate {
                 replay_boundary: materialization.replay_boundary,
                 fence_ancestry,
             },
-            execution: Some(execution),
+            // A Merge CAS admits only the event. Its apparent disposition is
+            // not final because a later same-height event can precede it in
+            // the canonical rebuild. Exact outcomes become observable only
+            // when an ordered seal finalizes the complete batch.
+            executions: Vec::new(),
         }))
     }
 
@@ -5058,11 +7064,11 @@ mod aggregate {
         Ok(compacted)
     }
 
-    pub(crate) fn prepare_checkpoint<S>(
-        store: &mut S,
+    pub(crate) fn prepare_checkpoint<'store, S>(
+        store: &'store mut S,
         materialization: &ReplayMaterialization,
     ) -> Result<
-        ReplayPreparedPublication,
+        ReplayPreparedPublication<'store, S>,
         MaterializeError<core::convert::Infallible, core::convert::Infallible>,
     >
     where
@@ -5070,6 +7076,28 @@ mod aggregate {
     {
         require_current_materialization(store, materialization)?;
         let current = &materialization.heads;
+        let indexes = InvocationIndexes::open(
+            store,
+            current.ordered_invocations,
+            current.merge_invocations,
+            current.local_invocations,
+        )
+        .map_err(|_| ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated))?;
+        for scope in [
+            InvocationOwnershipScope::Ordered,
+            InvocationOwnershipScope::Merge,
+            InvocationOwnershipScope::Local(current.node),
+        ] {
+            if InvocationOwnership::unfinalized(&indexes, scope)
+                .map_err(ReplayError::InvocationOwnership)?
+                != 0
+            {
+                return Err(ReplayError::InvocationOwnership(
+                    InvocationOwnershipError::Unauthenticated,
+                ));
+            }
+        }
+        drop(indexes);
         let state = compact_standard_checkpoint(&materialization.state)?;
         let artifacts = derive_standard_artifact_closure(current.genesis, &current.runtime, &state)
             .map_err(lift_validation)?;
@@ -5169,6 +7197,7 @@ mod aggregate {
             expected: materialization.heads_id,
             next: next.clone(),
             anchor: ReplayPublicationAnchor::Checkpoint(manifest),
+            outcomes: Vec::new(),
             checkpoint: Some(checkpoint),
             fence_ancestry: fence_ancestry.clone(),
         };
@@ -5194,6 +7223,7 @@ mod aggregate {
         }
         let checkpoint_merge_state = state.merge.clone();
         Ok(ReplayPreparedPublication {
+            store,
             sealed,
             successor: ReplayMaterialization {
                 heads_id: next.id(),
@@ -5212,7 +7242,7 @@ mod aggregate {
                 replay_boundary: ordered,
                 fence_ancestry,
             },
-            execution: None,
+            executions: Vec::new(),
         })
     }
 }
@@ -5221,7 +7251,7 @@ mod aggregate {
 #[allow(unused_imports)]
 pub(crate) use aggregate::{
     MaterializeError, materialize_current, prepare_checkpoint, prepare_local, prepare_merge,
-    prepare_ordered,
+    prepare_ordered, recover_invocation,
 };
 
 #[cfg(test)]
@@ -5241,17 +7271,15 @@ pub(crate) mod tests {
         SystemAgentGenesisClaim, SystemAgentGenesisEvidence, SystemAgentGenesisExpectations,
         TrustedRootAnchor,
     };
-    #[cfg(feature = "std")]
     use crate::agent::contract::RuntimePackageContract;
-    use crate::agent::execution::{ActorInvocation, ActorInvocationAuth};
+    use crate::agent::execution::{ActorInvocation, ActorInvocationAuth, ActorObservation};
     #[cfg(feature = "std")]
-    use crate::agent::invocation_index::InvocationIndexStore;
+    use crate::agent::invocation_index::{InvocationIndexStore, InvocationOutcomeStore};
     #[cfg(feature = "std")]
     use crate::agent::journal_store::{
-        AgentJournalStore, JournalBlobClass, JournalPublication, JournalStoreError,
-        MemoryAgentJournalStore,
+        AgentJournalGarbageCollection, AgentJournalStore, GcLimits, JournalBlobClass,
+        JournalPublication, JournalStoreError, MemoryAgentJournalStore,
     };
-    #[cfg(feature = "std")]
     use crate::agent::{
         AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LaneSet,
         LifecycleAuthorityAdmission, ReplicaRole, RuntimeCapabilities,
@@ -5322,6 +7350,21 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
+    impl InvocationOutcomeStore for LinearReplayStore {
+        fn load_outcome(&self, id: InvocationOutcomeId) -> Result<Option<Vec<u8>>, Self::Error> {
+            InvocationOutcomeStore::load_outcome(&self.inner, id)
+        }
+
+        fn put_outcome(
+            &mut self,
+            id: InvocationOutcomeId,
+            bytes: &[u8],
+        ) -> Result<(), Self::Error> {
+            InvocationOutcomeStore::put_outcome(&mut self.inner, id, bytes)
+        }
+    }
+
+    #[cfg(feature = "std")]
     impl AgentJournalStore for LinearReplayStore {
         fn initialize(&mut self, sealed: &ReplaySealedGenesis) -> Result<bool, JournalStoreError> {
             let created = self.inner.initialize(sealed)?;
@@ -5387,6 +7430,14 @@ pub(crate) mod tests {
                 return Err(JournalStoreError::Conflict);
             }
             let mut object_created = false;
+            for outcome in publication.outcomes() {
+                let record = outcome.record();
+                InvocationOutcomeStore::put_outcome(
+                    &mut self.inner,
+                    record.id(),
+                    &record.encode(),
+                )?;
+            }
             match publication.anchor() {
                 ReplayPublicationAnchor::Ordered(entry) => {
                     object_created |= self.inner.put(entry)?
@@ -5545,14 +7596,24 @@ pub(crate) mod tests {
         }
     }
 
+    fn standard_test_actor() -> (AgentId, ActorId) {
+        let agent = AgentId::derive(
+            SpaceId([0x31; 32]),
+            PrincipalId([0x32; 32]),
+            Hash([0x33; 32]).as_bytes(),
+        );
+        (agent, ActorId::top_level(agent, "replay-test-actor"))
+    }
+
     fn input(mode: MethodMode) -> ReplayInput {
         input_with_message(mode, vec![1])
     }
 
     fn input_with_message(mode: MethodMode, message: Vec<u8>) -> ReplayInput {
+        let (_, actor) = standard_test_actor();
         let invocation = ActorInvocation {
             invocation: InvocationId([0x51; 32]),
-            actor: ActorId([0x52; 32]),
+            actor,
             incarnation: Hash([0x50; 32]),
             deployment: DeploymentId([0x53; 32]),
             program: ProgramId([0x54; 32]),
@@ -5584,6 +7645,139 @@ pub(crate) mod tests {
                 observed_slot: 1,
             },
         }
+    }
+
+    fn successful_result(input: &ReplayInput) -> Result<ActorExecutionReply, ActorExecutionError> {
+        let ReplayOperation::Invoke { invocation, .. } = &input.operation else {
+            panic!("test result requires an invocation")
+        };
+        Ok(ActorExecutionReply {
+            invocation: invocation.invocation,
+            actor: invocation.actor,
+            incarnation: invocation.incarnation,
+            deployment: invocation.deployment,
+            mode: invocation.mode,
+            lane: result_lane(invocation.mode.result_storage()).state_lane(),
+            status: ActorExecutionStatus::Done,
+            reply: Vec::new(),
+            gas_remaining: invocation.gas,
+            observation: ActorObservation::default(),
+        })
+    }
+
+    fn standard_before() -> RuntimeState {
+        let space = SpaceId([0x31; 32]);
+        let owner = PrincipalId([0x32; 32]);
+        let creation_nonce = Hash([0x33; 32]);
+        let agent = AgentId::derive(space, owner, creation_nonce.as_bytes());
+        let config = AgentConfig {
+            identity: AgentIdentity {
+                space,
+                agent,
+                owner,
+                profile: AgentProfile::Local,
+                runtime_deployment: DeploymentId([0x34; 32]),
+                runtime_program: ProgramId([0x35; 32]),
+                runtime_producer: ProducerId([0x36; 32]),
+            },
+            creation_nonce,
+            authority: authority(),
+            runtime_package: BlobRef::of_bytes(b"replay-test-runtime"),
+            runtime_contract: RuntimePackageContract::canonical(),
+            capabilities: RuntimeCapabilities {
+                lanes: LaneSet::ALL,
+                scheduling: false,
+                proofs: false,
+                max_actors: 64,
+            },
+            replicas: vec![AgentReplica {
+                node: NodeId([0x37; 32]),
+                principal: owner,
+                role: ReplicaRole::Voter,
+            }],
+        };
+        assert!(config.validate().is_ok());
+        let (_, actor) = standard_test_actor();
+        let package = BlobRef::of_bytes(b"replay-test-actor-package");
+        let agent_schema = BlobRef::of_bytes(b"replay-test-agent-schema");
+        let role_policies = BlobRef::of_bytes(b"replay-test-role-policies");
+        let state_layout = Hash([0x38; 32]);
+        let requirements = crate::agent::RuntimeRequirements {
+            lanes: LaneSet::of(StateLane::Linear),
+            scheduling: false,
+            proofs: false,
+        };
+        let entry = crate::agent::ActorEntry {
+            actor,
+            name: "replay-test-actor".into(),
+            parent: None,
+            deployment: DeploymentId([0x53; 32]),
+            program: ProgramId([0x54; 32]),
+            package: package.clone(),
+            agent_schema: agent_schema.clone(),
+            role_policies: role_policies.clone(),
+            state_layout,
+            lanes: requirements.lanes,
+            suspended: false,
+        };
+        let state = crate::agent::standard::StandardRuntimeState {
+            config: Some(config),
+            actors: vec![crate::agent::standard::StandardActorState {
+                record: crate::agent::ActorRecord {
+                    entry,
+                    state_generation: Hash([0x50; 32]),
+                    producer: ProducerId([0x39; 32]),
+                    package,
+                    agent_schema,
+                    role_policies,
+                    state_layout,
+                    contract: crate::agent::contract::ActorPackageContract::canonical(),
+                    requirements,
+                },
+                debt: crate::agent::ActorLifecycleDebt::default(),
+            }],
+            ..crate::agent::standard::StandardRuntimeState::default()
+        };
+        assert!(StandardAgentRuntime::restore(state.clone()).is_ok());
+        encode_standard_runtime_state(&state)
+    }
+
+    fn clock_only_state(input: &ReplayInput, before: &RuntimeState) -> RuntimeState {
+        let ReplayOperation::Invoke {
+            invocation,
+            observed_slot,
+            ..
+        } = &input.operation
+        else {
+            panic!("clock-only test transition requires an invocation")
+        };
+        let decoded = decode_standard_runtime_state(before).unwrap();
+        let mut runtime = StandardAgentRuntime::restore(decoded).unwrap();
+        runtime
+            .commit_exact_outcome_clock(invocation, *observed_slot)
+            .unwrap();
+        encode_standard_runtime_state(&runtime.snapshot())
+    }
+
+    fn with_exact_standard_result(input: &ReplayInput, state: &RuntimeState) -> RuntimeState {
+        let ReplayOperation::Invoke { invocation, .. } = &input.operation else {
+            panic!("test result state requires an invocation")
+        };
+        let Ok(reply) = successful_result(input) else {
+            unreachable!()
+        };
+        let mut decoded = decode_standard_runtime_state(state).unwrap();
+        decoded
+            .invocation_results
+            .push(super::super::standard::StandardInvocationResult {
+                scope: invocation.mode.invocation_scope(),
+                invocation: invocation.invocation,
+                incarnation: invocation.incarnation,
+                request: invocation.commitment(),
+                reply,
+                storage: invocation.mode.result_storage(),
+            });
+        encode_standard_runtime_state(&decoded)
     }
 
     #[cfg(feature = "std")]
@@ -5728,6 +7922,88 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
+    fn admitted_acknowledgement(input: &ReplayInput) -> ReplayInput {
+        let ReplayOperation::Invoke {
+            invocation,
+            authority,
+            ..
+        } = &input.operation
+        else {
+            panic!("test acknowledgement requires an invocation")
+        };
+        ReplayInput {
+            runtime: input.runtime.clone(),
+            operation: ReplayOperation::Acknowledge {
+                invocation: invocation.clone(),
+                authority: authority.clone(),
+            },
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn divergent_invocation_input(input: &ReplayInput, discriminator: u8) -> ReplayInput {
+        let mut divergent = input.clone();
+        let (invocation, authority) = match &mut divergent.operation {
+            ReplayOperation::Invoke {
+                invocation,
+                authority,
+                ..
+            }
+            | ReplayOperation::Acknowledge {
+                invocation,
+                authority,
+            } => (invocation, authority),
+            ReplayOperation::Management { .. } | ReplayOperation::SealMerge => {
+                panic!("test divergence requires an invocation")
+            }
+        };
+        invocation.message.push(discriminator);
+        authority.claim.authorization = invocation.authorization_message();
+        assert!(divergent.validate().is_ok());
+        divergent
+    }
+
+    #[cfg(feature = "std")]
+    fn merge_position(event: &MergeEvent) -> ReplayPosition {
+        ReplayPosition::Merge {
+            id: event.id(),
+            causal_height: event.causal_height,
+            ordered_base: event.ordered_base,
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn persist_merge_seal<S: AgentJournalStore>(
+        store: &mut S,
+        materialized: &ReplayMaterialization,
+    ) -> MergeSealId {
+        let bytes = &materialized.state().merge;
+        let state = BlobRef::of_bytes(bytes);
+        store
+            .put_blob(JournalBlobClass::LaneState, &state, bytes)
+            .unwrap();
+        let manifest = derive_lane_state::<(), ()>(
+            materialized.heads().genesis,
+            materialized.runtime().clone(),
+            PersistedLane::Merge,
+            LaneCursor::Merge {
+                frontier: materialized.merge_frontier(),
+            },
+            bytes,
+        )
+        .unwrap();
+        store.put(&manifest).unwrap();
+        let seal = MergeSeal {
+            genesis: materialized.heads().genesis,
+            frontier: materialized.merge_frontier(),
+            ordered_base: materialized.ordered_base(),
+            merge_state: manifest.id(),
+        };
+        store.put(&seal).unwrap();
+        seal.id()
+    }
+
+    #[cfg(feature = "std")]
     #[derive(Default)]
     struct ExactCreateRejectInvocations {
         executions: usize,
@@ -5746,20 +8022,21 @@ pub(crate) mod tests {
 
         fn authenticate(
             &mut self,
-            _input: &ReplayInput,
+            input: &ReplayInput,
             _before: &RuntimeState,
             _position: ReplayPosition,
         ) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn recover_retained(
-            &mut self,
-            input: &ReplayInput,
-            before: &RuntimeState,
-            position: ReplayPosition,
-        ) -> Result<ReplayTransition, Self::Error> {
-            self.execute(input, before, position)
+            match &input.operation {
+                ReplayOperation::Invoke { authority, .. }
+                | ReplayOperation::Acknowledge { authority, .. } => authority
+                    .signature
+                    .first()
+                    .copied()
+                    .filter(|byte| *byte == 0xaa)
+                    .map(|_| ())
+                    .ok_or(()),
+                ReplayOperation::Management { .. } | ReplayOperation::SealMerge => Ok(()),
+            }
         }
 
         fn execute(
@@ -5783,13 +8060,15 @@ pub(crate) mod tests {
                 return Ok(ReplayTransition {
                     state: encode_standard_runtime_state(&runtime.snapshot()),
                     disposition,
+                    result: None,
                     next_runtime: input.runtime.clone(),
                     products: ReplayProducts::default(),
                 });
             }
             Ok(ReplayTransition {
-                state: before.clone(),
+                state: clock_only_state(input, before),
                 disposition: ReplayDisposition::Rejected,
+                result: Some(Err(ActorExecutionError::NotFound)),
                 next_runtime: input.runtime.clone(),
                 products: ReplayProducts::default(),
             })
@@ -5937,6 +8216,184 @@ pub(crate) mod tests {
         LinearReplayStore { inner, heads }
     }
 
+    #[cfg(feature = "std")]
+    fn quota_invocation(mode: MethodMode, ordinal: u64) -> ReplayInput {
+        let mut input = admitted_invocation(mode, 0xec);
+        let ReplayOperation::Invoke {
+            invocation,
+            authority,
+            ..
+        } = &mut input.operation
+        else {
+            unreachable!()
+        };
+        let mut invocation_id = [0x61; 32];
+        invocation_id[24..].copy_from_slice(&ordinal.to_be_bytes());
+        invocation.invocation = InvocationId(invocation_id);
+        invocation.message = ordinal.to_le_bytes().to_vec();
+        authority.claim.authorization = invocation.authorization_message();
+        assert!(input.validate().is_ok());
+        input
+    }
+
+    #[cfg(feature = "std")]
+    fn quota_anchor_bytes(tag: u8, ordinal: u64) -> [u8; 32] {
+        let mut bytes = [tag; 32];
+        bytes[24..].copy_from_slice(&ordinal.to_be_bytes());
+        bytes
+    }
+
+    /// Install a storage-closed, authenticated index at exactly the live
+    /// identity ceiling without consuming replay suffix entries. The journal
+    /// anchors are deliberately orphaned: this helper tests capacity before a
+    /// prospective publication, while the Linear store's synthetic head lets
+    /// the preparation path authenticate the exact full manifest.
+    #[cfg(feature = "std")]
+    fn seed_full_invocation_scope(
+        store: &mut LinearReplayStore,
+        materialized: &mut ReplayMaterialization,
+        mode: MethodMode,
+    ) -> ReplayInput {
+        let scope = match mode {
+            MethodMode::Linear => InvocationOwnershipScope::Ordered,
+            MethodMode::Merge => InvocationOwnershipScope::Merge,
+            MethodMode::Local => InvocationOwnershipScope::Local(materialized.heads.node),
+            MethodMode::Query | MethodMode::LinearizableQuery | MethodMode::LocalQuery => {
+                panic!("quota fixture requires a durable invocation scope")
+            }
+        };
+        let mut anchored_inputs = Vec::new();
+        for ordinal in 1..=MAX_INVOCATION_INDEX_LIVE_ENTRIES {
+            let input = quota_invocation(mode, ordinal);
+            let anchor = match scope {
+                InvocationOwnershipScope::Ordered => {
+                    let entry = OrderedEntry {
+                        genesis: materialized.heads.genesis,
+                        index: 1,
+                        parent: None,
+                        merge_frontier: materialized.heads.merge_frontier,
+                        merge_seal: None,
+                        input: input.clone(),
+                    };
+                    assert!(entry.validate().is_ok());
+                    store.put(&entry).unwrap();
+                    InvocationOutcomeAnchor::Ordered { entry: entry.id() }
+                }
+                InvocationOwnershipScope::Local(node) => {
+                    let entry = LocalEntry {
+                        genesis: materialized.heads.genesis,
+                        node,
+                        revision: 1,
+                        parent: None,
+                        ordered_base: materialized.ordered_base(),
+                        merge_frontier: materialized.heads.merge_frontier,
+                        input: input.clone(),
+                    };
+                    assert!(entry.validate().is_ok());
+                    store.put(&entry).unwrap();
+                    InvocationOutcomeAnchor::Local { entry: entry.id() }
+                }
+                InvocationOwnershipScope::Merge => {
+                    let event = MergeEvent {
+                        genesis: materialized.heads.genesis,
+                        author: materialized.heads.node,
+                        ordered_base: materialized.ordered_base(),
+                        causal_height: 1,
+                        parents: Vec::new(),
+                        input: input.clone(),
+                        signature: vec![0xdd; ED25519_SIGNATURE_BYTES],
+                    };
+                    assert!(event.validate().is_ok());
+                    store.put(&event).unwrap();
+                    InvocationOutcomeAnchor::Merge {
+                        source_event: event.id(),
+                        finalizing_entry: OrderedEntryId(quota_anchor_bytes(0x62, ordinal)),
+                        seal: MergeSealId(quota_anchor_bytes(0x63, ordinal)),
+                    }
+                }
+            };
+            anchored_inputs.push((input, anchor));
+        }
+
+        let roots = materialized.invocation_indexes();
+        let before = materialized.state.clone();
+        let mut indexes = InvocationIndexes::open(store, roots.0, roots.1, roots.2).unwrap();
+        let mut owners = Vec::with_capacity(anchored_inputs.len());
+        for (input, anchor) in &anchored_inputs {
+            let ReplayOperation::Invoke { invocation, .. } = &input.operation else {
+                unreachable!()
+            };
+            let key = InvocationOwnershipKey {
+                scope,
+                invocation: invocation.invocation,
+            };
+            let result_state = match scope {
+                InvocationOwnershipScope::Merge => {
+                    let InvocationOutcomeAnchor::Merge { source_event, .. } = *anchor else {
+                        unreachable!()
+                    };
+                    InvocationResultState::PendingMerge { source_event }
+                }
+                InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Local(_) => {
+                    let after = clock_only_state(input, &before);
+                    let outcome = InvocationOutcomeRecord::from_runtime_states(
+                        materialized.heads.genesis,
+                        scope,
+                        *anchor,
+                        input,
+                        &before,
+                        &after,
+                        Err(ActorExecutionError::NotFound),
+                    )
+                    .unwrap();
+                    let reference = indexes.persist_outcome(&outcome).unwrap();
+                    InvocationResultState::Retained {
+                        disposition: outcome.disposition(),
+                        outcome: reference,
+                    }
+                }
+            };
+            owners.push((
+                key,
+                InvocationOwnershipValue {
+                    scope,
+                    request_commitment: invocation.commitment(),
+                    first_input: input.id(),
+                    lane: input.persisted_lane(),
+                    node: match scope {
+                        InvocationOwnershipScope::Local(node) => Some(node),
+                        InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Merge => None,
+                    },
+                    result_state,
+                },
+            ));
+        }
+        let full_root = indexes.record_batch(scope, &owners).unwrap();
+        let manifest = *indexes.manifest(scope).unwrap();
+        assert_eq!(manifest.entries, MAX_INVOCATION_INDEX_LIVE_ENTRIES);
+        assert_eq!(manifest.tombstones, 0);
+        assert_eq!(
+            manifest.entries - manifest.tombstones,
+            MAX_INVOCATION_INDEX_LIVE_ENTRIES
+        );
+        drop(indexes);
+
+        let mut heads = store.heads.clone();
+        let previous = heads.id();
+        heads.publication_revision += 1;
+        heads.previous = Some(previous);
+        match scope {
+            InvocationOwnershipScope::Ordered => heads.ordered_invocations = full_root,
+            InvocationOwnershipScope::Merge => heads.merge_invocations = full_root,
+            InvocationOwnershipScope::Local(_) => heads.local_invocations = full_root,
+        }
+        assert!(heads.validate().is_ok());
+        store.heads = heads.clone();
+        materialized.heads_id = heads.id();
+        materialized.heads = heads;
+        anchored_inputs[0].0.clone()
+    }
+
     #[derive(Default)]
     struct RejectingExecutor {
         calls: usize,
@@ -5960,7 +8417,7 @@ pub(crate) mod tests {
             let signature = match &input.operation {
                 ReplayOperation::Invoke { authority, .. }
                 | ReplayOperation::Acknowledge { authority, .. } => &authority.signature,
-                ReplayOperation::Management { .. } => return Ok(()),
+                ReplayOperation::Management { .. } | ReplayOperation::SealMerge => return Ok(()),
             };
             signature
                 .first()
@@ -5968,15 +8425,6 @@ pub(crate) mod tests {
                 .filter(|byte| *byte == 0x55)
                 .map(|_| ())
                 .ok_or(())
-        }
-
-        fn recover_retained(
-            &mut self,
-            input: &ReplayInput,
-            before: &RuntimeState,
-            position: ReplayPosition,
-        ) -> Result<ReplayTransition, Self::Error> {
-            self.execute(input, before, position)
         }
 
         fn execute(
@@ -5987,8 +8435,9 @@ pub(crate) mod tests {
         ) -> Result<ReplayTransition, Self::Error> {
             self.calls += 1;
             Ok(ReplayTransition {
-                state: before.clone(),
+                state: clock_only_state(input, before),
                 disposition: ReplayDisposition::Rejected,
+                result: Some(Err(ActorExecutionError::NotFound)),
                 next_runtime: input.runtime.clone(),
                 products: ReplayProducts::default(),
             })
@@ -5998,7 +8447,6 @@ pub(crate) mod tests {
     #[derive(Default)]
     struct RetainedRecoveryExecutor {
         executions: usize,
-        recoveries: usize,
         authentications: usize,
     }
 
@@ -6019,21 +8467,61 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        fn recover_retained(
+        fn execute(
             &mut self,
             input: &ReplayInput,
             before: &RuntimeState,
             _position: ReplayPosition,
         ) -> Result<ReplayTransition, Self::Error> {
-            self.recoveries += 1;
-            let mut state = before.clone();
-            state.linear.push(2);
+            self.executions += 1;
             Ok(ReplayTransition {
-                state,
-                disposition: ReplayDisposition::Applied,
+                state: clock_only_state(input, before),
+                disposition: ReplayDisposition::Rejected,
+                result: Some(Err(ActorExecutionError::NotFound)),
                 next_runtime: input.runtime.clone(),
                 products: ReplayProducts::default(),
             })
+        }
+    }
+
+    struct UncommittedRefusalExecutor {
+        error: ActorExecutionError,
+        authentications: usize,
+        executions: usize,
+        merge_verifications: usize,
+        mutate_state: bool,
+        emit_products: bool,
+    }
+
+    impl UncommittedRefusalExecutor {
+        fn exact(error: ActorExecutionError) -> Self {
+            Self {
+                error,
+                authentications: 0,
+                executions: 0,
+                merge_verifications: 0,
+                mutate_state: false,
+                emit_products: false,
+            }
+        }
+    }
+
+    impl ReplayExecutor for UncommittedRefusalExecutor {
+        type Error = ();
+
+        fn verify_merge_event(&mut self, _event: &MergeEvent) -> Result<bool, Self::Error> {
+            self.merge_verifications += 1;
+            Ok(true)
+        }
+
+        fn authenticate(
+            &mut self,
+            _input: &ReplayInput,
+            _before: &RuntimeState,
+            _position: ReplayPosition,
+        ) -> Result<(), Self::Error> {
+            self.authentications += 1;
+            Ok(())
         }
 
         fn execute(
@@ -6044,12 +8532,18 @@ pub(crate) mod tests {
         ) -> Result<ReplayTransition, Self::Error> {
             self.executions += 1;
             let mut state = before.clone();
-            state.linear.push(1);
+            if self.mutate_state {
+                state.control.push(0xff);
+            }
             Ok(ReplayTransition {
                 state,
-                disposition: ReplayDisposition::Applied,
+                disposition: ReplayDisposition::Rejected,
+                result: Some(Err(self.error)),
                 next_runtime: input.runtime.clone(),
-                products: ReplayProducts::default(),
+                products: ReplayProducts {
+                    effects: self.emit_products,
+                    ..ReplayProducts::default()
+                },
             })
         }
     }
@@ -6072,15 +8566,6 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        fn recover_retained(
-            &mut self,
-            input: &ReplayInput,
-            before: &RuntimeState,
-            position: ReplayPosition,
-        ) -> Result<ReplayTransition, Self::Error> {
-            self.execute(input, before, position)
-        }
-
         fn execute(
             &mut self,
             input: &ReplayInput,
@@ -6090,9 +8575,10 @@ pub(crate) mod tests {
             Ok(ReplayTransition {
                 state: before.clone(),
                 disposition: ReplayDisposition::Applied,
+                result: Some(successful_result(input)),
                 next_runtime: input.runtime.clone(),
                 products: ReplayProducts {
-                    durable_actor_reply: true,
+                    effects: true,
                     ..ReplayProducts::default()
                 },
             })
@@ -6256,7 +8742,7 @@ pub(crate) mod tests {
         let genesis = AgentJournalGenesisId([0x71; 32]);
         let mut machine = ReplayMachine::from_genesis(genesis, runtime()).unwrap();
         let mut executor = RejectingExecutor::default();
-        let before = RuntimeState::default();
+        let before = standard_before();
         let merge_frontier = MergeFrontierId([0x72; 32]);
         let first = input(MethodMode::Linear);
         let first_id = OrderedEntryId([0x73; 32]);
@@ -6282,8 +8768,14 @@ pub(crate) mod tests {
             invocation: InvocationId([0x51; 32]),
         };
         let owner = machine.ownership.lookup(ordered_key).unwrap().unwrap();
-        assert_eq!(owner.result_state, InvocationResultState::Terminal);
-        assert_eq!(owner.disposition, InvocationDisposition::Rejected);
+        assert!(matches!(
+            owner.result_state,
+            InvocationResultState::Retained {
+                disposition: InvocationDisposition::Rejected,
+                ..
+            }
+        ));
+        assert_eq!(owner.disposition(), Some(InvocationDisposition::Rejected));
 
         let duplicate_id = OrderedEntryId([0x74; 32]);
         let duplicate = machine
@@ -6362,7 +8854,7 @@ pub(crate) mod tests {
         let genesis = AgentJournalGenesisId([0x78; 32]);
         let mut machine = ReplayMachine::from_genesis(genesis, runtime()).unwrap();
         let mut executor = RejectingExecutor::default();
-        let before = RuntimeState::default();
+        let before = standard_before();
         let merge_frontier = MergeFrontierId([0x79; 32]);
         let first = input(MethodMode::Linear);
         let first_id = OrderedEntryId([0x7a; 32]);
@@ -6449,7 +8941,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn retained_retry_executes_recovery_and_commits_its_clock_successor() {
+    fn retained_retry_survives_actor_retirement_and_runtime_capability_downgrade() {
         let genesis = AgentJournalGenesisId([0x7d; 32]);
         let mut machine = ReplayMachine::from_genesis(genesis, runtime()).unwrap();
         let mut executor = RetainedRecoveryExecutor::default();
@@ -6460,7 +8952,7 @@ pub(crate) mod tests {
             .apply::<_, ()>(
                 &mut executor,
                 &invocation,
-                &RuntimeState::default(),
+                &standard_before(),
                 ReplayPosition::Ordered {
                     id: first_id,
                     index: 1,
@@ -6471,16 +8963,33 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             first.outcome(),
-            ReplayStepOutcome::Applied(ReplayDisposition::Applied)
+            ReplayStepOutcome::Applied(ReplayDisposition::Rejected)
         );
-        assert_eq!(first.state().linear, vec![1]);
+        let first_decoded = decode_standard_runtime_state(first.state()).unwrap();
+        assert_eq!(first_decoded.lane_revisions.linear_authority_slot, Some(1));
+
+        // Terminal outcomes live in the authenticated external record, not
+        // the guest result table. Recovery remains possible after a later
+        // lifecycle transition removes the target actor entirely and a later
+        // runtime package drops the now-unused Linear capability.
+        let mut retired = first_decoded;
+        retired.actors.clear();
+        retired.config.as_mut().unwrap().capabilities.lanes = LaneSet::NONE;
+        let retired_state = encode_standard_runtime_state(&retired);
+        assert!(StandardAgentRuntime::restore(retired.clone()).is_ok());
+
+        let mut retry_invocation = invocation.clone();
+        let ReplayOperation::Invoke { observed_slot, .. } = &mut retry_invocation.operation else {
+            unreachable!()
+        };
+        *observed_slot = 2;
 
         let retry_id = OrderedEntryId([0x80; 32]);
         let retry = machine
             .apply::<_, ()>(
                 &mut executor,
-                &invocation,
-                first.state(),
+                &retry_invocation,
+                &retired_state,
                 ReplayPosition::Ordered {
                     id: retry_id,
                     index: 2,
@@ -6490,8 +8999,13 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(retry.outcome(), ReplayStepOutcome::ExactDuplicate);
-        assert_eq!(retry.state().linear, vec![1, 2]);
-        assert_eq!(retry.ownership_delta, InvocationIndexDelta::None);
+        let retry_state = decode_standard_runtime_state(retry.state()).unwrap();
+        assert_eq!(
+            retry_state.config.unwrap().capabilities.lanes,
+            LaneSet::NONE
+        );
+        assert_eq!(retry_state.lane_revisions.linear_authority_slot, Some(2));
+        assert_eq!(retry.ownership_delta, InvocationIndexDelta::NONE);
         assert!(
             machine
                 .runtime_at(OrderedBase {
@@ -6502,7 +9016,412 @@ pub(crate) mod tests {
         );
         assert_eq!(executor.authentications, 2);
         assert_eq!(executor.executions, 1);
-        assert_eq!(executor.recoveries, 1);
+    }
+
+    #[test]
+    fn seal_merge_is_an_ordered_protocol_noop_not_executor_work() {
+        let genesis = AgentJournalGenesisId([0x81; 32]);
+        let mut machine = ReplayMachine::from_genesis(genesis, runtime()).unwrap();
+        let mut executor = RetainedRecoveryExecutor::default();
+        let before = standard_before();
+        let input = ReplayInput {
+            runtime: runtime(),
+            operation: ReplayOperation::SealMerge,
+        };
+        let step = machine
+            .apply::<_, ()>(
+                &mut executor,
+                &input,
+                &before,
+                ReplayPosition::Ordered {
+                    id: OrderedEntryId([0x82; 32]),
+                    index: 1,
+                    merge_frontier: MergeFrontierId([0x83; 32]),
+                    merge_seal: Some(MergeSealId([0x84; 32])),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            step.outcome(),
+            ReplayStepOutcome::Applied(ReplayDisposition::Applied)
+        );
+        assert_eq!(step.state(), &before);
+        assert!(step.result().is_none());
+        assert_eq!(executor.authentications, 0);
+        assert_eq!(executor.executions, 0);
+    }
+
+    #[test]
+    fn standard_exact_outcome_and_acknowledgement_reject_result_lane_tampering() {
+        let invoke = input(MethodMode::Linear);
+        let before = standard_before();
+        let result = successful_result(&invoke);
+        let with_result = with_exact_standard_result(&invoke, &before);
+
+        // A fresh Done transition must install the complete scoped guest
+        // result. An external outcome object is not a substitute for this
+        // guest-owned lifecycle record.
+        assert!(
+            validate_standard_invocation_successor::<(), ()>(
+                &invoke,
+                &before,
+                &with_result,
+                &result,
+                false,
+                false,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_standard_invocation_successor::<(), ()>(
+                &invoke, &before, &before, &result, false, false,
+            ),
+            Err(ReplayError::TerminalMutation)
+        ));
+
+        let mut wrong_result = decode_standard_runtime_state(&with_result).unwrap();
+        wrong_result.invocation_results[0].request = Hash([0xe0; 32]);
+        let wrong_result = encode_standard_runtime_state(&wrong_result);
+        assert!(matches!(
+            validate_standard_invocation_successor::<(), ()>(
+                &invoke,
+                &before,
+                &wrong_result,
+                &result,
+                false,
+                false,
+            ),
+            Err(ReplayError::TerminalMutation)
+        ));
+
+        // Retained recovery preserves that exact result and may advance only
+        // the owning result lane's authority-slot high-water mark.
+        let retained_after = clock_only_state(&invoke, &with_result);
+        assert!(
+            validate_standard_invocation_successor::<(), ()>(
+                &invoke,
+                &with_result,
+                &retained_after,
+                &result,
+                true,
+                true,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_standard_invocation_successor::<(), ()>(
+                &invoke,
+                &with_result,
+                &clock_only_state(&invoke, &before),
+                &result,
+                true,
+                true,
+            ),
+            Err(ReplayError::TerminalMutation)
+        ));
+
+        // Durable terminal errors are the same exact H-only transition and
+        // must never manufacture a guest result.
+        let rejected = Err(ActorExecutionError::NotFound);
+        let rejected_after = clock_only_state(&invoke, &before);
+        assert!(
+            validate_standard_invocation_successor::<(), ()>(
+                &invoke,
+                &before,
+                &rejected_after,
+                &rejected,
+                false,
+                true,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_standard_invocation_successor::<(), ()>(
+                &invoke,
+                &before,
+                &with_result,
+                &rejected,
+                false,
+                true,
+            ),
+            Err(ReplayError::TerminalMutation)
+        ));
+
+        let ReplayOperation::Invoke {
+            invocation,
+            authority,
+            ..
+        } = invoke.operation.clone()
+        else {
+            unreachable!()
+        };
+        let acknowledgement = ReplayInput {
+            runtime: invoke.runtime.clone(),
+            operation: ReplayOperation::Acknowledge {
+                invocation,
+                authority,
+            },
+        };
+        let outcome = InvocationOutcomeRecord::from_runtime_states(
+            AgentJournalGenesisId([0xe1; 32]),
+            InvocationOwnershipScope::Ordered,
+            InvocationOutcomeAnchor::Ordered {
+                entry: OrderedEntryId([0xe2; 32]),
+            },
+            &invoke,
+            &before,
+            &with_result,
+            result,
+        )
+        .unwrap();
+        assert!(
+            validate_standard_acknowledgement_successor::<(), ()>(
+                &acknowledgement,
+                &with_result,
+                &before,
+                false,
+                &outcome,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_standard_acknowledgement_successor::<(), ()>(
+                &acknowledgement,
+                &with_result,
+                &with_result,
+                false,
+                &outcome,
+            ),
+            Err(ReplayError::TerminalMutation)
+        ));
+
+        let mut ack_tamper = decode_standard_runtime_state(&before).unwrap();
+        ack_tamper.authority_slot_high_water = Some(9);
+        assert!(
+            validate_standard_acknowledgement_successor::<(), ()>(
+                &acknowledgement,
+                &with_result,
+                &encode_standard_runtime_state(&ack_tamper),
+                false,
+                &outcome,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_outcome_status_and_error_allowlist_is_fail_closed() {
+        let input = input(MethodMode::Linear);
+        let before = standard_before();
+        let after = clock_only_state(&input, &before);
+        let position = ReplayPosition::Ordered {
+            id: OrderedEntryId([0xe3; 32]),
+            index: 1,
+            merge_frontier: MergeFrontierId([0xe4; 32]),
+            merge_seal: None,
+        };
+        for (status, disposition) in [
+            (
+                ActorExecutionStatus::Forbidden,
+                ReplayDisposition::Forbidden,
+            ),
+            (ActorExecutionStatus::Panicked, ReplayDisposition::Panicked),
+            (ActorExecutionStatus::OutOfGas, ReplayDisposition::OutOfGas),
+        ] {
+            let Ok(mut reply) = successful_result(&input) else {
+                unreachable!()
+            };
+            reply.status = status;
+            let transition = ReplayTransition {
+                state: after.clone(),
+                disposition,
+                result: Some(Ok(reply)),
+                next_runtime: input.runtime.clone(),
+                products: ReplayProducts::default(),
+            };
+            assert!(
+                validate_transition::<(), ()>(
+                    &input,
+                    &before,
+                    &transition,
+                    position,
+                    &input.runtime,
+                    false,
+                    false,
+                    None,
+                )
+                .is_ok()
+            );
+        }
+
+        for error in [
+            ActorExecutionError::NotFound,
+            ActorExecutionError::StaleIncarnation,
+            ActorExecutionError::Suspended,
+            ActorExecutionError::StaleDeployment,
+            ActorExecutionError::WrongProgram,
+            ActorExecutionError::UnsupportedMethod,
+            ActorExecutionError::InvalidInput,
+            ActorExecutionError::InvalidActorOutput,
+            ActorExecutionError::UnsupportedHostCall(u64::MAX),
+        ] {
+            let transition = ReplayTransition {
+                state: after.clone(),
+                disposition: ReplayDisposition::Rejected,
+                result: Some(Err(error)),
+                next_runtime: input.runtime.clone(),
+                products: ReplayProducts::default(),
+            };
+            assert!(
+                validate_transition::<(), ()>(
+                    &input,
+                    &before,
+                    &transition,
+                    position,
+                    &input.runtime,
+                    false,
+                    false,
+                    None,
+                )
+                .is_ok(),
+                "{error:?}"
+            );
+        }
+        for error in [
+            ActorExecutionError::NotCreated,
+            ActorExecutionError::UnsupportedResultStorage,
+            ActorExecutionError::MissingState,
+            ActorExecutionError::InvalidAvailability,
+            ActorExecutionError::DivergentInvocation,
+            ActorExecutionError::ResultCapacity,
+            ActorExecutionError::InvalidAuthorization,
+            ActorExecutionError::AuthorityExpired,
+            ActorExecutionError::AuthoritySlotRegressed,
+        ] {
+            let transition = ReplayTransition {
+                state: after.clone(),
+                disposition: ReplayDisposition::Rejected,
+                result: Some(Err(error)),
+                next_runtime: input.runtime.clone(),
+                products: ReplayProducts::default(),
+            };
+            assert!(matches!(
+                validate_transition::<(), ()>(
+                    &input,
+                    &before,
+                    &transition,
+                    position,
+                    &input.runtime,
+                    false,
+                    false,
+                    None,
+                ),
+                Err(ReplayError::InvalidRecord)
+            ));
+        }
+        for error in [
+            ActorExecutionError::UnsupportedResultStorage,
+            ActorExecutionError::MissingState,
+            ActorExecutionError::InvalidAvailability,
+            ActorExecutionError::ResultCapacity,
+            ActorExecutionError::AuthorityExpired,
+            ActorExecutionError::AuthoritySlotRegressed,
+        ] {
+            assert!(is_uncommitted_refusal(error), "{error:?}");
+        }
+        for error in [
+            ActorExecutionError::NotCreated,
+            ActorExecutionError::NotFound,
+            ActorExecutionError::StaleIncarnation,
+            ActorExecutionError::Suspended,
+            ActorExecutionError::StaleDeployment,
+            ActorExecutionError::WrongProgram,
+            ActorExecutionError::UnsupportedMethod,
+            ActorExecutionError::InvalidInput,
+            ActorExecutionError::InvalidActorOutput,
+            ActorExecutionError::DivergentInvocation,
+            ActorExecutionError::InvalidAuthorization,
+            ActorExecutionError::UnsupportedHostCall(1),
+        ] {
+            assert!(!is_uncommitted_refusal(error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn fresh_uncommitted_refusal_requires_an_exact_noop() {
+        let input = input(MethodMode::Linear);
+        let before = standard_before();
+        let position = ReplayPosition::Ordered {
+            id: OrderedEntryId([0xe5; 32]),
+            index: 1,
+            merge_frontier: MergeFrontierId([0xe6; 32]),
+            merge_seal: None,
+        };
+        for error in [
+            ActorExecutionError::UnsupportedResultStorage,
+            ActorExecutionError::MissingState,
+            ActorExecutionError::InvalidAvailability,
+            ActorExecutionError::ResultCapacity,
+            ActorExecutionError::AuthorityExpired,
+            ActorExecutionError::AuthoritySlotRegressed,
+        ] {
+            let mut machine =
+                ReplayMachine::from_genesis(AgentJournalGenesisId([0xe7; 32]), runtime()).unwrap();
+            let mut executor = UncommittedRefusalExecutor::exact(error);
+            assert_eq!(
+                machine.apply::<_, ()>(&mut executor, &input, &before, position),
+                Err(ReplayError::UncommittedInvocation(error))
+            );
+            assert_eq!(executor.authentications, 1);
+            assert_eq!(executor.executions, 1);
+            assert!(
+                machine
+                    .ownership
+                    .lookup(invocation_ownership_key(
+                        position,
+                        match &input.operation {
+                            ReplayOperation::Invoke { invocation, .. } => invocation.invocation,
+                            _ => unreachable!(),
+                        },
+                    ))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let mut state_tamper =
+            UncommittedRefusalExecutor::exact(ActorExecutionError::AuthoritySlotRegressed);
+        state_tamper.mutate_state = true;
+        let mut machine =
+            ReplayMachine::from_genesis(AgentJournalGenesisId([0xe8; 32]), runtime()).unwrap();
+        assert!(matches!(
+            machine.apply::<_, ()>(&mut state_tamper, &input, &before, position),
+            Err(ReplayError::TerminalMutation)
+        ));
+
+        let mut product_tamper =
+            UncommittedRefusalExecutor::exact(ActorExecutionError::ResultCapacity);
+        product_tamper.emit_products = true;
+        let mut machine =
+            ReplayMachine::from_genesis(AgentJournalGenesisId([0xe9; 32]), runtime()).unwrap();
+        assert!(matches!(
+            machine.apply::<_, ()>(&mut product_tamper, &input, &before, position),
+            Err(ReplayError::ForbiddenMergeProducts)
+        ));
+
+        let mut excluded = UncommittedRefusalExecutor::exact(ActorExecutionError::NotCreated);
+        let mut machine =
+            ReplayMachine::from_genesis(AgentJournalGenesisId([0xea; 32]), runtime()).unwrap();
+        assert!(matches!(
+            machine.apply::<_, ()>(&mut excluded, &input, &before, position),
+            Err(ReplayError::InvalidRecord)
+        ));
+        assert_eq!(
+            historical_replay_error(ReplayError::<(), ()>::UncommittedInvocation(
+                ActorExecutionError::AuthorityExpired,
+            )),
+            ReplayError::InvalidRecord
+        );
     }
 
     #[test]
@@ -6782,8 +9701,8 @@ pub(crate) mod tests {
 
         for _ in 0..3 {
             let prepared = prepare_checkpoint(&mut store, &materialized).unwrap();
-            let (_publication, successor, execution) = prepared.publish(&mut store).unwrap();
-            assert!(execution.is_none());
+            let (_publication, successor, execution) = prepared.publish().unwrap();
+            assert!(execution.is_empty());
             assert!(successor.heads().checkpoint.is_some());
             assert_eq!(successor.local_cursor(), materialized.local_cursor());
             assert_eq!(successor.ordered_snapshots.len(), 1);
@@ -6822,7 +9741,7 @@ pub(crate) mod tests {
                     ReplayPreparation::Ready(prepared) => prepared,
                     ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
                 };
-            let (_publication, successor, _) = prepared.publish(&mut store).unwrap();
+            let (_publication, successor, _) = prepared.publish().unwrap();
             materialized = successor;
         }
 
@@ -6846,7 +9765,7 @@ pub(crate) mod tests {
         assert_eq!(executor.executions, executions_before_overflow);
 
         let checkpoint = prepare_checkpoint(&mut store, &reopened).unwrap();
-        let (_publication, checkpointed, _) = checkpoint.publish(&mut store).unwrap();
+        let (_publication, checkpointed, _) = checkpoint.publish().unwrap();
         assert_eq!(checkpointed.suffix_budget.entries, 0);
         assert_eq!(checkpointed.ordered_snapshots.len(), 1);
 
@@ -6855,11 +9774,654 @@ pub(crate) mod tests {
                 ReplayPreparation::Ready(prepared) => prepared,
                 ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
             };
-        let (_publication, successor, _) = prepared.publish(&mut store).unwrap();
+        let (_publication, successor, _) = prepared.publish().unwrap();
         let reopened =
             materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
         assert_eq!(reopened.heads(), successor.heads());
         assert_eq!(reopened.suffix_budget.entries, 1);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn pending_merge_reserves_finalizer_capacity_across_all_lanes() {
+        let mut store = initialized_linear_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let mut materialized =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let repeated = admitted_invocation(MethodMode::Linear, 0xcd);
+
+        // Leave exactly two entry slots: one for the Merge source and one for
+        // its mandatory ordered finalizer.
+        for index in 1..=(MAX_REPLAY_SUFFIX_ENTRIES as u64 - 2) {
+            let entry = OrderedEntry {
+                genesis: materialized.heads().genesis,
+                index,
+                parent: materialized.heads().ordered_head,
+                merge_frontier: materialized.merge_frontier(),
+                merge_seal: None,
+                input: repeated.clone(),
+            };
+            let prepared =
+                match prepare_ordered(&mut store, &mut executor, &materialized, &entry).unwrap() {
+                    ReplayPreparation::Ready(prepared) => prepared,
+                    ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+                };
+            let (_publication, successor, _) = prepared.publish().unwrap();
+            materialized = successor;
+        }
+        assert_eq!(
+            materialized.suffix_budget.entries,
+            MAX_REPLAY_SUFFIX_ENTRIES - 2
+        );
+
+        let source = MergeEvent {
+            genesis: materialized.heads().genesis,
+            author: materialized.heads().node,
+            ordered_base: materialized.ordered_base(),
+            causal_height: 1,
+            parents: Vec::new(),
+            input: admitted_invocation(MethodMode::Merge, 0xce),
+            signature: vec![0xce; ED25519_SIGNATURE_BYTES],
+        };
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &materialized,
+            &source,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_publication, published_after_source, results) = prepared.publish().unwrap();
+        assert!(results.is_empty());
+        assert_eq!(
+            published_after_source.suffix_budget.entries,
+            MAX_REPLAY_SUFFIX_ENTRIES - 1
+        );
+        let after_source =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        assert_eq!(after_source.heads(), published_after_source.heads());
+        assert_eq!(
+            after_source.suffix_budget.entries,
+            MAX_REPLAY_SUFFIX_ENTRIES - 1
+        );
+
+        let next_merge = MergeEvent {
+            genesis: after_source.heads().genesis,
+            author: after_source.heads().node,
+            ordered_base: after_source.ordered_base(),
+            causal_height: 2,
+            parents: vec![source.id()],
+            input: admitted_invocation(MethodMode::Merge, 0xcf),
+            signature: vec![0xcf; ED25519_SIGNATURE_BYTES],
+        };
+        let next_ordered = OrderedEntry {
+            genesis: after_source.heads().genesis,
+            index: after_source.heads().ordered_index + 1,
+            parent: after_source.heads().ordered_head,
+            merge_frontier: after_source.merge_frontier(),
+            merge_seal: None,
+            input: admitted_invocation(MethodMode::Linear, 0xd0),
+        };
+        let next_local = LocalEntry {
+            genesis: after_source.heads().genesis,
+            node: after_source.heads().node,
+            revision: after_source.heads().local_revision + 1,
+            parent: after_source.heads().local_head,
+            ordered_base: after_source.ordered_base(),
+            merge_frontier: after_source.merge_frontier(),
+            input: admitted_invocation(MethodMode::Local, 0xd1),
+        };
+        let heads_before_rejections = store.heads().unwrap().unwrap();
+        let executions_before_rejections = executor.executions;
+        let verifications_before_rejections = executor.merge_verifications;
+        assert!(matches!(
+            prepare_merge(
+                &mut store,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &after_source,
+                &next_merge,
+            ),
+            Err(ReplayError::ReplayLimit)
+        ));
+        assert!(matches!(
+            prepare_ordered(&mut store, &mut executor, &after_source, &next_ordered,),
+            Err(ReplayError::ReplayLimit)
+        ));
+        assert!(matches!(
+            prepare_local(&mut store, &mut executor, &after_source, &next_local),
+            Err(ReplayError::ReplayLimit)
+        ));
+        assert_eq!(executor.executions, executions_before_rejections);
+        assert_eq!(
+            executor.merge_verifications,
+            verifications_before_rejections
+        );
+        assert_eq!(store.heads().unwrap().unwrap(), heads_before_rejections);
+
+        let seal = persist_merge_seal(&mut store, &after_source);
+        let finalizer = OrderedEntry {
+            genesis: after_source.heads().genesis,
+            index: after_source.heads().ordered_index + 1,
+            parent: after_source.heads().ordered_head,
+            merge_frontier: after_source.merge_frontier(),
+            merge_seal: Some(seal),
+            input: ReplayInput {
+                runtime: after_source.runtime().clone(),
+                operation: ReplayOperation::SealMerge,
+            },
+        };
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &after_source, &finalizer).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            };
+        let (_publication, finalized, executions) = prepared.publish().unwrap();
+        assert_eq!(executions.len(), 2);
+        assert_eq!(finalized.suffix_budget.entries, MAX_REPLAY_SUFFIX_ENTRIES);
+
+        let checkpoint = prepare_checkpoint(&mut store, &finalized).unwrap();
+        let (_publication, checkpointed, executions) = checkpoint.publish().unwrap();
+        assert!(executions.is_empty());
+        assert_eq!(checkpointed.suffix_budget.entries, 0);
+
+        // The checkpoint reset restores capacity for the next source. Its
+        // ordered base is the retained post-finalizer snapshot, while the
+        // parent remains the sealed Merge root.
+        let after_reset = MergeEvent {
+            ordered_base: checkpointed.ordered_base(),
+            ..next_merge
+        };
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &checkpointed,
+            &after_reset,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_publication, after_reset, executions) = prepared.publish().unwrap();
+        assert!(executions.is_empty());
+        assert_eq!(after_reset.suffix_budget.entries, 1);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn live_uncommitted_refusals_never_publish_or_claim_ownership() {
+        let cases = [
+            (
+                MethodMode::Linear,
+                ActorExecutionError::UnsupportedResultStorage,
+            ),
+            (MethodMode::Local, ActorExecutionError::MissingState),
+            (MethodMode::Merge, ActorExecutionError::InvalidAvailability),
+            (MethodMode::Linear, ActorExecutionError::ResultCapacity),
+            (MethodMode::Local, ActorExecutionError::AuthorityExpired),
+            (
+                MethodMode::Merge,
+                ActorExecutionError::AuthoritySlotRegressed,
+            ),
+        ];
+        for (offset, (mode, expected)) in cases.into_iter().enumerate() {
+            let mut store = initialized_replay_store();
+            let mut materializer = ExactCreateRejectInvocations::default();
+            let materialized =
+                materialize_current(&mut store, &mut materializer, &NoPrunedOrderedBases).unwrap();
+            let heads_before = store.heads().unwrap().unwrap();
+            let input = admitted_invocation(mode, 0xb0 + offset as u8);
+            let mut executor = UncommittedRefusalExecutor::exact(expected);
+            let error = match mode {
+                MethodMode::Linear => {
+                    let entry = OrderedEntry {
+                        genesis: materialized.heads().genesis,
+                        index: 1,
+                        parent: None,
+                        merge_frontier: materialized.merge_frontier(),
+                        merge_seal: None,
+                        input: input.clone(),
+                    };
+                    let id = entry.id();
+                    let error =
+                        match prepare_ordered(&mut store, &mut executor, &materialized, &entry) {
+                            Err(error) => error,
+                            Ok(_) => panic!("uncommitted refusal prepared an Ordered publication"),
+                        };
+                    assert!(
+                        AgentJournalStore::get::<OrderedEntry>(&store, id)
+                            .unwrap()
+                            .is_none()
+                    );
+                    error
+                }
+                MethodMode::Local => {
+                    let entry = LocalEntry {
+                        genesis: materialized.heads().genesis,
+                        node: materialized.heads().node,
+                        revision: 1,
+                        parent: None,
+                        ordered_base: materialized.ordered_base(),
+                        merge_frontier: materialized.merge_frontier(),
+                        input: input.clone(),
+                    };
+                    let id = entry.id();
+                    let error =
+                        match prepare_local(&mut store, &mut executor, &materialized, &entry) {
+                            Err(error) => error,
+                            Ok(_) => panic!("uncommitted refusal prepared a Local publication"),
+                        };
+                    assert!(
+                        AgentJournalStore::get::<LocalEntry>(&store, id)
+                            .unwrap()
+                            .is_none()
+                    );
+                    error
+                }
+                MethodMode::Merge => {
+                    let event = MergeEvent {
+                        genesis: materialized.heads().genesis,
+                        author: materialized.heads().node,
+                        ordered_base: materialized.ordered_base(),
+                        causal_height: 1,
+                        parents: Vec::new(),
+                        input: input.clone(),
+                        signature: vec![0xbb; ED25519_SIGNATURE_BYTES],
+                    };
+                    let id = event.id();
+                    let error = match prepare_merge(
+                        &mut store,
+                        &mut executor,
+                        &NoPrunedOrderedBases,
+                        &materialized,
+                        &event,
+                    ) {
+                        Err(error) => error,
+                        Ok(_) => panic!("uncommitted refusal prepared a Merge publication"),
+                    };
+                    assert!(
+                        AgentJournalStore::get::<MergeEvent>(&store, id)
+                            .unwrap()
+                            .is_none()
+                    );
+                    error
+                }
+                MethodMode::Query | MethodMode::LinearizableQuery | MethodMode::LocalQuery => {
+                    unreachable!()
+                }
+            };
+            assert_eq!(error, ReplayError::UncommittedInvocation(expected));
+            assert_eq!(executor.authentications, 1);
+            assert_eq!(executor.executions, 1);
+            assert_eq!(store.heads().unwrap().unwrap(), heads_before);
+
+            let ReplayOperation::Invoke { invocation, .. } = &input.operation else {
+                unreachable!()
+            };
+            let scope = match mode {
+                MethodMode::Linear => InvocationOwnershipScope::Ordered,
+                MethodMode::Merge => InvocationOwnershipScope::Merge,
+                MethodMode::Local => InvocationOwnershipScope::Local(heads_before.node),
+                MethodMode::Query | MethodMode::LinearizableQuery | MethodMode::LocalQuery => {
+                    unreachable!()
+                }
+            };
+            let indexes = InvocationIndexes::open(
+                &mut store,
+                heads_before.ordered_invocations,
+                heads_before.merge_invocations,
+                heads_before.local_invocations,
+            )
+            .unwrap();
+            assert!(
+                InvocationOwnership::lookup(
+                    &indexes,
+                    InvocationOwnershipKey {
+                        scope,
+                        invocation: invocation.invocation,
+                    },
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn full_invocation_scope_refuses_the_257th_before_execution_or_cas() {
+        for mode in [MethodMode::Linear, MethodMode::Local, MethodMode::Merge] {
+            let mut store = initialized_linear_replay_store();
+            let mut executor = ExactCreateRejectInvocations::default();
+            let mut materialized =
+                materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+            let retained = seed_full_invocation_scope(&mut store, &mut materialized, mode);
+            let full_heads = store.heads().unwrap().unwrap();
+            assert_eq!(materialized.heads(), &full_heads);
+
+            let fresh = quota_invocation(mode, MAX_INVOCATION_INDEX_LIVE_ENTRIES + 1);
+            let executions_before = executor.executions;
+            let error = match mode {
+                MethodMode::Linear => {
+                    let entry = OrderedEntry {
+                        genesis: full_heads.genesis,
+                        index: full_heads.ordered_index + 1,
+                        parent: full_heads.ordered_head,
+                        merge_frontier: full_heads.merge_frontier,
+                        merge_seal: None,
+                        input: fresh,
+                    };
+                    let id = entry.id();
+                    let error =
+                        match prepare_ordered(&mut store, &mut executor, &materialized, &entry) {
+                            Err(error) => error,
+                            Ok(_) => panic!("257th Ordered owner prepared a publication"),
+                        };
+                    assert!(store.get::<OrderedEntry>(id).unwrap().is_none());
+                    error
+                }
+                MethodMode::Local => {
+                    let entry = LocalEntry {
+                        genesis: full_heads.genesis,
+                        node: full_heads.node,
+                        revision: full_heads.local_revision + 1,
+                        parent: full_heads.local_head,
+                        ordered_base: materialized.ordered_base(),
+                        merge_frontier: full_heads.merge_frontier,
+                        input: fresh,
+                    };
+                    let id = entry.id();
+                    let error =
+                        match prepare_local(&mut store, &mut executor, &materialized, &entry) {
+                            Err(error) => error,
+                            Ok(_) => panic!("257th Local owner prepared a publication"),
+                        };
+                    assert!(store.get::<LocalEntry>(id).unwrap().is_none());
+                    error
+                }
+                MethodMode::Merge => {
+                    let event = MergeEvent {
+                        genesis: full_heads.genesis,
+                        author: full_heads.node,
+                        ordered_base: materialized.ordered_base(),
+                        causal_height: 1,
+                        parents: Vec::new(),
+                        input: fresh,
+                        signature: vec![0xde; ED25519_SIGNATURE_BYTES],
+                    };
+                    let id = event.id();
+                    let error = match prepare_merge(
+                        &mut store,
+                        &mut executor,
+                        &NoPrunedOrderedBases,
+                        &materialized,
+                        &event,
+                    ) {
+                        Err(error) => error,
+                        Ok(_) => panic!("257th Merge owner prepared a publication"),
+                    };
+                    assert!(store.get::<MergeEvent>(id).unwrap().is_none());
+                    error
+                }
+                MethodMode::Query | MethodMode::LinearizableQuery | MethodMode::LocalQuery => {
+                    unreachable!()
+                }
+            };
+            assert_eq!(
+                error,
+                ReplayError::UncommittedInvocation(ActorExecutionError::ResultCapacity)
+            );
+            assert_eq!(executor.executions, executions_before);
+            assert_eq!(store.heads().unwrap().unwrap(), full_heads);
+
+            // Capacity gates only a genuinely new owner. Exact retained
+            // retries and acknowledgements of existing direct outcomes still
+            // prepare without guest execution at the ceiling.
+            match mode {
+                MethodMode::Linear => {
+                    let retry = OrderedEntry {
+                        genesis: full_heads.genesis,
+                        index: full_heads.ordered_index + 1,
+                        parent: full_heads.ordered_head,
+                        merge_frontier: full_heads.merge_frontier,
+                        merge_seal: None,
+                        input: retained.clone(),
+                    };
+                    let prepared =
+                        match prepare_ordered(&mut store, &mut executor, &materialized, &retry)
+                            .unwrap()
+                        {
+                            ReplayPreparation::Ready(prepared) => prepared,
+                            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+                        };
+                    drop(prepared);
+                    let acknowledgement = OrderedEntry {
+                        input: admitted_acknowledgement(&retained),
+                        ..retry
+                    };
+                    let prepared = match prepare_ordered(
+                        &mut store,
+                        &mut executor,
+                        &materialized,
+                        &acknowledgement,
+                    )
+                    .unwrap()
+                    {
+                        ReplayPreparation::Ready(prepared) => prepared,
+                        ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+                    };
+                    drop(prepared);
+                }
+                MethodMode::Local => {
+                    let retry = LocalEntry {
+                        genesis: full_heads.genesis,
+                        node: full_heads.node,
+                        revision: full_heads.local_revision + 1,
+                        parent: full_heads.local_head,
+                        ordered_base: materialized.ordered_base(),
+                        merge_frontier: full_heads.merge_frontier,
+                        input: retained.clone(),
+                    };
+                    let prepared =
+                        match prepare_local(&mut store, &mut executor, &materialized, &retry)
+                            .unwrap()
+                        {
+                            ReplayPreparation::Ready(prepared) => prepared,
+                            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+                        };
+                    drop(prepared);
+                    let acknowledgement = LocalEntry {
+                        input: admitted_acknowledgement(&retained),
+                        ..retry
+                    };
+                    let prepared = match prepare_local(
+                        &mut store,
+                        &mut executor,
+                        &materialized,
+                        &acknowledgement,
+                    )
+                    .unwrap()
+                    {
+                        ReplayPreparation::Ready(prepared) => prepared,
+                        ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+                    };
+                    drop(prepared);
+                }
+                MethodMode::Merge => {}
+                MethodMode::Query | MethodMode::LinearizableQuery | MethodMode::LocalQuery => {
+                    unreachable!()
+                }
+            }
+            assert_eq!(executor.executions, executions_before);
+            assert_eq!(store.heads().unwrap().unwrap(), full_heads);
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn divergent_recovery_requires_a_reachable_publication() {
+        let mut store = initialized_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let base = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let original = OrderedEntry {
+            genesis: base.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: base.merge_frontier(),
+            merge_seal: None,
+            input: admitted_invocation(MethodMode::Linear, 0xd3),
+        };
+        let prepared = match prepare_ordered(&mut store, &mut executor, &base, &original).unwrap() {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_publication, retained, _) = prepared.publish().unwrap();
+
+        let divergent_input = divergent_invocation_input(&original.input, 0x01);
+        let divergent = OrderedEntry {
+            genesis: retained.heads().genesis,
+            index: 2,
+            parent: Some(original.id()),
+            merge_frontier: retained.merge_frontier(),
+            merge_seal: None,
+            input: divergent_input.clone(),
+        };
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &retained, &divergent).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            };
+        let (_publication, divergent_head, executions) = prepared.publish().unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(
+            executions[0].outcome(),
+            ReplayStepOutcome::DivergentInvocation
+        );
+        let divergent_position = ReplayPosition::Ordered {
+            id: divergent.id(),
+            index: divergent.index,
+            merge_frontier: divergent.merge_frontier,
+            merge_seal: divergent.merge_seal,
+        };
+        assert_eq!(
+            recover_invocation(
+                &mut store,
+                &divergent_head,
+                &divergent.input,
+                divergent_position,
+            )
+            .unwrap(),
+            ReplayInvocationRecovery::Divergent
+        );
+
+        // Both a byte-exact duplicate and another mismatching request may be
+        // staged as valid objects. Neither crossed the heads CAS, so neither
+        // may disclose the authenticated owner's divergent state.
+        let exact_orphan = OrderedEntry {
+            genesis: divergent_head.heads().genesis,
+            index: 3,
+            parent: Some(divergent.id()),
+            merge_frontier: divergent_head.merge_frontier(),
+            merge_seal: None,
+            input: divergent_input,
+        };
+        let mismatched_orphan = OrderedEntry {
+            input: divergent_invocation_input(&exact_orphan.input, 0x02),
+            ..exact_orphan.clone()
+        };
+        for orphan in [exact_orphan, mismatched_orphan] {
+            store.put(&orphan).unwrap();
+            assert_eq!(
+                recover_invocation(
+                    &mut store,
+                    &divergent_head,
+                    &orphan.input,
+                    ReplayPosition::Ordered {
+                        id: orphan.id(),
+                        index: orphan.index,
+                        merge_frontier: orphan.merge_frontier,
+                        merge_seal: orphan.merge_seal,
+                    },
+                )
+                .unwrap(),
+                ReplayInvocationRecovery::NotCommitted
+            );
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn checkpoint_gc_preserves_retained_outcome_anchor_recovery() {
+        let mut store = initialized_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let mut materialized =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let retained = OrderedEntry {
+            genesis: materialized.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: materialized.merge_frontier(),
+            merge_seal: None,
+            input: admitted_invocation(MethodMode::Linear, 0xd4),
+        };
+        for entry in [
+            retained.clone(),
+            OrderedEntry {
+                genesis: materialized.heads().genesis,
+                index: 2,
+                parent: Some(retained.id()),
+                merge_frontier: materialized.merge_frontier(),
+                merge_seal: None,
+                input: admitted_invocation(MethodMode::Linear, 0xd5),
+            },
+        ] {
+            let prepared =
+                match prepare_ordered(&mut store, &mut executor, &materialized, &entry).unwrap() {
+                    ReplayPreparation::Ready(prepared) => prepared,
+                    ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+                };
+            let (_publication, successor, _) = prepared.publish().unwrap();
+            materialized = successor;
+        }
+        assert_ne!(materialized.heads().ordered_head, Some(retained.id()));
+        let checkpoint = prepare_checkpoint(&mut store, &materialized).unwrap();
+        let (_publication, checkpointed, _) = checkpoint.publish().unwrap();
+        let limits = GcLimits {
+            max_index_nodes: 10_000,
+            max_marked_objects: 10_000,
+            max_marked_blobs: 10_000,
+            max_scanned_files: 10_000,
+            max_scanned_bytes: 64 * 1024 * 1024,
+            max_unlinks_per_run: 10_000,
+        };
+        let gc = store
+            .collect_garbage(checkpointed.heads().id(), limits)
+            .unwrap();
+        assert!(gc.complete);
+        let reopened =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        assert_eq!(reopened.heads(), checkpointed.heads());
+        assert_eq!(
+            recover_invocation(
+                &mut store,
+                &reopened,
+                &retained.input,
+                ReplayPosition::Ordered {
+                    id: retained.id(),
+                    index: retained.index,
+                    merge_frontier: retained.merge_frontier,
+                    merge_seal: retained.merge_seal,
+                },
+            )
+            .unwrap(),
+            ReplayInvocationRecovery::Retained(Err(ActorExecutionError::NotFound))
+        );
     }
 
     #[cfg(feature = "std")]
@@ -6885,16 +10447,18 @@ pub(crate) mod tests {
             ReplayPreparation::Ready(prepared) => prepared,
             ReplayPreparation::AlreadyCommitted(_) => panic!("fresh ordered input was committed"),
         };
-        let execution = prepared.execution().unwrap();
+        let (_publication, _lost_successor, published_execution) = prepared.publish().unwrap();
+        assert_eq!(published_execution.len(), 1);
         assert_eq!(
-            execution.outcome(),
+            published_execution[0].outcome(),
             ReplayStepOutcome::Applied(ReplayDisposition::Rejected)
         );
-        assert!(execution.products().is_empty());
-        assert_eq!(execution.input(), ordered.input.id());
-        let (_publication, _lost_successor, published_execution) =
-            prepared.publish(&mut store).unwrap();
-        assert_eq!(published_execution, Some(execution));
+        assert_eq!(
+            published_execution[0].result(),
+            Some(&Err(ActorExecutionError::NotFound))
+        );
+        assert!(published_execution[0].products().is_empty());
+        assert_eq!(published_execution[0].input(), ordered.input.id());
 
         // Simulate loss of the publication response: reopen from durable
         // heads, then recover the exact committed input without executing it.
@@ -6912,6 +10476,70 @@ pub(crate) mod tests {
             ReplayPosition::Ordered { id, index: 1, .. } if id == ordered.id()
         ));
         assert_eq!(executor.executions, executions_before_retry);
+        let recovery_position = recovery.position();
+        assert_eq!(
+            recover_invocation(&mut store, &materialized, &ordered.input, recovery_position,)
+                .unwrap(),
+            ReplayInvocationRecovery::Retained(Err(ActorExecutionError::NotFound))
+        );
+        assert_eq!(executor.executions, executions_before_retry);
+
+        // Supplying the complete request is not authorization to disclose
+        // its retained result. The receipt is authenticated against the
+        // exact committed position before the ownership index is consulted.
+        let mut forged = ordered.input.clone();
+        let ReplayOperation::Invoke { authority, .. } = &mut forged.operation else {
+            unreachable!();
+        };
+        authority.signature[0] = 0x56;
+        assert_eq!(
+            recover_invocation(&mut store, &materialized, &forged, recovery_position,).unwrap(),
+            ReplayInvocationRecovery::NotCommitted
+        );
+
+        // Checkpoint compaction retains the authenticated outcome/index and
+        // its content-addressed anchor, but only the checkpoint's current
+        // ordered snapshot. Response recovery therefore must not depend on
+        // resolving the source entry's historical pre-state.
+        let checkpoint = prepare_checkpoint(&mut store, &materialized).unwrap();
+        checkpoint.publish().unwrap();
+        materialized =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        assert_eq!(materialized.ordered_snapshots.len(), 1);
+        assert_eq!(
+            recover_invocation(&mut store, &materialized, &ordered.input, recovery_position,)
+                .unwrap(),
+            ReplayInvocationRecovery::Retained(Err(ActorExecutionError::NotFound))
+        );
+
+        // Merely prewriting another valid content-addressed entry containing
+        // the same authenticated input does not make it a disclosure anchor.
+        // It is neither the outcome's permanent anchor nor part of the
+        // authenticated post-checkpoint suffix.
+        let orphan = OrderedEntry {
+            genesis: materialized.heads().genesis,
+            index: 2,
+            parent: Some(ordered.id()),
+            merge_frontier: materialized.merge_frontier(),
+            merge_seal: None,
+            input: ordered.input.clone(),
+        };
+        store.put(&orphan).unwrap();
+        assert_eq!(
+            recover_invocation(
+                &mut store,
+                &materialized,
+                &orphan.input,
+                ReplayPosition::Ordered {
+                    id: orphan.id(),
+                    index: orphan.index,
+                    merge_frontier: orphan.merge_frontier,
+                    merge_seal: orphan.merge_seal,
+                },
+            )
+            .unwrap(),
+            ReplayInvocationRecovery::NotCommitted
+        );
 
         let local = LocalEntry {
             genesis: materialized.heads().genesis,
@@ -6927,7 +10555,7 @@ pub(crate) mod tests {
                 ReplayPreparation::Ready(prepared) => prepared,
                 ReplayPreparation::AlreadyCommitted(_) => panic!("fresh Local input was committed"),
             };
-        let (_publication, successor, _) = prepared.publish(&mut store).unwrap();
+        let (_publication, successor, _) = prepared.publish().unwrap();
         materialized = successor;
 
         let merge = MergeEvent {
@@ -6951,7 +10579,7 @@ pub(crate) mod tests {
             ReplayPreparation::Ready(prepared) => prepared,
             ReplayPreparation::AlreadyCommitted(_) => panic!("fresh Merge input was committed"),
         };
-        let (_publication, _successor, _) = prepared.publish(&mut store).unwrap();
+        let (_publication, _successor, _) = prepared.publish().unwrap();
         materialized =
             materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
         assert_eq!(materialized.heads().ordered_head, Some(ordered.id()));
@@ -6982,8 +10610,23 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
             assert_eq!(owner.scope, scope);
-            assert_eq!(owner.disposition, InvocationDisposition::Rejected);
-            assert_eq!(owner.result_state, InvocationResultState::Terminal);
+            match scope {
+                InvocationOwnershipScope::Merge => assert!(matches!(
+                    owner.result_state,
+                    InvocationResultState::PendingMerge { source_event }
+                        if source_event == merge.id()
+                )),
+                InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Local(_) => {
+                    assert!(matches!(
+                        owner.result_state,
+                        InvocationResultState::Retained {
+                            disposition: InvocationDisposition::Rejected,
+                            ..
+                        }
+                    ));
+                    assert_eq!(owner.disposition(), Some(InvocationDisposition::Rejected));
+                }
+            }
         }
         drop(indexes);
 
@@ -7020,7 +10663,7 @@ pub(crate) mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    fn failed_cas_cannot_publish_a_staged_ownership_root() {
+    fn dropped_store_bound_session_cannot_publish_its_staged_ownership_root() {
         let mut store = initialized_replay_store();
         let mut executor = ExactCreateRejectInvocations::default();
         let base = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
@@ -7039,20 +10682,17 @@ pub(crate) mod tests {
             ReplayPreparation::Ready(prepared) => prepared,
             ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
         };
+        // Dropping the exclusive session releases the store without making
+        // its prewritten candidate path reachable from durable heads.
+        drop(losing);
         let winning =
             match prepare_ordered(&mut store, &mut executor, &base, &winning_entry).unwrap() {
                 ReplayPreparation::Ready(prepared) => prepared,
                 ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
             };
-        let (_publication, winning_state, _) = winning.publish(&mut store).unwrap();
+        let (_publication, winning_state, _) = winning.publish().unwrap();
         let durable_after_winner = store.heads().unwrap().unwrap();
         assert_eq!(durable_after_winner, *winning_state.heads());
-
-        assert_eq!(
-            losing.publish(&mut store).map(|_| ()),
-            Err(crate::agent::journal_store::JournalStoreError::Conflict)
-        );
-        assert_eq!(store.heads().unwrap().unwrap(), durable_after_winner);
 
         let reopened =
             materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
@@ -7091,7 +10731,7 @@ pub(crate) mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    fn concurrent_merge_arrival_is_rebuilt_in_canonical_id_order() {
+    fn merge_reorder_seal_and_pending_acknowledgement_are_exact() {
         let mut store = initialized_replay_store();
         let mut executor = ExactCreateRejectInvocations::default();
         let base = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
@@ -7106,7 +10746,9 @@ pub(crate) mod tests {
         };
         let left = event(0xf1);
         let right = event(0xf2);
-        let (first, second) = if left.id() > right.id() {
+        let expected_finalized_inputs = vec![left.input.id(), right.input.id()];
+        let acknowledged_source = left.clone();
+        let (first_event, second_event) = if left.id() > right.id() {
             (left, right)
         } else {
             (right, left)
@@ -7117,17 +10759,18 @@ pub(crate) mod tests {
             &mut executor,
             &NoPrunedOrderedBases,
             &base,
-            &first,
+            &first_event,
         )
         .unwrap()
         {
             ReplayPreparation::Ready(prepared) => prepared,
             ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
         };
-        let (_publication, after_first, _) = first.publish(&mut store).unwrap();
+        let (_publication, after_first, first_results) = first.publish().unwrap();
+        assert!(first_results.is_empty());
         executor.merge_execution_order.clear();
 
-        let second_id = second.id();
+        let second_id = second_event.id();
         let first_id = after_first.merge_roots[0].id;
         assert!(second_id < first_id);
         let second = match prepare_merge(
@@ -7135,7 +10778,7 @@ pub(crate) mod tests {
             &mut executor,
             &NoPrunedOrderedBases,
             &after_first,
-            &second,
+            &second_event,
         )
         .unwrap()
         {
@@ -7143,8 +10786,9 @@ pub(crate) mod tests {
             ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
         };
         assert_eq!(executor.merge_execution_order, vec![second_id, first_id]);
-        let (_publication, successor, _) = second.publish(&mut store).unwrap();
-        let reopened =
+        let (_publication, successor, second_results) = second.publish().unwrap();
+        assert!(second_results.is_empty());
+        let mut reopened =
             materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
         assert_eq!(reopened.heads(), successor.heads());
         assert_eq!(
@@ -7155,6 +10799,227 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             vec![second_id, first_id]
         );
+
+        let source_position = ReplayPosition::Merge {
+            id: acknowledged_source.id(),
+            causal_height: acknowledged_source.causal_height,
+            ordered_base: acknowledged_source.ordered_base,
+        };
+        assert_eq!(
+            recover_invocation(
+                &mut store,
+                &reopened,
+                &acknowledged_source.input,
+                source_position,
+            )
+            .unwrap(),
+            ReplayInvocationRecovery::Pending
+        );
+        let exact_source_orphan = MergeEvent {
+            signature: vec![0xf5; ED25519_SIGNATURE_BYTES],
+            ..acknowledged_source.clone()
+        };
+        let mismatched_source_orphan = MergeEvent {
+            input: divergent_invocation_input(&acknowledged_source.input, 0x01),
+            signature: vec![0xf6; ED25519_SIGNATURE_BYTES],
+            ..acknowledged_source.clone()
+        };
+        let source_orphans = [exact_source_orphan, mismatched_source_orphan];
+        for orphan in &source_orphans {
+            store.put(orphan).unwrap();
+            assert_eq!(
+                recover_invocation(&mut store, &reopened, &orphan.input, merge_position(orphan),)
+                    .unwrap(),
+                ReplayInvocationRecovery::NotCommitted
+            );
+        }
+        assert!(prepare_checkpoint(&mut store, &reopened).is_err());
+
+        // The ordered fence is the sole publication boundary for every
+        // provisional Merge result. It rebuilds the complete suffix, writes
+        // outcomes first, then installs one deterministic ownership batch.
+        let first_seal = persist_merge_seal(&mut store, &reopened);
+        let first_fence = OrderedEntry {
+            genesis: reopened.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: reopened.merge_frontier(),
+            merge_seal: Some(first_seal),
+            input: ReplayInput {
+                runtime: reopened.runtime().clone(),
+                operation: ReplayOperation::SealMerge,
+            },
+        };
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &reopened, &first_fence).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            };
+        let (_publication, after_first_seal, finalized) = prepared.publish().unwrap();
+        assert_eq!(finalized.len(), 3);
+        assert!(finalized[0].result().is_none());
+        assert_eq!(
+            finalized[1..]
+                .iter()
+                .map(ReplayExecutionResult::input)
+                .collect::<Vec<_>>(),
+            expected_finalized_inputs
+        );
+        assert!(
+            finalized[1..].iter().all(|execution| {
+                execution.result() == Some(&Err(ActorExecutionError::NotFound))
+            })
+        );
+        reopened = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        assert_eq!(reopened.heads(), after_first_seal.heads());
+        assert_eq!(
+            recover_invocation(
+                &mut store,
+                &reopened,
+                &acknowledged_source.input,
+                source_position,
+            )
+            .unwrap(),
+            ReplayInvocationRecovery::Retained(Err(ActorExecutionError::NotFound))
+        );
+
+        let mut parents = vec![first_id, second_id];
+        parents.sort_unstable();
+        let acknowledgement = MergeEvent {
+            genesis: reopened.heads().genesis,
+            author: reopened.heads().node,
+            ordered_base: reopened.ordered_base(),
+            causal_height: 2,
+            parents,
+            input: admitted_acknowledgement(&acknowledged_source.input),
+            signature: vec![0xf4; ED25519_SIGNATURE_BYTES],
+        };
+        let acknowledgement_position = ReplayPosition::Merge {
+            id: acknowledgement.id(),
+            causal_height: acknowledgement.causal_height,
+            ordered_base: acknowledgement.ordered_base,
+        };
+        let exact_acknowledgement_orphan = MergeEvent {
+            signature: vec![0xf7; ED25519_SIGNATURE_BYTES],
+            ..acknowledgement.clone()
+        };
+        let mismatched_acknowledgement_orphan = MergeEvent {
+            input: divergent_invocation_input(&acknowledgement.input, 0x02),
+            signature: vec![0xf8; ED25519_SIGNATURE_BYTES],
+            ..acknowledgement.clone()
+        };
+        let acknowledgement_orphans = [
+            exact_acknowledgement_orphan,
+            mismatched_acknowledgement_orphan,
+        ];
+        for orphan in &acknowledgement_orphans {
+            store.put(orphan).unwrap();
+        }
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &reopened,
+            &acknowledgement,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_publication, after_ack, pending_results) = prepared.publish().unwrap();
+        assert!(pending_results.is_empty());
+        reopened = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        assert_eq!(reopened.heads(), after_ack.heads());
+        assert_eq!(
+            recover_invocation(
+                &mut store,
+                &reopened,
+                &acknowledgement.input,
+                acknowledgement_position,
+            )
+            .unwrap(),
+            ReplayInvocationRecovery::Pending
+        );
+        for orphan in source_orphans.iter().chain(&acknowledgement_orphans) {
+            assert_eq!(
+                recover_invocation(&mut store, &reopened, &orphan.input, merge_position(orphan),)
+                    .unwrap(),
+                ReplayInvocationRecovery::NotCommitted
+            );
+        }
+        assert_eq!(
+            recover_invocation(
+                &mut store,
+                &reopened,
+                &acknowledged_source.input,
+                source_position,
+            )
+            .unwrap(),
+            ReplayInvocationRecovery::Pending
+        );
+
+        let second_seal = persist_merge_seal(&mut store, &reopened);
+        let second_fence = OrderedEntry {
+            genesis: reopened.heads().genesis,
+            index: 2,
+            parent: reopened.heads().ordered_head,
+            merge_frontier: reopened.merge_frontier(),
+            merge_seal: Some(second_seal),
+            input: ReplayInput {
+                runtime: reopened.runtime().clone(),
+                operation: ReplayOperation::SealMerge,
+            },
+        };
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &reopened, &second_fence).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            };
+        let (_publication, acknowledged, final_ack_results) = prepared.publish().unwrap();
+        // Ack finalization changes only the authenticated owner leaf; it
+        // never republishes the application result.
+        assert_eq!(final_ack_results.len(), 1);
+        assert!(final_ack_results[0].result().is_none());
+        reopened = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        assert_eq!(reopened.heads(), acknowledged.heads());
+        for (input, position) in [
+            (&acknowledged_source.input, source_position),
+            (&acknowledgement.input, acknowledgement_position),
+        ] {
+            assert_eq!(
+                recover_invocation(&mut store, &reopened, input, position,).unwrap(),
+                ReplayInvocationRecovery::Acknowledged
+            );
+        }
+        for orphan in source_orphans.iter().chain(&acknowledgement_orphans) {
+            assert_eq!(
+                recover_invocation(&mut store, &reopened, &orphan.input, merge_position(orphan),)
+                    .unwrap(),
+                ReplayInvocationRecovery::NotCommitted
+            );
+        }
+
+        // Seal-only entries are a progress mechanism for pending Merge work,
+        // not a way to advance ordered history with repeated empty fences.
+        let empty_seal = persist_merge_seal(&mut store, &reopened);
+        let empty_fence = OrderedEntry {
+            genesis: reopened.heads().genesis,
+            index: 3,
+            parent: reopened.heads().ordered_head,
+            merge_frontier: reopened.merge_frontier(),
+            merge_seal: Some(empty_seal),
+            input: ReplayInput {
+                runtime: reopened.runtime().clone(),
+                operation: ReplayOperation::SealMerge,
+            },
+        };
+        assert!(matches!(
+            prepare_ordered(&mut store, &mut executor, &reopened, &empty_fence),
+            Err(ReplayError::InvalidFence)
+        ));
+        let checkpoint = prepare_checkpoint(&mut store, &reopened).unwrap();
+        checkpoint.publish().unwrap();
     }
 
     #[cfg(feature = "std")]
@@ -7164,7 +11029,7 @@ pub(crate) mod tests {
         let mut executor = ExactCreateRejectInvocations::default();
         let base = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
         let checkpoint = prepare_checkpoint(&mut store, &base).unwrap();
-        let (_publication, checkpointed, _) = checkpoint.publish(&mut store).unwrap();
+        let (_publication, checkpointed, _) = checkpoint.publish().unwrap();
         assert!(checkpointed.merge_boundary_roots.is_empty());
 
         let root = |discriminator| MergeEvent {
@@ -7190,7 +11055,7 @@ pub(crate) mod tests {
             ReplayPreparation::Ready(prepared) => prepared,
             ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
         };
-        let (_publication, after_first, _) = first.publish(&mut store).unwrap();
+        let (_publication, after_first, _) = first.publish().unwrap();
         let second = match prepare_merge(
             &mut store,
             &mut executor,
@@ -7203,7 +11068,7 @@ pub(crate) mod tests {
             ReplayPreparation::Ready(prepared) => prepared,
             ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
         };
-        let (_publication, successor, _) = second.publish(&mut store).unwrap();
+        let (_publication, successor, _) = second.publish().unwrap();
         let reopened =
             materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
         assert_eq!(reopened.heads(), successor.heads());

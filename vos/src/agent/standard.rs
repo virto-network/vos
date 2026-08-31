@@ -111,7 +111,6 @@ impl StandardLaneRevisions {
         }
     }
 
-    #[cfg(feature = "pvm")]
     fn set_authority_slot(&mut self, lane: StateLane, slot: u64) {
         *match lane {
             StateLane::Linear => &mut self.linear_authority_slot,
@@ -430,7 +429,6 @@ impl StandardAgentRuntime {
             .max()
     }
 
-    #[cfg(feature = "pvm")]
     fn advance_result_authority_slot(
         &mut self,
         storage: InvocationResultStorage,
@@ -450,6 +448,37 @@ impl StandardAgentRuntime {
                     current.map_or(observed_slot, |v| v.max(observed_slot)),
                 );
             }
+        }
+    }
+
+    /// Commit only the monotone authority clock for one externally retained
+    /// exact outcome. Terminal replies and deterministic execution errors do
+    /// not enter the guest result table and cannot mutate actor state.
+    pub(crate) fn commit_exact_outcome_clock(
+        &mut self,
+        invocation: &super::execution::ActorInvocation,
+        observed_slot: u64,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+
+        let storage = invocation.mode.result_storage();
+        if !self.result_storage_supported(storage) {
+            return Err(ActorExecutionError::UnsupportedResultStorage);
+        }
+        self.advance_result_authority_slot(storage, observed_slot);
+        Ok(())
+    }
+
+    /// Admit only invocation modes whose exact result has a durable owning
+    /// component in this immutable profile/capability set.
+    pub(crate) fn validate_invocation_result_storage(
+        &self,
+        invocation: &super::execution::ActorInvocation,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        if self.result_storage_supported(invocation.mode.result_storage()) {
+            Ok(())
+        } else {
+            Err(super::execution::ActorExecutionError::UnsupportedResultStorage)
         }
     }
 
@@ -622,18 +651,19 @@ impl StandardAgentRuntime {
     ) -> Result<Option<super::execution::ActorExecutionReply>, super::execution::ActorExecutionError>
     {
         use super::execution::ActorExecutionError;
-        self.validate_invocation_target(invocation)?;
+        invocation.validate()?;
         let key = (invocation.mode.invocation_scope(), invocation.invocation);
-        let Some(result) = self.invocation_results.get(&key) else {
-            return Ok(None);
-        };
-        if result.request != invocation.commitment() {
-            return Err(ActorExecutionError::DivergentInvocation);
+        if let Some(result) = self.invocation_results.get(&key) {
+            if result.request != invocation.commitment() {
+                return Err(ActorExecutionError::DivergentInvocation);
+            }
+            let reply = result.reply.clone();
+            let storage = result.storage;
+            self.advance_result_authority_slot(storage, observed_slot);
+            return Ok(Some(reply));
         }
-        let reply = result.reply.clone();
-        let storage = result.storage;
-        self.advance_result_authority_slot(storage, observed_slot);
-        Ok(Some(reply))
+        self.validate_invocation_target(invocation)?;
+        Ok(None)
     }
 
     #[cfg(feature = "pvm")]
@@ -700,7 +730,7 @@ impl StandardAgentRuntime {
         }
         let result_storage = invocation.mode.result_storage();
         if !self.result_storage_supported(result_storage) {
-            return Err(ActorExecutionError::UnsupportedMethod);
+            return Err(ActorExecutionError::UnsupportedResultStorage);
         }
         if self.invocation_result_count(result_storage) >= MAX_INVOCATION_RESULTS_PER_LANE
             || self.invocation_result_bytes(result_storage) >= MAX_INVOCATION_RESULT_BYTES_PER_LANE
@@ -906,7 +936,7 @@ impl StandardAgentRuntime {
         }
         let result_storage = invocation.mode.result_storage();
         if !self.result_storage_supported(result_storage) {
-            return Err(ActorExecutionError::UnsupportedMethod);
+            return Err(ActorExecutionError::UnsupportedResultStorage);
         }
         if self.invocation_result_count(result_storage) >= MAX_INVOCATION_RESULTS_PER_LANE
             || self
@@ -2273,13 +2303,19 @@ mod tests {
         let before = runtime.snapshot();
         assert_eq!(
             runtime.prepare_execution_state(&invocation),
-            Err(ActorExecutionError::UnsupportedMethod)
+            Err(ActorExecutionError::UnsupportedResultStorage)
         );
         assert_eq!(
             runtime.snapshot(),
             before,
             "rejection must not mutate state"
         );
+        assert_eq!(
+            runtime.commit_exact_outcome_clock(&invocation, 2),
+            Err(ActorExecutionError::UnsupportedResultStorage),
+            "an exact-outcome clock cannot synthesize unsupported result storage"
+        );
+        assert_eq!(runtime.snapshot(), before);
 
         let historical_entry = StandardLaneEntry {
             actor: ActorId([0x79; 32]),

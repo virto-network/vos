@@ -277,6 +277,9 @@ pub enum ActorExecutionError {
     StaleDeployment,
     WrongProgram,
     UnsupportedMethod,
+    /// The agent profile or runtime capabilities do not expose the durable
+    /// component which owns this invocation mode's exact result.
+    UnsupportedResultStorage,
     MissingState,
     InvalidAvailability,
     InvalidInput,
@@ -287,6 +290,30 @@ pub enum ActorExecutionError {
     AuthorityExpired,
     AuthoritySlotRegressed,
     UnsupportedHostCall(u64),
+}
+
+impl ActorExecutionError {
+    /// Whether an authenticated, fresh, structurally admitted invocation must
+    /// retain this deterministic rejection as an exact external outcome.
+    ///
+    /// The caller is still responsible for proving that the error arose after
+    /// admission. In particular, [`Self::InvalidInput`] is durable only at the
+    /// trusted runtime boundary; malformed host input is rejected before this
+    /// classification is consulted.
+    pub const fn is_durable_exact_outcome(self) -> bool {
+        matches!(
+            self,
+            Self::NotFound
+                | Self::StaleIncarnation
+                | Self::Suspended
+                | Self::StaleDeployment
+                | Self::WrongProgram
+                | Self::UnsupportedMethod
+                | Self::InvalidInput
+                | Self::InvalidActorOutput
+                | Self::UnsupportedHostCall(_)
+        )
+    }
 }
 
 /// Complete runtime execution call. `state` is opaque to the node.
@@ -999,6 +1026,36 @@ mod tests {
             invocation.validate(),
             Err(ActorExecutionError::InvalidInput)
         );
+    }
+
+    #[test]
+    fn exact_outcome_error_classification_is_exhaustive() {
+        for error in [
+            ActorExecutionError::NotFound,
+            ActorExecutionError::StaleIncarnation,
+            ActorExecutionError::Suspended,
+            ActorExecutionError::StaleDeployment,
+            ActorExecutionError::WrongProgram,
+            ActorExecutionError::UnsupportedMethod,
+            ActorExecutionError::InvalidInput,
+            ActorExecutionError::InvalidActorOutput,
+            ActorExecutionError::UnsupportedHostCall(u64::MAX),
+        ] {
+            assert!(error.is_durable_exact_outcome(), "{error:?}");
+        }
+        for error in [
+            ActorExecutionError::NotCreated,
+            ActorExecutionError::UnsupportedResultStorage,
+            ActorExecutionError::MissingState,
+            ActorExecutionError::InvalidAvailability,
+            ActorExecutionError::DivergentInvocation,
+            ActorExecutionError::ResultCapacity,
+            ActorExecutionError::InvalidAuthorization,
+            ActorExecutionError::AuthorityExpired,
+            ActorExecutionError::AuthoritySlotRegressed,
+        ] {
+            assert!(!error.is_durable_exact_outcome(), "{error:?}");
+        }
     }
 
     #[cfg(feature = "pvm")]

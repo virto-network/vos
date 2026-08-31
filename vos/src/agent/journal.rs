@@ -65,6 +65,18 @@ pub const MAX_INVOCATION_INDEX_MANIFEST_BYTES: usize = 4 * 1024;
 pub const MAX_INVOCATION_INDEX_NODE_BYTES: usize = 4 * 1024;
 /// Maximum canonical key/value leaf stored by an ownership index.
 pub const MAX_INVOCATION_OWNERSHIP_LEAF_BYTES: usize = 1024;
+/// Maximum retained, pending, or otherwise live invocation identities in one
+/// ownership scope. Acknowledged tombstones remain forever but do not consume
+/// a live slot.
+pub const MAX_INVOCATION_INDEX_LIVE_ENTRIES: u64 = 256;
+/// Maximum exact-result bytes reserved by one ownership scope. Pending Merge
+/// results reserve the complete record bound until finalization reveals the
+/// exact encoded length.
+pub const MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES: u64 = 4 * 1024 * 1024;
+/// Permanent logical-history ceiling before a checkpoint-governed physical
+/// index rollover is required. Existing members may still retry or transition
+/// at the ceiling.
+pub const MAX_INVOCATION_INDEX_LOGICAL_ENTRIES: u64 = 1_000_000;
 /// Maximum complete exact invocation-outcome record. A result may retain the
 /// actor ABI's full 8-KiB reply; the remaining half is a fixed-size audit and
 /// replay-authentication envelope.
@@ -367,22 +379,71 @@ pub enum InvocationDisposition {
     OutOfGas = 4,
 }
 
-/// Whether the invocation still owns a guest result or is a tombstone.
+/// Durable exact-result lifecycle for one invocation identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
 pub enum InvocationResultState {
-    /// A successfully applied result remains retrievable and acknowledgeable.
-    Retained = 0,
-    /// The retrievable result was explicitly acknowledged.
-    Acknowledged = 1,
-    /// Forbidden, panic, or out-of-gas permanently owns the identity without
-    /// retaining a guest reply.
-    Terminal = 2,
+    /// A Merge invocation owns its identity at the signed source event, but
+    /// its exact result is not public until an ordered seal finalizes it.
+    PendingMerge { source_event: MergeEventId },
+    /// Exact result is durably retrievable.
+    Retained {
+        disposition: InvocationDisposition,
+        outcome: InvocationOutcomeRef,
+    },
+    /// Acknowledgement itself is Merge work and remains unfinalized until an
+    /// ordered seal includes this exact acknowledgement event.
+    PendingMergeAcknowledgement {
+        acknowledgement_event: MergeEventId,
+        disposition: InvocationDisposition,
+        outcome: InvocationOutcomeRef,
+    },
+    /// Permanent ownership tombstone. The disposition remains authenticated
+    /// after the outcome object becomes unreachable from the live index.
+    Acknowledged { disposition: InvocationDisposition },
 }
 
 impl InvocationResultState {
     pub const fn is_tombstone(self) -> bool {
-        matches!(self, Self::Acknowledged | Self::Terminal)
+        matches!(self, Self::Acknowledged { .. })
+    }
+
+    pub const fn disposition(self) -> Option<InvocationDisposition> {
+        match self {
+            Self::PendingMerge { .. } => None,
+            Self::Retained { disposition, .. }
+            | Self::PendingMergeAcknowledgement { disposition, .. }
+            | Self::Acknowledged { disposition } => Some(disposition),
+        }
+    }
+
+    pub const fn outcome(self) -> Option<InvocationOutcomeRef> {
+        match self {
+            Self::Retained { outcome, .. } | Self::PendingMergeAcknowledgement { outcome, .. } => {
+                Some(outcome)
+            }
+            Self::PendingMerge { .. } | Self::Acknowledged { .. } => None,
+        }
+    }
+
+    pub const fn is_unfinalized(self) -> bool {
+        matches!(
+            self,
+            Self::PendingMerge { .. } | Self::PendingMergeAcknowledgement { .. }
+        )
+    }
+
+    pub const fn outcome_records(self) -> u64 {
+        if self.outcome().is_some() { 1 } else { 0 }
+    }
+
+    pub const fn reserved_outcome_bytes(self) -> u64 {
+        match self {
+            Self::PendingMerge { .. } => MAX_INVOCATION_OUTCOME_BYTES as u64,
+            Self::Retained { outcome, .. } | Self::PendingMergeAcknowledgement { outcome, .. } => {
+                outcome.encoded_bytes as u64
+            }
+            Self::Acknowledged { .. } => 0,
+        }
     }
 }
 
@@ -398,11 +459,30 @@ pub struct InvocationOwner {
     /// Present exactly when `lane` and `scope` are Local, and equal to the
     /// scope's exact node.
     pub node: Option<NodeId>,
-    pub disposition: InvocationDisposition,
     pub result_state: InvocationResultState,
 }
 
 impl InvocationOwner {
+    pub const fn disposition(self) -> Option<InvocationDisposition> {
+        self.result_state.disposition()
+    }
+
+    pub const fn outcome(self) -> Option<InvocationOutcomeRef> {
+        self.result_state.outcome()
+    }
+
+    pub const fn is_unfinalized(self) -> bool {
+        self.result_state.is_unfinalized()
+    }
+
+    pub const fn outcome_records(self) -> u64 {
+        self.result_state.outcome_records()
+    }
+
+    pub const fn reserved_outcome_bytes(self) -> u64 {
+        self.result_state.reserved_outcome_bytes()
+    }
+
     pub fn validate(self) -> Result<(), DecodeError> {
         self.scope.validate()?;
         let owner_matches_scope = match (self.scope, self.lane, self.node) {
@@ -419,23 +499,27 @@ impl InvocationOwner {
             ) => scope_node == owner_node && owner_node != NodeId::ZERO,
             _ => false,
         };
-        let state_matches_disposition = matches!(
-            (self.disposition, self.result_state),
+        let state_matches_scope = match (self.scope, self.result_state) {
             (
-                InvocationDisposition::Applied,
-                InvocationResultState::Retained | InvocationResultState::Acknowledged
-            ) | (
-                InvocationDisposition::Rejected
-                    | InvocationDisposition::Forbidden
-                    | InvocationDisposition::Panicked
-                    | InvocationDisposition::OutOfGas,
-                InvocationResultState::Terminal
-            )
-        );
+                InvocationOwnershipScope::Merge,
+                InvocationResultState::PendingMerge { source_event },
+            ) => source_event != MergeEventId::ZERO,
+            (
+                InvocationOwnershipScope::Merge,
+                InvocationResultState::PendingMergeAcknowledgement {
+                    acknowledgement_event,
+                    outcome,
+                    ..
+                },
+            ) => acknowledgement_event != MergeEventId::ZERO && outcome.validate().is_ok(),
+            (_, InvocationResultState::Retained { outcome, .. }) => outcome.validate().is_ok(),
+            (_, InvocationResultState::Acknowledged { .. }) => true,
+            _ => false,
+        };
         if self.request_commitment == Hash::ZERO
             || self.first_input == ReplayInputId::ZERO
             || !owner_matches_scope
-            || !state_matches_disposition
+            || !state_matches_scope
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -836,43 +920,35 @@ impl InvocationOutcomeRecord {
             }
         }
 
-        let terminal = !matches!(
-            &self.result,
-            Ok(ActorExecutionReply {
-                status: ActorExecutionStatus::Done,
-                ..
-            })
-        );
-        if terminal {
-            if self.before != self.after {
-                return Err(DecodeError::NonCanonical);
+        // Every authenticated execution attempt may advance the authority-slot
+        // high-water in its owning result component, including rejected and
+        // non-Done results. Replay validates that narrower semantic delta;
+        // this self-contained protocol record prevents any other visible
+        // component from changing.
+        let non_owner_unchanged = match self.lane {
+            PersistedLane::Control => {
+                self.before.linear == self.after.linear
+                    && self.before.merge == self.after.merge
+                    && self.before.local == self.after.local
             }
-        } else {
-            let non_owner_unchanged = match self.lane {
-                PersistedLane::Control => {
-                    self.before.linear == self.after.linear
-                        && self.before.merge == self.after.merge
-                        && self.before.local == self.after.local
-                }
-                PersistedLane::Linear => {
-                    self.before.control == self.after.control
-                        && self.before.merge == self.after.merge
-                        && self.before.local == self.after.local
-                }
-                PersistedLane::Merge => {
-                    self.before.control == self.after.control
-                        && self.before.linear == self.after.linear
-                        && self.before.local == self.after.local
-                }
-                PersistedLane::Local => {
-                    self.before.control == self.after.control
-                        && self.before.linear == self.after.linear
-                        && self.before.merge == self.after.merge
-                }
-            };
-            if !non_owner_unchanged {
-                return Err(DecodeError::NonCanonical);
+            PersistedLane::Linear => {
+                self.before.control == self.after.control
+                    && self.before.merge == self.after.merge
+                    && self.before.local == self.after.local
             }
+            PersistedLane::Merge => {
+                self.before.control == self.after.control
+                    && self.before.linear == self.after.linear
+                    && self.before.local == self.after.local
+            }
+            PersistedLane::Local => {
+                self.before.control == self.after.control
+                    && self.before.linear == self.after.linear
+                    && self.before.merge == self.after.merge
+            }
+        };
+        if !non_owner_unchanged {
+            return Err(DecodeError::NonCanonical);
         }
         validate_encoded_bound(self, MAX_INVOCATION_OUTCOME_BYTES)
     }
@@ -1068,9 +1144,15 @@ pub struct InvocationIndexManifest {
     /// Resolution must reject any reachable node or leaf whose embedded
     /// genesis/scope differs from this manifest.
     pub root: Option<InvocationIndexNodeId>,
-    /// Total leaves, including acknowledged and terminal tombstones.
+    /// Total leaves, including permanent acknowledged tombstones.
     pub entries: u64,
     pub tombstones: u64,
+    /// Pending source events plus pending Merge acknowledgements.
+    pub unfinalized: u64,
+    /// Leaves which retain an exact outcome reference.
+    pub outcome_records: u64,
+    /// Aggregate exact or conservatively reserved outcome bytes.
+    pub reserved_outcome_bytes: u64,
 }
 
 impl InvocationIndexManifest {
@@ -1081,15 +1163,32 @@ impl InvocationIndexManifest {
             root: None,
             entries: 0,
             tombstones: 0,
+            unfinalized: 0,
+            outcome_records: 0,
+            reserved_outcome_bytes: 0,
         }
     }
 
     fn validate_inner(&self) -> Result<(), DecodeError> {
         self.scope.validate()?;
+        let live = self.entries.checked_sub(self.tombstones);
         if self.genesis == AgentJournalGenesisId::ZERO
             || self.root == Some(InvocationIndexNodeId::ZERO)
             || (self.entries == 0) != self.root.is_none()
             || self.tombstones > self.entries
+            || self.entries > MAX_INVOCATION_INDEX_LOGICAL_ENTRIES
+            || live.is_none_or(|entries| entries > MAX_INVOCATION_INDEX_LIVE_ENTRIES)
+            || live.is_some_and(|entries| {
+                self.unfinalized > entries
+                    || self.outcome_records > entries
+                    || ((self.reserved_outcome_bytes == 0) != (entries == 0))
+            })
+            || self.reserved_outcome_bytes > MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES
+            || (self.entries == 0
+                && (self.tombstones != 0
+                    || self.unfinalized != 0
+                    || self.outcome_records != 0
+                    || self.reserved_outcome_bytes != 0))
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -1107,6 +1206,9 @@ impl ServiceWire for InvocationIndexManifest {
         encoder.option(&self.root, |encoder, root| encoder.fixed(&root.0));
         encoder.u64(self.entries);
         encoder.u64(self.tombstones);
+        encoder.u64(self.unfinalized);
+        encoder.u64(self.outcome_records);
+        encoder.u64(self.reserved_outcome_bytes);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -1117,6 +1219,9 @@ impl ServiceWire for InvocationIndexManifest {
             root: decoder.option(|decoder| Ok(InvocationIndexNodeId(decoder.fixed()?)))?,
             entries: decoder.u64()?,
             tombstones: decoder.u64()?,
+            unfinalized: decoder.u64()?,
+            outcome_records: decoder.u64()?,
+            reserved_outcome_bytes: decoder.u64()?,
         };
         manifest.validate_inner()?;
         Ok(manifest)
@@ -1160,12 +1265,18 @@ pub enum ReplayOperation {
         invocation: ActorInvocation,
         authority: ActorInvocationReceipt,
     },
+    /// Ordered maintenance entry which finalizes the exact Merge frontier
+    /// named by its enclosing [`OrderedEntry`]. It carries no guest request or
+    /// authority receipt: the ordered/Raft admission of the entry is its sole
+    /// authority, and replay requires the runtime transition itself to be a
+    /// byte-exact no-op apart from finalizing authenticated Merge outcomes.
+    SealMerge,
 }
 
 impl ReplayOperation {
     pub const fn persisted_lane(&self) -> PersistedLane {
         match self {
-            Self::Management { .. } => PersistedLane::Control,
+            Self::Management { .. } | Self::SealMerge => PersistedLane::Control,
             Self::Invoke { invocation, .. } | Self::Acknowledge { invocation, .. } => {
                 PersistedLane::from_result_storage(invocation.mode.result_storage())
             }
@@ -1209,6 +1320,7 @@ impl ReplayInput {
                 invocation,
                 authority,
             } => validate_invocation_receipt(&self.runtime, invocation, authority)?,
+            ReplayOperation::SealMerge => {}
         }
         Ok(())
     }
@@ -1378,8 +1490,9 @@ pub struct OrderedEntry {
     /// is the content ID of the explicit empty frontier, never an absent alias.
     pub merge_frontier: MergeFrontierId,
     /// Raft/local-ordered fence over `merge_frontier`. Every directory or
-    /// runtime lifecycle mutation requires one; ordinary invocation and
-    /// acknowledgement entries must not carry one.
+    /// runtime lifecycle mutation requires one, as does a seal-only maintenance
+    /// entry; ordinary invocation and acknowledgement entries must not carry
+    /// one.
     pub merge_seal: Option<MergeSealId>,
     pub input: ReplayInput,
 }
@@ -1398,8 +1511,10 @@ impl OrderedEntry {
                 PersistedLane::Control | PersistedLane::Linear
             )
             || is_create_operation(&self.input.operation)
-            || (matches!(&self.input.operation, ReplayOperation::Management { .. })
-                != self.merge_seal.is_some())
+            || (matches!(
+                &self.input.operation,
+                ReplayOperation::Management { .. } | ReplayOperation::SealMerge
+            ) != self.merge_seal.is_some())
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -2467,6 +2582,7 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
             encode_actor_invocation(encoder, invocation);
             encoder.bytes(&authority.encode());
         }
+        ReplayOperation::SealMerge => encoder.u8(3),
     }
 }
 
@@ -2497,6 +2613,7 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
                 MAX_AUTHORITY_RECEIPT_BYTES,
             )?)?,
         }),
+        3 => Ok(ReplayOperation::SealMerge),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -2918,8 +3035,34 @@ fn encode_invocation_owner(encoder: &mut Encoder<'_>, owner: InvocationOwner) {
     encoder.fixed(&owner.first_input.0);
     encoder.u8(owner.lane as u8);
     encoder.option(&owner.node, |encoder, node| encoder.fixed(&node.0));
-    encoder.u8(owner.disposition as u8);
-    encoder.u8(owner.result_state as u8);
+    match owner.result_state {
+        InvocationResultState::PendingMerge { source_event } => {
+            encoder.u8(0);
+            encoder.fixed(&source_event.0);
+        }
+        InvocationResultState::Retained {
+            disposition,
+            outcome,
+        } => {
+            encoder.u8(1);
+            encode_invocation_disposition(encoder, disposition);
+            encode_invocation_outcome_ref(encoder, outcome);
+        }
+        InvocationResultState::PendingMergeAcknowledgement {
+            acknowledgement_event,
+            disposition,
+            outcome,
+        } => {
+            encoder.u8(2);
+            encoder.fixed(&acknowledgement_event.0);
+            encode_invocation_disposition(encoder, disposition);
+            encode_invocation_outcome_ref(encoder, outcome);
+        }
+        InvocationResultState::Acknowledged { disposition } => {
+            encoder.u8(3);
+            encode_invocation_disposition(encoder, disposition);
+        }
+    }
 }
 
 fn decode_invocation_owner(decoder: &mut Decoder<'_>) -> Result<InvocationOwner, DecodeError> {
@@ -2929,23 +3072,60 @@ fn decode_invocation_owner(decoder: &mut Decoder<'_>) -> Result<InvocationOwner,
         first_input: ReplayInputId(decoder.fixed()?),
         lane: decode_persisted_lane(decoder.u8()?)?,
         node: decoder.option(|decoder| Ok(NodeId(decoder.fixed()?)))?,
-        disposition: match decoder.u8()? {
-            0 => InvocationDisposition::Applied,
-            1 => InvocationDisposition::Rejected,
-            2 => InvocationDisposition::Forbidden,
-            3 => InvocationDisposition::Panicked,
-            4 => InvocationDisposition::OutOfGas,
-            _ => return Err(DecodeError::InvalidTag),
-        },
         result_state: match decoder.u8()? {
-            0 => InvocationResultState::Retained,
-            1 => InvocationResultState::Acknowledged,
-            2 => InvocationResultState::Terminal,
+            0 => InvocationResultState::PendingMerge {
+                source_event: MergeEventId(decoder.fixed()?),
+            },
+            1 => InvocationResultState::Retained {
+                disposition: decode_invocation_disposition(decoder)?,
+                outcome: decode_invocation_outcome_ref(decoder)?,
+            },
+            2 => InvocationResultState::PendingMergeAcknowledgement {
+                acknowledgement_event: MergeEventId(decoder.fixed()?),
+                disposition: decode_invocation_disposition(decoder)?,
+                outcome: decode_invocation_outcome_ref(decoder)?,
+            },
+            3 => InvocationResultState::Acknowledged {
+                disposition: decode_invocation_disposition(decoder)?,
+            },
             _ => return Err(DecodeError::InvalidTag),
         },
     };
     owner.validate()?;
     Ok(owner)
+}
+
+fn encode_invocation_disposition(encoder: &mut Encoder<'_>, disposition: InvocationDisposition) {
+    encoder.u8(disposition as u8);
+}
+
+fn decode_invocation_disposition(
+    decoder: &mut Decoder<'_>,
+) -> Result<InvocationDisposition, DecodeError> {
+    match decoder.u8()? {
+        0 => Ok(InvocationDisposition::Applied),
+        1 => Ok(InvocationDisposition::Rejected),
+        2 => Ok(InvocationDisposition::Forbidden),
+        3 => Ok(InvocationDisposition::Panicked),
+        4 => Ok(InvocationDisposition::OutOfGas),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn encode_invocation_outcome_ref(encoder: &mut Encoder<'_>, outcome: InvocationOutcomeRef) {
+    encoder.fixed(&outcome.outcome.0);
+    encoder.u32(outcome.encoded_bytes);
+}
+
+fn decode_invocation_outcome_ref(
+    decoder: &mut Decoder<'_>,
+) -> Result<InvocationOutcomeRef, DecodeError> {
+    let outcome = InvocationOutcomeRef {
+        outcome: InvocationOutcomeId(decoder.fixed()?),
+        encoded_bytes: decoder.u32()?,
+    };
+    outcome.validate()?;
+    Ok(outcome)
 }
 
 fn encode_blob_ref(encoder: &mut Encoder<'_>, reference: &BlobRef) {
@@ -3266,8 +3446,13 @@ mod tests {
                 first_input: replay_input(MethodMode::Linear, false).id(),
                 lane,
                 node,
-                disposition: InvocationDisposition::Applied,
-                result_state: InvocationResultState::Retained,
+                result_state: InvocationResultState::Retained {
+                    disposition: InvocationDisposition::Applied,
+                    outcome: InvocationOutcomeRef {
+                        outcome: InvocationOutcomeId([0xb3; 32]),
+                        encoded_bytes: 512,
+                    },
+                },
             },
         }
     }
@@ -3454,12 +3639,15 @@ mod tests {
             ActorExecutionError::AuthorityExpired,
             ActorExecutionError::AuthoritySlotRegressed,
             ActorExecutionError::UnsupportedHostCall(u64::MAX),
+            ActorExecutionError::UnsupportedResultStorage,
         ];
         for error in errors {
-            let (_, record) = outcome_record(MethodMode::Linear, |_| Err(error));
+            let (_, mut record) = outcome_record(MethodMode::Linear, |_| Err(error));
             assert_eq!(record.result, Err(error));
             assert_eq!(record.disposition(), InvocationDisposition::Rejected);
             assert_eq!(record.before, record.after);
+            record.after.linear.as_mut().unwrap().hash = Hash([0x91; 32]);
+            record.validate().unwrap();
             roundtrip(&record);
         }
 
@@ -3612,8 +3800,12 @@ mod tests {
                 Vec::new(),
             ))
         });
+        let mut owner_advanced = terminal.clone();
+        owner_advanced.after.merge.as_mut().unwrap().hash = Hash([0xa3; 32]);
+        owner_advanced.validate().unwrap();
+        roundtrip(&owner_advanced);
         let mut invalid = terminal.clone();
-        invalid.after.merge.as_mut().unwrap().hash = Hash([0xa3; 32]);
+        invalid.after.control.hash = Hash([0xa3; 32]);
         assert_eq!(invalid.validate(), Err(DecodeError::NonCanonical));
         let mut invalid = terminal;
         let Ok(reply) = &mut invalid.result else {
@@ -3765,7 +3957,7 @@ mod tests {
     }
 
     #[test]
-    fn invocation_owner_result_states_are_canonical_tombstones() {
+    fn invocation_owner_result_states_bind_exact_lifecycle_data() {
         let genesis = AgentJournalGenesis {
             admission: genesis_admission(),
             create: create_input(),
@@ -3778,28 +3970,67 @@ mod tests {
             None,
         );
         assert!(!retained.owner.result_state.is_tombstone());
+        assert_eq!(
+            retained.owner.disposition(),
+            Some(InvocationDisposition::Applied)
+        );
+        assert!(retained.owner.outcome().is_some());
+        assert!(!retained.owner.is_unfinalized());
 
         let mut acknowledged = retained;
-        acknowledged.owner.result_state = InvocationResultState::Acknowledged;
+        acknowledged.owner.result_state = InvocationResultState::Acknowledged {
+            disposition: InvocationDisposition::Applied,
+        };
         acknowledged.validate().unwrap();
         assert!(acknowledged.owner.result_state.is_tombstone());
+        assert_eq!(acknowledged.owner.outcome(), None);
+        assert_eq!(acknowledged.owner.reserved_outcome_bytes(), 0);
 
-        let mut terminal = retained;
-        terminal.owner.disposition = InvocationDisposition::Forbidden;
-        terminal.owner.result_state = InvocationResultState::Terminal;
-        terminal.validate().unwrap();
-        assert!(terminal.owner.result_state.is_tombstone());
-
-        let mut terminal_with_result = terminal;
-        terminal_with_result.owner.result_state = InvocationResultState::Retained;
+        let mut pending_merge = ownership_leaf(
+            genesis,
+            InvocationOwnershipScope::Merge,
+            PersistedLane::Merge,
+            None,
+        );
+        pending_merge.owner.result_state = InvocationResultState::PendingMerge {
+            source_event: MergeEventId([0xc2; 32]),
+        };
+        pending_merge.validate().unwrap();
+        assert_eq!(pending_merge.owner.disposition(), None);
+        assert!(pending_merge.owner.is_unfinalized());
         assert_eq!(
-            terminal_with_result.validate(),
-            Err(DecodeError::NonCanonical)
+            pending_merge.owner.reserved_outcome_bytes(),
+            MAX_INVOCATION_OUTCOME_BYTES as u64
         );
 
-        let mut applied_tombstone = retained;
-        applied_tombstone.owner.result_state = InvocationResultState::Terminal;
-        assert_eq!(applied_tombstone.validate(), Err(DecodeError::NonCanonical));
+        let mut pending_acknowledgement = pending_merge;
+        pending_acknowledgement.owner.result_state =
+            InvocationResultState::PendingMergeAcknowledgement {
+                acknowledgement_event: MergeEventId([0xc3; 32]),
+                disposition: InvocationDisposition::Forbidden,
+                outcome: InvocationOutcomeRef {
+                    outcome: InvocationOutcomeId([0xc4; 32]),
+                    encoded_bytes: 640,
+                },
+            };
+        pending_acknowledgement.validate().unwrap();
+        assert!(pending_acknowledgement.owner.is_unfinalized());
+        assert_eq!(
+            pending_acknowledgement.owner.disposition(),
+            Some(InvocationDisposition::Forbidden)
+        );
+        assert_eq!(pending_acknowledgement.owner.reserved_outcome_bytes(), 640);
+
+        let mut ordered_pending = retained;
+        ordered_pending.owner.result_state = InvocationResultState::PendingMerge {
+            source_event: MergeEventId([0xc2; 32]),
+        };
+        assert_eq!(ordered_pending.validate(), Err(DecodeError::NonCanonical));
+
+        pending_merge.owner.result_state = InvocationResultState::PendingMerge {
+            source_event: MergeEventId::ZERO,
+        };
+        assert_eq!(pending_merge.validate(), Err(DecodeError::NonCanonical));
     }
 
     #[test]
@@ -3840,6 +4071,54 @@ mod tests {
             ..ordered
         };
         assert_eq!(excess_tombstones.validate(), Err(DecodeError::NonCanonical));
+
+        let live_without_reserved_bytes = InvocationIndexManifest {
+            root: Some(InvocationIndexNodeId([0xd1; 32])),
+            entries: 1,
+            ..ordered
+        };
+        assert_eq!(
+            live_without_reserved_bytes.validate(),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let impossible_unfinalized = InvocationIndexManifest {
+            root: Some(InvocationIndexNodeId([0xd1; 32])),
+            entries: 2,
+            tombstones: 1,
+            unfinalized: 2,
+            reserved_outcome_bytes: 1,
+            ..ordered
+        };
+        assert_eq!(
+            impossible_unfinalized.validate(),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let impossible_outcomes = InvocationIndexManifest {
+            root: Some(InvocationIndexNodeId([0xd1; 32])),
+            entries: 2,
+            tombstones: 1,
+            outcome_records: 2,
+            reserved_outcome_bytes: 1,
+            ..ordered
+        };
+        assert_eq!(
+            impossible_outcomes.validate(),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let tombstones_with_reserved_bytes = InvocationIndexManifest {
+            root: Some(InvocationIndexNodeId([0xd1; 32])),
+            entries: 1,
+            tombstones: 1,
+            reserved_outcome_bytes: 1,
+            ..ordered
+        };
+        assert_eq!(
+            tombstones_with_reserved_bytes.validate(),
+            Err(DecodeError::NonCanonical)
+        );
 
         let invalid_local =
             InvocationIndexManifest::empty(genesis, InvocationOwnershipScope::Local(NodeId::ZERO));
@@ -3917,6 +4196,33 @@ mod tests {
             roundtrip(&invoke);
             roundtrip(&acknowledge);
         }
+    }
+
+    #[test]
+    fn seal_merge_is_a_canonical_unit_control_operation() {
+        let input = ReplayInput {
+            runtime: runtime_binding(),
+            operation: ReplayOperation::SealMerge,
+        };
+        assert_eq!(input.persisted_lane(), PersistedLane::Control);
+        input.validate().unwrap();
+        roundtrip(&input);
+
+        let mut encoded = Vec::new();
+        encode_replay_operation(&mut Encoder(&mut encoded), &ReplayOperation::SealMerge);
+        assert_eq!(encoded, vec![3]);
+        let mut decoder = Decoder::new(&encoded);
+        assert_eq!(
+            decode_replay_operation(&mut decoder),
+            Ok(ReplayOperation::SealMerge)
+        );
+        assert!(decoder.exhausted());
+
+        let mut unknown = Decoder::new(&[4]);
+        assert_eq!(
+            decode_replay_operation(&mut unknown),
+            Err(DecodeError::InvalidTag)
+        );
     }
 
     #[test]
@@ -4032,7 +4338,7 @@ mod tests {
     }
 
     #[test]
-    fn every_post_genesis_management_entry_requires_a_merge_fence() {
+    fn management_and_seal_only_entries_require_a_merge_fence() {
         let genesis = AgentJournalGenesis {
             admission: genesis_admission(),
             create: create_input(),
@@ -4057,6 +4363,32 @@ mod tests {
         entry.merge_seal = Some(MergeSealId([0x33; 32]));
         entry.validate().unwrap();
         roundtrip(&entry);
+
+        let mut seal_only = OrderedEntry {
+            input: ReplayInput {
+                runtime: runtime_binding(),
+                operation: ReplayOperation::SealMerge,
+            },
+            ..entry.clone()
+        };
+        seal_only.validate().unwrap();
+        roundtrip(&seal_only);
+        seal_only.merge_seal = None;
+        assert_eq!(seal_only.validate(), Err(DecodeError::NonCanonical));
+
+        let invoke_with_seal = OrderedEntry {
+            input: replay_input(MethodMode::Linear, false),
+            ..entry.clone()
+        };
+        assert_eq!(invoke_with_seal.validate(), Err(DecodeError::NonCanonical));
+        let acknowledge_with_seal = OrderedEntry {
+            input: replay_input(MethodMode::Linear, true),
+            ..entry.clone()
+        };
+        assert_eq!(
+            acknowledge_with_seal.validate(),
+            Err(DecodeError::NonCanonical)
+        );
 
         let create = OrderedEntry {
             input: create_input(),

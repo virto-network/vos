@@ -23,6 +23,8 @@ pub(crate) mod invocation_index;
 pub mod journal;
 #[cfg(feature = "std")]
 pub(crate) mod journal_store;
+#[cfg(feature = "std")]
+pub(crate) mod local_journal_driver;
 #[cfg(feature = "pvm")]
 pub mod machine;
 pub mod package;

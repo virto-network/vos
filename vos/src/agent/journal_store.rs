@@ -36,12 +36,14 @@ use super::committee::{
 use super::execution::MAX_RUNTIME_STATE_BYTES;
 use super::invocation_index::{
     DEFAULT_INVOCATION_INDEX_NODE_LIMIT, InvocationIndexError, InvocationIndexNode,
-    InvocationIndexStore, validate_manifest_root,
+    InvocationIndexStore, InvocationOutcomeStore, collect_manifest_reachability,
+    validate_manifest_root,
 };
 use super::journal::{
     AgentJournalGenesis, ArtifactClosure, CanonicalJournalRecord, CheckpointId, CheckpointManifest,
-    InvocationIndexId, InvocationIndexManifest, InvocationIndexNodeId, InvocationOwnershipScope,
-    JournalHeads, JournalHeadsId, JournalObjectId, JournalStorageClass, LaneCursor, LaneStateId,
+    InvocationIndexId, InvocationIndexManifest, InvocationIndexNodeId, InvocationOutcomeAnchor,
+    InvocationOutcomeId, InvocationOutcomeRecord, InvocationOwnershipScope, JournalHeads,
+    JournalHeadsId, JournalObjectId, JournalStorageClass, LaneCursor, LaneStateId,
     LaneStateManifest, LocalEntry, LocalEntryId, MAX_ARTIFACT_CLOSURE_BYTES,
     MAX_ARTIFACT_CLOSURE_ENTRIES, MAX_ARTIFACT_CLOSURE_REFERENCED_BYTES,
     MAX_CHECKPOINT_MANIFEST_BYTES, MAX_INVOCATION_INDEX_MANIFEST_BYTES,
@@ -52,7 +54,7 @@ use super::journal::{
 };
 use super::replay::{ReplayPublicationAnchor, ReplaySealedGenesis, ReplaySealedPublication};
 use super::wire::{RuntimeState, decode_standard_runtime_state};
-use crate::service::wire::{DecodeError, ServiceWire};
+use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{AgentId, BlobRef, Hash, NodeId};
 
 /// Result of one idempotent journal publication.
@@ -63,6 +65,41 @@ pub struct JournalPublication {
     /// The durable head pointer changed. This is false for an exact retry
     /// after an ambiguous successful publication.
     pub heads_advanced: bool,
+}
+
+/// Explicit work budgets for one checkpoint-governed collection pass.
+///
+/// The scan bounds apply before a durable intent is installed. Once installed,
+/// `max_unlinks_per_run` is a resumable batch size: callers repeat collection
+/// with the same expected heads until [`JournalGc::complete`] is true.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GcLimits {
+    pub(crate) max_index_nodes: usize,
+    pub(crate) max_marked_objects: usize,
+    pub(crate) max_marked_blobs: usize,
+    pub(crate) max_scanned_files: usize,
+    pub(crate) max_scanned_bytes: u64,
+    pub(crate) max_unlinks_per_run: usize,
+}
+
+/// Result of one bounded garbage-collection pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JournalGc {
+    pub(crate) objects_removed: usize,
+    pub(crate) blobs_removed: usize,
+    pub(crate) aliases_removed: usize,
+    pub(crate) resumed: bool,
+    pub(crate) complete: bool,
+}
+
+/// Administrative collection boundary kept separate from normal journal
+/// mutation so replay-only store implementations need not expose physical GC.
+pub(crate) trait AgentJournalGarbageCollection: AgentJournalStore {
+    fn collect_garbage(
+        &mut self,
+        expected_heads: JournalHeadsId,
+        limits: GcLimits,
+    ) -> Result<JournalGc, JournalStoreError>;
 }
 
 /// Physical namespace for opaque bytes authenticated by a journal manifest.
@@ -92,6 +129,9 @@ pub enum JournalStoreError {
     LegacyGeneration,
     NotInitialized,
     Conflict,
+    /// A durable collection intent gates every journal mutation until its
+    /// bounded sweep has been resumed to completion.
+    GcPending,
     InvalidClass,
     NonCanonical,
     LimitExceeded,
@@ -132,7 +172,7 @@ pub(crate) trait CatalogBlobResolverFactory {
 /// from authenticated heads or a checkpoint and follows typed parent IDs.
 /// Content objects are never removed through this interface: later garbage
 /// collection must first prove that a checkpoint covers the retained suffix.
-pub trait AgentJournalStore: InvocationIndexStore<Error = JournalStoreError> {
+pub trait AgentJournalStore: InvocationOutcomeStore<Error = JournalStoreError> {
     /// Install immutable genesis and its empty head envelope. Exact retries
     /// are idempotent. Implementations may durably retain a validated partial
     /// initialization after an I/O failure; retrying this method completes it.
@@ -173,6 +213,97 @@ pub trait AgentJournalStore: InvocationIndexStore<Error = JournalStoreError> {
         &mut self,
         publication: &ReplaySealedPublication,
     ) -> Result<JournalPublication, JournalStoreError>;
+}
+
+const GC_INTENT_NAME: &str = "gc-intent";
+const GC_INTENT_STAGE_NAME: &str = "gc-intent.next";
+const MAX_GC_INTENT_BYTES: usize = 100;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GcIntent {
+    heads: JournalHeadsId,
+    checkpoint: CheckpointId,
+}
+
+impl GcIntent {
+    fn validate(self) -> Result<Self, JournalStoreError> {
+        if self.heads == JournalHeadsId::ZERO || self.checkpoint == CheckpointId::ZERO {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(self)
+    }
+}
+
+impl ServiceWire for GcIntent {
+    const MAGIC: [u8; 4] = *b"AGGI";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(self.heads.as_bytes());
+        encoder.fixed(self.checkpoint.as_bytes());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let intent = Self {
+            heads: JournalHeadsId(decoder.fixed()?),
+            checkpoint: CheckpointId(decoder.fixed()?),
+        };
+        if intent.heads == JournalHeadsId::ZERO || intent.checkpoint == CheckpointId::ZERO {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(intent)
+    }
+}
+
+fn decode_gc_intent(bytes: &[u8]) -> Result<GcIntent, JournalStoreError> {
+    if bytes.len() > MAX_GC_INTENT_BYTES {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let intent = GcIntent::decode(bytes).map_err(|_| JournalStoreError::Corrupt)?;
+    if intent.encode() != bytes {
+        return Err(JournalStoreError::Corrupt);
+    }
+    intent.validate()
+}
+
+#[derive(Debug)]
+struct GcMark {
+    objects: BTreeSet<(JournalStorageClass, [u8; 32])>,
+    blobs: BTreeSet<(JournalBlobClass, Hash)>,
+    max_objects: usize,
+    max_blobs: usize,
+}
+
+impl GcMark {
+    fn new(limits: GcLimits) -> Self {
+        Self {
+            objects: BTreeSet::new(),
+            blobs: BTreeSet::new(),
+            max_objects: limits.max_marked_objects,
+            max_blobs: limits.max_marked_blobs,
+        }
+    }
+
+    fn object<R: CanonicalJournalRecord>(&mut self, id: R::Id) -> Result<(), JournalStoreError> {
+        if self.objects.insert((R::STORAGE_CLASS, *id.as_bytes()))
+            && self.objects.len() > self.max_objects
+        {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn blob(
+        &mut self,
+        class: JournalBlobClass,
+        reference: &BlobRef,
+    ) -> Result<(), JournalStoreError> {
+        validate_blob_reference(class, reference)?;
+        if self.blobs.insert((class, reference.hash)) && self.blobs.len() > self.max_blobs {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -375,7 +506,8 @@ fn validate_publication_shape<R: CanonicalJournalRecord>(
                 || next.merge_frontier != current.merge_frontier
                 || next.merge_fence != expected_fence
                 || next.merge_seal != expected_seal
-                || next.merge_invocations != current.merge_invocations
+                || (entry.merge_seal.is_none()
+                    && next.merge_invocations != current.merge_invocations)
                 || next.local_invocations != current.local_invocations
                 || next.local_head != current.local_head
                 || next.local_revision != current.local_revision
@@ -773,14 +905,15 @@ fn validate_invocation_index<S: AgentJournalStore>(
 fn map_invocation_index_error(error: InvocationIndexError<JournalStoreError>) -> JournalStoreError {
     match error {
         InvocationIndexError::Storage(error) => error,
-        InvocationIndexError::MissingManifest(_) | InvocationIndexError::MissingNode(_) => {
-            JournalStoreError::MissingObject
-        }
-        InvocationIndexError::PathLimit | InvocationIndexError::NodeLimit => {
-            JournalStoreError::LimitExceeded
-        }
+        InvocationIndexError::MissingManifest(_)
+        | InvocationIndexError::MissingNode(_)
+        | InvocationIndexError::MissingOutcome(_) => JournalStoreError::MissingObject,
+        InvocationIndexError::PathLimit
+        | InvocationIndexError::NodeLimit
+        | InvocationIndexError::Capacity => JournalStoreError::LimitExceeded,
         InvocationIndexError::CorruptManifest
         | InvocationIndexError::CorruptNode(_)
+        | InvocationIndexError::CorruptOutcome(_)
         | InvocationIndexError::GenesisMismatch
         | InvocationIndexError::ScopeMismatch
         | InvocationIndexError::SummaryMismatch
@@ -920,6 +1053,335 @@ fn validate_checkpoint_publication<S: AgentJournalStore>(
     }
     validate_checkpoint_closure(store, checkpoint)?;
     Ok(())
+}
+
+fn validate_gc_limits(limits: GcLimits) -> Result<(), JournalStoreError> {
+    if limits.max_marked_objects == 0
+        || limits.max_marked_blobs == 0
+        || limits.max_scanned_files == 0
+        || limits.max_scanned_bytes == 0
+        || limits.max_unlinks_per_run == 0
+    {
+        return Err(JournalStoreError::LimitExceeded);
+    }
+    Ok(())
+}
+
+fn fresh_gc_checkpoint<S: AgentJournalStore>(
+    store: &S,
+    expected_heads: JournalHeadsId,
+) -> Result<(JournalHeads, CheckpointManifest), JournalStoreError> {
+    let heads = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+    if heads.id() != expected_heads {
+        return Err(JournalStoreError::Conflict);
+    }
+    let checkpoint_id = heads.checkpoint.ok_or(JournalStoreError::Conflict)?;
+    let checkpoint = require_record::<S, CheckpointManifest>(store, checkpoint_id)?;
+    let next_revision = checkpoint
+        .publication_revision
+        .checked_add(1)
+        .ok_or(JournalStoreError::LimitExceeded)?;
+    if checkpoint.id() != checkpoint_id
+        || next_revision != heads.publication_revision
+        || checkpoint.genesis != heads.genesis
+        || checkpoint.admission != heads.admission
+        || checkpoint.runtime != heads.runtime
+        || checkpoint.ordered_head != heads.ordered_head
+        || checkpoint.ordered_index != heads.ordered_index
+        || checkpoint.merge_frontier != heads.merge_frontier
+        || checkpoint.merge_fence != heads.merge_fence
+        || checkpoint.merge_seal != heads.merge_seal
+        || checkpoint.ordered_invocations != heads.ordered_invocations
+        || checkpoint.merge_invocations != heads.merge_invocations
+    {
+        return Err(JournalStoreError::Conflict);
+    }
+    let local = checkpoint
+        .lanes
+        .iter()
+        .find(|lane| lane.lane == PersistedLane::Local)
+        .ok_or(JournalStoreError::Corrupt)?;
+    let local_state = require_record::<S, LaneStateManifest>(store, local.state)?;
+    if local.node != Some(heads.node)
+        || local.invocations != Some(heads.local_invocations)
+        || !matches!(
+            local_state.cursor,
+            LaneCursor::Local { node, revision, head }
+                if node == heads.node
+                    && revision == heads.local_revision
+                    && head == heads.local_head
+        )
+    {
+        return Err(JournalStoreError::Conflict);
+    }
+    for lane in &checkpoint.lanes {
+        let state = require_record::<S, LaneStateManifest>(store, lane.state)?;
+        let exact_cursor = match (&lane.lane, &state.cursor) {
+            (PersistedLane::Control | PersistedLane::Linear, LaneCursor::Ordered { base }) => {
+                base.index == heads.ordered_index && base.head == heads.ordered_head
+            }
+            (PersistedLane::Merge, LaneCursor::Merge { frontier }) => {
+                *frontier == heads.merge_frontier
+            }
+            (
+                PersistedLane::Local,
+                LaneCursor::Local {
+                    node,
+                    revision,
+                    head,
+                },
+            ) => {
+                *node == heads.node
+                    && *revision == heads.local_revision
+                    && *head == heads.local_head
+            }
+            _ => false,
+        };
+        if !exact_cursor {
+            return Err(JournalStoreError::Conflict);
+        }
+    }
+    validate_checkpoint_closure(store, &checkpoint)?;
+    validate_head_targets(store, &heads)?;
+    Ok((heads, checkpoint))
+}
+
+fn mark_catalog_blob<S: AgentJournalStore>(
+    store: &S,
+    mark: &mut GcMark,
+    reference: &BlobRef,
+) -> Result<(), JournalStoreError> {
+    require_blob(store, JournalBlobClass::CatalogArtifact, reference)?;
+    mark.blob(JournalBlobClass::CatalogArtifact, reference)
+}
+
+fn mark_lane_state<S: AgentJournalStore>(
+    store: &S,
+    mark: &mut GcMark,
+    id: LaneStateId,
+) -> Result<LaneStateManifest, JournalStoreError> {
+    let state = validate_lane_state(store, id)?;
+    mark.object::<LaneStateManifest>(id)?;
+    mark.blob(JournalBlobClass::LaneState, &state.state)?;
+    mark_catalog_blob(store, mark, &state.runtime.package)?;
+    Ok(state)
+}
+
+fn mark_merge_frontier_tips<S: AgentJournalStore>(
+    store: &S,
+    mark: &mut GcMark,
+    genesis: super::journal::AgentJournalGenesisId,
+    id: MergeFrontierId,
+) -> Result<MergeFrontier, JournalStoreError> {
+    let frontier = require_record::<S, MergeFrontier>(store, id)?;
+    if frontier.genesis != genesis {
+        return Err(JournalStoreError::Corrupt);
+    }
+    mark.object::<MergeFrontier>(id)?;
+    for event_id in &frontier.events {
+        let event = require_record::<S, MergeEvent>(store, *event_id)?;
+        if event.genesis != genesis {
+            return Err(JournalStoreError::Corrupt);
+        }
+        mark.object::<MergeEvent>(*event_id)?;
+        mark_catalog_blob(store, mark, &event.input.runtime.package)?;
+    }
+    Ok(frontier)
+}
+
+fn mark_outcome_anchor<S: AgentJournalStore>(
+    store: &S,
+    mark: &mut GcMark,
+    outcome: &InvocationOutcomeRecord,
+) -> Result<(), JournalStoreError> {
+    match outcome.anchor {
+        InvocationOutcomeAnchor::Ordered { entry } => {
+            let entry = require_record::<S, OrderedEntry>(store, entry)?;
+            if entry.genesis != outcome.genesis
+                || outcome.validate_for(&entry.input).is_err()
+                || outcome.key.scope != InvocationOwnershipScope::Ordered
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+            mark.object::<OrderedEntry>(entry.id())?;
+            mark_catalog_blob(store, mark, &entry.input.runtime.package)?;
+        }
+        InvocationOutcomeAnchor::Local { entry } => {
+            let entry = require_record::<S, LocalEntry>(store, entry)?;
+            let InvocationOwnershipScope::Local(node) = outcome.key.scope else {
+                return Err(JournalStoreError::Corrupt);
+            };
+            if entry.genesis != outcome.genesis
+                || entry.node != node
+                || outcome.validate_for(&entry.input).is_err()
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+            mark.object::<LocalEntry>(entry.id())?;
+            mark_catalog_blob(store, mark, &entry.input.runtime.package)?;
+        }
+        InvocationOutcomeAnchor::Merge {
+            source_event,
+            finalizing_entry,
+            seal,
+        } => {
+            let source = require_record::<S, MergeEvent>(store, source_event)?;
+            let finalizing = require_record::<S, OrderedEntry>(store, finalizing_entry)?;
+            let sealed = require_record::<S, MergeSeal>(store, seal)?;
+            let expected_base = OrderedBase {
+                index: finalizing
+                    .index
+                    .checked_sub(1)
+                    .ok_or(JournalStoreError::Corrupt)?,
+                head: finalizing.parent,
+            };
+            if outcome.key.scope != InvocationOwnershipScope::Merge
+                || source.genesis != outcome.genesis
+                || finalizing.genesis != outcome.genesis
+                || sealed.genesis != outcome.genesis
+                || outcome.validate_for(&source.input).is_err()
+                || finalizing.merge_seal != Some(seal)
+                || sealed.frontier != finalizing.merge_frontier
+                || sealed.ordered_base != expected_base
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+            mark.object::<MergeEvent>(source_event)?;
+            mark.object::<OrderedEntry>(finalizing_entry)?;
+            mark.object::<MergeSeal>(seal)?;
+            mark_catalog_blob(store, mark, &source.input.runtime.package)?;
+            mark_catalog_blob(store, mark, &finalizing.input.runtime.package)?;
+        }
+    }
+    Ok(())
+}
+
+fn mark_invocation_index<S: AgentJournalStore>(
+    store: &S,
+    mark: &mut GcMark,
+    id: InvocationIndexId,
+    genesis: super::journal::AgentJournalGenesisId,
+    scope: InvocationOwnershipScope,
+    max_nodes: usize,
+) -> Result<(), JournalStoreError> {
+    let manifest = require_record::<S, InvocationIndexManifest>(store, id)?;
+    if manifest.genesis != genesis || manifest.scope != scope {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let reachable = collect_manifest_reachability(store, id, &manifest, max_nodes)
+        .map_err(map_invocation_index_error)?;
+    mark.object::<InvocationIndexManifest>(id)?;
+    for node in reachable.nodes {
+        mark.object::<InvocationIndexNode>(node)?;
+    }
+    for id in reachable.outcomes {
+        let outcome = require_record::<S, InvocationOutcomeRecord>(store, id)?;
+        if outcome.genesis != genesis {
+            return Err(JournalStoreError::Corrupt);
+        }
+        mark_outcome_anchor(store, mark, &outcome)?;
+        mark.object::<InvocationOutcomeRecord>(id)?;
+    }
+    Ok(())
+}
+
+fn build_gc_mark<S: AgentJournalStore>(
+    store: &S,
+    expected_heads: JournalHeadsId,
+    limits: GcLimits,
+) -> Result<(GcIntent, GcMark), JournalStoreError> {
+    validate_gc_limits(limits)?;
+    let (heads, checkpoint) = fresh_gc_checkpoint(store, expected_heads)?;
+    let mut mark = GcMark::new(limits);
+    mark.object::<CheckpointManifest>(checkpoint.id())?;
+
+    let genesis = store.genesis()?.ok_or(JournalStoreError::NotInitialized)?;
+    mark_catalog_blob(store, &mut mark, &genesis.runtime().package)?;
+    mark_catalog_blob(store, &mut mark, &heads.runtime.package)?;
+
+    let artifacts = require_record::<S, ArtifactClosure>(store, checkpoint.artifacts)?;
+    if artifacts.genesis != heads.genesis {
+        return Err(JournalStoreError::Corrupt);
+    }
+    mark.object::<ArtifactClosure>(checkpoint.artifacts)?;
+    for artifact in &artifacts.artifacts {
+        mark_catalog_blob(store, &mut mark, artifact)?;
+    }
+    for lane in &checkpoint.lanes {
+        mark_lane_state(store, &mut mark, lane.state)?;
+    }
+
+    if let Some(id) = heads.ordered_head {
+        let entry = require_record::<S, OrderedEntry>(store, id)?;
+        if entry.genesis != heads.genesis || entry.index != heads.ordered_index {
+            return Err(JournalStoreError::Corrupt);
+        }
+        mark.object::<OrderedEntry>(id)?;
+        mark_catalog_blob(store, &mut mark, &entry.input.runtime.package)?;
+    }
+    if let Some(id) = heads.local_head {
+        let entry = require_record::<S, LocalEntry>(store, id)?;
+        if entry.genesis != heads.genesis
+            || entry.node != heads.node
+            || entry.revision != heads.local_revision
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        mark.object::<LocalEntry>(id)?;
+        mark_catalog_blob(store, &mut mark, &entry.input.runtime.package)?;
+    }
+    mark_merge_frontier_tips(store, &mut mark, heads.genesis, heads.merge_frontier)?;
+    if heads.merge_fence != OrderedBase::post_genesis() {
+        let fence = heads.merge_fence.head.ok_or(JournalStoreError::Corrupt)?;
+        let entry = require_record::<S, OrderedEntry>(store, fence)?;
+        let seal_id = heads.merge_seal.ok_or(JournalStoreError::Corrupt)?;
+        let seal = require_record::<S, MergeSeal>(store, seal_id)?;
+        if entry.genesis != heads.genesis
+            || entry.index != heads.merge_fence.index
+            || entry.merge_seal != Some(seal_id)
+            || seal.genesis != heads.genesis
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        mark.object::<OrderedEntry>(fence)?;
+        mark.object::<MergeSeal>(seal_id)?;
+        mark_catalog_blob(store, &mut mark, &entry.input.runtime.package)?;
+        mark_merge_frontier_tips(store, &mut mark, heads.genesis, seal.frontier)?;
+        mark_lane_state(store, &mut mark, seal.merge_state)?;
+    }
+
+    mark_invocation_index(
+        store,
+        &mut mark,
+        heads.ordered_invocations,
+        heads.genesis,
+        InvocationOwnershipScope::Ordered,
+        limits.max_index_nodes,
+    )?;
+    mark_invocation_index(
+        store,
+        &mut mark,
+        heads.merge_invocations,
+        heads.genesis,
+        InvocationOwnershipScope::Merge,
+        limits.max_index_nodes,
+    )?;
+    mark_invocation_index(
+        store,
+        &mut mark,
+        heads.local_invocations,
+        heads.genesis,
+        InvocationOwnershipScope::Local(heads.node),
+        limits.max_index_nodes,
+    )?;
+
+    Ok((
+        GcIntent {
+            heads: expected_heads,
+            checkpoint: checkpoint.id(),
+        },
+        mark,
+    ))
 }
 
 fn ordered_base_is_ancestor<S: AgentJournalStore>(
@@ -1557,6 +2019,21 @@ fn stage_sealed_dependencies<S: AgentJournalStore>(
 ) -> Result<bool, JournalStoreError> {
     validate_sealed_fence_ancestry(store, publication)?;
     let mut created = false;
+    let mut outcome_ids = BTreeSet::new();
+    for sealed in publication.outcomes() {
+        let record = sealed.record();
+        if !outcome_ids.insert(record.id())
+            || record
+                .validate_for_genesis(publication.next().genesis, sealed.input())
+                .is_err()
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        // Exact result bytes must be immutable and readable before a
+        // successor invocation-index root which references them can become
+        // visible through `heads`.
+        created |= store.put(record)?;
+    }
     match publication.anchor() {
         ReplayPublicationAnchor::Merge { frontier, .. } => {
             if publication.checkpoint_validation().is_some()
@@ -1615,6 +2092,7 @@ pub struct MemoryAgentJournalStore {
     // Copy-on-write keeps already-issued catalog resolver snapshots immutable
     // while preserving cheap candidate clones for rollback-safe publication.
     blobs: Arc<BTreeMap<(JournalBlobClass, Hash), Vec<u8>>>,
+    gc_intent: Option<GcIntent>,
 }
 
 /// Immutable snapshot of an in-memory catalog namespace.
@@ -1660,7 +2138,16 @@ impl MemoryAgentJournalStore {
             authority: BTreeMap::new(),
             objects: BTreeMap::new(),
             blobs: Arc::new(BTreeMap::new()),
+            gc_intent: None,
         })
+    }
+
+    fn ensure_no_gc_pending(&self) -> Result<(), JournalStoreError> {
+        if self.gc_intent.is_some() {
+            Err(JournalStoreError::GcPending)
+        } else {
+            Ok(())
+        }
     }
 
     fn validate_scope(&self, genesis: &AgentJournalGenesis) -> Result<(), JournalStoreError> {
@@ -1674,6 +2161,7 @@ impl MemoryAgentJournalStore {
         &mut self,
         record: &R,
     ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         let id = record.storage_id();
         let bytes = record.encode();
         decode_authority_record::<R>(&bytes, id)?;
@@ -1702,6 +2190,7 @@ impl MemoryAgentJournalStore {
         anchor: &R,
         next: &JournalHeads,
     ) -> Result<JournalPublication, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         ensure_publication_class(R::STORAGE_CLASS)?;
         let encoded_anchor = encode_object(anchor)?;
         let encoded_next = encode_object(next)?;
@@ -1750,6 +2239,7 @@ impl MemoryAgentJournalStore {
         &mut self,
         genesis: &AgentJournalGenesis,
     ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         let encoded = encode_object(genesis)?;
         self.validate_scope(genesis)?;
         if self
@@ -1814,6 +2304,7 @@ impl MemoryAgentJournalStore {
 
 impl AgentJournalStore for MemoryAgentJournalStore {
     fn initialize(&mut self, sealed: &ReplaySealedGenesis) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         let shape = validate_sealed_genesis_shape(sealed, self.agent, self.node)?;
         let genesis = sealed.genesis();
         let encoded = encode_object(genesis)?;
@@ -1888,6 +2379,7 @@ impl AgentJournalStore for MemoryAgentJournalStore {
     }
 
     fn put<R: CanonicalJournalRecord>(&mut self, record: &R) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         ensure_content_class(R::STORAGE_CLASS)?;
         let encoded = encode_object(record)?;
         let key = (encoded.class, encoded.id);
@@ -1914,6 +2406,7 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         reference: &BlobRef,
         bytes: &[u8],
     ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         validate_supplied_blob(class, reference, bytes)?;
         let key = (class, reference.hash);
         match self.blobs.get(&key) {
@@ -1945,6 +2438,7 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         &mut self,
         publication: &ReplaySealedPublication,
     ) -> Result<JournalPublication, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         let dependency_created = stage_sealed_dependencies(self, publication)?;
         let expected = publication.expected();
         let next = publication.next();
@@ -1962,6 +2456,82 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         };
         result.object_created |= dependency_created;
         Ok(result)
+    }
+}
+
+impl AgentJournalGarbageCollection for MemoryAgentJournalStore {
+    fn collect_garbage(
+        &mut self,
+        expected_heads: JournalHeadsId,
+        limits: GcLimits,
+    ) -> Result<JournalGc, JournalStoreError> {
+        let (intent, mark) = build_gc_mark(self, expected_heads, limits)?;
+        let resumed = match self.gc_intent {
+            Some(existing) if existing == intent => true,
+            Some(_) => return Err(JournalStoreError::Corrupt),
+            None => false,
+        };
+
+        let mut scanned_files = 0_usize;
+        let mut scanned_bytes = 0_u64;
+        for bytes in self.objects.values().chain(self.blobs.values()) {
+            scanned_files = scanned_files
+                .checked_add(1)
+                .ok_or(JournalStoreError::LimitExceeded)?;
+            scanned_bytes = scanned_bytes
+                .checked_add(
+                    u64::try_from(bytes.len()).map_err(|_| JournalStoreError::LimitExceeded)?,
+                )
+                .ok_or(JournalStoreError::LimitExceeded)?;
+            if scanned_files > limits.max_scanned_files || scanned_bytes > limits.max_scanned_bytes
+            {
+                return Err(JournalStoreError::LimitExceeded);
+            }
+        }
+
+        let garbage_objects = self
+            .objects
+            .keys()
+            .filter(|key| !mark.objects.contains(key))
+            .copied()
+            .collect::<Vec<_>>();
+        let garbage_blobs = self
+            .blobs
+            .keys()
+            .filter(|key| !mark.blobs.contains(key))
+            .copied()
+            .collect::<Vec<_>>();
+        self.gc_intent = Some(intent);
+
+        let mut remaining = limits.max_unlinks_per_run;
+        let mut objects_removed = 0_usize;
+        for key in garbage_objects.iter().take(remaining) {
+            if self.objects.remove(key).is_some() {
+                objects_removed += 1;
+                remaining -= 1;
+            }
+        }
+        let mut blobs_removed = 0_usize;
+        if remaining != 0 {
+            let blobs = Arc::make_mut(&mut self.blobs);
+            for key in garbage_blobs.iter().take(remaining) {
+                if blobs.remove(key).is_some() {
+                    blobs_removed += 1;
+                    remaining -= 1;
+                }
+            }
+        }
+        let complete = garbage_objects.len() + garbage_blobs.len() <= limits.max_unlinks_per_run;
+        if complete {
+            self.gc_intent = None;
+        }
+        Ok(JournalGc {
+            objects_removed,
+            blobs_removed,
+            aliases_removed: 0,
+            resumed,
+            complete,
+        })
     }
 }
 
@@ -1983,6 +2553,184 @@ impl FileIdentity {
             inode: metadata.ino(),
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+const GC_OBJECT_NAMESPACES: &[(JournalStorageClass, &str)] = &[
+    (JournalStorageClass::ReplayInput, "records/replay-inputs"),
+    (JournalStorageClass::OrderedEntry, "records/ordered"),
+    (JournalStorageClass::LocalEntry, "records/local"),
+    (JournalStorageClass::MergeEvent, "records/merge-events"),
+    (
+        JournalStorageClass::MergeFrontier,
+        "records/merge-frontiers",
+    ),
+    (JournalStorageClass::MergeSeal, "records/merge-seals"),
+    (JournalStorageClass::LaneState, "lane-state/manifests"),
+    (JournalStorageClass::ArtifactClosure, "artifact-closures"),
+    (
+        JournalStorageClass::InvocationIndex,
+        "invocation-index/manifests",
+    ),
+    (
+        JournalStorageClass::InvocationIndexNode,
+        "invocation-index/nodes",
+    ),
+    (
+        JournalStorageClass::InvocationOutcome,
+        "invocation-outcomes",
+    ),
+    (JournalStorageClass::Checkpoint, "checkpoints"),
+];
+
+#[cfg(target_os = "linux")]
+const GC_BLOB_NAMESPACES: &[(JournalBlobClass, &str)] = &[
+    (JournalBlobClass::LaneState, "lane-state/blobs"),
+    (JournalBlobClass::CatalogArtifact, "catalog/blobs"),
+];
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileGcKind {
+    Object(JournalStorageClass),
+    Blob(JournalBlobClass),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct FileGcEntry {
+    directory: &'static str,
+    name: String,
+    id: [u8; 32],
+    identity: FileIdentity,
+    bytes: u64,
+    alias: bool,
+    kind: FileGcKind,
+}
+
+#[cfg(target_os = "linux")]
+impl FileGcEntry {
+    fn is_live(&self, mark: &GcMark) -> bool {
+        if self.alias {
+            return false;
+        }
+        match self.kind {
+            FileGcKind::Object(class) => mark.objects.contains(&(class, self.id)),
+            FileGcKind::Blob(class) => mark.blobs.contains(&(class, Hash(self.id))),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn decode_hex_32(name: &[u8]) -> Option<[u8; 32]> {
+    if name.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in name.chunks_exact(2).enumerate() {
+        bytes[index] = (decode_nibble(pair[0])? << 4) | decode_nibble(pair[1])?;
+    }
+    Some(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn scan_gc_directory(
+    directory: &File,
+    directory_key: &'static str,
+    kind: FileGcKind,
+    maximum: usize,
+    limits: GcLimits,
+    scanned_files: &mut usize,
+    scanned_bytes: &mut u64,
+    entries: &mut Vec<FileGcEntry>,
+) -> Result<(), JournalStoreError> {
+    // `fdopendir` consumes its descriptor; scan a duplicate of the pinned
+    // capability and close the stream before any unlink pass begins.
+    // SAFETY: `fcntl` receives a live descriptor and returns a fresh one.
+    let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(JournalStoreError::Unavailable);
+    }
+    // SAFETY: ownership of `duplicate` transfers to the DIR stream.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        // SAFETY: failed `fdopendir` did not consume the descriptor.
+        unsafe { libc::close(duplicate) };
+        return Err(JournalStoreError::Unavailable);
+    }
+    // SAFETY: the stream is live through `closedir` below.
+    unsafe { libc::rewinddir(stream) };
+    let scan = loop {
+        // SAFETY: Linux exposes a thread-local errno pointer.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: the stream remains live until the scan finishes.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            // SAFETY: Linux exposes a thread-local errno pointer.
+            let errno = unsafe { *libc::__errno_location() };
+            break if errno == 0 {
+                Ok(())
+            } else {
+                Err(JournalStoreError::Unavailable)
+            };
+        }
+        // SAFETY: a successful directory entry has a NUL-terminated name.
+        let raw = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if raw == b"." || raw == b".." {
+            continue;
+        }
+        let (stem, alias) = raw
+            .strip_suffix(b".next")
+            .map_or((raw, false), |stem| (stem, true));
+        let Some(id) = decode_hex_32(stem) else {
+            break Err(JournalStoreError::Corrupt);
+        };
+        let Ok(name) = std::str::from_utf8(raw) else {
+            break Err(JournalStoreError::Corrupt);
+        };
+        let status = match stat_at(directory, &c_name(name)?) {
+            Ok(Some(status)) => status,
+            Ok(None) => break Err(JournalStoreError::Corrupt),
+            Err(_) => break Err(JournalStoreError::Unavailable),
+        };
+        // SAFETY: `geteuid` has no preconditions or borrowed state.
+        let effective_user = unsafe { libc::geteuid() };
+        if status.st_mode & libc::S_IFMT != libc::S_IFREG
+            || status.st_uid != effective_user
+            || status.st_mode & 0o022 != 0
+            || status.st_size < 0
+            || status.st_size as u64 > maximum as u64
+        {
+            break Err(JournalStoreError::Corrupt);
+        }
+        *scanned_files = scanned_files
+            .checked_add(1)
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        *scanned_bytes = scanned_bytes
+            .checked_add(status.st_size as u64)
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        if *scanned_files > limits.max_scanned_files || *scanned_bytes > limits.max_scanned_bytes {
+            break Err(JournalStoreError::LimitExceeded);
+        }
+        entries
+            .try_reserve(1)
+            .map_err(|_| JournalStoreError::LimitExceeded)?;
+        entries.push(FileGcEntry {
+            directory: directory_key,
+            name: name.to_owned(),
+            id,
+            identity: status_identity(&status),
+            bytes: status.st_size as u64,
+            alias,
+            kind,
+        });
+    };
+    // SAFETY: `closedir` consumes the live stream and its descriptor.
+    let closed = unsafe { libc::closedir(stream) };
+    if closed != 0 {
+        return Err(JournalStoreError::Unavailable);
+    }
+    scan
 }
 
 #[cfg(target_os = "linux")]
@@ -2505,6 +3253,8 @@ impl FileAgentJournalStore {
                 "genesis.next",
                 "heads",
                 "heads.next",
+                GC_INTENT_NAME,
+                GC_INTENT_STAGE_NAME,
             ],
         )?;
         let directories =
@@ -2542,6 +3292,34 @@ impl FileAgentJournalStore {
             &self.stable_lock_name,
             self.stable_lock_identity,
         )
+    }
+
+    fn read_gc_intent_file(&self, name: &str) -> Result<Option<GcIntent>, JournalStoreError> {
+        let Some(bytes) = read_bounded_regular_at(self.directory("")?, name, MAX_GC_INTENT_BYTES)?
+        else {
+            return Ok(None);
+        };
+        decode_gc_intent(&bytes).map(Some)
+    }
+
+    fn gc_intent(&self) -> Result<Option<GcIntent>, JournalStoreError> {
+        let committed = self.read_gc_intent_file(GC_INTENT_NAME)?;
+        let staged = self.read_gc_intent_file(GC_INTENT_STAGE_NAME)?;
+        match (committed, staged) {
+            (Some(committed), Some(staged)) if committed != staged => {
+                Err(JournalStoreError::Corrupt)
+            }
+            (Some(intent), _) | (None, Some(intent)) => Ok(Some(intent)),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn ensure_no_gc_pending(&self) -> Result<(), JournalStoreError> {
+        if self.gc_intent()?.is_some() {
+            Err(JournalStoreError::GcPending)
+        } else {
+            Ok(())
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2716,6 +3494,7 @@ impl FileAgentJournalStore {
         &self,
         record: &R,
     ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         let id = record.storage_id();
         let bytes = record.encode();
         decode_authority_record::<R>(&bytes, id)?;
@@ -2831,6 +3610,7 @@ impl FileAgentJournalStore {
         &self,
         record: &R,
     ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         ensure_content_class(R::STORAGE_CLASS)?;
         let encoded = encode_object(record)?;
         let directory = self.object_directory(encoded.class)?;
@@ -2872,6 +3652,7 @@ impl FileAgentJournalStore {
         reference: &BlobRef,
         bytes: &[u8],
     ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         validate_supplied_blob(class, reference, bytes)?;
         let directory = self.blob_directory(class);
         persist_immutable_at(
@@ -2896,6 +3677,7 @@ impl FileAgentJournalStore {
     }
 
     fn persist_admission(&self, commitment: Hash) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         if commitment == Hash::ZERO {
             return Err(JournalStoreError::NonCanonical);
         }
@@ -2915,6 +3697,7 @@ impl FileAgentJournalStore {
     }
 
     fn validate_recovery_state(&self) -> Result<(), JournalStoreError> {
+        self.gc_intent()?;
         let admission = self.read_admission("genesis-admission")?;
         let staged_admission = self.read_admission("genesis-admission.next")?;
         if let (Some(committed), Some(staged)) = (admission, staged_admission)
@@ -2966,6 +3749,7 @@ impl FileAgentJournalStore {
     }
 
     fn install_initial_heads(&self, initial: &JournalHeads) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         let encoded = encode_object(initial)?;
         let directory = self.directory("")?;
         if let Some(current) = self.read_fixed::<JournalHeads>("", "heads")? {
@@ -3008,6 +3792,7 @@ impl FileAgentJournalStore {
         R: CanonicalJournalRecord,
         F: FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
     {
+        self.ensure_no_gc_pending()?;
         ensure_publication_class(R::STORAGE_CLASS)?;
         let encoded_anchor = encode_object(anchor)?;
         let encoded_next = encode_object(next)?;
@@ -3089,6 +3874,7 @@ impl FileAgentJournalStore {
         &mut self,
         genesis: &AgentJournalGenesis,
     ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         let encoded = encode_object(genesis)?;
         if genesis.runtime().agent != self.agent {
             return Err(JournalStoreError::ScopeMismatch);
@@ -3140,6 +3926,169 @@ impl FileAgentJournalStore {
         validate_head_targets(self, &initial)?;
         Ok(genesis_created || heads_created)
     }
+
+    #[cfg(target_os = "linux")]
+    fn scan_gc_namespace(&self, limits: GcLimits) -> Result<Vec<FileGcEntry>, JournalStoreError> {
+        let mut entries = Vec::new();
+        let mut scanned_files = 0_usize;
+        let mut scanned_bytes = 0_u64;
+        for &(class, directory) in GC_OBJECT_NAMESPACES {
+            scan_gc_directory(
+                self.directory(directory)?,
+                directory,
+                FileGcKind::Object(class),
+                class_maximum(class),
+                limits,
+                &mut scanned_files,
+                &mut scanned_bytes,
+                &mut entries,
+            )?;
+        }
+        for &(class, directory) in GC_BLOB_NAMESPACES {
+            scan_gc_directory(
+                self.directory(directory)?,
+                directory,
+                FileGcKind::Blob(class),
+                blob_maximum(class),
+                limits,
+                &mut scanned_files,
+                &mut scanned_bytes,
+                &mut entries,
+            )?;
+        }
+        entries.sort_by(|left, right| {
+            (left.directory, left.name.as_str()).cmp(&(right.directory, right.name.as_str()))
+        });
+        Ok(entries)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ensure_gc_intent_durable(
+        &self,
+        intent: GcIntent,
+        publication_point: &mut impl FnMut(GcPoint) -> Result<(), JournalStoreError>,
+    ) -> Result<bool, JournalStoreError> {
+        let committed = self.read_gc_intent_file(GC_INTENT_NAME)?;
+        let staged = self.read_gc_intent_file(GC_INTENT_STAGE_NAME)?;
+        if committed.is_some_and(|existing| existing != intent)
+            || staged.is_some_and(|existing| existing != intent)
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let resumed = committed.is_some() || staged.is_some();
+        let root = self.directory("")?;
+        if committed.is_some() {
+            if staged.is_some() {
+                unlink_file_at(root, GC_INTENT_STAGE_NAME)?;
+                root.sync_all()
+                    .map_err(|_| JournalStoreError::Unavailable)?;
+            }
+            publication_point(GcPoint::IntentDurable)?;
+            return Ok(resumed);
+        }
+        if staged.is_none() {
+            create_synced_stage_at(root, GC_INTENT_STAGE_NAME, &intent.encode())?;
+        } else {
+            sync_regular_file_at(root, GC_INTENT_STAGE_NAME)?;
+        }
+        publication_point(GcPoint::IntentStaged)?;
+        let heads = self.heads()?.ok_or(JournalStoreError::Corrupt)?;
+        if heads.id() != intent.heads
+            || self.read_fixed::<JournalHeads>("", "heads.next")?.is_some()
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        rename_file_at(root, GC_INTENT_STAGE_NAME, GC_INTENT_NAME)?;
+        root.sync_all()
+            .map_err(|_| JournalStoreError::Unavailable)?;
+        publication_point(GcPoint::IntentDurable)?;
+        Ok(resumed)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_gc_entry_unchanged(&self, entry: &FileGcEntry) -> Result<(), JournalStoreError> {
+        let directory = self.directory(entry.directory)?;
+        let name = c_name(&entry.name)?;
+        verify_regular_entry(directory, &name, entry.identity)?;
+        let status = stat_at(directory, &name)
+            .map_err(|_| JournalStoreError::Unavailable)?
+            .ok_or(JournalStoreError::Corrupt)?;
+        if status_identity(&status) != entry.identity
+            || status.st_size < 0
+            || status.st_size as u64 != entry.bytes
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn collect_garbage_inner(
+        &mut self,
+        expected_heads: JournalHeadsId,
+        limits: GcLimits,
+        mut publication_point: impl FnMut(GcPoint) -> Result<(), JournalStoreError>,
+    ) -> Result<JournalGc, JournalStoreError> {
+        validate_gc_limits(limits)?;
+        if self.read_fixed::<JournalHeads>("", "heads.next")?.is_some() {
+            return Err(JournalStoreError::Conflict);
+        }
+        let (intent, mark) = build_gc_mark(self, expected_heads, limits)?;
+
+        // Pass one is exhaustive and non-mutating. No intent is installed and
+        // no garbage is removed unless every namespace entry fits the caller's
+        // file/byte bounds and is an owned regular canonical name.
+        let scanned = self.scan_gc_namespace(limits)?;
+        let garbage = scanned
+            .into_iter()
+            .filter(|entry| !entry.is_live(&mark))
+            .collect::<Vec<_>>();
+        let resumed = self.ensure_gc_intent_durable(intent, &mut publication_point)?;
+
+        // Pass two revalidates the exact inode/name observed by preflight
+        // immediately before each descriptor-relative unlink.
+        let batch = garbage.len().min(limits.max_unlinks_per_run);
+        let mut synced = BTreeSet::new();
+        let mut objects_removed = 0_usize;
+        let mut blobs_removed = 0_usize;
+        let mut aliases_removed = 0_usize;
+        for entry in garbage.iter().take(batch) {
+            self.validate_gc_entry_unchanged(entry)?;
+            unlink_file_at(self.directory(entry.directory)?, &entry.name)?;
+            synced.insert(entry.directory);
+            if entry.alias {
+                aliases_removed += 1;
+            } else {
+                match entry.kind {
+                    FileGcKind::Object(_) => objects_removed += 1,
+                    FileGcKind::Blob(_) => blobs_removed += 1,
+                }
+            }
+        }
+        for directory in synced {
+            self.directory(directory)?
+                .sync_all()
+                .map_err(|_| JournalStoreError::Unavailable)?;
+        }
+        publication_point(GcPoint::SweepDurable)?;
+
+        let complete = batch == garbage.len();
+        if complete {
+            let root = self.directory("")?;
+            unlink_file_if_present_at(root, GC_INTENT_STAGE_NAME)?;
+            unlink_file_at(root, GC_INTENT_NAME)?;
+            root.sync_all()
+                .map_err(|_| JournalStoreError::Unavailable)?;
+            publication_point(GcPoint::Complete)?;
+        }
+        Ok(JournalGc {
+            objects_removed,
+            blobs_removed,
+            aliases_removed,
+            resumed,
+            complete,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3149,8 +4098,17 @@ enum PublicationPoint {
     HeadsDurable,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GcPoint {
+    IntentStaged,
+    IntentDurable,
+    SweepDurable,
+    Complete,
+}
+
 impl AgentJournalStore for FileAgentJournalStore {
     fn initialize(&mut self, sealed: &ReplaySealedGenesis) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         let shape = validate_sealed_genesis_shape(sealed, self.agent, self.node)?;
         let genesis = sealed.genesis();
         let encoded = encode_object(genesis)?;
@@ -3255,6 +4213,7 @@ impl AgentJournalStore for FileAgentJournalStore {
     }
 
     fn put<R: CanonicalJournalRecord>(&mut self, record: &R) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         self.persist_object(record)
     }
 
@@ -3268,6 +4227,7 @@ impl AgentJournalStore for FileAgentJournalStore {
         reference: &BlobRef,
         bytes: &[u8],
     ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         self.persist_blob(class, reference, bytes)
     }
 
@@ -3283,6 +4243,7 @@ impl AgentJournalStore for FileAgentJournalStore {
         &mut self,
         publication: &ReplaySealedPublication,
     ) -> Result<JournalPublication, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
         let dependency_created = stage_sealed_dependencies(self, publication)?;
         let expected = publication.expected();
         let next = publication.next();
@@ -3300,6 +4261,24 @@ impl AgentJournalStore for FileAgentJournalStore {
         };
         result.object_created |= dependency_created;
         Ok(result)
+    }
+}
+
+impl AgentJournalGarbageCollection for FileAgentJournalStore {
+    fn collect_garbage(
+        &mut self,
+        expected_heads: JournalHeadsId,
+        limits: GcLimits,
+    ) -> Result<JournalGc, JournalStoreError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (expected_heads, limits);
+            Err(JournalStoreError::Unavailable)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.collect_garbage_inner(expected_heads, limits, |_| Ok(()))
+        }
     }
 }
 
@@ -3338,6 +4317,25 @@ macro_rules! impl_invocation_index_store {
             ) -> Result<(), Self::Error> {
                 let node = decode_object::<InvocationIndexNode>(bytes, id)?;
                 AgentJournalStore::put(self, &node).map(|_| ())
+            }
+        }
+
+        impl InvocationOutcomeStore for $store {
+            fn load_outcome(
+                &self,
+                id: InvocationOutcomeId,
+            ) -> Result<Option<Vec<u8>>, Self::Error> {
+                AgentJournalStore::get::<InvocationOutcomeRecord>(self, id)
+                    .map(|record| record.map(|record| record.encode()))
+            }
+
+            fn put_outcome(
+                &mut self,
+                id: InvocationOutcomeId,
+                bytes: &[u8],
+            ) -> Result<(), Self::Error> {
+                let outcome = decode_object::<InvocationOutcomeRecord>(bytes, id)?;
+                AgentJournalStore::put(self, &outcome).map(|_| ())
             }
         }
     };
@@ -3420,11 +4418,15 @@ mod tests {
     };
     use crate::agent::committee::SystemAgentGenesisAdmissionId;
     use crate::agent::contract::RuntimePackageContract;
-    use crate::agent::execution::{ActorInvocation, ActorInvocationAuth};
+    use crate::agent::execution::{
+        ActorExecutionReply, ActorExecutionStatus, ActorInvocation, ActorInvocationAuth,
+        ActorObservation,
+    };
     use crate::agent::invocation_index::InvocationIndex;
     use crate::agent::journal::{
-        CheckpointLane, InvocationDisposition, InvocationOwner, InvocationOwnershipKey,
-        InvocationResultState, ReplayInput, ReplayInputId, ReplayOperation, RuntimeBinding,
+        CheckpointLane, InvocationDisposition, InvocationOutcomeAnchor, InvocationOutcomeRecord,
+        InvocationOwner, InvocationOwnershipKey, InvocationResultState, ReplayInput,
+        ReplayOperation, RuntimeBinding,
     };
     use crate::agent::{
         AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LaneSet,
@@ -3611,11 +4613,77 @@ mod tests {
         }
     }
 
+    fn management_input(discriminator: u8) -> ReplayInput {
+        let runtime = runtime_binding();
+        let inner = LifecycleRequest::Suspend {
+            actor: ActorId([discriminator; 32]),
+            expected_deployment: DeploymentId([discriminator.wrapping_add(1); 32]),
+        };
+        let claim = AgentAuthorityClaim {
+            authority: authority_binding(),
+            space: runtime.space,
+            agent: runtime.agent,
+            principal: config().identity.owner,
+            credential: CredentialId([discriminator.wrapping_add(2); 32]),
+            capability: CapabilityId::named("actor.lifecycle"),
+            operation: inner.commitment(),
+            sequence: discriminator as u64 + 1,
+            valid_from: 10,
+            valid_until: 20,
+        };
+        ReplayInput {
+            runtime,
+            operation: ReplayOperation::Management {
+                request: LifecycleRequest::Authorized {
+                    admission: LifecycleAuthorityAdmission {
+                        receipt: AgentAuthorityReceipt {
+                            claim,
+                            signature: vec![discriminator; ED25519_SIGNATURE_BYTES],
+                        },
+                        observed_slot: 15,
+                    },
+                    request: Box::new(inner),
+                },
+            },
+        }
+    }
+
     trait RawTestInitialize {
         fn initialize_raw(
             &mut self,
             genesis: &AgentJournalGenesis,
         ) -> Result<bool, JournalStoreError>;
+    }
+
+    trait RawTestPublish: AgentJournalStore {
+        fn publish_raw<R: CanonicalJournalRecord>(
+            &mut self,
+            expected: JournalHeadsId,
+            anchor: &R,
+            next: &JournalHeads,
+        ) -> Result<JournalPublication, JournalStoreError>;
+    }
+
+    impl RawTestPublish for MemoryAgentJournalStore {
+        fn publish_raw<R: CanonicalJournalRecord>(
+            &mut self,
+            expected: JournalHeadsId,
+            anchor: &R,
+            next: &JournalHeads,
+        ) -> Result<JournalPublication, JournalStoreError> {
+            self.publish_anchor(expected, anchor, next)
+        }
+    }
+
+    impl RawTestPublish for FileAgentJournalStore {
+        fn publish_raw<R: CanonicalJournalRecord>(
+            &mut self,
+            expected: JournalHeadsId,
+            anchor: &R,
+            next: &JournalHeads,
+        ) -> Result<JournalPublication, JournalStoreError> {
+            self.publish_anchor(expected, anchor, next)
+        }
     }
 
     impl RawTestInitialize for MemoryAgentJournalStore {
@@ -3648,6 +4716,126 @@ mod tests {
             )
             .unwrap();
         assert!(store.initialize_raw(genesis).unwrap());
+    }
+
+    fn gc_limits() -> GcLimits {
+        GcLimits {
+            max_index_nodes: DEFAULT_INVOCATION_INDEX_NODE_LIMIT,
+            max_marked_objects: 10_000,
+            max_marked_blobs: 10_000,
+            max_scanned_files: 10_000,
+            max_scanned_bytes: 64 * 1024 * 1024,
+            max_unlinks_per_run: 10_000,
+        }
+    }
+
+    fn install_fresh_checkpoint<S>(
+        store: &mut S,
+        genesis: &AgentJournalGenesis,
+    ) -> (JournalHeads, CheckpointManifest)
+    where
+        S: AgentJournalStore + RawTestPublish,
+    {
+        let heads = store.heads().unwrap().unwrap();
+        let state_bytes = b"gc-checkpoint-state";
+        let state = BlobRef::of_bytes(state_bytes);
+        store
+            .put_blob(JournalBlobClass::LaneState, &state, state_bytes)
+            .unwrap();
+        let lanes = [
+            (
+                PersistedLane::Control,
+                LaneCursor::Ordered {
+                    base: ordered_base(&heads),
+                },
+            ),
+            (
+                PersistedLane::Linear,
+                LaneCursor::Ordered {
+                    base: ordered_base(&heads),
+                },
+            ),
+            (
+                PersistedLane::Merge,
+                LaneCursor::Merge {
+                    frontier: heads.merge_frontier,
+                },
+            ),
+            (
+                PersistedLane::Local,
+                LaneCursor::Local {
+                    node: heads.node,
+                    revision: heads.local_revision,
+                    head: heads.local_head,
+                },
+            ),
+        ]
+        .map(|(lane, cursor)| {
+            let manifest = LaneStateManifest {
+                genesis: genesis.id(),
+                runtime: heads.runtime.clone(),
+                lane,
+                cursor,
+                state: state.clone(),
+            };
+            store.put(&manifest).unwrap();
+            manifest
+        });
+        let artifacts = ArtifactClosure {
+            genesis: genesis.id(),
+            artifacts: vec![genesis.runtime().package.clone()],
+        };
+        store.put(&artifacts).unwrap();
+        let checkpoint = CheckpointManifest {
+            genesis: genesis.id(),
+            admission: genesis.admission,
+            runtime: heads.runtime.clone(),
+            publication_revision: heads.publication_revision,
+            ordered_head: heads.ordered_head,
+            ordered_index: heads.ordered_index,
+            merge_frontier: heads.merge_frontier,
+            merge_fence: heads.merge_fence,
+            merge_seal: heads.merge_seal,
+            ordered_invocations: heads.ordered_invocations,
+            merge_invocations: heads.merge_invocations,
+            lanes: vec![
+                CheckpointLane {
+                    lane: PersistedLane::Control,
+                    node: None,
+                    state: lanes[0].id(),
+                    invocations: None,
+                },
+                CheckpointLane {
+                    lane: PersistedLane::Linear,
+                    node: None,
+                    state: lanes[1].id(),
+                    invocations: None,
+                },
+                CheckpointLane {
+                    lane: PersistedLane::Merge,
+                    node: None,
+                    state: lanes[2].id(),
+                    invocations: None,
+                },
+                CheckpointLane {
+                    lane: PersistedLane::Local,
+                    node: Some(heads.node),
+                    state: lanes[3].id(),
+                    invocations: Some(heads.local_invocations),
+                },
+            ],
+            artifacts: artifacts.id(),
+        };
+        let next = JournalHeads {
+            publication_revision: heads.publication_revision + 1,
+            previous: Some(heads.id()),
+            checkpoint: Some(checkpoint.id()),
+            ..heads
+        };
+        store
+            .publish_raw(next.previous.unwrap(), &checkpoint, &next)
+            .unwrap();
+        (next, checkpoint)
     }
 
     fn first_ordered(genesis: &AgentJournalGenesis, heads: &JournalHeads) -> OrderedEntry {
@@ -3780,6 +4968,48 @@ mod tests {
     }
 
     #[test]
+    fn ordered_seal_alone_may_advance_merge_invocation_root() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let current = store.heads().unwrap().unwrap();
+        let changed_merge_root = InvocationIndexId([0xd1; 32]);
+
+        let unsealed = first_ordered(&genesis, &current);
+        let unsealed_next = JournalHeads {
+            merge_invocations: changed_merge_root,
+            ..ordered_successor(&current, &unsealed)
+        };
+        assert_eq!(
+            validate_publication_shape(&current, &unsealed, &unsealed_next),
+            Err(JournalStoreError::NonCanonical)
+        );
+
+        let seal = MergeSealId([0xd2; 32]);
+        let sealed = OrderedEntry {
+            input: management_input(0xd3),
+            merge_seal: Some(seal),
+            ..unsealed
+        };
+        let sealed_next = JournalHeads {
+            publication_revision: current.publication_revision + 1,
+            previous: Some(current.id()),
+            ordered_head: Some(sealed.id()),
+            ordered_index: sealed.index,
+            merge_fence: OrderedBase {
+                index: sealed.index,
+                head: Some(sealed.id()),
+            },
+            merge_seal: Some(seal),
+            merge_invocations: changed_merge_root,
+            ..current.clone()
+        };
+        validate_publication_shape(&current, &sealed, &sealed_next).unwrap();
+    }
+
+    #[test]
     fn memory_catalog_resolver_is_an_immutable_cow_snapshot() {
         let config = config();
         let mut store =
@@ -3845,6 +5075,327 @@ mod tests {
             snapshot.load_catalog(&wrong_length),
             Err(JournalStoreError::Corrupt)
         );
+    }
+
+    #[test]
+    fn memory_gc_batches_gates_mutators_and_preserves_fresh_checkpoint() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let (heads, checkpoint) = install_fresh_checkpoint(&mut store, &genesis);
+
+        let first = replay_input(MethodMode::Linear, 0x91);
+        let second = replay_input(MethodMode::Local, 0x92);
+        store.put(&first).unwrap();
+        store.put(&second).unwrap();
+        let garbage_bytes = b"unreachable-catalog-blob";
+        let garbage_blob = BlobRef::of_bytes(garbage_bytes);
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &garbage_blob,
+                garbage_bytes,
+            )
+            .unwrap();
+
+        let mut limits = gc_limits();
+        limits.max_unlinks_per_run = 1;
+        let first_pass = store.collect_garbage(heads.id(), limits).unwrap();
+        assert!(!first_pass.complete);
+        assert!(!first_pass.resumed);
+        assert_eq!(first_pass.objects_removed + first_pass.blobs_removed, 1);
+        assert_eq!(
+            store.put(&replay_input(MethodMode::Linear, 0x93)),
+            Err(JournalStoreError::GcPending)
+        );
+
+        let mut passes = 1;
+        loop {
+            let pass = store.collect_garbage(heads.id(), limits).unwrap();
+            passes += 1;
+            assert!(pass.resumed);
+            if pass.complete {
+                break;
+            }
+        }
+        assert_eq!(passes, 3);
+        assert_eq!(store.get::<ReplayInput>(first.id()).unwrap(), None);
+        assert_eq!(store.get::<ReplayInput>(second.id()).unwrap(), None);
+        assert_eq!(
+            store
+                .load_blob(JournalBlobClass::CatalogArtifact, &garbage_blob)
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.genesis().unwrap(), Some(genesis));
+        assert_eq!(
+            store.get::<CheckpointManifest>(checkpoint.id()).unwrap(),
+            Some(checkpoint)
+        );
+        validate_head_targets(&store, &heads).unwrap();
+        store.put(&replay_input(MethodMode::Linear, 0x94)).unwrap();
+    }
+
+    #[test]
+    fn memory_gc_rejects_stale_checkpoint_and_preflight_limits_without_intent() {
+        let genesis = genesis();
+        let config = config();
+        let mut limited =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut limited, &genesis);
+        let (heads, _) = install_fresh_checkpoint(&mut limited, &genesis);
+        let mut limits = gc_limits();
+        limits.max_scanned_files = 1;
+        assert_eq!(
+            limited.collect_garbage(heads.id(), limits),
+            Err(JournalStoreError::LimitExceeded)
+        );
+        limited
+            .put(&replay_input(MethodMode::Linear, 0x95))
+            .unwrap();
+
+        let mut stale =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut stale, &genesis);
+        let (checkpoint_heads, _) = install_fresh_checkpoint(&mut stale, &genesis);
+        let entry = first_ordered(&genesis, &checkpoint_heads);
+        let next = ordered_successor(&checkpoint_heads, &entry);
+        stale
+            .publish_anchor(checkpoint_heads.id(), &entry, &next)
+            .unwrap();
+        assert_eq!(
+            stale.collect_garbage(next.id(), gc_limits()),
+            Err(JournalStoreError::Conflict)
+        );
+        stale.put(&replay_input(MethodMode::Linear, 0x96)).unwrap();
+    }
+
+    #[test]
+    fn memory_gc_keeps_live_outcome_anchor_and_tombstone_but_collects_acknowledged_outcome() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let initial = store.heads().unwrap().unwrap();
+
+        let input_one = replay_input(MethodMode::Linear, 0xa1);
+        let ReplayOperation::Invoke {
+            invocation: invocation_one,
+            ..
+        } = &input_one.operation
+        else {
+            unreachable!()
+        };
+        let entry_one = OrderedEntry {
+            genesis: genesis.id(),
+            index: 1,
+            parent: None,
+            merge_frontier: initial.merge_frontier,
+            merge_seal: None,
+            input: input_one.clone(),
+        };
+        let key_one = InvocationOwnershipKey {
+            scope: InvocationOwnershipScope::Ordered,
+            invocation: invocation_one.invocation,
+        };
+        let outcome_one = InvocationOutcomeRecord::from_runtime_states(
+            genesis.id(),
+            key_one.scope,
+            InvocationOutcomeAnchor::Ordered {
+                entry: entry_one.id(),
+            },
+            &input_one,
+            &RuntimeState::default(),
+            &RuntimeState::default(),
+            Ok(ActorExecutionReply {
+                invocation: invocation_one.invocation,
+                actor: invocation_one.actor,
+                incarnation: invocation_one.incarnation,
+                deployment: invocation_one.deployment,
+                mode: invocation_one.mode,
+                lane: invocation_one.mode.write_lane(),
+                status: ActorExecutionStatus::Done,
+                reply: vec![1],
+                gas_remaining: invocation_one.gas - 1,
+                observation: ActorObservation::default(),
+            }),
+        )
+        .unwrap();
+        let root_one = {
+            let mut index = InvocationIndex::open(&mut store, initial.ordered_invocations).unwrap();
+            let reference = index.persist_outcome(&outcome_one).unwrap();
+            index
+                .record(
+                    key_one,
+                    InvocationOwner {
+                        scope: key_one.scope,
+                        request_commitment: invocation_one.commitment(),
+                        first_input: input_one.id(),
+                        lane: PersistedLane::Linear,
+                        node: None,
+                        result_state: InvocationResultState::Retained {
+                            disposition: InvocationDisposition::Applied,
+                            outcome: reference,
+                        },
+                    },
+                )
+                .unwrap();
+            index.id()
+        };
+        let heads_one = JournalHeads {
+            ordered_invocations: root_one,
+            ..ordered_successor(&initial, &entry_one)
+        };
+        store
+            .publish_anchor(initial.id(), &entry_one, &heads_one)
+            .unwrap();
+
+        let input_two = replay_input(MethodMode::Linear, 0xa2);
+        let ReplayOperation::Invoke {
+            invocation: invocation_two,
+            authority: authority_two,
+            ..
+        } = &input_two.operation
+        else {
+            unreachable!()
+        };
+        let entry_two = OrderedEntry {
+            genesis: genesis.id(),
+            index: 2,
+            parent: Some(entry_one.id()),
+            merge_frontier: heads_one.merge_frontier,
+            merge_seal: None,
+            input: input_two.clone(),
+        };
+        let key_two = InvocationOwnershipKey {
+            scope: InvocationOwnershipScope::Ordered,
+            invocation: invocation_two.invocation,
+        };
+        let outcome_two = InvocationOutcomeRecord::from_runtime_states(
+            genesis.id(),
+            key_two.scope,
+            InvocationOutcomeAnchor::Ordered {
+                entry: entry_two.id(),
+            },
+            &input_two,
+            &RuntimeState::default(),
+            &RuntimeState::default(),
+            Ok(ActorExecutionReply {
+                invocation: invocation_two.invocation,
+                actor: invocation_two.actor,
+                incarnation: invocation_two.incarnation,
+                deployment: invocation_two.deployment,
+                mode: invocation_two.mode,
+                lane: invocation_two.mode.write_lane(),
+                status: ActorExecutionStatus::Done,
+                reply: vec![2],
+                gas_remaining: invocation_two.gas - 1,
+                observation: ActorObservation::default(),
+            }),
+        )
+        .unwrap();
+        let (root_two, owner_two) = {
+            let mut index = InvocationIndex::open(&mut store, root_one).unwrap();
+            let reference = index.persist_outcome(&outcome_two).unwrap();
+            let owner = InvocationOwner {
+                scope: key_two.scope,
+                request_commitment: invocation_two.commitment(),
+                first_input: input_two.id(),
+                lane: PersistedLane::Linear,
+                node: None,
+                result_state: InvocationResultState::Retained {
+                    disposition: InvocationDisposition::Applied,
+                    outcome: reference,
+                },
+            };
+            index.record(key_two, owner).unwrap();
+            (index.id(), owner)
+        };
+        let heads_two = JournalHeads {
+            publication_revision: heads_one.publication_revision + 1,
+            previous: Some(heads_one.id()),
+            ordered_head: Some(entry_two.id()),
+            ordered_index: entry_two.index,
+            ordered_invocations: root_two,
+            ..heads_one.clone()
+        };
+        store
+            .publish_anchor(heads_one.id(), &entry_two, &heads_two)
+            .unwrap();
+
+        let acknowledgement = ReplayInput {
+            runtime: input_two.runtime.clone(),
+            operation: ReplayOperation::Acknowledge {
+                invocation: invocation_two.clone(),
+                authority: authority_two.clone(),
+            },
+        };
+        let entry_three = OrderedEntry {
+            genesis: genesis.id(),
+            index: 3,
+            parent: Some(entry_two.id()),
+            merge_frontier: heads_two.merge_frontier,
+            merge_seal: None,
+            input: acknowledgement,
+        };
+        let root_three = {
+            let mut index = InvocationIndex::open(&mut store, root_two).unwrap();
+            index
+                .record(
+                    key_two,
+                    InvocationOwner {
+                        result_state: InvocationResultState::Acknowledged {
+                            disposition: InvocationDisposition::Applied,
+                        },
+                        ..owner_two
+                    },
+                )
+                .unwrap();
+            index.id()
+        };
+        let heads_three = JournalHeads {
+            publication_revision: heads_two.publication_revision + 1,
+            previous: Some(heads_two.id()),
+            ordered_head: Some(entry_three.id()),
+            ordered_index: entry_three.index,
+            ordered_invocations: root_three,
+            ..heads_two
+        };
+        store
+            .publish_anchor(heads_three.previous.unwrap(), &entry_three, &heads_three)
+            .unwrap();
+        let (checkpoint_heads, _) = install_fresh_checkpoint(&mut store, &genesis);
+
+        let result = store
+            .collect_garbage(checkpoint_heads.id(), gc_limits())
+            .unwrap();
+        assert!(result.complete);
+        assert_eq!(
+            store.get::<OrderedEntry>(entry_one.id()).unwrap(),
+            Some(entry_one)
+        );
+        assert_eq!(store.get::<OrderedEntry>(entry_two.id()).unwrap(), None);
+        assert_eq!(
+            store
+                .get::<InvocationOutcomeRecord>(outcome_one.id())
+                .unwrap(),
+            Some(outcome_one.clone())
+        );
+        assert_eq!(
+            store
+                .get::<InvocationOutcomeRecord>(outcome_two.id())
+                .unwrap(),
+            None
+        );
+        let index = InvocationIndex::open(&mut store, root_three).unwrap();
+        assert_eq!(index.outcome(key_one).unwrap(), Some(outcome_one));
+        assert!(matches!(
+            index.lookup(key_two).unwrap().unwrap().result_state,
+            InvocationResultState::Acknowledged { .. }
+        ));
     }
 
     #[test]
@@ -4263,20 +5814,51 @@ mod tests {
         let mut store = open_file_store(&directory);
         initialize(&mut store, &genesis);
         let heads = store.heads().unwrap().unwrap();
+        let input = replay_input(MethodMode::Linear, 0x61);
+        let ReplayOperation::Invoke { invocation, .. } = &input.operation else {
+            unreachable!()
+        };
         let key = InvocationOwnershipKey {
             scope: InvocationOwnershipScope::Ordered,
-            invocation: InvocationId([0x61; 32]),
-        };
-        let owner = InvocationOwner {
-            scope: key.scope,
-            request_commitment: Hash([0x62; 32]),
-            first_input: ReplayInputId([0x63; 32]),
-            lane: PersistedLane::Linear,
-            node: None,
-            disposition: InvocationDisposition::Applied,
-            result_state: InvocationResultState::Retained,
+            invocation: invocation.invocation,
         };
         let mut index = InvocationIndex::open(&mut store, heads.ordered_invocations).unwrap();
+        let outcome = InvocationOutcomeRecord::from_runtime_states(
+            genesis.id(),
+            key.scope,
+            InvocationOutcomeAnchor::Ordered {
+                entry: OrderedEntryId([0x62; 32]),
+            },
+            &input,
+            &RuntimeState::default(),
+            &RuntimeState::default(),
+            Ok(ActorExecutionReply {
+                invocation: invocation.invocation,
+                actor: invocation.actor,
+                incarnation: invocation.incarnation,
+                deployment: invocation.deployment,
+                mode: invocation.mode,
+                lane: invocation.mode.write_lane(),
+                status: ActorExecutionStatus::Done,
+                reply: vec![0x63],
+                gas_remaining: invocation.gas - 1,
+                observation: ActorObservation::default(),
+            }),
+        )
+        .unwrap();
+        let expected_outcome = outcome.clone();
+        let outcome = index.persist_outcome(&outcome).unwrap();
+        let owner = InvocationOwner {
+            scope: key.scope,
+            request_commitment: invocation.commitment(),
+            first_input: input.id(),
+            lane: PersistedLane::Linear,
+            node: None,
+            result_state: InvocationResultState::Retained {
+                disposition: InvocationDisposition::Applied,
+                outcome,
+            },
+        };
         index.record(key, owner).unwrap();
         let index_id = index.id();
         assert_ne!(index_id, heads.ordered_invocations);
@@ -4290,7 +5872,7 @@ mod tests {
         assert!(manifest.root.is_some());
 
         drop(store);
-        let reopened = open_file_store(&directory);
+        let mut reopened = open_file_store(&directory);
         validate_invocation_index(
             &reopened,
             index_id,
@@ -4298,6 +5880,127 @@ mod tests {
             InvocationOwnershipScope::Ordered,
         )
         .unwrap();
+        let reopened_index = InvocationIndex::open(&mut reopened, index_id).unwrap();
+        assert_eq!(reopened_index.lookup(key).unwrap(), Some(owner));
+        assert_eq!(reopened_index.outcome(key).unwrap(), Some(expected_outcome));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_gc_resumes_a_crash_staged_intent_and_gates_mutators() {
+        let directory = TestDirectory::new("gc-crash");
+        let genesis = genesis();
+        let mut store = open_file_store(&directory);
+        initialize(&mut store, &genesis);
+        let (heads, _) = install_fresh_checkpoint(&mut store, &genesis);
+        let garbage = replay_input(MethodMode::Linear, 0xb1);
+        store.put(&garbage).unwrap();
+        let garbage_path = store
+            .root()
+            .join("records/replay-inputs")
+            .join(encode_hex(garbage.id().as_bytes()));
+
+        assert_eq!(
+            store.collect_garbage_inner(heads.id(), gc_limits(), |point| {
+                if point == GcPoint::IntentStaged {
+                    Err(JournalStoreError::Unavailable)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(JournalStoreError::Unavailable)
+        );
+        assert!(store.root().join(GC_INTENT_STAGE_NAME).is_file());
+        assert_eq!(
+            store.put(&replay_input(MethodMode::Linear, 0xb2)),
+            Err(JournalStoreError::GcPending)
+        );
+
+        drop(store);
+        let mut reopened = open_file_store(&directory);
+        let result = reopened.collect_garbage(heads.id(), gc_limits()).unwrap();
+        assert!(result.resumed);
+        assert!(result.complete);
+        assert!(!garbage_path.exists());
+        assert!(!reopened.root().join(GC_INTENT_NAME).exists());
+        assert!(!reopened.root().join(GC_INTENT_STAGE_NAME).exists());
+        validate_head_targets(&reopened, &heads).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_gc_preflight_rejects_nonregular_entry_before_intent_or_deletion() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("gc-symlink");
+        let genesis = genesis();
+        let mut store = open_file_store(&directory);
+        initialize(&mut store, &genesis);
+        let (heads, checkpoint) = install_fresh_checkpoint(&mut store, &genesis);
+        let garbage = replay_input(MethodMode::Linear, 0xb3);
+        store.put(&garbage).unwrap();
+        let garbage_path = store
+            .root()
+            .join("records/replay-inputs")
+            .join(encode_hex(garbage.id().as_bytes()));
+        let hostile = store
+            .root()
+            .join("records/replay-inputs")
+            .join(encode_hex(&[0xee; 32]));
+        symlink(&garbage_path, &hostile).unwrap();
+
+        assert_eq!(
+            store.collect_garbage(heads.id(), gc_limits()),
+            Err(JournalStoreError::Corrupt)
+        );
+        assert!(garbage_path.is_file());
+        assert!(
+            store
+                .get::<CheckpointManifest>(checkpoint.id())
+                .unwrap()
+                .is_some()
+        );
+        assert!(!store.root().join(GC_INTENT_NAME).exists());
+        assert!(!store.root().join(GC_INTENT_STAGE_NAME).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_gc_second_pass_rejects_namespace_replacement() {
+        let directory = TestDirectory::new("gc-race");
+        let genesis = genesis();
+        let mut store = open_file_store(&directory);
+        initialize(&mut store, &genesis);
+        let (heads, _) = install_fresh_checkpoint(&mut store, &genesis);
+        let garbage = replay_input(MethodMode::Linear, 0xb4);
+        store.put(&garbage).unwrap();
+        let garbage_path = store
+            .root()
+            .join("records/replay-inputs")
+            .join(encode_hex(garbage.id().as_bytes()));
+        let displaced = garbage_path.with_extension("displaced");
+        let mut replaced = false;
+
+        assert_eq!(
+            store.collect_garbage_inner(heads.id(), gc_limits(), |point| {
+                if point == GcPoint::IntentDurable && !replaced {
+                    fs::rename(&garbage_path, &displaced).unwrap();
+                    fs::write(&garbage_path, b"replacement-must-not-be-unlinked").unwrap();
+                    replaced = true;
+                }
+                Ok(())
+            }),
+            Err(JournalStoreError::Corrupt)
+        );
+        assert_eq!(
+            fs::read(&garbage_path).unwrap(),
+            b"replacement-must-not-be-unlinked"
+        );
+        assert!(store.root().join(GC_INTENT_NAME).is_file());
+        assert_eq!(
+            store.put(&replay_input(MethodMode::Linear, 0xb5)),
+            Err(JournalStoreError::GcPending)
+        );
     }
 
     #[test]
@@ -4933,7 +6636,10 @@ fn private_stage_name(stage: &str) -> Result<String, JournalStoreError> {
 fn is_fixed_private_stage_name(name: &[u8]) -> bool {
     matches!(
         name,
-        b"genesis-admission.next.partial" | b"genesis.next.partial" | b"heads.next.partial"
+        b"genesis-admission.next.partial"
+            | b"genesis.next.partial"
+            | b"heads.next.partial"
+            | b"gc-intent.next.partial"
     )
 }
 
