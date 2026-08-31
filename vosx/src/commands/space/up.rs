@@ -7,6 +7,7 @@
 //! `run_forever` (or `run` for `--once`).
 
 use std::collections::HashSet;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -34,6 +35,14 @@ pub struct Args {
     pub service_pvm: Option<PathBuf>,
     pub production_trust_socket: Option<PathBuf>,
     pub allow_conformance: bool,
+    pub agent_root_pins: Option<PathBuf>,
+    pub agent_authority_socket: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentHostSelection {
+    root_pins: PathBuf,
+    authority_socket: PathBuf,
 }
 
 #[derive(Clone)]
@@ -98,6 +107,275 @@ fn validate_service_trust_mode(
         );
     }
     Ok(())
+}
+
+fn validate_agent_host_selection(
+    root_pins: Option<&Path>,
+    authority_socket: Option<&Path>,
+) -> anyhow::Result<Option<AgentHostSelection>> {
+    match (root_pins, authority_socket) {
+        (None, None) => Ok(None),
+        (Some(root_pins), Some(authority_socket)) => Ok(Some(AgentHostSelection {
+            root_pins: root_pins.to_path_buf(),
+            authority_socket: authority_socket.to_path_buf(),
+        })),
+        (Some(_), None) => {
+            anyhow::bail!("--agent-root-pins requires --agent-authority-socket")
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("--agent-authority-socket requires --agent-root-pins")
+        }
+    }
+}
+
+/// Decode the independently provisioned root pins without following a leaf
+/// symlink or allocating beyond the protocol's exact wire bound.
+///
+/// The CLI requires an absolute canonical path. Besides making the audit log
+/// unambiguous, this rejects aliases through a symlinked parent before the
+/// archived authority is allowed to mutate the Local Agent generation.
+fn load_agent_root_pins(
+    path: &Path,
+    data_dir: &Path,
+    expected_space: vos::service::SpaceId,
+) -> anyhow::Result<vos::agent::committee::RootAnchorPins> {
+    use vos::service::ServiceWire as _;
+
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "Agent root pins path must be absolute and canonical: {}",
+            path.display(),
+        );
+    }
+    let supplied_metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| anyhow::anyhow!("inspect Agent root pins {}: {error}", path.display()))?;
+    if supplied_metadata.file_type().is_symlink() || !supplied_metadata.file_type().is_file() {
+        anyhow::bail!(
+            "Agent root pins must be a regular non-symlink file: {}",
+            path.display(),
+        );
+    }
+    let canonical_path = std::fs::canonicalize(path).map_err(|error| {
+        anyhow::anyhow!("canonicalize Agent root pins {}: {error}", path.display())
+    })?;
+    if canonical_path != path {
+        anyhow::bail!(
+            "Agent root pins path is not canonical: {} (resolved {})",
+            path.display(),
+            canonical_path.display(),
+        );
+    }
+    let canonical_data_dir = std::fs::canonicalize(data_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize space data directory {}: {error}",
+            data_dir.display(),
+        )
+    })?;
+    if canonical_path.starts_with(&canonical_data_dir) {
+        anyhow::bail!(
+            "Agent root pins must be stored outside the space data directory {}",
+            canonical_data_dir.display(),
+        );
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(&canonical_path)
+        .map_err(|error| anyhow::anyhow!("open Agent root pins {}: {error}", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("inspect opened Agent root pins: {error}"))?;
+    if !opened_metadata.file_type().is_file() {
+        anyhow::bail!("opened Agent root pins are not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if supplied_metadata.dev() != opened_metadata.dev()
+            || supplied_metadata.ino() != opened_metadata.ino()
+        {
+            anyhow::bail!("Agent root pins changed while being opened");
+        }
+    }
+    let maximum = vos::agent::committee::MAX_ROOT_ANCHOR_PINS_BYTES;
+    if opened_metadata.len() > maximum as u64 {
+        anyhow::bail!("Agent root pins exceed the canonical {maximum}-byte bound");
+    }
+    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+    file.by_ref()
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("read Agent root pins {}: {error}", path.display()))?;
+    if bytes.len() > maximum || bytes.len() as u64 != opened_metadata.len() {
+        anyhow::bail!("Agent root pins changed while being read or exceed their wire bound");
+    }
+    let pins = vos::agent::committee::RootAnchorPins::decode(&bytes)
+        .map_err(|error| anyhow::anyhow!("decode Agent root pins: {error:?}"))?;
+    if pins.encode() != bytes {
+        anyhow::bail!("Agent root pins are not canonical wire bytes");
+    }
+    pins.validate()
+        .map_err(|error| anyhow::anyhow!("validate Agent root pins: {error:?}"))?;
+    if pins.record().space() != expected_space {
+        anyhow::bail!(
+            "Agent root pins belong to space {}, expected {}",
+            hex::encode(pins.record().space().0),
+            hex::encode(expected_space.0),
+        );
+    }
+    Ok(pins)
+}
+
+fn agent_residue(
+    agent_root: &Path,
+    include_host_sidecars: bool,
+) -> anyhow::Result<Option<PathBuf>> {
+    let metadata = match std::fs::symlink_metadata(agent_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect Agent root {}: {error}",
+                agent_root.display(),
+            ));
+        }
+    };
+    let is_directory = if metadata.file_type().is_symlink() {
+        // Agent mode rejects a symlinked host root at lease acquisition. With
+        // Agent mode disabled, preserve the legacy Service layout (which may
+        // already use a symlinked `agents` directory) while still scanning its
+        // target for native residue.
+        std::fs::metadata(agent_root)
+            .map(|target| target.is_dir())
+            .unwrap_or(false)
+    } else {
+        metadata.file_type().is_dir()
+    };
+    if !is_directory {
+        anyhow::bail!(
+            "cannot verify Agent host residue in non-directory {}",
+            agent_root.display(),
+        );
+    }
+    for entry in std::fs::read_dir(agent_root)
+        .map_err(|error| anyhow::anyhow!("scan Agent root {}: {error}", agent_root.display()))?
+    {
+        let entry = entry.map_err(|error| {
+            anyhow::anyhow!("scan Agent root {}: {error}", agent_root.display())
+        })?;
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        let generation = name.ends_with(".agent")
+            || name.ends_with(".agent-lock")
+            || name.ends_with(".agent-image");
+        let host_sidecar = matches!(
+            name.as_str(),
+            ".agent-host.scope" | ".agent-host.scope.tmp" | ".agent-host.lock"
+        );
+        if generation || (include_host_sidecars && host_sidecar) {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
+}
+
+fn agent_generation_residue(agent_root: &Path) -> anyhow::Result<Option<PathBuf>> {
+    agent_residue(agent_root, false)
+}
+
+fn agent_host_residue(agent_root: &Path) -> anyhow::Result<Option<PathBuf>> {
+    agent_residue(agent_root, true)
+}
+
+fn reject_agent_host_residue_without_authority(agent_root: &Path) -> anyhow::Result<()> {
+    if let Some(residue) = agent_host_residue(agent_root)? {
+        anyhow::bail!(
+            "Agent host residue {} requires both --agent-root-pins and \
+             --agent-authority-socket; legacy .agent-image generations are never migrated",
+            residue.display(),
+        );
+    }
+    Ok(())
+}
+
+fn load_daemon_keypair(data_dir: &Path) -> anyhow::Result<libp2p::identity::Keypair> {
+    let key_path = data_dir.join("node.key");
+    let key_bytes = std::fs::read(&key_path)
+        .map_err(|error| anyhow::anyhow!("read {}: {error}", key_path.display()))?;
+    libp2p::identity::Keypair::from_protobuf_encoding(&key_bytes)
+        .map_err(|error| anyhow::anyhow!("decode {}: {error}", key_path.display()))
+}
+
+fn preflight_agent_genesis_archive(
+    authority: &super::agent_authority::SocketAgentAuthority,
+    pins: &vos::agent::committee::RootAnchorPins,
+    scope: vos::agent::host::AgentHostScope,
+    agent_root: &Path,
+) -> anyhow::Result<bool> {
+    use vos::agent::bootstrap::{SystemAgentGenesisProvider as _, SystemAgentGenesisProviderError};
+
+    let locator = vos::agent::bootstrap::SystemAgentGenesisLocator {
+        space: scope.space,
+        agent: pins.record().system_agent(),
+        node: scope.node,
+    };
+    let provision = match authority.reproduce(locator) {
+        Ok(provision) => provision,
+        Err(SystemAgentGenesisProviderError::NotConfigured) => {
+            if let Some(residue) = agent_generation_residue(agent_root)? {
+                anyhow::bail!(
+                    "authority has no system-Agent genesis archive for existing residue {}",
+                    residue.display(),
+                );
+            }
+            // A clean, configured host may begin empty. Its later Create is
+            // provider-first; once any native generation residue exists the
+            // external archive becomes mandatory.
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "reproduce configured system-Agent genesis: {error}",
+            ));
+        }
+    };
+    if provision.root() != pins {
+        anyhow::bail!("authority archive root pins do not match the independently configured file");
+    }
+    for reference in provision.proposal().catalog() {
+        let bytes = authority
+            .load_catalog(locator, reference)
+            .map_err(|error| anyhow::anyhow!("load system-Agent genesis catalog: {error}"))?
+            .ok_or_else(|| anyhow::anyhow!("authority archive omitted a genesis catalog blob"))?;
+        if !reference.matches(&bytes) {
+            anyhow::bail!("authority archive returned a mismatched genesis catalog blob");
+        }
+    }
+    Ok(true)
+}
+
+fn require_preflight_archive_presence(
+    archive_expected: bool,
+    archive_opened: bool,
+) -> anyhow::Result<()> {
+    if archive_expected && !archive_opened {
+        anyhow::bail!(
+            "system-Agent genesis archive disappeared between preflight and host ownership",
+        );
+    }
+    Ok(())
+}
+
+fn cleanup_endpoint_after_collect<T, E>(data_dir: &Path, result: Result<T, E>) -> Result<T, E> {
+    // Cleanup is deliberately sequenced before propagating a checked Agent
+    // host shutdown failure, so clients never retain a published dead route.
+    crate::commands::space::endpoint::delete(data_dir);
+    result
 }
 
 /// Construct the frozen authority package contents for the current service
@@ -322,6 +600,26 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         args.production_trust_socket.is_some(),
         args.allow_conformance,
     )?;
+    let agent_host_selection = validate_agent_host_selection(
+        args.agent_root_pins.as_deref(),
+        args.agent_authority_socket.as_deref(),
+    )?;
+    // The authority handshake is the first Agent-mode side effect. In
+    // particular it precedes stable-lock creation, scope publication, and
+    // every journal write under `<data>/agents`.
+    let agent_authority = agent_host_selection
+        .as_ref()
+        .map(|selection| {
+            super::agent_authority::SocketAgentAuthority::open(&selection.authority_socket)
+        })
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("open Agent authority: {error}"))?;
+    if let Some(authority) = agent_authority.as_ref() {
+        tracing::info!(
+            policy = %hex::encode(authority.policy_id().0),
+            "Local system Agent uses the fail-closed external authority archive",
+        );
+    }
     let pinned_service_service = load_pinned_service_service(args.service_pvm.as_deref())?;
     let production_trust = args
         .production_trust_socket
@@ -394,6 +692,50 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let _space_data_lock = super::space_lock::SpaceDataLock::exclusive(&space_id)?;
     let mut pending_token = load_pending_token(&data_dir)?;
 
+    let agent_root = data_dir.join("agents");
+    let configured_agent_pins = match agent_host_selection.as_ref() {
+        Some(selection) => Some(load_agent_root_pins(
+            &selection.root_pins,
+            &data_dir,
+            vos::service::SpaceId(space_id),
+        )?),
+        None => {
+            reject_agent_host_residue_without_authority(&agent_root)?;
+            None
+        }
+    };
+
+    // Decode the per-space identity exactly once. The same keypair object is
+    // cloned into the libp2p NetworkConfig and, in Agent mode, the Local Merge
+    // authenticator. This prevents a compact prefix or a separately loaded key
+    // from becoming the journal's node identity.
+    let daemon_keypair = load_daemon_keypair(&data_dir)?;
+    let prepared_agent_host = match configured_agent_pins {
+        Some(pins) => {
+            let merge =
+                vos::agent::host::Ed25519NodeMergeAuthenticator::new(daemon_keypair.clone())
+                    .map_err(|error| {
+                        anyhow::anyhow!("Local Agent host requires an Ed25519 node.key: {error:?}")
+                    })?;
+            let peer = libp2p::PeerId::from(daemon_keypair.public());
+            let scope = vos::agent::host::AgentHostScope {
+                space: vos::service::SpaceId(space_id),
+                node: vos::service::NodeId::of_authenticated_peer(&peer.to_bytes()),
+            };
+            let authority = agent_authority
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Agent authority selection was lost"))?;
+            // Reproduce the complete external archive before Agent-host path
+            // creation. Host open repeats these checks while sealing replay;
+            // this preflight guarantees an unavailable, absent, or mismatched
+            // provider cannot leave a new local scope/journal generation.
+            let archive_expected =
+                preflight_agent_genesis_archive(authority, &pins, scope, &agent_root)?;
+            Some((pins, merge, scope, archive_expected))
+        }
+        None => None,
+    };
+
     // Verify the genesis CrdtEvent against the advertised
     // space_id BEFORE registering the agent (which opens the
     // redb exclusively). Creators pass immediately; joiners
@@ -446,7 +788,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Always attach a libp2p network — even local-only spaces
     // bind a loopback port so client commands (`space publish`,
     // `space install`, etc.) have an endpoint to dial.
-    let network = build_network_for_daemon(entry, &data_dir, &args.listen, &args.connect)?;
+    let network = build_network_for_daemon(
+        entry,
+        &data_dir,
+        &args.listen,
+        &args.connect,
+        daemon_keypair.clone(),
+    )?;
     let local_prefix = network.local_prefix();
 
     // Serve program blobs (actor ELFs) to space members from the same
@@ -454,6 +802,42 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // an agent it never received in the recipe can fetch the ELF from us.
     let mut node =
         VosNode::with_prefix(local_prefix).with_program_blobs_dir(blob_store::cache_dir());
+
+    if let Some((pins, merge, scope, archive_expected)) = prepared_agent_host {
+        let stable_lock = crate::paths::agent_host_lock_path(&space_id);
+        let stable_lock_parent = stable_lock
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Agent host lock has no parent directory"))?;
+        std::fs::create_dir_all(stable_lock_parent).map_err(|error| {
+            anyhow::anyhow!(
+                "create Agent host lock directory {}: {error}",
+                stable_lock_parent.display(),
+            )
+        })?;
+        let lease = vos::agent::host::AgentHostRootLease::acquire(&agent_root, &stable_lock, scope)
+            .map_err(|error| anyhow::anyhow!("acquire Local Agent host: {error}"))?;
+        let authority = std::sync::Arc::new(
+            agent_authority.ok_or_else(|| anyhow::anyhow!("Agent authority selection was lost"))?,
+        );
+        let trust: std::sync::Arc<dyn vos::agent::driver::AgentTrustProvider> = authority.clone();
+        let provider: std::sync::Arc<dyn vos::agent::bootstrap::SystemAgentGenesisProvider> =
+            authority;
+        let merge: std::sync::Arc<dyn vos::agent::host::LocalMergeAuthenticator> =
+            std::sync::Arc::new(merge);
+        let system_agent = pins.record().system_agent();
+        let control = vos::agent::host::AgentHostControl::open(lease, trust, merge, provider, pins)
+            .map_err(|error| anyhow::anyhow!("open Local Agent host: {error}"))?;
+        let archive_opened = control
+            .handle()
+            .identity(system_agent)
+            .map_err(|error| anyhow::anyhow!("inspect Local system Agent after open: {error}"))?
+            .is_some();
+        require_preflight_archive_presence(archive_expected, archive_opened)?;
+        node.attach_local_agent_host(control).map_err(|control| {
+            drop(control);
+            anyhow::anyhow!("attach Local Agent host: node rejected its unique owner")
+        })?;
+    }
 
     // Record this daemon's operator — the CLI identity that ran `vosx space
     // up` (the same `vosx/identity.key` the operator later presents when
@@ -727,7 +1111,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         });
     }
 
-    let results = node.collect();
+    let results = cleanup_endpoint_after_collect(
+        &data_dir,
+        node.collect_checked()
+            .map_err(|error| anyhow::anyhow!("Local Agent host shutdown failed: {error}")),
+    )?;
     let mut panics = 0u32;
     for r in &results {
         panics += r.panics;
@@ -735,11 +1123,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             tracing::error!("agent {} error: {err}", r.id);
         }
     }
-
-    // Best-effort cleanup; if a crash short-circuits this,
-    // the next client invocation sees the stale endpoint and
-    // surfaces it via `endpoint::is_alive`.
-    crate::commands::space::endpoint::delete(&data_dir);
 
     if panics > 0 {
         anyhow::bail!("{panics} pvm panics");
@@ -1291,6 +1674,7 @@ fn build_network_for_daemon(
     data_dir: &std::path::Path,
     listen_override: &[String],
     connect_extra: &[String],
+    keypair: libp2p::identity::Keypair,
 ) -> anyhow::Result<vos::network::Network> {
     let parse = |s: &str, kind: &str| -> anyhow::Result<libp2p::Multiaddr> {
         libp2p::Multiaddr::from_str(s)
@@ -1322,11 +1706,6 @@ fn build_network_for_daemon(
         bootstrap.push(parse(s, "connect")?);
     }
 
-    let key_path = data_dir.join("node.key");
-    let key_bytes = std::fs::read(&key_path)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", key_path.display()))?;
-    let keypair = libp2p::identity::Keypair::from_protobuf_encoding(&key_bytes)
-        .map_err(|e| anyhow::anyhow!("decode keypair: {e}"))?;
     let peer_id = libp2p::PeerId::from(keypair.public());
     let local_prefix = vos::network::derive_node_prefix(&peer_id);
     tracing::info!("node identity {peer_id} (prefix {local_prefix:#06x})");
@@ -4008,6 +4387,280 @@ mod tests {
         assert!(validate_service_trust_mode(false, true, false).is_err());
         assert!(validate_service_trust_mode(false, false, true).is_err());
         assert!(validate_service_trust_mode(true, true, true).is_err());
+    }
+
+    fn agent_test_directory(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "vosx-agent-up-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ))
+    }
+
+    fn agent_test_root_pins(space: vos::service::SpaceId) -> vos::agent::committee::RootAnchorPins {
+        use vos::agent::committee::{
+            AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommittee,
+            AuthorityCommitteeMember, AuthorityMemberRole, RootAnchorPins, RootAnchorRecord,
+        };
+        use vos::service::{AgentId, Hash, NodeId};
+
+        let authority_binding = Hash([0x31; 32]);
+        let member = AuthorityCommitteeMember::new(
+            NodeId([0x32; 32]),
+            [0x33; 32],
+            AuthorityMemberRole::Voter,
+        )
+        .unwrap();
+        let committee =
+            AuthorityCommittee::new(space, authority_binding, 1, None, vec![member]).unwrap();
+        let record = RootAnchorRecord::new(
+            1,
+            space,
+            AgentId([0x34; 32]),
+            authority_binding,
+            Hash([0x35; 32]),
+            committee,
+        )
+        .unwrap();
+        let claim = AuthorityClaimCommitment::from_payload_commitment(
+            AuthorityClaimDomain::SystemAgentGenesis,
+            1,
+            Hash([0x36; 32]),
+        )
+        .unwrap();
+        RootAnchorPins::new(
+            record.clone(),
+            record.config_version(),
+            record.id(),
+            record.config_commitment(),
+            claim,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn local_agent_host_flags_are_strictly_paired_in_validation_and_clap() {
+        use clap::Parser as _;
+
+        assert!(validate_agent_host_selection(None, None).unwrap().is_none());
+        let pins = Path::new("/etc/vos/team.agent-root-pins");
+        let socket = Path::new("/run/vos/agent-authority.sock");
+        let selected = validate_agent_host_selection(Some(pins), Some(socket))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.root_pins, pins);
+        assert_eq!(selected.authority_socket, socket);
+        assert!(validate_agent_host_selection(Some(pins), None).is_err());
+        assert!(validate_agent_host_selection(None, Some(socket)).is_err());
+
+        assert!(
+            crate::Cli::try_parse_from([
+                "vosx",
+                "space",
+                "up",
+                "team",
+                "--agent-root-pins",
+                "/etc/vos/team.agent-root-pins",
+            ])
+            .is_err(),
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "vosx",
+                "space",
+                "up",
+                "team",
+                "--agent-authority-socket",
+                "/run/vos/agent-authority.sock",
+            ])
+            .is_err(),
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "vosx",
+                "space",
+                "up",
+                "team",
+                "--agent-root-pins",
+                "/etc/vos/team.agent-root-pins",
+                "--agent-authority-socket",
+                "/run/vos/agent-authority.sock",
+            ])
+            .is_ok(),
+        );
+    }
+
+    #[test]
+    fn root_pins_are_bounded_canonical_external_and_space_matched() {
+        use vos::service::{ServiceWire as _, SpaceId};
+
+        let directory = agent_test_directory("root-pins");
+        let data = directory.join("data");
+        let external = directory.join("external");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let space = SpaceId([0x41; 32]);
+        let pins = agent_test_root_pins(space);
+        let pins_path = external.join("root-pins.wire");
+        std::fs::write(&pins_path, pins.encode()).unwrap();
+        let pins_path = std::fs::canonicalize(pins_path).unwrap();
+
+        assert_eq!(
+            load_agent_root_pins(&pins_path, &data, space).unwrap(),
+            pins
+        );
+        let mismatch = load_agent_root_pins(&pins_path, &data, SpaceId([0x42; 32])).unwrap_err();
+        assert!(mismatch.to_string().contains("belong to space"));
+        assert!(
+            load_agent_root_pins(Path::new("relative-root-pins"), &data, space)
+                .unwrap_err()
+                .to_string()
+                .contains("absolute and canonical"),
+        );
+
+        let embedded = data.join("root-pins.wire");
+        std::fs::write(&embedded, pins.encode()).unwrap();
+        let embedded = std::fs::canonicalize(embedded).unwrap();
+        assert!(
+            load_agent_root_pins(&embedded, &data, space)
+                .unwrap_err()
+                .to_string()
+                .contains("outside"),
+        );
+
+        let oversized = external.join("oversized.wire");
+        std::fs::write(
+            &oversized,
+            vec![0u8; vos::agent::committee::MAX_ROOT_ANCHOR_PINS_BYTES + 1],
+        )
+        .unwrap();
+        let oversized = std::fs::canonicalize(oversized).unwrap();
+        assert!(
+            load_agent_root_pins(&oversized, &data, space)
+                .unwrap_err()
+                .to_string()
+                .contains("bound"),
+        );
+
+        #[cfg(unix)]
+        {
+            let alias = external.join("root-pins-link");
+            std::os::unix::fs::symlink(&pins_path, &alias).unwrap();
+            assert!(
+                load_agent_root_pins(&alias, &data, space)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("non-symlink"),
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn disabled_agent_host_rejects_native_residue_but_ignores_service_databases() {
+        let directory = agent_test_directory("residue");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("00000000.redb"), b"legacy service").unwrap();
+        assert!(reject_agent_host_residue_without_authority(&directory).is_ok());
+
+        for name in [
+            format!("{}.agent", "11".repeat(32)),
+            format!("{}.agent-lock", "22".repeat(32)),
+            format!("{}.agent-image", "33".repeat(32)),
+            ".agent-host.scope".into(),
+            ".agent-host.scope.tmp".into(),
+            ".agent-host.lock".into(),
+            format!("{}.AGENT", "44".repeat(32)),
+        ] {
+            let path = directory.join(&name);
+            std::fs::write(&path, b"residue").unwrap();
+            let error = reject_agent_host_residue_without_authority(&directory).unwrap_err();
+            assert!(
+                error.to_string().contains("requires both"),
+                "{name}: {error}"
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn configured_empty_agent_host_may_reopen_with_only_scope_sidecars() {
+        let directory = agent_test_directory("empty-restart");
+        std::fs::create_dir_all(&directory).unwrap();
+        for name in [
+            ".agent-host.scope",
+            ".agent-host.scope.tmp",
+            ".agent-host.lock",
+        ] {
+            std::fs::write(directory.join(name), b"host metadata").unwrap();
+        }
+
+        assert!(agent_generation_residue(&directory).unwrap().is_none());
+        assert!(agent_host_residue(&directory).unwrap().is_some());
+
+        for name in [
+            format!("{}.agent", "11".repeat(32)),
+            format!("{}.agent-lock", "22".repeat(32)),
+            format!("{}.agent-image", "33".repeat(32)),
+        ] {
+            let path = directory.join(name);
+            std::fs::write(&path, b"generation").unwrap();
+            assert_eq!(
+                agent_generation_residue(&directory).unwrap(),
+                Some(path.clone())
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn one_decoded_ed25519_identity_drives_network_and_local_merge_identity() {
+        use vos::agent::host::LocalMergeAuthenticator as _;
+
+        let directory = agent_test_directory("node-key");
+        std::fs::create_dir_all(&directory).unwrap();
+        let original = libp2p::identity::Keypair::generate_ed25519();
+        std::fs::write(
+            directory.join("node.key"),
+            original.to_protobuf_encoding().unwrap(),
+        )
+        .unwrap();
+        let loaded = load_daemon_keypair(&directory).unwrap();
+        let network_keypair = loaded.clone();
+        let merge = vos::agent::host::Ed25519NodeMergeAuthenticator::new(loaded.clone()).unwrap();
+        let peer = libp2p::PeerId::from(original.public());
+        assert_eq!(libp2p::PeerId::from(network_keypair.public()), peer);
+        assert_eq!(
+            merge.node(),
+            vos::service::NodeId::of_authenticated_peer(&peer.to_bytes()),
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn checked_agent_host_failure_still_removes_published_endpoint() {
+        let directory = agent_test_directory("endpoint-cleanup");
+        std::fs::create_dir_all(&directory).unwrap();
+        let endpoint = crate::commands::space::endpoint::path(&directory);
+        std::fs::write(&endpoint, b"published").unwrap();
+        let result = cleanup_endpoint_after_collect(&directory, Err::<(), _>("host failed"));
+        assert_eq!(result, Err("host failed"));
+        assert!(!endpoint.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn archived_preflight_cannot_downgrade_to_an_empty_opened_host() {
+        assert!(require_preflight_archive_presence(true, true).is_ok());
+        assert!(require_preflight_archive_presence(false, false).is_ok());
+        assert!(require_preflight_archive_presence(false, true).is_ok());
+        assert!(require_preflight_archive_presence(true, false).is_err());
     }
     use libp2p::identity::Keypair;
     use vos::metadata::{ActorMeta, MessageMeta};

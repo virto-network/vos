@@ -12,6 +12,8 @@
 //!   local.toml                        # user overrides (subscriptions, listen addr)
 //!
 //! ~/.config/vosx/spaces.toml          # known-spaces index
+//! ~/.config/vosx/locks/<space_id>.agent-host.lock
+//!                                      # stable Local Agent host ownership
 //! ~/.cache/vosx/blobs/{hex_hash}     # cross-space blob cache (see blob_store)
 //! ```
 //!
@@ -89,6 +91,17 @@ pub fn config_root() -> PathBuf {
     xdg_root("XDG_CONFIG_HOME", &[".config"])
 }
 
+/// Stable ownership lock for one space's Local Agent host.
+///
+/// This deliberately lives outside the replaceable per-space data directory:
+/// backup/restore may rename that complete tree without changing the inode
+/// which serializes the host owner.
+pub fn agent_host_lock_path(space_id: &[u8; 32]) -> PathBuf {
+    config_root()
+        .join("locks")
+        .join(format!("{}.agent-host.lock", space_id_hex(space_id)))
+}
+
 /// Cache directory: `$XDG_CACHE_HOME/vosx` or `~/.cache/vosx`.
 /// The blob store extends this further with `/blobs`.
 pub fn cache_root() -> PathBuf {
@@ -139,6 +152,7 @@ mod tests {
         assert!(agent_db_path(&id, 0xC0DE).starts_with(&space));
         assert!(trash_dir(&id).starts_with(&space));
         assert!(local_config_path(&id).starts_with(&space));
+        assert!(!agent_host_lock_path(&id).starts_with(&space));
     }
 
     #[test]
@@ -154,5 +168,16 @@ mod tests {
         // Data ≠ config; we don't want them collapsing to the
         // same directory when XDG vars are unset.
         assert_ne!(data_root(), config_root());
+    }
+
+    #[test]
+    fn agent_host_lock_is_stable_and_space_scoped() {
+        let id = [0x5au8; 32];
+        assert_eq!(
+            agent_host_lock_path(&id),
+            config_root()
+                .join("locks")
+                .join(format!("{}.agent-host.lock", "5a".repeat(32))),
+        );
     }
 }

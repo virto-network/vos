@@ -172,6 +172,14 @@ pub enum SpaceCommand {
             conflicts_with = "production_trust_socket"
         )]
         allow_conformance: bool,
+        /// Canonical RootAnchorPins wire file independently provisioned for
+        /// this space's Local system Agent.
+        #[arg(long, value_name = "FILE", requires = "agent_authority_socket")]
+        agent_root_pins: Option<PathBuf>,
+        /// Generation-2 authority/archive Unix socket for the Local system
+        /// Agent. This must always be paired with --agent-root-pins.
+        #[arg(long, value_name = "SOCKET", requires = "agent_root_pins")]
+        agent_authority_socket: Option<PathBuf>,
     },
     /// Stop a running `space up` daemon by signalling its PID.
     /// SIGTERM by default (daemon flushes state, removes the
@@ -411,6 +419,8 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             service_pvm,
             production_trust_socket,
             allow_conformance,
+            agent_root_pins,
+            agent_authority_socket,
         } => up::run(up::Args {
             query: space,
             once,
@@ -419,6 +429,8 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             service_pvm,
             production_trust_socket,
             allow_conformance,
+            agent_root_pins,
+            agent_authority_socket,
         }),
         SpaceCommand::Down {
             space,

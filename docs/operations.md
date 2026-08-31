@@ -14,6 +14,48 @@ Production roots also require a configured trust provider. Route publication
 happens only after the local service has caught up, validated its trust policy,
 and—when applicable—proved committed final Raft membership.
 
+### Local system Agent host
+
+Enable the Agent-native Local journal host only with both independent inputs:
+
+```bash
+vosx space up team \
+  --agent-root-pins /etc/vos/spaces/team.root-pins \
+  --agent-authority-socket /run/vos/agent-authority.sock
+```
+
+The pins file is the bounded canonical `RootAnchorPins` wire, not TOML or hex.
+Pass its absolute canonical path; it must be a regular non-symlink file outside
+the space data directory and its embedded space must exactly match the space
+being booted. Provision it independently of the socket authority. In
+particular, never generate the configured pins from the archive response being
+verified.
+
+The socket authority owns the durable, provider-first system-genesis archive.
+It must remain available for every daemon restart once a native Agent
+generation exists. Back up and restore that external archive under the
+authority operator's procedure; it is intentionally not copied into a VOS
+space backup. An unavailable, conflicting, corrupt, or mismatched archive
+aborts startup before the Local Agent journal is opened. A configured authority
+may report no archive only while no native `.agent`, `.agent-lock`, or retired
+`.agent-image` generation exists; exact empty-host scope/lock metadata alone is
+allowed before the first provider-first Create.
+
+Native journals live under `<space-data>/agents/<full-agent-id>.agent` with a
+sibling `.agent-lock`. The stable host lock is
+`$XDG_CONFIG_HOME/vosx/locks/<space-id>.agent-host.lock` (or the corresponding
+home-directory fallback), outside the replaceable space tree. The full Ed25519
+identity decoded once from `<space-data>/node.key`
+binds both libp2p networking and Local Merge records. Non-Ed25519 node keys are
+rejected whenever this host is enabled.
+
+This is a clean generation cutover. `.agent-image` files are retired and are
+never opened or migrated. If the two Agent flags are absent, `space up` keeps
+the legacy Service behavior only when no `.agent`, `.agent-lock`,
+`.agent-image`, or Agent-host scope residue is present; finding any such state
+fails closed and requires explicit operator configuration or removal after an
+independent archival decision.
+
 ## Built-in ingress
 
 HTTP listeners are configured per node in `<space-data>/local.toml`. Issue and
@@ -47,9 +89,12 @@ vosx space backup team /safe/team-backup
 vosx space restore /safe/team-backup --data-dir /srv/vos/team
 ```
 
-The backup is a self-contained directory with a signed-content manifest,
-service images, local databases, private side stores, node identity, and the
-required blob cache. Restore verifies every file before replacing anything.
+The backup is a self-contained directory for the space-owned state, with a
+signed-content manifest, service images, local databases, private side stores,
+node identity, and the required blob cache. Restore verifies every file before
+replacing anything. A configured system-Agent genesis archive and its
+independent root-pins file are authority-owned external inputs and must be
+backed up separately as described above.
 
 A restored replicated node may be behind. This is expected: keep the same node
 identity and replication incarnation, reconnect it, and wait until its durable
