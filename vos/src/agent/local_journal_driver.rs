@@ -17,7 +17,7 @@ use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation, RuntimeBlob,
     RuntimeExecutionCall, RuntimeExecutionReturn,
 };
-use super::invocation_index::InvocationIndexes;
+use super::invocation_index::{InvocationIndexLookup, InvocationIndexes};
 use super::journal::{
     CanonicalJournalRecord, InvocationOutcomeAnchor, InvocationOwnershipKey,
     InvocationOwnershipScope, InvocationResultState, LaneCursor, LocalEntry, MergeEvent,
@@ -350,10 +350,10 @@ impl From<LocalReplayExecutorError> for LocalJournalDriverError {
 
 /// Recovery capability returned while a Merge source remains pending.
 ///
-/// It is restart-safe until finalization. After the owner becomes an
-/// `Acknowledged` tombstone, checkpoint GC may prune this suffix position;
-/// callers must then submit a fresh authenticated acknowledgement retry,
-/// which resolves the permanent tombstone without the historical event.
+/// It is restart-safe until finalization. After the owner becomes a
+/// permanent acknowledged-history fact, checkpoint GC may prune this suffix
+/// position; callers must then submit a fresh authenticated acknowledgement
+/// retry, which resolves that history fact without the historical event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingMergeReceipt {
     pub event: MergeEventId,
@@ -1456,11 +1456,24 @@ where
             heads.local_invocations,
         )
         .map_err(|_| LocalJournalDriverError::InvalidResult)?;
-        let Some(owner) = indexes
+        let Some(lookup) = indexes
             .lookup(key)
             .map_err(|_| LocalJournalDriverError::InvalidResult)?
         else {
             return Ok(None);
+        };
+        let owner = match lookup {
+            InvocationIndexLookup::Archived(fact) => {
+                if fact.validate().is_err()
+                    || fact.genesis() != heads.genesis
+                    || fact.key() != key
+                    || fact.request_commitment() != invocation.commitment()
+                {
+                    return Ok(None);
+                }
+                return Ok(Some(ExistingMergeRecovery::Acknowledged));
+            }
+            InvocationIndexLookup::Live(owner) => owner,
         };
         if owner.validate().is_err()
             || owner.scope != InvocationOwnershipScope::Merge
@@ -1469,9 +1482,6 @@ where
             return Ok(None);
         }
         let source_event = match (acknowledgement, owner.result_state) {
-            (_, InvocationResultState::Acknowledged { .. }) => {
-                return Ok(Some(ExistingMergeRecovery::Acknowledged));
-            }
             (false, InvocationResultState::PendingMerge { source_event }) => source_event,
             (
                 true,
@@ -3397,7 +3407,7 @@ mod tests {
         let ExistingMergeRecovery::Pending(pending) =
             reopened.existing_merge_recovery(&retry).unwrap().unwrap()
         else {
-            panic!("pending invocation resolved as an acknowledged tombstone")
+            panic!("pending invocation resolved as acknowledged history")
         };
         assert_eq!(pending.event, source_event);
         assert_eq!(pending.position, source_position);
@@ -3451,7 +3461,7 @@ mod tests {
             .unwrap()
             .unwrap()
         else {
-            panic!("pending acknowledgement resolved as an acknowledged tombstone")
+            panic!("pending acknowledgement resolved as acknowledged history")
         };
         assert_eq!(pending.event, acknowledgement_event);
         assert_eq!(pending.position, acknowledgement_position);
@@ -3505,7 +3515,7 @@ mod tests {
                 .get::<MergeEvent>(acknowledgement_event)
                 .unwrap(),
             None,
-            "the permanent tombstone does not retain the acknowledgement suffix anchor"
+            "permanent acknowledged history does not retain the acknowledgement suffix anchor"
         );
 
         let LocalJournalCore { store, .. } = reopened;

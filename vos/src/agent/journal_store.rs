@@ -34,23 +34,31 @@ use super::committee::{
     SystemAgentGenesisEvidence,
 };
 use super::execution::MAX_RUNTIME_STATE_BYTES;
+use super::invocation_history::{
+    InvocationHistoryError, InvocationHistoryNode, InvocationHistoryStore,
+    InvocationHistoryWritePlan, MAX_INVOCATION_HISTORY_INSERTIONS,
+    MAX_INVOCATION_HISTORY_NODE_BYTES, MAX_INVOCATION_HISTORY_PLAN_NODE_BYTES,
+    MAX_INVOCATION_HISTORY_PLAN_NODES, MAX_INVOCATION_HISTORY_RETIRED_NODES,
+    MAX_INVOCATION_HISTORY_WRITE_PLAN_BYTES,
+};
 use super::invocation_index::{
     DEFAULT_INVOCATION_INDEX_NODE_LIMIT, InvocationIndexError, InvocationIndexNode,
     InvocationIndexStore, InvocationOutcomeStore, collect_manifest_reachability,
     validate_manifest_root,
 };
 use super::journal::{
-    AgentJournalGenesis, ArtifactClosure, CanonicalJournalRecord, CheckpointId, CheckpointManifest,
-    InvocationIndexId, InvocationIndexManifest, InvocationIndexNodeId, InvocationOutcomeAnchor,
-    InvocationOutcomeId, InvocationOutcomeRecord, InvocationOwnershipScope, JournalHeads,
-    JournalHeadsId, JournalObjectId, JournalStorageClass, LaneCursor, LaneStateId,
-    LaneStateManifest, LocalEntry, LocalEntryId, MAX_ARTIFACT_CLOSURE_BYTES,
-    MAX_ARTIFACT_CLOSURE_ENTRIES, MAX_ARTIFACT_CLOSURE_REFERENCED_BYTES,
-    MAX_CHECKPOINT_MANIFEST_BYTES, MAX_INVOCATION_INDEX_MANIFEST_BYTES,
-    MAX_INVOCATION_INDEX_NODE_BYTES, MAX_INVOCATION_OUTCOME_BYTES, MAX_JOURNAL_RECORD_BYTES,
-    MAX_REPLAY_INPUT_BYTES, MAX_REPLAY_SUFFIX_BYTES, MAX_REPLAY_SUFFIX_ENTRIES, MergeEvent,
-    MergeEventId, MergeFrontier, MergeFrontierId, MergeSeal, MergeSealId, OrderedBase,
-    OrderedEntry, OrderedEntryId, PersistedLane, system_genesis_post_create_state_commitment,
+    AgentJournalGenesis, AgentJournalGenesisId, ArtifactClosure, CanonicalJournalRecord,
+    CheckpointId, CheckpointManifest, InvocationHistoryNodeId, InvocationIndexId,
+    InvocationIndexManifest, InvocationIndexNodeId, InvocationOutcomeAnchor, InvocationOutcomeId,
+    InvocationOutcomeRecord, InvocationOwnershipScope, JournalHeads, JournalHeadsId,
+    JournalObjectId, JournalStorageClass, LaneCursor, LaneStateId, LaneStateManifest, LocalEntry,
+    LocalEntryId, MAX_ARTIFACT_CLOSURE_BYTES, MAX_ARTIFACT_CLOSURE_ENTRIES,
+    MAX_ARTIFACT_CLOSURE_REFERENCED_BYTES, MAX_CHECKPOINT_MANIFEST_BYTES,
+    MAX_INVOCATION_INDEX_MANIFEST_BYTES, MAX_INVOCATION_INDEX_NODE_BYTES,
+    MAX_INVOCATION_OUTCOME_BYTES, MAX_JOURNAL_RECORD_BYTES, MAX_REPLAY_INPUT_BYTES,
+    MAX_REPLAY_SUFFIX_BYTES, MAX_REPLAY_SUFFIX_ENTRIES, MergeEvent, MergeEventId, MergeFrontier,
+    MergeFrontierId, MergeSeal, MergeSealId, OrderedBase, OrderedEntry, OrderedEntryId,
+    PersistedLane, system_genesis_post_create_state_commitment,
 };
 use super::replay::{ReplayPublicationAnchor, ReplaySealedGenesis, ReplaySealedPublication};
 use super::wire::{RuntimeState, decode_standard_runtime_state};
@@ -135,6 +143,9 @@ pub enum JournalStoreError {
     InvalidClass,
     NonCanonical,
     LimitExceeded,
+    /// A bounded authenticated-history retirement backlog must be covered by
+    /// a fresh checkpoint and collected before another history publication.
+    Backpressure,
     MissingObject,
     Corrupt,
     Unavailable,
@@ -172,7 +183,10 @@ pub(crate) trait CatalogBlobResolverFactory {
 /// from authenticated heads or a checkpoint and follows typed parent IDs.
 /// Content objects are never removed through this interface: later garbage
 /// collection must first prove that a checkpoint covers the retained suffix.
-pub trait AgentJournalStore: InvocationOutcomeStore<Error = JournalStoreError> {
+pub trait AgentJournalStore:
+    InvocationOutcomeStore<Error = JournalStoreError>
+    + InvocationHistoryStore<Error = JournalStoreError>
+{
     /// Install immutable genesis and its empty head envelope. Exact retries
     /// are idempotent. Implementations may durably retain a validated partial
     /// initialization after an I/O failure; retrying this method completes it.
@@ -266,6 +280,626 @@ fn decode_gc_intent(bytes: &[u8]) -> Result<GcIntent, JournalStoreError> {
     intent.validate()
 }
 
+const HISTORY_DIRECTORY: &str = "invocation-history";
+const HISTORY_NODES_DIRECTORY: &str = "invocation-history/nodes";
+const HISTORY_CANDIDATE_DIRECTORY: &str = "invocation-history/candidate";
+const HISTORY_CANDIDATE_INTENT_NAME: &str = "candidate-intent";
+const HISTORY_CANDIDATE_INTENT_STAGE_NAME: &str = "candidate-intent.next";
+const HISTORY_RETIREMENTS_NAME: &str = "retirements";
+const HISTORY_RETIREMENTS_STAGE_NAME: &str = "retirements.next";
+const MAX_HISTORY_PUBLICATION_PLANS: usize = 3;
+const MAX_HISTORY_RETIREMENT_PUBLICATIONS: usize = 64;
+const MAX_HISTORY_RETIREMENT_BACKLOG_IDS: usize = 4 * MAX_INVOCATION_HISTORY_RETIRED_NODES;
+const MAX_HISTORY_CANDIDATE_INTENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HISTORY_RETIREMENT_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+const HISTORY_CANDIDATE_DOMAIN: &[u8] = b"vos/agent/journal/history-candidate/v1";
+const HISTORY_QUEUE_DOMAIN: &[u8] = b"vos/agent/journal/history-retirement-queue/v1";
+
+fn encode_history_scope(encoder: &mut Encoder<'_>, scope: InvocationOwnershipScope) {
+    match scope {
+        InvocationOwnershipScope::Ordered => encoder.u8(0),
+        InvocationOwnershipScope::Merge => encoder.u8(1),
+        InvocationOwnershipScope::Local(node) => {
+            encoder.u8(2);
+            encoder.fixed(node.as_bytes());
+        }
+    }
+}
+
+fn decode_history_scope(
+    decoder: &mut Decoder<'_>,
+) -> Result<InvocationOwnershipScope, DecodeError> {
+    let scope = match decoder.u8()? {
+        0 => InvocationOwnershipScope::Ordered,
+        1 => InvocationOwnershipScope::Merge,
+        2 => InvocationOwnershipScope::Local(NodeId(decoder.fixed()?)),
+        _ => return Err(DecodeError::InvalidTag),
+    };
+    scope.validate()?;
+    Ok(scope)
+}
+
+fn encode_history_root(encoder: &mut Encoder<'_>, root: &Option<InvocationHistoryNodeId>) {
+    encoder.option(root, |encoder, root| encoder.fixed(root.as_bytes()));
+}
+
+fn decode_history_root(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<InvocationHistoryNodeId>, DecodeError> {
+    decoder.option(|decoder| Ok(InvocationHistoryNodeId(decoder.fixed()?)))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistoryRoots {
+    ordered: Option<InvocationHistoryNodeId>,
+    merge: Option<InvocationHistoryNodeId>,
+    local: Option<InvocationHistoryNodeId>,
+}
+
+impl HistoryRoots {
+    const fn get(self, scope: InvocationOwnershipScope) -> Option<InvocationHistoryNodeId> {
+        match scope {
+            InvocationOwnershipScope::Ordered => self.ordered,
+            InvocationOwnershipScope::Merge => self.merge,
+            InvocationOwnershipScope::Local(_) => self.local,
+        }
+    }
+
+    fn validate(self) -> Result<Self, JournalStoreError> {
+        if [self.ordered, self.merge, self.local]
+            .into_iter()
+            .flatten()
+            .any(|root| root == InvocationHistoryNodeId::ZERO)
+        {
+            Err(JournalStoreError::Corrupt)
+        } else {
+            Ok(self)
+        }
+    }
+
+    fn encode_to(&self, encoder: &mut Encoder<'_>) {
+        encode_history_root(encoder, &self.ordered);
+        encode_history_root(encoder, &self.merge);
+        encode_history_root(encoder, &self.local);
+    }
+
+    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let roots = Self {
+            ordered: decode_history_root(decoder)?,
+            merge: decode_history_root(decoder)?,
+            local: decode_history_root(decoder)?,
+        };
+        if [roots.ordered, roots.merge, roots.local]
+            .into_iter()
+            .flatten()
+            .any(|root| root == InvocationHistoryNodeId::ZERO)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(roots)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryRetirementRecord {
+    expected_heads: JournalHeadsId,
+    next_heads: JournalHeadsId,
+    publication_revision: u64,
+    expected_roots: HistoryRoots,
+    next_roots: HistoryRoots,
+    retired_node_ids: Vec<InvocationHistoryNodeId>,
+    retired_cursor: u32,
+}
+
+impl HistoryRetirementRecord {
+    fn validate(&self) -> Result<(), JournalStoreError> {
+        self.expected_roots.validate()?;
+        self.next_roots.validate()?;
+        if self.expected_heads == JournalHeadsId::ZERO
+            || self.next_heads == JournalHeadsId::ZERO
+            || self.expected_heads == self.next_heads
+            || self.publication_revision == 0
+            || self.expected_roots == self.next_roots
+            || self.retired_node_ids.len() > MAX_INVOCATION_HISTORY_RETIRED_NODES
+            || self.retired_cursor as usize > self.retired_node_ids.len()
+            || self
+                .retired_node_ids
+                .iter()
+                .any(|id| *id == InvocationHistoryNodeId::ZERO)
+            || self
+                .retired_node_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn encode_to(&self, encoder: &mut Encoder<'_>) {
+        encoder.fixed(self.expected_heads.as_bytes());
+        encoder.fixed(self.next_heads.as_bytes());
+        encoder.u64(self.publication_revision);
+        self.expected_roots.encode_to(encoder);
+        self.next_roots.encode_to(encoder);
+        encoder.list(&self.retired_node_ids, |encoder, id| {
+            encoder.fixed(id.as_bytes())
+        });
+        encoder.u32(self.retired_cursor);
+    }
+
+    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let record = Self {
+            expected_heads: JournalHeadsId(decoder.fixed()?),
+            next_heads: JournalHeadsId(decoder.fixed()?),
+            publication_revision: decoder.u64()?,
+            expected_roots: HistoryRoots::decode_from(decoder)?,
+            next_roots: HistoryRoots::decode_from(decoder)?,
+            retired_node_ids: decoder
+                .list(|decoder| Ok(InvocationHistoryNodeId(decoder.fixed()?)))?,
+            retired_cursor: decoder.u32()?,
+        };
+        record.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(record)
+    }
+
+    fn remaining(&self) -> &[InvocationHistoryNodeId] {
+        &self.retired_node_ids[self.retired_cursor as usize..]
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryRetirementQueue {
+    genesis: AgentJournalGenesisId,
+    node: NodeId,
+    records: Vec<HistoryRetirementRecord>,
+}
+
+impl HistoryRetirementQueue {
+    const fn empty(genesis: AgentJournalGenesisId, node: NodeId) -> Self {
+        Self {
+            genesis,
+            node,
+            records: Vec::new(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), JournalStoreError> {
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || self.node == NodeId::ZERO
+            || self.records.len() > MAX_HISTORY_RETIREMENT_PUBLICATIONS
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let mut outstanding = 0usize;
+        let mut all_retired = BTreeSet::new();
+        for (index, record) in self.records.iter().enumerate() {
+            record.validate()?;
+            if index != 0 {
+                let previous = &self.records[index - 1];
+                if previous.publication_revision >= record.publication_revision
+                    || previous.next_roots != record.expected_roots
+                {
+                    return Err(JournalStoreError::Corrupt);
+                }
+            }
+            outstanding = outstanding
+                .checked_add(record.remaining().len())
+                .ok_or(JournalStoreError::LimitExceeded)?;
+            for id in record.remaining() {
+                if !all_retired.insert(*id) {
+                    return Err(JournalStoreError::Corrupt);
+                }
+            }
+        }
+        if outstanding > MAX_HISTORY_RETIREMENT_BACKLOG_IDS {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn commitment(&self) -> Hash {
+        Hash::digest(HISTORY_QUEUE_DOMAIN, &[&self.encode()])
+    }
+
+    fn preflight_append(&self, record: &HistoryRetirementRecord) -> Result<(), JournalStoreError> {
+        self.validate()?;
+        record.validate()?;
+        if let Some(tail) = self.records.last()
+            && (tail.publication_revision >= record.publication_revision
+                || tail.next_roots != record.expected_roots)
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let outstanding = self
+            .records
+            .iter()
+            .try_fold(0usize, |count, record| {
+                count.checked_add(record.remaining().len())
+            })
+            .and_then(|count| count.checked_add(record.remaining().len()))
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        if self.records.len() == MAX_HISTORY_RETIREMENT_PUBLICATIONS
+            || outstanding > MAX_HISTORY_RETIREMENT_BACKLOG_IDS
+        {
+            return Err(JournalStoreError::Backpressure);
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for HistoryRetirementQueue {
+    const MAGIC: [u8; 4] = *b"IHRQ";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(self.genesis.as_bytes());
+        encoder.fixed(self.node.as_bytes());
+        encoder.list(&self.records, |encoder, record| record.encode_to(encoder));
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let queue = Self {
+            genesis: AgentJournalGenesisId(decoder.fixed()?),
+            node: NodeId(decoder.fixed()?),
+            records: decoder.list(HistoryRetirementRecord::decode_from)?,
+        };
+        queue.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(queue)
+    }
+}
+
+fn advance_history_retirement_queue(
+    queue: &HistoryRetirementQueue,
+    maximum_ids: usize,
+) -> Result<(HistoryRetirementQueue, Vec<InvocationHistoryNodeId>), JournalStoreError> {
+    queue.validate()?;
+    let mut next = queue.clone();
+    let mut ids = Vec::new();
+    loop {
+        let Some(record) = next.records.first_mut() else {
+            break;
+        };
+        if record.remaining().is_empty() {
+            next.records.remove(0);
+            continue;
+        }
+        if ids.len() == maximum_ids {
+            break;
+        }
+        ids.push(record.remaining()[0]);
+        record.retired_cursor += 1;
+    }
+    next.validate()?;
+    Ok((next, ids))
+}
+
+fn history_retirement_stage_delta(
+    committed: &HistoryRetirementQueue,
+    staged: &HistoryRetirementQueue,
+) -> Result<Vec<InvocationHistoryNodeId>, JournalStoreError> {
+    committed.validate()?;
+    staged.validate()?;
+    if committed.genesis != staged.genesis || committed.node != staged.node {
+        return Err(JournalStoreError::Corrupt);
+    }
+    if staged.records.len() > committed.records.len() {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let removed = committed.records.len() - staged.records.len();
+    let mut ids = Vec::new();
+    for record in &committed.records[..removed] {
+        ids.extend_from_slice(record.remaining());
+    }
+    if staged.records.is_empty() {
+        return Ok(ids);
+    }
+    let committed_first = &committed.records[removed];
+    let staged_first = &staged.records[0];
+    if staged_first.retired_cursor < committed_first.retired_cursor {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let mut expected_first = committed_first.clone();
+    expected_first.retired_cursor = staged_first.retired_cursor;
+    if expected_first != *staged_first || committed.records[removed + 1..] != staged.records[1..] {
+        return Err(JournalStoreError::Corrupt);
+    }
+    ids.extend_from_slice(
+        &committed_first.retired_node_ids
+            [committed_first.retired_cursor as usize..staged_first.retired_cursor as usize],
+    );
+    Ok(ids)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryCandidatePlanDescriptor {
+    scope: InvocationOwnershipScope,
+    hash: Hash,
+    encoded_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryCandidateIntent {
+    queue_commitment: Hash,
+    retirement: HistoryRetirementRecord,
+    plans: Vec<HistoryCandidatePlanDescriptor>,
+}
+
+impl HistoryCandidateIntent {
+    fn validate(&self) -> Result<(), JournalStoreError> {
+        self.retirement.validate()?;
+        if self.queue_commitment == Hash::ZERO
+            || self.plans.is_empty()
+            || self.plans.len() > MAX_HISTORY_PUBLICATION_PLANS
+            || self
+                .plans
+                .windows(2)
+                .any(|pair| pair[0].scope >= pair[1].scope)
+            || self.plans.iter().any(|plan| {
+                plan.hash == Hash::ZERO
+                    || plan.encoded_bytes == 0
+                    || plan.encoded_bytes > MAX_INVOCATION_HISTORY_WRITE_PLAN_BYTES as u64
+            })
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for HistoryCandidateIntent {
+    const MAGIC: [u8; 4] = *b"IHCI";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(self.queue_commitment.as_bytes());
+        self.retirement.encode_to(&mut encoder);
+        encoder.list(&self.plans, |encoder, plan| {
+            encode_history_scope(encoder, plan.scope);
+            encoder.fixed(plan.hash.as_bytes());
+            encoder.u64(plan.encoded_bytes);
+        });
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let intent = Self {
+            queue_commitment: Hash(decoder.fixed()?),
+            retirement: HistoryRetirementRecord::decode_from(decoder)?,
+            plans: decoder.list(|decoder| {
+                Ok(HistoryCandidatePlanDescriptor {
+                    scope: decode_history_scope(decoder)?,
+                    hash: Hash(decoder.fixed()?),
+                    encoded_bytes: decoder.u64()?,
+                })
+            })?,
+        };
+        intent.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(intent)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HistoryCandidateOverlay {
+    intent: HistoryCandidateIntent,
+    plans: Vec<InvocationHistoryWritePlan>,
+    nodes: BTreeMap<InvocationHistoryNodeId, Vec<u8>>,
+}
+
+fn decode_history_queue(bytes: &[u8]) -> Result<HistoryRetirementQueue, JournalStoreError> {
+    if bytes.len() > MAX_HISTORY_RETIREMENT_QUEUE_BYTES {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let queue = HistoryRetirementQueue::decode(bytes).map_err(|_| JournalStoreError::Corrupt)?;
+    if queue.encode() != bytes {
+        return Err(JournalStoreError::Corrupt);
+    }
+    queue.validate()?;
+    Ok(queue)
+}
+
+fn decode_history_candidate_intent(
+    bytes: &[u8],
+) -> Result<HistoryCandidateIntent, JournalStoreError> {
+    if bytes.len() > MAX_HISTORY_CANDIDATE_INTENT_BYTES {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let intent = HistoryCandidateIntent::decode(bytes).map_err(|_| JournalStoreError::Corrupt)?;
+    if intent.encode() != bytes {
+        return Err(JournalStoreError::Corrupt);
+    }
+    intent.validate()?;
+    Ok(intent)
+}
+
+fn decode_history_plan(bytes: &[u8]) -> Result<InvocationHistoryWritePlan, JournalStoreError> {
+    if bytes.len() > MAX_INVOCATION_HISTORY_WRITE_PLAN_BYTES {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let plan = InvocationHistoryWritePlan::decode(bytes).map_err(|_| JournalStoreError::Corrupt)?;
+    if plan.encode() != bytes {
+        return Err(JournalStoreError::Corrupt);
+    }
+    Ok(plan)
+}
+
+fn history_roots_for_heads<S: AgentJournalStore>(
+    store: &S,
+    heads: &JournalHeads,
+) -> Result<HistoryRoots, JournalStoreError> {
+    let ordered = require_record::<S, InvocationIndexManifest>(store, heads.ordered_invocations)?;
+    let merge = require_record::<S, InvocationIndexManifest>(store, heads.merge_invocations)?;
+    let local = require_record::<S, InvocationIndexManifest>(store, heads.local_invocations)?;
+    if ordered.genesis != heads.genesis
+        || ordered.scope != InvocationOwnershipScope::Ordered
+        || merge.genesis != heads.genesis
+        || merge.scope != InvocationOwnershipScope::Merge
+        || local.genesis != heads.genesis
+        || local.scope != InvocationOwnershipScope::Local(heads.node)
+    {
+        return Err(JournalStoreError::Corrupt);
+    }
+    HistoryRoots {
+        ordered: ordered.history_root,
+        merge: merge.history_root,
+        local: local.history_root,
+    }
+    .validate()
+}
+
+fn build_history_candidate<S: AgentJournalStore>(
+    store: &S,
+    current: &JournalHeads,
+    next: &JournalHeads,
+    plans: &[InvocationHistoryWritePlan],
+    queue: &HistoryRetirementQueue,
+) -> Result<Option<HistoryCandidateOverlay>, JournalStoreError> {
+    let expected_roots = history_roots_for_heads(store, current)?;
+    let next_roots = history_roots_for_heads(store, next)?;
+    if plans.is_empty() {
+        return if expected_roots == next_roots {
+            Ok(None)
+        } else {
+            Err(JournalStoreError::NonCanonical)
+        };
+    }
+    if plans.len() > MAX_HISTORY_PUBLICATION_PLANS
+        || plans
+            .windows(2)
+            .any(|pair| pair[0].scope() >= pair[1].scope())
+        || queue.genesis != current.genesis
+        || queue.node != current.node
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+
+    let mut insertions = 0usize;
+    let mut plan_nodes = 0usize;
+    let mut plan_node_bytes = 0usize;
+    let mut retired = Vec::new();
+    let mut overlay_nodes = BTreeMap::new();
+    let mut descriptors = Vec::new();
+    for plan in plans {
+        if plan.genesis() != current.genesis
+            || plan.expected_root() != expected_roots.get(plan.scope())
+            || plan.root() != next_roots.get(plan.scope())
+            || plan.expected_root() == plan.root()
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        plan.validate(store).map_err(map_invocation_history_error)?;
+        insertions = insertions
+            .checked_add(plan.inserted_facts().len())
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        plan_nodes = plan_nodes
+            .checked_add(plan.overlay_nodes().len())
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        for write in plan.overlay_nodes() {
+            plan_node_bytes = plan_node_bytes
+                .checked_add(write.bytes().len())
+                .ok_or(JournalStoreError::LimitExceeded)?;
+            match overlay_nodes.insert(write.id(), write.bytes().to_vec()) {
+                Some(existing) if existing != write.bytes() => {
+                    return Err(JournalStoreError::Corrupt);
+                }
+                _ => {}
+            }
+        }
+        retired.extend_from_slice(plan.retired_node_ids());
+        let bytes = plan.encode();
+        descriptors.push(HistoryCandidatePlanDescriptor {
+            scope: plan.scope(),
+            hash: Hash::digest(HISTORY_CANDIDATE_DOMAIN, &[&bytes]),
+            encoded_bytes: bytes.len() as u64,
+        });
+    }
+    if insertions > MAX_INVOCATION_HISTORY_INSERTIONS
+        || plan_nodes > MAX_INVOCATION_HISTORY_PLAN_NODES
+        || plan_node_bytes > MAX_INVOCATION_HISTORY_PLAN_NODE_BYTES
+    {
+        return Err(JournalStoreError::LimitExceeded);
+    }
+    retired.sort_unstable();
+    if retired.len() > MAX_INVOCATION_HISTORY_RETIRED_NODES
+        || retired.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    for scope in [
+        InvocationOwnershipScope::Ordered,
+        InvocationOwnershipScope::Merge,
+        InvocationOwnershipScope::Local(current.node),
+    ] {
+        let changed = expected_roots.get(scope) != next_roots.get(scope);
+        let planned = plans
+            .binary_search_by_key(&scope, |plan| plan.scope())
+            .is_ok();
+        if changed != planned {
+            return Err(JournalStoreError::NonCanonical);
+        }
+    }
+    let retirement = HistoryRetirementRecord {
+        expected_heads: current.id(),
+        next_heads: next.id(),
+        publication_revision: next.publication_revision,
+        expected_roots,
+        next_roots,
+        retired_node_ids: retired,
+        retired_cursor: 0,
+    };
+    queue.preflight_append(&retirement)?;
+    let intent = HistoryCandidateIntent {
+        queue_commitment: queue.commitment(),
+        retirement,
+        plans: descriptors,
+    };
+    intent.validate()?;
+    Ok(Some(HistoryCandidateOverlay {
+        intent,
+        plans: plans.to_vec(),
+        nodes: overlay_nodes,
+    }))
+}
+
+fn validate_idempotent_history_plans<S: AgentJournalStore>(
+    store: &S,
+    current: &JournalHeads,
+    plans: &[InvocationHistoryWritePlan],
+) -> Result<(), JournalStoreError> {
+    let roots = history_roots_for_heads(store, current)?;
+    if plans.len() > MAX_HISTORY_PUBLICATION_PLANS
+        || plans
+            .windows(2)
+            .any(|pair| pair[0].scope() >= pair[1].scope())
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    for plan in plans {
+        if plan.genesis() != current.genesis || plan.root() != roots.get(plan.scope()) {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        for write in plan.overlay_nodes() {
+            let bytes = store
+                .load_history_node(write.id())?
+                .ok_or(JournalStoreError::MissingObject)?;
+            if bytes != write.bytes() {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn publication_is_exact_retry(
+    current: &JournalHeads,
+    expected: JournalHeadsId,
+    next: &JournalHeads,
+) -> Result<bool, JournalStoreError> {
+    if current.id() != expected && current.id() != next.id() {
+        return Err(JournalStoreError::Conflict);
+    }
+    Ok(current.id() == next.id())
+}
+
 #[derive(Debug)]
 struct GcMark {
     objects: BTreeSet<(JournalStorageClass, [u8; 32])>,
@@ -329,6 +963,7 @@ fn class_maximum(class: JournalStorageClass) -> usize {
         | JournalStorageClass::Heads => MAX_CHECKPOINT_MANIFEST_BYTES,
         JournalStorageClass::InvocationIndexNode => MAX_INVOCATION_INDEX_NODE_BYTES,
         JournalStorageClass::InvocationOutcome => MAX_INVOCATION_OUTCOME_BYTES,
+        JournalStorageClass::InvocationHistoryNode => MAX_INVOCATION_HISTORY_NODE_BYTES,
     }
 }
 
@@ -435,7 +1070,7 @@ fn decode_object<R: CanonicalJournalRecord>(
     Ok(decoded)
 }
 
-fn ensure_content_class(class: JournalStorageClass) -> Result<(), JournalStoreError> {
+fn ensure_readable_content_class(class: JournalStorageClass) -> Result<(), JournalStoreError> {
     if matches!(
         class,
         JournalStorageClass::Genesis | JournalStorageClass::Heads
@@ -443,6 +1078,14 @@ fn ensure_content_class(class: JournalStorageClass) -> Result<(), JournalStoreEr
         Err(JournalStoreError::InvalidClass)
     } else {
         Ok(())
+    }
+}
+
+fn ensure_writable_content_class(class: JournalStorageClass) -> Result<(), JournalStoreError> {
+    if class == JournalStorageClass::InvocationHistoryNode {
+        Err(JournalStoreError::InvalidClass)
+    } else {
+        ensure_readable_content_class(class)
     }
 }
 
@@ -907,13 +1550,16 @@ fn map_invocation_index_error(error: InvocationIndexError<JournalStoreError>) ->
         InvocationIndexError::Storage(error) => error,
         InvocationIndexError::MissingManifest(_)
         | InvocationIndexError::MissingNode(_)
+        | InvocationIndexError::MissingHistoryNode(_)
         | InvocationIndexError::MissingOutcome(_) => JournalStoreError::MissingObject,
         InvocationIndexError::PathLimit
         | InvocationIndexError::NodeLimit
         | InvocationIndexError::Capacity => JournalStoreError::LimitExceeded,
         InvocationIndexError::CorruptManifest
         | InvocationIndexError::CorruptNode(_)
+        | InvocationIndexError::CorruptHistoryNode(_)
         | InvocationIndexError::CorruptOutcome(_)
+        | InvocationIndexError::CorruptHistory
         | InvocationIndexError::GenesisMismatch
         | InvocationIndexError::ScopeMismatch
         | InvocationIndexError::SummaryMismatch
@@ -924,6 +1570,28 @@ fn map_invocation_index_error(error: InvocationIndexError<JournalStoreError>) ->
         | InvocationIndexError::StoreViolation
         | InvocationIndexError::Conflict
         | InvocationIndexError::InvalidTransition => JournalStoreError::Corrupt,
+    }
+}
+
+fn map_invocation_history_error(
+    error: InvocationHistoryError<JournalStoreError>,
+) -> JournalStoreError {
+    match error {
+        InvocationHistoryError::Storage(error) => error,
+        InvocationHistoryError::MissingNode(_) => JournalStoreError::MissingObject,
+        InvocationHistoryError::PathLimit
+        | InvocationHistoryError::NodeLimit
+        | InvocationHistoryError::PlanLimit => JournalStoreError::LimitExceeded,
+        InvocationHistoryError::CorruptNode(_)
+        | InvocationHistoryError::GenesisMismatch
+        | InvocationHistoryError::ScopeMismatch
+        | InvocationHistoryError::SummaryMismatch
+        | InvocationHistoryError::NonCanonicalTree
+        | InvocationHistoryError::Cycle
+        | InvocationHistoryError::ObjectCollision(_)
+        | InvocationHistoryError::Conflict
+        | InvocationHistoryError::InvalidFact
+        | InvocationHistoryError::InvalidPlan => JournalStoreError::Corrupt,
     }
 }
 
@@ -1382,6 +2050,32 @@ fn build_gc_mark<S: AgentJournalStore>(
         },
         mark,
     ))
+}
+
+fn validate_history_retirement_coverage<S: AgentJournalStore>(
+    store: &S,
+    expected_heads: JournalHeadsId,
+    queue: &HistoryRetirementQueue,
+) -> Result<(), JournalStoreError> {
+    queue.validate()?;
+    if queue.records.is_empty() {
+        return Ok(());
+    }
+    let (heads, checkpoint) = fresh_gc_checkpoint(store, expected_heads)?;
+    if queue.genesis != heads.genesis || queue.node != heads.node {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let roots = history_roots_for_heads(store, &heads)?;
+    let tail = queue.records.last().ok_or(JournalStoreError::Corrupt)?;
+    if tail.next_roots != roots
+        || queue
+            .records
+            .iter()
+            .any(|record| record.publication_revision > checkpoint.publication_revision)
+    {
+        return Err(JournalStoreError::Conflict);
+    }
+    Ok(())
 }
 
 fn ordered_base_is_ancestor<S: AgentJournalStore>(
@@ -2089,6 +2783,8 @@ pub struct MemoryAgentJournalStore {
     heads: Option<Vec<u8>>,
     authority: BTreeMap<(AuthorityStorageClass, [u8; 32]), Vec<u8>>,
     objects: BTreeMap<(JournalStorageClass, [u8; 32]), Vec<u8>>,
+    history_nodes: BTreeMap<InvocationHistoryNodeId, Vec<u8>>,
+    history_retirements: Option<HistoryRetirementQueue>,
     // Copy-on-write keeps already-issued catalog resolver snapshots immutable
     // while preserving cheap candidate clones for rollback-safe publication.
     blobs: Arc<BTreeMap<(JournalBlobClass, Hash), Vec<u8>>>,
@@ -2137,6 +2833,8 @@ impl MemoryAgentJournalStore {
             heads: None,
             authority: BTreeMap::new(),
             objects: BTreeMap::new(),
+            history_nodes: BTreeMap::new(),
+            history_retirements: None,
             blobs: Arc::new(BTreeMap::new()),
             gc_intent: None,
         })
@@ -2155,6 +2853,60 @@ impl MemoryAgentJournalStore {
             return Err(JournalStoreError::ScopeMismatch);
         }
         Ok(())
+    }
+
+    fn history_queue(
+        &self,
+        genesis: AgentJournalGenesisId,
+    ) -> Result<&HistoryRetirementQueue, JournalStoreError> {
+        let queue = self
+            .history_retirements
+            .as_ref()
+            .ok_or(JournalStoreError::NotInitialized)?;
+        queue.validate()?;
+        if queue.genesis != genesis || queue.node != self.node {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(queue)
+    }
+
+    fn install_history_candidate(
+        &mut self,
+        overlay: &HistoryCandidateOverlay,
+    ) -> Result<bool, JournalStoreError> {
+        let mut created = false;
+        for plan in &overlay.plans {
+            for write in plan.overlay_nodes() {
+                match self.history_nodes.get(&write.id()) {
+                    Some(bytes) if bytes == write.bytes() => {}
+                    Some(_) => return Err(JournalStoreError::Corrupt),
+                    None if write.needs_write() => {
+                        let node =
+                            decode_object::<InvocationHistoryNode>(write.bytes(), write.id())?;
+                        self.history_nodes.insert(node.id(), write.bytes().to_vec());
+                        created = true;
+                    }
+                    None => return Err(JournalStoreError::Corrupt),
+                }
+            }
+        }
+        Ok(created)
+    }
+
+    fn enqueue_history_retirement(
+        &mut self,
+        intent: &HistoryCandidateIntent,
+    ) -> Result<(), JournalStoreError> {
+        let queue = self
+            .history_retirements
+            .as_mut()
+            .ok_or(JournalStoreError::NotInitialized)?;
+        if queue.commitment() != intent.queue_commitment {
+            return Err(JournalStoreError::Corrupt);
+        }
+        queue.preflight_append(&intent.retirement)?;
+        queue.records.push(intent.retirement.clone());
+        queue.validate()
     }
 
     fn persist_authority<R: CanonicalAuthorityRecord>(
@@ -2179,6 +2931,12 @@ impl MemoryAgentJournalStore {
     }
 
     fn object_bytes<R: CanonicalJournalRecord>(&self, id: R::Id) -> Option<&[u8]> {
+        if R::STORAGE_CLASS == JournalStorageClass::InvocationHistoryNode {
+            return self
+                .history_nodes
+                .get(&InvocationHistoryNodeId(*id.as_bytes()))
+                .map(Vec::as_slice);
+        }
         self.objects
             .get(&(R::STORAGE_CLASS, *id.as_bytes()))
             .map(Vec::as_slice)
@@ -2296,6 +3054,8 @@ impl MemoryAgentJournalStore {
         candidate.genesis_admission = Some(test_admission);
         candidate.genesis = Some(encoded.bytes);
         candidate.heads = Some(encoded_heads.bytes);
+        candidate.history_retirements =
+            Some(HistoryRetirementQueue::empty(genesis.id(), self.node));
         validate_head_targets(&candidate, &initial)?;
         *self = candidate;
         Ok(created)
@@ -2347,6 +3107,8 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         candidate.genesis_admission = Some(sealed.admission_commitment());
         candidate.genesis = Some(encoded.bytes);
         candidate.heads = Some(encoded_heads.bytes);
+        candidate.history_retirements =
+            Some(HistoryRetirementQueue::empty(genesis.id(), self.node));
         validate_head_targets(&candidate, &shape.initial)?;
         *self = candidate;
         Ok(created)
@@ -2380,7 +3142,7 @@ impl AgentJournalStore for MemoryAgentJournalStore {
 
     fn put<R: CanonicalJournalRecord>(&mut self, record: &R) -> Result<bool, JournalStoreError> {
         self.ensure_no_gc_pending()?;
-        ensure_content_class(R::STORAGE_CLASS)?;
+        ensure_writable_content_class(R::STORAGE_CLASS)?;
         let encoded = encode_object(record)?;
         let key = (encoded.class, encoded.id);
         match self.objects.get(&key) {
@@ -2394,7 +3156,7 @@ impl AgentJournalStore for MemoryAgentJournalStore {
     }
 
     fn get<R: CanonicalJournalRecord>(&self, id: R::Id) -> Result<Option<R>, JournalStoreError> {
-        ensure_content_class(R::STORAGE_CLASS)?;
+        ensure_readable_content_class(R::STORAGE_CLASS)?;
         self.object_bytes::<R>(id)
             .map(|bytes| decode_object(bytes, id))
             .transpose()
@@ -2439,23 +3201,73 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         publication: &ReplaySealedPublication,
     ) -> Result<JournalPublication, JournalStoreError> {
         self.ensure_no_gc_pending()?;
-        let dependency_created = stage_sealed_dependencies(self, publication)?;
         let expected = publication.expected();
         let next = publication.next();
+        let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        let exact_retry = publication_is_exact_retry(&current, expected, next)?;
+        if exact_retry {
+            validate_idempotent_history_plans(self, &current, publication.history_plans())?;
+        }
+        let overlay = if exact_retry {
+            None
+        } else {
+            let queue = self.history_queue(current.genesis)?.clone();
+            build_history_candidate(self, &current, next, publication.history_plans(), &queue)?
+        };
+
+        // All history writes, the retirement append, and head visibility are
+        // committed through one clone swap. A stale CAS can therefore leave
+        // ordinary content-addressed replay objects, but never permanent
+        // history nodes without the authenticating successor head.
+        let mut candidate = self.clone();
+        let history_created = overlay
+            .as_ref()
+            .map(|overlay| candidate.install_history_candidate(overlay))
+            .transpose()?
+            .unwrap_or(false);
+        let dependency_created = stage_sealed_dependencies(&mut candidate, publication)?;
         let mut result = match publication.anchor() {
             ReplayPublicationAnchor::Ordered(entry) => {
-                self.publish_anchor(expected, entry, next)?
+                candidate.publish_anchor(expected, entry, next)?
             }
-            ReplayPublicationAnchor::Local(entry) => self.publish_anchor(expected, entry, next)?,
+            ReplayPublicationAnchor::Local(entry) => {
+                candidate.publish_anchor(expected, entry, next)?
+            }
             ReplayPublicationAnchor::Merge { event, .. } => {
-                self.publish_anchor(expected, event, next)?
+                candidate.publish_anchor(expected, event, next)?
             }
             ReplayPublicationAnchor::Checkpoint(checkpoint) => {
-                self.publish_anchor(expected, checkpoint, next)?
+                candidate.publish_anchor(expected, checkpoint, next)?
             }
         };
-        result.object_created |= dependency_created;
+        if result.heads_advanced
+            && let Some(overlay) = &overlay
+        {
+            candidate.enqueue_history_retirement(&overlay.intent)?;
+        }
+        *self = candidate;
+        result.object_created |= dependency_created || history_created;
         Ok(result)
+    }
+}
+
+impl InvocationHistoryStore for MemoryAgentJournalStore {
+    type Error = JournalStoreError;
+
+    fn load_history_node(
+        &self,
+        id: InvocationHistoryNodeId,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        if id == InvocationHistoryNodeId::ZERO {
+            return Err(JournalStoreError::Corrupt);
+        }
+        self.history_nodes
+            .get(&id)
+            .map(|bytes| {
+                decode_object::<InvocationHistoryNode>(bytes, id)?;
+                Ok(bytes.clone())
+            })
+            .transpose()
     }
 }
 
@@ -2466,6 +3278,24 @@ impl AgentJournalGarbageCollection for MemoryAgentJournalStore {
         limits: GcLimits,
     ) -> Result<JournalGc, JournalStoreError> {
         let (intent, mark) = build_gc_mark(self, expected_heads, limits)?;
+        let history_queue = self
+            .history_retirements
+            .as_ref()
+            .ok_or(JournalStoreError::NotInitialized)?
+            .clone();
+        validate_history_retirement_coverage(self, expected_heads, &history_queue)?;
+        // The complete named retirement batch is authenticated before the GC
+        // intent is installed. A missing/tampered stale node is corruption;
+        // permanent history is never discovered by sweeping its namespace.
+        for record in &history_queue.records {
+            for id in record.remaining() {
+                let bytes = self
+                    .history_nodes
+                    .get(id)
+                    .ok_or(JournalStoreError::Corrupt)?;
+                decode_object::<InvocationHistoryNode>(bytes, *id)?;
+            }
+        }
         let resumed = match self.gc_intent {
             Some(existing) if existing == intent => true,
             Some(_) => return Err(JournalStoreError::Corrupt),
@@ -2505,9 +3335,31 @@ impl AgentJournalGarbageCollection for MemoryAgentJournalStore {
 
         let mut remaining = limits.max_unlinks_per_run;
         let mut objects_removed = 0_usize;
+        let queue = self
+            .history_retirements
+            .as_mut()
+            .ok_or(JournalStoreError::Corrupt)?;
+        while let Some(record) = queue.records.first_mut() {
+            if record.remaining().is_empty() {
+                queue.records.remove(0);
+                continue;
+            }
+            if remaining == 0 {
+                break;
+            }
+            let id = record.remaining()[0];
+            if self.history_nodes.remove(&id).is_none() {
+                return Err(JournalStoreError::Corrupt);
+            }
+            record.retired_cursor += 1;
+            objects_removed += 1;
+            remaining -= 1;
+        }
+        let mut normal_objects_removed = 0_usize;
         for key in garbage_objects.iter().take(remaining) {
             if self.objects.remove(key).is_some() {
                 objects_removed += 1;
+                normal_objects_removed += 1;
                 remaining -= 1;
             }
         }
@@ -2521,7 +3373,9 @@ impl AgentJournalGarbageCollection for MemoryAgentJournalStore {
                 }
             }
         }
-        let complete = garbage_objects.len() + garbage_blobs.len() <= limits.max_unlinks_per_run;
+        let complete = queue.records.is_empty()
+            && normal_objects_removed == garbage_objects.len()
+            && blobs_removed == garbage_blobs.len();
         if complete {
             self.gc_intent = None;
         }
@@ -2990,6 +3844,7 @@ pub struct FileAgentJournalStore {
     agent: AgentId,
     node: NodeId,
     directories: DirectoryCapabilities,
+    history_candidate: Option<HistoryCandidateOverlay>,
     #[cfg(target_os = "linux")]
     stable_lock_name: CString,
     #[cfg(target_os = "linux")]
@@ -3245,6 +4100,7 @@ impl FileAgentJournalStore {
                 "artifact-closures",
                 "invocation-index",
                 "invocation-outcomes",
+                HISTORY_DIRECTORY,
                 "catalog",
                 "authority",
                 "genesis-admission",
@@ -3265,12 +4121,14 @@ impl FileAgentJournalStore {
             agent,
             node,
             directories,
+            history_candidate: None,
             stable_lock_name,
             stable_lock_identity,
             _stable_lock: stable_lock,
         };
         store.validate_recovery_state()?;
         store.ensure_layout()?;
+        store.recover_history_state()?;
         store.validate_authority_recovery(sealed, allow_unverified_for_test)?;
         if let Some(heads) = store.heads()? {
             validate_head_targets(&store, &heads)?;
@@ -3346,11 +4204,16 @@ impl FileAgentJournalStore {
                 ("artifact-closures", "", "artifact-closures"),
                 ("invocation-index", "", "invocation-index"),
                 ("invocation-outcomes", "", "invocation-outcomes"),
+                (HISTORY_DIRECTORY, "", HISTORY_DIRECTORY),
                 ("catalog", "", "catalog"),
                 ("authority", "", "authority"),
             ] {
                 self.directories.add(key, parent, name)?;
             }
+            discard_private_stages_at(
+                self.directories.get(HISTORY_DIRECTORY)?,
+                is_history_fixed_private_stage_name,
+            )?;
             validate_directory_names(
                 self.directories.get("records")?,
                 &[
@@ -3366,6 +4229,17 @@ impl FileAgentJournalStore {
             validate_directory_names(
                 self.directories.get("invocation-index")?,
                 &["manifests", "nodes"],
+            )?;
+            validate_directory_names(
+                self.directories.get(HISTORY_DIRECTORY)?,
+                &[
+                    "nodes",
+                    "candidate",
+                    HISTORY_CANDIDATE_INTENT_NAME,
+                    HISTORY_CANDIDATE_INTENT_STAGE_NAME,
+                    HISTORY_RETIREMENTS_NAME,
+                    HISTORY_RETIREMENTS_STAGE_NAME,
+                ],
             )?;
             validate_directory_names(self.directories.get("catalog")?, &["blobs"])?;
             validate_directory_names(
@@ -3387,6 +4261,8 @@ impl FileAgentJournalStore {
                     "manifests",
                 ),
                 ("invocation-index/nodes", "invocation-index", "nodes"),
+                (HISTORY_NODES_DIRECTORY, HISTORY_DIRECTORY, "nodes"),
+                (HISTORY_CANDIDATE_DIRECTORY, HISTORY_DIRECTORY, "candidate"),
                 ("catalog/blobs", "catalog", "blobs"),
                 ("authority/root-anchors", "authority", "root-anchors"),
                 (
@@ -3402,6 +4278,30 @@ impl FileAgentJournalStore {
             ] {
                 self.directories.add(key, parent, name)?;
             }
+            discard_private_stages_at(
+                self.directories.get(HISTORY_CANDIDATE_DIRECTORY)?,
+                is_history_candidate_private_stage_name,
+            )?;
+            let history_nodes = self.directories.get(HISTORY_NODES_DIRECTORY)?;
+            let shard_names = (0_u16..=255)
+                .map(|value| format!("{value:02x}"))
+                .collect::<Vec<_>>();
+            for shard in &shard_names {
+                ensure_directory_at(history_nodes, shard)?;
+            }
+            let shard_name_refs = shard_names.iter().map(String::as_str).collect::<Vec<_>>();
+            validate_directory_names(history_nodes, &shard_name_refs)?;
+            validate_directory_names(
+                self.directories.get(HISTORY_CANDIDATE_DIRECTORY)?,
+                &[
+                    "plan-0",
+                    "plan-0.next",
+                    "plan-1",
+                    "plan-1.next",
+                    "plan-2",
+                    "plan-2.next",
+                ],
+            )?;
             for key in [
                 "records/replay-inputs",
                 "records/ordered",
@@ -3432,11 +4332,391 @@ impl FileAgentJournalStore {
                 "invocation-index",
                 "catalog",
                 "authority",
+                HISTORY_CANDIDATE_DIRECTORY,
+                HISTORY_NODES_DIRECTORY,
+                HISTORY_DIRECTORY,
                 "",
             ] {
                 self.directories.sync(key)?;
             }
             Ok(())
+        }
+    }
+
+    fn read_history_queue_file(
+        &self,
+        name: &str,
+    ) -> Result<Option<HistoryRetirementQueue>, JournalStoreError> {
+        let Some(bytes) = read_bounded_regular_at(
+            self.directory(HISTORY_DIRECTORY)?,
+            name,
+            MAX_HISTORY_RETIREMENT_QUEUE_BYTES,
+        )?
+        else {
+            return Ok(None);
+        };
+        decode_history_queue(&bytes).map(Some)
+    }
+
+    fn history_queue(
+        &self,
+        genesis: AgentJournalGenesisId,
+    ) -> Result<HistoryRetirementQueue, JournalStoreError> {
+        if self
+            .read_history_queue_file(HISTORY_RETIREMENTS_STAGE_NAME)?
+            .is_some()
+        {
+            return Err(JournalStoreError::GcPending);
+        }
+        let queue = self
+            .read_history_queue_file(HISTORY_RETIREMENTS_NAME)?
+            .unwrap_or_else(|| HistoryRetirementQueue::empty(genesis, self.node));
+        if queue.genesis != genesis || queue.node != self.node {
+            return Err(JournalStoreError::Corrupt);
+        }
+        queue.validate()?;
+        Ok(queue)
+    }
+
+    fn read_history_candidate_intent_file(
+        &self,
+        name: &str,
+    ) -> Result<Option<HistoryCandidateIntent>, JournalStoreError> {
+        let Some(bytes) = read_bounded_regular_at(
+            self.directory(HISTORY_DIRECTORY)?,
+            name,
+            MAX_HISTORY_CANDIDATE_INTENT_BYTES,
+        )?
+        else {
+            return Ok(None);
+        };
+        decode_history_candidate_intent(&bytes).map(Some)
+    }
+
+    fn read_history_candidate_plan(
+        &self,
+        index: usize,
+        maximum: usize,
+    ) -> Result<Option<InvocationHistoryWritePlan>, JournalStoreError> {
+        let name = format!("plan-{index}");
+        let Some(bytes) =
+            read_bounded_regular_at(self.directory(HISTORY_CANDIDATE_DIRECTORY)?, &name, maximum)?
+        else {
+            return Ok(None);
+        };
+        decode_history_plan(&bytes).map(Some)
+    }
+
+    fn load_history_candidate_overlay(
+        &self,
+        intent: HistoryCandidateIntent,
+    ) -> Result<HistoryCandidateOverlay, JournalStoreError> {
+        intent.validate()?;
+        let mut plans = Vec::new();
+        let mut nodes = BTreeMap::new();
+        let mut aggregate_bytes = 0usize;
+        let mut insertions = 0usize;
+        let mut retired = Vec::new();
+        for (index, descriptor) in intent.plans.iter().enumerate() {
+            let plan = self
+                .read_history_candidate_plan(index, descriptor.encoded_bytes as usize)?
+                .ok_or(JournalStoreError::Corrupt)?;
+            let bytes = plan.encode();
+            if bytes.len() as u64 != descriptor.encoded_bytes
+                || Hash::digest(HISTORY_CANDIDATE_DOMAIN, &[&bytes]) != descriptor.hash
+                || plan.scope() != descriptor.scope
+                || plan.genesis() == AgentJournalGenesisId::ZERO
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+            aggregate_bytes = aggregate_bytes
+                .checked_add(
+                    plan.overlay_nodes()
+                        .iter()
+                        .map(|write| write.bytes().len())
+                        .sum::<usize>(),
+                )
+                .ok_or(JournalStoreError::LimitExceeded)?;
+            insertions = insertions
+                .checked_add(plan.inserted_facts().len())
+                .ok_or(JournalStoreError::LimitExceeded)?;
+            for write in plan.overlay_nodes() {
+                match nodes.insert(write.id(), write.bytes().to_vec()) {
+                    Some(existing) if existing != write.bytes() => {
+                        return Err(JournalStoreError::Corrupt);
+                    }
+                    _ => {}
+                }
+            }
+            retired.extend_from_slice(plan.retired_node_ids());
+            plans.push(plan);
+        }
+        for index in intent.plans.len()..MAX_HISTORY_PUBLICATION_PLANS {
+            if self
+                .read_history_candidate_plan(index, MAX_INVOCATION_HISTORY_WRITE_PLAN_BYTES)?
+                .is_some()
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+        for index in 0..MAX_HISTORY_PUBLICATION_PLANS {
+            if read_bounded_regular_at(
+                self.directory(HISTORY_CANDIDATE_DIRECTORY)?,
+                &format!("plan-{index}.next"),
+                MAX_INVOCATION_HISTORY_WRITE_PLAN_BYTES,
+            )?
+            .is_some()
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+        if insertions > MAX_INVOCATION_HISTORY_INSERTIONS
+            || nodes.len() > MAX_INVOCATION_HISTORY_PLAN_NODES
+            || aggregate_bytes > MAX_INVOCATION_HISTORY_PLAN_NODE_BYTES
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        retired.sort_unstable();
+        if retired != intent.retirement.retired_node_ids
+            || retired.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        for plan in &plans {
+            if plan.expected_root() != intent.retirement.expected_roots.get(plan.scope())
+                || plan.root() != intent.retirement.next_roots.get(plan.scope())
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+        Ok(HistoryCandidateOverlay {
+            intent,
+            plans,
+            nodes,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn clear_history_candidate_files(&mut self) -> Result<(), JournalStoreError> {
+        // The intent is the sole authority that makes the private plans
+        // recoverable. Remove it first: a crash may then leave harmless plan
+        // files which the no-intent recovery path discards. Removing plans
+        // first could instead strand an authoritative intent with missing
+        // provenance and make a safely aborted publication unreopenable.
+        let history = self.directory(HISTORY_DIRECTORY)?;
+        let mut intent_changed = false;
+        intent_changed |= unlink_file_if_present_at(history, HISTORY_CANDIDATE_INTENT_STAGE_NAME)?;
+        intent_changed |= unlink_file_if_present_at(history, HISTORY_CANDIDATE_INTENT_NAME)?;
+        if intent_changed {
+            history
+                .sync_all()
+                .map_err(|_| JournalStoreError::Unavailable)?;
+        }
+        let candidate = self.directory(HISTORY_CANDIDATE_DIRECTORY)?;
+        let mut changed = false;
+        for index in 0..MAX_HISTORY_PUBLICATION_PLANS {
+            changed |= unlink_file_if_present_at(candidate, &format!("plan-{index}"))?;
+            changed |= unlink_file_if_present_at(candidate, &format!("plan-{index}.next"))?;
+        }
+        if changed {
+            candidate
+                .sync_all()
+                .map_err(|_| JournalStoreError::Unavailable)?;
+        }
+        self.history_candidate = None;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stage_history_candidate(
+        &mut self,
+        overlay: HistoryCandidateOverlay,
+        publication_point: &mut impl FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
+    ) -> Result<(), JournalStoreError> {
+        if let Some(existing) = &self.history_candidate {
+            return if existing.intent == overlay.intent && existing.plans == overlay.plans {
+                Ok(())
+            } else {
+                Err(JournalStoreError::Conflict)
+            };
+        }
+        if self
+            .read_history_candidate_intent_file(HISTORY_CANDIDATE_INTENT_NAME)?
+            .is_some()
+            || self
+                .read_history_candidate_intent_file(HISTORY_CANDIDATE_INTENT_STAGE_NAME)?
+                .is_some()
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let candidate = self.directory(HISTORY_CANDIDATE_DIRECTORY)?;
+        for (index, plan) in overlay.plans.iter().enumerate() {
+            let bytes = plan.encode();
+            let name = format!("plan-{index}");
+            persist_immutable_at(
+                candidate,
+                &name,
+                &bytes,
+                MAX_INVOCATION_HISTORY_WRITE_PLAN_BYTES,
+                |stored| decode_history_plan(stored).map(|_| ()),
+            )?;
+        }
+        let history = self.directory(HISTORY_DIRECTORY)?;
+        create_synced_stage_at(
+            history,
+            HISTORY_CANDIDATE_INTENT_STAGE_NAME,
+            &overlay.intent.encode(),
+        )?;
+        rename_file_at(
+            history,
+            HISTORY_CANDIDATE_INTENT_STAGE_NAME,
+            HISTORY_CANDIDATE_INTENT_NAME,
+        )?;
+        history
+            .sync_all()
+            .map_err(|_| JournalStoreError::Unavailable)?;
+        self.history_candidate = Some(overlay);
+        publication_point(PublicationPoint::HistoryCandidateDurable)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn append_history_retirement(
+        &self,
+        overlay: &HistoryCandidateOverlay,
+    ) -> Result<(), JournalStoreError> {
+        let genesis = overlay
+            .plans
+            .first()
+            .ok_or(JournalStoreError::Corrupt)?
+            .genesis();
+        let committed = self
+            .read_history_queue_file(HISTORY_RETIREMENTS_NAME)?
+            .unwrap_or_else(|| HistoryRetirementQueue::empty(genesis, self.node));
+        if committed.genesis != genesis || committed.node != self.node {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let staged = self.read_history_queue_file(HISTORY_RETIREMENTS_STAGE_NAME)?;
+        let already_appended = committed.records.last() == Some(&overlay.intent.retirement);
+        if already_appended {
+            if staged.is_some() {
+                return Err(JournalStoreError::Corrupt);
+            }
+            return Ok(());
+        }
+        if committed.commitment() != overlay.intent.queue_commitment {
+            return Err(JournalStoreError::Corrupt);
+        }
+        committed.preflight_append(&overlay.intent.retirement)?;
+        let mut next = committed.clone();
+        next.records.push(overlay.intent.retirement.clone());
+        next.validate()?;
+        if let Some(staged) = staged {
+            if staged != next {
+                return Err(JournalStoreError::Corrupt);
+            }
+            sync_regular_file_at(
+                self.directory(HISTORY_DIRECTORY)?,
+                HISTORY_RETIREMENTS_STAGE_NAME,
+            )?;
+        } else {
+            create_synced_stage_at(
+                self.directory(HISTORY_DIRECTORY)?,
+                HISTORY_RETIREMENTS_STAGE_NAME,
+                &next.encode(),
+            )?;
+        }
+        rename_file_at(
+            self.directory(HISTORY_DIRECTORY)?,
+            HISTORY_RETIREMENTS_STAGE_NAME,
+            HISTORY_RETIREMENTS_NAME,
+        )?;
+        self.directory(HISTORY_DIRECTORY)?
+            .sync_all()
+            .map_err(|_| JournalStoreError::Unavailable)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_history_candidate(
+        &mut self,
+        publication_point: &mut impl FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
+    ) -> Result<bool, JournalStoreError> {
+        let Some(overlay) = self.history_candidate.clone() else {
+            return Ok(false);
+        };
+        let mut created = false;
+        for plan in &overlay.plans {
+            for write in plan.overlay_nodes() {
+                match self.read_global_history_node(write.id())? {
+                    Some(bytes) if bytes == write.bytes() => {
+                        self.clear_exact_history_node_stage(write.id(), write.bytes())?;
+                    }
+                    Some(_) => return Err(JournalStoreError::Corrupt),
+                    None if write.needs_write() => {
+                        created |= self.persist_history_node(write.id(), write.bytes())?;
+                    }
+                    None => return Err(JournalStoreError::Corrupt),
+                }
+            }
+        }
+        publication_point(PublicationPoint::HistoryPromoted)?;
+        self.append_history_retirement(&overlay)?;
+        publication_point(PublicationPoint::HistoryRetirementDurable)?;
+        self.clear_history_candidate_files()?;
+        publication_point(PublicationPoint::HistoryCandidateCleared)?;
+        Ok(created)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recover_history_state(&mut self) -> Result<(), JournalStoreError> {
+        let intent = self.read_history_candidate_intent_file(HISTORY_CANDIDATE_INTENT_NAME)?;
+        let staged_intent =
+            self.read_history_candidate_intent_file(HISTORY_CANDIDATE_INTENT_STAGE_NAME)?;
+        if intent.is_none() {
+            if staged_intent.is_some() {
+                self.clear_history_candidate_files()?;
+            } else {
+                // Fully written plan files without a durable intent are a
+                // private pre-publication stage and can never authenticate a
+                // global object.
+                self.clear_history_candidate_files()?;
+            }
+            if self
+                .read_history_queue_file(HISTORY_RETIREMENTS_STAGE_NAME)?
+                .is_some()
+                && self.gc_intent()?.is_none()
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+            return Ok(());
+        }
+        if staged_intent.is_some() {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let overlay = self.load_history_candidate_overlay(intent.unwrap())?;
+        self.history_candidate = Some(overlay.clone());
+        for plan in &overlay.plans {
+            plan.validate(self).map_err(map_invocation_history_error)?;
+        }
+        let current = self
+            .read_fixed::<JournalHeads>("", "heads")?
+            .ok_or(JournalStoreError::Corrupt)?;
+        let staged = self.read_fixed::<JournalHeads>("", "heads.next")?;
+        let expected = overlay.intent.retirement.expected_heads;
+        let next = overlay.intent.retirement.next_heads;
+        match (current.id(), staged.as_ref().map(JournalHeads::id)) {
+            (head, None) if head == expected => {
+                let genesis = overlay.plans[0].genesis();
+                let queue = self.history_queue(genesis)?;
+                if queue.commitment() != overlay.intent.queue_commitment {
+                    return Err(JournalStoreError::Corrupt);
+                }
+                self.clear_history_candidate_files()
+            }
+            (head, Some(stage)) if head == expected && stage == next => Ok(()),
+            (head, None) if head == next => {
+                self.finish_history_candidate(&mut |_| Ok(())).map(|_| ())
+            }
+            _ => Err(JournalStoreError::Corrupt),
         }
     }
 
@@ -3457,11 +4737,139 @@ impl FileAgentJournalStore {
             JournalStorageClass::InvocationIndexNode => "invocation-index/nodes",
             JournalStorageClass::InvocationOutcome => "invocation-outcomes",
             JournalStorageClass::Checkpoint => "checkpoints",
-            JournalStorageClass::Genesis | JournalStorageClass::Heads => {
+            JournalStorageClass::Genesis
+            | JournalStorageClass::Heads
+            | JournalStorageClass::InvocationHistoryNode => {
                 return Err(JournalStoreError::InvalidClass);
             }
         };
         Ok(key)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn history_shard_directory(
+        &self,
+        id: InvocationHistoryNodeId,
+    ) -> Result<File, JournalStoreError> {
+        if id == InvocationHistoryNodeId::ZERO {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let shard = format!("{:02x}", id.as_bytes()[0]);
+        let directory = open_directory_at(self.directory(HISTORY_NODES_DIRECTORY)?, &shard)?;
+        validate_owned_directory(&directory)?;
+        Ok(directory)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_global_history_node(
+        &self,
+        id: InvocationHistoryNodeId,
+    ) -> Result<Option<Vec<u8>>, JournalStoreError> {
+        let directory = self.history_shard_directory(id)?;
+        let name = encode_hex(id.as_bytes());
+        let stage = sibling_next_name(&name);
+        if let Some(bytes) =
+            read_bounded_regular_at(&directory, &stage, MAX_INVOCATION_HISTORY_NODE_BYTES)?
+        {
+            decode_object::<InvocationHistoryNode>(&bytes, id)?;
+        }
+        let Some(bytes) =
+            read_bounded_regular_at(&directory, &name, MAX_INVOCATION_HISTORY_NODE_BYTES)?
+        else {
+            return Ok(None);
+        };
+        decode_object::<InvocationHistoryNode>(&bytes, id)?;
+        Ok(Some(bytes))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read_global_history_node(
+        &self,
+        _id: InvocationHistoryNodeId,
+    ) -> Result<Option<Vec<u8>>, JournalStoreError> {
+        Err(JournalStoreError::Unavailable)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn persist_history_node(
+        &self,
+        id: InvocationHistoryNodeId,
+        bytes: &[u8],
+    ) -> Result<bool, JournalStoreError> {
+        decode_object::<InvocationHistoryNode>(bytes, id)?;
+        let directory = self.history_shard_directory(id)?;
+        persist_immutable_at(
+            &directory,
+            &encode_hex(id.as_bytes()),
+            bytes,
+            MAX_INVOCATION_HISTORY_NODE_BYTES,
+            |stored| decode_object::<InvocationHistoryNode>(stored, id).map(|_| ()),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn clear_exact_history_node_stage(
+        &self,
+        id: InvocationHistoryNodeId,
+        expected: &[u8],
+    ) -> Result<(), JournalStoreError> {
+        let directory = self.history_shard_directory(id)?;
+        let stage = sibling_next_name(&encode_hex(id.as_bytes()));
+        let Some(bytes) =
+            read_bounded_regular_at(&directory, &stage, MAX_INVOCATION_HISTORY_NODE_BYTES)?
+        else {
+            return Ok(());
+        };
+        decode_object::<InvocationHistoryNode>(&bytes, id)?;
+        if bytes != expected {
+            return Err(JournalStoreError::Corrupt);
+        }
+        unlink_file_at(&directory, &stage)?;
+        directory
+            .sync_all()
+            .map_err(|_| JournalStoreError::Unavailable)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unlink_history_node(
+        &self,
+        id: InvocationHistoryNodeId,
+        missing_is_ok: bool,
+    ) -> Result<bool, JournalStoreError> {
+        let directory = self.history_shard_directory(id)?;
+        let name = encode_hex(id.as_bytes());
+        let stage = sibling_next_name(&name);
+        let staged =
+            read_bounded_regular_at(&directory, &stage, MAX_INVOCATION_HISTORY_NODE_BYTES)?;
+        let bytes = read_bounded_regular_at(&directory, &name, MAX_INVOCATION_HISTORY_NODE_BYTES)?;
+        if let Some(staged) = &staged {
+            decode_object::<InvocationHistoryNode>(staged, id)?;
+        }
+        let Some(bytes) = bytes else {
+            return if missing_is_ok && staged.is_none() {
+                Ok(false)
+            } else {
+                Err(JournalStoreError::Corrupt)
+            };
+        };
+        decode_object::<InvocationHistoryNode>(&bytes, id)?;
+        if let Some(staged) = staged {
+            if staged != bytes {
+                return Err(JournalStoreError::Corrupt);
+            }
+            unlink_file_at(&directory, &stage)?;
+            // Order alias retirement before removal of the canonical name.
+            // Otherwise a power loss could recover a stage-only inode after
+            // the retirement cursor has already authorized this ID.
+            directory
+                .sync_all()
+                .map_err(|_| JournalStoreError::Unavailable)?;
+        }
+        unlink_file_at(&directory, &name)?;
+        directory
+            .sync_all()
+            .map_err(|_| JournalStoreError::Unavailable)?;
+        Ok(true)
     }
 
     fn blob_directory(&self, class: JournalBlobClass) -> &'static str {
@@ -3582,7 +4990,14 @@ impl FileAgentJournalStore {
         &self,
         id: R::Id,
     ) -> Result<Option<R>, JournalStoreError> {
-        ensure_content_class(R::STORAGE_CLASS)?;
+        ensure_readable_content_class(R::STORAGE_CLASS)?;
+        if R::STORAGE_CLASS == JournalStorageClass::InvocationHistoryNode {
+            let history_id = InvocationHistoryNodeId(*id.as_bytes());
+            return self
+                .load_history_node(history_id)?
+                .map(|bytes| decode_object::<R>(&bytes, id))
+                .transpose();
+        }
         let directory = self.object_directory(R::STORAGE_CLASS)?;
         let name = encode_hex(id.as_bytes());
         let staged = sibling_next_name(&name);
@@ -3611,7 +5026,7 @@ impl FileAgentJournalStore {
         record: &R,
     ) -> Result<bool, JournalStoreError> {
         self.ensure_no_gc_pending()?;
-        ensure_content_class(R::STORAGE_CLASS)?;
+        ensure_writable_content_class(R::STORAGE_CLASS)?;
         let encoded = encode_object(record)?;
         let directory = self.object_directory(encoded.class)?;
         persist_immutable_at(
@@ -3869,6 +5284,104 @@ impl FileAgentJournalStore {
         self.publish_inner(expected, anchor, next, |_| Ok(()))
     }
 
+    #[cfg(target_os = "linux")]
+    fn stage_sealed_history_candidate(
+        &mut self,
+        expected: JournalHeadsId,
+        next: &JournalHeads,
+        plans: &[InvocationHistoryWritePlan],
+        publication_point: &mut impl FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
+    ) -> Result<(bool, Option<HistoryCandidateOverlay>), JournalStoreError> {
+        self.ensure_no_gc_pending()?;
+        self.recover_history_state()?;
+        let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        let exact_retry = publication_is_exact_retry(&current, expected, next)?;
+        if exact_retry {
+            validate_idempotent_history_plans(self, &current, plans)?;
+            return Ok((true, None));
+        }
+
+        let queue = self.history_queue(current.genesis)?;
+        let overlay = build_history_candidate(self, &current, next, plans, &queue)?;
+        if let Some(overlay) = overlay.clone() {
+            self.stage_history_candidate(overlay, publication_point)?;
+        } else if self.history_candidate.is_some() {
+            return Err(JournalStoreError::Conflict);
+        }
+        Ok((false, overlay))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publish_sealed_inner(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        mut publication_point: impl FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        let expected = publication.expected();
+        let next = publication.next();
+        let (exact_retry, overlay) = self.stage_sealed_history_candidate(
+            expected,
+            next,
+            publication.history_plans(),
+            &mut publication_point,
+        )?;
+        if exact_retry {
+            let dependency_created = stage_sealed_dependencies(self, publication)?;
+            let mut result = match publication.anchor() {
+                ReplayPublicationAnchor::Ordered(entry) => {
+                    self.publish_inner(expected, entry, next, &mut publication_point)?
+                }
+                ReplayPublicationAnchor::Local(entry) => {
+                    self.publish_inner(expected, entry, next, &mut publication_point)?
+                }
+                ReplayPublicationAnchor::Merge { event, .. } => {
+                    self.publish_inner(expected, event, next, &mut publication_point)?
+                }
+                ReplayPublicationAnchor::Checkpoint(checkpoint) => {
+                    self.publish_inner(expected, checkpoint, next, &mut publication_point)?
+                }
+            };
+            result.object_created |= dependency_created;
+            return Ok(result);
+        }
+
+        let attempted = (|| {
+            let dependency_created = stage_sealed_dependencies(self, publication)?;
+            let mut result = match publication.anchor() {
+                ReplayPublicationAnchor::Ordered(entry) => {
+                    self.publish_inner(expected, entry, next, &mut publication_point)?
+                }
+                ReplayPublicationAnchor::Local(entry) => {
+                    self.publish_inner(expected, entry, next, &mut publication_point)?
+                }
+                ReplayPublicationAnchor::Merge { event, .. } => {
+                    self.publish_inner(expected, event, next, &mut publication_point)?
+                }
+                ReplayPublicationAnchor::Checkpoint(checkpoint) => {
+                    self.publish_inner(expected, checkpoint, next, &mut publication_point)?
+                }
+            };
+            if result.heads_advanced && overlay.is_some() {
+                result.object_created |= self.finish_history_candidate(&mut publication_point)?;
+            }
+            result.object_created |= dependency_created;
+            Ok(result)
+        })();
+        if attempted.is_err() && overlay.is_some() {
+            let durable = self.heads()?.ok_or(JournalStoreError::Corrupt)?;
+            let staged = self.read_fixed::<JournalHeads>("", "heads.next")?;
+            if durable.id() == expected && staged.is_none() {
+                self.clear_history_candidate_files()?;
+            } else if !((durable.id() == expected
+                && staged.as_ref().is_some_and(|heads| heads.id() == next.id()))
+                || (durable.id() == next.id() && staged.is_none()))
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+        attempted
+    }
+
     #[cfg(test)]
     fn initialize_raw_for_test(
         &mut self,
@@ -3963,6 +5476,131 @@ impl FileAgentJournalStore {
     }
 
     #[cfg(target_os = "linux")]
+    fn history_queue_and_stage(
+        &self,
+        genesis: AgentJournalGenesisId,
+    ) -> Result<
+        (
+            HistoryRetirementQueue,
+            Option<(HistoryRetirementQueue, Vec<InvocationHistoryNodeId>)>,
+        ),
+        JournalStoreError,
+    > {
+        let committed = self
+            .read_history_queue_file(HISTORY_RETIREMENTS_NAME)?
+            .unwrap_or_else(|| HistoryRetirementQueue::empty(genesis, self.node));
+        if committed.genesis != genesis || committed.node != self.node {
+            return Err(JournalStoreError::Corrupt);
+        }
+        committed.validate()?;
+        let staged = self.read_history_queue_file(HISTORY_RETIREMENTS_STAGE_NAME)?;
+        let staged = staged
+            .map(|staged| {
+                let delta = history_retirement_stage_delta(&committed, &staged)?;
+                Ok((staged, delta))
+            })
+            .transpose()?;
+        Ok((committed, staged))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_history_retirement_nodes(
+        &self,
+        queue: &HistoryRetirementQueue,
+        authorized_missing: &[InvocationHistoryNodeId],
+    ) -> Result<(), JournalStoreError> {
+        let authorized_missing = authorized_missing.iter().copied().collect::<BTreeSet<_>>();
+        for record in &queue.records {
+            for id in record.remaining() {
+                match self.read_global_history_node(*id)? {
+                    Some(_) => {}
+                    None if authorized_missing.contains(id) => {}
+                    None => return Err(JournalStoreError::Corrupt),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn promote_history_retirement_stage(
+        &self,
+        staged: &HistoryRetirementQueue,
+    ) -> Result<(), JournalStoreError> {
+        let history = self.directory(HISTORY_DIRECTORY)?;
+        rename_file_at(
+            history,
+            HISTORY_RETIREMENTS_STAGE_NAME,
+            HISTORY_RETIREMENTS_NAME,
+        )?;
+        history
+            .sync_all()
+            .map_err(|_| JournalStoreError::Unavailable)?;
+        if staged.records.is_empty() {
+            unlink_file_at(history, HISTORY_RETIREMENTS_NAME)?;
+            history
+                .sync_all()
+                .map_err(|_| JournalStoreError::Unavailable)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resume_history_retirement_stage(
+        &self,
+        staged: &HistoryRetirementQueue,
+        ids: &[InvocationHistoryNodeId],
+        maximum: usize,
+        publication_point: &mut impl FnMut(GcPoint) -> Result<(), JournalStoreError>,
+    ) -> Result<(usize, bool), JournalStoreError> {
+        let mut removed = 0usize;
+        for id in ids {
+            if self.read_global_history_node(*id)?.is_none() {
+                // This also rejects a stage-only alias. Treating it as an
+                // already removed object would let cursor promotion strand
+                // an untracked permanent inode.
+                self.unlink_history_node(*id, true)?;
+                continue;
+            }
+            if removed == maximum {
+                return Ok((removed, false));
+            }
+            self.unlink_history_node(*id, false)?;
+            removed += 1;
+        }
+        publication_point(GcPoint::HistoryRetirementSweepDurable)?;
+        self.promote_history_retirement_stage(staged)?;
+        publication_point(GcPoint::HistoryRetirementCursorDurable)?;
+        Ok((removed, true))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn advance_history_retirements(
+        &self,
+        queue: &HistoryRetirementQueue,
+        maximum: usize,
+        publication_point: &mut impl FnMut(GcPoint) -> Result<(), JournalStoreError>,
+    ) -> Result<(usize, bool), JournalStoreError> {
+        let (next, ids) = advance_history_retirement_queue(queue, maximum)?;
+        if next == *queue {
+            return Ok((0, true));
+        }
+        create_synced_stage_at(
+            self.directory(HISTORY_DIRECTORY)?,
+            HISTORY_RETIREMENTS_STAGE_NAME,
+            &next.encode(),
+        )?;
+        publication_point(GcPoint::HistoryRetirementStaged)?;
+        for id in &ids {
+            self.unlink_history_node(*id, false)?;
+        }
+        publication_point(GcPoint::HistoryRetirementSweepDurable)?;
+        self.promote_history_retirement_stage(&next)?;
+        publication_point(GcPoint::HistoryRetirementCursorDurable)?;
+        Ok((ids.len(), true))
+    }
+
+    #[cfg(target_os = "linux")]
     fn ensure_gc_intent_durable(
         &self,
         intent: GcIntent,
@@ -4030,10 +5668,18 @@ impl FileAgentJournalStore {
         mut publication_point: impl FnMut(GcPoint) -> Result<(), JournalStoreError>,
     ) -> Result<JournalGc, JournalStoreError> {
         validate_gc_limits(limits)?;
+        self.recover_history_state()?;
         if self.read_fixed::<JournalHeads>("", "heads.next")?.is_some() {
             return Err(JournalStoreError::Conflict);
         }
         let (intent, mark) = build_gc_mark(self, expected_heads, limits)?;
+        let heads = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        let (history_queue, staged_history) = self.history_queue_and_stage(heads.genesis)?;
+        validate_history_retirement_coverage(self, expected_heads, &history_queue)?;
+        let authorized_missing = staged_history
+            .as_ref()
+            .map_or(&[][..], |(_, ids)| ids.as_slice());
+        self.validate_history_retirement_nodes(&history_queue, authorized_missing)?;
 
         // Pass one is exhaustive and non-mutating. No intent is installed and
         // no garbage is removed unless every namespace entry fits the caller's
@@ -4045,13 +5691,44 @@ impl FileAgentJournalStore {
             .collect::<Vec<_>>();
         let resumed = self.ensure_gc_intent_durable(intent, &mut publication_point)?;
 
-        // Pass two revalidates the exact inode/name observed by preflight
-        // immediately before each descriptor-relative unlink.
-        let batch = garbage.len().min(limits.max_unlinks_per_run);
+        let mut remaining = limits.max_unlinks_per_run;
         let mut synced = BTreeSet::new();
         let mut objects_removed = 0_usize;
         let mut blobs_removed = 0_usize;
         let mut aliases_removed = 0_usize;
+        if let Some((staged, ids)) = &staged_history {
+            let (removed, promoted) = self.resume_history_retirement_stage(
+                staged,
+                ids,
+                remaining,
+                &mut publication_point,
+            )?;
+            objects_removed += removed;
+            remaining -= removed;
+            if !promoted {
+                publication_point(GcPoint::SweepDurable)?;
+                return Ok(JournalGc {
+                    objects_removed,
+                    blobs_removed,
+                    aliases_removed,
+                    resumed,
+                    complete: false,
+                });
+            }
+        }
+        let queue = self
+            .read_history_queue_file(HISTORY_RETIREMENTS_NAME)?
+            .unwrap_or_else(|| HistoryRetirementQueue::empty(heads.genesis, self.node));
+        let (removed, _) =
+            self.advance_history_retirements(&queue, remaining, &mut publication_point)?;
+        objects_removed += removed;
+        remaining -= removed;
+
+        // Normal GC deliberately never scans permanent history. Its exact
+        // named retirements consume the same unlink budget, then the existing
+        // second pass revalidates every ordinary inode immediately before
+        // descriptor-relative removal.
+        let batch = garbage.len().min(remaining);
         for entry in garbage.iter().take(batch) {
             self.validate_gc_entry_unchanged(entry)?;
             unlink_file_at(self.directory(entry.directory)?, &entry.name)?;
@@ -4072,7 +5749,13 @@ impl FileAgentJournalStore {
         }
         publication_point(GcPoint::SweepDurable)?;
 
-        let complete = batch == garbage.len();
+        let queue_complete = self
+            .read_history_queue_file(HISTORY_RETIREMENTS_NAME)?
+            .is_none_or(|queue| queue.records.is_empty())
+            && self
+                .read_history_queue_file(HISTORY_RETIREMENTS_STAGE_NAME)?
+                .is_none();
+        let complete = queue_complete && batch == garbage.len();
         if complete {
             let root = self.directory("")?;
             unlink_file_if_present_at(root, GC_INTENT_STAGE_NAME)?;
@@ -4093,17 +5776,46 @@ impl FileAgentJournalStore {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublicationPoint {
+    HistoryCandidateDurable,
     ObjectDurable,
     HeadsStaged,
     HeadsDurable,
+    HistoryPromoted,
+    HistoryRetirementDurable,
+    HistoryCandidateCleared,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GcPoint {
     IntentStaged,
     IntentDurable,
+    HistoryRetirementStaged,
+    HistoryRetirementSweepDurable,
+    HistoryRetirementCursorDurable,
     SweepDurable,
     Complete,
+}
+
+impl InvocationHistoryStore for FileAgentJournalStore {
+    type Error = JournalStoreError;
+
+    fn load_history_node(
+        &self,
+        id: InvocationHistoryNodeId,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        if id == InvocationHistoryNodeId::ZERO {
+            return Err(JournalStoreError::Corrupt);
+        }
+        if let Some(bytes) = self
+            .history_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.nodes.get(&id))
+        {
+            decode_object::<InvocationHistoryNode>(bytes, id)?;
+            return Ok(Some(bytes.clone()));
+        }
+        self.read_global_history_node(id)
+    }
 }
 
 impl AgentJournalStore for FileAgentJournalStore {
@@ -4243,24 +5955,15 @@ impl AgentJournalStore for FileAgentJournalStore {
         &mut self,
         publication: &ReplaySealedPublication,
     ) -> Result<JournalPublication, JournalStoreError> {
-        self.ensure_no_gc_pending()?;
-        let dependency_created = stage_sealed_dependencies(self, publication)?;
-        let expected = publication.expected();
-        let next = publication.next();
-        let mut result = match publication.anchor() {
-            ReplayPublicationAnchor::Ordered(entry) => {
-                self.publish_anchor(expected, entry, next)?
-            }
-            ReplayPublicationAnchor::Local(entry) => self.publish_anchor(expected, entry, next)?,
-            ReplayPublicationAnchor::Merge { event, .. } => {
-                self.publish_anchor(expected, event, next)?
-            }
-            ReplayPublicationAnchor::Checkpoint(checkpoint) => {
-                self.publish_anchor(expected, checkpoint, next)?
-            }
-        };
-        result.object_created |= dependency_created;
-        Ok(result)
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = publication;
+            Err(JournalStoreError::Unavailable)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.publish_sealed_inner(publication, |_| Ok(()))
+        }
     }
 }
 
@@ -4422,11 +6125,11 @@ mod tests {
         ActorExecutionReply, ActorExecutionStatus, ActorInvocation, ActorInvocationAuth,
         ActorObservation,
     };
-    use crate::agent::invocation_index::InvocationIndex;
+    use crate::agent::invocation_index::{InvocationIndex, InvocationIndexLookup};
     use crate::agent::journal::{
-        CheckpointLane, InvocationDisposition, InvocationOutcomeAnchor, InvocationOutcomeRecord,
-        InvocationOwner, InvocationOwnershipKey, InvocationResultState, ReplayInput,
-        ReplayOperation, RuntimeBinding,
+        CheckpointLane, InvocationAcknowledgedFact, InvocationDisposition, InvocationOutcomeAnchor,
+        InvocationOutcomeRecord, InvocationOwner, InvocationOwnershipKey, InvocationResultState,
+        ReplayInput, ReplayOperation, RuntimeBinding,
     };
     use crate::agent::{
         AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LaneSet,
@@ -4859,6 +6562,146 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct PreparedHistoryTransition {
+        entry: OrderedEntry,
+        next: JournalHeads,
+        plan: InvocationHistoryWritePlan,
+        key: InvocationOwnershipKey,
+        fact: InvocationAcknowledgedFact,
+    }
+
+    fn prepare_history_transition<S>(
+        store: &mut S,
+        genesis: &AgentJournalGenesis,
+        current: &JournalHeads,
+        discriminator: u8,
+    ) -> PreparedHistoryTransition
+    where
+        S: AgentJournalStore + InvocationIndexStore<Error = JournalStoreError>,
+    {
+        let input = replay_input(MethodMode::Linear, discriminator);
+        let ReplayOperation::Invoke { invocation, .. } = &input.operation else {
+            unreachable!()
+        };
+        let entry = OrderedEntry {
+            genesis: genesis.id(),
+            index: current.ordered_index.checked_add(1).unwrap(),
+            parent: current.ordered_head,
+            merge_frontier: current.merge_frontier,
+            merge_seal: None,
+            input: input.clone(),
+        };
+        let key = InvocationOwnershipKey {
+            scope: InvocationOwnershipScope::Ordered,
+            invocation: invocation.invocation,
+        };
+        let outcome = InvocationOutcomeRecord::from_runtime_states(
+            genesis.id(),
+            key.scope,
+            InvocationOutcomeAnchor::Ordered { entry: entry.id() },
+            &input,
+            &RuntimeState::default(),
+            &RuntimeState::default(),
+            Ok(ActorExecutionReply {
+                invocation: invocation.invocation,
+                actor: invocation.actor,
+                incarnation: invocation.incarnation,
+                deployment: invocation.deployment,
+                mode: invocation.mode,
+                lane: invocation.mode.write_lane(),
+                status: ActorExecutionStatus::Done,
+                reply: vec![discriminator],
+                gas_remaining: invocation.gas - 1,
+                observation: ActorObservation::default(),
+            }),
+        )
+        .unwrap();
+        let mut index = InvocationIndex::open(store, current.ordered_invocations).unwrap();
+        let outcome = index.persist_outcome(&outcome).unwrap();
+        let owner = InvocationOwner {
+            scope: key.scope,
+            request_commitment: invocation.commitment(),
+            first_input: input.id(),
+            lane: PersistedLane::Linear,
+            node: None,
+            result_state: InvocationResultState::Retained {
+                disposition: InvocationDisposition::Applied,
+                outcome,
+            },
+        };
+        index.record(key, owner).unwrap();
+        index.archive(key, owner).unwrap();
+        let ordered_invocations = index.id();
+        let plan = index.history_write_plan().clone();
+        let fact = InvocationAcknowledgedFact::from_owner(genesis.id(), key, owner).unwrap();
+        drop(index);
+        let next = JournalHeads {
+            ordered_invocations,
+            ..ordered_successor(current, &entry)
+        };
+        PreparedHistoryTransition {
+            entry,
+            next,
+            plan,
+            key,
+            fact,
+        }
+    }
+
+    fn build_test_history_candidate<S: AgentJournalStore>(
+        store: &S,
+        current: &JournalHeads,
+        transition: &PreparedHistoryTransition,
+        queue: &HistoryRetirementQueue,
+    ) -> HistoryCandidateOverlay {
+        build_history_candidate(
+            store,
+            current,
+            &transition.next,
+            core::slice::from_ref(&transition.plan),
+            queue,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn saturated_history_queue(
+        genesis: AgentJournalGenesisId,
+        node: NodeId,
+        tail: HistoryRoots,
+    ) -> HistoryRetirementQueue {
+        let alternate = HistoryRoots {
+            ordered: Some(InvocationHistoryNodeId([0xe1; 32])),
+            merge: tail.merge,
+            local: tail.local,
+        };
+        assert_ne!(alternate, tail);
+        let mut roots = tail;
+        let mut records = Vec::new();
+        for index in 0..MAX_HISTORY_RETIREMENT_PUBLICATIONS {
+            let next_roots = if roots == tail { alternate } else { tail };
+            records.push(HistoryRetirementRecord {
+                expected_heads: JournalHeadsId([(index as u8).wrapping_add(1); 32]),
+                next_heads: JournalHeadsId([(index as u8).wrapping_add(2); 32]),
+                publication_revision: index as u64 + 1,
+                expected_roots: roots,
+                next_roots,
+                retired_node_ids: Vec::new(),
+                retired_cursor: 0,
+            });
+            roots = next_roots;
+        }
+        assert_eq!(roots, tail);
+        let queue = HistoryRetirementQueue {
+            genesis,
+            node,
+            records,
+        };
+        queue.validate().unwrap();
+        queue
+    }
+
     fn open_file_store(directory: &TestDirectory) -> FileAgentJournalStore {
         let config = config();
         FileAgentJournalStore::open_unverified_for_test(
@@ -4891,6 +6734,38 @@ mod tests {
             sealed.replica().node,
             sealed,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn history_node_path(root: &Path, id: InvocationHistoryNodeId) -> PathBuf {
+        root.join(HISTORY_NODES_DIRECTORY)
+            .join(format!("{:02x}", id.as_bytes()[0]))
+            .join(encode_hex(id.as_bytes()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn commit_file_history_transition(
+        store: &mut FileAgentJournalStore,
+        genesis: &AgentJournalGenesis,
+        discriminator: u8,
+    ) -> PreparedHistoryTransition {
+        let current = store.heads().unwrap().unwrap();
+        let transition = prepare_history_transition(store, genesis, &current, discriminator);
+        let queue = store.history_queue(genesis.id()).unwrap();
+        let history = build_test_history_candidate(store, &current, &transition, &queue);
+        store
+            .stage_history_candidate(history, &mut |_| Ok(()))
+            .unwrap();
+        store
+            .publish_inner(
+                current.id(),
+                &transition.entry,
+                &transition.next,
+                |_| Ok(()),
+            )
+            .unwrap();
+        store.finish_history_candidate(&mut |_| Ok(())).unwrap();
+        transition
     }
 
     fn initialize_sealed_file_store(
@@ -4965,6 +6840,203 @@ mod tests {
                 heads_advanced: false,
             }
         );
+    }
+
+    #[test]
+    fn memory_history_candidate_rolls_back_on_stale_cas_and_commits_exact_fact() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let current = store.heads().unwrap().unwrap();
+        let transition = prepare_history_transition(&mut store, &genesis, &current, 0x35);
+        let queue = store.history_queue(genesis.id()).unwrap().clone();
+        let history = build_test_history_candidate(&store, &current, &transition, &queue);
+        assert!(!history.nodes.is_empty());
+        assert!(
+            history
+                .plans
+                .iter()
+                .flat_map(InvocationHistoryWritePlan::overlay_nodes)
+                .all(|write| store.load_history_node(write.id()).unwrap().is_none())
+        );
+
+        let first_write = history.plans[0].overlay_nodes()[0].clone();
+        let node = InvocationHistoryNode::decode(first_write.bytes()).unwrap();
+        assert_eq!(node.id(), first_write.id());
+        assert_eq!(
+            store.put(&node),
+            Err(JournalStoreError::InvalidClass),
+            "generic content puts must not manufacture permanent history"
+        );
+
+        // Exercise the same copy-on-write shape as MemoryAgentJournalStore::publish:
+        // a candidate may contain permanent nodes, but a failed CAS never swaps it
+        // into the live store.
+        let mut stale_candidate = store.clone();
+        stale_candidate.install_history_candidate(&history).unwrap();
+        let competing_entry = OrderedEntry {
+            genesis: genesis.id(),
+            index: 1,
+            parent: None,
+            merge_frontier: current.merge_frontier,
+            merge_seal: None,
+            input: replay_input(MethodMode::Linear, 0x36),
+        };
+        let competing = ordered_successor(&current, &competing_entry);
+        stale_candidate
+            .publish_anchor(current.id(), &competing_entry, &competing)
+            .unwrap();
+        assert_eq!(
+            stale_candidate.publish_anchor(current.id(), &transition.entry, &transition.next,),
+            Err(JournalStoreError::Conflict)
+        );
+        drop(stale_candidate);
+        assert_eq!(store.heads().unwrap(), Some(current.clone()));
+        assert!(store.history_nodes.is_empty());
+
+        let mut committed = store.clone();
+        committed.install_history_candidate(&history).unwrap();
+        committed
+            .publish_anchor(current.id(), &transition.entry, &transition.next)
+            .unwrap();
+        committed
+            .enqueue_history_retirement(&history.intent)
+            .unwrap();
+        store = committed;
+        assert_eq!(store.heads().unwrap(), Some(transition.next.clone()));
+        let index = InvocationIndex::open(&mut store, transition.next.ordered_invocations).unwrap();
+        assert_eq!(
+            index.lookup(transition.key).unwrap(),
+            Some(InvocationIndexLookup::Archived(transition.fact))
+        );
+        drop(index);
+        assert_eq!(store.history_retirements.as_ref().unwrap().records.len(), 1);
+    }
+
+    #[test]
+    fn history_retirement_backpressure_is_preflight_only() {
+        let genesis = genesis();
+        let config = config();
+        let mut memory =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut memory, &genesis);
+        let current = memory.heads().unwrap().unwrap();
+        let mut transition = prepare_history_transition(&mut memory, &genesis, &current, 0x37);
+        let roots = history_roots_for_heads(&memory, &current).unwrap();
+        let queue = saturated_history_queue(genesis.id(), current.node, roots);
+        let fake_current = JournalHeads {
+            publication_revision: MAX_HISTORY_RETIREMENT_PUBLICATIONS as u64,
+            previous: Some(JournalHeadsId([0xd7; 32])),
+            ..current.clone()
+        };
+        transition.next = JournalHeads {
+            publication_revision: fake_current.publication_revision + 1,
+            previous: Some(fake_current.id()),
+            ..transition.next
+        };
+        let before_nodes = memory.history_nodes.clone();
+        assert!(matches!(
+            build_history_candidate(
+                &memory,
+                &fake_current,
+                &transition.next,
+                core::slice::from_ref(&transition.plan),
+                &queue,
+            ),
+            Err(JournalStoreError::Backpressure)
+        ));
+        assert_eq!(memory.history_nodes, before_nodes);
+
+        #[cfg(target_os = "linux")]
+        {
+            let directory = TestDirectory::new("history-backpressure");
+            let mut file = open_file_store(&directory);
+            initialize(&mut file, &genesis);
+            let current = file.heads().unwrap().unwrap();
+            let mut transition = prepare_history_transition(&mut file, &genesis, &current, 0x38);
+            let roots = history_roots_for_heads(&file, &current).unwrap();
+            let queue = saturated_history_queue(genesis.id(), current.node, roots);
+            let fake_current = JournalHeads {
+                publication_revision: MAX_HISTORY_RETIREMENT_PUBLICATIONS as u64,
+                previous: Some(JournalHeadsId([0xd8; 32])),
+                ..current
+            };
+            transition.next = JournalHeads {
+                publication_revision: fake_current.publication_revision + 1,
+                previous: Some(fake_current.id()),
+                ..transition.next
+            };
+            create_synced_stage_at(
+                file.directory("").unwrap(),
+                "heads.limit.next",
+                &fake_current.encode(),
+            )
+            .unwrap();
+            rename_file_at(file.directory("").unwrap(), "heads.limit.next", "heads").unwrap();
+            file.directory("").unwrap().sync_all().unwrap();
+            create_synced_stage_at(
+                file.directory(HISTORY_DIRECTORY).unwrap(),
+                HISTORY_RETIREMENTS_STAGE_NAME,
+                &queue.encode(),
+            )
+            .unwrap();
+            rename_file_at(
+                file.directory(HISTORY_DIRECTORY).unwrap(),
+                HISTORY_RETIREMENTS_STAGE_NAME,
+                HISTORY_RETIREMENTS_NAME,
+            )
+            .unwrap();
+            file.directory(HISTORY_DIRECTORY)
+                .unwrap()
+                .sync_all()
+                .unwrap();
+            let heads_before = fs::read(file.root().join("heads")).unwrap();
+            let queue_before = fs::read(
+                file.root()
+                    .join(HISTORY_DIRECTORY)
+                    .join(HISTORY_RETIREMENTS_NAME),
+            )
+            .unwrap();
+            let mut reached_write_point = false;
+            assert!(matches!(
+                file.stage_sealed_history_candidate(
+                    fake_current.id(),
+                    &transition.next,
+                    core::slice::from_ref(&transition.plan),
+                    &mut |_| {
+                        reached_write_point = true;
+                        Ok(())
+                    },
+                ),
+                Err(JournalStoreError::Backpressure)
+            ));
+            assert!(!reached_write_point);
+            assert_eq!(fs::read(file.root().join("heads")).unwrap(), heads_before);
+            assert_eq!(
+                fs::read(
+                    file.root()
+                        .join(HISTORY_DIRECTORY)
+                        .join(HISTORY_RETIREMENTS_NAME),
+                )
+                .unwrap(),
+                queue_before
+            );
+            assert!(
+                fs::read_dir(file.root().join(HISTORY_CANDIDATE_DIRECTORY))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            assert!(
+                transition
+                    .plan
+                    .overlay_nodes()
+                    .iter()
+                    .all(|write| file.read_global_history_node(write.id()).unwrap().is_none())
+            );
+        }
     }
 
     #[test]
@@ -5173,7 +7245,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_gc_keeps_live_outcome_anchor_and_tombstone_but_collects_acknowledged_outcome() {
+    fn memory_gc_keeps_live_outcome_and_history_fact_but_collects_acknowledged_outcome() {
         let genesis = genesis();
         let config = config();
         let mut store =
@@ -5341,20 +7413,10 @@ mod tests {
             merge_seal: None,
             input: acknowledgement,
         };
-        let root_three = {
+        let (root_three, history_plan) = {
             let mut index = InvocationIndex::open(&mut store, root_two).unwrap();
-            index
-                .record(
-                    key_two,
-                    InvocationOwner {
-                        result_state: InvocationResultState::Acknowledged {
-                            disposition: InvocationDisposition::Applied,
-                        },
-                        ..owner_two
-                    },
-                )
-                .unwrap();
-            index.id()
+            index.archive(key_two, owner_two).unwrap();
+            (index.id(), index.history_write_plan().clone())
         };
         let heads_three = JournalHeads {
             publication_revision: heads_two.publication_revision + 1,
@@ -5362,11 +7424,18 @@ mod tests {
             ordered_head: Some(entry_three.id()),
             ordered_index: entry_three.index,
             ordered_invocations: root_three,
-            ..heads_two
+            ..heads_two.clone()
         };
+        let queue = store.history_queue(genesis.id()).unwrap().clone();
+        let history =
+            build_history_candidate(&store, &heads_two, &heads_three, &[history_plan], &queue)
+                .unwrap()
+                .unwrap();
+        store.install_history_candidate(&history).unwrap();
         store
             .publish_anchor(heads_three.previous.unwrap(), &entry_three, &heads_three)
             .unwrap();
+        store.enqueue_history_retirement(&history.intent).unwrap();
         let (checkpoint_heads, _) = install_fresh_checkpoint(&mut store, &genesis);
 
         let result = store
@@ -5393,8 +7462,8 @@ mod tests {
         let index = InvocationIndex::open(&mut store, root_three).unwrap();
         assert_eq!(index.outcome(key_one).unwrap(), Some(outcome_one));
         assert!(matches!(
-            index.lookup(key_two).unwrap().unwrap().result_state,
-            InvocationResultState::Acknowledged { .. }
+            index.lookup(key_two).unwrap(),
+            Some(InvocationIndexLookup::Archived(_))
         ));
     }
 
@@ -5881,8 +7950,408 @@ mod tests {
         )
         .unwrap();
         let reopened_index = InvocationIndex::open(&mut reopened, index_id).unwrap();
-        assert_eq!(reopened_index.lookup(key).unwrap(), Some(owner));
+        assert_eq!(
+            reopened_index.lookup(key).unwrap(),
+            Some(InvocationIndexLookup::Live(owner))
+        );
         assert_eq!(reopened_index.outcome(key).unwrap(), Some(expected_outcome));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_history_candidate_recovers_every_durable_crash_state() {
+        for crash_at in [
+            PublicationPoint::HistoryCandidateDurable,
+            PublicationPoint::ObjectDurable,
+            PublicationPoint::HeadsStaged,
+            PublicationPoint::HeadsDurable,
+            PublicationPoint::HistoryPromoted,
+            PublicationPoint::HistoryRetirementDurable,
+            PublicationPoint::HistoryCandidateCleared,
+        ] {
+            let directory = TestDirectory::new("history-crash");
+            let genesis = genesis();
+            let mut store = open_file_store(&directory);
+            initialize(&mut store, &genesis);
+            let current = store.heads().unwrap().unwrap();
+            let transition = prepare_history_transition(&mut store, &genesis, &current, 0x71);
+            let queue = store.history_queue(genesis.id()).unwrap();
+            let history = build_test_history_candidate(&store, &current, &transition, &queue);
+            let writes = transition
+                .plan
+                .overlay_nodes()
+                .iter()
+                .map(|write| (write.id(), write.bytes().to_vec()))
+                .collect::<Vec<_>>();
+            let first = InvocationHistoryNode::decode(&writes[0].1).unwrap();
+            assert_eq!(
+                store.put(&first),
+                Err(JournalStoreError::InvalidClass),
+                "generic puts must reject the permanent namespace"
+            );
+
+            let mut crash = |point| {
+                if point == crash_at {
+                    Err(JournalStoreError::Unavailable)
+                } else {
+                    Ok(())
+                }
+            };
+            let attempted = (|| {
+                store.stage_history_candidate(history.clone(), &mut crash)?;
+                store.publish_inner(
+                    current.id(),
+                    &transition.entry,
+                    &transition.next,
+                    &mut crash,
+                )?;
+                store.finish_history_candidate(&mut crash)?;
+                Ok::<(), JournalStoreError>(())
+            })();
+            assert_eq!(attempted, Err(JournalStoreError::Unavailable));
+            drop(store);
+
+            let mut reopened = open_file_store(&directory);
+            match crash_at {
+                PublicationPoint::HistoryCandidateDurable | PublicationPoint::ObjectDurable => {
+                    assert_eq!(reopened.heads().unwrap(), Some(current.clone()));
+                    assert!(reopened.history_candidate.is_none());
+                    assert!(
+                        writes.iter().all(|(id, _)| reopened
+                            .read_global_history_node(*id)
+                            .unwrap()
+                            .is_none())
+                    );
+                    let queue = reopened.history_queue(genesis.id()).unwrap();
+                    let history =
+                        build_test_history_candidate(&reopened, &current, &transition, &queue);
+                    reopened
+                        .stage_history_candidate(history, &mut |_| Ok(()))
+                        .unwrap();
+                    reopened
+                        .publish_inner(
+                            current.id(),
+                            &transition.entry,
+                            &transition.next,
+                            |_| Ok(()),
+                        )
+                        .unwrap();
+                    reopened.finish_history_candidate(&mut |_| Ok(())).unwrap();
+                }
+                PublicationPoint::HeadsStaged => {
+                    assert_eq!(reopened.heads().unwrap(), Some(current.clone()));
+                    assert!(reopened.history_candidate.is_some());
+                    assert!(reopened.root().join("heads.next").is_file());
+                    reopened
+                        .publish_inner(
+                            current.id(),
+                            &transition.entry,
+                            &transition.next,
+                            |_| Ok(()),
+                        )
+                        .unwrap();
+                    reopened.finish_history_candidate(&mut |_| Ok(())).unwrap();
+                }
+                PublicationPoint::HeadsDurable
+                | PublicationPoint::HistoryPromoted
+                | PublicationPoint::HistoryRetirementDurable
+                | PublicationPoint::HistoryCandidateCleared => {
+                    // Reopen completes candidate promotion and retirement
+                    // publication before authenticating the new head target.
+                    assert_eq!(reopened.heads().unwrap(), Some(transition.next.clone()));
+                }
+            }
+
+            assert_eq!(reopened.heads().unwrap(), Some(transition.next.clone()));
+            assert!(reopened.history_candidate.is_none());
+            assert!(!reopened.root().join("heads.next").exists());
+            assert!(
+                fs::read_dir(reopened.root().join(HISTORY_CANDIDATE_DIRECTORY))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            assert!(
+                !reopened
+                    .root()
+                    .join(HISTORY_DIRECTORY)
+                    .join(HISTORY_CANDIDATE_INTENT_NAME)
+                    .exists()
+            );
+            for (id, bytes) in &writes {
+                assert_eq!(
+                    reopened.read_global_history_node(*id).unwrap(),
+                    Some(bytes.clone())
+                );
+                let path = history_node_path(reopened.root(), *id);
+                assert!(path.is_file(), "history node must use its first-byte shard");
+                assert!(!path.with_extension("next").exists());
+            }
+            let queue = reopened.history_queue(genesis.id()).unwrap();
+            assert_eq!(queue.records.len(), 1);
+            let index =
+                InvocationIndex::open(&mut reopened, transition.next.ordered_invocations).unwrap();
+            assert_eq!(
+                index.lookup(transition.key).unwrap(),
+                Some(InvocationIndexLookup::Archived(transition.fact))
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_history_stale_cas_is_zero_write_and_reopen_rejects_tampering() {
+        let genesis = genesis();
+
+        let stale_directory = TestDirectory::new("history-stale");
+        let mut stale = open_file_store(&stale_directory);
+        initialize(&mut stale, &genesis);
+        let current = stale.heads().unwrap().unwrap();
+        let transition = prepare_history_transition(&mut stale, &genesis, &current, 0x72);
+        let competing_entry = OrderedEntry {
+            genesis: genesis.id(),
+            index: 1,
+            parent: None,
+            merge_frontier: current.merge_frontier,
+            merge_seal: None,
+            input: replay_input(MethodMode::Linear, 0x73),
+        };
+        let competing = ordered_successor(&current, &competing_entry);
+        stale
+            .publish_inner(current.id(), &competing_entry, &competing, |_| Ok(()))
+            .unwrap();
+        let durable = stale.heads().unwrap().unwrap();
+        assert_eq!(durable, competing);
+        let heads_before = fs::read(stale.root().join("heads")).unwrap();
+        let mut reached_write_point = false;
+        assert!(matches!(
+            stale.stage_sealed_history_candidate(
+                current.id(),
+                &transition.next,
+                core::slice::from_ref(&transition.plan),
+                &mut |_| {
+                    reached_write_point = true;
+                    Ok(())
+                },
+            ),
+            Err(JournalStoreError::Conflict)
+        ));
+        assert!(!reached_write_point);
+        assert_eq!(fs::read(stale.root().join("heads")).unwrap(), heads_before);
+        assert!(
+            stale
+                .read_history_queue_file(HISTORY_RETIREMENTS_NAME)
+                .unwrap()
+                .is_none()
+        );
+        assert!(transition.plan.overlay_nodes().iter().all(|write| {
+            stale
+                .read_global_history_node(write.id())
+                .unwrap()
+                .is_none()
+        }));
+        assert!(
+            fs::read_dir(stale.root().join(HISTORY_CANDIDATE_DIRECTORY))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+
+        // Exact crash state after authority-first cleanup: once the intent is
+        // durably absent, leftover plan provenance is private garbage and a
+        // reopen must discard it without installing any global node.
+        let cleanup_directory = TestDirectory::new("history-cleanup-crash");
+        let mut cleanup = open_file_store(&cleanup_directory);
+        initialize(&mut cleanup, &genesis);
+        let current = cleanup.heads().unwrap().unwrap();
+        let transition = prepare_history_transition(&mut cleanup, &genesis, &current, 0x76);
+        let queue = cleanup.history_queue(genesis.id()).unwrap();
+        let history = build_test_history_candidate(&cleanup, &current, &transition, &queue);
+        cleanup
+            .stage_history_candidate(history, &mut |_| Ok(()))
+            .unwrap();
+        let cleanup_plan = cleanup
+            .root()
+            .join(HISTORY_CANDIDATE_DIRECTORY)
+            .join("plan-0");
+        assert!(cleanup_plan.is_file());
+        unlink_file_at(
+            cleanup.directory(HISTORY_DIRECTORY).unwrap(),
+            HISTORY_CANDIDATE_INTENT_NAME,
+        )
+        .unwrap();
+        cleanup
+            .directory(HISTORY_DIRECTORY)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        drop(cleanup);
+        let cleanup = open_file_store(&cleanup_directory);
+        assert!(!cleanup_plan.exists());
+        assert_eq!(cleanup.heads().unwrap(), Some(current));
+        assert!(transition.plan.overlay_nodes().iter().all(|write| {
+            cleanup
+                .read_global_history_node(write.id())
+                .unwrap()
+                .is_none()
+        }));
+        drop(cleanup);
+
+        let plan_directory = TestDirectory::new("history-plan-tamper");
+        let mut staged = open_file_store(&plan_directory);
+        initialize(&mut staged, &genesis);
+        let current = staged.heads().unwrap().unwrap();
+        let transition = prepare_history_transition(&mut staged, &genesis, &current, 0x74);
+        let queue = staged.history_queue(genesis.id()).unwrap();
+        let history = build_test_history_candidate(&staged, &current, &transition, &queue);
+        staged
+            .stage_history_candidate(history, &mut |_| Ok(()))
+            .unwrap();
+        let plan_path = staged
+            .root()
+            .join(HISTORY_CANDIDATE_DIRECTORY)
+            .join("plan-0");
+        drop(staged);
+        fs::write(plan_path, b"tampered candidate plan").unwrap();
+        assert!(matches!(
+            FileAgentJournalStore::open_unverified_for_test(
+                plan_directory.agent_root(config().identity.agent),
+                plan_directory.lock(config().identity.agent),
+                config().replicas[0].node,
+            ),
+            Err(JournalStoreError::Corrupt)
+        ));
+
+        let node_directory = TestDirectory::new("history-node-tamper");
+        let mut committed = open_file_store(&node_directory);
+        initialize(&mut committed, &genesis);
+        let transition = commit_file_history_transition(&mut committed, &genesis, 0x75);
+        let root = transition.plan.root().unwrap();
+        let node_path = history_node_path(committed.root(), root);
+        drop(committed);
+        fs::write(node_path, b"tampered permanent root").unwrap();
+        assert!(matches!(
+            FileAgentJournalStore::open_unverified_for_test(
+                node_directory.agent_root(config().identity.agent),
+                node_directory.lock(config().identity.agent),
+                config().replicas[0].node,
+            ),
+            Err(JournalStoreError::Corrupt)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_history_retirement_gc_resumes_crash_and_preserves_current_facts() {
+        for crash_at in [
+            GcPoint::HistoryRetirementStaged,
+            GcPoint::HistoryRetirementSweepDurable,
+            GcPoint::HistoryRetirementCursorDurable,
+        ] {
+            let directory = TestDirectory::new("history-retirement-gc");
+            let genesis = genesis();
+            let mut store = open_file_store(&directory);
+            initialize(&mut store, &genesis);
+
+            let transitions = (0x81..=0x85)
+                .map(|discriminator| {
+                    commit_file_history_transition(&mut store, &genesis, discriminator)
+                })
+                .collect::<Vec<_>>();
+            let retired = transitions
+                .iter()
+                .flat_map(|transition| transition.plan.retired_node_ids().iter().copied())
+                .collect::<Vec<_>>();
+            assert!(
+                !retired.is_empty(),
+                "three or more Patricia insertions must replace a global path node"
+            );
+            assert!(
+                retired
+                    .iter()
+                    .all(|id| store.read_global_history_node(*id).unwrap().is_some())
+            );
+            let final_root = transitions.last().unwrap().plan.root().unwrap();
+            let final_root_bytes = store.read_global_history_node(final_root).unwrap().unwrap();
+
+            let (checkpoint_heads, _) = install_fresh_checkpoint(&mut store, &genesis);
+            let mut limits = gc_limits();
+            limits.max_unlinks_per_run = 1;
+            let queue = store.history_queue(genesis.id()).unwrap();
+            let (_, first_batch) = advance_history_retirement_queue(&queue, 1).unwrap();
+            assert_eq!(first_batch.len(), 1);
+            let staged_path = history_node_path(store.root(), first_batch[0]);
+            let staged_alias = staged_path.with_extension("next");
+            fs::hard_link(&staged_path, &staged_alias).unwrap();
+            assert_eq!(
+                store.collect_garbage_inner(checkpoint_heads.id(), limits, |point| {
+                    if point == crash_at {
+                        Err(JournalStoreError::Unavailable)
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Err(JournalStoreError::Unavailable)
+            );
+            assert!(store.root().join(GC_INTENT_NAME).is_file());
+            assert_eq!(
+                store
+                    .root()
+                    .join(HISTORY_DIRECTORY)
+                    .join(HISTORY_RETIREMENTS_STAGE_NAME)
+                    .exists(),
+                crash_at != GcPoint::HistoryRetirementCursorDurable
+            );
+            assert_eq!(
+                store.put(&replay_input(MethodMode::Linear, 0x86)),
+                Err(JournalStoreError::GcPending)
+            );
+            drop(store);
+
+            let mut reopened = open_file_store(&directory);
+            let mut passes = 0usize;
+            loop {
+                let result = reopened
+                    .collect_garbage(checkpoint_heads.id(), limits)
+                    .unwrap();
+                passes += 1;
+                assert!(result.resumed);
+                if result.complete {
+                    break;
+                }
+                assert!(passes < 256, "bounded GC failed to drain its durable work");
+            }
+            assert!(!staged_alias.exists());
+            assert!(
+                retired
+                    .iter()
+                    .all(|id| reopened.read_global_history_node(*id).unwrap().is_none())
+            );
+            assert_eq!(
+                reopened.read_global_history_node(final_root).unwrap(),
+                Some(final_root_bytes)
+            );
+            assert!(
+                reopened
+                    .read_history_queue_file(HISTORY_RETIREMENTS_NAME)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                reopened
+                    .read_history_queue_file(HISTORY_RETIREMENTS_STAGE_NAME)
+                    .unwrap()
+                    .is_none()
+            );
+            let index =
+                InvocationIndex::open(&mut reopened, checkpoint_heads.ordered_invocations).unwrap();
+            for transition in &transitions {
+                assert_eq!(
+                    index.lookup(transition.key).unwrap(),
+                    Some(InvocationIndexLookup::Archived(transition.fact))
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -6640,6 +9109,22 @@ fn is_fixed_private_stage_name(name: &[u8]) -> bool {
             | b"genesis.next.partial"
             | b"heads.next.partial"
             | b"gc-intent.next.partial"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn is_history_fixed_private_stage_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"candidate-intent.next.partial" | b"retirements.next.partial"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn is_history_candidate_private_stage_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"plan-0.next.partial" | b"plan-1.next.partial" | b"plan-2.next.partial"
     )
 }
 

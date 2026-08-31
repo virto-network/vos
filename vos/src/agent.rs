@@ -19,6 +19,7 @@ pub mod driver;
 pub mod execution;
 #[cfg(feature = "std")]
 pub mod host;
+pub(crate) mod invocation_history;
 pub(crate) mod invocation_index;
 pub mod journal;
 #[cfg(feature = "std")]

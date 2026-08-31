@@ -17,23 +17,26 @@ use super::committee::{
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, MAX_RUNTIME_STATE_BYTES,
 };
+use super::invocation_history::InvocationHistoryWritePlan;
 #[cfg(feature = "std")]
 use super::invocation_index::InvocationIndexes;
+use super::invocation_index::{InvocationIndexBatchOperation, InvocationIndexLookup};
 use super::journal::{
     AgentJournalGenesis, AgentJournalGenesisId, ArtifactClosure, ArtifactClosureId,
     CanonicalJournalRecord, CheckpointId, CheckpointLane, CheckpointManifest,
-    InvocationDisposition, InvocationIndexId, InvocationIndexManifest, InvocationOutcomeAnchor,
-    InvocationOutcomeId, InvocationOutcomeRecord, InvocationOutcomeRef, InvocationOwnershipKey,
-    InvocationOwnershipScope, InvocationOwnershipValue, InvocationResultState, JournalHeads,
-    JournalHeadsId, LaneCursor, LaneStateId, LaneStateManifest, LocalEntry, LocalEntryId,
-    MergeEvent, MergeEventId, MergeFrontier, MergeFrontierId, MergeSeal, MergeSealId, OrderedBase,
-    OrderedEntry, OrderedEntryId, PersistedLane, ReplayInput, ReplayOperation, RuntimeBinding,
+    InvocationAcknowledgedFact, InvocationDisposition, InvocationIndexId, InvocationIndexManifest,
+    InvocationOutcomeAnchor, InvocationOutcomeId, InvocationOutcomeRecord, InvocationOutcomeRef,
+    InvocationOwnershipKey, InvocationOwnershipScope, InvocationOwnershipValue,
+    InvocationResultState, JournalHeads, JournalHeadsId, LaneCursor, LaneStateId,
+    LaneStateManifest, LocalEntry, LocalEntryId, MergeEvent, MergeEventId, MergeFrontier,
+    MergeFrontierId, MergeSeal, MergeSealId, OrderedBase, OrderedEntry, OrderedEntryId,
+    PersistedLane, ReplayInput, ReplayOperation, RuntimeBinding,
     system_genesis_post_create_state_commitment,
 };
 #[cfg(feature = "std")]
 use super::journal::{
-    MAX_INVOCATION_INDEX_LIVE_ENTRIES, MAX_INVOCATION_INDEX_LOGICAL_ENTRIES,
-    MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES, MAX_INVOCATION_OUTCOME_BYTES,
+    MAX_INVOCATION_INDEX_LIVE_ENTRIES, MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES,
+    MAX_INVOCATION_OUTCOME_BYTES,
 };
 #[cfg(feature = "std")]
 use super::journal_store::{
@@ -1637,6 +1640,7 @@ pub struct ReplaySealedPublication {
     next: JournalHeads,
     anchor: ReplayPublicationAnchor,
     outcomes: Vec<ReplaySealedOutcome>,
+    history_plans: Vec<InvocationHistoryWritePlan>,
     checkpoint: Option<ReplaySealedCheckpoint>,
     fence_ancestry: FenceAncestryEvidence,
 }
@@ -2053,6 +2057,10 @@ impl ReplaySealedPublication {
         &self.outcomes
     }
 
+    pub(crate) fn history_plans(&self) -> &[InvocationHistoryWritePlan] {
+        &self.history_plans
+    }
+
     pub(crate) const fn fence_ancestry(&self) -> &FenceAncestryEvidence {
         &self.fence_ancestry
     }
@@ -2077,20 +2085,21 @@ enum UnseenInvocationAdmission {
 
 /// Exact ownership index used across checkpoint compaction. Implementations
 /// must authenticate `lookup` against the invocation-index root committed by
-/// the opened head/checkpoint. `record` stages a request commitment and its
-/// acknowledgement status for the same atomic publication as successor lane
-/// manifests.
+/// the opened head/checkpoint. Mutations update the bounded live tree or
+/// atomically archive an acknowledged owner into permanent history for the
+/// same publication as the successor lane manifests.
 pub trait InvocationOwnership {
     fn lookup(
         &self,
         key: InvocationOwnershipKey,
-    ) -> Result<Option<InvocationOwnershipValue>, InvocationOwnershipError>;
+    ) -> Result<Option<InvocationIndexLookup>, InvocationOwnershipError>;
 
-    fn record(
+    fn mutate(
         &mut self,
-        key: InvocationOwnershipKey,
-        value: InvocationOwnershipValue,
-    ) -> Result<(), InvocationOwnershipError>;
+        operation: InvocationIndexBatchOperation,
+    ) -> Result<(), InvocationOwnershipError> {
+        self.mutate_batch(operation.key().scope, core::slice::from_ref(&operation))
+    }
 
     /// Install and read back an immutable exact outcome before any ownership
     /// root may reference it.
@@ -2107,10 +2116,10 @@ pub trait InvocationOwnership {
 
     /// Apply one strictly key-ordered set of transitions to exactly one scope
     /// and expose only the final root.
-    fn record_batch(
+    fn mutate_batch(
         &mut self,
         scope: InvocationOwnershipScope,
-        values: &[(InvocationOwnershipKey, InvocationOwnershipValue)],
+        operations: &[InvocationIndexBatchOperation],
     ) -> Result<(), InvocationOwnershipError>;
 
     /// Authenticated number of Merge owners which are not yet finalized.
@@ -2124,6 +2133,13 @@ pub trait InvocationOwnership {
         &self,
         scope: InvocationOwnershipScope,
     ) -> Result<InvocationIndexId, InvocationOwnershipError>;
+
+    /// Pure, bounded history-node plans staged while this ownership view was
+    /// mutated. Storage validates and installs them only inside the consuming
+    /// heads CAS; preparation never publishes permanent history objects.
+    fn history_write_plans(
+        &self,
+    ) -> Result<Vec<InvocationHistoryWritePlan>, InvocationOwnershipError>;
 }
 
 /// In-memory ownership used only while replaying from immutable genesis.
@@ -2131,6 +2147,7 @@ pub trait InvocationOwnership {
 pub struct GenesisInvocationOwnership {
     genesis: AgentJournalGenesisId,
     entries: BTreeMap<InvocationOwnershipKey, InvocationOwnershipValue>,
+    history: BTreeMap<InvocationOwnershipKey, InvocationAcknowledgedFact>,
     outcomes: BTreeMap<InvocationOutcomeId, InvocationOutcomeRecord>,
 }
 
@@ -2138,41 +2155,12 @@ impl InvocationOwnership for GenesisInvocationOwnership {
     fn lookup(
         &self,
         key: InvocationOwnershipKey,
-    ) -> Result<Option<InvocationOwnershipValue>, InvocationOwnershipError> {
-        Ok(self.entries.get(&key).copied())
-    }
-
-    fn record(
-        &mut self,
-        key: InvocationOwnershipKey,
-        value: InvocationOwnershipValue,
-    ) -> Result<(), InvocationOwnershipError> {
-        match self.entries.get(&key) {
-            Some(existing) if *existing == value => Ok(()),
-            Some(existing)
-                if existing.request_commitment == value.request_commitment
-                    && matches!(
-                        existing.result_state,
-                        InvocationResultState::Retained { .. }
-                    )
-                    && matches!(
-                        value.result_state,
-                        InvocationResultState::Acknowledged { .. }
-                    )
-                    && existing.scope == value.scope
-                    && existing.first_input == value.first_input
-                    && existing.lane == value.lane
-                    && existing.node == value.node
-                    && existing.disposition() == value.disposition() =>
-            {
-                self.entries.insert(key, value);
-                Ok(())
-            }
-            Some(_) => Err(InvocationOwnershipError::Conflict),
-            None => {
-                self.entries.insert(key, value);
-                Ok(())
-            }
+    ) -> Result<Option<InvocationIndexLookup>, InvocationOwnershipError> {
+        match (self.entries.get(&key), self.history.get(&key)) {
+            (Some(_), Some(_)) => Err(InvocationOwnershipError::Unauthenticated),
+            (Some(owner), None) => Ok(Some(InvocationIndexLookup::Live(*owner))),
+            (None, Some(fact)) => Ok(Some(InvocationIndexLookup::Archived(*fact))),
+            (None, None) => Ok(None),
         }
     }
 
@@ -2223,36 +2211,73 @@ impl InvocationOwnership for GenesisInvocationOwnership {
         Ok(Some(outcome.clone()))
     }
 
-    fn record_batch(
+    fn mutate_batch(
         &mut self,
         scope: InvocationOwnershipScope,
-        values: &[(InvocationOwnershipKey, InvocationOwnershipValue)],
+        operations: &[InvocationIndexBatchOperation],
     ) -> Result<(), InvocationOwnershipError> {
-        if values.windows(2).any(|pair| pair[0].0 >= pair[1].0)
-            || values.iter().any(|(key, _)| key.scope != scope)
+        if operations
+            .windows(2)
+            .any(|pair| pair[0].key() >= pair[1].key())
+            || operations
+                .iter()
+                .any(|operation| operation.key().scope != scope)
         {
             return Err(InvocationOwnershipError::Unauthenticated);
         }
-        let mut candidate = self.entries.clone();
-        for (key, value) in values {
-            match candidate.get(key) {
-                Some(existing) if existing == value => {}
-                Some(existing)
-                    if existing.request_commitment == value.request_commitment
-                        && existing.scope == value.scope
-                        && existing.first_input == value.first_input
-                        && existing.lane == value.lane
-                        && existing.node == value.node =>
-                {
-                    candidate.insert(*key, *value);
+        let mut entries = self.entries.clone();
+        let mut history = self.history.clone();
+        for operation in operations {
+            match *operation {
+                InvocationIndexBatchOperation::PutLive { key, value } => {
+                    if key.validate().is_err()
+                        || value.validate().is_err()
+                        || value.scope != key.scope
+                    {
+                        return Err(InvocationOwnershipError::Unauthenticated);
+                    }
+                    if let Some(fact) = history.get(&key) {
+                        let candidate =
+                            InvocationAcknowledgedFact::from_owner(self.genesis, key, value)
+                                .map_err(|_| InvocationOwnershipError::Conflict)?;
+                        if fact != &candidate {
+                            return Err(InvocationOwnershipError::Conflict);
+                        }
+                        continue;
+                    }
+                    match entries.get(&key) {
+                        Some(existing) if existing == &value => {}
+                        Some(existing)
+                            if existing.request_commitment == value.request_commitment
+                                && existing.scope == value.scope
+                                && existing.first_input == value.first_input
+                                && existing.lane == value.lane
+                                && existing.node == value.node =>
+                        {
+                            entries.insert(key, value);
+                        }
+                        Some(_) => return Err(InvocationOwnershipError::Conflict),
+                        None => {
+                            entries.insert(key, value);
+                        }
+                    }
                 }
-                Some(_) => return Err(InvocationOwnershipError::Conflict),
-                None => {
-                    candidate.insert(*key, *value);
+                InvocationIndexBatchOperation::Archive { key, expected } => {
+                    let fact = InvocationAcknowledgedFact::from_owner(self.genesis, key, expected)
+                        .map_err(|_| InvocationOwnershipError::Unauthenticated)?;
+                    match (entries.get(&key), history.get(&key)) {
+                        (Some(owner), None) if owner == &expected => {
+                            entries.remove(&key);
+                            history.insert(key, fact);
+                        }
+                        (None, Some(existing)) if existing == &fact => {}
+                        _ => return Err(InvocationOwnershipError::Conflict),
+                    }
                 }
             }
         }
-        self.entries = candidate;
+        self.entries = entries;
+        self.history = history;
         Ok(())
     }
 
@@ -2271,10 +2296,18 @@ impl InvocationOwnership for GenesisInvocationOwnership {
         &self,
         scope: InvocationOwnershipScope,
     ) -> Result<InvocationIndexId, InvocationOwnershipError> {
-        if self.entries.keys().any(|key| key.scope == scope) {
+        if self.entries.keys().any(|key| key.scope == scope)
+            || self.history.keys().any(|key| key.scope == scope)
+        {
             return Err(InvocationOwnershipError::Unavailable);
         }
         Ok(InvocationIndexManifest::empty(self.genesis, scope).id())
+    }
+
+    fn history_write_plans(
+        &self,
+    ) -> Result<Vec<InvocationHistoryWritePlan>, InvocationOwnershipError> {
+        Ok(Vec::new())
     }
 }
 
@@ -2303,6 +2336,7 @@ impl ReplayMachine<GenesisInvocationOwnership> {
             ownership: GenesisInvocationOwnership {
                 genesis,
                 entries: BTreeMap::new(),
+                history: BTreeMap::new(),
                 outcomes: BTreeMap::new(),
             },
             fence: None,
@@ -2640,11 +2674,27 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         let mut ownership_delta = InvocationIndexDelta::NONE;
         let mut sealed_outcomes = Vec::new();
         if let Some((key, request, operation)) = invocation_owner {
-            if let Some(seen) = self
+            let lookup = self
                 .ownership
                 .lookup(key)
-                .map_err(ReplayError::InvocationOwnership)?
-            {
+                .map_err(ReplayError::InvocationOwnership)?;
+            if let Some(InvocationIndexLookup::Archived(fact)) = lookup {
+                validate_archived_for_input(fact, self.genesis, key, input)
+                    .map_err(ReplayError::InvocationOwnership)?;
+                self.advance_noop_position(position, &execution_runtime);
+                return Ok(noop_replay_step(
+                    input,
+                    before,
+                    execution_runtime,
+                    position,
+                    if fact.request_commitment() == request {
+                        ReplayStepOutcome::ExactDuplicate
+                    } else {
+                        ReplayStepOutcome::DivergentInvocation
+                    },
+                ));
+            }
+            if let Some(InvocationIndexLookup::Live(seen)) = lookup {
                 validate_owner_for_input(seen, key, input)
                     .map_err(ReplayError::InvocationOwnership)?;
                 if seen.request_commitment != request {
@@ -2714,13 +2764,8 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                         ));
                     }
                     (
-                        InvocationOwnershipOperation::Invoke,
-                        InvocationResultState::Acknowledged { .. },
-                    )
-                    | (
                         InvocationOwnershipOperation::Acknowledge,
-                        InvocationResultState::Acknowledged { .. }
-                        | InvocationResultState::PendingMergeAcknowledgement { .. },
+                        InvocationResultState::PendingMergeAcknowledgement { .. },
                     ) => {
                         self.advance_noop_position(position, &execution_runtime);
                         return Ok(noop_replay_step(
@@ -2855,7 +2900,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             ));
         }
         if let Some((key, request, operation)) = invocation_owner {
-            let value = match (operation, prior_owner) {
+            let mutation = match (operation, prior_owner) {
                 (InvocationOwnershipOperation::Invoke, None) => {
                     let result_state = match position {
                         ReplayPosition::Merge { id, .. } => {
@@ -2908,7 +2953,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                             return Err(ReplayError::InvalidPosition);
                         }
                     };
-                    Some(InvocationOwnershipValue {
+                    let value = InvocationOwnershipValue {
                         scope: key.scope,
                         request_commitment: request,
                         first_input: input.id(),
@@ -2920,7 +2965,8 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                             }
                         },
                         result_state,
-                    })
+                    };
+                    Some(InvocationIndexBatchOperation::PutLive { key, value })
                 }
                 (InvocationOwnershipOperation::Acknowledge, Some(mut existing)) => {
                     let disposition =
@@ -2929,28 +2975,37 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                             .ok_or(ReplayError::InvocationOwnership(
                                 InvocationOwnershipError::Unauthenticated,
                             ))?;
-                    existing.result_state = match (key.scope, position, existing.result_state) {
+                    match (key.scope, position, existing.result_state) {
                         (
                             InvocationOwnershipScope::Merge,
                             ReplayPosition::Merge { id, .. },
                             InvocationResultState::Retained { outcome, .. },
-                        ) => InvocationResultState::PendingMergeAcknowledgement {
-                            acknowledgement_event: id,
-                            disposition,
-                            outcome,
-                        },
+                        ) => {
+                            existing.result_state =
+                                InvocationResultState::PendingMergeAcknowledgement {
+                                    acknowledgement_event: id,
+                                    disposition,
+                                    outcome,
+                                };
+                            Some(InvocationIndexBatchOperation::PutLive {
+                                key,
+                                value: existing,
+                            })
+                        }
                         (
                             InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Local(_),
                             _,
                             InvocationResultState::Retained { .. },
-                        ) => InvocationResultState::Acknowledged { disposition },
+                        ) => Some(InvocationIndexBatchOperation::Archive {
+                            key,
+                            expected: existing,
+                        }),
                         _ => {
                             return Err(ReplayError::InvocationOwnership(
                                 InvocationOwnershipError::Unauthenticated,
                             ));
                         }
-                    };
-                    Some(existing)
+                    }
                 }
                 (InvocationOwnershipOperation::Invoke, Some(_)) if replaying_pending_source => None,
                 (InvocationOwnershipOperation::Invoke, Some(_)) => None,
@@ -2960,10 +3015,10 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                     ));
                 }
             };
-            if let Some(value) = value {
+            if let Some(mutation) = mutation {
                 ownership_delta = ownership_delta.with(key.scope);
                 self.ownership
-                    .record(key, value)
+                    .mutate(mutation)
                     .map_err(ReplayError::InvocationOwnership)?;
             }
         }
@@ -3162,14 +3217,22 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 scope: InvocationOwnershipScope::Merge,
                 invocation,
             };
-            let Some(mut owner) = self
+            let lookup = self
                 .ownership
                 .lookup(key)
-                .map_err(ReplayError::InvocationOwnership)?
-            else {
-                return Err(ReplayError::InvocationOwnership(
-                    InvocationOwnershipError::Unauthenticated,
-                ));
+                .map_err(ReplayError::InvocationOwnership)?;
+            let mut owner = match lookup {
+                Some(InvocationIndexLookup::Live(owner)) => owner,
+                Some(InvocationIndexLookup::Archived(archived)) => {
+                    validate_archived_for_input(archived, self.genesis, key, &fact.event.input)
+                        .map_err(ReplayError::InvocationOwnership)?;
+                    continue;
+                }
+                None => {
+                    return Err(ReplayError::InvocationOwnership(
+                        InvocationOwnershipError::Unauthenticated,
+                    ));
+                }
             };
             validate_owner_for_input(owner, key, &fact.event.input)
                 .map_err(ReplayError::InvocationOwnership)?;
@@ -3207,7 +3270,12 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                         outcome: reference,
                     };
                     owner.validate().map_err(|_| ReplayError::InvalidRecord)?;
-                    if transitions.insert(key, owner).is_some()
+                    if transitions
+                        .insert(
+                            key,
+                            InvocationIndexBatchOperation::PutLive { key, value: owner },
+                        )
+                        .is_some()
                         || outcome_candidates.insert(key, record.clone()).is_some()
                         || executions
                             .insert(
@@ -3235,7 +3303,6 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                     InvocationOwnershipOperation::Acknowledge,
                     InvocationResultState::PendingMergeAcknowledgement {
                         acknowledgement_event,
-                        disposition,
                         ..
                     },
                 ) if acknowledgement_event == *event_id => {
@@ -3254,9 +3321,16 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                         &fact.event.input,
                     )
                     .map_err(ReplayError::InvocationOwnership)?;
-                    owner.result_state = InvocationResultState::Acknowledged { disposition };
-                    owner.validate().map_err(|_| ReplayError::InvalidRecord)?;
-                    if transitions.insert(key, owner).is_some() {
+                    if transitions
+                        .insert(
+                            key,
+                            InvocationIndexBatchOperation::Archive {
+                                key,
+                                expected: owner,
+                            },
+                        )
+                        .is_some()
+                    {
                         return Err(ReplayError::InvalidRecord);
                     }
                 }
@@ -3274,7 +3348,11 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 .ownership
                 .persist_outcome(record)
                 .map_err(ReplayError::InvocationOwnership)?;
-            if transitions.get(key).and_then(|owner| owner.outcome()) != Some(reference) {
+            if transitions.get(key).and_then(|operation| match operation {
+                InvocationIndexBatchOperation::PutLive { value, .. } => value.outcome(),
+                InvocationIndexBatchOperation::Archive { .. } => None,
+            }) != Some(reference)
+            {
                 return Err(ReplayError::InvocationOwnership(
                     InvocationOwnershipError::Unauthenticated,
                 ));
@@ -3293,17 +3371,28 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 input: fact.event.input.clone(),
             });
         }
-        let batch = transitions.into_iter().collect::<Vec<_>>();
+        let batch = transitions.into_values().collect::<Vec<_>>();
         if !batch.is_empty() {
             self.ownership
-                .record_batch(InvocationOwnershipScope::Merge, &batch)
+                .mutate_batch(InvocationOwnershipScope::Merge, &batch)
                 .map_err(ReplayError::InvocationOwnership)?;
-            for (key, expected) in &batch {
+            for operation in &batch {
+                let expected = match *operation {
+                    InvocationIndexBatchOperation::PutLive { value, .. } => {
+                        InvocationIndexLookup::Live(value)
+                    }
+                    InvocationIndexBatchOperation::Archive { key, expected } => {
+                        InvocationIndexLookup::Archived(
+                            InvocationAcknowledgedFact::from_owner(self.genesis, key, expected)
+                                .map_err(|_| ReplayError::InvalidRecord)?,
+                        )
+                    }
+                };
                 if self
                     .ownership
-                    .lookup(*key)
+                    .lookup(operation.key())
                     .map_err(ReplayError::InvocationOwnership)?
-                    != Some(*expected)
+                    != Some(expected)
                 {
                     return Err(ReplayError::InvocationOwnership(
                         InvocationOwnershipError::Unauthenticated,
@@ -3423,13 +3512,18 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 return Err(ReplayError::InvalidRecord);
             };
             let key = outcome.record.key;
-            let owner = self
+            let owner = match self
                 .ownership
                 .lookup(key)
                 .map_err(ReplayError::InvocationOwnership)?
-                .ok_or(ReplayError::InvocationOwnership(
-                    InvocationOwnershipError::Unauthenticated,
-                ))?;
+            {
+                Some(InvocationIndexLookup::Live(owner)) => owner,
+                Some(InvocationIndexLookup::Archived(_)) | None => {
+                    return Err(ReplayError::InvocationOwnership(
+                        InvocationOwnershipError::Unauthenticated,
+                    ));
+                }
+            };
             if key.scope != InvocationOwnershipScope::Merge
                 || source_event == MergeEventId::ZERO
                 || finalizing_entry != id
@@ -3451,6 +3545,10 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             next,
             anchor: ReplayPublicationAnchor::Ordered(entry.clone()),
             outcomes,
+            history_plans: self
+                .ownership
+                .history_write_plans()
+                .map_err(ReplayError::InvocationOwnership)?,
             checkpoint: None,
             fence_ancestry,
         })
@@ -3528,6 +3626,10 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             next,
             anchor: ReplayPublicationAnchor::Local(entry.clone()),
             outcomes,
+            history_plans: self
+                .ownership
+                .history_write_plans()
+                .map_err(ReplayError::InvocationOwnership)?,
             checkpoint: None,
             fence_ancestry,
         })
@@ -3591,6 +3693,10 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 frontier: replay.frontier.clone(),
             },
             outcomes: Vec::new(),
+            history_plans: self
+                .ownership
+                .history_write_plans()
+                .map_err(ReplayError::InvocationOwnership)?,
             checkpoint: None,
             fence_ancestry,
         })
@@ -3873,6 +3979,32 @@ fn validate_owner_for_input(
         || key.invocation != invocation
         || owner.lane != input.persisted_lane()
         || owner.node != expected_node
+    {
+        return Err(InvocationOwnershipError::Unauthenticated);
+    }
+    Ok(())
+}
+
+fn validate_archived_for_input(
+    fact: InvocationAcknowledgedFact,
+    genesis: AgentJournalGenesisId,
+    key: InvocationOwnershipKey,
+    input: &ReplayInput,
+) -> Result<(), InvocationOwnershipError> {
+    let Some((invocation, _, _)) = invocation_identity(input) else {
+        return Err(InvocationOwnershipError::Unauthenticated);
+    };
+    let expected_node = match key.scope {
+        InvocationOwnershipScope::Local(node) => Some(node),
+        InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Merge => None,
+    };
+    if key.validate().is_err()
+        || fact.validate().is_err()
+        || fact.genesis() != genesis
+        || fact.key() != key
+        || key.invocation != invocation
+        || fact.lane() != input.persisted_lane()
+        || fact.node() != expected_node
     {
         return Err(InvocationOwnershipError::Unauthenticated);
     }
@@ -5972,10 +6104,23 @@ mod aggregate {
             materialization.heads.local_invocations,
         )
         .map_err(|_| ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated))?;
-        let Some(owner) =
-            InvocationOwnership::lookup(&indexes, key).map_err(ReplayError::InvocationOwnership)?
-        else {
-            return Ok(ReplayInvocationRecovery::NotCommitted);
+        let lookup =
+            InvocationOwnership::lookup(&indexes, key).map_err(ReplayError::InvocationOwnership)?;
+        let owner = match lookup {
+            Some(InvocationIndexLookup::Archived(fact)) => {
+                if !position_reachable {
+                    return Ok(ReplayInvocationRecovery::NotCommitted);
+                }
+                validate_archived_for_input(fact, materialization.heads.genesis, key, input)
+                    .map_err(ReplayError::InvocationOwnership)?;
+                return Ok(if fact.request_commitment() == invocation.commitment() {
+                    ReplayInvocationRecovery::Acknowledged
+                } else {
+                    ReplayInvocationRecovery::Divergent
+                });
+            }
+            Some(InvocationIndexLookup::Live(owner)) => owner,
+            None => return Ok(ReplayInvocationRecovery::NotCommitted),
         };
         // A staged object which lost (or has not yet attempted) its heads CAS
         // is not a recovery capability. The sole exception is a retained
@@ -6123,9 +6268,6 @@ mod aggregate {
                 }
                 Ok(ReplayInvocationRecovery::Retained(outcome.result))
             }
-            InvocationResultState::Acknowledged { .. } => {
-                Ok(ReplayInvocationRecovery::Acknowledged)
-            }
         }
     }
 
@@ -6168,14 +6310,10 @@ mod aggregate {
         let manifest = indexes.manifest(scope).map_err(|_| {
             ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated)
         })?;
-        let live = manifest.entries.checked_sub(manifest.tombstones).ok_or(
-            ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated),
-        )?;
         let reserved = manifest
             .reserved_outcome_bytes
             .checked_add(MAX_INVOCATION_OUTCOME_BYTES as u64);
-        let has_capacity = manifest.entries < MAX_INVOCATION_INDEX_LOGICAL_ENTRIES
-            && live < MAX_INVOCATION_INDEX_LIVE_ENTRIES
+        let has_capacity = manifest.entries < MAX_INVOCATION_INDEX_LIVE_ENTRIES
             && reserved.is_some_and(|bytes| bytes <= MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES);
         if has_capacity {
             return Ok(UnseenInvocationAdmission::Available);
@@ -7198,6 +7336,7 @@ mod aggregate {
             next: next.clone(),
             anchor: ReplayPublicationAnchor::Checkpoint(manifest),
             outcomes: Vec::new(),
+            history_plans: Vec::new(),
             checkpoint: Some(checkpoint),
             fence_ancestry: fence_ancestry.clone(),
         };
@@ -7274,7 +7413,11 @@ pub(crate) mod tests {
     use crate::agent::contract::RuntimePackageContract;
     use crate::agent::execution::{ActorInvocation, ActorInvocationAuth, ActorObservation};
     #[cfg(feature = "std")]
+    use crate::agent::invocation_history::{InvocationHistoryNode, InvocationHistoryStore};
+    #[cfg(feature = "std")]
     use crate::agent::invocation_index::{InvocationIndexStore, InvocationOutcomeStore};
+    #[cfg(feature = "std")]
+    use crate::agent::journal::InvocationHistoryNodeId;
     #[cfg(feature = "std")]
     use crate::agent::journal_store::{
         AgentJournalGarbageCollection, AgentJournalStore, GcLimits, JournalBlobClass,
@@ -7315,6 +7458,7 @@ pub(crate) mod tests {
     struct LinearReplayStore {
         inner: MemoryAgentJournalStore,
         heads: JournalHeads,
+        history_nodes: BTreeMap<InvocationHistoryNodeId, Vec<u8>>,
     }
 
     #[cfg(feature = "std")]
@@ -7361,6 +7505,32 @@ pub(crate) mod tests {
             bytes: &[u8],
         ) -> Result<(), Self::Error> {
             InvocationOutcomeStore::put_outcome(&mut self.inner, id, bytes)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl InvocationHistoryStore for LinearReplayStore {
+        type Error = JournalStoreError;
+
+        fn load_history_node(
+            &self,
+            id: InvocationHistoryNodeId,
+        ) -> Result<Option<Vec<u8>>, Self::Error> {
+            if id == InvocationHistoryNodeId::ZERO {
+                return Err(JournalStoreError::Corrupt);
+            }
+            self.history_nodes
+                .get(&id)
+                .map(|bytes| {
+                    let node = InvocationHistoryNode::decode(bytes)
+                        .map_err(|_| JournalStoreError::Corrupt)?;
+                    node.validate().map_err(|_| JournalStoreError::Corrupt)?;
+                    if node.id() != id {
+                        return Err(JournalStoreError::Corrupt);
+                    }
+                    Ok(bytes.clone())
+                })
+                .transpose()
         }
     }
 
@@ -7430,6 +7600,29 @@ pub(crate) mod tests {
                 return Err(JournalStoreError::Conflict);
             }
             let mut object_created = false;
+            for plan in publication.history_plans() {
+                plan.validate(self)
+                    .map_err(|_| JournalStoreError::Corrupt)?;
+                for write in plan.node_writes() {
+                    let node = InvocationHistoryNode::decode(write.bytes())
+                        .map_err(|_| JournalStoreError::Corrupt)?;
+                    node.validate().map_err(|_| JournalStoreError::Corrupt)?;
+                    if node.id() != write.id() {
+                        return Err(JournalStoreError::Corrupt);
+                    }
+                    match self.history_nodes.get(&write.id()) {
+                        Some(bytes) if bytes.as_slice() == write.bytes() => {}
+                        Some(_) => return Err(JournalStoreError::Corrupt),
+                        None => {
+                            self.history_nodes
+                                .insert(write.id(), write.bytes().to_vec());
+                            object_created = true;
+                        }
+                    }
+                }
+                plan.validate(self)
+                    .map_err(|_| JournalStoreError::Corrupt)?;
+            }
             for outcome in publication.outcomes() {
                 let record = outcome.record();
                 InvocationOutcomeStore::put_outcome(
@@ -7721,7 +7914,7 @@ pub(crate) mod tests {
             suspended: false,
         };
         let state = crate::agent::standard::StandardRuntimeState {
-            config: Some(config),
+            config: Some(config.clone()),
             actors: vec![crate::agent::standard::StandardActorState {
                 record: crate::agent::ActorRecord {
                     entry,
@@ -7735,6 +7928,15 @@ pub(crate) mod tests {
                     requirements,
                 },
                 debt: crate::agent::ActorLifecycleDebt::default(),
+            }],
+            authority_slot_high_water: Some(1),
+            authority_sequence_high_water: Some(1),
+            authority_dispositions: vec![crate::agent::standard::StandardAuthorityDisposition {
+                credential: CredentialId([0x51; 32]),
+                sequence: 1,
+                claim: Hash([0x52; 32]),
+                operation: Hash([0x53; 32]),
+                result: Ok(crate::agent::LifecycleReply::Created(config.identity)),
             }],
             ..crate::agent::standard::StandardRuntimeState::default()
         };
@@ -8213,7 +8415,11 @@ pub(crate) mod tests {
     fn initialized_linear_replay_store() -> LinearReplayStore {
         let inner = initialized_replay_store();
         let heads = inner.heads().unwrap().unwrap();
-        LinearReplayStore { inner, heads }
+        LinearReplayStore {
+            inner,
+            heads,
+            history_nodes: BTreeMap::new(),
+        }
     }
 
     #[cfg(feature = "std")]
@@ -8371,11 +8577,6 @@ pub(crate) mod tests {
         let full_root = indexes.record_batch(scope, &owners).unwrap();
         let manifest = *indexes.manifest(scope).unwrap();
         assert_eq!(manifest.entries, MAX_INVOCATION_INDEX_LIVE_ENTRIES);
-        assert_eq!(manifest.tombstones, 0);
-        assert_eq!(
-            manifest.entries - manifest.tombstones,
-            MAX_INVOCATION_INDEX_LIVE_ENTRIES
-        );
         drop(indexes);
 
         let mut heads = store.heads.clone();
@@ -8738,7 +8939,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ownership_tombstones_duplicates_and_divergence_advance_ordered_runtime() {
+    fn ownership_duplicates_and_divergence_advance_ordered_runtime() {
         let genesis = AgentJournalGenesisId([0x71; 32]);
         let mut machine = ReplayMachine::from_genesis(genesis, runtime()).unwrap();
         let mut executor = RejectingExecutor::default();
@@ -8767,7 +8968,11 @@ pub(crate) mod tests {
             scope: InvocationOwnershipScope::Ordered,
             invocation: InvocationId([0x51; 32]),
         };
-        let owner = machine.ownership.lookup(ordered_key).unwrap().unwrap();
+        let InvocationIndexLookup::Live(owner) =
+            machine.ownership.lookup(ordered_key).unwrap().unwrap()
+        else {
+            panic!("fresh invocation must remain live");
+        };
         assert!(matches!(
             owner.result_state,
             InvocationResultState::Retained {
@@ -10426,6 +10631,198 @@ pub(crate) mod tests {
 
     #[cfg(feature = "std")]
     #[test]
+    fn direct_acknowledgement_archives_through_checkpoint_gc_and_frees_the_live_slot() {
+        let mut store = initialized_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let base = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let original = OrderedEntry {
+            genesis: base.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: base.merge_frontier(),
+            merge_seal: None,
+            input: admitted_invocation(MethodMode::Linear, 0xd6),
+        };
+        let prepared = match prepare_ordered(&mut store, &mut executor, &base, &original).unwrap() {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_publication, retained, _) = prepared.publish().unwrap();
+        let acknowledgement = OrderedEntry {
+            genesis: retained.heads().genesis,
+            index: 2,
+            parent: Some(original.id()),
+            merge_frontier: retained.merge_frontier(),
+            merge_seal: None,
+            input: admitted_acknowledgement(&original.input),
+        };
+        let prepared = match prepare_ordered(&mut store, &mut executor, &retained, &acknowledgement)
+            .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_publication, acknowledged, _) = prepared.publish().unwrap();
+
+        let mut reopened =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        assert_eq!(reopened.heads(), acknowledged.heads());
+        let key = InvocationOwnershipKey {
+            scope: InvocationOwnershipScope::Ordered,
+            invocation: InvocationId([0xd6; 32]),
+        };
+        {
+            let indexes = InvocationIndexes::open(
+                &mut store,
+                reopened.heads().ordered_invocations,
+                reopened.heads().merge_invocations,
+                reopened.heads().local_invocations,
+            )
+            .unwrap();
+            let manifest = indexes.manifest(InvocationOwnershipScope::Ordered).unwrap();
+            assert_eq!(manifest.entries, 0);
+            assert!(manifest.history_root.is_some());
+            let Some(InvocationIndexLookup::Archived(fact)) =
+                InvocationOwnership::lookup(&indexes, key).unwrap()
+            else {
+                panic!("acknowledgement did not move the owner into history")
+            };
+            assert_eq!(
+                fact.request_commitment(),
+                invocation_identity(&original.input).unwrap().1
+            );
+        }
+        for (input, entry) in [
+            (&original.input, &original),
+            (&acknowledgement.input, &acknowledgement),
+        ] {
+            assert_eq!(
+                recover_invocation(
+                    &mut store,
+                    &reopened,
+                    input,
+                    ReplayPosition::Ordered {
+                        id: entry.id(),
+                        index: entry.index,
+                        merge_frontier: entry.merge_frontier,
+                        merge_seal: entry.merge_seal,
+                    },
+                )
+                .unwrap(),
+                ReplayInvocationRecovery::Acknowledged
+            );
+        }
+
+        let checkpoint = prepare_checkpoint(&mut store, &reopened).unwrap();
+        let (_publication, checkpointed, _) = checkpoint.publish().unwrap();
+        let limits = GcLimits {
+            max_index_nodes: 10_000,
+            max_marked_objects: 10_000,
+            max_marked_blobs: 10_000,
+            max_scanned_files: 10_000,
+            max_scanned_bytes: 64 * 1024 * 1024,
+            max_unlinks_per_run: 10_000,
+        };
+        while !store
+            .collect_garbage(checkpointed.heads().id(), limits)
+            .unwrap()
+            .complete
+        {}
+        reopened = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+
+        let executions_before_retry = executor.executions;
+        let exact_retry = OrderedEntry {
+            genesis: reopened.heads().genesis,
+            index: reopened.heads().ordered_index + 1,
+            parent: reopened.heads().ordered_head,
+            merge_frontier: reopened.merge_frontier(),
+            merge_seal: None,
+            input: original.input.clone(),
+        };
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &reopened, &exact_retry).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            };
+        let (_publication, exact_successor, executions) = prepared.publish().unwrap();
+        assert_eq!(executor.executions, executions_before_retry);
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].outcome(), ReplayStepOutcome::ExactDuplicate);
+        assert_eq!(
+            recover_invocation(
+                &mut store,
+                &exact_successor,
+                &exact_retry.input,
+                ReplayPosition::Ordered {
+                    id: exact_retry.id(),
+                    index: exact_retry.index,
+                    merge_frontier: exact_retry.merge_frontier,
+                    merge_seal: exact_retry.merge_seal,
+                },
+            )
+            .unwrap(),
+            ReplayInvocationRecovery::Acknowledged
+        );
+
+        let divergent = OrderedEntry {
+            genesis: exact_successor.heads().genesis,
+            index: exact_successor.heads().ordered_index + 1,
+            parent: exact_successor.heads().ordered_head,
+            merge_frontier: exact_successor.merge_frontier(),
+            merge_seal: None,
+            input: divergent_invocation_input(&original.input, 0x01),
+        };
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &exact_successor, &divergent).unwrap()
+            {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            };
+        let (_publication, divergent_successor, executions) = prepared.publish().unwrap();
+        assert_eq!(executor.executions, executions_before_retry);
+        assert_eq!(executions.len(), 1);
+        assert_eq!(
+            executions[0].outcome(),
+            ReplayStepOutcome::DivergentInvocation
+        );
+
+        let fresh = OrderedEntry {
+            genesis: divergent_successor.heads().genesis,
+            index: divergent_successor.heads().ordered_index + 1,
+            parent: divergent_successor.heads().ordered_head,
+            merge_frontier: divergent_successor.merge_frontier(),
+            merge_seal: None,
+            input: admitted_invocation(MethodMode::Linear, 0xd7),
+        };
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &divergent_successor, &fresh).unwrap()
+            {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            };
+        let (_publication, fresh_successor, _) = prepared.publish().unwrap();
+        let indexes = InvocationIndexes::open(
+            &mut store,
+            fresh_successor.heads().ordered_invocations,
+            fresh_successor.heads().merge_invocations,
+            fresh_successor.heads().local_invocations,
+        )
+        .unwrap();
+        assert_eq!(
+            indexes
+                .manifest(InvocationOwnershipScope::Ordered)
+                .unwrap()
+                .entries,
+            1
+        );
+        assert!(matches!(
+            InvocationOwnership::lookup(&indexes, key).unwrap(),
+            Some(InvocationIndexLookup::Archived(_))
+        ));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
     fn prepare_publish_reopen_and_response_loss_retry_are_exact() {
         let mut store = initialized_replay_store();
         let mut executor = ExactCreateRejectInvocations::default();
@@ -10600,7 +10997,7 @@ pub(crate) mod tests {
             InvocationOwnershipScope::Merge,
             InvocationOwnershipScope::Local(heads.node),
         ] {
-            let owner = InvocationOwnership::lookup(
+            let lookup = InvocationOwnership::lookup(
                 &indexes,
                 InvocationOwnershipKey {
                     scope,
@@ -10609,6 +11006,9 @@ pub(crate) mod tests {
             )
             .unwrap()
             .unwrap();
+            let InvocationIndexLookup::Live(owner) = lookup else {
+                panic!("fresh scope owner must remain live");
+            };
             assert_eq!(owner.scope, scope);
             match scope {
                 InvocationOwnershipScope::Merge => assert!(matches!(

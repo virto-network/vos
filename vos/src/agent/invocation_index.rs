@@ -10,14 +10,18 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::fmt;
 
+use super::invocation_history::{
+    InvocationHistory, InvocationHistoryError, InvocationHistoryStore, InvocationHistoryWritePlan,
+};
 use super::journal::{
-    AgentJournalGenesisId, CanonicalJournalRecord, InvocationIndexId, InvocationIndexManifest,
-    InvocationIndexNodeId, InvocationOutcomeAnchor, InvocationOutcomeId, InvocationOutcomeRecord,
-    InvocationOutcomeRef, InvocationOwnershipKey, InvocationOwnershipLeaf,
-    InvocationOwnershipScope, InvocationOwnershipValue, InvocationResultState, JournalStorageClass,
-    MAX_INVOCATION_INDEX_LIVE_ENTRIES, MAX_INVOCATION_INDEX_LOGICAL_ENTRIES,
-    MAX_INVOCATION_INDEX_MANIFEST_BYTES, MAX_INVOCATION_INDEX_NODE_BYTES,
-    MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES, MAX_INVOCATION_OUTCOME_BYTES,
+    AgentJournalGenesisId, CanonicalJournalRecord, InvocationAcknowledgedFact,
+    InvocationHistoryNodeId, InvocationIndexId, InvocationIndexManifest, InvocationIndexNodeId,
+    InvocationOutcomeAnchor, InvocationOutcomeId, InvocationOutcomeRecord, InvocationOutcomeRef,
+    InvocationOwnershipKey, InvocationOwnershipLeaf, InvocationOwnershipScope,
+    InvocationOwnershipValue, InvocationResultState, JournalStorageClass,
+    MAX_INVOCATION_INDEX_LIVE_ENTRIES, MAX_INVOCATION_INDEX_MANIFEST_BYTES,
+    MAX_INVOCATION_INDEX_NODE_BYTES, MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES,
+    MAX_INVOCATION_OUTCOME_BYTES,
 };
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{Hash, InvocationId, NodeId};
@@ -45,13 +49,14 @@ const fn full_tree_node_count(entries: u64) -> Option<usize> {
     Some(nodes as usize)
 }
 
-/// Full-tree scrub and garbage-collection budget for one complete logical
-/// ownership epoch. A canonical binary Patricia tree has exactly `2n - 1`
-/// nodes for `n` leaves.
+/// Full-tree scrub and garbage-collection budget for the complete bounded live
+/// tree. A canonical binary Patricia tree has exactly `2n - 1` nodes for `n`
+/// leaves. Permanent acknowledged history lives in its own insert-only tree
+/// and never increases this bound.
 pub const DEFAULT_INVOCATION_INDEX_NODE_LIMIT: usize =
-    match full_tree_node_count(MAX_INVOCATION_INDEX_LOGICAL_ENTRIES) {
+    match full_tree_node_count(MAX_INVOCATION_INDEX_LIVE_ENTRIES) {
         Some(value) => value,
-        None => panic!("invocation-index logical limit does not fit the scrub node budget"),
+        None => panic!("invocation-index live limit does not fit the scrub node budget"),
     };
 
 const NODE_ID_DOMAIN: &[u8] = b"vos/agent/journal/invocation-index-node";
@@ -62,7 +67,6 @@ pub struct InvocationIndexSummary {
     pub min: InvocationId,
     pub max: InvocationId,
     pub entries: u64,
-    pub tombstones: u64,
     pub unfinalized: u64,
     pub outcome_records: u64,
     pub reserved_outcome_bytes: u64,
@@ -74,7 +78,6 @@ impl InvocationIndexSummary {
             min: leaf.key.invocation,
             max: leaf.key.invocation,
             entries: 1,
-            tombstones: u64::from(leaf.owner.result_state.is_tombstone()),
             unfinalized: u64::from(leaf.owner.is_unfinalized()),
             outcome_records: leaf.owner.outcome_records(),
             reserved_outcome_bytes: leaf.owner.reserved_outcome_bytes(),
@@ -82,19 +85,14 @@ impl InvocationIndexSummary {
     }
 
     fn validate(self) -> Result<(), DecodeError> {
-        let live = self.entries.checked_sub(self.tombstones);
         if self.min == InvocationId::ZERO
             || self.max == InvocationId::ZERO
             || self.min > self.max
             || self.entries == 0
-            || self.tombstones > self.entries
-            || self.entries > MAX_INVOCATION_INDEX_LOGICAL_ENTRIES
-            || live.is_none_or(|live| live > MAX_INVOCATION_INDEX_LIVE_ENTRIES)
-            || live.is_some_and(|live| {
-                self.unfinalized > live
-                    || self.outcome_records > live
-                    || ((self.reserved_outcome_bytes == 0) != (live == 0))
-            })
+            || self.entries > MAX_INVOCATION_INDEX_LIVE_ENTRIES
+            || self.unfinalized > self.entries
+            || self.outcome_records > self.entries
+            || ((self.reserved_outcome_bytes == 0) != (self.entries == 0))
             || self.reserved_outcome_bytes > MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES
         {
             return Err(DecodeError::NonCanonical);
@@ -161,11 +159,6 @@ impl InvocationIndexNode {
                     .summary
                     .entries
                     .checked_add(right.summary.entries)
-                    .ok_or(DecodeError::LimitExceeded)?,
-                tombstones: left
-                    .summary
-                    .tombstones
-                    .checked_add(right.summary.tombstones)
                     .ok_or(DecodeError::LimitExceeded)?,
                 unfinalized: left
                     .summary
@@ -319,10 +312,13 @@ pub enum InvocationIndexError<E> {
     Storage(E),
     MissingManifest(InvocationIndexId),
     MissingNode(InvocationIndexNodeId),
+    MissingHistoryNode(InvocationHistoryNodeId),
     MissingOutcome(InvocationOutcomeId),
     CorruptManifest,
     CorruptNode(InvocationIndexNodeId),
+    CorruptHistoryNode(InvocationHistoryNodeId),
     CorruptOutcome(InvocationOutcomeId),
+    CorruptHistory,
     GenesisMismatch,
     ScopeMismatch,
     SummaryMismatch,
@@ -351,7 +347,32 @@ pub enum InvocationIndexMutation {
     Inserted(InvocationIndexId),
     ExactRetry(InvocationIndexId),
     Transitioned(InvocationIndexId),
-    Acknowledged(InvocationIndexId),
+    Archived(InvocationIndexId),
+}
+
+/// One operation in an atomic scoped ownership mutation. Operations are
+/// strictly ordered by key and a key may occur at most once. `Archive` derives
+/// its permanent fact exclusively from a byte-exact expected live owner after
+/// authenticating that owner against the tree; callers cannot supply or
+/// rewrite acknowledged history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvocationIndexBatchOperation {
+    PutLive {
+        key: InvocationOwnershipKey,
+        value: InvocationOwnershipValue,
+    },
+    Archive {
+        key: InvocationOwnershipKey,
+        expected: InvocationOwnershipValue,
+    },
+}
+
+impl InvocationIndexBatchOperation {
+    pub const fn key(self) -> InvocationOwnershipKey {
+        match self {
+            Self::PutLive { key, .. } | Self::Archive { key, .. } => key,
+        }
+    }
 }
 
 impl InvocationIndexMutation {
@@ -360,7 +381,7 @@ impl InvocationIndexMutation {
             Self::Inserted(id)
             | Self::ExactRetry(id)
             | Self::Transitioned(id)
-            | Self::Acknowledged(id) => id,
+            | Self::Archived(id) => id,
         }
     }
 }
@@ -378,6 +399,16 @@ pub enum InvocationIndexProofResult {
     NonMember,
 }
 
+/// Composite authenticated state of one invocation identity. Live ownership
+/// is mutable within the bounded working tree; archived facts are permanent
+/// and insert-only. A key committed by both trees is corruption, never a
+/// precedence rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvocationIndexLookup {
+    Live(InvocationOwnershipValue),
+    Archived(InvocationAcknowledgedFact),
+}
+
 /// Fully authenticated immutable objects reachable from one invocation-index
 /// manifest. IDs are returned in canonical ascending order without duplicates
 /// so journal garbage collection is independent of tree traversal order.
@@ -392,6 +423,7 @@ pub struct InvocationIndex<'a, S: InvocationOutcomeStore> {
     store: &'a mut S,
     manifest: InvocationIndexManifest,
     id: InvocationIndexId,
+    history_plan: InvocationHistoryWritePlan,
 }
 
 type InvocationIndexPath = Vec<(InvocationIndexNode, bool)>;
@@ -413,13 +445,26 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndex<'a, S> {
     pub fn open(
         store: &'a mut S,
         id: InvocationIndexId,
-    ) -> Result<Self, InvocationIndexError<S::Error>> {
+    ) -> Result<Self, InvocationIndexError<<S as InvocationIndexStore>::Error>>
+    where
+        S: InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+    {
         let manifest = load_manifest(store, id)?;
         validate_manifest_root(store, id, &manifest)?;
+        let history_plan = InvocationHistory::open(
+            &*store,
+            manifest.genesis,
+            manifest.scope,
+            manifest.history_root,
+        )
+        .map_err(map_history_error)?
+        .write_plan()
+        .map_err(map_history_error)?;
         Ok(Self {
             store,
             manifest,
             id,
+            history_plan,
         })
     }
 
@@ -431,12 +476,22 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndex<'a, S> {
         &self.manifest
     }
 
+    pub const fn history_write_plan(&self) -> &InvocationHistoryWritePlan {
+        &self.history_plan
+    }
+
     /// Authenticated membership/nonmembership lookup against the opened root.
     pub fn lookup(
         &self,
         key: InvocationOwnershipKey,
-    ) -> Result<Option<InvocationOwnershipValue>, InvocationIndexError<S::Error>> {
-        lookup_in_manifest(self.store, &self.manifest, key)
+    ) -> Result<
+        Option<InvocationIndexLookup>,
+        InvocationIndexError<<S as InvocationIndexStore>::Error>,
+    >
+    where
+        S: InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+    {
+        lookup_composite_in_manifest(self.store, &self.manifest, &self.history_plan, key)
     }
 
     /// Persist and read back one exact outcome before any ownership leaf may
@@ -464,32 +519,76 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndex<'a, S> {
     }
 
     /// Insert a first owner, accept a byte-exact retry, or apply one legal
-    /// state-machine transition. Tombstones are never deleted or replaced.
+    /// live state-machine transition. Acknowledgement uses [`Self::archive`]
+    /// so the authenticated owner moves atomically into permanent history.
     pub fn record(
         &mut self,
         key: InvocationOwnershipKey,
         value: InvocationOwnershipValue,
-    ) -> Result<InvocationIndexMutation, InvocationIndexError<S::Error>> {
+    ) -> Result<InvocationIndexMutation, InvocationIndexError<<S as InvocationIndexStore>::Error>>
+    where
+        S: InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+    {
         let next = InvocationOwnershipLeaf {
             genesis: self.manifest.genesis,
             key,
             owner: value,
         };
-        let existing = self.lookup_leaf(key)?;
-        let transition = classify_transition(existing.as_ref(), &next)?;
-        let id = self.record_batch(&[(key, value)])?;
+        let transition = match self.lookup(key)? {
+            Some(InvocationIndexLookup::Live(existing)) => {
+                let existing = InvocationOwnershipLeaf {
+                    genesis: self.manifest.genesis,
+                    key,
+                    owner: existing,
+                };
+                classify_transition(Some(&existing), &next)?
+            }
+            Some(InvocationIndexLookup::Archived(existing)) => {
+                let candidate =
+                    InvocationAcknowledgedFact::from_owner(self.manifest.genesis, key, value)
+                        .map_err(|_| InvocationIndexError::Conflict)?;
+                if candidate != existing {
+                    return Err(InvocationIndexError::Conflict);
+                }
+                PlannedTransition::ExactRetry
+            }
+            None => classify_transition(None, &next)?,
+        };
+        let id = self.mutate_batch(&[InvocationIndexBatchOperation::PutLive { key, value }])?;
         Ok(match transition {
             PlannedTransition::ExactRetry => InvocationIndexMutation::ExactRetry(id),
             PlannedTransition::Insert => InvocationIndexMutation::Inserted(id),
-            PlannedTransition::Replace
-                if matches!(
-                    value.result_state,
-                    InvocationResultState::Acknowledged { .. }
-                ) =>
-            {
-                InvocationIndexMutation::Acknowledged(id)
-            }
             PlannedTransition::Replace => InvocationIndexMutation::Transitioned(id),
+        })
+    }
+
+    /// Move one exact authenticated final owner into permanent history and
+    /// delete its live Patricia leaf in the same candidate manifest.
+    pub fn archive(
+        &mut self,
+        key: InvocationOwnershipKey,
+        expected: InvocationOwnershipValue,
+    ) -> Result<InvocationIndexMutation, InvocationIndexError<<S as InvocationIndexStore>::Error>>
+    where
+        S: InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+    {
+        let candidate =
+            InvocationAcknowledgedFact::from_owner(self.manifest.genesis, key, expected)
+                .map_err(|_| InvocationIndexError::InvalidTransition)?;
+        let mutation = match self.lookup(key)? {
+            Some(InvocationIndexLookup::Live(owner)) if owner == expected => {
+                InvocationIndexMutation::Archived(self.id)
+            }
+            Some(InvocationIndexLookup::Archived(fact)) if fact == candidate => {
+                InvocationIndexMutation::ExactRetry(self.id)
+            }
+            _ => return Err(InvocationIndexError::Conflict),
+        };
+        let id = self.mutate_batch(&[InvocationIndexBatchOperation::Archive { key, expected }])?;
+        Ok(match mutation {
+            InvocationIndexMutation::Archived(_) => InvocationIndexMutation::Archived(id),
+            InvocationIndexMutation::ExactRetry(_) => InvocationIndexMutation::ExactRetry(id),
+            _ => unreachable!("archive classification has only two outcomes"),
         })
     }
 
@@ -501,52 +600,134 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndex<'a, S> {
     pub fn record_batch(
         &mut self,
         values: &[(InvocationOwnershipKey, InvocationOwnershipValue)],
-    ) -> Result<InvocationIndexId, InvocationIndexError<S::Error>> {
-        if values.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+    ) -> Result<InvocationIndexId, InvocationIndexError<<S as InvocationIndexStore>::Error>>
+    where
+        S: InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+    {
+        let mut operations = Vec::new();
+        operations
+            .try_reserve(values.len())
+            .map_err(|_| InvocationIndexError::NodeLimit)?;
+        operations.extend(values.iter().map(|(key, value)| {
+            InvocationIndexBatchOperation::PutLive {
+                key: *key,
+                value: *value,
+            }
+        }));
+        self.mutate_batch(&operations)
+    }
+
+    /// Apply one canonical, strictly key-ordered set of live puts and exact
+    /// archives. All live/history membership, outcome, transition, and final
+    /// capacity checks finish before any immutable live node is written.
+    /// History nodes remain only in the returned write-plan overlay until the
+    /// surrounding replay publication consumes them atomically.
+    pub fn mutate_batch(
+        &mut self,
+        operations: &[InvocationIndexBatchOperation],
+    ) -> Result<InvocationIndexId, InvocationIndexError<<S as InvocationIndexStore>::Error>>
+    where
+        S: InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+    {
+        if operations
+            .windows(2)
+            .any(|pair| pair[0].key() >= pair[1].key())
+        {
             return Err(InvocationIndexError::NonCanonicalTree);
         }
-        let mut planned = Vec::new();
+        let mut history = InvocationHistory::open_with_plan(&*self.store, &self.history_plan)
+            .map_err(map_history_error)?;
+        let mut puts = Vec::new();
+        let mut archives = Vec::new();
+        puts.try_reserve(operations.len())
+            .map_err(|_| InvocationIndexError::NodeLimit)?;
+        archives
+            .try_reserve(operations.len())
+            .map_err(|_| InvocationIndexError::NodeLimit)?;
         let mut counts = ManifestCounts::from_manifest(&self.manifest);
-        for (key, value) in values {
+        for operation in operations {
+            let key = operation.key();
             self.require_scope(key.scope)?;
-            let leaf = InvocationOwnershipLeaf {
-                genesis: self.manifest.genesis,
-                key: *key,
-                owner: *value,
-            };
-            leaf.validate()
-                .map_err(|_| InvocationIndexError::InvalidTransition)?;
-            let existing = self.lookup_leaf(*key)?;
-            let transition = classify_transition(existing.as_ref(), &leaf)?;
-            authenticate_transition_outcomes(self.store, existing.as_ref(), &leaf, transition)?;
-            counts.apply(existing.as_ref(), &leaf, transition)?;
-            planned
-                .try_reserve(1)
-                .map_err(|_| InvocationIndexError::NodeLimit)?;
-            planned.push((leaf, transition));
+            let live = self.lookup_leaf(key)?;
+            let archived = history.lookup(key).map_err(map_history_error)?;
+            if live.is_some() && archived.is_some() {
+                return Err(InvocationIndexError::CorruptHistory);
+            }
+            match *operation {
+                InvocationIndexBatchOperation::PutLive { value, .. } => {
+                    let leaf = InvocationOwnershipLeaf {
+                        genesis: self.manifest.genesis,
+                        key,
+                        owner: value,
+                    };
+                    leaf.validate()
+                        .map_err(|_| InvocationIndexError::InvalidTransition)?;
+                    if let Some(fact) = archived {
+                        let candidate = InvocationAcknowledgedFact::from_owner(
+                            self.manifest.genesis,
+                            key,
+                            value,
+                        )
+                        .map_err(|_| InvocationIndexError::Conflict)?;
+                        if candidate != fact {
+                            return Err(InvocationIndexError::Conflict);
+                        }
+                        continue;
+                    }
+                    let transition = classify_transition(live.as_ref(), &leaf)?;
+                    authenticate_transition_outcomes(self.store, live.as_ref(), &leaf, transition)?;
+                    counts.apply(live.as_ref(), &leaf, transition)?;
+                    puts.push((leaf, transition));
+                }
+                InvocationIndexBatchOperation::Archive { expected, .. } => {
+                    let fact = InvocationAcknowledgedFact::from_owner(
+                        self.manifest.genesis,
+                        key,
+                        expected,
+                    )
+                    .map_err(|_| InvocationIndexError::InvalidTransition)?;
+                    match (live, archived) {
+                        (Some(leaf), None) if leaf.owner == expected => {
+                            counts.remove(&leaf)?;
+                            if !history.insert(fact).map_err(map_history_error)?.inserted() {
+                                return Err(InvocationIndexError::CorruptHistory);
+                            }
+                            archives.push(key);
+                        }
+                        (None, Some(existing)) if existing == fact => {}
+                        _ => return Err(InvocationIndexError::Conflict),
+                    }
+                }
+            }
         }
-        // Capacity is a property of the atomic final batch, not its required
-        // canonical key ordering. In particular, an acknowledgement in the
-        // same batch may free the slot needed by a lower-sorting insertion.
+        // Capacity is a property of the atomic final batch, not its canonical
+        // key order. Archives may free every slot consumed by lower-sorting
+        // puts in a full-tree turnover.
         counts.validate()?;
+        let next_history_plan = history.write_plan().map_err(map_history_error)?;
+        drop(history);
 
         let original_manifest = self.manifest;
         let original_id = self.id;
         let applied = (|| {
-            // Replacements cannot increase live identities or reserved bytes,
-            // so applying them first keeps every internally persisted
-            // intermediate manifest canonical. Each phase retains canonical
-            // key order and the final Patricia root is order-independent.
-            for (leaf, transition) in planned.iter().copied() {
+            for key in archives.iter().copied() {
+                self.delete_leaf(key)?;
+            }
+            for (leaf, transition) in puts.iter().copied() {
                 if transition == PlannedTransition::Replace {
                     self.replace_leaf(leaf)?;
                 }
             }
-            for (leaf, transition) in planned.iter().copied() {
+            for (leaf, transition) in puts.iter().copied() {
                 if transition == PlannedTransition::Insert {
                     self.insert_leaf(leaf)?;
                 }
             }
+            if ManifestCounts::from_manifest(&self.manifest) != counts {
+                return Err(InvocationIndexError::SummaryMismatch);
+            }
+            self.manifest.history_root = next_history_plan.root();
+            self.id = put_manifest_immutable(self.store, &self.manifest)?;
             Ok(())
         })();
         if let Err(error) = applied {
@@ -554,6 +735,7 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndex<'a, S> {
             self.id = original_id;
             return Err(error);
         }
+        self.history_plan = next_history_plan;
         Ok(self.id)
     }
 
@@ -665,10 +847,7 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndex<'a, S> {
                 next
             }
         };
-        let next = manifest_from_root(self.manifest, root)?;
-        let id = put_manifest_immutable(self.store, &next)?;
-        self.manifest = next;
-        self.id = id;
+        self.manifest = manifest_from_optional_root(self.manifest, Some(root))?;
         Ok(())
     }
 
@@ -686,11 +865,41 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndex<'a, S> {
         }
         let replacement = put_node_immutable(self.store, &InvocationIndexNode::Leaf(leaf))?;
         let root = self.rebuild_ancestors(ancestors, replacement)?;
-        let next = manifest_from_root(self.manifest, root)?;
-        let id = put_manifest_immutable(self.store, &next)?;
-        self.manifest = next;
-        self.id = id;
+        self.manifest = manifest_from_optional_root(self.manifest, Some(root))?;
         Ok(())
+    }
+
+    /// Remove one authenticated live leaf. Its immediate parent is replaced
+    /// by the sibling subtree, then all remaining ancestors are rebuilt. This
+    /// is the canonical Patricia deletion: unary branches never persist and
+    /// the sibling's already-authenticated prefix becomes the recompressed
+    /// path below its next ancestor.
+    fn delete_leaf(
+        &mut self,
+        key: InvocationOwnershipKey,
+    ) -> Result<InvocationOwnershipLeaf, InvocationIndexError<S::Error>> {
+        let root = self
+            .manifest
+            .root
+            .ok_or(InvocationIndexError::InvalidTransition)?;
+        let (mut ancestors, _, terminal) = self.path_to_terminal(root, key.invocation)?;
+        let InvocationIndexNode::Leaf(leaf) = terminal else {
+            return Err(InvocationIndexError::InvalidTransition);
+        };
+        if leaf.key != key {
+            return Err(InvocationIndexError::InvalidTransition);
+        }
+        let root = if let Some((parent, went_right)) = ancestors.pop() {
+            let InvocationIndexNode::Branch { left, right, .. } = parent else {
+                return Err(InvocationIndexError::NonCanonicalTree);
+            };
+            let sibling = if went_right { left } else { right };
+            Some(self.rebuild_ancestors(ancestors, sibling)?)
+        } else {
+            None
+        };
+        self.manifest = manifest_from_optional_root(self.manifest, root)?;
+        Ok(leaf)
     }
 
     fn path_to_terminal(
@@ -816,10 +1025,11 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndex<'a, S> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct OpenedInvocationIndex {
     id: InvocationIndexId,
     manifest: InvocationIndexManifest,
+    history_plan: InvocationHistoryWritePlan,
 }
 
 /// Ordered, Merge, and replica-local ownership roots opened as one replay
@@ -838,13 +1048,19 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndexes<'a, S> {
         ordered: InvocationIndexId,
         merge: InvocationIndexId,
         local: InvocationIndexId,
-    ) -> Result<Self, InvocationIndexError<S::Error>> {
+    ) -> Result<Self, InvocationIndexError<<S as InvocationIndexStore>::Error>>
+    where
+        S: InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+    {
         let ordered_manifest = load_manifest(store, ordered)?;
         validate_manifest_root(store, ordered, &ordered_manifest)?;
+        let ordered_history_plan = initial_history_plan(store, &ordered_manifest)?;
         let merge_manifest = load_manifest(store, merge)?;
         validate_manifest_root(store, merge, &merge_manifest)?;
+        let merge_history_plan = initial_history_plan(store, &merge_manifest)?;
         let local_manifest = load_manifest(store, local)?;
         validate_manifest_root(store, local, &local_manifest)?;
+        let local_history_plan = initial_history_plan(store, &local_manifest)?;
         if ordered_manifest.scope != InvocationOwnershipScope::Ordered
             || merge_manifest.scope != InvocationOwnershipScope::Merge
             || !matches!(local_manifest.scope, InvocationOwnershipScope::Local(_))
@@ -861,14 +1077,17 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndexes<'a, S> {
             ordered: OpenedInvocationIndex {
                 id: ordered,
                 manifest: ordered_manifest,
+                history_plan: ordered_history_plan,
             },
             merge: OpenedInvocationIndex {
                 id: merge,
                 manifest: merge_manifest,
+                history_plan: merge_history_plan,
             },
             local: OpenedInvocationIndex {
                 id: local,
                 manifest: local_manifest,
+                history_plan: local_history_plan,
             },
         })
     }
@@ -898,6 +1117,14 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndexes<'a, S> {
         self.opened(scope).map(|opened| &opened.manifest)
     }
 
+    pub fn history_write_plans(&self) -> [&InvocationHistoryWritePlan; 3] {
+        [
+            &self.ordered.history_plan,
+            &self.merge.history_plan,
+            &self.local.history_plan,
+        ]
+    }
+
     pub fn unfinalized(
         &self,
         scope: InvocationOwnershipScope,
@@ -911,8 +1138,7 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndexes<'a, S> {
         &mut self,
         outcome: &InvocationOutcomeRecord,
     ) -> Result<InvocationOutcomeRef, InvocationIndexError<S::Error>> {
-        let opened = *self.opened(outcome.key.scope)?;
-        if outcome.genesis != opened.manifest.genesis {
+        if outcome.genesis != self.opened(outcome.key.scope)?.manifest.genesis {
             return Err(InvocationIndexError::GenesisMismatch);
         }
         put_outcome_immutable(self.store, outcome)
@@ -921,9 +1147,15 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndexes<'a, S> {
     pub fn lookup(
         &self,
         key: InvocationOwnershipKey,
-    ) -> Result<Option<InvocationOwnershipValue>, InvocationIndexError<S::Error>> {
+    ) -> Result<
+        Option<InvocationIndexLookup>,
+        InvocationIndexError<<S as InvocationIndexStore>::Error>,
+    >
+    where
+        S: InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+    {
         let opened = self.opened(key.scope)?;
-        lookup_in_manifest(self.store, &opened.manifest, key)
+        lookup_composite_in_manifest(self.store, &opened.manifest, &opened.history_plan, key)
     }
 
     pub fn outcome(
@@ -944,28 +1176,49 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndexes<'a, S> {
         &mut self,
         key: InvocationOwnershipKey,
         value: InvocationOwnershipValue,
-    ) -> Result<InvocationIndexMutation, InvocationIndexError<S::Error>> {
-        let opened = *self.opened(key.scope)?;
+    ) -> Result<InvocationIndexMutation, InvocationIndexError<<S as InvocationIndexStore>::Error>>
+    where
+        S: InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+    {
+        let opened = self.opened(key.scope)?.clone();
         let mut index = InvocationIndex {
             store: &mut *self.store,
             manifest: opened.manifest,
             id: opened.id,
+            history_plan: opened.history_plan,
         };
         let mutation = index.record(key, value)?;
         let successor = OpenedInvocationIndex {
             id: index.id,
             manifest: index.manifest,
+            history_plan: index.history_plan,
         };
-        match key.scope {
-            InvocationOwnershipScope::Ordered => self.ordered = successor,
-            InvocationOwnershipScope::Merge => self.merge = successor,
-            InvocationOwnershipScope::Local(node) if node == self.local_node() => {
-                self.local = successor;
-            }
-            InvocationOwnershipScope::Local(_) => {
-                return Err(InvocationIndexError::ScopeMismatch);
-            }
-        }
+        self.install_opened(key.scope, successor)?;
+        Ok(mutation)
+    }
+
+    pub fn archive(
+        &mut self,
+        key: InvocationOwnershipKey,
+        expected: InvocationOwnershipValue,
+    ) -> Result<InvocationIndexMutation, InvocationIndexError<<S as InvocationIndexStore>::Error>>
+    where
+        S: InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+    {
+        let opened = self.opened(key.scope)?.clone();
+        let mut index = InvocationIndex {
+            store: &mut *self.store,
+            manifest: opened.manifest,
+            id: opened.id,
+            history_plan: opened.history_plan,
+        };
+        let mutation = index.archive(key, expected)?;
+        let successor = OpenedInvocationIndex {
+            id: index.id,
+            manifest: index.manifest,
+            history_plan: index.history_plan,
+        };
+        self.install_opened(key.scope, successor)?;
         Ok(mutation)
     }
 
@@ -976,18 +1229,53 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndexes<'a, S> {
         &mut self,
         scope: InvocationOwnershipScope,
         values: &[(InvocationOwnershipKey, InvocationOwnershipValue)],
-    ) -> Result<InvocationIndexId, InvocationIndexError<S::Error>> {
-        let opened = *self.opened(scope)?;
+    ) -> Result<InvocationIndexId, InvocationIndexError<<S as InvocationIndexStore>::Error>>
+    where
+        S: InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+    {
+        let mut operations = Vec::new();
+        operations
+            .try_reserve(values.len())
+            .map_err(|_| InvocationIndexError::NodeLimit)?;
+        operations.extend(values.iter().map(|(key, value)| {
+            InvocationIndexBatchOperation::PutLive {
+                key: *key,
+                value: *value,
+            }
+        }));
+        self.mutate_batch(scope, &operations)
+    }
+
+    pub fn mutate_batch(
+        &mut self,
+        scope: InvocationOwnershipScope,
+        operations: &[InvocationIndexBatchOperation],
+    ) -> Result<InvocationIndexId, InvocationIndexError<<S as InvocationIndexStore>::Error>>
+    where
+        S: InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+    {
+        let opened = self.opened(scope)?.clone();
         let mut index = InvocationIndex {
             store: &mut *self.store,
             manifest: opened.manifest,
             id: opened.id,
+            history_plan: opened.history_plan,
         };
-        let id = index.record_batch(values)?;
+        let id = index.mutate_batch(operations)?;
         let successor = OpenedInvocationIndex {
             id: index.id,
             manifest: index.manifest,
+            history_plan: index.history_plan,
         };
+        self.install_opened(scope, successor)?;
+        Ok(id)
+    }
+
+    fn install_opened(
+        &mut self,
+        scope: InvocationOwnershipScope,
+        successor: OpenedInvocationIndex,
+    ) -> Result<(), InvocationIndexError<S::Error>> {
         match scope {
             InvocationOwnershipScope::Ordered => self.ordered = successor,
             InvocationOwnershipScope::Merge => self.merge = successor,
@@ -998,7 +1286,7 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndexes<'a, S> {
                 return Err(InvocationIndexError::ScopeMismatch);
             }
         }
-        Ok(id)
+        Ok(())
     }
 
     fn opened(
@@ -1014,22 +1302,15 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndexes<'a, S> {
     }
 }
 
-impl<S: InvocationOutcomeStore> super::replay::InvocationOwnership for InvocationIndex<'_, S> {
+impl<S> super::replay::InvocationOwnership for InvocationIndex<'_, S>
+where
+    S: InvocationOutcomeStore + InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+{
     fn lookup(
         &self,
         key: InvocationOwnershipKey,
-    ) -> Result<Option<InvocationOwnershipValue>, super::replay::InvocationOwnershipError> {
+    ) -> Result<Option<InvocationIndexLookup>, super::replay::InvocationOwnershipError> {
         InvocationIndex::lookup(self, key).map_err(map_replay_error)
-    }
-
-    fn record(
-        &mut self,
-        key: InvocationOwnershipKey,
-        value: InvocationOwnershipValue,
-    ) -> Result<(), super::replay::InvocationOwnershipError> {
-        InvocationIndex::record(self, key, value)
-            .map(|_| ())
-            .map_err(map_replay_error)
     }
 
     fn persist_outcome(
@@ -1049,15 +1330,15 @@ impl<S: InvocationOutcomeStore> super::replay::InvocationOwnership for Invocatio
         InvocationIndex::outcome(self, key).map_err(map_replay_error)
     }
 
-    fn record_batch(
+    fn mutate_batch(
         &mut self,
         scope: InvocationOwnershipScope,
-        values: &[(InvocationOwnershipKey, InvocationOwnershipValue)],
+        operations: &[InvocationIndexBatchOperation],
     ) -> Result<(), super::replay::InvocationOwnershipError> {
         if scope != self.manifest.scope {
             return Err(super::replay::InvocationOwnershipError::Unauthenticated);
         }
-        InvocationIndex::record_batch(self, values)
+        InvocationIndex::mutate_batch(self, operations)
             .map(|_| ())
             .map_err(map_replay_error)
     }
@@ -1083,24 +1364,30 @@ impl<S: InvocationOutcomeStore> super::replay::InvocationOwnership for Invocatio
             Err(super::replay::InvocationOwnershipError::Unauthenticated)
         }
     }
+
+    fn history_write_plans(
+        &self,
+    ) -> Result<Vec<InvocationHistoryWritePlan>, super::replay::InvocationOwnershipError> {
+        let mut plans = Vec::new();
+        if self.history_plan.expected_root() != self.history_plan.root() {
+            plans
+                .try_reserve(1)
+                .map_err(|_| super::replay::InvocationOwnershipError::Unavailable)?;
+            plans.push(self.history_plan.clone());
+        }
+        Ok(plans)
+    }
 }
 
-impl<S: InvocationOutcomeStore> super::replay::InvocationOwnership for InvocationIndexes<'_, S> {
+impl<S> super::replay::InvocationOwnership for InvocationIndexes<'_, S>
+where
+    S: InvocationOutcomeStore + InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+{
     fn lookup(
         &self,
         key: InvocationOwnershipKey,
-    ) -> Result<Option<InvocationOwnershipValue>, super::replay::InvocationOwnershipError> {
+    ) -> Result<Option<InvocationIndexLookup>, super::replay::InvocationOwnershipError> {
         InvocationIndexes::lookup(self, key).map_err(map_replay_error)
-    }
-
-    fn record(
-        &mut self,
-        key: InvocationOwnershipKey,
-        value: InvocationOwnershipValue,
-    ) -> Result<(), super::replay::InvocationOwnershipError> {
-        InvocationIndexes::record(self, key, value)
-            .map(|_| ())
-            .map_err(map_replay_error)
     }
 
     fn persist_outcome(
@@ -1117,12 +1404,12 @@ impl<S: InvocationOutcomeStore> super::replay::InvocationOwnership for Invocatio
         InvocationIndexes::outcome(self, key).map_err(map_replay_error)
     }
 
-    fn record_batch(
+    fn mutate_batch(
         &mut self,
         scope: InvocationOwnershipScope,
-        values: &[(InvocationOwnershipKey, InvocationOwnershipValue)],
+        operations: &[InvocationIndexBatchOperation],
     ) -> Result<(), super::replay::InvocationOwnershipError> {
-        InvocationIndexes::record_batch(self, scope, values)
+        InvocationIndexes::mutate_batch(self, scope, operations)
             .map(|_| ())
             .map_err(map_replay_error)
     }
@@ -1140,6 +1427,40 @@ impl<S: InvocationOutcomeStore> super::replay::InvocationOwnership for Invocatio
     ) -> Result<InvocationIndexId, super::replay::InvocationOwnershipError> {
         InvocationIndexes::index_id(self, scope).map_err(map_replay_error)
     }
+
+    fn history_write_plans(
+        &self,
+    ) -> Result<Vec<InvocationHistoryWritePlan>, super::replay::InvocationOwnershipError> {
+        let mut plans = Vec::new();
+        plans
+            .try_reserve(3)
+            .map_err(|_| super::replay::InvocationOwnershipError::Unavailable)?;
+        plans.extend(
+            InvocationIndexes::history_write_plans(self)
+                .into_iter()
+                .filter(|plan| plan.expected_root() != plan.root())
+                .cloned(),
+        );
+        Ok(plans)
+    }
+}
+
+fn initial_history_plan<S>(
+    store: &S,
+    manifest: &InvocationIndexManifest,
+) -> Result<InvocationHistoryWritePlan, InvocationIndexError<<S as InvocationIndexStore>::Error>>
+where
+    S: InvocationOutcomeStore + InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+{
+    InvocationHistory::open(
+        store,
+        manifest.genesis,
+        manifest.scope,
+        manifest.history_root,
+    )
+    .map_err(map_history_error)?
+    .write_plan()
+    .map_err(map_history_error)
 }
 
 fn lookup_in_manifest<S: InvocationOutcomeStore>(
@@ -1148,6 +1469,33 @@ fn lookup_in_manifest<S: InvocationOutcomeStore>(
     key: InvocationOwnershipKey,
 ) -> Result<Option<InvocationOwnershipValue>, InvocationIndexError<S::Error>> {
     lookup_leaf_in_manifest(store, manifest, key).map(|leaf| leaf.map(|leaf| leaf.owner))
+}
+
+fn lookup_composite_in_manifest<S>(
+    store: &S,
+    manifest: &InvocationIndexManifest,
+    history_plan: &InvocationHistoryWritePlan,
+    key: InvocationOwnershipKey,
+) -> Result<Option<InvocationIndexLookup>, InvocationIndexError<<S as InvocationIndexStore>::Error>>
+where
+    S: InvocationOutcomeStore + InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+{
+    let live = lookup_in_manifest(store, manifest, key)?;
+    if history_plan.genesis() != manifest.genesis
+        || history_plan.scope() != manifest.scope
+        || history_plan.root() != manifest.history_root
+    {
+        return Err(InvocationIndexError::CorruptHistory);
+    }
+    let history =
+        InvocationHistory::open_with_plan(store, history_plan).map_err(map_history_error)?;
+    let archived = history.lookup(key).map_err(map_history_error)?;
+    match (live, archived) {
+        (Some(_), Some(_)) => Err(InvocationIndexError::CorruptHistory),
+        (Some(owner), None) => Ok(Some(InvocationIndexLookup::Live(owner))),
+        (None, Some(fact)) => Ok(Some(InvocationIndexLookup::Archived(fact))),
+        (None, None) => Ok(None),
+    }
 }
 
 fn lookup_leaf_in_manifest<S: InvocationOutcomeStore>(
@@ -1218,6 +1566,7 @@ fn map_replay_error<E>(error: InvocationIndexError<E>) -> super::replay::Invocat
         InvocationIndexError::Storage(_)
         | InvocationIndexError::MissingManifest(_)
         | InvocationIndexError::MissingNode(_)
+        | InvocationIndexError::MissingHistoryNode(_)
         | InvocationIndexError::MissingOutcome(_)
         | InvocationIndexError::NodeLimit
         | InvocationIndexError::Capacity
@@ -1226,7 +1575,9 @@ fn map_replay_error<E>(error: InvocationIndexError<E>) -> super::replay::Invocat
         }
         InvocationIndexError::CorruptManifest
         | InvocationIndexError::CorruptNode(_)
+        | InvocationIndexError::CorruptHistoryNode(_)
         | InvocationIndexError::CorruptOutcome(_)
+        | InvocationIndexError::CorruptHistory
         | InvocationIndexError::GenesisMismatch
         | InvocationIndexError::ScopeMismatch
         | InvocationIndexError::SummaryMismatch
@@ -1240,31 +1591,61 @@ fn map_replay_error<E>(error: InvocationIndexError<E>) -> super::replay::Invocat
     }
 }
 
+fn map_history_error<E>(error: InvocationHistoryError<E>) -> InvocationIndexError<E> {
+    match error {
+        InvocationHistoryError::Storage(error) => InvocationIndexError::Storage(error),
+        InvocationHistoryError::MissingNode(id) => InvocationIndexError::MissingHistoryNode(id),
+        InvocationHistoryError::CorruptNode(id) => InvocationIndexError::CorruptHistoryNode(id),
+        InvocationHistoryError::Conflict => InvocationIndexError::Conflict,
+        InvocationHistoryError::NodeLimit | InvocationHistoryError::PlanLimit => {
+            InvocationIndexError::Capacity
+        }
+        InvocationHistoryError::ObjectCollision(_) => InvocationIndexError::ObjectCollision,
+        InvocationHistoryError::GenesisMismatch => InvocationIndexError::GenesisMismatch,
+        InvocationHistoryError::ScopeMismatch => InvocationIndexError::ScopeMismatch,
+        InvocationHistoryError::InvalidFact => InvocationIndexError::InvalidTransition,
+        InvocationHistoryError::SummaryMismatch
+        | InvocationHistoryError::NonCanonicalTree
+        | InvocationHistoryError::Cycle
+        | InvocationHistoryError::PathLimit
+        | InvocationHistoryError::InvalidPlan => InvocationIndexError::CorruptHistory,
+    }
+}
+
 /// Constant-work authentication for ordinary open and publication paths.
 ///
 /// This validates the manifest identity and the one root node, including its
 /// embedded genesis/scope and authenticated aggregate counts. Descendants are
 /// intentionally resolved only when their key path is accessed.
-pub fn validate_manifest_root<S: InvocationOutcomeStore>(
+pub fn validate_manifest_root<S>(
     store: &S,
     expected: InvocationIndexId,
     manifest: &InvocationIndexManifest,
-) -> Result<(), InvocationIndexError<S::Error>> {
+) -> Result<(), InvocationIndexError<<S as InvocationIndexStore>::Error>>
+where
+    S: InvocationOutcomeStore + InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+{
     manifest
         .validate()
         .map_err(|_| InvocationIndexError::CorruptManifest)?;
     if manifest.id() != expected {
         return Err(InvocationIndexError::CorruptManifest);
     }
-    let Some(root) = manifest.root else {
-        return Ok(());
-    };
-    let node = load_node(store, root)?;
-    validate_context(&node, manifest.genesis, manifest.scope)?;
-    validate_path_summary(&node, None, true, manifest)?;
-    if let InvocationIndexNode::Leaf(leaf) = node {
-        authenticate_leaf_reference(store, &leaf)?;
+    if let Some(root) = manifest.root {
+        let node = load_node(store, root)?;
+        validate_context(&node, manifest.genesis, manifest.scope)?;
+        validate_path_summary(&node, None, true, manifest)?;
+        if let InvocationIndexNode::Leaf(leaf) = node {
+            authenticate_leaf_reference(store, &leaf)?;
+        }
     }
+    InvocationHistory::open(
+        store,
+        manifest.genesis,
+        manifest.scope,
+        manifest.history_root,
+    )
+    .map_err(map_history_error)?;
     Ok(())
 }
 
@@ -1273,14 +1654,17 @@ pub fn validate_manifest_root<S: InvocationOutcomeStore>(
 /// Ordinary recovery, head validation, lookup, and publication must use
 /// [`validate_manifest_root`] and path validation instead. The store's node
 /// limit is an audit work budget; exceeding it does not invalidate a live
-/// index. The separate logical-entry ceiling is enforced on new members;
-/// checkpoint-governed physical rollover and garbage collection reclaim an
-/// acknowledged epoch without weakening permanent ownership semantics.
-pub fn audit_manifest<S: InvocationOutcomeStore>(
+/// index. Acknowledged identities are authenticated by the separate permanent
+/// history root and therefore never accumulate in this bounded live tree.
+pub fn audit_manifest<S>(
     store: &S,
     expected: InvocationIndexId,
     manifest: &InvocationIndexManifest,
-) -> Result<(), InvocationIndexError<S::Error>> {
+) -> Result<(), InvocationIndexError<<S as InvocationIndexStore>::Error>>
+where
+    S: InvocationOutcomeStore + InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
+{
+    validate_manifest_root(store, expected, manifest)?;
     collect_manifest_reachability(store, expected, manifest, store.node_limit()).map(|_| ())
 }
 
@@ -1690,7 +2074,6 @@ enum PlannedTransition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ManifestCounts {
     entries: u64,
-    tombstones: u64,
     unfinalized: u64,
     outcome_records: u64,
     reserved_outcome_bytes: u64,
@@ -1700,7 +2083,6 @@ impl ManifestCounts {
     const fn from_manifest(manifest: &InvocationIndexManifest) -> Self {
         Self {
             entries: manifest.entries,
-            tombstones: manifest.tombstones,
             unfinalized: manifest.unfinalized,
             outcome_records: manifest.outcome_records,
             reserved_outcome_bytes: manifest.reserved_outcome_bytes,
@@ -1724,11 +2106,6 @@ impl ManifestCounts {
                 .checked_add(1)
                 .ok_or(InvocationIndexError::Capacity)?;
         }
-        self.tombstones = replace_count(
-            self.tombstones,
-            old.map_or(0, |summary| summary.tombstones),
-            new.tombstones,
-        )?;
         self.unfinalized = replace_count(
             self.unfinalized,
             old.map_or(0, |summary| summary.unfinalized),
@@ -1747,16 +2124,35 @@ impl ManifestCounts {
         Ok(())
     }
 
+    fn remove<E>(
+        &mut self,
+        existing: &InvocationOwnershipLeaf,
+    ) -> Result<(), InvocationIndexError<E>> {
+        let old = InvocationIndexSummary::from_leaf(existing);
+        self.entries = self
+            .entries
+            .checked_sub(1)
+            .ok_or(InvocationIndexError::NonCanonicalTree)?;
+        self.unfinalized = self
+            .unfinalized
+            .checked_sub(old.unfinalized)
+            .ok_or(InvocationIndexError::NonCanonicalTree)?;
+        self.outcome_records = self
+            .outcome_records
+            .checked_sub(old.outcome_records)
+            .ok_or(InvocationIndexError::NonCanonicalTree)?;
+        self.reserved_outcome_bytes = self
+            .reserved_outcome_bytes
+            .checked_sub(old.reserved_outcome_bytes)
+            .ok_or(InvocationIndexError::NonCanonicalTree)?;
+        Ok(())
+    }
+
     fn validate<E>(self) -> Result<(), InvocationIndexError<E>> {
-        let live = self.entries.checked_sub(self.tombstones);
-        if self.entries > MAX_INVOCATION_INDEX_LOGICAL_ENTRIES
-            || self.tombstones > self.entries
-            || live.is_none_or(|live| live > MAX_INVOCATION_INDEX_LIVE_ENTRIES)
-            || live.is_some_and(|live| {
-                self.unfinalized > live
-                    || self.outcome_records > live
-                    || ((self.reserved_outcome_bytes == 0) != (live == 0))
-            })
+        if self.entries > MAX_INVOCATION_INDEX_LIVE_ENTRIES
+            || self.unfinalized > self.entries
+            || self.outcome_records > self.entries
+            || ((self.reserved_outcome_bytes == 0) != (self.entries == 0))
             || self.reserved_outcome_bytes > MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES
         {
             return Err(InvocationIndexError::Capacity);
@@ -1807,12 +2203,6 @@ fn classify_transition<E>(
         }
         (
             InvocationResultState::Retained {
-                disposition: old, ..
-            },
-            InvocationResultState::Acknowledged { disposition: new },
-        ) if !matches!(next.key.scope, InvocationOwnershipScope::Merge) => old == new,
-        (
-            InvocationResultState::Retained {
                 disposition: old,
                 outcome: old_outcome,
             },
@@ -1824,12 +2214,6 @@ fn classify_transition<E>(
         ) if matches!(next.key.scope, InvocationOwnershipScope::Merge) => {
             old == new && old_outcome == new_outcome
         }
-        (
-            InvocationResultState::PendingMergeAcknowledgement {
-                disposition: old, ..
-            },
-            InvocationResultState::Acknowledged { disposition: new },
-        ) if matches!(next.key.scope, InvocationOwnershipScope::Merge) => old == new,
         _ => false,
     };
     legal
@@ -1892,10 +2276,6 @@ fn authenticate_transition_outcomes<S: InvocationOutcomeStore>(
                 return Err(InvocationIndexError::InvalidTransition);
             }
         }
-        (
-            Some(InvocationResultState::PendingMergeAcknowledgement { .. }),
-            InvocationResultState::Acknowledged { .. },
-        ) if existing_outcome.is_some() => {}
         (None, InvocationResultState::Retained { .. }) if next_outcome.is_some() => {}
         (None, InvocationResultState::PendingMerge { .. }) => {}
         _ => {}
@@ -1996,19 +2376,20 @@ fn put_outcome_immutable<S: InvocationOutcomeStore>(
     Ok(reference)
 }
 
-fn manifest_from_root<E>(
+fn manifest_from_optional_root<E>(
     current: InvocationIndexManifest,
-    root: InvocationIndexChild,
+    root: Option<InvocationIndexChild>,
 ) -> Result<InvocationIndexManifest, InvocationIndexError<E>> {
-    root.validate()
-        .map_err(|_| InvocationIndexError::NonCanonicalTree)?;
+    if let Some(root) = root {
+        root.validate()
+            .map_err(|_| InvocationIndexError::NonCanonicalTree)?;
+    }
     let next = InvocationIndexManifest {
-        root: Some(root.id),
-        entries: root.summary.entries,
-        tombstones: root.summary.tombstones,
-        unfinalized: root.summary.unfinalized,
-        outcome_records: root.summary.outcome_records,
-        reserved_outcome_bytes: root.summary.reserved_outcome_bytes,
+        root: root.map(|root| root.id),
+        entries: root.map_or(0, |root| root.summary.entries),
+        unfinalized: root.map_or(0, |root| root.summary.unfinalized),
+        outcome_records: root.map_or(0, |root| root.summary.outcome_records),
+        reserved_outcome_bytes: root.map_or(0, |root| root.summary.reserved_outcome_bytes),
         ..current
     };
     next.validate()
@@ -2021,7 +2402,6 @@ fn summary_matches_manifest(
     manifest: &InvocationIndexManifest,
 ) -> bool {
     summary.entries == manifest.entries
-        && summary.tombstones == manifest.tombstones
         && summary.unfinalized == manifest.unfinalized
         && summary.outcome_records == manifest.outcome_records
         && summary.reserved_outcome_bytes == manifest.reserved_outcome_bytes
@@ -2062,7 +2442,6 @@ fn encode_child(encoder: &mut Encoder<'_>, child: InvocationIndexChild) {
     encoder.fixed(&child.summary.min.0);
     encoder.fixed(&child.summary.max.0);
     encoder.u64(child.summary.entries);
-    encoder.u64(child.summary.tombstones);
     encoder.u64(child.summary.unfinalized);
     encoder.u64(child.summary.outcome_records);
     encoder.u64(child.summary.reserved_outcome_bytes);
@@ -2075,7 +2454,6 @@ fn decode_child(decoder: &mut Decoder<'_>) -> Result<InvocationIndexChild, Decod
             min: InvocationId(decoder.fixed()?),
             max: InvocationId(decoder.fixed()?),
             entries: decoder.u64()?,
-            tombstones: decoder.u64()?,
             unfinalized: decoder.u64()?,
             outcome_records: decoder.u64()?,
             reserved_outcome_bytes: decoder.u64()?,
@@ -2123,6 +2501,7 @@ pub struct MemoryInvocationIndexStore {
     node_limit: usize,
     manifests: BTreeMap<InvocationIndexId, Vec<u8>>,
     nodes: BTreeMap<InvocationIndexNodeId, Vec<u8>>,
+    history_nodes: BTreeMap<InvocationHistoryNodeId, Vec<u8>>,
     outcomes: BTreeMap<InvocationOutcomeId, Vec<u8>>,
 }
 
@@ -2138,6 +2517,7 @@ impl MemoryInvocationIndexStore {
             node_limit,
             manifests: BTreeMap::new(),
             nodes: BTreeMap::new(),
+            history_nodes: BTreeMap::new(),
             outcomes: BTreeMap::new(),
         }
     }
@@ -2150,8 +2530,30 @@ impl MemoryInvocationIndexStore {
         self.nodes.len()
     }
 
+    pub fn history_node_count(&self) -> usize {
+        self.history_nodes.len()
+    }
+
     pub fn outcome_count(&self) -> usize {
         self.outcomes.len()
+    }
+
+    fn install_history_plan(
+        &mut self,
+        plan: &InvocationHistoryWritePlan,
+    ) -> Result<(), InvocationHistoryError<MemoryInvocationIndexStoreError>> {
+        plan.validate(self)?;
+        for write in plan.node_writes() {
+            match self.history_nodes.get(&write.id()) {
+                Some(existing) if existing.as_slice() == write.bytes() => {}
+                Some(_) => return Err(InvocationHistoryError::ObjectCollision(write.id())),
+                None => {
+                    self.history_nodes
+                        .insert(write.id(), write.bytes().to_vec());
+                }
+            }
+        }
+        plan.validate(self)
     }
 }
 
@@ -2222,6 +2624,17 @@ impl InvocationOutcomeStore for MemoryInvocationIndexStore {
                 Ok(())
             }
         }
+    }
+}
+
+impl InvocationHistoryStore for MemoryInvocationIndexStore {
+    type Error = MemoryInvocationIndexStoreError;
+
+    fn load_history_node(
+        &self,
+        id: InvocationHistoryNodeId,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.history_nodes.get(&id).cloned())
     }
 }
 
@@ -2381,18 +2794,6 @@ mod tests {
         retained_for(genesis(1), scope, id).0
     }
 
-    fn acknowledged(
-        scope: InvocationOwnershipScope,
-        id: InvocationId,
-        disposition: InvocationDisposition,
-    ) -> InvocationOwnershipValue {
-        owner_with_state(
-            scope,
-            id,
-            InvocationResultState::Acknowledged { disposition },
-        )
-    }
-
     fn pending_merge(id: InvocationId) -> InvocationOwnershipValue {
         owner_with_state(
             InvocationOwnershipScope::Merge,
@@ -2424,12 +2825,25 @@ mod tests {
             .collect()
     }
 
+    fn prefixed_ids(prefix: u8, count: usize) -> Vec<InvocationId> {
+        (0..count)
+            .map(|index| {
+                let mut bytes = [0; 32];
+                bytes[0] = prefix;
+                bytes[24..].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+                invocation(bytes)
+            })
+            .collect()
+    }
+
     fn maximum_depth_ids() -> Vec<InvocationId> {
         // A leading zero bit ensures the bit-zero neighbour is nonzero after
         // its remaining suffix is cleared.
         let target = invocation([0x55; 32]);
         let mut all = vec![target];
-        for bit in 0..256 {
+        // A live tree contains at most 256 leaves, so 255 successive split
+        // bits is the deepest canonical path that can be reachable.
+        for bit in 0..255 {
             let mut bytes = target.0;
             let byte = bit / 8;
             bytes[byte] ^= 1 << (7 - bit % 8);
@@ -2461,23 +2875,12 @@ mod tests {
         .unwrap();
         let id = {
             let mut index = InvocationIndex::open(&mut store, empty).unwrap();
-            for (position, invocation) in order.iter().enumerate() {
+            for invocation in order {
                 let retained = persist_retained(&mut index, scope, *invocation);
                 assert!(matches!(
                     index.record(key(scope, *invocation), retained).unwrap(),
                     InvocationIndexMutation::Inserted(_)
                 ));
-                // A maximum-depth tree has 257 logical members. Keep its
-                // first target live while acknowledging every other owner so
-                // the production live-entry quota remains enforced.
-                if order.len() > MAX_INVOCATION_INDEX_LIVE_ENTRIES as usize && position != 0 {
-                    index
-                        .record(
-                            key(scope, *invocation),
-                            acknowledged(scope, *invocation, retained.disposition().unwrap()),
-                        )
-                        .unwrap();
-                }
             }
             index.id()
         };
@@ -2557,11 +2960,14 @@ mod tests {
             Err(InvocationIndexError::Conflict)
         ));
         assert_eq!(index.id(), installed);
-        assert_eq!(index.lookup(key(scope, id)).unwrap(), Some(value));
+        assert_eq!(
+            index.lookup(key(scope, id)).unwrap(),
+            Some(InvocationIndexLookup::Live(value))
+        );
     }
 
     #[test]
-    fn acknowledgement_is_the_only_update_and_tombstones_persist() {
+    fn archive_is_permanent_exact_and_reopens_from_published_history() {
         let scope = InvocationOwnershipScope::Ordered;
         let id = invocation([8; 32]);
         let mut store = MemoryInvocationIndexStore::default();
@@ -2571,35 +2977,121 @@ mod tests {
             scope,
         )
         .unwrap();
-        let final_id = {
+        let (final_id, history_plan, fact) = {
             let mut index = InvocationIndex::open(&mut store, empty).unwrap();
             let retained = persist_retained(&mut index, scope, id);
             index.record(key(scope, id), retained).unwrap();
-            let acknowledged = acknowledged(scope, id, retained.disposition().unwrap());
             assert!(matches!(
-                index.record(key(scope, id), acknowledged).unwrap(),
-                InvocationIndexMutation::Acknowledged(_)
+                index.archive(key(scope, id), retained).unwrap(),
+                InvocationIndexMutation::Archived(_)
             ));
-            let acknowledged_id = index.id();
+            let fact = InvocationAcknowledgedFact::from_owner(genesis(1), key(scope, id), retained)
+                .unwrap();
             assert_eq!(
-                index.record(key(scope, id), acknowledged).unwrap(),
-                InvocationIndexMutation::ExactRetry(acknowledged_id)
+                index.lookup(key(scope, id)).unwrap(),
+                Some(InvocationIndexLookup::Archived(fact))
             );
+            let archived_id = index.id();
+            assert_eq!(
+                index.archive(key(scope, id), retained).unwrap(),
+                InvocationIndexMutation::ExactRetry(archived_id)
+            );
+            assert_eq!(
+                index.record(key(scope, id), retained).unwrap(),
+                InvocationIndexMutation::ExactRetry(archived_id)
+            );
+            let mut divergent = retained;
+            divergent.request_commitment = Hash([0xdd; 32]);
             assert!(matches!(
-                index.record(key(scope, id), retained),
-                Err(InvocationIndexError::InvalidTransition)
+                index.record(key(scope, id), divergent),
+                Err(InvocationIndexError::Conflict)
             ));
-            assert_eq!(index.lookup(key(scope, id)).unwrap(), Some(acknowledged));
-            assert_eq!(index.manifest().entries, 1);
-            assert_eq!(index.manifest().tombstones, 1);
-            index.id()
+            assert_eq!(index.manifest().entries, 0);
+            assert_eq!(index.manifest().outcome_records, 0);
+            (index.id(), index.history_write_plan().clone(), fact)
         };
+        assert_eq!(store.history_node_count(), 0);
+        store.install_history_plan(&history_plan).unwrap();
         let reopened = InvocationIndex::open(&mut store, final_id).unwrap();
-        assert_eq!(reopened.manifest().tombstones, 1);
+        assert_eq!(
+            reopened.lookup(key(scope, id)).unwrap(),
+            Some(InvocationIndexLookup::Archived(fact))
+        );
     }
 
     #[test]
-    fn local_results_retain_exact_outcomes_then_become_tombstones() {
+    fn replay_seals_only_changed_history_plans() {
+        use crate::agent::replay::InvocationOwnership;
+
+        let scope = InvocationOwnershipScope::Ordered;
+        let id = invocation([0x0f; 32]);
+        let mut store = MemoryInvocationIndexStore::default();
+        let empty = InvocationIndex::<MemoryInvocationIndexStore>::create_empty(
+            &mut store,
+            genesis(1),
+            scope,
+        )
+        .unwrap();
+        let mut index = InvocationIndex::open(&mut store, empty).unwrap();
+        assert!(
+            InvocationOwnership::history_write_plans(&index)
+                .unwrap()
+                .is_empty()
+        );
+
+        let owner = persist_retained(&mut index, scope, id);
+        index.record(key(scope, id), owner).unwrap();
+        assert!(
+            InvocationOwnership::history_write_plans(&index)
+                .unwrap()
+                .is_empty()
+        );
+
+        index.archive(key(scope, id), owner).unwrap();
+        let plans = InvocationOwnership::history_write_plans(&index).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].scope(), scope);
+        assert_ne!(plans[0].expected_root(), plans[0].root());
+    }
+
+    #[test]
+    fn dual_live_and_history_membership_is_authenticated_corruption() {
+        let scope = InvocationOwnershipScope::Ordered;
+        let id = invocation([0x18; 32]);
+        let mut store = MemoryInvocationIndexStore::default();
+        let empty = InvocationIndex::<MemoryInvocationIndexStore>::create_empty(
+            &mut store,
+            genesis(1),
+            scope,
+        )
+        .unwrap();
+        let (live_manifest, archived_manifest, plan) = {
+            let mut index = InvocationIndex::open(&mut store, empty).unwrap();
+            let owner = persist_retained(&mut index, scope, id);
+            index.record(key(scope, id), owner).unwrap();
+            let live_manifest = *index.manifest();
+            index.archive(key(scope, id), owner).unwrap();
+            (
+                live_manifest,
+                *index.manifest(),
+                index.history_write_plan().clone(),
+            )
+        };
+        store.install_history_plan(&plan).unwrap();
+        let dual = InvocationIndexManifest {
+            history_root: archived_manifest.history_root,
+            ..live_manifest
+        };
+        let dual_id = put_manifest_immutable(&mut store, &dual).unwrap();
+        let index = InvocationIndex::open(&mut store, dual_id).unwrap();
+        assert!(matches!(
+            index.lookup(key(scope, id)),
+            Err(InvocationIndexError::CorruptHistory)
+        ));
+    }
+
+    #[test]
+    fn local_results_retain_exact_outcomes_then_archive() {
         let scope = InvocationOwnershipScope::Local(NodeId([0x61; 32]));
         let id = invocation([0x62; 32]);
         let mut store = MemoryInvocationIndexStore::default();
@@ -2618,12 +3110,11 @@ mod tests {
             index.manifest().reserved_outcome_bytes,
             u64::from(reference.encoded_bytes)
         );
-        let acknowledged = acknowledged(scope, id, retained.disposition().unwrap());
-        index.record(key(scope, id), acknowledged).unwrap();
-        assert_eq!(index.manifest().entries, 1);
-        assert_eq!(index.manifest().tombstones, 1);
+        index.archive(key(scope, id), retained).unwrap();
+        assert_eq!(index.manifest().entries, 0);
         assert_eq!(index.manifest().outcome_records, 0);
         assert_eq!(index.manifest().reserved_outcome_bytes, 0);
+        assert_eq!(index.outcome(key(scope, id)).unwrap(), None);
     }
 
     #[test]
@@ -2640,13 +3131,14 @@ mod tests {
         let mut index = InvocationIndex::open(&mut store, empty).unwrap();
         let pending = pending_merge(id);
         index.record(key(scope, id), pending).unwrap();
-        let illegal = acknowledged(scope, id, InvocationDisposition::Rejected);
         assert!(matches!(
-            index.record(key(scope, id), illegal),
+            index.archive(key(scope, id), pending),
             Err(InvocationIndexError::InvalidTransition)
         ));
-        assert_eq!(index.lookup(key(scope, id)).unwrap(), Some(pending));
-        assert_eq!(index.manifest().tombstones, 0);
+        assert_eq!(
+            index.lookup(key(scope, id)).unwrap(),
+            Some(InvocationIndexLookup::Live(pending))
+        );
         assert_eq!(index.manifest().unfinalized, 1);
     }
 
@@ -2669,7 +3161,6 @@ mod tests {
             InvocationIndexMutation::Inserted(_)
         ));
         assert_eq!(index.manifest().entries, 1);
-        assert_eq!(index.manifest().tombstones, 0);
         assert_eq!(index.manifest().unfinalized, 1);
         assert_eq!(index.manifest().outcome_records, 0);
         assert_eq!(
@@ -2732,18 +3223,20 @@ mod tests {
         assert_eq!(index.manifest().unfinalized, 1);
         assert_eq!(index.manifest().outcome_records, 1);
 
-        let acknowledged = acknowledged(scope, id, retained.disposition().unwrap());
         assert!(matches!(
-            index.record(key(scope, id), acknowledged).unwrap(),
-            InvocationIndexMutation::Acknowledged(_)
+            index
+                .archive(key(scope, id), pending_acknowledgement)
+                .unwrap(),
+            InvocationIndexMutation::Archived(_)
         ));
-        let acknowledged_id = index.id();
+        let archived_id = index.id();
         assert_eq!(
-            index.record(key(scope, id), acknowledged).unwrap(),
-            InvocationIndexMutation::ExactRetry(acknowledged_id)
+            index
+                .archive(key(scope, id), pending_acknowledgement)
+                .unwrap(),
+            InvocationIndexMutation::ExactRetry(archived_id)
         );
-        assert_eq!(index.manifest().entries, 1);
-        assert_eq!(index.manifest().tombstones, 1);
+        assert_eq!(index.manifest().entries, 0);
         assert_eq!(index.manifest().unfinalized, 0);
         assert_eq!(index.manifest().outcome_records, 0);
         assert_eq!(index.manifest().reserved_outcome_bytes, 0);
@@ -2791,7 +3284,10 @@ mod tests {
             index.record_batch(&[(key(scope, id), retained), (key(scope, id), pending_ack)]),
             Err(InvocationIndexError::NonCanonicalTree)
         ));
-        assert_eq!(index.lookup(key(scope, id)).unwrap(), Some(pending));
+        assert_eq!(
+            index.lookup(key(scope, id)).unwrap(),
+            Some(InvocationIndexLookup::Live(pending))
+        );
 
         index.record(key(scope, id), retained).unwrap();
         assert!(matches!(
@@ -2823,10 +3319,12 @@ mod tests {
             (
                 InvocationOwnershipScope::Local(local_node),
                 invocation([0x22; 32]),
-                acknowledged(
+                owner_with_state(
                     InvocationOwnershipScope::Local(local_node),
                     invocation([0x22; 32]),
-                    InvocationDisposition::Rejected,
+                    InvocationResultState::PendingMerge {
+                        source_event: MergeEventId([2; 32]),
+                    },
                 ),
             ),
         ] {
@@ -3187,7 +3685,7 @@ mod tests {
 
     #[test]
     fn explicit_corrupt_back_edge_reports_cycle() {
-        let scope = InvocationOwnershipScope::Ordered;
+        let scope = InvocationOwnershipScope::Merge;
         let genesis = genesis(1);
         let mut store = MemoryInvocationIndexStore::default();
         let left_key = invocation([0x10; 32]);
@@ -3196,12 +3694,12 @@ mod tests {
         let middle = InvocationIndexNode::Leaf(InvocationOwnershipLeaf {
             genesis,
             key: key(scope, middle_key),
-            owner: acknowledged(scope, middle_key, InvocationDisposition::Rejected),
+            owner: pending_merge(middle_key),
         });
         let right = InvocationIndexNode::Leaf(InvocationOwnershipLeaf {
             genesis,
             key: key(scope, right_key),
-            owner: acknowledged(scope, right_key, InvocationDisposition::Rejected),
+            owner: pending_merge(right_key),
         });
         let middle_ref = put_node_immutable(&mut store, &middle).unwrap();
         let right_ref = put_node_immutable(&mut store, &right).unwrap();
@@ -3210,10 +3708,9 @@ mod tests {
             min: left_key,
             max: middle_key,
             entries: 2,
-            tombstones: 2,
-            unfinalized: 0,
+            unfinalized: 2,
             outcome_records: 0,
-            reserved_outcome_bytes: 0,
+            reserved_outcome_bytes: 2 * MAX_INVOCATION_OUTCOME_BYTES as u64,
         };
         let root_node = InvocationIndexNode::Branch {
             genesis,
@@ -3238,10 +3735,9 @@ mod tests {
                     min: left_key,
                     max: left_key,
                     entries: 1,
-                    tombstones: 1,
-                    unfinalized: 0,
+                    unfinalized: 1,
                     outcome_records: 0,
-                    reserved_outcome_bytes: 0,
+                    reserved_outcome_bytes: MAX_INVOCATION_OUTCOME_BYTES as u64,
                 },
             },
             right: middle_ref,
@@ -3253,10 +3749,10 @@ mod tests {
             scope,
             root: Some(root_ref.id),
             entries: 3,
-            tombstones: 3,
-            unfinalized: 0,
+            unfinalized: 3,
             outcome_records: 0,
-            reserved_outcome_bytes: 0,
+            reserved_outcome_bytes: 3 * MAX_INVOCATION_OUTCOME_BYTES as u64,
+            history_root: None,
         };
         let id = put_manifest_immutable(&mut store, &manifest).unwrap();
         InvocationIndex::open(&mut store, id).unwrap();
@@ -3328,7 +3824,7 @@ mod tests {
     }
 
     #[test]
-    fn last_bit_split_and_full_256_branch_path_are_supported() {
+    fn last_bit_split_and_deepest_live_path_are_supported() {
         let left = invocation({
             let mut bytes = [0; 32];
             bytes[31] = 2;
@@ -3363,7 +3859,7 @@ mod tests {
         let proof = deep
             .prove(key(InvocationOwnershipScope::Ordered, target))
             .unwrap();
-        assert_eq!(proof.nodes.len(), MAX_INVOCATION_INDEX_PATH + 1);
+        assert_eq!(proof.nodes.len(), MAX_INVOCATION_INDEX_PATH);
         assert!(matches!(
             verify_invocation_index_proof(
                 deep_id,
@@ -3372,6 +3868,36 @@ mod tests {
             ),
             Ok(InvocationIndexProofResult::Member(_))
         ));
+    }
+
+    #[test]
+    fn deepest_leaf_archive_collapses_and_recompresses_every_parent() {
+        let scope = InvocationOwnershipScope::Ordered;
+        let all = maximum_depth_ids();
+        let target = all[0];
+        let (_, _, expected_remaining) = build(&all[1..]);
+        let (mut store, id, _) = build(&all);
+        let mut index = InvocationIndex::open(&mut store, id).unwrap();
+        let expected = retained(scope, target);
+
+        assert!(matches!(
+            index.archive(key(scope, target), expected).unwrap(),
+            InvocationIndexMutation::Archived(_)
+        ));
+        assert_eq!(index.manifest().entries, all.len() as u64 - 1);
+        assert_eq!(index.manifest().root, expected_remaining.root);
+        assert_eq!(index.history_write_plan().inserted_facts().len(), 1);
+        let fact = InvocationAcknowledgedFact::from_owner(genesis(1), key(scope, target), expected)
+            .unwrap();
+        assert_eq!(
+            index.lookup(key(scope, target)).unwrap(),
+            Some(InvocationIndexLookup::Archived(fact))
+        );
+        let proof = index.prove(key(scope, target)).unwrap();
+        assert_eq!(
+            verify_invocation_index_proof(index.id(), key(scope, target), &proof).unwrap(),
+            InvocationIndexProofResult::NonMember
+        );
     }
 
     #[test]
@@ -3395,23 +3921,19 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(counts.node_loads.get(), MAX_INVOCATION_INDEX_PATH + 1);
+        assert_eq!(counts.node_loads.get(), MAX_INVOCATION_INDEX_PATH);
 
         counts.node_loads.set(0);
         counts.node_puts.set(0);
-        let acknowledged = acknowledged(
-            InvocationOwnershipScope::Ordered,
-            target,
-            InvocationDisposition::Rejected,
-        );
+        let expected = retained(InvocationOwnershipScope::Ordered, target);
         index
-            .record(key(InvocationOwnershipScope::Ordered, target), acknowledged)
+            .archive(key(InvocationOwnershipScope::Ordered, target), expected)
             .unwrap();
-        // Two prevalidation walks, the replacement walk, and immutable CAS
-        // read-before/readback checks remain a constant number of path reads.
+        // Composite prevalidation and Patricia deletion remain bounded by a
+        // constant number of authenticated key paths.
         assert!(counts.node_loads.get() <= 6 * (MAX_INVOCATION_INDEX_PATH + 1));
         assert!(counts.node_puts.get() <= MAX_INVOCATION_INDEX_PATH + 1);
-        assert_eq!(index.manifest().entries, all.len() as u64);
+        assert_eq!(index.manifest().entries, all.len() as u64 - 1);
     }
 
     #[derive(Default)]
@@ -3473,6 +3995,17 @@ mod tests {
         }
     }
 
+    impl InvocationHistoryStore for CountingStore {
+        type Error = MemoryInvocationIndexStoreError;
+
+        fn load_history_node(
+            &self,
+            id: InvocationHistoryNodeId,
+        ) -> Result<Option<Vec<u8>>, Self::Error> {
+            self.inner.load_history_node(id)
+        }
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum InjectedStoreError {
         Injected,
@@ -3531,6 +4064,19 @@ mod tests {
         ) -> Result<(), Self::Error> {
             self.inner
                 .put_outcome(id, bytes)
+                .map_err(InjectedStoreError::Inner)
+        }
+    }
+
+    impl InvocationHistoryStore for FailingManifestStore {
+        type Error = InjectedStoreError;
+
+        fn load_history_node(
+            &self,
+            id: InvocationHistoryNodeId,
+        ) -> Result<Option<Vec<u8>>, Self::Error> {
+            self.inner
+                .load_history_node(id)
                 .map_err(InjectedStoreError::Inner)
         }
     }
@@ -3634,13 +4180,13 @@ mod tests {
         let mut members = ids(MAX_INVOCATION_INDEX_LIVE_ENTRIES as usize);
         let (mut store, id, _) = build(&members);
         members.sort();
-        let acknowledged_id = *members.last().unwrap();
+        let archived_id = *members.last().unwrap();
         let inserted_id = invocation({
             let mut bytes = [0; 32];
             bytes[31] = 1;
             bytes
         });
-        assert!(inserted_id < acknowledged_id);
+        assert!(inserted_id < archived_id);
         assert!(!members.contains(&inserted_id));
 
         let mut index = InvocationIndex::open(&mut store, id).unwrap();
@@ -3649,32 +4195,94 @@ mod tests {
             index.record(key(scope, inserted_id), inserted_owner),
             Err(InvocationIndexError::Capacity)
         ));
-        let acknowledged_owner =
-            acknowledged(scope, acknowledged_id, InvocationDisposition::Rejected);
+        let archived_owner = retained(scope, archived_id);
         let next = index
-            .record_batch(&[
-                (key(scope, inserted_id), inserted_owner),
-                (key(scope, acknowledged_id), acknowledged_owner),
+            .mutate_batch(&[
+                InvocationIndexBatchOperation::PutLive {
+                    key: key(scope, inserted_id),
+                    value: inserted_owner,
+                },
+                InvocationIndexBatchOperation::Archive {
+                    key: key(scope, archived_id),
+                    expected: archived_owner,
+                },
             ])
             .unwrap();
         assert_eq!(next, index.id());
-        assert_eq!(
-            index.manifest().entries,
-            MAX_INVOCATION_INDEX_LIVE_ENTRIES + 1
-        );
-        assert_eq!(index.manifest().tombstones, 1);
-        assert_eq!(
-            index.manifest().entries - index.manifest().tombstones,
-            MAX_INVOCATION_INDEX_LIVE_ENTRIES
-        );
+        assert_eq!(index.manifest().entries, MAX_INVOCATION_INDEX_LIVE_ENTRIES);
         assert_eq!(
             index.lookup(key(scope, inserted_id)).unwrap(),
-            Some(inserted_owner)
+            Some(InvocationIndexLookup::Live(inserted_owner))
+        );
+        let archived_fact = InvocationAcknowledgedFact::from_owner(
+            genesis(1),
+            key(scope, archived_id),
+            archived_owner,
+        )
+        .unwrap();
+        assert_eq!(
+            index.lookup(key(scope, archived_id)).unwrap(),
+            Some(InvocationIndexLookup::Archived(archived_fact))
+        );
+    }
+
+    #[test]
+    fn one_batch_turns_over_all_256_live_slots_into_permanent_history() {
+        let scope = InvocationOwnershipScope::Ordered;
+        let old = prefixed_ids(0x80, MAX_INVOCATION_INDEX_LIVE_ENTRIES as usize);
+        let new = prefixed_ids(0x40, MAX_INVOCATION_INDEX_LIVE_ENTRIES as usize);
+        let (mut store, id, _) = build(&old);
+        let mut index = InvocationIndex::open(&mut store, id).unwrap();
+        let original_id = index.id();
+
+        let overflow = invocation([0x20; 32]);
+        let overflow_owner = persist_retained(&mut index, scope, overflow);
+        assert!(matches!(
+            index.record(key(scope, overflow), overflow_owner),
+            Err(InvocationIndexError::Capacity)
+        ));
+        assert_eq!(index.id(), original_id);
+        assert!(index.history_write_plan().inserted_facts().is_empty());
+
+        let mut operations = Vec::new();
+        for id in &new {
+            let owner = persist_retained(&mut index, scope, *id);
+            operations.push(InvocationIndexBatchOperation::PutLive {
+                key: key(scope, *id),
+                value: owner,
+            });
+        }
+        for id in &old {
+            operations.push(InvocationIndexBatchOperation::Archive {
+                key: key(scope, *id),
+                expected: retained(scope, *id),
+            });
+        }
+        assert!(
+            operations
+                .windows(2)
+                .all(|pair| pair[0].key() < pair[1].key())
+        );
+        index.mutate_batch(&operations).unwrap();
+
+        assert_eq!(index.manifest().entries, MAX_INVOCATION_INDEX_LIVE_ENTRIES);
+        assert_eq!(
+            index.history_write_plan().inserted_facts().len(),
+            MAX_INVOCATION_INDEX_LIVE_ENTRIES as usize
         );
         assert_eq!(
-            index.lookup(key(scope, acknowledged_id)).unwrap(),
-            Some(acknowledged_owner)
+            index.store.history_node_count(),
+            0,
+            "prepare is a pure overlay"
         );
+        assert!(matches!(
+            index.lookup(key(scope, new[0])).unwrap(),
+            Some(InvocationIndexLookup::Live(_))
+        ));
+        assert!(matches!(
+            index.lookup(key(scope, old[0])).unwrap(),
+            Some(InvocationIndexLookup::Archived(_))
+        ));
     }
 
     #[test]
@@ -3683,7 +4291,6 @@ mod tests {
             min: invocation([1; 32]),
             max: invocation([2; 32]),
             entries: MAX_INVOCATION_INDEX_LIVE_ENTRIES,
-            tombstones: 0,
             unfinalized: MAX_INVOCATION_INDEX_LIVE_ENTRIES,
             outcome_records: 0,
             reserved_outcome_bytes: MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES,
@@ -3694,16 +4301,6 @@ mod tests {
             InvocationIndexSummary {
                 entries: valid.entries + 1,
                 reserved_outcome_bytes: valid.reserved_outcome_bytes + 1,
-                ..valid
-            }
-            .validate(),
-            Err(DecodeError::NonCanonical)
-        );
-        assert_eq!(
-            InvocationIndexSummary {
-                tombstones: valid.entries,
-                unfinalized: 0,
-                reserved_outcome_bytes: 1,
                 ..valid
             }
             .validate(),
@@ -3794,40 +4391,35 @@ mod tests {
     }
 
     #[test]
-    fn default_reachability_limit_covers_the_complete_logical_epoch() {
+    fn default_reachability_limit_covers_the_complete_live_tree() {
         assert_eq!(full_tree_node_count(500_001), Some(1_000_001));
         assert_eq!(
-            full_tree_node_count(MAX_INVOCATION_INDEX_LOGICAL_ENTRIES),
+            full_tree_node_count(MAX_INVOCATION_INDEX_LIVE_ENTRIES),
             Some(DEFAULT_INVOCATION_INDEX_NODE_LIMIT)
         );
 
         let store = MemoryInvocationIndexStore::default();
-        for (entries, root_byte) in [
-            (500_001, 0xa1),
-            (MAX_INVOCATION_INDEX_LOGICAL_ENTRIES, 0xa2),
-        ] {
-            let root = InvocationIndexNodeId([root_byte; 32]);
-            let manifest = InvocationIndexManifest {
-                genesis: genesis(1),
-                scope: InvocationOwnershipScope::Ordered,
-                root: Some(root),
-                entries,
-                tombstones: entries,
-                unfinalized: 0,
-                outcome_records: 0,
-                reserved_outcome_bytes: 0,
-            };
-            let expected = manifest.id();
-            assert!(matches!(
-                collect_manifest_reachability(
-                    &store,
-                    expected,
-                    &manifest,
-                    DEFAULT_INVOCATION_INDEX_NODE_LIMIT,
-                ),
-                Err(InvocationIndexError::MissingNode(found)) if found == root
-            ));
-        }
+        let root = InvocationIndexNodeId([0xa2; 32]);
+        let manifest = InvocationIndexManifest {
+            genesis: genesis(1),
+            scope: InvocationOwnershipScope::Ordered,
+            root: Some(root),
+            entries: MAX_INVOCATION_INDEX_LIVE_ENTRIES,
+            unfinalized: 0,
+            outcome_records: 0,
+            reserved_outcome_bytes: 1,
+            history_root: None,
+        };
+        let expected = manifest.id();
+        assert!(matches!(
+            collect_manifest_reachability(
+                &store,
+                expected,
+                &manifest,
+                DEFAULT_INVOCATION_INDEX_NODE_LIMIT,
+            ),
+            Err(InvocationIndexError::MissingNode(found)) if found == root
+        ));
     }
 
     #[test]
@@ -3845,11 +4437,11 @@ mod tests {
     }
 
     #[test]
-    fn reachability_excludes_pending_and_tombstoned_outcomes() {
+    fn live_reachability_excludes_pending_and_archived_outcomes() {
         let scope = InvocationOwnershipScope::Merge;
         let pending_id = invocation([0x10; 32]);
         let pending_ack_id = invocation([0x80; 32]);
-        let tombstone_id = invocation([0xf0; 32]);
+        let archived_id = invocation([0xf0; 32]);
         let mut store = MemoryInvocationIndexStore::default();
         let empty = InvocationIndex::<MemoryInvocationIndexStore>::create_empty(
             &mut store,
@@ -3858,7 +4450,7 @@ mod tests {
         )
         .unwrap();
         let pending_ack_reference;
-        let tombstoned_reference;
+        let archived_reference;
         let final_id = {
             let mut index = InvocationIndex::open(&mut store, empty).unwrap();
             index
@@ -3889,44 +4481,31 @@ mod tests {
                 .unwrap();
 
             index
-                .record(key(scope, tombstone_id), pending_merge(tombstone_id))
+                .record(key(scope, archived_id), pending_merge(archived_id))
                 .unwrap();
-            let retained = persist_retained(&mut index, scope, tombstone_id);
-            tombstoned_reference = retained.outcome().unwrap();
-            index.record(key(scope, tombstone_id), retained).unwrap();
-            index
-                .record(
-                    key(scope, tombstone_id),
-                    owner_with_state(
-                        scope,
-                        tombstone_id,
-                        InvocationResultState::PendingMergeAcknowledgement {
-                            acknowledgement_event: MergeEventId(
-                                Hash::digest(b"index-test-acknowledgement", &[&tombstone_id.0]).0,
-                            ),
-                            disposition: retained.disposition().unwrap(),
-                            outcome: tombstoned_reference,
-                        },
+            let retained = persist_retained(&mut index, scope, archived_id);
+            archived_reference = retained.outcome().unwrap();
+            index.record(key(scope, archived_id), retained).unwrap();
+            let archivable = owner_with_state(
+                scope,
+                archived_id,
+                InvocationResultState::PendingMergeAcknowledgement {
+                    acknowledgement_event: MergeEventId(
+                        Hash::digest(b"index-test-acknowledgement", &[&archived_id.0]).0,
                     ),
-                )
-                .unwrap();
-            index
-                .record(
-                    key(scope, tombstone_id),
-                    acknowledged(scope, tombstone_id, retained.disposition().unwrap()),
-                )
-                .unwrap();
+                    disposition: retained.disposition().unwrap(),
+                    outcome: archived_reference,
+                },
+            );
+            index.record(key(scope, archived_id), archivable).unwrap();
+            index.archive(key(scope, archived_id), archivable).unwrap();
             index.id()
         };
         let manifest = load_manifest(&store, final_id).unwrap();
-        let reachability = collect_manifest_reachability(&store, final_id, &manifest, 5).unwrap();
-        assert_eq!(reachability.nodes.len(), 5);
+        let reachability = collect_manifest_reachability(&store, final_id, &manifest, 3).unwrap();
+        assert_eq!(reachability.nodes.len(), 3);
         assert_eq!(reachability.outcomes, vec![pending_ack_reference.outcome]);
-        assert!(
-            !reachability
-                .outcomes
-                .contains(&tombstoned_reference.outcome)
-        );
+        assert!(!reachability.outcomes.contains(&archived_reference.outcome));
         assert_eq!(store.outcome_count(), 2);
     }
 
@@ -3956,86 +4535,6 @@ mod tests {
         assert!(matches!(
             InvocationIndex::open(&mut limited, InvocationIndexId([0xfe; 32])),
             Err(InvocationIndexError::MissingManifest(_))
-        ));
-    }
-
-    #[test]
-    fn logical_cap_allows_retries_and_transitions_but_not_new_members() {
-        let scope = InvocationOwnershipScope::Ordered;
-        let genesis = genesis(7);
-        let left_key = invocation([0x10; 32]);
-        let mut store = MemoryInvocationIndexStore::with_node_limit(2);
-        let (left_owner, left_outcome) = retained_for(genesis, scope, left_key);
-        put_outcome_immutable(&mut store, &left_outcome).unwrap();
-        let left = InvocationIndexNode::Leaf(InvocationOwnershipLeaf {
-            genesis,
-            key: key(scope, left_key),
-            owner: left_owner,
-        });
-        let left = put_node_immutable(&mut store, &left).unwrap();
-        // This synthetic sibling summary represents acknowledged history whose
-        // physical closure is outside the tiny scrub budget. Ordinary work on
-        // the left path can still retry/transition at the logical epoch cap.
-        let historical_entries = MAX_INVOCATION_INDEX_LOGICAL_ENTRIES - 1;
-        let right = InvocationIndexChild {
-            id: InvocationIndexNodeId([0xee; 32]),
-            summary: InvocationIndexSummary {
-                min: invocation([0x80; 32]),
-                max: invocation([0xff; 32]),
-                entries: historical_entries,
-                tombstones: historical_entries,
-                unfinalized: 0,
-                outcome_records: 0,
-                reserved_outcome_bytes: 0,
-            },
-        };
-        let root = InvocationIndexNode::Branch {
-            genesis,
-            scope,
-            bit: 0,
-            prefix: [0; 32],
-            left,
-            right,
-        };
-        let root = put_node_immutable(&mut store, &root).unwrap();
-        let manifest = InvocationIndexManifest {
-            genesis,
-            scope,
-            root: Some(root.id),
-            entries: MAX_INVOCATION_INDEX_LOGICAL_ENTRIES,
-            tombstones: historical_entries,
-            unfinalized: 0,
-            outcome_records: 1,
-            reserved_outcome_bytes: left_owner.reserved_outcome_bytes(),
-        };
-        let id = put_manifest_immutable(&mut store, &manifest).unwrap();
-        let (next_id, next_manifest) = {
-            let mut index = InvocationIndex::open(&mut store, id).unwrap();
-            assert!(index.lookup(key(scope, left_key)).unwrap().is_some());
-            assert_eq!(
-                index.record(key(scope, left_key), left_owner).unwrap(),
-                InvocationIndexMutation::ExactRetry(id)
-            );
-            let acknowledged = acknowledged(scope, left_key, InvocationDisposition::Rejected);
-            index.record(key(scope, left_key), acknowledged).unwrap();
-            let new_key = invocation([0x20; 32]);
-            let new_owner = persist_retained(&mut index, scope, new_key);
-            assert!(matches!(
-                index.record(key(scope, new_key), new_owner),
-                Err(InvocationIndexError::Capacity)
-            ));
-            (index.id(), *index.manifest())
-        };
-        assert_ne!(next_id, id);
-        assert_eq!(next_manifest.entries, MAX_INVOCATION_INDEX_LOGICAL_ENTRIES);
-        assert_eq!(
-            next_manifest.tombstones,
-            MAX_INVOCATION_INDEX_LOGICAL_ENTRIES
-        );
-        assert_eq!(next_manifest.reserved_outcome_bytes, 0);
-        assert!(matches!(
-            audit_manifest(&store, next_id, &next_manifest),
-            Err(InvocationIndexError::NodeLimit)
         ));
     }
 
@@ -4081,6 +4580,11 @@ mod tests {
             let mut indexes = InvocationIndexes::open(&mut store, ordered, merge, local).unwrap();
             assert_eq!(indexes.genesis(), genesis);
             assert_eq!(indexes.local_node(), local_node);
+            assert!(
+                InvocationOwnership::history_write_plans(&indexes)
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(
                 indexes.persist_outcome(&ordered_outcome).unwrap(),
                 ordered_owner.outcome().unwrap()
@@ -4111,6 +4615,11 @@ mod tests {
                 assert!(indexes.lookup(key(scope, invocation)).unwrap().is_some());
                 assert_eq!(indexes.manifest(scope).unwrap().entries, 1);
             }
+            assert!(
+                InvocationOwnership::history_write_plans(&indexes)
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(
                 indexes
                     .outcome(key(InvocationOwnershipScope::Ordered, ordered_invocation,))

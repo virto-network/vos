@@ -65,17 +65,17 @@ pub const MAX_INVOCATION_INDEX_NODE_BYTES: usize = 4 * 1024;
 /// Maximum canonical key/value leaf stored by an ownership index.
 pub const MAX_INVOCATION_OWNERSHIP_LEAF_BYTES: usize = 1024;
 /// Maximum retained, pending, or otherwise live invocation identities in one
-/// ownership scope. Acknowledged tombstones remain forever but do not consume
-/// a live slot.
+/// ownership scope. Acknowledged identities move to the separate cumulative
+/// history root and therefore do not consume a live slot.
 pub const MAX_INVOCATION_INDEX_LIVE_ENTRIES: u64 = 256;
 /// Maximum exact-result bytes reserved by one ownership scope. Pending Merge
 /// results reserve the complete record bound until finalization reveals the
 /// exact encoded length.
 pub const MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES: u64 = 4 * 1024 * 1024;
-/// Permanent logical-history ceiling before a checkpoint-governed physical
-/// index rollover is required. Existing members may still retry or transition
-/// at the ceiling.
-pub const MAX_INVOCATION_INDEX_LOGICAL_ENTRIES: u64 = 1_000_000;
+/// Maximum complete acknowledged-history fact embedded in a history leaf.
+pub const MAX_INVOCATION_HISTORY_FACT_BYTES: usize = 1024;
+/// Maximum canonical acknowledged-history Patricia node.
+pub const MAX_INVOCATION_HISTORY_NODE_BYTES: usize = 1024;
 /// Maximum complete exact invocation-outcome record. A result may retain the
 /// actor ABI's full 8-KiB reply; the remaining half is a fixed-size audit and
 /// replay-authentication envelope.
@@ -158,6 +158,7 @@ journal_id_type!(LaneStateId, "LaneStateId");
 journal_id_type!(ArtifactClosureId, "ArtifactClosureId");
 journal_id_type!(InvocationIndexNodeId, "InvocationIndexNodeId");
 journal_id_type!(InvocationIndexId, "InvocationIndexId");
+journal_id_type!(InvocationHistoryNodeId, "InvocationHistoryNodeId");
 journal_id_type!(InvocationOutcomeId, "InvocationOutcomeId");
 journal_id_type!(CheckpointId, "CheckpointId");
 journal_id_type!(JournalHeadsId, "JournalHeadsId");
@@ -184,6 +185,9 @@ pub enum JournalStorageClass {
     /// Exact deterministic invocation reply/error retained independently of
     /// the opaque runtime image and authenticated ownership index.
     InvocationOutcome = 13,
+    /// Permanent insert-only acknowledged-history Patricia nodes. These use
+    /// a distinct namespace from mutable live-owner tree generations.
+    InvocationHistoryNode = 14,
 }
 
 pub(super) mod sealed {
@@ -396,22 +400,14 @@ pub enum InvocationResultState {
         disposition: InvocationDisposition,
         outcome: InvocationOutcomeRef,
     },
-    /// Permanent ownership tombstone. The disposition remains authenticated
-    /// after the outcome object becomes unreachable from the live index.
-    Acknowledged { disposition: InvocationDisposition },
 }
 
 impl InvocationResultState {
-    pub const fn is_tombstone(self) -> bool {
-        matches!(self, Self::Acknowledged { .. })
-    }
-
     pub const fn disposition(self) -> Option<InvocationDisposition> {
         match self {
             Self::PendingMerge { .. } => None,
             Self::Retained { disposition, .. }
-            | Self::PendingMergeAcknowledgement { disposition, .. }
-            | Self::Acknowledged { disposition } => Some(disposition),
+            | Self::PendingMergeAcknowledgement { disposition, .. } => Some(disposition),
         }
     }
 
@@ -420,7 +416,7 @@ impl InvocationResultState {
             Self::Retained { outcome, .. } | Self::PendingMergeAcknowledgement { outcome, .. } => {
                 Some(outcome)
             }
-            Self::PendingMerge { .. } | Self::Acknowledged { .. } => None,
+            Self::PendingMerge { .. } => None,
         }
     }
 
@@ -441,7 +437,6 @@ impl InvocationResultState {
             Self::Retained { outcome, .. } | Self::PendingMergeAcknowledgement { outcome, .. } => {
                 outcome.encoded_bytes as u64
             }
-            Self::Acknowledged { .. } => 0,
         }
     }
 }
@@ -512,7 +507,6 @@ impl InvocationOwner {
                 },
             ) => acknowledgement_event != MergeEventId::ZERO && outcome.validate().is_ok(),
             (_, InvocationResultState::Retained { outcome, .. }) => outcome.validate().is_ok(),
-            (_, InvocationResultState::Acknowledged { .. }) => true,
             _ => false,
         };
         if self.request_commitment == Hash::ZERO
@@ -523,6 +517,152 @@ impl InvocationOwner {
             return Err(DecodeError::NonCanonical);
         }
         Ok(())
+    }
+}
+
+/// Permanent authenticated fact that one exact winning invocation owner was
+/// acknowledged. The acknowledgement receipt and its suffix-scoped journal
+/// anchor are deliberately not retained: a fresh acknowledgement retry is
+/// authenticated independently and resolves this fact by the original
+/// request commitment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvocationAcknowledgedFact {
+    genesis: AgentJournalGenesisId,
+    key: InvocationOwnershipKey,
+    request_commitment: Hash,
+    first_input: ReplayInputId,
+    lane: PersistedLane,
+    node: Option<NodeId>,
+    disposition: InvocationDisposition,
+}
+
+impl InvocationAcknowledgedFact {
+    /// Derive the only canonical permanent fact from an authenticated live
+    /// owner. Pending source invocations cannot be acknowledged; a Merge
+    /// acknowledgement becomes archivable only after it owns an exact result.
+    pub fn from_owner(
+        genesis: AgentJournalGenesisId,
+        key: InvocationOwnershipKey,
+        owner: InvocationOwner,
+    ) -> Result<Self, DecodeError> {
+        owner.validate()?;
+        let disposition = match (owner.scope, owner.result_state) {
+            (
+                InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Local(_),
+                InvocationResultState::Retained { disposition, .. },
+            )
+            | (
+                InvocationOwnershipScope::Merge,
+                InvocationResultState::PendingMergeAcknowledgement { disposition, .. },
+            ) => disposition,
+            _ => {
+                return Err(DecodeError::NonCanonical);
+            }
+        };
+        let fact = Self {
+            genesis,
+            key,
+            request_commitment: owner.request_commitment,
+            first_input: owner.first_input,
+            lane: owner.lane,
+            node: owner.node,
+            disposition,
+        };
+        fact.validate_inner()?;
+        Ok(fact)
+    }
+
+    pub const fn genesis(&self) -> AgentJournalGenesisId {
+        self.genesis
+    }
+
+    pub const fn key(&self) -> InvocationOwnershipKey {
+        self.key
+    }
+
+    pub const fn request_commitment(&self) -> Hash {
+        self.request_commitment
+    }
+
+    pub const fn first_input(&self) -> ReplayInputId {
+        self.first_input
+    }
+
+    pub const fn lane(&self) -> PersistedLane {
+        self.lane
+    }
+
+    pub const fn node(&self) -> Option<NodeId> {
+        self.node
+    }
+
+    pub const fn disposition(&self) -> InvocationDisposition {
+        self.disposition
+    }
+
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_INVOCATION_HISTORY_FACT_BYTES)
+    }
+
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        self.key.validate()?;
+        let owner_matches_scope = match (self.key.scope, self.lane, self.node) {
+            (
+                InvocationOwnershipScope::Ordered,
+                PersistedLane::Control | PersistedLane::Linear,
+                None,
+            ) => true,
+            (InvocationOwnershipScope::Merge, PersistedLane::Merge, None) => true,
+            (
+                InvocationOwnershipScope::Local(scope_node),
+                PersistedLane::Local,
+                Some(owner_node),
+            ) => scope_node == owner_node && owner_node != NodeId::ZERO,
+            _ => false,
+        };
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || self.request_commitment == Hash::ZERO
+            || self.first_input == ReplayInputId::ZERO
+            || !owner_matches_scope
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for InvocationAcknowledgedFact {
+    const MAGIC: [u8; 4] = *b"AGHF";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encode_invocation_scope(&mut encoder, self.key.scope);
+        encoder.fixed(&self.key.invocation.0);
+        encoder.fixed(&self.request_commitment.0);
+        encoder.fixed(&self.first_input.0);
+        encoder.u8(self.lane as u8);
+        encoder.option(&self.node, |encoder, node| encoder.fixed(&node.0));
+        encode_invocation_disposition(&mut encoder, self.disposition);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_INVOCATION_HISTORY_FACT_BYTES)?;
+        let fact = Self {
+            genesis: AgentJournalGenesisId(decoder.fixed()?),
+            key: InvocationOwnershipKey {
+                scope: decode_invocation_scope(decoder)?,
+                invocation: InvocationId(decoder.fixed()?),
+            },
+            request_commitment: Hash(decoder.fixed()?),
+            first_input: ReplayInputId(decoder.fixed()?),
+            lane: decode_persisted_lane(decoder.u8()?)?,
+            node: decoder.option(|decoder| Ok(NodeId(decoder.fixed()?)))?,
+            disposition: decode_invocation_disposition(decoder)?,
+        };
+        fact.validate()?;
+        Ok(fact)
     }
 }
 
@@ -1143,15 +1283,18 @@ pub struct InvocationIndexManifest {
     /// Resolution must reject any reachable node or leaf whose embedded
     /// genesis/scope differs from this manifest.
     pub root: Option<InvocationIndexNodeId>,
-    /// Total leaves, including permanent acknowledged tombstones.
+    /// Total live leaves. Acknowledged identities are committed by
+    /// `history_root` and do not consume this bounded working set.
     pub entries: u64,
-    pub tombstones: u64,
     /// Pending source events plus pending Merge acknowledgements.
     pub unfinalized: u64,
     /// Leaves which retain an exact outcome reference.
     pub outcome_records: u64,
     /// Aggregate exact or conservatively reserved outcome bytes.
     pub reserved_outcome_bytes: u64,
+    /// Root of the cumulative insert-only acknowledged invocation history.
+    /// It remains present when the live tree is empty.
+    pub history_root: Option<InvocationHistoryNodeId>,
 }
 
 impl InvocationIndexManifest {
@@ -1161,31 +1304,26 @@ impl InvocationIndexManifest {
             scope,
             root: None,
             entries: 0,
-            tombstones: 0,
             unfinalized: 0,
             outcome_records: 0,
             reserved_outcome_bytes: 0,
+            history_root: None,
         }
     }
 
     fn validate_inner(&self) -> Result<(), DecodeError> {
         self.scope.validate()?;
-        let live = self.entries.checked_sub(self.tombstones);
         if self.genesis == AgentJournalGenesisId::ZERO
             || self.root == Some(InvocationIndexNodeId::ZERO)
+            || self.history_root == Some(InvocationHistoryNodeId::ZERO)
             || (self.entries == 0) != self.root.is_none()
-            || self.tombstones > self.entries
-            || self.entries > MAX_INVOCATION_INDEX_LOGICAL_ENTRIES
-            || live.is_none_or(|entries| entries > MAX_INVOCATION_INDEX_LIVE_ENTRIES)
-            || live.is_some_and(|entries| {
-                self.unfinalized > entries
-                    || self.outcome_records > entries
-                    || ((self.reserved_outcome_bytes == 0) != (entries == 0))
-            })
+            || self.entries > MAX_INVOCATION_INDEX_LIVE_ENTRIES
+            || self.unfinalized > self.entries
+            || self.outcome_records > self.entries
+            || ((self.reserved_outcome_bytes == 0) != (self.entries == 0))
             || self.reserved_outcome_bytes > MAX_INVOCATION_INDEX_RESERVED_OUTCOME_BYTES
             || (self.entries == 0
-                && (self.tombstones != 0
-                    || self.unfinalized != 0
+                && (self.unfinalized != 0
                     || self.outcome_records != 0
                     || self.reserved_outcome_bytes != 0))
         {
@@ -1196,7 +1334,7 @@ impl InvocationIndexManifest {
 }
 
 impl ServiceWire for InvocationIndexManifest {
-    const MAGIC: [u8; 4] = *b"AGJX";
+    const MAGIC: [u8; 4] = *b"AJX2";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -1204,10 +1342,10 @@ impl ServiceWire for InvocationIndexManifest {
         encode_invocation_scope(&mut encoder, self.scope);
         encoder.option(&self.root, |encoder, root| encoder.fixed(&root.0));
         encoder.u64(self.entries);
-        encoder.u64(self.tombstones);
         encoder.u64(self.unfinalized);
         encoder.u64(self.outcome_records);
         encoder.u64(self.reserved_outcome_bytes);
+        encoder.option(&self.history_root, |encoder, root| encoder.fixed(&root.0));
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -1217,10 +1355,11 @@ impl ServiceWire for InvocationIndexManifest {
             scope: decode_invocation_scope(decoder)?,
             root: decoder.option(|decoder| Ok(InvocationIndexNodeId(decoder.fixed()?)))?,
             entries: decoder.u64()?,
-            tombstones: decoder.u64()?,
             unfinalized: decoder.u64()?,
             outcome_records: decoder.u64()?,
             reserved_outcome_bytes: decoder.u64()?,
+            history_root: decoder
+                .option(|decoder| Ok(InvocationHistoryNodeId(decoder.fixed()?)))?,
         };
         manifest.validate_inner()?;
         Ok(manifest)
@@ -1240,7 +1379,7 @@ impl CanonicalJournalRecord for InvocationIndexManifest {
     }
 
     fn id(&self) -> Self::Id {
-        InvocationIndexId(content_id(b"vos/agent/journal/invocation-index", self))
+        InvocationIndexId(content_id(b"vos/agent/journal/invocation-index/v2", self))
     }
 }
 
@@ -3057,10 +3196,6 @@ fn encode_invocation_owner(encoder: &mut Encoder<'_>, owner: InvocationOwner) {
             encode_invocation_disposition(encoder, disposition);
             encode_invocation_outcome_ref(encoder, outcome);
         }
-        InvocationResultState::Acknowledged { disposition } => {
-            encoder.u8(3);
-            encode_invocation_disposition(encoder, disposition);
-        }
     }
 }
 
@@ -3083,9 +3218,6 @@ fn decode_invocation_owner(decoder: &mut Decoder<'_>) -> Result<InvocationOwner,
                 acknowledgement_event: MergeEventId(decoder.fixed()?),
                 disposition: decode_invocation_disposition(decoder)?,
                 outcome: decode_invocation_outcome_ref(decoder)?,
-            },
-            3 => InvocationResultState::Acknowledged {
-                disposition: decode_invocation_disposition(decoder)?,
             },
             _ => return Err(DecodeError::InvalidTag),
         },
@@ -3968,7 +4100,6 @@ mod tests {
             PersistedLane::Control,
             None,
         );
-        assert!(!retained.owner.result_state.is_tombstone());
         assert_eq!(
             retained.owner.disposition(),
             Some(InvocationDisposition::Applied)
@@ -3976,14 +4107,37 @@ mod tests {
         assert!(retained.owner.outcome().is_some());
         assert!(!retained.owner.is_unfinalized());
 
-        let mut acknowledged = retained;
-        acknowledged.owner.result_state = InvocationResultState::Acknowledged {
-            disposition: InvocationDisposition::Applied,
-        };
+        let acknowledged =
+            InvocationAcknowledgedFact::from_owner(genesis, retained.key, retained.owner).unwrap();
         acknowledged.validate().unwrap();
-        assert!(acknowledged.owner.result_state.is_tombstone());
-        assert_eq!(acknowledged.owner.outcome(), None);
-        assert_eq!(acknowledged.owner.reserved_outcome_bytes(), 0);
+        roundtrip(&acknowledged);
+        assert_eq!(acknowledged.genesis(), genesis);
+        assert_eq!(acknowledged.key(), retained.key);
+        assert_eq!(
+            acknowledged.request_commitment(),
+            retained.owner.request_commitment
+        );
+        assert_eq!(acknowledged.first_input(), retained.owner.first_input);
+        assert_eq!(acknowledged.lane(), retained.owner.lane);
+        assert_eq!(acknowledged.node(), retained.owner.node);
+        assert_eq!(acknowledged.disposition(), InvocationDisposition::Applied);
+        let mut invalid_fact = acknowledged;
+        invalid_fact.first_input = ReplayInputId::ZERO;
+        assert_eq!(invalid_fact.validate(), Err(DecodeError::NonCanonical));
+        let mut invalid_fact = acknowledged;
+        invalid_fact.request_commitment = Hash::ZERO;
+        assert_eq!(invalid_fact.validate(), Err(DecodeError::NonCanonical));
+        assert_eq!(
+            InvocationAcknowledgedFact::from_owner(
+                genesis,
+                InvocationOwnershipKey {
+                    scope: InvocationOwnershipScope::Merge,
+                    invocation: retained.key.invocation,
+                },
+                retained.owner,
+            ),
+            Err(DecodeError::NonCanonical)
+        );
 
         let mut pending_merge = ownership_leaf(
             genesis,
@@ -4019,6 +4173,34 @@ mod tests {
             Some(InvocationDisposition::Forbidden)
         );
         assert_eq!(pending_acknowledgement.owner.reserved_outcome_bytes(), 640);
+        let merge_acknowledged = InvocationAcknowledgedFact::from_owner(
+            genesis,
+            pending_acknowledgement.key,
+            pending_acknowledgement.owner,
+        )
+        .unwrap();
+        assert_eq!(
+            merge_acknowledged.disposition(),
+            InvocationDisposition::Forbidden
+        );
+
+        let mut merge_retained = pending_acknowledgement;
+        merge_retained.owner.result_state = InvocationResultState::Retained {
+            disposition: InvocationDisposition::Forbidden,
+            outcome: InvocationOutcomeRef {
+                outcome: InvocationOutcomeId([0xc4; 32]),
+                encoded_bytes: 640,
+            },
+        };
+        merge_retained.validate().unwrap();
+        assert_eq!(
+            InvocationAcknowledgedFact::from_owner(
+                genesis,
+                merge_retained.key,
+                merge_retained.owner,
+            ),
+            Err(DecodeError::NonCanonical)
+        );
 
         let mut ordered_pending = retained;
         ordered_pending.owner.result_state = InvocationResultState::PendingMerge {
@@ -4063,13 +4245,16 @@ mod tests {
         };
         assert_eq!(empty_with_root.validate(), Err(DecodeError::NonCanonical));
 
-        let excess_tombstones = InvocationIndexManifest {
+        let excess_live_entries = InvocationIndexManifest {
             root: Some(InvocationIndexNodeId([0xd1; 32])),
-            entries: 1,
-            tombstones: 2,
+            entries: MAX_INVOCATION_INDEX_LIVE_ENTRIES + 1,
+            reserved_outcome_bytes: 1,
             ..ordered
         };
-        assert_eq!(excess_tombstones.validate(), Err(DecodeError::NonCanonical));
+        assert_eq!(
+            excess_live_entries.validate(),
+            Err(DecodeError::NonCanonical)
+        );
 
         let live_without_reserved_bytes = InvocationIndexManifest {
             root: Some(InvocationIndexNodeId([0xd1; 32])),
@@ -4084,8 +4269,7 @@ mod tests {
         let impossible_unfinalized = InvocationIndexManifest {
             root: Some(InvocationIndexNodeId([0xd1; 32])),
             entries: 2,
-            tombstones: 1,
-            unfinalized: 2,
+            unfinalized: 3,
             reserved_outcome_bytes: 1,
             ..ordered
         };
@@ -4097,8 +4281,7 @@ mod tests {
         let impossible_outcomes = InvocationIndexManifest {
             root: Some(InvocationIndexNodeId([0xd1; 32])),
             entries: 2,
-            tombstones: 1,
-            outcome_records: 2,
+            outcome_records: 3,
             reserved_outcome_bytes: 1,
             ..ordered
         };
@@ -4107,17 +4290,19 @@ mod tests {
             Err(DecodeError::NonCanonical)
         );
 
-        let tombstones_with_reserved_bytes = InvocationIndexManifest {
-            root: Some(InvocationIndexNodeId([0xd1; 32])),
-            entries: 1,
-            tombstones: 1,
-            reserved_outcome_bytes: 1,
+        let history_only = InvocationIndexManifest {
+            history_root: Some(InvocationHistoryNodeId([0xd2; 32])),
             ..ordered
         };
-        assert_eq!(
-            tombstones_with_reserved_bytes.validate(),
-            Err(DecodeError::NonCanonical)
-        );
+        history_only.validate().unwrap();
+        roundtrip(&history_only);
+        assert_ne!(history_only.id(), ordered.id());
+
+        let zero_history_root = InvocationIndexManifest {
+            history_root: Some(InvocationHistoryNodeId::ZERO),
+            ..ordered
+        };
+        assert_eq!(zero_history_root.validate(), Err(DecodeError::NonCanonical));
 
         let invalid_local =
             InvocationIndexManifest::empty(genesis, InvocationOwnershipScope::Local(NodeId::ZERO));
