@@ -34,6 +34,7 @@ pub mod package;
 pub(crate) mod replay;
 pub mod schema;
 pub mod shared_commit;
+pub mod shared_raft;
 pub mod standard;
 pub mod wire;
 use crate::service::{

@@ -21,9 +21,10 @@ use std::os::fd::{AsRawFd, FromRawFd as _};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt as _;
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{FileExt as UnixFileExt, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "linux")]
 use fs2::FileExt;
@@ -60,7 +61,12 @@ use super::journal::{
     MergeFrontierId, MergeSeal, MergeSealId, OrderedBase, OrderedEntry, OrderedEntryId,
     PersistedLane, system_genesis_post_create_state_commitment,
 };
-use super::replay::{ReplayPublicationAnchor, ReplaySealedGenesis, ReplaySealedPublication};
+use super::replay::{
+    ReplayPublicationAnchor, ReplayPublicationMode, ReplaySealedGenesis, ReplaySealedPublication,
+    ReplaySealedSharedMergeProjection,
+};
+use super::shared_commit::{MAX_ORDERED_COMMIT_CLAIM_BYTES, OrderedCommitClaim};
+use super::shared_raft::JournalStoreInstanceId;
 use super::wire::{RuntimeState, decode_standard_runtime_state};
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{AgentId, BlobRef, Hash, NodeId};
@@ -73,6 +79,144 @@ pub struct JournalPublication {
     /// The durable head pointer changed. This is false for an exact retry
     /// after an ambiguous successful publication.
     pub heads_advanced: bool,
+}
+
+const MAX_SHARED_ORDERED_COMMIT_BINDING_BYTES: usize = MAX_ORDERED_COMMIT_CLAIM_BYTES + 288;
+const MAX_SHARED_ORDERED_COMMIT_BINDINGS: usize = 4_096;
+const MAX_SHARED_ORDERED_COMMIT_FILES: usize = 2 * MAX_SHARED_ORDERED_COMMIT_BINDINGS;
+const SHARED_ORDERED_COMMIT_DIRECTORY: &str = "shared-ordered-commits";
+
+/// Durable, immutable bridge from a published Agent-journal entry back to the
+/// exact Shared Raft authority which selected it.
+///
+/// This binding deliberately remains outside checkpoint reachability for now:
+/// Shared checkpoint/GC must fail closed until it can retain the complete
+/// claim/QC audit closure (or a replacement checkpoint certificate).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SharedOrderedCommitBinding {
+    journal_store: JournalStoreInstanceId,
+    entry: OrderedEntryId,
+    claim: OrderedCommitClaim,
+    raft_payload_commitment: Hash,
+}
+
+impl SharedOrderedCommitBinding {
+    fn new(
+        journal_store: JournalStoreInstanceId,
+        entry: OrderedEntryId,
+        claim: OrderedCommitClaim,
+        raft_payload_commitment: Hash,
+    ) -> Result<Self, JournalStoreError> {
+        let binding = Self {
+            journal_store,
+            entry,
+            claim,
+            raft_payload_commitment,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<(), JournalStoreError> {
+        if self.entry == OrderedEntryId::ZERO
+            || self.claim.validate().is_err()
+            || self.claim.ordered().head != Some(self.entry)
+            || self.raft_payload_commitment == Hash::ZERO
+        {
+            Err(JournalStoreError::Corrupt)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) const fn journal_store(&self) -> JournalStoreInstanceId {
+        self.journal_store
+    }
+
+    pub(crate) const fn entry(&self) -> OrderedEntryId {
+        self.entry
+    }
+
+    pub(crate) const fn claim(&self) -> &OrderedCommitClaim {
+        &self.claim
+    }
+
+    pub(crate) const fn raft_payload_commitment(&self) -> Hash {
+        self.raft_payload_commitment
+    }
+}
+
+impl ServiceWire for SharedOrderedCommitBinding {
+    const MAGIC: [u8; 4] = *b"AGCB";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(self.journal_store.as_bytes());
+        encoder.fixed(self.entry.as_bytes());
+        encoder.bytes(&self.claim.encode());
+        encoder.fixed(&self.raft_payload_commitment.0);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let binding = Self {
+            journal_store: JournalStoreInstanceId::from_bytes(decoder.fixed()?)
+                .ok_or(DecodeError::NonCanonical)?,
+            entry: OrderedEntryId(decoder.fixed()?),
+            claim: OrderedCommitClaim::decode(&decoder.bytes()?)?,
+            raft_payload_commitment: Hash(decoder.fixed()?),
+        };
+        binding.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(binding)
+    }
+}
+
+fn decode_shared_ordered_commit_binding(
+    bytes: &[u8],
+    expected: OrderedEntryId,
+) -> Result<SharedOrderedCommitBinding, JournalStoreError> {
+    if bytes.len() > MAX_SHARED_ORDERED_COMMIT_BINDING_BYTES {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let binding =
+        SharedOrderedCommitBinding::decode(bytes).map_err(|_| JournalStoreError::Corrupt)?;
+    if binding.entry != expected || binding.encode() != bytes {
+        return Err(JournalStoreError::Corrupt);
+    }
+    binding.validate()?;
+    Ok(binding)
+}
+
+fn validate_shared_ordered_commit_scope(
+    binding: &SharedOrderedCommitBinding,
+    heads: &JournalHeads,
+    journal_store: JournalStoreInstanceId,
+) -> Result<(), JournalStoreError> {
+    let claim = binding.claim();
+    if binding.journal_store() != journal_store
+        || claim.genesis() != heads.genesis
+        || claim.admission().as_bytes() != heads.admission.as_bytes()
+        || claim.space() != heads.runtime.space
+        || claim.agent() != heads.runtime.agent
+    {
+        Err(JournalStoreError::ScopeMismatch)
+    } else {
+        Ok(())
+    }
+}
+
+/// Crate-private authority namespace used only by Shared replay and the
+/// sealed publication implementations below. There is intentionally no raw
+/// public journal API for installing these bindings.
+pub(crate) trait SharedOrderedCommitStore: AgentJournalStore {
+    fn shared_ordered_commit(
+        &self,
+        entry: OrderedEntryId,
+    ) -> Result<Option<SharedOrderedCommitBinding>, JournalStoreError>;
+
+    fn persist_shared_ordered_commit(
+        &mut self,
+        binding: &SharedOrderedCommitBinding,
+    ) -> Result<bool, JournalStoreError>;
 }
 
 /// Explicit work budgets for one checkpoint-governed collection pass.
@@ -187,6 +331,10 @@ pub trait AgentJournalStore:
     InvocationOutcomeStore<Error = JournalStoreError>
     + InvocationHistoryStore<Error = JournalStoreError>
 {
+    /// Stable for one live physical journal slot and different for an
+    /// independently constructed or copied store.
+    fn instance_id(&self) -> JournalStoreInstanceId;
+
     /// Install immutable genesis and its empty head envelope. Exact retries
     /// are idempotent. Implementations may durably retain a validated partial
     /// initialization after an I/O failure; retrying this method completes it.
@@ -218,8 +366,10 @@ pub trait AgentJournalStore:
 
     /// Publish one replay-sealed anchor and its one-step successor head.
     ///
-    /// Typed closure objects carried by the token are installed by this call;
-    /// referenced raw blobs must already be durable through [`Self::put_blob`].
+    /// Typed closure objects carried by the token are installed by this call.
+    /// The Shared ordered pinned-Merge projection is also installed here as
+    /// one sealed blob-before-manifest dependency; other referenced raw blobs
+    /// must already be durable through [`Self::put_blob`].
     /// The opaque token can only be minted by exact replay, so callers cannot
     /// ask storage to infer lifecycle, ownership, or checkpoint semantics from
     /// independently assembled records.
@@ -1121,19 +1271,62 @@ fn validate_publication_shape<R: CanonicalJournalRecord>(
     anchor: &R,
     next: &JournalHeads,
 ) -> Result<(), JournalStoreError> {
+    validate_publication_shape_with_mode(current, anchor, next, ReplayPublicationMode::Canonical)
+}
+
+fn validate_publication_shape_with_mode<R: CanonicalJournalRecord>(
+    current: &JournalHeads,
+    anchor: &R,
+    next: &JournalHeads,
+    mode: ReplayPublicationMode,
+) -> Result<(), JournalStoreError> {
     match R::STORAGE_CLASS {
         JournalStorageClass::OrderedEntry => {
             let entry = decode_anchor::<OrderedEntry, _>(anchor)?;
-            let (expected_fence, expected_seal) = if entry.merge_seal.is_some() {
-                (
-                    OrderedBase {
-                        index: entry.index,
-                        head: Some(entry.id()),
-                    },
-                    entry.merge_seal,
-                )
-            } else {
-                (current.merge_fence, current.merge_seal)
+            let entry_base = OrderedBase {
+                index: entry.index,
+                head: Some(entry.id()),
+            };
+            let (expected_frontier, expected_merge_invocations, expected_fence, expected_seal) =
+                match mode {
+                    ReplayPublicationMode::Canonical => {
+                        let (fence, seal) = if entry.merge_seal.is_some() {
+                            (entry_base, entry.merge_seal)
+                        } else {
+                            (current.merge_fence, current.merge_seal)
+                        };
+                        (
+                            current.merge_frontier,
+                            entry
+                                .merge_seal
+                                .is_none()
+                                .then_some(current.merge_invocations),
+                            fence,
+                            seal,
+                        )
+                    }
+                    ReplayPublicationMode::SharedOrderedPreserveMerge => {
+                        if entry.merge_seal.is_some() {
+                            return Err(JournalStoreError::NonCanonical);
+                        }
+                        (
+                            current.merge_frontier,
+                            Some(current.merge_invocations),
+                            current.merge_fence,
+                            current.merge_seal,
+                        )
+                    }
+                    ReplayPublicationMode::SharedOrderedInstallFence => {
+                        if entry.merge_seal.is_none() {
+                            return Err(JournalStoreError::NonCanonical);
+                        }
+                        (entry.merge_frontier, None, entry_base, entry.merge_seal)
+                    }
+                };
+            let canonical_frontier = match mode {
+                ReplayPublicationMode::Canonical => entry.merge_frontier == current.merge_frontier,
+                ReplayPublicationMode::SharedOrderedPreserveMerge
+                | ReplayPublicationMode::SharedOrderedInstallFence => true,
             };
             if entry.genesis != current.genesis
                 || entry.input.runtime != current.runtime
@@ -1143,14 +1336,14 @@ fn validate_publication_shape<R: CanonicalJournalRecord>(
                         .ordered_index
                         .checked_add(1)
                         .ok_or(JournalStoreError::LimitExceeded)?
-                || entry.merge_frontier != current.merge_frontier
+                || !canonical_frontier
                 || next.ordered_head != Some(entry.id())
                 || next.ordered_index != entry.index
-                || next.merge_frontier != current.merge_frontier
+                || next.merge_frontier != expected_frontier
                 || next.merge_fence != expected_fence
                 || next.merge_seal != expected_seal
-                || (entry.merge_seal.is_none()
-                    && next.merge_invocations != current.merge_invocations)
+                || expected_merge_invocations
+                    .is_some_and(|expected| next.merge_invocations != expected)
                 || next.local_invocations != current.local_invocations
                 || next.local_head != current.local_head
                 || next.local_revision != current.local_revision
@@ -1160,6 +1353,9 @@ fn validate_publication_shape<R: CanonicalJournalRecord>(
             }
         }
         JournalStorageClass::LocalEntry => {
+            if mode != ReplayPublicationMode::Canonical {
+                return Err(JournalStoreError::NonCanonical);
+            }
             let entry = decode_anchor::<LocalEntry, _>(anchor)?;
             if entry.genesis != current.genesis
                 || entry.input.runtime != current.runtime
@@ -1188,6 +1384,9 @@ fn validate_publication_shape<R: CanonicalJournalRecord>(
             }
         }
         JournalStorageClass::MergeEvent => {
+            if mode != ReplayPublicationMode::Canonical {
+                return Err(JournalStoreError::NonCanonical);
+            }
             let event = decode_anchor::<MergeEvent, _>(anchor)?;
             if event.genesis != current.genesis
                 || event.input.runtime != current.runtime
@@ -1207,6 +1406,9 @@ fn validate_publication_shape<R: CanonicalJournalRecord>(
             }
         }
         JournalStorageClass::Checkpoint => {
+            if mode != ReplayPublicationMode::Canonical {
+                return Err(JournalStoreError::NonCanonical);
+            }
             let checkpoint = decode_anchor::<CheckpointManifest, _>(anchor)?;
             if checkpoint.genesis != current.genesis
                 || checkpoint.runtime != current.runtime
@@ -2707,12 +2909,162 @@ fn validate_sealed_fence_ancestry<S: AgentJournalStore>(
     Ok(())
 }
 
-fn stage_sealed_dependencies<S: AgentJournalStore>(
+fn validate_shared_merge_projection<'a>(
+    publication: &'a ReplaySealedPublication,
+) -> Result<Option<&'a ReplaySealedSharedMergeProjection>, JournalStoreError> {
+    let projection = publication.shared_merge_projection();
+    match publication.mode() {
+        ReplayPublicationMode::Canonical => {
+            if projection.is_some() {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            Ok(None)
+        }
+        ReplayPublicationMode::SharedOrderedPreserveMerge
+        | ReplayPublicationMode::SharedOrderedInstallFence => {
+            let projection = projection.ok_or(JournalStoreError::NonCanonical)?;
+            let entry = match publication.anchor() {
+                ReplayPublicationAnchor::Ordered(entry) => entry,
+                ReplayPublicationAnchor::Local(_)
+                | ReplayPublicationAnchor::Merge { .. }
+                | ReplayPublicationAnchor::Checkpoint(_) => {
+                    return Err(JournalStoreError::NonCanonical);
+                }
+            };
+            let manifest = projection.manifest();
+            if entry.validate().is_err()
+                || manifest.validate().is_err()
+                || entry.genesis != publication.next().genesis
+                || publication.next().ordered_head != Some(entry.id())
+                || manifest.genesis != entry.genesis
+                || manifest.runtime != entry.input.runtime
+                || manifest.lane != PersistedLane::Merge
+                || !matches!(
+                    &manifest.cursor,
+                    LaneCursor::Merge { frontier } if *frontier == entry.merge_frontier
+                )
+            {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            validate_supplied_blob(
+                JournalBlobClass::LaneState,
+                &manifest.state,
+                projection.state(),
+            )?;
+            Ok(Some(projection))
+        }
+    }
+}
+
+fn validate_shared_ordered_commit(
+    publication: &ReplaySealedPublication,
+) -> Result<Option<SharedOrderedCommitBinding>, JournalStoreError> {
+    let sealed = publication.shared_ordered_commit();
+    match publication.mode() {
+        ReplayPublicationMode::Canonical => {
+            if sealed.is_some() {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            Ok(None)
+        }
+        ReplayPublicationMode::SharedOrderedPreserveMerge
+        | ReplayPublicationMode::SharedOrderedInstallFence => {
+            let sealed = sealed.ok_or(JournalStoreError::NonCanonical)?;
+            let entry = match publication.anchor() {
+                ReplayPublicationAnchor::Ordered(entry) => entry,
+                ReplayPublicationAnchor::Local(_)
+                | ReplayPublicationAnchor::Merge { .. }
+                | ReplayPublicationAnchor::Checkpoint(_) => {
+                    return Err(JournalStoreError::NonCanonical);
+                }
+            };
+            let claim = sealed.claim();
+            let projection = publication
+                .shared_merge_projection()
+                .ok_or(JournalStoreError::NonCanonical)?;
+            let manifest = projection.manifest();
+            let committed = OrderedBase {
+                index: entry.index,
+                head: Some(entry.id()),
+            };
+            if claim.validate().is_err()
+                || claim.genesis() != entry.genesis
+                || claim.admission().as_bytes() != publication.next().admission.as_bytes()
+                || claim.ordered() != committed
+                || claim.merge_frontier() != entry.merge_frontier
+                || claim.merge().manifest() != manifest.id()
+                || claim.merge().state() != &manifest.state
+                || claim.runtime() != &publication.next().runtime
+                || claim.ordered_invocations() != publication.next().ordered_invocations
+                || claim.merge_fence() != publication.next().merge_fence
+                || claim.merge_seal() != publication.next().merge_seal
+                || sealed.raft_payload_commitment() == Hash::ZERO
+            {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            SharedOrderedCommitBinding::new(
+                sealed.journal_store(),
+                entry.id(),
+                claim.clone(),
+                sealed.raft_payload_commitment(),
+            )
+            .map(Some)
+            .map_err(|_| JournalStoreError::NonCanonical)
+        }
+    }
+}
+
+fn stage_shared_merge_projection<S: AgentJournalStore>(
+    store: &mut S,
+    publication: &ReplaySealedPublication,
+) -> Result<bool, JournalStoreError> {
+    let Some(projection) = validate_shared_merge_projection(publication)? else {
+        return Ok(false);
+    };
+    let manifest = projection.manifest();
+    let state = projection.state();
+
+    // State bytes become durable before the immutable manifest which names
+    // them. Both are read back through the store interface before any anchor
+    // or successor head can be installed.
+    let mut created = store.put_blob(JournalBlobClass::LaneState, &manifest.state, state)?;
+    created |= store.put(manifest)?;
+    if store.get::<LaneStateManifest>(manifest.id())?.as_ref() != Some(manifest)
+        || store
+            .load_blob(JournalBlobClass::LaneState, &manifest.state)?
+            .as_deref()
+            != Some(state)
+    {
+        return Err(JournalStoreError::Corrupt);
+    }
+    Ok(created)
+}
+
+fn stage_shared_ordered_commit<S: SharedOrderedCommitStore>(
+    store: &mut S,
+    binding: &SharedOrderedCommitBinding,
+) -> Result<bool, JournalStoreError> {
+    let created = store.persist_shared_ordered_commit(binding)?;
+    if store.shared_ordered_commit(binding.entry())?.as_ref() != Some(binding) {
+        return Err(JournalStoreError::Corrupt);
+    }
+    Ok(created)
+}
+
+fn stage_sealed_dependencies<S: SharedOrderedCommitStore>(
     store: &mut S,
     publication: &ReplaySealedPublication,
 ) -> Result<bool, JournalStoreError> {
     validate_sealed_fence_ancestry(store, publication)?;
-    let mut created = false;
+    // Validate the complete Shared authority/projection pair before either
+    // immutable dependency is written. Persistence order then guarantees the
+    // pinned projection and replay-derived Raft binding precede head exposure.
+    validate_shared_merge_projection(publication)?;
+    let shared_commit = validate_shared_ordered_commit(publication)?;
+    let mut created = stage_shared_merge_projection(store, publication)?;
+    if let Some(binding) = &shared_commit {
+        created |= stage_shared_ordered_commit(store, binding)?;
+    }
     let mut outcome_ids = BTreeSet::new();
     for sealed in publication.outcomes() {
         let record = sealed.record();
@@ -2774,14 +3126,16 @@ fn stage_sealed_dependencies<S: AgentJournalStore>(
 
 /// Process-local reference implementation used by deterministic replay and
 /// storage-adapter tests.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MemoryAgentJournalStore {
+    instance_id: JournalStoreInstanceId,
     agent: AgentId,
     node: NodeId,
     genesis_admission: Option<Hash>,
     genesis: Option<Vec<u8>>,
     heads: Option<Vec<u8>>,
     authority: BTreeMap<(AuthorityStorageClass, [u8; 32]), Vec<u8>>,
+    shared_ordered_commits: BTreeMap<OrderedEntryId, Vec<u8>>,
     objects: BTreeMap<(JournalStorageClass, [u8; 32]), Vec<u8>>,
     history_nodes: BTreeMap<InvocationHistoryNodeId, Vec<u8>>,
     history_retirements: Option<HistoryRetirementQueue>,
@@ -2789,6 +3143,48 @@ pub struct MemoryAgentJournalStore {
     // while preserving cheap candidate clones for rollback-safe publication.
     blobs: Arc<BTreeMap<(JournalBlobClass, Hash), Vec<u8>>>,
     gc_intent: Option<GcIntent>,
+}
+
+static NEXT_MEMORY_JOURNAL_STORE_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+fn new_memory_journal_store_instance(
+    agent: AgentId,
+    node: NodeId,
+) -> Result<JournalStoreInstanceId, JournalStoreError> {
+    let mut entropy = [0_u8; 32];
+    getrandom::getrandom(&mut entropy).map_err(|_| JournalStoreError::Unavailable)?;
+    JournalStoreInstanceId::from_bytes(
+        Hash::digest(
+            b"vos/agent/journal-store/memory-instance",
+            &[&agent.0, &node.0, &entropy],
+        )
+        .0,
+    )
+    .ok_or(JournalStoreError::Unavailable)
+}
+
+fn cloned_memory_journal_store_instance(parent: JournalStoreInstanceId) -> JournalStoreInstanceId {
+    let sequence = NEXT_MEMORY_JOURNAL_STORE_INSTANCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .expect("memory journal-store instance counter exhausted");
+    JournalStoreInstanceId::from_bytes(
+        Hash::digest(
+            b"vos/agent/journal-store/memory-clone-instance",
+            &[parent.as_bytes(), &sequence.to_le_bytes()],
+        )
+        .0,
+    )
+    .expect("memory journal-store instance commitment is nonzero")
+}
+
+impl Clone for MemoryAgentJournalStore {
+    /// A public clone is an independently mutable in-memory store, so it must
+    /// not inherit a Shared application capability for the source instance.
+    fn clone(&self) -> Self {
+        self.copy_with_instance(cloned_memory_journal_store_instance(self.instance_id))
+    }
 }
 
 /// Immutable snapshot of an in-memory catalog namespace.
@@ -2826,18 +3222,45 @@ impl MemoryAgentJournalStore {
             return Err(JournalStoreError::ScopeMismatch);
         }
         Ok(Self {
+            instance_id: new_memory_journal_store_instance(agent, node)?,
             agent,
             node,
             genesis_admission: None,
             genesis: None,
             heads: None,
             authority: BTreeMap::new(),
+            shared_ordered_commits: BTreeMap::new(),
             objects: BTreeMap::new(),
             history_nodes: BTreeMap::new(),
             history_retirements: None,
             blobs: Arc::new(BTreeMap::new()),
             gc_intent: None,
         })
+    }
+
+    fn copy_with_instance(&self, instance_id: JournalStoreInstanceId) -> Self {
+        Self {
+            instance_id,
+            agent: self.agent,
+            node: self.node,
+            genesis_admission: self.genesis_admission,
+            genesis: self.genesis.clone(),
+            heads: self.heads.clone(),
+            authority: self.authority.clone(),
+            shared_ordered_commits: self.shared_ordered_commits.clone(),
+            objects: self.objects.clone(),
+            history_nodes: self.history_nodes.clone(),
+            history_retirements: self.history_retirements.clone(),
+            blobs: Arc::clone(&self.blobs),
+            gc_intent: self.gc_intent,
+        }
+    }
+
+    /// Transactional copy for one publication attempt. Unlike public Clone,
+    /// this candidate remains the same logical journal instance and replaces
+    /// `self` only after the complete transition validates.
+    fn candidate_clone(&self) -> Self {
+        self.copy_with_instance(self.instance_id)
     }
 
     fn ensure_no_gc_pending(&self) -> Result<(), JournalStoreError> {
@@ -2942,11 +3365,12 @@ impl MemoryAgentJournalStore {
             .map(Vec::as_slice)
     }
 
-    fn publish_anchor<R: CanonicalJournalRecord>(
+    fn publish_anchor_with_mode<R: CanonicalJournalRecord>(
         &mut self,
         expected: JournalHeadsId,
         anchor: &R,
         next: &JournalHeads,
+        mode: ReplayPublicationMode,
     ) -> Result<JournalPublication, JournalStoreError> {
         self.ensure_no_gc_pending()?;
         ensure_publication_class(R::STORAGE_CLASS)?;
@@ -2976,11 +3400,11 @@ impl MemoryAgentJournalStore {
         current
             .validate_successor(next)
             .map_err(supplied_decode_error)?;
-        validate_publication_shape(&current, anchor, next)?;
+        validate_publication_shape_with_mode(&current, anchor, next, mode)?;
 
         // Build the candidate in a clone so an in-memory reference has the
         // same all-or-nothing head visibility as the filesystem head swap.
-        let mut candidate = self.clone();
+        let mut candidate = self.candidate_clone();
         let object_created = candidate.put(anchor)?;
         validate_anchor_dependencies(&candidate, &current, anchor, next)?;
         validate_head_targets(&candidate, next)?;
@@ -2990,6 +3414,15 @@ impl MemoryAgentJournalStore {
             object_created,
             heads_advanced: true,
         })
+    }
+
+    fn publish_anchor<R: CanonicalJournalRecord>(
+        &mut self,
+        expected: JournalHeadsId,
+        anchor: &R,
+        next: &JournalHeads,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        self.publish_anchor_with_mode(expected, anchor, next, ReplayPublicationMode::Canonical)
     }
 
     #[cfg(test)]
@@ -3046,7 +3479,7 @@ impl MemoryAgentJournalStore {
             return Err(JournalStoreError::Conflict);
         }
         let created = self.genesis.is_none() || self.heads.is_none();
-        let mut candidate = self.clone();
+        let mut candidate = self.candidate_clone();
         candidate.put(&empty_frontier)?;
         candidate.put(&ordered_invocations)?;
         candidate.put(&merge_invocations)?;
@@ -3063,6 +3496,10 @@ impl MemoryAgentJournalStore {
 }
 
 impl AgentJournalStore for MemoryAgentJournalStore {
+    fn instance_id(&self) -> JournalStoreInstanceId {
+        self.instance_id
+    }
+
     fn initialize(&mut self, sealed: &ReplaySealedGenesis) -> Result<bool, JournalStoreError> {
         self.ensure_no_gc_pending()?;
         let shape = validate_sealed_genesis_shape(sealed, self.agent, self.node)?;
@@ -3087,7 +3524,7 @@ impl AgentJournalStore for MemoryAgentJournalStore {
             return Err(JournalStoreError::Conflict);
         }
         let created = self.genesis.is_none() || self.heads.is_none();
-        let mut candidate = self.clone();
+        let mut candidate = self.candidate_clone();
         candidate.persist_authority(sealed.root_anchor())?;
         candidate.persist_authority(sealed.admission_evidence())?;
         candidate.persist_authority(&sealed.admission_record())?;
@@ -3219,27 +3656,27 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         // committed through one clone swap. A stale CAS can therefore leave
         // ordinary content-addressed replay objects, but never permanent
         // history nodes without the authenticating successor head.
-        let mut candidate = self.clone();
+        let mut candidate = self.candidate_clone();
         let history_created = overlay
             .as_ref()
             .map(|overlay| candidate.install_history_candidate(overlay))
             .transpose()?
             .unwrap_or(false);
         let dependency_created = stage_sealed_dependencies(&mut candidate, publication)?;
-        let mut result = match publication.anchor() {
-            ReplayPublicationAnchor::Ordered(entry) => {
-                candidate.publish_anchor(expected, entry, next)?
-            }
-            ReplayPublicationAnchor::Local(entry) => {
-                candidate.publish_anchor(expected, entry, next)?
-            }
-            ReplayPublicationAnchor::Merge { event, .. } => {
-                candidate.publish_anchor(expected, event, next)?
-            }
-            ReplayPublicationAnchor::Checkpoint(checkpoint) => {
-                candidate.publish_anchor(expected, checkpoint, next)?
-            }
-        };
+        let mut result =
+            match publication.anchor() {
+                ReplayPublicationAnchor::Ordered(entry) => {
+                    candidate.publish_anchor_with_mode(expected, entry, next, publication.mode())?
+                }
+                ReplayPublicationAnchor::Local(entry) => {
+                    candidate.publish_anchor_with_mode(expected, entry, next, publication.mode())?
+                }
+                ReplayPublicationAnchor::Merge { event, .. } => {
+                    candidate.publish_anchor_with_mode(expected, event, next, publication.mode())?
+                }
+                ReplayPublicationAnchor::Checkpoint(checkpoint) => candidate
+                    .publish_anchor_with_mode(expected, checkpoint, next, publication.mode())?,
+            };
         if result.heads_advanced
             && let Some(overlay) = &overlay
         {
@@ -3248,6 +3685,58 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         *self = candidate;
         result.object_created |= dependency_created || history_created;
         Ok(result)
+    }
+}
+
+impl SharedOrderedCommitStore for MemoryAgentJournalStore {
+    fn shared_ordered_commit(
+        &self,
+        entry: OrderedEntryId,
+    ) -> Result<Option<SharedOrderedCommitBinding>, JournalStoreError> {
+        if entry == OrderedEntryId::ZERO {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let binding = self
+            .shared_ordered_commits
+            .get(&entry)
+            .map(|bytes| decode_shared_ordered_commit_binding(bytes, entry))
+            .transpose()?;
+        if let Some(binding) = &binding {
+            let heads = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+            validate_shared_ordered_commit_scope(binding, &heads, self.instance_id())?;
+        }
+        Ok(binding)
+    }
+
+    fn persist_shared_ordered_commit(
+        &mut self,
+        binding: &SharedOrderedCommitBinding,
+    ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
+        binding.validate()?;
+        let heads = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        validate_shared_ordered_commit_scope(binding, &heads, self.instance_id())?;
+        let bytes = binding.encode();
+        if bytes.len() > MAX_SHARED_ORDERED_COMMIT_BINDING_BYTES {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        match self.shared_ordered_commits.get(&binding.entry) {
+            Some(existing) => {
+                decode_shared_ordered_commit_binding(existing, binding.entry)?;
+                if existing == &bytes {
+                    Ok(false)
+                } else {
+                    Err(JournalStoreError::Conflict)
+                }
+            }
+            None => {
+                if self.shared_ordered_commits.len() == MAX_SHARED_ORDERED_COMMIT_BINDINGS {
+                    return Err(JournalStoreError::LimitExceeded);
+                }
+                self.shared_ordered_commits.insert(binding.entry, bytes);
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -3407,6 +3896,28 @@ impl FileIdentity {
             inode: metadata.ino(),
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn file_journal_store_instance_id(
+    root: &Path,
+    agent: AgentId,
+    node: NodeId,
+    stable_lock_nonce: &[u8; STABLE_LOCK_NONCE_BYTES],
+) -> Result<JournalStoreInstanceId, JournalStoreError> {
+    JournalStoreInstanceId::from_bytes(
+        Hash::digest(
+            b"vos/agent/journal-store/file-instance",
+            &[
+                root.as_os_str().as_bytes(),
+                &agent.0,
+                &node.0,
+                stable_lock_nonce,
+            ],
+        )
+        .0,
+    )
+    .ok_or(JournalStoreError::Corrupt)
 }
 
 #[cfg(target_os = "linux")]
@@ -3826,7 +4337,9 @@ struct DirectoryCapabilities;
 /// `stable_lock_path` must be the deterministic sibling
 /// `<full-agent-id>.agent-lock`. Callers cannot select an alternate lock for
 /// the same root. The lock therefore remains authoritative if backup/restore
-/// replaces the complete Agent directory. Opening acquires it before creating,
+/// replaces the complete Agent directory. Its exact 32-byte nonce is durable
+/// store-instance state and must be preserved with backups. Opening acquires
+/// the lock before initializing or reading that nonce and before creating,
 /// repairing, or otherwise mutating anything below `root`.
 ///
 /// On Linux, the daemon user is the filesystem trust domain: the lock, Agent
@@ -3841,6 +4354,7 @@ struct DirectoryCapabilities;
 /// implementation is provided.
 pub struct FileAgentJournalStore {
     root: PathBuf,
+    instance_id: JournalStoreInstanceId,
     agent: AgentId,
     node: NodeId,
     directories: DirectoryCapabilities,
@@ -3849,6 +4363,8 @@ pub struct FileAgentJournalStore {
     stable_lock_name: CString,
     #[cfg(target_os = "linux")]
     stable_lock_identity: FileIdentity,
+    #[cfg(target_os = "linux")]
+    stable_lock_nonce: [u8; STABLE_LOCK_NONCE_BYTES],
     _stable_lock: File,
 }
 
@@ -3862,6 +4378,7 @@ struct FileCatalogCapability {
     directories: DirectoryCapabilities,
     stable_lock_name: CString,
     stable_lock_identity: FileIdentity,
+    stable_lock_nonce: [u8; STABLE_LOCK_NONCE_BYTES],
     stable_lock: File,
 }
 
@@ -3874,6 +4391,7 @@ impl FileCatalogCapability {
             &self.stable_lock_name,
             self.stable_lock_identity,
         )?;
+        verify_stable_lock_nonce(&self.stable_lock, &self.stable_lock_nonce)?;
         self.directories.get("catalog/blobs")?;
         Ok(())
     }
@@ -3962,6 +4480,7 @@ impl CatalogBlobResolverFactory for FileAgentJournalStore {
                 directories: self.directories.try_clone()?,
                 stable_lock_name: self.stable_lock_name.clone(),
                 stable_lock_identity: self.stable_lock_identity,
+                stable_lock_nonce: self.stable_lock_nonce,
                 stable_lock: self
                     ._stable_lock
                     .try_clone()
@@ -4070,7 +4589,8 @@ impl FileAgentJournalStore {
             .and_then(|name| name.to_str())
             .ok_or(JournalStoreError::InvalidPath)?;
         let external_parent = AbsoluteDirectoryCapability::open(&root_parent)?;
-        let stable_lock = open_stable_lock_at(external_parent.get()?, stable_lock_name)?;
+        let (stable_lock, stable_lock_nonce) =
+            open_stable_lock_at(external_parent.get()?, stable_lock_name)?;
         let stable_lock_identity = FileIdentity::of(&stable_lock)?;
         let stable_lock_name = c_name(stable_lock_name)?;
         verify_regular_entry(
@@ -4100,6 +4620,7 @@ impl FileAgentJournalStore {
                 "artifact-closures",
                 "invocation-index",
                 "invocation-outcomes",
+                SHARED_ORDERED_COMMIT_DIRECTORY,
                 HISTORY_DIRECTORY,
                 "catalog",
                 "authority",
@@ -4117,6 +4638,12 @@ impl FileAgentJournalStore {
             DirectoryCapabilities::new(external_parent, c_name(root_name)?, root_directory)?;
 
         let mut store = Self {
+            instance_id: file_journal_store_instance_id(
+                &canonical_root,
+                agent,
+                node,
+                &stable_lock_nonce,
+            )?,
             root: canonical_root,
             agent,
             node,
@@ -4124,6 +4651,7 @@ impl FileAgentJournalStore {
             history_candidate: None,
             stable_lock_name,
             stable_lock_identity,
+            stable_lock_nonce,
             _stable_lock: stable_lock,
         };
         store.validate_recovery_state()?;
@@ -4149,7 +4677,8 @@ impl FileAgentJournalStore {
             self.directories.external_parent()?,
             &self.stable_lock_name,
             self.stable_lock_identity,
-        )
+        )?;
+        verify_stable_lock_nonce(&self._stable_lock, &self.stable_lock_nonce)
     }
 
     fn read_gc_intent_file(&self, name: &str) -> Result<Option<GcIntent>, JournalStoreError> {
@@ -4204,6 +4733,11 @@ impl FileAgentJournalStore {
                 ("artifact-closures", "", "artifact-closures"),
                 ("invocation-index", "", "invocation-index"),
                 ("invocation-outcomes", "", "invocation-outcomes"),
+                (
+                    SHARED_ORDERED_COMMIT_DIRECTORY,
+                    "",
+                    SHARED_ORDERED_COMMIT_DIRECTORY,
+                ),
                 (HISTORY_DIRECTORY, "", HISTORY_DIRECTORY),
                 ("catalog", "", "catalog"),
                 ("authority", "", "authority"),
@@ -4316,6 +4850,7 @@ impl FileAgentJournalStore {
                 "invocation-index/manifests",
                 "invocation-index/nodes",
                 "invocation-outcomes",
+                SHARED_ORDERED_COMMIT_DIRECTORY,
                 "catalog/blobs",
                 "authority/root-anchors",
                 "authority/genesis-evidence",
@@ -4326,10 +4861,12 @@ impl FileAgentJournalStore {
                     is_content_private_stage_name,
                 )?;
             }
+            self.audit_shared_ordered_commit_directory()?;
             for key in [
                 "records",
                 "lane-state",
                 "invocation-index",
+                SHARED_ORDERED_COMMIT_DIRECTORY,
                 "catalog",
                 "authority",
                 HISTORY_CANDIDATE_DIRECTORY,
@@ -5079,6 +5616,117 @@ impl FileAgentJournalStore {
         )
     }
 
+    fn read_shared_ordered_commit_binding(
+        &self,
+        entry: OrderedEntryId,
+    ) -> Result<Option<SharedOrderedCommitBinding>, JournalStoreError> {
+        if entry == OrderedEntryId::ZERO {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let directory = self.directory(SHARED_ORDERED_COMMIT_DIRECTORY)?;
+        let name = encode_hex(entry.as_bytes());
+        let staged = sibling_next_name(&name);
+        let staged =
+            read_bounded_regular_at(directory, &staged, MAX_SHARED_ORDERED_COMMIT_BINDING_BYTES)?
+                .map(|bytes| decode_shared_ordered_commit_binding(&bytes, entry))
+                .transpose()?;
+        let committed =
+            read_bounded_regular_at(directory, &name, MAX_SHARED_ORDERED_COMMIT_BINDING_BYTES)?
+                .map(|bytes| decode_shared_ordered_commit_binding(&bytes, entry))
+                .transpose()?;
+        if let (Some(staged), Some(committed)) = (&staged, &committed)
+            && staged != committed
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(committed)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn audit_shared_ordered_commit_directory(&self) -> Result<usize, JournalStoreError> {
+        let directory = self.directory(SHARED_ORDERED_COMMIT_DIRECTORY)?;
+        let names = bounded_directory_names(directory, MAX_SHARED_ORDERED_COMMIT_FILES)?;
+        let heads = self.heads()?;
+        if heads.is_none() && !names.is_empty() {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let mut bindings: BTreeMap<
+            OrderedEntryId,
+            (
+                Option<SharedOrderedCommitBinding>,
+                Option<SharedOrderedCommitBinding>,
+            ),
+        > = BTreeMap::new();
+        for name in names {
+            let (stem, staged) = name
+                .strip_suffix(".next")
+                .map_or((name.as_str(), false), |stem| (stem, true));
+            let raw = decode_hex_32(stem.as_bytes()).ok_or(JournalStoreError::Corrupt)?;
+            let entry = OrderedEntryId(raw);
+            if entry == OrderedEntryId::ZERO || encode_hex(entry.as_bytes()) != stem {
+                return Err(JournalStoreError::Corrupt);
+            }
+            let bytes =
+                read_bounded_regular_at(directory, &name, MAX_SHARED_ORDERED_COMMIT_BINDING_BYTES)?
+                    .ok_or(JournalStoreError::Corrupt)?;
+            let binding = decode_shared_ordered_commit_binding(&bytes, entry)?;
+            let heads = heads.as_ref().ok_or(JournalStoreError::Corrupt)?;
+            validate_shared_ordered_commit_scope(&binding, heads, self.instance_id())?;
+            if binding.claim().ordered().index
+                > heads
+                    .ordered_index
+                    .checked_add(1)
+                    .ok_or(JournalStoreError::LimitExceeded)?
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+            if !bindings.contains_key(&entry)
+                && bindings.len() == MAX_SHARED_ORDERED_COMMIT_BINDINGS
+            {
+                return Err(JournalStoreError::LimitExceeded);
+            }
+            let slot = bindings.entry(entry).or_default();
+            let destination = if staged { &mut slot.1 } else { &mut slot.0 };
+            if destination.replace(binding).is_some() {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+        if bindings.values().any(|(committed, staged)| {
+            matches!((committed, staged), (Some(committed), Some(staged)) if committed != staged)
+        }) {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(bindings.len())
+    }
+
+    fn persist_shared_ordered_commit_binding(
+        &self,
+        binding: &SharedOrderedCommitBinding,
+    ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
+        binding.validate()?;
+        let heads = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        validate_shared_ordered_commit_scope(binding, &heads, self.instance_id())?;
+        let bytes = binding.encode();
+        if let Some(existing) = self.read_shared_ordered_commit_binding(binding.entry)? {
+            return if existing == *binding {
+                Ok(false)
+            } else {
+                Err(JournalStoreError::Conflict)
+            };
+        }
+        if self.audit_shared_ordered_commit_directory()? == MAX_SHARED_ORDERED_COMMIT_BINDINGS {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        persist_immutable_at(
+            self.directory(SHARED_ORDERED_COMMIT_DIRECTORY)?,
+            &encode_hex(binding.entry.as_bytes()),
+            &bytes,
+            MAX_SHARED_ORDERED_COMMIT_BINDING_BYTES,
+            |stored| decode_shared_ordered_commit_binding(stored, binding.entry).map(|_| ()),
+        )
+    }
+
     fn read_admission(&self, name: &str) -> Result<Option<Hash>, JournalStoreError> {
         let Some(bytes) = read_bounded_regular_at(self.directory("")?, name, 32)? else {
             return Ok(None);
@@ -5196,11 +5844,12 @@ impl FileAgentJournalStore {
         Ok(true)
     }
 
-    fn publish_inner<R, F>(
+    fn publish_inner_with_mode<R, F>(
         &mut self,
         expected: JournalHeadsId,
         anchor: &R,
         next: &JournalHeads,
+        mode: ReplayPublicationMode,
         mut publication_point: F,
     ) -> Result<JournalPublication, JournalStoreError>
     where
@@ -5233,7 +5882,7 @@ impl FileAgentJournalStore {
         current
             .validate_successor(next)
             .map_err(supplied_decode_error)?;
-        validate_publication_shape(&current, anchor, next)?;
+        validate_publication_shape_with_mode(&current, anchor, next, mode)?;
 
         let object_created = self.persist_object(anchor)?;
         publication_point(PublicationPoint::ObjectDurable)?;
@@ -5273,6 +5922,26 @@ impl FileAgentJournalStore {
             object_created,
             heads_advanced: true,
         })
+    }
+
+    fn publish_inner<R, F>(
+        &mut self,
+        expected: JournalHeadsId,
+        anchor: &R,
+        next: &JournalHeads,
+        publication_point: F,
+    ) -> Result<JournalPublication, JournalStoreError>
+    where
+        R: CanonicalJournalRecord,
+        F: FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
+    {
+        self.publish_inner_with_mode(
+            expected,
+            anchor,
+            next,
+            ReplayPublicationMode::Canonical,
+            publication_point,
+        )
     }
 
     fn publish_anchor<R: CanonicalJournalRecord>(
@@ -5328,18 +5997,34 @@ impl FileAgentJournalStore {
         if exact_retry {
             let dependency_created = stage_sealed_dependencies(self, publication)?;
             let mut result = match publication.anchor() {
-                ReplayPublicationAnchor::Ordered(entry) => {
-                    self.publish_inner(expected, entry, next, &mut publication_point)?
-                }
-                ReplayPublicationAnchor::Local(entry) => {
-                    self.publish_inner(expected, entry, next, &mut publication_point)?
-                }
-                ReplayPublicationAnchor::Merge { event, .. } => {
-                    self.publish_inner(expected, event, next, &mut publication_point)?
-                }
-                ReplayPublicationAnchor::Checkpoint(checkpoint) => {
-                    self.publish_inner(expected, checkpoint, next, &mut publication_point)?
-                }
+                ReplayPublicationAnchor::Ordered(entry) => self.publish_inner_with_mode(
+                    expected,
+                    entry,
+                    next,
+                    publication.mode(),
+                    &mut publication_point,
+                )?,
+                ReplayPublicationAnchor::Local(entry) => self.publish_inner_with_mode(
+                    expected,
+                    entry,
+                    next,
+                    publication.mode(),
+                    &mut publication_point,
+                )?,
+                ReplayPublicationAnchor::Merge { event, .. } => self.publish_inner_with_mode(
+                    expected,
+                    event,
+                    next,
+                    publication.mode(),
+                    &mut publication_point,
+                )?,
+                ReplayPublicationAnchor::Checkpoint(checkpoint) => self.publish_inner_with_mode(
+                    expected,
+                    checkpoint,
+                    next,
+                    publication.mode(),
+                    &mut publication_point,
+                )?,
             };
             result.object_created |= dependency_created;
             return Ok(result);
@@ -5348,18 +6033,34 @@ impl FileAgentJournalStore {
         let attempted = (|| {
             let dependency_created = stage_sealed_dependencies(self, publication)?;
             let mut result = match publication.anchor() {
-                ReplayPublicationAnchor::Ordered(entry) => {
-                    self.publish_inner(expected, entry, next, &mut publication_point)?
-                }
-                ReplayPublicationAnchor::Local(entry) => {
-                    self.publish_inner(expected, entry, next, &mut publication_point)?
-                }
-                ReplayPublicationAnchor::Merge { event, .. } => {
-                    self.publish_inner(expected, event, next, &mut publication_point)?
-                }
-                ReplayPublicationAnchor::Checkpoint(checkpoint) => {
-                    self.publish_inner(expected, checkpoint, next, &mut publication_point)?
-                }
+                ReplayPublicationAnchor::Ordered(entry) => self.publish_inner_with_mode(
+                    expected,
+                    entry,
+                    next,
+                    publication.mode(),
+                    &mut publication_point,
+                )?,
+                ReplayPublicationAnchor::Local(entry) => self.publish_inner_with_mode(
+                    expected,
+                    entry,
+                    next,
+                    publication.mode(),
+                    &mut publication_point,
+                )?,
+                ReplayPublicationAnchor::Merge { event, .. } => self.publish_inner_with_mode(
+                    expected,
+                    event,
+                    next,
+                    publication.mode(),
+                    &mut publication_point,
+                )?,
+                ReplayPublicationAnchor::Checkpoint(checkpoint) => self.publish_inner_with_mode(
+                    expected,
+                    checkpoint,
+                    next,
+                    publication.mode(),
+                    &mut publication_point,
+                )?,
             };
             if result.heads_advanced && overlay.is_some() {
                 result.object_created |= self.finish_history_candidate(&mut publication_point)?;
@@ -5819,6 +6520,10 @@ impl InvocationHistoryStore for FileAgentJournalStore {
 }
 
 impl AgentJournalStore for FileAgentJournalStore {
+    fn instance_id(&self) -> JournalStoreInstanceId {
+        self.instance_id
+    }
+
     fn initialize(&mut self, sealed: &ReplaySealedGenesis) -> Result<bool, JournalStoreError> {
         self.ensure_no_gc_pending()?;
         let shape = validate_sealed_genesis_shape(sealed, self.agent, self.node)?;
@@ -5964,6 +6669,27 @@ impl AgentJournalStore for FileAgentJournalStore {
         {
             self.publish_sealed_inner(publication, |_| Ok(()))
         }
+    }
+}
+
+impl SharedOrderedCommitStore for FileAgentJournalStore {
+    fn shared_ordered_commit(
+        &self,
+        entry: OrderedEntryId,
+    ) -> Result<Option<SharedOrderedCommitBinding>, JournalStoreError> {
+        let binding = self.read_shared_ordered_commit_binding(entry)?;
+        if let Some(binding) = &binding {
+            let heads = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+            validate_shared_ordered_commit_scope(binding, &heads, self.instance_id())?;
+        }
+        Ok(binding)
+    }
+
+    fn persist_shared_ordered_commit(
+        &mut self,
+        binding: &SharedOrderedCommitBinding,
+    ) -> Result<bool, JournalStoreError> {
+        self.persist_shared_ordered_commit_binding(binding)
     }
 }
 
@@ -6125,12 +6851,14 @@ mod tests {
         ActorExecutionReply, ActorExecutionStatus, ActorInvocation, ActorInvocationAuth,
         ActorObservation,
     };
+    use crate::agent::genesis::{AgentGenesisAdmissionId, AgentReplicaCommitteeId};
     use crate::agent::invocation_index::{InvocationIndex, InvocationIndexLookup};
     use crate::agent::journal::{
-        CheckpointLane, InvocationAcknowledgedFact, InvocationDisposition, InvocationOutcomeAnchor,
-        InvocationOutcomeRecord, InvocationOwner, InvocationOwnershipKey, InvocationResultState,
-        ReplayInput, ReplayOperation, RuntimeBinding,
+        ArtifactClosureId, CheckpointLane, InvocationAcknowledgedFact, InvocationDisposition,
+        InvocationOutcomeAnchor, InvocationOutcomeRecord, InvocationOwner, InvocationOwnershipKey,
+        InvocationResultState, ReplayInput, ReplayOperation, RuntimeBinding,
     };
+    use crate::agent::shared_commit::SharedLaneProjection;
     use crate::agent::{
         AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LaneSet,
         LifecycleAuthorityAdmission, LifecycleRequest, MethodMode, ReplicaRole,
@@ -6562,6 +7290,53 @@ mod tests {
         }
     }
 
+    fn shared_ordered_binding(
+        genesis: &AgentJournalGenesis,
+        heads: &JournalHeads,
+        entry: &OrderedEntry,
+        journal_store: JournalStoreInstanceId,
+    ) -> SharedOrderedCommitBinding {
+        let merge = SharedLaneProjection::new(
+            LaneStateId([0xd1; 32]),
+            BlobRef::of_bytes(b"shared merge projection"),
+        )
+        .unwrap();
+        let control = SharedLaneProjection::new(
+            LaneStateId([0xd2; 32]),
+            BlobRef::of_bytes(b"shared control projection"),
+        )
+        .unwrap();
+        let linear = SharedLaneProjection::new(
+            LaneStateId([0xd3; 32]),
+            BlobRef::of_bytes(b"shared linear projection"),
+        )
+        .unwrap();
+        let claim = OrderedCommitClaim::new(
+            genesis.id(),
+            AgentGenesisAdmissionId::from_bytes(*genesis.admission.as_bytes()),
+            AgentReplicaCommitteeId::from_bytes([0xd4; 32]),
+            entry.index,
+            1,
+            OrderedBase {
+                index: entry.index,
+                head: Some(entry.id()),
+            },
+            entry.merge_frontier,
+            merge,
+            heads.merge_invocations,
+            heads.runtime.clone(),
+            control,
+            linear,
+            heads.ordered_invocations,
+            ArtifactClosureId([0xd5; 32]),
+            heads.merge_fence,
+            None,
+            Hash([0xd6; 32]),
+        )
+        .unwrap();
+        SharedOrderedCommitBinding::new(journal_store, entry.id(), claim, Hash([0xd7; 32])).unwrap()
+    }
+
     #[derive(Clone)]
     struct PreparedHistoryTransition {
         entry: OrderedEntry,
@@ -6843,6 +7618,102 @@ mod tests {
     }
 
     #[test]
+    fn memory_shared_ordered_commit_binding_is_immutable_and_idempotent() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let heads = store.heads().unwrap().unwrap();
+        let entry = first_ordered(&genesis, &heads);
+        let binding = shared_ordered_binding(&genesis, &heads, &entry, store.instance_id());
+
+        assert!(store.persist_shared_ordered_commit(&binding).unwrap());
+        assert_eq!(
+            store.shared_ordered_commit(entry.id()).unwrap(),
+            Some(binding.clone())
+        );
+        assert!(!store.persist_shared_ordered_commit(&binding).unwrap());
+
+        let conflicting = SharedOrderedCommitBinding::new(
+            store.instance_id(),
+            entry.id(),
+            binding.claim().clone(),
+            Hash([0xd8; 32]),
+        )
+        .unwrap();
+        assert_eq!(
+            store.persist_shared_ordered_commit(&conflicting),
+            Err(JournalStoreError::Conflict)
+        );
+        assert_eq!(
+            store.shared_ordered_commit(entry.id()).unwrap(),
+            Some(binding)
+        );
+    }
+
+    #[test]
+    fn file_shared_ordered_commit_binding_survives_reopen_exactly() {
+        let directory = TestDirectory::new("shared-ordered-commit");
+        let genesis = genesis();
+        let mut store = open_file_store(&directory);
+        initialize(&mut store, &genesis);
+        let heads = store.heads().unwrap().unwrap();
+        let entry = first_ordered(&genesis, &heads);
+        let binding = shared_ordered_binding(&genesis, &heads, &entry, store.instance_id());
+
+        assert!(store.persist_shared_ordered_commit(&binding).unwrap());
+        assert!(!store.persist_shared_ordered_commit(&binding).unwrap());
+        drop(store);
+
+        let mut reopened = open_file_store(&directory);
+        assert_eq!(
+            reopened.shared_ordered_commit(entry.id()).unwrap(),
+            Some(binding.clone())
+        );
+        let conflicting = SharedOrderedCommitBinding::new(
+            reopened.instance_id(),
+            entry.id(),
+            binding.claim().clone(),
+            Hash([0xd9; 32]),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.persist_shared_ordered_commit(&conflicting),
+            Err(JournalStoreError::Conflict)
+        );
+        assert_eq!(
+            reopened.shared_ordered_commit(entry.id()).unwrap(),
+            Some(binding)
+        );
+    }
+
+    #[test]
+    fn file_shared_ordered_commit_namespace_rejects_extra_entries_on_open() {
+        let directory = TestDirectory::new("shared-ordered-commit-junk");
+        let genesis = genesis();
+        let mut store = open_file_store(&directory);
+        initialize(&mut store, &genesis);
+        let root = store.root().to_path_buf();
+        drop(store);
+
+        fs::write(
+            root.join(SHARED_ORDERED_COMMIT_DIRECTORY).join("junk"),
+            b"junk",
+        )
+        .unwrap();
+        let config = config();
+        assert!(matches!(
+            FileAgentJournalStore::open_unverified_for_test(
+                directory.agent_root(config.identity.agent),
+                directory.lock(config.identity.agent),
+                config.replicas[0].node,
+            ),
+            Err(JournalStoreError::Corrupt)
+        ));
+    }
+
+    #[test]
     fn memory_history_candidate_rolls_back_on_stale_cas_and_commits_exact_fact() {
         let genesis = genesis();
         let config = config();
@@ -7079,6 +7950,67 @@ mod tests {
             ..current.clone()
         };
         validate_publication_shape(&current, &sealed, &sealed_next).unwrap();
+    }
+
+    #[test]
+    fn shared_ordered_splice_requires_replay_private_publication_mode() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let current = store.heads().unwrap().unwrap();
+        let pinned = MergeFrontierId([0xe1; 32]);
+        let entry = OrderedEntry {
+            merge_frontier: pinned,
+            ..first_ordered(&genesis, &current)
+        };
+        let next = ordered_successor(&current, &entry);
+
+        // Raw/local journal publication has no authority to interpret a
+        // pinned Shared projection as a C/L-only splice.
+        assert_eq!(
+            validate_publication_shape(&current, &entry, &next),
+            Err(JournalStoreError::NonCanonical)
+        );
+        validate_publication_shape_with_mode(
+            &current,
+            &entry,
+            &next,
+            ReplayPublicationMode::SharedOrderedPreserveMerge,
+        )
+        .unwrap();
+
+        let seal = MergeSealId([0xe2; 32]);
+        let fenced = OrderedEntry {
+            input: management_input(0xe3),
+            merge_seal: Some(seal),
+            ..entry
+        };
+        let fenced_next = JournalHeads {
+            publication_revision: current.publication_revision + 1,
+            previous: Some(current.id()),
+            ordered_head: Some(fenced.id()),
+            ordered_index: fenced.index,
+            merge_frontier: pinned,
+            merge_fence: OrderedBase {
+                index: fenced.index,
+                head: Some(fenced.id()),
+            },
+            merge_seal: Some(seal),
+            ..current.clone()
+        };
+        assert_eq!(
+            validate_publication_shape(&current, &fenced, &fenced_next),
+            Err(JournalStoreError::NonCanonical)
+        );
+        validate_publication_shape_with_mode(
+            &current,
+            &fenced,
+            &fenced_next,
+            ReplayPublicationMode::SharedOrderedInstallFence,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -8762,6 +9694,74 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn file_store_instance_id_survives_exact_lock_reopen() {
+        let directory = TestDirectory::new("instance-id-reopen");
+        let config = config();
+        let lock = directory.lock(config.identity.agent);
+        let first = open_file_store(&directory);
+        let instance = first.instance_id();
+        let nonce = fs::read(&lock).unwrap();
+        assert_eq!(nonce.len(), STABLE_LOCK_NONCE_BYTES);
+        assert_ne!(nonce, vec![0; STABLE_LOCK_NONCE_BYTES]);
+        drop(first);
+
+        let reopened = open_file_store(&directory);
+        assert_eq!(reopened.instance_id(), instance);
+        assert_eq!(fs::read(lock).unwrap(), nonce);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_store_instance_id_binds_lock_nonce_and_canonical_path() {
+        let first_directory = TestDirectory::new("instance-id-first");
+        let config = config();
+        let first_lock = first_directory.lock(config.identity.agent);
+        let first = open_file_store(&first_directory);
+        let first_instance = first.instance_id();
+        let first_nonce = fs::read(&first_lock).unwrap();
+        drop(first);
+
+        // Replacing the stable lock at the same canonical path creates a new
+        // physical store even if the replaceable Agent directory remains.
+        fs::remove_file(&first_lock).unwrap();
+        fs::write(&first_lock, [0x91; STABLE_LOCK_NONCE_BYTES]).unwrap();
+        let replacement = open_file_store(&first_directory);
+        assert_ne!(replacement.instance_id(), first_instance);
+        drop(replacement);
+
+        // Reusing exact backup nonce bytes at another canonical root must not
+        // transplant the original store capability.
+        let other_directory = TestDirectory::new("instance-id-other-path");
+        fs::write(other_directory.lock(config.identity.agent), first_nonce).unwrap();
+        let other = open_file_store(&other_directory);
+        assert_ne!(other.instance_id(), first_instance);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_lock_rejects_malformed_or_zero_nonce() {
+        for bytes in [
+            vec![0x11],
+            vec![0x22; STABLE_LOCK_NONCE_BYTES - 1],
+            vec![0x33; STABLE_LOCK_NONCE_BYTES + 1],
+            vec![0; STABLE_LOCK_NONCE_BYTES],
+        ] {
+            let directory = TestDirectory::new("malformed-lock-nonce");
+            let config = config();
+            fs::write(directory.lock(config.identity.agent), bytes).unwrap();
+            assert!(matches!(
+                FileAgentJournalStore::open_unverified_for_test(
+                    directory.agent_root(config.identity.agent),
+                    directory.lock(config.identity.agent),
+                    config.replicas[0].node,
+                ),
+                Err(JournalStoreError::Corrupt)
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn file_catalog_resolver_reads_exact_content_and_retains_the_stable_lock() {
         let directory = TestDirectory::new("catalog-resolver-lock");
         let mut store = open_file_store(&directory);
@@ -9347,11 +10347,74 @@ fn open_directory_at(parent: &File, name: &str) -> Result<File, JournalStoreErro
 }
 
 #[cfg(target_os = "linux")]
-fn open_stable_lock_at(parent: &File, name: &str) -> Result<File, JournalStoreError> {
-    let name = c_name(name)?;
-    let existed = stat_at(parent, &name)
+const STABLE_LOCK_NONCE_BYTES: usize = 32;
+
+#[cfg(target_os = "linux")]
+fn stable_lock_nonce(
+    file: &File,
+    parent: &File,
+) -> Result<[u8; STABLE_LOCK_NONCE_BYTES], JournalStoreError> {
+    let length = file
+        .metadata()
         .map_err(|_| JournalStoreError::Unavailable)?
-        .is_some();
+        .len();
+    let mut nonce = [0_u8; STABLE_LOCK_NONCE_BYTES];
+    match length {
+        0 => {
+            getrandom::getrandom(&mut nonce).map_err(|_| JournalStoreError::Unavailable)?;
+            if nonce == [0; STABLE_LOCK_NONCE_BYTES] {
+                return Err(JournalStoreError::Unavailable);
+            }
+            UnixFileExt::write_all_at(file, &nonce, 0)
+                .map_err(|_| JournalStoreError::Unavailable)?;
+        }
+        length if length == STABLE_LOCK_NONCE_BYTES as u64 => {
+            UnixFileExt::read_exact_at(file, &mut nonce, 0)
+                .map_err(|_| JournalStoreError::Corrupt)?;
+            if nonce == [0; STABLE_LOCK_NONCE_BYTES] {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+        _ => return Err(JournalStoreError::Corrupt),
+    }
+
+    // Always re-establish durability, including a retry after a prior open
+    // wrote all 32 bytes but failed one of these syncs. Otherwise that retry
+    // could bind a ledger capability to a nonce that disappears on crash.
+    file.sync_all()
+        .and_then(|()| parent.sync_all())
+        .map_err(|_| JournalStoreError::Unavailable)?;
+    verify_stable_lock_nonce(file, &nonce)?;
+    Ok(nonce)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_stable_lock_nonce(
+    file: &File,
+    expected: &[u8; STABLE_LOCK_NONCE_BYTES],
+) -> Result<(), JournalStoreError> {
+    if file
+        .metadata()
+        .map_err(|_| JournalStoreError::Unavailable)?
+        .len()
+        != STABLE_LOCK_NONCE_BYTES as u64
+    {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let mut nonce = [0_u8; STABLE_LOCK_NONCE_BYTES];
+    UnixFileExt::read_exact_at(file, &mut nonce, 0).map_err(|_| JournalStoreError::Corrupt)?;
+    if nonce == [0; STABLE_LOCK_NONCE_BYTES] || nonce != *expected {
+        return Err(JournalStoreError::Corrupt);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_stable_lock_at(
+    parent: &File,
+    name: &str,
+) -> Result<(File, [u8; STABLE_LOCK_NONCE_BYTES]), JournalStoreError> {
+    let name = c_name(name)?;
     let file = open_at(
         parent,
         &name,
@@ -9367,12 +10430,8 @@ fn open_stable_lock_at(parent: &File, name: &str) -> Result<File, JournalStoreEr
             JournalStoreError::Unavailable
         }
     })?;
-    if !existed {
-        file.sync_all()
-            .and_then(|()| parent.sync_all())
-            .map_err(|_| JournalStoreError::Unavailable)?;
-    }
-    Ok(file)
+    let nonce = stable_lock_nonce(&file, parent)?;
+    Ok((file, nonce))
 }
 
 #[cfg(target_os = "linux")]
@@ -9505,6 +10564,66 @@ fn validate_directory_names(directory: &File, allowed: &[&str]) -> Result<(), Jo
         return Err(JournalStoreError::Unavailable);
     }
     result
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_directory_names(
+    directory: &File,
+    maximum: usize,
+) -> Result<Vec<String>, JournalStoreError> {
+    // `fdopendir` owns its descriptor, so duplicate the pinned capability.
+    // SAFETY: `fcntl` receives a valid descriptor and returns a fresh one.
+    let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(JournalStoreError::Unavailable);
+    }
+    // SAFETY: `duplicate` is fresh and ownership passes to the DIR stream.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        // SAFETY: `fdopendir` failed and did not consume the descriptor.
+        unsafe { libc::close(duplicate) };
+        return Err(JournalStoreError::Unavailable);
+    }
+    // SAFETY: `stream` is live until `closedir` below.
+    unsafe { libc::rewinddir(stream) };
+    let mut names = Vec::new();
+    let result = loop {
+        // SAFETY: Linux exposes a thread-local errno pointer.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: `stream` remains live until `closedir` below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            // SAFETY: Linux exposes a thread-local errno pointer.
+            let errno = unsafe { *libc::__errno_location() };
+            break if errno == 0 {
+                Ok(())
+            } else {
+                Err(JournalStoreError::Unavailable)
+            };
+        }
+        // SAFETY: `d_name` is NUL-terminated for a successful `readdir`.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        if names.len() == maximum {
+            break Err(JournalStoreError::LimitExceeded);
+        }
+        let Ok(name) = name.to_str() else {
+            break Err(JournalStoreError::Corrupt);
+        };
+        if names.try_reserve(1).is_err() {
+            break Err(JournalStoreError::LimitExceeded);
+        }
+        names.push(name.to_owned());
+    };
+    // SAFETY: `stream` is live and `closedir` consumes it and its descriptor.
+    let closed = unsafe { libc::closedir(stream) };
+    if closed != 0 {
+        return Err(JournalStoreError::Unavailable);
+    }
+    result?;
+    Ok(names)
 }
 
 #[cfg(target_os = "linux")]

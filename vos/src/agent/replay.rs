@@ -17,6 +17,7 @@ use super::committee::{
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, MAX_RUNTIME_STATE_BYTES,
 };
+use super::genesis::AgentReplicaCommittee;
 use super::invocation_history::InvocationHistoryWritePlan;
 #[cfg(feature = "std")]
 use super::invocation_index::InvocationIndexes;
@@ -41,10 +42,19 @@ use super::journal::{
 #[cfg(feature = "std")]
 use super::journal_store::{
     AgentJournalStore, JournalBlobClass, JournalPublication, JournalStoreError,
+    SharedOrderedCommitStore,
+};
+use super::shared_commit::OrderedCommitClaim;
+#[cfg(feature = "std")]
+use super::shared_commit::{SharedLaneProjection, SharedSealedMergeProjection};
+use super::shared_raft::{
+    AgentRaftCommand, AgentRouteKey, JournalStoreInstanceId, ReservedAgentRaftApplication,
 };
 use super::standard::StandardAgentRuntime;
 use super::wire::{RuntimeState, decode_standard_runtime_state, encode_standard_runtime_state};
-use super::{AgentReplica, AgentRuntime, InvocationResultStorage, LifecycleRequest, StateLane};
+use super::{
+    AgentProfile, AgentReplica, AgentRuntime, InvocationResultStorage, LifecycleRequest, StateLane,
+};
 use crate::service::wire::ServiceWire;
 use crate::service::{BlobRef, Hash, InvocationId, NodeId};
 
@@ -1742,6 +1752,132 @@ fn ordered_base_evidence_bytes(base: OrderedBase) -> [u8; 41] {
 }
 
 /// Opaque authority required by the journal store's public CAS operation.
+///
+/// Shared ordered publications are the one exception to the local journal's
+/// usual `entry.merge_frontier == current.merge_frontier` shape.  The mode is
+/// private to replay and storage: callers cannot turn a generic/raw journal
+/// anchor into a state splice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplayPublicationMode {
+    Canonical,
+    SharedOrderedPreserveMerge,
+    SharedOrderedInstallFence,
+}
+
+/// Opaque evidence that an exact Shared Ordered entry crossed the durable
+/// Raft-log commit boundary. Replay deliberately accepts neither a bare entry
+/// nor an application QC here: replicas first apply the committed log slot,
+/// then certify the exact replay-derived projection. A durable exact
+/// reservation is irrevocable: a later divergent reservation fail-stops new
+/// work but cannot revoke a bearer which may already have crossed journal
+/// CAS; the ledger still permits that originally stored exact reservation to
+/// consume into its one anchor.
+#[derive(Debug)]
+pub(crate) struct CommittedSharedOrdered {
+    reservation: ReservedAgentRaftApplication,
+    entry: OrderedEntry,
+    route: AgentRouteKey,
+    raft_index: u64,
+    raft_term: u64,
+    raft_payload_commitment: Hash,
+    journal_store: JournalStoreInstanceId,
+    local_node: NodeId,
+    committee: AgentReplicaCommittee,
+}
+
+impl CommittedSharedOrdered {
+    /// Bridge seam for an exact command read from the durable committed Raft
+    /// log and the independently admitted committee named by its route.
+    pub(crate) fn from_reserved_raft_application(
+        reserved: ReservedAgentRaftApplication,
+        trusted_committee: &AgentReplicaCommittee,
+    ) -> Result<Self, ReplayValidationError> {
+        let committed = reserved.committed();
+        let AgentRaftCommand::Ordered {
+            route,
+            artifact_batch,
+            entry,
+        } = committed.command()
+        else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        if artifact_batch.is_some()
+            || entry.validate().is_err()
+            || route.validate().is_err()
+            || route.genesis() != entry.genesis
+            || route.space() != entry.input.runtime.space
+            || route.agent() != entry.input.runtime.agent
+            || route.committee() != trusted_committee.id()
+            || trusted_committee.profile() != AgentProfile::Shared
+            || route.space() != trusted_committee.space()
+            || route.agent() != trusted_committee.agent()
+            || committed.index() == 0
+            || committed.term() == 0
+            || committed.committed_index() < committed.index()
+            || committed.payload_commitment() == Hash::ZERO
+            || trusted_committee
+                .member_by_node(reserved.local_node())
+                .is_none()
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let entry = entry.clone();
+        let route = *route;
+        let raft_index = committed.index();
+        let raft_term = committed.term();
+        let raft_payload_commitment = committed.payload_commitment();
+        let journal_store = reserved.journal_store();
+        let local_node = reserved.local_node();
+        Ok(Self {
+            reservation: reserved,
+            entry,
+            route,
+            raft_index,
+            raft_term,
+            raft_payload_commitment,
+            journal_store,
+            local_node,
+            committee: trusted_committee.clone(),
+        })
+    }
+
+    fn authenticated_entry(&self) -> Result<&OrderedEntry, ReplayValidationError> {
+        let AgentRaftCommand::Ordered {
+            route,
+            artifact_batch,
+            entry,
+        } = self.reservation.committed().command()
+        else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        if artifact_batch.is_some()
+            || route != &self.route
+            || entry != &self.entry
+            || self.entry.validate().is_err()
+            || self.route.validate().is_err()
+            || self.route.genesis() != self.entry.genesis
+            || self.route.space() != self.entry.input.runtime.space
+            || self.route.agent() != self.entry.input.runtime.agent
+            || self.route.committee() != self.committee.id()
+            || self.committee.profile() != AgentProfile::Shared
+            || self.raft_index == 0
+            || self.raft_term == 0
+            || self.raft_payload_commitment == Hash::ZERO
+            || self.reservation.journal_store() != self.journal_store
+            || self.committee.member_by_node(self.local_node).is_none()
+            || self.reservation.route() != self.route
+            || self.reservation.index() != self.raft_index
+            || self.reservation.term() != self.raft_term
+            || self.reservation.payload_commitment() != self.raft_payload_commitment
+            || self.reservation.local_node() != self.local_node
+        {
+            Err(ReplayError::InvalidRecord)
+        } else {
+            Ok(&self.entry)
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplaySealedPublication {
     expected: JournalHeadsId,
@@ -1750,7 +1886,138 @@ pub struct ReplaySealedPublication {
     outcomes: Vec<ReplaySealedOutcome>,
     history_plans: Vec<InvocationHistoryWritePlan>,
     checkpoint: Option<ReplaySealedCheckpoint>,
+    shared_merge_projection: Option<ReplaySealedSharedMergeProjection>,
+    shared_ordered_commit: Option<ReplaySealedSharedOrderedCommit>,
     fence_ancestry: FenceAncestryEvidence,
+    mode: ReplayPublicationMode,
+}
+
+/// Replay-authenticated pre-transition Merge(F) projection retained as an
+/// immutable publication dependency for Shared exact retry and recovery.
+///
+/// This is deliberately not a public wire capability: only the Shared replay
+/// path can place it inside a sealed publication, and storage validates and
+/// persists it before making the successor heads visible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReplaySealedSharedMergeProjection {
+    manifest: LaneStateManifest,
+    state: Vec<u8>,
+}
+
+impl ReplaySealedSharedMergeProjection {
+    pub(crate) const fn manifest(&self) -> &LaneStateManifest {
+        &self.manifest
+    }
+
+    pub(crate) fn state(&self) -> &[u8] {
+        &self.state
+    }
+}
+
+/// Full deterministic claim derived while applying one durable Shared Raft
+/// slot. Storage binds it immutably to the Ordered entry before the successor
+/// head CAS so a crash between publication and ledger anchoring is retryable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReplaySealedSharedOrderedCommit {
+    journal_store: JournalStoreInstanceId,
+    claim: OrderedCommitClaim,
+    raft_payload_commitment: Hash,
+}
+
+impl ReplaySealedSharedOrderedCommit {
+    pub(crate) const fn journal_store(&self) -> JournalStoreInstanceId {
+        self.journal_store
+    }
+
+    pub(crate) const fn claim(&self) -> &OrderedCommitClaim {
+        &self.claim
+    }
+
+    pub(crate) const fn raft_payload_commitment(&self) -> Hash {
+        self.raft_payload_commitment
+    }
+}
+
+/// Opaque proof that one exact replay-derived Shared projection is visible at
+/// the journal head. The evidence ledger accepts this receipt, never a raw
+/// caller-supplied claim.
+#[derive(Debug)]
+pub(crate) struct PublishedSharedOrdered {
+    journal_store: JournalStoreInstanceId,
+    claim: OrderedCommitClaim,
+    entry: OrderedEntryId,
+    successor: JournalHeadsId,
+    raft_payload_commitment: Hash,
+    reservation: ReservedAgentRaftApplication,
+}
+
+impl PublishedSharedOrdered {
+    pub(crate) const fn journal_store(&self) -> JournalStoreInstanceId {
+        self.journal_store
+    }
+
+    pub(crate) const fn claim(&self) -> &OrderedCommitClaim {
+        &self.claim
+    }
+
+    pub(crate) const fn entry(&self) -> OrderedEntryId {
+        self.entry
+    }
+
+    pub(crate) const fn successor(&self) -> JournalHeadsId {
+        self.successor
+    }
+
+    pub(crate) const fn raft_index(&self) -> u64 {
+        self.claim.raft_index()
+    }
+
+    pub(crate) const fn raft_term(&self) -> u64 {
+        self.claim.raft_term()
+    }
+
+    pub(crate) const fn raft_payload_commitment(&self) -> Hash {
+        self.raft_payload_commitment
+    }
+
+    pub(crate) const fn reservation(&self) -> &ReservedAgentRaftApplication {
+        &self.reservation
+    }
+
+    #[cfg(feature = "std")]
+    fn from_binding(
+        binding: &ReplaySealedSharedOrderedCommit,
+        successor: JournalHeadsId,
+        authority: CommittedSharedOrdered,
+    ) -> Result<Self, JournalStoreError> {
+        let entry = binding
+            .claim
+            .ordered()
+            .head
+            .ok_or(JournalStoreError::NonCanonical)?;
+        if binding.claim.validate().is_err()
+            || successor == JournalHeadsId::ZERO
+            || binding.raft_payload_commitment == Hash::ZERO
+            || binding.journal_store != authority.journal_store
+            || binding.claim.genesis() != authority.route.genesis()
+            || binding.claim.admission() != authority.route.admission()
+            || binding.claim.committee() != authority.route.committee()
+            || binding.claim.raft_index() != authority.raft_index
+            || binding.claim.raft_term() != authority.raft_term
+            || entry != authority.entry.id()
+            || binding.raft_payload_commitment != authority.raft_payload_commitment
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        Ok(Self {
+            journal_store: binding.journal_store,
+            claim: binding.claim.clone(),
+            entry,
+            successor,
+            raft_payload_commitment: binding.raft_payload_commitment,
+            reservation: authority.reservation,
+        })
+    }
 }
 
 /// Exact input/outcome pair authenticated by replay and installed before the
@@ -2130,8 +2397,62 @@ impl<'store, S: AgentJournalStore> ReplayPreparedPublication<'store, S> {
         ),
         JournalStoreError,
     > {
+        if self.sealed.mode != ReplayPublicationMode::Canonical
+            || self.sealed.shared_ordered_commit.is_some()
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
         let publication = self.store.publish(&self.sealed)?;
         Ok((publication, self.successor, self.executions))
+    }
+}
+
+/// Non-clonable holder of one exact pre-publication Shared reservation. An
+/// evidence ledger may reissue equivalent `(store, route, slot, payload)`
+/// reservations after failure; safety comes from the bound physical store,
+/// idempotent exact journal CAS, and single durable ledger anchor rather than
+/// from global bearer uniqueness. The reservation remains outside the
+/// clonable sealed-store token and crosses into the receipt only after CAS.
+#[cfg(feature = "std")]
+pub(crate) struct PreparedSharedOrderedPublication<'store, S: AgentJournalStore> {
+    inner: ReplayPreparedPublication<'store, S>,
+    authority: CommittedSharedOrdered,
+}
+
+#[cfg(feature = "std")]
+impl<'store, S: AgentJournalStore> PreparedSharedOrderedPublication<'store, S> {
+    pub(crate) fn publish_shared(
+        self,
+    ) -> Result<
+        (
+            JournalPublication,
+            ReplayMaterialization,
+            Vec<ReplayExecutionResult>,
+            PublishedSharedOrdered,
+        ),
+        JournalStoreError,
+    > {
+        let Self { inner, authority } = self;
+        if !matches!(
+            inner.sealed.mode,
+            ReplayPublicationMode::SharedOrderedPreserveMerge
+                | ReplayPublicationMode::SharedOrderedInstallFence
+        ) {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        if inner.store.instance_id() != authority.journal_store {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let binding = inner
+            .sealed
+            .shared_ordered_commit
+            .as_ref()
+            .ok_or(JournalStoreError::NonCanonical)?
+            .clone();
+        let successor = inner.successor.heads_id;
+        let publication = inner.store.publish(&inner.sealed)?;
+        let receipt = PublishedSharedOrdered::from_binding(&binding, successor, authority)?;
+        Ok((publication, inner.successor, inner.executions, receipt))
     }
 }
 
@@ -2142,6 +2463,18 @@ impl<'store, S: AgentJournalStore> ReplayPreparedPublication<'store, S> {
 pub enum ReplayPreparation<'store, S: AgentJournalStore> {
     Ready(ReplayPreparedPublication<'store, S>),
     AlreadyCommitted(ReplayCommittedRecovery),
+}
+
+/// Shared apply keeps its post-publication receipt explicit, including on an
+/// authenticated response-loss retry, without widening the Local preparation
+/// API or allowing generic publication of a Shared splice.
+#[cfg(feature = "std")]
+pub(crate) enum SharedReplayPreparation<'store, S: AgentJournalStore> {
+    Ready(PreparedSharedOrderedPublication<'store, S>),
+    AlreadyCommitted {
+        recovery: ReplayCommittedRecovery,
+        publication: PublishedSharedOrdered,
+    },
 }
 
 impl ReplaySealedPublication {
@@ -2171,6 +2504,20 @@ impl ReplaySealedPublication {
 
     pub(crate) const fn fence_ancestry(&self) -> &FenceAncestryEvidence {
         &self.fence_ancestry
+    }
+
+    pub(crate) const fn shared_merge_projection(
+        &self,
+    ) -> Option<&ReplaySealedSharedMergeProjection> {
+        self.shared_merge_projection.as_ref()
+    }
+
+    pub(crate) const fn shared_ordered_commit(&self) -> Option<&ReplaySealedSharedOrderedCommit> {
+        self.shared_ordered_commit.as_ref()
+    }
+
+    pub(crate) const fn mode(&self) -> ReplayPublicationMode {
+        self.mode
     }
 }
 
@@ -3658,7 +4005,253 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 .history_write_plans()
                 .map_err(ReplayError::InvocationOwnership)?,
             checkpoint: None,
+            shared_merge_projection: None,
+            shared_ordered_commit: None,
             fence_ancestry,
+            mode: ReplayPublicationMode::Canonical,
+        })
+    }
+
+    /// Mint the storage authority for a Raft-committed Shared Ordered splice.
+    /// `execution_before` is the authenticated Control/Linear + pinned
+    /// Merge(F) projection used by the executor; `materialization` remains the
+    /// physical replica image whose active Merge and Local lanes are spliced
+    /// into the successor.
+    fn seal_shared_ordered_publication(
+        &self,
+        current: &JournalHeads,
+        entry: &OrderedEntry,
+        next: JournalHeads,
+        step: &ReplayStep,
+        execution_before: &RuntimeState,
+        materialization: &ReplayMaterialization,
+        pinned_merge_manifest: &LaneStateManifest,
+        pinned_merge_state: &[u8],
+        journal_store: JournalStoreInstanceId,
+        claim: &OrderedCommitClaim,
+        raft_payload_commitment: Hash,
+        mode: ReplayPublicationMode,
+    ) -> Result<ReplaySealedPublication, ReplayValidationError> {
+        validate_publication_envelope(self.genesis, current, &next)?;
+        let id = entry.id();
+        let installing_fence = mode == ReplayPublicationMode::SharedOrderedInstallFence;
+        if !matches!(
+            mode,
+            ReplayPublicationMode::SharedOrderedPreserveMerge
+                | ReplayPublicationMode::SharedOrderedInstallFence
+        ) {
+            return Err(ReplayError::InvalidRecord);
+        }
+        if pinned_merge_manifest.genesis != current.genesis
+            || pinned_merge_manifest.runtime != entry.input.runtime
+            || pinned_merge_manifest.lane != PersistedLane::Merge
+            || pinned_merge_manifest.cursor
+                != (LaneCursor::Merge {
+                    frontier: entry.merge_frontier,
+                })
+            || pinned_merge_manifest.state != BlobRef::of_bytes(pinned_merge_state)
+            || claim.validate().is_err()
+            || claim.ordered()
+                != (OrderedBase {
+                    index: entry.index,
+                    head: Some(id),
+                })
+            || claim.merge_frontier() != entry.merge_frontier
+            || claim.runtime() != &next.runtime
+            || claim.ordered_invocations() != next.ordered_invocations
+            || claim.merge_fence() != next.merge_fence
+            || raft_payload_commitment == Hash::ZERO
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let position_matches = matches!(
+            step.position,
+            ReplayPosition::Ordered {
+                id: position_id,
+                index,
+                merge_frontier,
+                merge_seal,
+            } if position_id == id
+                && index == entry.index
+                && merge_frontier == entry.merge_frontier
+                && merge_seal == entry.merge_seal
+        );
+        let parent_base = OrderedBase {
+            index: current.ordered_index,
+            head: current.ordered_head,
+        };
+        if entry.validate().is_err()
+            || entry.genesis != current.genesis
+            || entry.parent != current.ordered_head
+            || entry.index
+                != current
+                    .ordered_index
+                    .checked_add(1)
+                    .ok_or(ReplayError::ReplayLimit)?
+            || entry.input.id() != step.input
+            || !position_matches
+            || self.runtime_at(parent_base) != Some(&entry.input.runtime)
+            || next.ordered_head != Some(id)
+            || next.ordered_index != entry.index
+            || next.runtime != step.runtime
+            || next.local_head != current.local_head
+            || next.local_revision != current.local_revision
+            || next.local_invocations != current.local_invocations
+            || next.checkpoint != current.checkpoint
+            || (installing_fence != entry.merge_seal.is_some())
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        if installing_fence {
+            let seal = entry.merge_seal.ok_or(ReplayError::InvalidFence)?;
+            let fence = self.fence.as_ref().ok_or(ReplayError::InvalidFence)?;
+            if fence.ordered_index != entry.index
+                || fence.ordered_head != id
+                || fence.frontier != entry.merge_frontier
+                || fence.seal != seal
+                || next.merge_frontier != entry.merge_frontier
+                || next.merge_fence
+                    != (OrderedBase {
+                        index: entry.index,
+                        head: Some(id),
+                    })
+                || next.merge_seal != Some(seal)
+            {
+                return Err(ReplayError::InvalidFence);
+            }
+        } else if next.merge_frontier != current.merge_frontier
+            || next.merge_invocations != current.merge_invocations
+            || next.merge_fence != current.merge_fence
+            || next.merge_seal != current.merge_seal
+        {
+            return Err(ReplayError::InvalidFence);
+        }
+
+        let staged_ordered = self
+            .ownership
+            .index_id(InvocationOwnershipScope::Ordered)
+            .map_err(ReplayError::InvocationOwnership)?;
+        let ordered_changed = step
+            .ownership_delta
+            .changed(InvocationOwnershipScope::Ordered);
+        if (ordered_changed
+            && (staged_ordered == current.ordered_invocations
+                || next.ordered_invocations != staged_ordered))
+            || (!ordered_changed
+                && (staged_ordered != current.ordered_invocations
+                    || next.ordered_invocations != current.ordered_invocations))
+        {
+            return Err(ReplayError::InvocationOwnership(
+                InvocationOwnershipError::Conflict,
+            ));
+        }
+        let staged_local = self
+            .ownership
+            .index_id(InvocationOwnershipScope::Local(current.node))
+            .map_err(ReplayError::InvocationOwnership)?;
+        if step
+            .ownership_delta
+            .changed(InvocationOwnershipScope::Local(current.node))
+            || staged_local != current.local_invocations
+            || next.local_invocations != current.local_invocations
+        {
+            return Err(ReplayError::InvocationOwnership(
+                InvocationOwnershipError::Conflict,
+            ));
+        }
+        if installing_fence {
+            let staged_merge = self
+                .ownership
+                .index_id(InvocationOwnershipScope::Merge)
+                .map_err(ReplayError::InvocationOwnership)?;
+            if next.merge_invocations != staged_merge {
+                return Err(ReplayError::InvocationOwnership(
+                    InvocationOwnershipError::Conflict,
+                ));
+            }
+        }
+
+        let mut outcomes = self.validate_direct_outcomes(
+            &entry.input,
+            execution_before,
+            step,
+            InvocationOwnershipScope::Ordered,
+            InvocationOutcomeAnchor::Ordered { entry: id },
+        )?;
+        for outcome in &step.sealed_outcomes {
+            if outcome.record.key.scope == InvocationOwnershipScope::Ordered {
+                continue;
+            }
+            let seal = entry.merge_seal.ok_or(ReplayError::InvalidRecord)?;
+            let InvocationOutcomeAnchor::Merge {
+                source_event,
+                finalizing_entry,
+                seal: outcome_seal,
+            } = outcome.record.anchor
+            else {
+                return Err(ReplayError::InvalidRecord);
+            };
+            let key = outcome.record.key;
+            let owner = match self
+                .ownership
+                .lookup(key)
+                .map_err(ReplayError::InvocationOwnership)?
+            {
+                Some(InvocationIndexLookup::Live(owner)) => owner,
+                Some(InvocationIndexLookup::Archived(_)) | None => {
+                    return Err(ReplayError::InvocationOwnership(
+                        InvocationOwnershipError::Unauthenticated,
+                    ));
+                }
+            };
+            if !installing_fence
+                || key.scope != InvocationOwnershipScope::Merge
+                || source_event == MergeEventId::ZERO
+                || finalizing_entry != id
+                || outcome_seal != seal
+                || outcome
+                    .record
+                    .validate_for_genesis(self.genesis, &outcome.input)
+                    .is_err()
+                || owner.outcome() != InvocationOutcomeRef::for_record(&outcome.record).ok()
+                || owner.disposition() != Some(outcome.record.disposition())
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
+            outcomes.push(outcome.clone());
+        }
+        let history_plans = self
+            .ownership
+            .history_write_plans()
+            .map_err(ReplayError::InvocationOwnership)?;
+        if !installing_fence
+            && history_plans
+                .iter()
+                .any(|plan| plan.scope() != InvocationOwnershipScope::Ordered)
+        {
+            return Err(ReplayError::InvocationOwnership(
+                InvocationOwnershipError::Conflict,
+            ));
+        }
+        let fence_ancestry = successor_fence_ancestry(materialization, &next, false, Some(entry))?;
+        Ok(ReplaySealedPublication {
+            expected: current.id(),
+            next,
+            anchor: ReplayPublicationAnchor::Ordered(entry.clone()),
+            outcomes,
+            history_plans,
+            checkpoint: None,
+            shared_merge_projection: Some(ReplaySealedSharedMergeProjection {
+                manifest: pinned_merge_manifest.clone(),
+                state: pinned_merge_state.to_vec(),
+            }),
+            shared_ordered_commit: Some(ReplaySealedSharedOrderedCommit {
+                journal_store,
+                claim: claim.clone(),
+                raft_payload_commitment,
+            }),
+            fence_ancestry,
+            mode,
         })
     }
 
@@ -3739,7 +4332,10 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 .history_write_plans()
                 .map_err(ReplayError::InvocationOwnership)?,
             checkpoint: None,
+            shared_merge_projection: None,
+            shared_ordered_commit: None,
             fence_ancestry,
+            mode: ReplayPublicationMode::Canonical,
         })
     }
 
@@ -3806,7 +4402,10 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 .history_write_plans()
                 .map_err(ReplayError::InvocationOwnership)?,
             checkpoint: None,
+            shared_merge_projection: None,
+            shared_ordered_commit: None,
             fence_ancestry,
+            mode: ReplayPublicationMode::Canonical,
         })
     }
 
@@ -4778,6 +5377,7 @@ mod aggregate {
             replay: MergeReplay,
             roots: Vec<SealedMergeRoot>,
             ancestry: BTreeSet<MergeEventId>,
+            reset_to_boundary: bool,
         },
         Local(LocalEntryId, LocalEntry),
         Ordered {
@@ -5247,6 +5847,8 @@ mod aggregate {
         store: &S,
         target: MergeFrontierId,
         available_ordered: OrderedBase,
+        boundary: &SealedMergeBase,
+        boundary_ancestry: &BTreeSet<MergeEventId>,
         current: &mut SealedMergeBase,
         ancestry: &mut BTreeSet<MergeEventId>,
         actions: &mut Vec<MaterializationAction>,
@@ -5260,7 +5862,18 @@ mod aggregate {
         if target == current.frontier_id() {
             return Ok(());
         }
-        let replay = load_merge_suffix(store, current, target).map_err(lift_replay)?;
+        let (replay, reset_to_boundary) = match load_merge_suffix(store, current, target) {
+            Ok(replay) => (replay, false),
+            Err(
+                ReplayError::ChainMismatch
+                | ReplayError::NonMinimalFrontier
+                | ReplayError::StaleMergeBranch(_),
+            ) => (
+                load_merge_suffix(store, boundary, target).map_err(lift_replay)?,
+                true,
+            ),
+            Err(error) => return Err(lift_replay(error)),
+        };
         budget.frontier(&replay.frontier).map_err(lift_validation)?;
         for (id, event) in replay.events() {
             budget.merge(*id, event).map_err(lift_validation)?;
@@ -5271,13 +5884,20 @@ mod aggregate {
                 return Err(ReplayError::InvalidOrderedBase);
             }
         }
-        let next = successor_merge_base(current, &replay).map_err(lift_validation)?;
+        let previous = if reset_to_boundary {
+            *ancestry = boundary_ancestry.clone();
+            boundary
+        } else {
+            &*current
+        };
+        let next = successor_merge_base(previous, &replay).map_err(lift_validation)?;
         ancestry.extend(replay.events().iter().map(|(id, _)| *id));
         *current = next;
         actions.push(MaterializationAction::Merge {
             replay,
             roots: current.roots().to_vec(),
             ancestry: ancestry.clone(),
+            reset_to_boundary,
         });
         Ok(())
     }
@@ -5319,6 +5939,8 @@ mod aggregate {
         let mut actions = Vec::new();
         let mut current_merge = base.merge.clone();
         let mut ancestry = base.merge_ancestry.clone();
+        let mut merge_boundary = base.merge.clone();
+        let mut merge_boundary_ancestry = base.merge_ancestry.clone();
         let mut local_index = 0usize;
         let mut current_ordered = base.ordered;
         for (id, entry) in ordered.entries() {
@@ -5336,6 +5958,8 @@ mod aggregate {
                     store,
                     local_entry.merge_frontier,
                     current_ordered,
+                    &merge_boundary,
+                    &merge_boundary_ancestry,
                     &mut current_merge,
                     &mut ancestry,
                     &mut actions,
@@ -5348,6 +5972,8 @@ mod aggregate {
                 store,
                 entry.merge_frontier,
                 current_ordered,
+                &merge_boundary,
+                &merge_boundary_ancestry,
                 &mut current_merge,
                 &mut ancestry,
                 &mut actions,
@@ -5365,6 +5991,10 @@ mod aggregate {
                 entry: entry.clone(),
                 fence,
             });
+            if entry.merge_seal.is_some() {
+                merge_boundary = current_merge.clone();
+                merge_boundary_ancestry = ancestry.clone();
+            }
             current_ordered = OrderedBase {
                 index: entry.index,
                 head: Some(*id),
@@ -5379,6 +6009,8 @@ mod aggregate {
                 store,
                 local_entry.merge_frontier,
                 current_ordered,
+                &merge_boundary,
+                &merge_boundary_ancestry,
                 &mut current_merge,
                 &mut ancestry,
                 &mut actions,
@@ -5391,6 +6023,8 @@ mod aggregate {
             store,
             heads.merge_frontier,
             current_ordered,
+            &merge_boundary,
+            &merge_boundary_ancestry,
             &mut current_merge,
             &mut ancestry,
             &mut actions,
@@ -5555,6 +6189,7 @@ mod aggregate {
             .iter()
             .map(|root| root.id)
             .collect::<BTreeSet<_>>();
+        let mut merge_boundary_frontier = base.merge.frontier_id();
         let mut merge_boundary_ancestry = base.merge_ancestry.clone();
         let mut merge_boundary_state = state.merge.clone();
         let mut merge_boundary_invocations = base.merge_invocations;
@@ -5607,7 +6242,56 @@ mod aggregate {
                     replay,
                     roots,
                     ancestry,
+                    reset_to_boundary,
                 } => {
+                    if reset_to_boundary {
+                        let ordered_invocations = InvocationOwnership::index_id(
+                            &machine.ownership,
+                            InvocationOwnershipScope::Ordered,
+                        )
+                        .map_err(ReplayError::InvocationOwnership)?;
+                        let local_invocations = InvocationOwnership::index_id(
+                            &machine.ownership,
+                            InvocationOwnershipScope::Local(heads.node),
+                        )
+                        .map_err(ReplayError::InvocationOwnership)?;
+                        let runtime = machine.runtime.clone();
+                        let runtime_history = machine.runtime_history.clone();
+                        let fence = machine.fence.clone();
+                        drop(machine);
+                        let indexes = InvocationIndexes::open(
+                            store,
+                            ordered_invocations,
+                            merge_boundary_invocations,
+                            local_invocations,
+                        )
+                        .map_err(|_| {
+                            ReplayError::InvocationOwnership(
+                                InvocationOwnershipError::Unauthenticated,
+                            )
+                        })?;
+                        machine = ReplayMachine {
+                            genesis: heads.genesis,
+                            runtime,
+                            runtime_history,
+                            ownership: indexes,
+                            fence,
+                        };
+                        if InvocationOwnership::unfinalized(
+                            &machine.ownership,
+                            InvocationOwnershipScope::Merge,
+                        )
+                        .map_err(ReplayError::InvocationOwnership)?
+                            != 0
+                        {
+                            return Err(ReplayError::InvocationOwnership(
+                                InvocationOwnershipError::Unauthenticated,
+                            ));
+                        }
+                        state.merge = merge_boundary_state.clone();
+                        current_frontier = merge_boundary_frontier;
+                        merge_facts.clear();
+                    }
                     if replay.checkpoint_frontier != current_frontier {
                         return Err(ReplayError::ChainMismatch);
                     }
@@ -5774,6 +6458,7 @@ mod aggregate {
                     if let Some(fence) = next_fence {
                         machine.install_fence(fence)?;
                         merge_boundary_roots = current_roots.iter().map(|root| root.id).collect();
+                        merge_boundary_frontier = current_frontier;
                         merge_boundary_ancestry = current_ancestry.clone();
                         merge_boundary_state = state.merge.clone();
                         merge_boundary_invocations = InvocationOwnership::index_id(
@@ -6406,6 +7091,16 @@ mod aggregate {
         Ok(artifacts)
     }
 
+    fn claim_lane_matches(
+        projection: &SharedLaneProjection,
+        manifest: &LaneStateManifest,
+        state: &[u8],
+    ) -> bool {
+        projection.manifest() == manifest.id()
+            && projection.state() == &manifest.state
+            && projection.verify_state(state).is_ok()
+    }
+
     /// Read-only worst-case admission for one invocation owner. Existing
     /// members remain admissible at the ceiling; this matters for Merge,
     /// whose canonical rebuild begins at the sealed boundary rather than the
@@ -6830,6 +7525,699 @@ mod aggregate {
             },
             executions,
         }))
+    }
+
+    /// Prepare one authenticated Raft-committed Shared Ordered entry.
+    ///
+    /// The entry's Merge frontier is an execution dependency, not an
+    /// instruction to move this replica's active Merge cursor.  Ordinary
+    /// entries therefore execute against C/L + Merge(F), then splice only the
+    /// resulting C/L projection into the physical C/L + Merge(G) + Local
+    /// image.  A lifecycle/seal entry is the explicit exception: it finalizes
+    /// exactly F and installs F as the next active Merge boundary.
+    pub(crate) fn prepare_shared_ordered<'store, S, E, R>(
+        store: &'store mut S,
+        executor: &mut E,
+        resolver: &R,
+        materialization: &ReplayMaterialization,
+        committed: CommittedSharedOrdered,
+    ) -> Result<SharedReplayPreparation<'store, S>, MaterializeError<R::Error, E::Error>>
+    where
+        S: AgentJournalStore + SharedOrderedCommitStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
+        require_current_materialization(store, materialization)?;
+        let entry = committed.authenticated_entry().map_err(lift_validation)?;
+        let current = &materialization.heads;
+        let id = entry.id();
+        let decoded = decode_standard_runtime_state(&materialization.state)
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        let config = decoded.config.as_ref().ok_or(ReplayError::InvalidRecord)?;
+        let admitted_replicas = committed
+            .committee
+            .members()
+            .iter()
+            .map(|member| member.replica())
+            .collect::<Vec<_>>();
+        if committed.committee.profile() != AgentProfile::Shared
+            || config.identity.profile != AgentProfile::Shared
+            || config.identity.space != committed.committee.space()
+            || config.identity.agent != committed.committee.agent()
+            || config.replicas != admitted_replicas
+            || store.instance_id() != committed.journal_store
+            || current.node != committed.local_node
+            || current.genesis != committed.route.genesis()
+            || current.admission.as_bytes() != committed.route.admission().as_bytes()
+            || current.runtime.space != committed.route.space()
+            || current.runtime.agent != committed.route.agent()
+            || committed.route.committee() != committed.committee.id()
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        if current.ordered_head == Some(id) && current.ordered_index == entry.index {
+            let stored: OrderedEntry = require_record(store, id)?;
+            let stored_commit = store
+                .shared_ordered_commit(id)
+                .map_err(journal)?
+                .ok_or_else(|| journal(JournalStoreError::Unavailable))?;
+            let claim = stored_commit.claim();
+            let current_base = materialization.ordered_base();
+            let control_manifest =
+                derive_lane_state::<ReplayMaterializationSourceError<R::Error>, E::Error>(
+                    current.genesis,
+                    current.runtime.clone(),
+                    PersistedLane::Control,
+                    LaneCursor::Ordered { base: current_base },
+                    &materialization.state.control,
+                )?;
+            let linear_manifest =
+                derive_lane_state::<ReplayMaterializationSourceError<R::Error>, E::Error>(
+                    current.genesis,
+                    current.runtime.clone(),
+                    PersistedLane::Linear,
+                    LaneCursor::Ordered { base: current_base },
+                    &materialization.state.linear,
+                )?;
+            let claimed_merge_manifest: LaneStateManifest =
+                require_record(store, claim.merge().manifest())?;
+            let claimed_merge_state =
+                require_blob(store, JournalBlobClass::LaneState, claim.merge().state())?;
+            let merge_projection_matches = claimed_merge_manifest.genesis == current.genesis
+                && claimed_merge_manifest.runtime == entry.input.runtime
+                && claimed_merge_manifest.lane == PersistedLane::Merge
+                && matches!(
+                    claimed_merge_manifest.cursor,
+                    LaneCursor::Merge { frontier } if frontier == entry.merge_frontier
+                )
+                && claim_lane_matches(claim.merge(), &claimed_merge_manifest, &claimed_merge_state);
+            {
+                let claimed_indexes = InvocationIndexes::open(
+                    store,
+                    current.ordered_invocations,
+                    claim.merge_invocations(),
+                    current.local_invocations,
+                )
+                .map_err(|_| {
+                    ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated)
+                })?;
+                if InvocationOwnership::index_id(&claimed_indexes, InvocationOwnershipScope::Merge)
+                    .map_err(ReplayError::InvocationOwnership)?
+                    != claim.merge_invocations()
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+            }
+            let sealed_matches = match (claim.sealed_merge(), current.merge_seal) {
+                (None, None) if current.merge_fence == OrderedBase::post_genesis() => true,
+                (Some(sealed), Some(seal)) => {
+                    let dependency = load_fence_dependency::<S, R::Error, E::Error>(store, seal)?;
+                    sealed.seal() == seal
+                        && sealed.frontier() == dependency.seal.frontier
+                        && claim_lane_matches(sealed.lane(), &dependency.state, &dependency.bytes)
+                        && sealed.invocations() == materialization.merge_boundary_invocations
+                }
+                _ => false,
+            };
+            if stored != *entry
+                || claim.genesis() != current.genesis
+                || claim.space() != current.runtime.space
+                || claim.agent() != current.runtime.agent
+                || claim.admission() != committed.route.admission()
+                || claim.committee() != committed.route.committee()
+                || claim.raft_index() != committed.raft_index
+                || claim.raft_term() != committed.raft_term
+                || claim.ordered() != current_base
+                || claim.merge_frontier() != entry.merge_frontier
+                || stored_commit.journal_store() != committed.journal_store
+                || stored_commit.raft_payload_commitment() != committed.raft_payload_commitment
+                || claim.runtime() != &current.runtime
+                || !claim_lane_matches(
+                    claim.control(),
+                    &control_manifest,
+                    &materialization.state.control,
+                )
+                || !claim_lane_matches(
+                    claim.linear(),
+                    &linear_manifest,
+                    &materialization.state.linear,
+                )
+                || claim.ordered_invocations() != current.ordered_invocations
+                || claim.artifacts() != materialization.artifacts.id()
+                || claim.merge_fence() != current.merge_fence
+                || claim.fence_ancestry() != materialization.fence_ancestry.commitment()
+                || !merge_projection_matches
+                || !sealed_matches
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
+            let binding = ReplaySealedSharedOrderedCommit {
+                journal_store: stored_commit.journal_store(),
+                claim: claim.clone(),
+                raft_payload_commitment: stored_commit.raft_payload_commitment(),
+            };
+            let recovery = ReplayCommittedRecovery {
+                input: entry.input.id(),
+                position: ReplayPosition::Ordered {
+                    id,
+                    index: entry.index,
+                    merge_frontier: entry.merge_frontier,
+                    merge_seal: entry.merge_seal,
+                },
+            };
+            let publication =
+                PublishedSharedOrdered::from_binding(&binding, current.id(), committed)
+                    .map_err(journal)?;
+            return Ok(SharedReplayPreparation::AlreadyCommitted {
+                recovery,
+                publication,
+            });
+        }
+        if entry.genesis != current.genesis
+            || entry.parent != current.ordered_head
+            || entry.index
+                != current
+                    .ordered_index
+                    .checked_add(1)
+                    .ok_or(ReplayError::ReplayLimit)?
+            || entry.input.runtime != current.runtime
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+
+        let fence_dependency = entry
+            .merge_seal
+            .map(|seal| load_fence_dependency(store, seal))
+            .transpose()?;
+        let retained_fence_dependency = if entry.merge_seal.is_none() {
+            current
+                .merge_seal
+                .map(|seal| load_fence_dependency(store, seal))
+                .transpose()?
+        } else {
+            None
+        };
+        let mut suffix_budget = materialization.suffix_budget.clone();
+        suffix_budget.ordered(id, entry).map_err(lift_validation)?;
+        if let Some(dependency) = fence_dependency.as_ref() {
+            suffix_budget
+                .seal(&dependency.seal)
+                .map_err(lift_validation)?;
+        }
+
+        // Reconstruct the retained boundary from the materialization rather
+        // than from the current active G.  This makes missing closure for F a
+        // hard unavailable/error and prevents fallback to newer replica-local
+        // Merge bytes.
+        let boundary_frontier = MergeFrontier {
+            genesis: current.genesis,
+            events: materialization
+                .merge_boundary_roots
+                .iter()
+                .copied()
+                .collect(),
+        };
+        if boundary_frontier.validate().is_err() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let stored_boundary: MergeFrontier = require_record(store, boundary_frontier.id())?;
+        if stored_boundary != boundary_frontier {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let mut boundary_roots = Vec::with_capacity(boundary_frontier.events.len());
+        for root_id in &boundary_frontier.events {
+            let event: MergeEvent = require_record(store, *root_id)?;
+            if event.validate().is_err()
+                || event.id() != *root_id
+                || event.genesis != current.genesis
+                || !executor
+                    .verify_merge_event(&event)
+                    .map_err(ReplayError::Executor)?
+            {
+                return Err(ReplayError::UnauthenticatedMergeEvent(*root_id));
+            }
+            boundary_roots.push(SealedMergeRoot {
+                id: *root_id,
+                causal_height: event.causal_height,
+                ordered_base: event.ordered_base,
+                runtime: event.input.runtime,
+            });
+        }
+        let boundary = SealedMergeBase {
+            structural: StructuralMergeBase {
+                genesis: current.genesis,
+                frontier_id: boundary_frontier.id(),
+                roots: boundary_roots,
+            },
+        };
+        let pinned =
+            load_merge_suffix(store, &boundary, entry.merge_frontier).map_err(lift_replay)?;
+        suffix_budget
+            .frontier(&pinned.frontier)
+            .map_err(lift_validation)?;
+        for (event_id, event) in pinned.events() {
+            suffix_budget
+                .merge(*event_id, event)
+                .map_err(lift_validation)?;
+        }
+        let pinned_base = successor_merge_base(&boundary, &pinned).map_err(lift_validation)?;
+        let mut pinned_ancestry = materialization.merge_boundary_ancestry.clone();
+        pinned_ancestry.extend(pinned.ancestry.iter().copied());
+
+        // The current ownership schema has no durable `StaleAfterFence`
+        // archive.  Dropping an active G-only pending owner would make its
+        // InvocationId appear unseen and permit re-execution, so fences which
+        // exclude any active event fail closed until that quarantine schema
+        // exists.  This check precedes all pinned replay/finalization writes.
+        if entry.merge_seal.is_some()
+            && materialization
+                .merge_ancestry
+                .difference(&pinned_ancestry)
+                .next()
+                .is_some()
+        {
+            return Err(ReplayError::InvalidFence);
+        }
+
+        // An ordinary Shared Ordered splice preserves G, including its
+        // pending-owner capacity obligation.
+        if entry.merge_seal.is_none() {
+            let physical_indexes = InvocationIndexes::open(
+                store,
+                current.ordered_invocations,
+                current.merge_invocations,
+                current.local_invocations,
+            )
+            .map_err(|_| {
+                ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated)
+            })?;
+            if InvocationOwnership::unfinalized(&physical_indexes, InvocationOwnershipScope::Merge)
+                .map_err(ReplayError::InvocationOwnership)?
+                != 0
+            {
+                validate_merge_finalizer_capacity(
+                    &suffix_budget,
+                    current.genesis,
+                    &current.runtime,
+                    OrderedBase {
+                        index: entry.index,
+                        head: Some(id),
+                    },
+                    current.merge_frontier,
+                    &materialization.state.merge,
+                )
+                .map_err(lift_validation)?;
+            }
+        }
+
+        let mut snapshots = materialization.ordered_snapshots.clone();
+        let indexes = InvocationIndexes::open(
+            store,
+            current.ordered_invocations,
+            materialization.merge_boundary_invocations,
+            current.local_invocations,
+        )
+        .map_err(|_| ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated))?;
+        let mut machine = ReplayMachine {
+            genesis: current.genesis,
+            runtime: current.runtime.clone(),
+            runtime_history: materialization
+                .ordered_snapshots
+                .iter()
+                .map(|(base, snapshot)| (*base, snapshot.runtime.clone()))
+                .collect(),
+            ownership: indexes,
+            fence: materialization.fence.clone(),
+        };
+        if InvocationOwnership::unfinalized(&machine.ownership, InvocationOwnershipScope::Merge)
+            .map_err(ReplayError::InvocationOwnership)?
+            != 0
+        {
+            return Err(ReplayError::InvocationOwnership(
+                InvocationOwnershipError::Unauthenticated,
+            ));
+        }
+        let ordered = OrderedReplay {
+            genesis: current.genesis,
+            checkpoint: materialization.ordered_base(),
+            base: materialization.ordered_base(),
+            entries: Vec::new(),
+            runtime_history: BTreeMap::new(),
+        };
+        let mut pinned_state = materialization.state.clone();
+        pinned_state.merge = materialization.merge_boundary_state.clone();
+        let mut facts = BTreeMap::new();
+        for (event_id, event) in pinned.events() {
+            if event.ordered_base.index > current.ordered_index
+                || (event.ordered_base.index == current.ordered_index
+                    && event.ordered_base.head != current.ordered_head)
+            {
+                return Err(ReplayError::InvalidOrderedBase);
+            }
+            let snapshot = resolve_snapshot::<R, E>(
+                resolver,
+                current.genesis,
+                materialization.ordered_base(),
+                event.ordered_base,
+                &mut snapshots,
+            )?;
+            if snapshot.runtime != event.input.runtime {
+                return Err(ReplayError::RuntimeMismatch);
+            }
+            machine
+                .runtime_history
+                .insert(event.ordered_base, snapshot.runtime.clone());
+            let before = RuntimeState {
+                control: snapshot.control,
+                linear: snapshot.linear,
+                merge: pinned_state.merge.clone(),
+                local: materialization.state.local.clone(),
+            };
+            let replayed = machine
+                .verify_and_apply_merge::<E, ReplayMaterializationSourceError<R::Error>>(
+                    executor, &ordered, *event_id, event, &before,
+                )
+                .map_err(historical_replay_error)?;
+            pinned_state.merge = replayed.state.merge.clone();
+            if facts
+                .insert(
+                    *event_id,
+                    MergeExecutionFact {
+                        event: event.clone(),
+                        before,
+                        after: replayed.state,
+                        result: replayed.result,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
+        }
+        validate_runtime_state_bound(&pinned_state)?;
+        let pinned_manifest =
+            derive_lane_state::<ReplayMaterializationSourceError<R::Error>, E::Error>(
+                current.genesis,
+                entry.input.runtime.clone(),
+                PersistedLane::Merge,
+                LaneCursor::Merge {
+                    frontier: entry.merge_frontier,
+                },
+                &pinned_state.merge,
+            )?;
+        let observed_merge_invocations =
+            InvocationOwnership::index_id(&machine.ownership, InvocationOwnershipScope::Merge)
+                .map_err(ReplayError::InvocationOwnership)?;
+        let observed_merge_projection =
+            SharedLaneProjection::new(pinned_manifest.id(), pinned_manifest.state.clone())
+                .map_err(|_| ReplayError::InvalidRecord)?;
+
+        let committed_base = OrderedBase {
+            index: entry.index,
+            head: Some(id),
+        };
+        let retained_sealed_merge = if entry.merge_seal.is_none() {
+            match current.merge_seal {
+                None if current.merge_fence == OrderedBase::post_genesis() => None,
+                Some(seal) => {
+                    let dependency = retained_fence_dependency
+                        .as_ref()
+                        .ok_or(ReplayError::InvalidRecord)?;
+                    if dependency.id != seal {
+                        return Err(ReplayError::InvalidRecord);
+                    }
+                    let lane = SharedLaneProjection::new(
+                        dependency.state.id(),
+                        dependency.state.state.clone(),
+                    )
+                    .map_err(|_| ReplayError::InvalidRecord)?;
+                    Some(
+                        SharedSealedMergeProjection::new(
+                            seal,
+                            dependency.seal.frontier,
+                            lane,
+                            materialization.merge_boundary_invocations,
+                        )
+                        .map_err(|_| ReplayError::InvalidRecord)?,
+                    )
+                }
+                _ => return Err(ReplayError::InvalidRecord),
+            }
+        } else {
+            None
+        };
+
+        let position = ReplayPosition::Ordered {
+            id,
+            index: entry.index,
+            merge_frontier: entry.merge_frontier,
+            merge_seal: entry.merge_seal,
+        };
+        let unseen_capacity =
+            has_unseen_invocation_capacity(&machine.ownership, &entry.input, position)?;
+        let mut finalized_outcomes = Vec::new();
+        let mut finalized_executions = Vec::new();
+        let mut finalized_delta = InvocationIndexDelta::NONE;
+        let next_fence = match fence_dependency.as_ref() {
+            Some(dependency) => {
+                let unfinalized = InvocationOwnership::unfinalized(
+                    &machine.ownership,
+                    InvocationOwnershipScope::Merge,
+                )
+                .map_err(ReplayError::InvocationOwnership)?;
+                if matches!(entry.input.operation, ReplayOperation::SealMerge) && unfinalized == 0 {
+                    return Err(ReplayError::InvalidFence);
+                }
+                (finalized_delta, finalized_outcomes, finalized_executions) = machine
+                    .finalize_merge_outcomes(id, dependency.id, &facts)
+                    .map_err(lift_validation)?;
+                Some(authenticate_action_fence(
+                    dependency,
+                    id,
+                    entry,
+                    &pinned_state,
+                    entry.merge_frontier,
+                    &pinned_ancestry,
+                )?)
+            }
+            None if entry.merge_seal.is_none() => None,
+            None => return Err(ReplayError::InvalidFence),
+        };
+        let execution_before = pinned_state.clone();
+        let mut step = machine
+            .apply_with_unseen_capacity::<_, ReplayMaterializationSourceError<R::Error>>(
+                executor,
+                &entry.input,
+                &execution_before,
+                position,
+                Some(unseen_capacity),
+            )?;
+        step.ownership_delta.ordered |= finalized_delta.ordered;
+        step.ownership_delta.merge |= finalized_delta.merge;
+        step.ownership_delta.local |= finalized_delta.local;
+        step.sealed_outcomes.extend(finalized_outcomes);
+        if let Some(fence) = next_fence {
+            machine.install_fence(fence)?;
+        }
+
+        let (ordered_invocations, finalized_merge_invocations, local_invocations) = machine
+            .ownership_ids(current.node)
+            .map_err(ReplayError::InvocationOwnership)?;
+        if local_invocations != current.local_invocations {
+            return Err(ReplayError::CrossLaneMutation);
+        }
+        let installing_fence = entry.merge_seal.is_some();
+        let mode = if installing_fence {
+            ReplayPublicationMode::SharedOrderedInstallFence
+        } else {
+            ReplayPublicationMode::SharedOrderedPreserveMerge
+        };
+        let mut next = successor_heads(current).map_err(lift_validation)?;
+        next.runtime = step.runtime.clone();
+        next.ordered_head = Some(id);
+        next.ordered_index = entry.index;
+        next.ordered_invocations = ordered_invocations;
+        next.local_invocations = current.local_invocations;
+        if installing_fence {
+            let fence = machine.fence.as_ref().ok_or(ReplayError::InvalidFence)?;
+            next.merge_frontier = entry.merge_frontier;
+            next.merge_invocations = finalized_merge_invocations;
+            next.merge_fence = OrderedBase {
+                index: fence.ordered_index,
+                head: Some(fence.ordered_head),
+            };
+            next.merge_seal = Some(fence.seal);
+        } else {
+            next.merge_frontier = current.merge_frontier;
+            next.merge_invocations = current.merge_invocations;
+        }
+
+        let mut state = step.state.clone();
+        state.local = materialization.state.local.clone();
+        if !installing_fence {
+            state.merge = materialization.state.merge.clone();
+        }
+        validate_runtime_state_bound(&state)?;
+        let projected_artifacts = derive_standard_artifact_closure::<core::convert::Infallible>(
+            next.genesis,
+            &next.runtime,
+            &state,
+        )
+        .map_err(lift_validation)?;
+        let output_base = OrderedBase {
+            index: entry.index,
+            head: Some(id),
+        };
+        let control_manifest =
+            derive_lane_state::<ReplayMaterializationSourceError<R::Error>, E::Error>(
+                current.genesis,
+                step.runtime.clone(),
+                PersistedLane::Control,
+                LaneCursor::Ordered { base: output_base },
+                &step.state.control,
+            )?;
+        let linear_manifest =
+            derive_lane_state::<ReplayMaterializationSourceError<R::Error>, E::Error>(
+                current.genesis,
+                step.runtime.clone(),
+                PersistedLane::Linear,
+                LaneCursor::Ordered { base: output_base },
+                &step.state.linear,
+            )?;
+        let derived_fence_ancestry =
+            successor_fence_ancestry(materialization, &next, false, Some(entry))
+                .map_err(lift_validation)?;
+        let control_projection =
+            SharedLaneProjection::new(control_manifest.id(), control_manifest.state.clone())
+                .map_err(|_| ReplayError::InvalidRecord)?;
+        let linear_projection =
+            SharedLaneProjection::new(linear_manifest.id(), linear_manifest.state.clone())
+                .map_err(|_| ReplayError::InvalidRecord)?;
+        let sealed_merge = if installing_fence {
+            Some(
+                SharedSealedMergeProjection::new(
+                    entry.merge_seal.ok_or(ReplayError::InvalidFence)?,
+                    entry.merge_frontier,
+                    observed_merge_projection.clone(),
+                    finalized_merge_invocations,
+                )
+                .map_err(|_| ReplayError::InvalidRecord)?,
+            )
+        } else {
+            retained_sealed_merge
+        };
+        let claim = OrderedCommitClaim::new(
+            current.genesis,
+            committed.route.admission(),
+            committed.route.committee(),
+            committed.raft_index,
+            committed.raft_term,
+            committed_base,
+            entry.merge_frontier,
+            observed_merge_projection,
+            observed_merge_invocations,
+            step.runtime.clone(),
+            control_projection,
+            linear_projection,
+            ordered_invocations,
+            projected_artifacts.id(),
+            next.merge_fence,
+            sealed_merge,
+            derived_fence_ancestry.commitment(),
+        )
+        .map_err(|_| ReplayError::InvalidRecord)?;
+
+        let sealed = machine
+            .seal_shared_ordered_publication(
+                current,
+                entry,
+                next.clone(),
+                &step,
+                &execution_before,
+                materialization,
+                &pinned_manifest,
+                &pinned_state.merge,
+                committed.journal_store,
+                &claim,
+                committed.raft_payload_commitment,
+                mode,
+            )
+            .map_err(lift_validation)?;
+        let fence_ancestry = sealed.fence_ancestry.clone();
+        let fence = machine.fence.clone();
+        drop(machine);
+        let artifacts = successor_artifacts::<S, R::Error, E>(store, &next, &state)?;
+        if artifacts != projected_artifacts {
+            return Err(ReplayError::InvalidRecord);
+        }
+        snapshots
+            .insert(
+                OrderedBase {
+                    index: entry.index,
+                    head: Some(id),
+                },
+                MaterializedOrderedSnapshot {
+                    runtime: step.runtime.clone(),
+                    control: step.state.control.clone(),
+                    linear: step.state.linear.clone(),
+                },
+            )
+            .map_err(lift_validation)?;
+        let (
+            merge_roots,
+            merge_boundary_roots,
+            merge_boundary_ancestry,
+            merge_boundary_state,
+            merge_boundary_invocations,
+            merge_ancestry,
+        ) = if installing_fence {
+            (
+                pinned_base.roots().to_vec(),
+                pinned_base.roots().iter().map(|root| root.id).collect(),
+                pinned_ancestry.clone(),
+                state.merge.clone(),
+                next.merge_invocations,
+                pinned_ancestry.clone(),
+            )
+        } else {
+            (
+                materialization.merge_roots.clone(),
+                materialization.merge_boundary_roots.clone(),
+                materialization.merge_boundary_ancestry.clone(),
+                materialization.merge_boundary_state.clone(),
+                materialization.merge_boundary_invocations,
+                materialization.merge_ancestry.clone(),
+            )
+        };
+        let mut executions = vec![step.execution_result(true)];
+        executions.extend(finalized_executions);
+        Ok(SharedReplayPreparation::Ready(
+            PreparedSharedOrderedPublication {
+                inner: ReplayPreparedPublication {
+                    store,
+                    sealed,
+                    successor: ReplayMaterialization {
+                        heads_id: next.id(),
+                        heads: next,
+                        state,
+                        ordered_snapshots: snapshots,
+                        merge_roots,
+                        merge_boundary_roots,
+                        merge_boundary_ancestry,
+                        merge_boundary_state,
+                        merge_boundary_invocations,
+                        merge_ancestry,
+                        fence,
+                        artifacts,
+                        suffix_budget,
+                        replay_boundary: materialization.replay_boundary,
+                        fence_ancestry,
+                    },
+                    executions,
+                },
+                authority: committed,
+            },
+        ))
     }
 
     pub(crate) fn prepare_local<'store, S, E>(
@@ -7333,6 +8721,19 @@ mod aggregate {
     {
         require_current_materialization(store, materialization)?;
         let current = &materialization.heads;
+        let decoded = decode_standard_runtime_state(&materialization.state)
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        if decoded
+            .config
+            .as_ref()
+            .is_some_and(|config| config.identity.profile == AgentProfile::Shared)
+        {
+            // Shared compaction requires a certified snapshot which retains
+            // the complete ordered claim/QC and pinned Merge audit closure.
+            // The canonical Local checkpoint capability carries none of that
+            // authority, so it must fail closed even before ledger anchoring.
+            return Err(ReplayError::InvalidRecord);
+        }
         let indexes = InvocationIndexes::open(
             store,
             current.ordered_invocations,
@@ -7457,7 +8858,10 @@ mod aggregate {
             outcomes: Vec::new(),
             history_plans: Vec::new(),
             checkpoint: Some(checkpoint),
+            shared_merge_projection: None,
+            shared_ordered_commit: None,
             fence_ancestry: fence_ancestry.clone(),
+            mode: ReplayPublicationMode::Canonical,
         };
         let snapshots = MaterializedOrderedSnapshots::singleton(
             ordered,
@@ -7509,7 +8913,7 @@ mod aggregate {
 #[allow(unused_imports)]
 pub(crate) use aggregate::{
     MaterializeError, materialize_current, prepare_checkpoint, prepare_local, prepare_merge,
-    prepare_ordered, recover_invocation,
+    prepare_ordered, prepare_shared_ordered, recover_invocation,
 };
 
 #[cfg(test)]
@@ -7531,6 +8935,11 @@ pub(crate) mod tests {
     use crate::agent::contract::RuntimePackageContract;
     use crate::agent::execution::{ActorInvocation, ActorInvocationAuth, ActorObservation};
     #[cfg(feature = "std")]
+    use crate::agent::genesis::{
+        AgentGenesisAdmissionId, AgentReplicaCommittee, AgentReplicaCommitteeId,
+        AgentReplicaMember, derive_replica_raft_slot,
+    };
+    #[cfg(feature = "std")]
     use crate::agent::invocation_history::{InvocationHistoryNode, InvocationHistoryStore};
     #[cfg(feature = "std")]
     use crate::agent::invocation_index::{InvocationIndexStore, InvocationOutcomeStore};
@@ -7540,6 +8949,16 @@ pub(crate) mod tests {
     use crate::agent::journal_store::{
         AgentJournalGarbageCollection, AgentJournalStore, GcLimits, JournalBlobClass,
         JournalPublication, JournalStoreError, MemoryAgentJournalStore,
+    };
+    #[cfg(feature = "std")]
+    use crate::agent::shared_commit::{
+        OrderedCommitClaim, ReplicaCommitSignature, ReplicaQuorumCertificate, SharedLaneProjection,
+        SharedSealedMergeProjection,
+    };
+    #[cfg(feature = "std")]
+    use crate::agent::shared_raft::{
+        AgentRaftCommand, AgentRaftEvidenceLedger, AgentRouteKey, ArtifactBatchId,
+        CommittedAgentRaftEntry, DurableAgentRaftLogWitness,
     };
     use crate::agent::{
         AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LaneSet,
@@ -7551,6 +8970,8 @@ pub(crate) mod tests {
     };
     #[cfg(feature = "std")]
     use ed25519_dalek::{Signer as _, SigningKey};
+    #[cfg(feature = "std")]
+    use redb::Database;
 
     #[derive(Default)]
     struct MemorySource {
@@ -7654,6 +9075,10 @@ pub(crate) mod tests {
 
     #[cfg(feature = "std")]
     impl AgentJournalStore for LinearReplayStore {
+        fn instance_id(&self) -> JournalStoreInstanceId {
+            self.inner.instance_id()
+        }
+
         fn initialize(&mut self, sealed: &ReplaySealedGenesis) -> Result<bool, JournalStoreError> {
             let created = self.inner.initialize(sealed)?;
             self.heads = self
@@ -8154,6 +9579,21 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
+    fn shared_admitted_config() -> AgentConfig {
+        let mut config = admitted_config();
+        config.identity.profile = AgentProfile::Shared;
+        let runtime = admitted_runtime();
+        let (committee, _) = shared_test_committee(&runtime);
+        config.replicas = committee
+            .members()
+            .iter()
+            .map(|member| member.replica())
+            .collect();
+        config.validate().unwrap();
+        config
+    }
+
+    #[cfg(feature = "std")]
     fn admitted_runtime() -> RuntimeBinding {
         let config = admitted_config();
         RuntimeBinding {
@@ -8179,6 +9619,41 @@ pub(crate) mod tests {
             principal: admitted_config().identity.owner,
             credential: CredentialId([0x98; 32]),
             capability: CapabilityId::named("agent.create.local"),
+            operation: inner.commitment(),
+            sequence: 1,
+            valid_from: 10,
+            valid_until: 20,
+        };
+        let signature = admitted_authority_key()
+            .sign(&claim.signing_message().0)
+            .to_bytes()
+            .to_vec();
+        ReplayInput {
+            runtime,
+            operation: ReplayOperation::Management {
+                request: LifecycleRequest::Authorized {
+                    admission: LifecycleAuthorityAdmission {
+                        receipt: AgentAuthorityReceipt { claim, signature },
+                        observed_slot: 15,
+                    },
+                    request: alloc::boxed::Box::new(inner),
+                },
+            },
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn shared_admitted_create_input() -> ReplayInput {
+        let runtime = admitted_runtime();
+        let config = shared_admitted_config();
+        let inner = LifecycleRequest::Create(config.clone());
+        let claim = AgentAuthorityClaim {
+            authority: admitted_authority(),
+            space: runtime.space,
+            agent: runtime.agent,
+            principal: config.identity.owner,
+            credential: CredentialId([0x98; 32]),
+            capability: CapabilityId::named("agent.create.shared"),
             operation: inner.commitment(),
             sequence: 1,
             valid_from: 10,
@@ -8400,11 +9875,33 @@ pub(crate) mod tests {
     /// exposes no callable authority constructor in non-test code.
     #[cfg(feature = "std")]
     pub(crate) fn admitted_genesis(admission: u8) -> ReplaySealedGenesis {
+        admitted_genesis_for(admission, admitted_config(), admitted_create_input())
+    }
+
+    #[cfg(feature = "std")]
+    fn shared_admitted_genesis(admission: u8) -> ReplaySealedGenesis {
+        admitted_genesis_for(
+            admission,
+            shared_admitted_config(),
+            shared_admitted_create_input(),
+        )
+    }
+
+    #[cfg(feature = "std")]
+    fn admitted_genesis_for(
+        admission: u8,
+        config: AgentConfig,
+        create: ReplayInput,
+    ) -> ReplaySealedGenesis {
         let mut executor = ExactCreateRejectInvocations::default();
-        let replica = admitted_config().replicas[0];
-        let prepared =
-            ReplayPreparedGenesis::prepare(admitted_create_input(), replica, &mut executor)
-                .unwrap();
+        let is_shared = config.identity.profile == AgentProfile::Shared;
+        let runtime = create.runtime.clone();
+        let replica = config.replicas[0];
+        let prepared = if config.identity.profile == AgentProfile::Shared {
+            prepare_shared_genesis_for_test(create, replica, &mut executor)
+        } else {
+            ReplayPreparedGenesis::prepare(create, replica, &mut executor).unwrap()
+        };
         let expected = prepared.expectations();
         let signing_keys = [
             SigningKey::from_bytes(&[admission; 32]),
@@ -8424,19 +9921,13 @@ pub(crate) mod tests {
             })
             .collect::<Vec<_>>();
         members.sort_by_key(AuthorityCommitteeMember::signer);
-        let authority_binding = admitted_config().authority.commitment();
-        let committee = AuthorityCommittee::new(
-            admitted_runtime().space,
-            authority_binding,
-            1,
-            None,
-            members,
-        )
-        .unwrap();
+        let authority_binding = config.authority.commitment();
+        let committee =
+            AuthorityCommittee::new(runtime.space, authority_binding, 1, None, members).unwrap();
         let root = RootAnchorRecord::new(
             u64::from(admission) + 1,
-            admitted_runtime().space,
-            admitted_runtime().agent,
+            runtime.space,
+            runtime.agent,
             authority_binding,
             Hash([admission.wrapping_add(3); 32]),
             committee.clone(),
@@ -8473,7 +9964,165 @@ pub(crate) mod tests {
                 .unwrap();
         let evidence = SystemAgentGenesisEvidence::new(claim, certificate).unwrap();
         let verified = evidence.verify(&trusted, expected).unwrap();
-        ReplaySealedGenesis::from_prepared_verified(&verified, evidence, prepared).unwrap()
+        if is_shared {
+            seal_shared_prepared_genesis_for_test(&verified, evidence, prepared)
+        } else {
+            ReplaySealedGenesis::from_prepared_verified(&verified, evidence, prepared).unwrap()
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn seal_shared_prepared_genesis_for_test(
+        verified: &VerifiedSystemAgentGenesis,
+        admission_evidence: SystemAgentGenesisEvidence,
+        prepared: ReplayPreparedGenesis,
+    ) -> ReplaySealedGenesis {
+        let ReplayOperation::Management { request } = &prepared.create.operation else {
+            unreachable!()
+        };
+        let LifecycleRequest::Authorized { request, .. } = request else {
+            unreachable!()
+        };
+        let LifecycleRequest::Create(config) = request.as_ref() else {
+            unreachable!()
+        };
+        assert_eq!(config.identity.profile, AgentProfile::Shared);
+        assert!(config.replicas.contains(&prepared.replica));
+        let admission_record = verified.admission_record();
+        let root_anchor = verified.root_anchor().clone();
+        assert_eq!(admission_record.evidence(), verified.evidence_id());
+        assert_eq!(admission_evidence.id(), verified.evidence_id());
+        assert_eq!(verified.space(), prepared.create.runtime.space);
+        assert_eq!(verified.system_agent(), prepared.create.runtime.agent);
+        assert_eq!(verified.authority_binding(), config.authority.commitment());
+        assert_eq!(
+            verified.genesis_intent(),
+            prepared.expectations.genesis_intent()
+        );
+        assert_eq!(
+            verified.runtime_binding(),
+            prepared.expectations.runtime_binding()
+        );
+        assert_eq!(
+            verified.post_create_state(),
+            prepared.expectations.post_create_state()
+        );
+        assert_eq!(
+            verified.artifact_closure(),
+            prepared.expectations.artifact_closure()
+        );
+        assert_eq!(verified.sequence(), prepared.expectations.sequence());
+
+        let genesis = AgentJournalGenesis {
+            admission: verified.admission_id(),
+            create: prepared.create,
+        };
+        genesis.validate().unwrap();
+        let genesis_id = genesis.id();
+        let artifacts = ArtifactClosure {
+            genesis: genesis_id,
+            artifacts: prepared.artifacts,
+        };
+        artifacts.validate().unwrap();
+        let post_create = prepared.post_create;
+        let replica = prepared.replica;
+        let empty_frontier = MergeFrontier {
+            genesis: genesis_id,
+            events: Vec::new(),
+        };
+        ReplaySealedGenesis {
+            genesis,
+            post_create,
+            empty_frontier,
+            ordered_invocations: InvocationIndexManifest::empty(
+                genesis_id,
+                InvocationOwnershipScope::Ordered,
+            ),
+            merge_invocations: InvocationIndexManifest::empty(
+                genesis_id,
+                InvocationOwnershipScope::Merge,
+            ),
+            local_invocations: InvocationIndexManifest::empty(
+                genesis_id,
+                InvocationOwnershipScope::Local(replica.node),
+            ),
+            artifacts,
+            root_anchor,
+            admission_record,
+            admission_evidence,
+            replica,
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn prepare_shared_genesis_for_test(
+        create: ReplayInput,
+        replica: AgentReplica,
+        executor: &mut ExactCreateRejectInvocations,
+    ) -> ReplayPreparedGenesis {
+        create.validate().unwrap();
+        validate_position::<(), ()>(&create, ReplayPosition::Genesis).unwrap();
+        let ReplayOperation::Management { request } = &create.operation else {
+            unreachable!()
+        };
+        let LifecycleRequest::Authorized { request, .. } = request else {
+            unreachable!()
+        };
+        let LifecycleRequest::Create(config) = request.as_ref() else {
+            unreachable!()
+        };
+        assert_eq!(config.identity.profile, AgentProfile::Shared);
+        assert!(config.replicas.contains(&replica));
+
+        let before = RuntimeState::default();
+        executor
+            .authenticate(&create, &before, ReplayPosition::Genesis)
+            .unwrap();
+        let transition = executor
+            .execute(&create, &before, ReplayPosition::Genesis)
+            .unwrap();
+        validate_transition::<(), ()>(
+            &create,
+            &before,
+            &transition,
+            ReplayPosition::Genesis,
+            &create.runtime,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(transition.disposition, ReplayDisposition::Applied);
+        assert!(transition.result.is_none());
+        assert_eq!(transition.next_runtime, create.runtime);
+        let post_create = transition.state;
+        let decoded = decode_standard_runtime_state(&post_create).unwrap();
+        assert_eq!(decoded.config.as_ref(), Some(config));
+        let artifacts = derive_standard_artifact_references::<core::convert::Infallible>(
+            &create.runtime,
+            &post_create,
+        )
+        .unwrap();
+        let expectations = SystemAgentGenesisExpectations::new(
+            create.runtime.commitment(),
+            request.commitment(),
+            system_genesis_post_create_state_commitment(&post_create).unwrap(),
+            system_genesis_artifact_closure_commitment(&artifacts).unwrap(),
+            match &create.operation {
+                ReplayOperation::Management {
+                    request: LifecycleRequest::Authorized { admission, .. },
+                } => admission.receipt.claim.sequence,
+                _ => unreachable!(),
+            },
+        )
+        .unwrap();
+        ReplayPreparedGenesis {
+            create,
+            replica,
+            post_create,
+            artifacts,
+            expectations,
+        }
     }
 
     #[cfg(feature = "std")]
@@ -8490,6 +10139,386 @@ pub(crate) mod tests {
             .unwrap();
         assert!(store.initialize(&sealed).unwrap());
         store
+    }
+
+    #[cfg(feature = "std")]
+    fn initialized_shared_replay_store() -> MemoryAgentJournalStore {
+        let sealed = shared_admitted_genesis(0xc5);
+        let config = shared_admitted_config();
+        let node = config.replicas[0].node;
+        let runtime = admitted_runtime();
+        let mut store = MemoryAgentJournalStore::new(runtime.agent, node).unwrap();
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &runtime.package,
+                b"replay-runtime-package",
+            )
+            .unwrap();
+        assert!(store.initialize(&sealed).unwrap());
+        store
+    }
+
+    #[cfg(feature = "std")]
+    fn publish_test_merge(
+        store: &mut MemoryAgentJournalStore,
+        executor: &mut ExactCreateRejectInvocations,
+        materialized: &ReplayMaterialization,
+        event: &MergeEvent,
+    ) -> ReplayMaterialization {
+        let prepared =
+            match prepare_merge(store, executor, &NoPrunedOrderedBases, materialized, event)
+                .unwrap()
+            {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => panic!("fresh Merge event was committed"),
+            };
+        let (_, successor, _) = prepared.publish().unwrap();
+        successor
+    }
+
+    #[cfg(feature = "std")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SharedClaimTamper {
+        None,
+        Admission,
+        MergeProjection,
+        MergeInvocations,
+        Runtime,
+        Control,
+        Linear,
+        OrderedInvocations,
+        Artifacts,
+        MergeFence,
+        SealedInvocations,
+        FenceAncestry,
+    }
+
+    #[cfg(feature = "std")]
+    fn shared_test_committee(runtime: &RuntimeBinding) -> (AgentReplicaCommittee, Vec<SigningKey>) {
+        const PEER_ID_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
+        let keys = [0xc2, 0xc3, 0xc4]
+            .into_iter()
+            .map(|byte| SigningKey::from_bytes(&[byte; 32]))
+            .collect::<Vec<_>>();
+        let mut members = keys
+            .iter()
+            .map(|key| {
+                let mut peer_id = PEER_ID_PREFIX.to_vec();
+                peer_id.extend_from_slice(&key.verifying_key().to_bytes());
+                let public_key = key.verifying_key().to_bytes();
+                AgentReplicaMember::new(
+                    AgentReplica {
+                        node: NodeId::of_authenticated_peer(&peer_id),
+                        principal: PrincipalId::of_public_key(&public_key),
+                        role: ReplicaRole::Voter,
+                    },
+                    peer_id.clone(),
+                    public_key,
+                    Some(derive_replica_raft_slot(&peer_id)),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| member.replica().node);
+        (
+            AgentReplicaCommittee::new(runtime.space, runtime.agent, AgentProfile::Shared, members)
+                .unwrap(),
+            keys,
+        )
+    }
+
+    #[cfg(feature = "std")]
+    fn shared_lane_projection(
+        genesis: AgentJournalGenesisId,
+        runtime: RuntimeBinding,
+        lane: PersistedLane,
+        cursor: LaneCursor,
+        state: &[u8],
+    ) -> SharedLaneProjection {
+        let manifest = derive_lane_state::<(), ()>(genesis, runtime, lane, cursor, state).unwrap();
+        SharedLaneProjection::new(manifest.id(), manifest.state).unwrap()
+    }
+
+    #[cfg(feature = "std")]
+    fn shared_claim_for_test(
+        committee: AgentReplicaCommitteeId,
+        entry: &OrderedEntry,
+        observed: &ReplayMaterialization,
+        successor: &ReplayMaterialization,
+        tamper: SharedClaimTamper,
+    ) -> OrderedCommitClaim {
+        assert_eq!(observed.merge_frontier(), entry.merge_frontier);
+        assert_eq!(successor.ordered_base().head, Some(entry.id()));
+        let mut admission =
+            AgentGenesisAdmissionId::from_bytes(*observed.heads().admission.as_bytes());
+        let mut merge = shared_lane_projection(
+            entry.genesis,
+            entry.input.runtime.clone(),
+            PersistedLane::Merge,
+            LaneCursor::Merge {
+                frontier: entry.merge_frontier,
+            },
+            &observed.state().merge,
+        );
+        let mut merge_invocations = observed.heads().merge_invocations;
+        let mut runtime = successor.runtime().clone();
+        let mut control = shared_lane_projection(
+            entry.genesis,
+            runtime.clone(),
+            PersistedLane::Control,
+            LaneCursor::Ordered {
+                base: successor.ordered_base(),
+            },
+            &successor.state().control,
+        );
+        let mut linear = shared_lane_projection(
+            entry.genesis,
+            runtime.clone(),
+            PersistedLane::Linear,
+            LaneCursor::Ordered {
+                base: successor.ordered_base(),
+            },
+            &successor.state().linear,
+        );
+        let mut ordered_invocations = successor.heads().ordered_invocations;
+        let mut artifacts = successor.artifacts().id();
+        let mut merge_fence = successor.heads().merge_fence;
+        let mut sealed_merge = successor.heads().merge_seal.map(|seal| {
+            let fence = successor.fence.as_ref().unwrap();
+            SharedSealedMergeProjection::new(
+                seal,
+                fence.frontier,
+                merge.clone(),
+                successor.merge_boundary_invocations,
+            )
+            .unwrap()
+        });
+        let mut fence_ancestry = successor.fence_ancestry.commitment();
+
+        match tamper {
+            SharedClaimTamper::None => {}
+            SharedClaimTamper::Admission => {
+                admission = AgentGenesisAdmissionId::from_bytes([0xd1; 32]);
+            }
+            SharedClaimTamper::MergeProjection => {
+                merge = SharedLaneProjection::new(
+                    LaneStateId([0xd2; 32]),
+                    BlobRef::of_bytes(b"tampered merge projection"),
+                )
+                .unwrap();
+                if let Some(sealed) = sealed_merge.as_ref() {
+                    sealed_merge = Some(
+                        SharedSealedMergeProjection::new(
+                            sealed.seal(),
+                            sealed.frontier(),
+                            merge.clone(),
+                            sealed.invocations(),
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+            SharedClaimTamper::MergeInvocations => {
+                merge_invocations = InvocationIndexId([0xd3; 32]);
+            }
+            SharedClaimTamper::Runtime => {
+                runtime.deployment = DeploymentId([0xd4; 32]);
+            }
+            SharedClaimTamper::Control => {
+                control = SharedLaneProjection::new(
+                    LaneStateId([0xd5; 32]),
+                    BlobRef::of_bytes(b"tampered control projection"),
+                )
+                .unwrap();
+            }
+            SharedClaimTamper::Linear => {
+                linear = SharedLaneProjection::new(
+                    LaneStateId([0xd6; 32]),
+                    BlobRef::of_bytes(b"tampered linear projection"),
+                )
+                .unwrap();
+            }
+            SharedClaimTamper::OrderedInvocations => {
+                ordered_invocations = InvocationIndexId([0xd7; 32]);
+            }
+            SharedClaimTamper::Artifacts => {
+                artifacts = ArtifactClosureId([0xd8; 32]);
+            }
+            SharedClaimTamper::MergeFence => {
+                merge_fence = OrderedBase::post_genesis();
+                sealed_merge = None;
+            }
+            SharedClaimTamper::SealedInvocations => {
+                let sealed = sealed_merge.as_ref().unwrap();
+                sealed_merge = Some(
+                    SharedSealedMergeProjection::new(
+                        sealed.seal(),
+                        sealed.frontier(),
+                        sealed.lane().clone(),
+                        InvocationIndexId([0xd9; 32]),
+                    )
+                    .unwrap(),
+                );
+            }
+            SharedClaimTamper::FenceAncestry => fence_ancestry = Hash([0xda; 32]),
+        }
+
+        OrderedCommitClaim::new(
+            entry.genesis,
+            admission,
+            committee,
+            1,
+            1,
+            successor.ordered_base(),
+            entry.merge_frontier,
+            merge,
+            merge_invocations,
+            runtime,
+            control,
+            linear,
+            ordered_invocations,
+            artifacts,
+            merge_fence,
+            sealed_merge,
+            fence_ancestry,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "std")]
+    fn shared_qc_for_test(
+        committee: &AgentReplicaCommittee,
+        keys: &[SigningKey],
+        claim: OrderedCommitClaim,
+    ) -> ReplicaQuorumCertificate {
+        let message = ReplicaQuorumCertificate::signing_message(committee.id(), claim.commitment());
+        let mut signatures = keys[..committee.quorum_threshold()]
+            .iter()
+            .map(|key| {
+                let mut peer_id = vec![0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
+                peer_id.extend_from_slice(&key.verifying_key().to_bytes());
+                ReplicaCommitSignature::new(
+                    NodeId::of_authenticated_peer(&peer_id),
+                    key.sign(&message.0).to_bytes(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(ReplicaCommitSignature::signer);
+        ReplicaQuorumCertificate::new(claim, signatures).unwrap()
+    }
+
+    #[cfg(feature = "std")]
+    struct TestCommittedRaftLog {
+        index: u64,
+        term: u64,
+        payload: Vec<u8>,
+    }
+
+    #[cfg(feature = "std")]
+    impl DurableAgentRaftLogWitness for TestCommittedRaftLog {
+        type Error = core::convert::Infallible;
+
+        fn read_committed_payload(
+            &self,
+            index: u64,
+        ) -> Result<Option<(u64, u64, u64, Vec<u8>)>, Self::Error> {
+            Ok((index == self.index)
+                .then(|| (self.index, self.term, self.index, self.payload.clone())))
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn committed_shared_for_test(
+        entry: OrderedEntry,
+        materialized: &ReplayMaterialization,
+        journal_store: JournalStoreInstanceId,
+    ) -> Result<CommittedSharedOrdered, ReplayValidationError> {
+        let (committee, _) = shared_test_committee(&entry.input.runtime);
+        let route = AgentRouteKey::new(
+            entry.input.runtime.space,
+            entry.input.runtime.agent,
+            entry.genesis,
+            AgentGenesisAdmissionId::from_bytes(*materialized.heads().admission.as_bytes()),
+            committee.id(),
+        )
+        .unwrap();
+        let command = AgentRaftCommand::Ordered {
+            route,
+            artifact_batch: None,
+            entry,
+        };
+        let witness = TestCommittedRaftLog {
+            index: 1,
+            term: 1,
+            payload: command.encode(),
+        };
+        let committed = CommittedAgentRaftEntry::from_durable_log(&witness, 1).unwrap();
+        let directory = std::env::temp_dir().join(alloc::format!(
+            "vos_shared_replay_reservation_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database =
+            alloc::sync::Arc::new(Database::create(directory.join("evidence.redb")).unwrap());
+        let local_node = committee.members()[0].replica().node;
+        let ledger = AgentRaftEvidenceLedger::open(
+            database,
+            route,
+            committee.clone(),
+            local_node,
+            journal_store,
+        )
+        .unwrap();
+        let reserved = ledger.reserve_ordered_application(&committed).unwrap();
+        let token = CommittedSharedOrdered::from_reserved_raft_application(reserved, &committee);
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(directory);
+        token
+    }
+
+    #[cfg(feature = "std")]
+    fn committed_placeholder_for_test(
+        entry: OrderedEntry,
+        materialized: &ReplayMaterialization,
+        journal_store: JournalStoreInstanceId,
+    ) -> Result<CommittedSharedOrdered, ReplayValidationError> {
+        committed_shared_for_test(entry, materialized, journal_store)
+    }
+
+    #[cfg(feature = "std")]
+    fn persist_projection_seal(
+        store: &mut MemoryAgentJournalStore,
+        materialized: &ReplayMaterialization,
+        frontier: MergeFrontierId,
+        merge: &[u8],
+    ) -> MergeSealId {
+        let state = BlobRef::of_bytes(merge);
+        store
+            .put_blob(JournalBlobClass::LaneState, &state, merge)
+            .unwrap();
+        let manifest = derive_lane_state::<(), ()>(
+            materialized.heads().genesis,
+            materialized.runtime().clone(),
+            PersistedLane::Merge,
+            LaneCursor::Merge { frontier },
+            merge,
+        )
+        .unwrap();
+        store.put(&manifest).unwrap();
+        let seal = MergeSeal {
+            genesis: materialized.heads().genesis,
+            frontier,
+            ordered_base: materialized.ordered_base(),
+            merge_state: manifest.id(),
+        };
+        store.put(&seal).unwrap();
+        seal.id()
     }
 
     #[cfg(feature = "std")]
@@ -11501,6 +13530,655 @@ pub(crate) mod tests {
         ));
         let checkpoint = prepare_checkpoint(&mut store, &reopened).unwrap();
         checkpoint.publish().unwrap();
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn canonical_checkpoint_rejects_shared_profile_without_snapshot_certificate() {
+        let mut store = initialized_shared_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let materialized =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let heads = store.heads().unwrap().unwrap();
+
+        assert!(matches!(
+            prepare_checkpoint(&mut store, &materialized),
+            Err(ReplayError::InvalidRecord)
+        ));
+        assert_eq!(store.heads().unwrap().unwrap(), heads);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn shared_reservation_rejects_byte_identical_memory_store_transplant() {
+        let mut authorized = initialized_shared_replay_store();
+        let mut transplant = authorized.clone();
+        assert_ne!(authorized.instance_id(), transplant.instance_id());
+
+        let mut authorized_executor = ExactCreateRejectInvocations::default();
+        let mut transplant_executor = ExactCreateRejectInvocations::default();
+        let authorized_state = materialize_current(
+            &mut authorized,
+            &mut authorized_executor,
+            &NoPrunedOrderedBases,
+        )
+        .unwrap();
+        let transplant_state = materialize_current(
+            &mut transplant,
+            &mut transplant_executor,
+            &NoPrunedOrderedBases,
+        )
+        .unwrap();
+        assert_eq!(authorized_state, transplant_state);
+
+        let entry = OrderedEntry {
+            genesis: authorized_state.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: authorized_state.merge_frontier(),
+            merge_seal: None,
+            input: admitted_invocation(MethodMode::Linear, 0x6f),
+        };
+        let committed =
+            committed_shared_for_test(entry, &authorized_state, authorized.instance_id()).unwrap();
+        let transplant_heads = transplant.heads().unwrap().unwrap();
+        assert!(matches!(
+            prepare_shared_ordered(
+                &mut transplant,
+                &mut transplant_executor,
+                &NoPrunedOrderedBases,
+                &transplant_state,
+                committed,
+            ),
+            Err(ReplayError::InvalidRecord)
+        ));
+        assert_eq!(transplant.heads().unwrap().unwrap(), transplant_heads);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn shared_replay_rejects_ordered_artifact_batch_without_publication_receipt() {
+        let mut store = initialized_shared_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let materialized =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let heads = store.heads().unwrap().unwrap();
+        let entry = OrderedEntry {
+            genesis: heads.genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: heads.merge_frontier,
+            merge_seal: None,
+            input: admitted_invocation(MethodMode::Linear, 0x70),
+        };
+        let (committee, _) = shared_test_committee(&entry.input.runtime);
+        let route = AgentRouteKey::new(
+            entry.input.runtime.space,
+            entry.input.runtime.agent,
+            entry.genesis,
+            AgentGenesisAdmissionId::from_bytes(*heads.admission.as_bytes()),
+            committee.id(),
+        )
+        .unwrap();
+        let command = AgentRaftCommand::Ordered {
+            route,
+            artifact_batch: Some(ArtifactBatchId::from_bytes([0xa7; 32])),
+            entry,
+        };
+        let witness = TestCommittedRaftLog {
+            index: 1,
+            term: 1,
+            payload: command.encode(),
+        };
+        let committed = CommittedAgentRaftEntry::from_durable_log(&witness, 1).unwrap();
+        let reserved = ReservedAgentRaftApplication::reserved_for_test(
+            committed,
+            heads.node,
+            store.instance_id(),
+        );
+        assert!(matches!(
+            CommittedSharedOrdered::from_reserved_raft_application(reserved, &committee),
+            Err(ReplayError::InvalidRecord)
+        ));
+        assert_eq!(store.heads().unwrap().unwrap(), heads);
+        assert_eq!(materialized.heads(), &heads);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn shared_ordered_pinned_projection_preserves_each_replica_active_merge() {
+        let initial = initialized_shared_replay_store();
+        let mut oracle_store = initial.clone();
+        let mut left_store = initial.clone();
+        let mut right_store = initial;
+        let mut oracle_executor = ExactCreateRejectInvocations::default();
+        let mut left_executor = ExactCreateRejectInvocations::default();
+        let mut right_executor = ExactCreateRejectInvocations::default();
+        let oracle_base = materialize_current(
+            &mut oracle_store,
+            &mut oracle_executor,
+            &NoPrunedOrderedBases,
+        )
+        .unwrap();
+        let left_base =
+            materialize_current(&mut left_store, &mut left_executor, &NoPrunedOrderedBases)
+                .unwrap();
+        let right_base =
+            materialize_current(&mut right_store, &mut right_executor, &NoPrunedOrderedBases)
+                .unwrap();
+        assert_eq!(left_base.heads(), right_base.heads());
+
+        let event = |discriminator| MergeEvent {
+            genesis: left_base.heads().genesis,
+            author: left_base.heads().node,
+            ordered_base: left_base.ordered_base(),
+            causal_height: 1,
+            parents: Vec::new(),
+            input: admitted_invocation(MethodMode::Merge, discriminator),
+            signature: vec![discriminator; ED25519_SIGNATURE_BYTES],
+        };
+        let pinned_event = event(0x71);
+        let left_active_event = event(0x72);
+        let right_active_event = event(0x73);
+        let pinned_frontier = MergeFrontier {
+            genesis: left_base.heads().genesis,
+            events: vec![pinned_event.id()],
+        };
+        for store in [&mut left_store, &mut right_store] {
+            store.put(&pinned_event).unwrap();
+            store.put(&pinned_frontier).unwrap();
+        }
+        let pinned_projection = publish_test_merge(
+            &mut oracle_store,
+            &mut oracle_executor,
+            &oracle_base,
+            &pinned_event,
+        );
+        assert_eq!(pinned_projection.merge_frontier(), pinned_frontier.id());
+        let left_active = publish_test_merge(
+            &mut left_store,
+            &mut left_executor,
+            &left_base,
+            &left_active_event,
+        );
+        let right_active = publish_test_merge(
+            &mut right_store,
+            &mut right_executor,
+            &right_base,
+            &right_active_event,
+        );
+        assert_ne!(left_active.merge_frontier(), pinned_frontier.id());
+        assert_ne!(right_active.merge_frontier(), pinned_frontier.id());
+        let left_merge_before = left_active.state().merge.clone();
+        let right_merge_before = right_active.state().merge.clone();
+        let left_local_before = (
+            left_active.state().local.clone(),
+            left_active.heads().local_head,
+            left_active.heads().local_revision,
+            left_active.heads().local_invocations,
+            left_active.heads().checkpoint,
+        );
+        let right_local_before = (
+            right_active.state().local.clone(),
+            right_active.heads().local_head,
+            right_active.heads().local_revision,
+            right_active.heads().local_invocations,
+            right_active.heads().checkpoint,
+        );
+
+        let entry = OrderedEntry {
+            genesis: left_active.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: pinned_frontier.id(),
+            merge_seal: None,
+            input: admitted_invocation(MethodMode::Linear, 0x74),
+        };
+        let expected = match prepare_ordered(
+            &mut oracle_store,
+            &mut oracle_executor,
+            &pinned_projection,
+            &entry,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_, expected_successor, _) = expected.publish().unwrap();
+        let (committee, committee_keys) = shared_test_committee(&entry.input.runtime);
+        let expected_claim = shared_claim_for_test(
+            committee.id(),
+            &entry,
+            &pinned_projection,
+            &expected_successor,
+            SharedClaimTamper::None,
+        );
+        let committed_left =
+            committed_shared_for_test(entry.clone(), &left_active, left_store.instance_id())
+                .unwrap();
+        let left = match prepare_shared_ordered(
+            &mut left_store,
+            &mut left_executor,
+            &NoPrunedOrderedBases,
+            &left_active,
+            committed_left,
+        )
+        .unwrap()
+        {
+            SharedReplayPreparation::Ready(prepared) => prepared,
+            SharedReplayPreparation::AlreadyCommitted { .. } => unreachable!(),
+        };
+        let (_, left_successor, _, left_receipt) = left.publish_shared().unwrap();
+        let committed_right =
+            committed_shared_for_test(entry.clone(), &right_active, right_store.instance_id())
+                .unwrap();
+        let right = match prepare_shared_ordered(
+            &mut right_store,
+            &mut right_executor,
+            &NoPrunedOrderedBases,
+            &right_active,
+            committed_right,
+        )
+        .unwrap()
+        {
+            SharedReplayPreparation::Ready(prepared) => prepared,
+            SharedReplayPreparation::AlreadyCommitted { .. } => unreachable!(),
+        };
+        let (_, right_successor, _, right_receipt) = right.publish_shared().unwrap();
+        assert_eq!(left_receipt.claim(), right_receipt.claim());
+        assert_eq!(left_receipt.claim(), &expected_claim);
+
+        let exact_certificate =
+            shared_qc_for_test(&committee, &committee_keys, left_receipt.claim().clone());
+        exact_certificate
+            .verify(&committee, left_receipt.claim())
+            .unwrap();
+        for tamper in [
+            SharedClaimTamper::Admission,
+            SharedClaimTamper::MergeProjection,
+            SharedClaimTamper::MergeInvocations,
+            SharedClaimTamper::Runtime,
+            SharedClaimTamper::Control,
+            SharedClaimTamper::Linear,
+            SharedClaimTamper::OrderedInvocations,
+            SharedClaimTamper::Artifacts,
+            SharedClaimTamper::FenceAncestry,
+        ] {
+            let tampered = shared_claim_for_test(
+                committee.id(),
+                &entry,
+                &pinned_projection,
+                &expected_successor,
+                tamper,
+            );
+            let certificate = shared_qc_for_test(&committee, &committee_keys, tampered.clone());
+            certificate.verify(&committee, &tampered).unwrap();
+            assert!(
+                certificate
+                    .verify(&committee, left_receipt.claim())
+                    .is_err()
+            );
+        }
+
+        assert_eq!(left_successor.state().merge, left_merge_before);
+        assert_eq!(right_successor.state().merge, right_merge_before);
+        assert_eq!(
+            (
+                left_successor.state().local.clone(),
+                left_successor.heads().local_head,
+                left_successor.heads().local_revision,
+                left_successor.heads().local_invocations,
+                left_successor.heads().checkpoint,
+            ),
+            left_local_before
+        );
+        assert_eq!(
+            (
+                right_successor.state().local.clone(),
+                right_successor.heads().local_head,
+                right_successor.heads().local_revision,
+                right_successor.heads().local_invocations,
+                right_successor.heads().checkpoint,
+            ),
+            right_local_before
+        );
+        assert_eq!(
+            left_successor.state().control,
+            right_successor.state().control
+        );
+        assert_eq!(
+            left_successor.state().linear,
+            right_successor.state().linear
+        );
+        assert_eq!(
+            left_successor.heads().ordered_invocations,
+            right_successor.heads().ordered_invocations
+        );
+        assert_eq!(left_successor.heads().ordered_head, Some(entry.id()));
+        assert_eq!(right_successor.heads().ordered_head, Some(entry.id()));
+
+        let reopened_left =
+            materialize_current(&mut left_store, &mut left_executor, &NoPrunedOrderedBases)
+                .unwrap();
+        let reopened_right =
+            materialize_current(&mut right_store, &mut right_executor, &NoPrunedOrderedBases)
+                .unwrap();
+        assert_eq!(reopened_left, left_successor);
+        assert_eq!(reopened_right, right_successor);
+
+        let executions_before_retry = left_executor.executions;
+        let committed_retry =
+            committed_shared_for_test(entry.clone(), &reopened_left, left_store.instance_id())
+                .unwrap();
+        match prepare_shared_ordered(
+            &mut left_store,
+            &mut left_executor,
+            &NoPrunedOrderedBases,
+            &reopened_left,
+            committed_retry,
+        )
+        .unwrap()
+        {
+            SharedReplayPreparation::Ready(_) => {
+                panic!("exact Shared retry prepared a second transition")
+            }
+            SharedReplayPreparation::AlreadyCommitted {
+                recovery,
+                publication,
+            } => {
+                assert_eq!(recovery.input(), entry.input.id());
+                assert_eq!(publication.claim(), left_receipt.claim());
+                assert_eq!(publication.entry(), left_receipt.entry());
+                assert_eq!(publication.successor(), left_receipt.successor());
+                assert_eq!(
+                    publication.raft_payload_commitment(),
+                    left_receipt.raft_payload_commitment()
+                );
+            }
+        }
+        assert_eq!(left_executor.executions, executions_before_retry);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn shared_ordered_missing_or_noncausal_pinned_frontier_fails_closed() {
+        let mut store = initialized_shared_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let base = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let missing = MergeFrontierId([0x81; 32]);
+        let missing_entry = OrderedEntry {
+            genesis: base.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: missing,
+            merge_seal: None,
+            input: admitted_invocation(MethodMode::Linear, 0x82),
+        };
+        let missing_commit =
+            committed_placeholder_for_test(missing_entry, &base, store.instance_id()).unwrap();
+        assert!(matches!(
+            prepare_shared_ordered(
+                &mut store,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &base,
+                missing_commit,
+            ),
+            Err(ReplayError::MissingMergeFrontier(id)) if id == missing
+        ));
+
+        let causal_parent = MergeEvent {
+            genesis: base.heads().genesis,
+            author: base.heads().node,
+            ordered_base: base.ordered_base(),
+            causal_height: 1,
+            parents: Vec::new(),
+            input: admitted_invocation(MethodMode::Merge, 0x83),
+            signature: vec![0x83; ED25519_SIGNATURE_BYTES],
+        };
+        let noncausal = MergeEvent {
+            genesis: base.heads().genesis,
+            author: base.heads().node,
+            ordered_base: base.ordered_base(),
+            causal_height: 3,
+            parents: vec![causal_parent.id()],
+            input: admitted_invocation(MethodMode::Merge, 0x85),
+            signature: vec![0x85; ED25519_SIGNATURE_BYTES],
+        };
+        let frontier = MergeFrontier {
+            genesis: base.heads().genesis,
+            events: vec![noncausal.id()],
+        };
+        store.put(&causal_parent).unwrap();
+        store.put(&noncausal).unwrap();
+        store.put(&frontier).unwrap();
+        let noncausal_entry = OrderedEntry {
+            genesis: base.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: frontier.id(),
+            merge_seal: None,
+            input: admitted_invocation(MethodMode::Linear, 0x84),
+        };
+        let noncausal_commit =
+            committed_placeholder_for_test(noncausal_entry, &base, store.instance_id()).unwrap();
+        assert!(matches!(
+            prepare_shared_ordered(
+                &mut store,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &base,
+                noncausal_commit,
+            ),
+            Err(ReplayError::InvalidCausalHeight)
+        ));
+        assert_eq!(store.heads().unwrap().unwrap(), *base.heads());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn shared_fence_rejects_excluded_pending_owner_and_accepts_full_frontier() {
+        let mut store = initialized_shared_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let base = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let event = |discriminator| MergeEvent {
+            genesis: base.heads().genesis,
+            author: base.heads().node,
+            ordered_base: base.ordered_base(),
+            causal_height: 1,
+            parents: Vec::new(),
+            input: admitted_invocation(MethodMode::Merge, discriminator),
+            signature: vec![discriminator; ED25519_SIGNATURE_BYTES],
+        };
+        let retained = event(0x91);
+        let excluded = event(0x92);
+        let after_retained = publish_test_merge(&mut store, &mut executor, &base, &retained);
+        let mut excluding_oracle_store = store.clone();
+        let mut excluding_oracle_executor = ExactCreateRejectInvocations::default();
+        let active = publish_test_merge(&mut store, &mut executor, &after_retained, &excluded);
+        let retained_frontier = after_retained.merge_frontier();
+        let retained_seal = persist_projection_seal(
+            &mut store,
+            &active,
+            retained_frontier,
+            &after_retained.state().merge,
+        );
+        let oracle_retained_seal = persist_projection_seal(
+            &mut excluding_oracle_store,
+            &after_retained,
+            retained_frontier,
+            &after_retained.state().merge,
+        );
+        assert_eq!(oracle_retained_seal, retained_seal);
+        let excluding_entry = OrderedEntry {
+            genesis: active.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: retained_frontier,
+            merge_seal: Some(retained_seal),
+            input: ReplayInput {
+                runtime: active.runtime().clone(),
+                operation: ReplayOperation::SealMerge,
+            },
+        };
+        let excluding_expected = match prepare_ordered(
+            &mut excluding_oracle_store,
+            &mut excluding_oracle_executor,
+            &after_retained,
+            &excluding_entry,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_, _excluding_successor, _) = excluding_expected.publish().unwrap();
+        let excluding_commit =
+            committed_shared_for_test(excluding_entry, &active, store.instance_id()).unwrap();
+        assert!(matches!(
+            prepare_shared_ordered(
+                &mut store,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &active,
+                excluding_commit,
+            ),
+            Err(ReplayError::InvalidFence)
+        ));
+        assert_eq!(store.heads().unwrap().unwrap(), *active.heads());
+        assert_eq!(
+            recover_invocation(
+                &mut store,
+                &active,
+                &excluded.input,
+                merge_position(&excluded),
+            )
+            .unwrap(),
+            ReplayInvocationRecovery::Pending
+        );
+
+        let mut inclusive_oracle_store = store.clone();
+        let mut inclusive_oracle_executor = ExactCreateRejectInvocations::default();
+        let inclusive_seal = persist_merge_seal(&mut store, &active);
+        let oracle_inclusive_seal = persist_merge_seal(&mut inclusive_oracle_store, &active);
+        assert_eq!(oracle_inclusive_seal, inclusive_seal);
+        let inclusive_entry = OrderedEntry {
+            genesis: active.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: active.merge_frontier(),
+            merge_seal: Some(inclusive_seal),
+            input: ReplayInput {
+                runtime: active.runtime().clone(),
+                operation: ReplayOperation::SealMerge,
+            },
+        };
+        let inclusive_expected = match prepare_ordered(
+            &mut inclusive_oracle_store,
+            &mut inclusive_oracle_executor,
+            &active,
+            &inclusive_entry,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_, inclusive_successor, _) = inclusive_expected.publish().unwrap();
+        let (committee, committee_keys) = shared_test_committee(&inclusive_entry.input.runtime);
+        let expected_claim = shared_claim_for_test(
+            committee.id(),
+            &inclusive_entry,
+            &active,
+            &inclusive_successor,
+            SharedClaimTamper::None,
+        );
+        let inclusive_commit =
+            committed_shared_for_test(inclusive_entry.clone(), &active, store.instance_id())
+                .unwrap();
+        let prepared = match prepare_shared_ordered(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &active,
+            inclusive_commit,
+        )
+        .unwrap()
+        {
+            SharedReplayPreparation::Ready(prepared) => prepared,
+            SharedReplayPreparation::AlreadyCommitted { .. } => unreachable!(),
+        };
+        let (_, fenced, finalized, receipt) = prepared.publish_shared().unwrap();
+        assert_eq!(receipt.entry(), inclusive_entry.id());
+        assert_eq!(receipt.claim(), &expected_claim);
+        assert_eq!(fenced.merge_frontier(), active.merge_frontier());
+        assert_eq!(fenced.heads().merge_fence.index, inclusive_entry.index);
+        assert_eq!(finalized.len(), 3);
+        let reopened =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        assert_eq!(reopened.heads(), fenced.heads());
+        assert_eq!(reopened.state(), fenced.state());
+        assert_eq!(reopened.merge_roots, fenced.merge_roots);
+        assert_eq!(reopened.merge_boundary_roots, fenced.merge_boundary_roots);
+        assert_eq!(
+            reopened.merge_boundary_invocations,
+            fenced.merge_boundary_invocations
+        );
+        assert_eq!(reopened.merge_ancestry, fenced.merge_ancestry);
+
+        let exact_certificate =
+            shared_qc_for_test(&committee, &committee_keys, receipt.claim().clone());
+        exact_certificate
+            .verify(&committee, receipt.claim())
+            .unwrap();
+        for tamper in [
+            SharedClaimTamper::MergeFence,
+            SharedClaimTamper::SealedInvocations,
+        ] {
+            let tampered = shared_claim_for_test(
+                committee.id(),
+                &inclusive_entry,
+                &active,
+                &inclusive_successor,
+                tamper,
+            );
+            let certificate = shared_qc_for_test(&committee, &committee_keys, tampered.clone());
+            certificate.verify(&committee, &tampered).unwrap();
+            assert!(certificate.verify(&committee, receipt.claim()).is_err());
+        }
+
+        let executions_before_retry = executor.executions;
+        let committed_retry =
+            committed_shared_for_test(inclusive_entry.clone(), &reopened, store.instance_id())
+                .unwrap();
+        match prepare_shared_ordered(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &reopened,
+            committed_retry,
+        )
+        .unwrap()
+        {
+            SharedReplayPreparation::Ready(_) => {
+                panic!("exact Shared fence retry prepared a second transition")
+            }
+            SharedReplayPreparation::AlreadyCommitted {
+                recovery,
+                publication,
+            } => {
+                assert_eq!(recovery.input(), inclusive_entry.input.id());
+                assert_eq!(publication.claim(), receipt.claim());
+                assert_eq!(publication.entry(), receipt.entry());
+                assert_eq!(publication.successor(), receipt.successor());
+                assert_eq!(
+                    publication.raft_payload_commitment(),
+                    receipt.raft_payload_commitment()
+                );
+            }
+        }
+        assert_eq!(executor.executions, executions_before_retry);
     }
 
     #[cfg(feature = "std")]
