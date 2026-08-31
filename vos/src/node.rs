@@ -4814,30 +4814,54 @@ impl VosNode {
     ///
     /// This seals only process ownership and lifecycle. It does not publish a
     /// route, mint authority evidence, or project an Agent into a legacy
-    /// [`ServiceId`]. This remains crate-private until a sealed production
-    /// authority adapter can construct it. A duplicate, stopped, or
-    /// post-shutdown attachment returns the incoming control unchanged so its
-    /// owner can shut it down explicitly.
-    #[allow(dead_code)] // Used by the sealed production authority adapter in the next slice.
-    pub(crate) fn attach_local_agent_host(
+    /// [`ServiceId`]. A duplicate, stopped, or post-shutdown attachment
+    /// returns the incoming control unchanged so its owner can shut it down
+    /// explicitly. The node deliberately does not return or expose the raw
+    /// command handle after taking ownership.
+    pub fn attach_local_agent_host(
         &mut self,
         control: crate::agent::host::AgentHostControl,
-    ) -> Result<crate::agent::host::AgentHostHandle, Box<crate::agent::host::AgentHostControl>>
-    {
+    ) -> Result<(), Box<crate::agent::host::AgentHostControl>> {
         if self.local_agent_host.is_some()
             || !control.is_running()
             || self.shutdown.load(Ordering::Acquire)
         {
             return Err(Box::new(control));
         }
-        let handle = control.handle();
         self.local_agent_host = Some(control);
-        Ok(handle)
+        Ok(())
     }
 
-    /// Clone the full-identity control handle for the attached Local host.
-    #[allow(dead_code)] // Kept crate-private until authenticated Agent ingress exists.
-    pub(crate) fn local_agent_host_handle(&self) -> Option<crate::agent::host::AgentHostHandle> {
+    /// Invoke one full-ID Local Agent actor and wait until its durable outcome
+    /// is settled. Pending Merge execution is finalized inside the host and is
+    /// never exposed through this node boundary.
+    pub fn invoke_local_agent_synchronous(
+        &self,
+        agent: crate::service::AgentId,
+        invocation: crate::agent::execution::ActorInvocation,
+        authority: crate::agent::authority::ActorInvocationReceipt,
+    ) -> Result<crate::agent::execution::ActorExecutionReply, crate::agent::host::AgentHostError>
+    {
+        self.local_agent_host_handle()
+            .ok_or(crate::agent::host::AgentHostError::Unavailable)?
+            .invoke(agent, invocation, authority)
+    }
+
+    /// Durably acknowledge one full-ID Local Agent invocation and wait for
+    /// the acknowledgement or an exact divergence result.
+    pub fn acknowledge_local_agent_invocation_synchronous(
+        &self,
+        agent: crate::service::AgentId,
+        invocation: crate::agent::execution::ActorInvocation,
+        authority: crate::agent::authority::ActorInvocationReceipt,
+    ) -> Result<(), crate::agent::host::AgentHostError> {
+        self.local_agent_host_handle()
+            .ok_or(crate::agent::host::AgentHostError::Unavailable)?
+            .acknowledge_invocation(agent, invocation, authority)
+    }
+
+    /// Clone the private command handle used by the narrow forwarding methods.
+    fn local_agent_host_handle(&self) -> Option<crate::agent::host::AgentHostHandle> {
         self.local_agent_host.as_ref().map(|host| host.handle())
     }
 
@@ -14604,6 +14628,105 @@ mod tests {
         }
     }
 
+    struct NoAgentMerge(crate::service::NodeId);
+
+    impl crate::agent::host::LocalMergeAuthenticator for NoAgentMerge {
+        fn node(&self) -> crate::service::NodeId {
+            self.0
+        }
+
+        fn sign_event(&self, _event: &mut crate::agent::journal::MergeEvent) -> bool {
+            false
+        }
+
+        fn verify_event(&self, _event: &crate::agent::journal::MergeEvent) -> bool {
+            false
+        }
+    }
+
+    struct NoAgentGenesis;
+
+    impl crate::agent::bootstrap::SystemAgentGenesisProvider for NoAgentGenesis {
+        fn create(
+            &self,
+            _proposal: &crate::agent::bootstrap::SystemAgentGenesisProposal,
+            _catalog: &[crate::agent::execution::RuntimeBlob],
+        ) -> Result<
+            crate::agent::bootstrap::SystemAgentGenesisProvision,
+            crate::agent::bootstrap::SystemAgentGenesisProviderError,
+        > {
+            Err(crate::agent::bootstrap::SystemAgentGenesisProviderError::NotConfigured)
+        }
+
+        fn reproduce(
+            &self,
+            _locator: crate::agent::bootstrap::SystemAgentGenesisLocator,
+        ) -> Result<
+            crate::agent::bootstrap::SystemAgentGenesisProvision,
+            crate::agent::bootstrap::SystemAgentGenesisProviderError,
+        > {
+            Err(crate::agent::bootstrap::SystemAgentGenesisProviderError::NotConfigured)
+        }
+
+        fn load_catalog(
+            &self,
+            _locator: crate::agent::bootstrap::SystemAgentGenesisLocator,
+            _reference: &crate::service::BlobRef,
+        ) -> Result<Option<Vec<u8>>, crate::agent::bootstrap::SystemAgentGenesisProviderError>
+        {
+            Ok(None)
+        }
+    }
+
+    fn inert_agent_root_pins(
+        scope: crate::agent::host::AgentHostScope,
+    ) -> crate::agent::committee::RootAnchorPins {
+        use crate::agent::committee::{
+            AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommittee,
+            AuthorityCommitteeMember, AuthorityMemberRole, RootAnchorPins, RootAnchorRecord,
+        };
+
+        let authority_binding = crate::service::Hash([0x41; 32]);
+        let committee = AuthorityCommittee::new(
+            scope.space,
+            authority_binding,
+            1,
+            None,
+            vec![
+                AuthorityCommitteeMember::new(
+                    crate::service::NodeId([0x42; 32]),
+                    [0x43; 32],
+                    AuthorityMemberRole::Voter,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let record = RootAnchorRecord::new(
+            1,
+            scope.space,
+            crate::service::AgentId([0x44; 32]),
+            authority_binding,
+            crate::service::Hash([0x45; 32]),
+            committee,
+        )
+        .unwrap();
+        let genesis_claim = AuthorityClaimCommitment::from_payload_commitment(
+            AuthorityClaimDomain::SystemAgentGenesis,
+            1,
+            crate::service::Hash([0x46; 32]),
+        )
+        .unwrap();
+        RootAnchorPins::new(
+            record.clone(),
+            record.config_version(),
+            record.id(),
+            record.config_commitment(),
+            genesis_claim,
+        )
+        .unwrap()
+    }
+
     struct RemoveAgentHostDirectory(std::path::PathBuf);
 
     impl Drop for RemoveAgentHostDirectory {
@@ -14627,18 +14750,101 @@ mod tests {
             std::process::id()
         ));
         let remove = RemoveAgentHostDirectory(base.clone());
+        let scope = crate::agent::host::AgentHostScope {
+            space: crate::service::SpaceId([0x31; 32]),
+            node: crate::service::NodeId([0x32; 32]),
+        };
         let lease = crate::agent::host::AgentHostRootLease::acquire(
             base.join("data"),
             base.join("owner.lock"),
-            crate::agent::host::AgentHostScope {
-                space: crate::service::SpaceId([0x31; 32]),
-                node: crate::service::NodeId([0x32; 32]),
-            },
+            scope,
         )
         .unwrap();
-        let control =
-            crate::agent::host::AgentHostControl::open(lease, Arc::new(NoAgentTrust)).unwrap();
+        let control = crate::agent::host::AgentHostControl::open(
+            lease,
+            Arc::new(NoAgentTrust),
+            Arc::new(NoAgentMerge(scope.node)),
+            Arc::new(NoAgentGenesis),
+            inert_agent_root_pins(scope),
+        )
+        .unwrap();
         (control, remove)
+    }
+
+    fn missing_agent_invocation(
+        agent: crate::service::AgentId,
+    ) -> (
+        crate::agent::execution::ActorInvocation,
+        crate::agent::authority::ActorInvocationReceipt,
+    ) {
+        let public_key = crate::agent::authority::ed25519_public_key_wire([0x51; 32]);
+        let authority = crate::agent::authority::AgentAuthorityBinding {
+            agent,
+            actor: crate::service::ActorId([0x52; 32]),
+            deployment: crate::service::DeploymentId([0x53; 32]),
+            program: crate::service::ProgramId([0x54; 32]),
+            producer: crate::service::ProducerId::of_public_key(&public_key),
+            public_key,
+        };
+        let auth = crate::agent::execution::ActorInvocationAuth::anonymous();
+        let invocation = crate::agent::execution::ActorInvocation {
+            invocation: crate::service::InvocationId([0x55; 32]),
+            actor: crate::service::ActorId([0x56; 32]),
+            incarnation: crate::service::Hash([0x57; 32]),
+            deployment: crate::service::DeploymentId([0x58; 32]),
+            program: crate::service::ProgramId([0x59; 32]),
+            mode: crate::agent::MethodMode::Query,
+            auth: auth.clone(),
+            message: vec![0x5a],
+            availability: Vec::new(),
+            gas: 1,
+        };
+        let receipt = crate::agent::authority::ActorInvocationReceipt {
+            claim: crate::agent::authority::ActorInvocationClaim {
+                authority,
+                space: crate::service::SpaceId([0x31; 32]),
+                agent,
+                principal: None,
+                credential: None,
+                authorization: invocation.authorization_message(),
+                auth,
+                valid_from: 1,
+                valid_until: 2,
+            },
+            signature: vec![0; crate::agent::authority::ED25519_SIGNATURE_BYTES],
+        };
+        (invocation, receipt)
+    }
+
+    #[test]
+    fn local_agent_node_surface_forwards_only_settled_full_id_operations() {
+        let agent = crate::service::AgentId([0x61; 32]);
+        let (invocation, receipt) = missing_agent_invocation(agent);
+        let mut node = VosNode::new();
+        assert_eq!(
+            node.invoke_local_agent_synchronous(agent, invocation.clone(), receipt.clone()),
+            Err(crate::agent::host::AgentHostError::Unavailable),
+        );
+        assert_eq!(
+            node.acknowledge_local_agent_invocation_synchronous(
+                agent,
+                invocation.clone(),
+                receipt.clone(),
+            ),
+            Err(crate::agent::host::AgentHostError::Unavailable),
+        );
+
+        let (control, _remove) = empty_agent_host_control("settled-forwarding");
+        node.attach_local_agent_host(control).unwrap();
+        assert_eq!(
+            node.invoke_local_agent_synchronous(agent, invocation.clone(), receipt.clone()),
+            Err(crate::agent::host::AgentHostError::AgentNotFound),
+        );
+        assert_eq!(
+            node.acknowledge_local_agent_invocation_synchronous(agent, invocation, receipt),
+            Err(crate::agent::host::AgentHostError::AgentNotFound),
+        );
+        node.collect_checked().unwrap();
     }
 
     #[test]
@@ -14649,7 +14855,8 @@ mod tests {
         stopped.request_shutdown();
         let mut node = VosNode::new();
         assert!(node.attach_local_agent_host(stopped).is_err());
-        let handle = node.attach_local_agent_host(control).unwrap();
+        let handle = control.handle();
+        node.attach_local_agent_host(control).unwrap();
         assert!(node.attach_local_agent_host(duplicate).is_err());
 
         let mut ticks = 0;
@@ -14674,7 +14881,8 @@ mod tests {
     fn checked_node_collection_surfaces_an_agent_host_worker_crash() {
         let (control, _remove) = empty_agent_host_control("worker-crash");
         let mut node = VosNode::new();
-        let handle = node.attach_local_agent_host(control).unwrap();
+        let handle = control.handle();
+        node.attach_local_agent_host(control).unwrap();
         assert_eq!(
             handle.crash_worker_for_test(),
             Err(crate::agent::host::AgentHostError::WorkerStopped)
@@ -14689,7 +14897,8 @@ mod tests {
     fn agent_host_crash_stops_a_node_even_while_a_legacy_worker_is_live() {
         let (control, _remove) = empty_agent_host_control("mixed-worker-crash");
         let mut node = VosNode::new();
-        let handle = node.attach_local_agent_host(control).unwrap();
+        let handle = control.handle();
+        node.attach_local_agent_host(control).unwrap();
         let shutdown = node.shutdown_handle();
         let worker_shutdown = shutdown.clone();
         node.agents.push(AgentHandle {
@@ -14752,7 +14961,8 @@ mod tests {
     fn run_until_idle_fans_out_an_agent_host_crash_without_waiting_for_threshold() {
         let (control, _remove) = empty_agent_host_control("idle-worker-crash");
         let mut node = VosNode::new();
-        let handle = node.attach_local_agent_host(control).unwrap();
+        let handle = control.handle();
+        node.attach_local_agent_host(control).unwrap();
         assert_eq!(
             handle.crash_worker_for_test(),
             Err(crate::agent::host::AgentHostError::WorkerStopped)
@@ -14771,7 +14981,8 @@ mod tests {
     fn active_agent_host_work_defers_the_complete_node_idle_window() {
         let (control, _remove) = empty_agent_host_control("active-idle-window");
         let mut node = VosNode::new();
-        let handle = node.attach_local_agent_host(control).unwrap();
+        let handle = control.handle();
+        node.attach_local_agent_host(control).unwrap();
         let (active_tx, active_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
         let worker_handle = handle.clone();
