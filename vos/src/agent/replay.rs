@@ -11,13 +11,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::committee::{
-    RootAnchorRecord, SystemAgentGenesisAdmissionId, SystemAgentGenesisAdmissionRecord,
-    SystemAgentGenesisEvidence, SystemAgentGenesisExpectations, VerifiedSystemAgentGenesis,
+    RootAnchorRecord, SystemAgentGenesisEvidence, SystemAgentGenesisExpectations,
+    VerifiedSystemAgentGenesis,
 };
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, MAX_RUNTIME_STATE_BYTES,
 };
-use super::genesis::AgentReplicaCommittee;
+use super::genesis::{AgentGenesisAdmissionId, AgentGenesisAdmissionRecord, AgentReplicaCommittee};
 use super::invocation_history::InvocationHistoryWritePlan;
 #[cfg(feature = "std")]
 use super::invocation_index::InvocationIndexes;
@@ -1334,7 +1334,7 @@ pub struct ReplaySealedGenesis {
     local_invocations: InvocationIndexManifest,
     artifacts: ArtifactClosure,
     root_anchor: RootAnchorRecord,
-    admission_record: SystemAgentGenesisAdmissionRecord,
+    admission_record: AgentGenesisAdmissionRecord,
     admission_evidence: SystemAgentGenesisEvidence,
     replica: AgentReplica,
 }
@@ -1372,8 +1372,8 @@ impl ReplaySealedGenesis {
         &self.root_anchor
     }
 
-    pub const fn admission_record(&self) -> SystemAgentGenesisAdmissionRecord {
-        self.admission_record
+    pub fn admission_record(&self) -> &AgentGenesisAdmissionRecord {
+        &self.admission_record
     }
 
     pub fn admission_evidence(&self) -> &SystemAgentGenesisEvidence {
@@ -1406,12 +1406,12 @@ impl ReplaySealedGenesis {
         let LifecycleRequest::Create(config) = request.as_ref() else {
             return Err(ReplayError::InvalidRecord);
         };
-        let admission_record = verified.admission_record();
+        let root_admission = verified.admission_record();
         let root_anchor = verified.root_anchor().clone();
-        if admission_record.evidence() != verified.evidence_id()
-            || admission_record.root_anchor() != root_anchor.id()
-            || admission_record.root_anchor_config_version() != root_anchor.config_version()
-            || admission_record.root_anchor_config() != root_anchor.config_commitment()
+        if root_admission.evidence() != verified.evidence_id()
+            || root_admission.root_anchor() != root_anchor.id()
+            || root_admission.root_anchor_config_version() != root_anchor.config_version()
+            || root_admission.root_anchor_config() != root_anchor.config_commitment()
             || admission_evidence.id() != verified.evidence_id()
             || verified.space() != prepared.create.runtime.space
             || verified.system_agent() != prepared.create.runtime.agent
@@ -1427,12 +1427,15 @@ impl ReplaySealedGenesis {
             return Err(ReplayError::InvalidRecord);
         }
 
+        let admission_record = AgentGenesisAdmissionRecord::root_bootstrap(root_admission)
+            .map_err(|_| ReplayError::InvalidRecord)?;
+
         let genesis = AgentJournalGenesis {
-            admission: verified.admission_id(),
+            admission: admission_record.id(),
             create: prepared.create,
         };
         genesis.validate().map_err(|_| ReplayError::InvalidRecord)?;
-        if verified.admission_commitment() != genesis.admission.as_hash()
+        if verified.admission_commitment() != root_admission.id().as_hash()
             || admission_record.id() != genesis.admission
             || genesis
                 .genesis_intent()
@@ -5283,7 +5286,7 @@ pub fn derive_lane_state<SourceError, ExecutorError>(
 #[allow(clippy::too_many_arguments)]
 pub fn derive_checkpoint<SourceError, ExecutorError>(
     genesis: AgentJournalGenesisId,
-    admission: SystemAgentGenesisAdmissionId,
+    admission: AgentGenesisAdmissionId,
     runtime: RuntimeBinding,
     publication_revision: u64,
     ordered: OrderedBase,
@@ -9988,9 +9991,9 @@ pub(crate) mod tests {
         };
         assert_eq!(config.identity.profile, AgentProfile::Shared);
         assert!(config.replicas.contains(&prepared.replica));
-        let admission_record = verified.admission_record();
+        let root_admission = verified.admission_record();
         let root_anchor = verified.root_anchor().clone();
-        assert_eq!(admission_record.evidence(), verified.evidence_id());
+        assert_eq!(root_admission.evidence(), verified.evidence_id());
         assert_eq!(admission_evidence.id(), verified.evidence_id());
         assert_eq!(verified.space(), prepared.create.runtime.space);
         assert_eq!(verified.system_agent(), prepared.create.runtime.agent);
@@ -10013,8 +10016,10 @@ pub(crate) mod tests {
         );
         assert_eq!(verified.sequence(), prepared.expectations.sequence());
 
+        let admission_record = AgentGenesisAdmissionRecord::root_bootstrap(root_admission).unwrap();
+
         let genesis = AgentJournalGenesis {
-            admission: verified.admission_id(),
+            admission: admission_record.id(),
             create: prepared.create,
         };
         genesis.validate().unwrap();
@@ -10250,8 +10255,7 @@ pub(crate) mod tests {
     ) -> OrderedCommitClaim {
         assert_eq!(observed.merge_frontier(), entry.merge_frontier);
         assert_eq!(successor.ordered_base().head, Some(entry.id()));
-        let mut admission =
-            AgentGenesisAdmissionId::from_bytes(*observed.heads().admission.as_bytes());
+        let mut admission = observed.heads().admission;
         let mut merge = shared_lane_projection(
             entry.genesis,
             entry.input.runtime.clone(),
@@ -10440,7 +10444,7 @@ pub(crate) mod tests {
             entry.input.runtime.space,
             entry.input.runtime.agent,
             entry.genesis,
-            AgentGenesisAdmissionId::from_bytes(*materialized.heads().admission.as_bytes()),
+            materialized.heads().admission,
             committee.id(),
         )
         .unwrap();
@@ -11944,6 +11948,15 @@ pub(crate) mod tests {
     #[test]
     fn sealed_genesis_initialization_binds_exact_create_closure() {
         let sealed = admitted_genesis(0xc1);
+        let AgentGenesisAdmissionRecord::RootBootstrap(root_admission) = sealed.admission_record()
+        else {
+            panic!("system bootstrap must carry the tagged root admission")
+        };
+        assert_eq!(sealed.genesis().admission, sealed.admission_record().id());
+        assert_ne!(
+            sealed.genesis().admission.as_bytes(),
+            root_admission.id().as_bytes()
+        );
         let node = admitted_config().replicas[0].node;
         let mut store = MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
         store
@@ -13616,7 +13629,7 @@ pub(crate) mod tests {
             entry.input.runtime.space,
             entry.input.runtime.agent,
             entry.genesis,
-            AgentGenesisAdmissionId::from_bytes(*heads.admission.as_bytes()),
+            heads.admission,
             committee.id(),
         )
         .unwrap();

@@ -959,7 +959,7 @@ mod tests {
             seal_prepared_system_agent_genesis(first, &configured_root, &provision).unwrap();
         assert_ne!(
             sealed.genesis().admission,
-            super::super::committee::SystemAgentGenesisAdmissionId::ZERO
+            super::super::genesis::AgentGenesisAdmissionId::ZERO
         );
         assert_eq!(sealed.genesis().create, *provision.proposal().create());
         assert_eq!(sealed.artifacts().artifacts, proposal.catalog);

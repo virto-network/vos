@@ -14,12 +14,13 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use super::authority::{ActorInvocationReceipt, AgentAuthorityReceipt, ED25519_SIGNATURE_BYTES};
-use super::committee::{GenesisIntentId, SystemAgentGenesisAdmissionId};
+use super::committee::GenesisIntentId;
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
     ActorInvocationAuth, MAX_EXECUTION_AVAILABILITY_BYTES, MAX_EXECUTION_BLOBS, MAX_EXECUTION_GAS,
     MAX_EXECUTION_MESSAGE_BYTES, MAX_EXECUTION_REPLY_BYTES, MAX_RUNTIME_STATE_BYTES, RuntimeBlob,
 };
+use super::genesis::AgentGenesisAdmissionId;
 use super::wire::{RuntimeCall, RuntimeState};
 use super::{InvocationResultStorage, LifecycleRequest, MethodMode, StateLane};
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
@@ -1504,10 +1505,12 @@ impl CanonicalJournalRecord for ReplayInput {
 /// Immutable root of one clean-generation agent journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentJournalGenesis {
-    /// Content ID of the independently root-verified admission record. This
-    /// is part of the final genesis ID but deliberately not part of the
-    /// upstream signed genesis intent.
-    pub admission: SystemAgentGenesisAdmissionId,
+    /// Content ID of the tagged Agent-genesis admission record. For the first
+    /// system Agent this names an `AGNA/v2` `RootBootstrap` wrapper around the
+    /// independently root-verified system admission. This is part of the
+    /// final genesis ID but deliberately not part of the upstream signed
+    /// genesis intent.
+    pub admission: AgentGenesisAdmissionId,
     /// The first input is always an authority-admitted `Create` mutation.
     pub create: ReplayInput,
 }
@@ -1549,7 +1552,7 @@ impl AgentJournalGenesis {
     }
 
     fn validate_inner(&self) -> Result<(), DecodeError> {
-        if self.admission == SystemAgentGenesisAdmissionId::ZERO {
+        if self.admission == AgentGenesisAdmissionId::ZERO {
             return Err(DecodeError::NonCanonical);
         }
         self.create.validate()?;
@@ -1580,7 +1583,7 @@ impl AgentJournalGenesis {
 }
 
 impl ServiceWire for AgentJournalGenesis {
-    const MAGIC: [u8; 4] = *b"AGJG";
+    const MAGIC: [u8; 4] = *b"AJG2";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -1590,7 +1593,7 @@ impl ServiceWire for AgentJournalGenesis {
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         enforce_complete_bound(decoder, MAX_JOURNAL_RECORD_BYTES)?;
-        let admission = SystemAgentGenesisAdmissionId::from_bytes(decoder.fixed()?);
+        let admission = AgentGenesisAdmissionId::from_bytes(decoder.fixed()?);
         let bytes = bounded_bytes_ref(decoder, MAX_REPLAY_INPUT_BYTES)?;
         let genesis = Self {
             admission,
@@ -1614,7 +1617,7 @@ impl CanonicalJournalRecord for AgentJournalGenesis {
     }
 
     fn id(&self) -> Self::Id {
-        AgentJournalGenesisId(content_id(b"vos/agent/journal/genesis", self))
+        AgentJournalGenesisId(content_id(b"vos/agent/journal/genesis/v2", self))
     }
 }
 
@@ -2278,8 +2281,8 @@ impl CheckpointLane {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointManifest {
     pub genesis: AgentJournalGenesisId,
-    /// Immutable system-genesis authority admission inherited from genesis.
-    pub admission: SystemAgentGenesisAdmissionId,
+    /// Immutable tagged Agent-genesis admission inherited from genesis.
+    pub admission: AgentGenesisAdmissionId,
     pub runtime: RuntimeBinding,
     pub publication_revision: u64,
     pub ordered_head: Option<OrderedEntryId>,
@@ -2310,7 +2313,7 @@ impl CheckpointManifest {
             .filter(|lane| lane.lane == PersistedLane::Local)
             .count();
         if self.genesis == AgentJournalGenesisId::ZERO
-            || self.admission == SystemAgentGenesisAdmissionId::ZERO
+            || self.admission == AgentGenesisAdmissionId::ZERO
             || (self.ordered_index == 0) != self.ordered_head.is_none()
             || self.ordered_head == Some(OrderedEntryId::ZERO)
             || self.merge_frontier == MergeFrontierId::ZERO
@@ -2344,7 +2347,7 @@ impl CheckpointManifest {
 }
 
 impl ServiceWire for CheckpointManifest {
-    const MAGIC: [u8; 4] = *b"AGJC";
+    const MAGIC: [u8; 4] = *b"AJC2";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -2371,7 +2374,7 @@ impl ServiceWire for CheckpointManifest {
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         enforce_complete_bound(decoder, MAX_CHECKPOINT_MANIFEST_BYTES)?;
         let genesis = AgentJournalGenesisId(decoder.fixed()?);
-        let admission = SystemAgentGenesisAdmissionId::from_bytes(decoder.fixed()?);
+        let admission = AgentGenesisAdmissionId::from_bytes(decoder.fixed()?);
         let runtime = decode_runtime_binding(decoder)?;
         let publication_revision = decoder.u64()?;
         let ordered_head = decoder.option(|decoder| Ok(OrderedEntryId(decoder.fixed()?)))?;
@@ -2430,7 +2433,7 @@ impl CanonicalJournalRecord for CheckpointManifest {
     }
 
     fn id(&self) -> Self::Id {
-        CheckpointId(content_id(b"vos/agent/journal/checkpoint", self))
+        CheckpointId(content_id(b"vos/agent/journal/checkpoint/v2", self))
     }
 }
 
@@ -2438,8 +2441,8 @@ impl CanonicalJournalRecord for CheckpointManifest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalHeads {
     pub genesis: AgentJournalGenesisId,
-    /// Immutable system-genesis authority admission inherited from genesis.
-    pub admission: SystemAgentGenesisAdmissionId,
+    /// Immutable tagged Agent-genesis admission inherited from genesis.
+    pub admission: AgentGenesisAdmissionId,
     pub node: NodeId,
     /// Runtime selected after replaying `ordered_head`. Genesis initializes
     /// this binding; only validated ordered replay may change it.
@@ -2471,7 +2474,7 @@ impl JournalHeads {
     /// Empty envelope written when a genesis is installed.
     pub fn initial(
         genesis: AgentJournalGenesisId,
-        admission: SystemAgentGenesisAdmissionId,
+        admission: AgentGenesisAdmissionId,
         node: NodeId,
         empty_merge_frontier: MergeFrontierId,
         runtime: RuntimeBinding,
@@ -2507,7 +2510,7 @@ impl JournalHeads {
         self.runtime.validate()?;
         self.merge_fence.validate()?;
         if self.genesis == AgentJournalGenesisId::ZERO
-            || self.admission == SystemAgentGenesisAdmissionId::ZERO
+            || self.admission == AgentGenesisAdmissionId::ZERO
             || self.node == NodeId::ZERO
             || (self.publication_revision == 0) != self.previous.is_none()
             || self.previous == Some(JournalHeadsId::ZERO)
@@ -2582,7 +2585,7 @@ impl JournalHeads {
 }
 
 impl ServiceWire for JournalHeads {
-    const MAGIC: [u8; 4] = *b"AGJH";
+    const MAGIC: [u8; 4] = *b"AJH2";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -2613,7 +2616,7 @@ impl ServiceWire for JournalHeads {
         enforce_complete_bound(decoder, MAX_CHECKPOINT_MANIFEST_BYTES)?;
         let heads = Self {
             genesis: AgentJournalGenesisId(decoder.fixed()?),
-            admission: SystemAgentGenesisAdmissionId::from_bytes(decoder.fixed()?),
+            admission: AgentGenesisAdmissionId::from_bytes(decoder.fixed()?),
             node: NodeId(decoder.fixed()?),
             runtime: decode_runtime_binding(decoder)?,
             publication_revision: decoder.u64()?,
@@ -2648,7 +2651,7 @@ impl CanonicalJournalRecord for JournalHeads {
     }
 
     fn id(&self) -> Self::Id {
-        JournalHeadsId(content_id(b"vos/agent/journal/heads", self))
+        JournalHeadsId(content_id(b"vos/agent/journal/heads/v2", self))
     }
 }
 
@@ -3456,8 +3459,8 @@ mod tests {
         }
     }
 
-    fn genesis_admission() -> SystemAgentGenesisAdmissionId {
-        SystemAgentGenesisAdmissionId::from_bytes([0xad; 32])
+    fn genesis_admission() -> AgentGenesisAdmissionId {
+        AgentGenesisAdmissionId::from_bytes([0xad; 32])
     }
 
     fn invocation(mode: MethodMode) -> ActorInvocation {
@@ -4450,6 +4453,28 @@ mod tests {
         };
         genesis.validate().unwrap();
         roundtrip(&genesis);
+        assert_eq!(
+            *genesis.id().as_bytes(),
+            [
+                234, 206, 12, 150, 186, 88, 166, 58, 252, 207, 128, 231, 39, 159, 213, 160, 39,
+                165, 121, 255, 192, 232, 133, 80, 141, 85, 126, 176, 186, 236, 10, 249,
+            ]
+        );
+        let legacy_id = content_id(b"vos/agent/journal/genesis", &genesis);
+        assert_eq!(
+            legacy_id,
+            [
+                158, 151, 148, 223, 179, 198, 228, 114, 155, 206, 236, 44, 27, 202, 219, 143, 86,
+                90, 129, 187, 46, 43, 170, 90, 185, 69, 36, 12, 10, 131, 37, 68,
+            ]
+        );
+        assert_ne!(*genesis.id().as_bytes(), legacy_id);
+        let mut legacy_wire = genesis.encode();
+        legacy_wire[..4].copy_from_slice(b"AGJG");
+        assert_eq!(
+            AgentJournalGenesis::decode(&legacy_wire),
+            Err(DecodeError::InvalidTag)
+        );
         let ReplayOperation::Management { request: outer } = &genesis.create.operation else {
             unreachable!();
         };
@@ -4468,11 +4493,11 @@ mod tests {
         assert_eq!(wrong.validate(), Err(DecodeError::NonCanonical));
 
         let mut missing_admission = genesis.clone();
-        missing_admission.admission = SystemAgentGenesisAdmissionId::ZERO;
+        missing_admission.admission = AgentGenesisAdmissionId::ZERO;
         assert_eq!(missing_admission.validate(), Err(DecodeError::NonCanonical));
 
         let mut alternate_admission = genesis.clone();
-        alternate_admission.admission = SystemAgentGenesisAdmissionId::from_bytes([0xae; 32]);
+        alternate_admission.admission = AgentGenesisAdmissionId::from_bytes([0xae; 32]);
         alternate_admission.validate().unwrap();
         assert_ne!(alternate_admission.id(), genesis.id());
 
@@ -4675,6 +4700,28 @@ mod tests {
         };
         checkpoint.validate().unwrap();
         roundtrip(&checkpoint);
+        assert_eq!(
+            *checkpoint.id().as_bytes(),
+            [
+                187, 211, 152, 37, 50, 139, 170, 161, 72, 39, 236, 12, 101, 11, 152, 2, 175, 166,
+                71, 230, 48, 47, 105, 110, 219, 92, 72, 198, 177, 55, 172, 30,
+            ]
+        );
+        let legacy_id = content_id(b"vos/agent/journal/checkpoint", &checkpoint);
+        assert_eq!(
+            legacy_id,
+            [
+                110, 164, 35, 68, 158, 78, 66, 218, 161, 71, 205, 252, 62, 115, 200, 130, 224, 178,
+                245, 79, 255, 237, 209, 172, 74, 227, 214, 234, 223, 58, 65, 100,
+            ]
+        );
+        assert_ne!(*checkpoint.id().as_bytes(), legacy_id);
+        let mut legacy_wire = checkpoint.encode();
+        legacy_wire[..4].copy_from_slice(b"AGJC");
+        assert_eq!(
+            CheckpointManifest::decode(&legacy_wire),
+            Err(DecodeError::InvalidTag)
+        );
     }
 
     #[test]
@@ -4839,6 +4886,28 @@ mod tests {
         );
         initial.validate().unwrap();
         roundtrip(&initial);
+        assert_eq!(
+            *initial.id().as_bytes(),
+            [
+                204, 92, 106, 123, 246, 34, 7, 71, 179, 15, 146, 245, 194, 119, 45, 220, 176, 5,
+                212, 126, 210, 238, 0, 204, 141, 227, 234, 30, 44, 223, 136, 111,
+            ]
+        );
+        let legacy_id = content_id(b"vos/agent/journal/heads", &initial);
+        assert_eq!(
+            legacy_id,
+            [
+                193, 214, 39, 129, 170, 201, 174, 122, 112, 45, 45, 187, 65, 201, 54, 67, 186, 70,
+                231, 235, 118, 199, 132, 59, 59, 4, 50, 114, 145, 192, 133, 59,
+            ]
+        );
+        assert_ne!(*initial.id().as_bytes(), legacy_id);
+        let mut legacy_wire = initial.encode();
+        legacy_wire[..4].copy_from_slice(b"AGJH");
+        assert_eq!(
+            JournalHeads::decode(&legacy_wire),
+            Err(DecodeError::InvalidTag)
+        );
         assert_eq!(initial.runtime, runtime_binding());
         assert_eq!(
             initial.ordered_invocations,
@@ -4886,7 +4955,7 @@ mod tests {
             ..initial.clone()
         };
         wrong_admission.publication_revision = 1;
-        wrong_admission.admission = SystemAgentGenesisAdmissionId::from_bytes([0xaf; 32]);
+        wrong_admission.admission = AgentGenesisAdmissionId::from_bytes([0xaf; 32]);
         assert_eq!(
             initial.validate_successor(&wrong_admission),
             Err(DecodeError::NonCanonical)

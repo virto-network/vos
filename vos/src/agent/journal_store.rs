@@ -30,11 +30,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use fs2::FileExt;
 
 use super::committee::{
-    MAX_ROOT_ANCHOR_RECORD_BYTES, MAX_SYSTEM_GENESIS_ADMISSION_BYTES,
-    MAX_SYSTEM_GENESIS_EVIDENCE_BYTES, RootAnchorRecord, SystemAgentGenesisAdmissionRecord,
-    SystemAgentGenesisEvidence,
+    MAX_ROOT_ANCHOR_RECORD_BYTES, MAX_SYSTEM_GENESIS_EVIDENCE_BYTES, RootAnchorRecord,
+    SystemAgentGenesisAdmissionRecord, SystemAgentGenesisEvidence,
 };
 use super::execution::MAX_RUNTIME_STATE_BYTES;
+use super::genesis::{AgentGenesisAdmissionRecord, MAX_AGENT_GENESIS_ADMISSION_BYTES};
 use super::invocation_history::{
     InvocationHistoryError, InvocationHistoryNode, InvocationHistoryStore,
     InvocationHistoryWritePlan, MAX_INVOCATION_HISTORY_INSERTIONS,
@@ -1159,10 +1159,10 @@ impl CanonicalAuthorityRecord for SystemAgentGenesisEvidence {
     }
 }
 
-impl CanonicalAuthorityRecord for SystemAgentGenesisAdmissionRecord {
+impl CanonicalAuthorityRecord for AgentGenesisAdmissionRecord {
     const STORAGE_CLASS: AuthorityStorageClass = AuthorityStorageClass::GenesisAdmission;
     const DIRECTORY: &'static str = "authority/genesis-admissions";
-    const MAXIMUM: usize = MAX_SYSTEM_GENESIS_ADMISSION_BYTES;
+    const MAXIMUM: usize = MAX_AGENT_GENESIS_ADMISSION_BYTES;
 
     fn storage_id(&self) -> [u8; 32] {
         *self.id().as_bytes()
@@ -1486,6 +1486,20 @@ fn genesis_state_component(state: &RuntimeState, lane: PersistedLane) -> &[u8] {
     }
 }
 
+/// Phase-one authority dispatch. Root bootstrap is fully reverified here;
+/// ordinary `SystemAuthorized` records remain fail-closed until the live
+/// system Agent can mint the opaque post-finalization capability required by
+/// the ordinary-genesis verifier. A valid unsupported variant is therefore
+/// unavailable, not corrupt authority data.
+fn phase_one_root_admission(
+    admission: &AgentGenesisAdmissionRecord,
+) -> Result<&SystemAgentGenesisAdmissionRecord, JournalStoreError> {
+    match admission {
+        AgentGenesisAdmissionRecord::RootBootstrap(admission) => Ok(admission),
+        AgentGenesisAdmissionRecord::SystemAuthorized { .. } => Err(JournalStoreError::Unavailable),
+    }
+}
+
 struct SealedGenesisShape {
     initial: JournalHeads,
     local_invocations: InvocationIndexManifest,
@@ -1496,8 +1510,9 @@ fn validate_authority_links(
     genesis: &AgentJournalGenesis,
     root: &RootAnchorRecord,
     evidence: &SystemAgentGenesisEvidence,
-    admission: SystemAgentGenesisAdmissionRecord,
+    admission: &AgentGenesisAdmissionRecord,
 ) -> Result<(), JournalStoreError> {
+    let root_admission = phase_one_root_admission(admission)?;
     let root_id = root.id();
     let evidence_id = evidence.id();
     let admission_id = admission.id();
@@ -1506,18 +1521,18 @@ fn validate_authority_links(
         &evidence.encode(),
         *evidence_id.as_bytes(),
     )?;
-    decode_authority_record::<SystemAgentGenesisAdmissionRecord>(
+    decode_authority_record::<AgentGenesisAdmissionRecord>(
         &admission.encode(),
         *admission_id.as_bytes(),
     )?;
 
     let claim = evidence.claim();
     if admission_id != genesis.admission
-        || admission.root_anchor() != root_id
-        || admission.root_anchor_config_version() != root.config_version()
-        || admission.root_anchor_config() != root.config_commitment()
-        || admission.evidence() != evidence_id
-        || admission.claim() != claim.authority_claim()
+        || root_admission.root_anchor() != root_id
+        || root_admission.root_anchor_config_version() != root.config_version()
+        || root_admission.root_anchor_config() != root.config_commitment()
+        || root_admission.evidence() != evidence_id
+        || root_admission.claim() != claim.authority_claim()
         || claim.root_anchor() != root_id
         || claim.root_anchor_config_version() != root.config_version()
         || claim.root_anchor_config() != root.config_commitment()
@@ -3527,7 +3542,7 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         let mut candidate = self.candidate_clone();
         candidate.persist_authority(sealed.root_anchor())?;
         candidate.persist_authority(sealed.admission_evidence())?;
-        candidate.persist_authority(&sealed.admission_record())?;
+        candidate.persist_authority(sealed.admission_record())?;
         candidate.put(sealed.empty_frontier())?;
         candidate.put(sealed.ordered_invocations())?;
         candidate.put(sealed.merge_invocations())?;
@@ -5459,20 +5474,21 @@ impl FileAgentJournalStore {
         (
             RootAnchorRecord,
             SystemAgentGenesisEvidence,
-            SystemAgentGenesisAdmissionRecord,
+            AgentGenesisAdmissionRecord,
         ),
         JournalStoreError,
     > {
         let admission = self
-            .read_authority::<SystemAgentGenesisAdmissionRecord>(*genesis.admission.as_bytes())?
+            .read_authority::<AgentGenesisAdmissionRecord>(*genesis.admission.as_bytes())?
             .ok_or(JournalStoreError::MissingObject)?;
+        let root_admission = phase_one_root_admission(&admission)?;
         let evidence = self
-            .read_authority::<SystemAgentGenesisEvidence>(*admission.evidence().as_bytes())?
+            .read_authority::<SystemAgentGenesisEvidence>(*root_admission.evidence().as_bytes())?
             .ok_or(JournalStoreError::MissingObject)?;
         let root = self
-            .read_authority::<RootAnchorRecord>(*admission.root_anchor().as_bytes())?
+            .read_authority::<RootAnchorRecord>(*root_admission.root_anchor().as_bytes())?
             .ok_or(JournalStoreError::MissingObject)?;
-        validate_authority_links(genesis, &root, &evidence, admission)?;
+        validate_authority_links(genesis, &root, &evidence, &admission)?;
         Ok((root, evidence, admission))
     }
 
@@ -5498,7 +5514,7 @@ impl FileAgentJournalStore {
         if sealed.genesis() != &genesis
             || sealed.root_anchor() != &root
             || sealed.admission_evidence() != &evidence
-            || sealed.admission_record() != admission
+            || sealed.admission_record() != &admission
         {
             return Err(JournalStoreError::ScopeMismatch);
         }
@@ -6567,7 +6583,7 @@ impl AgentJournalStore for FileAgentJournalStore {
         }
         self.persist_authority(sealed.root_anchor())?;
         self.persist_authority(sealed.admission_evidence())?;
-        self.persist_authority(&sealed.admission_record())?;
+        self.persist_authority(sealed.admission_record())?;
         self.persist_admission(sealed.admission_commitment())?;
         self.persist_object(sealed.empty_frontier())?;
         self.persist_object(sealed.ordered_invocations())?;
@@ -6845,13 +6861,16 @@ mod tests {
         ActorInvocationClaim, ActorInvocationReceipt, AgentAuthorityBinding, AgentAuthorityClaim,
         AgentAuthorityReceipt, ED25519_SIGNATURE_BYTES, ed25519_public_key_wire,
     };
-    use crate::agent::committee::SystemAgentGenesisAdmissionId;
+    use crate::agent::committee::{AuthorityClaimCommitment, AuthorityClaimDomain};
     use crate::agent::contract::RuntimePackageContract;
     use crate::agent::execution::{
         ActorExecutionReply, ActorExecutionStatus, ActorInvocation, ActorInvocationAuth,
         ActorObservation,
     };
-    use crate::agent::genesis::{AgentGenesisAdmissionId, AgentReplicaCommitteeId};
+    use crate::agent::genesis::{
+        AgentGenesisAdmissionId, AgentGenesisDecisionId, AgentGenesisEvidenceId,
+        AgentReplicaCommitteeId,
+    };
     use crate::agent::invocation_index::{InvocationIndex, InvocationIndexLookup};
     use crate::agent::journal::{
         ArtifactClosureId, CheckpointLane, InvocationAcknowledgedFact, InvocationDisposition,
@@ -6993,8 +7012,21 @@ mod tests {
 
     fn genesis() -> AgentJournalGenesis {
         AgentJournalGenesis {
-            admission: SystemAgentGenesisAdmissionId::from_bytes([0xf4; 32]),
+            admission: AgentGenesisAdmissionId::from_bytes([0xf4; 32]),
             create: create_input(),
+        }
+    }
+
+    fn phase_one_system_authorized_admission() -> AgentGenesisAdmissionRecord {
+        AgentGenesisAdmissionRecord::SystemAuthorized {
+            decision: AgentGenesisDecisionId::from_bytes([0x31; 32]),
+            evidence: AgentGenesisEvidenceId::from_bytes([0x32; 32]),
+            replicas: AgentReplicaCommitteeId::from_bytes([0x33; 32]),
+            claim: AuthorityClaimCommitment::of_bytes(
+                AuthorityClaimDomain::AgentGenesis,
+                1,
+                b"pending live-system finalization proof",
+            ),
         }
     }
 
@@ -7313,7 +7345,7 @@ mod tests {
         .unwrap();
         let claim = OrderedCommitClaim::new(
             genesis.id(),
-            AgentGenesisAdmissionId::from_bytes(*genesis.admission.as_bytes()),
+            genesis.admission,
             AgentReplicaCommitteeId::from_bytes([0xd4; 32]),
             entry.index,
             1,
@@ -7614,6 +7646,16 @@ mod tests {
                 object_created: false,
                 heads_advanced: false,
             }
+        );
+    }
+
+    #[test]
+    fn system_authorized_admission_stays_closed_until_live_verifier_exists() {
+        let admission = phase_one_system_authorized_admission();
+        admission.validate().unwrap();
+        assert_eq!(
+            phase_one_root_admission(&admission),
+            Err(JournalStoreError::Unavailable)
         );
     }
 
@@ -9476,6 +9518,37 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn reopen_rejects_mixed_legacy_genesis_and_heads_stages() {
+        for (index, stage) in ["genesis.next", "heads.next"].into_iter().enumerate() {
+            let directory = TestDirectory::new("legacy-fixed-stage");
+            let genesis = genesis();
+            let mut store = open_file_store(&directory);
+            initialize(&mut store, &genesis);
+            let mut legacy = if index == 0 {
+                genesis.encode()
+            } else {
+                store.heads().unwrap().unwrap().encode()
+            };
+            legacy[..4].copy_from_slice(if index == 0 { b"AGJG" } else { b"AGJH" });
+            let stage_path = store.root().join(stage);
+            fs::write(&stage_path, legacy).unwrap();
+            drop(store);
+
+            let config = config();
+            assert!(matches!(
+                FileAgentJournalStore::open_unverified_for_test(
+                    directory.agent_root(config.identity.agent),
+                    directory.lock(config.identity.agent),
+                    config.replicas[0].node,
+                ),
+                Err(JournalStoreError::Corrupt)
+            ));
+            assert!(stage_path.exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn reopen_discards_partial_private_object_and_blob_stages() {
         let directory = TestDirectory::new("partial-content-stage");
         let genesis = genesis();
@@ -9665,6 +9738,60 @@ mod tests {
                 Err(JournalStoreError::Corrupt)
             ));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authority_reopen_rejects_legacy_unwrapped_root_admission() {
+        let directory = TestDirectory::new("authority-legacy-admission");
+        let sealed = crate::agent::replay::tests::admitted_genesis(0xba);
+        let mut store = open_file_store_for_sealed(&directory, &sealed);
+        initialize_sealed_file_store(&mut store, &sealed);
+        let admission_path = authority_paths(store.root(), &sealed)
+            .into_iter()
+            .find_map(|(class, path)| {
+                (class == AuthorityStorageClass::GenesisAdmission).then_some(path)
+            })
+            .unwrap();
+        let AgentGenesisAdmissionRecord::RootBootstrap(root_admission) = sealed.admission_record()
+        else {
+            panic!("system bootstrap must carry a root admission")
+        };
+        drop(store);
+
+        // The previous generation persisted this nested record directly. A
+        // syntactically valid legacy authority object must not satisfy the
+        // v2 journal's outer AGNA identity.
+        fs::write(admission_path, root_admission.encode()).unwrap();
+        assert!(matches!(
+            reopen_file_store_reverified(&directory, &sealed),
+            Err(JournalStoreError::Corrupt)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_authorized_reopen_is_unavailable_until_live_verifier_exists() {
+        let directory = TestDirectory::new("authority-system-authorized");
+        let admission = phase_one_system_authorized_admission();
+        admission.validate().unwrap();
+        let mut genesis = genesis();
+        genesis.admission = admission.id();
+        genesis.validate().unwrap();
+        let mut store = open_file_store(&directory);
+        initialize(&mut store, &genesis);
+        assert!(store.persist_authority(&admission).unwrap());
+        drop(store);
+
+        let config = config();
+        assert!(matches!(
+            FileAgentJournalStore::open(
+                directory.agent_root(config.identity.agent),
+                directory.lock(config.identity.agent),
+                config.replicas[0].node,
+            ),
+            Err(JournalStoreError::Unavailable)
+        ));
     }
 
     #[test]
