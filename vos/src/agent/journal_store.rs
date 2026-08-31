@@ -23,6 +23,7 @@ use std::os::unix::ffi::OsStrExt as _;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use fs2::FileExt;
@@ -44,10 +45,10 @@ use super::journal::{
     LaneStateManifest, LocalEntry, LocalEntryId, MAX_ARTIFACT_CLOSURE_BYTES,
     MAX_ARTIFACT_CLOSURE_ENTRIES, MAX_ARTIFACT_CLOSURE_REFERENCED_BYTES,
     MAX_CHECKPOINT_MANIFEST_BYTES, MAX_INVOCATION_INDEX_MANIFEST_BYTES,
-    MAX_INVOCATION_INDEX_NODE_BYTES, MAX_JOURNAL_RECORD_BYTES, MAX_REPLAY_INPUT_BYTES,
-    MAX_REPLAY_SUFFIX_BYTES, MAX_REPLAY_SUFFIX_ENTRIES, MergeEvent, MergeEventId, MergeFrontier,
-    MergeFrontierId, MergeSeal, MergeSealId, OrderedBase, OrderedEntry, OrderedEntryId,
-    PersistedLane, system_genesis_post_create_state_commitment,
+    MAX_INVOCATION_INDEX_NODE_BYTES, MAX_INVOCATION_OUTCOME_BYTES, MAX_JOURNAL_RECORD_BYTES,
+    MAX_REPLAY_INPUT_BYTES, MAX_REPLAY_SUFFIX_BYTES, MAX_REPLAY_SUFFIX_ENTRIES, MergeEvent,
+    MergeEventId, MergeFrontier, MergeFrontierId, MergeSeal, MergeSealId, OrderedBase,
+    OrderedEntry, OrderedEntryId, PersistedLane, system_genesis_post_create_state_commitment,
 };
 use super::replay::{ReplayPublicationAnchor, ReplaySealedGenesis, ReplaySealedPublication};
 use super::wire::{RuntimeState, decode_standard_runtime_state};
@@ -106,6 +107,24 @@ impl core::fmt::Display for JournalStoreError {
 }
 
 impl std::error::Error for JournalStoreError {}
+
+/// Cloneable read-only capability for catalog artifacts.
+///
+/// A resolver is intentionally separate from [`AgentJournalStore`]: replay
+/// may hold it while the journal itself is mutably borrowed for publication.
+/// Implementations must authenticate both the content reference and the
+/// storage capability used to obtain the bytes.
+pub(crate) trait CatalogBlobResolver: Clone + Send + Sync {
+    fn load_catalog(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, JournalStoreError>;
+}
+
+/// Factory for a resolver whose lifetime is independent of a mutable store
+/// borrow.
+pub(crate) trait CatalogBlobResolverFactory {
+    type Resolver: CatalogBlobResolver;
+
+    fn catalog_blob_resolver(&self) -> Result<Self::Resolver, JournalStoreError>;
+}
 
 /// Typed persistence boundary shared by Local, Raft, and causal adapters.
 ///
@@ -178,6 +197,7 @@ fn class_maximum(class: JournalStorageClass) -> usize {
         | JournalStorageClass::Checkpoint
         | JournalStorageClass::Heads => MAX_CHECKPOINT_MANIFEST_BYTES,
         JournalStorageClass::InvocationIndexNode => MAX_INVOCATION_INDEX_NODE_BYTES,
+        JournalStorageClass::InvocationOutcome => MAX_INVOCATION_OUTCOME_BYTES,
     }
 }
 
@@ -1592,7 +1612,38 @@ pub struct MemoryAgentJournalStore {
     heads: Option<Vec<u8>>,
     authority: BTreeMap<(AuthorityStorageClass, [u8; 32]), Vec<u8>>,
     objects: BTreeMap<(JournalStorageClass, [u8; 32]), Vec<u8>>,
-    blobs: BTreeMap<(JournalBlobClass, Hash), Vec<u8>>,
+    // Copy-on-write keeps already-issued catalog resolver snapshots immutable
+    // while preserving cheap candidate clones for rollback-safe publication.
+    blobs: Arc<BTreeMap<(JournalBlobClass, Hash), Vec<u8>>>,
+}
+
+/// Immutable snapshot of an in-memory catalog namespace.
+#[derive(Clone, Debug)]
+pub(crate) struct MemoryCatalogBlobResolver {
+    blobs: Arc<BTreeMap<(JournalBlobClass, Hash), Vec<u8>>>,
+}
+
+impl CatalogBlobResolver for MemoryCatalogBlobResolver {
+    fn load_catalog(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, JournalStoreError> {
+        validate_blob_reference(JournalBlobClass::CatalogArtifact, reference)?;
+        self.blobs
+            .get(&(JournalBlobClass::CatalogArtifact, reference.hash))
+            .map(|bytes| {
+                validate_stored_blob(JournalBlobClass::CatalogArtifact, reference, bytes)?;
+                Ok(bytes.clone())
+            })
+            .transpose()
+    }
+}
+
+impl CatalogBlobResolverFactory for MemoryAgentJournalStore {
+    type Resolver = MemoryCatalogBlobResolver;
+
+    fn catalog_blob_resolver(&self) -> Result<Self::Resolver, JournalStoreError> {
+        Ok(MemoryCatalogBlobResolver {
+            blobs: Arc::clone(&self.blobs),
+        })
+    }
 }
 
 impl MemoryAgentJournalStore {
@@ -1608,7 +1659,7 @@ impl MemoryAgentJournalStore {
             heads: None,
             authority: BTreeMap::new(),
             objects: BTreeMap::new(),
-            blobs: BTreeMap::new(),
+            blobs: Arc::new(BTreeMap::new()),
         })
     }
 
@@ -1869,7 +1920,7 @@ impl AgentJournalStore for MemoryAgentJournalStore {
             Some(existing) if existing == bytes => Ok(false),
             Some(_) => Err(JournalStoreError::Corrupt),
             None => {
-                self.blobs.insert(key, bytes.to_vec());
+                Arc::make_mut(&mut self.blobs).insert(key, bytes.to_vec());
                 Ok(true)
             }
         }
@@ -1943,6 +1994,21 @@ struct PinnedDirectory {
 }
 
 #[cfg(target_os = "linux")]
+impl PinnedDirectory {
+    fn try_clone(&self) -> Result<Self, JournalStoreError> {
+        Ok(Self {
+            file: self
+                .file
+                .try_clone()
+                .map_err(|_| JournalStoreError::Unavailable)?,
+            parent: self.parent,
+            name: self.name.clone(),
+            identity: self.identity,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct AbsoluteDirectoryCapability {
     filesystem_root: File,
     components: Vec<PinnedDirectory>,
@@ -2012,6 +2078,26 @@ impl AbsoluteDirectoryCapability {
             self.verify(last)?;
         }
         Ok(self.last_file())
+    }
+
+    /// Duplicate already-pinned descriptors. This deliberately performs no
+    /// path lookup, directory reopen, or lock acquisition.
+    fn try_clone(&self) -> Result<Self, JournalStoreError> {
+        let filesystem_root = self
+            .filesystem_root
+            .try_clone()
+            .map_err(|_| JournalStoreError::Unavailable)?;
+        let components = self
+            .components
+            .iter()
+            .map(PinnedDirectory::try_clone)
+            .collect::<Result<Vec<_>, _>>()?;
+        let cloned = Self {
+            filesystem_root,
+            components,
+        };
+        cloned.get()?;
+        Ok(cloned)
     }
 }
 
@@ -2112,6 +2198,22 @@ impl DirectoryCapabilities {
             .sync_all()
             .map_err(|_| JournalStoreError::Unavailable)
     }
+
+    /// Duplicate the complete descriptor-pinned namespace without resolving
+    /// any path component again.
+    fn try_clone(&self) -> Result<Self, JournalStoreError> {
+        let cloned = Self {
+            external_parent: self.external_parent.try_clone()?,
+            directories: self
+                .directories
+                .iter()
+                .map(PinnedDirectory::try_clone)
+                .collect::<Result<Vec<_>, _>>()?,
+            indexes: self.indexes.clone(),
+        };
+        cloned.get("catalog/blobs")?;
+        Ok(cloned)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2145,6 +2247,129 @@ pub struct FileAgentJournalStore {
     #[cfg(target_os = "linux")]
     stable_lock_identity: FileIdentity,
     _stable_lock: File,
+}
+
+/// Read-only catalog capability detached from the mutable filesystem store.
+///
+/// On Linux this owns duplicates of the already-open namespace descriptors
+/// and of the stable-lock descriptor. Duplicating the latter keeps the same
+/// open-file-description lock alive if the writer handle is dropped.
+#[cfg(target_os = "linux")]
+struct FileCatalogCapability {
+    directories: DirectoryCapabilities,
+    stable_lock_name: CString,
+    stable_lock_identity: FileIdentity,
+    stable_lock: File,
+}
+
+#[cfg(target_os = "linux")]
+impl FileCatalogCapability {
+    fn verify(&self) -> Result<(), JournalStoreError> {
+        validate_owned_regular_file(&self.stable_lock)?;
+        verify_regular_entry(
+            self.directories.external_parent()?,
+            &self.stable_lock_name,
+            self.stable_lock_identity,
+        )?;
+        self.directories.get("catalog/blobs")?;
+        Ok(())
+    }
+
+    fn load_catalog(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, JournalStoreError> {
+        validate_blob_reference(JournalBlobClass::CatalogArtifact, reference)?;
+        self.verify()?;
+        let directory = self.directories.get("catalog/blobs")?;
+        let name = encode_hex(reference.hash.as_bytes());
+        let staged = sibling_next_name(&name);
+        if let Some(bytes) = read_pinned_bounded_regular_at(
+            directory,
+            &staged,
+            blob_maximum(JournalBlobClass::CatalogArtifact),
+        )? {
+            validate_stored_blob(JournalBlobClass::CatalogArtifact, reference, &bytes)?;
+        }
+        let bytes = read_pinned_bounded_regular_at(
+            directory,
+            &name,
+            blob_maximum(JournalBlobClass::CatalogArtifact),
+        )?;
+
+        // Revalidate every pinned namespace slot and the stable lock after
+        // the bounded O_NOFOLLOW read. If a slot raced with the read, bytes
+        // came from the pinned descriptor but are still rejected because the
+        // capability no longer denotes the authenticated live namespace.
+        self.verify()?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        validate_stored_blob(JournalBlobClass::CatalogArtifact, reference, &bytes)?;
+        Ok(Some(bytes))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub(crate) struct FileCatalogBlobResolver {
+    capability: Arc<FileCatalogCapability>,
+}
+
+#[cfg(target_os = "linux")]
+impl core::fmt::Debug for FileCatalogBlobResolver {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("FileCatalogBlobResolver")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Debug)]
+pub(crate) struct FileCatalogBlobResolver;
+
+impl CatalogBlobResolver for FileCatalogBlobResolver {
+    fn load_catalog(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, JournalStoreError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = reference;
+            Err(JournalStoreError::Unavailable)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.capability.load_catalog(reference)
+        }
+    }
+}
+
+impl CatalogBlobResolverFactory for FileAgentJournalStore {
+    type Resolver = FileCatalogBlobResolver;
+
+    fn catalog_blob_resolver(&self) -> Result<Self::Resolver, JournalStoreError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(JournalStoreError::Unavailable)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Validate before and after duplicating descriptors so a
+            // concurrent namespace replacement cannot mint a resolver for a
+            // stale capability while appearing current.
+            self.verify_lock()?;
+            self.directories.get("catalog/blobs")?;
+            let capability = FileCatalogCapability {
+                directories: self.directories.try_clone()?,
+                stable_lock_name: self.stable_lock_name.clone(),
+                stable_lock_identity: self.stable_lock_identity,
+                stable_lock: self
+                    ._stable_lock
+                    .try_clone()
+                    .map_err(|_| JournalStoreError::Unavailable)?,
+            };
+            capability.verify()?;
+            Ok(FileCatalogBlobResolver {
+                capability: Arc::new(capability),
+            })
+        }
+    }
 }
 
 impl core::fmt::Debug for FileAgentJournalStore {
@@ -2271,6 +2496,7 @@ impl FileAgentJournalStore {
                 "lane-state",
                 "artifact-closures",
                 "invocation-index",
+                "invocation-outcomes",
                 "catalog",
                 "authority",
                 "genesis-admission",
@@ -2341,6 +2567,7 @@ impl FileAgentJournalStore {
                 ("lane-state", "", "lane-state"),
                 ("artifact-closures", "", "artifact-closures"),
                 ("invocation-index", "", "invocation-index"),
+                ("invocation-outcomes", "", "invocation-outcomes"),
                 ("catalog", "", "catalog"),
                 ("authority", "", "authority"),
             ] {
@@ -2410,6 +2637,7 @@ impl FileAgentJournalStore {
                 "artifact-closures",
                 "invocation-index/manifests",
                 "invocation-index/nodes",
+                "invocation-outcomes",
                 "catalog/blobs",
                 "authority/root-anchors",
                 "authority/genesis-evidence",
@@ -2449,6 +2677,7 @@ impl FileAgentJournalStore {
             JournalStorageClass::ArtifactClosure => "artifact-closures",
             JournalStorageClass::InvocationIndex => "invocation-index/manifests",
             JournalStorageClass::InvocationIndexNode => "invocation-index/nodes",
+            JournalStorageClass::InvocationOutcome => "invocation-outcomes",
             JournalStorageClass::Checkpoint => "checkpoints",
             JournalStorageClass::Genesis | JournalStorageClass::Heads => {
                 return Err(JournalStoreError::InvalidClass);
@@ -3551,6 +3780,74 @@ mod tests {
     }
 
     #[test]
+    fn memory_catalog_resolver_is_an_immutable_cow_snapshot() {
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        let first_bytes = b"catalog snapshot first";
+        let first = BlobRef::of_bytes(first_bytes);
+        store
+            .put_blob(JournalBlobClass::CatalogArtifact, &first, first_bytes)
+            .unwrap();
+
+        let snapshot = store.catalog_blob_resolver().unwrap();
+        let second_bytes = b"catalog snapshot second";
+        let second = BlobRef::of_bytes(second_bytes);
+        store
+            .put_blob(JournalBlobClass::CatalogArtifact, &second, second_bytes)
+            .unwrap();
+
+        assert_eq!(
+            snapshot.load_catalog(&first).unwrap(),
+            Some(first_bytes.to_vec())
+        );
+        assert_eq!(snapshot.load_catalog(&second).unwrap(), None);
+        assert_eq!(
+            store
+                .catalog_blob_resolver()
+                .unwrap()
+                .load_catalog(&second)
+                .unwrap(),
+            Some(second_bytes.to_vec())
+        );
+
+        let rolled_back_bytes = b"catalog candidate rollback";
+        let rolled_back = BlobRef::of_bytes(rolled_back_bytes);
+        let mut candidate = store.clone();
+        candidate
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &rolled_back,
+                rolled_back_bytes,
+            )
+            .unwrap();
+        assert_eq!(
+            candidate
+                .catalog_blob_resolver()
+                .unwrap()
+                .load_catalog(&rolled_back)
+                .unwrap(),
+            Some(rolled_back_bytes.to_vec())
+        );
+        drop(candidate);
+        assert_eq!(
+            store
+                .catalog_blob_resolver()
+                .unwrap()
+                .load_catalog(&rolled_back)
+                .unwrap(),
+            None
+        );
+
+        let mut wrong_length = first.clone();
+        wrong_length.len += 1;
+        assert_eq!(
+            snapshot.load_catalog(&wrong_length),
+            Err(JournalStoreError::Corrupt)
+        );
+    }
+
+    #[test]
     fn checkpoint_publication_requires_every_raw_lane_and_catalog_blob() {
         let genesis = genesis();
         let config = config();
@@ -4291,6 +4588,150 @@ mod tests {
         open_file_store(&directory);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_catalog_resolver_reads_exact_content_and_retains_the_stable_lock() {
+        let directory = TestDirectory::new("catalog-resolver-lock");
+        let mut store = open_file_store(&directory);
+        let bytes = b"descriptor-pinned catalog content";
+        let reference = BlobRef::of_bytes(bytes);
+        store
+            .put_blob(JournalBlobClass::CatalogArtifact, &reference, bytes)
+            .unwrap();
+        let resolver = store.catalog_blob_resolver().unwrap();
+
+        assert_eq!(
+            resolver.load_catalog(&reference).unwrap(),
+            Some(bytes.to_vec())
+        );
+        let mut wrong_length = reference.clone();
+        wrong_length.len -= 1;
+        assert_eq!(
+            resolver.load_catalog(&wrong_length),
+            Err(JournalStoreError::Corrupt)
+        );
+
+        drop(store);
+        let config = config();
+        assert!(matches!(
+            FileAgentJournalStore::open(
+                directory.agent_root(config.identity.agent),
+                directory.lock(config.identity.agent),
+                config.replicas[0].node,
+            ),
+            Err(JournalStoreError::DirectoryInUse)
+        ));
+        assert_eq!(
+            resolver.load_catalog(&reference).unwrap(),
+            Some(bytes.to_vec())
+        );
+        drop(resolver);
+        open_file_store(&directory);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_catalog_resolver_rejects_namespace_slot_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("catalog-resolver-namespace");
+        let mut store = open_file_store(&directory);
+        let bytes = b"catalog bytes must remain pinned";
+        let reference = BlobRef::of_bytes(bytes);
+        store
+            .put_blob(JournalBlobClass::CatalogArtifact, &reference, bytes)
+            .unwrap();
+        let resolver = store.catalog_blob_resolver().unwrap();
+        let catalog = store.root().join("catalog");
+        let displaced = store.root().join("catalog.displaced");
+        let outside = directory.0.join("outside-catalog-resolver");
+        fs::create_dir(&outside).unwrap();
+        fs::rename(&catalog, &displaced).unwrap();
+        symlink(&outside, &catalog).unwrap();
+
+        assert_eq!(
+            resolver.load_catalog(&reference),
+            Err(JournalStoreError::Corrupt)
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_catalog_resolver_rejects_a_newly_writable_pinned_namespace() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = TestDirectory::new("catalog-resolver-namespace-mode");
+        let mut store = open_file_store(&directory);
+        let bytes = b"catalog namespace remains private";
+        let reference = BlobRef::of_bytes(bytes);
+        store
+            .put_blob(JournalBlobClass::CatalogArtifact, &reference, bytes)
+            .unwrap();
+        let resolver = store.catalog_blob_resolver().unwrap();
+        let catalog = store.root().join("catalog");
+        let mut permissions = fs::metadata(&catalog).unwrap().permissions();
+        permissions.set_mode(0o770);
+        fs::set_permissions(catalog, permissions).unwrap();
+
+        assert_eq!(
+            resolver.load_catalog(&reference),
+            Err(JournalStoreError::InvalidPath)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_catalog_resolver_rejects_symlink_nonregular_and_writable_blobs() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        enum Mutation {
+            Symlink,
+            Directory,
+            Writable,
+        }
+        for (label, mutation) in [
+            ("symlink", Mutation::Symlink),
+            ("directory", Mutation::Directory),
+            ("writable", Mutation::Writable),
+        ] {
+            let directory = TestDirectory::new(label);
+            let mut store = open_file_store(&directory);
+            let bytes = format!("catalog resolver rejects {label}").into_bytes();
+            let reference = BlobRef::of_bytes(&bytes);
+            store
+                .put_blob(JournalBlobClass::CatalogArtifact, &reference, &bytes)
+                .unwrap();
+            let resolver = store.catalog_blob_resolver().unwrap();
+            let path = store
+                .root()
+                .join("catalog/blobs")
+                .join(encode_hex(reference.hash.as_bytes()));
+            match mutation {
+                Mutation::Symlink => {
+                    let outside = directory.0.join("outside-blob");
+                    fs::write(&outside, &bytes).unwrap();
+                    fs::remove_file(&path).unwrap();
+                    symlink(outside, &path).unwrap();
+                }
+                Mutation::Directory => {
+                    fs::remove_file(&path).unwrap();
+                    fs::create_dir(&path).unwrap();
+                }
+                Mutation::Writable => {
+                    let mut permissions = fs::metadata(&path).unwrap().permissions();
+                    permissions.set_mode(0o660);
+                    fs::set_permissions(&path, permissions).unwrap();
+                }
+            }
+            assert_eq!(
+                resolver.load_catalog(&reference),
+                Err(JournalStoreError::Corrupt),
+                "mutation {label} must fail closed"
+            );
+        }
+    }
+
     #[test]
     fn legacy_whole_image_blocks_clean_journal_creation() {
         let directory = TestDirectory::new("legacy");
@@ -4907,6 +5348,49 @@ fn read_bounded_regular_at(
     if bytes.len() > maximum {
         return Err(JournalStoreError::Corrupt);
     }
+    Ok(Some(bytes))
+}
+
+/// Read a resolver-visible immutable file while authenticating both the open
+/// descriptor and its namespace slot before and after the bounded read.
+#[cfg(target_os = "linux")]
+fn read_pinned_bounded_regular_at(
+    directory: &File,
+    name: &str,
+    maximum: usize,
+) -> Result<Option<Vec<u8>>, JournalStoreError> {
+    let name = c_name(name)?;
+    let file = match open_at(
+        directory,
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        0,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+        Err(_) => return Err(JournalStoreError::Corrupt),
+    };
+    validate_owned_regular_file(&file)?;
+    let identity = FileIdentity::of(&file)?;
+    verify_regular_entry(directory, &name, identity)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| JournalStoreError::Unavailable)?;
+    if metadata.len() > maximum as u64 {
+        return Err(JournalStoreError::Corrupt);
+    }
+
+    let mut file = file;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take((maximum as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| JournalStoreError::Unavailable)?;
+    if bytes.len() > maximum {
+        return Err(JournalStoreError::Corrupt);
+    }
+    validate_owned_regular_file(&file)?;
+    verify_regular_entry(directory, &name, identity)?;
     Ok(Some(bytes))
 }
 
