@@ -772,10 +772,10 @@ mod durable {
     };
     use crate::service::NodeId;
 
-    // Clean-break schema: v2 writers understand the publication-intent fence.
-    // A v1 writer must never reopen and mutate a v2 ledger while an intent is
-    // pending.
-    const LEDGER_SCHEMA_VERSION: u32 = 2;
+    // Clean-break schema: v3 writers pin signer-independent route ownership
+    // before installing any local signing key. Older writers must reject the
+    // permanent v3 Config rows and cannot mutate this state machine.
+    const LEDGER_SCHEMA_VERSION: u32 = 3;
     // Config rows are permanent: a key that was ever local must never later be
     // admitted through the remote-share path and bypass its durable pledge.
     // One initial committee plus every protocol-bounded rotation can introduce
@@ -784,6 +784,7 @@ mod durable {
     const MAX_SHARE_ROWS_PER_CLAIM: usize = 2 * 256;
     const MAX_QC_ROWS_PER_CLAIM: usize = 2;
     const MAX_CONFIG_RECORD_BYTES: usize = 1024;
+    const MAX_ROUTE_CONFIG_RECORD_BYTES: usize = 1024;
     const MAX_META_RECORD_BYTES: usize = 1024;
     const MAX_PUBLICATION_INTENT_RECORD_BYTES: usize = 2048;
     const MAX_RESERVATION_RECORD_BYTES: usize =
@@ -796,6 +797,8 @@ mod durable {
 
     const CONFIG_TABLE: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_config_v1");
+    const ROUTE_CONFIG_TABLE: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("system_authority_ledger_route_config_v3");
     const META_TABLE: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_meta_v1");
     const RESERVATION_TABLE: TableDefinition<&[u8], &[u8]> =
@@ -1209,103 +1212,100 @@ mod durable {
         }
     }
 
-    /// Crash-safe authority signing ledger for one generation route and one
-    /// local signer. Multiple handles/signers may share the database; every
-    /// mutation rechecks configuration, fail-stop, and reservation in the
-    /// same redb write transaction.
-    pub(crate) struct SystemAuthorityEvidenceLedger {
+    /// Signer-independent owner of one durable authority-ledger route. Every
+    /// production signer child must be derived from the same `Arc`, so route
+    /// recovery, publication, retirement, and signing mutations share this
+    /// process lock in addition to redb's cross-handle writer serialization.
+    pub(crate) struct SystemAuthorityLedgerRouteOwner {
         database: Arc<Database>,
         route: SystemAuthorityLedgerRoute,
         journal_store: JournalStoreInstanceId,
         local_node: NodeId,
-        local_signer: AuthoritySignerId,
         writes: std::sync::Mutex<()>,
     }
 
-    impl SystemAuthorityEvidenceLedger {
+    impl SystemAuthorityLedgerRouteOwner {
         pub(crate) fn open(
             database: Arc<Database>,
             route: SystemAuthorityLedgerRoute,
             journal_store: JournalStoreInstanceId,
             local_node: NodeId,
-            local_signer: AuthoritySignerId,
-        ) -> Result<Self, SystemAuthorityLedgerError> {
+        ) -> Result<Arc<Self>, SystemAuthorityLedgerError> {
             route.validate()?;
             if local_node == NodeId::ZERO
-                || local_signer == AuthoritySignerId::ZERO
                 || JournalStoreInstanceId::from_bytes(*journal_store.as_bytes()).is_none()
             {
                 return Err(SystemAuthorityLedgerError::InvalidLocalSigner);
             }
-            let expected = ConfigRecord {
+            let expected = RouteConfigRecord {
                 version: LEDGER_SCHEMA_VERSION,
                 route,
                 journal_store,
                 local_node,
-                local_signer: *local_signer.as_bytes(),
             };
             expected.validate()?;
-            let ledger = Self {
+            let owner = Arc::new(Self {
                 database: database.clone(),
                 route,
                 journal_store,
                 local_node,
-                local_signer,
                 writes: std::sync::Mutex::new(()),
-            };
+            });
             let route_key = route_storage_key(route);
-            let key = config_storage_key(route, local_signer.as_bytes());
-            // redb serializes writers. Holding this transaction while auditing
-            // the last committed snapshot prevents a concurrent writer from
-            // changing any route row between preflight and Config insertion.
-            // Any pre-existing corruption drops this transaction, so opening
-            // a new local signer is a zero-write failure.
+            let sentinel_key = route_owner_sentinel_key(route);
+            let _write = owner.lock_writes()?;
             let transaction = database.begin_write()?;
-            ledger.audit_recovery_preflight()?;
             let existing = {
-                let table = transaction.open_table(CONFIG_TABLE)?;
+                let table = transaction.open_table(ROUTE_CONFIG_TABLE)?;
                 table
-                    .get(key.as_slice())?
+                    .get(route_key.as_slice())?
                     .map(|value| value.value().to_vec())
             };
             match existing {
                 Some(bytes) => {
-                    let existing = ConfigRecord::decode(&bytes)
+                    let existing = RouteConfigRecord::decode(&bytes)
                         .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
                     if existing != expected {
                         return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
                     }
+                    let sentinel = transaction
+                        .open_table(CONFIG_TABLE)?
+                        .get(sentinel_key.as_slice())?
+                        .map(|value| value.value().to_vec())
+                        .ok_or(SystemAuthorityLedgerError::ConfigurationMismatch)?;
+                    let sentinel = RouteConfigRecord::decode(&sentinel)
+                        .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                    if sentinel != expected {
+                        return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                    }
+                    // Holding this writer makes the committed snapshot stable
+                    // while the independent read audit runs. Exact reopen is
+                    // deliberately zero-write: drop instead of committing.
+                    owner.audit_recovery_preflight()?;
+                    drop(transaction);
+                    drop(_write);
+                    return Ok(owner);
                 }
                 None => {
-                    // A signature admitted while this key was classified as
-                    // remote cannot become a local share merely by installing
-                    // Config. The writer transaction makes this check atomic
-                    // with Config insertion.
-                    ledger.recheck_local_signer_installation(&transaction)?;
-                    let mut table = transaction.open_table(CONFIG_TABLE)?;
-                    let mut count = 0_usize;
-                    for row in table.range(route_key.as_slice()..)? {
-                        let (row_key, row_value) = row?;
-                        if !row_key.value().starts_with(route_key.as_slice()) {
-                            break;
-                        }
-                        let config = ConfigRecord::decode(row_value.value())
-                            .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
-                        if config.route != route
-                            || config.journal_store != journal_store
-                            || config.local_node != local_node
-                        {
-                            return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
-                        }
-                        count += 1;
-                        if count >= MAX_LOCAL_SIGNERS_PER_SCOPE {
-                            return Err(SystemAuthorityLedgerError::BacklogLimit);
-                        }
+                    if owner.route_has_residue(&transaction)? {
+                        return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
                     }
-                    table.insert(key.as_slice(), expected.encode().as_slice())?;
+                    transaction
+                        .open_table(ROUTE_CONFIG_TABLE)?
+                        .insert(route_key.as_slice(), expected.encode().as_slice())?;
+                    // v2 scans CONFIG_TABLE and attempts to decode every
+                    // route-prefixed row as its signer Config. This distinct
+                    // route-owner wire record is therefore an intentional,
+                    // permanent rollback fence for older writers.
+                    transaction
+                        .open_table(CONFIG_TABLE)?
+                        .insert(sentinel_key.as_slice(), expected.encode().as_slice())?;
                 }
             }
-            // Pin every table schema atomically before the first reservation.
+            // Pin every table schema atomically with first route ownership.
+            {
+                let _ = transaction.open_table(CONFIG_TABLE)?;
+            }
             {
                 let _ = transaction.open_table(META_TABLE)?;
             }
@@ -1328,15 +1328,12 @@ mod durable {
                 let _ = transaction.open_table(PUBLICATION_INTENT_TABLE)?;
             }
             transaction.commit()?;
-            Ok(ledger)
+            drop(_write);
+            Ok(owner)
         }
 
         pub(crate) const fn route(&self) -> SystemAuthorityLedgerRoute {
             self.route
-        }
-
-        pub(crate) const fn local_signer(&self) -> AuthoritySignerId {
-            self.local_signer
         }
 
         pub(crate) const fn local_node(&self) -> NodeId {
@@ -1347,13 +1344,250 @@ mod durable {
             self.journal_store
         }
 
-        pub(crate) fn is_fail_stopped(&self) -> Result<bool, SystemAuthorityLedgerError> {
-            Ok(read_exact(
-                &self.database,
+        pub(crate) fn open_signer(
+            self: &Arc<Self>,
+            local_signer: AuthoritySignerId,
+        ) -> Result<SystemAuthorityEvidenceLedger, SystemAuthorityLedgerError> {
+            if local_signer == AuthoritySignerId::ZERO {
+                return Err(SystemAuthorityLedgerError::InvalidLocalSigner);
+            }
+            let expected = ConfigRecord {
+                version: LEDGER_SCHEMA_VERSION,
+                route: self.route,
+                journal_store: self.journal_store,
+                local_node: self.local_node,
+                local_signer: *local_signer.as_bytes(),
+            };
+            expected.validate()?;
+            let ledger = SystemAuthorityEvidenceLedger {
+                owner: Arc::clone(self),
+                local_signer,
+            };
+            let route_key = route_storage_key(self.route);
+            let key = config_storage_key(self.route, local_signer.as_bytes());
+            let _write = self.lock_writes()?;
+            let transaction = self.database.begin_write()?;
+            self.recheck_route_config(&transaction)?;
+            self.audit_recovery_preflight()?;
+            let existing = transaction
+                .open_table(CONFIG_TABLE)?
+                .get(key.as_slice())?
+                .map(|value| value.value().to_vec());
+            if let Some(bytes) = existing {
+                let existing = ConfigRecord::decode(&bytes)
+                    .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                if existing != expected {
+                    return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                }
+                drop(transaction);
+                return Ok(ledger);
+            }
+
+            // A signature admitted while this key was classified as remote
+            // cannot become a local share merely by installing Config.
+            ledger.recheck_local_signer_installation(&transaction)?;
+            let mut count = 0_usize;
+            {
+                let table = transaction.open_table(CONFIG_TABLE)?;
+                for row in table.range(route_key.as_slice()..)? {
+                    let (row_key, row_value) = row?;
+                    if !row_key.value().starts_with(route_key.as_slice()) {
+                        break;
+                    }
+                    if row_key.value() == route_owner_sentinel_key(self.route) {
+                        let sentinel = RouteConfigRecord::decode(row_value.value())
+                            .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                        if sentinel
+                            != (RouteConfigRecord {
+                                version: LEDGER_SCHEMA_VERSION,
+                                route: self.route,
+                                journal_store: self.journal_store,
+                                local_node: self.local_node,
+                            })
+                        {
+                            return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                        }
+                        continue;
+                    }
+                    let config = ConfigRecord::decode(row_value.value())
+                        .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                    if row_key.value()
+                        != config_storage_key(config.route, &config.local_signer).as_slice()
+                        || config.route != self.route
+                        || config.journal_store != self.journal_store
+                        || config.local_node != self.local_node
+                    {
+                        return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                    }
+                    count += 1;
+                    if count >= MAX_LOCAL_SIGNERS_PER_SCOPE {
+                        return Err(SystemAuthorityLedgerError::BacklogLimit);
+                    }
+                }
+            }
+            transaction
+                .open_table(CONFIG_TABLE)?
+                .insert(key.as_slice(), expected.encode().as_slice())?;
+            transaction.commit()?;
+            Ok(ledger)
+        }
+
+        fn route_has_residue(
+            &self,
+            transaction: &redb::WriteTransaction,
+        ) -> Result<bool, SystemAuthorityLedgerError> {
+            let route_key = route_storage_key(self.route);
+            for definition in [
+                ROUTE_CONFIG_TABLE,
+                CONFIG_TABLE,
+                META_TABLE,
+                RESERVATION_TABLE,
+                PLEDGE_TABLE,
+                SHARE_TABLE,
+                QC_TABLE,
                 FAIL_STOP_TABLE,
-                route_storage_key(self.route).as_slice(),
-            )?
-            .is_some())
+                PUBLICATION_INTENT_TABLE,
+            ] {
+                let table = transaction.open_table(definition)?;
+                let mut rows = table.range(route_key.as_slice()..)?;
+                let Some(row) = rows.next() else {
+                    continue;
+                };
+                let (key, _) = row?;
+                if key.value().starts_with(route_key.as_slice()) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        fn recheck_route_config(
+            &self,
+            transaction: &redb::WriteTransaction,
+        ) -> Result<(), SystemAuthorityLedgerError> {
+            let route_key = route_storage_key(self.route);
+            let expected = RouteConfigRecord {
+                version: LEDGER_SCHEMA_VERSION,
+                route: self.route,
+                journal_store: self.journal_store,
+                local_node: self.local_node,
+            };
+            let route = transaction
+                .open_table(ROUTE_CONFIG_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::ConfigurationMismatch)?;
+            let route = RouteConfigRecord::decode(&route)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            let sentinel = transaction
+                .open_table(CONFIG_TABLE)?
+                .get(route_owner_sentinel_key(self.route).as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::ConfigurationMismatch)?;
+            let sentinel = RouteConfigRecord::decode(&sentinel)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            if route != expected || sentinel != expected {
+                return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
+            Ok(())
+        }
+
+        pub(crate) fn is_fail_stopped(&self) -> Result<bool, SystemAuthorityLedgerError> {
+            let transaction = self.database.begin_read()?;
+            self.recheck_route_config_read(&transaction)?;
+            let Some(bytes) = transaction
+                .open_table(FAIL_STOP_TABLE)?
+                .get(route_storage_key(self.route).as_slice())?
+                .map(|value| value.value().to_vec())
+            else {
+                return Ok(false);
+            };
+            let fail_stop = FailStopRecord::decode(&bytes)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            if fail_stop.route != self.route {
+                return Err(SystemAuthorityLedgerError::CorruptLedger);
+            }
+            Ok(true)
+        }
+
+        fn recheck_route_config_read(
+            &self,
+            transaction: &redb::ReadTransaction,
+        ) -> Result<(), SystemAuthorityLedgerError> {
+            let route_key = route_storage_key(self.route);
+            let expected = RouteConfigRecord {
+                version: LEDGER_SCHEMA_VERSION,
+                route: self.route,
+                journal_store: self.journal_store,
+                local_node: self.local_node,
+            };
+            let route = transaction
+                .open_table(ROUTE_CONFIG_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::ConfigurationMismatch)?;
+            let sentinel = transaction
+                .open_table(CONFIG_TABLE)?
+                .get(route_owner_sentinel_key(self.route).as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::ConfigurationMismatch)?;
+            if RouteConfigRecord::decode(&route)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?
+                != expected
+                || RouteConfigRecord::decode(&sentinel)
+                    .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?
+                    != expected
+            {
+                return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
+            Ok(())
+        }
+    }
+
+    /// Crash-safe authority signing child for one permanent local key. The
+    /// route owner remains usable for recovery after every signer child has
+    /// been dropped or rotated out.
+    pub(crate) struct SystemAuthorityEvidenceLedger {
+        owner: Arc<SystemAuthorityLedgerRouteOwner>,
+        local_signer: AuthoritySignerId,
+    }
+
+    impl core::ops::Deref for SystemAuthorityEvidenceLedger {
+        type Target = SystemAuthorityLedgerRouteOwner;
+
+        fn deref(&self) -> &Self::Target {
+            &self.owner
+        }
+    }
+
+    impl SystemAuthorityEvidenceLedger {
+        /// Compatibility constructor for existing replay/tests. Production
+        /// code which needs multiple signer children must open one shared
+        /// owner and call `open_signer`; redb still serializes writers across
+        /// independently opened compatibility owners.
+        #[cfg(test)]
+        pub(crate) fn open(
+            database: Arc<Database>,
+            route: SystemAuthorityLedgerRoute,
+            journal_store: JournalStoreInstanceId,
+            local_node: NodeId,
+            local_signer: AuthoritySignerId,
+        ) -> Result<Self, SystemAuthorityLedgerError> {
+            let owner =
+                SystemAuthorityLedgerRouteOwner::open(database, route, journal_store, local_node)?;
+            owner.open_signer(local_signer)
+        }
+
+        pub(crate) const fn local_signer(&self) -> AuthoritySignerId {
+            self.local_signer
+        }
+
+        pub(crate) const fn owner(&self) -> &Arc<SystemAuthorityLedgerRouteOwner> {
+            &self.owner
+        }
+
+        pub(crate) fn is_fail_stopped(&self) -> Result<bool, SystemAuthorityLedgerError> {
+            self.owner.is_fail_stopped()
         }
 
         /// Reserve a new rotation or reconcile an existing one against the
@@ -1558,7 +1792,9 @@ mod durable {
                 reserved: ReservedSystemAuthorityClaim { record: expected },
             })
         }
+    }
 
+    impl SystemAuthorityLedgerRouteOwner {
         /// Return the durable active row only as non-sign-capable recovery
         /// evidence. The caller must feed its rotation request and a current
         /// replay-authenticated view through `reserve_or_reconcile` before any
@@ -1568,6 +1804,7 @@ mod durable {
         ) -> Result<Option<PendingSystemAuthorityRecovery>, SystemAuthorityLedgerError> {
             let route_key = route_storage_key(self.route);
             let transaction = self.database.begin_read()?;
+            self.recheck_route_config_read(&transaction)?;
             let Some(bytes) = transaction
                 .open_table(RESERVATION_TABLE)?
                 .get(route_key.as_slice())?
@@ -1748,7 +1985,7 @@ mod durable {
             transaction: &redb::WriteTransaction,
             expected: &ReservationRecord,
         ) -> Result<SystemAuthorityRotationCertificate, SystemAuthorityLedgerError> {
-            self.recheck_config(transaction)?;
+            self.recheck_route_config(transaction)?;
             let route_key = route_storage_key(self.route);
             let active = transaction
                 .open_table(RESERVATION_TABLE)?
@@ -1834,13 +2071,13 @@ mod durable {
         /// inside this closure while the evidence database writer remains
         /// held; every ledger handle's reservation path must acquire that same
         /// redb writer and therefore cannot race the no-reservation check.
-        pub(crate) fn with_no_pending_reservation_for_gc<T>(
+        pub(crate) fn with_no_pending_root_mutation<T>(
             &self,
             operation: impl FnOnce() -> T,
         ) -> Result<T, SystemAuthorityLedgerError> {
             let _write = self.lock_writes()?;
             let transaction = self.database.begin_write()?;
-            self.recheck_config(&transaction)?;
+            self.recheck_route_config(&transaction)?;
             if transaction
                 .open_table(RESERVATION_TABLE)?
                 .get(route_storage_key(self.route).as_slice())?
@@ -1862,6 +2099,64 @@ mod durable {
         #[cfg(test)]
         fn has_pending_reservation(&self) -> Result<bool, SystemAuthorityLedgerError> {
             Ok(self.recover_pending_claim()?.is_some())
+        }
+    }
+
+    impl SystemAuthorityEvidenceLedger {
+        pub(crate) fn recover_pending_claim(
+            &self,
+        ) -> Result<Option<PendingSystemAuthorityRecovery>, SystemAuthorityLedgerError> {
+            self.owner.recover_pending_claim()
+        }
+
+        pub(crate) fn recheck_pending_recovery(
+            &self,
+            pending: &PendingSystemAuthorityRecovery,
+        ) -> Result<(), SystemAuthorityLedgerError> {
+            self.owner.recheck_pending_recovery(pending)
+        }
+
+        pub(crate) fn with_active_publication_reservation<T, E>(
+            &self,
+            reserved: &ReservedSystemAuthorityClaim,
+            expected_certificate: &SystemAuthorityRotationCertificate,
+            facts: &SystemAuthorityRotationPublicationFacts,
+            operation: impl FnOnce() -> Result<T, E>,
+        ) -> Result<Result<T, E>, SystemAuthorityLedgerError> {
+            self.owner.with_active_publication_reservation(
+                reserved,
+                expected_certificate,
+                facts,
+                operation,
+            )
+        }
+
+        pub(crate) fn with_pending_rotation_recovery<T, E>(
+            &self,
+            pending: &PendingSystemAuthorityRecovery,
+            operation: impl FnOnce(&SystemAuthorityRotationCertificate) -> Result<T, E>,
+        ) -> Result<Result<T, E>, SystemAuthorityLedgerError> {
+            self.owner
+                .with_pending_rotation_recovery(pending, operation)
+        }
+
+        pub(crate) fn with_no_pending_root_mutation<T>(
+            &self,
+            operation: impl FnOnce() -> T,
+        ) -> Result<T, SystemAuthorityLedgerError> {
+            self.owner.with_no_pending_root_mutation(operation)
+        }
+
+        pub(crate) fn with_no_pending_reservation_for_gc<T>(
+            &self,
+            operation: impl FnOnce() -> T,
+        ) -> Result<T, SystemAuthorityLedgerError> {
+            self.owner.with_no_pending_root_mutation(operation)
+        }
+
+        #[cfg(test)]
+        fn has_pending_reservation(&self) -> Result<bool, SystemAuthorityLedgerError> {
+            self.owner.has_pending_reservation()
         }
 
         /// Exact retry returns an already retained local share without
@@ -1941,7 +2236,9 @@ mod durable {
             validate_share(committee, reserved.record.request.claim(), &share)?;
             self.record_share(reserved, leg, share, false)
         }
+    }
 
+    impl SystemAuthorityLedgerRouteOwner {
         pub(crate) fn certificate(
             &self,
             reserved: &ReservedSystemAuthorityClaim,
@@ -2066,31 +2363,35 @@ mod durable {
             self.retire_validated(published)
         }
 
-        fn ensure_operational(&self) -> Result<(), SystemAuthorityLedgerError> {
-            if self.is_fail_stopped()? {
-                Err(SystemAuthorityLedgerError::FailStopped)
-            } else {
-                Ok(())
-            }
-        }
-
         fn ensure_reserved(
             &self,
             reserved: &ReservedSystemAuthorityClaim,
         ) -> Result<(), SystemAuthorityLedgerError> {
-            self.ensure_operational()?;
             if reserved.record.route != self.route
                 || reserved.record.journal_store != self.journal_store
             {
                 return Err(SystemAuthorityLedgerError::WrongRoute);
             }
             reserved.record.validate()?;
-            let bytes = read_exact(
-                &self.database,
-                RESERVATION_TABLE,
-                route_storage_key(self.route).as_slice(),
-            )?
-            .ok_or(SystemAuthorityLedgerError::ClaimNotReserved)?;
+            let transaction = self.database.begin_read()?;
+            self.recheck_route_config_read(&transaction)?;
+            if let Some(bytes) = transaction
+                .open_table(FAIL_STOP_TABLE)?
+                .get(route_storage_key(self.route).as_slice())?
+                .map(|value| value.value().to_vec())
+            {
+                let fail_stop = FailStopRecord::decode(&bytes)
+                    .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                if fail_stop.route != self.route {
+                    return Err(SystemAuthorityLedgerError::CorruptLedger);
+                }
+                return Err(SystemAuthorityLedgerError::FailStopped);
+            }
+            let bytes = transaction
+                .open_table(RESERVATION_TABLE)?
+                .get(route_storage_key(self.route).as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::ClaimNotReserved)?;
             let existing = ReservationRecord::decode(&bytes)
                 .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
             if existing != reserved.record {
@@ -2110,6 +2411,7 @@ mod durable {
             }
             reserved.record.validate()?;
             let transaction = self.database.begin_read()?;
+            self.recheck_route_config_read(&transaction)?;
             let table = transaction.open_table(RESERVATION_TABLE)?;
             let bytes = table
                 .get(route_storage_key(self.route).as_slice())?
@@ -2134,6 +2436,7 @@ mod durable {
             }
             pending.record.validate()?;
             let transaction = self.database.begin_read()?;
+            self.recheck_route_config_read(&transaction)?;
             let bytes = transaction
                 .open_table(RESERVATION_TABLE)?
                 .get(route_storage_key(self.route).as_slice())?
@@ -2156,6 +2459,41 @@ mod durable {
             Ok(())
         }
 
+        fn certificate_for(
+            &self,
+            reserved: &ReservedSystemAuthorityClaim,
+            leg: SystemAuthorityCommitteeLeg,
+        ) -> Result<Option<AuthorityQuorumCertificate>, SystemAuthorityLedgerError> {
+            self.certificate_for_record(&reserved.record, leg)
+        }
+
+        fn certificate_for_record(
+            &self,
+            record: &ReservationRecord,
+            leg: SystemAuthorityCommitteeLeg,
+        ) -> Result<Option<AuthorityQuorumCertificate>, SystemAuthorityLedgerError> {
+            let claim = record.request.claim();
+            let Some(committee) = record.request.committee(leg) else {
+                return Err(SystemAuthorityLedgerError::WrongCommitteeLeg);
+            };
+            let key = leg_storage_key(self.route, claim.sequence(), leg);
+            let transaction = self.database.begin_read()?;
+            self.recheck_route_config_read(&transaction)?;
+            let Some(bytes) = transaction
+                .open_table(QC_TABLE)?
+                .get(key.as_slice())?
+                .map(|value| value.value().to_vec())
+            else {
+                return Ok(None);
+            };
+            let row = CertificateRecord::decode(&bytes)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            row.validate_for(self.route, claim.sequence(), leg, committee, claim)?;
+            Ok(Some(row.certificate))
+        }
+    }
+
+    impl SystemAuthorityEvidenceLedger {
         fn ensure_pledge(
             &self,
             reserved: &ReservedSystemAuthorityClaim,
@@ -2354,7 +2692,13 @@ mod durable {
                 return Err(SystemAuthorityLedgerError::WrongCommitteeLeg);
             };
             let key = share_storage_key(self.route, claim.sequence(), leg, signer);
-            let Some(bytes) = read_exact(&self.database, SHARE_TABLE, key.as_slice())? else {
+            let transaction = self.database.begin_read()?;
+            self.owner.recheck_route_config_read(&transaction)?;
+            let Some(bytes) = transaction
+                .open_table(SHARE_TABLE)?
+                .get(key.as_slice())?
+                .map(|value| value.value().to_vec())
+            else {
                 return Ok(None);
             };
             let row = StoredShare::decode(&bytes)
@@ -2383,18 +2727,7 @@ mod durable {
             record: &ReservationRecord,
             leg: SystemAuthorityCommitteeLeg,
         ) -> Result<Option<AuthorityQuorumCertificate>, SystemAuthorityLedgerError> {
-            let claim = record.request.claim();
-            let Some(committee) = record.request.committee(leg) else {
-                return Err(SystemAuthorityLedgerError::WrongCommitteeLeg);
-            };
-            let key = leg_storage_key(self.route, claim.sequence(), leg);
-            let Some(bytes) = read_exact(&self.database, QC_TABLE, key.as_slice())? else {
-                return Ok(None);
-            };
-            let row = CertificateRecord::decode(&bytes)
-                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
-            row.validate_for(self.route, claim.sequence(), leg, committee, claim)?;
-            Ok(Some(row.certificate))
+            self.owner.certificate_for_record(record, leg)
         }
 
         fn pledged_claim(
@@ -2403,7 +2736,13 @@ mod durable {
             signer: &[u8; 32],
         ) -> Result<Option<AuthorityClaimCommitment>, SystemAuthorityLedgerError> {
             let key = pledge_storage_key(self.route, signer, sequence);
-            let Some(bytes) = read_exact(&self.database, PLEDGE_TABLE, key.as_slice())? else {
+            let transaction = self.database.begin_read()?;
+            self.owner.recheck_route_config_read(&transaction)?;
+            let Some(bytes) = transaction
+                .open_table(PLEDGE_TABLE)?
+                .get(key.as_slice())?
+                .map(|value| value.value().to_vec())
+            else {
                 return Ok(None);
             };
             let pledge = PledgeRecord::decode(&bytes)
@@ -2416,7 +2755,9 @@ mod durable {
             }
             Ok(Some(pledge.claim))
         }
+    }
 
+    impl SystemAuthorityLedgerRouteOwner {
         fn retire_validated(
             &self,
             published: PublishedSystemAuthorityClaim,
@@ -2476,7 +2817,7 @@ mod durable {
             let sequence = request.sequence();
             let claim = request.claim();
             let transaction = self.database.begin_write()?;
-            self.recheck_config(&transaction)?;
+            self.recheck_route_config(&transaction)?;
             let current_meta = transaction
                 .open_table(META_TABLE)?
                 .get(route_key.as_slice())?
@@ -2631,7 +2972,9 @@ mod durable {
             transaction.commit()?;
             Ok(())
         }
+    }
 
+    impl SystemAuthorityEvidenceLedger {
         /// Reclassifying a signer from remote to local is safe only when each
         /// retained share from that signer already crossed the exact global-H
         /// pledge boundary. `open` calls this while holding the same redb
@@ -2697,6 +3040,7 @@ mod durable {
             &self,
             transaction: &redb::WriteTransaction,
         ) -> Result<(), SystemAuthorityLedgerError> {
+            self.owner.recheck_route_config(transaction)?;
             let key = config_storage_key(self.route, self.local_signer.as_bytes());
             let bytes = transaction
                 .open_table(CONFIG_TABLE)?
@@ -2767,7 +3111,9 @@ mod durable {
             }
             Ok(())
         }
+    }
 
+    impl SystemAuthorityLedgerRouteOwner {
         fn lock_writes(&self) -> Result<std::sync::MutexGuard<'_, ()>, SystemAuthorityLedgerError> {
             self.writes
                 .lock()
@@ -2775,24 +3121,60 @@ mod durable {
         }
 
         fn audit_recovery_preflight(&self) -> Result<(), SystemAuthorityLedgerError> {
-            self.audit_recovery_inner(false, true)
+            self.audit_recovery_inner(false)
         }
 
         fn audit_recovery_inner(
             &self,
-            require_local_config: bool,
             allow_missing_tables: bool,
         ) -> Result<(), SystemAuthorityLedgerError> {
             let route_key = route_storage_key(self.route);
+            let expected_route = RouteConfigRecord {
+                version: LEDGER_SCHEMA_VERSION,
+                route: self.route,
+                journal_store: self.journal_store,
+                local_node: self.local_node,
+            };
+            let route_rows = rows_for_prefix_bounded_maybe_missing(
+                &self.database,
+                ROUTE_CONFIG_TABLE,
+                route_key.as_slice(),
+                1,
+                allow_missing_tables,
+            )?;
+            let [(route_row_key, route_config)] = route_rows.as_slice() else {
+                return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            };
+            if route_row_key.as_slice() != route_key.as_slice() {
+                return Err(SystemAuthorityLedgerError::CorruptLedger);
+            }
+            let route_config = RouteConfigRecord::decode(route_config)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            if route_config != expected_route {
+                return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
             let config_rows = rows_for_prefix_bounded_maybe_missing(
                 &self.database,
                 CONFIG_TABLE,
                 route_key.as_slice(),
-                MAX_LOCAL_SIGNERS_PER_SCOPE,
+                MAX_LOCAL_SIGNERS_PER_SCOPE + 1,
                 allow_missing_tables,
             )?;
             let mut configured = alloc::collections::BTreeSet::new();
+            let mut saw_owner_sentinel = false;
             for (key, bytes) in config_rows {
+                if key == route_owner_sentinel_key(self.route) {
+                    if saw_owner_sentinel {
+                        return Err(SystemAuthorityLedgerError::CorruptLedger);
+                    }
+                    let sentinel = RouteConfigRecord::decode(&bytes)
+                        .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                    if sentinel != expected_route {
+                        return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                    }
+                    saw_owner_sentinel = true;
+                    continue;
+                }
                 let config = ConfigRecord::decode(&bytes)
                     .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
                 if key != config_storage_key(config.route, &config.local_signer)
@@ -2808,7 +3190,7 @@ mod durable {
                 }
                 config.validate()?;
             }
-            if require_local_config && !configured.contains(self.local_signer.as_bytes()) {
+            if !saw_owner_sentinel {
                 return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
             }
 
@@ -3034,6 +3416,56 @@ mod durable {
                 record.validate()?;
             }
             Ok(())
+        }
+    }
+
+    /// Permanent signer-independent route ownership. The identical bytes are
+    /// stored in the v3 route table and under the reserved all-zero signer key
+    /// in legacy Config as a mutual rollback fence.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RouteConfigRecord {
+        version: u32,
+        route: SystemAuthorityLedgerRoute,
+        journal_store: JournalStoreInstanceId,
+        local_node: NodeId,
+    }
+
+    impl RouteConfigRecord {
+        fn validate(&self) -> Result<(), SystemAuthorityLedgerError> {
+            self.route.validate()?;
+            if self.version != LEDGER_SCHEMA_VERSION
+                || self.local_node == NodeId::ZERO
+                || JournalStoreInstanceId::from_bytes(*self.journal_store.as_bytes()).is_none()
+                || self.encode().len() > MAX_ROUTE_CONFIG_RECORD_BYTES
+            {
+                return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
+            Ok(())
+        }
+    }
+
+    impl ServiceWire for RouteConfigRecord {
+        const MAGIC: [u8; 4] = *b"AULO";
+
+        fn encode_body(&self, output: &mut Vec<u8>) {
+            let mut encoder = Encoder(output);
+            encoder.u32(self.version);
+            encoder.bytes(&self.route.encode());
+            encoder.fixed(self.journal_store.as_bytes());
+            encoder.fixed(&self.local_node.0);
+        }
+
+        fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+            enforce_complete_bound(decoder, MAX_ROUTE_CONFIG_RECORD_BYTES)?;
+            let record = Self {
+                version: decoder.u32()?,
+                route: decode_nested(decoder, MAX_SYSTEM_AUTHORITY_LEDGER_ROUTE_BYTES)?,
+                journal_store: JournalStoreInstanceId::from_bytes(decoder.fixed()?)
+                    .ok_or(DecodeError::NonCanonical)?,
+                local_node: NodeId(decoder.fixed()?),
+            };
+            record.validate().map_err(|_| DecodeError::NonCanonical)?;
+            Ok(record)
         }
     }
 
@@ -3879,6 +4311,10 @@ mod durable {
         key
     }
 
+    fn route_owner_sentinel_key(route: SystemAuthorityLedgerRoute) -> [u8; CONFIG_KEY_BYTES] {
+        config_storage_key(route, &[0; 32])
+    }
+
     fn pledge_storage_key(
         route: SystemAuthorityLedgerRoute,
         signer: &[u8; 32],
@@ -4358,13 +4794,14 @@ mod durable {
             database: Arc<Database>,
             fixture: &Fixture,
         ) -> SystemAuthorityEvidenceLedger {
-            SystemAuthorityEvidenceLedger::open(
+            SystemAuthorityLedgerRouteOwner::open(
                 database,
                 fixture.route,
                 fixture.store,
                 fixture.local_node(),
-                fixture.local_signer(),
             )
+            .unwrap()
+            .open_signer(fixture.local_signer())
             .unwrap()
         }
 
@@ -4428,6 +4865,357 @@ mod durable {
                 .unwrap()
                 .unwrap();
             (signer, joint)
+        }
+
+        #[test]
+        fn route_owner_opens_and_gates_without_any_signer() {
+            let fixture = Fixture::new();
+            let directory = TempDirectory::new("route_owner_no_signer");
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+
+            let owner = SystemAuthorityLedgerRouteOwner::open(
+                database.clone(),
+                fixture.route,
+                fixture.store,
+                fixture.local_node(),
+            )
+            .unwrap();
+            assert_eq!(owner.route(), fixture.route);
+            assert_eq!(owner.journal_store(), fixture.store);
+            assert_eq!(owner.local_node(), fixture.local_node());
+            assert!(!owner.is_fail_stopped().unwrap());
+            assert!(owner.recover_pending_claim().unwrap().is_none());
+            assert_eq!(owner.with_no_pending_root_mutation(|| 7_u8).unwrap(), 7);
+
+            let route_key = route_storage_key(fixture.route);
+            let sentinel_key = route_owner_sentinel_key(fixture.route);
+            let route_bytes = read_exact(&database, ROUTE_CONFIG_TABLE, route_key.as_slice())
+                .unwrap()
+                .unwrap();
+            let sentinel_bytes = read_exact(&database, CONFIG_TABLE, sentinel_key.as_slice())
+                .unwrap()
+                .unwrap();
+            assert_eq!(route_bytes, sentinel_bytes);
+            assert_eq!(
+                RouteConfigRecord::decode(&route_bytes).unwrap(),
+                RouteConfigRecord {
+                    version: LEDGER_SCHEMA_VERSION,
+                    route: fixture.route,
+                    journal_store: fixture.store,
+                    local_node: fixture.local_node(),
+                }
+            );
+            assert!(
+                ConfigRecord::decode(&sentinel_bytes).is_err(),
+                "a legacy v2 writer must reject the permanent v3 owner sentinel"
+            );
+
+            // Exact owner reopen audits the already-pinned route without
+            // installing a signer or changing either permanent row.
+            let reopened = SystemAuthorityLedgerRouteOwner::open(
+                database.clone(),
+                fixture.route,
+                fixture.store,
+                fixture.local_node(),
+            )
+            .unwrap();
+            assert!(reopened.recover_pending_claim().unwrap().is_none());
+            assert_eq!(
+                read_exact(&database, ROUTE_CONFIG_TABLE, route_key.as_slice())
+                    .unwrap()
+                    .unwrap(),
+                route_bytes
+            );
+            assert_eq!(
+                read_exact(&database, CONFIG_TABLE, sentinel_key.as_slice())
+                    .unwrap()
+                    .unwrap(),
+                sentinel_bytes
+            );
+        }
+
+        #[test]
+        fn signer_children_share_one_owner_lock_and_route_state() {
+            let fixture = Fixture::new();
+            let directory = TempDirectory::new("shared_owner");
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+            let owner = SystemAuthorityLedgerRouteOwner::open(
+                database,
+                fixture.route,
+                fixture.store,
+                fixture.local_node(),
+            )
+            .unwrap();
+            let first = owner.open_signer(fixture.local_signer()).unwrap();
+            let second_signer =
+                AuthoritySignerId::of_raw_ed25519(&fixture.keys[1].verifying_key().to_bytes());
+            let second = owner.open_signer(second_signer).unwrap();
+            assert!(Arc::ptr_eq(first.owner(), second.owner()));
+            assert!(Arc::ptr_eq(first.owner(), &owner));
+
+            first
+                .reserve_or_reconcile(&fixture.view, fixture.rotation_request())
+                .unwrap();
+            let pending = second.recover_pending_claim().unwrap().unwrap();
+            assert_eq!(pending.claim(), fixture.request.claim());
+            assert!(matches!(
+                owner.with_no_pending_root_mutation(|| ()),
+                Err(SystemAuthorityLedgerError::GcBlockedByPendingReservation)
+            ));
+        }
+
+        #[test]
+        fn owner_mismatch_and_legacy_residue_fail_without_writes() {
+            let fixture = Fixture::new();
+            let directory = TempDirectory::new("owner_mismatch");
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+            let owner = SystemAuthorityLedgerRouteOwner::open(
+                database.clone(),
+                fixture.route,
+                fixture.store,
+                fixture.local_node(),
+            )
+            .unwrap();
+            drop(owner);
+            let route_key = route_storage_key(fixture.route);
+            let sentinel_key = route_owner_sentinel_key(fixture.route);
+            let route_before = read_exact(&database, ROUTE_CONFIG_TABLE, route_key.as_slice())
+                .unwrap()
+                .unwrap();
+            let sentinel_before = read_exact(&database, CONFIG_TABLE, sentinel_key.as_slice())
+                .unwrap()
+                .unwrap();
+
+            let foreign_store = JournalStoreInstanceId::from_bytes([0xa2; 32]).unwrap();
+            assert!(matches!(
+                SystemAuthorityLedgerRouteOwner::open(
+                    database.clone(),
+                    fixture.route,
+                    foreign_store,
+                    fixture.local_node(),
+                ),
+                Err(SystemAuthorityLedgerError::ConfigurationMismatch)
+            ));
+            assert!(matches!(
+                SystemAuthorityLedgerRouteOwner::open(
+                    database.clone(),
+                    fixture.route,
+                    fixture.store,
+                    NodeId([0xa3; 32]),
+                ),
+                Err(SystemAuthorityLedgerError::ConfigurationMismatch)
+            ));
+            assert_eq!(
+                read_exact(&database, ROUTE_CONFIG_TABLE, route_key.as_slice())
+                    .unwrap()
+                    .unwrap(),
+                route_before
+            );
+            assert_eq!(
+                read_exact(&database, CONFIG_TABLE, sentinel_key.as_slice())
+                    .unwrap()
+                    .unwrap(),
+                sentinel_before
+            );
+
+            // A route containing a v2 signer Config cannot be upgraded in
+            // place. Failed v3 open neither installs RouteConfig nor replaces
+            // the pre-existing signer row with the owner sentinel.
+            let legacy_directory = TempDirectory::new("legacy_residue");
+            let legacy_database = Arc::new(Database::create(legacy_directory.database()).unwrap());
+            let signer_key = config_storage_key(fixture.route, fixture.local_signer().as_bytes());
+            let legacy = ConfigRecord {
+                version: 2,
+                route: fixture.route,
+                journal_store: fixture.store,
+                local_node: fixture.local_node(),
+                local_signer: *fixture.local_signer().as_bytes(),
+            }
+            .encode();
+            let transaction = legacy_database.begin_write().unwrap();
+            transaction
+                .open_table(CONFIG_TABLE)
+                .unwrap()
+                .insert(signer_key.as_slice(), legacy.as_slice())
+                .unwrap();
+            transaction.commit().unwrap();
+            assert!(matches!(
+                SystemAuthorityLedgerRouteOwner::open(
+                    legacy_database.clone(),
+                    fixture.route,
+                    fixture.store,
+                    fixture.local_node(),
+                ),
+                Err(SystemAuthorityLedgerError::ConfigurationMismatch)
+            ));
+            assert_eq!(
+                read_exact(&legacy_database, CONFIG_TABLE, signer_key.as_slice())
+                    .unwrap()
+                    .unwrap(),
+                legacy
+            );
+            assert!(
+                read_exact_maybe_missing(
+                    &legacy_database,
+                    ROUTE_CONFIG_TABLE,
+                    route_key.as_slice(),
+                    true,
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                read_exact(&legacy_database, CONFIG_TABLE, sentinel_key.as_slice())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn incomplete_owner_rows_and_missing_pinned_table_fail_closed() {
+            let fixture = Fixture::new();
+            let route_key = route_storage_key(fixture.route);
+            let sentinel_key = route_owner_sentinel_key(fixture.route);
+            let expected = RouteConfigRecord {
+                version: LEDGER_SCHEMA_VERSION,
+                route: fixture.route,
+                journal_store: fixture.store,
+                local_node: fixture.local_node(),
+            };
+
+            let partial_directory = TempDirectory::new("partial_owner");
+            let partial = Arc::new(Database::create(partial_directory.database()).unwrap());
+            let transaction = partial.begin_write().unwrap();
+            transaction
+                .open_table(ROUTE_CONFIG_TABLE)
+                .unwrap()
+                .insert(route_key.as_slice(), expected.encode().as_slice())
+                .unwrap();
+            transaction.commit().unwrap();
+            assert!(matches!(
+                SystemAuthorityLedgerRouteOwner::open(
+                    partial.clone(),
+                    fixture.route,
+                    fixture.store,
+                    fixture.local_node(),
+                ),
+                Err(SystemAuthorityLedgerError::ConfigurationMismatch)
+            ));
+            assert!(
+                read_exact_maybe_missing(&partial, CONFIG_TABLE, sentinel_key.as_slice(), true)
+                    .unwrap()
+                    .is_none(),
+                "failed open must not complete a partial owner installation"
+            );
+
+            let missing_directory = TempDirectory::new("missing_pinned_table");
+            let missing = Arc::new(Database::create(missing_directory.database()).unwrap());
+            let owner = SystemAuthorityLedgerRouteOwner::open(
+                missing.clone(),
+                fixture.route,
+                fixture.store,
+                fixture.local_node(),
+            )
+            .unwrap();
+            drop(owner);
+            let transaction = missing.begin_write().unwrap();
+            assert!(transaction.delete_table(PLEDGE_TABLE).unwrap());
+            transaction.commit().unwrap();
+            assert!(
+                SystemAuthorityLedgerRouteOwner::open(
+                    missing.clone(),
+                    fixture.route,
+                    fixture.store,
+                    fixture.local_node(),
+                )
+                .is_err()
+            );
+            let read = missing.begin_read().unwrap();
+            assert!(read.open_table(PLEDGE_TABLE).is_err());
+        }
+
+        #[test]
+        fn owner_row_tamper_blocks_child_reads_and_writes_without_state_change() {
+            let fixture = Fixture::new();
+            let directory = TempDirectory::new("owner_row_tamper");
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+            let owner = SystemAuthorityLedgerRouteOwner::open(
+                database.clone(),
+                fixture.route,
+                fixture.store,
+                fixture.local_node(),
+            )
+            .unwrap();
+            let child = owner.open_signer(fixture.local_signer()).unwrap();
+            let route_key = route_storage_key(fixture.route);
+            let transaction = database.begin_write().unwrap();
+            transaction
+                .open_table(CONFIG_TABLE)
+                .unwrap()
+                .remove(route_owner_sentinel_key(fixture.route).as_slice())
+                .unwrap();
+            transaction.commit().unwrap();
+
+            assert!(matches!(
+                child.reserve_or_reconcile(&fixture.view, fixture.rotation_request()),
+                Err(SystemAuthorityLedgerError::ConfigurationMismatch)
+            ));
+            assert!(matches!(
+                owner.recover_pending_claim(),
+                Err(SystemAuthorityLedgerError::ConfigurationMismatch)
+            ));
+            assert!(
+                read_exact(&database, RESERVATION_TABLE, route_key.as_slice())
+                    .unwrap()
+                    .is_none(),
+                "failed child mutation must not create a reservation"
+            );
+            assert!(
+                read_exact(&database, META_TABLE, route_key.as_slice())
+                    .unwrap()
+                    .is_none(),
+                "failed child mutation must not initialize Meta"
+            );
+        }
+
+        #[test]
+        fn owner_recovers_and_retires_after_signer_child_is_dropped() {
+            let fixture = Fixture::new();
+            let directory = TempDirectory::new("owner_retirement");
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+            let owner = SystemAuthorityLedgerRouteOwner::open(
+                database.clone(),
+                fixture.route,
+                fixture.store,
+                fixture.local_node(),
+            )
+            .unwrap();
+            let ledger = owner.open_signer(fixture.local_signer()).unwrap();
+            let reserved = ledger
+                .reserve_or_reconcile(&fixture.view, fixture.rotation_request())
+                .unwrap()
+                .into_reserved();
+            let (signer, joint) = certify_both_legs(&ledger, database, &fixture, &reserved);
+            let pending = owner.recover_pending_claim().unwrap().unwrap();
+            let successor = fixture.successor_view(joint);
+            drop(signer);
+            drop(ledger);
+
+            assert!(
+                owner
+                    .pending_joint_rotation_certificate(&pending)
+                    .unwrap()
+                    .is_some()
+            );
+            let receipt = PublishedSystemAuthorityClaim::for_test_after_exact_cas(
+                pending,
+                fixture.request.claim(),
+                &successor,
+            )
+            .unwrap();
+            owner.retire_published_claim(receipt).unwrap();
+            assert!(owner.recover_pending_claim().unwrap().is_none());
+            assert_eq!(owner.with_no_pending_root_mutation(|| 9_u8).unwrap(), 9);
         }
 
         #[test]
@@ -5282,7 +6070,7 @@ mod durable {
 #[allow(unused_imports)]
 pub(crate) use durable::{
     PendingSystemAuthorityRecovery, ReservedSystemAuthorityClaim, RetiredSystemAuthorityRotation,
-    SystemAuthorityEvidenceLedger, SystemAuthorityLedgerError,
+    SystemAuthorityEvidenceLedger, SystemAuthorityLedgerError, SystemAuthorityLedgerRouteOwner,
     SystemAuthorityReservationDisposition, SystemAuthorityReservationOutcome,
     SystemAuthorityRotationReservationRequest, SystemAuthorityShareOutcome,
     SystemAuthoritySignError, SystemAuthoritySigner,
