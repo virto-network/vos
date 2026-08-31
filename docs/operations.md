@@ -136,7 +136,7 @@ Recreate those spaces from packages and application exports.
 
 The standard Agent execution profile uses the same fail-closed rule. Agent
 Actor and AgentRuntime packages from the retired `standard-gas-r01` and
-`standard-gas-r02` generations cannot be opened by an `r03` host. Generation
+`standard-gas-r02` generations cannot be opened by an `r04` host. Generation
 `r02` introduced the full v0.8 reorder-buffer scheduler, full-Ψ deblob/entry
 failures, and sign-extended 64-bit `ecalli` identifiers. Generation `r03`
 additionally binds exact durable terminal and execution-error outcomes to the
@@ -144,8 +144,9 @@ authenticated invocation ownership and acknowledgement protocol. Rebuild
 those packages and recreate local development Agent images. The related
 lifecycle wire first moved from
 `vos-agent-runtime-abi-20260829r1` to `vos-agent-runtime-abi-20260829r2`, then
-to `vos-agent-runtime-abi-20260831r3` and `vos-agent-runtime-abi-20260831r4`, and now to
-`vos-agent-runtime-abi-20260831r5`. Generation r3 binds Suspend and Resume
+to `vos-agent-runtime-abi-20260831r3`, `vos-agent-runtime-abi-20260831r4`,
+`vos-agent-runtime-abi-20260831r5`, and now
+`vos-agent-runtime-abi-20260831r6`. Generation r3 binds Suspend and Resume
 authority to the actor's exact expected deployment, so a receipt prepared
 before an actor upgrade cannot mutate its replacement. Generation r4 makes
 the three actor-state lanes independently sparse, binds their entries to a
@@ -159,10 +160,15 @@ catalog resource ceilings into the runtime package and enforces them over the
 deduplicated runtime-package plus actor package/schema/policy closure. Every
 reference is capped at 8 MiB, the Standard closure at 12,289 unique references
 and 64 MiB of referenced content, and a hash presented with inconsistent
-lengths is rejected. An r5 host deliberately rejects r1/r2/r3/r4 runtime
-packages and persisted Agent images; rebuild the runtime and actor packages
-and recreate those images. The actor ABI itself remains unchanged. This
-cutover does not change the frozen Service execution identity or artifacts.
+lengths is rejected. Generation r6 adds the replay-authenticated journal
+generation/admission context and the root-pinned live system-authority Control
+state. Finalize and committee-rotation commands execute deterministically in
+the guest, but only independently authenticated replay may persist their
+history plans or mint post-publication authority. An r6 host deliberately
+rejects r1/r2/r3/r4/r5 runtime packages and persisted Agent images; rebuild the
+runtime and actor packages and recreate those images. The actor ABI itself
+remains unchanged. This cutover does not change the frozen Service execution
+identity or artifacts.
 
 Portable invocation continuations now use kernel snapshot version 5, which
 preserves sparse IPC DATA mappings exactly. Before upgrading a host, let every
