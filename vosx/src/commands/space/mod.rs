@@ -21,8 +21,10 @@ use clap::Subcommand;
 use std::path::PathBuf;
 
 pub mod access;
+mod agent_authority;
 pub mod agents;
 pub mod apply;
+mod authority_socket;
 pub mod backup;
 pub mod call;
 pub mod caps;
