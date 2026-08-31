@@ -1,9 +1,9 @@
-//! Durable multi-agent host.
+//! Durable Local system-Agent host.
 //!
-//! An [`AgentHost`] owns one filesystem directory and any number of agent
-//! runtime instances. Each image remains independently replaceable and is
-//! addressed by its full [`AgentId`]. Runtime packages and programs live in
-//! each image's mandatory content-addressed catalog closure.
+//! An [`AgentHost`] owns one filesystem directory and the one system Agent
+//! selected by independently configured root pins. The clean generation is a
+//! journal rooted at `<full-agent-id>.agent`; retired `.agent-image` files are
+//! rejected and are never migrated implicitly.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -18,23 +18,52 @@ use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 
-use super::authority::{ActorInvocationReceipt, AgentAuthorityBinding, AgentAuthorityReceipt};
-use super::driver::{AgentDriver, AgentDriverError, AgentTrustProvider, FileAgentStore};
+pub use super::local_journal_driver::LocalMergeAuthenticator;
+#[cfg(feature = "network")]
+pub use super::local_journal_driver::{
+    Ed25519NodeMergeAuthenticator, Ed25519NodeMergeAuthenticatorError,
+};
+
+use super::authority::{
+    ActorInvocationReceipt, AgentAuthorityBinding, AgentAuthorityReceipt, AuthorityError,
+};
+use super::bootstrap::{
+    SystemAgentGenesisBootstrapError, SystemAgentGenesisLocator, SystemAgentGenesisProposal,
+    SystemAgentGenesisProvider, SystemAgentGenesisProviderError,
+    seal_prepared_system_agent_genesis,
+};
+use super::committee::RootAnchorPins;
+use super::driver::AgentTrustProvider;
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorInvocation, MAX_EXECUTION_AVAILABILITY_BYTES,
     MAX_EXECUTION_BLOBS, MAX_EXECUTION_GAS, MAX_EXECUTION_MESSAGE_BYTES,
     MAX_EXECUTION_POLICY_BYTES, MAX_EXECUTION_PROGRAM_BYTES, MAX_EXECUTION_STATE_BYTES,
+    RuntimeBlob,
+};
+use super::journal::ReplayOperation;
+use super::journal_store::{AgentJournalStore, FileAgentJournalStore, JournalStoreError};
+use super::local_journal_driver::{
+    LocalJournalAgentDriver, LocalJournalDriverError, LocalLifecycleOperation,
+    LocalReplayExecutorError, LocalSettledAcknowledgementResult, LocalSettledInvocationResult,
 };
 use super::package::{
     MAX_ENCODED_PACKAGE_BYTES, MAX_PACKAGE_DIAGNOSTICS_BYTES, MAX_PACKAGE_INTERFACES_BYTES,
     MAX_PACKAGE_SCHEMAS_BYTES, MAX_PACKAGE_TASK_BYTES, Package, PackageError,
 };
-use super::{ActorDirectoryPage, ActorEntry, AgentConfig, AgentIdentity, LifecycleRequest};
+use super::replay::{ReplayError, ReplayMaterializationSourceError, ReplaySealedGenesis};
+use super::{
+    ActorDirectoryPage, ActorEntry, AgentConfig, AgentConfigError, AgentIdentity, LifecycleError,
+    LifecycleReply, LifecycleRequest, PackageKind,
+};
+use crate::service::wire::ServiceWire;
 use crate::service::{
-    ActorId, AgentId, CapabilityId, DeploymentId, Hash, InvocationId, NodeId, ProgramId, SpaceId,
+    ActorId, AgentId, BlobRef, CapabilityId, DeploymentId, Hash, InvocationId, NodeId, ProgramId,
+    SpaceId,
 };
 
-const IMAGE_SUFFIX: &str = ".agent-image";
+const JOURNAL_SUFFIX: &str = ".agent";
+const JOURNAL_LOCK_SUFFIX: &str = ".agent-lock";
+const LEGACY_IMAGE_SUFFIX: &str = ".agent-image";
 const HOST_LOCK_FILE: &str = ".agent-host.lock";
 const HOST_SCOPE_FILE: &str = ".agent-host.scope";
 const HOST_SCOPE_TEMP_FILE: &str = ".agent-host.scope.tmp";
@@ -65,7 +94,8 @@ pub enum AgentHostError {
     InvalidScopeBinding,
     DirectoryInUse,
     InvalidQueueCapacity,
-    InvalidImageName,
+    InvalidJournalName,
+    LegacyGeneration,
     DuplicateAgent,
     AgentNotFound,
     IdentityMismatch,
@@ -73,7 +103,19 @@ pub enum AgentHostError {
     ShuttingDown,
     WorkerStopped,
     WorkerPanicked,
-    Driver(AgentDriverError),
+    InvalidConfig(AgentConfigError),
+    Package(PackageError),
+    Lifecycle(LifecycleError),
+    Execution(ActorExecutionError),
+    Authority(AuthorityError),
+    Journal(AgentHostJournalError),
+    Bootstrap(SystemAgentGenesisBootstrapError),
+    Provider(SystemAgentGenesisProviderError),
+    InvalidAuthority,
+    TrustUnavailable,
+    Conflict,
+    InvalidRuntime,
+    InvocationAcknowledged,
 }
 
 impl core::fmt::Display for AgentHostError {
@@ -84,10 +126,23 @@ impl core::fmt::Display for AgentHostError {
 
 impl std::error::Error for AgentHostError {}
 
-impl From<AgentDriverError> for AgentHostError {
-    fn from(error: AgentDriverError) -> Self {
-        Self::Driver(error)
-    }
+/// Public, host-stable projection of the crate-private journal adapter errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentHostJournalError {
+    InvalidPath,
+    ScopeMismatch,
+    DirectoryInUse,
+    LegacyGeneration,
+    NotInitialized,
+    Conflict,
+    GcPending,
+    InvalidClass,
+    NonCanonical,
+    LimitExceeded,
+    Backpressure,
+    MissingObject,
+    Corrupt,
+    Unavailable,
 }
 
 /// Stable ownership token for one configured Agent data-root slot.
@@ -156,8 +211,11 @@ impl AgentHostRootLease {
 pub struct AgentHost {
     root: PathBuf,
     scope: AgentHostScope,
-    agents: BTreeMap<AgentId, AgentDriver<FileAgentStore>>,
+    agents: BTreeMap<AgentId, LocalJournalAgentDriver<FileAgentJournalStore>>,
     trust: Arc<dyn AgentTrustProvider>,
+    merge: Arc<dyn LocalMergeAuthenticator>,
+    genesis: Arc<dyn SystemAgentGenesisProvider>,
+    root_pins: RootAnchorPins,
     _directory_lock: File,
     _root_lease: AgentHostRootLease,
 }
@@ -213,7 +271,7 @@ impl PreparedLifecycleRequest {
     fn new(config: &AgentConfig, request: LifecycleRequest) -> Result<Self, AgentHostError> {
         let capability = request
             .required_capability()
-            .ok_or(AgentHostError::Driver(AgentDriverError::InvalidRuntime))?;
+            .ok_or(AgentHostError::InvalidRuntime)?;
         Ok(Self {
             authority: config.authority.clone(),
             space: config.identity.space,
@@ -406,11 +464,11 @@ impl AgentHostHandle {
     }
 
     pub fn identities(&self) -> Result<Vec<AgentIdentity>, AgentHostError> {
-        self.request(0, |host| Ok(host.identities().cloned().collect()))
+        self.request(0, |host| host.identities())
     }
 
     pub fn identity(&self, agent: AgentId) -> Result<Option<AgentIdentity>, AgentHostError> {
-        self.request(0, move |host| Ok(host.identity(agent).cloned()))
+        self.request(0, move |host| host.identity(agent))
     }
 
     pub fn revision(&self, agent: AgentId) -> Result<Option<u64>, AgentHostError> {
@@ -804,7 +862,7 @@ fn invocation_receipt_heap_payload_bytes(receipt: &ActorInvocationReceipt) -> us
 }
 
 fn invalid_package_shape(error: PackageError) -> AgentHostError {
-    AgentHostError::Driver(AgentDriverError::Package(error))
+    AgentHostError::Package(error)
 }
 
 /// Reject unbounded package shapes before inspecting nested allocations.
@@ -891,9 +949,7 @@ fn validate_package_shape_before_reservation(package: &Package) -> Result<(), Ag
 }
 
 fn invalid_invocation_shape() -> AgentHostError {
-    AgentHostError::Driver(AgentDriverError::Execution(
-        ActorExecutionError::InvalidInput,
-    ))
+    AgentHostError::Execution(ActorExecutionError::InvalidInput)
 }
 
 /// Apply only fixed-cost and bounded length checks before payload admission.
@@ -934,9 +990,7 @@ fn validate_invocation_shape_before_reservation(
 }
 
 fn invalid_lifecycle_request() -> AgentHostError {
-    AgentHostError::Driver(AgentDriverError::Lifecycle(
-        super::LifecycleError::InvalidRequest,
-    ))
+    AgentHostError::Lifecycle(super::LifecycleError::InvalidRequest)
 }
 
 fn validate_actor(actor: ActorId) -> Result<(), AgentHostError> {
@@ -974,9 +1028,9 @@ fn validate_agent_receipt_shape(receipt: &AgentAuthorityReceipt) -> Result<(), A
     if receipt.signature.len() != super::authority::ED25519_SIGNATURE_BYTES
         || !receipt.claim.authority.validate()
     {
-        return Err(AgentHostError::Driver(AgentDriverError::Authority(
+        return Err(AgentHostError::Authority(
             super::authority::AuthorityError::InvalidSignature,
-        )));
+        ));
     }
     Ok(())
 }
@@ -987,9 +1041,9 @@ fn validate_invocation_receipt_shape(
     if receipt.signature.len() != super::authority::ED25519_SIGNATURE_BYTES
         || !receipt.claim.authority.validate()
     {
-        return Err(AgentHostError::Driver(AgentDriverError::Authority(
+        return Err(AgentHostError::Authority(
             super::authority::AuthorityError::InvalidSignature,
-        )));
+        ));
     }
     Ok(())
 }
@@ -1024,20 +1078,33 @@ impl AgentHostControl {
     pub fn open(
         lease: AgentHostRootLease,
         trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        genesis: Arc<dyn SystemAgentGenesisProvider>,
+        root_pins: RootAnchorPins,
     ) -> Result<Self, AgentHostError> {
-        Self::open_with_queue_capacity(lease, trust, DEFAULT_AGENT_HOST_QUEUE_CAPACITY)
+        Self::open_with_queue_capacity(
+            lease,
+            trust,
+            merge,
+            genesis,
+            root_pins,
+            DEFAULT_AGENT_HOST_QUEUE_CAPACITY,
+        )
     }
 
     pub fn open_with_queue_capacity(
         lease: AgentHostRootLease,
         trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        genesis: Arc<dyn SystemAgentGenesisProvider>,
+        root_pins: RootAnchorPins,
         queue_capacity: usize,
     ) -> Result<Self, AgentHostError> {
         if queue_capacity == 0 {
             return Err(AgentHostError::InvalidQueueCapacity);
         }
         let scope = lease.scope();
-        let host = AgentHost::open(lease, trust)?;
+        let host = AgentHost::open(lease, trust, merge, genesis, root_pins)?;
         let (commands, receiver) = mpsc::sync_channel(queue_capacity);
         let state = Arc::new(AtomicU8::new(WORKER_RUNNING));
         let active_requests = Arc::new(AtomicUsize::new(0));
@@ -1159,81 +1226,151 @@ fn reject_queued_agent_host_jobs(receiver: &Receiver<AgentHostCommand>) {
 }
 
 impl AgentHost {
-    /// Open every canonical image in `root`.
+    /// Open the one independently pinned Local system Agent in `root`.
     ///
-    /// Runtime state is validated by executing the exact runtime named in the
-    /// image. A missing runtime or malformed image fails the complete open;
-    /// the host never exposes a partially recovered directory.
+    /// Startup probes the configured provider locator even when no journal is
+    /// present. An archived provider-first Create is therefore completed after
+    /// a crash before the first destination write. Conversely, generation
+    /// residue without its exact archive fails closed and is never re-minted.
     pub fn open(
         lease: AgentHostRootLease,
         trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        genesis: Arc<dyn SystemAgentGenesisProvider>,
+        root_pins: RootAnchorPins,
     ) -> Result<Self, AgentHostError> {
         let root = lease.root().to_path_buf();
         let scope = lease.scope();
+        validate_host_root_capabilities(scope, merge.as_ref(), &root_pins)?;
+        let system_agent = root_pins.record().system_agent();
         let directory_lock = lock_agent_host_directory(&root)?;
         let scope_state = read_agent_host_scope(&root, scope)?;
         if scope_state.scope().is_some_and(|bound| bound != scope) {
             return Err(AgentHostError::ScopeMismatch);
         }
-        let mut discovered = Vec::new();
+        let mut journals = Vec::new();
+        let mut journal_locks = Vec::new();
         for entry in fs::read_dir(&root).map_err(|_| AgentHostError::Unavailable)? {
             let entry = entry.map_err(|_| AgentHostError::Unavailable)?;
             let file_type = entry.file_type().map_err(|_| AgentHostError::Unavailable)?;
             let name = entry
                 .file_name()
                 .into_string()
-                .map_err(|_| AgentHostError::InvalidImageName)?;
-            if !name.ends_with(IMAGE_SUFFIX) {
+                .map_err(|_| AgentHostError::InvalidJournalName)?;
+            if matches!(
+                name.as_str(),
+                HOST_LOCK_FILE | HOST_SCOPE_FILE | HOST_SCOPE_TEMP_FILE
+            ) {
                 continue;
             }
-            if !file_type.is_file() {
-                return Err(AgentHostError::InvalidImageName);
+            let folded_name = name.to_ascii_lowercase();
+            if matches!(
+                folded_name.as_str(),
+                HOST_LOCK_FILE | HOST_SCOPE_FILE | HOST_SCOPE_TEMP_FILE
+            ) {
+                return Err(AgentHostError::InvalidJournalName);
             }
-            let encoded = &name[..name.len() - IMAGE_SUFFIX.len()];
-            let agent = decode_agent_id(encoded).ok_or(AgentHostError::InvalidImageName)?;
-            discovered.push((agent, entry.path()));
+            if folded_name.ends_with(LEGACY_IMAGE_SUFFIX) {
+                return Err(AgentHostError::LegacyGeneration);
+            }
+            if folded_name.ends_with(JOURNAL_LOCK_SUFFIX) {
+                if !name.ends_with(JOURNAL_LOCK_SUFFIX) {
+                    return Err(AgentHostError::InvalidJournalName);
+                }
+                if !file_type.is_file() || file_type.is_symlink() {
+                    return Err(AgentHostError::InvalidJournalName);
+                }
+                let encoded = &name[..name.len() - JOURNAL_LOCK_SUFFIX.len()];
+                let agent = decode_agent_id(encoded).ok_or(AgentHostError::InvalidJournalName)?;
+                if agent != system_agent {
+                    return Err(AgentHostError::ScopeMismatch);
+                }
+                journal_locks.push(agent);
+                continue;
+            }
+            if !folded_name.ends_with(JOURNAL_SUFFIX) {
+                continue;
+            }
+            if !name.ends_with(JOURNAL_SUFFIX) {
+                return Err(AgentHostError::InvalidJournalName);
+            }
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return Err(AgentHostError::InvalidJournalName);
+            }
+            let encoded = &name[..name.len() - JOURNAL_SUFFIX.len()];
+            let agent = decode_agent_id(encoded).ok_or(AgentHostError::InvalidJournalName)?;
+            if agent != system_agent {
+                return Err(AgentHostError::ScopeMismatch);
+            }
+            journals.push(agent);
         }
-        discovered.sort_unstable_by_key(|(agent, _)| *agent);
-        if discovered.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        journals.sort_unstable();
+        journal_locks.sort_unstable();
+        if journals.windows(2).any(|pair| pair[0] == pair[1])
+            || journal_locks.windows(2).any(|pair| pair[0] == pair[1])
+        {
             return Err(AgentHostError::DuplicateAgent);
         }
+        let generation_residue = !journals.is_empty() || !journal_locks.is_empty();
         match scope_state {
             AgentHostScopeState::Bound(_) => {}
-            AgentHostScopeState::Staged(_) if discovered.is_empty() => {
+            AgentHostScopeState::Staged(_) if !generation_residue => {
                 publish_agent_host_scope(
                     &root,
                     &root.join(HOST_SCOPE_TEMP_FILE),
                     &root.join(HOST_SCOPE_FILE),
                 )?;
             }
-            AgentHostScopeState::Absent if discovered.is_empty() => {
+            AgentHostScopeState::Absent if !generation_residue => {
                 write_agent_host_scope(&root, scope)?;
             }
             AgentHostScopeState::Staged(_) | AgentHostScopeState::Absent => {
-                // Never infer or overwrite the scope of a pre-sidecar image. An
-                // explicit offline migration can authenticate that image first;
-                // merely trying a caller-selected scope must not poison it.
+                // Never infer or overwrite the scope of a journal or stable
+                // lock left by a pre-sidecar generation.
                 return Err(AgentHostError::InvalidScopeBinding);
             }
         }
 
         let mut agents = BTreeMap::new();
-        for (agent, path) in discovered {
-            let store = FileAgentStore::new(path);
-            let driver = AgentDriver::open(store, trust.clone())?;
-            if driver.image().config.identity.agent != agent {
-                return Err(AgentHostError::IdentityMismatch);
+        let locator = SystemAgentGenesisLocator {
+            space: scope.space,
+            agent: system_agent,
+            node: scope.node,
+        };
+        match genesis.reproduce(locator) {
+            Ok(provision) => {
+                let (sealed, catalog, _, _) = prepare_archived_genesis(
+                    trust.clone(),
+                    merge.clone(),
+                    genesis.as_ref(),
+                    &root_pins,
+                    provision,
+                )?;
+                let driver = open_archived_system_agent(
+                    &root,
+                    scope,
+                    sealed,
+                    &catalog,
+                    trust.clone(),
+                    merge.clone(),
+                )?;
+                let identity = driver.identity().map_err(map_local_driver_error)?;
+                if identity.agent != system_agent || identity.space != scope.space {
+                    return Err(AgentHostError::IdentityMismatch);
+                }
+                agents.insert(system_agent, driver);
             }
-            if !scope.admits(&driver.image().config) {
-                return Err(AgentHostError::ScopeMismatch);
-            }
-            agents.insert(agent, driver);
+            Err(SystemAgentGenesisProviderError::NotConfigured) if !generation_residue => {}
+            Err(error) => return Err(AgentHostError::Provider(error)),
         }
         Ok(Self {
             root,
             scope,
             agents,
             trust,
+            merge,
+            genesis,
+            root_pins,
             _directory_lock: directory_lock,
             _root_lease: lease,
         })
@@ -1255,17 +1392,19 @@ impl AgentHost {
         self.agents.is_empty()
     }
 
-    /// Immutable agent identities in canonical ID order.
-    pub fn identities(&self) -> impl ExactSizeIterator<Item = &AgentIdentity> {
+    /// Immutable Agent identities in canonical ID order.
+    pub fn identities(&self) -> Result<Vec<AgentIdentity>, AgentHostError> {
         self.agents
             .values()
-            .map(|driver| &driver.image().config.identity)
+            .map(|driver| driver.identity().map_err(map_local_driver_error))
+            .collect()
     }
 
-    pub fn identity(&self, agent: AgentId) -> Option<&AgentIdentity> {
+    pub fn identity(&self, agent: AgentId) -> Result<Option<AgentIdentity>, AgentHostError> {
         self.agents
             .get(&agent)
-            .map(|driver| &driver.image().config.identity)
+            .map(|driver| driver.identity().map_err(map_local_driver_error))
+            .transpose()
     }
 
     /// Validate a Local creation target and runtime package without writing
@@ -1278,16 +1417,22 @@ impl AgentHost {
         if !self.scope.admits(config) {
             return Err(AgentHostError::ScopeMismatch);
         }
+        if config.identity.agent != self.system_agent() {
+            return Err(AgentHostError::ScopeMismatch);
+        }
         if let Some(driver) = self.agents.get(&config.identity.agent)
-            && driver.image().config != *config
+            && driver.config().map_err(map_local_driver_error)? != *config
         {
             return Err(AgentHostError::DuplicateAgent);
         }
-        let request = AgentDriver::<FileAgentStore>::create_request(
+        validate_system_create_target(
+            self.scope,
+            self.system_agent(),
             config,
             runtime_package,
             self.trust.as_ref(),
         )?;
+        let request = LifecycleRequest::Create(config.clone());
         PreparedLifecycleRequest::new(config, request)
     }
 
@@ -1302,8 +1447,13 @@ impl AgentHost {
             .agents
             .get(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
-        let request = driver.actor_install_request(name, parent, package)?;
-        PreparedLifecycleRequest::new(&driver.image().config, request)
+        let operation = driver
+            .actor_install_operation(name, parent, package)
+            .map_err(map_local_driver_error)?;
+        PreparedLifecycleRequest::new(
+            &driver.config().map_err(map_local_driver_error)?,
+            operation.request().clone(),
+        )
     }
 
     pub fn prepare_actor_upgrade(
@@ -1317,8 +1467,13 @@ impl AgentHost {
             .agents
             .get(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
-        let request = driver.actor_upgrade_request(actor, from_deployment, package)?;
-        PreparedLifecycleRequest::new(&driver.image().config, request)
+        let operation = driver
+            .actor_upgrade_operation(actor, from_deployment, package)
+            .map_err(map_local_driver_error)?;
+        PreparedLifecycleRequest::new(
+            &driver.config().map_err(map_local_driver_error)?,
+            operation.request().clone(),
+        )
     }
 
     pub fn prepare_actor_suspend(
@@ -1330,8 +1485,13 @@ impl AgentHost {
             .agents
             .get(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
-        let request = driver.actor_suspend_request(actor)?;
-        PreparedLifecycleRequest::new(&driver.image().config, request)
+        let operation = driver
+            .actor_suspend_operation(actor)
+            .map_err(map_local_driver_error)?;
+        PreparedLifecycleRequest::new(
+            &driver.config().map_err(map_local_driver_error)?,
+            operation.request().clone(),
+        )
     }
 
     pub fn prepare_actor_resume(
@@ -1343,8 +1503,13 @@ impl AgentHost {
             .agents
             .get(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
-        let request = driver.actor_resume_request(actor)?;
-        PreparedLifecycleRequest::new(&driver.image().config, request)
+        let operation = driver
+            .actor_resume_operation(actor)
+            .map_err(map_local_driver_error)?;
+        PreparedLifecycleRequest::new(
+            &driver.config().map_err(map_local_driver_error)?,
+            operation.request().clone(),
+        )
     }
 
     pub fn prepare_actor_remove(
@@ -1357,9 +1522,13 @@ impl AgentHost {
             .agents
             .get(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
-        let request =
-            AgentDriver::<FileAgentStore>::actor_remove_request(actor, expected_deployment)?;
-        PreparedLifecycleRequest::new(&driver.image().config, request)
+        let operation = driver
+            .actor_remove_operation(actor, expected_deployment)
+            .map_err(map_local_driver_error)?;
+        PreparedLifecycleRequest::new(
+            &driver.config().map_err(map_local_driver_error)?,
+            operation.request().clone(),
+        )
     }
 
     pub fn prepare_runtime_upgrade(
@@ -1372,8 +1541,13 @@ impl AgentHost {
             .agents
             .get(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
-        let request = driver.runtime_upgrade_request(from_deployment, package)?;
-        PreparedLifecycleRequest::new(&driver.image().config, request)
+        let operation = driver
+            .runtime_upgrade_operation(from_deployment, package)
+            .map_err(map_local_driver_error)?;
+        PreparedLifecycleRequest::new(
+            &driver.config().map_err(map_local_driver_error)?,
+            operation.request().clone(),
+        )
     }
 
     /// Create a durable empty agent with its explicitly selected runtime.
@@ -1386,53 +1560,101 @@ impl AgentHost {
         if !self.scope.admits(&config) {
             return Err(AgentHostError::ScopeMismatch);
         }
+        if config.identity.agent != self.system_agent() {
+            return Err(AgentHostError::ScopeMismatch);
+        }
         let agent = config.identity.agent;
-        if self.agents.contains_key(&agent) {
-            self.agents
-                .get_mut(&agent)
-                .expect("agent presence checked above")
-                .retry_create(&config, &runtime_package, authority)?;
-            return Ok(self
-                .agents
-                .get(&agent)
-                .expect("agent presence checked above")
-                .image()
-                .config
-                .identity
-                .clone());
-        }
-        let path = self.image_path(agent);
-        if path.exists() {
-            // A prior Create may have reached the atomic image rename before
-            // its final directory sync (or before the caller received the
-            // response). Reopen the exact durable closure and recover only
-            // the same authority disposition; mismatched or corrupt images
-            // still fail closed.
-            let mut driver = AgentDriver::open(FileAgentStore::new(&path), self.trust.clone())?;
-            if driver.image().config.identity.agent != agent {
-                return Err(AgentHostError::IdentityMismatch);
-            }
-            let identity = driver.retry_create(&config, &runtime_package, authority)?;
-            self.agents.insert(agent, driver);
-            return Ok(identity);
-        }
-        let store = FileAgentStore::new(path);
-        let driver = AgentDriver::create(
-            runtime_package,
-            config,
-            store,
-            self.trust.clone(),
+        validate_system_create_shape(self.scope, agent, &config, &runtime_package)?;
+        let locator = self.genesis_locator();
+        let (sealed, catalog, archived_config, archived_receipt) =
+            match self.genesis.reproduce(locator) {
+                Ok(provision) => prepare_archived_genesis(
+                    self.trust.clone(),
+                    self.merge.clone(),
+                    self.genesis.as_ref(),
+                    &self.root_pins,
+                    provision,
+                )?,
+                Err(SystemAgentGenesisProviderError::NotConfigured) => {
+                    if generation_path_exists(&self.journal_path(agent))?
+                        || generation_path_exists(&self.journal_lock_path(agent))?
+                    {
+                        return Err(AgentHostError::Provider(
+                            SystemAgentGenesisProviderError::NotConfigured,
+                        ));
+                    }
+                    let (create, supplied_catalog) =
+                        LocalJournalAgentDriver::<FileAgentJournalStore>::system_genesis_input(
+                            config.clone(),
+                            &runtime_package,
+                            authority.clone(),
+                            &self.trust,
+                            &self.merge,
+                        )
+                        .map_err(map_local_driver_error)?;
+                    let prepared =
+                        LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
+                            create,
+                            config.replicas[0],
+                            &supplied_catalog,
+                            self.trust.clone(),
+                            self.merge.clone(),
+                        )
+                        .map_err(map_local_driver_error)?;
+                    let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared)
+                        .map_err(AgentHostError::Bootstrap)?;
+                    let returned = self
+                        .genesis
+                        .create(&proposal, &supplied_catalog)
+                        .map_err(AgentHostError::Provider)?;
+                    let reproduced = self
+                        .genesis
+                        .reproduce(locator)
+                        .map_err(AgentHostError::Provider)?;
+                    if returned != reproduced {
+                        return Err(AgentHostError::Conflict);
+                    }
+                    let archived_catalog =
+                        load_archived_catalog(self.genesis.as_ref(), reproduced.proposal())?;
+                    if archived_catalog != supplied_catalog || reproduced.proposal() != &proposal {
+                        return Err(AgentHostError::Conflict);
+                    }
+                    let sealed =
+                        seal_prepared_system_agent_genesis(prepared, &self.root_pins, &reproduced)
+                            .map_err(AgentHostError::Bootstrap)?;
+                    (sealed, archived_catalog, config.clone(), authority.clone())
+                }
+                Err(error) => return Err(AgentHostError::Provider(error)),
+            };
+        require_exact_create_caller(
+            &catalog,
+            &archived_config,
+            &archived_receipt,
+            &config,
+            &runtime_package,
             authority,
         )?;
+        if let Some(driver) = self.agents.get(&agent) {
+            let current = driver.config().map_err(map_local_driver_error)?;
+            if current != config {
+                return Err(AgentHostError::Conflict);
+            }
+            return Ok(current.identity);
+        }
+        let driver = open_archived_system_agent(
+            &self.root,
+            self.scope,
+            sealed,
+            &catalog,
+            self.trust.clone(),
+            self.merge.clone(),
+        )?;
+        let identity = driver.identity().map_err(map_local_driver_error)?;
+        if identity != config.identity {
+            return Err(AgentHostError::IdentityMismatch);
+        }
         self.agents.insert(agent, driver);
-        Ok(self
-            .agents
-            .get(&agent)
-            .expect("agent was inserted above")
-            .image()
-            .config
-            .identity
-            .clone())
+        Ok(identity)
     }
 
     pub fn inspect(
@@ -1445,7 +1667,7 @@ impl AgentHost {
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?
             .inspect(after, limit)
-            .map_err(Into::into)
+            .map_err(map_local_driver_error)
     }
 
     pub fn install_actor(
@@ -1456,11 +1678,17 @@ impl AgentHost {
         parent: Option<ActorId>,
         package: &Package,
     ) -> Result<ActorEntry, AgentHostError> {
-        self.agents
+        let driver = self
+            .agents
             .get_mut(&agent)
-            .ok_or(AgentHostError::AgentNotFound)?
-            .install_actor(authority, name, parent, package)
-            .map_err(Into::into)
+            .ok_or(AgentHostError::AgentNotFound)?;
+        let operation = driver
+            .actor_install_operation(name, parent, package)
+            .map_err(map_local_driver_error)?;
+        match apply_local_lifecycle(driver, authority.clone(), operation)? {
+            LifecycleReply::Installed(entry) => Ok(entry),
+            _ => Err(AgentHostError::InvalidRuntime),
+        }
     }
 
     pub fn upgrade_actor(
@@ -1471,11 +1699,17 @@ impl AgentHost {
         from_deployment: DeploymentId,
         package: &Package,
     ) -> Result<ActorEntry, AgentHostError> {
-        self.agents
+        let driver = self
+            .agents
             .get_mut(&agent)
-            .ok_or(AgentHostError::AgentNotFound)?
-            .upgrade_actor(authority, actor, from_deployment, package)
-            .map_err(Into::into)
+            .ok_or(AgentHostError::AgentNotFound)?;
+        let operation = driver
+            .actor_upgrade_operation(actor, from_deployment, package)
+            .map_err(map_local_driver_error)?;
+        match apply_local_lifecycle(driver, authority.clone(), operation)? {
+            LifecycleReply::Upgraded(entry) => Ok(entry),
+            _ => Err(AgentHostError::InvalidRuntime),
+        }
     }
 
     pub fn suspend_actor(
@@ -1484,11 +1718,17 @@ impl AgentHost {
         authority: &AgentAuthorityReceipt,
         actor: ActorId,
     ) -> Result<ActorEntry, AgentHostError> {
-        self.agents
+        let driver = self
+            .agents
             .get_mut(&agent)
-            .ok_or(AgentHostError::AgentNotFound)?
-            .suspend_actor(authority, actor)
-            .map_err(Into::into)
+            .ok_or(AgentHostError::AgentNotFound)?;
+        let operation = driver
+            .actor_suspend_operation(actor)
+            .map_err(map_local_driver_error)?;
+        match apply_local_lifecycle(driver, authority.clone(), operation)? {
+            LifecycleReply::Suspended(entry) => Ok(entry),
+            _ => Err(AgentHostError::InvalidRuntime),
+        }
     }
 
     pub fn resume_actor(
@@ -1497,11 +1737,17 @@ impl AgentHost {
         authority: &AgentAuthorityReceipt,
         actor: ActorId,
     ) -> Result<ActorEntry, AgentHostError> {
-        self.agents
+        let driver = self
+            .agents
             .get_mut(&agent)
-            .ok_or(AgentHostError::AgentNotFound)?
-            .resume_actor(authority, actor)
-            .map_err(Into::into)
+            .ok_or(AgentHostError::AgentNotFound)?;
+        let operation = driver
+            .actor_resume_operation(actor)
+            .map_err(map_local_driver_error)?;
+        match apply_local_lifecycle(driver, authority.clone(), operation)? {
+            LifecycleReply::Resumed(entry) => Ok(entry),
+            _ => Err(AgentHostError::InvalidRuntime),
+        }
     }
 
     pub fn remove_actor(
@@ -1511,11 +1757,17 @@ impl AgentHost {
         actor: ActorId,
         expected_deployment: DeploymentId,
     ) -> Result<(), AgentHostError> {
-        self.agents
+        let driver = self
+            .agents
             .get_mut(&agent)
-            .ok_or(AgentHostError::AgentNotFound)?
-            .remove_actor(authority, actor, expected_deployment)
-            .map_err(Into::into)
+            .ok_or(AgentHostError::AgentNotFound)?;
+        let operation = driver
+            .actor_remove_operation(actor, expected_deployment)
+            .map_err(map_local_driver_error)?;
+        match apply_local_lifecycle(driver, authority.clone(), operation)? {
+            LifecycleReply::Removed(removed) if removed == actor => Ok(()),
+            _ => Err(AgentHostError::InvalidRuntime),
+        }
     }
 
     pub fn upgrade_runtime(
@@ -1525,11 +1777,17 @@ impl AgentHost {
         from_deployment: DeploymentId,
         package: &Package,
     ) -> Result<AgentIdentity, AgentHostError> {
-        self.agents
+        let driver = self
+            .agents
             .get_mut(&agent)
-            .ok_or(AgentHostError::AgentNotFound)?
-            .upgrade_runtime(authority, from_deployment, package)
-            .map_err(Into::into)
+            .ok_or(AgentHostError::AgentNotFound)?;
+        let operation = driver
+            .runtime_upgrade_operation(from_deployment, package)
+            .map_err(map_local_driver_error)?;
+        match apply_local_lifecycle(driver, authority.clone(), operation)? {
+            LifecycleReply::RuntimeUpgraded(identity) => Ok(identity),
+            _ => Err(AgentHostError::InvalidRuntime),
+        }
     }
 
     pub fn invoke(
@@ -1538,11 +1796,21 @@ impl AgentHost {
         invocation: ActorInvocation,
         authority: &ActorInvocationReceipt,
     ) -> Result<ActorExecutionReply, AgentHostError> {
-        self.agents
+        match self
+            .agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?
-            .invoke(invocation, authority)
-            .map_err(Into::into)
+            .invoke_synchronous(invocation, authority.clone())
+            .map_err(map_local_driver_error)?
+        {
+            LocalSettledInvocationResult::Final(Ok(reply)) => Ok(reply),
+            LocalSettledInvocationResult::Final(Err(error)) => {
+                Err(AgentHostError::Execution(error))
+            }
+            LocalSettledInvocationResult::Acknowledged => {
+                Err(AgentHostError::InvocationAcknowledged)
+            }
+        }
     }
 
     pub fn acknowledge_invocation(
@@ -1551,22 +1819,360 @@ impl AgentHost {
         invocation: ActorInvocation,
         authority: &ActorInvocationReceipt,
     ) -> Result<(), AgentHostError> {
-        self.agents
+        match self
+            .agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?
-            .acknowledge_invocation(invocation, authority)
-            .map_err(Into::into)
+            .acknowledge_invocation_synchronous(invocation, authority.clone())
+            .map_err(map_local_driver_error)?
+        {
+            LocalSettledAcknowledgementResult::Acknowledged => Ok(()),
+            LocalSettledAcknowledgementResult::Divergent => Err(AgentHostError::Execution(
+                ActorExecutionError::DivergentInvocation,
+            )),
+        }
     }
 
     pub fn revision(&self, agent: AgentId) -> Option<u64> {
         self.agents
             .get(&agent)
-            .map(|driver| driver.image().revision)
+            .map(LocalJournalAgentDriver::publication_revision)
     }
 
-    fn image_path(&self, agent: AgentId) -> PathBuf {
+    fn system_agent(&self) -> AgentId {
+        self.root_pins.record().system_agent()
+    }
+
+    fn genesis_locator(&self) -> SystemAgentGenesisLocator {
+        SystemAgentGenesisLocator {
+            space: self.scope.space,
+            agent: self.system_agent(),
+            node: self.scope.node,
+        }
+    }
+
+    fn journal_path(&self, agent: AgentId) -> PathBuf {
         self.root
-            .join(format!("{}{}", encode_agent_id(agent), IMAGE_SUFFIX))
+            .join(format!("{}{}", encode_agent_id(agent), JOURNAL_SUFFIX))
+    }
+
+    fn journal_lock_path(&self, agent: AgentId) -> PathBuf {
+        self.root
+            .join(format!("{}{}", encode_agent_id(agent), JOURNAL_LOCK_SUFFIX))
+    }
+}
+
+fn validate_host_root_capabilities(
+    scope: AgentHostScope,
+    merge: &dyn LocalMergeAuthenticator,
+    root_pins: &RootAnchorPins,
+) -> Result<(), AgentHostError> {
+    root_pins.validate().map_err(|error| {
+        AgentHostError::Bootstrap(SystemAgentGenesisBootstrapError::Authority(error))
+    })?;
+    if root_pins.record().space() != scope.space || merge.node() != scope.node {
+        return Err(AgentHostError::ScopeMismatch);
+    }
+    Ok(())
+}
+
+fn validate_system_create_shape(
+    scope: AgentHostScope,
+    system_agent: AgentId,
+    config: &AgentConfig,
+    runtime_package: &Package,
+) -> Result<(), AgentHostError> {
+    if config.identity.agent != system_agent || !scope.admits(config) {
+        return Err(AgentHostError::ScopeMismatch);
+    }
+    config.validate().map_err(AgentHostError::InvalidConfig)?;
+    runtime_package
+        .validate()
+        .map_err(AgentHostError::Package)?;
+    let PackageKind::AgentRuntime {
+        contract,
+        capabilities,
+    } = runtime_package.manifest.kind
+    else {
+        return Err(AgentHostError::Package(PackageError::WrongKind));
+    };
+    if runtime_package.deployment_id() != config.identity.runtime_deployment
+        || runtime_package.manifest.program != config.identity.runtime_program
+        || runtime_package.deployment_signature.producer != config.identity.runtime_producer
+        || BlobRef::of_bytes(&runtime_package.encode()) != config.runtime_package
+        || contract != config.runtime_contract
+        || capabilities != config.capabilities
+    {
+        return Err(AgentHostError::InvalidRuntime);
+    }
+    Ok(())
+}
+
+fn validate_system_create_target(
+    scope: AgentHostScope,
+    system_agent: AgentId,
+    config: &AgentConfig,
+    runtime_package: &Package,
+    trust: &dyn AgentTrustProvider,
+) -> Result<(), AgentHostError> {
+    validate_system_create_shape(scope, system_agent, config, runtime_package)?;
+    let anchored = trust
+        .authority_for_space(config.identity.space)
+        .ok_or(AgentHostError::TrustUnavailable)?;
+    if anchored != config.authority {
+        return Err(AgentHostError::InvalidAuthority);
+    }
+    if !trust.verify_package(config, runtime_package) {
+        return Err(AgentHostError::Package(PackageError::InvalidSignature));
+    }
+    Ok(())
+}
+
+fn archived_create_parts(
+    proposal: &SystemAgentGenesisProposal,
+) -> Result<(AgentConfig, AgentAuthorityReceipt), AgentHostError> {
+    let ReplayOperation::Management { request } = &proposal.create().operation else {
+        return Err(AgentHostError::Bootstrap(
+            SystemAgentGenesisBootstrapError::InvalidProposal,
+        ));
+    };
+    let LifecycleRequest::Authorized { admission, request } = request else {
+        return Err(AgentHostError::Bootstrap(
+            SystemAgentGenesisBootstrapError::InvalidProposal,
+        ));
+    };
+    let LifecycleRequest::Create(config) = request.as_ref() else {
+        return Err(AgentHostError::Bootstrap(
+            SystemAgentGenesisBootstrapError::InvalidProposal,
+        ));
+    };
+    Ok((config.clone(), admission.receipt.clone()))
+}
+
+fn load_archived_catalog(
+    provider: &dyn SystemAgentGenesisProvider,
+    proposal: &SystemAgentGenesisProposal,
+) -> Result<Vec<RuntimeBlob>, AgentHostError> {
+    let mut catalog = Vec::new();
+    catalog
+        .try_reserve_exact(proposal.catalog().len())
+        .map_err(|_| AgentHostError::Unavailable)?;
+    for reference in proposal.catalog() {
+        let bytes = provider
+            .load_catalog(proposal.locator(), reference)
+            .map_err(AgentHostError::Provider)?
+            .ok_or(AgentHostError::Provider(
+                SystemAgentGenesisProviderError::Corrupt,
+            ))?;
+        if !reference.matches(&bytes) {
+            return Err(AgentHostError::Provider(
+                SystemAgentGenesisProviderError::Corrupt,
+            ));
+        }
+        catalog.push(RuntimeBlob {
+            reference: reference.clone(),
+            bytes,
+        });
+    }
+    Ok(catalog)
+}
+
+fn prepare_archived_genesis(
+    trust: Arc<dyn AgentTrustProvider>,
+    merge: Arc<dyn LocalMergeAuthenticator>,
+    provider: &dyn SystemAgentGenesisProvider,
+    root_pins: &RootAnchorPins,
+    provision: super::bootstrap::SystemAgentGenesisProvision,
+) -> Result<
+    (
+        ReplaySealedGenesis,
+        Vec<RuntimeBlob>,
+        AgentConfig,
+        AgentAuthorityReceipt,
+    ),
+    AgentHostError,
+> {
+    let proposal = provision.proposal();
+    let (config, receipt) = archived_create_parts(proposal)?;
+    let catalog = load_archived_catalog(provider, proposal)?;
+    let prepared = LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
+        proposal.create().clone(),
+        proposal.replica(),
+        &catalog,
+        trust,
+        merge,
+    )
+    .map_err(map_local_driver_error)?;
+    let expected = SystemAgentGenesisProposal::from_prepared(proposal.locator(), &prepared)
+        .map_err(AgentHostError::Bootstrap)?;
+    if expected != *proposal {
+        return Err(AgentHostError::Conflict);
+    }
+    let sealed = seal_prepared_system_agent_genesis(prepared, root_pins, &provision)
+        .map_err(AgentHostError::Bootstrap)?;
+    Ok((sealed, catalog, config, receipt))
+}
+
+fn require_exact_create_caller(
+    catalog: &[RuntimeBlob],
+    archived_config: &AgentConfig,
+    archived_receipt: &AgentAuthorityReceipt,
+    supplied_config: &AgentConfig,
+    supplied_package: &Package,
+    supplied_receipt: &AgentAuthorityReceipt,
+) -> Result<(), AgentHostError> {
+    let supplied_bytes = supplied_package.encode();
+    if archived_config != supplied_config
+        || archived_receipt != supplied_receipt
+        || catalog.len() != 1
+        || catalog[0].reference != supplied_config.runtime_package
+        || catalog[0].bytes != supplied_bytes
+    {
+        return Err(AgentHostError::Conflict);
+    }
+    Ok(())
+}
+
+fn open_archived_system_agent(
+    root: &Path,
+    scope: AgentHostScope,
+    sealed: ReplaySealedGenesis,
+    catalog: &[RuntimeBlob],
+    trust: Arc<dyn AgentTrustProvider>,
+    merge: Arc<dyn LocalMergeAuthenticator>,
+) -> Result<LocalJournalAgentDriver<FileAgentJournalStore>, AgentHostError> {
+    let agent = sealed.genesis().runtime().agent;
+    let journal = root.join(format!("{}{}", encode_agent_id(agent), JOURNAL_SUFFIX));
+    let stable_lock = root.join(format!("{}{}", encode_agent_id(agent), JOURNAL_LOCK_SUFFIX));
+    let store = FileAgentJournalStore::open_reverified(journal, stable_lock, scope.node, &sealed)
+        .map_err(map_journal_error)?;
+    let genesis = store.genesis().map_err(map_journal_error)?;
+    let heads = store.heads().map_err(map_journal_error)?;
+    match (genesis, heads) {
+        (Some(_), Some(_)) => {
+            LocalJournalAgentDriver::open(store, trust, merge).map_err(map_local_driver_error)
+        }
+        // `initialize` publishes genesis before initial heads. Reusing the
+        // exact root-admitted seal is the one canonical repair for a crash at
+        // that boundary; both writes are immutable and conflict checked.
+        (None, None) | (Some(_), None) => {
+            // This store-bound preflight deliberately rechecks current root
+            // and package trust before installing immutable bytes. It does
+            // not re-authenticate the Create receipt or re-execute Replay;
+            // those happened exactly once while preparing `sealed`.
+            LocalJournalAgentDriver::create(store, sealed, catalog, trust, merge)
+                .map_err(map_local_driver_error)
+        }
+        (None, Some(_)) => Err(map_journal_error(JournalStoreError::Corrupt)),
+    }
+}
+
+fn apply_local_lifecycle(
+    driver: &mut LocalJournalAgentDriver<FileAgentJournalStore>,
+    authority: AgentAuthorityReceipt,
+    operation: LocalLifecycleOperation,
+) -> Result<LifecycleReply, AgentHostError> {
+    let (request, catalog) = operation.into_parts();
+    driver
+        .lifecycle(authority, request, &catalog)
+        .map_err(map_local_driver_error)?
+        .result
+        .map_err(AgentHostError::Lifecycle)
+}
+
+fn generation_path_exists(path: &Path) -> Result<bool, AgentHostError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(AgentHostError::Unavailable),
+    }
+}
+
+fn map_journal_error(error: JournalStoreError) -> AgentHostError {
+    let projected = match error {
+        JournalStoreError::InvalidPath => AgentHostJournalError::InvalidPath,
+        JournalStoreError::ScopeMismatch => AgentHostJournalError::ScopeMismatch,
+        JournalStoreError::DirectoryInUse => AgentHostJournalError::DirectoryInUse,
+        JournalStoreError::LegacyGeneration => AgentHostJournalError::LegacyGeneration,
+        JournalStoreError::NotInitialized => AgentHostJournalError::NotInitialized,
+        JournalStoreError::Conflict => AgentHostJournalError::Conflict,
+        JournalStoreError::GcPending => AgentHostJournalError::GcPending,
+        JournalStoreError::InvalidClass => AgentHostJournalError::InvalidClass,
+        JournalStoreError::NonCanonical => AgentHostJournalError::NonCanonical,
+        JournalStoreError::LimitExceeded => AgentHostJournalError::LimitExceeded,
+        JournalStoreError::Backpressure => AgentHostJournalError::Backpressure,
+        JournalStoreError::MissingObject => AgentHostJournalError::MissingObject,
+        JournalStoreError::Corrupt => AgentHostJournalError::Corrupt,
+        JournalStoreError::Unavailable => AgentHostJournalError::Unavailable,
+    };
+    AgentHostError::Journal(projected)
+}
+
+fn map_local_executor_error(error: LocalReplayExecutorError) -> AgentHostError {
+    match error {
+        LocalReplayExecutorError::InvalidProfile | LocalReplayExecutorError::WrongReplica => {
+            AgentHostError::ScopeMismatch
+        }
+        LocalReplayExecutorError::TrustUnavailable => AgentHostError::TrustUnavailable,
+        LocalReplayExecutorError::InvalidAuthority => AgentHostError::InvalidAuthority,
+        LocalReplayExecutorError::Package(error) => AgentHostError::Package(error),
+        LocalReplayExecutorError::Store(error) => map_journal_error(error),
+        LocalReplayExecutorError::InvalidState
+        | LocalReplayExecutorError::InvalidRequest
+        | LocalReplayExecutorError::ArtifactUnavailable(_)
+        | LocalReplayExecutorError::InvalidArtifact(_)
+        | LocalReplayExecutorError::RuntimeExit { .. }
+        | LocalReplayExecutorError::RuntimeOutput
+        | LocalReplayExecutorError::RuntimeStateTooLarge => AgentHostError::InvalidRuntime,
+    }
+}
+
+fn map_local_driver_error(error: LocalJournalDriverError) -> AgentHostError {
+    match error {
+        LocalJournalDriverError::Store(error) => map_journal_error(error),
+        LocalJournalDriverError::Executor(error) => map_local_executor_error(error),
+        LocalJournalDriverError::Lifecycle(error) => AgentHostError::Lifecycle(error),
+        LocalJournalDriverError::Conflict => AgentHostError::Conflict,
+        LocalJournalDriverError::InvalidResult => AgentHostError::InvalidRuntime,
+        LocalJournalDriverError::Replay(error) => match error {
+            ReplayError::Source(ReplayMaterializationSourceError::Journal(error)) => {
+                map_journal_error(error)
+            }
+            ReplayError::Source(ReplayMaterializationSourceError::Resolver(never)) => {
+                match never {}
+            }
+            ReplayError::Executor(error) => map_local_executor_error(error),
+            ReplayError::UncommittedInvocation(error) => AgentHostError::Execution(error),
+            ReplayError::MissingOrdered(_)
+            | ReplayError::MissingLocal(_)
+            | ReplayError::MissingMergeEvent(_)
+            | ReplayError::MissingMergeFrontier(_)
+            | ReplayError::MissingMergeSeal(_)
+            | ReplayError::MissingLaneState(_)
+            | ReplayError::MissingArtifactClosure(_)
+            | ReplayError::MissingInvocationIndex(_)
+            | ReplayError::MissingCheckpoint(_)
+            | ReplayError::InvalidRecord
+            | ReplayError::ScopeMismatch
+            | ReplayError::ChainMismatch
+            | ReplayError::ReplayLimit
+            | ReplayError::InvalidCausalHeight
+            | ReplayError::NonMinimalFrontier
+            | ReplayError::StaleMergeBranch(_)
+            | ReplayError::UnauthenticatedMergeEvent(_)
+            | ReplayError::InvalidOrderedBase
+            | ReplayError::UnavailableOrderedBase
+            | ReplayError::InvalidFence
+            | ReplayError::StalePreFenceEvent(_)
+            | ReplayError::RuntimeMismatch
+            | ReplayError::InvalidRuntimeUpgrade
+            | ReplayError::InvalidManagementTransition
+            | ReplayError::InvalidPosition
+            | ReplayError::CrossLaneMutation
+            | ReplayError::TerminalMutation
+            | ReplayError::ForbiddenMergeProducts
+            | ReplayError::InvocationOwnership(_) => AgentHostError::InvalidRuntime,
+        },
     }
 }
 
@@ -1887,6 +2493,549 @@ mod tests {
         }
     }
 
+    struct NoMerge(NodeId);
+
+    impl LocalMergeAuthenticator for NoMerge {
+        fn node(&self) -> NodeId {
+            self.0
+        }
+
+        fn sign_event(&self, _event: &mut super::super::journal::MergeEvent) -> bool {
+            false
+        }
+
+        fn verify_event(&self, _event: &super::super::journal::MergeEvent) -> bool {
+            false
+        }
+    }
+
+    struct NoGenesis;
+
+    impl SystemAgentGenesisProvider for NoGenesis {
+        fn create(
+            &self,
+            _proposal: &SystemAgentGenesisProposal,
+            _catalog: &[RuntimeBlob],
+        ) -> Result<
+            super::super::bootstrap::SystemAgentGenesisProvision,
+            SystemAgentGenesisProviderError,
+        > {
+            Err(SystemAgentGenesisProviderError::NotConfigured)
+        }
+
+        fn reproduce(
+            &self,
+            _locator: SystemAgentGenesisLocator,
+        ) -> Result<
+            super::super::bootstrap::SystemAgentGenesisProvision,
+            SystemAgentGenesisProviderError,
+        > {
+            Err(SystemAgentGenesisProviderError::NotConfigured)
+        }
+
+        fn load_catalog(
+            &self,
+            _locator: SystemAgentGenesisLocator,
+            _reference: &BlobRef,
+        ) -> Result<Option<Vec<u8>>, SystemAgentGenesisProviderError> {
+            Ok(None)
+        }
+    }
+
+    fn test_system_agent() -> AgentId {
+        AgentId([9; 32])
+    }
+
+    fn test_root_pins(scope: AgentHostScope) -> RootAnchorPins {
+        use super::super::committee::{
+            AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommittee,
+            AuthorityCommitteeMember, AuthorityMemberRole, RootAnchorRecord,
+        };
+
+        let authority_binding = Hash([0x41; 32]);
+        let member = AuthorityCommitteeMember::new(
+            NodeId([0x42; 32]),
+            [0x43; 32],
+            AuthorityMemberRole::Voter,
+        )
+        .unwrap();
+        let committee =
+            AuthorityCommittee::new(scope.space, authority_binding, 1, None, vec![member]).unwrap();
+        let root_record = RootAnchorRecord::new(
+            1,
+            scope.space,
+            test_system_agent(),
+            authority_binding,
+            Hash([0x44; 32]),
+            committee,
+        )
+        .unwrap();
+        let claim = AuthorityClaimCommitment::from_payload_commitment(
+            AuthorityClaimDomain::SystemAgentGenesis,
+            1,
+            Hash([0x45; 32]),
+        )
+        .unwrap();
+        RootAnchorPins::new(
+            root_record.clone(),
+            root_record.config_version(),
+            root_record.id(),
+            root_record.config_commitment(),
+            claim,
+        )
+        .unwrap()
+    }
+
+    fn open_empty_control(lease: AgentHostRootLease) -> Result<AgentHostControl, AgentHostError> {
+        let scope = lease.scope();
+        AgentHostControl::open(
+            lease,
+            Arc::new(NoTrust),
+            Arc::new(NoMerge(scope.node)),
+            Arc::new(NoGenesis),
+            test_root_pins(scope),
+        )
+    }
+
+    fn open_empty_control_with_capacity(
+        lease: AgentHostRootLease,
+        capacity: usize,
+    ) -> Result<AgentHostControl, AgentHostError> {
+        let scope = lease.scope();
+        AgentHostControl::open_with_queue_capacity(
+            lease,
+            Arc::new(NoTrust),
+            Arc::new(NoMerge(scope.node)),
+            Arc::new(NoGenesis),
+            test_root_pins(scope),
+            capacity,
+        )
+    }
+
+    const FIXTURE_AUTHORITY_SEED: [u8; 32] = [0x61; 32];
+    const FIXTURE_PACKAGE_KEY: &[u8] = b"vos-host-journal-fixture-package";
+
+    struct FixtureTrust {
+        space: SpaceId,
+        authority: AgentAuthorityBinding,
+        slot_reads: Arc<AtomicUsize>,
+    }
+
+    impl AgentTrustProvider for FixtureTrust {
+        fn current_logical_slot(&self) -> Option<u64> {
+            self.slot_reads.fetch_add(1, Ordering::SeqCst);
+            Some(10)
+        }
+
+        fn authority_for_space(&self, space: SpaceId) -> Option<AgentAuthorityBinding> {
+            (space == self.space).then(|| self.authority.clone())
+        }
+
+        fn verify_package(&self, config: &AgentConfig, package: &Package) -> bool {
+            config.identity.space == self.space
+                && package.deployment_signature.public_key == FIXTURE_PACKAGE_KEY
+                && package.deployment_signature.producer
+                    == crate::service::ProducerId::of_public_key(FIXTURE_PACKAGE_KEY)
+                && package.deployment_signature.signature == fixture_package_signature(package)
+        }
+    }
+
+    struct RecordingGenesis {
+        provision: super::super::bootstrap::SystemAgentGenesisProvision,
+        catalog: Vec<RuntimeBlob>,
+        journal: PathBuf,
+        stable_lock: PathBuf,
+        archived: Mutex<bool>,
+        create_saw_clean_destination: std::sync::atomic::AtomicBool,
+        refuse_create: std::sync::atomic::AtomicBool,
+        creates: AtomicUsize,
+    }
+
+    impl RecordingGenesis {
+        fn new(
+            provision: super::super::bootstrap::SystemAgentGenesisProvision,
+            catalog: Vec<RuntimeBlob>,
+            root: &Path,
+        ) -> Self {
+            let agent = provision.proposal().locator().agent;
+            Self {
+                provision,
+                catalog,
+                journal: root.join(format!("{}{}", encode_agent_id(agent), JOURNAL_SUFFIX)),
+                stable_lock: root.join(format!(
+                    "{}{}",
+                    encode_agent_id(agent),
+                    JOURNAL_LOCK_SUFFIX
+                )),
+                archived: Mutex::new(false),
+                create_saw_clean_destination: std::sync::atomic::AtomicBool::new(false),
+                refuse_create: std::sync::atomic::AtomicBool::new(false),
+                creates: AtomicUsize::new(0),
+            }
+        }
+
+        fn archive_for_test(&self) {
+            assert_eq!(
+                self.create(self.provision.proposal(), &self.catalog)
+                    .unwrap(),
+                self.provision
+            );
+        }
+    }
+
+    impl SystemAgentGenesisProvider for RecordingGenesis {
+        fn create(
+            &self,
+            proposal: &SystemAgentGenesisProposal,
+            catalog: &[RuntimeBlob],
+        ) -> Result<
+            super::super::bootstrap::SystemAgentGenesisProvision,
+            SystemAgentGenesisProviderError,
+        > {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            if proposal != self.provision.proposal() || catalog != self.catalog {
+                return Err(SystemAgentGenesisProviderError::Conflict);
+            }
+            let clean = !self.journal.exists() && !self.stable_lock.exists();
+            self.create_saw_clean_destination
+                .store(clean, Ordering::SeqCst);
+            if !clean {
+                return Err(SystemAgentGenesisProviderError::Refused);
+            }
+            if self.refuse_create.load(Ordering::SeqCst) {
+                return Err(SystemAgentGenesisProviderError::Refused);
+            }
+            *self
+                .archived
+                .lock()
+                .map_err(|_| SystemAgentGenesisProviderError::Unavailable)? = true;
+            Ok(self.provision.clone())
+        }
+
+        fn reproduce(
+            &self,
+            locator: SystemAgentGenesisLocator,
+        ) -> Result<
+            super::super::bootstrap::SystemAgentGenesisProvision,
+            SystemAgentGenesisProviderError,
+        > {
+            if locator != self.provision.proposal().locator() {
+                return Err(SystemAgentGenesisProviderError::Conflict);
+            }
+            if *self
+                .archived
+                .lock()
+                .map_err(|_| SystemAgentGenesisProviderError::Unavailable)?
+            {
+                Ok(self.provision.clone())
+            } else {
+                Err(SystemAgentGenesisProviderError::NotConfigured)
+            }
+        }
+
+        fn load_catalog(
+            &self,
+            locator: SystemAgentGenesisLocator,
+            reference: &BlobRef,
+        ) -> Result<Option<Vec<u8>>, SystemAgentGenesisProviderError> {
+            if locator != self.provision.proposal().locator() {
+                return Err(SystemAgentGenesisProviderError::Conflict);
+            }
+            if !*self
+                .archived
+                .lock()
+                .map_err(|_| SystemAgentGenesisProviderError::Unavailable)?
+            {
+                return Err(SystemAgentGenesisProviderError::NotConfigured);
+            }
+            Ok(self
+                .catalog
+                .iter()
+                .find(|blob| &blob.reference == reference)
+                .map(|blob| blob.bytes.clone()))
+        }
+    }
+
+    struct JournalFixture {
+        config: AgentConfig,
+        runtime_package: Package,
+        create_receipt: AgentAuthorityReceipt,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        provider: Arc<RecordingGenesis>,
+        pins: RootAnchorPins,
+        slot_reads: Arc<AtomicUsize>,
+    }
+
+    fn fixture_package_signature(package: &Package) -> Vec<u8> {
+        Hash::digest(
+            b"vos/agent/host-fixture-package-signature",
+            &[FIXTURE_PACKAGE_KEY, &package.signing_message()],
+        )
+        .0
+        .to_vec()
+    }
+
+    fn fixture_runtime_package() -> Package {
+        let pvm = include_bytes!("../../../vosx/blobs/agent_runtime.pvm").to_vec();
+        let interfaces = b"host-journal-runtime-interface".to_vec();
+        let schemas = b"host-journal-runtime-schema".to_vec();
+        let mut package = Package {
+            manifest: super::super::package::PackageManifest {
+                name: "host-journal-runtime".into(),
+                platform: crate::service::PLATFORM_ID,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+                kind: PackageKind::AgentRuntime {
+                    contract: super::super::contract::RuntimePackageContract::canonical(),
+                    capabilities: super::super::RuntimeCapabilities::standard(),
+                },
+                program: ProgramId::of_pvm(&pvm),
+                interfaces_hash: crate::service::artifact_hash(b"interfaces", &interfaces),
+                role_policies_hash: crate::service::artifact_hash(b"role-policies", &[]),
+                schemas_hash: crate::service::artifact_hash(b"schemas", &schemas),
+                agent_schema_hash: crate::service::artifact_hash(b"agent-schema", &[]),
+                dependencies_hash: crate::service::task_dependencies_hash(&[]),
+            },
+            pvm,
+            generated_interfaces: interfaces,
+            role_policies: Vec::new(),
+            schemas,
+            agent_schema: Vec::new(),
+            task_dependencies: Vec::new(),
+            diagnostics: None,
+            deployment_signature: crate::service::DeploymentSignature {
+                producer: crate::service::ProducerId::of_public_key(FIXTURE_PACKAGE_KEY),
+                public_key: FIXTURE_PACKAGE_KEY.to_vec(),
+                signature: Vec::new(),
+            },
+        };
+        package.deployment_signature.signature = fixture_package_signature(&package);
+        package
+    }
+
+    fn fixture_authority() -> (ed25519_dalek::SigningKey, AgentAuthorityBinding) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&FIXTURE_AUTHORITY_SEED);
+        let public_key =
+            super::super::authority::ed25519_public_key_wire(key.verifying_key().to_bytes());
+        let binding = AgentAuthorityBinding {
+            agent: AgentId([0x62; 32]),
+            actor: ActorId([0x63; 32]),
+            deployment: DeploymentId([0x64; 32]),
+            program: ProgramId([0x65; 32]),
+            producer: crate::service::ProducerId::of_public_key(&public_key),
+            public_key,
+        };
+        (key, binding)
+    }
+
+    fn fixture_receipt(
+        key: &ed25519_dalek::SigningKey,
+        config: &AgentConfig,
+        request: &LifecycleRequest,
+        sequence: u64,
+    ) -> AgentAuthorityReceipt {
+        use ed25519_dalek::Signer as _;
+
+        let claim = super::super::authority::AgentAuthorityClaim {
+            authority: config.authority.clone(),
+            space: config.identity.space,
+            agent: config.identity.agent,
+            principal: config.identity.owner,
+            credential: crate::service::CredentialId([0x66; 32]),
+            capability: CapabilityId::named(request.required_capability().unwrap()),
+            operation: request.commitment(),
+            sequence,
+            valid_from: 1,
+            valid_until: 100,
+        };
+        AgentAuthorityReceipt {
+            signature: key.sign(&claim.signing_message().0).to_bytes().to_vec(),
+            claim,
+        }
+    }
+
+    fn journal_fixture(journal_root: &Path) -> JournalFixture {
+        use super::super::committee::{
+            AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
+            AuthorityQuorumCertificate, AuthoritySignature, AuthoritySignerId, RootAnchorRecord,
+            SystemAgentGenesisClaim, SystemAgentGenesisEvidence,
+        };
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let scope = scope();
+        let package = fixture_runtime_package();
+        let owner = crate::service::PrincipalId([0x67; 32]);
+        let creation_nonce = Hash([0x68; 32]);
+        let agent = AgentId::derive(scope.space, owner, &creation_nonce.0);
+        let (authority_key, authority) = fixture_authority();
+        let config = AgentConfig {
+            identity: AgentIdentity {
+                space: scope.space,
+                agent,
+                owner,
+                profile: super::super::AgentProfile::Local,
+                runtime_deployment: package.deployment_id(),
+                runtime_program: package.manifest.program,
+                runtime_producer: package.deployment_signature.producer,
+            },
+            creation_nonce,
+            authority: authority.clone(),
+            runtime_package: BlobRef::of_bytes(&package.encode()),
+            runtime_contract: super::super::contract::RuntimePackageContract::canonical(),
+            capabilities: super::super::RuntimeCapabilities::standard(),
+            replicas: vec![super::super::AgentReplica {
+                node: scope.node,
+                principal: owner,
+                role: super::super::ReplicaRole::Voter,
+            }],
+        };
+        let request = LifecycleRequest::Create(config.clone());
+        let receipt = fixture_receipt(&authority_key, &config, &request, 1);
+        let slot_reads = Arc::new(AtomicUsize::new(0));
+        let trust: Arc<dyn AgentTrustProvider> = Arc::new(FixtureTrust {
+            space: scope.space,
+            authority,
+            slot_reads: slot_reads.clone(),
+        });
+        let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(NoMerge(scope.node));
+        let (input, catalog) =
+            LocalJournalAgentDriver::<FileAgentJournalStore>::system_genesis_input(
+                config.clone(),
+                &package,
+                receipt.clone(),
+                &trust,
+                &merge,
+            )
+            .unwrap();
+        let prepared = LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
+            input,
+            config.replicas[0],
+            &catalog,
+            trust.clone(),
+            merge.clone(),
+        )
+        .unwrap();
+        let locator = SystemAgentGenesisLocator {
+            space: scope.space,
+            agent,
+            node: scope.node,
+        };
+        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
+
+        let committee_keys = [
+            SigningKey::from_bytes(&[0x69; 32]),
+            SigningKey::from_bytes(&[0x6a; 32]),
+            SigningKey::from_bytes(&[0x6b; 32]),
+        ];
+        let mut members = committee_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                AuthorityCommitteeMember::new(
+                    NodeId([(index + 1) as u8; 32]),
+                    key.verifying_key().to_bytes(),
+                    AuthorityMemberRole::Voter,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(AuthorityCommitteeMember::signer);
+        let binding = config.authority.commitment();
+        let committee = AuthorityCommittee::new(scope.space, binding, 1, None, members).unwrap();
+        let root_record = RootAnchorRecord::new(
+            1,
+            scope.space,
+            agent,
+            binding,
+            Hash([0x6c; 32]),
+            committee.clone(),
+        )
+        .unwrap();
+        let claim = SystemAgentGenesisClaim::new(&root_record, proposal.expectations()).unwrap();
+        let message = AuthorityQuorumCertificate::signing_message(
+            committee.authority_binding(),
+            committee.epoch(),
+            committee.commitment(),
+            claim.authority_claim(),
+        );
+        let mut signatures = committee_keys[..2]
+            .iter()
+            .map(|key| {
+                AuthoritySignature::new(
+                    AuthoritySignerId::of_raw_ed25519(&key.verifying_key().to_bytes()),
+                    key.sign(&message.0).to_bytes(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(AuthoritySignature::signer);
+        let evidence = SystemAgentGenesisEvidence::new(
+            claim.clone(),
+            AuthorityQuorumCertificate::new(&committee, claim.authority_claim(), signatures)
+                .unwrap(),
+        )
+        .unwrap();
+        let pins = RootAnchorPins::new(
+            root_record.clone(),
+            root_record.config_version(),
+            root_record.id(),
+            root_record.config_commitment(),
+            claim.authority_claim(),
+        )
+        .unwrap();
+        let provision = super::super::bootstrap::SystemAgentGenesisProvision::new(
+            proposal,
+            pins.clone(),
+            evidence,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingGenesis::new(provision, catalog, journal_root));
+        JournalFixture {
+            config,
+            runtime_package: package,
+            create_receipt: receipt,
+            trust,
+            merge,
+            provider,
+            pins,
+            slot_reads,
+        }
+    }
+
+    fn fixture_invocation(config: &AgentConfig) -> (ActorInvocation, ActorInvocationReceipt) {
+        use ed25519_dalek::Signer as _;
+
+        let invocation = ActorInvocation {
+            invocation: InvocationId([0x6d; 32]),
+            actor: ActorId([0x6e; 32]),
+            incarnation: Hash([0x6f; 32]),
+            deployment: DeploymentId([0x70; 32]),
+            program: ProgramId([0x71; 32]),
+            mode: super::super::MethodMode::Query,
+            auth: super::super::execution::ActorInvocationAuth::anonymous(),
+            message: vec![1],
+            availability: Vec::new(),
+            gas: 1_000_000,
+        };
+        let claim = super::super::authority::ActorInvocationClaim {
+            authority: config.authority.clone(),
+            space: config.identity.space,
+            agent: config.identity.agent,
+            principal: None,
+            credential: None,
+            authorization: invocation.authorization_message(),
+            auth: invocation.auth.clone(),
+            valid_from: 1,
+            valid_until: 100,
+        };
+        let key = ed25519_dalek::SigningKey::from_bytes(&FIXTURE_AUTHORITY_SEED);
+        let receipt = ActorInvocationReceipt {
+            signature: key.sign(&claim.signing_message().0).to_bytes().to_vec(),
+            claim,
+        };
+        (invocation, receipt)
+    }
+
     struct RemoveOnDrop(PathBuf);
 
     impl Drop for RemoveOnDrop {
@@ -2056,13 +3205,305 @@ mod tests {
     }
 
     #[test]
-    fn agent_image_names_are_canonical() {
+    fn agent_journal_names_are_canonical() {
         let agent = AgentId([0xab; 32]);
         let encoded = encode_agent_id(agent);
         assert_eq!(encoded.len(), 64);
         assert_eq!(decode_agent_id(&encoded), Some(agent));
         assert_eq!(decode_agent_id(&encoded.to_uppercase()), None);
         assert_eq!(decode_agent_id("ab"), None);
+    }
+
+    #[test]
+    fn provider_precedes_destination_and_advanced_heads_reopen() {
+        let (directory, lock, _remove) = empty_host_directory("journal-reopen");
+        let fixture = journal_fixture(&directory);
+        let fixture_preparation_slot_reads = fixture.slot_reads.load(Ordering::SeqCst);
+        let journal = fixture.provider.journal.clone();
+        let journal_lock = fixture.provider.stable_lock.clone();
+        assert!(!journal.exists());
+        assert!(!journal_lock.exists());
+
+        let control = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+        let handle = control.handle();
+        assert!(handle.identities().unwrap().is_empty());
+        let identity = handle
+            .create(
+                fixture.config.clone(),
+                fixture.runtime_package.clone(),
+                fixture.create_receipt.clone(),
+            )
+            .unwrap();
+        assert_eq!(identity, fixture.config.identity);
+        assert!(
+            fixture
+                .provider
+                .create_saw_clean_destination
+                .load(Ordering::SeqCst),
+            "provider archive must complete before `.agent` or `.agent-lock` exists"
+        );
+        assert_eq!(fixture.provider.creates.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.slot_reads.load(Ordering::SeqCst),
+            fixture_preparation_slot_reads + 1,
+            "provider-miss Create samples the trusted slot exactly once"
+        );
+        assert!(journal.is_dir());
+        assert!(journal_lock.is_file());
+
+        // Response-loss retry reproduces the archived proposal and does not
+        // resample or reissue genesis.
+        assert_eq!(
+            handle
+                .create(
+                    fixture.config.clone(),
+                    fixture.runtime_package.clone(),
+                    fixture.create_receipt.clone(),
+                )
+                .unwrap(),
+            fixture.config.identity
+        );
+        assert_eq!(fixture.provider.creates.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.slot_reads.load(Ordering::SeqCst),
+            fixture_preparation_slot_reads + 1,
+            "an exact archived Create retry must not resample the slot"
+        );
+
+        let (invocation, invocation_receipt) = fixture_invocation(&fixture.config);
+        assert_eq!(
+            handle.invoke(
+                fixture.config.identity.agent,
+                invocation.clone(),
+                invocation_receipt.clone(),
+            ),
+            Err(AgentHostError::Execution(ActorExecutionError::NotFound))
+        );
+        let advanced = handle
+            .revision(fixture.config.identity.agent)
+            .unwrap()
+            .unwrap();
+        assert!(advanced > 0);
+        control.shutdown().unwrap();
+
+        let reopened = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+        let reopened_handle = reopened.handle();
+        assert_eq!(
+            reopened_handle
+                .revision(fixture.config.identity.agent)
+                .unwrap(),
+            Some(advanced),
+            "advanced heads must use Local open, never genesis re-initialization"
+        );
+        reopened.shutdown().unwrap();
+    }
+
+    #[test]
+    fn archived_startup_create_and_partial_initialization_repair_are_idempotent() {
+        let (directory, lock, _remove) = empty_host_directory("journal-partial-init");
+        let fixture = journal_fixture(&directory);
+        let journal = fixture.provider.journal.clone();
+        let journal_lock = fixture.provider.stable_lock.clone();
+
+        // Model a provider transaction that committed while the host was
+        // absent. Startup must reproduce that exact provision before opening
+        // either destination path and then complete journal initialization.
+        fixture.provider.archive_for_test();
+        assert!(
+            fixture
+                .provider
+                .create_saw_clean_destination
+                .load(Ordering::SeqCst)
+        );
+        assert!(!journal.exists());
+        assert!(!journal_lock.exists());
+        let created = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            created
+                .handle()
+                .revision(fixture.config.identity.agent)
+                .unwrap(),
+            Some(0)
+        );
+        created.shutdown().unwrap();
+        assert!(journal.join("genesis").is_file());
+        assert!(journal.join("heads").is_file());
+
+        // `initialize` commits immutable genesis before initial heads. The
+        // exact archived seal is the sole capability allowed to repair that
+        // recoverable boundary.
+        fs::remove_file(journal.join("heads")).unwrap();
+        let repaired = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            repaired
+                .handle()
+                .revision(fixture.config.identity.agent)
+                .unwrap(),
+            Some(0)
+        );
+        assert!(journal.join("heads").is_file());
+        assert_eq!(fixture.provider.creates.load(Ordering::SeqCst), 1);
+        repaired.shutdown().unwrap();
+    }
+
+    #[test]
+    fn provider_refusal_precedes_every_agent_destination_write() {
+        let (directory, lock, _remove) = empty_host_directory("journal-provider-refusal");
+        let fixture = journal_fixture(&directory);
+        fixture.provider.refuse_create.store(true, Ordering::SeqCst);
+        let control = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            control.handle().create(
+                fixture.config.clone(),
+                fixture.runtime_package.clone(),
+                fixture.create_receipt.clone(),
+            ),
+            Err(AgentHostError::Provider(
+                SystemAgentGenesisProviderError::Refused
+            ))
+        );
+        assert!(
+            fixture
+                .provider
+                .create_saw_clean_destination
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(fixture.provider.creates.load(Ordering::SeqCst), 1);
+        assert!(!fixture.provider.journal.exists());
+        assert!(!fixture.provider.stable_lock.exists());
+        control.shutdown().unwrap();
+    }
+
+    #[test]
+    fn retired_images_and_unarchived_lock_residue_fail_closed() {
+        let (directory, lock, _remove) = empty_host_directory("retired-generation");
+        let first = open_empty_control(lease(&directory, &lock, scope())).unwrap();
+        first.shutdown().unwrap();
+        fs::write(
+            directory.join(format!(
+                "{}{}",
+                encode_agent_id(test_system_agent()),
+                LEGACY_IMAGE_SUFFIX
+            )),
+            b"retired image",
+        )
+        .unwrap();
+        assert!(matches!(
+            open_empty_control(lease(&directory, &lock, scope())),
+            Err(AgentHostError::LegacyGeneration)
+        ));
+
+        fs::remove_file(directory.join(format!(
+            "{}{}",
+            encode_agent_id(test_system_agent()),
+            LEGACY_IMAGE_SUFFIX
+        )))
+        .unwrap();
+        fs::write(
+            directory.join(format!(
+                "{}{}",
+                encode_agent_id(test_system_agent()),
+                JOURNAL_LOCK_SUFFIX
+            )),
+            b"orphan lock",
+        )
+        .unwrap();
+        assert!(matches!(
+            open_empty_control(lease(&directory, &lock, scope())),
+            Err(AgentHostError::Provider(
+                SystemAgentGenesisProviderError::NotConfigured
+            ))
+        ));
+    }
+
+    #[test]
+    fn generation_aliases_are_rejected_instead_of_ignored() {
+        let (directory, lock, _remove) = empty_host_directory("generation-aliases");
+        let first = open_empty_control(lease(&directory, &lock, scope())).unwrap();
+        first.shutdown().unwrap();
+        let encoded = encode_agent_id(test_system_agent());
+
+        let uppercase_journal = directory.join(format!("{encoded}.AGENT"));
+        fs::create_dir(&uppercase_journal).unwrap();
+        assert!(matches!(
+            open_empty_control(lease(&directory, &lock, scope())),
+            Err(AgentHostError::InvalidJournalName)
+        ));
+        fs::remove_dir(&uppercase_journal).unwrap();
+
+        let uppercase_lock = directory.join(format!("{encoded}.AGENT-LOCK"));
+        fs::write(&uppercase_lock, b"alias").unwrap();
+        assert!(matches!(
+            open_empty_control(lease(&directory, &lock, scope())),
+            Err(AgentHostError::InvalidJournalName)
+        ));
+        fs::remove_file(&uppercase_lock).unwrap();
+
+        let uppercase_legacy = directory.join(format!("{encoded}.AGENT-IMAGE"));
+        fs::write(&uppercase_legacy, b"retired alias").unwrap();
+        assert!(matches!(
+            open_empty_control(lease(&directory, &lock, scope())),
+            Err(AgentHostError::LegacyGeneration)
+        ));
+        fs::remove_file(&uppercase_legacy).unwrap();
+
+        let uppercase_id = directory.join(format!(
+            "{}.agent",
+            encode_agent_id(AgentId([0xab; 32])).to_uppercase()
+        ));
+        fs::create_dir(&uppercase_id).unwrap();
+        assert!(matches!(
+            open_empty_control(lease(&directory, &lock, scope())),
+            Err(AgentHostError::InvalidJournalName)
+        ));
+        fs::remove_dir(&uppercase_id).unwrap();
+
+        let malformed = directory.join("not-an-agent.agent");
+        fs::create_dir(&malformed).unwrap();
+        assert!(matches!(
+            open_empty_control(lease(&directory, &lock, scope())),
+            Err(AgentHostError::InvalidJournalName)
+        ));
+        fs::remove_dir(&malformed).unwrap();
+
+        // The exact host lock and durable scope metadata remain admitted.
+        let reopened = open_empty_control(lease(&directory, &lock, scope())).unwrap();
+        reopened.shutdown().unwrap();
     }
 
     #[test]
@@ -2073,12 +3514,8 @@ mod tests {
         assert_send_sync::<AgentHostHandle>();
 
         let (directory, lock, _remove) = empty_host_directory("bounded-worker");
-        let control = AgentHostControl::open_with_queue_capacity(
-            lease(&directory, &lock, scope()),
-            Arc::new(NoTrust),
-            1,
-        )
-        .unwrap();
+        let control =
+            open_empty_control_with_capacity(lease(&directory, &lock, scope()), 1).unwrap();
         let handle = control.handle();
 
         let (active, active_rx) = mpsc::sync_channel(0);
@@ -2135,12 +3572,8 @@ mod tests {
     #[test]
     fn worker_payload_budget_backpressures_and_releases_on_completion() {
         let (directory, lock, _remove) = empty_host_directory("payload-budget");
-        let control = AgentHostControl::open_with_queue_capacity(
-            lease(&directory, &lock, scope()),
-            Arc::new(NoTrust),
-            4,
-        )
-        .unwrap();
+        let control =
+            open_empty_control_with_capacity(lease(&directory, &lock, scope()), 4).unwrap();
         let handle = control.handle();
 
         let (active, active_rx) = mpsc::sync_channel(0);
@@ -2176,8 +3609,7 @@ mod tests {
     #[test]
     fn nested_package_capacity_is_rejected_without_leaking_reservation() {
         let (directory, lock, _remove) = empty_host_directory("nested-payload-budget");
-        let control =
-            AgentHostControl::open(lease(&directory, &lock, scope()), Arc::new(NoTrust)).unwrap();
+        let control = open_empty_control(lease(&directory, &lock, scope())).unwrap();
         let handle = control.handle();
 
         let mut package = payload_test_runtime_package();
@@ -2276,8 +3708,7 @@ mod tests {
         let invocation_receipt = payload_test_invocation_receipt(invocation_agent);
 
         let (directory, lock, _remove) = empty_host_directory("oversized-shapes");
-        let control =
-            AgentHostControl::open(lease(&directory, &lock, scope()), Arc::new(NoTrust)).unwrap();
+        let control = open_empty_control(lease(&directory, &lock, scope())).unwrap();
         let handle = control.handle();
 
         let (active, active_rx) = mpsc::sync_channel(0);
@@ -2350,12 +3781,8 @@ mod tests {
     #[test]
     fn worker_panic_releases_active_and_queued_payload() {
         let (directory, lock, _remove) = empty_host_directory("payload-panic");
-        let control = AgentHostControl::open_with_queue_capacity(
-            lease(&directory, &lock, scope()),
-            Arc::new(NoTrust),
-            4,
-        )
-        .unwrap();
+        let control =
+            open_empty_control_with_capacity(lease(&directory, &lock, scope()), 4).unwrap();
         let handle = control.handle();
 
         let (active, active_rx) = mpsc::sync_channel(0);
@@ -2391,11 +3818,7 @@ mod tests {
     fn zero_capacity_is_rejected() {
         let (directory, lock, _remove) = empty_host_directory("zero-capacity");
         assert!(matches!(
-            AgentHostControl::open_with_queue_capacity(
-                lease(&directory, &lock, scope()),
-                Arc::new(NoTrust),
-                0,
-            ),
+            open_empty_control_with_capacity(lease(&directory, &lock, scope()), 0),
             Err(AgentHostError::InvalidQueueCapacity)
         ));
     }
@@ -2430,8 +3853,7 @@ mod tests {
     #[test]
     fn directory_scope_is_durable_and_has_one_live_owner() {
         let (directory, lock, _remove) = empty_host_directory("directory-owner");
-        let control =
-            AgentHostControl::open(lease(&directory, &lock, scope()), Arc::new(NoTrust)).unwrap();
+        let control = open_empty_control(lease(&directory, &lock, scope())).unwrap();
         assert!(matches!(
             AgentHostRootLease::acquire(&directory, &lock, scope()),
             Err(AgentHostError::DirectoryInUse)
@@ -2454,11 +3876,11 @@ mod tests {
             node: NodeId([3; 32]),
         };
         assert!(matches!(
-            AgentHostControl::open(lease(&directory, &lock, wrong_scope), Arc::new(NoTrust),),
+            open_empty_control(lease(&directory, &lock, wrong_scope)),
             Err(AgentHostError::ScopeMismatch)
         ));
 
-        AgentHostControl::open(lease(&directory, &lock, scope()), Arc::new(NoTrust))
+        open_empty_control(lease(&directory, &lock, scope()))
             .unwrap()
             .shutdown()
             .unwrap();
@@ -2524,32 +3946,29 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join(HOST_SCOPE_FILE), b"truncated").unwrap();
         assert!(matches!(
-            AgentHostControl::open(lease(&directory, &lock, scope()), Arc::new(NoTrust),),
+            open_empty_control(lease(&directory, &lock, scope())),
             Err(AgentHostError::InvalidScopeBinding)
         ));
     }
 
     #[test]
-    fn unbound_existing_images_are_not_claimed_by_a_guessed_scope() {
-        let (directory, lock, _remove) = empty_host_directory("unbound-image");
+    fn unbound_existing_journals_are_not_claimed_by_a_guessed_scope() {
+        let (directory, lock, _remove) = empty_host_directory("unbound-journal");
         fs::create_dir_all(&directory).unwrap();
-        fs::write(
-            directory.join(format!(
-                "{}{}",
-                encode_agent_id(AgentId([9; 32])),
-                IMAGE_SUFFIX
-            )),
-            b"legacy image placeholder",
-        )
+        fs::create_dir(directory.join(format!(
+            "{}{}",
+            encode_agent_id(test_system_agent()),
+            JOURNAL_SUFFIX
+        )))
         .unwrap();
         assert!(matches!(
-            AgentHostControl::open(lease(&directory, &lock, scope()), Arc::new(NoTrust),),
+            open_empty_control(lease(&directory, &lock, scope())),
             Err(AgentHostError::InvalidScopeBinding)
         ));
         assert!(!directory.join(HOST_SCOPE_FILE).exists());
         fs::write(directory.join(HOST_SCOPE_TEMP_FILE), encoded_scope(scope())).unwrap();
         assert!(matches!(
-            AgentHostControl::open(lease(&directory, &lock, scope()), Arc::new(NoTrust),),
+            open_empty_control(lease(&directory, &lock, scope())),
             Err(AgentHostError::InvalidScopeBinding)
         ));
         assert!(!directory.join(HOST_SCOPE_FILE).exists());
@@ -2574,10 +3993,7 @@ mod tests {
         let (directory, lock, _remove) = empty_host_directory("scope-recovery");
         let first_lease = lease(&directory, &lock, scope());
         fs::write(directory.join(HOST_SCOPE_TEMP_FILE), encoded_scope(scope())).unwrap();
-        AgentHostControl::open(first_lease, Arc::new(NoTrust))
-            .unwrap()
-            .shutdown()
-            .unwrap();
+        open_empty_control(first_lease).unwrap().shutdown().unwrap();
         assert!(directory.join(HOST_SCOPE_FILE).is_file());
         assert!(!directory.join(HOST_SCOPE_TEMP_FILE).exists());
 
@@ -2592,7 +4008,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            AgentHostControl::open(lease(&directory, &lock, scope()), Arc::new(NoTrust),),
+            open_empty_control(lease(&directory, &lock, scope())),
             Err(AgentHostError::ScopeMismatch)
         ));
         assert!(!directory.join(HOST_SCOPE_FILE).exists());
@@ -2613,7 +4029,7 @@ mod tests {
         fs::write(&target, b"untouched").unwrap();
         symlink(&target, directory.join(HOST_SCOPE_FILE)).unwrap();
         assert!(matches!(
-            AgentHostControl::open(lease, Arc::new(NoTrust)),
+            open_empty_control(lease),
             Err(AgentHostError::InvalidScopeBinding)
         ));
         assert_eq!(fs::read(target).unwrap(), b"untouched");
