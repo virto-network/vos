@@ -121,6 +121,32 @@ fn lbu(rd: u32, rs1: u32, imm: i32) -> u32 {
 fn add(rd: u32, rs1: u32, rs2: u32) -> u32 {
     (rs2 << 20) | (rs1 << 15) | (rd << 7) | 0x33
 }
+fn beq(rs1: u32, rs2: u32, imm: i32) -> u32 {
+    let i = imm as u32;
+    (((i >> 12) & 1) << 31)
+        | (((i >> 5) & 0x3f) << 25)
+        | (rs2 << 20)
+        | (rs1 << 15)
+        | (((i >> 1) & 0xf) << 8)
+        | (((i >> 11) & 1) << 7)
+        | 0x63
+}
+fn jal(rd: u32, imm: i32) -> u32 {
+    let i = imm as u32;
+    (((i >> 20) & 1) << 31)
+        | (((i >> 1) & 0x3ff) << 21)
+        | (((i >> 11) & 1) << 20)
+        | (((i >> 12) & 0xff) << 12)
+        | (rd << 7)
+        | 0x6f
+}
+fn jalr(rd: u32, rs1: u32, imm: i32) -> u32 {
+    ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (rd << 7) | 0x67
+}
+fn sb(rs2: u32, rs1: u32, imm: i32) -> u32 {
+    let i = imm as u32 & 0xfff;
+    ((i >> 5) << 25) | (rs2 << 20) | (rs1 << 15) | ((i & 0x1f) << 7) | 0x23
+}
 fn sd(rs2: u32, rs1: u32, imm: i32) -> u32 {
     let i = imm as u32 & 0xFFF;
     ((i >> 5) << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | ((i & 0x1F) << 7) | 0x23
@@ -172,6 +198,100 @@ fn checksum_guest_elf() -> Vec<u8> {
     )
 }
 
+/// Two predecessors carry different stack offsets into one shared ADD. The
+/// linear predecessor's load-immediate must never fuse into the targeted ADD:
+/// doing so overwrites the other predecessor's live register value.
+fn shared_consumer_diamond_elf() -> Vec<u8> {
+    let text = assemble(&[
+        lbu(T0, A0, 0),       //  0: select a predecessor
+        beq(T0, 0, 16),       //  4: zero -> alternate at 20
+        lui(A2, 0),           //  8: fallthrough offset producer
+        addi(A2, A2, -0x1e0), // 12
+        jal(0, 12),           // 16: join at 28 with a2 = -0x1e0
+        lui(A2, 0),           // 20: alternate offset producer
+        addi(A2, A2, -0x2d0), // 24
+        add(A0, SP, A2),      // 28: shared, directly targeted consumer
+        addi(T1, 0, 0x5a),    // 32
+        sb(T1, A0, 0),        // 36: make the selected byte readable
+        addi(A1, 0, 1),       // 40: one-byte output
+        ret(),                // 44
+    ]);
+    build_elf(TEXT_VADDR, &[(".text", 1, 0x6, TEXT_VADDR, &text)])
+}
+
+/// A stripped direct call represented only by a raw AUIPC+JALR pair. Its
+/// callee entry is also the consumer after an unrelated linear predecessor.
+fn raw_direct_call_elf() -> Vec<u8> {
+    let text = assemble(&[
+        addi(T2, RA, 0),      //  0: preserve the host return address
+        addi(A2, 0, -0x1e0),  //  4: caller's live stack offset
+        0x0000_0297,          //  8: auipc t0, 0
+        jalr(RA, T0, 24),     // 12: call target 32, return to 16
+        addi(RA, T2, 0),      // 16: restore host return address
+        ret(),                // 20
+        lui(A2, 0),           // 24: unrelated linear predecessor
+        addi(A2, A2, -0x2d0), // 28
+        add(A0, SP, A2),      // 32: raw-pair-only callee entry
+        addi(T1, 0, 0x5a),    // 36
+        sb(T1, A0, 0),        // 40
+        addi(A1, 0, 1),       // 44
+        ret(),                // 48
+    ]);
+    build_elf(TEXT_VADDR, &[(".text", 1, 0x6, TEXT_VADDR, &text)])
+}
+
+/// A stripped code pointer materialized by raw AUIPC+ADDI before an indirect
+/// call. The linker accepts this form without relocation metadata as well.
+fn raw_materialized_pointer_call_elf() -> Vec<u8> {
+    let text = assemble(&[
+        addi(T2, RA, 0),      //  0: preserve the host return address
+        addi(A2, 0, -0x1e0),  //  4: caller's live stack offset
+        0x0000_0297,          //  8: auipc t0, 0
+        addi(T0, T0, 28),     // 12: materialize callee entry 36
+        jalr(RA, T0, 0),      // 16: indirect call, return to 20
+        addi(RA, T2, 0),      // 20: restore host return address
+        ret(),                // 24
+        lui(A2, 0),           // 28: unrelated linear predecessor
+        addi(A2, A2, -0x2d0), // 32
+        add(A0, SP, A2),      // 36: materialized-pointer-only callee entry
+        addi(T1, 0, 0x5a),    // 40
+        sb(T1, A0, 0),        // 44
+        addi(A1, 0, 1),       // 48
+        ret(),                // 52
+    ]);
+    build_elf(TEXT_VADDR, &[(".text", 1, 0x6, TEXT_VADDR, &text)])
+}
+
+/// A stripped indirect call whose callee is discoverable only through a raw
+/// initialized-data code pointer accepted by the linker's pointer rewriter.
+fn raw_data_pointer_call_elf() -> Vec<u8> {
+    let callee = TEXT_VADDR + 36;
+    let pointer = callee.to_le_bytes();
+    let text = assemble(&[
+        addi(T2, RA, 0),      //  0: preserve the host return address
+        lui(T0, 0x10),        //  4: raw pointer at 0x1_0000
+        ld(T0, T0, 0),        //  8
+        addi(A2, 0, -0x1e0),  // 12: caller's live stack offset
+        jalr(RA, T0, 0),      // 16: indirect call, return to 20
+        addi(RA, T2, 0),      // 20: restore host return address
+        ret(),                // 24
+        lui(A2, 0),           // 28: unrelated linear predecessor
+        addi(A2, A2, -0x2d0), // 32
+        add(A0, SP, A2),      // 36: raw-pointer-only callee entry
+        addi(T1, 0, 0x5a),    // 40
+        sb(T1, A0, 0),        // 44
+        addi(A1, 0, 1),       // 48
+        ret(),                // 52
+    ]);
+    build_elf(
+        TEXT_VADDR,
+        &[
+            (".rodata", 1, 0x2, RO_VADDR, &pointer),
+            (".text", 1, 0x6, TEXT_VADDR, &text),
+        ],
+    )
+}
+
 // ---------------------------------------------------------------------------
 // (a) Round-trip: the emitted blob parses and lays out the intended zones.
 // ---------------------------------------------------------------------------
@@ -216,6 +336,41 @@ fn spi_blob_round_trips_and_lays_out_per_gp() {
     assert_eq!(l.registers[1], stack_top);
     assert_eq!(l.registers[7], l.args.base);
     assert_eq!(l.registers[8], ARGS.len() as u64);
+}
+
+#[test]
+fn branch_target_preserves_each_predecessors_live_immediate() {
+    let blob = link_elf_spi(&shared_consumer_diamond_elf()).expect("diamond links");
+
+    for (argument, offset) in [(1u8, 0x1e0u64), (0, 0x2d0)] {
+        let invocation = refine::execute(&blob, &[argument], GAS).expect("diamond executes");
+        assert_eq!(invocation.exit, ExitReason::Halt);
+        assert_eq!(invocation.output().as_deref(), Some(&[0x5a][..]));
+        assert_eq!(
+            invocation.registers[7],
+            invocation.registers[1] - offset,
+            "the shared ADD must consume the offset from its actual predecessor"
+        );
+    }
+}
+
+#[test]
+fn stripped_direct_and_data_pointer_entries_preserve_live_inputs() {
+    for elf in [
+        raw_direct_call_elf(),
+        raw_materialized_pointer_call_elf(),
+        raw_data_pointer_call_elf(),
+    ] {
+        let blob = link_elf_spi(&elf).expect("stripped call links");
+        let invocation = refine::execute(&blob, &[], GAS).expect("stripped call executes");
+        assert_eq!(invocation.exit, ExitReason::Halt);
+        assert_eq!(invocation.output().as_deref(), Some(&[0x5a][..]));
+        assert_eq!(
+            invocation.registers[7],
+            invocation.registers[1] - 0x1e0,
+            "callee must consume the caller's live offset"
+        );
+    }
 }
 
 /// `.rodata` linked above the GP base gets leading zero padding so it still

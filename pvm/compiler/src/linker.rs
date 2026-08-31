@@ -13,8 +13,8 @@
 
 use crate::TranspileError;
 use crate::emitter;
-use crate::riscv::{OpcodeEncoding, TranslationContext};
-use std::collections::HashMap;
+use crate::riscv::{OpcodeEncoding, TranslationContext, decode_b_imm, decode_j_imm};
+use std::collections::{HashMap, HashSet};
 
 /// RISC-V relocation types we care about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +89,9 @@ struct LinkedElf {
     sub32_relocs: Vec<(u64, u64)>,
     /// Code section address ranges for detecting code pointers.
     code_ranges: Vec<(u64, u64)>,
+    /// Every statically reachable RISC-V instruction address. Translation-time
+    /// predecessor fusion must stop at these boundaries.
+    control_flow_targets: HashSet<u64>,
     /// ELF entry point (e_entry) — the RISC-V vaddr of _start (refine entry).
     entry_vaddr: u64,
     /// RISC-V vaddr of the exported `accumulate` symbol, if the service
@@ -696,6 +699,127 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
         }
     }
 
+    let mut control_flow_targets = HashSet::new();
+    control_flow_targets.insert(e_entry);
+    control_flow_targets.extend(accumulate_vaddr);
+    control_flow_targets.extend(
+        symbols_by_idx
+            .iter()
+            .map(|(_, value)| *value)
+            .filter(|value| code_ranges.iter().any(|(lo, hi)| value >= lo && value < hi)),
+    );
+    for (&call_site, &target) in &call_targets {
+        control_flow_targets.insert(target);
+        // CALL_PLT occupies AUIPC+JALR; execution resumes after both.
+        control_flow_targets.insert(call_site + 8);
+    }
+    control_flow_targets.extend(abs64_relocs.iter().map(|(_, target, _)| *target));
+    control_flow_targets.extend(hi20_targets.values().copied().filter(|target| {
+        code_ranges
+            .iter()
+            .any(|(lo, hi)| target >= lo && target < hi)
+    }));
+    let is_code_target = |target: u64| {
+        code_ranges
+            .iter()
+            .any(|(lo, hi)| target >= *lo && target < *hi)
+    };
+
+    // The data-pointer rewriter below accepts stripped linked ELFs whose only
+    // reference to a function entry is a raw pointer or an orphan SUB32 table
+    // value. Collect those exact accepted targets before translating code so
+    // they receive the same predecessor-fusion barrier as symbolic entries.
+    for &(data_vaddr, base_addr) in &sub32_relocs {
+        if abs64_relocs
+            .iter()
+            .any(|(absolute_vaddr, _, _)| *absolute_vaddr == data_vaddr)
+        {
+            continue;
+        }
+        let bytes = data_vaddr
+            .checked_sub(stack_size)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|offset| offset.checked_add(4).map(|end| (offset, end)))
+            .and_then(|(offset, end)| ro_data.get(offset..end))
+            .or_else(|| {
+                let offset = usize::try_from(data_vaddr.checked_sub(rw_base)?).ok()?;
+                let end = offset.checked_add(4)?;
+                rw_data.get(offset..end)
+            });
+        if let Some(bytes) = bytes {
+            let relative = i32::from_le_bytes(bytes.try_into().expect("four-byte slice"));
+            let target = (base_addr as i64 + i64::from(relative)) as u64;
+            if is_code_target(target) {
+                control_flow_targets.insert(target);
+            }
+        }
+    }
+    for data in [&ro_data, &rw_data] {
+        for bytes in data.chunks_exact(8) {
+            let target = u64::from_le_bytes(bytes.try_into().expect("eight-byte chunk"));
+            if is_code_target(target) {
+                control_flow_targets.insert(target);
+            }
+        }
+    }
+
+    for (_, base, code) in &code_sections {
+        for (index, bytes) in code.chunks_exact(4).enumerate() {
+            let address = *base + (index * 4) as u64;
+            let instruction = u32::from_le_bytes(bytes.try_into().expect("four-byte chunk"));
+            if instruction & 0x7f == 0x17
+                && let Some(next_bytes) = code.get(index * 4 + 4..index * 4 + 8)
+            {
+                let next = u32::from_le_bytes(
+                    next_bytes
+                        .try_into()
+                        .expect("adjacent four-byte instruction"),
+                );
+                let auipc_rd = (instruction >> 7) & 0x1f;
+                let jalr_rs1 = (next >> 15) & 0x1f;
+                if next & 0x7f == 0x67 && (next >> 12) & 0x7 == 0 && auipc_rd == jalr_rs1 {
+                    let upper = (instruction & 0xffff_f000) as i32;
+                    let lower = (next as i32) >> 20;
+                    let target = (address as i64 + i64::from(upper) + i64::from(lower)) as u64;
+                    if is_code_target(target) {
+                        control_flow_targets.insert(target);
+                    }
+                }
+                let addi_rd = (next >> 7) & 0x1f;
+                if next & 0x7f == 0x13
+                    && (next >> 12) & 0x7 == 0
+                    && auipc_rd != 0
+                    && addi_rd == auipc_rd
+                    && jalr_rs1 == auipc_rd
+                {
+                    let upper = (instruction & 0xffff_f000) as i32;
+                    let lower = (next as i32) >> 20;
+                    let target = (address as i64 + i64::from(upper) + i64::from(lower)) as u64;
+                    if is_code_target(target) {
+                        control_flow_targets.insert(target);
+                    }
+                }
+            }
+            match instruction & 0x7f {
+                0x6f => {
+                    control_flow_targets
+                        .insert((address as i64 + i64::from(decode_j_imm(instruction))) as u64);
+                    if (instruction >> 7) & 0x1f != 0 {
+                        control_flow_targets.insert(address + 4);
+                    }
+                }
+                0x63 => {
+                    control_flow_targets
+                        .insert((address as i64 + i64::from(decode_b_imm(instruction))) as u64);
+                }
+                0x67 if (instruction >> 7) & 0x1f != 0 => {
+                    control_flow_targets.insert(address + 4);
+                }
+                _ => {}
+            }
+        }
+    }
+
     let heap_pages = 16u32; // 64KB heap
 
     Ok(LinkedElf {
@@ -714,6 +838,7 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
         abs_code_ptrs: abs64_relocs,
         sub32_relocs,
         code_ranges,
+        control_flow_targets,
         entry_vaddr: e_entry,
         accumulate_vaddr,
     })
@@ -888,7 +1013,7 @@ fn translate_section_linked(
     let mut offset = 0;
     while offset < data.len() {
         let rv_addr = base_addr + offset as u64;
-        ctx.address_map.insert(rv_addr, ctx.code.len() as u32);
+        ctx.begin_instruction(rv_addr, elf.control_flow_targets.contains(&rv_addr))?;
 
         if offset + 4 > data.len() {
             break;
@@ -921,6 +1046,11 @@ fn translate_section_linked(
                 // CALL_PLT: AUIPC+JALR pair for function call
                 // Peek at JALR to get link register
                 if offset + 8 <= data.len() {
+                    if elf.control_flow_targets.contains(&(rv_addr + 4)) {
+                        return Err(TranspileError::InvalidSection(
+                            "control-flow target splits a relocated AUIPC+JALR call pair".into(),
+                        ));
+                    }
                     let jalr = u32::from_le_bytes([
                         data[offset + 4],
                         data[offset + 5],
@@ -960,6 +1090,11 @@ fn translate_section_linked(
                 if offset + 8 <= data.len()
                     && let Some(&_) = elf.lo12_targets.get(&next_addr)
                 {
+                    if elf.control_flow_targets.contains(&next_addr) {
+                        return Err(TranspileError::InvalidSection(
+                            "control-flow target splits a relocated HI20+LO12 pair".into(),
+                        ));
+                    }
                     let next_inst = u32::from_le_bytes([
                         data[offset + 4],
                         data[offset + 5],

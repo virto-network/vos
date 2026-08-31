@@ -143,6 +143,25 @@ impl TranslationContext {
         Ok(())
     }
 
+    /// Begin translating one RISC-V instruction at an address whose PVM
+    /// location may be referenced by another control-flow edge.
+    ///
+    /// Pending LUI/AUIPC state belongs exclusively to the linear predecessor,
+    /// and `pending_load_imm` fusion may remove that predecessor. Flush all of
+    /// it before recording a branch target so an incoming edge lands on the
+    /// consumer with its own register state intact.
+    pub(crate) fn begin_instruction(
+        &mut self,
+        address: u64,
+        is_control_flow_target: bool,
+    ) -> Result<(), TranspileError> {
+        if is_control_flow_target {
+            self.flush_pending()?;
+        }
+        self.address_map.insert(address, self.code.len() as u32);
+        Ok(())
+    }
+
     /// Translate one or more 32-bit RISC-V instructions starting at `offset`.
     /// Returns the number of bytes consumed (always 4).
     pub(crate) fn translate_instruction(
@@ -1940,7 +1959,7 @@ impl TranslationContext {
 
 // ===== RISC-V immediate decoders =====
 
-fn decode_j_imm(inst: u32) -> i32 {
+pub(crate) fn decode_j_imm(inst: u32) -> i32 {
     let imm20 = (inst >> 31) & 1;
     let imm10_1 = (inst >> 21) & 0x3FF;
     let imm11 = (inst >> 20) & 1;
@@ -1954,7 +1973,7 @@ fn decode_j_imm(inst: u32) -> i32 {
     }
 }
 
-fn decode_b_imm(inst: u32) -> i32 {
+pub(crate) fn decode_b_imm(inst: u32) -> i32 {
     let imm12 = (inst >> 31) & 1;
     let imm10_5 = (inst >> 25) & 0x3F;
     let imm4_1 = (inst >> 8) & 0xF;
@@ -2205,6 +2224,41 @@ mod tests {
                 "{what}: a register-form compare must follow the preserved load_imm",
             );
         }
+    }
+
+    #[test]
+    fn control_flow_target_keeps_fallthrough_immediate_out_of_shared_consumer() {
+        // Fallthrough computes a stack offset in a0, while another arm jumps
+        // directly to the shared ADD with its own a0. Fusing the fallthrough
+        // load into the targeted ADD would overwrite the incoming arm's value.
+        let mut ctx = TranslationContext::new(true);
+        let lui_a0_0x4000 = 0x0000_4537_u32;
+        let addi_a0_a0_0x1e0 = (0x1e0_u32 << 20) | (10 << 15) | (10 << 7) | 0x13;
+        let add_a0_sp_a0 = (10_u32 << 20) | (2 << 15) | (10 << 7) | 0x33;
+
+        ctx.begin_instruction(0, false).unwrap();
+        ctx.translate_instruction(&lui_a0_0x4000.to_le_bytes(), 0, 0)
+            .unwrap();
+        ctx.begin_instruction(4, false).unwrap();
+        ctx.translate_instruction(&addi_a0_a0_0x1e0.to_le_bytes(), 0, 4)
+            .unwrap();
+        let load_len = ctx.code.len();
+        assert_eq!(ctx.code[0], 51, "fallthrough materializes load_imm");
+
+        ctx.begin_instruction(8, true).unwrap();
+        let target = ctx.address_map[&8] as usize;
+        assert_eq!(
+            target, load_len,
+            "the target starts after the predecessor load"
+        );
+        ctx.translate_instruction(&add_a0_sp_a0.to_le_bytes(), 0, 8)
+            .unwrap();
+
+        assert_eq!(ctx.code[0], 51, "targeted fusion must not remove load_imm");
+        assert_eq!(
+            ctx.code[target], 200,
+            "shared consumer remains register ADD64"
+        );
     }
 
     #[test]
