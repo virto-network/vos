@@ -26,6 +26,18 @@ pub const CAPABILITY_AGENT_RUNTIME_UPGRADE: &str = "agent.runtime.upgrade";
 pub const ED25519_PUBLIC_KEY_WIRE_BYTES: usize = 36;
 pub const ED25519_SIGNATURE_BYTES: usize = 64;
 
+const SERVICE_WIRE_HEADER_BYTES: usize = 4 + 32;
+const AGENT_AUTHORITY_BINDING_BODY_BYTES: usize = 5 * 32 + 4 + ED25519_PUBLIC_KEY_WIRE_BYTES;
+
+/// Maximum complete canonical [`AgentAuthorityBinding`] service wire.
+///
+/// Authority bindings currently carry five fixed identities and one exact
+/// canonical libp2p Ed25519 public-key wrapper. The bound includes the magic
+/// and platform identifier so an external adapter can reject oversized input
+/// before retaining or forwarding it.
+pub const MAX_AGENT_AUTHORITY_BINDING_WIRE_BYTES: usize =
+    SERVICE_WIRE_HEADER_BYTES + AGENT_AUTHORITY_BINDING_BODY_BYTES;
+
 /// Canonical libp2p protobuf wrapper for one raw Ed25519 public key.
 pub fn ed25519_public_key_wire(raw: [u8; 32]) -> Vec<u8> {
     let mut wire = Vec::with_capacity(ED25519_PUBLIC_KEY_WIRE_BYTES);
@@ -92,6 +104,23 @@ impl AgentAuthorityBinding {
         let mut encoder = Encoder(&mut bytes);
         encode_binding(&mut encoder, self);
         Hash::digest(b"vos/agent/authority-binding", &[&bytes])
+    }
+}
+
+impl ServiceWire for AgentAuthorityBinding {
+    // This is the first standalone authority-binding envelope. Nested claim
+    // codecs deliberately continue to use `encode_binding` directly.
+    const MAGIC: [u8; 4] = *b"AAB1";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        encode_binding(&mut Encoder(output), self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        if decoder.remaining() > AGENT_AUTHORITY_BINDING_BODY_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        decode_binding(decoder)
     }
 }
 
@@ -441,6 +470,108 @@ mod tests {
             program: ProgramId([4; 32]),
             producer: ProducerId::of_public_key(&public_key),
             public_key,
+        }
+    }
+
+    #[test]
+    fn standalone_authority_binding_wire_roundtrips_the_existing_body() {
+        let key = SigningKey::from_bytes(&[0x41; 32]);
+        let binding = binding(&key);
+        let commitment = binding.commitment();
+        let wire = binding.encode();
+
+        let mut existing_body = Vec::new();
+        encode_binding(&mut Encoder(&mut existing_body), &binding);
+        assert_eq!(wire.len(), MAX_AGENT_AUTHORITY_BINDING_WIRE_BYTES);
+        assert_eq!(&wire[..4], b"AAB1");
+        assert_eq!(&wire[SERVICE_WIRE_HEADER_BYTES..], existing_body);
+        assert_eq!(AgentAuthorityBinding::decode(&wire), Ok(binding));
+        assert_eq!(
+            AgentAuthorityBinding::decode(&wire).unwrap().commitment(),
+            commitment
+        );
+        assert_eq!(
+            commitment,
+            Hash([
+                0x97, 0x9f, 0xf3, 0xe2, 0xda, 0xe1, 0x9f, 0xba, 0x39, 0x70, 0xd8, 0x9f, 0xf6, 0x17,
+                0xbc, 0x9a, 0xc2, 0x52, 0x6c, 0xed, 0xfc, 0x26, 0xc3, 0x6f, 0x82, 0xa8, 0x98, 0xef,
+                0x0c, 0x7e, 0xad, 0xfd,
+            ])
+        );
+    }
+
+    #[test]
+    fn standalone_authority_binding_wire_rejects_malformed_input() {
+        let key = SigningKey::from_bytes(&[0x41; 32]);
+        let wire = binding(&key).encode();
+
+        let mut wrong_magic = wire.clone();
+        wrong_magic[0] ^= 0xff;
+        assert_eq!(
+            AgentAuthorityBinding::decode(&wrong_magic),
+            Err(DecodeError::InvalidTag)
+        );
+
+        let mut truncated = wire.clone();
+        truncated.pop();
+        assert_eq!(
+            AgentAuthorityBinding::decode(&truncated),
+            Err(DecodeError::Truncated)
+        );
+
+        let mut malformed_key = wire;
+        let public_key_offset = SERVICE_WIRE_HEADER_BYTES + 5 * 32 + 4;
+        malformed_key[public_key_offset] ^= 0xff;
+        assert_eq!(
+            AgentAuthorityBinding::decode(&malformed_key),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn standalone_authority_binding_wire_rejects_oversize_and_trailing_bytes() {
+        let key = SigningKey::from_bytes(&[0x41; 32]);
+        let mut wire = binding(&key).encode();
+        wire.push(0);
+        assert_eq!(wire.len(), MAX_AGENT_AUTHORITY_BINDING_WIRE_BYTES + 1);
+        assert_eq!(
+            AgentAuthorityBinding::decode(&wire),
+            Err(DecodeError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn standalone_authority_binding_wire_rejects_every_zero_identity() {
+        let key = SigningKey::from_bytes(&[0x41; 32]);
+        let original = binding(&key);
+        let invalid = [
+            AgentAuthorityBinding {
+                agent: AgentId::ZERO,
+                ..original.clone()
+            },
+            AgentAuthorityBinding {
+                actor: ActorId::ZERO,
+                ..original.clone()
+            },
+            AgentAuthorityBinding {
+                deployment: DeploymentId::ZERO,
+                ..original.clone()
+            },
+            AgentAuthorityBinding {
+                program: ProgramId::ZERO,
+                ..original.clone()
+            },
+            AgentAuthorityBinding {
+                producer: ProducerId::ZERO,
+                ..original
+            },
+        ];
+
+        for binding in invalid {
+            assert_eq!(
+                AgentAuthorityBinding::decode(&binding.encode()),
+                Err(DecodeError::NonCanonical)
+            );
         }
     }
 
