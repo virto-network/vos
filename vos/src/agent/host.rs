@@ -30,7 +30,7 @@ use super::authority::{
 use super::bootstrap::{
     SystemAgentGenesisBootstrapError, SystemAgentGenesisLocator, SystemAgentGenesisProposal,
     SystemAgentGenesisProvider, SystemAgentGenesisProviderError,
-    seal_prepared_system_agent_genesis,
+    seal_prepared_system_agent_genesis, validate_prepared_system_agent_genesis_root,
 };
 use super::committee::RootAnchorPins;
 use super::driver::AgentTrustProvider;
@@ -1430,6 +1430,7 @@ impl AgentHost {
             self.system_agent(),
             config,
             runtime_package,
+            &self.root_pins,
             self.trust.as_ref(),
         )?;
         let request = LifecycleRequest::Create(config.clone());
@@ -1588,6 +1589,7 @@ impl AgentHost {
                             config.clone(),
                             &runtime_package,
                             authority.clone(),
+                            &self.root_pins,
                             &self.trust,
                             &self.merge,
                         )
@@ -1601,6 +1603,8 @@ impl AgentHost {
                             self.merge.clone(),
                         )
                         .map_err(map_local_driver_error)?;
+                    validate_prepared_system_agent_genesis_root(&prepared, &self.root_pins)
+                        .map_err(AgentHostError::Bootstrap)?;
                     let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared)
                         .map_err(AgentHostError::Bootstrap)?;
                     let returned = self
@@ -1913,9 +1917,26 @@ fn validate_system_create_target(
     system_agent: AgentId,
     config: &AgentConfig,
     runtime_package: &Package,
+    root_pins: &RootAnchorPins,
     trust: &dyn AgentTrustProvider,
 ) -> Result<(), AgentHostError> {
     validate_system_create_shape(scope, system_agent, config, runtime_package)?;
+    let marker = config
+        .system_authority_genesis
+        .as_ref()
+        .ok_or(AgentHostError::InvalidConfig(
+            AgentConfigError::InvalidSystemAuthorityGenesis,
+        ))?;
+    marker
+        .validate_root_config(root_pins.record(), config, marker.initial_sequence())
+        .map_err(|_| {
+            AgentHostError::InvalidConfig(AgentConfigError::InvalidSystemAuthorityGenesis)
+        })?;
+    if root_pins.genesis_claim().sequence() != marker.initial_sequence() {
+        return Err(AgentHostError::InvalidConfig(
+            AgentConfigError::InvalidSystemAuthorityGenesis,
+        ));
+    }
     let anchored = trust
         .authority_for_space(config.identity.space)
         .ok_or(AgentHostError::TrustUnavailable)?;
@@ -2813,12 +2834,12 @@ mod tests {
         package
     }
 
-    fn fixture_authority() -> (ed25519_dalek::SigningKey, AgentAuthorityBinding) {
+    fn fixture_authority(agent: AgentId) -> (ed25519_dalek::SigningKey, AgentAuthorityBinding) {
         let key = ed25519_dalek::SigningKey::from_bytes(&FIXTURE_AUTHORITY_SEED);
         let public_key =
             super::super::authority::ed25519_public_key_wire(key.verifying_key().to_bytes());
         let binding = AgentAuthorityBinding {
-            agent: AgentId([0x62; 32]),
+            agent,
             actor: ActorId([0x63; 32]),
             deployment: DeploymentId([0x64; 32]),
             program: ProgramId([0x65; 32]),
@@ -2856,9 +2877,10 @@ mod tests {
 
     fn journal_fixture(journal_root: &Path) -> JournalFixture {
         use super::super::committee::{
-            AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
-            AuthorityQuorumCertificate, AuthoritySignature, AuthoritySignerId, RootAnchorRecord,
-            SystemAgentGenesisClaim, SystemAgentGenesisEvidence,
+            AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommittee,
+            AuthorityCommitteeMember, AuthorityMemberRole, AuthorityQuorumCertificate,
+            AuthoritySignature, AuthoritySignerId, RootAnchorRecord, SystemAgentGenesisClaim,
+            SystemAgentGenesisEvidence,
         };
         use ed25519_dalek::{Signer as _, SigningKey};
 
@@ -2867,61 +2889,7 @@ mod tests {
         let owner = crate::service::PrincipalId([0x67; 32]);
         let creation_nonce = Hash([0x68; 32]);
         let agent = AgentId::derive(scope.space, owner, &creation_nonce.0);
-        let (authority_key, authority) = fixture_authority();
-        let config = AgentConfig {
-            identity: AgentIdentity {
-                space: scope.space,
-                agent,
-                owner,
-                profile: super::super::AgentProfile::Local,
-                runtime_deployment: package.deployment_id(),
-                runtime_program: package.manifest.program,
-                runtime_producer: package.deployment_signature.producer,
-            },
-            creation_nonce,
-            authority: authority.clone(),
-            runtime_package: BlobRef::of_bytes(&package.encode()),
-            runtime_contract: super::super::contract::RuntimePackageContract::canonical(),
-            capabilities: super::super::RuntimeCapabilities::standard(),
-            replicas: vec![super::super::AgentReplica {
-                node: scope.node,
-                principal: owner,
-                role: super::super::ReplicaRole::Voter,
-            }],
-        };
-        let request = LifecycleRequest::Create(config.clone());
-        let receipt = fixture_receipt(&authority_key, &config, &request, 1);
-        let slot_reads = Arc::new(AtomicUsize::new(0));
-        let trust: Arc<dyn AgentTrustProvider> = Arc::new(FixtureTrust {
-            space: scope.space,
-            authority,
-            slot_reads: slot_reads.clone(),
-        });
-        let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(NoMerge(scope.node));
-        let (input, catalog) =
-            LocalJournalAgentDriver::<FileAgentJournalStore>::system_genesis_input(
-                config.clone(),
-                &package,
-                receipt.clone(),
-                &trust,
-                &merge,
-            )
-            .unwrap();
-        let prepared = LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
-            input,
-            config.replicas[0],
-            &catalog,
-            trust.clone(),
-            merge.clone(),
-        )
-        .unwrap();
-        let locator = SystemAgentGenesisLocator {
-            space: scope.space,
-            agent,
-            node: scope.node,
-        };
-        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
-
+        let (authority_key, authority) = fixture_authority(agent);
         let committee_keys = [
             SigningKey::from_bytes(&[0x69; 32]),
             SigningKey::from_bytes(&[0x6a; 32]),
@@ -2940,7 +2908,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         members.sort_by_key(AuthorityCommitteeMember::signer);
-        let binding = config.authority.commitment();
+        let binding = authority.commitment();
         let committee = AuthorityCommittee::new(scope.space, binding, 1, None, members).unwrap();
         let root_record = RootAnchorRecord::new(
             1,
@@ -2951,6 +2919,87 @@ mod tests {
             committee.clone(),
         )
         .unwrap();
+        let system_authority_genesis = super::super::system_authority::SystemAuthorityGenesis::new(
+            root_record.id(),
+            root_record.config_version(),
+            root_record.config_commitment(),
+            committee.clone(),
+            1,
+            8,
+            8,
+        )
+        .unwrap();
+        let config = AgentConfig {
+            identity: AgentIdentity {
+                space: scope.space,
+                agent,
+                owner,
+                profile: super::super::AgentProfile::Local,
+                runtime_deployment: package.deployment_id(),
+                runtime_program: package.manifest.program,
+                runtime_producer: package.deployment_signature.producer,
+            },
+            creation_nonce,
+            authority: authority.clone(),
+            system_authority_genesis: Some(system_authority_genesis),
+            runtime_package: BlobRef::of_bytes(&package.encode()),
+            runtime_contract: super::super::contract::RuntimePackageContract::canonical(),
+            capabilities: super::super::RuntimeCapabilities::standard(),
+            replicas: vec![super::super::AgentReplica {
+                node: scope.node,
+                principal: owner,
+                role: super::super::ReplicaRole::Voter,
+            }],
+        };
+        let request = LifecycleRequest::Create(config.clone());
+        let receipt = fixture_receipt(&authority_key, &config, &request, 1);
+        let slot_reads = Arc::new(AtomicUsize::new(0));
+        let trust: Arc<dyn AgentTrustProvider> = Arc::new(FixtureTrust {
+            space: scope.space,
+            authority,
+            slot_reads: slot_reads.clone(),
+        });
+        let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(NoMerge(scope.node));
+        // Production pins carry the exact replay-derived genesis claim. This
+        // construction-only fixture needs the independently pinned root
+        // record before it can deterministically derive that claim below.
+        let configured_root = RootAnchorPins::new(
+            root_record.clone(),
+            root_record.config_version(),
+            root_record.id(),
+            root_record.config_commitment(),
+            AuthorityClaimCommitment::from_payload_commitment(
+                AuthorityClaimDomain::SystemAgentGenesis,
+                1,
+                Hash([0x6d; 32]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (input, catalog) =
+            LocalJournalAgentDriver::<FileAgentJournalStore>::system_genesis_input(
+                config.clone(),
+                &package,
+                receipt.clone(),
+                &configured_root,
+                &trust,
+                &merge,
+            )
+            .unwrap();
+        let prepared = LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
+            input,
+            config.replicas[0],
+            &catalog,
+            trust.clone(),
+            merge.clone(),
+        )
+        .unwrap();
+        let locator = SystemAgentGenesisLocator {
+            space: scope.space,
+            agent,
+            node: scope.node,
+        };
+        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
         let claim = SystemAgentGenesisClaim::new(&root_record, proposal.expectations()).unwrap();
         let message = AuthorityQuorumCertificate::signing_message(
             committee.authority_binding(),
@@ -3162,6 +3211,7 @@ mod tests {
             },
             creation_nonce,
             authority: payload_test_authority(agent),
+            system_authority_genesis: None,
             runtime_package: crate::service::BlobRef {
                 hash: Hash([0x78; 32]),
                 len: 1,

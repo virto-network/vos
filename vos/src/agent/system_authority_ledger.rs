@@ -529,8 +529,8 @@ impl ReplayedSystemAuthorityView {
             .map_err(|_| SystemAuthorityLedgerWireError::InvalidStateView)?
             != route.authority_scope
             || state
-                .journal_scope()
-                .is_some_and(|scope| scope != trusted_scope)
+                .journal_binding()
+                .is_some_and(|binding| binding != trusted_scope.binding())
         {
             return Err(SystemAuthorityLedgerWireError::InvalidStateView);
         }
@@ -635,6 +635,10 @@ impl ReplayedSystemAuthorityView {
             || self.state.current_committee().authority_binding() != self.route.authority_binding
             || self.trusted_scope.system_genesis() != self.route.system_genesis
             || self.trusted_scope.agent_admission() != self.route.agent_admission
+            || self
+                .state
+                .journal_binding()
+                .is_some_and(|binding| binding != self.trusted_scope.binding())
             || self.authority_state == Hash::ZERO
             || self.compute_authority_state_commitment() != self.authority_state
             || self.commitment == Hash::ZERO
@@ -3499,6 +3503,22 @@ mod durable {
                     .apply_rotation(self.scope, &command)
                     .unwrap()
                     .into_state();
+                assert_eq!(next.journal_binding(), Some(self.scope.binding()));
+                let foreign_scope = SystemAuthorityJournalScope::for_test(
+                    AgentJournalGenesisId::new([0xb7; 32]),
+                    self.scope.agent_admission(),
+                )
+                .unwrap();
+                assert!(matches!(
+                    ReplayedSystemAuthorityView::for_test_from_authenticated_replay(
+                        foreign_scope,
+                        &next,
+                        self.store,
+                        HEADS_2,
+                        CONTROL_2,
+                    ),
+                    Err(SystemAuthorityLedgerWireError::InvalidStateView)
+                ));
                 ReplayedSystemAuthorityView::for_test_from_authenticated_replay(
                     self.scope, &next, self.store, HEADS_2, CONTROL_2,
                 )

@@ -41,8 +41,12 @@ pub(crate) const MAX_SYSTEM_AUTHORITY_ROTATION_TREE_NODES: usize =
 /// Maximum complete root-seeding descriptor.
 pub const MAX_SYSTEM_AUTHORITY_GENESIS_BYTES: usize =
     SERVICE_WIRE_HEADER_BYTES + 32 + 8 + 32 + 8 + 4 + 4 + 4 + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES;
+/// Maximum data-only root-journal identity binding. Decoding this record does
+/// not attest that replay materialized the named journal generation.
+pub const MAX_SYSTEM_AUTHORITY_JOURNAL_BINDING_BYTES: usize = SERVICE_WIRE_HEADER_BYTES + 32 + 32;
 /// Maximum complete replay-authenticated authority state in Standard Control.
-pub const MAX_SYSTEM_AUTHORITY_STATE_BYTES: usize = 380 + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES;
+pub const MAX_SYSTEM_AUTHORITY_STATE_BYTES: usize =
+    320 + MAX_SYSTEM_AUTHORITY_JOURNAL_BINDING_BYTES + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES;
 /// Maximum complete finalized-decision fact.
 pub const MAX_SYSTEM_AUTHORITY_DECISION_FACT_BYTES: usize = 470;
 /// Maximum one permanent decision-history node.
@@ -339,22 +343,82 @@ impl ServiceWire for SystemAuthorityGenesis {
     }
 }
 
-/// Opaque final root-journal scope selected by root-reverified replay, never
-/// by provider bytes or public callers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SystemAuthorityJournalScope {
+/// Data-only identity of the root journal generation permanently bound by the
+/// first accepted authority command. This record is safe to persist and
+/// decode, but is never evidence that replay actually materialized it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SystemAuthorityJournalBinding {
     system_genesis: AgentJournalGenesisId,
     agent_admission: AgentGenesisAdmissionId,
 }
 
+impl SystemAuthorityJournalBinding {
+    pub fn new(
+        system_genesis: AgentJournalGenesisId,
+        agent_admission: AgentGenesisAdmissionId,
+    ) -> Result<Self, SystemAuthorityError> {
+        let binding = Self {
+            system_genesis,
+            agent_admission,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    pub const fn system_genesis(self) -> AgentJournalGenesisId {
+        self.system_genesis
+    }
+
+    pub const fn agent_admission(self) -> AgentGenesisAdmissionId {
+        self.agent_admission
+    }
+
+    pub fn validate(self) -> Result<(), SystemAuthorityError> {
+        if self.system_genesis == AgentJournalGenesisId::ZERO
+            || self.agent_admission == AgentGenesisAdmissionId::ZERO
+        {
+            Err(SystemAuthorityError::InvalidScope)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl ServiceWire for SystemAuthorityJournalBinding {
+    const MAGIC: [u8; 4] = *b"SAJB";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(self.system_genesis.as_bytes());
+        encoder.fixed(self.agent_admission.as_bytes());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_SYSTEM_AUTHORITY_JOURNAL_BINDING_BYTES)?;
+        let binding = Self {
+            system_genesis: AgentJournalGenesisId::new(decoder.fixed()?),
+            agent_admission: AgentGenesisAdmissionId::from_bytes(decoder.fixed()?),
+        };
+        binding.validate().map_err(map_decode_error)?;
+        Ok(binding)
+    }
+}
+
+/// Opaque replay provenance that the named root-journal generation was
+/// independently materialized and authenticated. It is deliberately neither
+/// wire-decodable nor constructible from a data-only journal binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SystemAuthorityJournalScope {
+    binding: SystemAuthorityJournalBinding,
+}
+
 impl SystemAuthorityJournalScope {
-    pub(crate) fn new(
+    fn new(
         system_genesis: AgentJournalGenesisId,
         agent_admission: AgentGenesisAdmissionId,
     ) -> Result<Self, SystemAuthorityError> {
         let scope = Self {
-            system_genesis,
-            agent_admission,
+            binding: SystemAuthorityJournalBinding::new(system_genesis, agent_admission)?,
         };
         scope.validate()?;
         Ok(scope)
@@ -369,21 +433,19 @@ impl SystemAuthorityJournalScope {
     }
 
     pub(crate) const fn system_genesis(self) -> AgentJournalGenesisId {
-        self.system_genesis
+        self.binding.system_genesis()
     }
 
     pub(crate) const fn agent_admission(self) -> AgentGenesisAdmissionId {
-        self.agent_admission
+        self.binding.agent_admission()
+    }
+
+    pub(crate) const fn binding(self) -> SystemAuthorityJournalBinding {
+        self.binding
     }
 
     fn validate(self) -> Result<(), SystemAuthorityError> {
-        if self.system_genesis == AgentJournalGenesisId::ZERO
-            || self.agent_admission == AgentGenesisAdmissionId::ZERO
-        {
-            Err(SystemAuthorityError::InvalidScope)
-        } else {
-            Ok(())
-        }
+        self.binding.validate()
     }
 
     pub(crate) fn commitment(
@@ -393,8 +455,8 @@ impl SystemAuthorityJournalScope {
         Self::validate(self)?;
         SystemAuthorityScopeCommitment::for_journal(
             root_anchor,
-            self.system_genesis,
-            self.agent_admission,
+            self.binding.system_genesis(),
+            self.binding.agent_admission(),
         )
     }
 }
@@ -1770,7 +1832,9 @@ pub struct SystemAuthorityState {
     authority_binding: Hash,
     decision_limit: u32,
     rotation_limit: u32,
-    journal_scope: Option<SystemAuthorityJournalScope>,
+    /// Data-only generation identity. The opaque replay witness is supplied
+    /// separately to every authority transition and is never persisted here.
+    journal_binding: Option<SystemAuthorityJournalBinding>,
     current_committee: AuthorityCommittee,
     /// High-water in the committee-certified claim namespace only. Standard
     /// lifecycle receipts are replay-protected per target Agent and are not
@@ -1784,7 +1848,9 @@ pub struct SystemAuthorityState {
 }
 
 impl SystemAuthorityState {
-    pub const VERSION: u16 = 1;
+    /// Version 2 separates durable journal identity from the non-serializable
+    /// replay provenance witness used to authorize transitions.
+    pub const VERSION: u16 = 2;
 
     pub fn from_genesis(
         system_agent: AgentId,
@@ -1804,7 +1870,7 @@ impl SystemAuthorityState {
             authority_binding: genesis.initial_committee.authority_binding(),
             decision_limit: genesis.decision_limit,
             rotation_limit: genesis.rotation_limit,
-            journal_scope: None,
+            journal_binding: None,
             current_committee: genesis.initial_committee.clone(),
             committee_sequence_high_water: genesis.initial_sequence,
             rotation_first_sequence: None,
@@ -1849,8 +1915,8 @@ impl SystemAuthorityState {
         self.root_anchor_config
     }
 
-    pub(crate) const fn journal_scope(&self) -> Option<SystemAuthorityJournalScope> {
-        self.journal_scope
+    pub const fn journal_binding(&self) -> Option<SystemAuthorityJournalBinding> {
+        self.journal_binding
     }
 
     pub const fn current_committee(&self) -> &AuthorityCommittee {
@@ -1903,7 +1969,11 @@ impl SystemAuthorityState {
             || self.authority_binding != genesis.initial_committee.authority_binding()
             || self.decision_limit != genesis.decision_limit
             || self.rotation_limit != genesis.rotation_limit
-            || self.committee_sequence_high_water < genesis.initial_sequence
+            || (self.decision_count == 0
+                && self.rotation_count == 0
+                && self.committee_sequence_high_water != genesis.initial_sequence)
+            || ((self.decision_count != 0 || self.rotation_count != 0)
+                && self.committee_sequence_high_water <= genesis.initial_sequence)
             || (self.rotation_count == 0 && self.current_committee != genesis.initial_committee)
         {
             Err(SystemAuthorityError::InvalidState)
@@ -1931,8 +2001,8 @@ impl SystemAuthorityState {
             || claim.system_agent() != self.system_agent
             || claim.authority_binding() != self.authority_binding
             || self
-                .journal_scope
-                .is_some_and(|existing| existing != trusted_scope)
+                .journal_binding
+                .is_some_and(|existing| existing != trusted_scope.binding())
         {
             return Err(SystemAuthorityError::WrongSystemAgent);
         }
@@ -2032,7 +2102,7 @@ impl SystemAuthorityState {
             self.verify_current_certificate(&fact, finalize.evidence())?;
             self.validate_fresh_committee_sequence(fact.claim.sequence())?;
             let mut next = self.clone();
-            next.bind_scope(trusted_scope)?;
+            next.bind_journal(trusted_scope)?;
             next.committee_sequence_high_water = fact.claim.sequence();
             next.rotation_first_sequence = None;
             next.validate()?;
@@ -2051,7 +2121,7 @@ impl SystemAuthorityState {
         }
 
         let mut next = self.clone();
-        next.bind_scope(trusted_scope)?;
+        next.bind_journal(trusted_scope)?;
         next.committee_sequence_high_water = fact.claim.sequence();
         next.rotation_first_sequence = None;
 
@@ -2118,7 +2188,7 @@ impl SystemAuthorityState {
         )?;
         let mut next = self.clone();
         next.current_committee = rotation.new_committee.clone();
-        next.bind_scope(trusted_scope)?;
+        next.bind_journal(trusted_scope)?;
         next.committee_sequence_high_water = sequence;
         next.rotation_first_sequence = Some(first);
         next.rotations_root = history.root;
@@ -2133,6 +2203,46 @@ impl SystemAuthorityState {
             record,
             history,
         })
+    }
+
+    /// Deterministically simulate a guest-provided journal context without
+    /// turning those raw IDs into an authority capability. The returned data
+    /// deliberately omits the admitted fact and history write plan; replay
+    /// must independently reapply with an opaque
+    /// [`SystemAuthorityJournalScope`] before it may persist or publish the
+    /// transition.
+    pub(crate) fn simulate_finalize_untrusted(
+        &self,
+        system_genesis: AgentJournalGenesisId,
+        agent_admission: AgentGenesisAdmissionId,
+        finalize: &SystemAuthorityFinalize,
+    ) -> Result<(Self, SystemAuthorityFinalizeOutcome), SystemAuthorityError> {
+        let transition = self.apply_finalize(
+            SystemAuthorityJournalScope::new(system_genesis, agent_admission)?,
+            finalize,
+        )?;
+        Ok((transition.state().clone(), transition.outcome()))
+    }
+
+    /// Data-only companion to [`Self::simulate_finalize_untrusted`] for a
+    /// committee rotation. No committee records or history write plan cross
+    /// this boundary.
+    pub(crate) fn simulate_rotation_untrusted(
+        &self,
+        system_genesis: AgentJournalGenesisId,
+        agent_admission: AgentGenesisAdmissionId,
+        rotation: &SystemAuthorityRotation,
+    ) -> Result<(Self, SystemAuthorityRotationId, u64, bool), SystemAuthorityError> {
+        let transition = self.apply_rotation(
+            SystemAuthorityJournalScope::new(system_genesis, agent_admission)?,
+            rotation,
+        )?;
+        Ok((
+            transition.state().clone(),
+            transition.record().id(),
+            transition.record().new_epoch(),
+            transition.exact_retry(),
+        ))
     }
 
     pub fn validate(&self) -> Result<(), SystemAuthorityError> {
@@ -2164,13 +2274,13 @@ impl SystemAuthorityState {
             || self.current_committee.authority_binding() != self.authority_binding
             || self.rotation_count.checked_add(1) != Some(self.current_committee.epoch())
             || (self.rotation_first_sequence.is_some() && self.rotation_count == 0)
-            || (self.journal_scope.is_some()
+            || (self.journal_binding.is_some()
                 != (self.decision_count != 0 || self.rotation_count != 0))
         {
             return Err(SystemAuthorityError::InvalidState);
         }
-        if let Some(scope) = self.journal_scope {
-            scope.validate()?;
+        if let Some(binding) = self.journal_binding {
+            binding.validate()?;
         }
         enforce_encoded_bound(self, MAX_SYSTEM_AUTHORITY_STATE_BYTES)
     }
@@ -2180,14 +2290,14 @@ impl SystemAuthorityState {
         trusted_scope: SystemAuthorityJournalScope,
         fact: &SystemAuthorityDecisionFact,
     ) -> Result<(), SystemAuthorityError> {
-        if fact.system_genesis != trusted_scope.system_genesis
-            || fact.system_admission != trusted_scope.agent_admission
+        if fact.system_genesis != trusted_scope.system_genesis()
+            || fact.system_admission != trusted_scope.agent_admission()
             || fact.space != self.space
             || fact.system_agent != self.system_agent
             || fact.authority_binding != self.authority_binding
             || self
-                .journal_scope
-                .is_some_and(|existing| existing != trusted_scope)
+                .journal_binding
+                .is_some_and(|existing| existing != trusted_scope.binding())
         {
             Err(SystemAuthorityError::WrongSystemAgent)
         } else {
@@ -2224,8 +2334,8 @@ impl SystemAuthorityState {
             || claim.space != self.space
             || claim.authority_binding != self.authority_binding
             || self
-                .journal_scope
-                .is_some_and(|existing| existing != trusted_scope)
+                .journal_binding
+                .is_some_and(|existing| existing != trusted_scope.binding())
         {
             Err(SystemAuthorityError::WrongSystemAgent)
         } else {
@@ -2242,15 +2352,16 @@ impl SystemAuthorityState {
         }
     }
 
-    fn bind_scope(
+    fn bind_journal(
         &mut self,
         scope: SystemAuthorityJournalScope,
     ) -> Result<(), SystemAuthorityError> {
-        match self.journal_scope {
-            Some(existing) if existing != scope => Err(SystemAuthorityError::WrongSystemAgent),
+        let binding = scope.binding();
+        match self.journal_binding {
+            Some(existing) if existing != binding => Err(SystemAuthorityError::WrongSystemAgent),
             Some(_) => Ok(()),
             None => {
-                self.journal_scope = Some(scope);
+                self.journal_binding = Some(binding);
                 Ok(())
             }
         }
@@ -2271,9 +2382,8 @@ impl ServiceWire for SystemAuthorityState {
         encoder.fixed(&self.authority_binding.0);
         encoder.u32(self.decision_limit);
         encoder.u32(self.rotation_limit);
-        encoder.option(&self.journal_scope, |encoder, scope| {
-            encoder.fixed(&scope.system_genesis.0);
-            encoder.fixed(scope.agent_admission.as_bytes());
+        encoder.option(&self.journal_binding, |encoder, binding| {
+            encoder.bytes(&binding.encode());
         });
         encoder.bytes(&self.current_committee.encode());
         encoder.u64(self.committee_sequence_high_water);
@@ -2297,13 +2407,8 @@ impl ServiceWire for SystemAuthorityState {
         let authority_binding = Hash(decoder.fixed()?);
         let decision_limit = decoder.u32()?;
         let rotation_limit = decoder.u32()?;
-        let journal_scope = decoder.option(|decoder| {
-            SystemAuthorityJournalScope::new(
-                AgentJournalGenesisId(decoder.fixed()?),
-                AgentGenesisAdmissionId::from_bytes(decoder.fixed()?),
-            )
-            .map_err(map_decode_error)
-        })?;
+        let journal_binding = decoder
+            .option(|decoder| decode_nested(decoder, MAX_SYSTEM_AUTHORITY_JOURNAL_BINDING_BYTES))?;
         let current_committee = decode_nested(decoder, MAX_AUTHORITY_COMMITTEE_WIRE_BYTES)?;
         let committee_sequence_high_water = decoder.u64()?;
         let rotation_first_sequence = decoder.option(Decoder::u64)?;
@@ -2321,7 +2426,7 @@ impl ServiceWire for SystemAuthorityState {
             authority_binding,
             decision_limit,
             rotation_limit,
-            journal_scope,
+            journal_binding,
             current_committee,
             committee_sequence_high_water,
             rotation_first_sequence,
@@ -3664,6 +3769,7 @@ mod tests {
             },
             creation_nonce: nonce,
             authority: authority_binding(),
+            system_authority_genesis: None,
             runtime_package: BlobRef::of_bytes(RUNTIME_BYTES),
             runtime_contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities {
@@ -3933,6 +4039,14 @@ mod tests {
         let committee = authority_committee(1, None, &keys);
         let genesis = system_genesis(&committee);
         let state = SystemAuthorityState::from_genesis(SYSTEM_AGENT, &genesis).unwrap();
+        let mut empty_high_water_tamper = state.clone();
+        empty_high_water_tamper.committee_sequence_high_water += 1;
+        let decoded_empty_high_water =
+            SystemAuthorityState::decode(&empty_high_water_tamper.encode()).unwrap();
+        assert_eq!(
+            decoded_empty_high_water.validate_against_genesis(SYSTEM_AGENT, &genesis),
+            Err(SystemAuthorityError::InvalidState)
+        );
         let scope = journal_scope();
         let fixture = ordinary_fixture(
             AgentProfile::Shared,
@@ -3972,8 +4086,23 @@ mod tests {
         assert_eq!(admitted.state().decision_count(), 1);
         verify_provision_fact(&fixture.provision, &fact).unwrap();
 
+        let mut nonempty_high_water_tamper = admitted.state().clone();
+        nonempty_high_water_tamper.committee_sequence_high_water = genesis.initial_sequence();
+        let decoded_nonempty_high_water =
+            SystemAuthorityState::decode(&nonempty_high_water_tamper.encode()).unwrap();
+        assert_eq!(
+            decoded_nonempty_high_water.validate_against_genesis(SYSTEM_AGENT, &genesis),
+            Err(SystemAuthorityError::InvalidState)
+        );
+
         let reopened = SystemAuthorityState::decode(&admitted.state().encode()).unwrap();
         assert_eq!(reopened, *admitted.state());
+        let decoded_binding: Option<SystemAuthorityJournalBinding> = reopened.journal_binding();
+        assert_eq!(decoded_binding, Some(scope.binding()));
+        assert_eq!(
+            SystemAuthorityJournalBinding::decode(&scope.binding().encode()).unwrap(),
+            scope.binding()
+        );
         reopened
             .validate_against_genesis(SYSTEM_AGENT, &genesis)
             .unwrap();
@@ -3991,6 +4120,19 @@ mod tests {
         );
         assert_eq!(retried.admitted_fact(), Some(&fact));
         assert!(!retried.history().inserted());
+
+        // Raw SAST/SAJB bytes recover only identity data. They never recover
+        // the replay provenance needed by `apply_finalize`: presenting a
+        // different opaque replay witness still fails before exact retry.
+        let foreign_scope = SystemAuthorityJournalScope::new(
+            AgentJournalGenesisId::new([0xfa; 32]),
+            scope.agent_admission(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.apply_finalize(foreign_scope, &retry),
+            Err(SystemAuthorityError::WrongSystemAgent)
+        );
 
         let divergent = ordinary_fixture(
             AgentProfile::Shared,
@@ -4398,7 +4540,7 @@ mod tests {
         );
         let mut impossible_prebind =
             SystemAuthorityState::from_genesis(SYSTEM_AGENT, &genesis).unwrap();
-        impossible_prebind.journal_scope = Some(scope);
+        impossible_prebind.journal_binding = Some(scope.binding());
         assert_eq!(
             impossible_prebind.validate(),
             Err(SystemAuthorityError::InvalidState)
@@ -5210,8 +5352,9 @@ mod tests {
         let state = SystemAuthorityState::from_genesis(SYSTEM_AGENT, &genesis).unwrap();
         assert_eq!(
             MAX_SYSTEM_AUTHORITY_STATE_BYTES,
-            380 + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES
+            420 + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES
         );
+        assert_eq!(MAX_SYSTEM_AUTHORITY_JOURNAL_BINDING_BYTES, 100);
         assert_eq!(
             MAX_SYSTEM_AUTHORITY_GENESIS_BYTES,
             128 + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES
@@ -5228,6 +5371,15 @@ mod tests {
         assert!(state.encode().len() <= MAX_SYSTEM_AUTHORITY_STATE_BYTES);
         assert_eq!(state.decision_limit(), 64);
         assert_eq!(state.rotation_limit(), 16);
+        let binding = journal_scope().binding();
+        assert_eq!(
+            binding.encode().len(),
+            MAX_SYSTEM_AUTHORITY_JOURNAL_BINDING_BYTES
+        );
+        assert_eq!(
+            SystemAuthorityJournalBinding::decode(&binding.encode()).unwrap(),
+            binding
+        );
         let committee_record = SystemAuthorityCommitteeRecord::new(committee.clone()).unwrap();
         assert!(committee_record.encode().len() <= MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORD_BYTES);
         assert_eq!(

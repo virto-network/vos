@@ -106,6 +106,7 @@ struct ManagedActor {
 #[derive(Clone, Debug, Default)]
 pub struct StandardAgentRuntime {
     config: Option<AgentConfig>,
+    system_authority: Option<super::system_authority::SystemAuthorityState>,
     actors: BTreeMap<ActorId, ManagedActor>,
     lane_state: StandardLaneState,
     invocation_results: BTreeMap<(InvocationScope, InvocationId), StandardInvocationResult>,
@@ -121,6 +122,7 @@ pub struct StandardAgentRuntime {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StandardRuntimeState {
     pub config: Option<AgentConfig>,
+    pub system_authority: Option<super::system_authority::SystemAuthorityState>,
     pub actors: Vec<StandardActorState>,
     pub lane_state: StandardLaneState,
     pub invocation_results: Vec<StandardInvocationResult>,
@@ -129,6 +131,46 @@ pub struct StandardRuntimeState {
     pub authority_slot_high_water: Option<u64>,
     pub authority_sequence_high_water: Option<u64>,
     pub authority_dispositions: Vec<StandardAuthorityDisposition>,
+}
+
+/// Replay-only durable objects selected by an authenticated native reapply.
+/// Guest execution never exposes this metadata and raw journal-context bytes
+/// cannot mint it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StandardSystemAuthorityWrite {
+    Finalize {
+        admitted_fact: Option<super::system_authority::SystemAuthorityDecisionFact>,
+        history: super::system_authority::SystemAuthorityDecisionWritePlan,
+    },
+    Rotation {
+        record: super::system_authority::SystemAuthorityRotationRecord,
+        history: super::system_authority::SystemAuthorityRotationWritePlan,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StandardScopedApply {
+    result: Result<LifecycleReply, LifecycleError>,
+    system_authority_write: Option<StandardSystemAuthorityWrite>,
+}
+
+impl StandardScopedApply {
+    pub(crate) const fn result(&self) -> &Result<LifecycleReply, LifecycleError> {
+        &self.result
+    }
+
+    pub(crate) const fn system_authority_write(&self) -> Option<&StandardSystemAuthorityWrite> {
+        self.system_authority_write.as_ref()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Result<LifecycleReply, LifecycleError>,
+        Option<StandardSystemAuthorityWrite>,
+    ) {
+        (self.result, self.system_authority_write)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -245,6 +287,7 @@ impl StandardAgentRuntime {
     pub const fn new() -> Self {
         Self {
             config: None,
+            system_authority: None,
             actors: BTreeMap::new(),
             lane_state: StandardLaneState {
                 linear: Vec::new(),
@@ -271,6 +314,12 @@ impl StandardAgentRuntime {
         self.config.as_ref()
     }
 
+    pub(crate) fn system_authority(
+        &self,
+    ) -> Option<&super::system_authority::SystemAuthorityState> {
+        self.system_authority.as_ref()
+    }
+
     pub fn actor(&self, actor: ActorId) -> Option<&ActorEntry> {
         self.actors.get(&actor).map(|actor| &actor.record.entry)
     }
@@ -290,6 +339,7 @@ impl StandardAgentRuntime {
     pub fn snapshot(&self) -> StandardRuntimeState {
         StandardRuntimeState {
             config: self.config.clone(),
+            system_authority: self.system_authority.clone(),
             actors: self
                 .actors
                 .values()
@@ -330,6 +380,7 @@ impl StandardAgentRuntime {
     pub fn restore(state: StandardRuntimeState) -> Result<Self, LifecycleError> {
         let Some(config) = state.config else {
             return if state.actors.is_empty()
+                && state.system_authority.is_none()
                 && state.lane_state == StandardLaneState::default()
                 && state.invocation_results.is_empty()
                 && state.lane_revisions == StandardLaneRevisions::default()
@@ -365,6 +416,22 @@ impl StandardAgentRuntime {
 
         let mut runtime = Self::new();
         runtime.apply_mutation(LifecycleRequest::Create(config))?;
+        match (
+            runtime
+                .config
+                .as_ref()
+                .and_then(|config| config.system_authority_genesis.as_ref()),
+            state.system_authority,
+        ) {
+            (Some(genesis), Some(system_authority)) => {
+                system_authority
+                    .validate_against_genesis(runtime.created()?.identity.agent, genesis)
+                    .map_err(LifecycleError::SystemAuthority)?;
+                runtime.system_authority = Some(system_authority);
+            }
+            (None, None) => {}
+            _ => return Err(LifecycleError::InvalidRequest),
+        }
         let mut pending = state.actors;
         let mut suspended = Vec::new();
         while !pending.is_empty() {
@@ -1472,6 +1539,18 @@ impl StandardAgentRuntime {
         {
             return Err(LifecycleError::InvalidRequest);
         }
+        if matches!(
+            &request,
+            LifecycleRequest::Create(config)
+                if config
+                    .system_authority_genesis
+                    .as_ref()
+                    .is_some_and(|genesis| genesis.initial_sequence() != claim.sequence)
+        ) {
+            return Err(LifecycleError::SystemAuthority(
+                super::system_authority::SystemAuthorityError::InvalidGenesis,
+            ));
+        }
 
         let claim_hash = claim.signing_message();
 
@@ -1599,6 +1678,200 @@ impl StandardAgentRuntime {
         limited
     }
 
+    fn live_system_authority(
+        &self,
+    ) -> Result<&super::system_authority::SystemAuthorityState, LifecycleError> {
+        let config = self.created()?;
+        let genesis =
+            config
+                .system_authority_genesis
+                .as_ref()
+                .ok_or(LifecycleError::SystemAuthority(
+                    super::system_authority::SystemAuthorityError::WrongSystemAgent,
+                ))?;
+        let state = self
+            .system_authority
+            .as_ref()
+            .ok_or(LifecycleError::SystemAuthority(
+                super::system_authority::SystemAuthorityError::InvalidState,
+            ))?;
+        state
+            .validate_against_genesis(config.identity.agent, genesis)
+            .map_err(LifecycleError::SystemAuthority)?;
+        Ok(state)
+    }
+
+    /// Apply a management input whose raw journal context has independently
+    /// been authenticated by replay. The opaque scope is the capability; the
+    /// wire context is exact-compared to it before any transition or write
+    /// plan can be produced.
+    pub(crate) fn apply_scoped(
+        &mut self,
+        context: super::wire::RuntimeJournalContext,
+        trusted_scope: super::system_authority::SystemAuthorityJournalScope,
+        request: LifecycleRequest,
+    ) -> StandardScopedApply {
+        if !context.matches_system_authority_scope(trusted_scope) {
+            return StandardScopedApply {
+                result: Err(LifecycleError::SystemAuthority(
+                    super::system_authority::SystemAuthorityError::InvalidScope,
+                )),
+                system_authority_write: None,
+            };
+        }
+        match request {
+            LifecycleRequest::FinalizeSystemAuthority(finalize) => {
+                self.apply_system_authority_finalize(trusted_scope, finalize)
+            }
+            LifecycleRequest::RotateSystemAuthority(rotation) => {
+                self.apply_system_authority_rotation(trusted_scope, rotation)
+            }
+            request => StandardScopedApply {
+                result: self.apply(request),
+                system_authority_write: None,
+            },
+        }
+    }
+
+    /// Guest/data-only application. Raw context bytes select deterministic
+    /// state and reply bytes, but the primitive strips every admitted fact,
+    /// committee record, and history plan from this path.
+    pub(crate) fn apply_guest(
+        &mut self,
+        context: Option<super::wire::RuntimeJournalContext>,
+        request: LifecycleRequest,
+    ) -> Result<LifecycleReply, LifecycleError> {
+        match request {
+            LifecycleRequest::FinalizeSystemAuthority(finalize) => match context {
+                Some(context) => self.simulate_system_authority_finalize(context, finalize),
+                None => self.apply(LifecycleRequest::FinalizeSystemAuthority(finalize)),
+            },
+            LifecycleRequest::RotateSystemAuthority(rotation) => match context {
+                Some(context) => self.simulate_system_authority_rotation(context, rotation),
+                None => self.apply(LifecycleRequest::RotateSystemAuthority(rotation)),
+            },
+            request => self.apply(request),
+        }
+    }
+
+    fn apply_system_authority_finalize(
+        &mut self,
+        trusted_scope: super::system_authority::SystemAuthorityJournalScope,
+        finalize: super::system_authority::SystemAuthorityFinalize,
+    ) -> StandardScopedApply {
+        let transition = match self.live_system_authority().and_then(|state| {
+            state
+                .apply_finalize(trusted_scope, &finalize)
+                .map_err(LifecycleError::SystemAuthority)
+        }) {
+            Ok(transition) => transition,
+            Err(error) => {
+                return StandardScopedApply {
+                    result: Err(error),
+                    system_authority_write: None,
+                };
+            }
+        };
+        let before = self.system_authority.clone();
+        self.system_authority = Some(transition.state().clone());
+        let result = Ok(LifecycleReply::SystemAuthorityFinalized(
+            transition.outcome(),
+        ));
+        if self.validate_signed_state_resource().is_err() {
+            self.system_authority = before;
+            return StandardScopedApply {
+                result: Err(LifecycleError::ResourceLimit),
+                system_authority_write: None,
+            };
+        }
+        StandardScopedApply {
+            result,
+            system_authority_write: Some(StandardSystemAuthorityWrite::Finalize {
+                admitted_fact: transition.admitted_fact().cloned(),
+                history: transition.history().clone(),
+            }),
+        }
+    }
+
+    fn apply_system_authority_rotation(
+        &mut self,
+        trusted_scope: super::system_authority::SystemAuthorityJournalScope,
+        rotation: super::system_authority::SystemAuthorityRotation,
+    ) -> StandardScopedApply {
+        let transition = match self.live_system_authority().and_then(|state| {
+            state
+                .apply_rotation(trusted_scope, &rotation)
+                .map_err(LifecycleError::SystemAuthority)
+        }) {
+            Ok(transition) => transition,
+            Err(error) => {
+                return StandardScopedApply {
+                    result: Err(error),
+                    system_authority_write: None,
+                };
+            }
+        };
+        let before = self.system_authority.clone();
+        self.system_authority = Some(transition.state().clone());
+        let result = Ok(LifecycleReply::SystemAuthorityRotated {
+            rotation: transition.record().id(),
+            epoch: transition.record().new_epoch(),
+            exact_retry: transition.exact_retry(),
+        });
+        if self.validate_signed_state_resource().is_err() {
+            self.system_authority = before;
+            return StandardScopedApply {
+                result: Err(LifecycleError::ResourceLimit),
+                system_authority_write: None,
+            };
+        }
+        StandardScopedApply {
+            result,
+            system_authority_write: Some(StandardSystemAuthorityWrite::Rotation {
+                record: transition.record().clone(),
+                history: transition.history().clone(),
+            }),
+        }
+    }
+
+    fn simulate_system_authority_finalize(
+        &mut self,
+        context: super::wire::RuntimeJournalContext,
+        finalize: super::system_authority::SystemAuthorityFinalize,
+    ) -> Result<LifecycleReply, LifecycleError> {
+        let (state, outcome) = self
+            .live_system_authority()?
+            .simulate_finalize_untrusted(context.genesis(), context.agent_admission(), &finalize)
+            .map_err(LifecycleError::SystemAuthority)?;
+        let before = self.system_authority.replace(state);
+        if self.validate_signed_state_resource().is_err() {
+            self.system_authority = before;
+            return Err(LifecycleError::ResourceLimit);
+        }
+        Ok(LifecycleReply::SystemAuthorityFinalized(outcome))
+    }
+
+    fn simulate_system_authority_rotation(
+        &mut self,
+        context: super::wire::RuntimeJournalContext,
+        rotation: super::system_authority::SystemAuthorityRotation,
+    ) -> Result<LifecycleReply, LifecycleError> {
+        let (state, rotation, epoch, exact_retry) = self
+            .live_system_authority()?
+            .simulate_rotation_untrusted(context.genesis(), context.agent_admission(), &rotation)
+            .map_err(LifecycleError::SystemAuthority)?;
+        let before = self.system_authority.replace(state);
+        if self.validate_signed_state_resource().is_err() {
+            self.system_authority = before;
+            return Err(LifecycleError::ResourceLimit);
+        }
+        Ok(LifecycleReply::SystemAuthorityRotated {
+            rotation,
+            epoch,
+            exact_retry,
+        })
+    }
+
     fn apply_mutation(
         &mut self,
         request: LifecycleRequest,
@@ -1625,7 +1898,19 @@ impl StandardAgentRuntime {
                     core::iter::once(&config.runtime_package),
                 )?;
                 let identity = config.identity.clone();
+                let system_authority = config
+                    .system_authority_genesis
+                    .as_ref()
+                    .map(|genesis| {
+                        super::system_authority::SystemAuthorityState::from_genesis(
+                            config.identity.agent,
+                            genesis,
+                        )
+                    })
+                    .transpose()
+                    .map_err(LifecycleError::SystemAuthority)?;
                 self.config = Some(config);
+                self.system_authority = system_authority;
                 Ok(LifecycleReply::Created(identity))
             }
             LifecycleRequest::Install(_) => Err(LifecycleError::InvalidRequest),
@@ -1661,6 +1946,8 @@ impl StandardAgentRuntime {
             ),
             LifecycleRequest::Inspect { .. }
             | LifecycleRequest::AcknowledgeInvocation { .. }
+            | LifecycleRequest::FinalizeSystemAuthority(_)
+            | LifecycleRequest::RotateSystemAuthority(_)
             | LifecycleRequest::Authorized { .. } => Err(LifecycleError::InvalidRequest),
         }
     }
@@ -1785,6 +2072,10 @@ impl AgentRuntime for StandardAgentRuntime {
             | LifecycleRequest::Resume { .. }
             | LifecycleRequest::RemoveLeaf { .. }
             | LifecycleRequest::UpgradeRuntime { .. } => Err(LifecycleError::InvalidRequest),
+            LifecycleRequest::FinalizeSystemAuthority(_)
+            | LifecycleRequest::RotateSystemAuthority(_) => Err(LifecycleError::SystemAuthority(
+                super::system_authority::SystemAuthorityError::InvalidScope,
+            )),
         }
     }
 
@@ -1831,12 +2122,38 @@ fn derive_state_generation(claim: Hash, sequence: u64, operation: Hash, actor: A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{
-        AgentIdentity, AgentProfile, AgentReplica, InstallActor, LaneSet, ReplicaRole,
-        RuntimeCapabilities, StateLane, UpgradeActor,
+    use crate::agent::authority::{
+        AgentAuthorityClaim, AgentAuthorityReceipt, CAPABILITY_AGENT_CREATE_SHARED,
+        ED25519_SIGNATURE_BYTES,
     };
-    use crate::service::{BlobRef, Hash, NodeId, PrincipalId, ProducerId, SpaceId};
-    use alloc::vec;
+    use crate::agent::committee::{
+        AuthorityClaimCommitment, AuthorityCommittee, AuthorityCommitteeMember,
+        AuthorityMemberRole, AuthorityQuorumCertificate, AuthoritySignature, AuthoritySignerId,
+        RootAnchorConfigCommitment, RootAnchorId,
+    };
+    use crate::agent::genesis::{
+        AgentGenesisClaim, AgentGenesisDecision, AgentGenesisEvidence, AgentGenesisExpectations,
+        AgentGenesisLocator, AgentGenesisProposal, AgentReplicaCommittee, AgentReplicaMember,
+        derive_replica_raft_slot,
+    };
+    use crate::agent::journal::{
+        AgentJournalGenesisId, ReplayInput, ReplayOperation, RuntimeBinding,
+        system_genesis_artifact_closure_commitment,
+    };
+    use crate::agent::system_authority::{
+        SystemAuthorityDecisionProof, SystemAuthorityFinalize, SystemAuthorityGenesis,
+        SystemAuthorityJournalScope, SystemAuthorityRotation, SystemAuthorityRotationCertificate,
+        SystemAuthorityRotationClaim, SystemAuthorityRotationProof,
+    };
+    use crate::agent::{
+        AgentIdentity, AgentProfile, AgentReplica, InstallActor, LaneSet,
+        LifecycleAuthorityAdmission, ReplicaRole, RuntimeCapabilities, StateLane, UpgradeActor,
+    };
+    use crate::service::wire::ServiceWire;
+    use crate::service::{
+        BlobRef, CapabilityId, CredentialId, Hash, NodeId, PrincipalId, ProducerId, SpaceId,
+    };
+    use alloc::{collections::BTreeMap, vec, vec::Vec};
     use ed25519_dalek::{Signer as _, SigningKey};
 
     fn authority_key() -> SigningKey {
@@ -1870,6 +2187,7 @@ mod tests {
                 producer: ProducerId::of_public_key(&authority_public),
                 public_key: authority_public,
             },
+            system_authority_genesis: None,
             capabilities: RuntimeCapabilities {
                 max_actors,
                 ..RuntimeCapabilities::standard()
@@ -1894,6 +2212,762 @@ mod tests {
             LaneSet::of(StateLane::Merge).union(LaneSet::of(StateLane::Local));
         config.replicas[0].role = ReplicaRole::Observer;
         config
+    }
+
+    const TEST_PEER_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
+
+    fn committee_key(byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[byte; 32])
+    }
+
+    fn authority_committee(
+        config: &AgentConfig,
+        epoch: u64,
+        previous: Option<Hash>,
+        keys: &[SigningKey],
+    ) -> AuthorityCommittee {
+        let mut members = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                AuthorityCommitteeMember::new(
+                    NodeId([(0x80 + index as u8).wrapping_add(key.to_bytes()[0]); 32]),
+                    key.verifying_key().to_bytes(),
+                    AuthorityMemberRole::Voter,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(AuthorityCommitteeMember::signer);
+        AuthorityCommittee::new(
+            config.identity.space,
+            config.authority.commitment(),
+            epoch,
+            previous,
+            members,
+        )
+        .unwrap()
+    }
+
+    fn authority_certificate(
+        committee: &AuthorityCommittee,
+        claim: AuthorityClaimCommitment,
+        keys: &[SigningKey],
+    ) -> AuthorityQuorumCertificate {
+        let message = AuthorityQuorumCertificate::signing_message(
+            committee.authority_binding(),
+            committee.epoch(),
+            committee.commitment(),
+            claim,
+        );
+        let mut signatures = keys
+            .iter()
+            .map(|key| {
+                AuthoritySignature::new(
+                    AuthoritySignerId::of_raw_ed25519(&key.verifying_key().to_bytes()),
+                    key.sign(&message.0).to_bytes(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(AuthoritySignature::signer);
+        AuthorityQuorumCertificate::new(committee, claim, signatures).unwrap()
+    }
+
+    fn system_config() -> (AgentConfig, AuthorityCommittee, Vec<SigningKey>) {
+        system_config_with_limits(
+            64,
+            crate::agent::contract::RuntimeResourceLimits::standard().max_runtime_state_bytes,
+        )
+    }
+
+    fn system_config_with_limits(
+        decision_limit: u32,
+        max_runtime_state_bytes: u32,
+    ) -> (AgentConfig, AuthorityCommittee, Vec<SigningKey>) {
+        let mut config = config(64);
+        config.authority.agent = config.identity.agent;
+        config.runtime_contract.resources.max_runtime_state_bytes = max_runtime_state_bytes;
+        let keys = vec![committee_key(0x51)];
+        let committee = authority_committee(&config, 1, None, &keys);
+        config.system_authority_genesis = Some(
+            SystemAuthorityGenesis::new(
+                RootAnchorId::from_bytes([0x71; 32]),
+                1,
+                RootAnchorConfigCommitment::from_bytes([0x72; 32]),
+                committee.clone(),
+                1,
+                decision_limit,
+                16,
+            )
+            .unwrap(),
+        );
+        config.validate().unwrap();
+        (config, committee, keys)
+    }
+
+    fn journal_scope(byte: u8) -> SystemAuthorityJournalScope {
+        SystemAuthorityJournalScope::for_test(
+            AgentJournalGenesisId::new([byte; 32]),
+            crate::agent::genesis::AgentGenesisAdmissionId::from_bytes([byte.wrapping_add(1); 32]),
+        )
+        .unwrap()
+    }
+
+    fn journal_context(
+        scope: SystemAuthorityJournalScope,
+    ) -> crate::agent::wire::RuntimeJournalContext {
+        crate::agent::wire::RuntimeCall::scoped_system_authority(
+            crate::agent::wire::RuntimeState::default(),
+            LifecycleRequest::Inspect {
+                after: None,
+                limit: 1,
+            },
+            scope,
+        )
+        .journal_context()
+        .unwrap()
+    }
+
+    fn replica_member(byte: u8) -> AgentReplicaMember {
+        let raw = [byte; 32];
+        let mut peer_id = Vec::from(TEST_PEER_PREFIX);
+        peer_id.extend_from_slice(&raw);
+        AgentReplicaMember::new(
+            AgentReplica {
+                node: NodeId::of_authenticated_peer(&peer_id),
+                principal: PrincipalId::of_public_key(&raw),
+                role: ReplicaRole::Voter,
+            },
+            peer_id.clone(),
+            raw,
+            Some(derive_replica_raft_slot(&peer_id)),
+        )
+        .unwrap()
+    }
+
+    fn finalize_command(
+        system: &AgentConfig,
+        committee: &AuthorityCommittee,
+        keys: &[SigningKey],
+        scope: SystemAuthorityJournalScope,
+        sequence: u64,
+    ) -> SystemAuthorityFinalize {
+        let member = replica_member(0x31);
+        let owner = PrincipalId([0x12; 32]);
+        let nonce = Hash([0x10_u8.wrapping_add(sequence as u8); 32]);
+        let agent = AgentId::derive(system.identity.space, owner, nonce.as_bytes());
+        let target = AgentConfig {
+            identity: AgentIdentity {
+                space: system.identity.space,
+                agent,
+                owner,
+                profile: AgentProfile::Shared,
+                runtime_deployment: DeploymentId([0x21; 32]),
+                runtime_program: ProgramId([0x22; 32]),
+                runtime_producer: ProducerId([0x23; 32]),
+            },
+            creation_nonce: nonce,
+            authority: system.authority.clone(),
+            system_authority_genesis: None,
+            runtime_package: BlobRef::of_bytes(b"ordinary-standard-runtime"),
+            runtime_contract: crate::agent::contract::RuntimePackageContract::canonical(),
+            capabilities: RuntimeCapabilities::standard(),
+            replicas: vec![member.replica()],
+        };
+        target.validate().unwrap();
+        let inner = LifecycleRequest::Create(target.clone());
+        let create = ReplayInput {
+            runtime: RuntimeBinding {
+                space: target.identity.space,
+                agent,
+                deployment: target.identity.runtime_deployment,
+                program: target.identity.runtime_program,
+                producer: target.identity.runtime_producer,
+                package: target.runtime_package.clone(),
+                runtime_abi: super::super::RUNTIME_ABI_ID,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            },
+            operation: ReplayOperation::Management {
+                request: LifecycleRequest::Authorized {
+                    admission: LifecycleAuthorityAdmission {
+                        receipt: AgentAuthorityReceipt {
+                            claim: AgentAuthorityClaim {
+                                authority: target.authority.clone(),
+                                space: target.identity.space,
+                                agent,
+                                principal: owner,
+                                credential: CredentialId([0x24; 32]),
+                                capability: CapabilityId::named(CAPABILITY_AGENT_CREATE_SHARED),
+                                operation: inner.commitment(),
+                                sequence,
+                                valid_from: 10,
+                                valid_until: 40,
+                            },
+                            signature: vec![0x25; ED25519_SIGNATURE_BYTES],
+                        },
+                        observed_slot: 20,
+                    },
+                    request: Box::new(inner.clone()),
+                },
+            },
+        };
+        let catalog = vec![target.runtime_package.clone()];
+        let expectations = AgentGenesisExpectations::new(
+            create.runtime.commitment(),
+            inner.commitment(),
+            Hash([0x26; 32]),
+            system_genesis_artifact_closure_commitment(&catalog).unwrap(),
+            sequence,
+        )
+        .unwrap();
+        let proposal = AgentGenesisProposal::new(
+            AgentGenesisLocator {
+                space: target.identity.space,
+                agent,
+            },
+            create,
+            expectations,
+            catalog,
+        )
+        .unwrap();
+        let replicas = AgentReplicaCommittee::new(
+            target.identity.space,
+            agent,
+            AgentProfile::Shared,
+            vec![member],
+        )
+        .unwrap();
+        let claim = AgentGenesisClaim::new(
+            system.identity.agent,
+            scope.system_genesis(),
+            scope.agent_admission(),
+            &proposal,
+            &replicas,
+        )
+        .unwrap();
+        let evidence = AgentGenesisEvidence::new(
+            claim.clone(),
+            authority_certificate(committee, claim.authority_claim(), keys),
+        )
+        .unwrap();
+        let decision = AgentGenesisDecision::new(&proposal, &replicas, &evidence).unwrap();
+        SystemAuthorityFinalize::new(
+            decision,
+            evidence,
+            SystemAuthorityDecisionProof::vacant(agent, vec![]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn rotation_command(
+        state: &crate::agent::system_authority::SystemAuthorityState,
+        scope: SystemAuthorityJournalScope,
+        old: &AuthorityCommittee,
+        old_keys: &[SigningKey],
+        new: &AuthorityCommittee,
+        new_keys: &[SigningKey],
+    ) -> SystemAuthorityRotation {
+        let claim = SystemAuthorityRotationClaim::new(
+            state.root_anchor(),
+            state.root_anchor_config_version(),
+            state.root_anchor_config(),
+            scope.commitment(state.root_anchor()).unwrap(),
+            old,
+            new,
+            3,
+            4,
+        )
+        .unwrap();
+        let authority_claim = claim.authority_claim();
+        let certificate = SystemAuthorityRotationCertificate::new(
+            claim,
+            authority_certificate(old, authority_claim, old_keys),
+            authority_certificate(new, authority_claim, new_keys),
+        )
+        .unwrap();
+        SystemAuthorityRotation::new(
+            new.clone(),
+            certificate,
+            SystemAuthorityRotationProof::vacant(2, vec![]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn system_authority_seed_is_exactly_bound_to_config_and_restore() {
+        let (config, _, _) = system_config();
+
+        let mut wrong_sequence = StandardAgentRuntime::new();
+        assert_eq!(
+            wrong_sequence.apply(authorized_at(
+                &config,
+                CredentialId([0x44; 32]),
+                2,
+                1,
+                1,
+                LifecycleRequest::Create(config.clone()),
+            )),
+            Err(LifecycleError::SystemAuthority(
+                crate::agent::system_authority::SystemAuthorityError::InvalidGenesis
+            ))
+        );
+        assert_eq!(wrong_sequence.snapshot(), StandardRuntimeState::default());
+
+        let mut runtime = StandardAgentRuntime::new();
+        assert!(matches!(
+            create_authorized(&mut runtime, &config, 1),
+            Ok(LifecycleReply::Created(_))
+        ));
+        let snapshot = runtime.snapshot();
+        let seeded = snapshot.system_authority.as_ref().unwrap();
+        seeded
+            .validate_against_genesis(
+                config.identity.agent,
+                config.system_authority_genesis.as_ref().unwrap(),
+            )
+            .unwrap();
+        let encoded = crate::agent::wire::encode_standard_runtime_state(&snapshot);
+        let decoded = crate::agent::wire::decode_standard_runtime_state(&encoded).unwrap();
+        assert_eq!(decoded, snapshot);
+        assert_eq!(
+            StandardAgentRuntime::restore(decoded).unwrap().snapshot(),
+            snapshot
+        );
+
+        let mut missing_state = snapshot.clone();
+        missing_state.system_authority = None;
+        assert!(matches!(
+            StandardAgentRuntime::restore(missing_state),
+            Err(LifecycleError::InvalidRequest)
+        ));
+
+        let mut missing_marker = snapshot.clone();
+        missing_marker
+            .config
+            .as_mut()
+            .unwrap()
+            .system_authority_genesis = None;
+        assert!(matches!(
+            StandardAgentRuntime::restore(missing_marker),
+            Err(LifecycleError::InvalidRequest)
+        ));
+
+        let mut high_water_tamper = snapshot.clone();
+        let authority = high_water_tamper.system_authority.as_ref().unwrap();
+        let mut authority_bytes = authority.encode();
+        let high_water_offset = 36
+            + 2
+            + 32
+            + 8
+            + 32
+            + 32
+            + 32
+            + 32
+            + 4
+            + 4
+            + 1
+            + 4
+            + authority.current_committee().encode().len();
+        authority_bytes[high_water_offset..high_water_offset + 8]
+            .copy_from_slice(&2_u64.to_le_bytes());
+        high_water_tamper.system_authority = Some(
+            crate::agent::system_authority::SystemAuthorityState::decode(&authority_bytes).unwrap(),
+        );
+        assert!(matches!(
+            StandardAgentRuntime::restore(high_water_tamper),
+            Err(LifecycleError::SystemAuthority(
+                crate::agent::system_authority::SystemAuthorityError::InvalidState
+            ))
+        ));
+
+        let mut changed_marker = snapshot;
+        let genesis = config.system_authority_genesis.as_ref().unwrap();
+        changed_marker
+            .config
+            .as_mut()
+            .unwrap()
+            .system_authority_genesis = Some(
+            SystemAuthorityGenesis::new(
+                genesis.root_anchor(),
+                genesis.root_anchor_config_version(),
+                genesis.root_anchor_config(),
+                genesis.initial_committee().clone(),
+                genesis.initial_sequence(),
+                genesis.decision_limit() - 1,
+                genesis.rotation_limit(),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            StandardAgentRuntime::restore(changed_marker),
+            Err(LifecycleError::SystemAuthority(
+                crate::agent::system_authority::SystemAuthorityError::InvalidState
+            ))
+        ));
+    }
+
+    #[test]
+    fn scoped_finalize_matches_guest_and_only_native_yields_write_metadata() {
+        let (config, committee, keys) = system_config();
+        let scope = journal_scope(0x61);
+        let context = journal_context(scope);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let command = finalize_command(&config, &committee, &keys, scope, 2);
+        let request = LifecycleRequest::FinalizeSystemAuthority(command.clone());
+        let before = crate::agent::wire::encode_standard_runtime_state(&runtime.snapshot());
+
+        let mut public = runtime.clone();
+        assert_eq!(
+            public.apply(request.clone()),
+            Err(LifecycleError::SystemAuthority(
+                crate::agent::system_authority::SystemAuthorityError::InvalidScope
+            ))
+        );
+        assert_eq!(
+            crate::agent::wire::encode_standard_runtime_state(&public.snapshot()),
+            before
+        );
+        let unscoped = crate::agent::wire::apply_standard(crate::agent::wire::RuntimeCall::new(
+            before.clone(),
+            request.clone(),
+        ))
+        .unwrap();
+        assert_eq!(
+            unscoped.result,
+            Err(LifecycleError::SystemAuthority(
+                crate::agent::system_authority::SystemAuthorityError::InvalidScope
+            ))
+        );
+        assert_eq!(unscoped.state, before);
+
+        let guest_call = crate::agent::wire::RuntimeCall::scoped_system_authority(
+            before,
+            request.clone(),
+            scope,
+        );
+        let guest_call = crate::agent::wire::RuntimeCall::decode(&guest_call.encode()).unwrap();
+        let guest = crate::agent::wire::apply_standard(guest_call).unwrap();
+        assert_eq!(
+            crate::agent::wire::RuntimeReturn::decode(
+                &crate::agent::wire::RuntimeReturn {
+                    state: guest.state.clone(),
+                    result: guest.result.clone(),
+                }
+                .encode(),
+            )
+            .unwrap(),
+            guest
+        );
+        let mut native = runtime;
+        let native_apply = native.apply_scoped(context, scope, request.clone());
+        assert_eq!(native_apply.result(), &guest.result);
+        assert_eq!(
+            crate::agent::wire::encode_standard_runtime_state(&native.snapshot()),
+            guest.state
+        );
+        let StandardSystemAuthorityWrite::Finalize {
+            admitted_fact,
+            history,
+        } = native_apply.system_authority_write().unwrap()
+        else {
+            panic!("finalize must return finalize metadata")
+        };
+        assert!(admitted_fact.is_some());
+        assert!(history.inserted());
+
+        let accepted = crate::agent::wire::encode_standard_runtime_state(&native.snapshot());
+        let stale = native.apply_scoped(context, scope, request);
+        assert_eq!(
+            stale.result(),
+            &Err(LifecycleError::SystemAuthority(
+                crate::agent::system_authority::SystemAuthorityError::InvalidDecisionProof
+            ))
+        );
+        assert!(stale.system_authority_write().is_none());
+        assert_eq!(
+            crate::agent::wire::encode_standard_runtime_state(&native.snapshot()),
+            accepted,
+            "a stale sparse proof must roll back byte-identically"
+        );
+
+        let nodes = history
+            .nodes()
+            .iter()
+            .map(|node| (node.id(), node.encode()))
+            .collect::<BTreeMap<_, _>>();
+        let fact = command.fact().unwrap();
+        let proof = crate::agent::system_authority::prove_decision(
+            native.system_authority().unwrap().decisions_root(),
+            fact.target_agent(),
+            |id| Ok::<_, ()>(nodes.get(&id).cloned()),
+        )
+        .unwrap();
+        let retry = SystemAuthorityFinalize::new(
+            command.decision().clone(),
+            command.evidence().clone(),
+            proof,
+        )
+        .unwrap();
+        let original_request = LifecycleRequest::FinalizeSystemAuthority(command);
+        let retry_request = LifecycleRequest::FinalizeSystemAuthority(retry);
+        assert_eq!(original_request.commitment(), retry_request.commitment());
+        assert_ne!(
+            crate::agent::wire::RuntimeCall::new(
+                crate::agent::wire::RuntimeState::default(),
+                original_request,
+            )
+            .encode(),
+            crate::agent::wire::RuntimeCall::new(
+                crate::agent::wire::RuntimeState::default(),
+                retry_request.clone(),
+            )
+            .encode(),
+        );
+        let retry_apply = native.apply_scoped(context, scope, retry_request);
+        assert!(matches!(
+            retry_apply.result(),
+            Ok(LifecycleReply::SystemAuthorityFinalized(
+                crate::agent::system_authority::SystemAuthorityFinalizeOutcome::ExactRetry(_)
+            ))
+        ));
+        let StandardSystemAuthorityWrite::Finalize { history, .. } =
+            retry_apply.system_authority_write().unwrap()
+        else {
+            panic!("retry must retain finalize metadata")
+        };
+        assert!(!history.inserted());
+    }
+
+    #[test]
+    fn scoped_rotation_matches_guest_and_refreshes_retry_proof_without_rekeying_operation() {
+        let (config, old, old_keys) = system_config();
+        let scope = journal_scope(0x71);
+        let context = journal_context(scope);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let finalize = finalize_command(&config, &old, &old_keys, scope, 2);
+        let finalized = runtime.apply_scoped(
+            context,
+            scope,
+            LifecycleRequest::FinalizeSystemAuthority(finalize),
+        );
+        assert!(finalized.result().is_ok());
+
+        let new_keys = vec![committee_key(0x52)];
+        let new = authority_committee(&config, 2, Some(old.commitment()), &new_keys);
+        let rotation = rotation_command(
+            runtime.system_authority().unwrap(),
+            scope,
+            &old,
+            &old_keys,
+            &new,
+            &new_keys,
+        );
+        let request = LifecycleRequest::RotateSystemAuthority(rotation.clone());
+        let before = crate::agent::wire::encode_standard_runtime_state(&runtime.snapshot());
+        let guest_call = crate::agent::wire::RuntimeCall::scoped_system_authority(
+            before,
+            request.clone(),
+            scope,
+        );
+        let guest_call = crate::agent::wire::RuntimeCall::decode(&guest_call.encode()).unwrap();
+        let guest = crate::agent::wire::apply_standard(guest_call).unwrap();
+        assert_eq!(
+            crate::agent::wire::RuntimeReturn::decode(
+                &crate::agent::wire::RuntimeReturn {
+                    state: guest.state.clone(),
+                    result: guest.result.clone(),
+                }
+                .encode(),
+            )
+            .unwrap(),
+            guest
+        );
+        let applied = runtime.apply_scoped(context, scope, request);
+        assert_eq!(applied.result(), &guest.result);
+        assert_eq!(
+            crate::agent::wire::encode_standard_runtime_state(&runtime.snapshot()),
+            guest.state
+        );
+        let StandardSystemAuthorityWrite::Rotation { record, history } =
+            applied.system_authority_write().unwrap()
+        else {
+            panic!("rotation must return rotation metadata")
+        };
+        assert_eq!(record.new_epoch(), 2);
+        assert!(history.inserted());
+
+        let nodes = history
+            .nodes()
+            .iter()
+            .map(|node| (node.id(), node.encode()))
+            .collect::<BTreeMap<_, _>>();
+        let lookup = crate::agent::system_authority::prove_rotation(
+            runtime.system_authority().unwrap().rotations_root(),
+            2,
+            |id| Ok::<_, ()>(nodes.get(&id).cloned()),
+        )
+        .unwrap();
+        assert_eq!(lookup.occupied_record(), Some(record));
+        let retry = SystemAuthorityRotation::new(
+            rotation.new_committee().clone(),
+            rotation.certificate().clone(),
+            lookup.proof().clone(),
+        )
+        .unwrap();
+        let original = LifecycleRequest::RotateSystemAuthority(rotation);
+        let refreshed = LifecycleRequest::RotateSystemAuthority(retry);
+        assert_eq!(original.commitment(), refreshed.commitment());
+        assert_ne!(
+            crate::agent::wire::RuntimeCall::new(
+                crate::agent::wire::RuntimeState::default(),
+                original,
+            )
+            .encode(),
+            crate::agent::wire::RuntimeCall::new(
+                crate::agent::wire::RuntimeState::default(),
+                refreshed.clone(),
+            )
+            .encode(),
+        );
+        let retry = runtime.apply_scoped(context, scope, refreshed);
+        assert!(matches!(
+            retry.result(),
+            Ok(LifecycleReply::SystemAuthorityRotated {
+                epoch: 2,
+                exact_retry: true,
+                ..
+            })
+        ));
+        let StandardSystemAuthorityWrite::Rotation { history, .. } =
+            retry.system_authority_write().unwrap()
+        else {
+            panic!("rotation retry must retain rotation metadata")
+        };
+        assert!(!history.inserted());
+    }
+
+    #[test]
+    fn scoped_authority_capacity_and_resource_refusals_roll_back_byte_identically() {
+        let scope = journal_scope(0x75);
+        let context = journal_context(scope);
+
+        // The signed resource ceiling is part of Config but fixed-width on
+        // wire, so the exact created-state length measured here remains the
+        // exact created-state length after installing that value as its cap.
+        let (probe_config, _, _) = system_config();
+        let mut probe = StandardAgentRuntime::new();
+        create_authorized(&mut probe, &probe_config, 1).unwrap();
+        let exact_created_len =
+            crate::agent::wire::encode_standard_runtime_state(&probe.snapshot())
+                .encoded_len()
+                .unwrap();
+        let (capped_config, capped_committee, capped_keys) =
+            system_config_with_limits(64, u32::try_from(exact_created_len).unwrap());
+        let mut capped = StandardAgentRuntime::new();
+        create_authorized(&mut capped, &capped_config, 1).unwrap();
+        let capped_before = crate::agent::wire::encode_standard_runtime_state(&capped.snapshot());
+        assert_eq!(capped_before.encoded_len(), Some(exact_created_len));
+        let capped_request = LifecycleRequest::FinalizeSystemAuthority(finalize_command(
+            &capped_config,
+            &capped_committee,
+            &capped_keys,
+            scope,
+            2,
+        ));
+
+        let guest = crate::agent::wire::apply_standard(
+            crate::agent::wire::RuntimeCall::scoped_system_authority(
+                capped_before.clone(),
+                capped_request.clone(),
+                scope,
+            ),
+        )
+        .unwrap();
+        assert_eq!(guest.result, Err(LifecycleError::ResourceLimit));
+        assert_eq!(guest.state, capped_before);
+
+        let native = capped.apply_scoped(context, scope, capped_request);
+        assert_eq!(native.result(), &Err(LifecycleError::ResourceLimit));
+        assert!(native.system_authority_write().is_none());
+        assert_eq!(
+            crate::agent::wire::encode_standard_runtime_state(&capped.snapshot()),
+            capped_before
+        );
+
+        let (capacity_config, capacity_committee, capacity_keys) = system_config_with_limits(
+            1,
+            crate::agent::contract::RuntimeResourceLimits::standard().max_runtime_state_bytes,
+        );
+        let mut capacity = StandardAgentRuntime::new();
+        create_authorized(&mut capacity, &capacity_config, 1).unwrap();
+        let first = capacity.apply_scoped(
+            context,
+            scope,
+            LifecycleRequest::FinalizeSystemAuthority(finalize_command(
+                &capacity_config,
+                &capacity_committee,
+                &capacity_keys,
+                scope,
+                2,
+            )),
+        );
+        assert!(first.result().is_ok());
+        let StandardSystemAuthorityWrite::Finalize { history, .. } =
+            first.system_authority_write().unwrap()
+        else {
+            panic!("the admitted decision must return finalize history")
+        };
+        let nodes = history
+            .nodes()
+            .iter()
+            .map(|node| (node.id(), node.encode()))
+            .collect::<BTreeMap<_, _>>();
+        let capacity_before =
+            crate::agent::wire::encode_standard_runtime_state(&capacity.snapshot());
+        let full = finalize_command(
+            &capacity_config,
+            &capacity_committee,
+            &capacity_keys,
+            scope,
+            3,
+        );
+        let target = full.fact().unwrap().target_agent();
+        let proof = crate::agent::system_authority::prove_decision(
+            capacity.system_authority().unwrap().decisions_root(),
+            target,
+            |id| Ok::<_, ()>(nodes.get(&id).cloned()),
+        )
+        .unwrap();
+        assert!(proof.occupied_fact().is_none());
+        let full_request = LifecycleRequest::FinalizeSystemAuthority(
+            SystemAuthorityFinalize::new(full.decision().clone(), full.evidence().clone(), proof)
+                .unwrap(),
+        );
+        let expected = Err(LifecycleError::SystemAuthority(
+            crate::agent::system_authority::SystemAuthorityError::Capacity,
+        ));
+
+        let guest = crate::agent::wire::apply_standard(
+            crate::agent::wire::RuntimeCall::scoped_system_authority(
+                capacity_before.clone(),
+                full_request.clone(),
+                scope,
+            ),
+        )
+        .unwrap();
+        assert_eq!(guest.result, expected);
+        assert_eq!(guest.state, capacity_before);
+
+        let native = capacity.apply_scoped(context, scope, full_request);
+        assert_eq!(native.result(), &expected);
+        assert!(native.system_authority_write().is_none());
+        assert_eq!(
+            crate::agent::wire::encode_standard_runtime_state(&capacity.snapshot()),
+            capacity_before
+        );
     }
 
     fn install(agent: AgentId, parent: Option<ActorId>, name: &str) -> InstallActor {

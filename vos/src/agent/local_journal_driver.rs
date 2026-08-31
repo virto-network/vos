@@ -12,6 +12,7 @@ use vos_pvm::refine_host::RefineContext;
 use vos_pvm::{ExitReason, Gas};
 
 use super::authority::{ActorInvocationReceipt, AgentAuthorityReceipt};
+use super::committee::RootAnchorPins;
 use super::driver::{AgentTrustProvider, DEFAULT_MANAGEMENT_GAS};
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation, RuntimeBlob,
@@ -803,6 +804,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             | LifecycleRequest::Resume { .. }
             | LifecycleRequest::AcknowledgeInvocation { .. }
             | LifecycleRequest::RemoveLeaf { .. }
+            | LifecycleRequest::FinalizeSystemAuthority(_)
+            | LifecycleRequest::RotateSystemAuthority(_)
             | LifecycleRequest::Authorized { .. } => Vec::new(),
         };
         let mut expected_by_id = BTreeMap::new();
@@ -941,7 +944,9 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             | LifecycleRequest::Suspend { .. }
             | LifecycleRequest::Resume { .. }
             | LifecycleRequest::AcknowledgeInvocation { .. }
-            | LifecycleRequest::RemoveLeaf { .. } => {}
+            | LifecycleRequest::RemoveLeaf { .. }
+            | LifecycleRequest::FinalizeSystemAuthority(_)
+            | LifecycleRequest::RotateSystemAuthority(_) => {}
             LifecycleRequest::Authorized { .. } => {
                 return Err(LocalReplayExecutorError::InvalidRequest);
             }
@@ -1281,11 +1286,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                 let returned: RuntimeReturn = self.execute_wire(
                     &runtime.pvm,
                     self.management_gas,
-                    &RuntimeCall {
-                        state: before.clone(),
-                        request: request.clone(),
-                    }
-                    .encode(),
+                    &RuntimeCall::new(before.clone(), request.clone()).encode(),
                 )?;
                 if returned.result != expected_result {
                     return Err(LocalReplayExecutorError::InvalidState);
@@ -1325,11 +1326,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                 let returned: RuntimeReturn = self.execute_wire(
                     &runtime.pvm,
                     self.management_gas,
-                    &RuntimeCall {
-                        state: before.clone(),
-                        request,
-                    }
-                    .encode(),
+                    &RuntimeCall::new(before.clone(), request).encode(),
                 )?;
                 self.validate_state_size(&returned.state, &config)?;
                 if !matches!(
@@ -1800,9 +1797,20 @@ where
         config: AgentConfig,
         runtime_package: &Package,
         receipt: AgentAuthorityReceipt,
+        configured_root: &RootAnchorPins,
         trust: &Arc<dyn AgentTrustProvider>,
         merge: &Arc<dyn LocalMergeAuthenticator>,
     ) -> Result<(ReplayInput, Vec<RuntimeBlob>), LocalJournalDriverError> {
+        configured_root
+            .validate()
+            .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+        let system_authority_genesis = config
+            .system_authority_genesis
+            .as_ref()
+            .ok_or(LocalReplayExecutorError::InvalidRequest)?;
+        system_authority_genesis
+            .validate_root_config(configured_root.record(), &config, receipt.claim.sequence)
+            .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
         let catalog = Self::runtime_package_catalog(runtime_package);
         let runtime = RuntimeBinding {
             space: config.identity.space,
@@ -2040,6 +2048,8 @@ where
             LifecycleRequest::Create(_)
                 | LifecycleRequest::Inspect { .. }
                 | LifecycleRequest::AcknowledgeInvocation { .. }
+                | LifecycleRequest::FinalizeSystemAuthority(_)
+                | LifecycleRequest::RotateSystemAuthority(_)
                 | LifecycleRequest::Authorized { .. }
         ) {
             return Err(LocalReplayExecutorError::InvalidRequest.into());
@@ -2299,6 +2309,8 @@ where
             LifecycleRequest::Create(_)
                 | LifecycleRequest::Inspect { .. }
                 | LifecycleRequest::AcknowledgeInvocation { .. }
+                | LifecycleRequest::FinalizeSystemAuthority(_)
+                | LifecycleRequest::RotateSystemAuthority(_)
                 | LifecycleRequest::Authorized { .. }
         ) {
             return Err(LocalReplayExecutorError::InvalidRequest.into());
@@ -3073,11 +3085,7 @@ where
         let returned: RuntimeReturn = self.core.executor.execute_wire(
             &runtime.pvm,
             self.core.executor.management_gas,
-            &RuntimeCall {
-                state: self.core.materialization.state().clone(),
-                request,
-            }
-            .encode(),
+            &RuntimeCall::new(self.core.materialization.state().clone(), request).encode(),
         )?;
         if returned.state != *self.core.materialization.state()
             || returned.result != expected_result
@@ -3123,6 +3131,7 @@ mod tests {
         AgentJournalGarbageCollection, GcLimits, MemoryAgentJournalStore,
     };
     use super::super::package::{PackageManifest, actor_runtime_requirements};
+    use super::super::system_authority::{SystemAuthorityGenesis, SystemAuthorityState};
     use super::super::wire::encode_standard_runtime_state;
     use super::super::{
         ActorEntry, FieldPersistence, InstallActor, LaneSet, MethodMode, RuntimeCapabilities,
@@ -3493,16 +3502,7 @@ mod tests {
         }
     }
 
-    fn seal_host_surface_genesis(
-        config: &AgentConfig,
-        prepared: ReplayPreparedGenesis,
-    ) -> ReplaySealedGenesis {
-        let locator = SystemAgentGenesisLocator {
-            space: config.identity.space,
-            agent: config.identity.agent,
-            node: config.replicas[0].node,
-        };
-        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
+    fn host_surface_root_material(config: &AgentConfig) -> (RootAnchorRecord, [SigningKey; 3]) {
         let keys = [
             SigningKey::from_bytes(&[0x81; 32]),
             SigningKey::from_bytes(&[0x82; 32]),
@@ -3533,6 +3533,65 @@ mod tests {
             committee.clone(),
         )
         .unwrap();
+        (root, keys)
+    }
+
+    fn host_surface_root_pins(
+        config: &AgentConfig,
+        receipt: &AgentAuthorityReceipt,
+        observed_slot: u64,
+    ) -> RootAnchorPins {
+        let runtime = RuntimeBinding {
+            space: config.identity.space,
+            agent: config.identity.agent,
+            deployment: config.identity.runtime_deployment,
+            program: config.identity.runtime_program,
+            producer: config.identity.runtime_producer,
+            package: config.runtime_package.clone(),
+            runtime_abi: super::super::RUNTIME_ABI_ID,
+            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+        };
+        let create = ReplayInput {
+            runtime,
+            operation: ReplayOperation::Management {
+                request: LifecycleRequest::Authorized {
+                    admission: LifecycleAuthorityAdmission {
+                        receipt: receipt.clone(),
+                        observed_slot,
+                    },
+                    request: Box::new(LifecycleRequest::Create(config.clone())),
+                },
+            },
+        };
+        let mut executor = ExactTestExecutor::default();
+        let prepared =
+            ReplayPreparedGenesis::prepare(create, config.replicas[0], &mut executor).unwrap();
+        let (root, _) = host_surface_root_material(config);
+        let claim = SystemAgentGenesisClaim::new(&root, prepared.expectations()).unwrap();
+        RootAnchorPins::new(
+            root.clone(),
+            root.config_version(),
+            root.id(),
+            root.config_commitment(),
+            claim.authority_claim(),
+        )
+        .unwrap()
+    }
+
+    fn seal_host_surface_genesis(
+        config: &AgentConfig,
+        prepared: ReplayPreparedGenesis,
+        configured_root: &RootAnchorPins,
+    ) -> ReplaySealedGenesis {
+        let locator = SystemAgentGenesisLocator {
+            space: config.identity.space,
+            agent: config.identity.agent,
+            node: config.replicas[0].node,
+        };
+        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
+        let (root, keys) = host_surface_root_material(config);
+        assert_eq!(configured_root.record(), &root);
+        let committee = root.initial_committee().clone();
         let claim = SystemAgentGenesisClaim::new(&root, proposal.expectations()).unwrap();
         let message = AuthorityQuorumCertificate::signing_message(
             committee.authority_binding(),
@@ -3557,17 +3616,10 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let pins = RootAnchorPins::new(
-            root.clone(),
-            root.config_version(),
-            root.id(),
-            root.config_commitment(),
-            claim.authority_claim(),
-        )
-        .unwrap();
-        let configured_root = pins.clone();
-        let provision = SystemAgentGenesisProvision::new(proposal, pins, evidence).unwrap();
-        seal_prepared_system_agent_genesis(prepared, &configured_root, &provision).unwrap()
+        assert_eq!(configured_root.genesis_claim(), claim.authority_claim());
+        let provision =
+            SystemAgentGenesisProvision::new(proposal, configured_root.clone(), evidence).unwrap();
+        seal_prepared_system_agent_genesis(prepared, configured_root, &provision).unwrap()
     }
 
     fn host_surface_config_and_runtime(name: &str) -> (AgentConfig, Package) {
@@ -3590,6 +3642,19 @@ mod tests {
         };
         config.runtime_contract = contract;
         config.capabilities = capabilities;
+        let (root, _) = host_surface_root_material(&config);
+        config.system_authority_genesis = Some(
+            SystemAuthorityGenesis::new(
+                root.id(),
+                root.config_version(),
+                root.config_commitment(),
+                root.initial_committee().clone(),
+                1,
+                8,
+                8,
+            )
+            .unwrap(),
+        );
         config.validate().unwrap();
         runtime_package.validate().unwrap();
         (config, runtime_package)
@@ -3611,11 +3676,13 @@ mod tests {
             Arc::new(StaticMerge(config.replicas[0].node));
         let create = LifecycleRequest::Create(config.clone());
         let receipt = lifecycle_receipt(&config, &create, 1);
+        let configured_root = host_surface_root_pins(&config, &receipt, 20);
         let (input, catalog) =
             LocalJournalAgentDriver::<MemoryAgentJournalStore>::system_genesis_input(
                 config.clone(),
                 &runtime_package,
                 receipt,
+                &configured_root,
                 &trust,
                 &merge,
             )
@@ -3628,7 +3695,7 @@ mod tests {
             Arc::clone(&merge),
         )
         .unwrap();
-        let sealed = seal_host_surface_genesis(&config, prepared);
+        let sealed = seal_host_surface_genesis(&config, prepared, &configured_root);
         let store =
             MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
         let driver = LocalJournalAgentDriver::create(
@@ -3682,12 +3749,14 @@ mod tests {
             Arc::new(StaticMerge(config.replicas[0].node));
         let create = LifecycleRequest::Create(config.clone());
         let receipt = lifecycle_receipt(&config, &create, 1);
+        let configured_root = host_surface_root_pins(&config, &receipt, 20);
 
         let (input, catalog) =
             LocalJournalAgentDriver::<MemoryAgentJournalStore>::system_genesis_input(
                 config.clone(),
                 &runtime_package,
                 receipt,
+                &configured_root,
                 &trust,
                 &merge,
             )
@@ -3707,6 +3776,135 @@ mod tests {
         assert_eq!(counted.slot_samples.load(Ordering::Relaxed), 1);
         assert_eq!(counted.authority_checks.load(Ordering::Relaxed), 1);
         assert_eq!(counted.package_checks.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn root_marker_mismatch_fails_before_clock_sampling_or_destination_work() {
+        let (config, runtime_package) =
+            host_surface_config_and_runtime("root-marker-preflight-runtime");
+        let create = LifecycleRequest::Create(config.clone());
+        let receipt = lifecycle_receipt(&config, &create, 1);
+        let configured_root = host_surface_root_pins(&config, &receipt, 20);
+        let counted = Arc::new(CountingTrust {
+            slot: 20,
+            authority: config.authority.clone(),
+            slot_samples: AtomicUsize::new(0),
+            authority_checks: AtomicUsize::new(0),
+            package_checks: AtomicUsize::new(0),
+        });
+        let trust: Arc<dyn AgentTrustProvider> = counted.clone();
+        let merge: Arc<dyn LocalMergeAuthenticator> =
+            Arc::new(StaticMerge(config.replicas[0].node));
+
+        let mut missing = config.clone();
+        missing.system_authority_genesis = None;
+        let missing_request = LifecycleRequest::Create(missing.clone());
+        let missing_receipt = lifecycle_receipt(&missing, &missing_request, 1);
+        assert_eq!(
+            LocalJournalAgentDriver::<MemoryAgentJournalStore>::system_genesis_input(
+                missing,
+                &runtime_package,
+                missing_receipt,
+                &configured_root,
+                &trust,
+                &merge,
+            ),
+            Err(LocalJournalDriverError::Executor(
+                LocalReplayExecutorError::InvalidRequest
+            ))
+        );
+
+        let mut divergent = config.clone();
+        let configured_record = configured_root.record();
+        let divergent_record = RootAnchorRecord::new(
+            configured_record.config_version() + 1,
+            configured_record.space(),
+            configured_record.system_agent(),
+            configured_record.authority_binding(),
+            Hash([0x85; 32]),
+            configured_record.initial_committee().clone(),
+        )
+        .unwrap();
+        divergent.system_authority_genesis = Some(
+            SystemAuthorityGenesis::new(
+                divergent_record.id(),
+                divergent_record.config_version(),
+                divergent_record.config_commitment(),
+                divergent_record.initial_committee().clone(),
+                1,
+                8,
+                8,
+            )
+            .unwrap(),
+        );
+        let divergent_request = LifecycleRequest::Create(divergent.clone());
+        let divergent_receipt = lifecycle_receipt(&divergent, &divergent_request, 1);
+        assert_eq!(
+            LocalJournalAgentDriver::<MemoryAgentJournalStore>::system_genesis_input(
+                divergent,
+                &runtime_package,
+                divergent_receipt,
+                &configured_root,
+                &trust,
+                &merge,
+            ),
+            Err(LocalJournalDriverError::Executor(
+                LocalReplayExecutorError::InvalidRequest
+            ))
+        );
+
+        let mut wrong_sequence = config.clone();
+        let marker = wrong_sequence.system_authority_genesis.as_ref().unwrap();
+        wrong_sequence.system_authority_genesis = Some(
+            SystemAuthorityGenesis::new(
+                marker.root_anchor(),
+                marker.root_anchor_config_version(),
+                marker.root_anchor_config(),
+                marker.initial_committee().clone(),
+                2,
+                marker.decision_limit(),
+                marker.rotation_limit(),
+            )
+            .unwrap(),
+        );
+        let wrong_sequence_request = LifecycleRequest::Create(wrong_sequence.clone());
+        let wrong_sequence_receipt = lifecycle_receipt(&wrong_sequence, &wrong_sequence_request, 1);
+        assert_eq!(
+            LocalJournalAgentDriver::<MemoryAgentJournalStore>::system_genesis_input(
+                wrong_sequence,
+                &runtime_package,
+                wrong_sequence_receipt,
+                &configured_root,
+                &trust,
+                &merge,
+            ),
+            Err(LocalJournalDriverError::Executor(
+                LocalReplayExecutorError::InvalidRequest
+            ))
+        );
+
+        assert_eq!(counted.slot_samples.load(Ordering::Relaxed), 0);
+        assert_eq!(counted.authority_checks.load(Ordering::Relaxed), 0);
+        assert_eq!(counted.package_checks.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn seeded_root_authority_is_exact_after_create_and_reopen() {
+        let (driver, config, trust, merge) = host_surface_driver();
+        let expected = SystemAuthorityState::from_genesis(
+            config.identity.agent,
+            config.system_authority_genesis.as_ref().unwrap(),
+        )
+        .unwrap();
+        let created = decode_standard_runtime_state(driver.core.materialization.state()).unwrap();
+        assert_eq!(created.system_authority.as_ref(), Some(&expected));
+
+        let store = driver.core.store;
+        let reopened = LocalJournalAgentDriver::open(store, trust, merge).unwrap();
+        let restored =
+            decode_standard_runtime_state(reopened.core.materialization.state()).unwrap();
+        assert_eq!(restored.config.as_ref(), Some(&config));
+        assert_eq!(restored.system_authority, Some(expected));
     }
 
     #[cfg(feature = "network")]

@@ -1279,13 +1279,13 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let output = execute_runtime(
             &runtime_pvm,
             DEFAULT_MANAGEMENT_GAS,
-            RuntimeCall {
-                state: RuntimeState::default(),
-                request: LifecycleRequest::Authorized {
+            RuntimeCall::new(
+                RuntimeState::default(),
+                LifecycleRequest::Authorized {
                     admission,
                     request: Box::new(request),
                 },
-            },
+            ),
         )?;
         if output.result != Ok(LifecycleReply::Created(config.identity.clone())) {
             return Err(AgentDriverError::InvalidRuntime);
@@ -1392,7 +1392,12 @@ impl<S: AgentImageStore> AgentDriver<S> {
         if matches!(request, LifecycleRequest::Create(_)) {
             return Err(AgentDriverError::Lifecycle(LifecycleError::AlreadyCreated));
         }
-        if matches!(request, LifecycleRequest::UpgradeRuntime { .. }) {
+        if matches!(
+            request,
+            LifecycleRequest::UpgradeRuntime { .. }
+                | LifecycleRequest::FinalizeSystemAuthority(_)
+                | LifecycleRequest::RotateSystemAuthority(_)
+        ) {
             return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
         }
         let read_only = matches!(request, LifecycleRequest::Inspect { .. });
@@ -1400,10 +1405,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let output = execute_runtime(
             &self.runtime_pvm,
             self.management_gas,
-            RuntimeCall {
-                state: self.image.runtime_state.clone(),
-                request,
-            },
+            RuntimeCall::new(self.image.runtime_state.clone(), request),
         )?;
         match output.result {
             Err(error) => {
@@ -1845,13 +1847,13 @@ impl<S: AgentImageStore> AgentDriver<S> {
             let output = execute_runtime(
                 &self.runtime_pvm,
                 self.management_gas,
-                RuntimeCall {
-                    state: self.image.runtime_state.clone(),
-                    request: LifecycleRequest::Inspect {
+                RuntimeCall::new(
+                    self.image.runtime_state.clone(),
+                    LifecycleRequest::Inspect {
                         after,
                         limit: super::standard::MAX_DIRECTORY_PAGE,
                     },
-                },
+                ),
             )?;
             if output.state != self.image.runtime_state {
                 return Err(AgentDriverError::InvalidRuntime);
@@ -2226,13 +2228,13 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let output = execute_runtime(
             &self.runtime_pvm,
             self.management_gas,
-            RuntimeCall {
-                state: self.image.runtime_state.clone(),
-                request: LifecycleRequest::Authorized {
+            RuntimeCall::new(
+                self.image.runtime_state.clone(),
+                LifecycleRequest::Authorized {
                     admission,
                     request: Box::new(request),
                 },
-            },
+            ),
         )?;
         let reply = match output.result {
             Ok(reply) => reply,
@@ -2259,13 +2261,13 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let probe = execute_runtime(
             &new_runtime_pvm,
             self.management_gas,
-            RuntimeCall {
-                state: output.state.clone(),
-                request: LifecycleRequest::Inspect {
+            RuntimeCall::new(
+                output.state.clone(),
+                LifecycleRequest::Inspect {
                     after: None,
                     limit: 1,
                 },
-            },
+            ),
         )?;
         if !matches!(probe.result, Ok(LifecycleReply::Directory(_))) || probe.state != output.state
         {
@@ -2329,13 +2331,13 @@ impl<S: AgentImageStore> AgentDriver<S> {
             let output = execute_runtime(
                 &self.runtime_pvm,
                 self.management_gas,
-                RuntimeCall {
-                    state: self.image.runtime_state.clone(),
-                    request: LifecycleRequest::Inspect {
+                RuntimeCall::new(
+                    self.image.runtime_state.clone(),
+                    LifecycleRequest::Inspect {
                         after,
                         limit: super::standard::MAX_DIRECTORY_PAGE,
                     },
-                },
+                ),
             )?;
             let Ok(LifecycleReply::Directory(page)) = output.result else {
                 return Err(AgentDriverError::InvalidRuntime);
@@ -3554,6 +3556,7 @@ mod tests {
                 producer: ProducerId::of_public_key(&authority_key),
                 public_key: authority_key,
             },
+            system_authority_genesis: None,
             runtime_package: BlobRef {
                 hash: Hash([6; 32]),
                 len: 1,

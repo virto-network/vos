@@ -369,6 +369,7 @@ fn config_for(creation_nonce: Hash) -> AgentConfig {
         },
         creation_nonce,
         authority: authority_binding(),
+        system_authority_genesis: None,
         runtime_package: BlobRef::of_bytes(&runtime.encode()),
         runtime_contract: RuntimePackageContract::canonical(),
         capabilities: RuntimeCapabilities::standard(),
@@ -436,36 +437,33 @@ fn bundled_runtime_identity_is_pinned() {
 fn bundled_runtime_persists_an_empty_agent_between_invocations() {
     let config = config();
     let create = LifecycleRequest::Create(config.clone());
-    let rejected = invoke(RuntimeCall {
-        state: RuntimeState::default(),
-        request: create.clone(),
-    });
+    let rejected = invoke(RuntimeCall::new(RuntimeState::default(), create.clone()));
     assert_eq!(
         rejected.result,
         Err(vos::agent::LifecycleError::InvalidRequest)
     );
-    let created = invoke(RuntimeCall {
-        state: RuntimeState::default(),
-        request: authorized_request(
+    let created = invoke(RuntimeCall::new(
+        RuntimeState::default(),
+        authorized_request(
             &config,
             create,
             vos::agent::authority::CAPABILITY_AGENT_CREATE_LOCAL,
             1,
         ),
-    });
+    ));
     assert_eq!(
         created.result,
         Ok(LifecycleReply::Created(config.identity.clone()))
     );
     assert!(!created.state.is_empty());
 
-    let inspected = invoke(RuntimeCall {
-        state: created.state,
-        request: LifecycleRequest::Inspect {
+    let inspected = invoke(RuntimeCall::new(
+        created.state,
+        LifecycleRequest::Inspect {
             after: None,
             limit: 16,
         },
-    });
+    ));
     assert_eq!(
         inspected.result,
         Ok(LifecycleReply::Directory(vos::agent::ActorDirectoryPage {
@@ -654,15 +652,15 @@ fn reopen_rejects_a_previous_actor_package_in_the_catalog_closure() {
         contract,
         requirements,
     });
-    let installed = invoke(RuntimeCall {
-        state: driver.image().runtime_state.clone(),
-        request: authorized_request(
+    let installed = invoke(RuntimeCall::new(
+        driver.image().runtime_state.clone(),
+        authorized_request(
             &config,
             install,
             vos::agent::authority::CAPABILITY_ACTOR_INSTALL,
             2,
         ),
-    });
+    ));
     assert_eq!(installed.result, Ok(LifecycleReply::Installed(entry)));
 
     let mut store = driver.into_store();
@@ -1114,10 +1112,7 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
         requirements,
     });
     let preinstall_state = driver.image().runtime_state.clone();
-    let raw = invoke(RuntimeCall {
-        state: preinstall_state.clone(),
-        request: install.clone(),
-    });
+    let raw = invoke(RuntimeCall::new(preinstall_state.clone(), install.clone()));
     assert_eq!(
         raw.result,
         Err(vos::agent::LifecycleError::InvalidRequest),
@@ -1132,16 +1127,16 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
         2,
     );
     forged_lifecycle.signature[0] ^= 1;
-    let forged = invoke(RuntimeCall {
-        state: preinstall_state.clone(),
-        request: LifecycleRequest::Authorized {
+    let forged = invoke(RuntimeCall::new(
+        preinstall_state.clone(),
+        LifecycleRequest::Authorized {
             admission: LifecycleAuthorityAdmission {
                 receipt: forged_lifecycle,
                 observed_slot: 1,
             },
             request: Box::new(install.clone()),
         },
-    });
+    ));
     assert_eq!(
         forged.result,
         Err(vos::agent::LifecycleError::InvalidRequest),
@@ -1149,15 +1144,15 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
     );
     assert_eq!(forged.state, preinstall_state);
 
-    let installed = invoke(RuntimeCall {
-        state: preinstall_state,
-        request: authorized_request(
+    let installed = invoke(RuntimeCall::new(
+        preinstall_state,
+        authorized_request(
             &config,
             install,
             vos::agent::authority::CAPABILITY_ACTOR_INSTALL,
             2,
         ),
-    });
+    ));
     assert_eq!(
         installed.result,
         Ok(LifecycleReply::Installed(installed_entry))

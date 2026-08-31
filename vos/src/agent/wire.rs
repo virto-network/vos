@@ -2,7 +2,6 @@
 
 use alloc::{boxed::Box, vec::Vec};
 
-use super::AgentRuntime;
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
     ActorInvocationAuth, RuntimeBlob, RuntimeExecutionCall, RuntimeExecutionReturn,
@@ -23,11 +22,87 @@ use crate::service::{
     ProgramId, SpaceId,
 };
 
+/// Replay-authenticated identity of the exact journal generation applying a
+/// management input. These bytes are deterministic state-machine input, not a
+/// capability: only replay may construct a scoped call which is eligible for
+/// publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeJournalContext {
+    genesis: super::journal::AgentJournalGenesisId,
+    agent_admission: super::genesis::AgentGenesisAdmissionId,
+}
+
+impl RuntimeJournalContext {
+    fn new(
+        genesis: super::journal::AgentJournalGenesisId,
+        agent_admission: super::genesis::AgentGenesisAdmissionId,
+    ) -> Result<Self, super::system_authority::SystemAuthorityError> {
+        if genesis == super::journal::AgentJournalGenesisId::ZERO
+            || agent_admission == super::genesis::AgentGenesisAdmissionId::ZERO
+        {
+            return Err(super::system_authority::SystemAuthorityError::InvalidScope);
+        }
+        Ok(Self {
+            genesis,
+            agent_admission,
+        })
+    }
+
+    pub(crate) const fn genesis(self) -> super::journal::AgentJournalGenesisId {
+        self.genesis
+    }
+
+    pub(crate) const fn agent_admission(self) -> super::genesis::AgentGenesisAdmissionId {
+        self.agent_admission
+    }
+
+    pub(crate) fn matches_system_authority_scope(
+        self,
+        scope: super::system_authority::SystemAuthorityJournalScope,
+    ) -> bool {
+        self.genesis == scope.system_genesis() && self.agent_admission == scope.agent_admission()
+    }
+}
+
 /// One management call. Runtime-owned state is opaque to the node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeCall {
     pub state: RuntimeState,
     pub request: LifecycleRequest,
+    journal_context: Option<RuntimeJournalContext>,
+}
+
+impl RuntimeCall {
+    /// Construct an unscoped public call. Pre-genesis Create and logical
+    /// operation commitments use this form. Direct live-authority commands
+    /// deterministically reject it.
+    pub const fn new(state: RuntimeState, request: LifecycleRequest) -> Self {
+        Self {
+            state,
+            request,
+            journal_context: None,
+        }
+    }
+
+    /// Construct the exact replay input used by native and guest execution.
+    pub(crate) const fn scoped_system_authority(
+        state: RuntimeState,
+        request: LifecycleRequest,
+        trusted_scope: super::system_authority::SystemAuthorityJournalScope,
+    ) -> Self {
+        Self {
+            state,
+            request,
+            journal_context: Some(RuntimeJournalContext {
+                genesis: trusted_scope.system_genesis(),
+                agent_admission: trusted_scope.agent_admission(),
+            }),
+        }
+    }
+
+    pub(crate) const fn journal_context(&self) -> Option<RuntimeJournalContext> {
+        self.journal_context
+    }
 }
 
 /// Private runtime-to-actor dispatch control. Unlike the dynamic application
@@ -97,6 +172,10 @@ impl ServiceWire for RuntimeCall {
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
         encoder.fixed(&super::RUNTIME_ABI_ID.0);
+        encoder.option(&self.journal_context, |encoder, context| {
+            encoder.fixed(&context.genesis.0);
+            encoder.fixed(context.agent_admission.as_bytes());
+        });
         encode_runtime_state(&mut encoder, &self.state);
         encode_request(&mut encoder, &self.request);
     }
@@ -105,9 +184,17 @@ impl ServiceWire for RuntimeCall {
         if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID {
             return Err(DecodeError::InvalidPlatform);
         }
+        let journal_context = decoder.option(|decoder| {
+            RuntimeJournalContext::new(
+                super::journal::AgentJournalGenesisId(decoder.fixed()?),
+                super::genesis::AgentGenesisAdmissionId::from_bytes(decoder.fixed()?),
+            )
+            .map_err(|_| DecodeError::NonCanonical)
+        })?;
         Ok(Self {
             state: decode_runtime_state(decoder)?,
             request: decode_request(decoder)?,
+            journal_context,
         })
     }
 }
@@ -329,6 +416,9 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
     let mut encoder = Encoder(&mut control);
     encoder.fixed(&super::RUNTIME_ABI_ID.0);
     encoder.option(&state.config, encode_config);
+    encoder.option(&state.system_authority, |encoder, authority| {
+        encoder.bytes(&authority.encode())
+    });
     encoder.list(&state.actors, |encoder, actor| {
         encode_entry(encoder, &actor.record.entry);
         encoder.fixed(&actor.record.state_generation.0);
@@ -416,6 +506,13 @@ pub fn decode_standard_runtime_state(
         return Err(DecodeError::InvalidPlatform);
     }
     let config = decoder.option(decode_config)?;
+    let system_authority = decoder.option(|decoder| {
+        let bytes = decoder.bytes_ref()?;
+        if bytes.len() > super::system_authority::MAX_SYSTEM_AUTHORITY_STATE_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        super::system_authority::SystemAuthorityState::decode(bytes)
+    })?;
     let actors = decode_bounded_list(
         &mut decoder,
         super::contract::STANDARD_MAX_ACTORS as usize,
@@ -533,6 +630,7 @@ pub fn decode_standard_runtime_state(
     }
     let state = StandardRuntimeState {
         config,
+        system_authority,
         actors,
         lane_state,
         invocation_results,
@@ -687,7 +785,7 @@ pub fn apply_standard(call: RuntimeCall) -> Result<RuntimeReturn, DecodeError> {
     let state = decode_standard_runtime_state(&call.state)?;
     let mut runtime =
         StandardAgentRuntime::restore(state).map_err(|_| DecodeError::NonCanonical)?;
-    let result = runtime.apply(call.request);
+    let result = runtime.apply_guest(call.journal_context(), call.request);
     Ok(RuntimeReturn {
         state: encode_standard_runtime_state(&runtime.snapshot()),
         result,
@@ -1282,6 +1380,14 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             super::contract::encode_runtime_contract(encoder, *contract);
             encode_capabilities(encoder, *capabilities);
         }
+        LifecycleRequest::FinalizeSystemAuthority(finalize) => {
+            encoder.u8(10);
+            encoder.bytes(&finalize.encode());
+        }
+        LifecycleRequest::RotateSystemAuthority(rotation) => {
+            encoder.u8(11);
+            encoder.bytes(&rotation.encode());
+        }
         LifecycleRequest::Authorized { admission, request } => {
             encoder.u8(9);
             encoder.bytes(&admission.receipt.encode());
@@ -1371,6 +1477,24 @@ fn decode_request_at_depth(
                 request: alloc::boxed::Box::new(request),
             })
         }
+        10 => {
+            let bytes = decoder.bytes_ref()?;
+            if bytes.len() > super::system_authority::MAX_SYSTEM_AUTHORITY_FINALIZE_BYTES {
+                return Err(DecodeError::LimitExceeded);
+            }
+            Ok(LifecycleRequest::FinalizeSystemAuthority(
+                super::system_authority::SystemAuthorityFinalize::decode(bytes)?,
+            ))
+        }
+        11 => {
+            let bytes = decoder.bytes_ref()?;
+            if bytes.len() > super::system_authority::MAX_SYSTEM_AUTHORITY_ROTATION_BYTES {
+                return Err(DecodeError::LimitExceeded);
+            }
+            Ok(LifecycleRequest::RotateSystemAuthority(
+                super::system_authority::SystemAuthorityRotation::decode(bytes)?,
+            ))
+        }
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -1414,6 +1538,35 @@ fn encode_reply(encoder: &mut Encoder<'_>, reply: &LifecycleReply) {
             encoder.u8(encode_invocation_scope(*scope));
             encoder.fixed(&invocation.0);
         }
+        LifecycleReply::SystemAuthorityFinalized(outcome) => {
+            encoder.u8(9);
+            match outcome {
+                super::system_authority::SystemAuthorityFinalizeOutcome::Admitted(decision) => {
+                    encoder.u8(0);
+                    encoder.fixed(decision.as_bytes());
+                }
+                super::system_authority::SystemAuthorityFinalizeOutcome::ExactRetry(decision) => {
+                    encoder.u8(1);
+                    encoder.fixed(decision.as_bytes());
+                }
+                super::system_authority::SystemAuthorityFinalizeOutcome::TargetConflict(
+                    decision,
+                ) => {
+                    encoder.u8(2);
+                    encoder.fixed(decision.as_bytes());
+                }
+            }
+        }
+        LifecycleReply::SystemAuthorityRotated {
+            rotation,
+            epoch,
+            exact_retry,
+        } => {
+            encoder.u8(10);
+            encoder.fixed(rotation.as_bytes());
+            encoder.u64(*epoch);
+            encoder.bool(*exact_retry);
+        }
     }
 }
 
@@ -1431,6 +1584,35 @@ fn decode_reply(decoder: &mut Decoder<'_>) -> Result<LifecycleReply, DecodeError
             scope: decode_invocation_scope(decoder.u8()?)?,
             invocation: crate::service::InvocationId(decoder.fixed()?),
         }),
+        9 => {
+            let outcome = decoder.u8()?;
+            let decision = super::genesis::AgentGenesisDecisionId::from_bytes(decoder.fixed()?);
+            if decision == super::genesis::AgentGenesisDecisionId::ZERO {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(LifecycleReply::SystemAuthorityFinalized(match outcome {
+                0 => super::system_authority::SystemAuthorityFinalizeOutcome::Admitted(decision),
+                1 => super::system_authority::SystemAuthorityFinalizeOutcome::ExactRetry(decision),
+                2 => super::system_authority::SystemAuthorityFinalizeOutcome::TargetConflict(
+                    decision,
+                ),
+                _ => return Err(DecodeError::InvalidTag),
+            }))
+        }
+        10 => {
+            let rotation =
+                super::system_authority::SystemAuthorityRotationId::from_bytes(decoder.fixed()?);
+            let epoch = decoder.u64()?;
+            let exact_retry = decoder.bool()?;
+            if rotation == super::system_authority::SystemAuthorityRotationId::ZERO || epoch == 0 {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(LifecycleReply::SystemAuthorityRotated {
+                rotation,
+                epoch,
+                exact_retry,
+            })
+        }
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -1455,6 +1637,11 @@ fn encode_error(encoder: &mut Encoder<'_>, error: LifecycleError) {
         LifecycleError::AuthoritySequenceConflict => 11,
         LifecycleError::AuthoritySlotRegressed => 12,
         LifecycleError::ResourceLimit => 13,
+        LifecycleError::SystemAuthority(error) => {
+            encoder.u8(14);
+            encode_system_authority_error(encoder, error);
+            return;
+        }
     };
     encoder.u8(tag);
 }
@@ -1475,6 +1662,201 @@ fn decode_error(decoder: &mut Decoder<'_>) -> Result<LifecycleError, DecodeError
         11 => LifecycleError::AuthoritySequenceConflict,
         12 => LifecycleError::AuthoritySlotRegressed,
         13 => LifecycleError::ResourceLimit,
+        14 => LifecycleError::SystemAuthority(decode_system_authority_error(decoder)?),
+        _ => return Err(DecodeError::InvalidTag),
+    })
+}
+
+fn encode_system_authority_error(
+    encoder: &mut Encoder<'_>,
+    error: super::system_authority::SystemAuthorityError,
+) {
+    use super::system_authority::SystemAuthorityError;
+    let tag = match error {
+        SystemAuthorityError::InvalidGenesis => 0,
+        SystemAuthorityError::InvalidScope => 1,
+        SystemAuthorityError::InvalidState => 2,
+        SystemAuthorityError::InvalidDecisionFact => 3,
+        SystemAuthorityError::InvalidDecisionNode => 4,
+        SystemAuthorityError::InvalidDecisionProof => 5,
+        SystemAuthorityError::InvalidRotationNode => 6,
+        SystemAuthorityError::InvalidRotationProof => 7,
+        SystemAuthorityError::InvalidFinalize => 8,
+        SystemAuthorityError::InvalidProvision => 9,
+        SystemAuthorityError::WrongSystemAgent => 10,
+        SystemAuthorityError::StaleCommittee => 11,
+        SystemAuthorityError::SequenceConflict => 12,
+        SystemAuthorityError::RotationFirstSequencePending => 13,
+        SystemAuthorityError::Capacity => 14,
+        SystemAuthorityError::LimitExceeded => 15,
+        SystemAuthorityError::Authority(error) => {
+            encoder.u8(16);
+            encode_authority_committee_error(encoder, error);
+            return;
+        }
+        SystemAuthorityError::Genesis(error) => {
+            encoder.u8(17);
+            encode_agent_genesis_error(encoder, error);
+            return;
+        }
+    };
+    encoder.u8(tag);
+}
+
+fn decode_system_authority_error(
+    decoder: &mut Decoder<'_>,
+) -> Result<super::system_authority::SystemAuthorityError, DecodeError> {
+    use super::system_authority::SystemAuthorityError;
+    Ok(match decoder.u8()? {
+        0 => SystemAuthorityError::InvalidGenesis,
+        1 => SystemAuthorityError::InvalidScope,
+        2 => SystemAuthorityError::InvalidState,
+        3 => SystemAuthorityError::InvalidDecisionFact,
+        4 => SystemAuthorityError::InvalidDecisionNode,
+        5 => SystemAuthorityError::InvalidDecisionProof,
+        6 => SystemAuthorityError::InvalidRotationNode,
+        7 => SystemAuthorityError::InvalidRotationProof,
+        8 => SystemAuthorityError::InvalidFinalize,
+        9 => SystemAuthorityError::InvalidProvision,
+        10 => SystemAuthorityError::WrongSystemAgent,
+        11 => SystemAuthorityError::StaleCommittee,
+        12 => SystemAuthorityError::SequenceConflict,
+        13 => SystemAuthorityError::RotationFirstSequencePending,
+        14 => SystemAuthorityError::Capacity,
+        15 => SystemAuthorityError::LimitExceeded,
+        16 => SystemAuthorityError::Authority(decode_authority_committee_error(decoder)?),
+        17 => SystemAuthorityError::Genesis(decode_agent_genesis_error(decoder)?),
+        _ => return Err(DecodeError::InvalidTag),
+    })
+}
+
+fn encode_agent_genesis_error(encoder: &mut Encoder<'_>, error: super::genesis::AgentGenesisError) {
+    use super::genesis::AgentGenesisError;
+    let tag = match error {
+        AgentGenesisError::InvalidLocator => 0,
+        AgentGenesisError::InvalidExpectations => 1,
+        AgentGenesisError::InvalidProposal => 2,
+        AgentGenesisError::InvalidReplicaCommittee => 3,
+        AgentGenesisError::InvalidClaim => 4,
+        AgentGenesisError::InvalidEvidence => 5,
+        AgentGenesisError::InvalidDecision => 6,
+        AgentGenesisError::InvalidAdmission => 7,
+        AgentGenesisError::InvalidProvision => 8,
+        AgentGenesisError::InvalidCatalog => 9,
+        AgentGenesisError::LimitExceeded => 10,
+        AgentGenesisError::Authority(error) => {
+            encoder.u8(11);
+            encode_authority_committee_error(encoder, error);
+            return;
+        }
+    };
+    encoder.u8(tag);
+}
+
+fn decode_agent_genesis_error(
+    decoder: &mut Decoder<'_>,
+) -> Result<super::genesis::AgentGenesisError, DecodeError> {
+    use super::genesis::AgentGenesisError;
+    Ok(match decoder.u8()? {
+        0 => AgentGenesisError::InvalidLocator,
+        1 => AgentGenesisError::InvalidExpectations,
+        2 => AgentGenesisError::InvalidProposal,
+        3 => AgentGenesisError::InvalidReplicaCommittee,
+        4 => AgentGenesisError::InvalidClaim,
+        5 => AgentGenesisError::InvalidEvidence,
+        6 => AgentGenesisError::InvalidDecision,
+        7 => AgentGenesisError::InvalidAdmission,
+        8 => AgentGenesisError::InvalidProvision,
+        9 => AgentGenesisError::InvalidCatalog,
+        10 => AgentGenesisError::LimitExceeded,
+        11 => AgentGenesisError::Authority(decode_authority_committee_error(decoder)?),
+        _ => return Err(DecodeError::InvalidTag),
+    })
+}
+
+fn encode_authority_committee_error(
+    encoder: &mut Encoder<'_>,
+    error: super::committee::AuthorityCommitteeError,
+) {
+    use super::committee::AuthorityCommitteeError;
+    let tag = match error {
+        AuthorityCommitteeError::InvalidBinding => 0,
+        AuthorityCommitteeError::InvalidMember => 1,
+        AuthorityCommitteeError::InvalidSigner => 2,
+        AuthorityCommitteeError::InvalidEpoch => 3,
+        AuthorityCommitteeError::InvalidPreviousCommittee => 4,
+        AuthorityCommitteeError::CommitteeTooLarge => 5,
+        AuthorityCommitteeError::CertificateTooLarge => 6,
+        AuthorityCommitteeError::NoVoters => 7,
+        AuthorityCommitteeError::DuplicateNode => 8,
+        AuthorityCommitteeError::NonCanonicalOrder => 9,
+        AuthorityCommitteeError::InvalidClaim => 10,
+        AuthorityCommitteeError::WrongAuthorityBinding => 11,
+        AuthorityCommitteeError::WrongEpoch => 12,
+        AuthorityCommitteeError::WrongCommittee => 13,
+        AuthorityCommitteeError::WrongClaim => 14,
+        AuthorityCommitteeError::UnknownSigner => 15,
+        AuthorityCommitteeError::ObserverSignature => 16,
+        AuthorityCommitteeError::InsufficientQuorum => 17,
+        AuthorityCommitteeError::InvalidSignature => 18,
+        AuthorityCommitteeError::InvalidRotationEpoch => 19,
+        AuthorityCommitteeError::InvalidRotationLink => 20,
+        AuthorityCommitteeError::InvalidRotationSequence => 21,
+        AuthorityCommitteeError::InvalidRootAnchor => 22,
+        AuthorityCommitteeError::RootAnchorTooLarge => 23,
+        AuthorityCommitteeError::InvalidGenesisIntent => 24,
+        AuthorityCommitteeError::InvalidGenesisExpectation => 25,
+        AuthorityCommitteeError::InvalidGenesisClaim => 26,
+        AuthorityCommitteeError::GenesisEvidenceTooLarge => 27,
+        AuthorityCommitteeError::InvalidGenesisAdmission => 28,
+        AuthorityCommitteeError::GenesisAdmissionTooLarge => 29,
+        AuthorityCommitteeError::InvalidBootstrapAnchor => 30,
+        AuthorityCommitteeError::WrongBootstrapAnchor => 31,
+        AuthorityCommitteeError::WrongGenesisIntent => 32,
+        AuthorityCommitteeError::WrongGenesisExpectation => 33,
+    };
+    encoder.u8(tag);
+}
+
+fn decode_authority_committee_error(
+    decoder: &mut Decoder<'_>,
+) -> Result<super::committee::AuthorityCommitteeError, DecodeError> {
+    use super::committee::AuthorityCommitteeError;
+    Ok(match decoder.u8()? {
+        0 => AuthorityCommitteeError::InvalidBinding,
+        1 => AuthorityCommitteeError::InvalidMember,
+        2 => AuthorityCommitteeError::InvalidSigner,
+        3 => AuthorityCommitteeError::InvalidEpoch,
+        4 => AuthorityCommitteeError::InvalidPreviousCommittee,
+        5 => AuthorityCommitteeError::CommitteeTooLarge,
+        6 => AuthorityCommitteeError::CertificateTooLarge,
+        7 => AuthorityCommitteeError::NoVoters,
+        8 => AuthorityCommitteeError::DuplicateNode,
+        9 => AuthorityCommitteeError::NonCanonicalOrder,
+        10 => AuthorityCommitteeError::InvalidClaim,
+        11 => AuthorityCommitteeError::WrongAuthorityBinding,
+        12 => AuthorityCommitteeError::WrongEpoch,
+        13 => AuthorityCommitteeError::WrongCommittee,
+        14 => AuthorityCommitteeError::WrongClaim,
+        15 => AuthorityCommitteeError::UnknownSigner,
+        16 => AuthorityCommitteeError::ObserverSignature,
+        17 => AuthorityCommitteeError::InsufficientQuorum,
+        18 => AuthorityCommitteeError::InvalidSignature,
+        19 => AuthorityCommitteeError::InvalidRotationEpoch,
+        20 => AuthorityCommitteeError::InvalidRotationLink,
+        21 => AuthorityCommitteeError::InvalidRotationSequence,
+        22 => AuthorityCommitteeError::InvalidRootAnchor,
+        23 => AuthorityCommitteeError::RootAnchorTooLarge,
+        24 => AuthorityCommitteeError::InvalidGenesisIntent,
+        25 => AuthorityCommitteeError::InvalidGenesisExpectation,
+        26 => AuthorityCommitteeError::InvalidGenesisClaim,
+        27 => AuthorityCommitteeError::GenesisEvidenceTooLarge,
+        28 => AuthorityCommitteeError::InvalidGenesisAdmission,
+        29 => AuthorityCommitteeError::GenesisAdmissionTooLarge,
+        30 => AuthorityCommitteeError::InvalidBootstrapAnchor,
+        31 => AuthorityCommitteeError::WrongBootstrapAnchor,
+        32 => AuthorityCommitteeError::WrongGenesisIntent,
+        33 => AuthorityCommitteeError::WrongGenesisExpectation,
         _ => return Err(DecodeError::InvalidTag),
     })
 }
@@ -1483,6 +1865,9 @@ fn encode_config(encoder: &mut Encoder<'_>, config: &AgentConfig) {
     encode_identity(encoder, &config.identity);
     encoder.fixed(&config.creation_nonce.0);
     super::authority::encode_binding(encoder, &config.authority);
+    encoder.option(&config.system_authority_genesis, |encoder, genesis| {
+        encoder.bytes(&genesis.encode())
+    });
     encode_blob(encoder, &config.runtime_package);
     super::contract::encode_runtime_contract(encoder, config.runtime_contract);
     encode_capabilities(encoder, config.capabilities);
@@ -1497,6 +1882,13 @@ fn decode_config(decoder: &mut Decoder<'_>) -> Result<AgentConfig, DecodeError> 
     let identity = decode_identity(decoder)?;
     let creation_nonce = Hash(decoder.fixed()?);
     let authority = super::authority::decode_binding(decoder)?;
+    let system_authority_genesis = decoder.option(|decoder| {
+        let bytes = decoder.bytes_ref()?;
+        if bytes.len() > super::system_authority::MAX_SYSTEM_AUTHORITY_GENESIS_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        super::system_authority::SystemAuthorityGenesis::decode(bytes)
+    })?;
     let runtime_package = decode_blob(decoder)?;
     let runtime_contract = super::contract::decode_runtime_contract(decoder)?;
     let capabilities = decode_capabilities(decoder)?;
@@ -1523,6 +1915,7 @@ fn decode_config(decoder: &mut Decoder<'_>) -> Result<AgentConfig, DecodeError> 
         identity,
         creation_nonce,
         authority,
+        system_authority_genesis,
         runtime_package,
         runtime_contract,
         capabilities,
@@ -1746,6 +2139,7 @@ mod tests {
             },
             creation_nonce,
             authority: authority_binding(),
+            system_authority_genesis: None,
             runtime_package: BlobRef {
                 hash: Hash([7; 32]),
                 len: 100,
@@ -1785,6 +2179,7 @@ mod tests {
         let generation = Hash([0x84; 32]);
         StandardRuntimeState {
             config: Some(config.clone()),
+            system_authority: None,
             actors: vec![StandardActorState {
                 record: super::super::ActorRecord {
                     entry: ActorEntry {
@@ -2533,17 +2928,134 @@ mod tests {
 
     #[test]
     fn lifecycle_call_round_trips_with_opaque_runtime_state() {
-        let call = RuntimeCall {
-            state: RuntimeState {
+        let call = RuntimeCall::new(
+            RuntimeState {
                 control: vec![11],
                 linear: vec![12],
                 merge: vec![13],
                 local: vec![14],
             },
-            request: LifecycleRequest::Create(config()),
-        };
+            LifecycleRequest::Create(config()),
+        );
         let encoded = call.encode();
         assert_eq!(RuntimeCall::decode(&encoded).unwrap(), call);
+    }
+
+    #[test]
+    fn journal_context_round_trips_but_zero_ids_are_noncanonical() {
+        let scope = super::super::system_authority::SystemAuthorityJournalScope::for_test(
+            super::super::journal::AgentJournalGenesisId::new([0x31; 32]),
+            super::super::genesis::AgentGenesisAdmissionId::from_bytes([0x32; 32]),
+        )
+        .unwrap();
+        let call = RuntimeCall::scoped_system_authority(
+            RuntimeState::default(),
+            LifecycleRequest::Inspect {
+                after: None,
+                limit: 1,
+            },
+            scope,
+        );
+        let encoded = call.encode();
+        let decoded = RuntimeCall::decode(&encoded).unwrap();
+        assert_eq!(decoded, call);
+        assert!(
+            decoded
+                .journal_context()
+                .unwrap()
+                .matches_system_authority_scope(scope)
+        );
+
+        // ServiceWire header (36) + runtime ABI (32) + Some tag (1).
+        let mut zero_genesis = encoded.clone();
+        zero_genesis[69..101].fill(0);
+        assert_eq!(
+            RuntimeCall::decode(&zero_genesis),
+            Err(DecodeError::NonCanonical)
+        );
+        let mut zero_admission = encoded;
+        zero_admission[101..133].fill(0);
+        assert_eq!(
+            RuntimeCall::decode(&zero_admission),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn direct_system_authority_payloads_are_bounded_before_nested_decode() {
+        for (tag, maximum) in [
+            (
+                10,
+                super::super::system_authority::MAX_SYSTEM_AUTHORITY_FINALIZE_BYTES,
+            ),
+            (
+                11,
+                super::super::system_authority::MAX_SYSTEM_AUTHORITY_ROTATION_BYTES,
+            ),
+        ] {
+            let mut encoded = Vec::new();
+            encoded.extend_from_slice(&RuntimeCall::MAGIC);
+            encoded.extend_from_slice(&crate::service::PLATFORM_ID.0);
+            {
+                let mut encoder = Encoder(&mut encoded);
+                encoder.fixed(&super::super::RUNTIME_ABI_ID.0);
+                encoder.bool(false);
+                encode_runtime_state(&mut encoder, &RuntimeState::default());
+                encoder.u8(tag);
+                encoder.u32(u32::try_from(maximum + 1).unwrap());
+            }
+            encoded.resize(encoded.len() + maximum + 1, 0);
+            assert_eq!(
+                RuntimeCall::decode(&encoded),
+                Err(DecodeError::LimitExceeded)
+            );
+        }
+    }
+
+    #[test]
+    fn system_authority_genesis_and_state_are_bounded_before_nested_decode() {
+        let config = config();
+        let genesis_maximum = super::super::system_authority::MAX_SYSTEM_AUTHORITY_GENESIS_BYTES;
+        let mut encoded_config = Vec::new();
+        encoded_config.extend_from_slice(&AgentConfig::MAGIC);
+        encoded_config.extend_from_slice(&crate::service::PLATFORM_ID.0);
+        {
+            let mut encoder = Encoder(&mut encoded_config);
+            encoder.fixed(&super::super::RUNTIME_ABI_ID.0);
+            encode_identity(&mut encoder, &config.identity);
+            encoder.fixed(&config.creation_nonce.0);
+            super::super::authority::encode_binding(&mut encoder, &config.authority);
+            encoder.bool(true);
+            encoder.u32(u32::try_from(genesis_maximum + 1).unwrap());
+        }
+        encoded_config.resize(encoded_config.len() + genesis_maximum + 1, 0);
+        assert_eq!(
+            AgentConfig::decode(&encoded_config),
+            Err(DecodeError::LimitExceeded),
+            "an oversized nested genesis is rejected before its body is decoded"
+        );
+
+        let state_maximum = super::super::system_authority::MAX_SYSTEM_AUTHORITY_STATE_BYTES;
+        let mut control = Vec::new();
+        {
+            let mut encoder = Encoder(&mut control);
+            encoder.fixed(&super::super::RUNTIME_ABI_ID.0);
+            encoder.bool(false);
+            encoder.bool(true);
+            encoder.u32(u32::try_from(state_maximum + 1).unwrap());
+        }
+        control.resize(control.len() + state_maximum + 1, 0);
+        let state = RuntimeState {
+            control,
+            linear: vec![1],
+            merge: vec![1],
+            local: vec![1],
+        };
+        assert_eq!(
+            decode_standard_runtime_state(&state),
+            Err(DecodeError::LimitExceeded),
+            "an oversized nested authority state is rejected before its body is decoded"
+        );
     }
 
     #[test]
@@ -2566,10 +3078,7 @@ mod tests {
                 expected_deployment,
             },
         ] {
-            let call = RuntimeCall {
-                state: state.clone(),
-                request,
-            };
+            let call = RuntimeCall::new(state.clone(), request);
             let encoded = call.encode();
             assert_eq!(RuntimeCall::decode(&encoded).unwrap(), call);
             assert_eq!(
@@ -2605,16 +3114,16 @@ mod tests {
             },
             observed_slot: 10,
         };
-        let call = RuntimeCall {
-            state: RuntimeState::default(),
-            request: LifecycleRequest::Authorized {
+        let call = RuntimeCall::new(
+            RuntimeState::default(),
+            LifecycleRequest::Authorized {
                 admission: admission.clone(),
                 request: alloc::boxed::Box::new(LifecycleRequest::Authorized {
                     admission,
                     request: alloc::boxed::Box::new(request),
                 }),
             },
-        };
+        );
         assert_eq!(
             RuntimeCall::decode(&call.encode()),
             Err(DecodeError::NonCanonical)
@@ -2794,27 +3303,27 @@ mod tests {
 
     #[test]
     fn runtime_state_wire_enforces_its_aggregate_guest_budget() {
-        let exact = RuntimeCall {
-            state: RuntimeState {
+        let exact = RuntimeCall::new(
+            RuntimeState {
                 control: vec![1; super::super::execution::MAX_RUNTIME_STATE_BYTES / 2],
                 linear: vec![2; super::super::execution::MAX_RUNTIME_STATE_BYTES / 2],
                 merge: Vec::new(),
                 local: Vec::new(),
             },
-            request: LifecycleRequest::Inspect {
+            LifecycleRequest::Inspect {
                 after: None,
                 limit: 1,
             },
-        };
+        );
         assert_eq!(RuntimeCall::decode(&exact.encode()).unwrap(), exact);
 
-        let oversized = RuntimeCall {
-            state: RuntimeState {
+        let oversized = RuntimeCall::new(
+            RuntimeState {
                 local: vec![3],
                 ..exact.state
             },
-            request: exact.request,
-        };
+            exact.request,
+        );
         assert_eq!(
             RuntimeCall::decode(&oversized.encode()),
             Err(DecodeError::LimitExceeded)
@@ -2870,7 +3379,7 @@ mod tests {
         );
         assert!(decoder.exhausted());
 
-        let mut decoder = Decoder::new(&[14]);
+        let mut decoder = Decoder::new(&[15]);
         assert_eq!(decode_error(&mut decoder), Err(DecodeError::InvalidTag));
 
         let output = RuntimeReturn {
@@ -2883,16 +3392,100 @@ mod tests {
             result: Err(LifecycleError::ResourceLimit),
         };
         assert_eq!(RuntimeReturn::decode(&output.encode()).unwrap(), output);
+
+        use super::super::committee::AuthorityCommitteeError as CommitteeError;
+        use super::super::genesis::AgentGenesisError as GenesisError;
+        use super::super::system_authority::SystemAuthorityError as AuthorityError;
+
+        let mut errors = vec![
+            AuthorityError::InvalidGenesis,
+            AuthorityError::InvalidScope,
+            AuthorityError::InvalidState,
+            AuthorityError::InvalidDecisionFact,
+            AuthorityError::InvalidDecisionNode,
+            AuthorityError::InvalidDecisionProof,
+            AuthorityError::InvalidRotationNode,
+            AuthorityError::InvalidRotationProof,
+            AuthorityError::InvalidFinalize,
+            AuthorityError::InvalidProvision,
+            AuthorityError::WrongSystemAgent,
+            AuthorityError::StaleCommittee,
+            AuthorityError::SequenceConflict,
+            AuthorityError::RotationFirstSequencePending,
+            AuthorityError::Capacity,
+            AuthorityError::LimitExceeded,
+        ];
+        errors.extend(
+            [
+                CommitteeError::InvalidBinding,
+                CommitteeError::InvalidMember,
+                CommitteeError::InvalidSigner,
+                CommitteeError::InvalidEpoch,
+                CommitteeError::InvalidPreviousCommittee,
+                CommitteeError::CommitteeTooLarge,
+                CommitteeError::CertificateTooLarge,
+                CommitteeError::NoVoters,
+                CommitteeError::DuplicateNode,
+                CommitteeError::NonCanonicalOrder,
+                CommitteeError::InvalidClaim,
+                CommitteeError::WrongAuthorityBinding,
+                CommitteeError::WrongEpoch,
+                CommitteeError::WrongCommittee,
+                CommitteeError::WrongClaim,
+                CommitteeError::UnknownSigner,
+                CommitteeError::ObserverSignature,
+                CommitteeError::InsufficientQuorum,
+                CommitteeError::InvalidSignature,
+                CommitteeError::InvalidRotationEpoch,
+                CommitteeError::InvalidRotationLink,
+                CommitteeError::InvalidRotationSequence,
+                CommitteeError::InvalidRootAnchor,
+                CommitteeError::RootAnchorTooLarge,
+                CommitteeError::InvalidGenesisIntent,
+                CommitteeError::InvalidGenesisExpectation,
+                CommitteeError::InvalidGenesisClaim,
+                CommitteeError::GenesisEvidenceTooLarge,
+                CommitteeError::InvalidGenesisAdmission,
+                CommitteeError::GenesisAdmissionTooLarge,
+                CommitteeError::InvalidBootstrapAnchor,
+                CommitteeError::WrongBootstrapAnchor,
+                CommitteeError::WrongGenesisIntent,
+                CommitteeError::WrongGenesisExpectation,
+            ]
+            .map(AuthorityError::Authority),
+        );
+        errors.extend(
+            [
+                GenesisError::InvalidLocator,
+                GenesisError::InvalidExpectations,
+                GenesisError::InvalidProposal,
+                GenesisError::InvalidReplicaCommittee,
+                GenesisError::InvalidClaim,
+                GenesisError::InvalidEvidence,
+                GenesisError::InvalidDecision,
+                GenesisError::InvalidAdmission,
+                GenesisError::InvalidProvision,
+                GenesisError::InvalidCatalog,
+                GenesisError::LimitExceeded,
+                GenesisError::Authority(CommitteeError::WrongCommittee),
+            ]
+            .map(AuthorityError::Genesis),
+        );
+        for authority_error in errors {
+            let error = LifecycleError::SystemAuthority(authority_error);
+            let mut bytes = Vec::new();
+            encode_error(&mut Encoder(&mut bytes), error);
+            let mut decoder = Decoder::new(&bytes);
+            assert_eq!(decode_error(&mut decoder), Ok(error));
+            assert!(decoder.exhausted());
+        }
     }
 
     #[test]
     fn immediate_prior_runtime_abi_is_rejected_without_a_compatibility_decoder() {
-        let mut bytes = RuntimeCall {
-            state: RuntimeState::default(),
-            request: LifecycleRequest::Create(config()),
-        }
-        .encode();
-        bytes[36..68].copy_from_slice(b"vos-agent-runtime-abi-20260831r4");
+        let mut bytes =
+            RuntimeCall::new(RuntimeState::default(), LifecycleRequest::Create(config())).encode();
+        bytes[36..68].copy_from_slice(b"vos-agent-runtime-abi-20260831r5");
         assert_eq!(
             RuntimeCall::decode(&bytes),
             Err(DecodeError::InvalidPlatform)
@@ -2901,10 +3494,8 @@ mod tests {
 
     #[test]
     fn unsorted_replica_configuration_is_noncanonical() {
-        let mut call = RuntimeCall {
-            state: RuntimeState::default(),
-            request: LifecycleRequest::Create(config()),
-        };
+        let mut call =
+            RuntimeCall::new(RuntimeState::default(), LifecycleRequest::Create(config()));
         let LifecycleRequest::Create(config) = &mut call.request else {
             unreachable!()
         };
@@ -2957,25 +3548,25 @@ mod tests {
             .sign(&claim.signing_message().0)
             .to_bytes()
             .to_vec();
-        let created = apply_standard(RuntimeCall {
-            state: RuntimeState::default(),
-            request: LifecycleRequest::Authorized {
+        let created = apply_standard(RuntimeCall::new(
+            RuntimeState::default(),
+            LifecycleRequest::Authorized {
                 admission: super::super::LifecycleAuthorityAdmission {
                     receipt: crate::agent::authority::AgentAuthorityReceipt { claim, signature },
                     observed_slot: 1,
                 },
                 request: Box::new(request),
             },
-        })
+        ))
         .unwrap();
         assert!(matches!(created.result, Ok(LifecycleReply::Created(_))));
-        let inspected = apply_standard(RuntimeCall {
-            state: created.state,
-            request: LifecycleRequest::Inspect {
+        let inspected = apply_standard(RuntimeCall::new(
+            created.state,
+            LifecycleRequest::Inspect {
                 after: None,
                 limit: 16,
             },
-        })
+        ))
         .unwrap();
         assert_eq!(
             inspected.result,

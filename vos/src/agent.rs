@@ -45,7 +45,7 @@ use crate::service::{
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260831r5");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260831r6");
 
 /// Consensus-visible execution semantics for standard-PVM agent packages.
 ///
@@ -59,8 +59,11 @@ pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260831r5");
 /// acknowledgement protocol. Generation `r02` introduced the full v0.8
 /// reorder-buffer gas scheduler, full-Ψ deblob/entry failure boundary, and
 /// sign-extended 64-bit `ecalli` identifiers; older generations are
-/// incompatible.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r03");
+/// incompatible. Generation `r04` adds the replay-authenticated journal
+/// context and the root-seeded live system-authority state machine to
+/// Standard Control; its direct finalize/rotate operations are therefore
+/// incompatible with every earlier Standard runtime image.
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r04");
 
 /// Maximum bytes named by one content-addressed artifact reference in an
 /// authenticated Agent catalog closure.
@@ -541,6 +544,14 @@ pub enum LifecycleRequest {
         contract: contract::RuntimePackageContract,
         capabilities: RuntimeCapabilities,
     },
+    /// Finalize one quorum-certified ordinary Agent genesis decision in the
+    /// root system Agent's permanent decision tree. This is a direct
+    /// management command: its embedded committee QC is the authority, so it
+    /// must never be wrapped in a generic lifecycle receipt.
+    FinalizeSystemAuthority(system_authority::SystemAuthorityFinalize),
+    /// Rotate the live system-authority committee under the retiring and
+    /// incoming committees' joint certificate.
+    RotateSystemAuthority(system_authority::SystemAuthorityRotation),
     /// Authority-signed lifecycle operation. The bundled runtime verifies
     /// its sequence exactly once and retains a bounded durable disposition so
     /// retries cannot reapply an older transition after later operations.
@@ -581,19 +592,27 @@ impl LifecycleRequest {
                 Some(authority::CAPABILITY_ACTOR_LIFECYCLE)
             }
             Self::UpgradeRuntime { .. } => Some(authority::CAPABILITY_AGENT_RUNTIME_UPGRADE),
-            Self::Inspect { .. } | Self::AcknowledgeInvocation { .. } | Self::Authorized { .. } => {
-                None
-            }
+            Self::Inspect { .. }
+            | Self::AcknowledgeInvocation { .. }
+            | Self::FinalizeSystemAuthority(_)
+            | Self::RotateSystemAuthority(_)
+            | Self::Authorized { .. } => None,
         }
     }
 
     /// Stable commitment used by authority receipts. It includes the runtime
     /// ABI and every request field, but no mutable runtime state.
     pub fn commitment(&self) -> Hash {
-        let call = wire::RuntimeCall {
-            state: wire::RuntimeState::default(),
-            request: self.clone(),
-        };
+        // Sparse membership proofs are replaceable transport evidence. The
+        // logical operation identity is the exact certified decision or
+        // rotation, not the path against whichever permanent root is current
+        // when a retry is submitted.
+        match self {
+            Self::FinalizeSystemAuthority(finalize) => return finalize.operation_commitment(),
+            Self::RotateSystemAuthority(rotation) => return rotation.operation_commitment(),
+            _ => {}
+        }
+        let call = wire::RuntimeCall::new(wire::RuntimeState::default(), self.clone());
         Hash::digest(
             b"vos/agent/lifecycle-operation",
             &[&crate::service::wire::ServiceWire::encode(&call)],
@@ -617,6 +636,10 @@ pub enum LifecycleError {
     AuthoritySequenceConflict,
     AuthoritySlotRegressed,
     ResourceLimit,
+    /// Exact deterministic refusal from the live system-authority state
+    /// machine. Keeping the structured cause in the lifecycle ABI makes the
+    /// native replay and guest executions byte-for-byte comparable.
+    SystemAuthority(system_authority::SystemAuthorityError),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -633,6 +656,12 @@ pub enum LifecycleReply {
     },
     Removed(ActorId),
     RuntimeUpgraded(AgentIdentity),
+    SystemAuthorityFinalized(system_authority::SystemAuthorityFinalizeOutcome),
+    SystemAuthorityRotated {
+        rotation: system_authority::SystemAuthorityRotationId,
+        epoch: u64,
+        exact_retry: bool,
+    },
 }
 
 /// Public Rust contract custom agent runtimes implement. The PVM entry glue
@@ -660,6 +689,7 @@ pub enum AgentConfigError {
     InvalidPrivateReplicaOwner,
     InvalidRuntimeCapacity,
     InvalidRuntimePackage,
+    InvalidSystemAuthorityGenesis,
 }
 
 /// Maximum replicas admitted by one immutable Agent configuration.
@@ -678,6 +708,10 @@ pub struct AgentConfig {
     /// Exact system-authority deployment allowed to issue lifecycle receipts
     /// for this agent.
     pub authority: authority::AgentAuthorityBinding,
+    /// Root-only immutable seed for the live system authority. Ordinary
+    /// Agents carry `None`; a root system Agent carries the exact root-pinned
+    /// genesis descriptor which Standard Control revalidates on every restore.
+    pub system_authority_genesis: Option<system_authority::SystemAuthorityGenesis>,
     pub runtime_package: BlobRef,
     pub runtime_contract: contract::RuntimePackageContract,
     pub capabilities: RuntimeCapabilities,
@@ -700,6 +734,15 @@ impl AgentConfig {
         }
         if !self.authority.validate() {
             return Err(AgentConfigError::InvalidIdentity);
+        }
+        if let Some(genesis) = &self.system_authority_genesis {
+            if genesis.validate().is_err()
+                || self.identity.agent != self.authority.agent
+                || genesis.initial_committee().space() != self.identity.space
+                || genesis.initial_committee().authority_binding() != self.authority.commitment()
+            {
+                return Err(AgentConfigError::InvalidSystemAuthorityGenesis);
+            }
         }
         if self.capabilities.max_actors == 0 || !self.runtime_contract.is_valid() {
             return Err(AgentConfigError::InvalidRuntimeCapacity);
@@ -896,6 +939,7 @@ mod tests {
             },
             creation_nonce,
             authority: authority_binding(),
+            system_authority_genesis: None,
             capabilities: RuntimeCapabilities {
                 lanes: LaneSet::of(StateLane::Merge).union(LaneSet::of(StateLane::Local)),
                 scheduling: false,
@@ -949,6 +993,7 @@ mod tests {
             },
             creation_nonce,
             authority: authority_binding(),
+            system_authority_genesis: None,
             runtime_package: BlobRef {
                 hash: Hash([11; 32]),
                 len: 100,

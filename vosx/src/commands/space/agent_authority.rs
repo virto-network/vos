@@ -492,6 +492,7 @@ mod tests {
             },
             creation_nonce: nonce,
             authority: authority_binding(),
+            system_authority_genesis: None,
             runtime_package: BlobRef::of_bytes(b"runtime package"),
             runtime_contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities::standard(),

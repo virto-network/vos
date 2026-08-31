@@ -11,8 +11,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::committee::{
-    RootAnchorRecord, SystemAgentGenesisEvidence, SystemAgentGenesisExpectations,
-    VerifiedSystemAgentGenesis,
+    RootAnchorRecord, SystemAgentGenesisAdmissionId, SystemAgentGenesisAdmissionRecord,
+    SystemAgentGenesisEvidence, SystemAgentGenesisExpectations, VerifiedSystemAgentGenesis,
 };
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, MAX_RUNTIME_STATE_BYTES,
@@ -1274,6 +1274,20 @@ impl ReplayPreparedGenesis {
         {
             return Err(ReplayError::InvalidManagementTransition);
         }
+        let expected_system_authority = config
+            .system_authority_genesis
+            .as_ref()
+            .map(|genesis| {
+                super::system_authority::SystemAuthorityState::from_genesis(
+                    config.identity.agent,
+                    genesis,
+                )
+            })
+            .transpose()
+            .map_err(|_| ReplayError::InvalidManagementTransition)?;
+        if decoded.system_authority != expected_system_authority {
+            return Err(ReplayError::InvalidManagementTransition);
+        }
         let artifacts = derive_standard_artifact_references::<core::convert::Infallible>(
             &create.runtime,
             &post_create,
@@ -1334,6 +1348,7 @@ pub struct ReplaySealedGenesis {
     local_invocations: InvocationIndexManifest,
     artifacts: ArtifactClosure,
     root_anchor: RootAnchorRecord,
+    root_admission_record: SystemAgentGenesisAdmissionRecord,
     admission_record: AgentGenesisAdmissionRecord,
     admission_evidence: SystemAgentGenesisEvidence,
     replica: AgentReplica,
@@ -1374,6 +1389,16 @@ impl ReplaySealedGenesis {
 
     pub fn admission_record(&self) -> &AgentGenesisAdmissionRecord {
         &self.admission_record
+    }
+
+    /// Typed inner root admission. This is distinct from the tagged outer
+    /// journal admission whose ID is committed by [`AgentJournalGenesis`].
+    pub const fn root_admission_record(&self) -> &SystemAgentGenesisAdmissionRecord {
+        &self.root_admission_record
+    }
+
+    pub fn root_admission_id(&self) -> SystemAgentGenesisAdmissionId {
+        self.root_admission_record.id()
     }
 
     pub fn admission_evidence(&self) -> &SystemAgentGenesisEvidence {
@@ -1429,9 +1454,17 @@ impl ReplaySealedGenesis {
 
         let admission_record = AgentGenesisAdmissionRecord::root_bootstrap(root_admission)
             .map_err(|_| ReplayError::InvalidRecord)?;
+        let root_admission_id = root_admission.id();
+        let journal_admission_id = admission_record.id();
+        if root_admission_id == SystemAgentGenesisAdmissionId::ZERO
+            || journal_admission_id == AgentGenesisAdmissionId::ZERO
+            || journal_admission_id.as_bytes() == root_admission_id.as_bytes()
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
 
         let genesis = AgentJournalGenesis {
-            admission: admission_record.id(),
+            admission: journal_admission_id,
             create: prepared.create,
         };
         genesis.validate().map_err(|_| ReplayError::InvalidRecord)?;
@@ -1449,6 +1482,9 @@ impl ReplaySealedGenesis {
             return Err(ReplayError::InvalidRecord);
         }
         let genesis_id = genesis.id();
+        if genesis_id == AgentJournalGenesisId::ZERO {
+            return Err(ReplayError::InvalidRecord);
+        }
         let artifacts = ArtifactClosure {
             genesis: genesis_id,
             artifacts: prepared.artifacts,
@@ -1487,6 +1523,7 @@ impl ReplaySealedGenesis {
             ),
             artifacts,
             root_anchor,
+            root_admission_record: root_admission,
             admission_record,
             admission_evidence,
             replica,
@@ -8963,6 +9000,8 @@ pub(crate) mod tests {
         AgentRaftCommand, AgentRaftEvidenceLedger, AgentRouteKey, ArtifactBatchId,
         CommittedAgentRaftEntry, DurableAgentRaftLogWitness,
     };
+    #[cfg(feature = "std")]
+    use crate::agent::system_authority::SystemAuthorityGenesis;
     use crate::agent::{
         AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LaneSet,
         LifecycleAuthorityAdmission, ReplicaRole, RuntimeCapabilities,
@@ -9421,6 +9460,7 @@ pub(crate) mod tests {
             },
             creation_nonce,
             authority: authority(),
+            system_authority_genesis: None,
             runtime_package: BlobRef::of_bytes(b"replay-test-runtime"),
             runtime_contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities {
@@ -9538,7 +9578,7 @@ pub(crate) mod tests {
         let public_key =
             ed25519_public_key_wire(admitted_authority_key().verifying_key().to_bytes());
         AgentAuthorityBinding {
-            agent: AgentId([0x89; 32]),
+            agent: admitted_agent(),
             actor: ActorId([0x8a; 32]),
             deployment: DeploymentId([0x8b; 32]),
             program: ProgramId([0x8c; 32]),
@@ -9548,12 +9588,56 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
+    fn admitted_agent() -> AgentId {
+        AgentId::derive(
+            SpaceId([0x91; 32]),
+            PrincipalId([0x92; 32]),
+            Hash([0x93; 32]).as_bytes(),
+        )
+    }
+
+    #[cfg(feature = "std")]
+    fn admitted_root_material(config: &AgentConfig) -> (RootAnchorRecord, [SigningKey; 3]) {
+        let keys = [
+            SigningKey::from_bytes(&[0xd1; 32]),
+            SigningKey::from_bytes(&[0xd2; 32]),
+            SigningKey::from_bytes(&[0xd3; 32]),
+        ];
+        let mut members = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                AuthorityCommitteeMember::new(
+                    NodeId([(index + 1) as u8; 32]),
+                    key.verifying_key().to_bytes(),
+                    AuthorityMemberRole::Voter,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(AuthorityCommitteeMember::signer);
+        let binding = config.authority.commitment();
+        let committee =
+            AuthorityCommittee::new(config.identity.space, binding, 1, None, members).unwrap();
+        let root = RootAnchorRecord::new(
+            1,
+            config.identity.space,
+            config.identity.agent,
+            binding,
+            Hash([0xd4; 32]),
+            committee,
+        )
+        .unwrap();
+        (root, keys)
+    }
+
+    #[cfg(feature = "std")]
     fn admitted_config() -> AgentConfig {
         let space = SpaceId([0x91; 32]);
         let owner = PrincipalId([0x92; 32]);
         let creation_nonce = Hash([0x93; 32]);
         let agent = AgentId::derive(space, owner, creation_nonce.as_bytes());
-        AgentConfig {
+        let mut config = AgentConfig {
             identity: AgentIdentity {
                 space,
                 agent,
@@ -9565,6 +9649,7 @@ pub(crate) mod tests {
             },
             creation_nonce,
             authority: admitted_authority(),
+            system_authority_genesis: None,
             runtime_package: BlobRef::of_bytes(b"replay-runtime-package"),
             runtime_contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities {
@@ -9578,13 +9663,29 @@ pub(crate) mod tests {
                 principal: owner,
                 role: ReplicaRole::Voter,
             }],
-        }
+        };
+        let (root, _) = admitted_root_material(&config);
+        config.system_authority_genesis = Some(
+            SystemAuthorityGenesis::new(
+                root.id(),
+                root.config_version(),
+                root.config_commitment(),
+                root.initial_committee().clone(),
+                1,
+                8,
+                8,
+            )
+            .unwrap(),
+        );
+        config.validate().unwrap();
+        config
     }
 
     #[cfg(feature = "std")]
     fn shared_admitted_config() -> AgentConfig {
         let mut config = admitted_config();
         config.identity.profile = AgentProfile::Shared;
+        config.system_authority_genesis = None;
         let runtime = admitted_runtime();
         let (committee, _) = shared_test_committee(&runtime);
         config.replicas = committee
@@ -9612,15 +9713,15 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
-    fn admitted_create_input() -> ReplayInput {
+    fn admitted_create_input_for(config: AgentConfig, credential: u8) -> ReplayInput {
         let runtime = admitted_runtime();
-        let inner = LifecycleRequest::Create(admitted_config());
+        let inner = LifecycleRequest::Create(config.clone());
         let claim = AgentAuthorityClaim {
-            authority: admitted_authority(),
+            authority: config.authority.clone(),
             space: runtime.space,
             agent: runtime.agent,
-            principal: admitted_config().identity.owner,
-            credential: CredentialId([0x98; 32]),
+            principal: config.identity.owner,
+            credential: CredentialId([credential; 32]),
             capability: CapabilityId::named("agent.create.local"),
             operation: inner.commitment(),
             sequence: 1,
@@ -9646,16 +9747,15 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
-    fn shared_admitted_create_input() -> ReplayInput {
+    fn shared_admitted_create_input_for(config: AgentConfig, credential: u8) -> ReplayInput {
         let runtime = admitted_runtime();
-        let config = shared_admitted_config();
         let inner = LifecycleRequest::Create(config.clone());
         let claim = AgentAuthorityClaim {
-            authority: admitted_authority(),
+            authority: config.authority.clone(),
             space: runtime.space,
             agent: runtime.agent,
             principal: config.identity.owner,
-            credential: CredentialId([0x98; 32]),
+            credential: CredentialId([credential; 32]),
             capability: CapabilityId::named("agent.create.shared"),
             operation: inner.commitment(),
             sequence: 1,
@@ -9878,27 +9978,22 @@ pub(crate) mod tests {
     /// exposes no callable authority constructor in non-test code.
     #[cfg(feature = "std")]
     pub(crate) fn admitted_genesis(admission: u8) -> ReplaySealedGenesis {
-        admitted_genesis_for(admission, admitted_config(), admitted_create_input())
+        let config = admitted_config();
+        let create = admitted_create_input_for(config.clone(), admission);
+        admitted_genesis_for(config, create)
     }
 
     #[cfg(feature = "std")]
     fn shared_admitted_genesis(admission: u8) -> ReplaySealedGenesis {
-        admitted_genesis_for(
-            admission,
-            shared_admitted_config(),
-            shared_admitted_create_input(),
-        )
+        let config = shared_admitted_config();
+        let create = shared_admitted_create_input_for(config.clone(), admission);
+        admitted_genesis_for(config, create)
     }
 
     #[cfg(feature = "std")]
-    fn admitted_genesis_for(
-        admission: u8,
-        config: AgentConfig,
-        create: ReplayInput,
-    ) -> ReplaySealedGenesis {
+    fn admitted_genesis_for(config: AgentConfig, create: ReplayInput) -> ReplaySealedGenesis {
         let mut executor = ExactCreateRejectInvocations::default();
         let is_shared = config.identity.profile == AgentProfile::Shared;
-        let runtime = create.runtime.clone();
         let replica = config.replicas[0];
         let prepared = if config.identity.profile == AgentProfile::Shared {
             prepare_shared_genesis_for_test(create, replica, &mut executor)
@@ -9906,36 +10001,8 @@ pub(crate) mod tests {
             ReplayPreparedGenesis::prepare(create, replica, &mut executor).unwrap()
         };
         let expected = prepared.expectations();
-        let signing_keys = [
-            SigningKey::from_bytes(&[admission; 32]),
-            SigningKey::from_bytes(&[admission.wrapping_add(1); 32]),
-            SigningKey::from_bytes(&[admission.wrapping_add(2); 32]),
-        ];
-        let mut members = signing_keys
-            .iter()
-            .enumerate()
-            .map(|(index, key)| {
-                AuthorityCommitteeMember::new(
-                    NodeId([(index + 1) as u8; 32]),
-                    key.verifying_key().to_bytes(),
-                    AuthorityMemberRole::Voter,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        members.sort_by_key(AuthorityCommitteeMember::signer);
-        let authority_binding = config.authority.commitment();
-        let committee =
-            AuthorityCommittee::new(runtime.space, authority_binding, 1, None, members).unwrap();
-        let root = RootAnchorRecord::new(
-            u64::from(admission) + 1,
-            runtime.space,
-            runtime.agent,
-            authority_binding,
-            Hash([admission.wrapping_add(3); 32]),
-            committee.clone(),
-        )
-        .unwrap();
+        let (root, signing_keys) = admitted_root_material(&config);
+        let committee = root.initial_committee().clone();
         let claim = SystemAgentGenesisClaim::new(&root, expected).unwrap();
         let trusted = TrustedRootAnchor::verify_configured(
             root.clone(),
@@ -10053,6 +10120,7 @@ pub(crate) mod tests {
             ),
             artifacts,
             root_anchor,
+            root_admission_record: root_admission,
             admission_record,
             admission_evidence,
             replica,
@@ -11952,6 +12020,14 @@ pub(crate) mod tests {
         else {
             panic!("system bootstrap must carry the tagged root admission")
         };
+        assert_eq!(root_admission, sealed.root_admission_record());
+        assert_eq!(root_admission.id(), sealed.root_admission_id());
+        assert_ne!(
+            sealed.root_admission_id(),
+            SystemAgentGenesisAdmissionId::ZERO
+        );
+        assert_ne!(sealed.genesis().admission, AgentGenesisAdmissionId::ZERO);
+        assert_ne!(sealed.genesis().id(), AgentJournalGenesisId::ZERO);
         assert_eq!(sealed.genesis().admission, sealed.admission_record().id());
         assert_ne!(
             sealed.genesis().admission.as_bytes(),

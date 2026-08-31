@@ -2699,10 +2699,7 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
     match operation {
         ReplayOperation::Management { request } => {
             encoder.u8(0);
-            let call = RuntimeCall {
-                state: RuntimeState::default(),
-                request: request.clone(),
-            };
+            let call = RuntimeCall::new(RuntimeState::default(), request.clone());
             encoder.bytes(&call.encode());
         }
         ReplayOperation::Invoke {
@@ -2732,7 +2729,7 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
         0 => {
             let bytes = bounded_bytes_ref(decoder, MAX_REPLAY_INPUT_BYTES)?;
             let call = RuntimeCall::decode(bytes)?;
-            if !call.state.is_empty() {
+            if !call.state.is_empty() || call.journal_context().is_some() {
                 return Err(DecodeError::NonCanonical);
             }
             Ok(ReplayOperation::Management {
@@ -3397,6 +3394,7 @@ mod tests {
             },
             creation_nonce,
             authority: authority_binding(),
+            system_authority_genesis: None,
             runtime_package: BlobRef::of_bytes(b"runtime-package"),
             runtime_contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities {
@@ -4409,6 +4407,33 @@ mod tests {
         assert_eq!(
             decode_replay_operation(&mut unknown),
             Err(DecodeError::InvalidTag)
+        );
+    }
+
+    #[test]
+    fn raw_replay_management_rejects_a_runtime_journal_context() {
+        let scope = super::super::system_authority::SystemAuthorityJournalScope::for_test(
+            AgentJournalGenesisId::new([0x91; 32]),
+            AgentGenesisAdmissionId::from_bytes([0x92; 32]),
+        )
+        .unwrap();
+        let call = RuntimeCall::scoped_system_authority(
+            RuntimeState::default(),
+            LifecycleRequest::Inspect {
+                after: None,
+                limit: 1,
+            },
+            scope,
+        );
+        let mut encoded = Vec::new();
+        let mut encoder = Encoder(&mut encoded);
+        encoder.u8(0);
+        encoder.bytes(&call.encode());
+
+        let mut decoder = Decoder::new(&encoded);
+        assert_eq!(
+            decode_replay_operation(&mut decoder),
+            Err(DecodeError::NonCanonical)
         );
     }
 

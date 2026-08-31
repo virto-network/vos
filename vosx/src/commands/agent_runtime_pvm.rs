@@ -53,13 +53,13 @@ fn canonical_agent_runtime_pvm(elf: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 fn validate_agent_runtime_pvm(pvm: &[u8]) -> anyhow::Result<()> {
-    let probe = RuntimeCall {
-        state: RuntimeState::default(),
-        request: LifecycleRequest::Inspect {
+    let probe = RuntimeCall::new(
+        RuntimeState::default(),
+        LifecycleRequest::Inspect {
             after: None,
             limit: 1,
         },
-    }
+    )
     .encode();
     let invocation = RefineContext::load(pvm, &probe, ABI_PROBE_GAS)
         .map_err(|error| anyhow!("load agent-runtime PVM: {error}"))?
