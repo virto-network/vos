@@ -67,6 +67,13 @@ use super::replay::{
 };
 use super::shared_commit::{MAX_ORDERED_COMMIT_CLAIM_BYTES, OrderedCommitClaim};
 use super::shared_raft::JournalStoreInstanceId;
+use super::system_authority::{
+    MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORD_BYTES, MAX_SYSTEM_AUTHORITY_DECISION_NODE_BYTES,
+    MAX_SYSTEM_AUTHORITY_DECISION_TREE_NODES, MAX_SYSTEM_AUTHORITY_ROTATION_NODE_BYTES,
+    MAX_SYSTEM_AUTHORITY_ROTATION_TREE_NODES, MAX_SYSTEM_AUTHORITY_ROTATIONS,
+    SystemAuthorityCommitteeId, SystemAuthorityCommitteeRecord, SystemAuthorityDecisionNode,
+    SystemAuthorityDecisionNodeId, SystemAuthorityRotationNode, SystemAuthorityRotationNodeId,
+};
 use super::wire::{RuntimeState, decode_standard_runtime_state};
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{AgentId, BlobRef, Hash, NodeId};
@@ -217,6 +224,69 @@ pub(crate) trait SharedOrderedCommitStore: AgentJournalStore {
         &mut self,
         binding: &SharedOrderedCommitBinding,
     ) -> Result<bool, JournalStoreError>;
+}
+
+/// Typed, content-addressed persistence for permanent live-system authority
+/// history.
+///
+/// This seam deliberately exposes neither raw bytes nor enumeration. Replay
+/// may only install already-validated typed objects and follow authenticated
+/// node/committee IDs. These objects are permanent audit history and are not
+/// checkpoint-GC candidates.
+pub(crate) trait SystemAuthorityHistoryStore: AgentJournalStore {
+    fn load_system_authority_decision_node(
+        &self,
+        id: SystemAuthorityDecisionNodeId,
+    ) -> Result<Option<SystemAuthorityDecisionNode>, JournalStoreError>;
+
+    fn persist_system_authority_decision_node(
+        &mut self,
+        node: &SystemAuthorityDecisionNode,
+    ) -> Result<(), JournalStoreError>;
+
+    fn load_system_authority_rotation_node(
+        &self,
+        id: SystemAuthorityRotationNodeId,
+    ) -> Result<Option<SystemAuthorityRotationNode>, JournalStoreError>;
+
+    fn persist_system_authority_rotation_node(
+        &mut self,
+        node: &SystemAuthorityRotationNode,
+    ) -> Result<(), JournalStoreError>;
+
+    fn load_system_authority_committee_record(
+        &self,
+        id: SystemAuthorityCommitteeId,
+    ) -> Result<Option<SystemAuthorityCommitteeRecord>, JournalStoreError>;
+
+    fn persist_system_authority_committee_record(
+        &mut self,
+        record: &SystemAuthorityCommitteeRecord,
+    ) -> Result<(), JournalStoreError>;
+}
+
+/// Caller-selected work budget for an explicit authority-history scrub.
+///
+/// Normal reopen never enumerates these protocol-scale permanent namespaces.
+/// An operator may request a bounded streaming scrub separately; exhausting
+/// either budget fails closed without retaining a directory-sized buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SystemAuthorityHistoryScrubLimits {
+    pub(crate) max_namespace_entries: usize,
+    pub(crate) max_file_reads: usize,
+    pub(crate) max_bytes_read: u64,
+}
+
+/// Completed explicit scrub accounting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SystemAuthorityHistoryScrubReport {
+    pub(crate) namespace_entries: usize,
+    pub(crate) private_partial_entries: usize,
+    pub(crate) file_reads: usize,
+    pub(crate) bytes_read: u64,
+    pub(crate) decision_records: usize,
+    pub(crate) rotation_records: usize,
+    pub(crate) committee_records: usize,
 }
 
 /// Explicit work budgets for one checkpoint-governed collection pass.
@@ -1129,6 +1199,9 @@ enum AuthorityStorageClass {
     RootAnchor,
     GenesisEvidence,
     GenesisAdmission,
+    SystemDecision,
+    SystemRotation,
+    SystemCommittee,
 }
 
 trait CanonicalAuthorityRecord: Clone + PartialEq + ServiceWire {
@@ -1163,6 +1236,41 @@ impl CanonicalAuthorityRecord for AgentGenesisAdmissionRecord {
     const STORAGE_CLASS: AuthorityStorageClass = AuthorityStorageClass::GenesisAdmission;
     const DIRECTORY: &'static str = "authority/genesis-admissions";
     const MAXIMUM: usize = MAX_AGENT_GENESIS_ADMISSION_BYTES;
+
+    fn storage_id(&self) -> [u8; 32] {
+        *self.id().as_bytes()
+    }
+}
+
+const AUTHORITY_SYSTEM_DECISIONS_DIRECTORY: &str = "authority/system-decisions";
+const AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY: &str = "authority/system-rotations";
+const AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY: &str = "authority/system-committees";
+const MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORDS: usize = MAX_SYSTEM_AUTHORITY_ROTATIONS as usize + 1;
+
+impl CanonicalAuthorityRecord for SystemAuthorityDecisionNode {
+    const STORAGE_CLASS: AuthorityStorageClass = AuthorityStorageClass::SystemDecision;
+    const DIRECTORY: &'static str = AUTHORITY_SYSTEM_DECISIONS_DIRECTORY;
+    const MAXIMUM: usize = MAX_SYSTEM_AUTHORITY_DECISION_NODE_BYTES;
+
+    fn storage_id(&self) -> [u8; 32] {
+        *self.id().as_bytes()
+    }
+}
+
+impl CanonicalAuthorityRecord for SystemAuthorityRotationNode {
+    const STORAGE_CLASS: AuthorityStorageClass = AuthorityStorageClass::SystemRotation;
+    const DIRECTORY: &'static str = AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY;
+    const MAXIMUM: usize = MAX_SYSTEM_AUTHORITY_ROTATION_NODE_BYTES;
+
+    fn storage_id(&self) -> [u8; 32] {
+        *self.id().as_bytes()
+    }
+}
+
+impl CanonicalAuthorityRecord for SystemAuthorityCommitteeRecord {
+    const STORAGE_CLASS: AuthorityStorageClass = AuthorityStorageClass::SystemCommittee;
+    const DIRECTORY: &'static str = AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY;
+    const MAXIMUM: usize = MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORD_BYTES;
 
     fn storage_id(&self) -> [u8; 32] {
         *self.id().as_bytes()
@@ -3368,6 +3476,31 @@ impl MemoryAgentJournalStore {
         Ok(true)
     }
 
+    fn read_authority<R: CanonicalAuthorityRecord>(
+        &self,
+        expected: [u8; 32],
+    ) -> Result<Option<R>, JournalStoreError> {
+        if expected == [0; 32] {
+            return Err(JournalStoreError::Corrupt);
+        }
+        self.authority
+            .get(&(R::STORAGE_CLASS, expected))
+            .map(|bytes| decode_authority_record::<R>(bytes, expected))
+            .transpose()
+    }
+
+    fn persist_authority_with_readback<R: CanonicalAuthorityRecord>(
+        &mut self,
+        record: &R,
+    ) -> Result<(), JournalStoreError> {
+        let id = record.storage_id();
+        self.persist_authority(record)?;
+        if self.read_authority::<R>(id)?.as_ref() != Some(record) {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(())
+    }
+
     fn object_bytes<R: CanonicalJournalRecord>(&self, id: R::Id) -> Option<&[u8]> {
         if R::STORAGE_CLASS == JournalStorageClass::InvocationHistoryNode {
             return self
@@ -3752,6 +3885,50 @@ impl SharedOrderedCommitStore for MemoryAgentJournalStore {
                 Ok(true)
             }
         }
+    }
+}
+
+impl SystemAuthorityHistoryStore for MemoryAgentJournalStore {
+    fn load_system_authority_decision_node(
+        &self,
+        id: SystemAuthorityDecisionNodeId,
+    ) -> Result<Option<SystemAuthorityDecisionNode>, JournalStoreError> {
+        self.read_authority(*id.as_bytes())
+    }
+
+    fn persist_system_authority_decision_node(
+        &mut self,
+        node: &SystemAuthorityDecisionNode,
+    ) -> Result<(), JournalStoreError> {
+        self.persist_authority_with_readback(node)
+    }
+
+    fn load_system_authority_rotation_node(
+        &self,
+        id: SystemAuthorityRotationNodeId,
+    ) -> Result<Option<SystemAuthorityRotationNode>, JournalStoreError> {
+        self.read_authority(*id.as_bytes())
+    }
+
+    fn persist_system_authority_rotation_node(
+        &mut self,
+        node: &SystemAuthorityRotationNode,
+    ) -> Result<(), JournalStoreError> {
+        self.persist_authority_with_readback(node)
+    }
+
+    fn load_system_authority_committee_record(
+        &self,
+        id: SystemAuthorityCommitteeId,
+    ) -> Result<Option<SystemAuthorityCommitteeRecord>, JournalStoreError> {
+        self.read_authority(*id.as_bytes())
+    }
+
+    fn persist_system_authority_committee_record(
+        &mut self,
+        record: &SystemAuthorityCommitteeRecord,
+    ) -> Result<(), JournalStoreError> {
+        self.persist_authority_with_readback(record)
     }
 }
 
@@ -4793,7 +4970,14 @@ impl FileAgentJournalStore {
             validate_directory_names(self.directories.get("catalog")?, &["blobs"])?;
             validate_directory_names(
                 self.directories.get("authority")?,
-                &["root-anchors", "genesis-evidence", "genesis-admissions"],
+                &[
+                    "root-anchors",
+                    "genesis-evidence",
+                    "genesis-admissions",
+                    "system-decisions",
+                    "system-rotations",
+                    "system-committees",
+                ],
             )?;
             for (key, parent, name) in [
                 ("records/replay-inputs", "records", "replay-inputs"),
@@ -4823,6 +5007,21 @@ impl FileAgentJournalStore {
                     "authority/genesis-admissions",
                     "authority",
                     "genesis-admissions",
+                ),
+                (
+                    AUTHORITY_SYSTEM_DECISIONS_DIRECTORY,
+                    "authority",
+                    "system-decisions",
+                ),
+                (
+                    AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY,
+                    "authority",
+                    "system-rotations",
+                ),
+                (
+                    AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY,
+                    "authority",
+                    "system-committees",
                 ),
             ] {
                 self.directories.add(key, parent, name)?;
@@ -4884,6 +5083,9 @@ impl FileAgentJournalStore {
                 SHARED_ORDERED_COMMIT_DIRECTORY,
                 "catalog",
                 "authority",
+                AUTHORITY_SYSTEM_DECISIONS_DIRECTORY,
+                AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY,
+                AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY,
                 HISTORY_CANDIDATE_DIRECTORY,
                 HISTORY_NODES_DIRECTORY,
                 HISTORY_DIRECTORY,
@@ -5435,19 +5637,24 @@ impl FileAgentJournalStore {
         &self,
         expected: [u8; 32],
     ) -> Result<Option<R>, JournalStoreError> {
+        if expected == [0; 32] {
+            return Err(JournalStoreError::Corrupt);
+        }
         let name = encode_hex(&expected);
         let staged = sibling_next_name(&name);
-        if let Some(bytes) =
-            read_bounded_regular_at(self.directory(R::DIRECTORY)?, &staged, R::MAXIMUM)?
+        let directory = self.directory(R::DIRECTORY)?;
+        let staged = read_bounded_regular_at(directory, &staged, R::MAXIMUM)?
+            .map(|bytes| decode_authority_record::<R>(&bytes, expected))
+            .transpose()?;
+        let committed = read_bounded_regular_at(directory, &name, R::MAXIMUM)?
+            .map(|bytes| decode_authority_record::<R>(&bytes, expected))
+            .transpose()?;
+        if let (Some(staged), Some(committed)) = (&staged, &committed)
+            && staged != committed
         {
-            decode_authority_record::<R>(&bytes, expected)?;
+            return Err(JournalStoreError::Corrupt);
         }
-        let Some(bytes) =
-            read_bounded_regular_at(self.directory(R::DIRECTORY)?, &name, R::MAXIMUM)?
-        else {
-            return Ok(None);
-        };
-        decode_authority_record::<R>(&bytes, expected).map(Some)
+        Ok(committed)
     }
 
     fn persist_authority<R: CanonicalAuthorityRecord>(
@@ -5458,13 +5665,191 @@ impl FileAgentJournalStore {
         let id = record.storage_id();
         let bytes = record.encode();
         decode_authority_record::<R>(&bytes, id)?;
-        persist_immutable_at(
-            self.directory(R::DIRECTORY)?,
-            &encode_hex(&id),
-            &bytes,
-            R::MAXIMUM,
-            |stored| decode_authority_record::<R>(stored, id).map(|_| ()),
-        )
+        let directory = self.directory(R::DIRECTORY)?;
+        let name = encode_hex(&id);
+        let created = persist_immutable_at(directory, &name, &bytes, R::MAXIMUM, |stored| {
+            decode_authority_record::<R>(stored, id).map(|_| ())
+        })?;
+        #[cfg(target_os = "linux")]
+        {
+            // Lazy open deliberately leaves private stages inert. A targeted
+            // successful retry owns recovery for this exact ID, including the
+            // case where a durable `.next` or canonical file already existed.
+            let private = private_stage_name(&sibling_next_name(&name))?;
+            if unlink_file_if_present_at(directory, &private)? {
+                directory
+                    .sync_all()
+                    .map_err(|_| JournalStoreError::Unavailable)?;
+            }
+        }
+        Ok(created)
+    }
+
+    fn persist_authority_with_readback<R: CanonicalAuthorityRecord>(
+        &self,
+        record: &R,
+    ) -> Result<(), JournalStoreError> {
+        let id = record.storage_id();
+        self.persist_authority(record)?;
+        if self.read_authority::<R>(id)?.as_ref() != Some(record) {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_authority_bytes_for_scrub<R: CanonicalAuthorityRecord>(
+        directory: &File,
+        name: &str,
+        limits: SystemAuthorityHistoryScrubLimits,
+        report: &mut SystemAuthorityHistoryScrubReport,
+    ) -> Result<Option<Vec<u8>>, JournalStoreError> {
+        if report.file_reads == limits.max_file_reads {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        report.file_reads += 1;
+        let remaining_bytes = limits
+            .max_bytes_read
+            .checked_sub(report.bytes_read)
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        let Some(bytes) =
+            read_bounded_regular_at_with_work_limit(directory, name, R::MAXIMUM, remaining_bytes)?
+        else {
+            return Ok(None);
+        };
+        let length = u64::try_from(bytes.len()).map_err(|_| JournalStoreError::LimitExceeded)?;
+        report.bytes_read = report
+            .bytes_read
+            .checked_add(length)
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        Ok(Some(bytes))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_authority_for_scrub<R: CanonicalAuthorityRecord>(
+        directory: &File,
+        name: &str,
+        expected: [u8; 32],
+        limits: SystemAuthorityHistoryScrubLimits,
+        report: &mut SystemAuthorityHistoryScrubReport,
+    ) -> Result<Option<R>, JournalStoreError> {
+        Self::read_authority_bytes_for_scrub::<R>(directory, name, limits, report)?
+            .map(|bytes| decode_authority_record::<R>(&bytes, expected))
+            .transpose()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scrub_authority_history_directory<R: CanonicalAuthorityRecord>(
+        &self,
+        maximum_records: usize,
+        limits: SystemAuthorityHistoryScrubLimits,
+        report: &mut SystemAuthorityHistoryScrubReport,
+    ) -> Result<usize, JournalStoreError> {
+        let maximum_names = maximum_records
+            .checked_mul(3)
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        let directory = self.directory(R::DIRECTORY)?;
+        let mut records = 0_usize;
+        visit_directory_names_bounded(directory, maximum_names, |name| {
+            if report.namespace_entries == limits.max_namespace_entries {
+                return Err(JournalStoreError::LimitExceeded);
+            }
+            report.namespace_entries += 1;
+            let (stem, staged, private_partial) =
+                if let Some(stem) = name.strip_suffix(PRIVATE_STAGE_SUFFIX) {
+                    (stem, false, true)
+                } else if let Some(stem) = name.strip_suffix(".next") {
+                    (stem, true, false)
+                } else {
+                    (name, false, false)
+                };
+            let id = decode_hex_32(stem.as_bytes()).ok_or(JournalStoreError::Corrupt)?;
+            if id == [0; 32] || encode_hex(&id) != stem {
+                return Err(JournalStoreError::Corrupt);
+            }
+            if private_partial {
+                Self::read_authority_bytes_for_scrub::<R>(directory, name, limits, report)?
+                    .ok_or(JournalStoreError::Corrupt)?;
+                report.private_partial_entries = report
+                    .private_partial_entries
+                    .checked_add(1)
+                    .ok_or(JournalStoreError::LimitExceeded)?;
+                return Ok(());
+            }
+            let record = Self::read_authority_for_scrub::<R>(directory, name, id, limits, report)?
+                .ok_or(JournalStoreError::Corrupt)?;
+
+            let counts_as_record = if staged {
+                match Self::read_authority_for_scrub::<R>(directory, stem, id, limits, report)? {
+                    Some(committed) if committed == record => false,
+                    Some(_) => return Err(JournalStoreError::Corrupt),
+                    None => true,
+                }
+            } else {
+                true
+            };
+            if counts_as_record {
+                records = records
+                    .checked_add(1)
+                    .ok_or(JournalStoreError::LimitExceeded)?;
+                if records > maximum_records {
+                    return Err(JournalStoreError::LimitExceeded);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(records)
+    }
+
+    /// Explicitly stream and authenticate every permanent authority-history
+    /// object under caller-supplied work limits.
+    ///
+    /// This is intentionally not part of `open`: no namespace entry grants
+    /// authority until an exact typed ID load validates it, and a mandatory
+    /// protocol-scale scrub would make a valid large store unavailable.
+    pub(crate) fn scrub_system_authority_history(
+        &self,
+        limits: SystemAuthorityHistoryScrubLimits,
+    ) -> Result<SystemAuthorityHistoryScrubReport, JournalStoreError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = limits;
+            Err(JournalStoreError::Unavailable)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut report = SystemAuthorityHistoryScrubReport {
+                namespace_entries: 0,
+                private_partial_entries: 0,
+                file_reads: 0,
+                bytes_read: 0,
+                decision_records: 0,
+                rotation_records: 0,
+                committee_records: 0,
+            };
+            let decision_records = self
+                .scrub_authority_history_directory::<SystemAuthorityDecisionNode>(
+                    MAX_SYSTEM_AUTHORITY_DECISION_TREE_NODES,
+                    limits,
+                    &mut report,
+                )?;
+            report.decision_records = decision_records;
+            let rotation_records = self
+                .scrub_authority_history_directory::<SystemAuthorityRotationNode>(
+                    MAX_SYSTEM_AUTHORITY_ROTATION_TREE_NODES,
+                    limits,
+                    &mut report,
+                )?;
+            report.rotation_records = rotation_records;
+            let committee_records = self
+                .scrub_authority_history_directory::<SystemAuthorityCommitteeRecord>(
+                    MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORDS,
+                    limits,
+                    &mut report,
+                )?;
+            report.committee_records = committee_records;
+            Ok(report)
+        }
     }
 
     fn load_authority_closure(
@@ -6709,6 +7094,50 @@ impl SharedOrderedCommitStore for FileAgentJournalStore {
     }
 }
 
+impl SystemAuthorityHistoryStore for FileAgentJournalStore {
+    fn load_system_authority_decision_node(
+        &self,
+        id: SystemAuthorityDecisionNodeId,
+    ) -> Result<Option<SystemAuthorityDecisionNode>, JournalStoreError> {
+        self.read_authority(*id.as_bytes())
+    }
+
+    fn persist_system_authority_decision_node(
+        &mut self,
+        node: &SystemAuthorityDecisionNode,
+    ) -> Result<(), JournalStoreError> {
+        self.persist_authority_with_readback(node)
+    }
+
+    fn load_system_authority_rotation_node(
+        &self,
+        id: SystemAuthorityRotationNodeId,
+    ) -> Result<Option<SystemAuthorityRotationNode>, JournalStoreError> {
+        self.read_authority(*id.as_bytes())
+    }
+
+    fn persist_system_authority_rotation_node(
+        &mut self,
+        node: &SystemAuthorityRotationNode,
+    ) -> Result<(), JournalStoreError> {
+        self.persist_authority_with_readback(node)
+    }
+
+    fn load_system_authority_committee_record(
+        &self,
+        id: SystemAuthorityCommitteeId,
+    ) -> Result<Option<SystemAuthorityCommitteeRecord>, JournalStoreError> {
+        self.read_authority(*id.as_bytes())
+    }
+
+    fn persist_system_authority_committee_record(
+        &mut self,
+        record: &SystemAuthorityCommitteeRecord,
+    ) -> Result<(), JournalStoreError> {
+        self.persist_authority_with_readback(record)
+    }
+}
+
 impl AgentJournalGarbageCollection for FileAgentJournalStore {
     fn collect_garbage(
         &mut self,
@@ -6861,7 +7290,10 @@ mod tests {
         ActorInvocationClaim, ActorInvocationReceipt, AgentAuthorityBinding, AgentAuthorityClaim,
         AgentAuthorityReceipt, ED25519_SIGNATURE_BYTES, ed25519_public_key_wire,
     };
-    use crate::agent::committee::{AuthorityClaimCommitment, AuthorityClaimDomain};
+    use crate::agent::committee::{
+        AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommittee,
+        AuthorityCommitteeMember, AuthorityMemberRole,
+    };
     use crate::agent::contract::RuntimePackageContract;
     use crate::agent::execution::{
         ActorExecutionReply, ActorExecutionStatus, ActorInvocation, ActorInvocationAuth,
@@ -7616,6 +8048,464 @@ mod tests {
                     .join(encode_hex(sealed.admission_record().id().as_bytes())),
             ),
         ]
+    }
+
+    fn system_authority_history_fixture() -> (
+        SystemAuthorityDecisionNode,
+        SystemAuthorityRotationNode,
+        SystemAuthorityCommitteeRecord,
+    ) {
+        let decision = SystemAuthorityDecisionNode::Branch {
+            depth: 7,
+            left: SystemAuthorityDecisionNodeId::from_bytes([0x41; 32]),
+            right: SystemAuthorityDecisionNodeId::from_bytes([0x42; 32]),
+        };
+        let rotation = SystemAuthorityRotationNode::Branch {
+            depth: 3,
+            left: SystemAuthorityRotationNodeId::from_bytes([0x51; 32]),
+            right: SystemAuthorityRotationNodeId::from_bytes([0x52; 32]),
+        };
+        let member = AuthorityCommitteeMember::new(
+            NodeId([0x61; 32]),
+            [0x62; 32],
+            AuthorityMemberRole::Voter,
+        )
+        .unwrap();
+        let committee =
+            AuthorityCommittee::new(SpaceId([0x63; 32]), Hash([0x64; 32]), 1, None, vec![member])
+                .unwrap();
+        let committee = SystemAuthorityCommitteeRecord::new(committee).unwrap();
+        (decision, rotation, committee)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn system_authority_history_path(root: &Path, directory: &str, id: &[u8; 32]) -> PathBuf {
+        root.join(directory).join(encode_hex(id))
+    }
+
+    #[cfg(target_os = "linux")]
+    const fn system_authority_history_scrub_limits() -> SystemAuthorityHistoryScrubLimits {
+        SystemAuthorityHistoryScrubLimits {
+            max_namespace_entries: 64,
+            max_file_reads: 64,
+            max_bytes_read: 4 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn memory_system_authority_history_is_typed_bounded_and_content_addressed() {
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        let (decision, rotation, committee) = system_authority_history_fixture();
+
+        assert_eq!(
+            store.load_system_authority_decision_node(SystemAuthorityDecisionNodeId::from_bytes(
+                [0x71; 32]
+            )),
+            Ok(None)
+        );
+        assert_eq!(
+            store.load_system_authority_rotation_node(SystemAuthorityRotationNodeId::from_bytes(
+                [0x72; 32]
+            )),
+            Ok(None)
+        );
+        assert_eq!(
+            store.load_system_authority_committee_record(SystemAuthorityCommitteeId::from_bytes(
+                [0x73; 32]
+            )),
+            Ok(None)
+        );
+        assert_eq!(
+            store.load_system_authority_decision_node(SystemAuthorityDecisionNodeId::ZERO),
+            Err(JournalStoreError::Corrupt)
+        );
+
+        store
+            .persist_system_authority_decision_node(&decision)
+            .unwrap();
+        store
+            .persist_system_authority_rotation_node(&rotation)
+            .unwrap();
+        store
+            .persist_system_authority_committee_record(&committee)
+            .unwrap();
+        // Exact retries prove and retain the same canonical bytes.
+        store
+            .persist_system_authority_decision_node(&decision)
+            .unwrap();
+        assert_eq!(
+            store.load_system_authority_decision_node(decision.id()),
+            Ok(Some(decision.clone()))
+        );
+        assert_eq!(
+            store.load_system_authority_rotation_node(rotation.id()),
+            Ok(Some(rotation.clone()))
+        );
+        assert_eq!(
+            store.load_system_authority_committee_record(committee.id()),
+            Ok(Some(committee.clone()))
+        );
+
+        store.authority.insert(
+            (
+                AuthorityStorageClass::SystemRotation,
+                *rotation.id().as_bytes(),
+            ),
+            b"tampered".to_vec(),
+        );
+        assert_eq!(
+            store.load_system_authority_rotation_node(rotation.id()),
+            Err(JournalStoreError::Corrupt)
+        );
+        store.authority.insert(
+            (
+                AuthorityStorageClass::SystemDecision,
+                *decision.id().as_bytes(),
+            ),
+            vec![0; MAX_SYSTEM_AUTHORITY_DECISION_NODE_BYTES + 1],
+        );
+        assert_eq!(
+            store.load_system_authority_decision_node(decision.id()),
+            Err(JournalStoreError::Corrupt)
+        );
+        let wrong_committee_id = SystemAuthorityCommitteeId::from_bytes([0x74; 32]);
+        store.authority.insert(
+            (
+                AuthorityStorageClass::SystemCommittee,
+                *wrong_committee_id.as_bytes(),
+            ),
+            committee.encode(),
+        );
+        assert_eq!(
+            store.load_system_authority_committee_record(wrong_committee_id),
+            Err(JournalStoreError::Corrupt)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_system_authority_history_reopens_and_missing_stays_missing() {
+        let directory = TestDirectory::new("system-authority-history-reopen");
+        let (decision, rotation, committee) = system_authority_history_fixture();
+        let mut store = open_file_store(&directory);
+        store
+            .persist_system_authority_decision_node(&decision)
+            .unwrap();
+        store
+            .persist_system_authority_rotation_node(&rotation)
+            .unwrap();
+        store
+            .persist_system_authority_committee_record(&committee)
+            .unwrap();
+        let paths = [
+            system_authority_history_path(
+                store.root(),
+                AUTHORITY_SYSTEM_DECISIONS_DIRECTORY,
+                decision.id().as_bytes(),
+            ),
+            system_authority_history_path(
+                store.root(),
+                AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY,
+                rotation.id().as_bytes(),
+            ),
+            system_authority_history_path(
+                store.root(),
+                AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY,
+                committee.id().as_bytes(),
+            ),
+        ];
+        for path in &paths {
+            assert!(path.is_file());
+            assert!(!path.with_extension("next").exists());
+        }
+        drop(store);
+
+        let mut reopened = open_file_store(&directory);
+        assert_eq!(
+            reopened.load_system_authority_decision_node(decision.id()),
+            Ok(Some(decision.clone()))
+        );
+        assert_eq!(
+            reopened.load_system_authority_rotation_node(rotation.id()),
+            Ok(Some(rotation.clone()))
+        );
+        assert_eq!(
+            reopened.load_system_authority_committee_record(committee.id()),
+            Ok(Some(committee.clone()))
+        );
+        reopened
+            .persist_system_authority_committee_record(&committee)
+            .unwrap();
+        drop(reopened);
+
+        for path in &paths {
+            fs::remove_file(path).unwrap();
+        }
+        let missing = open_file_store(&directory);
+        assert_eq!(
+            missing.load_system_authority_decision_node(decision.id()),
+            Ok(None)
+        );
+        assert_eq!(
+            missing.load_system_authority_rotation_node(rotation.id()),
+            Ok(None)
+        );
+        assert_eq!(
+            missing.load_system_authority_committee_record(committee.id()),
+            Ok(None)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_system_authority_history_lazy_open_and_scrub_reject_tamper() {
+        let (decision, rotation, committee) = system_authority_history_fixture();
+        let targets = [
+            (
+                AUTHORITY_SYSTEM_DECISIONS_DIRECTORY,
+                *decision.id().as_bytes(),
+            ),
+            (
+                AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY,
+                *rotation.id().as_bytes(),
+            ),
+            (
+                AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY,
+                *committee.id().as_bytes(),
+            ),
+        ];
+        for (index, (authority_directory, id)) in targets.into_iter().enumerate() {
+            let directory = TestDirectory::new(&format!("system-authority-history-tamper-{index}"));
+            let mut store = open_file_store(&directory);
+            store
+                .persist_system_authority_decision_node(&decision)
+                .unwrap();
+            store
+                .persist_system_authority_rotation_node(&rotation)
+                .unwrap();
+            store
+                .persist_system_authority_committee_record(&committee)
+                .unwrap();
+            let path = system_authority_history_path(store.root(), authority_directory, &id);
+            drop(store);
+            fs::write(path, b"tampered authority history").unwrap();
+
+            // Reopen authenticates topology and capabilities only. An inert,
+            // unreferenced permanent object cannot make a large valid store
+            // unavailable, but following its exact typed ID still fails
+            // closed.
+            let reopened = open_file_store(&directory);
+            let loaded = match index {
+                0 => reopened
+                    .load_system_authority_decision_node(decision.id())
+                    .map(|record| record.map(|_| ())),
+                1 => reopened
+                    .load_system_authority_rotation_node(rotation.id())
+                    .map(|record| record.map(|_| ())),
+                2 => reopened
+                    .load_system_authority_committee_record(committee.id())
+                    .map(|record| record.map(|_| ())),
+                _ => unreachable!(),
+            };
+            assert_eq!(loaded, Err(JournalStoreError::Corrupt));
+            assert_eq!(
+                reopened.scrub_system_authority_history(system_authority_history_scrub_limits()),
+                Err(JournalStoreError::Corrupt)
+            );
+        }
+
+        let directory = TestDirectory::new("system-authority-history-name");
+        let store = open_file_store(&directory);
+        fs::write(
+            store
+                .root()
+                .join(AUTHORITY_SYSTEM_DECISIONS_DIRECTORY)
+                .join("not-a-content-id"),
+            b"junk",
+        )
+        .unwrap();
+        drop(store);
+        let reopened = open_file_store(&directory);
+        assert_eq!(
+            reopened.scrub_system_authority_history(system_authority_history_scrub_limits()),
+            Err(JournalStoreError::Corrupt)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_system_authority_history_lazy_load_and_scrub_enforce_each_wire_bound() {
+        for (index, (authority_directory, maximum)) in [
+            (
+                AUTHORITY_SYSTEM_DECISIONS_DIRECTORY,
+                MAX_SYSTEM_AUTHORITY_DECISION_NODE_BYTES,
+            ),
+            (
+                AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY,
+                MAX_SYSTEM_AUTHORITY_ROTATION_NODE_BYTES,
+            ),
+            (
+                AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY,
+                MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORD_BYTES,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = TestDirectory::new(&format!("system-authority-history-bound-{index}"));
+            let store = open_file_store(&directory);
+            let id = [(0x81_u8).wrapping_add(index as u8); 32];
+            let path = system_authority_history_path(store.root(), authority_directory, &id);
+            fs::write(path, vec![0; maximum + 1]).unwrap();
+            drop(store);
+
+            let reopened = open_file_store(&directory);
+            let loaded = match index {
+                0 => reopened
+                    .load_system_authority_decision_node(SystemAuthorityDecisionNodeId::from_bytes(
+                        id,
+                    ))
+                    .map(|record| record.map(|_| ())),
+                1 => reopened
+                    .load_system_authority_rotation_node(SystemAuthorityRotationNodeId::from_bytes(
+                        id,
+                    ))
+                    .map(|record| record.map(|_| ())),
+                2 => reopened
+                    .load_system_authority_committee_record(SystemAuthorityCommitteeId::from_bytes(
+                        id,
+                    ))
+                    .map(|record| record.map(|_| ())),
+                _ => unreachable!(),
+            };
+            assert_eq!(loaded, Err(JournalStoreError::Corrupt));
+            assert_eq!(
+                reopened.scrub_system_authority_history(system_authority_history_scrub_limits()),
+                Err(JournalStoreError::Corrupt)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_system_authority_history_scrub_streams_aliases_partials_and_budgets() {
+        let directory = TestDirectory::new("system-authority-history-streaming-scrub");
+        let (decision, rotation, committee) = system_authority_history_fixture();
+        let mut store = open_file_store(&directory);
+        store
+            .persist_system_authority_decision_node(&decision)
+            .unwrap();
+        store
+            .persist_system_authority_rotation_node(&rotation)
+            .unwrap();
+        let decision_path = system_authority_history_path(
+            store.root(),
+            AUTHORITY_SYSTEM_DECISIONS_DIRECTORY,
+            decision.id().as_bytes(),
+        );
+        let rotation_path = system_authority_history_path(
+            store.root(),
+            AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY,
+            rotation.id().as_bytes(),
+        );
+        let committee_path = system_authority_history_path(
+            store.root(),
+            AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY,
+            committee.id().as_bytes(),
+        );
+        let decision_stage = decision_path.with_extension("next");
+        let rotation_stage = rotation_path.with_extension("next");
+        let decision_partial = PathBuf::from(format!("{}.next.partial", decision_path.display()));
+        let rotation_partial = PathBuf::from(format!("{}.next.partial", rotation_path.display()));
+        let committee_partial = PathBuf::from(format!("{}.next.partial", committee_path.display()));
+        fs::copy(&decision_path, &decision_stage).unwrap();
+        fs::rename(&rotation_path, &rotation_stage).unwrap();
+        fs::write(&decision_partial, b"interrupted equal-alias retry").unwrap();
+        fs::write(&rotation_partial, b"interrupted stage-only retry").unwrap();
+        fs::write(&committee_partial, b"interrupted partial-only retry").unwrap();
+        drop(store);
+
+        let mut reopened = open_file_store(&directory);
+        // Lazy reopen does not enumerate or discard inert private partials.
+        assert!(decision_partial.exists());
+        assert!(rotation_partial.exists());
+        assert!(committee_partial.exists());
+        assert_eq!(
+            reopened.load_system_authority_decision_node(decision.id()),
+            Ok(Some(decision.clone()))
+        );
+        assert_eq!(
+            reopened.load_system_authority_rotation_node(rotation.id()),
+            Ok(None)
+        );
+        assert_eq!(
+            reopened.load_system_authority_committee_record(committee.id()),
+            Ok(None)
+        );
+
+        let report = reopened
+            .scrub_system_authority_history(system_authority_history_scrub_limits())
+            .unwrap();
+        assert_eq!(report.namespace_entries, 6);
+        assert_eq!(report.private_partial_entries, 3);
+        assert_eq!(report.file_reads, 8);
+        assert_eq!(report.decision_records, 1);
+        assert_eq!(report.rotation_records, 1);
+        assert_eq!(report.committee_records, 0);
+
+        assert_eq!(
+            reopened.scrub_system_authority_history(SystemAuthorityHistoryScrubLimits {
+                max_namespace_entries: 5,
+                ..system_authority_history_scrub_limits()
+            }),
+            Err(JournalStoreError::LimitExceeded)
+        );
+        assert_eq!(
+            reopened.scrub_system_authority_history(SystemAuthorityHistoryScrubLimits {
+                max_file_reads: 4,
+                ..system_authority_history_scrub_limits()
+            }),
+            Err(JournalStoreError::LimitExceeded)
+        );
+        assert_eq!(
+            reopened.scrub_system_authority_history(SystemAuthorityHistoryScrubLimits {
+                max_bytes_read: 0,
+                ..system_authority_history_scrub_limits()
+            }),
+            Err(JournalStoreError::LimitExceeded)
+        );
+
+        // A retry reconciles the exact ID without scanning the namespace and
+        // removes a crash-left private sibling whether the canonical object
+        // or only its durable public stage existed.
+        reopened
+            .persist_system_authority_decision_node(&decision)
+            .unwrap();
+        reopened
+            .persist_system_authority_rotation_node(&rotation)
+            .unwrap();
+        assert!(!decision_stage.exists());
+        assert!(!decision_partial.exists());
+        assert!(rotation_path.exists());
+        assert!(!rotation_stage.exists());
+        assert!(!rotation_partial.exists());
+
+        let divergent = SystemAuthorityDecisionNode::Branch {
+            depth: 8,
+            left: SystemAuthorityDecisionNodeId::from_bytes([0x91; 32]),
+            right: SystemAuthorityDecisionNodeId::from_bytes([0x92; 32]),
+        };
+        fs::write(&decision_stage, divergent.encode()).unwrap();
+        assert_eq!(
+            reopened.load_system_authority_decision_node(decision.id()),
+            Err(JournalStoreError::Corrupt)
+        );
+        assert_eq!(
+            reopened.scrub_system_authority_history(system_authority_history_scrub_limits()),
+            Err(JournalStoreError::Corrupt)
+        );
     }
 
     #[test]
@@ -10695,6 +11585,70 @@ fn validate_directory_names(directory: &File, allowed: &[&str]) -> Result<(), Jo
 }
 
 #[cfg(target_os = "linux")]
+fn visit_directory_names_bounded(
+    directory: &File,
+    maximum: usize,
+    mut visit: impl FnMut(&str) -> Result<(), JournalStoreError>,
+) -> Result<usize, JournalStoreError> {
+    // `fdopendir` consumes its descriptor. Keep the pinned capability intact
+    // and stream one borrowed name at a time from a duplicate descriptor.
+    // SAFETY: `fcntl` receives a valid descriptor and returns a fresh one.
+    let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(JournalStoreError::Unavailable);
+    }
+    // SAFETY: ownership of `duplicate` passes to the DIR stream.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        // SAFETY: failed `fdopendir` did not consume the descriptor.
+        unsafe { libc::close(duplicate) };
+        return Err(JournalStoreError::Unavailable);
+    }
+    // Duplicated directory descriptors share an offset. Rewind before every
+    // explicit scrub so a prior scan cannot hide entries.
+    // SAFETY: `stream` remains live until `closedir` below.
+    unsafe { libc::rewinddir(stream) };
+    let mut visited = 0_usize;
+    let result = loop {
+        // SAFETY: Linux exposes a thread-local errno pointer.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: `stream` remains live until `closedir` below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            // SAFETY: Linux exposes a thread-local errno pointer.
+            let errno = unsafe { *libc::__errno_location() };
+            break if errno == 0 {
+                Ok(())
+            } else {
+                Err(JournalStoreError::Unavailable)
+            };
+        }
+        // SAFETY: a successful directory entry has a NUL-terminated name.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        if visited == maximum {
+            break Err(JournalStoreError::LimitExceeded);
+        }
+        let Ok(name) = name.to_str() else {
+            break Err(JournalStoreError::Corrupt);
+        };
+        visited += 1;
+        if let Err(error) = visit(name) {
+            break Err(error);
+        }
+    };
+    // SAFETY: `closedir` consumes the live stream and duplicate descriptor.
+    let closed = unsafe { libc::closedir(stream) };
+    if closed != 0 {
+        return Err(JournalStoreError::Unavailable);
+    }
+    result?;
+    Ok(visited)
+}
+
+#[cfg(target_os = "linux")]
 fn bounded_directory_names(
     directory: &File,
     maximum: usize,
@@ -10760,6 +11714,16 @@ fn read_bounded_regular_at(
     name: &str,
     maximum: usize,
 ) -> Result<Option<Vec<u8>>, JournalStoreError> {
+    read_bounded_regular_at_with_work_limit(directory, name, maximum, u64::MAX)
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_regular_at_with_work_limit(
+    directory: &File,
+    name: &str,
+    maximum: usize,
+    work_limit: u64,
+) -> Result<Option<Vec<u8>>, JournalStoreError> {
     let file = match open_at(
         directory,
         &c_name(name)?,
@@ -10777,14 +11741,23 @@ fn read_bounded_regular_at(
     if metadata.len() > maximum as u64 {
         return Err(JournalStoreError::Corrupt);
     }
+    if metadata.len() > work_limit {
+        return Err(JournalStoreError::LimitExceeded);
+    }
     let mut file = file;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let read_limit = (maximum as u64)
+        .saturating_add(1)
+        .min(work_limit.saturating_add(1));
     Read::by_ref(&mut file)
-        .take((maximum as u64).saturating_add(1))
+        .take(read_limit)
         .read_to_end(&mut bytes)
         .map_err(|_| JournalStoreError::Unavailable)?;
     if bytes.len() > maximum {
         return Err(JournalStoreError::Corrupt);
+    }
+    if bytes.len() as u64 > work_limit {
+        return Err(JournalStoreError::LimitExceeded);
     }
     Ok(Some(bytes))
 }
