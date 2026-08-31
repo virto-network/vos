@@ -39,7 +39,9 @@ use super::replay::{
     prepare_merge, prepare_ordered, recover_invocation,
 };
 use super::standard::{StandardAgentRuntime, StandardRuntimeState};
-use super::wire::{RuntimeCall, RuntimeReturn, RuntimeState, decode_standard_runtime_state};
+use super::wire::{
+    RuntimeCall, RuntimeJournalContext, RuntimeReturn, RuntimeState, decode_standard_runtime_state,
+};
 use super::{
     ActorDirectoryPage, ActorDirectoryRecord, ActorEntry, AgentConfig, AgentIdentity, AgentProfile,
     AgentReplica, AgentRuntime, InstallActor, InvocationScope, LifecycleAuthorityAdmission,
@@ -996,8 +998,11 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         config: &AgentConfig,
         request: &LifecycleRequest,
     ) -> Result<(), LocalReplayExecutorError> {
-        let LifecycleRequest::Authorized { admission, request } = request else {
-            return Err(LocalReplayExecutorError::InvalidRequest);
+        let (admission, request) = match request {
+            LifecycleRequest::FinalizeSystemAuthority(_)
+            | LifecycleRequest::RotateSystemAuthority(_) => return Ok(()),
+            LifecycleRequest::Authorized { admission, request } => (admission, request),
+            _ => return Err(LocalReplayExecutorError::InvalidRequest),
         };
         let inner = request.as_ref();
         let capability = inner
@@ -1263,6 +1268,16 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
         before: &RuntimeState,
         position: ReplayPosition,
     ) -> Result<ReplayTransition, Self::Error> {
+        self.execute_with_journal_context(input, before, position, None)
+    }
+
+    fn execute_with_journal_context(
+        &mut self,
+        input: &ReplayInput,
+        before: &RuntimeState,
+        position: ReplayPosition,
+        journal_context: Option<RuntimeJournalContext>,
+    ) -> Result<ReplayTransition, Self::Error> {
         let authenticated = self
             .authenticated_execution
             .take()
@@ -1282,12 +1297,26 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
             ReplayOperation::Management { request } => {
                 let mut expected = StandardAgentRuntime::restore(decoded.clone())
                     .map_err(|_| LocalReplayExecutorError::InvalidState)?;
-                let expected_result = expected.apply(request.clone());
-                let returned: RuntimeReturn = self.execute_wire(
-                    &runtime.pvm,
-                    self.management_gas,
-                    &RuntimeCall::new(before.clone(), request.clone()).encode(),
-                )?;
+                let direct_system_authority = matches!(
+                    request,
+                    LifecycleRequest::FinalizeSystemAuthority(_)
+                        | LifecycleRequest::RotateSystemAuthority(_)
+                );
+                if direct_system_authority != journal_context.is_some() {
+                    return Err(LocalReplayExecutorError::InvalidState);
+                }
+                let expected_result = match journal_context {
+                    Some(context) => expected.apply_guest(Some(context), request.clone()),
+                    None => expected.apply(request.clone()),
+                };
+                let call = match journal_context {
+                    Some(context) => {
+                        RuntimeCall::from_replay_context(before.clone(), request.clone(), context)
+                    }
+                    None => RuntimeCall::new(before.clone(), request.clone()),
+                };
+                let returned: RuntimeReturn =
+                    self.execute_wire(&runtime.pvm, self.management_gas, &call.encode())?;
                 if returned.result != expected_result {
                     return Err(LocalReplayExecutorError::InvalidState);
                 }
@@ -4126,6 +4155,31 @@ mod tests {
                 executor,
             },
         }
+    }
+
+    #[test]
+    fn local_lifecycle_surface_rejects_direct_system_authority_commands() {
+        let sealed = super::super::replay::tests::admitted_genesis(0xe9);
+        let finalize = super::super::replay::tests::admitted_finalize_for_test(&sealed, 2);
+        let mut driver = standard_test_driver();
+        let config = current_test_config(&driver.core.materialization);
+        let dummy = LifecycleRequest::Suspend {
+            actor: ActorId([0xea; 32]),
+            expected_deployment: DeploymentId([0xeb; 32]),
+        };
+        let receipt = lifecycle_receipt(&config, &dummy, 2);
+        let heads_before = driver.core.store.heads().unwrap().unwrap();
+        assert!(matches!(
+            driver.lifecycle(
+                receipt,
+                LifecycleRequest::FinalizeSystemAuthority(finalize),
+                &[],
+            ),
+            Err(LocalJournalDriverError::Executor(
+                LocalReplayExecutorError::InvalidRequest
+            ))
+        ));
+        assert_eq!(driver.core.store.heads().unwrap().unwrap(), heads_before);
     }
 
     fn invocation_input(

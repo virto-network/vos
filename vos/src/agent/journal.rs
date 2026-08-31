@@ -2760,6 +2760,16 @@ fn validate_management_request(
     runtime: &RuntimeBinding,
     request: &LifecycleRequest,
 ) -> Result<(), DecodeError> {
+    // Live system-authority commands are self-authorizing through their
+    // embedded committee certificates. They are admitted only as bare
+    // management requests; wrapping one in the generic lifecycle receipt
+    // would create a second, drifting authority domain.
+    if matches!(
+        request,
+        LifecycleRequest::FinalizeSystemAuthority(_) | LifecycleRequest::RotateSystemAuthority(_)
+    ) {
+        return Ok(());
+    }
     let LifecycleRequest::Authorized { admission, request } = request else {
         return Err(DecodeError::NonCanonical);
     };
@@ -2768,6 +2778,8 @@ fn validate_management_request(
         inner,
         LifecycleRequest::Inspect { .. }
             | LifecycleRequest::AcknowledgeInvocation { .. }
+            | LifecycleRequest::FinalizeSystemAuthority(_)
+            | LifecycleRequest::RotateSystemAuthority(_)
             | LifecycleRequest::Authorized { .. }
     ) {
         return Err(DecodeError::NonCanonical);

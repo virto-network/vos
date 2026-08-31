@@ -48,6 +48,15 @@ impl RuntimeJournalContext {
         })
     }
 
+    /// Derive deterministic guest input from replay's opaque root identity.
+    /// This value remains data only: decoding or copying it never mints the
+    /// separate `SystemAuthorityJournalScope` capability.
+    pub(crate) fn from_replayed_root(
+        identity: &super::replay::ReplayedRootJournalIdentity,
+    ) -> Result<Self, super::system_authority::SystemAuthorityError> {
+        Self::new(identity.genesis(), identity.outer_admission())
+    }
+
     pub(crate) const fn genesis(self) -> super::journal::AgentJournalGenesisId {
         self.genesis
     }
@@ -97,6 +106,21 @@ impl RuntimeCall {
                 genesis: trusted_scope.system_genesis(),
                 agent_admission: trusted_scope.agent_admission(),
             }),
+        }
+    }
+
+    /// Construct a replay-selected guest call from data-only journal
+    /// context. Only replay can obtain the context used by live authority
+    /// execution; the guest still receives ordinary bytes, not a capability.
+    pub(crate) const fn from_replay_context(
+        state: RuntimeState,
+        request: LifecycleRequest,
+        journal_context: RuntimeJournalContext,
+    ) -> Self {
+        Self {
+            state,
+            request,
+            journal_context: Some(journal_context),
         }
     }
 

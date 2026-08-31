@@ -50,10 +50,14 @@ use super::shared_commit::{SharedLaneProjection, SharedSealedMergeProjection};
 use super::shared_raft::{
     AgentRaftCommand, AgentRouteKey, JournalStoreInstanceId, ReservedAgentRaftApplication,
 };
-use super::standard::StandardAgentRuntime;
-use super::wire::{RuntimeState, decode_standard_runtime_state, encode_standard_runtime_state};
+use super::standard::{StandardAgentRuntime, StandardSystemAuthorityWrite};
+use super::wire::{
+    RuntimeJournalContext, RuntimeState, decode_standard_runtime_state,
+    encode_standard_runtime_state,
+};
 use super::{
-    AgentProfile, AgentReplica, AgentRuntime, InvocationResultStorage, LifecycleRequest, StateLane,
+    AgentProfile, AgentReplica, AgentRuntime, InvocationResultStorage, LifecycleReply,
+    LifecycleRequest, StateLane,
 };
 use crate::service::wire::ServiceWire;
 use crate::service::{BlobRef, Hash, InvocationId, NodeId};
@@ -198,6 +202,28 @@ pub struct ReplayTransition {
     pub products: ReplayProducts,
 }
 
+/// One live authority execution selected by replay provenance. The guest
+/// receives only `context`; native revalidation additionally consumes the
+/// opaque `scope`. Neither member is wire authority on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplaySystemAuthorityExecution {
+    context: RuntimeJournalContext,
+    scope: super::system_authority::SystemAuthorityJournalScope,
+}
+
+impl ReplaySystemAuthorityExecution {
+    fn from_replayed_root(
+        identity: &ReplayedRootJournalIdentity,
+    ) -> Result<Self, super::system_authority::SystemAuthorityError> {
+        Ok(Self {
+            context: RuntimeJournalContext::from_replayed_root(identity)?,
+            scope: super::system_authority::SystemAuthorityJournalScope::from_replayed_root(
+                identity,
+            )?,
+        })
+    }
+}
+
 /// Runtime and Merge-authentication seam. The executor is responsible for
 /// resolving exact packages/programs and for verifying the event author's
 /// authority-certified signing key.
@@ -232,6 +258,21 @@ pub trait ReplayExecutor {
         before: &RuntimeState,
         position: ReplayPosition,
     ) -> Result<ReplayTransition, Self::Error>;
+
+    /// Execute with replay-authenticated journal context. Executors which do
+    /// not understand the bundled Standard runtime deliberately receive no
+    /// additional authority: the default discards this data-only context,
+    /// while replay still performs native scoped revalidation of the result.
+    fn execute_with_journal_context(
+        &mut self,
+        input: &ReplayInput,
+        before: &RuntimeState,
+        position: ReplayPosition,
+        journal_context: Option<RuntimeJournalContext>,
+    ) -> Result<ReplayTransition, Self::Error> {
+        let _ = journal_context;
+        self.execute(input, before, position)
+    }
 }
 
 /// A QC-authenticated Control/Linear snapshot older than the locally retained
@@ -1096,6 +1137,31 @@ pub enum ReplayStepOutcome {
     DivergentInvocation,
 }
 
+/// Replay-only durable authority objects selected by native scoped
+/// revalidation. The operation commitment prevents a plan selected for one
+/// command from being attached to another command with replaceable proofs.
+/// Storage integration consumes this private token in batch 5c.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReplaySystemAuthorityWrite {
+    operation: Hash,
+    result: LifecycleReply,
+    selected: StandardSystemAuthorityWrite,
+}
+
+impl ReplaySystemAuthorityWrite {
+    pub(crate) const fn operation(&self) -> Hash {
+        self.operation
+    }
+
+    pub(crate) const fn selected(&self) -> &StandardSystemAuthorityWrite {
+        &self.selected
+    }
+
+    pub(crate) const fn result(&self) -> &LifecycleReply {
+        &self.result
+    }
+}
+
 /// Validated successor of one replay step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayStep {
@@ -1108,6 +1174,7 @@ pub struct ReplayStep {
     position: ReplayPosition,
     ownership_delta: InvocationIndexDelta,
     sealed_outcomes: Vec<ReplaySealedOutcome>,
+    system_authority_write: Option<ReplaySystemAuthorityWrite>,
     merge_authenticated: bool,
 }
 
@@ -1197,6 +1264,29 @@ pub enum ReplayPublicationAnchor {
     Checkpoint(CheckpointManifest),
 }
 
+/// Opaque identity of the exact root-admitted journal generation replay may
+/// use for live system-authority transitions.
+///
+/// The fields are intentionally private and the type is neither wire
+/// encodable nor constructible from `JournalHeads`. Only a root-reverified
+/// [`ReplaySealedGenesis`] can mint it. The admission is the tagged outer
+/// `AgentGenesisAdmissionId`, never the inner root-admission ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplayedRootJournalIdentity {
+    genesis: AgentJournalGenesisId,
+    outer_admission: AgentGenesisAdmissionId,
+}
+
+impl ReplayedRootJournalIdentity {
+    pub(crate) const fn genesis(self) -> AgentJournalGenesisId {
+        self.genesis
+    }
+
+    pub(crate) const fn outer_admission(self) -> AgentGenesisAdmissionId {
+        self.outer_admission
+    }
+}
+
 /// Exact, genesis-ID-free result of executing the one admitted Create input.
 ///
 /// Fields are deliberately private. The token can only be minted by the
@@ -1246,7 +1336,7 @@ impl ReplayPreparedGenesis {
             .execute(&create, &before, ReplayPosition::Genesis)
             .map_err(ReplayError::Executor)?;
         validate_runtime_state_bound(&transition.state)?;
-        validate_transition(
+        let system_authority_write = validate_transition(
             &create,
             &before,
             &transition,
@@ -1255,7 +1345,11 @@ impl ReplayPreparedGenesis {
             false,
             false,
             None,
+            None,
         )?;
+        if system_authority_write.is_some() {
+            return Err(ReplayError::InvalidManagementTransition);
+        }
         if transition.disposition != ReplayDisposition::Applied
             || transition.result.is_some()
             || transition.next_runtime != create.runtime
@@ -1407,6 +1501,31 @@ impl ReplaySealedGenesis {
 
     pub fn admission_commitment(&self) -> Hash {
         self.genesis.admission.as_hash()
+    }
+
+    /// Mint replay provenance from the complete root-reverified seal. This
+    /// is deliberately the only production constructor for the opaque root
+    /// journal identity.
+    pub(crate) fn replayed_root_identity(
+        &self,
+    ) -> Result<ReplayedRootJournalIdentity, ReplayValidationError> {
+        let AgentGenesisAdmissionRecord::RootBootstrap(root_admission) = &self.admission_record
+        else {
+            return Err(ReplayError::ScopeMismatch);
+        };
+        if root_admission != &self.root_admission_record
+            || self.admission_record.id() != self.genesis.admission
+            || root_admission.root_anchor() != self.root_anchor.id()
+            || root_admission.root_anchor_config_version() != self.root_anchor.config_version()
+            || root_admission.root_anchor_config() != self.root_anchor.config_commitment()
+            || root_admission.evidence() != self.admission_evidence.id()
+        {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        Ok(ReplayedRootJournalIdentity {
+            genesis: self.genesis.id(),
+            outer_admission: self.genesis.admission,
+        })
     }
 
     pub const fn replica(&self) -> AgentReplica {
@@ -1928,6 +2047,7 @@ pub struct ReplaySealedPublication {
     checkpoint: Option<ReplaySealedCheckpoint>,
     shared_merge_projection: Option<ReplaySealedSharedMergeProjection>,
     shared_ordered_commit: Option<ReplaySealedSharedOrderedCommit>,
+    system_authority_write: Option<ReplaySystemAuthorityWrite>,
     fence_ancestry: FenceAncestryEvidence,
     mode: ReplayPublicationMode,
 }
@@ -2276,6 +2396,7 @@ impl ReplaySuffixBudget {
 pub struct ReplayMaterialization {
     heads_id: JournalHeadsId,
     heads: JournalHeads,
+    replayed_root: Option<ReplayedRootJournalIdentity>,
     state: RuntimeState,
     ordered_snapshots: MaterializedOrderedSnapshots,
     merge_roots: Vec<SealedMergeRoot>,
@@ -2343,6 +2464,30 @@ impl ReplayMaterialization {
 
     pub fn artifacts(&self) -> &ArtifactClosure {
         &self.artifacts
+    }
+
+    /// Attach root provenance only from the exact independently reverified
+    /// seal for this already authenticated materialization. Cold store
+    /// integration calls this seam in batch 5c; until then reopen remains
+    /// deliberately unscoped.
+    pub(crate) fn attach_replayed_root(
+        &mut self,
+        sealed: &ReplaySealedGenesis,
+    ) -> Result<(), ReplayValidationError> {
+        let identity = sealed.replayed_root_identity()?;
+        if identity.genesis() != self.heads.genesis
+            || identity.outer_admission() != self.heads.admission
+            || sealed.genesis().id() != self.heads.genesis
+            || sealed.genesis().admission != self.heads.admission
+        {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        self.replayed_root = Some(identity);
+        Ok(())
+    }
+
+    pub(crate) const fn replayed_root(&self) -> Option<ReplayedRootJournalIdentity> {
+        self.replayed_root
     }
 }
 
@@ -2439,6 +2584,7 @@ impl<'store, S: AgentJournalStore> ReplayPreparedPublication<'store, S> {
     > {
         if self.sealed.mode != ReplayPublicationMode::Canonical
             || self.sealed.shared_ordered_commit.is_some()
+            || self.sealed.system_authority_write.is_some()
         {
             return Err(JournalStoreError::NonCanonical);
         }
@@ -2477,7 +2623,8 @@ impl<'store, S: AgentJournalStore> PreparedSharedOrderedPublication<'store, S> {
             inner.sealed.mode,
             ReplayPublicationMode::SharedOrderedPreserveMerge
                 | ReplayPublicationMode::SharedOrderedInstallFence
-        ) {
+        ) || inner.sealed.system_authority_write.is_some()
+        {
             return Err(JournalStoreError::NonCanonical);
         }
         if inner.store.instance_id() != authority.journal_store {
@@ -2554,6 +2701,13 @@ impl ReplaySealedPublication {
 
     pub(crate) const fn shared_ordered_commit(&self) -> Option<&ReplaySealedSharedOrderedCommit> {
         self.shared_ordered_commit.as_ref()
+    }
+
+    /// Private batch-5c handoff. Generic publication deliberately rejects a
+    /// token returned here until storage can stage and read back its complete
+    /// content-addressed dependency closure.
+    pub(crate) const fn system_authority_write(&self) -> Option<&ReplaySystemAuthorityWrite> {
+        self.system_authority_write.as_ref()
     }
 
     pub(crate) const fn mode(&self) -> ReplayPublicationMode {
@@ -2809,6 +2963,7 @@ impl InvocationOwnership for GenesisInvocationOwnership {
 /// Stateful transition validator shared by ordered, Merge, and Local replay.
 pub struct ReplayMachine<Ownership> {
     genesis: AgentJournalGenesisId,
+    replayed_root: Option<ReplayedRootJournalIdentity>,
     runtime: RuntimeBinding,
     runtime_history: BTreeMap<OrderedBase, RuntimeBinding>,
     ownership: Ownership,
@@ -2826,6 +2981,7 @@ impl ReplayMachine<GenesisInvocationOwnership> {
         }
         Ok(Self {
             genesis,
+            replayed_root: None,
             runtime: runtime.clone(),
             runtime_history: BTreeMap::from([(OrderedBase::post_genesis(), runtime)]),
             ownership: GenesisInvocationOwnership {
@@ -2836,6 +2992,27 @@ impl ReplayMachine<GenesisInvocationOwnership> {
             },
             fence: None,
         })
+    }
+
+    /// Start replay from an explicitly root-reverified sealed generation.
+    /// This is intentionally distinct from [`Self::from_genesis`], whose raw
+    /// IDs never acquire live authority provenance.
+    pub(crate) fn from_replayed_root_genesis(
+        sealed: &ReplaySealedGenesis,
+        runtime: RuntimeBinding,
+    ) -> Result<Self, InvocationOwnershipError> {
+        let identity = sealed
+            .replayed_root_identity()
+            .map_err(|_| InvocationOwnershipError::Unauthenticated)?;
+        if sealed.genesis().runtime() != &runtime
+            || sealed.genesis().id() != identity.genesis()
+            || sealed.genesis().admission != identity.outer_admission()
+        {
+            return Err(InvocationOwnershipError::Unauthenticated);
+        }
+        let mut machine = Self::from_genesis(identity.genesis(), runtime)?;
+        machine.replayed_root = Some(identity);
+        Ok(machine)
     }
 }
 
@@ -2859,6 +3036,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         }
         Ok(Self {
             genesis: heads.genesis,
+            replayed_root: materialization.replayed_root,
             runtime: heads.runtime.clone(),
             runtime_history: materialization
                 .ordered_snapshots
@@ -2903,6 +3081,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         }
         Ok(Self {
             genesis,
+            replayed_root: None,
             runtime: runtime.clone(),
             runtime_history: BTreeMap::from([(ordered_base, runtime)]),
             ownership,
@@ -2985,6 +3164,30 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             self.ownership
                 .index_id(InvocationOwnershipScope::Local(node))?,
         ))
+    }
+
+    fn system_authority_execution<SourceError, ExecutorError>(
+        &self,
+        input: &ReplayInput,
+    ) -> Result<Option<ReplaySystemAuthorityExecution>, ReplayError<SourceError, ExecutorError>>
+    {
+        let ReplayOperation::Management { request } = &input.operation else {
+            return Ok(None);
+        };
+        if !matches!(
+            request,
+            LifecycleRequest::FinalizeSystemAuthority(_)
+                | LifecycleRequest::RotateSystemAuthority(_)
+        ) {
+            return Ok(None);
+        }
+        let identity = self.replayed_root.ok_or(ReplayError::ScopeMismatch)?;
+        if identity.genesis() != self.genesis {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        ReplaySystemAuthorityExecution::from_replayed_root(&identity)
+            .map(Some)
+            .map_err(|_| ReplayError::ScopeMismatch)
     }
 
     /// Validate the Raft-owned Merge seal consumed by an ordered management
@@ -3127,6 +3330,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         if input.runtime != execution_runtime {
             return Err(ReplayError::RuntimeMismatch);
         }
+        let system_authority_execution = self.system_authority_execution(input)?;
 
         // Authority admission precedes every ownership shortcut. In
         // particular, a forged receipt with an otherwise exact request
@@ -3353,7 +3557,12 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             )?
         } else {
             executor
-                .execute(input, before, position)
+                .execute_with_journal_context(
+                    input,
+                    before,
+                    position,
+                    system_authority_execution.map(|execution| execution.context),
+                )
                 .map_err(ReplayError::Executor)?
         };
         if prior_owner.is_none()
@@ -3376,7 +3585,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             return Err(ReplayError::UncommittedInvocation(*error));
         }
         validate_runtime_state_bound(&transition.state)?;
-        validate_transition(
+        let system_authority_write = validate_transition(
             input,
             before,
             &transition,
@@ -3385,6 +3594,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             retained_recovery,
             non_applied_ack,
             acknowledgement_outcome.as_ref(),
+            system_authority_execution,
         )?;
         if retained_recovery
             && let Some(outcome) = &retained_outcome
@@ -3543,6 +3753,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             position,
             ownership_delta,
             sealed_outcomes,
+            system_authority_write,
             merge_authenticated: false,
         })
     }
@@ -3603,6 +3814,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                     position,
                     ownership_delta: InvocationIndexDelta::NONE,
                     sealed_outcomes: Vec::new(),
+                    system_authority_write: None,
                     merge_authenticated: true,
                 });
             }
@@ -3926,6 +4138,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         materialization: &ReplayMaterialization,
     ) -> Result<ReplaySealedPublication, ReplayValidationError> {
         validate_publication_envelope(self.genesis, current, &next)?;
+        validate_system_authority_side_product(&entry.input, step)?;
         let id = entry.id();
         let position_matches = matches!(
             step.position,
@@ -4047,6 +4260,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             checkpoint: None,
             shared_merge_projection: None,
             shared_ordered_commit: None,
+            system_authority_write: step.system_authority_write.clone(),
             fence_ancestry,
             mode: ReplayPublicationMode::Canonical,
         })
@@ -4073,6 +4287,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         mode: ReplayPublicationMode,
     ) -> Result<ReplaySealedPublication, ReplayValidationError> {
         validate_publication_envelope(self.genesis, current, &next)?;
+        validate_system_authority_side_product(&entry.input, step)?;
         let id = entry.id();
         let installing_fence = mode == ReplayPublicationMode::SharedOrderedInstallFence;
         if !matches!(
@@ -4290,6 +4505,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 claim: claim.clone(),
                 raft_payload_commitment,
             }),
+            system_authority_write: step.system_authority_write.clone(),
             fence_ancestry,
             mode,
         })
@@ -4305,6 +4521,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         materialization: &ReplayMaterialization,
     ) -> Result<ReplaySealedPublication, ReplayValidationError> {
         validate_publication_envelope(self.genesis, current, &next)?;
+        validate_system_authority_side_product(&entry.input, step)?;
         let id = entry.id();
         let ordered_base = OrderedBase {
             index: current.ordered_index,
@@ -4374,6 +4591,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             checkpoint: None,
             shared_merge_projection: None,
             shared_ordered_commit: None,
+            system_authority_write: None,
             fence_ancestry,
             mode: ReplayPublicationMode::Canonical,
         })
@@ -4392,6 +4610,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         materialization: &ReplayMaterialization,
     ) -> Result<ReplaySealedPublication, ReplayValidationError> {
         validate_publication_envelope(self.genesis, current, &next)?;
+        validate_system_authority_side_product(&event.input, step)?;
         let id = event.id();
         let position_matches = matches!(
             step.position,
@@ -4444,6 +4663,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             checkpoint: None,
             shared_merge_projection: None,
             shared_ordered_commit: None,
+            system_authority_write: None,
             fence_ancestry,
             mode: ReplayPublicationMode::Canonical,
         })
@@ -4681,6 +4901,34 @@ fn validate_position<SourceError, ExecutorError>(
     }
 }
 
+fn validate_system_authority_side_product<SourceError, ExecutorError>(
+    input: &ReplayInput,
+    step: &ReplayStep,
+) -> Result<(), ReplayError<SourceError, ExecutorError>> {
+    let direct_request = match &input.operation {
+        ReplayOperation::Management { request }
+            if matches!(
+                request,
+                LifecycleRequest::FinalizeSystemAuthority(_)
+                    | LifecycleRequest::RotateSystemAuthority(_)
+            ) =>
+        {
+            Some(request)
+        }
+        _ => None,
+    };
+    match (direct_request, step.system_authority_write.as_ref()) {
+        (Some(request), Some(write))
+            if step.outcome == ReplayStepOutcome::Applied(ReplayDisposition::Applied)
+                && write.operation() == request.commitment() =>
+        {
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => Err(ReplayError::InvalidManagementTransition),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InvocationOwnershipOperation {
     Invoke,
@@ -4831,6 +5079,7 @@ fn noop_replay_step(
         position,
         ownership_delta: InvocationIndexDelta::NONE,
         sealed_outcomes: Vec::new(),
+        system_authority_write: None,
         merge_authenticated: false,
     }
 }
@@ -4910,7 +5159,8 @@ fn validate_transition<SourceError, ExecutorError>(
     retained_recovery: bool,
     synthetic_acknowledgement: bool,
     acknowledgement_outcome: Option<&InvocationOutcomeRecord>,
-) -> Result<(), ReplayError<SourceError, ExecutorError>> {
+    system_authority_execution: Option<ReplaySystemAuthorityExecution>,
+) -> Result<Option<ReplaySystemAuthorityWrite>, ReplayError<SourceError, ExecutorError>> {
     // Runtime side products are not yet content-addressed members of the
     // journal CAS. Accepting them here would make a crash able to lose or
     // duplicate replies/effects even when state replay is exact.
@@ -4963,13 +5213,17 @@ fn validate_transition<SourceError, ExecutorError>(
                 retained_recovery,
                 clock_only,
             )?;
-            validate_lane_mutation(
+            let authority_write = validate_lane_mutation(
                 input,
                 before,
                 &transition.state,
                 transition.disposition,
                 position,
+                None,
             )?;
+            if authority_write.is_some() {
+                return Err(ReplayError::InvalidRecord);
+            }
         }
         ReplayOperation::Acknowledge { .. } => {
             if transition.result.is_some()
@@ -4985,26 +5239,31 @@ fn validate_transition<SourceError, ExecutorError>(
                 synthetic_acknowledgement,
                 acknowledgement_outcome.ok_or(ReplayError::InvalidRecord)?,
             )?;
-            validate_lane_mutation(
+            let authority_write = validate_lane_mutation(
                 input,
                 before,
                 &transition.state,
                 transition.disposition,
                 position,
+                None,
             )?;
+            if authority_write.is_some() {
+                return Err(ReplayError::InvalidRecord);
+            }
         }
         ReplayOperation::Management { .. } => {
             if transition.result.is_some() {
                 return Err(ReplayError::InvalidManagementTransition);
             }
             validate_runtime_successor(input, transition, current_runtime)?;
-            validate_lane_mutation(
+            return validate_lane_mutation(
                 input,
                 before,
                 &transition.state,
                 transition.disposition,
                 position,
-            )?;
+                system_authority_execution,
+            );
         }
         ReplayOperation::SealMerge => {
             if transition.state != *before
@@ -5017,7 +5276,7 @@ fn validate_transition<SourceError, ExecutorError>(
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn validate_standard_invocation_successor<SourceError, ExecutorError>(
@@ -5224,7 +5483,8 @@ fn validate_lane_mutation<SourceError, ExecutorError>(
     after: &RuntimeState,
     disposition: ReplayDisposition,
     position: ReplayPosition,
-) -> Result<(), ReplayError<SourceError, ExecutorError>> {
+    system_authority_execution: Option<ReplaySystemAuthorityExecution>,
+) -> Result<Option<ReplaySystemAuthorityWrite>, ReplayError<SourceError, ExecutorError>> {
     if matches!(input.operation, ReplayOperation::Management { .. }) {
         if !matches!(
             position,
@@ -5236,7 +5496,13 @@ fn validate_lane_mutation<SourceError, ExecutorError>(
         ) {
             return Err(ReplayError::InvalidFence);
         }
-        return validate_standard_management_transition(input, before, after, disposition);
+        return validate_standard_management_transition(
+            input,
+            before,
+            after,
+            disposition,
+            system_authority_execution,
+        );
     }
 
     let lane = input.persisted_lane();
@@ -5265,7 +5531,7 @@ fn validate_lane_mutation<SourceError, ExecutorError>(
     if changed_outside_owner {
         Err(ReplayError::CrossLaneMutation)
     } else {
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -5274,7 +5540,8 @@ fn validate_standard_management_transition<SourceError, ExecutorError>(
     before: &RuntimeState,
     after: &RuntimeState,
     disposition: ReplayDisposition,
-) -> Result<(), ReplayError<SourceError, ExecutorError>> {
+    system_authority_execution: Option<ReplaySystemAuthorityExecution>,
+) -> Result<Option<ReplaySystemAuthorityWrite>, ReplayError<SourceError, ExecutorError>> {
     let ReplayOperation::Management { request } = &input.operation else {
         return Err(ReplayError::InvalidPosition);
     };
@@ -5282,7 +5549,19 @@ fn validate_standard_management_transition<SourceError, ExecutorError>(
         .map_err(|_| ReplayError::InvalidManagementTransition)?;
     let mut runtime = StandardAgentRuntime::restore(decoded)
         .map_err(|_| ReplayError::InvalidManagementTransition)?;
-    let result = runtime.apply(request.clone());
+    let direct_system_authority = matches!(
+        request,
+        LifecycleRequest::FinalizeSystemAuthority(_) | LifecycleRequest::RotateSystemAuthority(_)
+    );
+    let (result, selected) = match (direct_system_authority, system_authority_execution) {
+        (true, Some(execution)) => runtime
+            .apply_scoped(execution.context, execution.scope, request.clone())
+            .into_parts(),
+        (true, None) | (false, Some(_)) => {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        (false, None) => (runtime.apply(request.clone()), None),
+    };
     let expected_disposition = if result.is_ok() {
         ReplayDisposition::Applied
     } else {
@@ -5293,7 +5572,22 @@ fn validate_standard_management_transition<SourceError, ExecutorError>(
     {
         return Err(ReplayError::InvalidManagementTransition);
     }
-    Ok(())
+    match (result, selected) {
+        (Ok(result), Some(selected)) if direct_system_authority => {
+            Ok(Some(ReplaySystemAuthorityWrite {
+                operation: request.commitment(),
+                result,
+                selected,
+            }))
+        }
+        (Ok(_), Some(_)) | (Err(_), Some(_)) | (Ok(_), None) | (Err(_), None)
+            if direct_system_authority =>
+        {
+            Err(ReplayError::InvalidManagementTransition)
+        }
+        (_, Some(_)) => Err(ReplayError::InvalidManagementTransition),
+        (_, None) => Ok(None),
+    }
 }
 
 /// Construct and validate one derived lane-state manifest.
@@ -6200,6 +6494,7 @@ mod aggregate {
         .map_err(|_| ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated))?;
         let mut machine = ReplayMachine {
             genesis: heads.genesis,
+            replayed_root: None,
             runtime: base
                 .snapshots
                 .get(&base.ordered)
@@ -6312,6 +6607,7 @@ mod aggregate {
                         })?;
                         machine = ReplayMachine {
                             genesis: heads.genesis,
+                            replayed_root: None,
                             runtime,
                             runtime_history,
                             ownership: indexes,
@@ -6571,6 +6867,7 @@ mod aggregate {
         Ok(ReplayMaterialization {
             heads_id: heads.id(),
             heads,
+            replayed_root: None,
             state,
             ordered_snapshots: snapshots,
             merge_roots: current_roots,
@@ -7346,6 +7643,7 @@ mod aggregate {
         let mut machine = if entry.merge_seal.is_some() {
             ReplayMachine {
                 genesis: current.genesis,
+                replayed_root: materialization.replayed_root,
                 runtime: current.runtime.clone(),
                 runtime_history: materialization
                     .ordered_snapshots
@@ -7549,6 +7847,7 @@ mod aggregate {
             successor: ReplayMaterialization {
                 heads_id: next.id(),
                 heads: next,
+                replayed_root: materialization.replayed_root,
                 state: step.state,
                 ordered_snapshots: snapshots,
                 merge_roots: materialization.merge_roots.clone(),
@@ -7880,6 +8179,7 @@ mod aggregate {
         .map_err(|_| ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated))?;
         let mut machine = ReplayMachine {
             genesis: current.genesis,
+            replayed_root: materialization.replayed_root,
             runtime: current.runtime.clone(),
             runtime_history: materialization
                 .ordered_snapshots
@@ -8239,6 +8539,7 @@ mod aggregate {
                     successor: ReplayMaterialization {
                         heads_id: next.id(),
                         heads: next,
+                        replayed_root: materialization.replayed_root,
                         state,
                         ordered_snapshots: snapshots,
                         merge_roots,
@@ -8377,6 +8678,7 @@ mod aggregate {
             successor: ReplayMaterialization {
                 heads_id: next.id(),
                 heads: next,
+                replayed_root: materialization.replayed_root,
                 state,
                 ordered_snapshots: materialization.ordered_snapshots.clone(),
                 merge_roots: materialization.merge_roots.clone(),
@@ -8604,6 +8906,7 @@ mod aggregate {
         .map_err(|_| ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated))?;
         let mut machine = ReplayMachine {
             genesis: current.genesis,
+            replayed_root: materialization.replayed_root,
             runtime: current.runtime.clone(),
             runtime_history: materialization
                 .ordered_snapshots
@@ -8713,6 +9016,7 @@ mod aggregate {
             successor: ReplayMaterialization {
                 heads_id: next.id(),
                 heads: next,
+                replayed_root: materialization.replayed_root,
                 state,
                 ordered_snapshots: snapshots,
                 merge_roots: next_roots,
@@ -8900,6 +9204,7 @@ mod aggregate {
             checkpoint: Some(checkpoint),
             shared_merge_projection: None,
             shared_ordered_commit: None,
+            system_authority_write: None,
             fence_ancestry: fence_ancestry.clone(),
             mode: ReplayPublicationMode::Canonical,
         };
@@ -8930,6 +9235,7 @@ mod aggregate {
             successor: ReplayMaterialization {
                 heads_id: next.id(),
                 heads: next,
+                replayed_root: materialization.replayed_root,
                 state,
                 ordered_snapshots: snapshots,
                 merge_roots: materialization.merge_roots.clone(),
@@ -8976,8 +9282,9 @@ pub(crate) mod tests {
     use crate::agent::execution::{ActorInvocation, ActorInvocationAuth, ActorObservation};
     #[cfg(feature = "std")]
     use crate::agent::genesis::{
-        AgentGenesisAdmissionId, AgentReplicaCommittee, AgentReplicaCommitteeId,
-        AgentReplicaMember, derive_replica_raft_slot,
+        AgentGenesisAdmissionId, AgentGenesisClaim, AgentGenesisDecision, AgentGenesisEvidence,
+        AgentGenesisExpectations, AgentGenesisLocator, AgentGenesisProposal, AgentReplicaCommittee,
+        AgentReplicaCommitteeId, AgentReplicaMember, derive_replica_raft_slot,
     };
     #[cfg(feature = "std")]
     use crate::agent::invocation_history::{InvocationHistoryNode, InvocationHistoryStore};
@@ -9001,7 +9308,9 @@ pub(crate) mod tests {
         CommittedAgentRaftEntry, DurableAgentRaftLogWitness,
     };
     #[cfg(feature = "std")]
-    use crate::agent::system_authority::SystemAuthorityGenesis;
+    use crate::agent::system_authority::{
+        SystemAuthorityDecisionProof, SystemAuthorityFinalize, SystemAuthorityGenesis,
+    };
     use crate::agent::{
         AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LaneSet,
         LifecycleAuthorityAdmission, ReplicaRole, RuntimeCapabilities,
@@ -9713,6 +10022,201 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
+    struct AdmittedFinalizeFixture {
+        command: SystemAuthorityFinalize,
+        later_admission: AgentGenesisAdmissionRecord,
+    }
+
+    #[cfg(feature = "std")]
+    fn admitted_finalize_fixture(
+        sealed: &ReplaySealedGenesis,
+        sequence: u64,
+        signed_scope: Option<(AgentJournalGenesisId, AgentGenesisAdmissionId)>,
+    ) -> AdmittedFinalizeFixture {
+        const PEER_ID_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
+
+        let ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { request, .. },
+        } = &sealed.genesis().create.operation
+        else {
+            unreachable!()
+        };
+        let LifecycleRequest::Create(system) = request.as_ref() else {
+            unreachable!()
+        };
+        let (root, committee_keys) = admitted_root_material(system);
+        assert_eq!(&root, sealed.root_anchor());
+
+        let raw_member_key = [0x31; 32];
+        let mut peer_id = Vec::from(PEER_ID_PREFIX);
+        peer_id.extend_from_slice(&raw_member_key);
+        let member = AgentReplicaMember::new(
+            AgentReplica {
+                node: NodeId::of_authenticated_peer(&peer_id),
+                principal: PrincipalId::of_public_key(&raw_member_key),
+                role: ReplicaRole::Voter,
+            },
+            peer_id.clone(),
+            raw_member_key,
+            Some(derive_replica_raft_slot(&peer_id)),
+        )
+        .unwrap();
+        let owner = PrincipalId([0x12; 32]);
+        let nonce = Hash([0x10_u8.wrapping_add(sequence as u8); 32]);
+        let agent = AgentId::derive(system.identity.space, owner, nonce.as_bytes());
+        let target = AgentConfig {
+            identity: AgentIdentity {
+                space: system.identity.space,
+                agent,
+                owner,
+                profile: AgentProfile::Shared,
+                runtime_deployment: DeploymentId([0x21; 32]),
+                runtime_program: ProgramId([0x22; 32]),
+                runtime_producer: ProducerId([0x23; 32]),
+            },
+            creation_nonce: nonce,
+            authority: system.authority.clone(),
+            system_authority_genesis: None,
+            runtime_package: BlobRef::of_bytes(b"ordinary-replay-runtime"),
+            runtime_contract: RuntimePackageContract::canonical(),
+            capabilities: RuntimeCapabilities::standard(),
+            replicas: vec![member.replica()],
+        };
+        target.validate().unwrap();
+
+        let inner = LifecycleRequest::Create(target.clone());
+        let create = ReplayInput {
+            runtime: RuntimeBinding {
+                space: target.identity.space,
+                agent,
+                deployment: target.identity.runtime_deployment,
+                program: target.identity.runtime_program,
+                producer: target.identity.runtime_producer,
+                package: target.runtime_package.clone(),
+                runtime_abi: super::super::RUNTIME_ABI_ID,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            },
+            operation: ReplayOperation::Management {
+                request: LifecycleRequest::Authorized {
+                    admission: LifecycleAuthorityAdmission {
+                        receipt: AgentAuthorityReceipt {
+                            claim: AgentAuthorityClaim {
+                                authority: target.authority.clone(),
+                                space: target.identity.space,
+                                agent,
+                                principal: owner,
+                                credential: CredentialId([0x24; 32]),
+                                capability: CapabilityId::named("agent.create.shared"),
+                                operation: inner.commitment(),
+                                sequence,
+                                valid_from: 10,
+                                valid_until: 40,
+                            },
+                            signature: vec![0x25; ED25519_SIGNATURE_BYTES],
+                        },
+                        observed_slot: 20,
+                    },
+                    request: alloc::boxed::Box::new(inner.clone()),
+                },
+            },
+        };
+        create.validate().unwrap();
+        let catalog = vec![target.runtime_package.clone()];
+        let expectations = AgentGenesisExpectations::new(
+            create.runtime.commitment(),
+            inner.commitment(),
+            Hash([0x26; 32]),
+            system_genesis_artifact_closure_commitment(&catalog).unwrap(),
+            sequence,
+        )
+        .unwrap();
+        let proposal = AgentGenesisProposal::new(
+            AgentGenesisLocator {
+                space: target.identity.space,
+                agent,
+            },
+            create,
+            expectations,
+            catalog,
+        )
+        .unwrap();
+        let replicas = AgentReplicaCommittee::new(
+            target.identity.space,
+            agent,
+            AgentProfile::Shared,
+            vec![member],
+        )
+        .unwrap();
+        let (system_genesis, system_admission) =
+            signed_scope.unwrap_or((sealed.genesis().id(), sealed.genesis().admission));
+        let claim = AgentGenesisClaim::new(
+            system.identity.agent,
+            system_genesis,
+            system_admission,
+            &proposal,
+            &replicas,
+        )
+        .unwrap();
+        let committee = root.initial_committee();
+        let message = AuthorityQuorumCertificate::signing_message(
+            committee.authority_binding(),
+            committee.epoch(),
+            committee.commitment(),
+            claim.authority_claim(),
+        );
+        let mut signatures = committee_keys[..2]
+            .iter()
+            .map(|key| {
+                AuthoritySignature::new(
+                    AuthoritySignerId::of_raw_ed25519(&key.verifying_key().to_bytes()),
+                    key.sign(&message.0).to_bytes(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(AuthoritySignature::signer);
+        let certificate =
+            AuthorityQuorumCertificate::new(committee, claim.authority_claim(), signatures)
+                .unwrap();
+        let evidence = AgentGenesisEvidence::new(claim, certificate).unwrap();
+        let decision = AgentGenesisDecision::new(&proposal, &replicas, &evidence).unwrap();
+        let later_admission =
+            AgentGenesisAdmissionRecord::system_authorized(&decision, &evidence, &replicas)
+                .unwrap();
+        let command = SystemAuthorityFinalize::new(
+            decision,
+            evidence,
+            SystemAuthorityDecisionProof::vacant(agent, vec![]).unwrap(),
+        )
+        .unwrap();
+        AdmittedFinalizeFixture {
+            command,
+            later_admission,
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn admitted_finalize_for_test(
+        sealed: &ReplaySealedGenesis,
+        sequence: u64,
+    ) -> SystemAuthorityFinalize {
+        admitted_finalize_fixture(sealed, sequence, None).command
+    }
+
+    #[cfg(feature = "std")]
+    fn authority_finalize_input(
+        sealed: &ReplaySealedGenesis,
+        command: SystemAuthorityFinalize,
+    ) -> ReplayInput {
+        ReplayInput {
+            runtime: sealed.genesis().runtime().clone(),
+            operation: ReplayOperation::Management {
+                request: LifecycleRequest::FinalizeSystemAuthority(command),
+            },
+        }
+    }
+
+    #[cfg(feature = "std")]
     fn admitted_create_input_for(config: AgentConfig, credential: u8) -> ReplayInput {
         let runtime = admitted_runtime();
         let inner = LifecycleRequest::Create(config.clone());
@@ -9971,6 +10475,36 @@ pub(crate) mod tests {
                 products: ReplayProducts::default(),
             })
         }
+
+        fn execute_with_journal_context(
+            &mut self,
+            input: &ReplayInput,
+            before: &RuntimeState,
+            position: ReplayPosition,
+            journal_context: Option<RuntimeJournalContext>,
+        ) -> Result<ReplayTransition, Self::Error> {
+            let Some(context) = journal_context else {
+                return self.execute(input, before, position);
+            };
+            self.executions += 1;
+            let ReplayOperation::Management { request } = &input.operation else {
+                return Err(());
+            };
+            let decoded = decode_standard_runtime_state(before).map_err(|_| ())?;
+            let mut runtime = StandardAgentRuntime::restore(decoded).map_err(|_| ())?;
+            let result = runtime.apply_guest(Some(context), request.clone());
+            Ok(ReplayTransition {
+                state: encode_standard_runtime_state(&runtime.snapshot()),
+                disposition: if result.is_ok() {
+                    ReplayDisposition::Applied
+                } else {
+                    ReplayDisposition::Rejected
+                },
+                result: None,
+                next_runtime: input.runtime.clone(),
+                products: ReplayProducts::default(),
+            })
+        }
     }
 
     /// Test-only root admission. It still authenticates and executes the
@@ -10162,6 +10696,7 @@ pub(crate) mod tests {
             &create.runtime,
             false,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -11636,6 +12171,7 @@ pub(crate) mod tests {
                     false,
                     false,
                     None,
+                    None,
                 )
                 .is_ok()
             );
@@ -11669,6 +12205,7 @@ pub(crate) mod tests {
                     false,
                     false,
                     None,
+                    None,
                 )
                 .is_ok(),
                 "{error:?}"
@@ -11701,6 +12238,7 @@ pub(crate) mod tests {
                     &input.runtime,
                     false,
                     false,
+                    None,
                     None,
                 ),
                 Err(ReplayError::InvalidRecord)
@@ -12009,6 +12547,258 @@ pub(crate) mod tests {
         assert!(matches!(
             aggregate::test_composite_entry_budget(512, 256, 257),
             Err(ReplayError::ReplayLimit)
+        ));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn system_authority_management_is_bare_and_never_generic_authorized() {
+        let sealed = admitted_genesis(0xc0);
+        let command = admitted_finalize_for_test(&sealed, 2);
+        let bare = authority_finalize_input(&sealed, command.clone());
+        bare.validate().unwrap();
+        assert_eq!(ReplayInput::decode(&bare.encode()).unwrap(), bare);
+
+        let ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { admission, .. },
+        } = &sealed.genesis().create.operation
+        else {
+            unreachable!()
+        };
+        let wrapped = ReplayInput {
+            runtime: sealed.genesis().runtime().clone(),
+            operation: ReplayOperation::Management {
+                request: LifecycleRequest::Authorized {
+                    admission: admission.clone(),
+                    request: alloc::boxed::Box::new(LifecycleRequest::FinalizeSystemAuthority(
+                        command,
+                    )),
+                },
+            },
+        };
+        assert_eq!(
+            wrapped.validate(),
+            Err(crate::service::wire::DecodeError::NonCanonical)
+        );
+        assert_eq!(
+            ReplayInput::decode(&wrapped.encode()),
+            Err(crate::service::wire::DecodeError::NonCanonical)
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn root_replay_identity_rejects_a_later_system_authorized_seal() {
+        let mut sealed = admitted_genesis(0xc6);
+        let fixture = admitted_finalize_fixture(&sealed, 2, None);
+        let identity = sealed.replayed_root_identity().unwrap();
+        assert_eq!(identity.genesis(), sealed.genesis().id());
+        assert_eq!(identity.outer_admission(), sealed.genesis().admission);
+
+        sealed.admission_record = fixture.later_admission;
+        assert!(matches!(
+            sealed.replayed_root_identity(),
+            Err(ReplayError::ScopeMismatch)
+        ));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn raw_genesis_replay_cannot_acquire_system_authority_scope() {
+        let sealed = admitted_genesis(0xc7);
+        let input = authority_finalize_input(&sealed, admitted_finalize_for_test(&sealed, 2));
+        let mut machine =
+            ReplayMachine::from_genesis(sealed.genesis().id(), sealed.genesis().runtime().clone())
+                .unwrap();
+        let mut executor = ExactCreateRejectInvocations::default();
+        assert!(matches!(
+            machine.apply::<_, ()>(
+                &mut executor,
+                &input,
+                sealed.post_create(),
+                ReplayPosition::Ordered {
+                    id: OrderedEntryId([0xc8; 32]),
+                    index: 1,
+                    merge_frontier: sealed.empty_frontier().id(),
+                    merge_seal: Some(MergeSealId([0xc9; 32])),
+                },
+            ),
+            Err(ReplayError::ScopeMismatch)
+        ));
+        assert_eq!(executor.executions, 0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn scoped_replay_selects_reply_bound_native_authority_write() {
+        let sealed = admitted_genesis(0xca);
+        let input = authority_finalize_input(&sealed, admitted_finalize_for_test(&sealed, 2));
+        let mut machine =
+            ReplayMachine::from_replayed_root_genesis(&sealed, sealed.genesis().runtime().clone())
+                .unwrap();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let step = machine
+            .apply::<_, ()>(
+                &mut executor,
+                &input,
+                sealed.post_create(),
+                ReplayPosition::Ordered {
+                    id: OrderedEntryId([0xcb; 32]),
+                    index: 1,
+                    merge_frontier: sealed.empty_frontier().id(),
+                    merge_seal: Some(MergeSealId([0xcc; 32])),
+                },
+            )
+            .unwrap();
+        let write = step.system_authority_write.as_ref().unwrap();
+        let ReplayOperation::Management { request } = &input.operation else {
+            unreachable!()
+        };
+        assert_eq!(write.operation(), request.commitment());
+        assert!(matches!(
+            write.result(),
+            LifecycleReply::SystemAuthorityFinalized(
+                crate::agent::system_authority::SystemAuthorityFinalizeOutcome::Admitted(_)
+            )
+        ));
+        assert!(matches!(
+            write.selected(),
+            StandardSystemAuthorityWrite::Finalize { .. }
+        ));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn wrong_scope_and_invalid_direct_authority_commands_never_prepare() {
+        let sealed = admitted_genesis(0xcd);
+        let foreign = admitted_finalize_fixture(
+            &sealed,
+            2,
+            Some((
+                AgentJournalGenesisId::new([0xce; 32]),
+                AgentGenesisAdmissionId::from_bytes([0xcf; 32]),
+            )),
+        );
+        let wrong_scope = authority_finalize_input(&sealed, foreign.command);
+        let stale = authority_finalize_input(&sealed, admitted_finalize_for_test(&sealed, 1));
+        let position = ReplayPosition::Ordered {
+            id: OrderedEntryId([0xd0; 32]),
+            index: 1,
+            merge_frontier: sealed.empty_frontier().id(),
+            merge_seal: Some(MergeSealId([0xd1; 32])),
+        };
+        for input in [wrong_scope, stale] {
+            let mut machine = ReplayMachine::from_replayed_root_genesis(
+                &sealed,
+                sealed.genesis().runtime().clone(),
+            )
+            .unwrap();
+            let mut executor = ExactCreateRejectInvocations::default();
+            assert!(matches!(
+                machine.apply::<_, ()>(&mut executor, &input, sealed.post_create(), position),
+                Err(ReplayError::InvalidManagementTransition)
+            ));
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn custom_executor_authority_write_cannot_cross_generic_publish_seam() {
+        let sealed = admitted_genesis(0xd2);
+        let node = admitted_config().replicas[0].node;
+        let mut store = MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &admitted_runtime().package,
+                b"replay-runtime-package",
+            )
+            .unwrap();
+        assert!(store.initialize(&sealed).unwrap());
+        let mut executor = ExactCreateRejectInvocations::default();
+        let mut materialized =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        materialized.attach_replayed_root(&sealed).unwrap();
+        let merge_seal = persist_merge_seal(&mut store, &materialized);
+        let entry = OrderedEntry {
+            genesis: materialized.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: materialized.merge_frontier(),
+            merge_seal: Some(merge_seal),
+            input: authority_finalize_input(&sealed, admitted_finalize_for_test(&sealed, 2)),
+        };
+        let heads_before = store.heads().unwrap().unwrap();
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &materialized, &entry).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            };
+        let write = prepared.sealed.system_authority_write().unwrap();
+        assert!(matches!(
+            write.result(),
+            LifecycleReply::SystemAuthorityFinalized(_)
+        ));
+        assert_eq!(prepared.publish(), Err(JournalStoreError::NonCanonical));
+        assert_eq!(store.heads().unwrap().unwrap(), heads_before);
+
+        let invalid = OrderedEntry {
+            genesis: materialized.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: materialized.merge_frontier(),
+            merge_seal: Some(merge_seal),
+            input: authority_finalize_input(&sealed, admitted_finalize_for_test(&sealed, 1)),
+        };
+        assert!(matches!(
+            prepare_ordered(&mut store, &mut executor, &materialized, &invalid),
+            Err(ReplayError::InvalidManagementTransition)
+        ));
+        assert_eq!(store.heads().unwrap().unwrap(), heads_before);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn checkpoint_constructor_does_not_inherit_root_authority_provenance() {
+        let sealed = admitted_genesis(0xd3);
+        let node = admitted_config().replicas[0].node;
+        let mut store = MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &admitted_runtime().package,
+                b"replay-runtime-package",
+            )
+            .unwrap();
+        assert!(store.initialize(&sealed).unwrap());
+        let mut executor = ExactCreateRejectInvocations::default();
+        let materialized =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let prepared = prepare_checkpoint(&mut store, &materialized).unwrap();
+        let checkpoint = prepared.sealed.checkpoint.clone().unwrap();
+        drop(prepared);
+        let ownership = GenesisInvocationOwnership {
+            genesis: sealed.genesis().id(),
+            entries: BTreeMap::new(),
+            history: BTreeMap::new(),
+            outcomes: BTreeMap::new(),
+        };
+        let mut machine = ReplayMachine::from_checkpoint(&checkpoint, ownership, None).unwrap();
+        assert!(machine.replayed_root.is_none());
+        let input = authority_finalize_input(&sealed, admitted_finalize_for_test(&sealed, 2));
+        assert!(matches!(
+            machine.apply::<_, ()>(
+                &mut executor,
+                &input,
+                materialized.state(),
+                ReplayPosition::Ordered {
+                    id: OrderedEntryId([0xd4; 32]),
+                    index: 1,
+                    merge_frontier: materialized.merge_frontier(),
+                    merge_seal: Some(MergeSealId([0xd5; 32])),
+                },
+            ),
+            Err(ReplayError::ScopeMismatch)
         ));
     }
 

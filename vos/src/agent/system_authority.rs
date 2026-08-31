@@ -382,6 +382,18 @@ impl SystemAuthorityJournalBinding {
             Ok(())
         }
     }
+
+    fn commitment(
+        self,
+        root_anchor: RootAnchorId,
+    ) -> Result<SystemAuthorityScopeCommitment, SystemAuthorityError> {
+        self.validate()?;
+        SystemAuthorityScopeCommitment::for_journal(
+            root_anchor,
+            self.system_genesis,
+            self.agent_admission,
+        )
+    }
 }
 
 impl ServiceWire for SystemAuthorityJournalBinding {
@@ -413,12 +425,29 @@ pub(crate) struct SystemAuthorityJournalScope {
 }
 
 impl SystemAuthorityJournalScope {
+    #[cfg(test)]
     fn new(
         system_genesis: AgentJournalGenesisId,
         agent_admission: AgentGenesisAdmissionId,
     ) -> Result<Self, SystemAuthorityError> {
         let scope = Self {
             binding: SystemAuthorityJournalBinding::new(system_genesis, agent_admission)?,
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    /// Promote only replay's opaque, root-reverified journal identity into
+    /// the capability accepted by live authority transitions. Raw IDs and a
+    /// decoded journal binding deliberately cannot call this seam.
+    pub(crate) fn from_replayed_root(
+        identity: &super::replay::ReplayedRootJournalIdentity,
+    ) -> Result<Self, SystemAuthorityError> {
+        let scope = Self {
+            binding: SystemAuthorityJournalBinding::new(
+                identity.genesis(),
+                identity.outer_admission(),
+            )?,
         };
         scope.validate()?;
         Ok(scope)
@@ -453,11 +482,7 @@ impl SystemAuthorityJournalScope {
         root_anchor: RootAnchorId,
     ) -> Result<SystemAuthorityScopeCommitment, SystemAuthorityError> {
         Self::validate(self)?;
-        SystemAuthorityScopeCommitment::for_journal(
-            root_anchor,
-            self.binding.system_genesis(),
-            self.binding.agent_admission(),
-        )
+        self.binding.commitment(root_anchor)
     }
 }
 
@@ -2028,9 +2053,23 @@ impl SystemAuthorityState {
         claim: &SystemAuthorityRotationClaim,
         new_committee: &AuthorityCommittee,
     ) -> Result<(), SystemAuthorityError> {
-        self.validate()?;
         trusted_scope.validate()?;
-        self.validate_rotation_scope(trusted_scope, claim)?;
+        self.validate_rotation_claim_for_signing_binding(
+            trusted_scope.binding(),
+            claim,
+            new_committee,
+        )
+    }
+
+    fn validate_rotation_claim_for_signing_binding(
+        &self,
+        binding: SystemAuthorityJournalBinding,
+        claim: &SystemAuthorityRotationClaim,
+        new_committee: &AuthorityCommittee,
+    ) -> Result<(), SystemAuthorityError> {
+        self.validate()?;
+        binding.validate()?;
+        self.validate_rotation_scope(binding, claim)?;
         claim.validate_against_committees(&self.current_committee, new_committee)?;
         self.validate_fresh_committee_sequence(claim.rotation_sequence())?;
         if self.rotation_count >= u64::from(self.rotation_limit) {
@@ -2052,7 +2091,7 @@ impl SystemAuthorityState {
     ) -> Result<(), SystemAuthorityError> {
         self.validate()?;
         trusted_scope.validate()?;
-        self.validate_rotation_scope(trusted_scope, record.certificate().transition())?;
+        self.validate_rotation_scope(trusted_scope.binding(), record.certificate().transition())?;
         record.verify_with_committees(old_committee, new_committee)
     }
 
@@ -2068,7 +2107,7 @@ impl SystemAuthorityState {
     ) -> Result<(), SystemAuthorityError> {
         self.validate()?;
         trusted_scope.validate()?;
-        self.validate_fact_scope(trusted_scope, fact)?;
+        self.validate_fact_scope(trusted_scope.binding(), fact)?;
         verify_provision_fact_with_committee(provision, fact, committee)
     }
 
@@ -2077,11 +2116,20 @@ impl SystemAuthorityState {
         trusted_scope: SystemAuthorityJournalScope,
         finalize: &SystemAuthorityFinalize,
     ) -> Result<SystemAuthorityFinalizeTransition, SystemAuthorityError> {
-        self.validate()?;
         trusted_scope.validate()?;
+        self.apply_finalize_binding(trusted_scope.binding(), finalize)
+    }
+
+    fn apply_finalize_binding(
+        &self,
+        binding: SystemAuthorityJournalBinding,
+        finalize: &SystemAuthorityFinalize,
+    ) -> Result<SystemAuthorityFinalizeTransition, SystemAuthorityError> {
+        self.validate()?;
+        binding.validate()?;
         finalize.validate()?;
         let fact = finalize.fact()?;
-        self.validate_fact_scope(trusted_scope, &fact)?;
+        self.validate_fact_scope(binding, &fact)?;
 
         finalize.proof.verifies(self.decisions_root)?;
         if finalize.proof.occupied.as_ref() == Some(&fact) {
@@ -2102,7 +2150,7 @@ impl SystemAuthorityState {
             self.verify_current_certificate(&fact, finalize.evidence())?;
             self.validate_fresh_committee_sequence(fact.claim.sequence())?;
             let mut next = self.clone();
-            next.bind_journal(trusted_scope)?;
+            next.bind_journal(binding)?;
             next.committee_sequence_high_water = fact.claim.sequence();
             next.rotation_first_sequence = None;
             next.validate()?;
@@ -2121,7 +2169,7 @@ impl SystemAuthorityState {
         }
 
         let mut next = self.clone();
-        next.bind_journal(trusted_scope)?;
+        next.bind_journal(binding)?;
         next.committee_sequence_high_water = fact.claim.sequence();
         next.rotation_first_sequence = None;
 
@@ -2146,10 +2194,19 @@ impl SystemAuthorityState {
         trusted_scope: SystemAuthorityJournalScope,
         rotation: &SystemAuthorityRotation,
     ) -> Result<SystemAuthorityRotationTransition, SystemAuthorityError> {
-        self.validate()?;
         trusted_scope.validate()?;
+        self.apply_rotation_binding(trusted_scope.binding(), rotation)
+    }
+
+    fn apply_rotation_binding(
+        &self,
+        binding: SystemAuthorityJournalBinding,
+        rotation: &SystemAuthorityRotation,
+    ) -> Result<SystemAuthorityRotationTransition, SystemAuthorityError> {
+        self.validate()?;
+        binding.validate()?;
         rotation.validate()?;
-        self.validate_rotation_scope(trusted_scope, rotation.certificate.transition())?;
+        self.validate_rotation_scope(binding, rotation.certificate.transition())?;
         let candidate = SystemAuthorityRotationRecord::from_command_shape(rotation)?;
         rotation.proof.verifies(self.rotations_root, &candidate)?;
 
@@ -2172,8 +2229,8 @@ impl SystemAuthorityState {
         if record != candidate {
             return Err(SystemAuthorityError::InvalidRotationProof);
         }
-        self.validate_rotation_claim_for_signing(
-            trusted_scope,
+        self.validate_rotation_claim_for_signing_binding(
+            binding,
             record.certificate().transition(),
             &rotation.new_committee,
         )?;
@@ -2188,7 +2245,7 @@ impl SystemAuthorityState {
         )?;
         let mut next = self.clone();
         next.current_committee = rotation.new_committee.clone();
-        next.bind_journal(trusted_scope)?;
+        next.bind_journal(binding)?;
         next.committee_sequence_high_water = sequence;
         next.rotation_first_sequence = Some(first);
         next.rotations_root = history.root;
@@ -2217,10 +2274,8 @@ impl SystemAuthorityState {
         agent_admission: AgentGenesisAdmissionId,
         finalize: &SystemAuthorityFinalize,
     ) -> Result<(Self, SystemAuthorityFinalizeOutcome), SystemAuthorityError> {
-        let transition = self.apply_finalize(
-            SystemAuthorityJournalScope::new(system_genesis, agent_admission)?,
-            finalize,
-        )?;
+        let binding = SystemAuthorityJournalBinding::new(system_genesis, agent_admission)?;
+        let transition = self.apply_finalize_binding(binding, finalize)?;
         Ok((transition.state().clone(), transition.outcome()))
     }
 
@@ -2233,10 +2288,8 @@ impl SystemAuthorityState {
         agent_admission: AgentGenesisAdmissionId,
         rotation: &SystemAuthorityRotation,
     ) -> Result<(Self, SystemAuthorityRotationId, u64, bool), SystemAuthorityError> {
-        let transition = self.apply_rotation(
-            SystemAuthorityJournalScope::new(system_genesis, agent_admission)?,
-            rotation,
-        )?;
+        let binding = SystemAuthorityJournalBinding::new(system_genesis, agent_admission)?;
+        let transition = self.apply_rotation_binding(binding, rotation)?;
         Ok((
             transition.state().clone(),
             transition.record().id(),
@@ -2287,17 +2340,17 @@ impl SystemAuthorityState {
 
     fn validate_fact_scope(
         &self,
-        trusted_scope: SystemAuthorityJournalScope,
+        binding: SystemAuthorityJournalBinding,
         fact: &SystemAuthorityDecisionFact,
     ) -> Result<(), SystemAuthorityError> {
-        if fact.system_genesis != trusted_scope.system_genesis()
-            || fact.system_admission != trusted_scope.agent_admission()
+        if fact.system_genesis != binding.system_genesis()
+            || fact.system_admission != binding.agent_admission()
             || fact.space != self.space
             || fact.system_agent != self.system_agent
             || fact.authority_binding != self.authority_binding
             || self
                 .journal_binding
-                .is_some_and(|existing| existing != trusted_scope.binding())
+                .is_some_and(|existing| existing != binding)
         {
             Err(SystemAuthorityError::WrongSystemAgent)
         } else {
@@ -2323,10 +2376,10 @@ impl SystemAuthorityState {
 
     fn validate_rotation_scope(
         &self,
-        trusted_scope: SystemAuthorityJournalScope,
+        binding: SystemAuthorityJournalBinding,
         claim: &SystemAuthorityRotationClaim,
     ) -> Result<(), SystemAuthorityError> {
-        let expected_scope = trusted_scope.commitment(self.root_anchor)?;
+        let expected_scope = binding.commitment(self.root_anchor)?;
         if claim.root_anchor != self.root_anchor
             || claim.root_anchor_config_version != self.root_anchor_config_version
             || claim.root_anchor_config != self.root_anchor_config
@@ -2335,7 +2388,7 @@ impl SystemAuthorityState {
             || claim.authority_binding != self.authority_binding
             || self
                 .journal_binding
-                .is_some_and(|existing| existing != trusted_scope.binding())
+                .is_some_and(|existing| existing != binding)
         {
             Err(SystemAuthorityError::WrongSystemAgent)
         } else {
@@ -2354,9 +2407,8 @@ impl SystemAuthorityState {
 
     fn bind_journal(
         &mut self,
-        scope: SystemAuthorityJournalScope,
+        binding: SystemAuthorityJournalBinding,
     ) -> Result<(), SystemAuthorityError> {
-        let binding = scope.binding();
         match self.journal_binding {
             Some(existing) if existing != binding => Err(SystemAuthorityError::WrongSystemAgent),
             Some(_) => Ok(()),
