@@ -187,6 +187,25 @@ fn acknowledge(
     driver.acknowledge_invocation(invocation, &receipt)
 }
 
+fn installed_incarnation(
+    driver: &mut AgentDriver<FileAgentStore>,
+    actor: ActorId,
+    deployment: DeploymentId,
+) -> Hash {
+    let page = driver
+        .inspect(None, 1)
+        .expect("inspect the fixture's installed actor");
+    assert_eq!(page.next, None, "the fixture installs exactly one actor");
+    let record = page
+        .entries
+        .into_iter()
+        .next()
+        .expect("the installed actor is present in the guest directory");
+    assert_eq!(record.entry.actor, actor);
+    assert_eq!(record.entry.deployment, deployment);
+    record.incarnation
+}
+
 fn authority_receipt(
     config: &AgentConfig,
     request: &LifecycleRequest,
@@ -362,10 +381,12 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
     driver
         .install_actor(&receipt, "counter".into(), None, &package)
         .unwrap();
+    let incarnation = installed_incarnation(&mut driver, actor, deployment);
 
     let first = ActorInvocation {
         invocation: InvocationId([0x20; 32]),
         actor,
+        incarnation,
         deployment,
         program: package.manifest.program,
         mode: vos::agent::MethodMode::Linear,
@@ -585,12 +606,14 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
     driver
         .install_actor(&receipt, "board".into(), None, &package)
         .unwrap();
+    let incarnation = installed_incarnation(&mut driver, actor, deployment);
 
     let installed = driver.image().runtime_state.clone();
 
     let invocation = |id: u8, mode, message| ActorInvocation {
         invocation: InvocationId([id; 32]),
         actor,
+        incarnation,
         deployment,
         program: package.manifest.program,
         mode,
@@ -612,11 +635,17 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
         MethodMode::Linear,
         dynamic_string("set_title", "title", "Agent architecture".into()),
     );
+    let revision = driver.image().revision;
     assert_eq!(
         invoke(&mut driver, anonymous_title).unwrap().status,
         ActorExecutionStatus::Forbidden
     );
-    assert_eq!(driver.image().runtime_state, installed);
+    assert_eq!(driver.image().revision, revision + 1);
+    let after_forbidden = driver.image().runtime_state.clone();
+    assert_eq!(after_forbidden.control, installed.control);
+    assert_ne!(after_forbidden.linear, installed.linear);
+    assert_eq!(after_forbidden.merge, installed.merge);
+    assert_eq!(after_forbidden.local, installed.local);
 
     // Public application bytes cannot forge the private role control item.
     // Even placing the former 0xFD prefix directly before a valid method
@@ -624,13 +653,15 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
     let mut forged_message = vec![0xfd, 1, moderator_role];
     forged_message.extend(dynamic_string("set_title", "title", "forged title".into()));
     let forged_control = invocation(0x43, MethodMode::Linear, forged_message);
+    let revision = driver.image().revision;
     assert_eq!(
         invoke(&mut driver, forged_control),
         Err(AgentDriverError::Execution(
             ActorExecutionError::UnsupportedMethod
         ))
     );
-    assert_eq!(driver.image().runtime_state, installed);
+    assert_eq!(driver.image().revision, revision);
+    assert_eq!(driver.image().runtime_state, after_forbidden);
 
     let mut set_title = invocation(
         0x41,
@@ -650,9 +681,10 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
         ActorExecutionStatus::Done
     );
     let after_linear = driver.image().runtime_state.clone();
-    assert_ne!(after_linear.linear, installed.linear);
-    assert_eq!(after_linear.merge, installed.merge);
-    assert_eq!(after_linear.local, installed.local);
+    assert_eq!(after_linear.control, after_forbidden.control);
+    assert_ne!(after_linear.linear, after_forbidden.linear);
+    assert_eq!(after_linear.merge, after_forbidden.merge);
+    assert_eq!(after_linear.local, after_forbidden.local);
     acknowledge(&mut driver, set_title.clone()).unwrap();
     let after_linear = driver.image().runtime_state.clone();
 
@@ -669,8 +701,9 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
     );
     assert_eq!(driver.image().runtime_state, after_linear);
 
-    // Correct method name but incomplete arguments reaches the actor guest;
-    // a skipped typed dispatch must fail without committing a lane.
+    // Correct method name but incomplete arguments reaches the actor guest.
+    // The durable Panicked outcome advances only its owning Merge result
+    // component; it cannot commit a candidate in any other component.
     let wrong_arguments = invocation(
         0x44,
         MethodMode::Merge,
@@ -681,8 +714,12 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
         invoke(&mut driver, wrong_arguments).unwrap().status,
         ActorExecutionStatus::Panicked
     );
-    assert_eq!(driver.image().revision, revision);
-    assert_eq!(driver.image().runtime_state, after_linear);
+    assert_eq!(driver.image().revision, revision + 1);
+    let after_panicked = driver.image().runtime_state.clone();
+    assert_eq!(after_panicked.control, after_linear.control);
+    assert_eq!(after_panicked.linear, after_linear.linear);
+    assert_ne!(after_panicked.merge, after_linear.merge);
+    assert_eq!(after_panicked.local, after_linear.local);
 
     let task_text = "A task large enough to cross the FETCH probe".repeat(32);
     let add_task = invocation(0x45, MethodMode::Merge, dynamic_task(1, task_text.clone()));
@@ -694,9 +731,10 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
         "Merge execution can return only data available through its Merge view"
     );
     let after_merge = driver.image().runtime_state.clone();
-    assert_eq!(after_merge.linear, after_linear.linear);
-    assert_ne!(after_merge.merge, after_linear.merge);
-    assert_eq!(after_merge.local, after_linear.local);
+    assert_eq!(after_merge.control, after_panicked.control);
+    assert_eq!(after_merge.linear, after_panicked.linear);
+    assert_ne!(after_merge.merge, after_panicked.merge);
+    assert_eq!(after_merge.local, after_panicked.local);
     acknowledge(&mut driver, add_task.clone()).unwrap();
     let after_merge = driver.image().runtime_state.clone();
 

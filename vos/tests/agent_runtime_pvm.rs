@@ -21,8 +21,8 @@ use vos::agent::host::{
 };
 use vos::agent::package::{Package, PackageManifest, PackageSignatureVerifier};
 use vos::agent::standard::{
-    StandardActorState, StandardLaneEntry, StandardLaneRevisions, StandardLaneState,
-    StandardRuntimeState,
+    StandardActorState, StandardAuthorityDisposition, StandardLaneEntry, StandardLaneRevisions,
+    StandardLaneState, StandardRuntimeState,
 };
 use vos::agent::wire::{
     RuntimeCall, RuntimeReturn, RuntimeState, decode_standard_runtime_state,
@@ -120,6 +120,14 @@ fn invocation_receipt(
     config: &AgentConfig,
     invocation: &ActorInvocation,
 ) -> ActorInvocationReceipt {
+    invocation_receipt_valid_until(config, invocation, 2)
+}
+
+fn invocation_receipt_valid_until(
+    config: &AgentConfig,
+    invocation: &ActorInvocation,
+    valid_until: u64,
+) -> ActorInvocationReceipt {
     let key = authority_signing_key();
     let claim = ActorInvocationClaim {
         authority: config.authority.clone(),
@@ -130,7 +138,7 @@ fn invocation_receipt(
         authorization: invocation.authorization_message(),
         auth: invocation.auth.clone(),
         valid_from: 1,
-        valid_until: 2,
+        valid_until,
     };
     ActorInvocationReceipt {
         signature: key.sign(&claim.signing_message().0).to_bytes().to_vec(),
@@ -1232,6 +1240,15 @@ fn lane_probe_call(
             local: 1,
             ..Default::default()
         },
+        authority_slot_high_water: Some(1),
+        authority_sequence_high_water: Some(1),
+        authority_dispositions: vec![StandardAuthorityDisposition {
+            credential: CredentialId([0xa5; 32]),
+            sequence: 1,
+            claim: Hash([0xa6; 32]),
+            operation: Hash([0xa7; 32]),
+            result: Ok(LifecycleReply::Created(config.identity.clone())),
+        }],
         ..Default::default()
     });
     let mut message = vec![vos::value::TAG_DYNAMIC];
@@ -1661,7 +1678,7 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
 
     let mut unseen = query.clone();
     unseen.invocation = InvocationId([0x6b; 32]);
-    let unseen_receipt = invocation_receipt(&driver.image().config, &unseen);
+    let unseen_receipt = invocation_receipt_valid_until(&driver.image().config, &unseen, 40);
     assert_eq!(
         driver.invoke(unseen, &unseen_receipt),
         Err(AgentDriverError::Execution(

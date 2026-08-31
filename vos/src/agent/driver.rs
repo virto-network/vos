@@ -1978,8 +1978,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
     }
 
     /// Execute one authenticated actor invocation through this agent's
-    /// runtime. Actor failures are typed replies and do not commit runtime
-    /// state; deterministic runtime validation failures are driver errors.
+    /// runtime. Exact terminal outcomes commit only their owning result
+    /// clock; nondurable admission failures remain byte-identical driver
+    /// errors.
     pub fn invoke(
         &mut self,
         invocation: ActorInvocation,
@@ -2051,7 +2052,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             outer_gas,
             &RuntimeExecutionCall {
                 state: self.image.runtime_state.clone(),
-                invocation,
+                invocation: invocation.clone(),
                 authority,
                 observed_slot,
                 recovery_only,
@@ -2064,7 +2065,19 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let reply = match output.result {
             Ok(reply) => reply,
             Err(error) => {
-                if output.state != self.image.runtime_state {
+                if error.is_durable_exact_outcome() {
+                    validate_state_size(&output.state, &self.image.config.runtime_contract)?;
+                    validate_exact_execution_transition(
+                        self.image.runtime_program,
+                        &self.image.runtime_state,
+                        &output.state,
+                        &invocation,
+                        observed_slot,
+                    )?;
+                    if output.state != self.image.runtime_state {
+                        self.commit_runtime_state(output.state)?;
+                    }
+                } else if output.state != self.image.runtime_state {
                     return Err(AgentDriverError::InvalidRuntime);
                 }
                 return Err(AgentDriverError::Execution(error));
@@ -2080,8 +2093,15 @@ impl<S: AgentImageStore> AgentDriver<S> {
         }
         validate_state_size(&output.state, &self.image.config.runtime_contract)?;
         if reply.status != ActorExecutionStatus::Done {
+            validate_exact_execution_transition(
+                self.image.runtime_program,
+                &self.image.runtime_state,
+                &output.state,
+                &invocation,
+                observed_slot,
+            )?;
             if output.state != self.image.runtime_state {
-                return Err(AgentDriverError::InvalidRuntime);
+                self.commit_runtime_state(output.state)?;
             }
             return Ok(reply);
         }
@@ -2093,18 +2113,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             return Ok(reply);
         }
 
-        let next = AgentImage {
-            revision: self
-                .image
-                .revision
-                .checked_add(1)
-                .ok_or(AgentDriverError::InvalidRuntime)?,
-            runtime_program: self.image.runtime_program,
-            config: self.image.config.clone(),
-            runtime_state: output.state,
-        };
-        self.store.commit(Some(self.image.revision), &next)?;
-        self.image = next;
+        self.commit_runtime_state(output.state)?;
         Ok(reply)
     }
 
@@ -2527,6 +2536,31 @@ fn validate_execution_transition(
     Ok(())
 }
 
+fn validate_exact_execution_transition(
+    runtime_program: ProgramId,
+    prior: &RuntimeState,
+    next: &RuntimeState,
+    invocation: &ActorInvocation,
+    observed_slot: u64,
+) -> Result<(), AgentDriverError> {
+    if runtime_program != super::STANDARD_RUNTIME_PROGRAM_ID {
+        return validate_execution_transition(prior, next, invocation.mode);
+    }
+    let state = super::wire::decode_standard_runtime_state(prior)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let mut runtime = super::standard::StandardAgentRuntime::restore(state)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    runtime
+        .commit_exact_outcome_clock(invocation, observed_slot)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let expected = super::wire::encode_standard_runtime_state(&runtime.snapshot());
+    if next == &expected {
+        Ok(())
+    } else {
+        Err(AgentDriverError::InvalidRuntime)
+    }
+}
+
 fn execute_runtime(
     runtime_pvm: &[u8],
     gas: Gas,
@@ -2938,6 +2972,134 @@ mod tests {
                 &contract,
             ),
             Ok(())
+        );
+    }
+
+    fn standard_exact_transition_fixture(
+        observed_slot: u64,
+    ) -> (RuntimeState, RuntimeState, ActorInvocation) {
+        let mut config = invalid_config();
+        config.replicas = vec![super::super::AgentReplica {
+            node: crate::service::NodeId([0x21; 32]),
+            principal: config.identity.owner,
+            role: super::super::ReplicaRole::Voter,
+        }];
+        assert_eq!(config.validate(), Ok(()));
+        let base = super::super::standard::StandardRuntimeState {
+            config: Some(config.clone()),
+            authority_slot_high_water: Some(1),
+            authority_sequence_high_water: Some(1),
+            authority_dispositions: vec![super::super::standard::StandardAuthorityDisposition {
+                credential: crate::service::CredentialId([0x22; 32]),
+                sequence: 1,
+                claim: Hash([0x23; 32]),
+                operation: Hash([0x24; 32]),
+                result: Ok(LifecycleReply::Created(config.identity.clone())),
+            }],
+            ..Default::default()
+        };
+        let prior = super::super::wire::encode_standard_runtime_state(&base);
+        let mut successor = base;
+        successor.lane_revisions.linear_authority_slot = Some(observed_slot);
+        let next = super::super::wire::encode_standard_runtime_state(&successor);
+        let invocation = ActorInvocation {
+            invocation: crate::service::InvocationId([0x25; 32]),
+            actor: ActorId([0x26; 32]),
+            incarnation: Hash([0x27; 32]),
+            deployment: DeploymentId([0x28; 32]),
+            program: ProgramId([0x29; 32]),
+            mode: super::super::MethodMode::Linear,
+            auth: super::super::execution::ActorInvocationAuth::anonymous(),
+            message: vec![1],
+            availability: Vec::new(),
+            gas: 1,
+        };
+        (prior, next, invocation)
+    }
+
+    #[test]
+    fn bundled_runtime_exact_outcome_accepts_only_the_canonical_clock_successor() {
+        let observed_slot = 9;
+        let (prior, next, invocation) = standard_exact_transition_fixture(observed_slot);
+        assert_eq!(
+            validate_exact_execution_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                &next,
+                &invocation,
+                observed_slot,
+            ),
+            Ok(())
+        );
+
+        let mut actor_bytes = next.clone();
+        actor_bytes.linear.push(0xff);
+        assert_eq!(
+            validate_exact_execution_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                &actor_bytes,
+                &invocation,
+                observed_slot,
+            ),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let mut wrong_component = next.clone();
+        wrong_component.merge.push(0xee);
+        assert_eq!(
+            validate_exact_execution_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                &wrong_component,
+                &invocation,
+                observed_slot,
+            ),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let (_, wrong_clock, _) = standard_exact_transition_fixture(observed_slot + 1);
+        assert_eq!(
+            validate_exact_execution_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                &wrong_clock,
+                &invocation,
+                observed_slot,
+            ),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+    }
+
+    #[test]
+    fn custom_runtime_exact_outcome_preserves_opaque_owning_component_isolation() {
+        let prior = RuntimeState {
+            control: vec![1],
+            linear: vec![2],
+            merge: vec![3],
+            local: vec![4],
+        };
+        let mut next = prior.clone();
+        next.linear.push(5);
+        let (_, _, invocation) = standard_exact_transition_fixture(9);
+        let custom_runtime = ProgramId([0x2a; 32]);
+        assert_ne!(custom_runtime, super::super::STANDARD_RUNTIME_PROGRAM_ID);
+        assert_eq!(
+            validate_exact_execution_transition(custom_runtime, &prior, &next, &invocation, 9,),
+            Ok(())
+        );
+
+        let mut wrong_component = next;
+        wrong_component.merge.push(6);
+        assert_eq!(
+            validate_exact_execution_transition(
+                custom_runtime,
+                &prior,
+                &wrong_component,
+                &invocation,
+                9,
+            ),
+            Err(AgentDriverError::InvalidRuntime)
         );
     }
 
