@@ -28,6 +28,8 @@ use super::genesis::{
     MAX_AGENT_GENESIS_CLAIM_BYTES, MAX_AGENT_GENESIS_PROPOSAL_BYTES,
     MAX_AGENT_REPLICA_COMMITTEE_BYTES,
 };
+#[cfg(all(feature = "std", feature = "storage"))]
+use super::journal::OrderedEntryId;
 use super::journal::{AgentJournalGenesisId, JournalHeadsId, LaneStateId};
 use super::shared_raft::JournalStoreInstanceId;
 use super::system_authority::{
@@ -760,16 +762,20 @@ mod durable {
     };
     use crate::agent::journal_store::{AgentJournalStore, JournalPublication};
     use crate::agent::replay::{
-        PublishedSystemAuthorityRotation, PublishedSystemAuthorityRotationFacts,
-        ReplayExecutionResult, ReplayMaterialization,
+        PublishedSystemAuthorityRotation, RecoveredSystemAuthorityRotation, ReplayExecutionResult,
+        ReplayMaterialization, SystemAuthorityRotationPublicationFacts,
     };
     use crate::agent::system_authority::{
-        MAX_SYSTEM_AUTHORITY_ROTATIONS, SystemAuthorityRotationCertificate,
+        MAX_SYSTEM_AUTHORITY_ROTATIONS, SystemAuthorityCommitteeId,
+        SystemAuthorityRotationCertificate, SystemAuthorityRotationId,
         SystemAuthorityRotationNodeId,
     };
     use crate::service::NodeId;
 
-    const LEDGER_SCHEMA_VERSION: u32 = 1;
+    // Clean-break schema: v2 writers understand the publication-intent fence.
+    // A v1 writer must never reopen and mutate a v2 ledger while an intent is
+    // pending.
+    const LEDGER_SCHEMA_VERSION: u32 = 2;
     // Config rows are permanent: a key that was ever local must never later be
     // admitted through the remote-share path and bypass its durable pledge.
     // One initial committee plus every protocol-bounded rotation can introduce
@@ -779,6 +785,7 @@ mod durable {
     const MAX_QC_ROWS_PER_CLAIM: usize = 2;
     const MAX_CONFIG_RECORD_BYTES: usize = 1024;
     const MAX_META_RECORD_BYTES: usize = 1024;
+    const MAX_PUBLICATION_INTENT_RECORD_BYTES: usize = 2048;
     const MAX_RESERVATION_RECORD_BYTES: usize =
         MAX_SYSTEM_AUTHORITY_LEDGER_ROUTE_BYTES + MAX_SYSTEM_AUTHORITY_LEDGER_CLAIM_BYTES + 512;
     const MAX_PLEDGE_RECORD_BYTES: usize = 1024;
@@ -801,6 +808,8 @@ mod durable {
         TableDefinition::new("system_authority_ledger_qc_v1");
     const FAIL_STOP_TABLE: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_fail_stop_v1");
+    const PUBLICATION_INTENT_TABLE: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("system_authority_ledger_publication_intent_v2");
 
     const ROUTE_KEY_BYTES: usize = 32;
     const CONFIG_KEY_BYTES: usize = ROUTE_KEY_BYTES + 32;
@@ -922,6 +931,7 @@ mod durable {
     #[derive(Clone, Debug)]
     pub(crate) struct PendingSystemAuthorityRecovery {
         record: ReservationRecord,
+        publication_intent: Option<PublicationIntentRecord>,
     }
 
     impl PendingSystemAuthorityRecovery {
@@ -971,6 +981,30 @@ mod durable {
             .then(|| SystemAuthorityRotationReservationRequest {
                 request: self.record.request.clone(),
             })
+        }
+
+        pub(crate) const fn expected_successor_heads(&self) -> Option<JournalHeadsId> {
+            match &self.publication_intent {
+                Some(intent) => Some(intent.successor_heads),
+                None => None,
+            }
+        }
+
+        pub(crate) const fn expected_ordered_entry(&self) -> Option<OrderedEntryId> {
+            match &self.publication_intent {
+                Some(intent) => Some(intent.ordered_entry),
+                None => None,
+            }
+        }
+
+        pub(crate) fn matches_publication_facts(
+            &self,
+            facts: &SystemAuthorityRotationPublicationFacts,
+        ) -> bool {
+            self.publication_intent.as_ref()
+                == PublicationIntentRecord::for_facts(&self.record, facts)
+                    .ok()
+                    .as_ref()
         }
     }
 
@@ -1032,6 +1066,7 @@ mod durable {
     #[derive(Debug)]
     struct PublishedSystemAuthorityClaim {
         reservation: ReservationRecord,
+        publication_intent: Option<PublicationIntentRecord>,
         journal_store: JournalStoreInstanceId,
         successor_heads: JournalHeadsId,
         successor_control: LaneStateId,
@@ -1045,10 +1080,28 @@ mod durable {
     impl PublishedSystemAuthorityClaim {
         fn for_rotation_receipt(
             reserved: &ReservedSystemAuthorityClaim,
-            facts: &PublishedSystemAuthorityRotationFacts,
+            facts: &SystemAuthorityRotationPublicationFacts,
             frozen_certificate: &SystemAuthorityRotationCertificate,
         ) -> Result<Self, SystemAuthorityLedgerError> {
-            let reservation = &reserved.record;
+            Self::for_rotation_record(&reserved.record, facts, frozen_certificate)
+        }
+
+        fn for_recovered_rotation(
+            pending: &PendingSystemAuthorityRecovery,
+            facts: &SystemAuthorityRotationPublicationFacts,
+            frozen_certificate: &SystemAuthorityRotationCertificate,
+        ) -> Result<Self, SystemAuthorityLedgerError> {
+            if !pending.matches_publication_facts(facts) {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            }
+            Self::for_rotation_record(&pending.record, facts, frozen_certificate)
+        }
+
+        fn for_rotation_record(
+            reservation: &ReservationRecord,
+            facts: &SystemAuthorityRotationPublicationFacts,
+            frozen_certificate: &SystemAuthorityRotationCertificate,
+        ) -> Result<Self, SystemAuthorityLedgerError> {
             let SystemAuthorityLedgerClaim::CommitteeRotation {
                 retiring,
                 incoming,
@@ -1092,6 +1145,7 @@ mod durable {
             }
             Ok(Self {
                 reservation: reservation.clone(),
+                publication_intent: Some(PublicationIntentRecord::for_facts(reservation, facts)?),
                 journal_store: facts.journal_store(),
                 successor_heads: facts.successor_heads(),
                 successor_control: facts.successor_control(),
@@ -1144,6 +1198,7 @@ mod durable {
                 journal_store: successor.journal_store(),
                 successor_heads: successor.heads(),
                 reservation,
+                publication_intent: None,
                 successor_control: successor.control_state(),
                 successor_view: successor.commitment(),
                 successor_authority_state: successor.authority_state_commitment(),
@@ -1269,6 +1324,9 @@ mod durable {
             {
                 let _ = transaction.open_table(FAIL_STOP_TABLE)?;
             }
+            {
+                let _ = transaction.open_table(PUBLICATION_INTENT_TABLE)?;
+            }
             transaction.commit()?;
             Ok(ledger)
         }
@@ -1352,6 +1410,15 @@ mod durable {
                         .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)
                 })
                 .transpose()?;
+            let publication_intent = transaction
+                .open_table(PUBLICATION_INTENT_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .map(|bytes| {
+                    PublicationIntentRecord::decode(&bytes)
+                        .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)
+                })
+                .transpose()?;
 
             if let Some(active) = active {
                 active.validate()?;
@@ -1365,6 +1432,23 @@ mod durable {
                     || meta.retired_high_water != active.prior_high_water
                 {
                     return Err(SystemAuthorityLedgerError::CorruptLedger);
+                }
+                if let Some(intent) = &publication_intent {
+                    intent.validate()?;
+                    if intent.route != active.route
+                        || intent.journal_store != active.journal_store
+                        || intent.predecessor_heads != active.predecessor_heads
+                        || intent.predecessor_control != active.control_state
+                        || intent.predecessor_view != active.state_view
+                        || intent.predecessor_authority_state != active.authority_state
+                        || intent.claim != active.request.claim().claim_hash()
+                        || !matches!(
+                            &active.request,
+                            SystemAuthorityLedgerClaim::CommitteeRotation { .. }
+                        )
+                    {
+                        return Err(SystemAuthorityLedgerError::CorruptLedger);
+                    }
                 }
                 if view.authority_state_commitment() != active.authority_state {
                     return Err(SystemAuthorityLedgerError::PublicationRecoveryRequired);
@@ -1395,6 +1479,13 @@ mod durable {
                     return Err(SystemAuthorityLedgerError::DivergentReservation);
                 }
 
+                if publication_intent.is_some() {
+                    // The exact admitted request remains drainable, but no
+                    // bearer reissue or predecessor rebase may escape cold
+                    // reconciliation once publication intent is durable.
+                    return Err(SystemAuthorityLedgerError::PublicationRecoveryRequired);
+                }
+
                 if view.committee_sequence_high_water() != active.prior_high_water
                     || view.rotation_first_sequence() != active.prior_first_sequence
                 {
@@ -1419,6 +1510,10 @@ mod durable {
                     disposition: SystemAuthorityReservationDisposition::Rebased,
                     reserved: ReservedSystemAuthorityClaim { record: next },
                 });
+            }
+
+            if publication_intent.is_some() {
+                return Err(SystemAuthorityLedgerError::CorruptLedger);
             }
 
             if fail_stopped {
@@ -1478,6 +1573,13 @@ mod durable {
                 .get(route_key.as_slice())?
                 .map(|value| value.value().to_vec())
             else {
+                if transaction
+                    .open_table(PUBLICATION_INTENT_TABLE)?
+                    .get(route_key.as_slice())?
+                    .is_some()
+                {
+                    return Err(SystemAuthorityLedgerError::CorruptLedger);
+                }
                 return Ok(None);
             };
             let record = ReservationRecord::decode(&bytes)
@@ -1489,6 +1591,15 @@ mod durable {
                 .ok_or(SystemAuthorityLedgerError::CorruptLedger)?;
             let meta =
                 MetaRecord::decode(&meta).map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            let publication_intent = transaction
+                .open_table(PUBLICATION_INTENT_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .map(|bytes| {
+                    PublicationIntentRecord::decode(&bytes)
+                        .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)
+                })
+                .transpose()?;
             if record.route != self.route
                 || record.journal_store != self.journal_store
                 || meta.route != self.route
@@ -1500,7 +1611,36 @@ mod durable {
             }
             record.validate()?;
             meta.validate()?;
-            Ok(Some(PendingSystemAuthorityRecovery { record }))
+            if let Some(intent) = &publication_intent {
+                intent.validate()?;
+                if intent.route != record.route
+                    || intent.journal_store != record.journal_store
+                    || intent.predecessor_heads != record.predecessor_heads
+                    || intent.predecessor_control != record.control_state
+                    || intent.predecessor_view != record.state_view
+                    || intent.predecessor_authority_state != record.authority_state
+                    || intent.claim != record.request.claim().claim_hash()
+                    || !matches!(
+                        &record.request,
+                        SystemAuthorityLedgerClaim::CommitteeRotation { .. }
+                    )
+                {
+                    return Err(SystemAuthorityLedgerError::CorruptLedger);
+                }
+            }
+            Ok(Some(PendingSystemAuthorityRecovery {
+                record,
+                publication_intent,
+            }))
+        }
+
+        /// Recheck one previously loaded non-signing recovery token against
+        /// the exact current Reservation and publication-intent rows.
+        pub(crate) fn recheck_pending_recovery(
+            &self,
+            pending: &PendingSystemAuthorityRecovery,
+        ) -> Result<(), SystemAuthorityLedgerError> {
+            self.ensure_pending_read_only(pending)
         }
 
         /// Keep the exact active reservation stable across an external
@@ -1513,11 +1653,102 @@ mod durable {
             &self,
             reserved: &ReservedSystemAuthorityClaim,
             expected_certificate: &SystemAuthorityRotationCertificate,
+            facts: &SystemAuthorityRotationPublicationFacts,
             operation: impl FnOnce() -> Result<T, E>,
         ) -> Result<Result<T, E>, SystemAuthorityLedgerError> {
             let _write = self.lock_writes()?;
+
+            // First commit the immutable exact candidate. A crash from this
+            // point either leaves the predecessor plus intent or the one
+            // precommitted successor; cold recovery can distinguish them.
             let transaction = self.database.begin_write()?;
-            self.recheck_config(&transaction)?;
+            let route_key = route_storage_key(self.route);
+            let frozen = self.validate_active_rotation_snapshot(&transaction, &reserved.record)?;
+            if &frozen != expected_certificate {
+                return Err(SystemAuthorityLedgerError::InvalidCertificate);
+            }
+            let intent = PublicationIntentRecord::for_facts(&reserved.record, facts)?;
+            {
+                let mut table = transaction.open_table(PUBLICATION_INTENT_TABLE)?;
+                let existing = table
+                    .get(route_key.as_slice())?
+                    .map(|value| value.value().to_vec());
+                match existing {
+                    Some(bytes) => {
+                        let existing = PublicationIntentRecord::decode(&bytes)
+                            .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                        if existing != intent {
+                            return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+                        }
+                    }
+                    None => {
+                        table.insert(route_key.as_slice(), intent.encode().as_slice())?;
+                    }
+                }
+            }
+            transaction.commit()?;
+
+            // Reacquire and recheck the globally serialized writer after the
+            // intent commit. Another handle may have run in between, but no
+            // journal write occurs unless every row remains exact now.
+            let transaction = self.database.begin_write()?;
+            let frozen = self.validate_active_rotation_snapshot(&transaction, &reserved.record)?;
+            if &frozen != expected_certificate {
+                return Err(SystemAuthorityLedgerError::InvalidCertificate);
+            }
+            let persisted = transaction
+                .open_table(PUBLICATION_INTENT_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::PublicationRecoveryRequired)?;
+            let persisted = PublicationIntentRecord::decode(&persisted)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            if persisted != intent {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            }
+            let result = operation();
+            // This second writer is intentionally never committed: it fences
+            // the exact reservation, QCs, Meta, FailStop, and intent across
+            // dependency staging, Heads CAS, and post-CAS readback.
+            drop(transaction);
+            Ok(result)
+        }
+
+        /// Keep the exact cold-recovery row, intent, and frozen QCs stable
+        /// while replay reconstructs and re-reads the immediate successor.
+        pub(crate) fn with_pending_rotation_recovery<T, E>(
+            &self,
+            pending: &PendingSystemAuthorityRecovery,
+            operation: impl FnOnce(&SystemAuthorityRotationCertificate) -> Result<T, E>,
+        ) -> Result<Result<T, E>, SystemAuthorityLedgerError> {
+            let _write = self.lock_writes()?;
+            let transaction = self.database.begin_write()?;
+            let frozen = self.validate_active_rotation_snapshot(&transaction, &pending.record)?;
+            let expected = pending
+                .publication_intent
+                .as_ref()
+                .ok_or(SystemAuthorityLedgerError::PublicationRecoveryRequired)?;
+            let persisted = transaction
+                .open_table(PUBLICATION_INTENT_TABLE)?
+                .get(route_storage_key(self.route).as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::PublicationRecoveryRequired)?;
+            let persisted = PublicationIntentRecord::decode(&persisted)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            if &persisted != expected {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            }
+            let result = operation(&frozen);
+            drop(transaction);
+            Ok(result)
+        }
+
+        fn validate_active_rotation_snapshot(
+            &self,
+            transaction: &redb::WriteTransaction,
+            expected: &ReservationRecord,
+        ) -> Result<SystemAuthorityRotationCertificate, SystemAuthorityLedgerError> {
+            self.recheck_config(transaction)?;
             let route_key = route_storage_key(self.route);
             let active = transaction
                 .open_table(RESERVATION_TABLE)?
@@ -1526,7 +1757,7 @@ mod durable {
                 .ok_or(SystemAuthorityLedgerError::ClaimNotReserved)?;
             let active = ReservationRecord::decode(&active)
                 .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
-            if active != reserved.record
+            if &active != expected
                 || active.route != self.route
                 || active.journal_store != self.journal_store
             {
@@ -1560,7 +1791,7 @@ mod durable {
                     return Err(SystemAuthorityLedgerError::CorruptLedger);
                 }
                 // A canonical later fail-stop prevents new work but does not
-                // revoke this already-active exact claim with both frozen QCs.
+                // revoke an already-frozen exact publication intent.
             }
             let SystemAuthorityLedgerClaim::CommitteeRotation {
                 retiring,
@@ -1586,21 +1817,12 @@ mod durable {
                 row.validate_for(self.route, claim.sequence(), leg, committee, claim)?;
                 certificates.push(row.certificate);
             }
-            let frozen = SystemAuthorityRotationCertificate::new(
+            SystemAuthorityRotationCertificate::new(
                 transition.clone(),
                 certificates.remove(0),
                 certificates.remove(0),
             )
-            .map_err(|_| SystemAuthorityLedgerError::InvalidCertificate)?;
-            if &frozen != expected_certificate {
-                return Err(SystemAuthorityLedgerError::InvalidCertificate);
-            }
-            let result = operation();
-            // The writer is intentionally never committed: its sole purpose
-            // is excluding an active-row mutation while the journal crosses
-            // its independently crash-safe publication boundary.
-            drop(transaction);
-            Ok(result)
+            .map_err(|_| SystemAuthorityLedgerError::InvalidCertificate)
         }
 
         /// Run a root-journal checkpoint/GC operation only while reservation
@@ -1623,6 +1845,10 @@ mod durable {
                 .open_table(RESERVATION_TABLE)?
                 .get(route_storage_key(self.route).as_slice())?
                 .is_some()
+                || transaction
+                    .open_table(PUBLICATION_INTENT_TABLE)?
+                    .get(route_storage_key(self.route).as_slice())?
+                    .is_some()
             {
                 return Err(SystemAuthorityLedgerError::GcBlockedByPendingReservation);
             }
@@ -1811,6 +2037,24 @@ mod durable {
             Ok(published.into_results(RetiredSystemAuthorityRotation { _private: () }))
         }
 
+        /// Retire a cold-reconstructed immediate successor while the opaque
+        /// receipt still quarantines the mutable physical journal store.
+        pub(crate) fn retire_recovered_rotation<S: AgentJournalStore>(
+            &self,
+            recovered: RecoveredSystemAuthorityRotation<'_, S>,
+        ) -> Result<ReplayMaterialization, SystemAuthorityLedgerError> {
+            let frozen = self
+                .pending_joint_rotation_certificate(recovered.pending())?
+                .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
+            let claim = PublishedSystemAuthorityClaim::for_recovered_rotation(
+                recovered.pending(),
+                recovered.facts(),
+                &frozen,
+            )?;
+            self.retire_published_claim(claim)?;
+            Ok(recovered.into_materialization(RetiredSystemAuthorityRotation { _private: () }))
+        }
+
         /// Advance the durable retired high-water and clear the active claim
         /// only from replay's exact post-CAS receipt. Pledges, shares, and QCs
         /// are removed in the same transaction; the monotone meta record and
@@ -1897,7 +2141,16 @@ mod durable {
                 .ok_or(SystemAuthorityLedgerError::ClaimNotReserved)?;
             let active = ReservationRecord::decode(&bytes)
                 .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
-            if active != pending.record {
+            let publication_intent = transaction
+                .open_table(PUBLICATION_INTENT_TABLE)?
+                .get(route_storage_key(self.route).as_slice())?
+                .map(|value| value.value().to_vec())
+                .map(|bytes| {
+                    PublicationIntentRecord::decode(&bytes)
+                        .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)
+                })
+                .transpose()?;
+            if active != pending.record || publication_intent != pending.publication_intent {
                 return Err(SystemAuthorityLedgerError::ClaimNotReserved);
             }
             Ok(())
@@ -2169,6 +2422,20 @@ mod durable {
             published: PublishedSystemAuthorityClaim,
         ) -> Result<(), SystemAuthorityLedgerError> {
             let reserved = &published.reservation;
+            let intent_commitment = match &published.publication_intent {
+                Some(intent) => intent.facts,
+                #[cfg(test)]
+                None => Hash::digest(
+                    b"vos/agent/system-authority-test-publication-intent/v1",
+                    &[
+                        reserved.predecessor_heads.as_bytes(),
+                        published.successor_heads.as_bytes(),
+                        &reserved.request.claim().claim_hash().0,
+                    ],
+                ),
+                #[cfg(not(test))]
+                None => return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt),
+            };
             if reserved.route != self.route
                 || published.journal_store != self.journal_store
                 || reserved.journal_store != self.journal_store
@@ -2217,12 +2484,24 @@ mod durable {
                 .ok_or(SystemAuthorityLedgerError::CorruptLedger)?;
             let current_meta = MetaRecord::decode(&current_meta)
                 .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            current_meta.validate()?;
+            let current_intent = transaction
+                .open_table(PUBLICATION_INTENT_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .map(|bytes| {
+                    PublicationIntentRecord::decode(&bytes)
+                        .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)
+                })
+                .transpose()?;
 
             let active = transaction
                 .open_table(RESERVATION_TABLE)?
                 .get(route_key.as_slice())?
                 .map(|value| value.value().to_vec());
             if active.is_none()
+                && current_intent.is_none()
+                && current_meta.route == self.route
                 && current_meta.retired_high_water == sequence
                 && current_meta.journal_store == self.journal_store
                 && current_meta.authority_state == published.successor_authority_state
@@ -2233,6 +2512,7 @@ mod durable {
                         successor_heads: published.successor_heads,
                         successor_control: published.successor_control,
                         successor_view: published.successor_view,
+                        intent: intent_commitment,
                     })
             {
                 return Ok(());
@@ -2247,6 +2527,12 @@ mod durable {
                 || current_meta.authority_state != active.authority_state
             {
                 return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            }
+            match (&published.publication_intent, &current_intent) {
+                (Some(expected), Some(current)) if expected == current => {}
+                #[cfg(test)]
+                (None, None) => {}
+                _ => return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt),
             }
 
             // A published operation must have crossed every threshold. Read
@@ -2277,6 +2563,7 @@ mod durable {
                     successor_heads: published.successor_heads,
                     successor_control: published.successor_control,
                     successor_view: published.successor_view,
+                    intent: intent_commitment,
                 }),
             };
             next_meta.validate()?;
@@ -2288,6 +2575,11 @@ mod durable {
             {
                 transaction
                     .open_table(RESERVATION_TABLE)?
+                    .remove(route_key.as_slice())?;
+            }
+            {
+                transaction
+                    .open_table(PUBLICATION_INTENT_TABLE)?
                     .remove(route_key.as_slice())?;
             }
 
@@ -2456,6 +2748,13 @@ mod durable {
             {
                 return Err(SystemAuthorityLedgerError::FailStopped);
             }
+            if transaction
+                .open_table(PUBLICATION_INTENT_TABLE)?
+                .get(route_key.as_slice())?
+                .is_some()
+            {
+                return Err(SystemAuthorityLedgerError::PublicationRecoveryRequired);
+            }
             let bytes = transaction
                 .open_table(RESERVATION_TABLE)?
                 .get(route_key.as_slice())?
@@ -2540,6 +2839,17 @@ mod durable {
                     .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)
             })
             .transpose()?;
+            let publication_intent = read_exact_maybe_missing(
+                &self.database,
+                PUBLICATION_INTENT_TABLE,
+                route_key.as_slice(),
+                allow_missing_tables,
+            )?
+            .map(|bytes| {
+                PublicationIntentRecord::decode(&bytes)
+                    .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)
+            })
+            .transpose()?;
             if let Some(reservation) = &reservation {
                 reservation.validate()?;
                 let meta = meta
@@ -2550,6 +2860,26 @@ mod durable {
                     || meta.journal_store != self.journal_store
                     || reservation.prior_high_water != meta.retired_high_water
                     || reservation.authority_state != meta.authority_state
+                {
+                    return Err(SystemAuthorityLedgerError::CorruptLedger);
+                }
+            }
+            if publication_intent.is_some() && reservation.is_none() {
+                return Err(SystemAuthorityLedgerError::CorruptLedger);
+            }
+            if let (Some(intent), Some(reservation)) = (&publication_intent, &reservation) {
+                intent.validate()?;
+                if intent.route != reservation.route
+                    || intent.journal_store != reservation.journal_store
+                    || intent.predecessor_heads != reservation.predecessor_heads
+                    || intent.predecessor_control != reservation.control_state
+                    || intent.predecessor_view != reservation.state_view
+                    || intent.predecessor_authority_state != reservation.authority_state
+                    || intent.claim != reservation.request.claim().claim_hash()
+                    || !matches!(
+                        &reservation.request,
+                        SystemAuthorityLedgerClaim::CommitteeRotation { .. }
+                    )
                 {
                     return Err(SystemAuthorityLedgerError::CorruptLedger);
                 }
@@ -2639,7 +2969,7 @@ mod durable {
                     }
                 }
 
-                let mut certificates = alloc::collections::BTreeSet::new();
+                let mut certificates = alloc::collections::BTreeMap::new();
                 for (key, bytes) in qc_rows {
                     let row = CertificateRecord::decode(&bytes)
                         .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
@@ -2647,7 +2977,9 @@ mod durable {
                         .committee(row.leg)
                         .ok_or(SystemAuthorityLedgerError::CorruptLedger)?;
                     if key != leg_storage_key(self.route, row.sequence, row.leg)
-                        || !certificates.insert(row.leg)
+                        || certificates
+                            .insert(row.leg, row.certificate.clone())
+                            .is_some()
                     {
                         return Err(SystemAuthorityLedgerError::CorruptLedger);
                     }
@@ -2661,6 +2993,22 @@ mod durable {
                         }
                     }
                 }
+                if publication_intent.is_some() {
+                    let SystemAuthorityLedgerClaim::CommitteeRotation { transition, .. } = request
+                    else {
+                        return Err(SystemAuthorityLedgerError::CorruptLedger);
+                    };
+                    let old = certificates
+                        .get(&SystemAuthorityCommitteeLeg::Retiring)
+                        .cloned()
+                        .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
+                    let new = certificates
+                        .get(&SystemAuthorityCommitteeLeg::Incoming)
+                        .cloned()
+                        .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
+                    SystemAuthorityRotationCertificate::new(transition.clone(), old, new)
+                        .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                }
             }
             let failure = read_exact_maybe_missing(
                 &self.database,
@@ -2669,7 +3017,11 @@ mod durable {
                 allow_missing_tables,
             )?;
             if configured.is_empty()
-                && (meta.is_some() || has_reservation || has_evidence_rows || failure.is_some())
+                && (meta.is_some()
+                    || has_reservation
+                    || has_evidence_rows
+                    || publication_intent.is_some()
+                    || failure.is_some())
             {
                 return Err(SystemAuthorityLedgerError::CorruptLedger);
             }
@@ -2736,12 +3088,194 @@ mod durable {
         }
     }
 
+    /// Immutable exact publication candidate committed after both frozen QCs
+    /// and before any journal dependency or Heads CAS. Its facts commitment
+    /// is produced only by replay's private native-transition object.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct PublicationIntentRecord {
+        version: u32,
+        route: SystemAuthorityLedgerRoute,
+        journal_store: JournalStoreInstanceId,
+        predecessor_heads: JournalHeadsId,
+        predecessor_control: LaneStateId,
+        predecessor_view: Hash,
+        predecessor_authority_state: Hash,
+        successor_heads: JournalHeadsId,
+        ordered_entry: OrderedEntryId,
+        successor_control: LaneStateId,
+        successor_view: Hash,
+        successor_authority_state: Hash,
+        claim: Hash,
+        operation: Hash,
+        rotation: SystemAuthorityRotationId,
+        leaf: SystemAuthorityRotationNodeId,
+        root: SystemAuthorityRotationNodeId,
+        old_committee: SystemAuthorityCommitteeId,
+        new_committee: SystemAuthorityCommitteeId,
+        facts: Hash,
+    }
+
+    impl PublicationIntentRecord {
+        fn for_facts(
+            reservation: &ReservationRecord,
+            facts: &SystemAuthorityRotationPublicationFacts,
+        ) -> Result<Self, SystemAuthorityLedgerError> {
+            let SystemAuthorityLedgerClaim::CommitteeRotation {
+                retiring,
+                incoming,
+                transition,
+            } = &reservation.request
+            else {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            };
+            let record = facts.record();
+            if facts.journal_store() != reservation.journal_store
+                || facts.predecessor_heads() != reservation.predecessor_heads
+                || facts.predecessor_control() != reservation.control_state
+                || facts.predecessor_view() != reservation.state_view
+                || facts.predecessor_authority_state() != reservation.authority_state
+                || facts.claim() != reservation.request.claim()
+                || facts.successor_heads() == JournalHeadsId::ZERO
+                || facts.successor_heads() == facts.predecessor_heads()
+                || facts.ordered_entry() == OrderedEntryId::ZERO
+                || facts.successor_control() == LaneStateId::ZERO
+                || facts.successor_view() == Hash::ZERO
+                || facts.successor_authority_state() == Hash::ZERO
+                || facts.operation() == Hash::ZERO
+                || record.old_committee().as_bytes() != &retiring.commitment().0
+                || record.new_committee().as_bytes() != &incoming.commitment().0
+                || record.certificate().transition() != transition
+                || facts.result()
+                    != &(LifecycleReply::SystemAuthorityRotated {
+                        rotation: record.id(),
+                        epoch: record.new_epoch(),
+                        exact_retry: false,
+                    })
+            {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            }
+            let intent = Self {
+                version: LEDGER_SCHEMA_VERSION,
+                route: reservation.route,
+                journal_store: facts.journal_store(),
+                predecessor_heads: facts.predecessor_heads(),
+                predecessor_control: facts.predecessor_control(),
+                predecessor_view: facts.predecessor_view(),
+                predecessor_authority_state: facts.predecessor_authority_state(),
+                successor_heads: facts.successor_heads(),
+                ordered_entry: facts.ordered_entry(),
+                successor_control: facts.successor_control(),
+                successor_view: facts.successor_view(),
+                successor_authority_state: facts.successor_authority_state(),
+                claim: facts.claim().claim_hash(),
+                operation: facts.operation(),
+                rotation: record.id(),
+                leaf: record.leaf_id(),
+                root: facts.root(),
+                old_committee: record.old_committee(),
+                new_committee: record.new_committee(),
+                facts: facts.commitment(),
+            };
+            intent.validate()?;
+            Ok(intent)
+        }
+
+        fn validate(&self) -> Result<(), SystemAuthorityLedgerError> {
+            self.route.validate()?;
+            if self.version != LEDGER_SCHEMA_VERSION
+                || JournalStoreInstanceId::from_bytes(*self.journal_store.as_bytes()).is_none()
+                || self.predecessor_heads == JournalHeadsId::ZERO
+                || self.successor_heads == JournalHeadsId::ZERO
+                || self.predecessor_heads == self.successor_heads
+                || self.predecessor_control == LaneStateId::ZERO
+                || self.successor_control == LaneStateId::ZERO
+                || self.predecessor_view == Hash::ZERO
+                || self.successor_view == Hash::ZERO
+                || self.predecessor_authority_state == Hash::ZERO
+                || self.successor_authority_state == Hash::ZERO
+                || self.ordered_entry == OrderedEntryId::ZERO
+                || self.claim == Hash::ZERO
+                || self.operation == Hash::ZERO
+                || self.rotation == SystemAuthorityRotationId::ZERO
+                || self.leaf == SystemAuthorityRotationNodeId::ZERO
+                || self.root == SystemAuthorityRotationNodeId::ZERO
+                || self.old_committee == SystemAuthorityCommitteeId::ZERO
+                || self.new_committee == SystemAuthorityCommitteeId::ZERO
+                || self.old_committee == self.new_committee
+                || self.facts == Hash::ZERO
+                || self.encode().len() > MAX_PUBLICATION_INTENT_RECORD_BYTES
+            {
+                Err(SystemAuthorityLedgerError::CorruptLedger)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ServiceWire for PublicationIntentRecord {
+        const MAGIC: [u8; 4] = *b"AULI";
+
+        fn encode_body(&self, output: &mut Vec<u8>) {
+            let mut encoder = Encoder(output);
+            encoder.u32(self.version);
+            encoder.bytes(&self.route.encode());
+            encoder.fixed(self.journal_store.as_bytes());
+            encoder.fixed(self.predecessor_heads.as_bytes());
+            encoder.fixed(self.predecessor_control.as_bytes());
+            encoder.fixed(&self.predecessor_view.0);
+            encoder.fixed(&self.predecessor_authority_state.0);
+            encoder.fixed(self.successor_heads.as_bytes());
+            encoder.fixed(self.ordered_entry.as_bytes());
+            encoder.fixed(self.successor_control.as_bytes());
+            encoder.fixed(&self.successor_view.0);
+            encoder.fixed(&self.successor_authority_state.0);
+            encoder.fixed(&self.claim.0);
+            encoder.fixed(&self.operation.0);
+            encoder.fixed(self.rotation.as_bytes());
+            encoder.fixed(self.leaf.as_bytes());
+            encoder.fixed(self.root.as_bytes());
+            encoder.fixed(self.old_committee.as_bytes());
+            encoder.fixed(self.new_committee.as_bytes());
+            encoder.fixed(&self.facts.0);
+        }
+
+        fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+            enforce_complete_bound(decoder, MAX_PUBLICATION_INTENT_RECORD_BYTES)?;
+            let record = Self {
+                version: decoder.u32()?,
+                route: decode_nested(decoder, MAX_SYSTEM_AUTHORITY_LEDGER_ROUTE_BYTES)?,
+                journal_store: JournalStoreInstanceId::from_bytes(decoder.fixed()?)
+                    .ok_or(DecodeError::NonCanonical)?,
+                predecessor_heads: JournalHeadsId::new(decoder.fixed()?),
+                predecessor_control: LaneStateId::new(decoder.fixed()?),
+                predecessor_view: Hash(decoder.fixed()?),
+                predecessor_authority_state: Hash(decoder.fixed()?),
+                successor_heads: JournalHeadsId::new(decoder.fixed()?),
+                ordered_entry: OrderedEntryId::new(decoder.fixed()?),
+                successor_control: LaneStateId::new(decoder.fixed()?),
+                successor_view: Hash(decoder.fixed()?),
+                successor_authority_state: Hash(decoder.fixed()?),
+                claim: Hash(decoder.fixed()?),
+                operation: Hash(decoder.fixed()?),
+                rotation: SystemAuthorityRotationId::from_bytes(decoder.fixed()?),
+                leaf: SystemAuthorityRotationNodeId::from_bytes(decoder.fixed()?),
+                root: SystemAuthorityRotationNodeId::from_bytes(decoder.fixed()?),
+                old_committee: SystemAuthorityCommitteeId::from_bytes(decoder.fixed()?),
+                new_committee: SystemAuthorityCommitteeId::from_bytes(decoder.fixed()?),
+                facts: Hash(decoder.fixed()?),
+            };
+            record.validate().map_err(|_| DecodeError::NonCanonical)?;
+            Ok(record)
+        }
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct LastPublication {
         predecessor_heads: JournalHeadsId,
         successor_heads: JournalHeadsId,
         successor_control: LaneStateId,
         successor_view: Hash,
+        intent: Hash,
     }
 
     impl LastPublication {
@@ -2751,6 +3285,7 @@ mod durable {
                 || self.predecessor_heads == self.successor_heads
                 || self.successor_control == LaneStateId::ZERO
                 || self.successor_view == Hash::ZERO
+                || self.intent == Hash::ZERO
             {
                 Err(SystemAuthorityLedgerError::CorruptLedger)
             } else {
@@ -2803,6 +3338,7 @@ mod durable {
                 encoder.fixed(publication.successor_heads.as_bytes());
                 encoder.fixed(publication.successor_control.as_bytes());
                 encoder.fixed(&publication.successor_view.0);
+                encoder.fixed(&publication.intent.0);
             });
         }
 
@@ -2821,6 +3357,7 @@ mod durable {
                         successor_heads: JournalHeadsId::new(decoder.fixed()?),
                         successor_control: LaneStateId::new(decoder.fixed()?),
                         successor_view: Hash(decoder.fixed()?),
+                        intent: Hash(decoder.fixed()?),
                     })
                 })?,
             };

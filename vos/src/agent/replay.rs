@@ -65,8 +65,9 @@ use super::system_authority::{
 };
 #[cfg(all(feature = "std", feature = "storage"))]
 use super::system_authority_ledger::{
-    ReplayedSystemAuthorityView, ReservedSystemAuthorityClaim, RetiredSystemAuthorityRotation,
-    SystemAuthorityEvidenceLedger, SystemAuthorityLedgerClaim, SystemAuthorityLedgerError,
+    PendingSystemAuthorityRecovery, ReplayedSystemAuthorityView, ReservedSystemAuthorityClaim,
+    RetiredSystemAuthorityRotation, SystemAuthorityEvidenceLedger, SystemAuthorityLedgerClaim,
+    SystemAuthorityLedgerError,
 };
 use super::wire::{
     RuntimeJournalContext, RuntimeState, decode_standard_runtime_state,
@@ -2302,6 +2303,16 @@ struct MaterializedOrderedSnapshots {
     bytes: usize,
 }
 
+/// Exact native system-authority side product reconstructed while replaying
+/// the current canonical Ordered head. This is process-local evidence inside
+/// an authenticated materialization, never a persisted or caller-supplied
+/// backwards state transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplayMaterializedSystemAuthorityWrite {
+    entry: OrderedEntry,
+    write: ReplaySystemAuthorityWrite,
+}
+
 impl MaterializedOrderedSnapshots {
     fn get(&self, base: &OrderedBase) -> Option<&MaterializedOrderedSnapshot> {
         self.values.get(base)
@@ -2483,6 +2494,7 @@ pub struct ReplayMaterialization {
     heads: JournalHeads,
     replayed_root: Option<ReplayedRootJournalIdentity>,
     state: RuntimeState,
+    final_system_authority_write: Option<ReplayMaterializedSystemAuthorityWrite>,
     ordered_snapshots: MaterializedOrderedSnapshots,
     merge_roots: Vec<SealedMergeRoot>,
     /// Retained roots of the authenticated replay boundary. A new Merge
@@ -2756,15 +2768,40 @@ impl From<SystemAuthorityLedgerError> for SystemAuthorityPublicationError {
     }
 }
 
-/// Exact facts retained by the opaque post-CAS rotation receipt. This is
-/// separated from the receipt only so the ledger can consume it without ever
-/// accepting a caller-constructible successor tuple as authority.
+/// Failure to classify and validate one cold pending rotation against the
+/// independently reverified current journal.
 #[cfg(all(feature = "std", feature = "storage"))]
 #[derive(Debug)]
-pub(crate) struct PublishedSystemAuthorityRotationFacts {
+pub(crate) enum SystemAuthorityRecoveryError {
+    Journal(JournalStoreError),
+    Ledger(SystemAuthorityLedgerError),
+}
+
+#[cfg(all(feature = "std", feature = "storage"))]
+impl From<JournalStoreError> for SystemAuthorityRecoveryError {
+    fn from(error: JournalStoreError) -> Self {
+        Self::Journal(error)
+    }
+}
+
+#[cfg(all(feature = "std", feature = "storage"))]
+impl From<SystemAuthorityLedgerError> for SystemAuthorityRecoveryError {
+    fn from(error: SystemAuthorityLedgerError) -> Self {
+        Self::Ledger(error)
+    }
+}
+
+/// Exact replay-owned facts committed durably before crossing the journal CAS
+/// and retained by the opaque post-CAS receipt. The private fields prevent a
+/// caller-constructed successor tuple from becoming either publication intent
+/// or retirement authority.
+#[cfg(all(feature = "std", feature = "storage"))]
+#[derive(Debug)]
+pub(crate) struct SystemAuthorityRotationPublicationFacts {
     journal_store: JournalStoreInstanceId,
     predecessor_heads: JournalHeadsId,
     successor_heads: JournalHeadsId,
+    ordered_entry: OrderedEntryId,
     predecessor_control: LaneStateId,
     successor_control: LaneStateId,
     predecessor_view: Hash,
@@ -2780,7 +2817,7 @@ pub(crate) struct PublishedSystemAuthorityRotationFacts {
 }
 
 #[cfg(all(feature = "std", feature = "storage"))]
-impl PublishedSystemAuthorityRotationFacts {
+impl SystemAuthorityRotationPublicationFacts {
     pub(crate) const fn journal_store(&self) -> JournalStoreInstanceId {
         self.journal_store
     }
@@ -2791,6 +2828,10 @@ impl PublishedSystemAuthorityRotationFacts {
 
     pub(crate) const fn successor_heads(&self) -> JournalHeadsId {
         self.successor_heads
+    }
+
+    pub(crate) const fn ordered_entry(&self) -> OrderedEntryId {
+        self.ordered_entry
     }
 
     pub(crate) const fn predecessor_control(&self) -> LaneStateId {
@@ -2840,6 +2881,59 @@ impl PublishedSystemAuthorityRotationFacts {
     pub(crate) const fn root(&self) -> SystemAuthorityRotationNodeId {
         self.root
     }
+
+    /// Domain-separated commitment persisted in the evidence ledger before
+    /// any authority dependency or successor Heads can become durable.
+    pub(crate) fn commitment(&self) -> Hash {
+        const DOMAIN: &[u8] = b"vos/agent/system-authority-publication-intent/v1";
+        const COMMAND_DOMAIN: &[u8] = b"vos/agent/system-authority-publication-command/v1";
+        const RESULT_DOMAIN: &[u8] = b"vos/agent/system-authority-publication-result/v1";
+        const RECORD_DOMAIN: &[u8] = b"vos/agent/system-authority-publication-record/v1";
+        let command = self.command.encode();
+        let result = match &self.result {
+            LifecycleReply::SystemAuthorityRotated {
+                rotation,
+                epoch,
+                exact_retry,
+            } => Hash::digest(
+                RESULT_DOMAIN,
+                &[
+                    rotation.as_bytes(),
+                    &epoch.to_le_bytes(),
+                    &[u8::from(*exact_retry)],
+                ],
+            ),
+            _ => Hash::ZERO,
+        };
+        let record = self.record.encode();
+        let command = Hash::digest(COMMAND_DOMAIN, &[&command]);
+        let record = Hash::digest(RECORD_DOMAIN, &[&record]);
+        Hash::digest(
+            DOMAIN,
+            &[
+                self.journal_store.as_bytes(),
+                self.predecessor_heads.as_bytes(),
+                self.successor_heads.as_bytes(),
+                self.ordered_entry.as_bytes(),
+                self.predecessor_control.as_bytes(),
+                self.successor_control.as_bytes(),
+                &self.predecessor_view.0,
+                &self.successor_view.0,
+                &self.predecessor_authority_state.0,
+                &self.successor_authority_state.0,
+                &self.claim.claim_hash().0,
+                &self.operation.0,
+                &command.0,
+                &result.0,
+                &record.0,
+                self.record.id().as_bytes(),
+                self.record.leaf_id().as_bytes(),
+                self.root.as_bytes(),
+                self.record.old_committee().as_bytes(),
+                self.record.new_committee().as_bytes(),
+            ],
+        )
+    }
 }
 
 /// Opaque post-CAS rotation receipt. Holding the physical store borrow keeps
@@ -2849,7 +2943,7 @@ impl PublishedSystemAuthorityRotationFacts {
 pub(crate) struct PublishedSystemAuthorityRotation<'store, S: AgentJournalStore> {
     store: &'store mut S,
     reserved: ReservedSystemAuthorityClaim,
-    facts: PublishedSystemAuthorityRotationFacts,
+    facts: SystemAuthorityRotationPublicationFacts,
     publication: JournalPublication,
     successor: ReplayMaterialization,
     executions: Vec<ReplayExecutionResult>,
@@ -2861,7 +2955,7 @@ impl<'store, S: AgentJournalStore> PublishedSystemAuthorityRotation<'store, S> {
         &self.reserved
     }
 
-    pub(crate) const fn facts(&self) -> &PublishedSystemAuthorityRotationFacts {
+    pub(crate) const fn facts(&self) -> &SystemAuthorityRotationPublicationFacts {
         &self.facts
     }
 
@@ -2886,6 +2980,72 @@ impl<'store, S: AgentJournalStore> PublishedSystemAuthorityRotation<'store, S> {
         } = self;
         (publication, successor, executions)
     }
+}
+
+/// Cold-reconstructed proof that the exact intent successor is already the
+/// reverified physical store head. It is rotation-retirement evidence only:
+/// the receipt is non-Clone, retains the mutable store borrow, and releases
+/// the materialization solely through the ledger's private retirement token.
+#[cfg(all(feature = "std", feature = "storage"))]
+pub(crate) struct RecoveredSystemAuthorityRotation<'store, S: AgentJournalStore> {
+    store: &'store mut S,
+    pending: PendingSystemAuthorityRecovery,
+    facts: SystemAuthorityRotationPublicationFacts,
+    current: ReplayMaterialization,
+}
+
+#[cfg(all(feature = "std", feature = "storage"))]
+impl<'store, S: AgentJournalStore> RecoveredSystemAuthorityRotation<'store, S> {
+    pub(crate) const fn pending(&self) -> &PendingSystemAuthorityRecovery {
+        &self.pending
+    }
+
+    pub(crate) const fn facts(&self) -> &SystemAuthorityRotationPublicationFacts {
+        &self.facts
+    }
+
+    pub(crate) fn into_materialization(
+        self,
+        _retired: RetiredSystemAuthorityRotation,
+    ) -> ReplayMaterialization {
+        let Self {
+            store: _,
+            pending: _,
+            facts: _,
+            current,
+        } = self;
+        current
+    }
+}
+
+/// Cold reconciliation never upgrades a predecessor reservation into signing
+/// authority. The predecessor status also retains the mutable store borrow so
+/// startup cannot expose a mutable journal driver while its reservation is
+/// unresolved.
+#[cfg(all(feature = "std", feature = "storage"))]
+pub(crate) struct ReconciledPendingSystemAuthorityRotation<'store, S: AgentJournalStore> {
+    store: &'store mut S,
+    current: ReplayMaterialization,
+    pending: PendingSystemAuthorityRecovery,
+}
+
+#[cfg(all(feature = "std", feature = "storage"))]
+impl<'store, S: AgentJournalStore> ReconciledPendingSystemAuthorityRotation<'store, S> {
+    pub(crate) const fn current(&self) -> &ReplayMaterialization {
+        &self.current
+    }
+
+    pub(crate) const fn pending(&self) -> &PendingSystemAuthorityRecovery {
+        &self.pending
+    }
+}
+
+/// Only an exact intent successor carries the opaque retirement receipt; both
+/// outcomes keep the physical store quarantined.
+#[cfg(all(feature = "std", feature = "storage"))]
+pub(crate) enum PendingSystemAuthorityRotationRecovery<'store, S: AgentJournalStore> {
+    Pending(ReconciledPendingSystemAuthorityRotation<'store, S>),
+    Published(RecoveredSystemAuthorityRotation<'store, S>),
 }
 
 /// Fresh rotation publication bound to one exact active durable reservation.
@@ -3260,96 +3420,112 @@ where
         + SystemAuthorityPublicationStore
         + ReplaySource<Error = JournalStoreError>,
 {
+    fn publication_facts(
+        &self,
+    ) -> Result<SystemAuthorityRotationPublicationFacts, JournalStoreError> {
+        let ReplayPublicationAnchor::Ordered(entry) = self.inner.sealed.anchor() else {
+            return Err(JournalStoreError::NonCanonical);
+        };
+        let write = self
+            .inner
+            .sealed
+            .system_authority_write()
+            .ok_or(JournalStoreError::NonCanonical)?;
+        Ok(SystemAuthorityRotationPublicationFacts {
+            journal_store: self.inner.store.instance_id(),
+            predecessor_heads: self.reserved.predecessor_heads(),
+            successor_heads: self.inner.sealed.next().id(),
+            ordered_entry: entry.id(),
+            predecessor_control: self.predecessor.control_state(),
+            successor_control: self.successor.control_state(),
+            predecessor_view: self.predecessor.commitment(),
+            successor_view: self.successor.commitment(),
+            predecessor_authority_state: self.predecessor.authority_state_commitment(),
+            successor_authority_state: self.successor.authority_state_commitment(),
+            claim: self.reserved.request().claim(),
+            command: self.command.clone(),
+            operation: write.operation(),
+            result: write.result().clone(),
+            record: self.storage.history.record().clone(),
+            root: self.storage.history.root(),
+        })
+    }
+
     pub(crate) fn publish_system_authority_rotation(
         self,
         ledger: &SystemAuthorityEvidenceLedger,
     ) -> Result<PublishedSystemAuthorityRotation<'store, S>, SystemAuthorityPublicationError> {
+        let facts = self.publication_facts()?;
         let Self {
             inner,
             reserved,
             storage,
             command,
-            predecessor,
+            predecessor: _,
             successor,
         } = self;
         let active = reserved.clone();
+        let operation_reserved = reserved.clone();
         let expected_certificate = command.certificate().clone();
-        ledger
-            .with_active_publication_reservation(&active, &expected_certificate, move || {
-                let ReplayPreparedPublication {
-                    store,
-                    sealed,
-                    successor: materialization,
-                    executions,
-                } = inner;
-                let publication = store.publish_system_authority(&sealed, &storage)?;
-                let durable = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
-                let next = sealed.next();
-                let ReplayPublicationAnchor::Ordered(entry) = sealed.anchor() else {
-                    return Err(JournalStoreError::NonCanonical);
-                };
-                if durable != *next
-                    || durable.id() != next.id()
-                    || next.previous != Some(reserved.predecessor_heads())
-                    || store.get::<OrderedEntry>(entry.id())?.as_ref() != Some(entry)
-                    || (!publication.heads_advanced
-                        && (durable.id() != next.id() || next.previous != Some(sealed.expected())))
-                {
-                    return Err(JournalStoreError::Corrupt);
-                }
-                verify_rotation_storage_closure(store, &storage, &command, false)?;
-                let replayed_root = materialization
-                    .replayed_root()
-                    .ok_or(JournalStoreError::NonCanonical)?;
-                let scope = SystemAuthorityJournalScope::from_replayed_root(&replayed_root)
+        let (store, publication, materialization, executions) = ledger
+            .with_active_publication_reservation(
+                &active,
+                &expected_certificate,
+                &facts,
+                move || {
+                    let ReplayPreparedPublication {
+                        store,
+                        sealed,
+                        successor: materialization,
+                        executions,
+                    } = inner;
+                    let publication = store.publish_system_authority(&sealed, &storage)?;
+                    let durable = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+                    let next = sealed.next();
+                    let ReplayPublicationAnchor::Ordered(entry) = sealed.anchor() else {
+                        return Err(JournalStoreError::NonCanonical);
+                    };
+                    if durable != *next
+                        || durable.id() != next.id()
+                        || next.previous != Some(operation_reserved.predecessor_heads())
+                        || store.get::<OrderedEntry>(entry.id())?.as_ref() != Some(entry)
+                        || (!publication.heads_advanced
+                            && (durable.id() != next.id()
+                                || next.previous != Some(sealed.expected())))
+                    {
+                        return Err(JournalStoreError::Corrupt);
+                    }
+                    verify_rotation_storage_closure(store, &storage, &command, false)?;
+                    let replayed_root = materialization
+                        .replayed_root()
+                        .ok_or(JournalStoreError::NonCanonical)?;
+                    let scope = SystemAuthorityJournalScope::from_replayed_root(&replayed_root)
+                        .map_err(|_| JournalStoreError::NonCanonical)?;
+                    let post = ReplayedSystemAuthorityView::from_authenticated_replay(
+                        scope,
+                        successor.authority_state(),
+                        store.instance_id(),
+                        durable.id(),
+                        successor.control_state(),
+                    )
                     .map_err(|_| JournalStoreError::NonCanonical)?;
-                let post = ReplayedSystemAuthorityView::from_authenticated_replay(
-                    scope,
-                    successor.authority_state(),
-                    store.instance_id(),
-                    durable.id(),
-                    successor.control_state(),
-                )
-                .map_err(|_| JournalStoreError::NonCanonical)?;
-                if post.commitment() != successor.commitment()
-                    || post.authority_state_commitment() != successor.authority_state_commitment()
-                {
-                    return Err(JournalStoreError::Corrupt);
-                }
-                let facts = PublishedSystemAuthorityRotationFacts {
-                    journal_store: store.instance_id(),
-                    predecessor_heads: reserved.predecessor_heads(),
-                    successor_heads: durable.id(),
-                    predecessor_control: predecessor.control_state(),
-                    successor_control: successor.control_state(),
-                    predecessor_view: predecessor.commitment(),
-                    successor_view: successor.commitment(),
-                    predecessor_authority_state: predecessor.authority_state_commitment(),
-                    successor_authority_state: successor.authority_state_commitment(),
-                    claim: reserved.request().claim(),
-                    command: command.clone(),
-                    operation: sealed
-                        .system_authority_write()
-                        .ok_or(JournalStoreError::NonCanonical)?
-                        .operation(),
-                    result: sealed
-                        .system_authority_write()
-                        .ok_or(JournalStoreError::NonCanonical)?
-                        .result()
-                        .clone(),
-                    record: storage.history.record().clone(),
-                    root: storage.history.root(),
-                };
-                Ok(PublishedSystemAuthorityRotation {
-                    store,
-                    reserved,
-                    facts,
-                    publication,
-                    successor: materialization,
-                    executions,
-                })
-            })?
-            .map_err(Into::into)
+                    if post.commitment() != successor.commitment()
+                        || post.authority_state_commitment()
+                            != successor.authority_state_commitment()
+                    {
+                        return Err(JournalStoreError::Corrupt);
+                    }
+                    Ok((store, publication, materialization, executions))
+                },
+            )??;
+        Ok(PublishedSystemAuthorityRotation {
+            store,
+            reserved,
+            facts,
+            publication,
+            successor: materialization,
+            executions,
+        })
     }
 }
 
@@ -7254,6 +7430,7 @@ mod aggregate {
         let mut local_revision = base.local_revision;
         let mut local_head = base.local_head;
         let mut merge_facts = BTreeMap::new();
+        let mut final_system_authority_write = None;
 
         if InvocationOwnership::unfinalized(&machine.ownership, InvocationOwnershipScope::Merge)
             .map_err(ReplayError::InvocationOwnership)?
@@ -7488,6 +7665,15 @@ mod aggregate {
                             },
                         )
                         .map_err(historical_replay_error)?;
+                    if canonical_head.head == Some(id) && canonical_head.index == entry.index {
+                        final_system_authority_write =
+                            step.system_authority_write.clone().map(|write| {
+                                ReplayMaterializedSystemAuthorityWrite {
+                                    entry: entry.clone(),
+                                    write,
+                                }
+                            });
+                    }
                     state = step.state;
                     validate_runtime_state_bound(&state)?;
                     current_ordered = OrderedBase {
@@ -7590,6 +7776,7 @@ mod aggregate {
             heads,
             replayed_root,
             state,
+            final_system_authority_write,
             ordered_snapshots: snapshots,
             merge_roots: current_roots,
             merge_boundary_roots,
@@ -7680,6 +7867,304 @@ mod aggregate {
         )
     }
 
+    #[cfg(feature = "storage")]
+    fn materialized_system_authority_view<S>(
+        store: &S,
+        current: &ReplayMaterialization,
+    ) -> Result<(SystemAuthorityJournalScope, ReplayedSystemAuthorityView), JournalStoreError>
+    where
+        S: AgentJournalStore + ReverifiedRootJournalStore,
+    {
+        authenticated_materialization::<core::convert::Infallible, core::convert::Infallible>(
+            current,
+        )
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+        let durable = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        let identity = current
+            .replayed_root()
+            .ok_or(JournalStoreError::NonCanonical)?;
+        if durable != current.heads
+            || durable.id() != current.heads_id
+            || JournalStoreInstanceId::from_bytes(*store.instance_id().as_bytes()).is_none()
+            || store.replayed_root_identity() != Some(identity)
+            || identity.genesis() != current.heads.genesis
+            || identity.outer_admission() != current.heads.admission
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        let decoded = decode_standard_runtime_state(&current.state)
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        let authority = decoded
+            .system_authority
+            .as_ref()
+            .ok_or(JournalStoreError::NonCanonical)?;
+        let control = derive_lane_state::<core::convert::Infallible, core::convert::Infallible>(
+            current.heads.genesis,
+            current.heads.runtime.clone(),
+            PersistedLane::Control,
+            LaneCursor::Ordered {
+                base: current.ordered_base(),
+            },
+            &current.state.control,
+        )
+        .map_err(|_| JournalStoreError::NonCanonical)?
+        .id();
+        let scope = SystemAuthorityJournalScope::from_replayed_root(&identity)
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        let view = ReplayedSystemAuthorityView::from_authenticated_replay(
+            scope,
+            authority,
+            store.instance_id(),
+            current.heads_id,
+            control,
+        )
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+        Ok((scope, view))
+    }
+
+    /// Classify one cold pending rotation without reconstructing signing
+    /// authority. Both outcomes quarantine the mutable store; only the exact
+    /// precommitted successor can be consumed by ledger retirement.
+    #[cfg(feature = "storage")]
+    pub(crate) fn recover_pending_system_authority_rotation<'store, S>(
+        store: &'store mut S,
+        current: ReplayMaterialization,
+        pending: PendingSystemAuthorityRecovery,
+        ledger: &SystemAuthorityEvidenceLedger,
+    ) -> Result<PendingSystemAuthorityRotationRecovery<'store, S>, SystemAuthorityRecoveryError>
+    where
+        S: AgentJournalStore
+            + ReverifiedRootJournalStore
+            + SystemAuthorityHistoryStore
+            + ReplaySource<Error = JournalStoreError>,
+    {
+        if store.instance_id() != pending.journal_store() {
+            return Err(JournalStoreError::NonCanonical.into());
+        }
+        let (scope, current_view) = materialized_system_authority_view(store, &current)?;
+        if current.heads_id() == pending.predecessor_heads() {
+            ledger.recheck_pending_recovery(&pending)?;
+            if current_view.route() != pending.route()
+                || current_view.journal_store() != pending.journal_store()
+                || current_view.heads() != pending.predecessor_heads()
+                || current_view.control_state() != pending.control_state()
+                || current_view.commitment() != pending.state_view_commitment()
+                || current_view.authority_state_commitment() != pending.authority_state_commitment()
+            {
+                return Err(JournalStoreError::NonCanonical.into());
+            }
+            return Ok(PendingSystemAuthorityRotationRecovery::Pending(
+                ReconciledPendingSystemAuthorityRotation {
+                    store,
+                    current,
+                    pending,
+                },
+            ));
+        }
+
+        let expected_successor = pending
+            .expected_successor_heads()
+            .ok_or(SystemAuthorityLedgerError::PublicationRecoveryRequired)?;
+        let expected_entry = pending
+            .expected_ordered_entry()
+            .ok_or(SystemAuthorityLedgerError::PublicationRecoveryRequired)?;
+        if current.heads_id() != expected_successor
+            || current.heads().previous != Some(pending.predecessor_heads())
+            || current.heads().ordered_head != Some(expected_entry)
+        {
+            return Err(JournalStoreError::Conflict.into());
+        }
+
+        let stable_pending = pending.clone();
+        let recovered =
+            ledger.with_pending_rotation_recovery(&stable_pending, move |frozen| {
+                let final_write = current
+                    .final_system_authority_write
+                    .as_ref()
+                    .ok_or(JournalStoreError::NonCanonical)?;
+                let entry = &final_write.entry;
+                let write = &final_write.write;
+                let stored = store
+                    .get::<OrderedEntry>(entry.id())?
+                    .ok_or(JournalStoreError::MissingObject)?;
+                let ReplayOperation::Management {
+                    request: LifecycleRequest::RotateSystemAuthority(command),
+                } = &entry.input.operation
+                else {
+                    return Err(JournalStoreError::NonCanonical);
+                };
+                let StandardSystemAuthorityWrite::Rotation { record, history } = write.selected()
+                else {
+                    return Err(JournalStoreError::NonCanonical);
+                };
+                let LifecycleReply::SystemAuthorityRotated {
+                    rotation,
+                    epoch,
+                    exact_retry,
+                } = write.result()
+                else {
+                    return Err(JournalStoreError::NonCanonical);
+                };
+                let SystemAuthorityLedgerClaim::CommitteeRotation {
+                    retiring,
+                    incoming,
+                    transition,
+                } = pending.request()
+                else {
+                    return Err(JournalStoreError::NonCanonical);
+                };
+                if stored != *entry
+                    || entry.id() != expected_entry
+                    || entry.id() != current.heads().ordered_head.unwrap_or_default()
+                    || entry.index != current.heads().ordered_index
+                    || write.successor_control() != current.state.control
+                    || write.operation()
+                        != LifecycleRequest::RotateSystemAuthority(command.clone()).commitment()
+                    || command.operation_commitment() != write.operation()
+                    || command.certificate() != frozen
+                    || record.certificate() != frozen
+                    || record.certificate().transition() != transition
+                    || pending.claim() != transition.authority_claim()
+                    || command.new_committee() != incoming
+                    || record.old_committee().as_bytes() != &retiring.commitment().0
+                    || record.new_committee().as_bytes() != &incoming.commitment().0
+                    || *rotation != record.id()
+                    || *epoch != record.new_epoch()
+                    || *exact_retry
+                    || !history.inserted()
+                {
+                    return Err(JournalStoreError::NonCanonical);
+                }
+
+                let reapplied = write
+                    .predecessor_authority()
+                    .apply_rotation(scope, command)
+                    .map_err(|_| JournalStoreError::NonCanonical)?;
+                if reapplied.exact_retry()
+                    || reapplied.state() != write.successor_authority()
+                    || reapplied.record() != record
+                    || reapplied.history() != history
+                {
+                    return Err(JournalStoreError::NonCanonical);
+                }
+                validate_fresh_rotation_state_transition(
+                    scope,
+                    write.predecessor_authority(),
+                    write.successor_authority(),
+                    retiring,
+                    incoming,
+                    record,
+                    history,
+                )?;
+                let committee_records = rotation_committee_records(retiring, incoming)?;
+                if history.committee_records() != committee_records {
+                    return Err(JournalStoreError::NonCanonical);
+                }
+                let storage = ReplaySystemAuthorityStoragePlan {
+                    history: ReplaySystemAuthorityHistory {
+                        record: record.clone(),
+                        root: history.root(),
+                    },
+                    committee_records,
+                };
+                verify_rotation_storage_closure(store, &storage, command, false)?;
+
+                let predecessor_base = OrderedBase {
+                    index: entry
+                        .index
+                        .checked_sub(1)
+                        .ok_or(JournalStoreError::NonCanonical)?,
+                    head: entry.parent,
+                };
+                let successor_base = OrderedBase {
+                    index: entry.index,
+                    head: Some(entry.id()),
+                };
+                let predecessor_control =
+                    derive_lane_state::<core::convert::Infallible, core::convert::Infallible>(
+                        entry.genesis,
+                        entry.input.runtime.clone(),
+                        PersistedLane::Control,
+                        LaneCursor::Ordered {
+                            base: predecessor_base,
+                        },
+                        write.predecessor_control(),
+                    )
+                    .map_err(|_| JournalStoreError::NonCanonical)?
+                    .id();
+                let successor_control =
+                    derive_lane_state::<core::convert::Infallible, core::convert::Infallible>(
+                        entry.genesis,
+                        current.heads().runtime.clone(),
+                        PersistedLane::Control,
+                        LaneCursor::Ordered {
+                            base: successor_base,
+                        },
+                        write.successor_control(),
+                    )
+                    .map_err(|_| JournalStoreError::NonCanonical)?
+                    .id();
+                let predecessor_view = ReplayedSystemAuthorityView::from_authenticated_replay(
+                    scope,
+                    write.predecessor_authority(),
+                    store.instance_id(),
+                    pending.predecessor_heads(),
+                    predecessor_control,
+                )
+                .map_err(|_| JournalStoreError::NonCanonical)?;
+                let successor_view = ReplayedSystemAuthorityView::from_authenticated_replay(
+                    scope,
+                    write.successor_authority(),
+                    store.instance_id(),
+                    current.heads_id(),
+                    successor_control,
+                )
+                .map_err(|_| JournalStoreError::NonCanonical)?;
+                if predecessor_view.route() != pending.route()
+                    || predecessor_view.control_state() != pending.control_state()
+                    || predecessor_view.commitment() != pending.state_view_commitment()
+                    || predecessor_view.authority_state_commitment()
+                        != pending.authority_state_commitment()
+                    || successor_view.route() != current_view.route()
+                    || successor_view.control_state() != current_view.control_state()
+                    || successor_view.commitment() != current_view.commitment()
+                    || successor_view.authority_state_commitment()
+                        != current_view.authority_state_commitment()
+                {
+                    return Err(JournalStoreError::NonCanonical);
+                }
+
+                let facts = SystemAuthorityRotationPublicationFacts {
+                    journal_store: store.instance_id(),
+                    predecessor_heads: pending.predecessor_heads(),
+                    successor_heads: current.heads_id(),
+                    ordered_entry: entry.id(),
+                    predecessor_control,
+                    successor_control,
+                    predecessor_view: predecessor_view.commitment(),
+                    successor_view: successor_view.commitment(),
+                    predecessor_authority_state: predecessor_view.authority_state_commitment(),
+                    successor_authority_state: successor_view.authority_state_commitment(),
+                    claim: pending.claim(),
+                    command: command.clone(),
+                    operation: write.operation(),
+                    result: write.result().clone(),
+                    record: record.clone(),
+                    root: history.root(),
+                };
+                if !pending.matches_publication_facts(&facts) {
+                    return Err(JournalStoreError::NonCanonical);
+                }
+                Ok(RecoveredSystemAuthorityRotation {
+                    store,
+                    pending,
+                    facts,
+                    current,
+                })
+            })??;
+        Ok(PendingSystemAuthorityRotationRecovery::Published(recovered))
+    }
+
     fn successor_heads(current: &JournalHeads) -> Result<JournalHeads, ReplayValidationError> {
         let mut next = current.clone();
         next.publication_revision = current
@@ -7702,6 +8187,35 @@ mod aggregate {
             .ordered_snapshots
             .validate()
             .map_err(lift_validation)?;
+        if let Some(final_write) = &materialization.final_system_authority_write {
+            let decoded = decode_standard_runtime_state(&materialization.state)
+                .map_err(|_| ReplayError::InvalidRecord)?;
+            let request = match &final_write.entry.input.operation {
+                ReplayOperation::Management { request }
+                    if matches!(
+                        request,
+                        LifecycleRequest::FinalizeSystemAuthority(_)
+                            | LifecycleRequest::RotateSystemAuthority(_)
+                    ) =>
+                {
+                    request
+                }
+                _ => return Err(ReplayError::InvalidRecord),
+            };
+            if materialization.replayed_root.is_none()
+                || final_write.entry.validate().is_err()
+                || final_write.entry.genesis != materialization.heads.genesis
+                || final_write.entry.id() != materialization.heads.ordered_head.unwrap_or_default()
+                || final_write.entry.index != materialization.heads.ordered_index
+                || final_write.entry.input.runtime != materialization.heads.runtime
+                || final_write.write.operation() != request.commitment()
+                || final_write.write.successor_control() != materialization.state.control
+                || decoded.system_authority.as_ref()
+                    != Some(final_write.write.successor_authority())
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
+        }
         if materialization.merge_boundary_state.len() > MAX_RUNTIME_STATE_BYTES {
             return Err(ReplayError::ReplayLimit);
         }
@@ -8614,6 +9128,12 @@ mod aggregate {
                 heads_id: next.id(),
                 heads: next,
                 replayed_root: materialization.replayed_root,
+                final_system_authority_write: step.system_authority_write.clone().map(|write| {
+                    ReplayMaterializedSystemAuthorityWrite {
+                        entry: entry.clone(),
+                        write,
+                    }
+                }),
                 state: step.state,
                 ordered_snapshots: snapshots,
                 merge_roots: materialization.merge_roots.clone(),
@@ -9306,6 +9826,12 @@ mod aggregate {
                         heads_id: next.id(),
                         heads: next,
                         replayed_root: materialization.replayed_root,
+                        final_system_authority_write: step.system_authority_write.clone().map(
+                            |write| ReplayMaterializedSystemAuthorityWrite {
+                                entry: entry.clone(),
+                                write,
+                            },
+                        ),
                         state,
                         ordered_snapshots: snapshots,
                         merge_roots,
@@ -9445,6 +9971,7 @@ mod aggregate {
                 heads_id: next.id(),
                 heads: next,
                 replayed_root: materialization.replayed_root,
+                final_system_authority_write: materialization.final_system_authority_write.clone(),
                 state,
                 ordered_snapshots: materialization.ordered_snapshots.clone(),
                 merge_roots: materialization.merge_roots.clone(),
@@ -9783,6 +10310,7 @@ mod aggregate {
                 heads_id: next.id(),
                 heads: next,
                 replayed_root: materialization.replayed_root,
+                final_system_authority_write: materialization.final_system_authority_write.clone(),
                 state,
                 ordered_snapshots: snapshots,
                 merge_roots: next_roots,
@@ -10002,6 +10530,7 @@ mod aggregate {
                 heads_id: next.id(),
                 heads: next,
                 replayed_root: materialization.replayed_root,
+                final_system_authority_write: None,
                 state,
                 ordered_snapshots: snapshots,
                 merge_roots: materialization.merge_roots.clone(),
@@ -10027,6 +10556,10 @@ pub(crate) use aggregate::{
     MaterializeError, materialize_current, materialize_current_reverified, prepare_checkpoint,
     prepare_local, prepare_merge, prepare_ordered, prepare_shared_ordered, recover_invocation,
 };
+
+#[cfg(all(feature = "std", feature = "storage"))]
+#[allow(unused_imports)]
+pub(crate) use aggregate::recover_pending_system_authority_rotation;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -10791,6 +11324,157 @@ pub(crate) mod tests {
                 .certificate()
                 .is_some()
         );
+    }
+
+    #[cfg(all(feature = "std", feature = "storage"))]
+    struct RotationPublicationFixture {
+        store: MemoryAgentJournalStore,
+        executor: ExactCreateRejectInvocations,
+        predecessor: ReplayMaterialization,
+        ledger: SystemAuthorityEvidenceLedger,
+        reserved: ReservedSystemAuthorityClaim,
+        entry: OrderedEntry,
+        database: alloc::sync::Arc<Database>,
+        directory: std::path::PathBuf,
+    }
+
+    #[cfg(all(feature = "std", feature = "storage"))]
+    fn rotation_publication_fixture(seed: u8) -> RotationPublicationFixture {
+        let sealed = admitted_genesis(seed);
+        let node = admitted_config().replicas[0].node;
+        let mut store = MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &admitted_runtime().package,
+                b"replay-runtime-package",
+            )
+            .unwrap();
+        assert!(store.initialize(&sealed).unwrap());
+
+        let mut executor = ExactCreateRejectInvocations::default();
+        let predecessor =
+            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
+                .unwrap();
+        let identity = predecessor.replayed_root().unwrap();
+        let scope = SystemAuthorityJournalScope::from_replayed_root(&identity).unwrap();
+        let decoded = decode_standard_runtime_state(predecessor.state()).unwrap();
+        let authority = decoded.system_authority.unwrap();
+        let retiring = authority.current_committee().clone();
+        let (_, keys) = admitted_root_material(&admitted_config());
+        let incoming = rotated_committee(&retiring, &keys);
+        let transition = SystemAuthorityRotationClaim::new(
+            authority.root_anchor(),
+            authority.root_anchor_config_version(),
+            authority.root_anchor_config(),
+            scope.commitment(authority.root_anchor()).unwrap(),
+            &retiring,
+            &incoming,
+            2,
+            3,
+        )
+        .unwrap();
+        let request = SystemAuthorityRotationReservationRequest::new(
+            retiring.clone(),
+            incoming.clone(),
+            transition,
+        )
+        .unwrap();
+        let predecessor_control = derive_lane_state::<(), ()>(
+            predecessor.heads().genesis,
+            predecessor.runtime().clone(),
+            PersistedLane::Control,
+            LaneCursor::Ordered {
+                base: predecessor.ordered_base(),
+            },
+            &predecessor.state().control,
+        )
+        .unwrap()
+        .id();
+        let view = ReplayedSystemAuthorityView::from_authenticated_replay(
+            scope,
+            &authority,
+            store.instance_id(),
+            predecessor.heads_id(),
+            predecessor_control,
+        )
+        .unwrap();
+
+        let directory = std::env::temp_dir().join(alloc::format!(
+            "vos_authority_recovery_{}_{}_{}",
+            std::process::id(),
+            seed,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database =
+            alloc::sync::Arc::new(Database::create(directory.join("evidence.redb")).unwrap());
+        let local_signer = AuthoritySignerId::of_raw_ed25519(&keys[0].verifying_key().to_bytes());
+        let local_node = retiring.member(local_signer).unwrap().node();
+        let ledger = SystemAuthorityEvidenceLedger::open(
+            database.clone(),
+            view.route(),
+            store.instance_id(),
+            local_node,
+            local_signer,
+        )
+        .unwrap();
+        let reserved = ledger
+            .reserve_or_reconcile(&view, request)
+            .unwrap()
+            .into_reserved();
+        retain_rotation_qc_leg(
+            &ledger,
+            &reserved,
+            SystemAuthorityCommitteeLeg::Retiring,
+            &retiring,
+            &keys,
+        );
+        retain_rotation_qc_leg(
+            &ledger,
+            &reserved,
+            SystemAuthorityCommitteeLeg::Incoming,
+            &incoming,
+            &keys,
+        );
+        let certificate = ledger
+            .joint_rotation_certificate(&reserved)
+            .unwrap()
+            .unwrap();
+        let command = SystemAuthorityRotation::new(
+            incoming,
+            certificate,
+            SystemAuthorityRotationProof::vacant(retiring.epoch() + 1, vec![]).unwrap(),
+        )
+        .unwrap();
+        let merge_seal = persist_merge_seal(&mut store, &predecessor);
+        let entry = OrderedEntry {
+            genesis: predecessor.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: predecessor.merge_frontier(),
+            merge_seal: Some(merge_seal),
+            input: ReplayInput {
+                runtime: predecessor.runtime().clone(),
+                operation: ReplayOperation::Management {
+                    request: LifecycleRequest::RotateSystemAuthority(command),
+                },
+            },
+        };
+
+        RotationPublicationFixture {
+            store,
+            executor,
+            predecessor,
+            ledger,
+            reserved,
+            entry,
+            database,
+            directory,
+        }
     }
 
     #[cfg(feature = "std")]
@@ -13858,6 +14542,252 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_some()
         );
+        drop(ledger);
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(feature = "std", feature = "storage"))]
+    #[test]
+    fn same_process_pre_cas_intent_is_idempotent_for_exact_retained_reprepare() {
+        let RotationPublicationFixture {
+            mut store,
+            mut executor,
+            predecessor,
+            ledger,
+            reserved,
+            entry,
+            database,
+            directory,
+        } = rotation_publication_fixture(0xd8);
+        let retained = reserved.clone();
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            }
+            .prepare_system_authority_rotation(reserved)
+            .unwrap();
+        let facts = prepared.publication_facts().unwrap();
+        let certificate = ledger
+            .joint_rotation_certificate(&retained)
+            .unwrap()
+            .unwrap();
+        let injected = ledger
+            .with_active_publication_reservation(&retained, &certificate, &facts, || {
+                Err::<(), _>(JournalStoreError::Unavailable)
+            })
+            .unwrap();
+        assert_eq!(injected, Err(JournalStoreError::Unavailable));
+        drop(prepared);
+        let pending = ledger.recover_pending_claim().unwrap().unwrap();
+        assert_eq!(pending.predecessor_heads(), predecessor.heads_id());
+        assert_eq!(
+            pending.expected_successor_heads(),
+            Some(facts.successor_heads())
+        );
+        assert_eq!(store.heads().unwrap().unwrap().id(), predecessor.heads_id());
+        let reconciled = match recover_pending_system_authority_rotation(
+            &mut store,
+            predecessor.clone(),
+            pending,
+            &ledger,
+        )
+        .unwrap()
+        {
+            PendingSystemAuthorityRotationRecovery::Pending(reconciled) => reconciled,
+            PendingSystemAuthorityRotationRecovery::Published(_) => unreachable!(),
+        };
+        assert_eq!(reconciled.current().heads_id(), predecessor.heads_id());
+        assert_eq!(
+            reconciled.pending().expected_successor_heads(),
+            Some(facts.successor_heads())
+        );
+        drop(reconciled);
+
+        // This is deliberately a same-process retry using an equivalent
+        // retained bearer. Cold predecessor+Intent startup stays quarantined
+        // until the later driver-owned resume-payload slice.
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            }
+            .prepare_system_authority_rotation(retained)
+            .unwrap();
+        let published = prepared.publish_system_authority_rotation(&ledger).unwrap();
+        assert_eq!(published.facts().successor_heads(), facts.successor_heads());
+        ledger.retire_published_rotation(published).unwrap();
+        assert!(ledger.recover_pending_claim().unwrap().is_none());
+
+        drop(ledger);
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(feature = "std", feature = "storage"))]
+    #[test]
+    fn cold_immediate_rotation_successor_recovers_and_retires_exact_intent() {
+        let RotationPublicationFixture {
+            mut store,
+            mut executor,
+            predecessor,
+            ledger,
+            reserved,
+            entry,
+            database,
+            directory,
+        } = rotation_publication_fixture(0xd9);
+        let route = ledger.route();
+        let local_node = ledger.local_node();
+        let local_signer = ledger.local_signer();
+        let journal_store = ledger.journal_store();
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            }
+            .prepare_system_authority_rotation(reserved)
+            .unwrap();
+        let published = prepared.publish_system_authority_rotation(&ledger).unwrap();
+        let expected_successor = published.facts().successor_heads();
+        drop(published);
+
+        // Memory journal durability is simulated by retaining the physical
+        // store while discarding all process-local replay and ledger objects.
+        let database_path = directory.join("evidence.redb");
+        drop(ledger);
+        drop(database);
+        let database = alloc::sync::Arc::new(Database::open(&database_path).unwrap());
+        let ledger = SystemAuthorityEvidenceLedger::open(
+            database.clone(),
+            route,
+            journal_store,
+            local_node,
+            local_signer,
+        )
+        .unwrap();
+        let current =
+            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
+                .unwrap();
+        assert_eq!(current.heads_id(), expected_successor);
+        let pending = ledger.recover_pending_claim().unwrap().unwrap();
+        let recovered =
+            match recover_pending_system_authority_rotation(&mut store, current, pending, &ledger)
+                .unwrap()
+            {
+                PendingSystemAuthorityRotationRecovery::Published(recovered) => recovered,
+                PendingSystemAuthorityRotationRecovery::Pending(_) => unreachable!(),
+            };
+        assert_eq!(recovered.facts().successor_heads(), expected_successor);
+        let current = ledger.retire_recovered_rotation(recovered).unwrap();
+        assert_eq!(current.heads_id(), expected_successor);
+        assert_eq!(store.heads().unwrap().unwrap().id(), expected_successor);
+        assert!(ledger.recover_pending_claim().unwrap().is_none());
+
+        drop(ledger);
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(feature = "std", feature = "storage"))]
+    #[test]
+    fn cold_rotation_recovery_rejects_tampered_replay_write_without_retirement() {
+        let RotationPublicationFixture {
+            mut store,
+            mut executor,
+            predecessor,
+            ledger,
+            reserved,
+            entry,
+            database,
+            directory,
+        } = rotation_publication_fixture(0xda);
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            }
+            .prepare_system_authority_rotation(reserved)
+            .unwrap();
+        let published = prepared.publish_system_authority_rotation(&ledger).unwrap();
+        drop(published);
+        let current =
+            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
+                .unwrap();
+        let mut tampered = current.clone();
+        tampered
+            .final_system_authority_write
+            .as_mut()
+            .unwrap()
+            .write
+            .operation = Hash([0x5a; 32]);
+        let pending = ledger.recover_pending_claim().unwrap().unwrap();
+        assert!(matches!(
+            recover_pending_system_authority_rotation(&mut store, tampered, pending, &ledger),
+            Err(SystemAuthorityRecoveryError::Journal(
+                JournalStoreError::NonCanonical
+            ))
+        ));
+        assert!(ledger.recover_pending_claim().unwrap().is_some());
+
+        let pending = ledger.recover_pending_claim().unwrap().unwrap();
+        let recovered =
+            match recover_pending_system_authority_rotation(&mut store, current, pending, &ledger)
+                .unwrap()
+            {
+                PendingSystemAuthorityRotationRecovery::Published(recovered) => recovered,
+                PendingSystemAuthorityRotationRecovery::Pending(_) => unreachable!(),
+            };
+        ledger.retire_recovered_rotation(recovered).unwrap();
+        assert!(ledger.recover_pending_claim().unwrap().is_none());
+
+        drop(ledger);
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(feature = "std", feature = "storage"))]
+    #[test]
+    fn cold_rotation_recovery_rejects_a_later_unrelated_head() {
+        let RotationPublicationFixture {
+            mut store,
+            mut executor,
+            predecessor,
+            ledger,
+            reserved,
+            entry,
+            database,
+            directory,
+        } = rotation_publication_fixture(0xdb);
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            }
+            .prepare_system_authority_rotation(reserved)
+            .unwrap();
+        let published = prepared.publish_system_authority_rotation(&ledger).unwrap();
+        let exact_successor = published.facts().successor_heads();
+        drop(published);
+        let current =
+            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
+                .unwrap();
+        assert_eq!(current.heads_id(), exact_successor);
+        let checkpoint = prepare_checkpoint(&mut store, &current).unwrap();
+        let (_, later, _) = checkpoint.publish().unwrap();
+        assert_ne!(later.heads_id(), exact_successor);
+        assert_eq!(later.heads().previous, Some(exact_successor));
+
+        let pending = ledger.recover_pending_claim().unwrap().unwrap();
+        assert!(matches!(
+            recover_pending_system_authority_rotation(&mut store, later, pending, &ledger),
+            Err(SystemAuthorityRecoveryError::Journal(
+                JournalStoreError::Conflict
+            ))
+        ));
+        assert!(ledger.recover_pending_claim().unwrap().is_some());
+
         drop(ledger);
         drop(database);
         std::fs::remove_dir_all(directory).unwrap();
