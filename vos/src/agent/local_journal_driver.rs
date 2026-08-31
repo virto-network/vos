@@ -933,6 +933,21 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         Ok(())
     }
 
+    fn management_state_config(
+        &self,
+        state: &RuntimeState,
+        current: &AgentConfig,
+        runtime_upgraded: bool,
+    ) -> Result<AgentConfig, LocalReplayExecutorError> {
+        if !runtime_upgraded {
+            return Ok(current.clone());
+        }
+        decode_standard_runtime_state(state)
+            .map_err(|_| LocalReplayExecutorError::InvalidState)?
+            .config
+            .ok_or(LocalReplayExecutorError::InvalidState)
+    }
+
     fn disposition(result: &Result<ActorExecutionReply, ActorExecutionError>) -> ReplayDisposition {
         match result {
             Ok(reply) => match reply.status {
@@ -1050,21 +1065,18 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                     }
                     .encode(),
                 )?;
-                self.validate_state_size(&returned.state, &config)?;
                 if returned.result != expected_result {
                     return Err(LocalReplayExecutorError::InvalidState);
                 }
                 self.last_management_result = Some((input.id(), returned.result.clone()));
                 let applied = returned.result.is_ok();
                 let next_runtime = Self::runtime_upgrade_target(input, applied);
-                if applied && next_runtime != input.runtime {
-                    let next_state = decode_standard_runtime_state(&returned.state)
-                        .map_err(|_| LocalReplayExecutorError::InvalidState)?;
-                    let next_config = next_state
-                        .config
-                        .as_ref()
-                        .ok_or(LocalReplayExecutorError::InvalidState)?;
-                    self.validate_local_config(next_config, &next_runtime)?;
+                let runtime_upgraded = applied && next_runtime != input.runtime;
+                let state_config =
+                    self.management_state_config(&returned.state, &config, runtime_upgraded)?;
+                self.validate_state_size(&returned.state, &state_config)?;
+                if runtime_upgraded {
+                    self.validate_local_config(&state_config, &next_runtime)?;
                 }
                 ReplayTransition {
                     state: returned.state,
@@ -2910,6 +2922,53 @@ mod tests {
                 Self::Merge(event) => core.publish_merge(event),
             }
         }
+    }
+
+    #[test]
+    fn applied_runtime_upgrade_uses_the_target_signed_state_ceiling() {
+        let driver = standard_test_driver();
+        let mut target =
+            decode_standard_runtime_state(driver.core.materialization.state()).unwrap();
+        target
+            .config
+            .as_mut()
+            .unwrap()
+            .runtime_contract
+            .resources
+            .max_runtime_state_bytes = super::super::execution::MAX_RUNTIME_STATE_BYTES as u32;
+        let returned = encode_standard_runtime_state(&target);
+
+        let mut current = target.config.as_ref().unwrap().clone();
+        current.runtime_contract.resources.max_runtime_state_bytes = 1;
+        assert!(
+            driver
+                .core
+                .executor
+                .validate_state_size(&returned, &current)
+                .is_err(),
+            "the successor intentionally exceeds the old signed ceiling"
+        );
+
+        let selected = driver
+            .core
+            .executor
+            .management_state_config(&returned, &current, true)
+            .unwrap();
+        assert_eq!(selected, target.config.unwrap());
+        driver
+            .core
+            .executor
+            .validate_state_size(&returned, &selected)
+            .unwrap();
+        assert_eq!(
+            driver
+                .core
+                .executor
+                .management_state_config(&returned, &current, false)
+                .unwrap(),
+            current,
+            "rejected and non-upgrade management stays under the current contract"
+        );
     }
 
     #[test]

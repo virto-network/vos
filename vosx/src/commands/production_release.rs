@@ -421,12 +421,12 @@ mod tests {
     }
 
     #[test]
-    fn release_manifest_rejects_the_pre_rob_agent_semantics() {
+    fn release_manifest_rejects_the_previous_agent_semantics() {
         let mut manifest = manifest_for(b"service", b"authority", b"agent runtime");
-        manifest.agent_execution_semantics = hex::encode(*b"vos-pvm-41d31e6-standard-gas-r01");
+        manifest.agent_execution_semantics = hex::encode(*b"vos-pvm-41d31e6-standard-gas-r02");
         assert!(
             validate_manifest(&manifest, b"service", b"authority", b"agent runtime").is_err(),
-            "a release produced for the retired gas scheduler must fail closed",
+            "a release produced for the immediately previous Agent semantics must fail closed",
         );
     }
 

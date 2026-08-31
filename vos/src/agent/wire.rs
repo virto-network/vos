@@ -703,6 +703,11 @@ pub fn apply_standard_execution(
 ) -> Result<RuntimeExecutionReturn, DecodeError> {
     let original_state = call.state;
     let state = decode_standard_runtime_state(&original_state)?;
+    let hard_state_limit = super::execution::MAX_RUNTIME_STATE_BYTES;
+    let signed_state_limit = state.config.as_ref().map_or(hard_state_limit, |config| {
+        config.runtime_contract.resources.max_runtime_state_bytes as usize
+    });
+    let state_limit = hard_state_limit.min(signed_state_limit);
     let mut runtime =
         StandardAgentRuntime::restore(state).map_err(|_| DecodeError::NonCanonical)?;
     let (mut result, commit_candidate) = match call.invocation.validate() {
@@ -792,21 +797,34 @@ pub fn apply_standard_execution(
             },
         },
     };
-    let state = if commit_candidate {
-        let candidate = encode_standard_runtime_state(&runtime.snapshot());
-        if candidate
-            .encoded_len()
-            .is_none_or(|len| len > super::execution::MAX_RUNTIME_STATE_BYTES)
-        {
-            result = Err(ActorExecutionError::ResultCapacity);
-            original_state
-        } else {
-            candidate
-        }
-    } else {
-        original_state
-    };
+    let state = finish_standard_execution_candidate(
+        original_state,
+        &runtime,
+        commit_candidate,
+        state_limit,
+        &mut result,
+    );
     Ok(RuntimeExecutionReturn { state, result })
+}
+
+#[cfg(feature = "pvm")]
+fn finish_standard_execution_candidate(
+    original_state: RuntimeState,
+    runtime: &StandardAgentRuntime,
+    commit_candidate: bool,
+    state_limit: usize,
+    result: &mut Result<ActorExecutionReply, ActorExecutionError>,
+) -> RuntimeState {
+    if !commit_candidate {
+        return original_state;
+    }
+    let candidate = encode_standard_runtime_state(&runtime.snapshot());
+    if candidate.encoded_len().is_none_or(|len| len > state_limit) {
+        *result = Err(ActorExecutionError::ResultCapacity);
+        original_state
+    } else {
+        candidate
+    }
 }
 
 /// Finish a fresh, authenticated execution result. `Done` has already passed
@@ -1436,6 +1454,7 @@ fn encode_error(encoder: &mut Encoder<'_>, error: LifecycleError) {
         LifecycleError::AuthoritySequenceRegressed => 10,
         LifecycleError::AuthoritySequenceConflict => 11,
         LifecycleError::AuthoritySlotRegressed => 12,
+        LifecycleError::ResourceLimit => 13,
     };
     encoder.u8(tag);
 }
@@ -1455,6 +1474,7 @@ fn decode_error(decoder: &mut Decoder<'_>) -> Result<LifecycleError, DecodeError
         10 => LifecycleError::AuthoritySequenceRegressed,
         11 => LifecycleError::AuthoritySequenceConflict,
         12 => LifecycleError::AuthoritySlotRegressed,
+        13 => LifecycleError::ResourceLimit,
         _ => return Err(DecodeError::InvalidTag),
     })
 }
@@ -1749,7 +1769,7 @@ mod tests {
         };
         let generation = Hash([0x84; 32]);
         StandardRuntimeState {
-            config: Some(config),
+            config: Some(config.clone()),
             actors: vec![StandardActorState {
                 record: super::super::ActorRecord {
                     entry: ActorEntry {
@@ -1793,6 +1813,15 @@ mod tests {
                 linear: 1,
                 ..Default::default()
             },
+            authority_slot_high_water: Some(1),
+            authority_sequence_high_water: Some(1),
+            authority_dispositions: vec![StandardAuthorityDisposition {
+                credential: crate::service::CredentialId([0x8a; 32]),
+                sequence: 1,
+                claim: Hash([0x8b; 32]),
+                operation: Hash([0x8c; 32]),
+                result: Ok(LifecycleReply::Created(config.identity)),
+            }],
             ..Default::default()
         }
     }
@@ -2177,6 +2206,97 @@ mod tests {
             &encode_standard_runtime_state(&snapshot),
             MethodMode::Linear,
         );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn actor_execution_refuses_a_candidate_past_the_signed_state_ceiling() {
+        fn done_candidate(
+            state: StandardRuntimeState,
+        ) -> (
+            RuntimeState,
+            StandardAgentRuntime,
+            Result<ActorExecutionReply, ActorExecutionError>,
+        ) {
+            let original = encode_standard_runtime_state(&state);
+            let invocation = sparse_invocation(MethodMode::Linear, 0x90);
+            let mut runtime = StandardAgentRuntime::restore(state).unwrap();
+            let before = runtime.prepare_execution_state(&invocation).unwrap();
+            let mut after = before.visible_for(invocation.mode);
+            after.linear = Some(vec![0x2a]);
+            let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+            runtime
+                .commit_execution(&invocation, &mut reply, &before, after, 50)
+                .unwrap();
+            (original, runtime, Ok(reply))
+        }
+
+        let hard_limit = super::super::execution::MAX_RUNTIME_STATE_BYTES;
+        let base = sparse_standard_state();
+        let (hard_before, hard_candidate, mut accepted_result) = done_candidate(base.clone());
+        let hard_before_len = hard_before.encoded_len().unwrap();
+        let accepted = finish_standard_execution_candidate(
+            hard_before,
+            &hard_candidate,
+            true,
+            hard_limit,
+            &mut accepted_result,
+        );
+        assert!(matches!(
+            accepted_result,
+            Ok(ActorExecutionReply {
+                status: ActorExecutionStatus::Done,
+                ..
+            })
+        ));
+        let candidate_len = accepted.encoded_len().unwrap();
+        assert!(candidate_len > hard_before_len);
+        assert!(candidate_len <= hard_limit);
+        let accepted_state = decode_standard_runtime_state(&accepted).unwrap();
+        assert_eq!(accepted_state.invocation_results.len(), 1);
+        assert_eq!(accepted_state.lane_state.linear[0].value, vec![0x2a]);
+
+        let signed_limit = u32::try_from(candidate_len - 1).unwrap();
+        let mut constrained_state = base;
+        constrained_state
+            .config
+            .as_mut()
+            .unwrap()
+            .runtime_contract
+            .resources
+            .max_runtime_state_bytes = signed_limit;
+        let (before, constrained_candidate, mut constrained_result) =
+            done_candidate(constrained_state);
+        assert_eq!(before.encoded_len(), Some(hard_before_len));
+        assert!(hard_before_len <= signed_limit as usize);
+        let before_decoded = decode_standard_runtime_state(&before).unwrap();
+        assert_eq!(
+            before_decoded
+                .config
+                .as_ref()
+                .unwrap()
+                .runtime_contract
+                .resources
+                .max_runtime_state_bytes,
+            signed_limit
+        );
+
+        let returned = finish_standard_execution_candidate(
+            before.clone(),
+            &constrained_candidate,
+            true,
+            signed_limit as usize,
+            &mut constrained_result,
+        );
+        assert_eq!(constrained_result, Err(ActorExecutionError::ResultCapacity));
+        assert_eq!(returned, before);
+        assert_eq!(
+            decode_standard_runtime_state(&returned).unwrap(),
+            before_decoded
+        );
+        assert_eq!(before_decoded.lane_revisions.linear_authority_slot, None);
+        assert!(before_decoded.invocation_results.is_empty());
+        assert_eq!(before_decoded.lane_state.linear[0].value, vec![0x89]);
     }
 
     #[cfg(feature = "pvm")]
@@ -2721,6 +2841,47 @@ mod tests {
             result: Err(LifecycleError::Busy(debt)),
         };
         assert_eq!(RuntimeReturn::decode(&output.encode()).unwrap(), output);
+    }
+
+    #[test]
+    fn resource_limit_uses_new_canonical_error_tag_and_unknown_tags_fail_closed() {
+        let mut bytes = Vec::new();
+        encode_error(&mut Encoder(&mut bytes), LifecycleError::ResourceLimit);
+        assert_eq!(bytes, vec![13]);
+        let mut decoder = Decoder::new(&bytes);
+        assert_eq!(
+            decode_error(&mut decoder),
+            Ok(LifecycleError::ResourceLimit)
+        );
+        assert!(decoder.exhausted());
+
+        let mut decoder = Decoder::new(&[14]);
+        assert_eq!(decode_error(&mut decoder), Err(DecodeError::InvalidTag));
+
+        let output = RuntimeReturn {
+            state: RuntimeState {
+                control: vec![1],
+                linear: vec![2],
+                merge: vec![3],
+                local: vec![4],
+            },
+            result: Err(LifecycleError::ResourceLimit),
+        };
+        assert_eq!(RuntimeReturn::decode(&output.encode()).unwrap(), output);
+    }
+
+    #[test]
+    fn immediate_prior_runtime_abi_is_rejected_without_a_compatibility_decoder() {
+        let mut bytes = RuntimeCall {
+            state: RuntimeState::default(),
+            request: LifecycleRequest::Create(config()),
+        }
+        .encode();
+        bytes[36..68].copy_from_slice(b"vos-agent-runtime-abi-20260831r4");
+        assert_eq!(
+            RuntimeCall::decode(&bytes),
+            Err(DecodeError::InvalidPlatform)
+        );
     }
 
     #[test]

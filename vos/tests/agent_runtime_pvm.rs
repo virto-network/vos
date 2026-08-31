@@ -47,7 +47,7 @@ const GAS: u64 = 1_000_000_000;
 
 const TEST_PACKAGE_KEY: &[u8] = b"vos-agent-test-package-key";
 const TEST_AUTHORITY_SEED: [u8; 32] = [0x42; 32];
-const PRE_ROB_AGENT_SEMANTICS: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r01");
+const PREVIOUS_AGENT_SEMANTICS: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r02");
 
 struct TestTrust;
 
@@ -590,7 +590,7 @@ fn reopen_requires_the_exact_runtime_catalog_closure() {
 }
 
 #[test]
-fn reopen_rejects_the_pre_rob_runtime_package() {
+fn reopen_rejects_the_previous_runtime_package_generation() {
     let config = config();
     let driver = AgentDriver::create(
         runtime_package(),
@@ -603,7 +603,7 @@ fn reopen_rejects_the_pre_rob_runtime_package() {
     let mut store = driver.into_store();
 
     let mut legacy_runtime = runtime_package();
-    legacy_runtime.manifest.execution_semantics = PRE_ROB_AGENT_SEMANTICS;
+    legacy_runtime.manifest.execution_semantics = PREVIOUS_AGENT_SEMANTICS;
     legacy_runtime.deployment_signature.signature = package_signature(&legacy_runtime);
     let legacy_bytes = legacy_runtime.encode();
     let legacy_reference = BlobRef::of_bytes(&legacy_bytes);
@@ -629,7 +629,7 @@ fn reopen_rejects_the_pre_rob_runtime_package() {
 }
 
 #[test]
-fn reopen_rejects_a_pre_rob_actor_package_in_the_catalog_closure() {
+fn reopen_rejects_a_previous_actor_package_in_the_catalog_closure() {
     let config = config();
     let driver = AgentDriver::create(
         runtime_package(),
@@ -640,7 +640,7 @@ fn reopen_rejects_a_pre_rob_actor_package_in_the_catalog_closure() {
     )
     .expect("create current agent");
 
-    let legacy_actor = counter_actor_package(PRE_ROB_AGENT_SEMANTICS);
+    let legacy_actor = counter_actor_package(PREVIOUS_AGENT_SEMANTICS);
     let package_bytes = legacy_actor.encode();
     let package_reference = BlobRef::of_bytes(&package_bytes);
     let schema_reference = BlobRef::of_bytes(&legacy_actor.agent_schema);

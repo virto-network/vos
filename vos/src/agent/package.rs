@@ -877,24 +877,26 @@ mod tests {
     }
 
     #[test]
-    fn standard_packages_reject_the_pre_rob_metering_generation() {
-        const PRE_ROB_METERING: crate::service::Hash =
-            crate::service::Hash(*b"vos-pvm-41d31e6-standard-gas-r01");
+    fn standard_packages_reject_retired_metering_generations() {
+        for retired in [
+            crate::service::Hash(*b"vos-pvm-41d31e6-standard-gas-r01"),
+            crate::service::Hash(*b"vos-pvm-41d31e6-standard-gas-r02"),
+        ] {
+            let mut runtime = runtime_package();
+            runtime.manifest.execution_semantics = retired;
+            assert_eq!(
+                runtime.validate(),
+                Err(PackageError::WrongExecutionSemantics),
+            );
 
-        let mut runtime = runtime_package();
-        runtime.manifest.execution_semantics = PRE_ROB_METERING;
-        assert_eq!(
-            runtime.validate(),
-            Err(PackageError::WrongExecutionSemantics),
-        );
-
-        let mut actor = actor_package(
-            &ACTOR_META,
-            &ACTOR_SCHEMA,
-            super::super::schema::ExecutionEntryKind::AgentActor,
-        );
-        actor.manifest.execution_semantics = PRE_ROB_METERING;
-        assert_eq!(actor.validate(), Err(PackageError::WrongExecutionSemantics));
+            let mut actor = actor_package(
+                &ACTOR_META,
+                &ACTOR_SCHEMA,
+                super::super::schema::ExecutionEntryKind::AgentActor,
+            );
+            actor.manifest.execution_semantics = retired;
+            assert_eq!(actor.validate(), Err(PackageError::WrongExecutionSemantics));
+        }
     }
 
     #[test]
@@ -961,7 +963,7 @@ mod tests {
     fn runtime_contract_and_capacity_are_signed_and_checked() {
         let mut package = runtime_package();
         let mut contract = RuntimePackageContract::canonical();
-        contract.lifecycle_abi = Hash([9; 32]);
+        contract.lifecycle_abi = Hash(*b"vos-agent-runtime-abi-20260831r4");
         package.manifest.kind = PackageKind::AgentRuntime {
             contract,
             capabilities: RuntimeCapabilities::standard(),

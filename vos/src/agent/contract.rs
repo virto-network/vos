@@ -18,8 +18,8 @@ pub const ACTOR_ABI: u32 = 1;
 /// control-schema repin whenever that wire identity changes.
 pub const CONTROL_SCHEMA_DESCRIPTOR: &[u8] = &super::RUNTIME_ABI_ID.0;
 pub const CONTROL_SCHEMA_ID: Hash = Hash([
-    0x9f, 0xf2, 0x85, 0x68, 0x16, 0x81, 0xbf, 0x6c, 0x1f, 0xe6, 0x99, 0xc4, 0x3c, 0x19, 0x9e, 0x4b,
-    0x97, 0x15, 0x1f, 0x06, 0x84, 0x0e, 0x93, 0xbf, 0x60, 0x1c, 0x6a, 0xe4, 0xdf, 0x62, 0x9f, 0x69,
+    0x67, 0xf9, 0x42, 0x2e, 0x81, 0x30, 0xc1, 0xb7, 0x28, 0x40, 0x7f, 0xb9, 0x2d, 0xb4, 0xdf, 0xf2,
+    0x9f, 0x1e, 0xc0, 0x03, 0xb1, 0x1f, 0xda, 0xf2, 0x45, 0x75, 0xa8, 0x3e, 0x62, 0xa0, 0xcb, 0xec,
 ]);
 
 /// Standard runtime directory capacity. This is an agent policy limit, not
@@ -68,26 +68,37 @@ impl ActorAbiRange {
     }
 }
 
-/// Runtime-owned state-image ceiling authenticated by the package.
+/// Runtime-owned state-image and catalog-closure ceilings authenticated by
+/// the package.
 ///
 /// Actor count and state bytes are separate resources: supporting 4,096
 /// directory entries does not promise that 4,096 maximum-sized actors fit in
-/// one image.
+/// one image. Artifact limits count exact `(hash, encoded_len)` references,
+/// so shared content is charged once while a hash presented with two lengths
+/// is never a canonical closure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeResourceLimits {
     pub max_runtime_state_bytes: u32,
+    pub max_artifact_references: u32,
+    pub max_artifact_referenced_bytes: u64,
 }
 
 impl RuntimeResourceLimits {
     pub const fn standard() -> Self {
         Self {
             max_runtime_state_bytes: super::execution::MAX_RUNTIME_STATE_BYTES as u32,
+            max_artifact_references: super::MAX_CATALOG_ARTIFACT_REFERENCES,
+            max_artifact_referenced_bytes: super::MAX_CATALOG_ARTIFACT_REFERENCED_BYTES,
         }
     }
 
     pub const fn is_valid(self) -> bool {
         self.max_runtime_state_bytes != 0
             && self.max_runtime_state_bytes <= super::execution::MAX_RUNTIME_STATE_BYTES as u32
+            && self.max_artifact_references != 0
+            && self.max_artifact_references <= super::MAX_CATALOG_ARTIFACT_REFERENCES
+            && self.max_artifact_referenced_bytes != 0
+            && self.max_artifact_referenced_bytes <= super::MAX_CATALOG_ARTIFACT_REFERENCED_BYTES
     }
 }
 
@@ -158,6 +169,8 @@ pub(crate) fn encode_runtime_contract(encoder: &mut Encoder<'_>, contract: Runti
     encoder.u32(contract.actor_abis.maximum);
     encoder.fixed(&contract.control_schema.0);
     encoder.u32(contract.resources.max_runtime_state_bytes);
+    encoder.u32(contract.resources.max_artifact_references);
+    encoder.u64(contract.resources.max_artifact_referenced_bytes);
     encoder.u8(contract.migration as u8);
 }
 
@@ -173,6 +186,8 @@ pub(crate) fn decode_runtime_contract(
         control_schema: Hash(decoder.fixed()?),
         resources: RuntimeResourceLimits {
             max_runtime_state_bytes: decoder.u32()?,
+            max_artifact_references: decoder.u32()?,
+            max_artifact_referenced_bytes: decoder.u64()?,
         },
         migration: match decoder.u8()? {
             0 => RuntimeMigrationPolicy::None,
@@ -222,10 +237,79 @@ mod tests {
         assert!(contract.is_valid());
         assert!(contract.supports(ActorPackageContract::canonical()));
         assert_eq!(STANDARD_MAX_ACTORS, 4_096);
+        assert_eq!(super::super::MAX_CATALOG_ARTIFACT_REFERENCES, 12_289);
         assert_eq!(
             contract.resources.max_runtime_state_bytes,
             super::super::execution::MAX_RUNTIME_STATE_BYTES as u32
         );
+        assert_eq!(
+            contract.resources.max_artifact_references,
+            super::super::MAX_CATALOG_ARTIFACT_REFERENCES
+        );
+        assert_eq!(
+            contract.resources.max_artifact_referenced_bytes,
+            super::super::MAX_CATALOG_ARTIFACT_REFERENCED_BYTES
+        );
         assert_eq!(contract.migration, RuntimeMigrationPolicy::None);
+    }
+
+    #[test]
+    fn runtime_resource_limits_are_nonzero_and_canonically_bounded() {
+        let canonical = RuntimeResourceLimits::standard();
+        assert!(canonical.is_valid());
+
+        for invalid in [
+            RuntimeResourceLimits {
+                max_runtime_state_bytes: 0,
+                ..canonical
+            },
+            RuntimeResourceLimits {
+                max_runtime_state_bytes: super::super::execution::MAX_RUNTIME_STATE_BYTES as u32
+                    + 1,
+                ..canonical
+            },
+            RuntimeResourceLimits {
+                max_artifact_references: 0,
+                ..canonical
+            },
+            RuntimeResourceLimits {
+                max_artifact_references: super::super::MAX_CATALOG_ARTIFACT_REFERENCES + 1,
+                ..canonical
+            },
+            RuntimeResourceLimits {
+                max_artifact_referenced_bytes: 0,
+                ..canonical
+            },
+            RuntimeResourceLimits {
+                max_artifact_referenced_bytes: super::super::MAX_CATALOG_ARTIFACT_REFERENCED_BYTES
+                    + 1,
+                ..canonical
+            },
+        ] {
+            assert!(!invalid.is_valid());
+            let contract = RuntimePackageContract {
+                resources: invalid,
+                ..RuntimePackageContract::canonical()
+            };
+            let mut bytes = alloc::vec::Vec::new();
+            encode_runtime_contract(&mut Encoder(&mut bytes), contract);
+            assert_eq!(
+                decode_runtime_contract(&mut Decoder::new(&bytes)),
+                Err(DecodeError::NonCanonical)
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_resource_limits_round_trip_in_the_signed_contract_wire() {
+        let mut contract = RuntimePackageContract::canonical();
+        contract.resources.max_runtime_state_bytes = 1;
+        contract.resources.max_artifact_references = 2;
+        contract.resources.max_artifact_referenced_bytes = 3;
+        let mut bytes = alloc::vec::Vec::new();
+        encode_runtime_contract(&mut Encoder(&mut bytes), contract);
+        let mut decoder = Decoder::new(&bytes);
+        assert_eq!(decode_runtime_contract(&mut decoder), Ok(contract));
+        assert!(decoder.exhausted());
     }
 }

@@ -37,15 +37,14 @@ pub const MAX_MERGE_FRONTIER_ENTRIES: usize = 512;
 /// Maximum complete checkpoint or lane-state manifest.
 pub const MAX_CHECKPOINT_MANIFEST_BYTES: usize = 128 * 1024;
 /// Maximum complete artifact-closure manifest.
-pub const MAX_ARTIFACT_CLOSURE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ARTIFACT_CLOSURE_BYTES: usize = super::MAX_CATALOG_ARTIFACT_BYTES as usize;
 /// Standard runtime closure: one runtime package plus package/schema/policy
 /// artifacts for every possible actor.
-pub const MAX_ARTIFACT_CLOSURE_ENTRIES: usize =
-    1 + 3 * super::contract::STANDARD_MAX_ACTORS as usize;
+pub const MAX_ARTIFACT_CLOSURE_ENTRIES: usize = super::MAX_CATALOG_ARTIFACT_REFERENCES as usize;
 /// Maximum aggregate bytes reachable through one artifact closure. This is
 /// independent of the encoded manifest bound and prevents a small list of
 /// individually valid BlobRefs from forcing multi-gigabyte recovery work.
-pub const MAX_ARTIFACT_CLOSURE_REFERENCED_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_ARTIFACT_CLOSURE_REFERENCED_BYTES: u64 = super::MAX_CATALOG_ARTIFACT_REFERENCED_BYTES;
 /// Maximum Local lane states named by one aggregate checkpoint.
 /// A physical replica checkpoint may bind only that replica's Local lane.
 /// Multi-node backup/export uses a separately certified aggregate bundle.
@@ -1996,9 +1995,9 @@ impl CanonicalJournalRecord for LaneStateManifest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactClosure {
     pub genesis: AgentJournalGenesisId,
-    /// Strictly ordered by `(hash, len)` with no duplicate content identity.
-    /// The catalog retained by guest state supplies the artifact's semantic
-    /// role; closure only needs exact byte reachability.
+    /// Strictly ordered by hash with one canonical length per content
+    /// identity. The catalog retained by guest state supplies the artifact's
+    /// semantic role; closure only needs exact byte reachability.
     pub artifacts: Vec<BlobRef>,
 }
 
@@ -2051,7 +2050,7 @@ fn validate_system_genesis_artifacts(artifacts: &[BlobRef]) -> Result<(), Decode
             .any(|artifact| !valid_blob_ref(artifact, true, MAX_ARTIFACT_CLOSURE_BYTES as u64))
         || artifacts
             .windows(2)
-            .any(|pair| (pair[0].hash, pair[0].len) >= (pair[1].hash, pair[1].len))
+            .any(|pair| pair[0].hash >= pair[1].hash)
     {
         return Err(DecodeError::NonCanonical);
     }
@@ -4833,6 +4832,28 @@ mod tests {
         assert_eq!(
             ArtifactClosure::decode(&over_bytes.encode()),
             Err(DecodeError::LimitExceeded)
+        );
+
+        let same_hash_different_length = ArtifactClosure {
+            genesis,
+            artifacts: vec![
+                BlobRef {
+                    hash: Hash([0x44; 32]),
+                    len: 1,
+                },
+                BlobRef {
+                    hash: Hash([0x44; 32]),
+                    len: 2,
+                },
+            ],
+        };
+        assert_eq!(
+            same_hash_different_length.validate(),
+            Err(DecodeError::NonCanonical)
+        );
+        assert_eq!(
+            ArtifactClosure::decode(&same_hash_different_length.encode()),
+            Err(DecodeError::NonCanonical)
         );
     }
 

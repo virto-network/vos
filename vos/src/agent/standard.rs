@@ -15,7 +15,8 @@ use super::{
     LifecycleRequest, RuntimeRequirements, StateLane,
 };
 use crate::service::{
-    ActorId, AgentId, CredentialId, DeploymentId, Hash, InvocationId, ProducerId, ProgramId,
+    ActorId, AgentId, BlobRef, CredentialId, DeploymentId, Hash, InvocationId, ProducerId,
+    ProgramId,
 };
 
 pub const MAX_DIRECTORY_PAGE: u16 = 256;
@@ -25,6 +26,75 @@ pub const MAX_AUTHORITY_DISPOSITIONS: usize = 256;
 /// Explicit cap below both the runtime-image byte limit and the generic wire
 /// item limit. Historical entries are retained until checkpoint compaction.
 pub const MAX_LANE_STATE_ENTRIES: usize = 16_384;
+
+#[derive(Default)]
+struct ArtifactResourceUsage {
+    /// Catalog storage is hash-keyed. Retaining the one admitted length here
+    /// both deduplicates exact references and rejects an unsatisfiable second
+    /// length for the same content identity.
+    lengths: BTreeMap<Hash, u64>,
+    referenced_bytes: u64,
+}
+
+impl ArtifactResourceUsage {
+    fn insert(
+        &mut self,
+        reference: &BlobRef,
+        limits: super::contract::RuntimeResourceLimits,
+    ) -> Result<(), LifecycleError> {
+        if reference.hash == Hash::ZERO || reference.len == 0 {
+            return Err(LifecycleError::InvalidRequest);
+        }
+        if let Some(encoded_len) = self.lengths.get(&reference.hash) {
+            return if *encoded_len == reference.len {
+                Ok(())
+            } else {
+                Err(LifecycleError::InvalidRequest)
+            };
+        }
+        let references = self
+            .lengths
+            .len()
+            .checked_add(1)
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or(LifecycleError::ResourceLimit)?;
+        let referenced_bytes = self
+            .referenced_bytes
+            .checked_add(reference.len)
+            .ok_or(LifecycleError::ResourceLimit)?;
+        if reference.len > super::MAX_CATALOG_ARTIFACT_BYTES
+            || references > limits.max_artifact_references
+            || referenced_bytes > limits.max_artifact_referenced_bytes
+        {
+            return Err(LifecycleError::ResourceLimit);
+        }
+        self.lengths.insert(reference.hash, reference.len);
+        self.referenced_bytes = referenced_bytes;
+        Ok(())
+    }
+}
+
+fn validate_artifact_resources<'a>(
+    limits: super::contract::RuntimeResourceLimits,
+    references: impl IntoIterator<Item = &'a BlobRef>,
+) -> Result<(), LifecycleError> {
+    if !limits.is_valid() {
+        return Err(LifecycleError::InvalidRequest);
+    }
+    let mut usage = ArtifactResourceUsage::default();
+    for reference in references {
+        usage.insert(reference, limits)?;
+    }
+    Ok(())
+}
+
+fn actor_artifact_references(actor: &ManagedActor) -> [&BlobRef; 3] {
+    [
+        &actor.record.package,
+        &actor.record.agent_schema,
+        &actor.record.role_policies,
+    ]
+}
 
 #[derive(Clone, Debug)]
 struct ManagedActor {
@@ -387,10 +457,9 @@ impl StandardAgentRuntime {
             }
             runtime.authority_dispositions.push(disposition);
         }
-        if runtime.authority_sequence_high_water.is_some()
-            != runtime.authority_slot_high_water.is_some()
-            || runtime.authority_sequence_high_water.is_some()
-                == runtime.authority_dispositions.is_empty()
+        if runtime.authority_sequence_high_water.is_none()
+            || runtime.authority_slot_high_water.is_none()
+            || runtime.authority_dispositions.is_empty()
             || runtime
                 .authority_dispositions
                 .last()
@@ -399,6 +468,7 @@ impl StandardAgentRuntime {
         {
             return Err(LifecycleError::InvalidRequest);
         }
+        runtime.validate_signed_state_resource()?;
         Ok(runtime)
     }
 
@@ -419,6 +489,48 @@ impl StandardAgentRuntime {
 
     fn created(&self) -> Result<&AgentConfig, LifecycleError> {
         self.config.as_ref().ok_or(LifecycleError::NotCreated)
+    }
+
+    fn validate_signed_state_resource(&self) -> Result<(), LifecycleError> {
+        let limit = self
+            .created()?
+            .runtime_contract
+            .resources
+            .max_runtime_state_bytes as usize;
+        let state = super::wire::encode_standard_runtime_state(&self.snapshot());
+        if state.encoded_len().is_none_or(|bytes| bytes > limit) {
+            Err(LifecycleError::ResourceLimit)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record_authority_disposition(
+        &mut self,
+        credential: CredentialId,
+        sequence: u64,
+        claim: Hash,
+        operation: Hash,
+        observed_slot: u64,
+        result: &Result<LifecycleReply, LifecycleError>,
+    ) {
+        self.authority_sequence_high_water = Some(sequence);
+        self.authority_slot_high_water = Some(observed_slot);
+        if self.authority_dispositions.len() == MAX_AUTHORITY_DISPOSITIONS {
+            // Globally monotone sequences make the oldest journal entry the
+            // only canonical eviction candidate. Its sequence remains below
+            // the durable high-water, so a later retry is rejected without
+            // reapplying the lifecycle operation.
+            self.authority_dispositions.remove(0);
+        }
+        self.authority_dispositions
+            .push(StandardAuthorityDisposition {
+                credential,
+                sequence,
+                claim,
+                operation,
+                result: result.clone(),
+            });
     }
 
     fn logical_slot_high_water(&self) -> Option<u64> {
@@ -595,6 +707,16 @@ impl StandardAgentRuntime {
                 ));
             }
         }
+        validate_artifact_resources(
+            config.runtime_contract.resources,
+            core::iter::once(&config.runtime_package)
+                .chain(self.actors.values().flat_map(actor_artifact_references))
+                .chain([
+                    &install.package,
+                    &install.agent_schema,
+                    &install.role_policies,
+                ]),
+        )?;
         let entry = install.entry.clone();
         self.actors.insert(
             entry.actor,
@@ -1100,7 +1222,7 @@ impl StandardAgentRuntime {
         }
         let actor = self
             .actors
-            .get_mut(&upgrade.actor)
+            .get(&upgrade.actor)
             .ok_or(LifecycleError::NotFound)?;
         if actor.record.entry.deployment != upgrade.from_deployment {
             return Err(LifecycleError::StaleDeployment);
@@ -1138,6 +1260,26 @@ impl StandardAgentRuntime {
         if actor.record.state_layout != upgrade.state_layout {
             return Err(LifecycleError::UnsupportedLane);
         }
+        let config = self.created()?;
+        validate_artifact_resources(
+            config.runtime_contract.resources,
+            core::iter::once(&config.runtime_package)
+                .chain(
+                    self.actors
+                        .iter()
+                        .filter(|(actor, _)| **actor != upgrade.actor)
+                        .flat_map(|(_, actor)| actor_artifact_references(actor)),
+                )
+                .chain([
+                    &upgrade.package,
+                    &upgrade.agent_schema,
+                    &upgrade.role_policies,
+                ]),
+        )?;
+        let actor = self
+            .actors
+            .get_mut(&upgrade.actor)
+            .expect("validated actor remains installed");
         actor.record.entry.deployment = upgrade.to_deployment;
         actor.record.entry.program = upgrade.to_program;
         actor.record.entry.package = upgrade.package.clone();
@@ -1234,6 +1376,7 @@ impl StandardAgentRuntime {
         capabilities: super::RuntimeCapabilities,
     ) -> Result<LifecycleReply, LifecycleError> {
         let config = self.created()?;
+        let intrinsic = super::RuntimeCapabilities::standard();
         if config.identity.runtime_deployment != from_deployment {
             return Err(LifecycleError::StaleDeployment);
         }
@@ -1243,6 +1386,10 @@ impl StandardAgentRuntime {
             || producer == ProducerId::ZERO
             || package.hash == Hash::ZERO
             || package.len == 0
+            || capabilities.max_actors > intrinsic.max_actors
+            || capabilities.lanes.bits() & !intrinsic.lanes.bits() != 0
+            || (capabilities.scheduling && !intrinsic.scheduling)
+            || (capabilities.proofs && !intrinsic.proofs)
             || capabilities.max_actors < self.actors.len() as u32
             || !capabilities.lanes.supported_by(config.identity.profile)
             || self.actors.values().any(|actor| {
@@ -1260,6 +1407,11 @@ impl StandardAgentRuntime {
         {
             return Err(LifecycleError::UnsupportedRuntime);
         }
+        validate_artifact_resources(
+            contract.resources,
+            core::iter::once(&package)
+                .chain(self.actors.values().flat_map(actor_artifact_references)),
+        )?;
         if let Some(debt) = self
             .actors
             .keys()
@@ -1268,14 +1420,18 @@ impl StandardAgentRuntime {
         {
             return Err(LifecycleError::Busy(debt));
         }
-        let config = self.config.as_mut().expect("created agent has config");
+        let mut next = self.clone();
+        let config = next.config.as_mut().expect("created agent has config");
         config.identity.runtime_deployment = to_deployment;
         config.identity.runtime_program = to_program;
         config.identity.runtime_producer = producer;
         config.runtime_package = package;
         config.runtime_contract = contract;
         config.capabilities = capabilities;
-        Ok(LifecycleReply::RuntimeUpgraded(config.identity.clone()))
+        let identity = config.identity.clone();
+        next.validate_signed_state_resource()?;
+        *self = next;
+        Ok(LifecycleReply::RuntimeUpgraded(identity))
     }
 
     fn apply_authorized(
@@ -1378,26 +1534,69 @@ impl StandardAgentRuntime {
             (_, Some(_)) => unreachable!("only install requests derive an actor generation"),
         };
         if result.is_err() {
+            *self = before.clone();
+        }
+
+        // Before Create there is no canonical Agent state in which to retain
+        // a disposition. Preserve the semantic refusal verbatim; only a
+        // successful Create whose exact Created disposition exceeds its own
+        // signed ceiling is translated to `ResourceLimit` below.
+        if before.config.is_none() && result.is_err() {
+            *self = before;
+            return result;
+        }
+
+        // The signed state ceiling owns the exact final image for every
+        // authorized outcome, including authority high-water and the retained
+        // disposition itself. Successful Create/UpgradeRuntime naturally use
+        // the newly installed contract here; every other transition uses the
+        // current contract.
+        let mut prospective = self.clone();
+        prospective.record_authority_disposition(
+            claim.credential,
+            claim.sequence,
+            claim_hash,
+            claim.operation,
+            admission.observed_slot,
+            &result,
+        );
+        if prospective.validate_signed_state_resource().is_ok() {
+            *self = prospective;
+            return result;
+        }
+
+        // Roll back application semantics and retain a deterministic capacity
+        // refusal under the pre-transition contract. An established Agent has
+        // at least its Create disposition available as bounded eviction
+        // headroom. `ResourceLimit` is smaller than every successful reply and
+        // no larger than a fixed lifecycle error, so replacing the oldest
+        // entry cannot grow a previously valid image.
+        let limited = Err(LifecycleError::ResourceLimit);
+        let mut fallback = before.clone();
+        if fallback.config.is_none() {
+            *self = before;
+            return limited;
+        }
+        if !fallback.authority_dispositions.is_empty() {
+            fallback.authority_dispositions.remove(0);
+        }
+        fallback.record_authority_disposition(
+            claim.credential,
+            claim.sequence,
+            claim_hash,
+            claim.operation,
+            admission.observed_slot,
+            &limited,
+        );
+        if fallback.validate_signed_state_resource().is_ok() {
+            *self = fallback;
+        } else {
+            // A non-production state created without an authorized Create can
+            // have no eviction headroom. Fail closed without making that
+            // malformed baseline larger.
             *self = before;
         }
-        self.authority_sequence_high_water = Some(claim.sequence);
-        self.authority_slot_high_water = Some(admission.observed_slot);
-        if self.authority_dispositions.len() == MAX_AUTHORITY_DISPOSITIONS {
-            // Globally monotone sequences make the oldest journal entry the
-            // only canonical eviction candidate. Its sequence remains below
-            // the durable high-water, so a later retry is rejected without
-            // reapplying the lifecycle operation.
-            self.authority_dispositions.remove(0);
-        }
-        self.authority_dispositions
-            .push(StandardAuthorityDisposition {
-                credential: claim.credential,
-                sequence: claim.sequence,
-                claim: claim_hash,
-                operation: claim.operation,
-                result: result.clone(),
-            });
-        result
+        limited
     }
 
     fn apply_mutation(
@@ -1421,6 +1620,10 @@ impl StandardAgentRuntime {
                 {
                     return Err(LifecycleError::UnsupportedRuntime);
                 }
+                validate_artifact_resources(
+                    config.runtime_contract.resources,
+                    core::iter::once(&config.runtime_package),
+                )?;
                 let identity = config.identity.clone();
                 self.config = Some(config);
                 Ok(LifecycleReply::Created(identity))
@@ -1739,6 +1942,20 @@ mod tests {
         }
     }
 
+    fn set_install_artifacts(
+        install: &mut InstallActor,
+        package: BlobRef,
+        agent_schema: BlobRef,
+        role_policies: BlobRef,
+    ) {
+        install.entry.package = package.clone();
+        install.entry.agent_schema = agent_schema.clone();
+        install.entry.role_policies = role_policies.clone();
+        install.package = package;
+        install.agent_schema = agent_schema;
+        install.role_policies = role_policies;
+    }
+
     fn suspend(actor: ActorId, expected_deployment: DeploymentId) -> LifecycleRequest {
         LifecycleRequest::Suspend {
             actor,
@@ -2004,9 +2221,7 @@ mod tests {
     fn standard_directory_physically_encodes_and_restores_its_signed_capacity() {
         let config = config(super::super::RuntimeCapabilities::STANDARD_MAX_ACTORS);
         let mut runtime = StandardAgentRuntime::new();
-        runtime
-            .apply_mutation(LifecycleRequest::Create(config.clone()))
-            .unwrap();
+        create_authorized(&mut runtime, &config, 1).unwrap();
         for index in 0..config.capabilities.max_actors {
             runtime
                 .install(
@@ -3103,6 +3318,18 @@ mod tests {
             StandardAgentRuntime::restore(snapshot),
             Err(LifecycleError::InvalidRequest)
         ));
+
+        let mut transient = StandardAgentRuntime::new();
+        transient
+            .apply_mutation(LifecycleRequest::Create(config))
+            .unwrap();
+        assert!(
+            matches!(
+                StandardAgentRuntime::restore(transient.snapshot()),
+                Err(LifecycleError::InvalidRequest)
+            ),
+            "a durable created state must retain its authorized Create tail"
+        );
     }
 
     #[test]
@@ -3346,16 +3573,527 @@ mod tests {
     #[test]
     fn create_cannot_overstate_standard_runtime_capabilities() {
         let oversized = config(super::super::RuntimeCapabilities::STANDARD_MAX_ACTORS + 1);
+        let mut runtime = StandardAgentRuntime::new();
         assert_eq!(
-            create_authorized(&mut StandardAgentRuntime::new(), &oversized, 1),
+            create_authorized(&mut runtime, &oversized, 1),
             Err(LifecycleError::UnsupportedRuntime)
         );
+        assert_eq!(runtime.snapshot(), StandardRuntimeState::default());
 
         let mut proof_capable = config(1);
         proof_capable.capabilities.proofs = true;
+        let mut runtime = StandardAgentRuntime::new();
         assert_eq!(
-            create_authorized(&mut StandardAgentRuntime::new(), &proof_capable, 1),
+            create_authorized(&mut runtime, &proof_capable, 1),
             Err(LifecycleError::UnsupportedRuntime)
+        );
+        assert_eq!(runtime.snapshot(), StandardRuntimeState::default());
+    }
+
+    #[test]
+    fn create_enforces_signed_aggregate_and_global_per_reference_artifact_limits() {
+        let mut aggregate = config(1);
+        aggregate
+            .runtime_contract
+            .resources
+            .max_artifact_referenced_bytes = aggregate.runtime_package.len - 1;
+        let mut runtime = StandardAgentRuntime::new();
+        assert_eq!(
+            runtime.apply_mutation(LifecycleRequest::Create(aggregate)),
+            Err(LifecycleError::ResourceLimit)
+        );
+        assert!(runtime.config().is_none());
+
+        let mut per_reference = config(1);
+        per_reference.runtime_package.len = super::super::MAX_CATALOG_ARTIFACT_BYTES + 1;
+        let mut runtime = StandardAgentRuntime::new();
+        assert_eq!(
+            runtime.apply_mutation(LifecycleRequest::Create(per_reference)),
+            Err(LifecycleError::ResourceLimit)
+        );
+        assert!(runtime.config().is_none());
+    }
+
+    #[test]
+    fn install_counts_unique_exact_references_and_rejects_ambiguous_lengths() {
+        let mut bounded = config(8);
+        bounded.runtime_contract.resources.max_artifact_references = 4;
+        bounded
+            .runtime_contract
+            .resources
+            .max_artifact_referenced_bytes = 400;
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &bounded, 1).unwrap();
+        apply_authorized(
+            &mut runtime,
+            &bounded,
+            LifecycleRequest::Install(install(bounded.identity.agent, None, "first")),
+        )
+        .unwrap();
+        apply_authorized(
+            &mut runtime,
+            &bounded,
+            LifecycleRequest::Install(install(bounded.identity.agent, None, "shared")),
+        )
+        .unwrap();
+        assert_eq!(runtime.len(), 2, "exact cross-actor references deduplicate");
+
+        let mut fifth = install(bounded.identity.agent, None, "fifth-ref");
+        let package = BlobRef {
+            hash: Hash([0x91; 32]),
+            len: 100,
+        };
+        fifth.entry.package = package.clone();
+        fifth.package = package;
+        assert_eq!(
+            apply_authorized(&mut runtime, &bounded, LifecycleRequest::Install(fifth)),
+            Err(LifecycleError::ResourceLimit)
+        );
+        assert_eq!(runtime.len(), 2);
+
+        let mut ambiguous_config = config(2);
+        ambiguous_config
+            .runtime_contract
+            .resources
+            .max_artifact_references = 4;
+        ambiguous_config
+            .runtime_contract
+            .resources
+            .max_artifact_referenced_bytes = 1_000;
+        let mut ambiguous_runtime = StandardAgentRuntime::new();
+        create_authorized(&mut ambiguous_runtime, &ambiguous_config, 1).unwrap();
+        let mut ambiguous = install(ambiguous_config.identity.agent, None, "ambiguous");
+        let package = BlobRef {
+            hash: ambiguous_config.runtime_package.hash,
+            len: ambiguous_config.runtime_package.len + 1,
+        };
+        ambiguous.entry.package = package.clone();
+        ambiguous.package = package;
+        assert_eq!(
+            apply_authorized(
+                &mut ambiguous_runtime,
+                &ambiguous_config,
+                LifecycleRequest::Install(ambiguous)
+            ),
+            Err(LifecycleError::InvalidRequest)
+        );
+        assert!(ambiguous_runtime.is_empty());
+    }
+
+    #[test]
+    fn install_exact_duplicates_charge_once_at_the_one_reference_boundary() {
+        let mut config = config(1);
+        config.runtime_contract.resources.max_artifact_references = 1;
+        config
+            .runtime_contract
+            .resources
+            .max_artifact_referenced_bytes = config.runtime_package.len;
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let mut actor = install(config.identity.agent, None, "one-blob");
+        set_install_artifacts(
+            &mut actor,
+            config.runtime_package.clone(),
+            config.runtime_package.clone(),
+            config.runtime_package.clone(),
+        );
+        assert!(apply_authorized(&mut runtime, &config, LifecycleRequest::Install(actor)).is_ok());
+        assert_eq!(runtime.len(), 1);
+    }
+
+    #[test]
+    fn actor_upgrade_keeps_globally_shared_old_references_charged() {
+        let mut config = config(4);
+        config.runtime_contract.resources.max_artifact_references = 6;
+        config
+            .runtime_contract
+            .resources
+            .max_artifact_referenced_bytes = 1_000;
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let first = install(config.identity.agent, None, "first-sharer");
+        let first_entry = first.entry.clone();
+        let second = install(config.identity.agent, None, "second-sharer");
+        apply_authorized(&mut runtime, &config, LifecycleRequest::Install(first)).unwrap();
+        apply_authorized(&mut runtime, &config, LifecycleRequest::Install(second)).unwrap();
+
+        let upgrade = UpgradeActor {
+            actor: first_entry.actor,
+            from_deployment: first_entry.deployment,
+            to_deployment: DeploymentId([0x92; 32]),
+            to_program: first_entry.program,
+            producer: ProducerId([0x93; 32]),
+            package: BlobRef {
+                hash: Hash([0x94; 32]),
+                len: 100,
+            },
+            agent_schema: BlobRef {
+                hash: Hash([0x95; 32]),
+                len: 100,
+            },
+            role_policies: BlobRef {
+                hash: Hash([0x96; 32]),
+                len: 100,
+            },
+            state_layout: first_entry.state_layout,
+            contract: crate::agent::contract::ActorPackageContract::canonical(),
+            requirements: RuntimeRequirements {
+                lanes: first_entry.lanes,
+                scheduling: false,
+                proofs: false,
+            },
+        };
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::UpgradeActor(upgrade)
+            ),
+            Err(LifecycleError::ResourceLimit)
+        );
+        assert_eq!(runtime.actor(first_entry.actor), Some(&first_entry));
+        assert_eq!(runtime.len(), 2);
+    }
+
+    #[test]
+    fn runtime_upgrade_uses_target_artifact_and_intrinsic_capacity_limits() {
+        let mut config = config(8);
+        config.runtime_contract.resources.max_artifact_references = 4;
+        config
+            .runtime_contract
+            .resources
+            .max_artifact_referenced_bytes = 400;
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::Install(install(config.identity.agent, None, "resident")),
+        )
+        .unwrap();
+
+        let mut lower = config.runtime_contract;
+        lower.resources.max_artifact_referenced_bytes = 399;
+        let lower_request = LifecycleRequest::UpgradeRuntime {
+            from_deployment: config.identity.runtime_deployment,
+            to_deployment: DeploymentId([0xa1; 32]),
+            to_program: ProgramId([0xa2; 32]),
+            producer: ProducerId([0xa3; 32]),
+            package: BlobRef {
+                hash: Hash([0xa4; 32]),
+                len: 100,
+            },
+            contract: lower,
+            capabilities: config.capabilities,
+        };
+        assert_eq!(
+            apply_authorized(&mut runtime, &config, lower_request),
+            Err(LifecycleError::ResourceLimit)
+        );
+        assert_eq!(
+            runtime.config().unwrap().identity.runtime_deployment,
+            config.identity.runtime_deployment
+        );
+
+        let mut excessive_capabilities = config.capabilities;
+        excessive_capabilities.max_actors = RuntimeCapabilities::STANDARD_MAX_ACTORS + 1;
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::UpgradeRuntime {
+                    from_deployment: config.identity.runtime_deployment,
+                    to_deployment: DeploymentId([0xa5; 32]),
+                    to_program: ProgramId([0xa6; 32]),
+                    producer: ProducerId([0xa7; 32]),
+                    package: BlobRef {
+                        hash: Hash([0xa8; 32]),
+                        len: 100,
+                    },
+                    contract: config.runtime_contract,
+                    capabilities: excessive_capabilities,
+                }
+            ),
+            Err(LifecycleError::UnsupportedRuntime)
+        );
+
+        let mut higher = config.runtime_contract;
+        higher.resources.max_artifact_referenced_bytes = 500;
+        let upgraded = apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::UpgradeRuntime {
+                from_deployment: config.identity.runtime_deployment,
+                to_deployment: DeploymentId([0xa9; 32]),
+                to_program: ProgramId([0xaa; 32]),
+                producer: ProducerId([0xab; 32]),
+                package: BlobRef {
+                    hash: Hash([0xac; 32]),
+                    len: 200,
+                },
+                contract: higher,
+                capabilities: config.capabilities,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            upgraded,
+            LifecycleReply::RuntimeUpgraded(identity)
+                if identity.runtime_deployment == DeploymentId([0xa9; 32])
+        ));
+    }
+
+    #[test]
+    fn restore_recomputes_signed_artifact_closure_and_state_limits() {
+        let config = config(2);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        runtime
+            .install(
+                install(config.identity.agent, None, "restored"),
+                Hash([0xb1; 32]),
+            )
+            .unwrap();
+        let snapshot = runtime.snapshot();
+
+        let mut artifact_overflow = snapshot.clone();
+        artifact_overflow
+            .config
+            .as_mut()
+            .unwrap()
+            .runtime_contract
+            .resources
+            .max_artifact_referenced_bytes = 399;
+        assert!(matches!(
+            StandardAgentRuntime::restore(artifact_overflow),
+            Err(LifecycleError::ResourceLimit)
+        ));
+
+        let mut ambiguous = snapshot.clone();
+        let runtime_reference = ambiguous.config.as_ref().unwrap().runtime_package.clone();
+        let package = BlobRef {
+            hash: runtime_reference.hash,
+            len: runtime_reference.len + 1,
+        };
+        ambiguous.actors[0].record.entry.package = package.clone();
+        ambiguous.actors[0].record.package = package;
+        assert!(matches!(
+            StandardAgentRuntime::restore(ambiguous),
+            Err(LifecycleError::InvalidRequest)
+        ));
+
+        let mut state_overflow = snapshot;
+        let encoded_len = super::super::wire::encode_standard_runtime_state(&state_overflow)
+            .encoded_len()
+            .unwrap();
+        state_overflow
+            .config
+            .as_mut()
+            .unwrap()
+            .runtime_contract
+            .resources
+            .max_runtime_state_bytes = u32::try_from(encoded_len - 1).unwrap();
+        assert!(matches!(
+            StandardAgentRuntime::restore(state_overflow),
+            Err(LifecycleError::ResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn authorized_resource_refusal_is_atomic_consumed_and_exactly_retryable() {
+        let mut config = config(2);
+        config.runtime_contract.resources.max_artifact_references = 1;
+        config
+            .runtime_contract
+            .resources
+            .max_artifact_referenced_bytes = config.runtime_package.len;
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let before_config = runtime.config().unwrap().clone();
+        let request =
+            LifecycleRequest::Install(install(config.identity.agent, None, "over-signed-limit"));
+        let signed = authorized(&config, CredentialId([0xb2; 32]), 2, 2, request);
+
+        assert_eq!(
+            runtime.apply(signed.clone()),
+            Err(LifecycleError::ResourceLimit)
+        );
+        assert!(runtime.is_empty());
+        assert_eq!(runtime.config(), Some(&before_config));
+        assert_eq!(runtime.authority_sequence_high_water, Some(2));
+        assert_eq!(runtime.authority_slot_high_water, Some(100));
+        assert_eq!(
+            runtime
+                .authority_dispositions
+                .last()
+                .map(|item| &item.result),
+            Some(&Err(LifecycleError::ResourceLimit))
+        );
+        let disposition_count = runtime.authority_dispositions.len();
+
+        let encoded = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+        let decoded = super::super::wire::decode_standard_runtime_state(&encoded).unwrap();
+        assert_eq!(
+            decoded
+                .authority_dispositions
+                .last()
+                .map(|item| &item.result),
+            Some(&Err(LifecycleError::ResourceLimit))
+        );
+        let mut reopened = StandardAgentRuntime::restore(decoded).unwrap();
+        assert_eq!(
+            reopened.apply(signed),
+            Err(LifecycleError::ResourceLimit),
+            "an exact retry recovers the retained refusal without rechecking resources"
+        );
+        assert!(reopened.is_empty());
+        assert_eq!(reopened.config(), Some(&before_config));
+        assert_eq!(reopened.authority_sequence_high_water, Some(2));
+        assert_eq!(reopened.authority_dispositions.len(), disposition_count);
+    }
+
+    #[test]
+    fn every_authorized_outcome_reserves_its_exact_signed_state_bytes() {
+        let config = config(2);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let current_bytes = super::super::wire::encode_standard_runtime_state(&runtime.snapshot())
+            .encoded_len()
+            .unwrap();
+        runtime
+            .config
+            .as_mut()
+            .unwrap()
+            .runtime_contract
+            .resources
+            .max_runtime_state_bytes = u32::try_from(current_bytes).unwrap();
+
+        let request = LifecycleRequest::Install(install(
+            config.identity.agent,
+            None,
+            "state-capacity-refusal",
+        ));
+        let signed = authorized(&config, CredentialId([0xb7; 32]), 2, 2, request);
+        assert_eq!(
+            runtime.apply(signed.clone()),
+            Err(LifecycleError::ResourceLimit)
+        );
+        assert!(runtime.is_empty(), "the actor install must roll back");
+        assert_eq!(runtime.authority_sequence_high_water, Some(2));
+        assert_eq!(runtime.authority_slot_high_water, Some(100));
+        assert_eq!(runtime.authority_dispositions.len(), 1);
+        assert_eq!(runtime.authority_dispositions[0].sequence, 2);
+        assert_eq!(
+            runtime.authority_dispositions[0].result,
+            Err(LifecycleError::ResourceLimit),
+            "the oldest disposition supplies bounded headroom for the exact refusal"
+        );
+        assert!(
+            super::super::wire::encode_standard_runtime_state(&runtime.snapshot())
+                .encoded_len()
+                .unwrap()
+                <= current_bytes
+        );
+
+        let mut reopened = StandardAgentRuntime::restore(runtime.snapshot()).unwrap();
+        assert_eq!(reopened.apply(signed), Err(LifecycleError::ResourceLimit));
+        assert_eq!(reopened.authority_dispositions.len(), 1);
+
+        let next = authorized(
+            &config,
+            CredentialId([0xb8; 32]),
+            3,
+            3,
+            LifecycleRequest::Install(install(
+                config.identity.agent,
+                None,
+                "second-state-capacity-refusal",
+            )),
+        );
+        assert_eq!(reopened.apply(next), Err(LifecycleError::ResourceLimit));
+        assert_eq!(reopened.authority_sequence_high_water, Some(3));
+        assert_eq!(reopened.authority_dispositions.len(), 1);
+        assert_eq!(reopened.authority_dispositions[0].sequence, 3);
+        assert_eq!(
+            reopened.apply(authorized(
+                &config,
+                CredentialId([0xb7; 32]),
+                2,
+                2,
+                LifecycleRequest::Install(install(
+                    config.identity.agent,
+                    None,
+                    "state-capacity-refusal",
+                )),
+            )),
+            Err(LifecycleError::AuthoritySequenceRegressed),
+            "evicted capacity refusals retain the global anti-replay high-water"
+        );
+    }
+
+    #[test]
+    fn undersized_create_refuses_without_publishing_a_partial_agent() {
+        let mut config = config(1);
+        config.runtime_contract.resources.max_runtime_state_bytes = 1;
+        let mut runtime = StandardAgentRuntime::new();
+        assert_eq!(
+            create_authorized(&mut runtime, &config, 1),
+            Err(LifecycleError::ResourceLimit)
+        );
+        assert_eq!(runtime.snapshot(), StandardRuntimeState::default());
+    }
+
+    #[test]
+    fn runtime_upgrade_reserves_target_state_bytes_for_its_exact_disposition() {
+        let config = config(1);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+
+        let package = BlobRef {
+            hash: Hash([0xb3; 32]),
+            len: 100,
+        };
+        let mut direct = runtime.clone();
+        direct
+            .upgrade_runtime(
+                config.identity.runtime_deployment,
+                DeploymentId([0xb4; 32]),
+                ProgramId([0xb5; 32]),
+                ProducerId([0xb6; 32]),
+                package.clone(),
+                config.runtime_contract,
+                config.capabilities,
+            )
+            .unwrap();
+        let direct_bytes = super::super::wire::encode_standard_runtime_state(&direct.snapshot())
+            .encoded_len()
+            .unwrap();
+        let mut target_contract = config.runtime_contract;
+        target_contract.resources.max_runtime_state_bytes = u32::try_from(direct_bytes).unwrap();
+        let request = LifecycleRequest::UpgradeRuntime {
+            from_deployment: config.identity.runtime_deployment,
+            to_deployment: DeploymentId([0xb4; 32]),
+            to_program: ProgramId([0xb5; 32]),
+            producer: ProducerId([0xb6; 32]),
+            package,
+            contract: target_contract,
+            capabilities: config.capabilities,
+        };
+        assert_eq!(
+            apply_authorized(&mut runtime, &config, request),
+            Err(LifecycleError::ResourceLimit)
+        );
+        assert_eq!(
+            runtime.config().unwrap().identity.runtime_deployment,
+            config.identity.runtime_deployment,
+            "the semantic upgrade rolls back while its exact refusal is retained"
+        );
+        assert_eq!(
+            runtime
+                .authority_dispositions
+                .last()
+                .map(|item| &item.result),
+            Some(&Err(LifecycleError::ResourceLimit))
         );
     }
 

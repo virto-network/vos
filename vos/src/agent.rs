@@ -38,7 +38,7 @@ use crate::service::{
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260831r4");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260831r5");
 
 /// Consensus-visible execution semantics for standard-PVM agent packages.
 ///
@@ -47,11 +47,23 @@ pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260831r4");
 /// capability-manifest profile, while Agent Actor and AgentRuntime packages
 /// execute the standard SPI profile. A semantics change in one profile must
 /// not silently accept—or unnecessarily invalidate—packages for the other
-/// profile. Generation `r02` binds the full v0.8 reorder-buffer gas scheduler,
-/// full-Ψ deblob/entry failure boundary, and sign-extended 64-bit `ecalli`
-/// identifiers; `r01` used the retired register-ready approximation and is
+/// profile. Generation `r03` additionally binds exact durable terminal and
+/// execution-error outcomes to their authenticated invocation ownership and
+/// acknowledgement protocol. Generation `r02` introduced the full v0.8
+/// reorder-buffer gas scheduler, full-Ψ deblob/entry failure boundary, and
+/// sign-extended 64-bit `ecalli` identifiers; older generations are
 /// incompatible.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r02");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r03");
+
+/// Maximum bytes named by one content-addressed artifact reference in an
+/// authenticated Agent catalog closure.
+pub const MAX_CATALOG_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum distinct `(hash, encoded_len)` references in a Standard Agent
+/// catalog: one runtime package plus package/schema/policy for every actor.
+pub const MAX_CATALOG_ARTIFACT_REFERENCES: u32 = 1 + 3 * contract::STANDARD_MAX_ACTORS;
+/// Maximum aggregate bytes reachable through one authenticated Agent catalog
+/// closure, independently of its encoded manifest size.
+pub const MAX_CATALOG_ARTIFACT_REFERENCED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Program identity of the bundled standard runtime artifact.
 pub const STANDARD_RUNTIME_PROGRAM_ID: ProgramId = ProgramId([
@@ -597,6 +609,7 @@ pub enum LifecycleError {
     AuthoritySequenceRegressed,
     AuthoritySequenceConflict,
     AuthoritySlotRegressed,
+    ResourceLimit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
