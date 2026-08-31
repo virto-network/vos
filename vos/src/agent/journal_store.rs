@@ -59,22 +59,26 @@ use super::journal::{
     MAX_INVOCATION_OUTCOME_BYTES, MAX_JOURNAL_RECORD_BYTES, MAX_REPLAY_INPUT_BYTES,
     MAX_REPLAY_SUFFIX_BYTES, MAX_REPLAY_SUFFIX_ENTRIES, MergeEvent, MergeEventId, MergeFrontier,
     MergeFrontierId, MergeSeal, MergeSealId, OrderedBase, OrderedEntry, OrderedEntryId,
-    PersistedLane, system_genesis_post_create_state_commitment,
+    PersistedLane, ReplayOperation, system_genesis_post_create_state_commitment,
 };
 use super::replay::{
     ReplayPublicationAnchor, ReplayPublicationMode, ReplaySealedGenesis, ReplaySealedPublication,
-    ReplaySealedSharedMergeProjection,
+    ReplaySealedSharedMergeProjection, ReplaySystemAuthorityStoragePlan,
+    ReplayedRootJournalIdentity,
 };
 use super::shared_commit::{MAX_ORDERED_COMMIT_CLAIM_BYTES, OrderedCommitClaim};
 use super::shared_raft::JournalStoreInstanceId;
+use super::standard::StandardSystemAuthorityWrite;
 use super::system_authority::{
     MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORD_BYTES, MAX_SYSTEM_AUTHORITY_DECISION_NODE_BYTES,
     MAX_SYSTEM_AUTHORITY_DECISION_TREE_NODES, MAX_SYSTEM_AUTHORITY_ROTATION_NODE_BYTES,
     MAX_SYSTEM_AUTHORITY_ROTATION_TREE_NODES, MAX_SYSTEM_AUTHORITY_ROTATIONS,
     SystemAuthorityCommitteeId, SystemAuthorityCommitteeRecord, SystemAuthorityDecisionNode,
     SystemAuthorityDecisionNodeId, SystemAuthorityRotationNode, SystemAuthorityRotationNodeId,
+    prove_rotation,
 };
 use super::wire::{RuntimeState, decode_standard_runtime_state};
+use super::{LifecycleReply, LifecycleRequest};
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{AgentId, BlobRef, Hash, NodeId};
 
@@ -263,6 +267,27 @@ pub(crate) trait SystemAuthorityHistoryStore: AgentJournalStore {
         &mut self,
         record: &SystemAuthorityCommitteeRecord,
     ) -> Result<(), JournalStoreError>;
+}
+
+/// Private publication path for a replay transition already bound to the
+/// exact durable system-authority reservation.
+///
+/// The public [`AgentJournalStore::publish`] path always rejects a sealed
+/// authority write. Only replay's non-clonable prepared holder can call this
+/// seam with the independently validated typed dependency closure.
+pub(crate) trait SystemAuthorityPublicationStore: SystemAuthorityHistoryStore {
+    fn publish_system_authority(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        storage: &ReplaySystemAuthorityStoragePlan,
+    ) -> Result<JournalPublication, JournalStoreError>;
+}
+
+/// Process-local proof that this store was initialized or reopened from the
+/// independently reverified root seal. The identity is never reconstructed
+/// from persisted Heads or admission IDs.
+pub(crate) trait ReverifiedRootJournalStore: AgentJournalStore {
+    fn replayed_root_identity(&self) -> Option<ReplayedRootJournalIdentity>;
 }
 
 /// Caller-selected work budget for an explicit authority-history scrub.
@@ -3174,6 +3199,186 @@ fn stage_shared_ordered_commit<S: SharedOrderedCommitStore>(
     Ok(created)
 }
 
+fn persist_and_read_back_authority_record<S, R>(
+    store: &mut S,
+    record: &R,
+    load: impl Fn(&S, R::Id) -> Result<Option<R>, JournalStoreError>,
+    persist: impl Fn(&mut S, &R) -> Result<(), JournalStoreError>,
+) -> Result<bool, JournalStoreError>
+where
+    S: SystemAuthorityHistoryStore,
+    R: Clone + PartialEq,
+    R::Id: Copy,
+    R: AuthorityRecordId,
+{
+    let id = record.authority_id();
+    let created = load(store, id)?.is_none();
+    persist(store, record)?;
+    if load(store, id)?.as_ref() != Some(record) {
+        return Err(JournalStoreError::Corrupt);
+    }
+    Ok(created)
+}
+
+trait AuthorityRecordId {
+    type Id;
+
+    fn authority_id(&self) -> Self::Id;
+}
+
+impl AuthorityRecordId for SystemAuthorityDecisionNode {
+    type Id = SystemAuthorityDecisionNodeId;
+
+    fn authority_id(&self) -> Self::Id {
+        self.id()
+    }
+}
+
+impl AuthorityRecordId for SystemAuthorityRotationNode {
+    type Id = SystemAuthorityRotationNodeId;
+
+    fn authority_id(&self) -> Self::Id {
+        self.id()
+    }
+}
+
+impl AuthorityRecordId for SystemAuthorityCommitteeRecord {
+    type Id = SystemAuthorityCommitteeId;
+
+    fn authority_id(&self) -> Self::Id {
+        self.id()
+    }
+}
+
+fn validate_authority_committee_closure(
+    records: &[SystemAuthorityCommitteeRecord],
+) -> Result<(), JournalStoreError> {
+    if records.is_empty() || records.windows(2).any(|pair| pair[0].id() >= pair[1].id()) {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    Ok(())
+}
+
+fn stage_system_authority_dependencies<S: SystemAuthorityPublicationStore>(
+    store: &mut S,
+    publication: &ReplaySealedPublication,
+    storage: &ReplaySystemAuthorityStoragePlan,
+) -> Result<bool, JournalStoreError> {
+    if publication.mode() != ReplayPublicationMode::Canonical
+        || publication.shared_ordered_commit().is_some()
+        || publication.shared_merge_projection().is_some()
+        || !matches!(publication.anchor(), ReplayPublicationAnchor::Ordered(_))
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    validate_authority_committee_closure(storage.committee_records())?;
+    let write = publication
+        .system_authority_write()
+        .ok_or(JournalStoreError::NonCanonical)?;
+
+    let mut created = false;
+    let exact_retry = match (write.selected(), write.result()) {
+        (
+            StandardSystemAuthorityWrite::Rotation { record, history },
+            LifecycleReply::SystemAuthorityRotated {
+                rotation,
+                epoch,
+                exact_retry,
+            },
+        ) => {
+            if record != storage.history().record()
+                || record.id() != *rotation
+                || record.new_epoch() != *epoch
+                || history.root() != storage.history().root()
+                || history.previous_root() == SystemAuthorityRotationNodeId::ZERO
+                || history.root() == SystemAuthorityRotationNodeId::ZERO
+                || history.inserted() == *exact_retry
+                || *exact_retry
+                || !history.inserted()
+                || storage.committee_records().len() != 2
+                || storage.committee_records()[0].id()
+                    != record.old_committee().min(record.new_committee())
+                || storage.committee_records()[1].id()
+                    != record.old_committee().max(record.new_committee())
+            {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            if history.nodes().is_empty()
+                || history
+                    .nodes()
+                    .windows(2)
+                    .any(|pair| pair[0].id() >= pair[1].id())
+                || history
+                    .nodes()
+                    .iter()
+                    .all(|node| node.id() != history.root())
+                || history
+                    .nodes()
+                    .iter()
+                    .all(|node| node != &SystemAuthorityRotationNode::Leaf(record.clone()))
+                || history.committee_records() != storage.committee_records()
+            {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            for node in history.nodes() {
+                created |= persist_and_read_back_authority_record(
+                    store,
+                    node,
+                    SystemAuthorityHistoryStore::load_system_authority_rotation_node,
+                    SystemAuthorityHistoryStore::persist_system_authority_rotation_node,
+                )?;
+            }
+            *exact_retry
+        }
+        _ => return Err(JournalStoreError::NonCanonical),
+    };
+
+    let ReplayPublicationAnchor::Ordered(entry) = publication.anchor() else {
+        return Err(JournalStoreError::NonCanonical);
+    };
+    let ReplayOperation::Management {
+        request: LifecycleRequest::RotateSystemAuthority(command),
+    } = &entry.input.operation
+    else {
+        return Err(JournalStoreError::NonCanonical);
+    };
+    let lookup = prove_rotation(
+        storage.history().root(),
+        storage.history().record().new_epoch(),
+        |id| {
+            store
+                .load_system_authority_rotation_node(id)
+                .map(|node| node.map(|node| node.encode()))
+        },
+    )
+    .map_err(|_| JournalStoreError::Corrupt)?;
+    if lookup.occupied_record() != Some(storage.history().record())
+        || (exact_retry && lookup.proof() != command.proof())
+    {
+        return Err(JournalStoreError::Corrupt);
+    }
+
+    for record in storage.committee_records() {
+        if exact_retry {
+            if store
+                .load_system_authority_committee_record(record.id())?
+                .as_ref()
+                != Some(record)
+            {
+                return Err(JournalStoreError::MissingObject);
+            }
+        } else {
+            created |= persist_and_read_back_authority_record(
+                store,
+                record,
+                SystemAuthorityHistoryStore::load_system_authority_committee_record,
+                SystemAuthorityHistoryStore::persist_system_authority_committee_record,
+            )?;
+        }
+    }
+    Ok(created)
+}
+
 fn stage_sealed_dependencies<S: SharedOrderedCommitStore>(
     store: &mut S,
     publication: &ReplaySealedPublication,
@@ -3266,6 +3471,7 @@ pub struct MemoryAgentJournalStore {
     // while preserving cheap candidate clones for rollback-safe publication.
     blobs: Arc<BTreeMap<(JournalBlobClass, Hash), Vec<u8>>>,
     gc_intent: Option<GcIntent>,
+    replayed_root: Option<ReplayedRootJournalIdentity>,
 }
 
 static NEXT_MEMORY_JOURNAL_STORE_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -3306,7 +3512,13 @@ impl Clone for MemoryAgentJournalStore {
     /// A public clone is an independently mutable in-memory store, so it must
     /// not inherit a Shared application capability for the source instance.
     fn clone(&self) -> Self {
-        self.copy_with_instance(cloned_memory_journal_store_instance(self.instance_id))
+        let mut cloned =
+            self.copy_with_instance(cloned_memory_journal_store_instance(self.instance_id));
+        // A public clone is a different physical journal capability. Root
+        // provenance is process-local and may only come from that clone's own
+        // independently reverified initialize/open boundary.
+        cloned.replayed_root = None;
+        cloned
     }
 }
 
@@ -3358,6 +3570,7 @@ impl MemoryAgentJournalStore {
             history_retirements: None,
             blobs: Arc::new(BTreeMap::new()),
             gc_intent: None,
+            replayed_root: None,
         })
     }
 
@@ -3376,6 +3589,7 @@ impl MemoryAgentJournalStore {
             history_retirements: self.history_retirements.clone(),
             blobs: Arc::clone(&self.blobs),
             gc_intent: self.gc_intent,
+            replayed_root: self.replayed_root,
         }
     }
 
@@ -3573,6 +3787,72 @@ impl MemoryAgentJournalStore {
         self.publish_anchor_with_mode(expected, anchor, next, ReplayPublicationMode::Canonical)
     }
 
+    fn publish_sealed_internal(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        authority: Option<&ReplaySystemAuthorityStoragePlan>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        match (publication.system_authority_write(), authority) {
+            (None, None) | (Some(_), Some(_)) => {}
+            _ => return Err(JournalStoreError::NonCanonical),
+        }
+        self.ensure_no_gc_pending()?;
+        let expected = publication.expected();
+        let next = publication.next();
+        let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        let exact_retry = publication_is_exact_retry(&current, expected, next)?;
+        if exact_retry {
+            validate_idempotent_history_plans(self, &current, publication.history_plans())?;
+        }
+        let overlay = if exact_retry {
+            None
+        } else {
+            let queue = self.history_queue(current.genesis)?.clone();
+            build_history_candidate(self, &current, next, publication.history_plans(), &queue)?
+        };
+
+        // Build the complete candidate in a private clone. Authority history
+        // is exact-read back before the anchor CAS and again after the
+        // candidate's head has advanced, but is not exposed if validation or
+        // the CAS fails.
+        let mut candidate = self.candidate_clone();
+        let history_created = overlay
+            .as_ref()
+            .map(|overlay| candidate.install_history_candidate(overlay))
+            .transpose()?
+            .unwrap_or(false);
+        let authority_created = authority
+            .map(|plan| stage_system_authority_dependencies(&mut candidate, publication, plan))
+            .transpose()?
+            .unwrap_or(false);
+        let dependency_created = stage_sealed_dependencies(&mut candidate, publication)?;
+        let mut result =
+            match publication.anchor() {
+                ReplayPublicationAnchor::Ordered(entry) => {
+                    candidate.publish_anchor_with_mode(expected, entry, next, publication.mode())?
+                }
+                ReplayPublicationAnchor::Local(entry) => {
+                    candidate.publish_anchor_with_mode(expected, entry, next, publication.mode())?
+                }
+                ReplayPublicationAnchor::Merge { event, .. } => {
+                    candidate.publish_anchor_with_mode(expected, event, next, publication.mode())?
+                }
+                ReplayPublicationAnchor::Checkpoint(checkpoint) => candidate
+                    .publish_anchor_with_mode(expected, checkpoint, next, publication.mode())?,
+            };
+        if result.heads_advanced
+            && let Some(overlay) = &overlay
+        {
+            candidate.enqueue_history_retirement(&overlay.intent)?;
+        }
+        if let Some(plan) = authority {
+            stage_system_authority_dependencies(&mut candidate, publication, plan)?;
+        }
+        *self = candidate;
+        result.object_created |= authority_created || dependency_created || history_created;
+        Ok(result)
+    }
+
     #[cfg(test)]
     fn initialize_raw_for_test(
         &mut self,
@@ -3637,6 +3917,7 @@ impl MemoryAgentJournalStore {
         candidate.heads = Some(encoded_heads.bytes);
         candidate.history_retirements =
             Some(HistoryRetirementQueue::empty(genesis.id(), self.node));
+        candidate.replayed_root = None;
         validate_head_targets(&candidate, &initial)?;
         *self = candidate;
         Ok(created)
@@ -3651,6 +3932,9 @@ impl AgentJournalStore for MemoryAgentJournalStore {
     fn initialize(&mut self, sealed: &ReplaySealedGenesis) -> Result<bool, JournalStoreError> {
         self.ensure_no_gc_pending()?;
         let shape = validate_sealed_genesis_shape(sealed, self.agent, self.node)?;
+        let replayed_root = sealed
+            .replayed_root_identity()
+            .map_err(|_| JournalStoreError::ScopeMismatch)?;
         let genesis = sealed.genesis();
         let encoded = encode_object(genesis)?;
         let encoded_heads = encode_object(&shape.initial)?;
@@ -3668,6 +3952,9 @@ impl AgentJournalStore for MemoryAgentJournalStore {
                 .heads
                 .as_ref()
                 .is_some_and(|existing| existing != &encoded_heads.bytes)
+            || self
+                .replayed_root
+                .is_some_and(|existing| existing != replayed_root)
         {
             return Err(JournalStoreError::Conflict);
         }
@@ -3694,6 +3981,7 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         candidate.heads = Some(encoded_heads.bytes);
         candidate.history_retirements =
             Some(HistoryRetirementQueue::empty(genesis.id(), self.node));
+        candidate.replayed_root = Some(replayed_root);
         validate_head_targets(&candidate, &shape.initial)?;
         *self = candidate;
         Ok(created)
@@ -3785,54 +4073,7 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         &mut self,
         publication: &ReplaySealedPublication,
     ) -> Result<JournalPublication, JournalStoreError> {
-        self.ensure_no_gc_pending()?;
-        let expected = publication.expected();
-        let next = publication.next();
-        let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
-        let exact_retry = publication_is_exact_retry(&current, expected, next)?;
-        if exact_retry {
-            validate_idempotent_history_plans(self, &current, publication.history_plans())?;
-        }
-        let overlay = if exact_retry {
-            None
-        } else {
-            let queue = self.history_queue(current.genesis)?.clone();
-            build_history_candidate(self, &current, next, publication.history_plans(), &queue)?
-        };
-
-        // All history writes, the retirement append, and head visibility are
-        // committed through one clone swap. A stale CAS can therefore leave
-        // ordinary content-addressed replay objects, but never permanent
-        // history nodes without the authenticating successor head.
-        let mut candidate = self.candidate_clone();
-        let history_created = overlay
-            .as_ref()
-            .map(|overlay| candidate.install_history_candidate(overlay))
-            .transpose()?
-            .unwrap_or(false);
-        let dependency_created = stage_sealed_dependencies(&mut candidate, publication)?;
-        let mut result =
-            match publication.anchor() {
-                ReplayPublicationAnchor::Ordered(entry) => {
-                    candidate.publish_anchor_with_mode(expected, entry, next, publication.mode())?
-                }
-                ReplayPublicationAnchor::Local(entry) => {
-                    candidate.publish_anchor_with_mode(expected, entry, next, publication.mode())?
-                }
-                ReplayPublicationAnchor::Merge { event, .. } => {
-                    candidate.publish_anchor_with_mode(expected, event, next, publication.mode())?
-                }
-                ReplayPublicationAnchor::Checkpoint(checkpoint) => candidate
-                    .publish_anchor_with_mode(expected, checkpoint, next, publication.mode())?,
-            };
-        if result.heads_advanced
-            && let Some(overlay) = &overlay
-        {
-            candidate.enqueue_history_retirement(&overlay.intent)?;
-        }
-        *self = candidate;
-        result.object_created |= dependency_created || history_created;
-        Ok(result)
+        self.publish_sealed_internal(publication, None)
     }
 }
 
@@ -3929,6 +4170,22 @@ impl SystemAuthorityHistoryStore for MemoryAgentJournalStore {
         record: &SystemAuthorityCommitteeRecord,
     ) -> Result<(), JournalStoreError> {
         self.persist_authority_with_readback(record)
+    }
+}
+
+impl SystemAuthorityPublicationStore for MemoryAgentJournalStore {
+    fn publish_system_authority(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        storage: &ReplaySystemAuthorityStoragePlan,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        self.publish_sealed_internal(publication, Some(storage))
+    }
+}
+
+impl ReverifiedRootJournalStore for MemoryAgentJournalStore {
+    fn replayed_root_identity(&self) -> Option<ReplayedRootJournalIdentity> {
+        self.replayed_root
     }
 }
 
@@ -4551,6 +4808,7 @@ pub struct FileAgentJournalStore {
     node: NodeId,
     directories: DirectoryCapabilities,
     history_candidate: Option<HistoryCandidateOverlay>,
+    replayed_root: Option<ReplayedRootJournalIdentity>,
     #[cfg(target_os = "linux")]
     stable_lock_name: CString,
     #[cfg(target_os = "linux")]
@@ -4841,6 +5099,7 @@ impl FileAgentJournalStore {
             node,
             directories,
             history_candidate: None,
+            replayed_root: None,
             stable_lock_name,
             stable_lock_identity,
             stable_lock_nonce,
@@ -4850,6 +5109,10 @@ impl FileAgentJournalStore {
         store.ensure_layout()?;
         store.recover_history_state()?;
         store.validate_authority_recovery(sealed, allow_unverified_for_test)?;
+        store.replayed_root = sealed
+            .map(ReplaySealedGenesis::replayed_root_identity)
+            .transpose()
+            .map_err(|_| JournalStoreError::ScopeMismatch)?;
         if let Some(heads) = store.heads()? {
             validate_head_targets(&store, &heads)?;
         }
@@ -6385,8 +6648,13 @@ impl FileAgentJournalStore {
     fn publish_sealed_inner(
         &mut self,
         publication: &ReplaySealedPublication,
+        authority: Option<&ReplaySystemAuthorityStoragePlan>,
         mut publication_point: impl FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
     ) -> Result<JournalPublication, JournalStoreError> {
+        match (publication.system_authority_write(), authority) {
+            (None, None) | (Some(_), Some(_)) => {}
+            _ => return Err(JournalStoreError::NonCanonical),
+        }
         let expected = publication.expected();
         let next = publication.next();
         let (exact_retry, overlay) = self.stage_sealed_history_candidate(
@@ -6396,6 +6664,13 @@ impl FileAgentJournalStore {
             &mut publication_point,
         )?;
         if exact_retry {
+            let authority_created = authority
+                .map(|plan| stage_system_authority_dependencies(self, publication, plan))
+                .transpose()?
+                .unwrap_or(false);
+            if authority.is_some() {
+                publication_point(PublicationPoint::AuthorityDependenciesDurable)?;
+            }
             let dependency_created = stage_sealed_dependencies(self, publication)?;
             let mut result = match publication.anchor() {
                 ReplayPublicationAnchor::Ordered(entry) => self.publish_inner_with_mode(
@@ -6427,11 +6702,21 @@ impl FileAgentJournalStore {
                     &mut publication_point,
                 )?,
             };
-            result.object_created |= dependency_created;
+            if let Some(plan) = authority {
+                stage_system_authority_dependencies(self, publication, plan)?;
+            }
+            result.object_created |= authority_created || dependency_created;
             return Ok(result);
         }
 
         let attempted = (|| {
+            let authority_created = authority
+                .map(|plan| stage_system_authority_dependencies(self, publication, plan))
+                .transpose()?
+                .unwrap_or(false);
+            if authority.is_some() {
+                publication_point(PublicationPoint::AuthorityDependenciesDurable)?;
+            }
             let dependency_created = stage_sealed_dependencies(self, publication)?;
             let mut result = match publication.anchor() {
                 ReplayPublicationAnchor::Ordered(entry) => self.publish_inner_with_mode(
@@ -6466,7 +6751,10 @@ impl FileAgentJournalStore {
             if result.heads_advanced && overlay.is_some() {
                 result.object_created |= self.finish_history_candidate(&mut publication_point)?;
             }
-            result.object_created |= dependency_created;
+            if let Some(plan) = authority {
+                stage_system_authority_dependencies(self, publication, plan)?;
+            }
+            result.object_created |= authority_created || dependency_created;
             Ok(result)
         })();
         if attempted.is_err() && overlay.is_some() {
@@ -6879,6 +7167,7 @@ impl FileAgentJournalStore {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublicationPoint {
     HistoryCandidateDurable,
+    AuthorityDependenciesDurable,
     ObjectDurable,
     HeadsStaged,
     HeadsDurable,
@@ -6928,6 +7217,15 @@ impl AgentJournalStore for FileAgentJournalStore {
     fn initialize(&mut self, sealed: &ReplaySealedGenesis) -> Result<bool, JournalStoreError> {
         self.ensure_no_gc_pending()?;
         let shape = validate_sealed_genesis_shape(sealed, self.agent, self.node)?;
+        let replayed_root = sealed
+            .replayed_root_identity()
+            .map_err(|_| JournalStoreError::ScopeMismatch)?;
+        if self
+            .replayed_root
+            .is_some_and(|existing| existing != replayed_root)
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
         let genesis = sealed.genesis();
         let encoded = encode_object(genesis)?;
         for reference in &sealed.artifacts().artifacts {
@@ -6996,6 +7294,7 @@ impl AgentJournalStore for FileAgentJournalStore {
         )?;
         let heads_created = self.install_initial_heads(&shape.initial)?;
         validate_head_targets(self, &shape.initial)?;
+        self.replayed_root = Some(replayed_root);
         Ok(genesis_created || heads_created)
     }
 
@@ -7068,7 +7367,7 @@ impl AgentJournalStore for FileAgentJournalStore {
         }
         #[cfg(target_os = "linux")]
         {
-            self.publish_sealed_inner(publication, |_| Ok(()))
+            self.publish_sealed_inner(publication, None, |_| Ok(()))
         }
     }
 }
@@ -7135,6 +7434,30 @@ impl SystemAuthorityHistoryStore for FileAgentJournalStore {
         record: &SystemAuthorityCommitteeRecord,
     ) -> Result<(), JournalStoreError> {
         self.persist_authority_with_readback(record)
+    }
+}
+
+impl SystemAuthorityPublicationStore for FileAgentJournalStore {
+    fn publish_system_authority(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        storage: &ReplaySystemAuthorityStoragePlan,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (publication, storage);
+            Err(JournalStoreError::Unavailable)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.publish_sealed_inner(publication, Some(storage), |_| Ok(()))
+        }
+    }
+}
+
+impl ReverifiedRootJournalStore for FileAgentJournalStore {
+    fn replayed_root_identity(&self) -> Option<ReplayedRootJournalIdentity> {
+        self.replayed_root
     }
 }
 
@@ -9878,6 +10201,9 @@ mod tests {
 
             let mut reopened = open_file_store(&directory);
             match crash_at {
+                PublicationPoint::AuthorityDependenciesDurable => {
+                    unreachable!("history-only publication has no authority dependency phase")
+                }
                 PublicationPoint::HistoryCandidateDurable | PublicationPoint::ObjectDurable => {
                     assert_eq!(reopened.heads().unwrap(), Some(current.clone()));
                     assert!(reopened.history_candidate.is_none());

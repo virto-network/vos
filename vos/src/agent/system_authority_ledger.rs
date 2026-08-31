@@ -583,6 +583,10 @@ impl ReplayedSystemAuthorityView {
         self.state.current_committee()
     }
 
+    pub(crate) const fn authority_state(&self) -> &SystemAuthorityState {
+        &self.state
+    }
+
     pub(crate) const fn committee_sequence_high_water(&self) -> u64 {
         self.state.committee_sequence_high_water()
     }
@@ -749,12 +753,19 @@ mod durable {
     use redb::{Database, ReadableTable, TableDefinition};
 
     use super::*;
+    use crate::agent::LifecycleReply;
     use crate::agent::committee::{
         AuthorityMemberRole, AuthorityQuorumCertificate, AuthoritySignature, AuthoritySignerId,
         MAX_AUTHORITY_QC_WIRE_BYTES,
     };
+    use crate::agent::journal_store::{AgentJournalStore, JournalPublication};
+    use crate::agent::replay::{
+        PublishedSystemAuthorityRotation, PublishedSystemAuthorityRotationFacts,
+        ReplayExecutionResult, ReplayMaterialization,
+    };
     use crate::agent::system_authority::{
         MAX_SYSTEM_AUTHORITY_ROTATIONS, SystemAuthorityRotationCertificate,
+        SystemAuthorityRotationNodeId,
     };
     use crate::service::NodeId;
 
@@ -862,6 +873,18 @@ mod durable {
 
         pub(crate) const fn state_view_commitment(&self) -> Hash {
             self.record.state_view
+        }
+
+        pub(crate) const fn journal_store(&self) -> JournalStoreInstanceId {
+            self.record.journal_store
+        }
+
+        pub(crate) const fn predecessor_heads(&self) -> JournalHeadsId {
+            self.record.predecessor_heads
+        }
+
+        pub(crate) const fn authority_state_commitment(&self) -> Hash {
+            self.record.authority_state
         }
     }
 
@@ -987,6 +1010,13 @@ mod durable {
         certificate: Option<AuthorityQuorumCertificate>,
     }
 
+    /// One-shot unlock minted only after the exact post-CAS reservation has
+    /// been durably retired. Its private field prevents ordinary crate code
+    /// from using replay's result-release seam as a retirement bypass.
+    pub(crate) struct RetiredSystemAuthorityRotation {
+        _private: (),
+    }
+
     impl SystemAuthorityShareOutcome {
         pub(crate) const fn share(&self) -> &AuthoritySignature {
             &self.share
@@ -997,12 +1027,8 @@ mod durable {
         }
     }
 
-    /// Module-private model of replay's future post-CAS receipt. Production
-    /// code cannot construct or submit this value: integration must define a
-    /// replay/store-owned opaque receipt after sealed-dependency readback and
-    /// the exact predecessor-to-successor Heads CAS, then wire that receipt to
-    /// the private retirement core without exposing successor facts as a
-    /// capability.
+    /// Ledger-private retirement model built only from replay's opaque,
+    /// store-borrowing post-CAS receipt.
     #[derive(Debug)]
     struct PublishedSystemAuthorityClaim {
         reservation: ReservationRecord,
@@ -1017,6 +1043,66 @@ mod durable {
     }
 
     impl PublishedSystemAuthorityClaim {
+        fn for_rotation_receipt(
+            reserved: &ReservedSystemAuthorityClaim,
+            facts: &PublishedSystemAuthorityRotationFacts,
+            frozen_certificate: &SystemAuthorityRotationCertificate,
+        ) -> Result<Self, SystemAuthorityLedgerError> {
+            let reservation = &reserved.record;
+            let SystemAuthorityLedgerClaim::CommitteeRotation {
+                retiring,
+                incoming,
+                transition,
+            } = &reservation.request
+            else {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            };
+            let record = facts.record();
+            let command = facts.command();
+            if facts.journal_store() != reservation.journal_store
+                || facts.predecessor_heads() != reservation.predecessor_heads
+                || facts.predecessor_control() != reservation.control_state
+                || facts.predecessor_view() != reservation.state_view
+                || facts.predecessor_authority_state() != reservation.authority_state
+                || facts.successor_heads() == JournalHeadsId::ZERO
+                || facts.successor_heads() == facts.predecessor_heads()
+                || facts.successor_control() == LaneStateId::ZERO
+                || facts.successor_control() == facts.predecessor_control()
+                || facts.successor_view() == Hash::ZERO
+                || facts.successor_view() == facts.predecessor_view()
+                || facts.successor_authority_state() == Hash::ZERO
+                || facts.successor_authority_state() == facts.predecessor_authority_state()
+                || facts.claim() != reservation.request.claim()
+                || command.operation_commitment() != facts.operation()
+                || command.new_committee() != incoming
+                || command.certificate() != frozen_certificate
+                || record.certificate() != frozen_certificate
+                || record.certificate().transition() != transition
+                || record.old_committee().as_bytes() != &retiring.commitment().0
+                || record.new_committee().as_bytes() != &incoming.commitment().0
+                || facts.root() == SystemAuthorityRotationNodeId::ZERO
+                || facts.result()
+                    != &(LifecycleReply::SystemAuthorityRotated {
+                        rotation: record.id(),
+                        epoch: record.new_epoch(),
+                        exact_retry: false,
+                    })
+            {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            }
+            Ok(Self {
+                reservation: reservation.clone(),
+                journal_store: facts.journal_store(),
+                successor_heads: facts.successor_heads(),
+                successor_control: facts.successor_control(),
+                successor_view: facts.successor_view(),
+                successor_authority_state: facts.successor_authority_state(),
+                resulting_high_water: transition.rotation_sequence(),
+                resulting_first_sequence: Some(transition.first_sequence()),
+                resulting_committee: incoming.commitment(),
+            })
+        }
+
         #[cfg(test)]
         fn for_test_after_exact_cas(
             pending: PendingSystemAuthorityRecovery,
@@ -1417,6 +1503,106 @@ mod durable {
             Ok(Some(PendingSystemAuthorityRecovery { record }))
         }
 
+        /// Keep the exact active reservation stable across an external
+        /// journal CAS. The otherwise read-only redb writer excludes every
+        /// reservation rebase/replacement from all ledger handles until the
+        /// operation returns. Equivalent cloned reservation bearers remain
+        /// safe because both this preflight and retirement exact-compare the
+        /// one durable active row.
+        pub(crate) fn with_active_publication_reservation<T, E>(
+            &self,
+            reserved: &ReservedSystemAuthorityClaim,
+            expected_certificate: &SystemAuthorityRotationCertificate,
+            operation: impl FnOnce() -> Result<T, E>,
+        ) -> Result<Result<T, E>, SystemAuthorityLedgerError> {
+            let _write = self.lock_writes()?;
+            let transaction = self.database.begin_write()?;
+            self.recheck_config(&transaction)?;
+            let route_key = route_storage_key(self.route);
+            let active = transaction
+                .open_table(RESERVATION_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::ClaimNotReserved)?;
+            let active = ReservationRecord::decode(&active)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            if active != reserved.record
+                || active.route != self.route
+                || active.journal_store != self.journal_store
+            {
+                return Err(SystemAuthorityLedgerError::ClaimNotReserved);
+            }
+            active.validate()?;
+            let meta = transaction
+                .open_table(META_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::CorruptLedger)?;
+            let meta =
+                MetaRecord::decode(&meta).map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            meta.validate()?;
+            if meta.route != self.route
+                || meta.journal_store != self.journal_store
+                || meta.retired_high_water != active.prior_high_water
+                || meta.authority_state != active.authority_state
+            {
+                return Err(SystemAuthorityLedgerError::CorruptLedger);
+            }
+            if let Some(bytes) = transaction
+                .open_table(FAIL_STOP_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+            {
+                let fail_stop = FailStopRecord::decode(&bytes)
+                    .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                fail_stop.validate()?;
+                if fail_stop.route != self.route {
+                    return Err(SystemAuthorityLedgerError::CorruptLedger);
+                }
+                // A canonical later fail-stop prevents new work but does not
+                // revoke this already-active exact claim with both frozen QCs.
+            }
+            let SystemAuthorityLedgerClaim::CommitteeRotation {
+                retiring,
+                incoming,
+                transition,
+            } = &active.request
+            else {
+                return Err(SystemAuthorityLedgerError::WrongCommitteeLeg);
+            };
+            let claim = active.request.claim();
+            let mut certificates = Vec::with_capacity(2);
+            for (leg, committee) in [
+                (SystemAuthorityCommitteeLeg::Retiring, retiring),
+                (SystemAuthorityCommitteeLeg::Incoming, incoming),
+            ] {
+                let bytes = transaction
+                    .open_table(QC_TABLE)?
+                    .get(leg_storage_key(self.route, claim.sequence(), leg).as_slice())?
+                    .map(|value| value.value().to_vec())
+                    .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
+                let row = CertificateRecord::decode(&bytes)
+                    .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                row.validate_for(self.route, claim.sequence(), leg, committee, claim)?;
+                certificates.push(row.certificate);
+            }
+            let frozen = SystemAuthorityRotationCertificate::new(
+                transition.clone(),
+                certificates.remove(0),
+                certificates.remove(0),
+            )
+            .map_err(|_| SystemAuthorityLedgerError::InvalidCertificate)?;
+            if &frozen != expected_certificate {
+                return Err(SystemAuthorityLedgerError::InvalidCertificate);
+            }
+            let result = operation();
+            // The writer is intentionally never committed: its sole purpose
+            // is excluding an active-row mutation while the journal crosses
+            // its independently crash-safe publication boundary.
+            drop(transaction);
+            Ok(result)
+        }
+
         /// Run a root-journal checkpoint/GC operation only while reservation
         /// insertion is excluded by redb's global writer. A TargetConflict may
         /// leave no permanent decision-tree leaf, so its exact publication
@@ -1596,6 +1782,33 @@ mod durable {
             SystemAuthorityRotationCertificate::new(transition, old_certificate, new_certificate)
                 .map(Some)
                 .map_err(|_| SystemAuthorityLedgerError::InvalidCertificate)
+        }
+
+        /// Retire the exact fresh rotation while its opaque receipt still
+        /// retains the mutable physical journal-store borrow. Replay outputs
+        /// become available only after the durable reservation row and frozen
+        /// QCs have been atomically retired.
+        pub(crate) fn retire_published_rotation<S: AgentJournalStore>(
+            &self,
+            published: PublishedSystemAuthorityRotation<'_, S>,
+        ) -> Result<
+            (
+                JournalPublication,
+                ReplayMaterialization,
+                Vec<ReplayExecutionResult>,
+            ),
+            SystemAuthorityLedgerError,
+        > {
+            let frozen = self
+                .joint_rotation_certificate(published.reserved())?
+                .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
+            let claim = PublishedSystemAuthorityClaim::for_rotation_receipt(
+                published.reserved(),
+                published.facts(),
+                &frozen,
+            )?;
+            self.retire_published_claim(claim)?;
+            Ok(published.into_results(RetiredSystemAuthorityRotation { _private: () }))
         }
 
         /// Advance the durable retired high-water and clear the active claim
@@ -4531,8 +4744,9 @@ mod durable {
 #[cfg(all(feature = "std", feature = "storage"))]
 #[allow(unused_imports)]
 pub(crate) use durable::{
-    PendingSystemAuthorityRecovery, ReservedSystemAuthorityClaim, SystemAuthorityEvidenceLedger,
-    SystemAuthorityLedgerError, SystemAuthorityReservationDisposition,
-    SystemAuthorityReservationOutcome, SystemAuthorityRotationReservationRequest,
-    SystemAuthorityShareOutcome, SystemAuthoritySignError, SystemAuthoritySigner,
+    PendingSystemAuthorityRecovery, ReservedSystemAuthorityClaim, RetiredSystemAuthorityRotation,
+    SystemAuthorityEvidenceLedger, SystemAuthorityLedgerError,
+    SystemAuthorityReservationDisposition, SystemAuthorityReservationOutcome,
+    SystemAuthorityRotationReservationRequest, SystemAuthorityShareOutcome,
+    SystemAuthoritySignError, SystemAuthoritySigner,
 };
