@@ -16,8 +16,9 @@ use core::fmt;
 use super::authority::{ActorInvocationReceipt, AgentAuthorityReceipt, ED25519_SIGNATURE_BYTES};
 use super::committee::{GenesisIntentId, SystemAgentGenesisAdmissionId};
 use super::execution::{
-    ActorInvocation, ActorInvocationAuth, MAX_EXECUTION_AVAILABILITY_BYTES, MAX_EXECUTION_BLOBS,
-    MAX_EXECUTION_MESSAGE_BYTES, MAX_RUNTIME_STATE_BYTES, RuntimeBlob,
+    ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
+    ActorInvocationAuth, MAX_EXECUTION_AVAILABILITY_BYTES, MAX_EXECUTION_BLOBS, MAX_EXECUTION_GAS,
+    MAX_EXECUTION_MESSAGE_BYTES, MAX_EXECUTION_REPLY_BYTES, MAX_RUNTIME_STATE_BYTES, RuntimeBlob,
 };
 use super::wire::{RuntimeCall, RuntimeState};
 use super::{InvocationResultStorage, LifecycleRequest, MethodMode, StateLane};
@@ -64,6 +65,12 @@ pub const MAX_INVOCATION_INDEX_MANIFEST_BYTES: usize = 4 * 1024;
 pub const MAX_INVOCATION_INDEX_NODE_BYTES: usize = 4 * 1024;
 /// Maximum canonical key/value leaf stored by an ownership index.
 pub const MAX_INVOCATION_OWNERSHIP_LEAF_BYTES: usize = 1024;
+/// Maximum complete exact invocation-outcome record. A result may retain the
+/// actor ABI's full 8-KiB reply; the remaining half is a fixed-size audit and
+/// replay-authentication envelope.
+pub const MAX_INVOCATION_OUTCOME_BYTES: usize = 16 * 1024;
+/// Maximum standalone content reference to an invocation outcome.
+pub const MAX_INVOCATION_OUTCOME_REF_BYTES: usize = 128;
 /// Maximum complete authority receipt nested in a replay operation.
 const MAX_AUTHORITY_RECEIPT_BYTES: usize = 4 * 1024;
 /// Four-byte magic plus the canonical 32-byte platform identifier.
@@ -140,6 +147,7 @@ journal_id_type!(LaneStateId, "LaneStateId");
 journal_id_type!(ArtifactClosureId, "ArtifactClosureId");
 journal_id_type!(InvocationIndexNodeId, "InvocationIndexNodeId");
 journal_id_type!(InvocationIndexId, "InvocationIndexId");
+journal_id_type!(InvocationOutcomeId, "InvocationOutcomeId");
 journal_id_type!(CheckpointId, "CheckpointId");
 journal_id_type!(JournalHeadsId, "JournalHeadsId");
 
@@ -162,6 +170,9 @@ pub enum JournalStorageClass {
     InvocationIndexNode = 10,
     Checkpoint = 11,
     Heads = 12,
+    /// Exact deterministic invocation reply/error retained independently of
+    /// the opaque runtime image and authenticated ownership index.
+    InvocationOutcome = 13,
 }
 
 pub(super) mod sealed {
@@ -429,6 +440,558 @@ impl InvocationOwner {
             return Err(DecodeError::NonCanonical);
         }
         Ok(())
+    }
+}
+
+/// Domain-separated content commitment to one opaque runtime-state
+/// component visible at an invocation boundary. The length is consensus
+/// data, rather than metadata supplied by storage, so truncation and
+/// zero-extension cannot share a commitment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VisibleStateComponentCommitment {
+    pub hash: Hash,
+    pub len: u64,
+}
+
+impl VisibleStateComponentCommitment {
+    pub fn of_bytes(component: PersistedLane, bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() > MAX_RUNTIME_STATE_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let len = bytes.len() as u64;
+        let component_tag = [component as u8];
+        let commitment = Self {
+            hash: Hash::digest(
+                b"vos/agent/journal/visible-state-component/v1",
+                &[&component_tag, &len.to_le_bytes(), bytes],
+            ),
+            len,
+        };
+        commitment.validate()?;
+        Ok(commitment)
+    }
+
+    pub fn matches_bytes(self, component: PersistedLane, bytes: &[u8]) -> bool {
+        Self::of_bytes(component, bytes).is_ok_and(|expected| expected == self)
+    }
+
+    fn validate(self) -> Result<(), DecodeError> {
+        if self.hash == Hash::ZERO || self.len > MAX_RUNTIME_STATE_BYTES as u64 {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+/// Exact opaque state components visible to one invocation scope.
+///
+/// Control is always committed because it authenticates the actor directory,
+/// install incarnation, and result authority state. Ordered work additionally
+/// observes Linear and a pinned Merge snapshot, Merge work observes only its
+/// ordered Control base plus Merge, and Local work observes all four
+/// components. An omitted component is therefore meaningful and cannot be
+/// substituted for a commitment to empty bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisibleStateCommitment {
+    pub control: VisibleStateComponentCommitment,
+    pub linear: Option<VisibleStateComponentCommitment>,
+    pub merge: Option<VisibleStateComponentCommitment>,
+    pub local: Option<VisibleStateComponentCommitment>,
+}
+
+impl VisibleStateCommitment {
+    pub fn from_runtime_state(
+        scope: InvocationOwnershipScope,
+        state: &RuntimeState,
+    ) -> Result<Self, DecodeError> {
+        scope.validate()?;
+        if state
+            .encoded_len()
+            .is_none_or(|bytes| bytes > MAX_RUNTIME_STATE_BYTES)
+        {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let control =
+            VisibleStateComponentCommitment::of_bytes(PersistedLane::Control, &state.control)?;
+        let linear = matches!(
+            scope,
+            InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Local(_)
+        )
+        .then(|| VisibleStateComponentCommitment::of_bytes(PersistedLane::Linear, &state.linear))
+        .transpose()?;
+        let merge = Some(VisibleStateComponentCommitment::of_bytes(
+            PersistedLane::Merge,
+            &state.merge,
+        )?);
+        let local = matches!(scope, InvocationOwnershipScope::Local(_))
+            .then(|| VisibleStateComponentCommitment::of_bytes(PersistedLane::Local, &state.local))
+            .transpose()?;
+        let commitment = Self {
+            control,
+            linear,
+            merge,
+            local,
+        };
+        commitment.validate(scope)?;
+        Ok(commitment)
+    }
+
+    pub fn validate(self, scope: InvocationOwnershipScope) -> Result<(), DecodeError> {
+        scope.validate()?;
+        self.control.validate()?;
+        for component in [self.linear, self.merge, self.local].into_iter().flatten() {
+            component.validate()?;
+        }
+        let exact_components = match scope {
+            InvocationOwnershipScope::Ordered => {
+                self.linear.is_some() && self.merge.is_some() && self.local.is_none()
+            }
+            InvocationOwnershipScope::Merge => {
+                self.linear.is_none() && self.merge.is_some() && self.local.is_none()
+            }
+            InvocationOwnershipScope::Local(_) => {
+                self.linear.is_some() && self.merge.is_some() && self.local.is_some()
+            }
+        };
+        let aggregate = [Some(self.control), self.linear, self.merge, self.local]
+            .into_iter()
+            .flatten()
+            .try_fold(0u64, |total, component| total.checked_add(component.len));
+        if !exact_components || aggregate.is_none_or(|bytes| bytes > MAX_RUNTIME_STATE_BYTES as u64)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+/// Compact duplicate of the request fields needed to validate an exact
+/// execution reply without resolving the historical input first. All other
+/// execution-significant fields remain bound by `request_commitment`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvocationOutcomeRequestFacts {
+    pub actor: ActorId,
+    pub incarnation: Hash,
+    pub deployment: DeploymentId,
+    pub program: ProgramId,
+    pub mode: MethodMode,
+    pub gas_limit: u64,
+}
+
+impl InvocationOutcomeRequestFacts {
+    pub fn from_invocation(invocation: &ActorInvocation) -> Result<Self, DecodeError> {
+        invocation
+            .validate()
+            .map_err(|_| DecodeError::NonCanonical)?;
+        Ok(Self {
+            actor: invocation.actor,
+            incarnation: invocation.incarnation,
+            deployment: invocation.deployment,
+            program: invocation.program,
+            mode: invocation.mode,
+            gas_limit: invocation.gas,
+        })
+    }
+
+    pub fn matches_invocation(self, invocation: &ActorInvocation) -> bool {
+        invocation.validate().is_ok()
+            && self.actor == invocation.actor
+            && self.incarnation == invocation.incarnation
+            && self.deployment == invocation.deployment
+            && self.program == invocation.program
+            && self.mode == invocation.mode
+            && self.gas_limit == invocation.gas
+    }
+
+    fn validate(self) -> Result<(), DecodeError> {
+        if self.actor == ActorId::ZERO
+            || self.incarnation == Hash::ZERO
+            || self.deployment == DeploymentId::ZERO
+            || self.program == ProgramId::ZERO
+            || self.gas_limit == 0
+            || self.gas_limit > MAX_EXECUTION_GAS
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+/// Exact journal publication which makes an outcome recoverable. Merge work
+/// is intentionally not recoverable at its source event alone: the causal
+/// result becomes public only after an ordered entry names the exact seal
+/// which finalized it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvocationOutcomeAnchor {
+    Ordered {
+        entry: OrderedEntryId,
+    },
+    Local {
+        entry: LocalEntryId,
+    },
+    Merge {
+        source_event: MergeEventId,
+        finalizing_entry: OrderedEntryId,
+        seal: MergeSealId,
+    },
+}
+
+impl InvocationOutcomeAnchor {
+    pub fn validate(self, scope: InvocationOwnershipScope) -> Result<(), DecodeError> {
+        let valid = match (scope, self) {
+            (InvocationOwnershipScope::Ordered, Self::Ordered { entry }) => {
+                entry != OrderedEntryId::ZERO
+            }
+            (InvocationOwnershipScope::Local(_), Self::Local { entry }) => {
+                entry != LocalEntryId::ZERO
+            }
+            (
+                InvocationOwnershipScope::Merge,
+                Self::Merge {
+                    source_event,
+                    finalizing_entry,
+                    seal,
+                },
+            ) => {
+                source_event != MergeEventId::ZERO
+                    && finalizing_entry != OrderedEntryId::ZERO
+                    && seal != MergeSealId::ZERO
+            }
+            _ => false,
+        };
+        valid.then_some(()).ok_or(DecodeError::NonCanonical)
+    }
+}
+
+/// Complete exact deterministic result owned by one scoped InvocationId.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvocationOutcomeRecord {
+    pub genesis: AgentJournalGenesisId,
+    pub key: InvocationOwnershipKey,
+    pub request_commitment: Hash,
+    pub first_input: ReplayInputId,
+    pub request: InvocationOutcomeRequestFacts,
+    pub anchor: InvocationOutcomeAnchor,
+    pub lane: PersistedLane,
+    pub node: Option<NodeId>,
+    pub before: VisibleStateCommitment,
+    pub after: VisibleStateCommitment,
+    pub result: Result<ActorExecutionReply, ActorExecutionError>,
+}
+
+impl InvocationOutcomeRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        genesis: AgentJournalGenesisId,
+        scope: InvocationOwnershipScope,
+        anchor: InvocationOutcomeAnchor,
+        input: &ReplayInput,
+        before: VisibleStateCommitment,
+        after: VisibleStateCommitment,
+        result: Result<ActorExecutionReply, ActorExecutionError>,
+    ) -> Result<Self, DecodeError> {
+        input.validate()?;
+        let ReplayOperation::Invoke { invocation, .. } = &input.operation else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let lane = PersistedLane::from_result_storage(invocation.mode.result_storage());
+        let record = Self {
+            genesis,
+            key: InvocationOwnershipKey {
+                scope,
+                invocation: invocation.invocation,
+            },
+            request_commitment: invocation.commitment(),
+            first_input: input.id(),
+            request: InvocationOutcomeRequestFacts::from_invocation(invocation)?,
+            anchor,
+            lane,
+            node: match scope {
+                InvocationOwnershipScope::Local(node) => Some(node),
+                InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Merge => None,
+            },
+            before,
+            after,
+            result,
+        };
+        record.validate_for(input)?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_runtime_states(
+        genesis: AgentJournalGenesisId,
+        scope: InvocationOwnershipScope,
+        anchor: InvocationOutcomeAnchor,
+        input: &ReplayInput,
+        before: &RuntimeState,
+        after: &RuntimeState,
+        result: Result<ActorExecutionReply, ActorExecutionError>,
+    ) -> Result<Self, DecodeError> {
+        Self::new(
+            genesis,
+            scope,
+            anchor,
+            input,
+            VisibleStateCommitment::from_runtime_state(scope, before)?,
+            VisibleStateCommitment::from_runtime_state(scope, after)?,
+            result,
+        )
+    }
+
+    /// Derive the ownership disposition from the exact runtime result. It is
+    /// never encoded a second time where it could disagree with that result.
+    pub const fn disposition(&self) -> InvocationDisposition {
+        match &self.result {
+            Ok(reply) => match reply.status {
+                ActorExecutionStatus::Done => InvocationDisposition::Applied,
+                ActorExecutionStatus::Forbidden => InvocationDisposition::Forbidden,
+                ActorExecutionStatus::Panicked => InvocationDisposition::Panicked,
+                ActorExecutionStatus::OutOfGas => InvocationDisposition::OutOfGas,
+            },
+            Err(_) => InvocationDisposition::Rejected,
+        }
+    }
+
+    /// Rebind the self-contained outcome to its exact canonical first input.
+    /// Storage/replay callers must use this after resolving `first_input`.
+    pub fn validate_for(&self, input: &ReplayInput) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        input.validate()?;
+        let ReplayOperation::Invoke { invocation, .. } = &input.operation else {
+            return Err(DecodeError::NonCanonical);
+        };
+        if input.id() != self.first_input
+            || invocation.invocation != self.key.invocation
+            || invocation.commitment() != self.request_commitment
+            || !self.request.matches_invocation(invocation)
+            || input.persisted_lane() != self.lane
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+
+    /// Validate both the exact journal namespace and first input. This is the
+    /// boundary used by stores and ownership indexes, where accepting a valid
+    /// outcome transplanted from another agent would be a security failure.
+    pub fn validate_for_genesis(
+        &self,
+        expected_genesis: AgentJournalGenesisId,
+        input: &ReplayInput,
+    ) -> Result<(), DecodeError> {
+        if expected_genesis == AgentJournalGenesisId::ZERO || self.genesis != expected_genesis {
+            return Err(DecodeError::NonCanonical);
+        }
+        self.validate_for(input)
+    }
+
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        self.key.validate()?;
+        self.request.validate()?;
+        self.anchor.validate(self.key.scope)?;
+        self.before.validate(self.key.scope)?;
+        self.after.validate(self.key.scope)?;
+        let expected_lane = PersistedLane::from_result_storage(self.request.mode.result_storage());
+        let scope_matches_mode = matches!(
+            (self.key.scope, self.request.mode),
+            (
+                InvocationOwnershipScope::Ordered,
+                MethodMode::Query | MethodMode::LinearizableQuery | MethodMode::Linear
+            ) | (InvocationOwnershipScope::Merge, MethodMode::Merge)
+                | (
+                    InvocationOwnershipScope::Local(_),
+                    MethodMode::LocalQuery | MethodMode::Local
+                )
+        );
+        let node_matches_scope = match (self.key.scope, self.node) {
+            (InvocationOwnershipScope::Local(scope_node), Some(node)) => scope_node == node,
+            (InvocationOwnershipScope::Ordered | InvocationOwnershipScope::Merge, None) => true,
+            _ => false,
+        };
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || self.request_commitment == Hash::ZERO
+            || self.first_input == ReplayInputId::ZERO
+            || self.lane != expected_lane
+            || !scope_matches_mode
+            || !node_matches_scope
+            || self.result == Err(ActorExecutionError::DivergentInvocation)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+
+        if let Ok(reply) = &self.result {
+            super::wire::validate_execution_reply(reply)?;
+            if reply.invocation != self.key.invocation
+                || reply.actor != self.request.actor
+                || reply.incarnation != self.request.incarnation
+                || reply.deployment != self.request.deployment
+                || reply.mode != self.request.mode
+                || reply.gas_remaining > self.request.gas_limit
+                || (reply.status != ActorExecutionStatus::Done
+                    && reply.observation != super::execution::ActorObservation::default())
+                || reply.reply.len() > MAX_EXECUTION_REPLY_BYTES
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
+
+        let terminal = !matches!(
+            &self.result,
+            Ok(ActorExecutionReply {
+                status: ActorExecutionStatus::Done,
+                ..
+            })
+        );
+        if terminal {
+            if self.before != self.after {
+                return Err(DecodeError::NonCanonical);
+            }
+        } else {
+            let non_owner_unchanged = match self.lane {
+                PersistedLane::Control => {
+                    self.before.linear == self.after.linear
+                        && self.before.merge == self.after.merge
+                        && self.before.local == self.after.local
+                }
+                PersistedLane::Linear => {
+                    self.before.control == self.after.control
+                        && self.before.merge == self.after.merge
+                        && self.before.local == self.after.local
+                }
+                PersistedLane::Merge => {
+                    self.before.control == self.after.control
+                        && self.before.linear == self.after.linear
+                        && self.before.local == self.after.local
+                }
+                PersistedLane::Local => {
+                    self.before.control == self.after.control
+                        && self.before.linear == self.after.linear
+                        && self.before.merge == self.after.merge
+                }
+            };
+            if !non_owner_unchanged {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
+        validate_encoded_bound(self, MAX_INVOCATION_OUTCOME_BYTES)
+    }
+}
+
+impl ServiceWire for InvocationOutcomeRecord {
+    const MAGIC: [u8; 4] = *b"AGJU";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encode_invocation_scope(&mut encoder, self.key.scope);
+        encoder.fixed(&self.key.invocation.0);
+        encoder.fixed(&self.request_commitment.0);
+        encoder.fixed(&self.first_input.0);
+        encode_invocation_outcome_request(&mut encoder, self.request);
+        encode_invocation_outcome_anchor(&mut encoder, self.anchor);
+        encoder.u8(self.lane as u8);
+        encoder.option(&self.node, |encoder, node| encoder.fixed(&node.0));
+        encode_visible_state_commitment(&mut encoder, self.before);
+        encode_visible_state_commitment(&mut encoder, self.after);
+        super::wire::encode_execution_result(&mut encoder, &self.result);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_INVOCATION_OUTCOME_BYTES)?;
+        let record = Self {
+            genesis: AgentJournalGenesisId(decoder.fixed()?),
+            key: InvocationOwnershipKey {
+                scope: decode_invocation_scope(decoder)?,
+                invocation: InvocationId(decoder.fixed()?),
+            },
+            request_commitment: Hash(decoder.fixed()?),
+            first_input: ReplayInputId(decoder.fixed()?),
+            request: decode_invocation_outcome_request(decoder)?,
+            anchor: decode_invocation_outcome_anchor(decoder)?,
+            lane: decode_persisted_lane(decoder.u8()?)?,
+            node: decoder.option(|decoder| Ok(NodeId(decoder.fixed()?)))?,
+            before: decode_visible_state_commitment(decoder)?,
+            after: decode_visible_state_commitment(decoder)?,
+            result: super::wire::decode_execution_result(decoder)?,
+        };
+        record.validate_inner()?;
+        Ok(record)
+    }
+}
+
+impl sealed::Sealed for InvocationOutcomeRecord {}
+
+impl CanonicalJournalRecord for InvocationOutcomeRecord {
+    type Id = InvocationOutcomeId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::InvocationOutcome;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()
+    }
+
+    fn id(&self) -> Self::Id {
+        InvocationOutcomeId(content_id(b"vos/agent/journal/invocation-outcome/v1", self))
+    }
+}
+
+/// Bounded reference embedded by an authenticated invocation-owner leaf.
+/// `encoded_bytes` supports deterministic per-scope byte quotas without
+/// loading every retained outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvocationOutcomeRef {
+    pub outcome: InvocationOutcomeId,
+    pub encoded_bytes: u32,
+}
+
+impl InvocationOutcomeRef {
+    pub fn for_record(record: &InvocationOutcomeRecord) -> Result<Self, DecodeError> {
+        record.validate()?;
+        let encoded_bytes =
+            u32::try_from(record.encode().len()).map_err(|_| DecodeError::LimitExceeded)?;
+        let reference = Self {
+            outcome: record.id(),
+            encoded_bytes,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    pub fn validate(self) -> Result<(), DecodeError> {
+        if self.outcome == InvocationOutcomeId::ZERO
+            || self.encoded_bytes as usize <= SERVICE_WIRE_HEADER_BYTES
+            || self.encoded_bytes as usize > MAX_INVOCATION_OUTCOME_BYTES
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+
+    pub fn authenticates(self, record: &InvocationOutcomeRecord) -> bool {
+        record.validate().is_ok()
+            && self.outcome == record.id()
+            && self.encoded_bytes as usize == record.encode().len()
+    }
+}
+
+impl ServiceWire for InvocationOutcomeRef {
+    const MAGIC: [u8; 4] = *b"AGJR";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.outcome.0);
+        encoder.u32(self.encoded_bytes);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_INVOCATION_OUTCOME_REF_BYTES)?;
+        let reference = Self {
+            outcome: InvocationOutcomeId(decoder.fixed()?),
+            encoded_bytes: decoder.u32()?,
+        };
+        reference.validate()?;
+        Ok(reference)
     }
 }
 
@@ -2237,6 +2800,118 @@ fn decode_invocation_scope(
     Ok(scope)
 }
 
+fn encode_invocation_outcome_request(
+    encoder: &mut Encoder<'_>,
+    request: InvocationOutcomeRequestFacts,
+) {
+    encoder.fixed(&request.actor.0);
+    encoder.fixed(&request.incarnation.0);
+    encoder.fixed(&request.deployment.0);
+    encoder.fixed(&request.program.0);
+    encoder.u8(encode_method_mode(request.mode));
+    encoder.u64(request.gas_limit);
+}
+
+fn decode_invocation_outcome_request(
+    decoder: &mut Decoder<'_>,
+) -> Result<InvocationOutcomeRequestFacts, DecodeError> {
+    let request = InvocationOutcomeRequestFacts {
+        actor: ActorId(decoder.fixed()?),
+        incarnation: Hash(decoder.fixed()?),
+        deployment: DeploymentId(decoder.fixed()?),
+        program: ProgramId(decoder.fixed()?),
+        mode: decode_method_mode(decoder.u8()?)?,
+        gas_limit: decoder.u64()?,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn encode_invocation_outcome_anchor(encoder: &mut Encoder<'_>, anchor: InvocationOutcomeAnchor) {
+    match anchor {
+        InvocationOutcomeAnchor::Ordered { entry } => {
+            encoder.u8(0);
+            encoder.fixed(&entry.0);
+        }
+        InvocationOutcomeAnchor::Local { entry } => {
+            encoder.u8(1);
+            encoder.fixed(&entry.0);
+        }
+        InvocationOutcomeAnchor::Merge {
+            source_event,
+            finalizing_entry,
+            seal,
+        } => {
+            encoder.u8(2);
+            encoder.fixed(&source_event.0);
+            encoder.fixed(&finalizing_entry.0);
+            encoder.fixed(&seal.0);
+        }
+    }
+}
+
+fn decode_invocation_outcome_anchor(
+    decoder: &mut Decoder<'_>,
+) -> Result<InvocationOutcomeAnchor, DecodeError> {
+    match decoder.u8()? {
+        0 => Ok(InvocationOutcomeAnchor::Ordered {
+            entry: OrderedEntryId(decoder.fixed()?),
+        }),
+        1 => Ok(InvocationOutcomeAnchor::Local {
+            entry: LocalEntryId(decoder.fixed()?),
+        }),
+        2 => Ok(InvocationOutcomeAnchor::Merge {
+            source_event: MergeEventId(decoder.fixed()?),
+            finalizing_entry: OrderedEntryId(decoder.fixed()?),
+            seal: MergeSealId(decoder.fixed()?),
+        }),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn encode_visible_state_component(
+    encoder: &mut Encoder<'_>,
+    component: VisibleStateComponentCommitment,
+) {
+    encoder.fixed(&component.hash.0);
+    encoder.u64(component.len);
+}
+
+fn decode_visible_state_component(
+    decoder: &mut Decoder<'_>,
+) -> Result<VisibleStateComponentCommitment, DecodeError> {
+    let component = VisibleStateComponentCommitment {
+        hash: Hash(decoder.fixed()?),
+        len: decoder.u64()?,
+    };
+    component.validate()?;
+    Ok(component)
+}
+
+fn encode_visible_state_commitment(encoder: &mut Encoder<'_>, state: VisibleStateCommitment) {
+    encode_visible_state_component(encoder, state.control);
+    encoder.option(&state.linear, |encoder, component| {
+        encode_visible_state_component(encoder, *component)
+    });
+    encoder.option(&state.merge, |encoder, component| {
+        encode_visible_state_component(encoder, *component)
+    });
+    encoder.option(&state.local, |encoder, component| {
+        encode_visible_state_component(encoder, *component)
+    });
+}
+
+fn decode_visible_state_commitment(
+    decoder: &mut Decoder<'_>,
+) -> Result<VisibleStateCommitment, DecodeError> {
+    Ok(VisibleStateCommitment {
+        control: decode_visible_state_component(decoder)?,
+        linear: decoder.option(decode_visible_state_component)?,
+        merge: decoder.option(decode_visible_state_component)?,
+        local: decoder.option(decode_visible_state_component)?,
+    })
+}
+
 fn encode_invocation_owner(encoder: &mut Encoder<'_>, owner: InvocationOwner) {
     encode_invocation_scope(encoder, owner.scope);
     encoder.fixed(&owner.request_commitment.0);
@@ -2603,6 +3278,453 @@ mod tests {
     {
         let decoded = T::decode(&value.encode());
         assert_eq!(decoded.as_ref(), Ok(value));
+    }
+
+    fn outcome_genesis() -> AgentJournalGenesisId {
+        AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        }
+        .id()
+    }
+
+    fn outcome_scope(mode: MethodMode) -> InvocationOwnershipScope {
+        match mode {
+            MethodMode::Query | MethodMode::LinearizableQuery | MethodMode::Linear => {
+                InvocationOwnershipScope::Ordered
+            }
+            MethodMode::Merge => InvocationOwnershipScope::Merge,
+            MethodMode::LocalQuery | MethodMode::Local => {
+                InvocationOwnershipScope::Local(NodeId([7; 32]))
+            }
+        }
+    }
+
+    fn outcome_anchor(mode: MethodMode) -> InvocationOutcomeAnchor {
+        match mode {
+            MethodMode::Query | MethodMode::LinearizableQuery | MethodMode::Linear => {
+                InvocationOutcomeAnchor::Ordered {
+                    entry: OrderedEntryId([0x31; 32]),
+                }
+            }
+            MethodMode::Merge => InvocationOutcomeAnchor::Merge {
+                source_event: MergeEventId([0x32; 32]),
+                finalizing_entry: OrderedEntryId([0x33; 32]),
+                seal: MergeSealId([0x34; 32]),
+            },
+            MethodMode::LocalQuery | MethodMode::Local => InvocationOutcomeAnchor::Local {
+                entry: LocalEntryId([0x35; 32]),
+            },
+        }
+    }
+
+    fn outcome_state() -> RuntimeState {
+        RuntimeState {
+            control: vec![0x41, 0x42],
+            linear: vec![0x51, 0x52],
+            merge: vec![0x61, 0x62],
+            local: vec![0x71, 0x72],
+        }
+    }
+
+    fn exact_reply(
+        invocation: &ActorInvocation,
+        status: ActorExecutionStatus,
+        bytes: Vec<u8>,
+    ) -> ActorExecutionReply {
+        ActorExecutionReply {
+            invocation: invocation.invocation,
+            actor: invocation.actor,
+            incarnation: invocation.incarnation,
+            deployment: invocation.deployment,
+            mode: invocation.mode,
+            lane: invocation.mode.write_lane(),
+            status,
+            reply: bytes,
+            gas_remaining: invocation.gas - 1,
+            observation: super::super::execution::ActorObservation::default(),
+        }
+    }
+
+    fn outcome_record(
+        mode: MethodMode,
+        result: impl FnOnce(&ActorInvocation) -> Result<ActorExecutionReply, ActorExecutionError>,
+    ) -> (ReplayInput, InvocationOutcomeRecord) {
+        let input = replay_input(mode, false);
+        let ReplayOperation::Invoke { invocation, .. } = &input.operation else {
+            unreachable!()
+        };
+        let result = result(invocation);
+        let before = outcome_state();
+        let mut after = before.clone();
+        if matches!(
+            result,
+            Ok(ActorExecutionReply {
+                status: ActorExecutionStatus::Done,
+                ..
+            })
+        ) {
+            match PersistedLane::from_result_storage(mode.result_storage()) {
+                PersistedLane::Control => after.control.push(0x81),
+                PersistedLane::Linear => after.linear.push(0x82),
+                PersistedLane::Merge => after.merge.push(0x83),
+                PersistedLane::Local => after.local.push(0x84),
+            }
+        }
+        let record = InvocationOutcomeRecord::from_runtime_states(
+            outcome_genesis(),
+            outcome_scope(mode),
+            outcome_anchor(mode),
+            &input,
+            &before,
+            &after,
+            result,
+        )
+        .unwrap();
+        (input, record)
+    }
+
+    #[test]
+    fn invocation_outcomes_roundtrip_every_scope_and_derive_disposition() {
+        for (mode, expected_lane) in [
+            (MethodMode::Query, PersistedLane::Control),
+            (MethodMode::LinearizableQuery, PersistedLane::Linear),
+            (MethodMode::Linear, PersistedLane::Linear),
+            (MethodMode::Merge, PersistedLane::Merge),
+            (MethodMode::LocalQuery, PersistedLane::Local),
+            (MethodMode::Local, PersistedLane::Local),
+        ] {
+            let (input, record) = outcome_record(mode, |invocation| {
+                Ok(exact_reply(
+                    invocation,
+                    ActorExecutionStatus::Done,
+                    vec![1, 2, 3],
+                ))
+            });
+            assert_eq!(record.lane, expected_lane);
+            assert_eq!(record.disposition(), InvocationDisposition::Applied);
+            record.validate().unwrap();
+            record.validate_for(&input).unwrap();
+            record
+                .validate_for_genesis(outcome_genesis(), &input)
+                .unwrap();
+            roundtrip(&record);
+
+            let reference = InvocationOutcomeRef::for_record(&record).unwrap();
+            assert!(reference.authenticates(&record));
+            roundtrip(&reference);
+            assert!(record.encode().len() <= MAX_INVOCATION_OUTCOME_BYTES);
+
+            match record.key.scope {
+                InvocationOwnershipScope::Ordered => {
+                    assert!(record.before.linear.is_some());
+                    assert!(record.before.merge.is_some());
+                    assert!(record.before.local.is_none());
+                }
+                InvocationOwnershipScope::Merge => {
+                    assert!(record.before.linear.is_none());
+                    assert!(record.before.merge.is_some());
+                    assert!(record.before.local.is_none());
+                }
+                InvocationOwnershipScope::Local(_) => {
+                    assert!(record.before.linear.is_some());
+                    assert!(record.before.merge.is_some());
+                    assert!(record.before.local.is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invocation_outcome_error_variants_roundtrip_exactly() {
+        let errors = [
+            ActorExecutionError::NotCreated,
+            ActorExecutionError::NotFound,
+            ActorExecutionError::StaleIncarnation,
+            ActorExecutionError::Suspended,
+            ActorExecutionError::StaleDeployment,
+            ActorExecutionError::WrongProgram,
+            ActorExecutionError::UnsupportedMethod,
+            ActorExecutionError::MissingState,
+            ActorExecutionError::InvalidAvailability,
+            ActorExecutionError::InvalidInput,
+            ActorExecutionError::InvalidActorOutput,
+            ActorExecutionError::ResultCapacity,
+            ActorExecutionError::InvalidAuthorization,
+            ActorExecutionError::AuthorityExpired,
+            ActorExecutionError::AuthoritySlotRegressed,
+            ActorExecutionError::UnsupportedHostCall(u64::MAX),
+        ];
+        for error in errors {
+            let (_, record) = outcome_record(MethodMode::Linear, |_| Err(error));
+            assert_eq!(record.result, Err(error));
+            assert_eq!(record.disposition(), InvocationDisposition::Rejected);
+            assert_eq!(record.before, record.after);
+            roundtrip(&record);
+        }
+
+        let input = replay_input(MethodMode::Linear, false);
+        let before = outcome_state();
+        assert_eq!(
+            InvocationOutcomeRecord::from_runtime_states(
+                outcome_genesis(),
+                InvocationOwnershipScope::Ordered,
+                outcome_anchor(MethodMode::Linear),
+                &input,
+                &before,
+                &before,
+                Err(ActorExecutionError::DivergentInvocation),
+            ),
+            Err(DecodeError::NonCanonical)
+        );
+
+        for (status, disposition) in [
+            (
+                ActorExecutionStatus::Forbidden,
+                InvocationDisposition::Forbidden,
+            ),
+            (
+                ActorExecutionStatus::Panicked,
+                InvocationDisposition::Panicked,
+            ),
+            (
+                ActorExecutionStatus::OutOfGas,
+                InvocationDisposition::OutOfGas,
+            ),
+        ] {
+            let (_, record) = outcome_record(MethodMode::Local, |invocation| {
+                Ok(exact_reply(invocation, status, vec![0xa5]))
+            });
+            assert_eq!(record.disposition(), disposition);
+            assert_eq!(record.before, record.after);
+            roundtrip(&record);
+        }
+    }
+
+    #[test]
+    fn invocation_outcome_reply_boundary_is_exactly_eight_kibibytes() {
+        let (_, record) = outcome_record(MethodMode::Query, |invocation| {
+            Ok(exact_reply(
+                invocation,
+                ActorExecutionStatus::Done,
+                vec![0xa5; MAX_EXECUTION_REPLY_BYTES],
+            ))
+        });
+        record.validate().unwrap();
+        roundtrip(&record);
+        assert!(record.encode().len() <= MAX_INVOCATION_OUTCOME_BYTES);
+
+        let mut oversized = record;
+        let Ok(reply) = &mut oversized.result else {
+            unreachable!()
+        };
+        reply.reply.push(0xff);
+        assert!(oversized.validate().is_err());
+        assert_eq!(
+            InvocationOutcomeRecord::decode(&oversized.encode()),
+            Err(DecodeError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn invocation_outcome_ids_are_sensitive_to_every_security_boundary() {
+        let (_, record) = outcome_record(MethodMode::Linear, |invocation| {
+            Ok(exact_reply(
+                invocation,
+                ActorExecutionStatus::Done,
+                vec![1, 2, 3],
+            ))
+        });
+        let id = record.id();
+        let assert_changed = |candidate: InvocationOutcomeRecord| assert_ne!(candidate.id(), id);
+
+        let mut candidate = record.clone();
+        candidate.genesis = AgentJournalGenesisId([0x91; 32]);
+        assert_changed(candidate);
+        let mut candidate = record.clone();
+        candidate.key.invocation = InvocationId([0x92; 32]);
+        assert_changed(candidate);
+        let mut candidate = record.clone();
+        candidate.request_commitment = Hash([0x93; 32]);
+        assert_changed(candidate);
+        let mut candidate = record.clone();
+        candidate.first_input = ReplayInputId([0x94; 32]);
+        assert_changed(candidate);
+        let mut candidate = record.clone();
+        candidate.request.program = ProgramId([0x95; 32]);
+        assert_changed(candidate);
+        let mut candidate = record.clone();
+        candidate.anchor = InvocationOutcomeAnchor::Ordered {
+            entry: OrderedEntryId([0x96; 32]),
+        };
+        assert_changed(candidate);
+        let mut candidate = record.clone();
+        candidate.lane = PersistedLane::Control;
+        assert_changed(candidate);
+        let mut candidate = record.clone();
+        candidate.node = Some(NodeId([0x97; 32]));
+        assert_changed(candidate);
+        let mut candidate = record.clone();
+        candidate.before.control.hash = Hash([0x98; 32]);
+        assert_changed(candidate);
+        let mut candidate = record.clone();
+        candidate.after.linear.as_mut().unwrap().hash = Hash([0x99; 32]);
+        assert_changed(candidate);
+        let mut candidate = record;
+        let Ok(reply) = &mut candidate.result else {
+            unreachable!()
+        };
+        reply.reply.push(4);
+        assert_changed(candidate);
+    }
+
+    #[test]
+    fn invocation_outcomes_reject_scope_anchor_node_reply_and_state_mismatches() {
+        let (_, record) = outcome_record(MethodMode::Linear, |invocation| {
+            Ok(exact_reply(invocation, ActorExecutionStatus::Done, vec![1]))
+        });
+
+        let mut invalid = record.clone();
+        invalid.anchor = InvocationOutcomeAnchor::Local {
+            entry: LocalEntryId([1; 32]),
+        };
+        assert_eq!(invalid.validate(), Err(DecodeError::NonCanonical));
+        let mut invalid = record.clone();
+        invalid.node = Some(NodeId([1; 32]));
+        assert_eq!(invalid.validate(), Err(DecodeError::NonCanonical));
+        let mut invalid = record.clone();
+        invalid.lane = PersistedLane::Merge;
+        assert_eq!(invalid.validate(), Err(DecodeError::NonCanonical));
+        let mut invalid = record.clone();
+        invalid.request.actor = ActorId([0xa1; 32]);
+        assert_eq!(invalid.validate(), Err(DecodeError::NonCanonical));
+        let mut invalid = record.clone();
+        invalid.request.gas_limit = 1;
+        assert_eq!(invalid.validate(), Err(DecodeError::NonCanonical));
+        let mut invalid = record.clone();
+        invalid.after.merge.as_mut().unwrap().hash = Hash([0xa2; 32]);
+        assert_eq!(invalid.validate(), Err(DecodeError::NonCanonical));
+
+        let (_, terminal) = outcome_record(MethodMode::Merge, |invocation| {
+            Ok(exact_reply(
+                invocation,
+                ActorExecutionStatus::Forbidden,
+                Vec::new(),
+            ))
+        });
+        let mut invalid = terminal.clone();
+        invalid.after.merge.as_mut().unwrap().hash = Hash([0xa3; 32]);
+        assert_eq!(invalid.validate(), Err(DecodeError::NonCanonical));
+        let mut invalid = terminal;
+        let Ok(reply) = &mut invalid.result else {
+            unreachable!()
+        };
+        reply.observation.merge_frontier = Some(Hash([0xa4; 32]));
+        assert_eq!(invalid.validate(), Err(DecodeError::NonCanonical));
+
+        for invalid_anchor in [
+            InvocationOutcomeAnchor::Merge {
+                source_event: MergeEventId::ZERO,
+                finalizing_entry: OrderedEntryId([1; 32]),
+                seal: MergeSealId([2; 32]),
+            },
+            InvocationOutcomeAnchor::Merge {
+                source_event: MergeEventId([1; 32]),
+                finalizing_entry: OrderedEntryId::ZERO,
+                seal: MergeSealId([2; 32]),
+            },
+            InvocationOutcomeAnchor::Merge {
+                source_event: MergeEventId([1; 32]),
+                finalizing_entry: OrderedEntryId([2; 32]),
+                seal: MergeSealId::ZERO,
+            },
+        ] {
+            assert_eq!(
+                invalid_anchor.validate(InvocationOwnershipScope::Merge),
+                Err(DecodeError::NonCanonical)
+            );
+        }
+    }
+
+    #[test]
+    fn visible_state_commitments_bind_component_domain_length_and_scope() {
+        let state = outcome_state();
+        let control =
+            VisibleStateComponentCommitment::of_bytes(PersistedLane::Control, &state.control)
+                .unwrap();
+        let same_bytes_linear =
+            VisibleStateComponentCommitment::of_bytes(PersistedLane::Linear, &state.control)
+                .unwrap();
+        assert_ne!(control, same_bytes_linear);
+        assert!(control.matches_bytes(PersistedLane::Control, &state.control));
+        assert!(!control.matches_bytes(PersistedLane::Control, &[0x41]));
+        assert_ne!(
+            VisibleStateComponentCommitment::of_bytes(PersistedLane::Merge, &[])
+                .unwrap()
+                .hash,
+            Hash::ZERO
+        );
+
+        let ordered =
+            VisibleStateCommitment::from_runtime_state(InvocationOwnershipScope::Ordered, &state)
+                .unwrap();
+        let merge =
+            VisibleStateCommitment::from_runtime_state(InvocationOwnershipScope::Merge, &state)
+                .unwrap();
+        let local = VisibleStateCommitment::from_runtime_state(
+            InvocationOwnershipScope::Local(NodeId([1; 32])),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(ordered.local, None);
+        assert_eq!(merge.linear, None);
+        assert!(local.local.is_some());
+
+        let mut wrong_shape = ordered;
+        wrong_shape.local = Some(control);
+        assert_eq!(
+            wrong_shape.validate(InvocationOwnershipScope::Ordered),
+            Err(DecodeError::NonCanonical)
+        );
+        let mut excessive = local;
+        excessive.control.len = MAX_RUNTIME_STATE_BYTES as u64;
+        assert_eq!(
+            excessive.validate(InvocationOwnershipScope::Local(NodeId([1; 32]))),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn invocation_outcomes_reject_cross_input_and_cross_genesis_transplants() {
+        let (input, record) = outcome_record(MethodMode::Local, |invocation| {
+            Ok(exact_reply(invocation, ActorExecutionStatus::Done, vec![1]))
+        });
+        let mut divergent = input.clone();
+        let ReplayOperation::Invoke {
+            invocation,
+            authority,
+            ..
+        } = &mut divergent.operation
+        else {
+            unreachable!()
+        };
+        invocation.message.push(0xfe);
+        authority.claim.authorization = invocation.authorization_message();
+        divergent.validate().unwrap();
+        assert_eq!(
+            record.validate_for(&divergent),
+            Err(DecodeError::NonCanonical)
+        );
+        assert_eq!(
+            record.validate_for_genesis(AgentJournalGenesisId([0xee; 32]), &input),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let reference = InvocationOutcomeRef::for_record(&record).unwrap();
+        let mut transplanted = record;
+        transplanted.genesis = AgentJournalGenesisId([0xef; 32]);
+        assert!(!reference.authenticates(&transplanted));
+        assert_ne!(reference.outcome, transplanted.id());
     }
 
     #[test]

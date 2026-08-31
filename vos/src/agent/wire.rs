@@ -257,16 +257,7 @@ impl ServiceWire for RuntimeExecutionReturn {
         let mut encoder = Encoder(output);
         encoder.fixed(&super::RUNTIME_ABI_ID.0);
         encode_runtime_state(&mut encoder, &self.state);
-        match &self.result {
-            Ok(reply) => {
-                encoder.bool(true);
-                encode_execution_reply(&mut encoder, reply);
-            }
-            Err(error) => {
-                encoder.bool(false);
-                encode_execution_error(&mut encoder, *error);
-            }
-        }
+        encode_execution_result(&mut encoder, &self.result);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -274,11 +265,7 @@ impl ServiceWire for RuntimeExecutionReturn {
             return Err(DecodeError::InvalidPlatform);
         }
         let state = decode_runtime_state(decoder)?;
-        let result = if decoder.bool()? {
-            Ok(decode_execution_reply(decoder)?)
-        } else {
-            Err(decode_execution_error(decoder)?)
-        };
+        let result = decode_execution_result(decoder)?;
         Ok(Self { state, result })
     }
 }
@@ -913,7 +900,7 @@ fn decode_invocation_auth(decoder: &mut Decoder<'_>) -> Result<ActorInvocationAu
         .ok_or(DecodeError::NonCanonical)
 }
 
-fn encode_execution_reply(encoder: &mut Encoder<'_>, reply: &ActorExecutionReply) {
+pub(crate) fn encode_execution_reply(encoder: &mut Encoder<'_>, reply: &ActorExecutionReply) {
     encoder.fixed(&reply.invocation.0);
     encoder.fixed(&reply.actor.0);
     encoder.fixed(&reply.incarnation.0);
@@ -934,7 +921,9 @@ fn encode_execution_reply(encoder: &mut Encoder<'_>, reply: &ActorExecutionReply
     });
 }
 
-fn decode_execution_reply(decoder: &mut Decoder<'_>) -> Result<ActorExecutionReply, DecodeError> {
+pub(crate) fn decode_execution_reply(
+    decoder: &mut Decoder<'_>,
+) -> Result<ActorExecutionReply, DecodeError> {
     let reply = ActorExecutionReply {
         invocation: crate::service::InvocationId(decoder.fixed()?),
         actor: ActorId(decoder.fixed()?),
@@ -963,6 +952,11 @@ fn decode_execution_reply(decoder: &mut Decoder<'_>) -> Result<ActorExecutionRep
             local_revision: decoder.option(Decoder::u64)?,
         },
     };
+    validate_execution_reply(&reply)?;
+    Ok(reply)
+}
+
+pub(crate) fn validate_execution_reply(reply: &ActorExecutionReply) -> Result<(), DecodeError> {
     if reply.invocation == crate::service::InvocationId::ZERO
         || reply.actor == ActorId::ZERO
         || reply.incarnation == Hash::ZERO
@@ -972,10 +966,10 @@ fn decode_execution_reply(decoder: &mut Decoder<'_>) -> Result<ActorExecutionRep
     {
         return Err(DecodeError::NonCanonical);
     }
-    Ok(reply)
+    Ok(())
 }
 
-fn encode_execution_error(encoder: &mut Encoder<'_>, error: ActorExecutionError) {
+pub(crate) fn encode_execution_error(encoder: &mut Encoder<'_>, error: ActorExecutionError) {
     match error {
         ActorExecutionError::NotCreated => encoder.u8(0),
         ActorExecutionError::NotFound => encoder.u8(1),
@@ -1000,7 +994,9 @@ fn encode_execution_error(encoder: &mut Encoder<'_>, error: ActorExecutionError)
     }
 }
 
-fn decode_execution_error(decoder: &mut Decoder<'_>) -> Result<ActorExecutionError, DecodeError> {
+pub(crate) fn decode_execution_error(
+    decoder: &mut Decoder<'_>,
+) -> Result<ActorExecutionError, DecodeError> {
     Ok(match decoder.u8()? {
         0 => ActorExecutionError::NotCreated,
         1 => ActorExecutionError::NotFound,
@@ -1021,6 +1017,36 @@ fn decode_execution_error(decoder: &mut Decoder<'_>) -> Result<ActorExecutionErr
         16 => ActorExecutionError::StaleIncarnation,
         _ => return Err(DecodeError::InvalidTag),
     })
+}
+
+/// Canonical nested codec shared by the runtime-return ABI and durable
+/// invocation outcomes. Keeping one implementation prevents exact-result
+/// recovery from assigning different tags or validation rules to a result
+/// which crossed the live runtime boundary first.
+pub(crate) fn encode_execution_result(
+    encoder: &mut Encoder<'_>,
+    result: &Result<ActorExecutionReply, ActorExecutionError>,
+) {
+    match result {
+        Ok(reply) => {
+            encoder.bool(true);
+            encode_execution_reply(encoder, reply);
+        }
+        Err(error) => {
+            encoder.bool(false);
+            encode_execution_error(encoder, *error);
+        }
+    }
+}
+
+pub(crate) fn decode_execution_result(
+    decoder: &mut Decoder<'_>,
+) -> Result<Result<ActorExecutionReply, ActorExecutionError>, DecodeError> {
+    if decoder.bool()? {
+        Ok(Ok(decode_execution_reply(decoder)?))
+    } else {
+        Ok(Err(decode_execution_error(decoder)?))
+    }
 }
 
 const fn encode_method_mode(mode: MethodMode) -> u8 {
