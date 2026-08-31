@@ -498,6 +498,7 @@ mod tests {
         ActorInvocation {
             invocation: InvocationId([0x31; 32]),
             actor: ActorId([0x32; 32]),
+            incarnation: Hash([0x39; 32]),
             deployment: DeploymentId([0x33; 32]),
             program: ProgramId([0x34; 32]),
             mode: MethodMode::Query,

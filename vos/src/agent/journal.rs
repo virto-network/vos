@@ -1,0 +1,3435 @@
+//! Canonical lane-journal protocol for durable agents.
+//!
+//! Journal inputs are the durable source of truth. Runtime lane images and
+//! checkpoints are derived materializations which can always be authenticated
+//! against the exact input suffix that produced them. Control and Linear
+//! inputs share one ordered chain, Merge inputs form an authenticated causal
+//! DAG, and Local inputs form one chain per exact replica node.
+//!
+//! This module deliberately contains no filesystem or network policy. Its
+//! strict, `no_std` codec is shared by local storage, Raft application entries,
+//! causal anti-entropy, and recovery tooling.
+
+use alloc::vec::Vec;
+use core::fmt;
+
+use super::authority::{ActorInvocationReceipt, AgentAuthorityReceipt, ED25519_SIGNATURE_BYTES};
+use super::committee::{GenesisIntentId, SystemAgentGenesisAdmissionId};
+use super::execution::{
+    ActorInvocation, ActorInvocationAuth, MAX_EXECUTION_AVAILABILITY_BYTES, MAX_EXECUTION_BLOBS,
+    MAX_EXECUTION_MESSAGE_BYTES, MAX_RUNTIME_STATE_BYTES, RuntimeBlob,
+};
+use super::wire::{RuntimeCall, RuntimeState};
+use super::{InvocationResultStorage, LifecycleRequest, MethodMode, StateLane};
+use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
+use crate::service::{
+    ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, Hash, InvocationId,
+    NodeId, PrincipalId, ProducerId, ProgramId, SpaceId,
+};
+
+/// Maximum complete canonical replay input, including its wire header.
+pub const MAX_REPLAY_INPUT_BYTES: usize = 128 * 1024;
+/// Maximum complete ordered, local, or Merge journal record.
+pub const MAX_JOURNAL_RECORD_BYTES: usize = 160 * 1024;
+/// Maximum parents on a Merge event and entries in a Merge frontier.
+pub const MAX_MERGE_FRONTIER_ENTRIES: usize = 512;
+/// Maximum complete checkpoint or lane-state manifest.
+pub const MAX_CHECKPOINT_MANIFEST_BYTES: usize = 128 * 1024;
+/// Maximum complete artifact-closure manifest.
+pub const MAX_ARTIFACT_CLOSURE_BYTES: usize = 8 * 1024 * 1024;
+/// Standard runtime closure: one runtime package plus package/schema/policy
+/// artifacts for every possible actor.
+pub const MAX_ARTIFACT_CLOSURE_ENTRIES: usize =
+    1 + 3 * super::contract::STANDARD_MAX_ACTORS as usize;
+/// Maximum aggregate bytes reachable through one artifact closure. This is
+/// independent of the encoded manifest bound and prevents a small list of
+/// individually valid BlobRefs from forcing multi-gigabyte recovery work.
+pub const MAX_ARTIFACT_CLOSURE_REFERENCED_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum Local lane states named by one aggregate checkpoint.
+/// A physical replica checkpoint may bind only that replica's Local lane.
+/// Multi-node backup/export uses a separately certified aggregate bundle.
+pub const MAX_CHECKPOINT_LOCAL_LANES: usize = 1;
+/// Maximum input records replayed after one checkpoint.
+pub const MAX_REPLAY_SUFFIX_ENTRIES: usize = 1024;
+/// Maximum aggregate canonical bytes replayed after one checkpoint.
+pub const MAX_REPLAY_SUFFIX_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum Merge events accepted in one bounded anti-entropy import.
+pub const MAX_IMPORT_EVENTS: usize = 256;
+/// Maximum aggregate canonical bytes in one Merge import.
+pub const MAX_IMPORT_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum complete ownership-index manifest.
+pub const MAX_INVOCATION_INDEX_MANIFEST_BYTES: usize = 4 * 1024;
+/// Maximum canonical Patricia branch/leaf node. Node persistence is reserved
+/// for the next bounded index slice.
+pub const MAX_INVOCATION_INDEX_NODE_BYTES: usize = 4 * 1024;
+/// Maximum canonical key/value leaf stored by an ownership index.
+pub const MAX_INVOCATION_OWNERSHIP_LEAF_BYTES: usize = 1024;
+/// Maximum complete authority receipt nested in a replay operation.
+const MAX_AUTHORITY_RECEIPT_BYTES: usize = 4 * 1024;
+/// Four-byte magic plus the canonical 32-byte platform identifier.
+const SERVICE_WIRE_HEADER_BYTES: usize = 4 + 32;
+
+macro_rules! journal_id_type {
+    ($name:ident, $label:literal) => {
+        #[repr(transparent)]
+        #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub [u8; 32]);
+
+        impl $name {
+            pub const ZERO: Self = Self([0; 32]);
+
+            pub const fn new(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
+
+            pub const fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+        }
+
+        impl JournalObjectId for $name {
+            fn from_bytes(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
+
+            fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+        }
+
+        impl From<[u8; 32]> for $name {
+            fn from(value: [u8; 32]) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<$name> for [u8; 32] {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(concat!($label, "("))?;
+                for byte in &self.0[..4] {
+                    write!(formatter, "{byte:02x}")?;
+                }
+                formatter.write_str("…)")
+            }
+        }
+    };
+}
+
+/// Fixed-width identity accepted by the typed journal store.
+pub trait JournalObjectId:
+    Copy + Eq + Ord + core::hash::Hash + fmt::Debug + Send + Sync + 'static
+{
+    fn from_bytes(bytes: [u8; 32]) -> Self;
+    fn as_bytes(&self) -> &[u8; 32];
+}
+
+journal_id_type!(ReplayInputId, "ReplayInputId");
+journal_id_type!(AgentJournalGenesisId, "AgentJournalGenesisId");
+journal_id_type!(OrderedEntryId, "OrderedEntryId");
+journal_id_type!(LocalEntryId, "LocalEntryId");
+journal_id_type!(MergeEventId, "MergeEventId");
+journal_id_type!(MergeFrontierId, "MergeFrontierId");
+journal_id_type!(MergeSealId, "MergeSealId");
+journal_id_type!(LaneStateId, "LaneStateId");
+journal_id_type!(ArtifactClosureId, "ArtifactClosureId");
+journal_id_type!(InvocationIndexNodeId, "InvocationIndexNodeId");
+journal_id_type!(InvocationIndexId, "InvocationIndexId");
+journal_id_type!(CheckpointId, "CheckpointId");
+journal_id_type!(JournalHeadsId, "JournalHeadsId");
+
+/// Stable storage namespace for a canonical journal object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum JournalStorageClass {
+    ReplayInput = 0,
+    Genesis = 1,
+    OrderedEntry = 2,
+    LocalEntry = 3,
+    MergeEvent = 4,
+    MergeFrontier = 5,
+    MergeSeal = 6,
+    LaneState = 7,
+    ArtifactClosure = 8,
+    InvocationIndex = 9,
+    /// Reserved for authenticated Patricia branch/leaf nodes. Manifests and
+    /// nodes deliberately use distinct storage namespaces.
+    InvocationIndexNode = 10,
+    Checkpoint = 11,
+    Heads = 12,
+}
+
+pub(super) mod sealed {
+    pub trait Sealed {}
+}
+
+/// A self-validating, content-identified journal object.
+///
+/// Storage implementations must call [`Self::validate`] before encoding and
+/// must recompute [`Self::id`] after decoding. The sealed implementations keep
+/// storage classes and identity domains consensus-stable.
+pub trait CanonicalJournalRecord: ServiceWire + sealed::Sealed {
+    type Id: JournalObjectId;
+
+    const STORAGE_CLASS: JournalStorageClass;
+
+    fn validate(&self) -> Result<(), DecodeError>;
+    fn id(&self) -> Self::Id;
+}
+
+/// Runtime identity which must be used to replay one input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeBinding {
+    pub space: SpaceId,
+    pub agent: AgentId,
+    pub deployment: DeploymentId,
+    pub program: ProgramId,
+    pub producer: ProducerId,
+    pub package: BlobRef,
+    pub runtime_abi: Hash,
+    pub execution_semantics: Hash,
+}
+
+impl RuntimeBinding {
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.space == SpaceId::ZERO
+            || self.agent == AgentId::ZERO
+            || self.deployment == DeploymentId::ZERO
+            || self.program == ProgramId::ZERO
+            || self.producer == ProducerId::ZERO
+            || !valid_blob_ref(&self.package, false, MAX_ARTIFACT_CLOSURE_BYTES as u64)
+            || self.runtime_abi != super::RUNTIME_ABI_ID
+            || self.execution_semantics != super::EXECUTION_SEMANTICS_ID
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+
+    /// Canonical authority-facing commitment to this exact replay runtime.
+    /// System-genesis intent combines this value with the commitment of the
+    /// unauthenticated inner `Create` request, never its evidence-bearing
+    /// `Authorized` wrapper.
+    pub fn commitment(&self) -> Hash {
+        let mut bytes = Vec::new();
+        encode_runtime_binding(&mut Encoder(&mut bytes), self);
+        Hash::digest(b"vos/agent/runtime-binding/v1", &[&bytes])
+    }
+}
+
+/// Canonical commitment to the complete post-Create runtime image. Length
+/// prefixes preserve lane boundaries and lane order is protocol-fixed.
+pub fn system_genesis_post_create_state_commitment(
+    state: &RuntimeState,
+) -> Result<Hash, DecodeError> {
+    if state
+        .encoded_len()
+        .is_none_or(|bytes| bytes > MAX_RUNTIME_STATE_BYTES)
+    {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder(&mut bytes);
+    encoder.bytes(&state.control);
+    encoder.bytes(&state.linear);
+    encoder.bytes(&state.merge);
+    encoder.bytes(&state.local);
+    Ok(Hash::digest(
+        b"vos/agent/system-genesis-post-create-state/v1",
+        &[&bytes],
+    ))
+}
+
+/// One independently persisted runtime-state component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum PersistedLane {
+    Control = 0,
+    Linear = 1,
+    Merge = 2,
+    Local = 3,
+}
+
+impl PersistedLane {
+    pub const fn state_lane(self) -> Option<StateLane> {
+        match self {
+            Self::Control => None,
+            Self::Linear => Some(StateLane::Linear),
+            Self::Merge => Some(StateLane::Merge),
+            Self::Local => Some(StateLane::Local),
+        }
+    }
+
+    const fn from_result_storage(storage: InvocationResultStorage) -> Self {
+        match storage {
+            InvocationResultStorage::Control => Self::Control,
+            InvocationResultStorage::Lane(StateLane::Linear) => Self::Linear,
+            InvocationResultStorage::Lane(StateLane::Merge) => Self::Merge,
+            InvocationResultStorage::Lane(StateLane::Local) => Self::Local,
+        }
+    }
+}
+
+/// Exact Control/Linear snapshot visible to a non-ordered input.
+///
+/// `post_genesis()` names the state produced by the genesis `Create` input.
+/// Every later base carries both the ordered index and its content-identified
+/// head, preventing lifecycle changes under one runtime deployment from being
+/// observed in a different order during replay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OrderedBase {
+    pub index: u64,
+    pub head: Option<OrderedEntryId>,
+}
+
+impl OrderedBase {
+    pub const fn post_genesis() -> Self {
+        Self {
+            index: 0,
+            head: None,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), DecodeError> {
+        if (self.index == 0) != self.head.is_none() || self.head == Some(OrderedEntryId::ZERO) {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+/// Ordering domain which owns an invocation identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum InvocationOwnershipScope {
+    /// Control and Linear share one total ownership index.
+    Ordered,
+    /// Merge ownership is finalized by causal replay and lifecycle seals.
+    Merge,
+    /// Replica-private ownership. Equal public InvocationIds on distinct
+    /// nodes are intentionally independent.
+    Local(NodeId),
+}
+
+impl InvocationOwnershipScope {
+    pub fn validate(self) -> Result<(), DecodeError> {
+        if matches!(self, Self::Local(NodeId::ZERO)) {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+/// Scoped key used by the authenticated invocation-ownership index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InvocationOwnershipKey {
+    pub scope: InvocationOwnershipScope,
+    pub invocation: InvocationId,
+}
+
+impl InvocationOwnershipKey {
+    pub fn validate(self) -> Result<(), DecodeError> {
+        self.scope.validate()?;
+        if self.invocation == InvocationId::ZERO {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+/// Replay disposition retained by an ownership leaf.
+///
+/// Discriminants intentionally match `replay::ReplayDisposition`; conversion
+/// remains in the replay layer so the foundational codec has no dependency on
+/// the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InvocationDisposition {
+    Applied = 0,
+    Rejected = 1,
+    Forbidden = 2,
+    Panicked = 3,
+    OutOfGas = 4,
+}
+
+/// Whether the invocation still owns a guest result or is a tombstone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InvocationResultState {
+    /// A successfully applied result remains retrievable and acknowledgeable.
+    Retained = 0,
+    /// The retrievable result was explicitly acknowledged.
+    Acknowledged = 1,
+    /// Forbidden, panic, or out-of-gas permanently owns the identity without
+    /// retaining a guest reply.
+    Terminal = 2,
+}
+
+impl InvocationResultState {
+    pub const fn is_tombstone(self) -> bool {
+        matches!(self, Self::Acknowledged | Self::Terminal)
+    }
+}
+
+/// Authenticated owner of one scoped InvocationId.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvocationOwner {
+    pub scope: InvocationOwnershipScope,
+    pub request_commitment: Hash,
+    /// Audit identity of the first winning input. Idempotency compares the
+    /// request commitment, not this content ID.
+    pub first_input: ReplayInputId,
+    pub lane: PersistedLane,
+    /// Present exactly when `lane` and `scope` are Local, and equal to the
+    /// scope's exact node.
+    pub node: Option<NodeId>,
+    pub disposition: InvocationDisposition,
+    pub result_state: InvocationResultState,
+}
+
+impl InvocationOwner {
+    pub fn validate(self) -> Result<(), DecodeError> {
+        self.scope.validate()?;
+        let owner_matches_scope = match (self.scope, self.lane, self.node) {
+            (
+                InvocationOwnershipScope::Ordered,
+                PersistedLane::Control | PersistedLane::Linear,
+                None,
+            ) => true,
+            (InvocationOwnershipScope::Merge, PersistedLane::Merge, None) => true,
+            (
+                InvocationOwnershipScope::Local(scope_node),
+                PersistedLane::Local,
+                Some(owner_node),
+            ) => scope_node == owner_node && owner_node != NodeId::ZERO,
+            _ => false,
+        };
+        let state_matches_disposition = matches!(
+            (self.disposition, self.result_state),
+            (
+                InvocationDisposition::Applied,
+                InvocationResultState::Retained | InvocationResultState::Acknowledged
+            ) | (
+                InvocationDisposition::Rejected
+                    | InvocationDisposition::Forbidden
+                    | InvocationDisposition::Panicked
+                    | InvocationDisposition::OutOfGas,
+                InvocationResultState::Terminal
+            )
+        );
+        if self.request_commitment == Hash::ZERO
+            || self.first_input == ReplayInputId::ZERO
+            || !owner_matches_scope
+            || !state_matches_disposition
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+/// Compatibility name used by the replay ownership trait.
+pub type InvocationOwnershipValue = InvocationOwner;
+
+/// One Patricia-tree leaf. Manifests retain only the authenticated root and
+/// counts; they never flatten all ownership entries into a checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvocationOwnershipLeaf {
+    /// Agent journal whose ownership tree contains this leaf. Including the
+    /// genesis in every node hash prevents transplanting a valid root between
+    /// otherwise shape-compatible agents.
+    pub genesis: AgentJournalGenesisId,
+    pub key: InvocationOwnershipKey,
+    pub owner: InvocationOwner,
+}
+
+impl InvocationOwnershipLeaf {
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.genesis == AgentJournalGenesisId::ZERO {
+            return Err(DecodeError::NonCanonical);
+        }
+        self.key.validate()?;
+        self.owner.validate()?;
+        if self.key.scope != self.owner.scope {
+            return Err(DecodeError::NonCanonical);
+        }
+        validate_encoded_bound(self, MAX_INVOCATION_OWNERSHIP_LEAF_BYTES)
+    }
+
+    /// Canonical authenticated leaf hash used by the future Patricia index.
+    pub fn hash(&self) -> Hash {
+        Hash::digest(
+            b"vos/agent/journal/invocation-ownership-leaf",
+            &[&self.encode()],
+        )
+    }
+}
+
+impl ServiceWire for InvocationOwnershipLeaf {
+    const MAGIC: [u8; 4] = *b"AGIL";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encode_invocation_scope(&mut encoder, self.key.scope);
+        encoder.fixed(&self.key.invocation.0);
+        encode_invocation_owner(&mut encoder, self.owner);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_INVOCATION_OWNERSHIP_LEAF_BYTES)?;
+        let leaf = Self {
+            genesis: AgentJournalGenesisId(decoder.fixed()?),
+            key: InvocationOwnershipKey {
+                scope: decode_invocation_scope(decoder)?,
+                invocation: InvocationId(decoder.fixed()?),
+            },
+            owner: decode_invocation_owner(decoder)?,
+        };
+        leaf.validate()?;
+        Ok(leaf)
+    }
+}
+
+/// Authenticated root and cardinality of one scoped invocation index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvocationIndexManifest {
+    pub genesis: AgentJournalGenesisId,
+    pub scope: InvocationOwnershipScope,
+    /// Root Patricia node. Empty indexes are represented only as `None`;
+    /// their scoped manifest IDs remain nonzero and independently stored.
+    /// Resolution must reject any reachable node or leaf whose embedded
+    /// genesis/scope differs from this manifest.
+    pub root: Option<InvocationIndexNodeId>,
+    /// Total leaves, including acknowledged and terminal tombstones.
+    pub entries: u64,
+    pub tombstones: u64,
+}
+
+impl InvocationIndexManifest {
+    pub const fn empty(genesis: AgentJournalGenesisId, scope: InvocationOwnershipScope) -> Self {
+        Self {
+            genesis,
+            scope,
+            root: None,
+            entries: 0,
+            tombstones: 0,
+        }
+    }
+
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        self.scope.validate()?;
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || self.root == Some(InvocationIndexNodeId::ZERO)
+            || (self.entries == 0) != self.root.is_none()
+            || self.tombstones > self.entries
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for InvocationIndexManifest {
+    const MAGIC: [u8; 4] = *b"AGJX";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encode_invocation_scope(&mut encoder, self.scope);
+        encoder.option(&self.root, |encoder, root| encoder.fixed(&root.0));
+        encoder.u64(self.entries);
+        encoder.u64(self.tombstones);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_INVOCATION_INDEX_MANIFEST_BYTES)?;
+        let manifest = Self {
+            genesis: AgentJournalGenesisId(decoder.fixed()?),
+            scope: decode_invocation_scope(decoder)?,
+            root: decoder.option(|decoder| Ok(InvocationIndexNodeId(decoder.fixed()?)))?,
+            entries: decoder.u64()?,
+            tombstones: decoder.u64()?,
+        };
+        manifest.validate_inner()?;
+        Ok(manifest)
+    }
+}
+
+impl sealed::Sealed for InvocationIndexManifest {}
+
+impl CanonicalJournalRecord for InvocationIndexManifest {
+    type Id = InvocationIndexId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::InvocationIndex;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_INVOCATION_INDEX_MANIFEST_BYTES)
+    }
+
+    fn id(&self) -> Self::Id {
+        InvocationIndexId(content_id(b"vos/agent/journal/invocation-index", self))
+    }
+}
+
+/// One exact guest operation retained as replay truth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayOperation {
+    /// Authority-admitted management mutation. Read-only inspection and
+    /// invocation acknowledgement are not accepted through this variant.
+    Management { request: LifecycleRequest },
+    /// Exact authenticated actor invocation. Executable and policy artifacts
+    /// are resolved from the checkpoint/catalog closure during replay.
+    Invoke {
+        invocation: ActorInvocation,
+        authority: ActorInvocationReceipt,
+        observed_slot: u64,
+    },
+    /// Retire the exact result produced by `invocation`. Keeping the complete
+    /// invocation and receipt makes its owning result lane independently
+    /// derivable; a bare invocation ID is deliberately insufficient.
+    Acknowledge {
+        invocation: ActorInvocation,
+        authority: ActorInvocationReceipt,
+    },
+}
+
+impl ReplayOperation {
+    pub const fn persisted_lane(&self) -> PersistedLane {
+        match self {
+            Self::Management { .. } => PersistedLane::Control,
+            Self::Invoke { invocation, .. } | Self::Acknowledge { invocation, .. } => {
+                PersistedLane::from_result_storage(invocation.mode.result_storage())
+            }
+        }
+    }
+}
+
+/// Canonical replay source shared by all physical journal classes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayInput {
+    pub runtime: RuntimeBinding,
+    pub operation: ReplayOperation,
+}
+
+impl ReplayInput {
+    pub const fn persisted_lane(&self) -> PersistedLane {
+        self.operation.persisted_lane()
+    }
+
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        self.runtime.validate()?;
+        // Logical-slot freshness is execution state, not wire canonicality.
+        // Both lifecycle and invocation runtimes recover an exact committed
+        // request before applying the freshness check for unseen work; making
+        // the window structural would make a valid retry undecodable after
+        // expiry. Receipt shape and exact claim linkage remain canonical here,
+        // while replay authentication verifies the signature and fresh
+        // execution enforces the observed slot.
+        match &self.operation {
+            ReplayOperation::Management { request } => {
+                validate_management_request(&self.runtime, request)?;
+            }
+            ReplayOperation::Invoke {
+                invocation,
+                authority,
+                observed_slot: _,
+            } => {
+                validate_invocation_receipt(&self.runtime, invocation, authority)?;
+            }
+            ReplayOperation::Acknowledge {
+                invocation,
+                authority,
+            } => validate_invocation_receipt(&self.runtime, invocation, authority)?,
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for ReplayInput {
+    const MAGIC: [u8; 4] = *b"AGJI";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encode_runtime_binding(&mut encoder, &self.runtime);
+        encode_replay_operation(&mut encoder, &self.operation);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_REPLAY_INPUT_BYTES)?;
+        let input = Self {
+            runtime: decode_runtime_binding(decoder)?,
+            operation: decode_replay_operation(decoder)?,
+        };
+        input.validate_inner()?;
+        Ok(input)
+    }
+}
+
+impl sealed::Sealed for ReplayInput {}
+
+impl CanonicalJournalRecord for ReplayInput {
+    type Id = ReplayInputId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::ReplayInput;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_REPLAY_INPUT_BYTES)
+    }
+
+    fn id(&self) -> Self::Id {
+        ReplayInputId(content_id(b"vos/agent/journal/replay-input", self))
+    }
+}
+
+/// Immutable root of one clean-generation agent journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentJournalGenesis {
+    /// Content ID of the independently root-verified admission record. This
+    /// is part of the final genesis ID but deliberately not part of the
+    /// upstream signed genesis intent.
+    pub admission: SystemAgentGenesisAdmissionId,
+    /// The first input is always an authority-admitted `Create` mutation.
+    pub create: ReplayInput,
+}
+
+impl AgentJournalGenesis {
+    pub fn runtime(&self) -> &RuntimeBinding {
+        &self.create.runtime
+    }
+
+    /// Recompute the cycle-free intent certified by the system authority.
+    pub fn genesis_intent(&self) -> Result<GenesisIntentId, DecodeError> {
+        let ReplayOperation::Management { request } = &self.create.operation else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let LifecycleRequest::Authorized { request, .. } = request else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let LifecycleRequest::Create(_) = request.as_ref() else {
+            return Err(DecodeError::NonCanonical);
+        };
+        GenesisIntentId::from_commitments(self.create.runtime.commitment(), request.commitment())
+            .map_err(|_| DecodeError::NonCanonical)
+    }
+
+    /// Authority sequence of the exact receipt which admits the inner Create.
+    pub fn genesis_authority_sequence(&self) -> Result<u64, DecodeError> {
+        let ReplayOperation::Management { request } = &self.create.operation else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let LifecycleRequest::Authorized { admission, request } = request else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let LifecycleRequest::Create(_) = request.as_ref() else {
+            return Err(DecodeError::NonCanonical);
+        };
+        (admission.receipt.claim.sequence != 0)
+            .then_some(admission.receipt.claim.sequence)
+            .ok_or(DecodeError::NonCanonical)
+    }
+
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        if self.admission == SystemAgentGenesisAdmissionId::ZERO {
+            return Err(DecodeError::NonCanonical);
+        }
+        self.create.validate()?;
+        let ReplayOperation::Management { request } = &self.create.operation else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let LifecycleRequest::Authorized { request, .. } = request else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let LifecycleRequest::Create(config) = request.as_ref() else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let runtime = &self.create.runtime;
+        if config.validate().is_err()
+            || config.identity.space != runtime.space
+            || config.identity.agent != runtime.agent
+            || config.identity.runtime_deployment != runtime.deployment
+            || config.identity.runtime_program != runtime.program
+            || config.identity.runtime_producer != runtime.producer
+            || config.runtime_package != runtime.package
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        self.genesis_intent()?;
+        self.genesis_authority_sequence()?;
+        Ok(())
+    }
+}
+
+impl ServiceWire for AgentJournalGenesis {
+    const MAGIC: [u8; 4] = *b"AGJG";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(self.admission.as_bytes());
+        encoder.bytes(&self.create.encode());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_JOURNAL_RECORD_BYTES)?;
+        let admission = SystemAgentGenesisAdmissionId::from_bytes(decoder.fixed()?);
+        let bytes = bounded_bytes_ref(decoder, MAX_REPLAY_INPUT_BYTES)?;
+        let genesis = Self {
+            admission,
+            create: ReplayInput::decode(bytes)?,
+        };
+        genesis.validate_inner()?;
+        Ok(genesis)
+    }
+}
+
+impl sealed::Sealed for AgentJournalGenesis {}
+
+impl CanonicalJournalRecord for AgentJournalGenesis {
+    type Id = AgentJournalGenesisId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::Genesis;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_JOURNAL_RECORD_BYTES)
+    }
+
+    fn id(&self) -> Self::Id {
+        AgentJournalGenesisId(content_id(b"vos/agent/journal/genesis", self))
+    }
+}
+
+/// One Control or Linear input in the shared ordered chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderedEntry {
+    pub genesis: AgentJournalGenesisId,
+    pub index: u64,
+    pub parent: Option<OrderedEntryId>,
+    /// Exact Merge snapshot visible at admission. Before the first event this
+    /// is the content ID of the explicit empty frontier, never an absent alias.
+    pub merge_frontier: MergeFrontierId,
+    /// Raft/local-ordered fence over `merge_frontier`. Every directory or
+    /// runtime lifecycle mutation requires one; ordinary invocation and
+    /// acknowledgement entries must not carry one.
+    pub merge_seal: Option<MergeSealId>,
+    pub input: ReplayInput,
+}
+
+impl OrderedEntry {
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        self.input.validate()?;
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || self.index == 0
+            || (self.index == 1) != self.parent.is_none()
+            || self.parent == Some(OrderedEntryId::ZERO)
+            || self.merge_frontier == MergeFrontierId::ZERO
+            || self.merge_seal == Some(MergeSealId::ZERO)
+            || !matches!(
+                self.input.persisted_lane(),
+                PersistedLane::Control | PersistedLane::Linear
+            )
+            || is_create_operation(&self.input.operation)
+            || (matches!(&self.input.operation, ReplayOperation::Management { .. })
+                != self.merge_seal.is_some())
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for OrderedEntry {
+    const MAGIC: [u8; 4] = *b"AGJO";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encoder.u64(self.index);
+        encoder.option(&self.parent, |encoder, parent| encoder.fixed(&parent.0));
+        encoder.fixed(&self.merge_frontier.0);
+        encoder.option(&self.merge_seal, |encoder, seal| encoder.fixed(&seal.0));
+        encoder.bytes(&self.input.encode());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_JOURNAL_RECORD_BYTES)?;
+        let genesis = AgentJournalGenesisId(decoder.fixed()?);
+        let index = decoder.u64()?;
+        let parent = decoder.option(|decoder| Ok(OrderedEntryId(decoder.fixed()?)))?;
+        let merge_frontier = MergeFrontierId(decoder.fixed()?);
+        let merge_seal = decoder.option(|decoder| Ok(MergeSealId(decoder.fixed()?)))?;
+        let input = ReplayInput::decode(bounded_bytes_ref(decoder, MAX_REPLAY_INPUT_BYTES)?)?;
+        let entry = Self {
+            genesis,
+            index,
+            parent,
+            merge_frontier,
+            merge_seal,
+            input,
+        };
+        entry.validate_inner()?;
+        Ok(entry)
+    }
+}
+
+impl sealed::Sealed for OrderedEntry {}
+
+impl CanonicalJournalRecord for OrderedEntry {
+    type Id = OrderedEntryId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::OrderedEntry;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_JOURNAL_RECORD_BYTES)
+    }
+
+    fn id(&self) -> Self::Id {
+        OrderedEntryId(content_id(b"vos/agent/journal/ordered-entry", self))
+    }
+}
+
+/// One Local input in an exact replica node's private chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalEntry {
+    pub genesis: AgentJournalGenesisId,
+    pub node: NodeId,
+    pub revision: u64,
+    pub parent: Option<LocalEntryId>,
+    /// Lifecycle/directory and Linear snapshot visible at admission.
+    pub ordered_base: OrderedBase,
+    /// Exact Merge snapshot visible at admission, including the explicit empty
+    /// frontier before the first event.
+    pub merge_frontier: MergeFrontierId,
+    pub input: ReplayInput,
+}
+
+impl LocalEntry {
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        self.input.validate()?;
+        self.ordered_base.validate()?;
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || self.node == NodeId::ZERO
+            || self.revision == 0
+            || (self.revision == 1) != self.parent.is_none()
+            || self.parent == Some(LocalEntryId::ZERO)
+            || self.merge_frontier == MergeFrontierId::ZERO
+            || self.input.persisted_lane() != PersistedLane::Local
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for LocalEntry {
+    const MAGIC: [u8; 4] = *b"AGJL";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encoder.fixed(&self.node.0);
+        encoder.u64(self.revision);
+        encoder.option(&self.parent, |encoder, parent| encoder.fixed(&parent.0));
+        encode_ordered_base(&mut encoder, self.ordered_base);
+        encoder.fixed(&self.merge_frontier.0);
+        encoder.bytes(&self.input.encode());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_JOURNAL_RECORD_BYTES)?;
+        let genesis = AgentJournalGenesisId(decoder.fixed()?);
+        let node = NodeId(decoder.fixed()?);
+        let revision = decoder.u64()?;
+        let parent = decoder.option(|decoder| Ok(LocalEntryId(decoder.fixed()?)))?;
+        let ordered_base = decode_ordered_base(decoder)?;
+        let merge_frontier = MergeFrontierId(decoder.fixed()?);
+        let input = ReplayInput::decode(bounded_bytes_ref(decoder, MAX_REPLAY_INPUT_BYTES)?)?;
+        let entry = Self {
+            genesis,
+            node,
+            revision,
+            parent,
+            ordered_base,
+            merge_frontier,
+            input,
+        };
+        entry.validate_inner()?;
+        Ok(entry)
+    }
+}
+
+impl sealed::Sealed for LocalEntry {}
+
+impl CanonicalJournalRecord for LocalEntry {
+    type Id = LocalEntryId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::LocalEntry;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_JOURNAL_RECORD_BYTES)
+    }
+
+    fn id(&self) -> Self::Id {
+        LocalEntryId(content_id(b"vos/agent/journal/local-entry", self))
+    }
+}
+
+/// One authenticated Merge input in the causal DAG.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeEvent {
+    pub genesis: AgentJournalGenesisId,
+    pub author: NodeId,
+    /// Exact lifecycle/directory snapshot used to admit this event.
+    pub ordered_base: OrderedBase,
+    /// One plus the maximum verified parent height. Importers independently
+    /// verify this value after resolving every parent.
+    pub causal_height: u64,
+    /// Strictly sorted, duplicate-free causal parents.
+    pub parents: Vec<MergeEventId>,
+    pub input: ReplayInput,
+    /// Signature by the authority-certified key of `author` over
+    /// [`Self::signing_message`]. Key resolution and cryptographic checking
+    /// remain membership policy, outside this canonical codec.
+    pub signature: Vec<u8>,
+}
+
+impl MergeEvent {
+    pub fn signing_message(&self) -> Hash {
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder(&mut bytes);
+        encoder.fixed(&self.genesis.0);
+        encoder.fixed(&self.author.0);
+        encode_ordered_base(&mut encoder, self.ordered_base);
+        encoder.u64(self.causal_height);
+        encoder.list(&self.parents, |encoder, parent| encoder.fixed(&parent.0));
+        encoder.bytes(&self.input.encode());
+        Hash::digest(b"vos/agent/journal/merge-event-signature", &[&bytes])
+    }
+
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        self.input.validate()?;
+        self.ordered_base.validate()?;
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || self.author == NodeId::ZERO
+            || self.causal_height == 0
+            || self.parents.len() > MAX_MERGE_FRONTIER_ENTRIES
+            || (self.parents.is_empty() != (self.causal_height == 1))
+            || !strictly_increasing(&self.parents)
+            || self.parents.contains(&MergeEventId::ZERO)
+            || self.input.persisted_lane() != PersistedLane::Merge
+            || self.signature.len() != ED25519_SIGNATURE_BYTES
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for MergeEvent {
+    const MAGIC: [u8; 4] = *b"AGJE";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encoder.fixed(&self.author.0);
+        encode_ordered_base(&mut encoder, self.ordered_base);
+        encoder.u64(self.causal_height);
+        encoder.list(&self.parents, |encoder, parent| encoder.fixed(&parent.0));
+        encoder.bytes(&self.input.encode());
+        encoder.bytes(&self.signature);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_JOURNAL_RECORD_BYTES)?;
+        let genesis = AgentJournalGenesisId(decoder.fixed()?);
+        let author = NodeId(decoder.fixed()?);
+        let ordered_base = decode_ordered_base(decoder)?;
+        let causal_height = decoder.u64()?;
+        let parents = decode_fixed_id_list::<MergeEventId>(decoder, MAX_MERGE_FRONTIER_ENTRIES)?;
+        let input = ReplayInput::decode(bounded_bytes_ref(decoder, MAX_REPLAY_INPUT_BYTES)?)?;
+        let signature = bounded_bytes_ref(decoder, ED25519_SIGNATURE_BYTES)?.to_vec();
+        let event = Self {
+            genesis,
+            author,
+            ordered_base,
+            causal_height,
+            parents,
+            input,
+            signature,
+        };
+        event.validate_inner()?;
+        Ok(event)
+    }
+}
+
+impl sealed::Sealed for MergeEvent {}
+
+impl CanonicalJournalRecord for MergeEvent {
+    type Id = MergeEventId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::MergeEvent;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_JOURNAL_RECORD_BYTES)
+    }
+
+    fn id(&self) -> Self::Id {
+        MergeEventId(content_id(b"vos/agent/journal/merge-event", self))
+    }
+}
+
+/// Canonical, minimal Merge DAG frontier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeFrontier {
+    pub genesis: AgentJournalGenesisId,
+    /// Strictly sorted, duplicate-free maximal events. The empty frontier is
+    /// canonical before the first Merge event.
+    pub events: Vec<MergeEventId>,
+}
+
+impl MergeFrontier {
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || self.events.len() > MAX_MERGE_FRONTIER_ENTRIES
+            || !strictly_increasing(&self.events)
+            || self.events.contains(&MergeEventId::ZERO)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for MergeFrontier {
+    const MAGIC: [u8; 4] = *b"AGJF";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encoder.list(&self.events, |encoder, event| encoder.fixed(&event.0));
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_CHECKPOINT_MANIFEST_BYTES)?;
+        let frontier = Self {
+            genesis: AgentJournalGenesisId(decoder.fixed()?),
+            events: decode_fixed_id_list::<MergeEventId>(decoder, MAX_MERGE_FRONTIER_ENTRIES)?,
+        };
+        frontier.validate_inner()?;
+        Ok(frontier)
+    }
+}
+
+impl sealed::Sealed for MergeFrontier {}
+
+impl CanonicalJournalRecord for MergeFrontier {
+    type Id = MergeFrontierId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::MergeFrontier;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_CHECKPOINT_MANIFEST_BYTES)
+    }
+
+    fn id(&self) -> Self::Id {
+        MergeFrontierId(content_id(b"vos/agent/journal/merge-frontier", self))
+    }
+}
+
+/// Materialized Merge state sealed at an authenticated frontier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeSeal {
+    pub genesis: AgentJournalGenesisId,
+    pub frontier: MergeFrontierId,
+    /// Ordered snapshot immediately before the lifecycle fence that consumes
+    /// this seal.
+    pub ordered_base: OrderedBase,
+    pub merge_state: LaneStateId,
+}
+
+impl MergeSeal {
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        self.ordered_base.validate()?;
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || self.frontier == MergeFrontierId::ZERO
+            || self.merge_state == LaneStateId::ZERO
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for MergeSeal {
+    const MAGIC: [u8; 4] = *b"AGJS";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encoder.fixed(&self.frontier.0);
+        encode_ordered_base(&mut encoder, self.ordered_base);
+        encoder.fixed(&self.merge_state.0);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_CHECKPOINT_MANIFEST_BYTES)?;
+        let seal = Self {
+            genesis: AgentJournalGenesisId(decoder.fixed()?),
+            frontier: MergeFrontierId(decoder.fixed()?),
+            ordered_base: decode_ordered_base(decoder)?,
+            merge_state: LaneStateId(decoder.fixed()?),
+        };
+        seal.validate_inner()?;
+        Ok(seal)
+    }
+}
+
+impl sealed::Sealed for MergeSeal {}
+
+impl CanonicalJournalRecord for MergeSeal {
+    type Id = MergeSealId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::MergeSeal;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_CHECKPOINT_MANIFEST_BYTES)
+    }
+
+    fn id(&self) -> Self::Id {
+        MergeSealId(content_id(b"vos/agent/journal/merge-seal", self))
+    }
+}
+
+/// Replay cursor which authenticated one materialized lane image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaneCursor {
+    Ordered {
+        base: OrderedBase,
+    },
+    Merge {
+        frontier: MergeFrontierId,
+    },
+    Local {
+        node: NodeId,
+        revision: u64,
+        /// Revision zero is the explicit post-genesis Local cursor and has no
+        /// journal entry. Every later revision names its exact Local head.
+        head: Option<LocalEntryId>,
+    },
+}
+
+/// Content reference for one derived runtime-state lane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneStateManifest {
+    pub genesis: AgentJournalGenesisId,
+    pub runtime: RuntimeBinding,
+    pub lane: PersistedLane,
+    pub cursor: LaneCursor,
+    /// Canonical opaque bytes for this runtime-state component. Empty lane
+    /// bytes use `BlobRef::of_bytes(&[])`, never the zero reference.
+    pub state: BlobRef,
+}
+
+impl LaneStateManifest {
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        self.runtime.validate()?;
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || !valid_blob_ref(&self.state, true, MAX_RUNTIME_STATE_BYTES as u64)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        match (&self.lane, &self.cursor) {
+            (PersistedLane::Control | PersistedLane::Linear, LaneCursor::Ordered { base })
+                if base.validate().is_ok() => {}
+            (PersistedLane::Merge, LaneCursor::Merge { frontier })
+                if *frontier != MergeFrontierId::ZERO => {}
+            (
+                PersistedLane::Local,
+                LaneCursor::Local {
+                    node,
+                    revision,
+                    head,
+                },
+            ) if *node != NodeId::ZERO
+                && ((*revision == 0 && head.is_none())
+                    || (*revision != 0 && head.is_some_and(|head| head != LocalEntryId::ZERO))) => {
+            }
+            _ => return Err(DecodeError::NonCanonical),
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for LaneStateManifest {
+    const MAGIC: [u8; 4] = *b"AGJN";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encode_runtime_binding(&mut encoder, &self.runtime);
+        encoder.u8(self.lane as u8);
+        encode_lane_cursor(&mut encoder, &self.cursor);
+        encode_blob_ref(&mut encoder, &self.state);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_CHECKPOINT_MANIFEST_BYTES)?;
+        let manifest = Self {
+            genesis: AgentJournalGenesisId(decoder.fixed()?),
+            runtime: decode_runtime_binding(decoder)?,
+            lane: decode_persisted_lane(decoder.u8()?)?,
+            cursor: decode_lane_cursor(decoder)?,
+            state: decode_blob_ref(decoder)?,
+        };
+        manifest.validate_inner()?;
+        Ok(manifest)
+    }
+}
+
+impl sealed::Sealed for LaneStateManifest {}
+
+impl CanonicalJournalRecord for LaneStateManifest {
+    type Id = LaneStateId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::LaneState;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_CHECKPOINT_MANIFEST_BYTES)
+    }
+
+    fn id(&self) -> Self::Id {
+        LaneStateId(content_id(b"vos/agent/journal/lane-state", self))
+    }
+}
+
+/// Complete content-addressed artifact reachability set of a checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactClosure {
+    pub genesis: AgentJournalGenesisId,
+    /// Strictly ordered by `(hash, len)` with no duplicate content identity.
+    /// The catalog retained by guest state supplies the artifact's semantic
+    /// role; closure only needs exact byte reachability.
+    pub artifacts: Vec<BlobRef>,
+}
+
+impl ArtifactClosure {
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        validate_system_genesis_artifacts(&self.artifacts)?;
+        if self.genesis == AgentJournalGenesisId::ZERO {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+
+    /// Genesis-safe commitment to the exact artifact reachability set. The
+    /// physical closure record's final genesis scope is intentionally omitted
+    /// because that genesis ID itself includes the authority admission ID.
+    pub fn system_genesis_commitment(&self) -> Result<Hash, DecodeError> {
+        system_genesis_artifact_closure_commitment(&self.artifacts)
+    }
+}
+
+/// Commit to a canonical artifact closure before the final journal genesis ID
+/// exists. Callers must later construct an [`ArtifactClosure`] with these same
+/// references and the admitted final genesis scope.
+pub fn system_genesis_artifact_closure_commitment(
+    artifacts: &[BlobRef],
+) -> Result<Hash, DecodeError> {
+    validate_system_genesis_artifacts(artifacts)?;
+    let mut bytes = Vec::new();
+    Encoder(&mut bytes).list(artifacts, encode_blob_ref);
+    Ok(Hash::digest(
+        b"vos/agent/system-genesis-artifact-closure/v1",
+        &[&bytes],
+    ))
+}
+
+fn validate_system_genesis_artifacts(artifacts: &[BlobRef]) -> Result<(), DecodeError> {
+    let referenced_bytes = artifacts.iter().try_fold(0_u64, |bytes, artifact| {
+        bytes
+            .checked_add(artifact.len)
+            .ok_or(DecodeError::LimitExceeded)
+    })?;
+    if artifacts.len() > MAX_ARTIFACT_CLOSURE_ENTRIES
+        || referenced_bytes > MAX_ARTIFACT_CLOSURE_REFERENCED_BYTES
+    {
+        return Err(DecodeError::LimitExceeded);
+    }
+    if artifacts.is_empty()
+        || artifacts
+            .iter()
+            .any(|artifact| !valid_blob_ref(artifact, true, MAX_ARTIFACT_CLOSURE_BYTES as u64))
+        || artifacts
+            .windows(2)
+            .any(|pair| (pair[0].hash, pair[0].len) >= (pair[1].hash, pair[1].len))
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(())
+}
+
+impl ServiceWire for ArtifactClosure {
+    const MAGIC: [u8; 4] = *b"AGJA";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encoder.list(&self.artifacts, encode_blob_ref);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_ARTIFACT_CLOSURE_BYTES)?;
+        let genesis = AgentJournalGenesisId(decoder.fixed()?);
+        let count = decoder.u32()? as usize;
+        if count > MAX_ARTIFACT_CLOSURE_ENTRIES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let maximum = max_fixed_items(decoder, count, 40, MAX_ARTIFACT_CLOSURE_BYTES)?;
+        if count > maximum {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let mut artifacts = Vec::new();
+        for _ in 0..count {
+            artifacts
+                .try_reserve(1)
+                .map_err(|_| DecodeError::LimitExceeded)?;
+            artifacts.push(decode_blob_ref(decoder)?);
+        }
+        let closure = Self { genesis, artifacts };
+        closure.validate_inner()?;
+        Ok(closure)
+    }
+}
+
+impl sealed::Sealed for ArtifactClosure {}
+
+impl CanonicalJournalRecord for ArtifactClosure {
+    type Id = ArtifactClosureId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::ArtifactClosure;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_ARTIFACT_CLOSURE_BYTES)
+    }
+
+    fn id(&self) -> Self::Id {
+        ArtifactClosureId(content_id(b"vos/agent/journal/artifact-closure", self))
+    }
+}
+
+/// One lane-state reference in an aggregate checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointLane {
+    pub lane: PersistedLane,
+    /// Present exactly for replica-local state.
+    pub node: Option<NodeId>,
+    pub state: LaneStateId,
+    /// Present exactly for Local state and scoped to `node`.
+    pub invocations: Option<InvocationIndexId>,
+}
+
+impl CheckpointLane {
+    fn key(&self) -> (PersistedLane, Option<NodeId>) {
+        (self.lane, self.node)
+    }
+
+    fn validate(&self) -> bool {
+        self.state != LaneStateId::ZERO
+            && self.invocations != Some(InvocationIndexId::ZERO)
+            && match self.lane {
+                PersistedLane::Local => {
+                    self.node.is_some_and(|node| node != NodeId::ZERO) && self.invocations.is_some()
+                }
+                _ => self.node.is_none() && self.invocations.is_none(),
+            }
+    }
+}
+
+/// Coherent aggregate checkpoint across every materialized lane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointManifest {
+    pub genesis: AgentJournalGenesisId,
+    /// Immutable system-genesis authority admission inherited from genesis.
+    pub admission: SystemAgentGenesisAdmissionId,
+    pub runtime: RuntimeBinding,
+    pub publication_revision: u64,
+    pub ordered_head: Option<OrderedEntryId>,
+    pub ordered_index: u64,
+    pub merge_frontier: MergeFrontierId,
+    /// Ordered base immediately after the latest lifecycle mutation. Events
+    /// admitted against an older base are late across that fence unless they
+    /// were already covered by `merge_seal`.
+    pub merge_fence: OrderedBase,
+    /// Seal consumed by the lifecycle entry at `merge_fence`. This is not
+    /// necessarily a seal of the newer `merge_frontier`.
+    pub merge_seal: Option<MergeSealId>,
+    /// Checkpoint-authenticated ownership roots for shared ordering domains.
+    pub ordered_invocations: InvocationIndexId,
+    pub merge_invocations: InvocationIndexId,
+    /// Control, Linear, Merge, then zero or more node-sorted Local states.
+    pub lanes: Vec<CheckpointLane>,
+    pub artifacts: ArtifactClosureId,
+}
+
+impl CheckpointManifest {
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        self.runtime.validate()?;
+        self.merge_fence.validate()?;
+        let local_count = self
+            .lanes
+            .iter()
+            .filter(|lane| lane.lane == PersistedLane::Local)
+            .count();
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || self.admission == SystemAgentGenesisAdmissionId::ZERO
+            || (self.ordered_index == 0) != self.ordered_head.is_none()
+            || self.ordered_head == Some(OrderedEntryId::ZERO)
+            || self.merge_frontier == MergeFrontierId::ZERO
+            || self.merge_seal == Some(MergeSealId::ZERO)
+            || self.ordered_invocations == InvocationIndexId::ZERO
+            || self.merge_invocations == InvocationIndexId::ZERO
+            || ((self.merge_fence == OrderedBase::post_genesis()) != self.merge_seal.is_none())
+            || self.merge_fence.index > self.ordered_index
+            || (self.merge_fence.index == self.ordered_index
+                && self.merge_fence.head != self.ordered_head)
+            || self.lanes.is_empty()
+            || local_count > MAX_CHECKPOINT_LOCAL_LANES
+            || self.lanes.iter().any(|lane| !lane.validate())
+            || self
+                .lanes
+                .windows(2)
+                .any(|pair| pair[0].key() >= pair[1].key())
+            || self.artifacts == ArtifactClosureId::ZERO
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        if !self
+            .lanes
+            .iter()
+            .any(|lane| lane.lane == PersistedLane::Control)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for CheckpointManifest {
+    const MAGIC: [u8; 4] = *b"AGJC";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encoder.fixed(self.admission.as_bytes());
+        encode_runtime_binding(&mut encoder, &self.runtime);
+        encoder.u64(self.publication_revision);
+        encoder.option(&self.ordered_head, |encoder, head| encoder.fixed(&head.0));
+        encoder.u64(self.ordered_index);
+        encoder.fixed(&self.merge_frontier.0);
+        encode_ordered_base(&mut encoder, self.merge_fence);
+        encoder.option(&self.merge_seal, |encoder, seal| encoder.fixed(&seal.0));
+        encoder.fixed(&self.ordered_invocations.0);
+        encoder.fixed(&self.merge_invocations.0);
+        encoder.list(&self.lanes, |encoder, lane| {
+            encoder.u8(lane.lane as u8);
+            encoder.option(&lane.node, |encoder, node| encoder.fixed(&node.0));
+            encoder.fixed(&lane.state.0);
+            encoder.option(&lane.invocations, |encoder, index| encoder.fixed(&index.0));
+        });
+        encoder.fixed(&self.artifacts.0);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_CHECKPOINT_MANIFEST_BYTES)?;
+        let genesis = AgentJournalGenesisId(decoder.fixed()?);
+        let admission = SystemAgentGenesisAdmissionId::from_bytes(decoder.fixed()?);
+        let runtime = decode_runtime_binding(decoder)?;
+        let publication_revision = decoder.u64()?;
+        let ordered_head = decoder.option(|decoder| Ok(OrderedEntryId(decoder.fixed()?)))?;
+        let ordered_index = decoder.u64()?;
+        let merge_frontier = MergeFrontierId(decoder.fixed()?);
+        let merge_fence = decode_ordered_base(decoder)?;
+        let merge_seal = decoder.option(|decoder| Ok(MergeSealId(decoder.fixed()?)))?;
+        let ordered_invocations = InvocationIndexId(decoder.fixed()?);
+        let merge_invocations = InvocationIndexId(decoder.fixed()?);
+        let count = decoder.u32()? as usize;
+        if count > MAX_CHECKPOINT_LOCAL_LANES + 3 {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let mut lanes = Vec::new();
+        for _ in 0..count {
+            lanes
+                .try_reserve(1)
+                .map_err(|_| DecodeError::LimitExceeded)?;
+            lanes.push(CheckpointLane {
+                lane: decode_persisted_lane(decoder.u8()?)?,
+                node: decoder.option(|decoder| Ok(NodeId(decoder.fixed()?)))?,
+                state: LaneStateId(decoder.fixed()?),
+                invocations: decoder.option(|decoder| Ok(InvocationIndexId(decoder.fixed()?)))?,
+            });
+        }
+        let manifest = Self {
+            genesis,
+            admission,
+            runtime,
+            publication_revision,
+            ordered_head,
+            ordered_index,
+            merge_frontier,
+            merge_fence,
+            merge_seal,
+            ordered_invocations,
+            merge_invocations,
+            lanes,
+            artifacts: ArtifactClosureId(decoder.fixed()?),
+        };
+        manifest.validate_inner()?;
+        Ok(manifest)
+    }
+}
+
+impl sealed::Sealed for CheckpointManifest {}
+
+impl CanonicalJournalRecord for CheckpointManifest {
+    type Id = CheckpointId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::Checkpoint;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_CHECKPOINT_MANIFEST_BYTES)
+    }
+
+    fn id(&self) -> Self::Id {
+        CheckpointId(content_id(b"vos/agent/journal/checkpoint", self))
+    }
+}
+
+/// Atomically published journal tips for one physical replica.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalHeads {
+    pub genesis: AgentJournalGenesisId,
+    /// Immutable system-genesis authority admission inherited from genesis.
+    pub admission: SystemAgentGenesisAdmissionId,
+    pub node: NodeId,
+    /// Runtime selected after replaying `ordered_head`. Genesis initializes
+    /// this binding; only validated ordered replay may change it.
+    pub runtime: RuntimeBinding,
+    /// CAS generation of this envelope, independent of ordered/local indexes.
+    pub publication_revision: u64,
+    /// Exact predecessor envelope. A staged `heads.next` therefore proves the
+    /// CAS candidate it was intended to replace.
+    pub previous: Option<JournalHeadsId>,
+    pub ordered_head: Option<OrderedEntryId>,
+    pub ordered_index: u64,
+    /// Always names a concrete frontier object, including the empty frontier.
+    pub merge_frontier: MergeFrontierId,
+    /// Ordered base immediately after the latest lifecycle mutation.
+    pub merge_fence: OrderedBase,
+    /// Seal consumed by that lifecycle mutation. It may cover an older
+    /// frontier than `merge_frontier` after later Merge publications.
+    pub merge_seal: Option<MergeSealId>,
+    pub ordered_invocations: InvocationIndexId,
+    pub merge_invocations: InvocationIndexId,
+    /// Current physical node's Local ownership index.
+    pub local_invocations: InvocationIndexId,
+    pub local_head: Option<LocalEntryId>,
+    pub local_revision: u64,
+    pub checkpoint: Option<CheckpointId>,
+}
+
+impl JournalHeads {
+    /// Empty envelope written when a genesis is installed.
+    pub fn initial(
+        genesis: AgentJournalGenesisId,
+        admission: SystemAgentGenesisAdmissionId,
+        node: NodeId,
+        empty_merge_frontier: MergeFrontierId,
+        runtime: RuntimeBinding,
+    ) -> Self {
+        let ordered_invocations =
+            InvocationIndexManifest::empty(genesis, InvocationOwnershipScope::Ordered).id();
+        let merge_invocations =
+            InvocationIndexManifest::empty(genesis, InvocationOwnershipScope::Merge).id();
+        let local_invocations =
+            InvocationIndexManifest::empty(genesis, InvocationOwnershipScope::Local(node)).id();
+        Self {
+            genesis,
+            admission,
+            node,
+            runtime,
+            publication_revision: 0,
+            previous: None,
+            ordered_head: None,
+            ordered_index: 0,
+            merge_frontier: empty_merge_frontier,
+            merge_fence: OrderedBase::post_genesis(),
+            merge_seal: None,
+            ordered_invocations,
+            merge_invocations,
+            local_invocations,
+            local_head: None,
+            local_revision: 0,
+            checkpoint: None,
+        }
+    }
+
+    fn validate_inner(&self) -> Result<(), DecodeError> {
+        self.runtime.validate()?;
+        self.merge_fence.validate()?;
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || self.admission == SystemAgentGenesisAdmissionId::ZERO
+            || self.node == NodeId::ZERO
+            || (self.publication_revision == 0) != self.previous.is_none()
+            || self.previous == Some(JournalHeadsId::ZERO)
+            || (self.ordered_index == 0) != self.ordered_head.is_none()
+            || self.ordered_head == Some(OrderedEntryId::ZERO)
+            || self.merge_frontier == MergeFrontierId::ZERO
+            || self.merge_seal == Some(MergeSealId::ZERO)
+            || self.ordered_invocations == InvocationIndexId::ZERO
+            || self.merge_invocations == InvocationIndexId::ZERO
+            || self.local_invocations == InvocationIndexId::ZERO
+            || ((self.merge_fence == OrderedBase::post_genesis()) != self.merge_seal.is_none())
+            || self.merge_fence.index > self.ordered_index
+            || (self.merge_fence.index == self.ordered_index
+                && self.merge_fence.head != self.ordered_head)
+            || (self.local_revision == 0) != self.local_head.is_none()
+            || self.local_head == Some(LocalEntryId::ZERO)
+            || self.checkpoint == Some(CheckpointId::ZERO)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        if self.publication_revision == 0
+            && (self.ordered_head.is_some()
+                || self.merge_seal.is_some()
+                || self.local_head.is_some()
+                || self.checkpoint.is_some())
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        if self.publication_revision == 0
+            && (self.ordered_invocations
+                != InvocationIndexManifest::empty(self.genesis, InvocationOwnershipScope::Ordered)
+                    .id()
+                || self.merge_invocations
+                    != InvocationIndexManifest::empty(
+                        self.genesis,
+                        InvocationOwnershipScope::Merge,
+                    )
+                    .id()
+                || self.local_invocations
+                    != InvocationIndexManifest::empty(
+                        self.genesis,
+                        InvocationOwnershipScope::Local(self.node),
+                    )
+                    .id())
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+
+    /// Validate the immutable scope and one-step CAS relationship between two
+    /// head envelopes. Record-specific tip advancement is checked by storage.
+    pub fn validate_successor(&self, next: &Self) -> Result<(), DecodeError> {
+        self.validate()?;
+        next.validate()?;
+        if next.genesis != self.genesis
+            || next.admission != self.admission
+            || next.node != self.node
+            || next.runtime.space != self.runtime.space
+            || next.runtime.agent != self.runtime.agent
+            || next.publication_revision
+                != self
+                    .publication_revision
+                    .checked_add(1)
+                    .ok_or(DecodeError::LimitExceeded)?
+            || next.previous != Some(self.id())
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for JournalHeads {
+    const MAGIC: [u8; 4] = *b"AGJH";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encoder.fixed(self.admission.as_bytes());
+        encoder.fixed(&self.node.0);
+        encode_runtime_binding(&mut encoder, &self.runtime);
+        encoder.u64(self.publication_revision);
+        encoder.option(&self.previous, |encoder, previous| {
+            encoder.fixed(&previous.0)
+        });
+        encoder.option(&self.ordered_head, |encoder, head| encoder.fixed(&head.0));
+        encoder.u64(self.ordered_index);
+        encoder.fixed(&self.merge_frontier.0);
+        encode_ordered_base(&mut encoder, self.merge_fence);
+        encoder.option(&self.merge_seal, |encoder, seal| encoder.fixed(&seal.0));
+        encoder.fixed(&self.ordered_invocations.0);
+        encoder.fixed(&self.merge_invocations.0);
+        encoder.fixed(&self.local_invocations.0);
+        encoder.option(&self.local_head, |encoder, head| encoder.fixed(&head.0));
+        encoder.u64(self.local_revision);
+        encoder.option(&self.checkpoint, |encoder, checkpoint| {
+            encoder.fixed(&checkpoint.0)
+        });
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_CHECKPOINT_MANIFEST_BYTES)?;
+        let heads = Self {
+            genesis: AgentJournalGenesisId(decoder.fixed()?),
+            admission: SystemAgentGenesisAdmissionId::from_bytes(decoder.fixed()?),
+            node: NodeId(decoder.fixed()?),
+            runtime: decode_runtime_binding(decoder)?,
+            publication_revision: decoder.u64()?,
+            previous: decoder.option(|decoder| Ok(JournalHeadsId(decoder.fixed()?)))?,
+            ordered_head: decoder.option(|decoder| Ok(OrderedEntryId(decoder.fixed()?)))?,
+            ordered_index: decoder.u64()?,
+            merge_frontier: MergeFrontierId(decoder.fixed()?),
+            merge_fence: decode_ordered_base(decoder)?,
+            merge_seal: decoder.option(|decoder| Ok(MergeSealId(decoder.fixed()?)))?,
+            ordered_invocations: InvocationIndexId(decoder.fixed()?),
+            merge_invocations: InvocationIndexId(decoder.fixed()?),
+            local_invocations: InvocationIndexId(decoder.fixed()?),
+            local_head: decoder.option(|decoder| Ok(LocalEntryId(decoder.fixed()?)))?,
+            local_revision: decoder.u64()?,
+            checkpoint: decoder.option(|decoder| Ok(CheckpointId(decoder.fixed()?)))?,
+        };
+        heads.validate_inner()?;
+        Ok(heads)
+    }
+}
+
+impl sealed::Sealed for JournalHeads {}
+
+impl CanonicalJournalRecord for JournalHeads {
+    type Id = JournalHeadsId;
+
+    const STORAGE_CLASS: JournalStorageClass = JournalStorageClass::Heads;
+
+    fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_inner()?;
+        validate_encoded_bound(self, MAX_CHECKPOINT_MANIFEST_BYTES)
+    }
+
+    fn id(&self) -> Self::Id {
+        JournalHeadsId(content_id(b"vos/agent/journal/heads", self))
+    }
+}
+
+fn encode_runtime_binding(encoder: &mut Encoder<'_>, binding: &RuntimeBinding) {
+    encoder.fixed(&binding.space.0);
+    encoder.fixed(&binding.agent.0);
+    encoder.fixed(&binding.deployment.0);
+    encoder.fixed(&binding.program.0);
+    encoder.fixed(&binding.producer.0);
+    encode_blob_ref(encoder, &binding.package);
+    encoder.fixed(&binding.runtime_abi.0);
+    encoder.fixed(&binding.execution_semantics.0);
+}
+
+fn encode_ordered_base(encoder: &mut Encoder<'_>, base: OrderedBase) {
+    encoder.u64(base.index);
+    encoder.option(&base.head, |encoder, head| encoder.fixed(&head.0));
+}
+
+fn decode_ordered_base(decoder: &mut Decoder<'_>) -> Result<OrderedBase, DecodeError> {
+    let base = OrderedBase {
+        index: decoder.u64()?,
+        head: decoder.option(|decoder| Ok(OrderedEntryId(decoder.fixed()?)))?,
+    };
+    base.validate()?;
+    Ok(base)
+}
+
+fn decode_runtime_binding(decoder: &mut Decoder<'_>) -> Result<RuntimeBinding, DecodeError> {
+    let binding = RuntimeBinding {
+        space: SpaceId(decoder.fixed()?),
+        agent: AgentId(decoder.fixed()?),
+        deployment: DeploymentId(decoder.fixed()?),
+        program: ProgramId(decoder.fixed()?),
+        producer: ProducerId(decoder.fixed()?),
+        package: decode_blob_ref(decoder)?,
+        runtime_abi: Hash(decoder.fixed()?),
+        execution_semantics: Hash(decoder.fixed()?),
+    };
+    binding.validate()?;
+    Ok(binding)
+}
+
+fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperation) {
+    match operation {
+        ReplayOperation::Management { request } => {
+            encoder.u8(0);
+            let call = RuntimeCall {
+                state: RuntimeState::default(),
+                request: request.clone(),
+            };
+            encoder.bytes(&call.encode());
+        }
+        ReplayOperation::Invoke {
+            invocation,
+            authority,
+            observed_slot,
+        } => {
+            encoder.u8(1);
+            encode_actor_invocation(encoder, invocation);
+            encoder.bytes(&authority.encode());
+            encoder.u64(*observed_slot);
+        }
+        ReplayOperation::Acknowledge {
+            invocation,
+            authority,
+        } => {
+            encoder.u8(2);
+            encode_actor_invocation(encoder, invocation);
+            encoder.bytes(&authority.encode());
+        }
+    }
+}
+
+fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation, DecodeError> {
+    match decoder.u8()? {
+        0 => {
+            let bytes = bounded_bytes_ref(decoder, MAX_REPLAY_INPUT_BYTES)?;
+            let call = RuntimeCall::decode(bytes)?;
+            if !call.state.is_empty() {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(ReplayOperation::Management {
+                request: call.request,
+            })
+        }
+        1 => Ok(ReplayOperation::Invoke {
+            invocation: decode_actor_invocation(decoder)?,
+            authority: ActorInvocationReceipt::decode(bounded_bytes_ref(
+                decoder,
+                MAX_AUTHORITY_RECEIPT_BYTES,
+            )?)?,
+            observed_slot: decoder.u64()?,
+        }),
+        2 => Ok(ReplayOperation::Acknowledge {
+            invocation: decode_actor_invocation(decoder)?,
+            authority: ActorInvocationReceipt::decode(bounded_bytes_ref(
+                decoder,
+                MAX_AUTHORITY_RECEIPT_BYTES,
+            )?)?,
+        }),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn validate_management_request(
+    runtime: &RuntimeBinding,
+    request: &LifecycleRequest,
+) -> Result<(), DecodeError> {
+    let LifecycleRequest::Authorized { admission, request } = request else {
+        return Err(DecodeError::NonCanonical);
+    };
+    let inner = request.as_ref();
+    if matches!(
+        inner,
+        LifecycleRequest::Inspect { .. }
+            | LifecycleRequest::AcknowledgeInvocation { .. }
+            | LifecycleRequest::Authorized { .. }
+    ) {
+        return Err(DecodeError::NonCanonical);
+    }
+    validate_agent_authority_receipt(&admission.receipt)?;
+    let claim = &admission.receipt.claim;
+    let capability = inner
+        .required_capability()
+        .ok_or(DecodeError::NonCanonical)?;
+    if claim.space != runtime.space
+        || claim.agent != runtime.agent
+        || claim.capability != CapabilityId::named(capability)
+        || claim.operation != inner.commitment()
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    match inner {
+        LifecycleRequest::Create(config) => {
+            if config.validate().is_err()
+                || config.identity.space != runtime.space
+                || config.identity.agent != runtime.agent
+                || config.identity.owner != claim.principal
+                || config.identity.runtime_deployment != runtime.deployment
+                || config.identity.runtime_program != runtime.program
+                || config.identity.runtime_producer != runtime.producer
+                || config.runtime_package != runtime.package
+                || config.authority != claim.authority
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
+        LifecycleRequest::UpgradeRuntime {
+            from_deployment, ..
+        } if *from_deployment != runtime.deployment => return Err(DecodeError::NonCanonical),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_create_operation(operation: &ReplayOperation) -> bool {
+    matches!(
+        operation,
+        ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { request, .. }
+        } if matches!(request.as_ref(), LifecycleRequest::Create(_))
+    )
+}
+
+fn validate_agent_authority_receipt(receipt: &AgentAuthorityReceipt) -> Result<(), DecodeError> {
+    let claim = &receipt.claim;
+    if !claim.authority.validate()
+        || claim.space == SpaceId::ZERO
+        || claim.agent == AgentId::ZERO
+        || claim.principal == PrincipalId::ZERO
+        || claim.credential == CredentialId::ZERO
+        || claim.capability == CapabilityId::ZERO
+        || claim.operation == Hash::ZERO
+        || claim.sequence == 0
+        || claim.valid_until < claim.valid_from
+        || receipt.signature.len() != ED25519_SIGNATURE_BYTES
+        || receipt.encode().len() > MAX_AUTHORITY_RECEIPT_BYTES
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(())
+}
+
+fn validate_invocation_receipt(
+    runtime: &RuntimeBinding,
+    invocation: &ActorInvocation,
+    receipt: &ActorInvocationReceipt,
+) -> Result<(), DecodeError> {
+    invocation
+        .validate()
+        .map_err(|_| DecodeError::NonCanonical)?;
+    let claim = &receipt.claim;
+    let authenticated = matches!(
+        claim.auth.origin,
+        crate::service::Origin::Member(_) | crate::service::Origin::Actor(_)
+    );
+    if !claim.authority.validate()
+        || claim.space != runtime.space
+        || claim.agent != runtime.agent
+        || claim.principal == Some(PrincipalId::ZERO)
+        || claim.credential == Some(CredentialId::ZERO)
+        || authenticated != claim.principal.is_some()
+        || authenticated != claim.credential.is_some()
+        || claim.authorization != invocation.authorization_message()
+        || claim.auth != invocation.auth
+        || claim.principal != invocation.auth.principal
+        || claim.valid_until < claim.valid_from
+        || receipt.signature.len() != ED25519_SIGNATURE_BYTES
+        || receipt.encode().len() > MAX_AUTHORITY_RECEIPT_BYTES
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(())
+}
+
+fn encode_actor_invocation(encoder: &mut Encoder<'_>, invocation: &ActorInvocation) {
+    encoder.fixed(&invocation.invocation.0);
+    encoder.fixed(&invocation.actor.0);
+    encoder.fixed(&invocation.incarnation.0);
+    encoder.fixed(&invocation.deployment.0);
+    encoder.fixed(&invocation.program.0);
+    encoder.u8(encode_method_mode(invocation.mode));
+    encode_invocation_auth(encoder, &invocation.auth);
+    encoder.bytes(&invocation.message);
+    encoder.list(&invocation.availability, |encoder, blob| {
+        encode_blob_ref(encoder, &blob.reference);
+        encoder.bytes(&blob.bytes);
+    });
+    encoder.u64(invocation.gas);
+}
+
+fn decode_actor_invocation(decoder: &mut Decoder<'_>) -> Result<ActorInvocation, DecodeError> {
+    let invocation = crate::service::InvocationId(decoder.fixed()?);
+    let actor = ActorId(decoder.fixed()?);
+    let incarnation = Hash(decoder.fixed()?);
+    if incarnation == Hash::ZERO {
+        return Err(DecodeError::NonCanonical);
+    }
+    let deployment = DeploymentId(decoder.fixed()?);
+    let program = ProgramId(decoder.fixed()?);
+    let mode = decode_method_mode(decoder.u8()?)?;
+    let auth = decode_invocation_auth(decoder)?;
+    let message = bounded_bytes_ref(decoder, MAX_EXECUTION_MESSAGE_BYTES)?.to_vec();
+    let count = decoder.u32()? as usize;
+    if count > MAX_EXECUTION_BLOBS {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let mut availability = Vec::new();
+    let mut remaining = MAX_EXECUTION_AVAILABILITY_BYTES;
+    for _ in 0..count {
+        let reference = decode_blob_ref(decoder)?;
+        let bytes = bounded_bytes_ref(decoder, remaining)?;
+        remaining -= bytes.len();
+        availability
+            .try_reserve(1)
+            .map_err(|_| DecodeError::LimitExceeded)?;
+        availability.push(RuntimeBlob {
+            reference,
+            bytes: bytes.to_vec(),
+        });
+    }
+    let invocation = ActorInvocation {
+        invocation,
+        actor,
+        incarnation,
+        deployment,
+        program,
+        mode,
+        auth,
+        message,
+        availability,
+        gas: decoder.u64()?,
+    };
+    invocation
+        .validate()
+        .map_err(|_| DecodeError::NonCanonical)?;
+    Ok(invocation)
+}
+
+fn encode_invocation_auth(encoder: &mut Encoder<'_>, auth: &ActorInvocationAuth) {
+    crate::service::encode_origin(encoder, auth.origin);
+    encoder.option(&auth.principal, |encoder, principal| {
+        encoder.fixed(&principal.0)
+    });
+    encoder.option(&auth.origin_service, crate::service::encode_service);
+    encoder.option(&auth.space_role, |encoder, role| encoder.u8(*role));
+    encoder.option(&auth.actor_role, |encoder, role| encoder.u8(*role));
+    encoder.option(&auth.capability, |encoder, capability| {
+        encoder.fixed(&capability.0)
+    });
+}
+
+fn decode_invocation_auth(decoder: &mut Decoder<'_>) -> Result<ActorInvocationAuth, DecodeError> {
+    let auth = ActorInvocationAuth {
+        origin: crate::service::decode_origin(decoder)?,
+        principal: decoder.option(|decoder| Ok(PrincipalId(decoder.fixed()?)))?,
+        origin_service: decoder.option(crate::service::decode_service)?,
+        space_role: decoder.option(Decoder::u8)?,
+        actor_role: decoder.option(Decoder::u8)?,
+        capability: decoder.option(|decoder| Ok(CapabilityId(decoder.fixed()?)))?,
+    };
+    auth.validate()
+        .then_some(auth)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+const fn encode_method_mode(mode: MethodMode) -> u8 {
+    match mode {
+        MethodMode::Query => 0,
+        MethodMode::LinearizableQuery => 1,
+        MethodMode::LocalQuery => 2,
+        MethodMode::Linear => 3,
+        MethodMode::Merge => 4,
+        MethodMode::Local => 5,
+    }
+}
+
+fn decode_method_mode(value: u8) -> Result<MethodMode, DecodeError> {
+    match value {
+        0 => Ok(MethodMode::Query),
+        1 => Ok(MethodMode::LinearizableQuery),
+        2 => Ok(MethodMode::LocalQuery),
+        3 => Ok(MethodMode::Linear),
+        4 => Ok(MethodMode::Merge),
+        5 => Ok(MethodMode::Local),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn encode_lane_cursor(encoder: &mut Encoder<'_>, cursor: &LaneCursor) {
+    match cursor {
+        LaneCursor::Ordered { base } => {
+            encoder.u8(0);
+            encode_ordered_base(encoder, *base);
+        }
+        LaneCursor::Merge { frontier } => {
+            encoder.u8(1);
+            encoder.fixed(&frontier.0);
+        }
+        LaneCursor::Local {
+            node,
+            revision,
+            head,
+        } => {
+            encoder.u8(2);
+            encoder.fixed(&node.0);
+            encoder.u64(*revision);
+            encoder.option(head, |encoder, head| encoder.fixed(&head.0));
+        }
+    }
+}
+
+fn decode_lane_cursor(decoder: &mut Decoder<'_>) -> Result<LaneCursor, DecodeError> {
+    match decoder.u8()? {
+        0 => Ok(LaneCursor::Ordered {
+            base: decode_ordered_base(decoder)?,
+        }),
+        1 => Ok(LaneCursor::Merge {
+            frontier: MergeFrontierId(decoder.fixed()?),
+        }),
+        2 => Ok(LaneCursor::Local {
+            node: NodeId(decoder.fixed()?),
+            revision: decoder.u64()?,
+            head: decoder.option(|decoder| Ok(LocalEntryId(decoder.fixed()?)))?,
+        }),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn decode_persisted_lane(value: u8) -> Result<PersistedLane, DecodeError> {
+    match value {
+        0 => Ok(PersistedLane::Control),
+        1 => Ok(PersistedLane::Linear),
+        2 => Ok(PersistedLane::Merge),
+        3 => Ok(PersistedLane::Local),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn encode_invocation_scope(encoder: &mut Encoder<'_>, scope: InvocationOwnershipScope) {
+    match scope {
+        InvocationOwnershipScope::Ordered => encoder.u8(0),
+        InvocationOwnershipScope::Merge => encoder.u8(1),
+        InvocationOwnershipScope::Local(node) => {
+            encoder.u8(2);
+            encoder.fixed(&node.0);
+        }
+    }
+}
+
+fn decode_invocation_scope(
+    decoder: &mut Decoder<'_>,
+) -> Result<InvocationOwnershipScope, DecodeError> {
+    let scope = match decoder.u8()? {
+        0 => InvocationOwnershipScope::Ordered,
+        1 => InvocationOwnershipScope::Merge,
+        2 => InvocationOwnershipScope::Local(NodeId(decoder.fixed()?)),
+        _ => return Err(DecodeError::InvalidTag),
+    };
+    scope.validate()?;
+    Ok(scope)
+}
+
+fn encode_invocation_owner(encoder: &mut Encoder<'_>, owner: InvocationOwner) {
+    encode_invocation_scope(encoder, owner.scope);
+    encoder.fixed(&owner.request_commitment.0);
+    encoder.fixed(&owner.first_input.0);
+    encoder.u8(owner.lane as u8);
+    encoder.option(&owner.node, |encoder, node| encoder.fixed(&node.0));
+    encoder.u8(owner.disposition as u8);
+    encoder.u8(owner.result_state as u8);
+}
+
+fn decode_invocation_owner(decoder: &mut Decoder<'_>) -> Result<InvocationOwner, DecodeError> {
+    let owner = InvocationOwner {
+        scope: decode_invocation_scope(decoder)?,
+        request_commitment: Hash(decoder.fixed()?),
+        first_input: ReplayInputId(decoder.fixed()?),
+        lane: decode_persisted_lane(decoder.u8()?)?,
+        node: decoder.option(|decoder| Ok(NodeId(decoder.fixed()?)))?,
+        disposition: match decoder.u8()? {
+            0 => InvocationDisposition::Applied,
+            1 => InvocationDisposition::Rejected,
+            2 => InvocationDisposition::Forbidden,
+            3 => InvocationDisposition::Panicked,
+            4 => InvocationDisposition::OutOfGas,
+            _ => return Err(DecodeError::InvalidTag),
+        },
+        result_state: match decoder.u8()? {
+            0 => InvocationResultState::Retained,
+            1 => InvocationResultState::Acknowledged,
+            2 => InvocationResultState::Terminal,
+            _ => return Err(DecodeError::InvalidTag),
+        },
+    };
+    owner.validate()?;
+    Ok(owner)
+}
+
+fn encode_blob_ref(encoder: &mut Encoder<'_>, reference: &BlobRef) {
+    encoder.fixed(&reference.hash.0);
+    encoder.u64(reference.len);
+}
+
+fn decode_blob_ref(decoder: &mut Decoder<'_>) -> Result<BlobRef, DecodeError> {
+    Ok(BlobRef {
+        hash: Hash(decoder.fixed()?),
+        len: decoder.u64()?,
+    })
+}
+
+fn valid_blob_ref(reference: &BlobRef, allow_empty: bool, maximum: u64) -> bool {
+    reference.hash != Hash::ZERO && reference.len <= maximum && (allow_empty || reference.len != 0)
+}
+
+fn bounded_bytes_ref<'a>(
+    decoder: &mut Decoder<'a>,
+    maximum: usize,
+) -> Result<&'a [u8], DecodeError> {
+    let len = decoder.u32()? as usize;
+    if len > maximum {
+        return Err(DecodeError::LimitExceeded);
+    }
+    decoder.take(len)
+}
+
+fn decode_fixed_id_list<I: JournalObjectId>(
+    decoder: &mut Decoder<'_>,
+    maximum: usize,
+) -> Result<Vec<I>, DecodeError> {
+    let count = decoder.u32()? as usize;
+    if count > maximum || count > decoder.remaining() / 32 {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let mut values = Vec::new();
+    for _ in 0..count {
+        values
+            .try_reserve(1)
+            .map_err(|_| DecodeError::LimitExceeded)?;
+        values.push(I::from_bytes(decoder.fixed()?));
+    }
+    Ok(values)
+}
+
+fn strictly_increasing<T: Ord>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn max_fixed_items(
+    decoder: &Decoder<'_>,
+    claimed: usize,
+    encoded_item_bytes: usize,
+    complete_maximum: usize,
+) -> Result<usize, DecodeError> {
+    if claimed
+        .checked_mul(encoded_item_bytes)
+        .is_none_or(|bytes| bytes > decoder.remaining())
+    {
+        return Err(DecodeError::LimitExceeded);
+    }
+    Ok((complete_maximum.saturating_sub(SERVICE_WIRE_HEADER_BYTES)) / encoded_item_bytes)
+}
+
+fn enforce_complete_bound(
+    decoder: &Decoder<'_>,
+    complete_maximum: usize,
+) -> Result<(), DecodeError> {
+    if decoder
+        .remaining()
+        .checked_add(SERVICE_WIRE_HEADER_BYTES)
+        .is_none_or(|len| len > complete_maximum)
+    {
+        return Err(DecodeError::LimitExceeded);
+    }
+    Ok(())
+}
+
+fn validate_encoded_bound<T: ServiceWire>(
+    value: &T,
+    complete_maximum: usize,
+) -> Result<(), DecodeError> {
+    (value.encode().len() <= complete_maximum)
+        .then_some(())
+        .ok_or(DecodeError::LimitExceeded)
+}
+
+fn content_id<T: ServiceWire>(domain: &[u8], value: &T) -> [u8; 32] {
+    Hash::digest(domain, &[&value.encode()]).0
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{boxed::Box, vec};
+
+    use super::*;
+    use crate::agent::authority::{
+        ActorInvocationClaim, AgentAuthorityBinding, AgentAuthorityClaim, ed25519_public_key_wire,
+    };
+    use crate::agent::contract::RuntimePackageContract;
+    use crate::agent::{
+        AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LaneSet,
+        LifecycleAuthorityAdmission, ReplicaRole, RuntimeCapabilities,
+    };
+    use crate::service::{InvocationId, Origin};
+
+    fn authority_binding() -> AgentAuthorityBinding {
+        let public_key = ed25519_public_key_wire([0x41; 32]);
+        AgentAuthorityBinding {
+            agent: AgentId([0xa1; 32]),
+            actor: ActorId([0xa2; 32]),
+            deployment: DeploymentId([0xa3; 32]),
+            program: ProgramId([0xa4; 32]),
+            producer: ProducerId::of_public_key(&public_key),
+            public_key,
+        }
+    }
+
+    fn config() -> AgentConfig {
+        let space = SpaceId([1; 32]);
+        let owner = PrincipalId([2; 32]);
+        let creation_nonce = Hash([3; 32]);
+        let agent = AgentId::derive(space, owner, &creation_nonce.0);
+        AgentConfig {
+            identity: AgentIdentity {
+                space,
+                agent,
+                owner,
+                profile: AgentProfile::Local,
+                runtime_deployment: DeploymentId([4; 32]),
+                runtime_program: ProgramId([5; 32]),
+                runtime_producer: ProducerId([6; 32]),
+            },
+            creation_nonce,
+            authority: authority_binding(),
+            runtime_package: BlobRef::of_bytes(b"runtime-package"),
+            runtime_contract: RuntimePackageContract::canonical(),
+            capabilities: RuntimeCapabilities {
+                lanes: LaneSet::ALL,
+                scheduling: false,
+                proofs: false,
+                max_actors: 4096,
+            },
+            replicas: vec![AgentReplica {
+                node: NodeId([7; 32]),
+                principal: owner,
+                role: ReplicaRole::Voter,
+            }],
+        }
+    }
+
+    fn runtime_binding() -> RuntimeBinding {
+        let config = config();
+        RuntimeBinding {
+            space: config.identity.space,
+            agent: config.identity.agent,
+            deployment: config.identity.runtime_deployment,
+            program: config.identity.runtime_program,
+            producer: config.identity.runtime_producer,
+            package: config.runtime_package,
+            runtime_abi: super::super::RUNTIME_ABI_ID,
+            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+        }
+    }
+
+    fn create_input() -> ReplayInput {
+        let runtime = runtime_binding();
+        let inner = LifecycleRequest::Create(config());
+        let claim = AgentAuthorityClaim {
+            authority: authority_binding(),
+            space: runtime.space,
+            agent: runtime.agent,
+            principal: config().identity.owner,
+            credential: CredentialId([8; 32]),
+            capability: CapabilityId::named("agent.create.local"),
+            operation: inner.commitment(),
+            sequence: 1,
+            valid_from: 10,
+            valid_until: 20,
+        };
+        ReplayInput {
+            runtime,
+            operation: ReplayOperation::Management {
+                request: LifecycleRequest::Authorized {
+                    admission: LifecycleAuthorityAdmission {
+                        receipt: AgentAuthorityReceipt {
+                            claim,
+                            signature: vec![9; ED25519_SIGNATURE_BYTES],
+                        },
+                        observed_slot: 15,
+                    },
+                    request: Box::new(inner),
+                },
+            },
+        }
+    }
+
+    fn genesis_admission() -> SystemAgentGenesisAdmissionId {
+        SystemAgentGenesisAdmissionId::from_bytes([0xad; 32])
+    }
+
+    fn invocation(mode: MethodMode) -> ActorInvocation {
+        ActorInvocation {
+            invocation: InvocationId([0x11; 32]),
+            actor: ActorId([0x12; 32]),
+            incarnation: Hash([0x15; 32]),
+            deployment: DeploymentId([0x13; 32]),
+            program: ProgramId([0x14; 32]),
+            mode,
+            auth: ActorInvocationAuth::anonymous(),
+            message: vec![1, 2, 3],
+            availability: Vec::new(),
+            gas: 1_000,
+        }
+    }
+
+    fn invocation_receipt(invocation: &ActorInvocation) -> ActorInvocationReceipt {
+        let runtime = runtime_binding();
+        ActorInvocationReceipt {
+            claim: ActorInvocationClaim {
+                authority: authority_binding(),
+                space: runtime.space,
+                agent: runtime.agent,
+                principal: None,
+                credential: None,
+                authorization: invocation.authorization_message(),
+                auth: invocation.auth.clone(),
+                valid_from: 10,
+                valid_until: 20,
+            },
+            signature: vec![0x22; ED25519_SIGNATURE_BYTES],
+        }
+    }
+
+    fn replay_input(mode: MethodMode, acknowledge: bool) -> ReplayInput {
+        let invocation = invocation(mode);
+        let authority = invocation_receipt(&invocation);
+        ReplayInput {
+            runtime: runtime_binding(),
+            operation: if acknowledge {
+                ReplayOperation::Acknowledge {
+                    invocation,
+                    authority,
+                }
+            } else {
+                ReplayOperation::Invoke {
+                    invocation,
+                    authority,
+                    observed_slot: 15,
+                }
+            },
+        }
+    }
+
+    fn management_input(inner: LifecycleRequest, capability: &str) -> ReplayInput {
+        let runtime = runtime_binding();
+        let claim = AgentAuthorityClaim {
+            authority: authority_binding(),
+            space: runtime.space,
+            agent: runtime.agent,
+            principal: config().identity.owner,
+            credential: CredentialId([8; 32]),
+            capability: CapabilityId::named(capability),
+            operation: inner.commitment(),
+            sequence: 2,
+            valid_from: 10,
+            valid_until: 20,
+        };
+        ReplayInput {
+            runtime,
+            operation: ReplayOperation::Management {
+                request: LifecycleRequest::Authorized {
+                    admission: LifecycleAuthorityAdmission {
+                        receipt: AgentAuthorityReceipt {
+                            claim,
+                            signature: vec![9; ED25519_SIGNATURE_BYTES],
+                        },
+                        observed_slot: 15,
+                    },
+                    request: Box::new(inner),
+                },
+            },
+        }
+    }
+
+    fn empty_frontier(genesis: AgentJournalGenesisId) -> MergeFrontierId {
+        MergeFrontier {
+            genesis,
+            events: Vec::new(),
+        }
+        .id()
+    }
+
+    fn empty_index(
+        genesis: AgentJournalGenesisId,
+        scope: InvocationOwnershipScope,
+    ) -> InvocationIndexId {
+        InvocationIndexManifest::empty(genesis, scope).id()
+    }
+
+    fn ownership_leaf(
+        genesis: AgentJournalGenesisId,
+        scope: InvocationOwnershipScope,
+        lane: PersistedLane,
+        node: Option<NodeId>,
+    ) -> InvocationOwnershipLeaf {
+        InvocationOwnershipLeaf {
+            genesis,
+            key: InvocationOwnershipKey {
+                scope,
+                invocation: InvocationId([0xb1; 32]),
+            },
+            owner: InvocationOwner {
+                scope,
+                request_commitment: Hash([0xb2; 32]),
+                first_input: replay_input(MethodMode::Linear, false).id(),
+                lane,
+                node,
+                disposition: InvocationDisposition::Applied,
+                result_state: InvocationResultState::Retained,
+            },
+        }
+    }
+
+    fn roundtrip<T>(value: &T)
+    where
+        T: ServiceWire + PartialEq + fmt::Debug,
+    {
+        let decoded = T::decode(&value.encode());
+        assert_eq!(decoded.as_ref(), Ok(value));
+    }
+
+    #[test]
+    fn invocation_ownership_leaves_bind_genesis_scope_and_first_input() {
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        }
+        .id();
+        let ordered = ownership_leaf(
+            genesis,
+            InvocationOwnershipScope::Ordered,
+            PersistedLane::Linear,
+            None,
+        );
+        ordered.validate().unwrap();
+        roundtrip(&ordered);
+
+        let merge = ownership_leaf(
+            genesis,
+            InvocationOwnershipScope::Merge,
+            PersistedLane::Merge,
+            None,
+        );
+        merge.validate().unwrap();
+        assert_ne!(ordered.hash(), merge.hash());
+
+        let other_genesis = InvocationOwnershipLeaf {
+            genesis: AgentJournalGenesisId([0xc1; 32]),
+            ..ordered
+        };
+        other_genesis.validate().unwrap();
+        assert_ne!(other_genesis.hash(), ordered.hash());
+
+        let mut mismatched_scope = merge;
+        mismatched_scope.owner.scope = InvocationOwnershipScope::Ordered;
+        assert_eq!(mismatched_scope.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn invocation_owner_result_states_are_canonical_tombstones() {
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        }
+        .id();
+        let retained = ownership_leaf(
+            genesis,
+            InvocationOwnershipScope::Ordered,
+            PersistedLane::Control,
+            None,
+        );
+        assert!(!retained.owner.result_state.is_tombstone());
+
+        let mut acknowledged = retained;
+        acknowledged.owner.result_state = InvocationResultState::Acknowledged;
+        acknowledged.validate().unwrap();
+        assert!(acknowledged.owner.result_state.is_tombstone());
+
+        let mut terminal = retained;
+        terminal.owner.disposition = InvocationDisposition::Forbidden;
+        terminal.owner.result_state = InvocationResultState::Terminal;
+        terminal.validate().unwrap();
+        assert!(terminal.owner.result_state.is_tombstone());
+
+        let mut terminal_with_result = terminal;
+        terminal_with_result.owner.result_state = InvocationResultState::Retained;
+        assert_eq!(
+            terminal_with_result.validate(),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut applied_tombstone = retained;
+        applied_tombstone.owner.result_state = InvocationResultState::Terminal;
+        assert_eq!(applied_tombstone.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn empty_invocation_indexes_are_explicit_and_scope_separated() {
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        }
+        .id();
+        let node = NodeId([7; 32]);
+        let ordered = InvocationIndexManifest::empty(genesis, InvocationOwnershipScope::Ordered);
+        let merge = InvocationIndexManifest::empty(genesis, InvocationOwnershipScope::Merge);
+        let local = InvocationIndexManifest::empty(genesis, InvocationOwnershipScope::Local(node));
+        for manifest in [ordered, merge, local] {
+            manifest.validate().unwrap();
+            roundtrip(&manifest);
+            assert_ne!(manifest.id(), InvocationIndexId::ZERO);
+        }
+        assert_ne!(ordered.id(), merge.id());
+        assert_ne!(merge.id(), local.id());
+
+        let missing_root = InvocationIndexManifest {
+            entries: 1,
+            ..ordered
+        };
+        assert_eq!(missing_root.validate(), Err(DecodeError::NonCanonical));
+
+        let empty_with_root = InvocationIndexManifest {
+            root: Some(InvocationIndexNodeId([0xd1; 32])),
+            ..ordered
+        };
+        assert_eq!(empty_with_root.validate(), Err(DecodeError::NonCanonical));
+
+        let excess_tombstones = InvocationIndexManifest {
+            root: Some(InvocationIndexNodeId([0xd1; 32])),
+            entries: 1,
+            tombstones: 2,
+            ..ordered
+        };
+        assert_eq!(excess_tombstones.validate(), Err(DecodeError::NonCanonical));
+
+        let invalid_local =
+            InvocationIndexManifest::empty(genesis, InvocationOwnershipScope::Local(NodeId::ZERO));
+        assert_eq!(invalid_local.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn replay_inputs_roundtrip_and_bind_the_current_runtime() {
+        let create = create_input();
+        create.validate().unwrap();
+        roundtrip(&create);
+
+        let mut wrong_runtime = create.clone();
+        wrong_runtime.runtime.runtime_abi = Hash([0xff; 32]);
+        assert_eq!(wrong_runtime.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn receipt_window_is_execution_state_not_wire_canonicality() {
+        let mut invoke = replay_input(MethodMode::Linear, false);
+        let ReplayOperation::Invoke { observed_slot, .. } = &mut invoke.operation else {
+            unreachable!();
+        };
+        *observed_slot = 21;
+        invoke.validate().unwrap();
+        roundtrip(&invoke);
+
+        let mut management = management_input(
+            LifecycleRequest::Suspend {
+                actor: ActorId([0x31; 32]),
+                expected_deployment: DeploymentId([0x32; 32]),
+            },
+            "actor.lifecycle",
+        );
+        let ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { admission, .. },
+        } = &mut management.operation
+        else {
+            unreachable!();
+        };
+        admission.observed_slot = 21;
+        management.validate().unwrap();
+        roundtrip(&management);
+    }
+
+    #[test]
+    fn replay_input_codec_rejects_a_zero_actor_incarnation() {
+        let mut input = replay_input(MethodMode::Linear, false);
+        let ReplayOperation::Invoke { invocation, .. } = &mut input.operation else {
+            unreachable!();
+        };
+        invocation.incarnation = Hash::ZERO;
+        assert_eq!(
+            ReplayInput::decode(&input.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn invocation_and_acknowledgement_derive_the_same_result_lane() {
+        for (mode, lane) in [
+            (MethodMode::Query, PersistedLane::Control),
+            (MethodMode::LinearizableQuery, PersistedLane::Linear),
+            (MethodMode::Linear, PersistedLane::Linear),
+            (MethodMode::Merge, PersistedLane::Merge),
+            (MethodMode::LocalQuery, PersistedLane::Local),
+            (MethodMode::Local, PersistedLane::Local),
+        ] {
+            let invoke = replay_input(mode, false);
+            let acknowledge = replay_input(mode, true);
+            assert_eq!(invoke.persisted_lane(), lane);
+            assert_eq!(acknowledge.persisted_lane(), lane);
+            invoke.validate().unwrap();
+            acknowledge.validate().unwrap();
+            roundtrip(&invoke);
+            roundtrip(&acknowledge);
+        }
+    }
+
+    #[test]
+    fn acknowledgement_retains_the_exact_original_invocation_and_receipt() {
+        let mut acknowledge = replay_input(MethodMode::Merge, true);
+        let ReplayOperation::Acknowledge {
+            invocation,
+            authority,
+        } = &mut acknowledge.operation
+        else {
+            unreachable!();
+        };
+        invocation.message.push(4);
+        let _ = authority;
+        assert_eq!(acknowledge.validate(), Err(DecodeError::NonCanonical));
+
+        let ReplayOperation::Acknowledge { authority, .. } = &mut acknowledge.operation else {
+            unreachable!();
+        };
+        authority.claim.authorization = Hash([0x55; 32]);
+        assert_eq!(acknowledge.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn read_only_or_unadmitted_management_work_is_not_journal_input() {
+        let mut input = create_input();
+        input.operation = ReplayOperation::Management {
+            request: LifecycleRequest::Inspect {
+                after: None,
+                limit: 1,
+            },
+        };
+        assert_eq!(input.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn genesis_binds_the_authorized_create_input() {
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        };
+        genesis.validate().unwrap();
+        roundtrip(&genesis);
+        let ReplayOperation::Management { request: outer } = &genesis.create.operation else {
+            unreachable!();
+        };
+        let LifecycleRequest::Authorized { request, .. } = outer else {
+            unreachable!();
+        };
+        assert_eq!(
+            genesis.genesis_intent().unwrap(),
+            GenesisIntentId::from_commitments(genesis.runtime().commitment(), request.commitment())
+                .unwrap()
+        );
+        assert_eq!(genesis.genesis_authority_sequence(), Ok(1));
+
+        let mut wrong = genesis.clone();
+        wrong.create.runtime.program = ProgramId([0xee; 32]);
+        assert_eq!(wrong.validate(), Err(DecodeError::NonCanonical));
+
+        let mut missing_admission = genesis.clone();
+        missing_admission.admission = SystemAgentGenesisAdmissionId::ZERO;
+        assert_eq!(missing_admission.validate(), Err(DecodeError::NonCanonical));
+
+        let mut alternate_admission = genesis.clone();
+        alternate_admission.admission = SystemAgentGenesisAdmissionId::from_bytes([0xae; 32]);
+        alternate_admission.validate().unwrap();
+        assert_ne!(alternate_admission.id(), genesis.id());
+
+        let mut alternate_runtime = genesis.runtime().clone();
+        alternate_runtime.package = BlobRef::of_bytes(b"alternate-runtime");
+        assert_ne!(
+            alternate_runtime.commitment(),
+            genesis.runtime().commitment()
+        );
+    }
+
+    #[test]
+    fn physical_record_classes_reject_the_wrong_lane() {
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        }
+        .id();
+        let ordered = OrderedEntry {
+            genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: empty_frontier(genesis),
+            merge_seal: None,
+            input: replay_input(MethodMode::Linear, false),
+        };
+        ordered.validate().unwrap();
+        roundtrip(&ordered);
+
+        let wrong_ordered = OrderedEntry {
+            input: replay_input(MethodMode::Merge, false),
+            ..ordered.clone()
+        };
+        assert_eq!(wrong_ordered.validate(), Err(DecodeError::NonCanonical));
+
+        let local = LocalEntry {
+            genesis,
+            node: NodeId([7; 32]),
+            revision: 1,
+            parent: None,
+            ordered_base: OrderedBase::post_genesis(),
+            merge_frontier: empty_frontier(genesis),
+            input: replay_input(MethodMode::Local, false),
+        };
+        local.validate().unwrap();
+        roundtrip(&local);
+    }
+
+    #[test]
+    fn every_post_genesis_management_entry_requires_a_merge_fence() {
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        }
+        .id();
+        let input = management_input(
+            LifecycleRequest::Suspend {
+                actor: ActorId([0x31; 32]),
+                expected_deployment: DeploymentId([0x32; 32]),
+            },
+            "actor.lifecycle",
+        );
+        let mut entry = OrderedEntry {
+            genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: empty_frontier(genesis),
+            merge_seal: None,
+            input,
+        };
+        assert_eq!(entry.validate(), Err(DecodeError::NonCanonical));
+        entry.merge_seal = Some(MergeSealId([0x33; 32]));
+        entry.validate().unwrap();
+        roundtrip(&entry);
+
+        let create = OrderedEntry {
+            input: create_input(),
+            ..entry
+        };
+        assert_eq!(create.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn merge_parents_and_frontiers_are_strictly_bounded_and_sorted() {
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        }
+        .id();
+        let event = MergeEvent {
+            genesis,
+            author: NodeId([7; 32]),
+            ordered_base: OrderedBase::post_genesis(),
+            causal_height: 1,
+            parents: Vec::new(),
+            input: replay_input(MethodMode::Merge, false),
+            signature: vec![3; ED25519_SIGNATURE_BYTES],
+        };
+        event.validate().unwrap();
+        roundtrip(&event);
+
+        let event_id = event.id();
+        let frontier = MergeFrontier {
+            genesis,
+            events: vec![event_id],
+        };
+        frontier.validate().unwrap();
+        roundtrip(&frontier);
+
+        let duplicate = MergeFrontier {
+            genesis,
+            events: vec![event_id, event_id],
+        };
+        assert_eq!(duplicate.validate(), Err(DecodeError::NonCanonical));
+
+        let oversized = MergeFrontier {
+            genesis,
+            events: (0..=MAX_MERGE_FRONTIER_ENTRIES)
+                .map(|index| MergeEventId([(index & 0xff) as u8; 32]))
+                .collect(),
+        };
+        assert_eq!(oversized.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn derived_manifests_roundtrip_with_explicit_lane_cursors() {
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        }
+        .id();
+        let ordered_head = OrderedEntryId([1; 32]);
+        let lane_state = LaneStateManifest {
+            genesis,
+            runtime: runtime_binding(),
+            lane: PersistedLane::Control,
+            cursor: LaneCursor::Ordered {
+                base: OrderedBase {
+                    index: 1,
+                    head: Some(ordered_head),
+                },
+            },
+            state: BlobRef::of_bytes(b"control-state"),
+        };
+        lane_state.validate().unwrap();
+        roundtrip(&lane_state);
+
+        let closure = ArtifactClosure {
+            genesis,
+            artifacts: vec![BlobRef::of_bytes(b"artifact")],
+        };
+        closure.validate().unwrap();
+        roundtrip(&closure);
+
+        let checkpoint = CheckpointManifest {
+            genesis,
+            admission: genesis_admission(),
+            runtime: runtime_binding(),
+            publication_revision: 1,
+            ordered_head: Some(ordered_head),
+            ordered_index: 1,
+            merge_frontier: empty_frontier(genesis),
+            merge_fence: OrderedBase::post_genesis(),
+            merge_seal: None,
+            ordered_invocations: empty_index(genesis, InvocationOwnershipScope::Ordered),
+            merge_invocations: empty_index(genesis, InvocationOwnershipScope::Merge),
+            lanes: vec![CheckpointLane {
+                lane: PersistedLane::Control,
+                node: None,
+                state: lane_state.id(),
+                invocations: None,
+            }],
+            artifacts: closure.id(),
+        };
+        checkpoint.validate().unwrap();
+        roundtrip(&checkpoint);
+    }
+
+    #[test]
+    fn post_genesis_empty_agent_checkpoint_is_representable() {
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        }
+        .id();
+        let node = NodeId([0x71; 32]);
+        let control = LaneStateManifest {
+            genesis,
+            runtime: runtime_binding(),
+            lane: PersistedLane::Control,
+            cursor: LaneCursor::Ordered {
+                base: OrderedBase::post_genesis(),
+            },
+            state: BlobRef::of_bytes(b"post-genesis-control"),
+        };
+        control.validate().unwrap();
+        roundtrip(&control);
+
+        let local = LaneStateManifest {
+            genesis,
+            runtime: runtime_binding(),
+            lane: PersistedLane::Local,
+            cursor: LaneCursor::Local {
+                node,
+                revision: 0,
+                head: None,
+            },
+            state: BlobRef::of_bytes(b"post-genesis-local"),
+        };
+        local.validate().unwrap();
+        roundtrip(&local);
+
+        let mut noncanonical_local = local.clone();
+        noncanonical_local.cursor = LaneCursor::Local {
+            node,
+            revision: 0,
+            head: Some(LocalEntryId([0x72; 32])),
+        };
+        assert_eq!(
+            noncanonical_local.validate(),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let closure = ArtifactClosure {
+            genesis,
+            artifacts: vec![runtime_binding().package],
+        };
+        closure.validate().unwrap();
+        let checkpoint = CheckpointManifest {
+            genesis,
+            admission: genesis_admission(),
+            runtime: runtime_binding(),
+            publication_revision: 0,
+            ordered_head: None,
+            ordered_index: 0,
+            merge_frontier: empty_frontier(genesis),
+            merge_fence: OrderedBase::post_genesis(),
+            merge_seal: None,
+            ordered_invocations: empty_index(genesis, InvocationOwnershipScope::Ordered),
+            merge_invocations: empty_index(genesis, InvocationOwnershipScope::Merge),
+            lanes: vec![CheckpointLane {
+                lane: PersistedLane::Control,
+                node: None,
+                state: control.id(),
+                invocations: None,
+            }],
+            artifacts: closure.id(),
+        };
+        checkpoint.validate().unwrap();
+        roundtrip(&checkpoint);
+    }
+
+    #[test]
+    fn checkpoint_lane_keys_are_unique_and_local_state_is_node_scoped() {
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        }
+        .id();
+        let base = CheckpointManifest {
+            genesis,
+            admission: genesis_admission(),
+            runtime: runtime_binding(),
+            publication_revision: 1,
+            ordered_head: Some(OrderedEntryId([1; 32])),
+            ordered_index: 1,
+            merge_frontier: empty_frontier(genesis),
+            merge_fence: OrderedBase::post_genesis(),
+            merge_seal: None,
+            ordered_invocations: empty_index(genesis, InvocationOwnershipScope::Ordered),
+            merge_invocations: empty_index(genesis, InvocationOwnershipScope::Merge),
+            lanes: vec![CheckpointLane {
+                lane: PersistedLane::Control,
+                node: None,
+                state: LaneStateId([2; 32]),
+                invocations: None,
+            }],
+            artifacts: ArtifactClosureId([3; 32]),
+        };
+        let mut duplicate = base.clone();
+        duplicate.lanes.push(duplicate.lanes[0].clone());
+        assert_eq!(duplicate.validate(), Err(DecodeError::NonCanonical));
+
+        let mut scoped_local = base.clone();
+        scoped_local.lanes.push(CheckpointLane {
+            lane: PersistedLane::Local,
+            node: Some(NodeId([7; 32])),
+            state: LaneStateId([4; 32]),
+            invocations: Some(empty_index(
+                genesis,
+                InvocationOwnershipScope::Local(NodeId([7; 32])),
+            )),
+        });
+        scoped_local.validate().unwrap();
+        roundtrip(&scoped_local);
+
+        let mut unscoped_local = base;
+        unscoped_local.lanes.push(CheckpointLane {
+            lane: PersistedLane::Local,
+            node: None,
+            state: LaneStateId([4; 32]),
+            invocations: Some(empty_index(
+                genesis,
+                InvocationOwnershipScope::Local(NodeId([7; 32])),
+            )),
+        });
+        assert_eq!(unscoped_local.validate(), Err(DecodeError::NonCanonical));
+
+        let mut local_without_index = unscoped_local.clone();
+        let local = local_without_index.lanes.last_mut().unwrap();
+        local.node = Some(NodeId([7; 32]));
+        local.invocations = None;
+        assert_eq!(
+            local_without_index.validate(),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut indexed_control = unscoped_local;
+        indexed_control.lanes.pop();
+        indexed_control.lanes[0].invocations =
+            Some(empty_index(genesis, InvocationOwnershipScope::Ordered));
+        assert_eq!(indexed_control.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn heads_are_predecessor_bound_cas_envelopes() {
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        }
+        .id();
+        let initial = JournalHeads::initial(
+            genesis,
+            genesis_admission(),
+            NodeId([7; 32]),
+            empty_frontier(genesis),
+            runtime_binding(),
+        );
+        initial.validate().unwrap();
+        roundtrip(&initial);
+        assert_eq!(initial.runtime, runtime_binding());
+        assert_eq!(
+            initial.ordered_invocations,
+            empty_index(genesis, InvocationOwnershipScope::Ordered)
+        );
+        assert_eq!(
+            initial.merge_invocations,
+            empty_index(genesis, InvocationOwnershipScope::Merge)
+        );
+        assert_eq!(
+            initial.local_invocations,
+            empty_index(genesis, InvocationOwnershipScope::Local(NodeId([7; 32])))
+        );
+
+        let next = JournalHeads {
+            publication_revision: 1,
+            previous: Some(initial.id()),
+            ordered_head: Some(OrderedEntryId([1; 32])),
+            ordered_index: 1,
+            ..initial.clone()
+        };
+        initial.validate_successor(&next).unwrap();
+        roundtrip(&next);
+
+        let mut wrong = next;
+        wrong.previous = Some(JournalHeadsId([0xff; 32]));
+        assert_eq!(
+            initial.validate_successor(&wrong),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut wrong_runtime = JournalHeads {
+            previous: Some(initial.id()),
+            ..initial.clone()
+        };
+        wrong_runtime.publication_revision = 1;
+        wrong_runtime.runtime.agent = AgentId([0xee; 32]);
+        assert_eq!(
+            initial.validate_successor(&wrong_runtime),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut wrong_admission = JournalHeads {
+            previous: Some(initial.id()),
+            ..initial.clone()
+        };
+        wrong_admission.publication_revision = 1;
+        wrong_admission.admission = SystemAgentGenesisAdmissionId::from_bytes([0xaf; 32]);
+        assert_eq!(
+            initial.validate_successor(&wrong_admission),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn object_id_domains_are_stable_and_separate() {
+        let input = replay_input(MethodMode::Linear, false);
+        assert_eq!(input.id(), input.clone().id());
+
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        };
+        let ordered = OrderedEntry {
+            genesis: genesis.id(),
+            index: 1,
+            parent: None,
+            merge_frontier: empty_frontier(genesis.id()),
+            merge_seal: None,
+            input,
+        };
+        assert_ne!(genesis.id().0, ordered.id().0);
+    }
+
+    #[test]
+    fn decode_rejects_trailing_or_over_limit_envelopes() {
+        let input = replay_input(MethodMode::Linear, false);
+        let mut trailing = input.encode();
+        trailing.push(0);
+        assert_eq!(
+            ReplayInput::decode(&trailing),
+            Err(DecodeError::TrailingBytes)
+        );
+
+        let mut oversized = input.encode();
+        oversized.resize(MAX_REPLAY_INPUT_BYTES + 1, 0);
+        assert_eq!(
+            ReplayInput::decode(&oversized),
+            Err(DecodeError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn clean_platform_header_rejects_previous_generation_bytes() {
+        let input = replay_input(MethodMode::Linear, false);
+        let mut bytes = input.encode();
+        bytes[4] ^= 1;
+        assert_eq!(
+            ReplayInput::decode(&bytes),
+            Err(DecodeError::InvalidPlatform)
+        );
+    }
+
+    #[test]
+    fn profile_lane_assumptions_remain_explicit() {
+        assert!(AgentProfile::Local.supports(StateLane::Linear));
+        assert!(AgentProfile::Shared.supports(StateLane::Merge));
+        assert!(!AgentProfile::Private.supports(StateLane::Linear));
+    }
+
+    #[test]
+    fn anonymous_receipt_shape_does_not_smuggle_an_authenticated_origin() {
+        let mut input = replay_input(MethodMode::Merge, false);
+        let ReplayOperation::Invoke {
+            invocation,
+            authority,
+            ..
+        } = &mut input.operation
+        else {
+            unreachable!();
+        };
+        invocation.auth.origin = Origin::Member(crate::service::SubjectId([1; 32]));
+        authority.claim.auth = invocation.auth.clone();
+        authority.claim.authorization = invocation.authorization_message();
+        assert_eq!(input.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn artifact_closure_bounds_count_and_aggregate_referenced_bytes() {
+        let genesis = AgentJournalGenesisId([0xa7; 32]);
+        let artifacts = (1..=MAX_ARTIFACT_CLOSURE_ENTRIES)
+            .map(|index| {
+                let mut hash = [0_u8; 32];
+                hash[24..].copy_from_slice(&(index as u64).to_be_bytes());
+                BlobRef {
+                    hash: Hash(hash),
+                    len: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let at_count_limit = ArtifactClosure { genesis, artifacts };
+        at_count_limit.validate().unwrap();
+        roundtrip(&at_count_limit);
+
+        let mut over_count = at_count_limit.clone();
+        let mut hash = [0_u8; 32];
+        hash[24..].copy_from_slice(&((MAX_ARTIFACT_CLOSURE_ENTRIES + 1) as u64).to_be_bytes());
+        over_count.artifacts.push(BlobRef {
+            hash: Hash(hash),
+            len: 1,
+        });
+        assert_eq!(over_count.validate(), Err(DecodeError::LimitExceeded));
+        assert_eq!(
+            ArtifactClosure::decode(&over_count.encode()),
+            Err(DecodeError::LimitExceeded)
+        );
+
+        let over_bytes = ArtifactClosure {
+            genesis,
+            artifacts: (1_u8..=9)
+                .map(|tag| BlobRef {
+                    hash: Hash([tag; 32]),
+                    len: MAX_ARTIFACT_CLOSURE_BYTES as u64,
+                })
+                .collect(),
+        };
+        assert!(
+            over_bytes
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.len)
+                .sum::<u64>()
+                > MAX_ARTIFACT_CLOSURE_REFERENCED_BYTES
+        );
+        assert_eq!(over_bytes.validate(), Err(DecodeError::LimitExceeded));
+        assert_eq!(
+            ArtifactClosure::decode(&over_bytes.encode()),
+            Err(DecodeError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn genesis_output_commitments_are_canonical_and_cycle_free() {
+        let state = RuntimeState {
+            control: vec![1, 2],
+            linear: vec![3],
+            merge: vec![4, 5],
+            local: vec![6],
+        };
+        let state_commitment = system_genesis_post_create_state_commitment(&state).unwrap();
+        assert_eq!(
+            state_commitment,
+            system_genesis_post_create_state_commitment(&state).unwrap()
+        );
+        let mut lane_swapped = state.clone();
+        core::mem::swap(&mut lane_swapped.linear, &mut lane_swapped.local);
+        lane_swapped.local.push(7);
+        assert_ne!(
+            state_commitment,
+            system_genesis_post_create_state_commitment(&lane_swapped).unwrap()
+        );
+
+        let mut artifacts = vec![
+            BlobRef::of_bytes(b"artifact-a"),
+            BlobRef::of_bytes(b"artifact-b"),
+        ];
+        artifacts.sort_by_key(|artifact| (artifact.hash, artifact.len));
+        let first = ArtifactClosure {
+            genesis: AgentJournalGenesisId([0xa7; 32]),
+            artifacts: artifacts.clone(),
+        };
+        let second = ArtifactClosure {
+            genesis: AgentJournalGenesisId([0xa8; 32]),
+            artifacts,
+        };
+        first.validate().unwrap();
+        second.validate().unwrap();
+        assert_ne!(first.id(), second.id());
+        assert_eq!(
+            first.system_genesis_commitment().unwrap(),
+            second.system_genesis_commitment().unwrap()
+        );
+
+        let mut alternate = second.artifacts.clone();
+        alternate.push(BlobRef::of_bytes(b"artifact-c"));
+        alternate.sort_by_key(|artifact| (artifact.hash, artifact.len));
+        assert_ne!(
+            first.system_genesis_commitment().unwrap(),
+            system_genesis_artifact_closure_commitment(&alternate).unwrap()
+        );
+    }
+}

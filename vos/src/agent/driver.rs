@@ -24,9 +24,9 @@ use super::execution::{
 use super::package::{Package, PackageError};
 use super::wire::{RuntimeCall, RuntimeReturn, RuntimeState};
 use super::{
-    ActorEntry, AgentConfig, AgentConfigError, AgentIdentity, AgentProfile, InstallActor,
-    LifecycleAuthorityAdmission, LifecycleError, LifecycleReply, LifecycleRequest, PackageKind,
-    RUNTIME_ABI_ID,
+    ActorDirectoryRecord, ActorEntry, AgentConfig, AgentConfigError, AgentIdentity, AgentProfile,
+    InstallActor, LifecycleAuthorityAdmission, LifecycleError, LifecycleReply, LifecycleRequest,
+    PackageKind, RUNTIME_ABI_ID,
 };
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{ActorId, BlobRef, CapabilityId, DeploymentId, Hash, ProgramId};
@@ -1810,7 +1810,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
     ) -> Result<LifecycleRequest, AgentDriverError> {
         Ok(LifecycleRequest::Suspend {
             actor,
-            expected_deployment: self.actor_deployment(actor)?,
+            expected_deployment: self.inspect_actor(actor)?.entry.deployment,
         })
     }
 
@@ -1820,16 +1820,18 @@ impl<S: AgentImageStore> AgentDriver<S> {
     ) -> Result<LifecycleRequest, AgentDriverError> {
         Ok(LifecycleRequest::Resume {
             actor,
-            expected_deployment: self.actor_deployment(actor)?,
+            expected_deployment: self.inspect_actor(actor)?.entry.deployment,
         })
     }
 
-    /// Resolve the current deployment through the runtime-owned directory.
-    /// The host cannot infer this from catalog sidecars: only the guest's
-    /// committed directory selects the deployment a lifecycle receipt must
-    /// bind. Inspection is read-only and every page must preserve the exact
-    /// runtime state.
-    fn actor_deployment(&self, actor: ActorId) -> Result<DeploymentId, AgentDriverError> {
+    /// Resolve one actor and its immutable install incarnation through the
+    /// runtime-owned directory.
+    ///
+    /// Callers use this record to construct [`ActorInvocation`] values; the
+    /// generation is guest-derived and must never be guessed from catalog
+    /// sidecars or deployment metadata. Inspection is read-only and every
+    /// page must preserve the exact runtime state.
+    pub fn inspect_actor(&self, actor: ActorId) -> Result<ActorDirectoryRecord, AgentDriverError> {
         if actor == ActorId::ZERO {
             return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
         }
@@ -1862,11 +1864,15 @@ impl<S: AgentImageStore> AgentDriver<S> {
             seen = validate_actor_directory_page(after, &page, page_limit, seen, max_actors)?;
             if let Ok(index) = page
                 .entries
-                .binary_search_by_key(&actor, |entry| entry.actor)
+                .binary_search_by_key(&actor, |record| record.entry.actor)
             {
-                return Ok(page.entries[index].deployment);
+                return Ok(page.entries[index].clone());
             }
-            if page.entries.last().is_some_and(|entry| entry.actor > actor) {
+            if page
+                .entries
+                .last()
+                .is_some_and(|record| record.entry.actor > actor)
+            {
                 return Err(AgentDriverError::Lifecycle(LifecycleError::NotFound));
             }
             let Some(next) = page.next else {
@@ -1878,6 +1884,35 @@ impl<S: AgentImageStore> AgentDriver<S> {
             after = Some(next);
         }
         Err(AgentDriverError::InvalidRuntime)
+    }
+
+    fn validate_invocation_directory(
+        &self,
+        invocation: &ActorInvocation,
+    ) -> Result<(), AgentDriverError> {
+        let directory = match self.inspect_actor(invocation.actor) {
+            Ok(record) => record,
+            Err(AgentDriverError::Lifecycle(LifecycleError::NotFound)) => {
+                return Err(AgentDriverError::Execution(ActorExecutionError::NotFound));
+            }
+            Err(error) => return Err(error),
+        };
+        if directory.incarnation != invocation.incarnation {
+            return Err(AgentDriverError::Execution(
+                ActorExecutionError::StaleIncarnation,
+            ));
+        }
+        if directory.entry.deployment != invocation.deployment {
+            return Err(AgentDriverError::Execution(
+                ActorExecutionError::StaleDeployment,
+            ));
+        }
+        if directory.entry.program != invocation.program {
+            return Err(AgentDriverError::Execution(
+                ActorExecutionError::WrongProgram,
+            ));
+        }
+        Ok(())
     }
 
     fn authorized_actor_lifecycle(
@@ -1983,8 +2018,10 @@ impl<S: AgentImageStore> AgentDriver<S> {
         // adding caller-selected gas to the outer runtime budget. The guest
         // repeats this check when decoding the execution wire.
         invocation.validate().map_err(AgentDriverError::Execution)?;
+        self.validate_invocation_directory(&invocation)?;
         let expected_invocation = invocation.invocation;
         let expected_actor = invocation.actor;
+        let expected_incarnation = invocation.incarnation;
         let expected_deployment = invocation.deployment;
         let mode = invocation.mode;
         let outer_gas = self.management_gas.saturating_add(invocation.gas);
@@ -2035,6 +2072,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         };
         if reply.invocation != expected_invocation
             || reply.actor != expected_actor
+            || reply.incarnation != expected_incarnation
             || reply.deployment != expected_deployment
             || reply.mode != mode
         {
@@ -2087,12 +2125,19 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 &invocation,
             )
             .map_err(AgentDriverError::Authority)?;
+        self.validate_invocation_directory(&invocation)?;
         let reply = self.lifecycle(LifecycleRequest::AcknowledgeInvocation {
+            scope: invocation.mode.invocation_scope(),
             invocation: invocation.invocation,
             request: invocation.commitment(),
             authority: Box::new(authority.clone()),
         })?;
-        if reply == LifecycleReply::InvocationAcknowledged(invocation.invocation) {
+        if reply
+            == (LifecycleReply::InvocationAcknowledged {
+                scope: invocation.mode.invocation_scope(),
+                invocation: invocation.invocation,
+            })
+        {
             Ok(())
         } else {
             Err(AgentDriverError::InvalidRuntime)
@@ -2289,10 +2334,15 @@ impl<S: AgentImageStore> AgentDriver<S> {
             if output.state != self.image.runtime_state {
                 return Err(AgentDriverError::InvalidRuntime);
             }
-            for actor in &page.entries {
-                validate_loaded_actor(&self.store, self.trust.as_ref(), &self.image.config, actor)?;
+            for record in &page.entries {
+                validate_loaded_actor(
+                    &self.store,
+                    self.trust.as_ref(),
+                    &self.image.config,
+                    &record.entry,
+                )?;
             }
-            actors.extend(page.entries);
+            actors.extend(page.entries.into_iter().map(|record| record.entry));
             let Some(next) = page.next else {
                 break;
             };
@@ -2496,16 +2546,19 @@ fn validate_actor_directory_page(
     let ordered = !page
         .entries
         .windows(2)
-        .any(|pair| pair[0].actor >= pair[1].actor);
+        .any(|pair| pair[0].entry.actor >= pair[1].entry.actor);
     let starts_after_cursor = after.is_none_or(|cursor| {
         page.entries
             .first()
-            .is_none_or(|entry| entry.actor > cursor)
+            .is_none_or(|record| record.entry.actor > cursor)
     });
     let next_is_canonical = match page.next {
         Some(next) => {
             page.entries.len() == page_limit
-                && page.entries.last().is_some_and(|entry| entry.actor == next)
+                && page
+                    .entries
+                    .last()
+                    .is_some_and(|record| record.entry.actor == next)
                 && after.is_none_or(|cursor| next > cursor)
         }
         None => true,
@@ -2513,10 +2566,15 @@ fn validate_actor_directory_page(
     let seen = seen
         .checked_add(page.entries.len())
         .ok_or(AgentDriverError::InvalidRuntime)?;
+    let incarnations_are_valid = page
+        .entries
+        .iter()
+        .all(|record| record.incarnation != Hash::ZERO);
     if page_size_is_valid
         && ordered
         && starts_after_cursor
         && next_is_canonical
+        && incarnations_are_valid
         && seen <= max_actors
     {
         Ok(seen)
@@ -2676,9 +2734,13 @@ mod tests {
     fn actor_deployment_pagination_rejects_noncanonical_runtime_pages() {
         let first = CatalogFixture::new(0x31, ActorId([0x41; 32])).entry;
         let second = CatalogFixture::new(0x32, ActorId([0x42; 32])).entry;
+        let record = |entry: ActorEntry, seed| super::super::ActorDirectoryRecord {
+            entry,
+            incarnation: Hash([seed; 32]),
+        };
 
         let backwards = super::super::ActorDirectoryPage {
-            entries: vec![first.clone()],
+            entries: vec![record(first.clone(), 1)],
             next: None,
         };
         assert_eq!(
@@ -2687,7 +2749,7 @@ mod tests {
         );
 
         let unordered = super::super::ActorDirectoryPage {
-            entries: vec![second.clone(), first.clone()],
+            entries: vec![record(second.clone(), 2), record(first.clone(), 1)],
             next: None,
         };
         assert_eq!(
@@ -2696,7 +2758,7 @@ mod tests {
         );
 
         let underfull_continuation = super::super::ActorDirectoryPage {
-            entries: vec![first.clone()],
+            entries: vec![record(first.clone(), 1)],
             next: Some(first.actor),
         };
         assert_eq!(
@@ -2705,7 +2767,7 @@ mod tests {
         );
 
         let oversized = super::super::ActorDirectoryPage {
-            entries: vec![first.clone(), second.clone()],
+            entries: vec![record(first.clone(), 1), record(second.clone(), 2)],
             next: None,
         };
         assert_eq!(
@@ -2714,7 +2776,7 @@ mod tests {
         );
 
         let over_capacity = super::super::ActorDirectoryPage {
-            entries: vec![first, second],
+            entries: vec![record(first, 1), record(second, 2)],
             next: None,
         };
         assert_eq!(

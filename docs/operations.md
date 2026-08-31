@@ -96,13 +96,22 @@ scheduler, `r02` binds full-Ψ deblob/entry failures and sign-extended 64-bit
 `ecalli` identifiers. Rebuild those packages and recreate local development
 Agent images. The related lifecycle wire first moved from
 `vos-agent-runtime-abi-20260829r1` to `vos-agent-runtime-abi-20260829r2`, then
-to `vos-agent-runtime-abi-20260831r3`. Generation r3 binds Suspend and Resume
+to `vos-agent-runtime-abi-20260831r3`, and now to
+`vos-agent-runtime-abi-20260831r4`. Generation r3 binds Suspend and Resume
 authority to the actor's exact expected deployment, so a receipt prepared
-before an actor upgrade cannot mutate its replacement. An r3 host deliberately
-rejects r1/r2 runtime packages and persisted Agent images; rebuild the runtime
-packages and recreate those images. Actor packages remain compatible because
-this cutover does not change the actor ABI or standard execution semantics.
-It also does not change the frozen Service execution identity or artifacts.
+before an actor upgrade cannot mutate its replacement. Generation r4 makes
+the three actor-state lanes independently sparse, binds their entries to a
+per-install state generation, and scopes retained invocation results and
+acknowledgements to Ordered, Merge, or replica-local execution. Invocation
+authorization, AGEX/AGIR messages, replies, and retained results all bind the
+same nonzero incarnation. Callers obtain that guest-derived value from
+`AgentDriver::inspect_actor` or a validated paged directory inspection; it
+must not be inferred from deployment metadata. An r4 host
+deliberately rejects r1/r2/r3 runtime packages and persisted Agent images;
+rebuild the runtime package and recreate those images. Actor packages remain
+compatible because this cutover does not change the actor ABI or standard
+execution semantics. It also does not change the frozen Service execution
+identity or artifacts.
 
 Portable invocation continuations now use kernel snapshot version 5, which
 preserves sparse IPC DATA mappings exactly. Before upgrading a host, let every

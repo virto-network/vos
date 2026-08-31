@@ -2264,6 +2264,7 @@ mod tests {
         let oversized_invocation = ActorInvocation {
             invocation: InvocationId([0x7f; 32]),
             actor: ActorId([0x80; 32]),
+            incarnation: Hash([0x83; 32]),
             deployment: DeploymentId([0x81; 32]),
             program: ProgramId([0x82; 32]),
             mode: super::super::MethodMode::Query,

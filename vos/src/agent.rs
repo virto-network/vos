@@ -12,15 +12,21 @@ use alloc::vec::Vec;
 
 pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
 pub mod authority;
+pub mod committee;
 pub mod contract;
 #[cfg(feature = "std")]
 pub mod driver;
 pub mod execution;
 #[cfg(feature = "std")]
 pub mod host;
+pub(crate) mod invocation_index;
+pub mod journal;
+#[cfg(feature = "std")]
+pub(crate) mod journal_store;
 #[cfg(feature = "pvm")]
 pub mod machine;
 pub mod package;
+pub(crate) mod replay;
 pub mod schema;
 pub mod standard;
 pub mod wire;
@@ -30,7 +36,7 @@ use crate::service::{
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260831r3");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260831r4");
 
 /// Consensus-visible execution semantics for standard-PVM agent packages.
 ///
@@ -96,6 +102,21 @@ pub enum StateLane {
     Local = 2,
 }
 
+/// Exactly-once namespace selected by an invocation's consistency mode.
+///
+/// Ordered invocations share one namespace across control/query and Linear
+/// execution. Merge invocations are deduplicated at the canonical Merge
+/// replay position. Local invocations are deduplicated in the replica-local
+/// component, so the physical Local state additionally scopes them to the
+/// owning node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum InvocationScope {
+    Ordered = 0,
+    Merge = 1,
+    Local = 2,
+}
+
 /// Guest-owned durable component retaining one exact invocation result.
 /// Ordinary coherent queries span Linear and Merge snapshots, so their
 /// disposition belongs to topology-neutral control state rather than either
@@ -158,6 +179,15 @@ impl MethodMode {
             }
             Self::Merge => InvocationResultStorage::Lane(StateLane::Merge),
             Self::LocalQuery | Self::Local => InvocationResultStorage::Lane(StateLane::Local),
+        }
+    }
+
+    /// Exactly-once namespace for this invocation mode.
+    pub const fn invocation_scope(self) -> InvocationScope {
+        match self {
+            Self::Query | Self::LinearizableQuery | Self::Linear => InvocationScope::Ordered,
+            Self::Merge => InvocationScope::Merge,
+            Self::LocalQuery | Self::Local => InvocationScope::Local,
         }
     }
 }
@@ -360,10 +390,23 @@ pub struct ActorEntry {
     pub suspended: bool,
 }
 
+/// One installed actor together with the immutable identity of this exact
+/// installation. The incarnation changes when an ActorId is removed and
+/// installed again, but remains stable across an in-place upgrade.
+///
+/// Keeping this separate from [`ActorEntry`] avoids giving install callers a
+/// generation field which the guest, rather than the caller, must derive from
+/// the admitted lifecycle operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActorDirectoryRecord {
+    pub entry: ActorEntry,
+    pub incarnation: Hash,
+}
+
 /// One deterministic page of the potentially large actor forest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActorDirectoryPage {
-    pub entries: Vec<ActorEntry>,
+    pub entries: Vec<ActorDirectoryRecord>,
     pub next: Option<ActorId>,
 }
 
@@ -400,6 +443,10 @@ pub struct UpgradeActor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActorRecord {
     pub entry: ActorEntry,
+    /// Guest-derived identity of this exact install. It is stable across
+    /// upgrades and prevents sparse lane bytes left by a removed actor from
+    /// being attached to a later install which reuses the same [`ActorId`].
+    pub state_generation: Hash,
     pub producer: ProducerId,
     pub package: BlobRef,
     pub agent_schema: BlobRef,
@@ -455,6 +502,7 @@ pub enum LifecycleRequest {
     /// it. The request commitment prevents an unrelated invocation holder
     /// from deleting another result.
     AcknowledgeInvocation {
+        scope: InvocationScope,
         invocation: crate::service::InvocationId,
         request: Hash,
         authority: Box<authority::ActorInvocationReceipt>,
@@ -557,7 +605,10 @@ pub enum LifecycleReply {
     Upgraded(ActorEntry),
     Suspended(ActorEntry),
     Resumed(ActorEntry),
-    InvocationAcknowledged(crate::service::InvocationId),
+    InvocationAcknowledged {
+        scope: InvocationScope,
+        invocation: crate::service::InvocationId,
+    },
     Removed(ActorId),
     RuntimeUpgraded(AgentIdentity),
 }
@@ -576,6 +627,7 @@ pub trait AgentRuntime {
 pub enum AgentConfigError {
     InvalidIdentity,
     NoReplicas,
+    InvalidReplicaIdentity,
     DuplicateReplica,
     ReplicaOrder,
     UnsupportedLane,
@@ -636,6 +688,13 @@ impl AgentConfig {
         }
         if self.replicas.is_empty() {
             return Err(AgentConfigError::NoReplicas);
+        }
+        if self
+            .replicas
+            .iter()
+            .any(|replica| replica.node == NodeId::ZERO || replica.principal == PrincipalId::ZERO)
+        {
+            return Err(AgentConfigError::InvalidReplicaIdentity);
         }
         if self.identity.profile == AgentProfile::Local && self.replicas.len() != 1 {
             return Err(AgentConfigError::InvalidLocalReplicaSet);
@@ -715,6 +774,24 @@ mod tests {
         assert!(!MethodMode::Query.can_write(StateLane::Linear));
         assert!(!MethodMode::Query.can_read(StateLane::Local));
         assert!(MethodMode::LocalQuery.can_read(StateLane::Local));
+        assert_eq!(
+            MethodMode::Query.invocation_scope(),
+            InvocationScope::Ordered
+        );
+        assert_eq!(
+            MethodMode::LinearizableQuery.invocation_scope(),
+            InvocationScope::Ordered
+        );
+        assert_eq!(
+            MethodMode::Linear.invocation_scope(),
+            InvocationScope::Ordered
+        );
+        assert_eq!(MethodMode::Merge.invocation_scope(), InvocationScope::Merge);
+        assert_eq!(
+            MethodMode::LocalQuery.invocation_scope(),
+            InvocationScope::Local
+        );
+        assert_eq!(MethodMode::Local.invocation_scope(), InvocationScope::Local);
     }
 
     #[test]
@@ -805,6 +882,17 @@ mod tests {
             }],
         };
         assert_eq!(config.validate(), Ok(()));
+        config.replicas[0].node = NodeId::ZERO;
+        assert_eq!(
+            config.validate(),
+            Err(AgentConfigError::InvalidReplicaIdentity)
+        );
+        config.replicas[0].node = NodeId([6; 32]);
+        config.replicas[0].principal = PrincipalId::ZERO;
+        assert_eq!(
+            config.validate(),
+            Err(AgentConfigError::InvalidReplicaIdentity)
+        );
         config.replicas[0].principal = PrincipalId([7; 32]);
         assert_eq!(
             config.validate(),

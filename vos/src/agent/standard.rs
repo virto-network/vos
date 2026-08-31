@@ -11,8 +11,8 @@ use core::ops::Bound::{Excluded, Unbounded};
 
 use super::{
     ActorEntry, ActorLifecycleDebt, ActorRecord, AgentConfig, AgentConfigError, AgentRuntime,
-    InvocationResultStorage, LaneSet, LifecycleError, LifecycleReply, LifecycleRequest,
-    RuntimeRequirements, StateLane,
+    InvocationResultStorage, InvocationScope, LaneSet, LifecycleError, LifecycleReply,
+    LifecycleRequest, RuntimeRequirements, StateLane,
 };
 use crate::service::{
     ActorId, AgentId, CredentialId, DeploymentId, Hash, InvocationId, ProducerId, ProgramId,
@@ -22,20 +22,23 @@ pub const MAX_DIRECTORY_PAGE: u16 = 256;
 pub const MAX_INVOCATION_RESULTS_PER_LANE: usize = 32;
 pub const MAX_INVOCATION_RESULT_BYTES_PER_LANE: usize = 64 * 1024;
 pub const MAX_AUTHORITY_DISPOSITIONS: usize = 256;
+/// Explicit cap below both the runtime-image byte limit and the generic wire
+/// item limit. Historical entries are retained until checkpoint compaction.
+pub const MAX_LANE_STATE_ENTRIES: usize = 16_384;
 
 #[derive(Clone, Debug)]
 struct ManagedActor {
     record: ActorRecord,
     /// Non-structural durable work. Child debt is derived from the directory.
     debt: ActorLifecycleDebt,
-    lane_state: StandardLaneState,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct StandardAgentRuntime {
     config: Option<AgentConfig>,
     actors: BTreeMap<ActorId, ManagedActor>,
-    invocation_results: BTreeMap<InvocationId, StandardInvocationResult>,
+    lane_state: StandardLaneState,
+    invocation_results: BTreeMap<(InvocationScope, InvocationId), StandardInvocationResult>,
     lane_revisions: StandardLaneRevisions,
     control_authority_slot: Option<u64>,
     authority_slot_high_water: Option<u64>,
@@ -49,6 +52,7 @@ pub struct StandardAgentRuntime {
 pub struct StandardRuntimeState {
     pub config: Option<AgentConfig>,
     pub actors: Vec<StandardActorState>,
+    pub lane_state: StandardLaneState,
     pub invocation_results: Vec<StandardInvocationResult>,
     pub lane_revisions: StandardLaneRevisions,
     pub control_authority_slot: Option<u64>,
@@ -69,7 +73,10 @@ pub struct StandardAuthorityDisposition {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandardInvocationResult {
+    pub scope: InvocationScope,
     pub invocation: InvocationId,
+    /// Install incarnation which owns this retained result.
+    pub incarnation: Hash,
     pub request: Hash,
     pub reply: super::execution::ActorExecutionReply,
     /// Physical durable component retaining this exact result. Query replies
@@ -88,12 +95,19 @@ pub struct StandardLaneRevisions {
 }
 
 impl StandardLaneRevisions {
-    #[cfg(feature = "pvm")]
     fn authority_slot(self, lane: StateLane) -> Option<u64> {
         match lane {
             StateLane::Linear => self.linear_authority_slot,
             StateLane::Merge => self.merge_authority_slot,
             StateLane::Local => self.local_authority_slot,
+        }
+    }
+
+    fn revision(self, lane: StateLane) -> u64 {
+        match lane {
+            StateLane::Linear => self.linear,
+            StateLane::Merge => self.merge,
+            StateLane::Local => self.local,
         }
     }
 
@@ -135,17 +149,27 @@ impl StandardLaneRevisions {
 pub struct StandardActorState {
     pub record: ActorRecord,
     pub debt: ActorLifecycleDebt,
-    pub lane_state: StandardLaneState,
 }
 
-/// Runtime-owned bytes for each durable actor lane. Every freshly installed
-/// actor starts with the empty sentinel. The signed actor PVM expands that
-/// sentinel into its constructor defaults on first execution.
+/// One independently keyed physical lane entry. Active entries are selected
+/// by the directory's exact `(actor, state_generation)` pair. Nonmatching
+/// entries are historical and remain authenticated until checkpoint-only
+/// compaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandardLaneEntry {
+    pub actor: ActorId,
+    pub state_generation: Hash,
+    pub value: Vec<u8>,
+}
+
+/// Sparse physical state of all three independently persisted lanes. A
+/// supported active actor with no matching entry hydrates as canonical empty
+/// state; unsupported lanes hydrate as absent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StandardLaneState {
-    pub linear: Option<Vec<u8>>,
-    pub merge: Option<Vec<u8>>,
-    pub local: Option<Vec<u8>>,
+    pub linear: Vec<StandardLaneEntry>,
+    pub merge: Vec<StandardLaneEntry>,
+    pub local: Vec<StandardLaneEntry>,
 }
 
 impl StandardAgentRuntime {
@@ -153,6 +177,11 @@ impl StandardAgentRuntime {
         Self {
             config: None,
             actors: BTreeMap::new(),
+            lane_state: StandardLaneState {
+                linear: Vec::new(),
+                merge: Vec::new(),
+                local: Vec::new(),
+            },
             invocation_results: BTreeMap::new(),
             lane_revisions: StandardLaneRevisions {
                 linear: 0,
@@ -198,9 +227,9 @@ impl StandardAgentRuntime {
                 .map(|actor| StandardActorState {
                     record: actor.record.clone(),
                     debt: actor.debt,
-                    lane_state: actor.lane_state.clone(),
                 })
                 .collect(),
+            lane_state: self.lane_state.clone(),
             invocation_results: self.invocation_results.values().cloned().collect(),
             lane_revisions: self.lane_revisions,
             control_authority_slot: self.control_authority_slot,
@@ -210,9 +239,29 @@ impl StandardAgentRuntime {
         }
     }
 
+    /// Drop only lane entries which do not belong to an active install.
+    ///
+    /// This is intentionally not part of ordinary lifecycle or actor
+    /// execution. A checkpoint publisher may call it only while materializing
+    /// a new authenticated checkpoint; journal history remains the authority
+    /// for the compacted generations.
+    #[allow(dead_code)]
+    pub(crate) fn compact_historical_lane_entries_for_checkpoint(&mut self) {
+        let actors = &self.actors;
+        for lane in [StateLane::Linear, StateLane::Merge, StateLane::Local] {
+            self.lane_state.select_mut(lane).retain(|entry| {
+                actors.get(&entry.actor).is_some_and(|actor| {
+                    actor.record.state_generation == entry.state_generation
+                        && actor.record.entry.lanes.contains(lane)
+                })
+            });
+        }
+    }
+
     pub fn restore(state: StandardRuntimeState) -> Result<Self, LifecycleError> {
         let Some(config) = state.config else {
             return if state.actors.is_empty()
+                && state.lane_state == StandardLaneState::default()
                 && state.invocation_results.is_empty()
                 && state.lane_revisions == StandardLaneRevisions::default()
                 && state.control_authority_slot.is_none()
@@ -229,11 +278,13 @@ impl StandardAgentRuntime {
             .actors
             .windows(2)
             .any(|pair| pair[0].record.entry.actor >= pair[1].record.entry.actor)
-            || state.actors.iter().any(|actor| actor.debt.children != 0)
-            || state
-                .invocation_results
-                .windows(2)
-                .any(|pair| pair[0].invocation >= pair[1].invocation)
+            || state.actors.iter().any(|actor| {
+                actor.debt.children != 0 || actor.record.state_generation == Hash::ZERO
+            })
+            || state.invocation_results.windows(2).any(|pair| {
+                (pair[0].scope, pair[0].invocation) >= (pair[1].scope, pair[1].invocation)
+            })
+            || !state.lane_state.is_canonical()
             || state.authority_dispositions.len() > MAX_AUTHORITY_DISPOSITIONS
             || state
                 .authority_dispositions
@@ -265,40 +316,50 @@ impl StandardAgentRuntime {
                 entry.suspended = false;
             }
             let actor_id = entry.actor;
-            runtime.install(super::InstallActor {
-                entry,
-                producer: actor.record.producer,
-                package: actor.record.package,
-                agent_schema: actor.record.agent_schema,
-                role_policies: actor.record.role_policies,
-                state_layout: actor.record.state_layout,
-                contract: actor.record.contract,
-                requirements: actor.record.requirements,
-            })?;
+            let state_generation = actor.record.state_generation;
+            runtime.install(
+                super::InstallActor {
+                    entry,
+                    producer: actor.record.producer,
+                    package: actor.record.package,
+                    agent_schema: actor.record.agent_schema,
+                    role_policies: actor.record.role_policies,
+                    state_layout: actor.record.state_layout,
+                    contract: actor.record.contract,
+                    requirements: actor.record.requirements,
+                },
+                state_generation,
+            )?;
             runtime.set_lifecycle_debt(actor_id, actor.debt)?;
-            runtime.validate_restored_lane_state(actor_id, &actor.lane_state)?;
-            runtime
-                .actors
-                .get_mut(&actor_id)
-                .expect("the actor was installed above")
-                .lane_state = actor.lane_state;
         }
         for (actor, expected_deployment) in suspended {
             runtime.set_suspended(actor, expected_deployment, true)?;
         }
+        runtime.lane_state = state.lane_state;
+        runtime.lane_revisions = state.lane_revisions;
+        runtime.validate_restored_lane_state()?;
         for result in state.invocation_results {
+            let actor = runtime.actors.get(&result.reply.actor);
             if result.invocation == InvocationId::ZERO
+                || result.incarnation == Hash::ZERO
                 || result.reply.invocation != result.invocation
+                || result.reply.incarnation != result.incarnation
                 || result.request == Hash::ZERO
                 || result.reply.status != super::execution::ActorExecutionStatus::Done
-                || !runtime.actors.contains_key(&result.reply.actor)
+                || actor.is_none_or(|actor| {
+                    actor.record.state_generation != result.incarnation
+                        || actor.record.entry.deployment != result.reply.deployment
+                })
+                || result.scope != result.reply.mode.invocation_scope()
                 || result.storage != result.reply.mode.result_storage()
+                || !runtime.result_storage_supported(result.storage)
             {
                 return Err(LifecycleError::InvalidRequest);
             }
-            runtime.invocation_results.insert(result.invocation, result);
+            runtime
+                .invocation_results
+                .insert((result.scope, result.invocation), result);
         }
-        runtime.lane_revisions = state.lane_revisions;
         runtime.control_authority_slot = state.control_authority_slot;
         for storage in [
             InvocationResultStorage::Control,
@@ -413,6 +474,18 @@ impl StandardAgentRuntime {
         Ok(())
     }
 
+    fn result_storage_supported(&self, storage: InvocationResultStorage) -> bool {
+        let Some(config) = self.config.as_ref() else {
+            return false;
+        };
+        match storage {
+            InvocationResultStorage::Control => true,
+            InvocationResultStorage::Lane(lane) => {
+                config.identity.profile.supports(lane) && config.capabilities.lanes.contains(lane)
+            }
+        }
+    }
+
     fn directory_page(
         &self,
         after: Option<ActorId>,
@@ -428,10 +501,13 @@ impl StandardAgentRuntime {
             None => Box::new(self.actors.iter()),
         };
         for (_, actor) in iterator.by_ref().take(usize::from(limit)) {
-            entries.push(actor.record.entry.clone());
+            entries.push(super::ActorDirectoryRecord {
+                entry: actor.record.entry.clone(),
+                incarnation: actor.record.state_generation,
+            });
         }
         let next = if entries.len() == usize::from(limit) && iterator.next().is_some() {
-            entries.last().map(|entry| entry.actor)
+            entries.last().map(|record| record.entry.actor)
         } else {
             None
         };
@@ -441,7 +517,11 @@ impl StandardAgentRuntime {
         }))
     }
 
-    fn install(&mut self, install: super::InstallActor) -> Result<LifecycleReply, LifecycleError> {
+    fn install(
+        &mut self,
+        install: super::InstallActor,
+        state_generation: Hash,
+    ) -> Result<LifecycleReply, LifecycleError> {
         self.validate_requirements(install.requirements)?;
         let config = self.created()?;
         if !config.runtime_contract.supports(install.contract) {
@@ -470,6 +550,7 @@ impl StandardAgentRuntime {
             || install.role_policies.len == 0
             || install.role_policies.len > super::execution::MAX_EXECUTION_POLICY_BYTES as u64
             || install.state_layout == Hash::ZERO
+            || state_generation == Hash::ZERO
             || Self::expected_actor_id(config.identity.agent, &install.entry) != install.entry.actor
         {
             return Err(LifecycleError::InvalidRequest);
@@ -486,12 +567,12 @@ impl StandardAgentRuntime {
             }
         }
         let entry = install.entry.clone();
-        let lane_state = StandardLaneState::fresh();
         self.actors.insert(
             entry.actor,
             ManagedActor {
                 record: ActorRecord {
                     entry: install.entry,
+                    state_generation,
                     producer: install.producer,
                     package: install.package,
                     agent_schema: install.agent_schema,
@@ -501,10 +582,36 @@ impl StandardAgentRuntime {
                     requirements: install.requirements,
                 },
                 debt: ActorLifecycleDebt::default(),
-                lane_state,
             },
         );
         Ok(LifecycleReply::Installed(entry))
+    }
+
+    #[cfg(feature = "pvm")]
+    fn validate_invocation_target(
+        &self,
+        invocation: &super::execution::ActorInvocation,
+    ) -> Result<&ManagedActor, super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+
+        invocation.validate()?;
+        self.config
+            .as_ref()
+            .ok_or(ActorExecutionError::NotCreated)?;
+        let actor = self
+            .actors
+            .get(&invocation.actor)
+            .ok_or(ActorExecutionError::NotFound)?;
+        if actor.record.state_generation != invocation.incarnation {
+            return Err(ActorExecutionError::StaleIncarnation);
+        }
+        if actor.record.entry.deployment != invocation.deployment {
+            return Err(ActorExecutionError::StaleDeployment);
+        }
+        if actor.record.entry.program != invocation.program {
+            return Err(ActorExecutionError::WrongProgram);
+        }
+        Ok(actor)
     }
 
     #[cfg(feature = "pvm")]
@@ -515,8 +622,9 @@ impl StandardAgentRuntime {
     ) -> Result<Option<super::execution::ActorExecutionReply>, super::execution::ActorExecutionError>
     {
         use super::execution::ActorExecutionError;
-        invocation.validate()?;
-        let Some(result) = self.invocation_results.get(&invocation.invocation) else {
+        self.validate_invocation_target(invocation)?;
+        let key = (invocation.mode.invocation_scope(), invocation.invocation);
+        let Some(result) = self.invocation_results.get(&key) else {
             return Ok(None);
         };
         if result.request != invocation.commitment() {
@@ -577,23 +685,13 @@ impl StandardAgentRuntime {
     ) -> Result<super::execution::ActorStateLanes, super::execution::ActorExecutionError> {
         use super::execution::{ActorExecutionError, ActorStateLanes};
 
-        invocation.validate()?;
         let config = self
             .config
             .as_ref()
             .ok_or(ActorExecutionError::NotCreated)?;
-        let actor = self
-            .actors
-            .get(&invocation.actor)
-            .ok_or(ActorExecutionError::NotFound)?;
+        let actor = self.validate_invocation_target(invocation)?;
         if actor.record.entry.suspended {
             return Err(ActorExecutionError::Suspended);
-        }
-        if actor.record.entry.deployment != invocation.deployment {
-            return Err(ActorExecutionError::StaleDeployment);
-        }
-        if actor.record.entry.program != invocation.program {
-            return Err(ActorExecutionError::WrongProgram);
         }
         if let Some(lane) = invocation.mode.write_lane() {
             if !config.identity.profile.supports(lane) || !actor.record.entry.lanes.contains(lane) {
@@ -601,6 +699,9 @@ impl StandardAgentRuntime {
             }
         }
         let result_storage = invocation.mode.result_storage();
+        if !self.result_storage_supported(result_storage) {
+            return Err(ActorExecutionError::UnsupportedMethod);
+        }
         if self.invocation_result_count(result_storage) >= MAX_INVOCATION_RESULTS_PER_LANE
             || self.invocation_result_bytes(result_storage) >= MAX_INVOCATION_RESULT_BYTES_PER_LANE
         {
@@ -610,12 +711,15 @@ impl StandardAgentRuntime {
             if !actor.record.entry.lanes.contains(lane) {
                 return Ok(None);
             }
-            actor
-                .lane_state
-                .select(lane)
-                .clone()
-                .map(Some)
-                .ok_or(ActorExecutionError::MissingState)
+            Ok(Some(
+                self.lane_state
+                    .lookup(
+                        lane,
+                        actor.record.entry.actor,
+                        actor.record.state_generation,
+                    )
+                    .map_or_else(Vec::new, |entry| entry.value.clone()),
+            ))
         };
         let state = ActorStateLanes {
             linear: resolve(StateLane::Linear)?,
@@ -763,13 +867,17 @@ impl StandardAgentRuntime {
         observed_slot: u64,
     ) -> Result<(), super::execution::ActorExecutionError> {
         use super::execution::{ActorExecutionError, MAX_EXECUTION_STATE_BYTES};
+        self.validate_invocation_target(invocation)?;
         if reply.invocation != invocation.invocation
             || reply.actor != invocation.actor
+            || reply.incarnation != invocation.incarnation
             || reply.deployment != invocation.deployment
             || reply.mode != invocation.mode
             || reply.lane != invocation.mode.write_lane()
             || reply.observation != super::execution::ActorObservation::default()
-            || self.invocation_results.contains_key(&invocation.invocation)
+            || self
+                .invocation_results
+                .contains_key(&(invocation.mode.invocation_scope(), invocation.invocation))
         {
             return Err(ActorExecutionError::InvalidActorOutput);
         }
@@ -797,6 +905,9 @@ impl StandardAgentRuntime {
             }
         }
         let result_storage = invocation.mode.result_storage();
+        if !self.result_storage_supported(result_storage) {
+            return Err(ActorExecutionError::UnsupportedMethod);
+        }
         if self.invocation_result_count(result_storage) >= MAX_INVOCATION_RESULTS_PER_LANE
             || self
                 .invocation_result_bytes(result_storage)
@@ -814,17 +925,28 @@ impl StandardAgentRuntime {
             }
             let actor = self
                 .actors
-                .get_mut(&reply.actor)
+                .get(&reply.actor)
                 .ok_or(ActorExecutionError::NotFound)?;
-            *actor.lane_state.select_mut(lane) = Some(state);
+            if actor.record.state_generation != reply.incarnation {
+                return Err(ActorExecutionError::StaleIncarnation);
+            }
+            self.lane_state.upsert(
+                lane,
+                actor.record.entry.actor,
+                actor.record.state_generation,
+                state,
+            )?;
             self.lane_revisions.increment(lane)?;
         }
         reply.observation = self.observation(reply.actor, reply.mode)?;
         self.advance_result_authority_slot(result_storage, observed_slot);
+        let scope = invocation.mode.invocation_scope();
         self.invocation_results.insert(
-            invocation.invocation,
+            (scope, invocation.invocation),
             StandardInvocationResult {
+                scope,
                 invocation: invocation.invocation,
+                incarnation: invocation.incarnation,
                 request: invocation.commitment(),
                 reply: reply.clone(),
                 storage: result_storage,
@@ -868,12 +990,17 @@ impl StandardAgentRuntime {
             merge_frontier: (actor.record.entry.lanes.contains(StateLane::Merge)
                 && mode.can_read(StateLane::Merge))
             .then(|| {
+                let merge = self
+                    .lane_state
+                    .lookup(
+                        StateLane::Merge,
+                        actor.record.entry.actor,
+                        actor.record.state_generation,
+                    )
+                    .map_or(&[][..], |entry| entry.value.as_slice());
                 Hash::digest(
                     b"vos/agent/merge-frontier",
-                    &[
-                        &actor.record.entry.actor.0,
-                        actor.lane_state.merge.as_deref().unwrap_or_default(),
-                    ],
+                    &[&actor.record.entry.actor.0, merge],
                 )
             }),
             local_revision: (actor.record.entry.lanes.contains(StateLane::Local)
@@ -882,34 +1009,49 @@ impl StandardAgentRuntime {
         })
     }
 
-    fn validate_restored_lane_state(
-        &self,
-        actor: crate::service::ActorId,
-        state: &StandardLaneState,
-    ) -> Result<(), LifecycleError> {
-        let actor = self.actors.get(&actor).ok_or(LifecycleError::NotFound)?;
-        let lanes = [
-            (StateLane::Linear, &state.linear),
-            (StateLane::Merge, &state.merge),
-            (StateLane::Local, &state.local),
-        ];
-        for (lane, value) in lanes {
-            if value
-                .as_ref()
-                .is_some_and(|bytes| bytes.len() > super::execution::MAX_EXECUTION_STATE_BYTES)
-                || value.is_none()
-                || (!actor.record.entry.lanes.contains(lane) && value.as_deref() != Some(&[][..]))
+    fn validate_restored_lane_state(&self) -> Result<(), LifecycleError> {
+        if !self.lane_state.is_canonical() {
+            return Err(LifecycleError::InvalidRequest);
+        }
+        let profile = self.created()?.identity.profile;
+        for (lane, entries) in self.lane_state.lanes() {
+            // Profile support is immutable. Unlike a Local/Shared runtime
+            // capability downgrade, a Private agent could never have owned
+            // Linear history, so any such bytes or cursor are corruption.
+            if !profile.supports(lane)
+                && (!entries.is_empty()
+                    || self.lane_revisions.revision(lane) != 0
+                    || self.lane_revisions.authority_slot(lane).is_some())
             {
                 return Err(LifecycleError::InvalidRequest);
             }
+            for entry in entries {
+                if let Some(actor) = self.actors.get(&entry.actor)
+                    && actor.record.state_generation == entry.state_generation
+                    && !actor.record.entry.lanes.contains(lane)
+                {
+                    return Err(LifecycleError::InvalidRequest);
+                }
+            }
         }
-        if lanes
-            .into_iter()
-            .filter_map(|(_, value)| value.as_deref())
-            .try_fold(0usize, |total, value| total.checked_add(value.len()))
-            .is_none_or(|len| len > super::execution::MAX_EXECUTION_STATE_TOTAL_BYTES)
-        {
-            return Err(LifecycleError::InvalidRequest);
+        for actor in self.actors.values() {
+            let total = [StateLane::Linear, StateLane::Merge, StateLane::Local]
+                .into_iter()
+                .filter(|lane| actor.record.entry.lanes.contains(*lane))
+                .try_fold(0usize, |total, lane| {
+                    total.checked_add(
+                        self.lane_state
+                            .lookup(
+                                lane,
+                                actor.record.entry.actor,
+                                actor.record.state_generation,
+                            )
+                            .map_or(0, |entry| entry.value.len()),
+                    )
+                });
+            if total.is_none_or(|len| len > super::execution::MAX_EXECUTION_STATE_TOTAL_BYTES) {
+                return Err(LifecycleError::InvalidRequest);
+            }
         }
         Ok(())
     }
@@ -1009,15 +1151,16 @@ impl StandardAgentRuntime {
 
     fn acknowledge_invocation(
         &mut self,
+        scope: InvocationScope,
         invocation: InvocationId,
         request: Hash,
         authority: super::authority::ActorInvocationReceipt,
     ) -> Result<LifecycleReply, LifecycleError> {
         let result = self
             .invocation_results
-            .get(&invocation)
+            .get(&(scope, invocation))
             .ok_or(LifecycleError::NotFound)?;
-        if result.request != request {
+        if result.request != request || result.scope != scope {
             return Err(LifecycleError::InvalidRequest);
         }
         let config = self.created()?;
@@ -1029,8 +1172,8 @@ impl StandardAgentRuntime {
         {
             return Err(LifecycleError::InvalidRequest);
         }
-        self.invocation_results.remove(&invocation);
-        Ok(LifecycleReply::InvocationAcknowledged(invocation))
+        self.invocation_results.remove(&(scope, invocation));
+        Ok(LifecycleReply::InvocationAcknowledged { scope, invocation })
     }
 
     fn remove_leaf(
@@ -1075,6 +1218,14 @@ impl StandardAgentRuntime {
             || self.actors.values().any(|actor| {
                 !capabilities.satisfies(actor.record.requirements)
                     || !contract.supports(actor.record.contract)
+            })
+            || self.invocation_results.values().any(|result| {
+                matches!(
+                    result.storage,
+                    InvocationResultStorage::Lane(lane)
+                        if !config.identity.profile.supports(lane)
+                            || !capabilities.lanes.contains(lane)
+                )
             })
         {
             return Err(LifecycleError::UnsupportedRuntime);
@@ -1178,8 +1329,24 @@ impl StandardAgentRuntime {
         // Lifecycle implementations promise atomic rejection. Preserve that
         // property defensively while still consuming the signed sequence and
         // recording its exact deterministic refusal.
+        let install_generation = match &request {
+            LifecycleRequest::Install(install) => Some(derive_state_generation(
+                claim_hash,
+                claim.sequence,
+                claim.operation,
+                install.entry.actor,
+            )),
+            _ => None,
+        };
         let before = self.clone();
-        let result = self.apply_mutation(request);
+        let result = match (request, install_generation) {
+            (LifecycleRequest::Install(install), Some(generation)) => {
+                self.install(install, generation)
+            }
+            (LifecycleRequest::Install(_), None) => Err(LifecycleError::InvalidRequest),
+            (request, None) => self.apply_mutation(request),
+            (_, Some(_)) => unreachable!("only install requests derive an actor generation"),
+        };
         if result.is_err() {
             *self = before;
         }
@@ -1228,7 +1395,7 @@ impl StandardAgentRuntime {
                 self.config = Some(config);
                 Ok(LifecycleReply::Created(identity))
             }
-            LifecycleRequest::Install(install) => self.install(install),
+            LifecycleRequest::Install(_) => Err(LifecycleError::InvalidRequest),
             LifecycleRequest::UpgradeActor(upgrade) => self.upgrade_actor(upgrade),
             LifecycleRequest::Suspend {
                 actor,
@@ -1267,16 +1434,7 @@ impl StandardAgentRuntime {
 }
 
 impl StandardLaneState {
-    fn fresh() -> Self {
-        Self {
-            linear: Some(Vec::new()),
-            merge: Some(Vec::new()),
-            local: Some(Vec::new()),
-        }
-    }
-
-    #[cfg(feature = "pvm")]
-    fn select(&self, lane: StateLane) -> &Option<Vec<u8>> {
+    fn select(&self, lane: StateLane) -> &[StandardLaneEntry] {
         match lane {
             StateLane::Linear => &self.linear,
             StateLane::Merge => &self.merge,
@@ -1284,13 +1442,86 @@ impl StandardLaneState {
         }
     }
 
-    #[cfg(feature = "pvm")]
-    fn select_mut(&mut self, lane: StateLane) -> &mut Option<Vec<u8>> {
+    fn select_mut(&mut self, lane: StateLane) -> &mut Vec<StandardLaneEntry> {
         match lane {
             StateLane::Linear => &mut self.linear,
             StateLane::Merge => &mut self.merge,
             StateLane::Local => &mut self.local,
         }
+    }
+
+    fn lanes(&self) -> [(StateLane, &[StandardLaneEntry]); 3] {
+        [
+            (StateLane::Linear, &self.linear),
+            (StateLane::Merge, &self.merge),
+            (StateLane::Local, &self.local),
+        ]
+    }
+
+    fn lookup(
+        &self,
+        lane: StateLane,
+        actor: ActorId,
+        state_generation: Hash,
+    ) -> Option<&StandardLaneEntry> {
+        self.select(lane)
+            .binary_search_by_key(&(actor, state_generation), |entry| {
+                (entry.actor, entry.state_generation)
+            })
+            .ok()
+            .and_then(|index| self.select(lane).get(index))
+    }
+
+    #[cfg(feature = "pvm")]
+    fn upsert(
+        &mut self,
+        lane: StateLane,
+        actor: ActorId,
+        state_generation: Hash,
+        value: Vec<u8>,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+
+        let entries = self.select_mut(lane);
+        match entries.binary_search_by_key(&(actor, state_generation), |entry| {
+            (entry.actor, entry.state_generation)
+        }) {
+            Ok(index) if value.is_empty() => {
+                entries.remove(index);
+            }
+            Ok(index) => entries[index].value = value,
+            Err(_) if value.is_empty() => {}
+            Err(index) => {
+                if entries.len() >= MAX_LANE_STATE_ENTRIES {
+                    return Err(ActorExecutionError::ResultCapacity);
+                }
+                entries.insert(
+                    index,
+                    StandardLaneEntry {
+                        actor,
+                        state_generation,
+                        value,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn is_canonical(&self) -> bool {
+        self.lanes().into_iter().all(|(_, entries)| {
+            entries.len() <= MAX_LANE_STATE_ENTRIES
+                && entries.iter().all(|entry| {
+                    entry.actor != ActorId::ZERO
+                        && entry.state_generation != Hash::ZERO
+                        && !entry.value.is_empty()
+                        && entry.value.len() <= super::execution::MAX_EXECUTION_STATE_BYTES
+                })
+                && entries.windows(2).all(|pair| {
+                    (pair[0].actor, pair[0].state_generation)
+                        < (pair[1].actor, pair[1].state_generation)
+                })
+        })
     }
 }
 
@@ -1306,10 +1537,11 @@ impl AgentRuntime for StandardAgentRuntime {
         match request {
             LifecycleRequest::Inspect { after, limit } => self.directory_page(after, limit),
             LifecycleRequest::AcknowledgeInvocation {
+                scope,
                 invocation,
                 request,
                 authority,
-            } => self.acknowledge_invocation(invocation, request, *authority),
+            } => self.acknowledge_invocation(scope, invocation, request, *authority),
             LifecycleRequest::Authorized { admission, request } => {
                 self.apply_authorized(admission, *request)
             }
@@ -1349,6 +1581,18 @@ impl AgentRuntime for StandardAgentRuntime {
 fn quiescent(mut debt: ActorLifecycleDebt) -> bool {
     debt.children = 0;
     debt.is_clear()
+}
+
+fn derive_state_generation(claim: Hash, sequence: u64, operation: Hash, actor: ActorId) -> Hash {
+    let mut generation = Hash::digest(
+        b"vos/agent/actor-state-generation/v1",
+        &[&claim.0, &sequence.to_le_bytes(), &operation.0, &actor.0],
+    );
+    // State generation is an identity sentinel as well as a commitment. Make
+    // nonzero structural rather than probabilistic while retaining all digest
+    // bits except this dedicated marker bit.
+    generation.0[0] |= 0x80;
+    generation
 }
 
 #[cfg(test)]
@@ -1408,6 +1652,15 @@ mod tests {
                 role: ReplicaRole::Voter,
             }],
         }
+    }
+
+    fn private_config(max_actors: u32) -> AgentConfig {
+        let mut config = config(max_actors);
+        config.identity.profile = AgentProfile::Private;
+        config.capabilities.lanes =
+            LaneSet::of(StateLane::Merge).union(LaneSet::of(StateLane::Local));
+        config.replicas[0].role = ReplicaRole::Observer;
+        config
     }
 
     fn install(agent: AgentId, parent: Option<ActorId>, name: &str) -> InstallActor {
@@ -1471,6 +1724,15 @@ mod tests {
     }
 
     #[cfg(feature = "pvm")]
+    fn set_lane(runtime: &mut StandardAgentRuntime, actor: ActorId, lane: StateLane, value: &[u8]) {
+        let generation = runtime.actors[&actor].record.state_generation;
+        runtime
+            .lane_state
+            .upsert(lane, actor, generation, value.to_vec())
+            .unwrap();
+    }
+
+    #[cfg(feature = "pvm")]
     #[test]
     fn merge_receives_only_merge_state_and_cannot_return_hidden_linear() {
         use crate::agent::execution::{
@@ -1495,12 +1757,13 @@ mod tests {
         let deployment = install.entry.deployment;
         let program = install.entry.program;
         apply_authorized(&mut runtime, &config, LifecycleRequest::Install(install)).unwrap();
-        runtime.actors.get_mut(&actor).unwrap().lane_state.linear = Some(vec![7]);
-        runtime.actors.get_mut(&actor).unwrap().lane_state.merge = Some(Vec::new());
+        let incarnation = runtime.actors[&actor].record.state_generation;
+        set_lane(&mut runtime, actor, StateLane::Linear, &[7]);
 
         let invocation = ActorInvocation {
             invocation: InvocationId([31; 32]),
             actor,
+            incarnation,
             deployment,
             program,
             mode: crate::agent::MethodMode::Merge,
@@ -1521,6 +1784,7 @@ mod tests {
         let mut reply = ActorExecutionReply {
             invocation: invocation.invocation,
             actor,
+            incarnation,
             deployment,
             mode: invocation.mode,
             lane: Some(StateLane::Merge),
@@ -1715,20 +1979,22 @@ mod tests {
             .unwrap();
         for index in 0..config.capabilities.max_actors {
             runtime
-                .apply_mutation(LifecycleRequest::Install(install(
-                    config.identity.agent,
-                    None,
-                    &alloc::format!("actor-{index:04}"),
-                )))
+                .install(
+                    install(
+                        config.identity.agent,
+                        None,
+                        &alloc::format!("actor-{index:04}"),
+                    ),
+                    Hash::digest(b"vos/test/state-generation", &[&index.to_le_bytes()]),
+                )
                 .unwrap();
         }
         assert_eq!(runtime.len(), 4_096);
         assert_eq!(
-            runtime.apply_mutation(LifecycleRequest::Install(install(
-                config.identity.agent,
-                None,
-                "actor-overflow",
-            ))),
+            runtime.install(
+                install(config.identity.agent, None, "actor-overflow"),
+                Hash([0x99; 32]),
+            ),
             Err(LifecycleError::DirectoryFull)
         );
 
@@ -1741,6 +2007,594 @@ mod tests {
         let decoded = super::super::wire::decode_standard_runtime_state(&encoded).unwrap();
         let restored = StandardAgentRuntime::restore(decoded).unwrap();
         assert_eq!(restored.len(), 4_096);
+    }
+
+    #[test]
+    fn management_directory_changes_leave_all_lane_components_byte_identical() {
+        let config = config(8);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let before_install = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+
+        let mut request = install(config.identity.agent, None, "sparse");
+        request.entry.lanes = LaneSet::ALL;
+        request.requirements.lanes = LaneSet::ALL;
+        let actor = request.entry.actor;
+        let initial_deployment = request.entry.deployment;
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::Install(request.clone()),
+        )
+        .unwrap();
+        let after_install = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+        assert_eq!(after_install.linear, before_install.linear);
+        assert_eq!(after_install.merge, before_install.merge);
+        assert_eq!(after_install.local, before_install.local);
+
+        let generation = runtime.actors[&actor].record.state_generation;
+        runtime.lane_state.linear.push(StandardLaneEntry {
+            actor,
+            state_generation: generation,
+            value: vec![1],
+        });
+        runtime.lane_state.merge.push(StandardLaneEntry {
+            actor,
+            state_generation: generation,
+            value: vec![2],
+        });
+        runtime.lane_state.local.push(StandardLaneEntry {
+            actor,
+            state_generation: generation,
+            value: vec![3],
+        });
+        let baseline = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+        let assert_lanes = |runtime: &StandardAgentRuntime| {
+            let state = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+            assert_eq!(state.linear, baseline.linear);
+            assert_eq!(state.merge, baseline.merge);
+            assert_eq!(state.local, baseline.local);
+        };
+
+        apply_authorized(&mut runtime, &config, suspend(actor, initial_deployment)).unwrap();
+        assert_lanes(&runtime);
+        apply_authorized(&mut runtime, &config, resume(actor, initial_deployment)).unwrap();
+        assert_lanes(&runtime);
+
+        let upgraded_deployment = DeploymentId([0x71; 32]);
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::UpgradeActor(UpgradeActor {
+                actor,
+                from_deployment: initial_deployment,
+                to_deployment: upgraded_deployment,
+                to_program: request.entry.program,
+                producer: request.producer,
+                package: request.package.clone(),
+                agent_schema: request.agent_schema.clone(),
+                role_policies: request.role_policies.clone(),
+                state_layout: request.state_layout,
+                contract: request.contract,
+                requirements: request.requirements,
+            }),
+        )
+        .unwrap();
+        assert_lanes(&runtime);
+        assert_eq!(runtime.actors[&actor].record.state_generation, generation);
+
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::UpgradeRuntime {
+                from_deployment: config.identity.runtime_deployment,
+                to_deployment: DeploymentId([0x72; 32]),
+                to_program: ProgramId([0x73; 32]),
+                producer: ProducerId([0x74; 32]),
+                package: BlobRef {
+                    hash: Hash([0x75; 32]),
+                    len: 101,
+                },
+                contract: super::super::contract::RuntimePackageContract::canonical(),
+                capabilities: RuntimeCapabilities::standard(),
+            },
+        )
+        .unwrap();
+        assert_lanes(&runtime);
+
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::RemoveLeaf {
+                actor,
+                expected_deployment: upgraded_deployment,
+            },
+        )
+        .unwrap();
+        assert_lanes(&runtime);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn remove_and_reinstall_never_resurrect_historical_lane_state() {
+        use crate::agent::execution::{ActorExecutionError, ActorInvocation, ActorInvocationAuth};
+        use crate::service::InvocationId;
+
+        let config = config(8);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let request = install(config.identity.agent, None, "reused");
+        let actor = request.entry.actor;
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::Install(request.clone()),
+        )
+        .unwrap();
+        let old_generation = runtime.actors[&actor].record.state_generation;
+        let old_invocation = ActorInvocation {
+            invocation: InvocationId([0x75; 32]),
+            actor,
+            incarnation: old_generation,
+            deployment: request.entry.deployment,
+            program: request.entry.program,
+            mode: super::super::MethodMode::Linear,
+            auth: ActorInvocationAuth::anonymous(),
+            message: vec![1],
+            availability: Vec::new(),
+            gas: 1,
+        };
+        let old_receipt = signed_invocation_receipt(&config, &old_invocation, 0, 100);
+        set_lane(&mut runtime, actor, StateLane::Linear, &[0xaa]);
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::RemoveLeaf {
+                actor,
+                expected_deployment: request.entry.deployment,
+            },
+        )
+        .unwrap();
+        assert_eq!(runtime.lane_state.linear.len(), 1);
+
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::Install(request.clone()),
+        )
+        .unwrap();
+        let new_generation = runtime.actors[&actor].record.state_generation;
+        assert_ne!(new_generation, old_generation);
+        assert_ne!(new_generation, Hash::ZERO);
+        runtime
+            .verify_invocation_authority(&old_invocation, &old_receipt)
+            .unwrap();
+        assert_eq!(
+            runtime.prepare_execution_state(&old_invocation),
+            Err(ActorExecutionError::StaleIncarnation),
+            "a valid receipt minted for a retired install cannot reach its replacement"
+        );
+        assert_eq!(
+            runtime.recover_execution(&old_invocation, 1),
+            Err(ActorExecutionError::StaleIncarnation)
+        );
+
+        let LifecycleReply::Directory(directory) = runtime
+            .apply(LifecycleRequest::Inspect {
+                after: None,
+                limit: 1,
+            })
+            .unwrap()
+        else {
+            panic!("inspect must return a directory page")
+        };
+        let current = directory.entries.into_iter().next().unwrap();
+        assert_eq!(current.entry.actor, actor);
+        assert_eq!(current.incarnation, new_generation);
+        let invocation = ActorInvocation {
+            invocation: InvocationId([0x76; 32]),
+            actor: current.entry.actor,
+            incarnation: current.incarnation,
+            deployment: current.entry.deployment,
+            program: current.entry.program,
+            mode: super::super::MethodMode::Linear,
+            auth: ActorInvocationAuth::anonymous(),
+            message: vec![1],
+            availability: Vec::new(),
+            gas: 1,
+        };
+        assert_eq!(
+            runtime
+                .prepare_execution_state(&invocation)
+                .unwrap()
+                .linear
+                .as_deref(),
+            Some(&[][..])
+        );
+
+        let encoded = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+        let decoded = super::super::wire::decode_standard_runtime_state(&encoded).unwrap();
+        let mut reopened = StandardAgentRuntime::restore(decoded).unwrap();
+        assert_eq!(
+            reopened.lane_state.linear[0].state_generation,
+            old_generation
+        );
+        assert_eq!(
+            reopened
+                .prepare_execution_state(&invocation)
+                .unwrap()
+                .linear
+                .as_deref(),
+            Some(&[][..])
+        );
+
+        set_lane(&mut reopened, actor, StateLane::Linear, &[0xbb]);
+        reopened.compact_historical_lane_entries_for_checkpoint();
+        assert_eq!(reopened.lane_state.linear.len(), 1);
+        assert_eq!(
+            reopened.lane_state.linear[0].state_generation,
+            new_generation
+        );
+        assert_eq!(reopened.lane_state.linear[0].value, vec![0xbb]);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn private_profile_rejects_linearizable_queries_and_all_linear_history() {
+        use crate::agent::execution::{
+            ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
+            ActorInvocationAuth,
+        };
+        use crate::service::InvocationId;
+
+        let config = private_config(8);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let mut install = install(config.identity.agent, None, "private");
+        install.entry.lanes = LaneSet::of(StateLane::Merge);
+        install.requirements.lanes = LaneSet::of(StateLane::Merge);
+        let actor = install.entry.actor;
+        let deployment = install.entry.deployment;
+        let program = install.entry.program;
+        apply_authorized(&mut runtime, &config, LifecycleRequest::Install(install)).unwrap();
+        let incarnation = runtime.actors[&actor].record.state_generation;
+        let invocation = ActorInvocation {
+            invocation: InvocationId([0x78; 32]),
+            actor,
+            incarnation,
+            deployment,
+            program,
+            mode: super::super::MethodMode::LinearizableQuery,
+            auth: ActorInvocationAuth::anonymous(),
+            message: vec![1],
+            availability: Vec::new(),
+            gas: 1,
+        };
+        let before = runtime.snapshot();
+        assert_eq!(
+            runtime.prepare_execution_state(&invocation),
+            Err(ActorExecutionError::UnsupportedMethod)
+        );
+        assert_eq!(
+            runtime.snapshot(),
+            before,
+            "rejection must not mutate state"
+        );
+
+        let historical_entry = StandardLaneEntry {
+            actor: ActorId([0x79; 32]),
+            state_generation: Hash([0x7a; 32]),
+            value: vec![1],
+        };
+        let mut with_entry = before.clone();
+        with_entry.lane_state.linear.push(historical_entry);
+        assert!(matches!(
+            StandardAgentRuntime::restore(with_entry),
+            Err(LifecycleError::InvalidRequest)
+        ));
+
+        let mut with_revision = before.clone();
+        with_revision.lane_revisions.linear = 1;
+        assert!(matches!(
+            StandardAgentRuntime::restore(with_revision),
+            Err(LifecycleError::InvalidRequest)
+        ));
+
+        let mut with_slot = before.clone();
+        with_slot.lane_revisions.linear_authority_slot = Some(1);
+        assert!(matches!(
+            StandardAgentRuntime::restore(with_slot),
+            Err(LifecycleError::InvalidRequest)
+        ));
+
+        let mut with_result = before;
+        with_result
+            .invocation_results
+            .push(StandardInvocationResult {
+                scope: InvocationScope::Ordered,
+                invocation: invocation.invocation,
+                incarnation,
+                request: invocation.commitment(),
+                reply: ActorExecutionReply {
+                    invocation: invocation.invocation,
+                    actor,
+                    incarnation,
+                    deployment,
+                    mode: invocation.mode,
+                    lane: None,
+                    status: ActorExecutionStatus::Done,
+                    reply: vec![1],
+                    gas_remaining: 0,
+                    observation: super::super::execution::ActorObservation::default(),
+                },
+                storage: InvocationResultStorage::Lane(StateLane::Linear),
+            });
+        assert!(matches!(
+            StandardAgentRuntime::restore(with_result),
+            Err(LifecycleError::InvalidRequest)
+        ));
+    }
+
+    #[test]
+    fn local_capability_downgrade_retains_unreachable_historical_lane_entries() {
+        let config = config(8);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        runtime.lane_state.linear.push(StandardLaneEntry {
+            actor: ActorId([0x7b; 32]),
+            state_generation: Hash([0x7c; 32]),
+            value: vec![1],
+        });
+        runtime.lane_revisions.linear = 1;
+        let mut downgraded = config.capabilities;
+        downgraded.lanes = LaneSet::of(StateLane::Merge).union(LaneSet::of(StateLane::Local));
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::UpgradeRuntime {
+                from_deployment: config.identity.runtime_deployment,
+                to_deployment: DeploymentId([0x7d; 32]),
+                to_program: ProgramId([0x7e; 32]),
+                producer: ProducerId([0x7f; 32]),
+                package: BlobRef {
+                    hash: Hash([0x80; 32]),
+                    len: 1,
+                },
+                contract: config.runtime_contract,
+                capabilities: downgraded,
+            },
+        )
+        .unwrap();
+
+        let reopened = StandardAgentRuntime::restore(runtime.snapshot()).unwrap();
+        assert_eq!(reopened.lane_state.linear.len(), 1);
+        assert_eq!(reopened.lane_revisions.linear, 1);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn runtime_cannot_disable_a_lane_which_owns_a_retained_result() {
+        use crate::agent::execution::{
+            ActorExecutionReply, ActorExecutionStatus, ActorInvocation, ActorInvocationAuth,
+        };
+        use crate::service::InvocationId;
+
+        let config = config(8);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let mut install = install(config.identity.agent, None, "result-owner");
+        install.entry.lanes = LaneSet::NONE;
+        install.requirements.lanes = LaneSet::NONE;
+        let actor = install.entry.actor;
+        let deployment = install.entry.deployment;
+        let program = install.entry.program;
+        apply_authorized(&mut runtime, &config, LifecycleRequest::Install(install)).unwrap();
+        let incarnation = runtime.actors[&actor].record.state_generation;
+        let invocation = ActorInvocation {
+            invocation: InvocationId([0x81; 32]),
+            actor,
+            incarnation,
+            deployment,
+            program,
+            mode: super::super::MethodMode::LinearizableQuery,
+            auth: ActorInvocationAuth::anonymous(),
+            message: vec![1],
+            availability: Vec::new(),
+            gas: 1,
+        };
+        let before = runtime.prepare_execution_state(&invocation).unwrap();
+        let mut reply = ActorExecutionReply {
+            invocation: invocation.invocation,
+            actor,
+            incarnation,
+            deployment,
+            mode: invocation.mode,
+            lane: None,
+            status: ActorExecutionStatus::Done,
+            reply: vec![1],
+            gas_remaining: 0,
+            observation: super::super::execution::ActorObservation::default(),
+        };
+        runtime
+            .commit_execution(
+                &invocation,
+                &mut reply,
+                &before,
+                before.visible_for(invocation.mode),
+                2,
+            )
+            .unwrap();
+
+        let mut downgraded = config.capabilities;
+        downgraded.lanes = LaneSet::of(StateLane::Merge).union(LaneSet::of(StateLane::Local));
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::UpgradeRuntime {
+                    from_deployment: config.identity.runtime_deployment,
+                    to_deployment: DeploymentId([0x82; 32]),
+                    to_program: ProgramId([0x83; 32]),
+                    producer: ProducerId([0x84; 32]),
+                    package: BlobRef {
+                        hash: Hash([0x85; 32]),
+                        len: 1,
+                    },
+                    contract: config.runtime_contract,
+                    capabilities: downgraded,
+                },
+            ),
+            Err(LifecycleError::UnsupportedRuntime)
+        );
+        assert!(
+            runtime
+                .config()
+                .unwrap()
+                .capabilities
+                .lanes
+                .contains(StateLane::Linear)
+        );
+        assert_eq!(runtime.invocation_results.len(), 1);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn invocation_identity_is_scoped_and_acknowledgement_routes_exactly() {
+        use crate::agent::execution::{
+            ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
+            ActorInvocationAuth,
+        };
+        use crate::service::InvocationId;
+
+        let config = config(8);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let mut request = install(config.identity.agent, None, "scoped");
+        request.entry.lanes = LaneSet::ALL;
+        request.requirements.lanes = LaneSet::ALL;
+        let actor = request.entry.actor;
+        let deployment = request.entry.deployment;
+        let program = request.entry.program;
+        apply_authorized(&mut runtime, &config, LifecycleRequest::Install(request)).unwrap();
+        let incarnation = runtime.actors[&actor].record.state_generation;
+
+        let raw_id = InvocationId([0x77; 32]);
+        let invocation = |mode| ActorInvocation {
+            invocation: raw_id,
+            actor,
+            incarnation,
+            deployment,
+            program,
+            mode,
+            auth: ActorInvocationAuth::anonymous(),
+            message: vec![mode as u8 + 1],
+            availability: Vec::new(),
+            gas: 1,
+        };
+        let query = invocation(super::super::MethodMode::Query);
+        let query_before = runtime.prepare_execution_state(&query).unwrap();
+        let mut query_reply = ActorExecutionReply {
+            invocation: raw_id,
+            actor,
+            incarnation,
+            deployment,
+            mode: query.mode,
+            lane: None,
+            status: ActorExecutionStatus::Done,
+            reply: vec![0x11],
+            gas_remaining: 0,
+            observation: super::super::execution::ActorObservation::default(),
+        };
+        runtime
+            .commit_execution(
+                &query,
+                &mut query_reply,
+                &query_before,
+                query_before.visible_for(query.mode),
+                10,
+            )
+            .unwrap();
+
+        let merge = invocation(super::super::MethodMode::Merge);
+        let merge_before = runtime.prepare_execution_state(&merge).unwrap();
+        let mut merge_reply = ActorExecutionReply {
+            invocation: raw_id,
+            actor,
+            incarnation,
+            deployment,
+            mode: merge.mode,
+            lane: Some(StateLane::Merge),
+            status: ActorExecutionStatus::Done,
+            reply: vec![0x22],
+            gas_remaining: 0,
+            observation: super::super::execution::ActorObservation::default(),
+        };
+        runtime
+            .commit_execution(
+                &merge,
+                &mut merge_reply,
+                &merge_before,
+                merge_before.visible_for(merge.mode),
+                11,
+            )
+            .unwrap();
+        assert_eq!(runtime.invocation_results.len(), 2);
+        assert_eq!(
+            runtime.recover_execution(&query, 12).unwrap(),
+            Some(query_reply.clone())
+        );
+        assert_eq!(
+            runtime.recover_execution(&merge, 12).unwrap(),
+            Some(merge_reply.clone())
+        );
+
+        let linear = invocation(super::super::MethodMode::Linear);
+        assert_eq!(
+            runtime.recover_execution(&linear, 12),
+            Err(ActorExecutionError::DivergentInvocation),
+            "Query and Linear share the Ordered exactly-once namespace"
+        );
+
+        let query_receipt = signed_invocation_receipt(&config, &query, 0, 100);
+        assert_eq!(
+            runtime.apply(LifecycleRequest::AcknowledgeInvocation {
+                scope: super::super::InvocationScope::Merge,
+                invocation: raw_id,
+                request: query.commitment(),
+                authority: Box::new(query_receipt.clone()),
+            }),
+            Err(LifecycleError::InvalidRequest),
+            "an explicit but wrong scope cannot retire another result"
+        );
+        assert_eq!(
+            runtime.apply(LifecycleRequest::AcknowledgeInvocation {
+                scope: super::super::InvocationScope::Ordered,
+                invocation: raw_id,
+                request: query.commitment(),
+                authority: Box::new(query_receipt),
+            }),
+            Ok(LifecycleReply::InvocationAcknowledged {
+                scope: super::super::InvocationScope::Ordered,
+                invocation: raw_id,
+            })
+        );
+        assert_eq!(runtime.recover_execution(&query, 12).unwrap(), None);
+        assert_eq!(
+            runtime.recover_execution(&merge, 12).unwrap(),
+            Some(merge_reply)
+        );
+        let merge_receipt = signed_invocation_receipt(&config, &merge, 0, 100);
+        assert!(
+            runtime
+                .apply(LifecycleRequest::AcknowledgeInvocation {
+                    scope: super::super::InvocationScope::Merge,
+                    invocation: raw_id,
+                    request: merge.commitment(),
+                    authority: Box::new(merge_receipt),
+                })
+                .is_ok()
+        );
+        assert!(runtime.invocation_results.is_empty());
     }
 
     #[test]
@@ -1780,10 +2634,10 @@ mod tests {
         let deployment = installed.entry.deployment;
         let program = installed.entry.program;
         apply_authorized(&mut runtime, &config, LifecycleRequest::Install(installed)).unwrap();
-        let managed = runtime.actors.get_mut(&actor).unwrap();
-        managed.lane_state.linear = Some(vec![1]);
-        managed.lane_state.merge = Some(vec![2]);
-        managed.lane_state.local = Some(vec![3]);
+        let incarnation = runtime.actors[&actor].record.state_generation;
+        set_lane(&mut runtime, actor, StateLane::Linear, &[1]);
+        set_lane(&mut runtime, actor, StateLane::Merge, &[2]);
+        set_lane(&mut runtime, actor, StateLane::Local, &[3]);
         runtime.lane_revisions.linear = 7;
         runtime.lane_revisions.merge = 8;
         runtime.lane_revisions.local = 9;
@@ -1791,6 +2645,7 @@ mod tests {
         let invocation = ActorInvocation {
             invocation: InvocationId([0x61; 32]),
             actor,
+            incarnation,
             deployment,
             program,
             mode: super::super::MethodMode::Query,
@@ -1814,6 +2669,7 @@ mod tests {
         let mut reply = ActorExecutionReply {
             invocation: invocation.invocation,
             actor,
+            incarnation,
             deployment,
             mode: invocation.mode,
             lane: None,
@@ -1843,7 +2699,7 @@ mod tests {
 
         // Mutation after the reply cannot change exact query recovery. The
         // result lives in the topology-neutral control component.
-        runtime.actors.get_mut(&actor).unwrap().lane_state.linear = Some(vec![9]);
+        set_lane(&mut runtime, actor, StateLane::Linear, &[9]);
         let encoded = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
         let decoded = super::super::wire::decode_standard_runtime_state(&encoded).unwrap();
         let mut reopened = StandardAgentRuntime::restore(decoded).unwrap();
@@ -1903,13 +2759,15 @@ mod tests {
         );
         assert_eq!(
             reopened.apply(LifecycleRequest::AcknowledgeInvocation {
+                scope: invocation.mode.invocation_scope(),
                 invocation: invocation.invocation,
                 request: invocation.commitment(),
                 authority: Box::new(receipt),
             }),
-            Ok(LifecycleReply::InvocationAcknowledged(
-                invocation.invocation
-            ))
+            Ok(LifecycleReply::InvocationAcknowledged {
+                scope: invocation.mode.invocation_scope(),
+                invocation: invocation.invocation,
+            })
         );
         assert_eq!(reopened.recover_execution(&invocation, 151).unwrap(), None);
     }
@@ -2335,12 +3193,14 @@ mod tests {
         let deployment = installed.entry.deployment;
         let program = installed.entry.program;
         apply_authorized(&mut runtime, &config, LifecycleRequest::Install(installed)).unwrap();
+        let incarnation = runtime.actors[&actor].record.state_generation;
 
         let mut message = vec![TAG_DYNAMIC];
         message.extend_from_slice(&Msg::new("set_title").encode());
         let mut invocation = super::super::execution::ActorInvocation {
             invocation: InvocationId([0x52; 32]),
             actor,
+            incarnation,
             deployment,
             program,
             mode: super::super::MethodMode::Linear,

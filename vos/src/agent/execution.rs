@@ -219,6 +219,11 @@ impl Default for ActorInvocationAuth {
 pub struct ActorInvocation {
     pub invocation: InvocationId,
     pub actor: ActorId,
+    /// Immutable identity of the exact install targeted by this work.
+    /// Removing and reinstalling the same ActorId changes this value, so an
+    /// authorization issued for the retired install cannot reach its
+    /// replacement even when deployment and program are reused.
+    pub incarnation: Hash,
     pub deployment: DeploymentId,
     pub program: ProgramId,
     pub mode: MethodMode,
@@ -253,6 +258,7 @@ pub struct ActorObservation {
 pub struct ActorExecutionReply {
     pub invocation: InvocationId,
     pub actor: ActorId,
+    pub incarnation: Hash,
     pub deployment: DeploymentId,
     pub mode: MethodMode,
     pub lane: Option<StateLane>,
@@ -266,6 +272,7 @@ pub struct ActorExecutionReply {
 pub enum ActorExecutionError {
     NotCreated,
     NotFound,
+    StaleIncarnation,
     Suspended,
     StaleDeployment,
     WrongProgram,
@@ -324,6 +331,7 @@ impl ActorInvocation {
         let mut encoder = Encoder(&mut bytes);
         encoder.fixed(&self.invocation.0);
         encoder.fixed(&self.actor.0);
+        encoder.fixed(&self.incarnation.0);
         encoder.fixed(&self.deployment.0);
         encoder.fixed(&self.program.0);
         encoder.u8(match self.mode {
@@ -371,6 +379,7 @@ impl ActorInvocation {
             .try_fold(0usize, |total, blob| total.checked_add(blob.bytes.len()));
         if self.invocation == InvocationId::ZERO
             || self.actor == ActorId::ZERO
+            || self.incarnation == Hash::ZERO
             || self.deployment == DeploymentId::ZERO
             || self.program == ProgramId::ZERO
             || self.gas == 0
@@ -643,6 +652,7 @@ fn terminal_reply(
     ActorExecutionReply {
         invocation: invocation.invocation,
         actor: invocation.actor,
+        incarnation: invocation.incarnation,
         deployment: invocation.deployment,
         mode: invocation.mode,
         lane: invocation.mode.write_lane(),
@@ -718,6 +728,7 @@ fn decode_actor_output(
         ActorExecutionReply {
             invocation: invocation.invocation,
             actor: invocation.actor,
+            incarnation: invocation.incarnation,
             deployment: invocation.deployment,
             mode: invocation.mode,
             lane: invocation.mode.write_lane(),
@@ -738,6 +749,7 @@ mod tests {
         ActorInvocation {
             invocation: InvocationId([1; 32]),
             actor: ActorId([2; 32]),
+            incarnation: Hash([5; 32]),
             deployment: DeploymentId([3; 32]),
             program: ProgramId([4; 32]),
             mode: MethodMode::Linear,

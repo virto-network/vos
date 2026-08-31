@@ -21,7 +21,8 @@ use vos::agent::host::{
 };
 use vos::agent::package::{Package, PackageManifest, PackageSignatureVerifier};
 use vos::agent::standard::{
-    StandardActorState, StandardLaneRevisions, StandardLaneState, StandardRuntimeState,
+    StandardActorState, StandardLaneEntry, StandardLaneRevisions, StandardLaneState,
+    StandardRuntimeState,
 };
 use vos::agent::wire::{
     RuntimeCall, RuntimeReturn, RuntimeState, decode_standard_runtime_state,
@@ -1197,6 +1198,7 @@ fn lane_probe_call(
         actors: vec![StandardActorState {
             record: ActorRecord {
                 entry,
+                state_generation: Hash([0xa4; 32]),
                 producer: ProducerId([0xa3; 32]),
                 package,
                 agent_schema: schema_reference.clone(),
@@ -1206,12 +1208,24 @@ fn lane_probe_call(
                 requirements,
             },
             debt: ActorLifecycleDebt::default(),
-            lane_state: StandardLaneState {
-                linear: Some(vec![linear]),
-                merge: Some(vec![merge]),
-                local: Some(vec![local]),
-            },
         }],
+        lane_state: StandardLaneState {
+            linear: vec![StandardLaneEntry {
+                actor,
+                state_generation: Hash([0xa4; 32]),
+                value: vec![linear],
+            }],
+            merge: vec![StandardLaneEntry {
+                actor,
+                state_generation: Hash([0xa4; 32]),
+                value: vec![merge],
+            }],
+            local: vec![StandardLaneEntry {
+                actor,
+                state_generation: Hash([0xa4; 32]),
+                value: vec![local],
+            }],
+        },
         lane_revisions: StandardLaneRevisions {
             linear: 1,
             merge: 1,
@@ -1225,6 +1239,7 @@ fn lane_probe_call(
     let invocation = ActorInvocation {
         invocation: InvocationId([invocation_byte; 32]),
         actor,
+        incarnation: Hash([0xa4; 32]),
         deployment,
         program,
         mode,
@@ -1431,6 +1446,11 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
         installed.result,
         Ok(LifecycleReply::Installed(installed_entry))
     );
+    let incarnation = decode_standard_runtime_state(&installed.state)
+        .unwrap()
+        .actors[0]
+        .record
+        .state_generation;
     let mut store = driver.into_store();
     store
         .put_package(&package_reference, &package_bytes)
@@ -1468,6 +1488,7 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
     let forged_claim = ActorInvocation {
         invocation: InvocationId([0x64; 32]),
         actor,
+        incarnation,
         deployment,
         program,
         mode: MethodMode::Linear,
@@ -1487,6 +1508,7 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
     let excessive_gas = ActorInvocation {
         invocation: InvocationId([0x65; 32]),
         actor,
+        incarnation,
         deployment,
         program,
         mode: MethodMode::Linear,
@@ -1507,6 +1529,7 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
     let invocation = ActorInvocation {
         invocation: InvocationId([0x66; 32]),
         actor,
+        incarnation,
         deployment,
         program,
         mode: MethodMode::Linear,
@@ -1557,12 +1580,18 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
     assert_eq!(driver.image().revision, 3);
 
     let state = decode_standard_runtime_state(&driver.image().runtime_state).unwrap();
+    let state_generation = state.actors[0].record.state_generation;
     assert_eq!(
-        state.actors[0].lane_state.linear.as_deref(),
-        Some(&[0x2a][..])
+        state
+            .lane_state
+            .linear
+            .iter()
+            .find(|entry| entry.actor == actor && entry.state_generation == state_generation)
+            .map(|entry| entry.value.as_slice()),
+        Some(&[0x2a][..]),
     );
-    assert!(state.actors[0].lane_state.merge.as_deref() == Some(&[][..]));
-    assert!(state.actors[0].lane_state.local.as_deref() == Some(&[][..]));
+    assert!(state.lane_state.merge.is_empty());
+    assert!(state.lane_state.local.is_empty());
 
     let dynamic_read = || {
         let mut message = vec![vos::value::TAG_DYNAMIC];
@@ -1572,6 +1601,7 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
     let query = ActorInvocation {
         invocation: InvocationId([0x68; 32]),
         actor,
+        incarnation,
         deployment,
         program,
         mode: MethodMode::Query,

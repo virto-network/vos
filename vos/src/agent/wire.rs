@@ -9,12 +9,13 @@ use super::execution::{
 };
 use super::standard::{
     StandardActorState, StandardAgentRuntime, StandardAuthorityDisposition,
-    StandardInvocationResult, StandardLaneState, StandardRuntimeState,
+    StandardInvocationResult, StandardLaneEntry, StandardLaneState, StandardRuntimeState,
 };
 use super::{
-    ActorDirectoryPage, ActorEntry, ActorLifecycleDebt, AgentConfig, AgentIdentity, AgentProfile,
-    AgentReplica, LaneSet, LifecycleError, LifecycleReply, LifecycleRequest, MethodMode,
-    ReplicaRole, RuntimeCapabilities, RuntimeRequirements, StateLane,
+    ActorDirectoryPage, ActorDirectoryRecord, ActorEntry, ActorLifecycleDebt, AgentConfig,
+    AgentIdentity, AgentProfile, AgentReplica, InvocationScope, LaneSet, LifecycleError,
+    LifecycleReply, LifecycleRequest, MethodMode, ReplicaRole, RuntimeCapabilities,
+    RuntimeRequirements, StateLane,
 };
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{
@@ -308,6 +309,32 @@ impl RuntimeState {
     }
 }
 
+fn decode_bounded_list<T>(
+    decoder: &mut Decoder<'_>,
+    maximum: usize,
+    mut decode: impl FnMut(&mut Decoder<'_>) -> Result<T, DecodeError>,
+) -> Result<Vec<T>, DecodeError> {
+    let len = decoder.u32()? as usize;
+    if len > maximum {
+        return Err(DecodeError::LimitExceeded);
+    }
+    // Validate the declared cardinality before allocating, then grow only
+    // after a complete item consumed authenticated input.
+    let mut values = Vec::new();
+    for _ in 0..len {
+        let before = decoder.remaining();
+        let value = decode(decoder)?;
+        if decoder.remaining() >= before {
+            return Err(DecodeError::NonCanonical);
+        }
+        values
+            .try_reserve(1)
+            .map_err(|_| DecodeError::LimitExceeded)?;
+        values.push(value);
+    }
+    Ok(values)
+}
+
 /// Encode the standard runtime's policy state and three actor-state lanes as
 /// independently durable opaque components.
 pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeState {
@@ -317,6 +344,7 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
     encoder.option(&state.config, encode_config);
     encoder.list(&state.actors, |encoder, actor| {
         encode_entry(encoder, &actor.record.entry);
+        encoder.fixed(&actor.record.state_generation.0);
         encoder.fixed(&actor.record.producer.0);
         encode_blob(encoder, &actor.record.package);
         encode_blob(encoder, &actor.record.agent_schema);
@@ -358,7 +386,9 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
             .filter(|result| result.storage == super::InvocationResultStorage::Control)
             .collect::<Vec<_>>(),
         |encoder, result| {
+            encoder.u8(encode_invocation_scope(result.scope));
             encoder.fixed(&result.invocation.0);
+            encoder.fixed(&result.incarnation.0);
             encoder.fixed(&result.request.0);
             encode_execution_reply(encoder, &result.reply);
         },
@@ -371,11 +401,19 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
     }
 }
 
-/// Decode all opaque standard-runtime components and enforce that their actor
-/// keysets agree exactly with the control directory.
+/// Decode all opaque standard-runtime components. Lane maps are sparse and
+/// independently keyed: matching active generations hydrate actor state,
+/// missing matching entries mean fresh empty state, and nonmatching entries
+/// remain historical until checkpoint compaction.
 pub fn decode_standard_runtime_state(
     state: &RuntimeState,
 ) -> Result<StandardRuntimeState, DecodeError> {
+    if state
+        .encoded_len()
+        .is_none_or(|bytes| bytes > super::execution::MAX_RUNTIME_STATE_BYTES)
+    {
+        return Err(DecodeError::LimitExceeded);
+    }
     if state.is_empty() {
         return Ok(StandardRuntimeState::default());
     }
@@ -391,59 +429,79 @@ pub fn decode_standard_runtime_state(
         return Err(DecodeError::InvalidPlatform);
     }
     let config = decoder.option(decode_config)?;
-    let mut actors = decoder.list(|decoder| {
-        Ok(StandardActorState {
-            record: super::ActorRecord {
-                entry: decode_entry(decoder)?,
-                producer: ProducerId(decoder.fixed()?),
-                package: decode_blob(decoder)?,
-                agent_schema: decode_blob(decoder)?,
-                role_policies: decode_blob(decoder)?,
-                state_layout: Hash(decoder.fixed()?),
-                contract: super::contract::decode_actor_contract(decoder)?,
-                requirements: decode_requirements(decoder)?,
-            },
-            debt: decode_debt(decoder)?,
-            lane_state: StandardLaneState::default(),
-        })
-    })?;
+    let actors = decode_bounded_list(
+        &mut decoder,
+        super::contract::STANDARD_MAX_ACTORS as usize,
+        |decoder| {
+            Ok(StandardActorState {
+                record: super::ActorRecord {
+                    entry: decode_entry(decoder)?,
+                    state_generation: Hash(decoder.fixed()?),
+                    producer: ProducerId(decoder.fixed()?),
+                    package: decode_blob(decoder)?,
+                    agent_schema: decode_blob(decoder)?,
+                    role_policies: decode_blob(decoder)?,
+                    state_layout: Hash(decoder.fixed()?),
+                    contract: super::contract::decode_actor_contract(decoder)?,
+                    requirements: decode_requirements(decoder)?,
+                },
+                debt: decode_debt(decoder)?,
+            })
+        },
+    )?;
     let authority_slot_high_water = decoder.option(|decoder| decoder.u64())?;
     let authority_sequence_high_water = decoder.option(|decoder| decoder.u64())?;
-    let authority_dispositions = decoder.list(|decoder| {
-        Ok(StandardAuthorityDisposition {
-            credential: crate::service::CredentialId(decoder.fixed()?),
-            sequence: decoder.u64()?,
-            claim: Hash(decoder.fixed()?),
-            operation: Hash(decoder.fixed()?),
-            result: if decoder.bool()? {
-                Ok(decode_reply(decoder)?)
-            } else {
-                Err(decode_error(decoder)?)
-            },
-        })
-    })?;
+    let authority_dispositions = decode_bounded_list(
+        &mut decoder,
+        super::standard::MAX_AUTHORITY_DISPOSITIONS,
+        |decoder| {
+            Ok(StandardAuthorityDisposition {
+                credential: crate::service::CredentialId(decoder.fixed()?),
+                sequence: decoder.u64()?,
+                claim: Hash(decoder.fixed()?),
+                operation: Hash(decoder.fixed()?),
+                result: if decoder.bool()? {
+                    Ok(decode_reply(decoder)?)
+                } else {
+                    Err(decode_error(decoder)?)
+                },
+            })
+        },
+    )?;
     let control_authority_slot = decoder.option(Decoder::u64)?;
-    let mut invocation_results = decoder.list(|decoder| {
-        let invocation = crate::service::InvocationId(decoder.fixed()?);
-        let request = Hash(decoder.fixed()?);
-        let reply = decode_execution_reply(decoder)?;
-        if invocation == crate::service::InvocationId::ZERO
-            || request == Hash::ZERO
-            || reply.invocation != invocation
-            || reply.mode.result_storage() != super::InvocationResultStorage::Control
-        {
-            return Err(DecodeError::NonCanonical);
-        }
-        Ok(StandardInvocationResult {
-            invocation,
-            request,
-            reply,
-            storage: super::InvocationResultStorage::Control,
-        })
-    })?;
+    let mut invocation_results = decode_bounded_list(
+        &mut decoder,
+        super::standard::MAX_INVOCATION_RESULTS_PER_LANE,
+        |decoder| {
+            let scope = decode_invocation_scope(decoder.u8()?)?;
+            let invocation = crate::service::InvocationId(decoder.fixed()?);
+            let incarnation = Hash(decoder.fixed()?);
+            let request = Hash(decoder.fixed()?);
+            let reply = decode_execution_reply(decoder)?;
+            if scope != InvocationScope::Ordered
+                || invocation == crate::service::InvocationId::ZERO
+                || incarnation == Hash::ZERO
+                || request == Hash::ZERO
+                || reply.invocation != invocation
+                || reply.incarnation != incarnation
+                || reply.mode.invocation_scope() != scope
+                || reply.mode.result_storage() != super::InvocationResultStorage::Control
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(StandardInvocationResult {
+                scope,
+                invocation,
+                incarnation,
+                request,
+                reply,
+                storage: super::InvocationResultStorage::Control,
+            })
+        },
+    )?;
     if invocation_results
         .windows(2)
-        .any(|pair| pair[0].invocation >= pair[1].invocation)
+        .any(|pair| (pair[0].scope, pair[0].invocation) >= (pair[1].scope, pair[1].invocation))
     {
         return Err(DecodeError::NonCanonical);
     }
@@ -451,6 +509,7 @@ pub fn decode_standard_runtime_state(
         return Err(DecodeError::TrailingBytes);
     }
     let mut lane_revisions = super::standard::StandardLaneRevisions::default();
+    let mut lane_state = StandardLaneState::default();
     for (lane, bytes) in [
         (StateLane::Linear, state.linear.as_slice()),
         (StateLane::Merge, state.merge.as_slice()),
@@ -471,31 +530,24 @@ pub fn decode_standard_runtime_state(
                 lane_revisions.local_authority_slot = decoded.authority_slot;
             }
         }
-        if decoded.values.len() != actors.len() {
-            return Err(DecodeError::NonCanonical);
-        }
-        for (actor, (id, value)) in actors.iter_mut().zip(decoded.values) {
-            if actor.record.entry.actor != id {
-                return Err(DecodeError::NonCanonical);
-            }
-            match lane {
-                StateLane::Linear => actor.lane_state.linear = value,
-                StateLane::Merge => actor.lane_state.merge = value,
-                StateLane::Local => actor.lane_state.local = value,
-            }
+        match lane {
+            StateLane::Linear => lane_state.linear = decoded.values,
+            StateLane::Merge => lane_state.merge = decoded.values,
+            StateLane::Local => lane_state.local = decoded.values,
         }
         invocation_results.extend(decoded.invocation_results);
     }
-    invocation_results.sort_unstable_by_key(|result| result.invocation);
+    invocation_results.sort_unstable_by_key(|result| (result.scope, result.invocation));
     if invocation_results
         .windows(2)
-        .any(|pair| pair[0].invocation >= pair[1].invocation)
+        .any(|pair| (pair[0].scope, pair[0].invocation) >= (pair[1].scope, pair[1].invocation))
     {
         return Err(DecodeError::NonCanonical);
     }
     let state = StandardRuntimeState {
         config,
         actors,
+        lane_state,
         invocation_results,
         lane_revisions,
         control_authority_slot,
@@ -525,14 +577,15 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
         },
         |encoder, slot| encoder.u64(*slot),
     );
-    encoder.list(&state.actors, |encoder, actor| {
-        encoder.fixed(&actor.record.entry.actor.0);
-        let value = match lane {
-            StateLane::Linear => &actor.lane_state.linear,
-            StateLane::Merge => &actor.lane_state.merge,
-            StateLane::Local => &actor.lane_state.local,
-        };
-        encoder.option(value, |encoder, bytes| encoder.bytes(bytes));
+    let entries = match lane {
+        StateLane::Linear => &state.lane_state.linear,
+        StateLane::Merge => &state.lane_state.merge,
+        StateLane::Local => &state.lane_state.local,
+    };
+    encoder.list(entries, |encoder, entry| {
+        encoder.fixed(&entry.actor.0);
+        encoder.fixed(&entry.state_generation.0);
+        encoder.bytes(&entry.value);
     });
     encoder.list(
         &state
@@ -541,7 +594,9 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
             .filter(|result| result.storage == super::InvocationResultStorage::Lane(lane))
             .collect::<Vec<_>>(),
         |encoder, result| {
+            encoder.u8(encode_invocation_scope(result.scope));
             encoder.fixed(&result.invocation.0);
+            encoder.fixed(&result.incarnation.0);
             encoder.fixed(&result.request.0);
             encode_execution_reply(encoder, &result.reply);
         },
@@ -552,7 +607,7 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
 struct DecodedStandardLane {
     revision: u64,
     authority_slot: Option<u64>,
-    values: Vec<(ActorId, Option<Vec<u8>>)>,
+    values: Vec<StandardLaneEntry>,
     invocation_results: Vec<StandardInvocationResult>,
 }
 
@@ -568,48 +623,66 @@ fn decode_standard_lane(
     }
     let revision = decoder.u64()?;
     let authority_slot = decoder.option(Decoder::u64)?;
-    let values = decoder.list(|decoder| {
-        let actor = ActorId(decoder.fixed()?);
-        let value = decoder.option(|decoder| {
-            let bytes = decoder.bytes_ref()?;
-            if bytes.len() > super::execution::MAX_EXECUTION_STATE_BYTES {
-                return Err(DecodeError::LimitExceeded);
+    let values = decode_bounded_list(
+        &mut decoder,
+        super::standard::MAX_LANE_STATE_ENTRIES,
+        |decoder| {
+            let actor = ActorId(decoder.fixed()?);
+            let state_generation = Hash(decoder.fixed()?);
+            let value = decoder.bytes_ref()?;
+            if actor == ActorId::ZERO
+                || state_generation == Hash::ZERO
+                || value.is_empty()
+                || value.len() > super::execution::MAX_EXECUTION_STATE_BYTES
+            {
+                return Err(DecodeError::NonCanonical);
             }
-            Ok(bytes.to_vec())
-        })?;
-        if actor == ActorId::ZERO
-            || value
-                .as_ref()
-                .is_some_and(|bytes| bytes.len() > super::execution::MAX_EXECUTION_STATE_BYTES)
-        {
-            return Err(DecodeError::NonCanonical);
-        }
-        Ok((actor, value))
-    })?;
-    if values.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            Ok(StandardLaneEntry {
+                actor,
+                state_generation,
+                value: value.to_vec(),
+            })
+        },
+    )?;
+    if values.windows(2).any(|pair| {
+        (pair[0].actor, pair[0].state_generation) >= (pair[1].actor, pair[1].state_generation)
+    }) {
         return Err(DecodeError::NonCanonical);
     }
-    let invocation_results = decoder.list(|decoder| {
-        let invocation = crate::service::InvocationId(decoder.fixed()?);
-        let request = Hash(decoder.fixed()?);
-        let reply = decode_execution_reply(decoder)?;
-        if invocation == crate::service::InvocationId::ZERO
-            || request == Hash::ZERO
-            || reply.invocation != invocation
-            || reply.mode.result_storage() != super::InvocationResultStorage::Lane(expected_lane)
-        {
-            return Err(DecodeError::NonCanonical);
-        }
-        Ok(StandardInvocationResult {
-            invocation,
-            request,
-            reply,
-            storage: super::InvocationResultStorage::Lane(expected_lane),
-        })
-    })?;
+    let invocation_results = decode_bounded_list(
+        &mut decoder,
+        super::standard::MAX_INVOCATION_RESULTS_PER_LANE,
+        |decoder| {
+            let scope = decode_invocation_scope(decoder.u8()?)?;
+            let invocation = crate::service::InvocationId(decoder.fixed()?);
+            let incarnation = Hash(decoder.fixed()?);
+            let request = Hash(decoder.fixed()?);
+            let reply = decode_execution_reply(decoder)?;
+            if scope != invocation_scope_for_lane(expected_lane)
+                || invocation == crate::service::InvocationId::ZERO
+                || incarnation == Hash::ZERO
+                || request == Hash::ZERO
+                || reply.invocation != invocation
+                || reply.incarnation != incarnation
+                || reply.mode.invocation_scope() != scope
+                || reply.mode.result_storage()
+                    != super::InvocationResultStorage::Lane(expected_lane)
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(StandardInvocationResult {
+                scope,
+                invocation,
+                incarnation,
+                request,
+                reply,
+                storage: super::InvocationResultStorage::Lane(expected_lane),
+            })
+        },
+    )?;
     if invocation_results
         .windows(2)
-        .any(|pair| pair[0].invocation >= pair[1].invocation)
+        .any(|pair| (pair[0].scope, pair[0].invocation) >= (pair[1].scope, pair[1].invocation))
         || !decoder.exhausted()
     {
         return Err(DecodeError::NonCanonical);
@@ -659,6 +732,7 @@ pub fn apply_standard_execution(
                 Ok(false) => Ok(ActorExecutionReply {
                     invocation: call.invocation.invocation,
                     actor: call.invocation.actor,
+                    incarnation: call.invocation.incarnation,
                     deployment: call.invocation.deployment,
                     mode: call.invocation.mode,
                     lane: call.invocation.mode.write_lane(),
@@ -757,6 +831,7 @@ fn decode_runtime_state(decoder: &mut Decoder<'_>) -> Result<RuntimeState, Decod
 fn encode_actor_invocation(encoder: &mut Encoder<'_>, invocation: &ActorInvocation) {
     encoder.fixed(&invocation.invocation.0);
     encoder.fixed(&invocation.actor.0);
+    encoder.fixed(&invocation.incarnation.0);
     encoder.fixed(&invocation.deployment.0);
     encoder.fixed(&invocation.program.0);
     encoder.u8(encode_method_mode(invocation.mode));
@@ -772,6 +847,7 @@ fn encode_actor_invocation(encoder: &mut Encoder<'_>, invocation: &ActorInvocati
 fn decode_actor_invocation(decoder: &mut Decoder<'_>) -> Result<ActorInvocation, DecodeError> {
     let invocation = crate::service::InvocationId(decoder.fixed()?);
     let actor = ActorId(decoder.fixed()?);
+    let incarnation = Hash(decoder.fixed()?);
     let deployment = DeploymentId(decoder.fixed()?);
     let program = ProgramId(decoder.fixed()?);
     let mode = decode_method_mode(decoder.u8()?)?;
@@ -799,6 +875,7 @@ fn decode_actor_invocation(decoder: &mut Decoder<'_>) -> Result<ActorInvocation,
     Ok(ActorInvocation {
         invocation,
         actor,
+        incarnation,
         deployment,
         program,
         mode,
@@ -839,6 +916,7 @@ fn decode_invocation_auth(decoder: &mut Decoder<'_>) -> Result<ActorInvocationAu
 fn encode_execution_reply(encoder: &mut Encoder<'_>, reply: &ActorExecutionReply) {
     encoder.fixed(&reply.invocation.0);
     encoder.fixed(&reply.actor.0);
+    encoder.fixed(&reply.incarnation.0);
     encoder.fixed(&reply.deployment.0);
     encoder.u8(encode_method_mode(reply.mode));
     encoder.option(&reply.lane, |encoder, lane| encoder.u8(*lane as u8));
@@ -860,6 +938,7 @@ fn decode_execution_reply(decoder: &mut Decoder<'_>) -> Result<ActorExecutionRep
     let reply = ActorExecutionReply {
         invocation: crate::service::InvocationId(decoder.fixed()?),
         actor: ActorId(decoder.fixed()?),
+        incarnation: Hash(decoder.fixed()?),
         deployment: DeploymentId(decoder.fixed()?),
         mode: decode_method_mode(decoder.u8()?)?,
         lane: decoder.option(|decoder| decode_state_lane(decoder.u8()?))?,
@@ -886,6 +965,7 @@ fn decode_execution_reply(decoder: &mut Decoder<'_>) -> Result<ActorExecutionRep
     };
     if reply.invocation == crate::service::InvocationId::ZERO
         || reply.actor == ActorId::ZERO
+        || reply.incarnation == Hash::ZERO
         || reply.deployment == DeploymentId::ZERO
         || reply.lane != reply.mode.write_lane()
         || reply.reply.len() > super::execution::MAX_EXECUTION_REPLY_BYTES
@@ -916,6 +996,7 @@ fn encode_execution_error(encoder: &mut Encoder<'_>, error: ActorExecutionError)
         ActorExecutionError::InvalidAuthorization => encoder.u8(13),
         ActorExecutionError::AuthorityExpired => encoder.u8(14),
         ActorExecutionError::AuthoritySlotRegressed => encoder.u8(15),
+        ActorExecutionError::StaleIncarnation => encoder.u8(16),
     }
 }
 
@@ -937,6 +1018,7 @@ fn decode_execution_error(decoder: &mut Decoder<'_>) -> Result<ActorExecutionErr
         13 => ActorExecutionError::InvalidAuthorization,
         14 => ActorExecutionError::AuthorityExpired,
         15 => ActorExecutionError::AuthoritySlotRegressed,
+        16 => ActorExecutionError::StaleIncarnation,
         _ => return Err(DecodeError::InvalidTag),
     })
 }
@@ -961,6 +1043,27 @@ fn decode_method_mode(value: u8) -> Result<MethodMode, DecodeError> {
         4 => Ok(MethodMode::Merge),
         5 => Ok(MethodMode::Local),
         _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+const fn encode_invocation_scope(scope: InvocationScope) -> u8 {
+    scope as u8
+}
+
+fn decode_invocation_scope(value: u8) -> Result<InvocationScope, DecodeError> {
+    match value {
+        0 => Ok(InvocationScope::Ordered),
+        1 => Ok(InvocationScope::Merge),
+        2 => Ok(InvocationScope::Local),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+const fn invocation_scope_for_lane(lane: StateLane) -> InvocationScope {
+    match lane {
+        StateLane::Linear => InvocationScope::Ordered,
+        StateLane::Merge => InvocationScope::Merge,
+        StateLane::Local => InvocationScope::Local,
     }
 }
 
@@ -1026,11 +1129,13 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             encoder.fixed(&expected_deployment.0);
         }
         LifecycleRequest::AcknowledgeInvocation {
+            scope,
             invocation,
             request,
             authority,
         } => {
             encoder.u8(8);
+            encoder.u8(encode_invocation_scope(*scope));
             encoder.fixed(&invocation.0);
             encoder.fixed(&request.0);
             encoder.bytes(&authority.encode());
@@ -1129,6 +1234,7 @@ fn decode_request_at_depth(
             capabilities: decode_capabilities(decoder)?,
         }),
         8 => Ok(LifecycleRequest::AcknowledgeInvocation {
+            scope: decode_invocation_scope(decoder.u8()?)?,
             invocation: crate::service::InvocationId(decoder.fixed()?),
             request: Hash(decoder.fixed()?),
             authority: Box::new(super::authority::ActorInvocationReceipt::decode(
@@ -1187,8 +1293,9 @@ fn encode_reply(encoder: &mut Encoder<'_>, reply: &LifecycleReply) {
             encoder.u8(7);
             encode_identity(encoder, identity);
         }
-        LifecycleReply::InvocationAcknowledged(invocation) => {
+        LifecycleReply::InvocationAcknowledged { scope, invocation } => {
             encoder.u8(8);
+            encoder.u8(encode_invocation_scope(*scope));
             encoder.fixed(&invocation.0);
         }
     }
@@ -1204,9 +1311,10 @@ fn decode_reply(decoder: &mut Decoder<'_>) -> Result<LifecycleReply, DecodeError
         5 => Ok(LifecycleReply::Resumed(decode_entry(decoder)?)),
         6 => Ok(LifecycleReply::Removed(ActorId(decoder.fixed()?))),
         7 => Ok(LifecycleReply::RuntimeUpgraded(decode_identity(decoder)?)),
-        8 => Ok(LifecycleReply::InvocationAcknowledged(
-            crate::service::InvocationId(decoder.fixed()?),
-        )),
+        8 => Ok(LifecycleReply::InvocationAcknowledged {
+            scope: decode_invocation_scope(decoder.u8()?)?,
+            invocation: crate::service::InvocationId(decoder.fixed()?),
+        }),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -1364,21 +1472,34 @@ fn decode_entry(decoder: &mut Decoder<'_>) -> Result<ActorEntry, DecodeError> {
 }
 
 fn encode_directory_page(encoder: &mut Encoder<'_>, page: &ActorDirectoryPage) {
-    encoder.list(&page.entries, encode_entry);
+    encoder.list(&page.entries, |encoder, record| {
+        encode_entry(encoder, &record.entry);
+        encoder.fixed(&record.incarnation.0);
+    });
     encoder.option(&page.next, |encoder, next| encoder.fixed(&next.0));
 }
 
 fn decode_directory_page(decoder: &mut Decoder<'_>) -> Result<ActorDirectoryPage, DecodeError> {
-    let entries = decoder.list(decode_entry)?;
-    if entries.len() > usize::from(super::standard::MAX_DIRECTORY_PAGE)
-        || entries
-            .windows(2)
-            .any(|pair| pair[0].actor >= pair[1].actor)
+    let entries = decode_bounded_list(
+        decoder,
+        usize::from(super::standard::MAX_DIRECTORY_PAGE),
+        |decoder| {
+            let entry = decode_entry(decoder)?;
+            let incarnation = Hash(decoder.fixed()?);
+            if incarnation == Hash::ZERO {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(ActorDirectoryRecord { entry, incarnation })
+        },
+    )?;
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].entry.actor >= pair[1].entry.actor)
     {
         return Err(DecodeError::NonCanonical);
     }
     let next = decoder.option(|decoder| Ok(ActorId(decoder.fixed()?)))?;
-    if next.is_some() && next != entries.last().map(|entry| entry.actor) {
+    if next.is_some() && next != entries.last().map(|record| record.entry.actor) {
         return Err(DecodeError::NonCanonical);
     }
     Ok(ActorDirectoryPage { entries, next })
@@ -1513,6 +1634,147 @@ mod tests {
         }
     }
 
+    fn sparse_standard_state() -> StandardRuntimeState {
+        let config = config();
+        let actor = ActorId::top_level(config.identity.agent, "sparse");
+        let package = BlobRef {
+            hash: Hash([0x81; 32]),
+            len: 10,
+        };
+        let agent_schema = BlobRef {
+            hash: Hash([0x82; 32]),
+            len: 11,
+        };
+        let role_policies = BlobRef {
+            hash: Hash([0x83; 32]),
+            len: 12,
+        };
+        let generation = Hash([0x84; 32]);
+        StandardRuntimeState {
+            config: Some(config),
+            actors: vec![StandardActorState {
+                record: super::super::ActorRecord {
+                    entry: ActorEntry {
+                        actor,
+                        name: "sparse".into(),
+                        parent: None,
+                        deployment: DeploymentId([0x85; 32]),
+                        program: ProgramId([0x86; 32]),
+                        package: package.clone(),
+                        agent_schema: agent_schema.clone(),
+                        role_policies: role_policies.clone(),
+                        state_layout: Hash([0x87; 32]),
+                        lanes: LaneSet::ALL,
+                        suspended: false,
+                    },
+                    state_generation: generation,
+                    producer: ProducerId([0x88; 32]),
+                    package,
+                    agent_schema,
+                    role_policies,
+                    state_layout: Hash([0x87; 32]),
+                    contract: super::super::contract::ActorPackageContract::canonical(),
+                    requirements: RuntimeRequirements {
+                        lanes: LaneSet::ALL,
+                        scheduling: false,
+                        proofs: false,
+                    },
+                },
+                debt: ActorLifecycleDebt::default(),
+            }],
+            lane_state: StandardLaneState {
+                linear: vec![StandardLaneEntry {
+                    actor,
+                    state_generation: generation,
+                    value: vec![0x89],
+                }],
+                merge: Vec::new(),
+                local: Vec::new(),
+            },
+            lane_revisions: super::super::standard::StandardLaneRevisions {
+                linear: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sparse_lane_state_round_trips_and_missing_is_the_only_empty_encoding() {
+        let state = sparse_standard_state();
+        let encoded = encode_standard_runtime_state(&state);
+        assert_eq!(decode_standard_runtime_state(&encoded).unwrap(), state);
+
+        let mut missing = state.clone();
+        missing.lane_state.linear.clear();
+        let encoded_missing = encode_standard_runtime_state(&missing);
+        assert_eq!(
+            decode_standard_runtime_state(&encoded_missing).unwrap(),
+            missing,
+            "a supported missing entry is canonical fresh-empty state"
+        );
+
+        let mut explicit_empty = state.clone();
+        explicit_empty.lane_state.linear[0].value.clear();
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&explicit_empty)),
+            Err(DecodeError::NonCanonical),
+            "explicit empty and missing must never encode the same logical state"
+        );
+    }
+
+    #[test]
+    fn sparse_lane_state_rejects_duplicate_unsorted_and_oversized_cardinality() {
+        let state = sparse_standard_state();
+        let mut duplicate = state.clone();
+        duplicate
+            .lane_state
+            .linear
+            .push(duplicate.lane_state.linear[0].clone());
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&duplicate)),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut unsorted = state.clone();
+        unsorted.lane_state.linear = vec![
+            StandardLaneEntry {
+                actor: ActorId([2; 32]),
+                state_generation: Hash([1; 32]),
+                value: vec![1],
+            },
+            StandardLaneEntry {
+                actor: ActorId([1; 32]),
+                state_generation: Hash([1; 32]),
+                value: vec![2],
+            },
+        ];
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&unsorted)),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut zero_generation = state.clone();
+        zero_generation.lane_state.linear[0].state_generation = Hash::ZERO;
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&zero_generation)),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut encoded = encode_standard_runtime_state(&state);
+        const LANE_LIST_OFFSET: usize = 32 + 1 + 8 + 1;
+        encoded.linear[LANE_LIST_OFFSET..LANE_LIST_OFFSET + 4].copy_from_slice(
+            &u32::try_from(super::super::standard::MAX_LANE_STATE_ENTRIES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert_eq!(
+            decode_standard_runtime_state(&encoded),
+            Err(DecodeError::LimitExceeded),
+            "declared lane cardinality is rejected before entry allocation"
+        );
+    }
+
     #[test]
     fn lifecycle_call_round_trips_with_opaque_runtime_state() {
         let call = RuntimeCall {
@@ -1637,7 +1899,10 @@ mod tests {
                 local: vec![4],
             },
             result: Ok(LifecycleReply::Directory(ActorDirectoryPage {
-                entries: vec![entry.clone()],
+                entries: vec![ActorDirectoryRecord {
+                    entry: entry.clone(),
+                    incarnation: Hash([0x44; 32]),
+                }],
                 next: Some(entry.actor),
             })),
         };
@@ -1667,6 +1932,7 @@ mod tests {
         let invocation = ActorInvocation {
             invocation: crate::service::InvocationId([1; 32]),
             actor: ActorId([2; 32]),
+            incarnation: Hash([0x45; 32]),
             deployment: DeploymentId([3; 32]),
             program: ProgramId::of_pvm(&actor_pvm),
             mode: MethodMode::Linear,
@@ -1773,6 +2039,20 @@ mod tests {
         };
         assert_eq!(
             RuntimeCall::decode(&oversized.encode()),
+            Err(DecodeError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn standard_state_decoder_bounds_the_aggregate_before_component_decoding() {
+        let oversized = RuntimeState {
+            control: vec![0; super::super::execution::MAX_RUNTIME_STATE_BYTES],
+            linear: vec![0],
+            merge: vec![0],
+            local: vec![0],
+        };
+        assert_eq!(
+            decode_standard_runtime_state(&oversized),
             Err(DecodeError::LimitExceeded)
         );
     }
