@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 
 use super::committee::{
     RootAnchorRecord, SystemAgentGenesisAdmissionId, SystemAgentGenesisAdmissionRecord,
-    SystemAgentGenesisEvidence, VerifiedSystemAgentGenesis,
+    SystemAgentGenesisEvidence, SystemAgentGenesisExpectations, VerifiedSystemAgentGenesis,
 };
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, MAX_RUNTIME_STATE_BYTES,
@@ -31,7 +31,7 @@ use super::journal::{
     LaneStateManifest, LocalEntry, LocalEntryId, MergeEvent, MergeEventId, MergeFrontier,
     MergeFrontierId, MergeSeal, MergeSealId, OrderedBase, OrderedEntry, OrderedEntryId,
     PersistedLane, ReplayInput, ReplayOperation, RuntimeBinding,
-    system_genesis_post_create_state_commitment,
+    system_genesis_artifact_closure_commitment, system_genesis_post_create_state_commitment,
 };
 #[cfg(feature = "std")]
 use super::journal::{
@@ -1187,11 +1187,134 @@ pub enum ReplayPublicationAnchor {
     Checkpoint(CheckpointManifest),
 }
 
+/// Exact, genesis-ID-free result of executing the one admitted Create input.
+///
+/// Fields are deliberately private. The token can only be minted by the
+/// replay engine after authentication, exact execution, and the complete
+/// genesis transition checks. In particular, neither a caller-supplied state
+/// nor a placeholder admission/genesis ID can be promoted into a seal.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReplayPreparedGenesis {
+    create: ReplayInput,
+    replica: AgentReplica,
+    post_create: RuntimeState,
+    artifacts: Vec<BlobRef>,
+    expectations: SystemAgentGenesisExpectations,
+}
+
+impl ReplayPreparedGenesis {
+    pub(crate) fn prepare<E: ReplayExecutor>(
+        create: ReplayInput,
+        replica: AgentReplica,
+        executor: &mut E,
+    ) -> Result<Self, ReplayError<core::convert::Infallible, E::Error>> {
+        if create.validate().is_err() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        validate_position(&create, ReplayPosition::Genesis)?;
+        let ReplayOperation::Management { request } = &create.operation else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        let LifecycleRequest::Authorized { request, .. } = request else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        let LifecycleRequest::Create(config) = request.as_ref() else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        if config.identity.profile != super::AgentProfile::Local
+            || config.replicas.as_slice() != [replica]
+        {
+            return Err(ReplayError::ScopeMismatch);
+        }
+
+        let before = RuntimeState::default();
+        validate_runtime_state_bound(&before)?;
+        executor
+            .authenticate(&create, &before, ReplayPosition::Genesis)
+            .map_err(ReplayError::Executor)?;
+        let transition = executor
+            .execute(&create, &before, ReplayPosition::Genesis)
+            .map_err(ReplayError::Executor)?;
+        validate_runtime_state_bound(&transition.state)?;
+        validate_transition(
+            &create,
+            &before,
+            &transition,
+            ReplayPosition::Genesis,
+            &create.runtime,
+            false,
+            false,
+            None,
+        )?;
+        if transition.disposition != ReplayDisposition::Applied
+            || transition.result.is_some()
+            || transition.next_runtime != create.runtime
+        {
+            return Err(ReplayError::InvalidManagementTransition);
+        }
+
+        let post_create = transition.state;
+        let decoded =
+            decode_standard_runtime_state(&post_create).map_err(|_| ReplayError::InvalidRecord)?;
+        if decoded.config.as_ref() != Some(config)
+            || !decoded.config.as_ref().is_some_and(|created| {
+                created.identity.profile == super::AgentProfile::Local
+                    && created.replicas.as_slice() == [replica]
+            })
+        {
+            return Err(ReplayError::InvalidManagementTransition);
+        }
+        let artifacts = derive_standard_artifact_references::<core::convert::Infallible>(
+            &create.runtime,
+            &post_create,
+        )
+        .map_err(|error| error.map_executor(|never| match never {}))?;
+        let expectations = SystemAgentGenesisExpectations::new(
+            create.runtime.commitment(),
+            request.commitment(),
+            system_genesis_post_create_state_commitment(&post_create)
+                .map_err(|_| ReplayError::InvalidRecord)?,
+            system_genesis_artifact_closure_commitment(&artifacts)
+                .map_err(|_| ReplayError::InvalidRecord)?,
+            match &create.operation {
+                ReplayOperation::Management {
+                    request: LifecycleRequest::Authorized { admission, .. },
+                } => admission.receipt.claim.sequence,
+                _ => unreachable!("validated genesis operation"),
+            },
+        )
+        .map_err(|_| ReplayError::InvalidRecord)?;
+
+        Ok(Self {
+            create,
+            replica,
+            post_create,
+            artifacts,
+            expectations,
+        })
+    }
+
+    pub(crate) const fn create(&self) -> &ReplayInput {
+        &self.create
+    }
+
+    pub(crate) const fn replica(&self) -> AgentReplica {
+        self.replica
+    }
+
+    pub(crate) fn artifacts(&self) -> &[BlobRef] {
+        &self.artifacts
+    }
+
+    pub(crate) const fn expectations(&self) -> SystemAgentGenesisExpectations {
+        self.expectations
+    }
+}
+
 /// Root-admitted, exactly executed clean-generation journal bootstrap.
 ///
-/// Production construction remains deliberately unavailable until the system
-/// Agent's QC/root-bootstrap adapter lands. Storage may inspect this closure,
-/// but cannot manufacture one from a merely self-canonical genesis record.
+/// Storage may inspect this closure, but cannot manufacture one from a merely
+/// self-canonical genesis record or decoded authority evidence.
 pub struct ReplaySealedGenesis {
     genesis: AgentJournalGenesis,
     post_create: RuntimeState,
@@ -1259,15 +1382,12 @@ impl ReplaySealedGenesis {
     /// system-Agent admission and the exact replayed Create transition.
     /// Decoded evidence, a self-canonical genesis, or caller-supplied state is
     /// never sufficient on its own.
-    pub(crate) fn from_verified<E: ReplayExecutor>(
+    pub(crate) fn from_prepared_verified(
         verified: &VerifiedSystemAgentGenesis,
         admission_evidence: SystemAgentGenesisEvidence,
-        genesis: AgentJournalGenesis,
-        replica: AgentReplica,
-        executor: &mut E,
-    ) -> Result<Self, ReplayError<core::convert::Infallible, E::Error>> {
-        genesis.validate().map_err(|_| ReplayError::InvalidRecord)?;
-        let ReplayOperation::Management { request } = &genesis.create.operation else {
+        prepared: ReplayPreparedGenesis,
+    ) -> Result<Self, ReplayValidationError> {
+        let ReplayOperation::Management { request } = &prepared.create.operation else {
             return Err(ReplayError::InvalidRecord);
         };
         let LifecycleRequest::Authorized { request, .. } = request else {
@@ -1278,65 +1398,51 @@ impl ReplaySealedGenesis {
         };
         let admission_record = verified.admission_record();
         let root_anchor = verified.root_anchor().clone();
-        if verified.admission_id() != genesis.admission
-            || verified.admission_commitment() != genesis.admission.as_hash()
-            || admission_record.id() != genesis.admission
-            || admission_record.evidence() != verified.evidence_id()
+        if admission_record.evidence() != verified.evidence_id()
             || admission_record.root_anchor() != root_anchor.id()
             || admission_record.root_anchor_config_version() != root_anchor.config_version()
             || admission_record.root_anchor_config() != root_anchor.config_commitment()
             || admission_evidence.id() != verified.evidence_id()
-            || verified.space() != genesis.runtime().space
-            || verified.system_agent() != genesis.runtime().agent
+            || verified.space() != prepared.create.runtime.space
+            || verified.system_agent() != prepared.create.runtime.agent
             || verified.authority_binding() != config.authority.commitment()
-            || verified.genesis_intent()
-                != genesis
-                    .genesis_intent()
-                    .map_err(|_| ReplayError::InvalidRecord)?
-            || verified.runtime_binding() != genesis.runtime().commitment()
-            || verified.sequence()
-                != genesis
-                    .genesis_authority_sequence()
-                    .map_err(|_| ReplayError::InvalidRecord)?
-            || !config.replicas.contains(&replica)
+            || verified.genesis_intent() != prepared.expectations.genesis_intent()
+            || verified.runtime_binding() != prepared.expectations.runtime_binding()
+            || verified.post_create_state() != prepared.expectations.post_create_state()
+            || verified.artifact_closure() != prepared.expectations.artifact_closure()
+            || verified.sequence() != prepared.expectations.sequence()
+            || config.identity.profile != super::AgentProfile::Local
+            || config.replicas.as_slice() != [prepared.replica]
         {
             return Err(ReplayError::InvalidRecord);
         }
 
-        let genesis_id = genesis.id();
-        let mut machine = ReplayMachine::from_genesis(genesis_id, genesis.runtime().clone())
-            .map_err(ReplayError::InvocationOwnership)?;
-        let step = machine.apply::<_, core::convert::Infallible>(
-            executor,
-            &genesis.create,
-            &RuntimeState::default(),
-            ReplayPosition::Genesis,
-        )?;
-        if step.outcome != ReplayStepOutcome::Applied(ReplayDisposition::Applied)
-            || step.runtime != *genesis.runtime()
-        {
-            return Err(ReplayError::InvalidRecord);
-        }
-        let post_create = step.state;
-        let decoded =
-            decode_standard_runtime_state(&post_create).map_err(|_| ReplayError::InvalidRecord)?;
-        if decoded.config.as_ref() != Some(config)
-            || !decoded
-                .config
-                .as_ref()
-                .is_some_and(|state_config| state_config.replicas.contains(&replica))
-            || system_genesis_post_create_state_commitment(&post_create)
+        let genesis = AgentJournalGenesis {
+            admission: verified.admission_id(),
+            create: prepared.create,
+        };
+        genesis.validate().map_err(|_| ReplayError::InvalidRecord)?;
+        if verified.admission_commitment() != genesis.admission.as_hash()
+            || admission_record.id() != genesis.admission
+            || genesis
+                .genesis_intent()
                 .map_err(|_| ReplayError::InvalidRecord)?
-                != verified.post_create_state()
+                != verified.genesis_intent()
+            || genesis
+                .genesis_authority_sequence()
+                .map_err(|_| ReplayError::InvalidRecord)?
+                != verified.sequence()
         {
             return Err(ReplayError::InvalidRecord);
         }
-        let artifacts = derive_standard_artifact_closure::<core::convert::Infallible>(
-            genesis_id,
-            &step.runtime,
-            &post_create,
-        )
-        .map_err(|error| error.map_executor(|never| match never {}))?;
+        let genesis_id = genesis.id();
+        let artifacts = ArtifactClosure {
+            genesis: genesis_id,
+            artifacts: prepared.artifacts,
+        };
+        artifacts
+            .validate()
+            .map_err(|_| ReplayError::InvalidRecord)?;
         if artifacts
             .system_genesis_commitment()
             .map_err(|_| ReplayError::InvalidRecord)?
@@ -1344,6 +1450,8 @@ impl ReplaySealedGenesis {
         {
             return Err(ReplayError::InvalidRecord);
         }
+        let post_create = prepared.post_create;
+        let replica = prepared.replica;
         let empty_frontier = MergeFrontier {
             genesis: genesis_id,
             events: Vec::new(),
@@ -3806,6 +3914,18 @@ fn derive_standard_artifact_closure<SourceError>(
     runtime: &RuntimeBinding,
     state: &RuntimeState,
 ) -> Result<ArtifactClosure, ReplayError<SourceError, core::convert::Infallible>> {
+    let artifacts = derive_standard_artifact_references(runtime, state)?;
+    let closure = ArtifactClosure { genesis, artifacts };
+    if closure.validate().is_err() {
+        return Err(ReplayError::InvalidRecord);
+    }
+    Ok(closure)
+}
+
+fn derive_standard_artifact_references<SourceError>(
+    runtime: &RuntimeBinding,
+    state: &RuntimeState,
+) -> Result<Vec<BlobRef>, ReplayError<SourceError, core::convert::Infallible>> {
     validate_runtime_state_bound(state)?;
     let decoded = decode_standard_runtime_state(state).map_err(|_| ReplayError::InvalidRecord)?;
     let config = decoded.config.as_ref().ok_or(ReplayError::InvalidRecord)?;
@@ -3826,11 +3946,10 @@ fn derive_standard_artifact_closure<SourceError>(
     }
     artifacts.sort_unstable_by_key(|artifact| (artifact.hash, artifact.len));
     artifacts.dedup_by_key(|artifact| (artifact.hash, artifact.len));
-    let closure = ArtifactClosure { genesis, artifacts };
-    if closure.validate().is_err() {
+    if system_genesis_artifact_closure_commitment(&artifacts).is_err() {
         return Err(ReplayError::InvalidRecord);
     }
-    Ok(closure)
+    Ok(artifacts)
 }
 
 trait ScopedJournalRecord: CanonicalJournalRecord {
@@ -7407,8 +7526,7 @@ pub(crate) mod tests {
     use crate::agent::committee::{
         AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
         AuthorityQuorumCertificate, AuthoritySignature, AuthoritySignerId, RootAnchorRecord,
-        SystemAgentGenesisClaim, SystemAgentGenesisEvidence, SystemAgentGenesisExpectations,
-        TrustedRootAnchor,
+        SystemAgentGenesisClaim, SystemAgentGenesisEvidence, TrustedRootAnchor,
     };
     use crate::agent::contract::RuntimePackageContract;
     use crate::agent::execution::{ActorInvocation, ActorInvocationAuth, ActorObservation};
@@ -8277,56 +8395,17 @@ pub(crate) mod tests {
         }
     }
 
-    /// Test-only root admission. It still runs the exact Create transition
-    /// through ReplayMachine and derives the complete artifact closure; it
-    /// exposes no callable constructor in non-test code.
+    /// Test-only root admission. It still authenticates and executes the
+    /// exact Create transition and derives the complete artifact closure; it
+    /// exposes no callable authority constructor in non-test code.
     #[cfg(feature = "std")]
     pub(crate) fn admitted_genesis(admission: u8) -> ReplaySealedGenesis {
-        // The admission ID is derived only after the cycle-free intent and
-        // exact Create outputs have been certified. A temporary nonzero ID is
-        // used solely to execute the same request and derive those outputs;
-        // their authority commitments explicitly exclude the final genesis
-        // scope.
-        let mut genesis = AgentJournalGenesis {
-            admission: SystemAgentGenesisAdmissionId::from_bytes([admission; 32]),
-            create: admitted_create_input(),
-        };
-        assert!(genesis.validate().is_ok());
-        let genesis_id = genesis.id();
-        let mut machine = ReplayMachine::from_genesis(genesis_id, admitted_runtime()).unwrap();
         let mut executor = ExactCreateRejectInvocations::default();
-        let step = machine
-            .apply::<_, ()>(
-                &mut executor,
-                &genesis.create,
-                &RuntimeState::default(),
-                ReplayPosition::Genesis,
-            )
-            .unwrap();
-        assert_eq!(
-            step.outcome(),
-            ReplayStepOutcome::Applied(ReplayDisposition::Applied)
-        );
-        let artifacts = derive_standard_artifact_closure::<core::convert::Infallible>(
-            genesis_id,
-            &step.runtime,
-            &step.state,
-        )
-        .unwrap();
-        let inner_create = match &genesis.create.operation {
-            ReplayOperation::Management {
-                request: LifecycleRequest::Authorized { request, .. },
-            } => request.commitment(),
-            _ => unreachable!(),
-        };
-        let expected = SystemAgentGenesisExpectations::new(
-            genesis.runtime().commitment(),
-            inner_create,
-            system_genesis_post_create_state_commitment(&step.state).unwrap(),
-            artifacts.system_genesis_commitment().unwrap(),
-            genesis.genesis_authority_sequence().unwrap(),
-        )
-        .unwrap();
+        let replica = admitted_config().replicas[0];
+        let prepared =
+            ReplayPreparedGenesis::prepare(admitted_create_input(), replica, &mut executor)
+                .unwrap();
+        let expected = prepared.expectations();
         let signing_keys = [
             SigningKey::from_bytes(&[admission; 32]),
             SigningKey::from_bytes(&[admission.wrapping_add(1); 32]),
@@ -8346,13 +8425,18 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         members.sort_by_key(AuthorityCommitteeMember::signer);
         let authority_binding = admitted_config().authority.commitment();
-        let committee =
-            AuthorityCommittee::new(genesis.runtime().space, authority_binding, 1, None, members)
-                .unwrap();
+        let committee = AuthorityCommittee::new(
+            admitted_runtime().space,
+            authority_binding,
+            1,
+            None,
+            members,
+        )
+        .unwrap();
         let root = RootAnchorRecord::new(
             u64::from(admission) + 1,
-            genesis.runtime().space,
-            genesis.runtime().agent,
+            admitted_runtime().space,
+            admitted_runtime().agent,
             authority_binding,
             Hash([admission.wrapping_add(3); 32]),
             committee.clone(),
@@ -8389,10 +8473,7 @@ pub(crate) mod tests {
                 .unwrap();
         let evidence = SystemAgentGenesisEvidence::new(claim, certificate).unwrap();
         let verified = evidence.verify(&trusted, expected).unwrap();
-        genesis.admission = verified.admission_id();
-        let replica = admitted_config().replicas[0];
-        ReplaySealedGenesis::from_verified(&verified, evidence, genesis, replica, &mut executor)
-            .unwrap()
+        ReplaySealedGenesis::from_prepared_verified(&verified, evidence, prepared).unwrap()
     }
 
     #[cfg(feature = "std")]

@@ -27,6 +27,20 @@ pub const AUTHORITY_ED25519_SIGNATURE_BYTES: usize = 64;
 
 /// Maximum complete root-anchor record, including its service-wire header.
 pub const MAX_ROOT_ANCHOR_RECORD_BYTES: usize = 32 * 1024;
+/// Maximum complete independently pinned root-anchor configuration.
+///
+/// The outer record repeats the fixed deployment pins beside one bounded
+/// [`RootAnchorRecord`]. Keeping this separate from the record itself is what
+/// prevents decoded authority bytes from selecting their own trust root.
+pub const MAX_ROOT_ANCHOR_PINS_BYTES: usize = SERVICE_WIRE_HEADER_BYTES
+    + 4 // nested record length
+    + MAX_ROOT_ANCHOR_RECORD_BYTES
+    + 8 // config version
+    + 32 // root ID
+    + 32 // config commitment
+    + 1 // claim domain
+    + 8 // claim sequence
+    + 32; // claim payload commitment
 /// Maximum complete authority QC, including its service-wire header.
 pub const MAX_AUTHORITY_QC_WIRE_BYTES: usize = 32 * 1024;
 /// Maximum complete system-Agent genesis evidence record.
@@ -1064,6 +1078,129 @@ impl ServiceWire for RootAnchorRecord {
         };
         record.validate().map_err(canonical_decode_error)?;
         Ok(record)
+    }
+}
+
+/// Independently provisioned pins for one exact system-Agent root admission.
+///
+/// Constructing or decoding this value still does not mint a trusted-root
+/// capability. The crate-sealed verifier repeats every record comparison and
+/// requires the exact system-genesis claim selected by independent operator
+/// configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootAnchorPins {
+    record: RootAnchorRecord,
+    config_version: u64,
+    root_anchor: RootAnchorId,
+    config_commitment: RootAnchorConfigCommitment,
+    genesis_claim: AuthorityClaimCommitment,
+}
+
+impl RootAnchorPins {
+    pub fn new(
+        record: RootAnchorRecord,
+        config_version: u64,
+        root_anchor: RootAnchorId,
+        config_commitment: RootAnchorConfigCommitment,
+        genesis_claim: AuthorityClaimCommitment,
+    ) -> Result<Self, AuthorityCommitteeError> {
+        let pins = Self {
+            record,
+            config_version,
+            root_anchor,
+            config_commitment,
+            genesis_claim,
+        };
+        pins.validate()?;
+        Ok(pins)
+    }
+
+    pub const fn record(&self) -> &RootAnchorRecord {
+        &self.record
+    }
+
+    pub const fn config_version(&self) -> u64 {
+        self.config_version
+    }
+
+    pub const fn root_anchor(&self) -> RootAnchorId {
+        self.root_anchor
+    }
+
+    pub const fn config_commitment(&self) -> RootAnchorConfigCommitment {
+        self.config_commitment
+    }
+
+    pub const fn genesis_claim(&self) -> AuthorityClaimCommitment {
+        self.genesis_claim
+    }
+
+    pub fn validate(&self) -> Result<(), AuthorityCommitteeError> {
+        self.record.validate()?;
+        self.genesis_claim.validate()?;
+        if self.config_version == 0
+            || self.root_anchor == RootAnchorId::ZERO
+            || self.config_commitment == RootAnchorConfigCommitment::ZERO
+            || self.genesis_claim.domain != AuthorityClaimDomain::SystemAgentGenesis
+        {
+            return Err(AuthorityCommitteeError::InvalidBootstrapAnchor);
+        }
+        if self.record.config_version != self.config_version
+            || self.record.id() != self.root_anchor
+            || self.record.config_commitment() != self.config_commitment
+        {
+            return Err(AuthorityCommitteeError::WrongBootstrapAnchor);
+        }
+        if self.encode().len() > MAX_ROOT_ANCHOR_PINS_BYTES {
+            return Err(AuthorityCommitteeError::RootAnchorTooLarge);
+        }
+        Ok(())
+    }
+
+    /// Promote independently configured pins only for their exact
+    /// system-genesis claim. A caller-computed claim can be compared here but
+    /// can never replace the independently supplied pin.
+    pub(crate) fn verify_claim(
+        &self,
+        claim: AuthorityClaimCommitment,
+    ) -> Result<TrustedRootAnchor, AuthorityCommitteeError> {
+        self.validate()?;
+        if claim != self.genesis_claim {
+            return Err(AuthorityCommitteeError::WrongBootstrapAnchor);
+        }
+        TrustedRootAnchor::verify_configured(
+            self.record.clone(),
+            self.config_version,
+            self.root_anchor,
+            self.config_commitment,
+            self.genesis_claim,
+        )
+    }
+}
+
+impl ServiceWire for RootAnchorPins {
+    const MAGIC: [u8; 4] = *b"AGRP";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.bytes(&self.record.encode());
+        encoder.u64(self.config_version);
+        encoder.fixed(self.root_anchor.as_bytes());
+        encoder.fixed(self.config_commitment.as_bytes());
+        encode_claim(&mut encoder, self.genesis_claim);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_wire_bound(decoder, MAX_ROOT_ANCHOR_PINS_BYTES)?;
+        let pins = Self {
+            record: decode_nested_wire::<RootAnchorRecord>(decoder, MAX_ROOT_ANCHOR_RECORD_BYTES)?,
+            config_version: decoder.u64()?,
+            root_anchor: RootAnchorId(decoder.fixed()?),
+            config_commitment: RootAnchorConfigCommitment(decoder.fixed()?),
+            genesis_claim: decode_claim(decoder)?,
+        };
+        pins.validate().map_err(canonical_decode_error)?;
+        Ok(pins)
     }
 }
 
@@ -2234,6 +2371,97 @@ mod tests {
             expected.genesis_intent(),
             GenesisIntentId::from_commitments(expected.runtime_binding(), Hash([0x57; 32]))
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn root_anchor_pins_are_canonical_independent_and_exact() {
+        let voters = keys(1..=3);
+        let committee = committee(1, None, &voters, &[]);
+        let root = root_anchor(committee, 9);
+        let expected = genesis_expectations(4);
+        let claim = SystemAgentGenesisClaim::new(&root, expected).unwrap();
+        let pins = RootAnchorPins::new(
+            root.clone(),
+            root.config_version(),
+            root.id(),
+            root.config_commitment(),
+            claim.authority_claim(),
+        )
+        .unwrap();
+        assert_eq!(RootAnchorPins::decode(&pins.encode()).unwrap(), pins);
+        assert!(pins.encode().len() <= MAX_ROOT_ANCHOR_PINS_BYTES);
+        let trusted = pins.verify_claim(claim.authority_claim()).unwrap();
+        assert_eq!(trusted.record(), &root);
+
+        assert_eq!(
+            RootAnchorPins::new(
+                root.clone(),
+                root.config_version() + 1,
+                root.id(),
+                root.config_commitment(),
+                claim.authority_claim(),
+            ),
+            Err(AuthorityCommitteeError::WrongBootstrapAnchor)
+        );
+        assert_eq!(
+            RootAnchorPins::new(
+                root.clone(),
+                root.config_version(),
+                RootAnchorId::from_bytes([0x81; 32]),
+                root.config_commitment(),
+                claim.authority_claim(),
+            ),
+            Err(AuthorityCommitteeError::WrongBootstrapAnchor)
+        );
+        assert_eq!(
+            RootAnchorPins::new(
+                root.clone(),
+                root.config_version(),
+                root.id(),
+                RootAnchorConfigCommitment::from_bytes([0x82; 32]),
+                claim.authority_claim(),
+            ),
+            Err(AuthorityCommitteeError::WrongBootstrapAnchor)
+        );
+        assert_eq!(
+            RootAnchorPins::new(
+                root.clone(),
+                root.config_version(),
+                root.id(),
+                root.config_commitment(),
+                AuthorityClaimCommitment::of_bytes(
+                    AuthorityClaimDomain::Lifecycle,
+                    expected.sequence(),
+                    b"wrong domain",
+                ),
+            ),
+            Err(AuthorityCommitteeError::InvalidBootstrapAnchor)
+        );
+
+        let alternate = AuthorityClaimCommitment::of_bytes(
+            AuthorityClaimDomain::SystemAgentGenesis,
+            expected.sequence(),
+            b"alternate exact pin",
+        );
+        let alternate_pins = RootAnchorPins::new(
+            root.clone(),
+            root.config_version(),
+            root.id(),
+            root.config_commitment(),
+            alternate,
+        )
+        .unwrap();
+        assert_eq!(
+            alternate_pins.verify_claim(claim.authority_claim()),
+            Err(AuthorityCommitteeError::WrongBootstrapAnchor)
+        );
+
+        let mut oversized = pins.encode();
+        oversized.resize(MAX_ROOT_ANCHOR_PINS_BYTES + 1, 0);
+        assert_eq!(
+            RootAnchorPins::decode(&oversized),
+            Err(DecodeError::LimitExceeded)
         );
     }
 

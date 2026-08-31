@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 
 pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
 pub mod authority;
+pub mod bootstrap;
 pub mod committee;
 pub mod contract;
 #[cfg(feature = "std")]
