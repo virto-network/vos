@@ -494,11 +494,13 @@ pub(crate) struct ReplayedSystemAuthorityView {
 }
 
 impl ReplayedSystemAuthorityView {
-    // Production construction intentionally lives at the future replay/store
-    // integration seam. A constructor from decoded state plus caller-chosen
-    // IDs would turn those facts into a signing capability.
-    #[cfg(test)]
-    fn for_test_from_authenticated_replay(
+    /// Bind replay-authenticated authority state to its exact physical store,
+    /// predecessor Heads, and Control state.
+    ///
+    /// The journal scope is deliberately opaque and cannot be reconstructed
+    /// from its raw genesis/admission IDs. Consequently decoded authority
+    /// state and caller-chosen IDs alone cannot mint this signing view.
+    pub(crate) fn from_authenticated_replay(
         trusted_scope: SystemAuthorityJournalScope,
         state: &SystemAuthorityState,
         journal_store: JournalStoreInstanceId,
@@ -548,6 +550,17 @@ impl ReplayedSystemAuthorityView {
         view.commitment = view.compute_commitment();
         view.validate()?;
         Ok(view)
+    }
+
+    #[cfg(test)]
+    fn for_test_from_authenticated_replay(
+        trusted_scope: SystemAuthorityJournalScope,
+        state: &SystemAuthorityState,
+        journal_store: JournalStoreInstanceId,
+        heads: JournalHeadsId,
+        control_state: LaneStateId,
+    ) -> Result<Self, SystemAuthorityLedgerWireError> {
+        Self::from_authenticated_replay(trusted_scope, state, journal_store, heads, control_state)
     }
 
     pub(crate) const fn route(&self) -> SystemAuthorityLedgerRoute {
@@ -891,6 +904,36 @@ mod durable {
     impl PendingSystemAuthorityRecovery {
         pub(crate) const fn route(&self) -> SystemAuthorityLedgerRoute {
             self.record.route
+        }
+
+        pub(crate) const fn journal_store(&self) -> JournalStoreInstanceId {
+            self.record.journal_store
+        }
+
+        pub(crate) const fn predecessor_heads(&self) -> JournalHeadsId {
+            self.record.predecessor_heads
+        }
+
+        pub(crate) const fn control_state(&self) -> LaneStateId {
+            self.record.control_state
+        }
+
+        /// Commitment to the complete predecessor tuple, including its exact
+        /// store, Heads, Control state, and authenticated authority state.
+        pub(crate) const fn state_view_commitment(&self) -> Hash {
+            self.record.state_view
+        }
+
+        /// Commitment to authority state alone. Replay uses this to
+        /// distinguish an unrelated-Heads rebase from an already-published
+        /// authority transition without promoting this evidence to a
+        /// reservation.
+        pub(crate) const fn authority_state_commitment(&self) -> Hash {
+            self.record.authority_state
+        }
+
+        pub(crate) fn claim(&self) -> AuthorityClaimCommitment {
+            self.record.request.claim()
         }
 
         pub(crate) const fn request(&self) -> &SystemAuthorityLedgerClaim {
@@ -1503,8 +1546,8 @@ mod durable {
             pending: &PendingSystemAuthorityRecovery,
             leg: SystemAuthorityCommitteeLeg,
         ) -> Result<Option<AuthorityQuorumCertificate>, SystemAuthorityLedgerError> {
-            let reserved = self.pending_as_read_only(pending)?;
-            self.certificate_for(&reserved, leg)
+            self.ensure_pending_read_only(pending)?;
+            self.certificate_for_record(&pending.record, leg)
         }
 
         pub(crate) fn joint_rotation_certificate(
@@ -1536,17 +1579,17 @@ mod durable {
             pending: &PendingSystemAuthorityRecovery,
         ) -> Result<Option<SystemAuthorityRotationCertificate>, SystemAuthorityLedgerError>
         {
-            let reserved = self.pending_as_read_only(pending)?;
-            let Some(transition) = reserved.record.request.transition().cloned() else {
+            self.ensure_pending_read_only(pending)?;
+            let Some(transition) = pending.record.request.transition().cloned() else {
                 return Err(SystemAuthorityLedgerError::WrongCommitteeLeg);
             };
-            let Some(old_certificate) =
-                self.certificate_for(&reserved, SystemAuthorityCommitteeLeg::Retiring)?
+            let Some(old_certificate) = self
+                .certificate_for_record(&pending.record, SystemAuthorityCommitteeLeg::Retiring)?
             else {
                 return Ok(None);
             };
-            let Some(new_certificate) =
-                self.certificate_for(&reserved, SystemAuthorityCommitteeLeg::Incoming)?
+            let Some(new_certificate) = self
+                .certificate_for_record(&pending.record, SystemAuthorityCommitteeLeg::Incoming)?
             else {
                 return Ok(None);
             };
@@ -1623,10 +1666,10 @@ mod durable {
             Ok(())
         }
 
-        fn pending_as_read_only(
+        fn ensure_pending_read_only(
             &self,
             pending: &PendingSystemAuthorityRecovery,
-        ) -> Result<ReservedSystemAuthorityClaim, SystemAuthorityLedgerError> {
+        ) -> Result<(), SystemAuthorityLedgerError> {
             if pending.record.route != self.route
                 || pending.record.journal_store != self.journal_store
             {
@@ -1644,7 +1687,7 @@ mod durable {
             if active != pending.record {
                 return Err(SystemAuthorityLedgerError::ClaimNotReserved);
             }
-            Ok(ReservedSystemAuthorityClaim { record: active })
+            Ok(())
         }
 
         fn ensure_pledge(
@@ -1866,8 +1909,16 @@ mod durable {
             reserved: &ReservedSystemAuthorityClaim,
             leg: SystemAuthorityCommitteeLeg,
         ) -> Result<Option<AuthorityQuorumCertificate>, SystemAuthorityLedgerError> {
-            let claim = reserved.record.request.claim();
-            let Some(committee) = reserved.record.request.committee(leg) else {
+            self.certificate_for_record(&reserved.record, leg)
+        }
+
+        fn certificate_for_record(
+            &self,
+            record: &ReservationRecord,
+            leg: SystemAuthorityCommitteeLeg,
+        ) -> Result<Option<AuthorityQuorumCertificate>, SystemAuthorityLedgerError> {
+            let claim = record.request.claim();
+            let Some(committee) = record.request.committee(leg) else {
                 return Err(SystemAuthorityLedgerError::WrongCommitteeLeg);
             };
             let key = leg_storage_key(self.route, claim.sequence(), leg);
@@ -3251,6 +3302,7 @@ mod durable {
         const CONTROL_1: LaneStateId = LaneStateId::new([0x1a; 32]);
         const CONTROL_2: LaneStateId = LaneStateId::new([0x1b; 32]);
         const CONTROL_REBASE: LaneStateId = LaneStateId::new([0x1d; 32]);
+        const FOREIGN_GENESIS: AgentJournalGenesisId = AgentJournalGenesisId::new([0x1e; 32]);
 
         struct TempDirectory(std::path::PathBuf);
 
@@ -3371,7 +3423,7 @@ mod durable {
                 )
                 .unwrap();
                 let store = JournalStoreInstanceId::from_bytes([0x31; 32]).unwrap();
-                let view = ReplayedSystemAuthorityView::for_test_from_authenticated_replay(
+                let view = ReplayedSystemAuthorityView::from_authenticated_replay(
                     scope, &state, store, HEADS_1, CONTROL_1,
                 )
                 .unwrap();
@@ -3626,6 +3678,200 @@ mod durable {
                 .unwrap()
                 .unwrap();
             (signer, joint)
+        }
+
+        #[test]
+        fn authenticated_view_constructor_keeps_scope_capability_and_exact_ids() {
+            let fixture = Fixture::new();
+
+            // Pin the production constructor's capability-bearing signature:
+            // raw genesis/admission IDs are not accepted in place of the
+            // replay-minted scope.
+            let constructor: fn(
+                SystemAuthorityJournalScope,
+                &SystemAuthorityState,
+                JournalStoreInstanceId,
+                JournalHeadsId,
+                LaneStateId,
+            ) -> Result<
+                ReplayedSystemAuthorityView,
+                SystemAuthorityLedgerWireError,
+            > = ReplayedSystemAuthorityView::from_authenticated_replay;
+
+            assert!(matches!(
+                constructor(
+                    fixture.scope,
+                    &fixture.state,
+                    fixture.store,
+                    JournalHeadsId::ZERO,
+                    CONTROL_1,
+                ),
+                Err(SystemAuthorityLedgerWireError::InvalidStateView)
+            ));
+            assert!(matches!(
+                constructor(
+                    fixture.scope,
+                    &fixture.state,
+                    fixture.store,
+                    HEADS_1,
+                    LaneStateId::ZERO,
+                ),
+                Err(SystemAuthorityLedgerWireError::InvalidStateView)
+            ));
+
+            let directory = TempDirectory::new("view_scope_store");
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+            let ledger = open_ledger(database.clone(), &fixture);
+            let foreign_scope = SystemAuthorityJournalScope::for_test(
+                FOREIGN_GENESIS,
+                fixture.scope.agent_admission(),
+            )
+            .unwrap();
+            let foreign_scope_view = constructor(
+                foreign_scope,
+                &fixture.state,
+                fixture.store,
+                HEADS_1,
+                CONTROL_1,
+            )
+            .unwrap();
+            assert_ne!(foreign_scope_view.route(), fixture.route);
+            assert!(matches!(
+                ledger.reserve_or_reconcile(&foreign_scope_view, fixture.rotation_request()),
+                Err(SystemAuthorityLedgerError::WrongRoute)
+            ));
+
+            let foreign_store = JournalStoreInstanceId::from_bytes([0x32; 32]).unwrap();
+            let foreign_store_view = constructor(
+                fixture.scope,
+                &fixture.state,
+                foreign_store,
+                HEADS_1,
+                CONTROL_1,
+            )
+            .unwrap();
+            assert_eq!(foreign_store_view.route(), fixture.route);
+            assert!(matches!(
+                ledger.reserve_or_reconcile(&foreign_store_view, fixture.rotation_request()),
+                Err(SystemAuthorityLedgerError::WrongRoute)
+            ));
+
+            // Once authority state has been journal-bound by an executed
+            // transition, even another replay-minted scope cannot be used to
+            // re-anchor it. `successor_view` asserts that rejection before
+            // returning the correctly scoped successor.
+            let reserved = ledger
+                .reserve_or_reconcile(&fixture.view, fixture.rotation_request())
+                .unwrap()
+                .into_reserved();
+            let (_, joint) = certify_both_legs(&ledger, database, &fixture, &reserved);
+            let _ = fixture.successor_view(joint);
+        }
+
+        #[test]
+        fn pending_recovery_exposes_exact_non_signing_predecessor_evidence() {
+            let fixture = Fixture::new();
+            let directory = TempDirectory::new("pending_evidence");
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+            let ledger = open_ledger(database, &fixture);
+            ledger
+                .reserve_or_reconcile(&fixture.view, fixture.rotation_request())
+                .unwrap();
+
+            let pending = ledger.recover_pending_claim().unwrap().unwrap();
+            assert_eq!(pending.route(), fixture.view.route());
+            assert_eq!(pending.journal_store(), fixture.view.journal_store());
+            assert_eq!(pending.predecessor_heads(), fixture.view.heads());
+            assert_eq!(pending.control_state(), fixture.view.control_state());
+            assert_eq!(pending.state_view_commitment(), fixture.view.commitment());
+            assert_eq!(
+                pending.authority_state_commitment(),
+                fixture.view.authority_state_commitment()
+            );
+            assert_eq!(pending.claim(), fixture.request.claim());
+            assert_eq!(pending.request(), &fixture.request);
+
+            let foreign_heads = ReplayedSystemAuthorityView::from_authenticated_replay(
+                fixture.scope,
+                &fixture.state,
+                fixture.store,
+                HEADS_REBASE,
+                CONTROL_1,
+            )
+            .unwrap();
+            assert_ne!(pending.predecessor_heads(), foreign_heads.heads());
+            assert_ne!(pending.state_view_commitment(), foreign_heads.commitment());
+            assert_eq!(
+                pending.authority_state_commitment(),
+                foreign_heads.authority_state_commitment()
+            );
+
+            let foreign_control = ReplayedSystemAuthorityView::from_authenticated_replay(
+                fixture.scope,
+                &fixture.state,
+                fixture.store,
+                HEADS_1,
+                CONTROL_REBASE,
+            )
+            .unwrap();
+            assert_ne!(pending.control_state(), foreign_control.control_state());
+            assert_ne!(
+                pending.state_view_commitment(),
+                foreign_control.commitment()
+            );
+            assert_eq!(
+                pending.authority_state_commitment(),
+                foreign_control.authority_state_commitment()
+            );
+
+            let foreign_store = ReplayedSystemAuthorityView::from_authenticated_replay(
+                fixture.scope,
+                &fixture.state,
+                JournalStoreInstanceId::from_bytes([0x33; 32]).unwrap(),
+                HEADS_1,
+                CONTROL_1,
+            )
+            .unwrap();
+            assert_ne!(pending.journal_store(), foreign_store.journal_store());
+            assert_ne!(pending.state_view_commitment(), foreign_store.commitment());
+            assert_eq!(
+                pending.authority_state_commitment(),
+                foreign_store.authority_state_commitment()
+            );
+
+            let alternate_keys = vec![
+                (fixture.keys[0].clone(), AuthorityMemberRole::Voter),
+                (fixture.keys[1].clone(), AuthorityMemberRole::Voter),
+                (key(0x2f), AuthorityMemberRole::Voter),
+            ];
+            let alternate = committee(2, Some(fixture.old.commitment()), &alternate_keys);
+            let transition = SystemAuthorityRotationClaim::new(
+                ROOT,
+                1,
+                ROOT_CONFIG,
+                fixture.route.authority_scope(),
+                &fixture.old,
+                &alternate,
+                2,
+                3,
+            )
+            .unwrap();
+            let alternate = SystemAuthorityRotationReservationRequest::new(
+                fixture.old.clone(),
+                alternate,
+                transition,
+            )
+            .unwrap();
+            assert_ne!(pending.claim(), alternate.claim());
+
+            // Recovery inspection remains usable without reconciliation and
+            // therefore without manufacturing a sign-capable reservation.
+            assert!(
+                ledger
+                    .pending_certificate(&pending, SystemAuthorityCommitteeLeg::Retiring)
+                    .unwrap()
+                    .is_none()
+            );
         }
 
         #[test]
