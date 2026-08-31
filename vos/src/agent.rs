@@ -36,6 +36,8 @@ pub mod schema;
 pub mod shared_commit;
 pub mod shared_raft;
 pub mod standard;
+pub mod system_authority;
+pub(crate) mod system_authority_ledger;
 pub mod wire;
 use crate::service::{
     ActorId, AgentId, BlobRef, DeploymentId, Hash, NodeId, PrincipalId, ProducerId, ProgramId,
