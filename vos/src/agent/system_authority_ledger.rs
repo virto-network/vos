@@ -28,9 +28,11 @@ use super::genesis::{
     MAX_AGENT_GENESIS_CLAIM_BYTES, MAX_AGENT_GENESIS_PROPOSAL_BYTES,
     MAX_AGENT_REPLICA_COMMITTEE_BYTES,
 };
-#[cfg(all(feature = "std", feature = "storage"))]
-use super::journal::OrderedEntryId;
 use super::journal::{AgentJournalGenesisId, JournalHeadsId, LaneStateId};
+#[cfg(all(feature = "std", feature = "storage"))]
+use super::journal::{
+    CanonicalJournalRecord, MAX_JOURNAL_RECORD_BYTES, OrderedEntry, OrderedEntryId, ReplayOperation,
+};
 use super::shared_raft::JournalStoreInstanceId;
 use super::system_authority::{
     MAX_SYSTEM_AUTHORITY_DECISION_PROOF_BYTES, MAX_SYSTEM_AUTHORITY_ROTATION_CLAIM_BYTES,
@@ -755,7 +757,6 @@ mod durable {
     use redb::{Database, ReadableTable, TableDefinition};
 
     use super::*;
-    use crate::agent::LifecycleReply;
     use crate::agent::committee::{
         AuthorityMemberRole, AuthorityQuorumCertificate, AuthoritySignature, AuthoritySignerId,
         MAX_AUTHORITY_QC_WIRE_BYTES,
@@ -763,19 +764,22 @@ mod durable {
     use crate::agent::journal_store::{AgentJournalStore, JournalPublication};
     use crate::agent::replay::{
         PublishedSystemAuthorityRotation, RecoveredSystemAuthorityRotation, ReplayExecutionResult,
-        ReplayMaterialization, SystemAuthorityRotationPublicationFacts,
+        ReplayMaterialization, RetiredSystemAuthorityRotationRecovery,
+        SystemAuthorityRotationPublicationFacts,
     };
     use crate::agent::system_authority::{
         MAX_SYSTEM_AUTHORITY_ROTATIONS, SystemAuthorityCommitteeId,
         SystemAuthorityRotationCertificate, SystemAuthorityRotationId,
         SystemAuthorityRotationNodeId,
     };
+    use crate::agent::{LifecycleReply, LifecycleRequest};
     use crate::service::NodeId;
 
-    // Clean-break schema: v3 writers pin signer-independent route ownership
-    // before installing any local signing key. Older writers must reject the
-    // permanent v3 Config rows and cannot mutate this state machine.
-    const LEDGER_SCHEMA_VERSION: u32 = 3;
+    // Clean-break schema: v4 intents retain the complete bounded ordered
+    // replay payload. The permanent Config sentinel makes both v2 and v3
+    // writers reject this route before they can install a signer or mutate
+    // evidence rows.
+    const LEDGER_SCHEMA_VERSION: u32 = 4;
     // Config rows are permanent: a key that was ever local must never later be
     // admitted through the remote-share path and bypass its durable pledge.
     // One initial committee plus every protocol-bounded rotation can introduce
@@ -786,7 +790,16 @@ mod durable {
     const MAX_CONFIG_RECORD_BYTES: usize = 1024;
     const MAX_ROUTE_CONFIG_RECORD_BYTES: usize = 1024;
     const MAX_META_RECORD_BYTES: usize = 1024;
-    const MAX_PUBLICATION_INTENT_RECORD_BYTES: usize = 2048;
+    // One complete canonical OrderedEntry plus fixed publication facts and a
+    // bounded route. Keep this an explicit protocol bound: intent decoding
+    // must never allocate based on an attacker-controlled length alone.
+    const MAX_PUBLICATION_INTENT_RECORD_BYTES: usize = SERVICE_WIRE_HEADER_BYTES
+        + 4
+        + 4
+        + MAX_SYSTEM_AUTHORITY_LEDGER_ROUTE_BYTES
+        + 19 * 32
+        + 4
+        + MAX_JOURNAL_RECORD_BYTES;
     const MAX_RESERVATION_RECORD_BYTES: usize =
         MAX_SYSTEM_AUTHORITY_LEDGER_ROUTE_BYTES + MAX_SYSTEM_AUTHORITY_LEDGER_CLAIM_BYTES + 512;
     const MAX_PLEDGE_RECORD_BYTES: usize = 1024;
@@ -798,6 +811,8 @@ mod durable {
     const CONFIG_TABLE: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_config_v1");
     const ROUTE_CONFIG_TABLE: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("system_authority_ledger_route_config_v4");
+    const LEGACY_ROUTE_CONFIG_TABLE_V3: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_route_config_v3");
     const META_TABLE: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_meta_v1");
@@ -993,9 +1008,16 @@ mod durable {
             }
         }
 
-        pub(crate) const fn expected_ordered_entry(&self) -> Option<OrderedEntryId> {
+        pub(crate) const fn expected_ordered_entry_id(&self) -> Option<OrderedEntryId> {
             match &self.publication_intent {
                 Some(intent) => Some(intent.ordered_entry),
+                None => None,
+            }
+        }
+
+        pub(crate) const fn expected_ordered_entry(&self) -> Option<&OrderedEntry> {
+            match &self.publication_intent {
+                Some(intent) => Some(&intent.ordered_entry_payload),
                 None => None,
             }
         }
@@ -1278,6 +1300,9 @@ mod durable {
                     if sentinel != expected {
                         return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
                     }
+                    if owner.table_has_route_residue(&transaction, LEGACY_ROUTE_CONFIG_TABLE_V3)? {
+                        return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                    }
                     // Holding this writer makes the committed snapshot stable
                     // while the independent read audit runs. Exact reopen is
                     // deliberately zero-write: drop instead of committing.
@@ -1439,6 +1464,7 @@ mod durable {
             let route_key = route_storage_key(self.route);
             for definition in [
                 ROUTE_CONFIG_TABLE,
+                LEGACY_ROUTE_CONFIG_TABLE_V3,
                 CONFIG_TABLE,
                 META_TABLE,
                 RESERVATION_TABLE,
@@ -1459,6 +1485,20 @@ mod durable {
                 }
             }
             Ok(false)
+        }
+
+        fn table_has_route_residue(
+            &self,
+            transaction: &redb::WriteTransaction,
+            definition: TableDefinition<&[u8], &[u8]>,
+        ) -> Result<bool, SystemAuthorityLedgerError> {
+            let route_key = route_storage_key(self.route);
+            let table = transaction.open_table(definition)?;
+            let mut rows = table.range(route_key.as_slice()..)?;
+            let Some(row) = rows.next() else {
+                return Ok(false);
+            };
+            Ok(row?.0.value().starts_with(route_key.as_slice()))
         }
 
         fn recheck_route_config(
@@ -1486,7 +1526,10 @@ mod durable {
                 .ok_or(SystemAuthorityLedgerError::ConfigurationMismatch)?;
             let sentinel = RouteConfigRecord::decode(&sentinel)
                 .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
-            if route != expected || sentinel != expected {
+            if route != expected
+                || sentinel != expected
+                || self.table_has_route_residue(transaction, LEGACY_ROUTE_CONFIG_TABLE_V3)?
+            {
                 return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
             }
             Ok(())
@@ -1539,6 +1582,15 @@ mod durable {
                     != expected
             {
                 return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
+            {
+                let legacy = transaction.open_table(LEGACY_ROUTE_CONFIG_TABLE_V3)?;
+                let mut rows = legacy.range(route_key.as_slice()..)?;
+                if let Some(row) = rows.next() {
+                    if row?.0.value().starts_with(route_key.as_slice()) {
+                        return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                    }
+                }
             }
             Ok(())
         }
@@ -1952,12 +2004,21 @@ mod durable {
         }
 
         /// Keep the exact cold-recovery row, intent, and frozen QCs stable
-        /// while replay reconstructs and re-reads the immediate successor.
-        pub(crate) fn with_pending_rotation_recovery<T, E>(
+        /// across deterministic replay, dependency staging, Heads CAS,
+        /// post-CAS readback, and atomic ledger retirement. The recovered
+        /// receipt retains the mutable store borrow until this transaction
+        /// commits, so no caller-observable CAS-to-retirement gap exists.
+        pub(crate) fn with_pending_rotation_recovery_and_retirement<'store, S, E>(
             &self,
             pending: &PendingSystemAuthorityRecovery,
-            operation: impl FnOnce(&SystemAuthorityRotationCertificate) -> Result<T, E>,
-        ) -> Result<Result<T, E>, SystemAuthorityLedgerError> {
+            operation: impl FnOnce(
+                &SystemAuthorityRotationCertificate,
+            )
+                -> Result<RecoveredSystemAuthorityRotation<'store, S>, E>,
+        ) -> Result<Result<RetiredSystemAuthorityRotationRecovery, E>, SystemAuthorityLedgerError>
+        where
+            S: AgentJournalStore + 'store,
+        {
             let _write = self.lock_writes()?;
             let transaction = self.database.begin_write()?;
             let frozen = self.validate_active_rotation_snapshot(&transaction, &pending.record)?;
@@ -1975,9 +2036,20 @@ mod durable {
             if &persisted != expected {
                 return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
             }
-            let result = operation(&frozen);
-            drop(transaction);
-            Ok(result)
+            let recovered = match operation(&frozen) {
+                Ok(recovered) => recovered,
+                Err(error) => return Ok(Err(error)),
+            };
+            let published = PublishedSystemAuthorityClaim::for_recovered_rotation(
+                recovered.pending(),
+                recovered.facts(),
+                &frozen,
+            )?;
+            self.retire_validated_in_transaction(&transaction, &published)?;
+            transaction.commit()?;
+            Ok(Ok(recovered.into_retired(RetiredSystemAuthorityRotation {
+                _private: (),
+            })))
         }
 
         fn validate_active_rotation_snapshot(
@@ -2100,6 +2172,38 @@ mod durable {
         fn has_pending_reservation(&self) -> Result<bool, SystemAuthorityLedgerError> {
             Ok(self.recover_pending_claim()?.is_some())
         }
+
+        /// Test-only durable-corruption hook used to prove that cold replay
+        /// loads every dependency named by the immutable payload and leaves
+        /// the pending evidence untouched on failure.
+        #[cfg(test)]
+        pub(crate) fn replace_pending_ordered_entry_for_test(
+            &self,
+            entry: OrderedEntry,
+        ) -> Result<(), SystemAuthorityLedgerError> {
+            entry
+                .validate()
+                .map_err(|_| SystemAuthorityLedgerError::InvalidPublicationReceipt)?;
+            let _write = self.lock_writes()?;
+            let transaction = self.database.begin_write()?;
+            self.recheck_route_config(&transaction)?;
+            let route_key = route_storage_key(self.route);
+            let bytes = transaction
+                .open_table(PUBLICATION_INTENT_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::PublicationRecoveryRequired)?;
+            let mut intent = PublicationIntentRecord::decode(&bytes)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            intent.ordered_entry = entry.id();
+            intent.ordered_entry_payload = entry;
+            intent.validate()?;
+            transaction
+                .open_table(PUBLICATION_INTENT_TABLE)?
+                .insert(route_key.as_slice(), intent.encode().as_slice())?;
+            transaction.commit()?;
+            Ok(())
+        }
     }
 
     impl SystemAuthorityEvidenceLedger {
@@ -2129,15 +2233,6 @@ mod durable {
                 facts,
                 operation,
             )
-        }
-
-        pub(crate) fn with_pending_rotation_recovery<T, E>(
-            &self,
-            pending: &PendingSystemAuthorityRecovery,
-            operation: impl FnOnce(&SystemAuthorityRotationCertificate) -> Result<T, E>,
-        ) -> Result<Result<T, E>, SystemAuthorityLedgerError> {
-            self.owner
-                .with_pending_rotation_recovery(pending, operation)
         }
 
         pub(crate) fn with_no_pending_root_mutation<T>(
@@ -2332,24 +2427,6 @@ mod durable {
             )?;
             self.retire_published_claim(claim)?;
             Ok(published.into_results(RetiredSystemAuthorityRotation { _private: () }))
-        }
-
-        /// Retire a cold-reconstructed immediate successor while the opaque
-        /// receipt still quarantines the mutable physical journal store.
-        pub(crate) fn retire_recovered_rotation<S: AgentJournalStore>(
-            &self,
-            recovered: RecoveredSystemAuthorityRotation<'_, S>,
-        ) -> Result<ReplayMaterialization, SystemAuthorityLedgerError> {
-            let frozen = self
-                .pending_joint_rotation_certificate(recovered.pending())?
-                .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
-            let claim = PublishedSystemAuthorityClaim::for_recovered_rotation(
-                recovered.pending(),
-                recovered.facts(),
-                &frozen,
-            )?;
-            self.retire_published_claim(claim)?;
-            Ok(recovered.into_materialization(RetiredSystemAuthorityRotation { _private: () }))
         }
 
         /// Advance the durable retired high-water and clear the active claim
@@ -2762,6 +2839,18 @@ mod durable {
             &self,
             published: PublishedSystemAuthorityClaim,
         ) -> Result<(), SystemAuthorityLedgerError> {
+            let _write = self.lock_writes()?;
+            let transaction = self.database.begin_write()?;
+            self.retire_validated_in_transaction(&transaction, &published)?;
+            transaction.commit()?;
+            Ok(())
+        }
+
+        fn retire_validated_in_transaction(
+            &self,
+            transaction: &redb::WriteTransaction,
+            published: &PublishedSystemAuthorityClaim,
+        ) -> Result<(), SystemAuthorityLedgerError> {
             let reserved = &published.reservation;
             let intent_commitment = match &published.publication_intent {
                 Some(intent) => intent.facts,
@@ -2812,11 +2901,9 @@ mod durable {
                 }
             }
 
-            let _write = self.lock_writes()?;
             let route_key = route_storage_key(self.route);
             let sequence = request.sequence();
             let claim = request.claim();
-            let transaction = self.database.begin_write()?;
             self.recheck_route_config(&transaction)?;
             let current_meta = transaction
                 .open_table(META_TABLE)?
@@ -2969,7 +3056,6 @@ mod durable {
                     table.remove(key.as_slice())?;
                 }
             }
-            transaction.commit()?;
             Ok(())
         }
     }
@@ -3151,6 +3237,17 @@ mod durable {
             let route_config = RouteConfigRecord::decode(route_config)
                 .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
             if route_config != expected_route {
+                return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
+            if !rows_for_prefix_bounded_maybe_missing(
+                &self.database,
+                LEGACY_ROUTE_CONFIG_TABLE_V3,
+                route_key.as_slice(),
+                1,
+                allow_missing_tables,
+            )?
+            .is_empty()
+            {
                 return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
             }
             let config_rows = rows_for_prefix_bounded_maybe_missing(
@@ -3376,7 +3473,11 @@ mod durable {
                     }
                 }
                 if publication_intent.is_some() {
-                    let SystemAuthorityLedgerClaim::CommitteeRotation { transition, .. } = request
+                    let SystemAuthorityLedgerClaim::CommitteeRotation {
+                        incoming,
+                        transition,
+                        ..
+                    } = request
                     else {
                         return Err(SystemAuthorityLedgerError::CorruptLedger);
                     };
@@ -3388,8 +3489,24 @@ mod durable {
                         .get(&SystemAuthorityCommitteeLeg::Incoming)
                         .cloned()
                         .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
-                    SystemAuthorityRotationCertificate::new(transition.clone(), old, new)
-                        .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                    let frozen =
+                        SystemAuthorityRotationCertificate::new(transition.clone(), old, new)
+                            .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                    let intent = publication_intent
+                        .as_ref()
+                        .ok_or(SystemAuthorityLedgerError::CorruptLedger)?;
+                    let ReplayOperation::Management {
+                        request: LifecycleRequest::RotateSystemAuthority(command),
+                    } = &intent.ordered_entry_payload.input.operation
+                    else {
+                        return Err(SystemAuthorityLedgerError::CorruptLedger);
+                    };
+                    if command.certificate() != &frozen
+                        || command.certificate().transition() != transition
+                        || command.new_committee() != incoming
+                    {
+                        return Err(SystemAuthorityLedgerError::CorruptLedger);
+                    }
                 }
             }
             let failure = read_exact_maybe_missing(
@@ -3420,7 +3537,7 @@ mod durable {
     }
 
     /// Permanent signer-independent route ownership. The identical bytes are
-    /// stored in the v3 route table and under the reserved all-zero signer key
+    /// stored in the v4 route table and under the reserved all-zero signer key
     /// in legacy Config as a mutual rollback fence.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RouteConfigRecord {
@@ -3534,6 +3651,7 @@ mod durable {
         predecessor_authority_state: Hash,
         successor_heads: JournalHeadsId,
         ordered_entry: OrderedEntryId,
+        ordered_entry_payload: OrderedEntry,
         successor_control: LaneStateId,
         successor_view: Hash,
         successor_authority_state: Hash,
@@ -3544,6 +3662,7 @@ mod durable {
         root: SystemAuthorityRotationNodeId,
         old_committee: SystemAuthorityCommitteeId,
         new_committee: SystemAuthorityCommitteeId,
+        storage_plan: Hash,
         facts: Hash,
     }
 
@@ -3561,6 +3680,13 @@ mod durable {
                 return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
             };
             let record = facts.record();
+            let ordered_entry = facts.ordered_entry();
+            let ReplayOperation::Management {
+                request: LifecycleRequest::RotateSystemAuthority(command),
+            } = &ordered_entry.input.operation
+            else {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            };
             if facts.journal_store() != reservation.journal_store
                 || facts.predecessor_heads() != reservation.predecessor_heads
                 || facts.predecessor_control() != reservation.control_state
@@ -3569,11 +3695,15 @@ mod durable {
                 || facts.claim() != reservation.request.claim()
                 || facts.successor_heads() == JournalHeadsId::ZERO
                 || facts.successor_heads() == facts.predecessor_heads()
-                || facts.ordered_entry() == OrderedEntryId::ZERO
+                || ordered_entry.validate().is_err()
+                || facts.ordered_entry_id() == OrderedEntryId::ZERO
+                || command != facts.command()
+                || command.operation_commitment() != facts.operation()
                 || facts.successor_control() == LaneStateId::ZERO
                 || facts.successor_view() == Hash::ZERO
                 || facts.successor_authority_state() == Hash::ZERO
                 || facts.operation() == Hash::ZERO
+                || facts.storage_plan() == Hash::ZERO
                 || record.old_committee().as_bytes() != &retiring.commitment().0
                 || record.new_committee().as_bytes() != &incoming.commitment().0
                 || record.certificate().transition() != transition
@@ -3595,7 +3725,8 @@ mod durable {
                 predecessor_view: facts.predecessor_view(),
                 predecessor_authority_state: facts.predecessor_authority_state(),
                 successor_heads: facts.successor_heads(),
-                ordered_entry: facts.ordered_entry(),
+                ordered_entry: facts.ordered_entry_id(),
+                ordered_entry_payload: ordered_entry.clone(),
                 successor_control: facts.successor_control(),
                 successor_view: facts.successor_view(),
                 successor_authority_state: facts.successor_authority_state(),
@@ -3606,6 +3737,7 @@ mod durable {
                 root: facts.root(),
                 old_committee: record.old_committee(),
                 new_committee: record.new_committee(),
+                storage_plan: facts.storage_plan(),
                 facts: facts.commitment(),
             };
             intent.validate()?;
@@ -3626,6 +3758,8 @@ mod durable {
                 || self.predecessor_authority_state == Hash::ZERO
                 || self.successor_authority_state == Hash::ZERO
                 || self.ordered_entry == OrderedEntryId::ZERO
+                || self.ordered_entry_payload.validate().is_err()
+                || self.ordered_entry_payload.id() != self.ordered_entry
                 || self.claim == Hash::ZERO
                 || self.operation == Hash::ZERO
                 || self.rotation == SystemAuthorityRotationId::ZERO
@@ -3634,12 +3768,39 @@ mod durable {
                 || self.old_committee == SystemAuthorityCommitteeId::ZERO
                 || self.new_committee == SystemAuthorityCommitteeId::ZERO
                 || self.old_committee == self.new_committee
+                || self.storage_plan == Hash::ZERO
                 || self.facts == Hash::ZERO
                 || self.encode().len() > MAX_PUBLICATION_INTENT_RECORD_BYTES
             {
                 Err(SystemAuthorityLedgerError::CorruptLedger)
             } else {
-                Ok(())
+                let ReplayOperation::Management {
+                    request: LifecycleRequest::RotateSystemAuthority(command),
+                } = &self.ordered_entry_payload.input.operation
+                else {
+                    return Err(SystemAuthorityLedgerError::CorruptLedger);
+                };
+                let transition = command.certificate().transition();
+                if command.operation_commitment() != self.operation
+                    || transition.authority_claim().claim_hash() != self.claim
+                    || transition.old_committee() != self.old_committee
+                    || transition.new_committee() != self.new_committee
+                    || command.new_committee().commitment().0 != *self.new_committee.as_bytes()
+                    || self.ordered_entry_payload.genesis != self.route.system_genesis()
+                    || self.ordered_entry_payload.input.runtime.space != self.route.space()
+                    || self.ordered_entry_payload.input.runtime.agent != self.route.system_agent()
+                    || transition.root_anchor() != self.route.root_anchor()
+                    || transition.root_anchor_config_version()
+                        != self.route.root_anchor_config_version()
+                    || transition.root_anchor_config() != self.route.root_anchor_config()
+                    || transition.authority_scope() != self.route.authority_scope()
+                    || transition.space() != self.route.space()
+                    || transition.authority_binding() != self.route.authority_binding()
+                {
+                    Err(SystemAuthorityLedgerError::CorruptLedger)
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -3658,6 +3819,7 @@ mod durable {
             encoder.fixed(&self.predecessor_authority_state.0);
             encoder.fixed(self.successor_heads.as_bytes());
             encoder.fixed(self.ordered_entry.as_bytes());
+            encoder.bytes(&self.ordered_entry_payload.encode());
             encoder.fixed(self.successor_control.as_bytes());
             encoder.fixed(&self.successor_view.0);
             encoder.fixed(&self.successor_authority_state.0);
@@ -3668,6 +3830,7 @@ mod durable {
             encoder.fixed(self.root.as_bytes());
             encoder.fixed(self.old_committee.as_bytes());
             encoder.fixed(self.new_committee.as_bytes());
+            encoder.fixed(&self.storage_plan.0);
             encoder.fixed(&self.facts.0);
         }
 
@@ -3684,6 +3847,7 @@ mod durable {
                 predecessor_authority_state: Hash(decoder.fixed()?),
                 successor_heads: JournalHeadsId::new(decoder.fixed()?),
                 ordered_entry: OrderedEntryId::new(decoder.fixed()?),
+                ordered_entry_payload: decode_nested(decoder, MAX_JOURNAL_RECORD_BYTES)?,
                 successor_control: LaneStateId::new(decoder.fixed()?),
                 successor_view: Hash(decoder.fixed()?),
                 successor_authority_state: Hash(decoder.fixed()?),
@@ -3694,6 +3858,7 @@ mod durable {
                 root: SystemAuthorityRotationNodeId::from_bytes(decoder.fixed()?),
                 old_committee: SystemAuthorityCommitteeId::from_bytes(decoder.fixed()?),
                 new_committee: SystemAuthorityCommitteeId::from_bytes(decoder.fixed()?),
+                storage_plan: Hash(decoder.fixed()?),
                 facts: Hash(decoder.fixed()?),
             };
             record.validate().map_err(|_| DecodeError::NonCanonical)?;
@@ -4907,7 +5072,7 @@ mod durable {
             );
             assert!(
                 ConfigRecord::decode(&sentinel_bytes).is_err(),
-                "a legacy v2 writer must reject the permanent v3 owner sentinel"
+                "a legacy writer must reject the permanent v4 owner sentinel"
             );
 
             // Exact owner reopen audits the already-pinned route without
@@ -5019,7 +5184,7 @@ mod durable {
             );
 
             // A route containing a v2 signer Config cannot be upgraded in
-            // place. Failed v3 open neither installs RouteConfig nor replaces
+            // place. Failed v4 open neither installs RouteConfig nor replaces
             // the pre-existing signer row with the owner sentinel.
             let legacy_directory = TempDirectory::new("legacy_residue");
             let legacy_database = Arc::new(Database::create(legacy_directory.database()).unwrap());
@@ -5068,6 +5233,65 @@ mod durable {
                 read_exact(&legacy_database, CONFIG_TABLE, sentinel_key.as_slice())
                     .unwrap()
                     .is_none()
+            );
+
+            // A v3 route-owner marker is an equally permanent clean-break
+            // fence. Its exact bytes survive a failed v4 open, while neither
+            // the v4 route row nor its Config sentinel is installed.
+            let v3_directory = TempDirectory::new("v3_route_residue");
+            let v3_database = Arc::new(Database::create(v3_directory.database()).unwrap());
+            let v3 = RouteConfigRecord {
+                version: 3,
+                route: fixture.route,
+                journal_store: fixture.store,
+                local_node: fixture.local_node(),
+            }
+            .encode();
+            let transaction = v3_database.begin_write().unwrap();
+            transaction
+                .open_table(LEGACY_ROUTE_CONFIG_TABLE_V3)
+                .unwrap()
+                .insert(route_key.as_slice(), v3.as_slice())
+                .unwrap();
+            transaction.commit().unwrap();
+            assert!(matches!(
+                SystemAuthorityLedgerRouteOwner::open(
+                    v3_database.clone(),
+                    fixture.route,
+                    fixture.store,
+                    fixture.local_node(),
+                ),
+                Err(SystemAuthorityLedgerError::ConfigurationMismatch)
+            ));
+            assert_eq!(
+                read_exact(
+                    &v3_database,
+                    LEGACY_ROUTE_CONFIG_TABLE_V3,
+                    route_key.as_slice(),
+                )
+                .unwrap()
+                .unwrap(),
+                v3
+            );
+            assert!(
+                read_exact_maybe_missing(
+                    &v3_database,
+                    ROUTE_CONFIG_TABLE,
+                    route_key.as_slice(),
+                    true,
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                read_exact_maybe_missing(
+                    &v3_database,
+                    CONFIG_TABLE,
+                    sentinel_key.as_slice(),
+                    true,
+                )
+                .unwrap()
+                .is_none()
             );
         }
 
