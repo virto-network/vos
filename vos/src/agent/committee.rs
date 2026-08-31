@@ -25,6 +25,11 @@ pub const MAX_AUTHORITY_QC_SIGNATURES: usize = MAX_AUTHORITY_COMMITTEE_MEMBERS;
 pub const AUTHORITY_ED25519_PUBLIC_KEY_BYTES: usize = 32;
 pub const AUTHORITY_ED25519_SIGNATURE_BYTES: usize = 64;
 
+/// Maximum complete authority committee, including its service-wire header.
+///
+/// The member count is independently bounded, but callers need a complete
+/// byte limit before retaining or forwarding an opaque committee envelope.
+pub const MAX_AUTHORITY_COMMITTEE_WIRE_BYTES: usize = 32 * 1024;
 /// Maximum complete root-anchor record, including its service-wire header.
 pub const MAX_ROOT_ANCHOR_RECORD_BYTES: usize = 32 * 1024;
 /// Maximum complete independently pinned root-anchor configuration.
@@ -353,6 +358,7 @@ impl ServiceWire for AuthorityCommittee {
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_wire_bound(decoder, MAX_AUTHORITY_COMMITTEE_WIRE_BYTES)?;
         let space = SpaceId(decoder.fixed()?);
         let authority_binding = Hash(decoder.fixed()?);
         let epoch = decoder.u64()?;
@@ -383,6 +389,9 @@ pub enum AuthorityClaimDomain {
     CommitteeRotation = 3,
     Catalog = 4,
     NodeControl = 5,
+    /// Finalized creation of an ordinary Agent by the live system Agent.
+    /// This is deliberately distinct from first-system root bootstrap.
+    AgentGenesis = 6,
 }
 
 /// Exact domain-separated claim named by a QC.
@@ -1911,6 +1920,7 @@ fn decode_claim(decoder: &mut Decoder<'_>) -> Result<AuthorityClaimCommitment, D
         3 => AuthorityClaimDomain::CommitteeRotation,
         4 => AuthorityClaimDomain::Catalog,
         5 => AuthorityClaimDomain::NodeControl,
+        6 => AuthorityClaimDomain::AgentGenesis,
         _ => return Err(DecodeError::InvalidTag),
     };
     AuthorityClaimCommitment::from_payload_commitment(
@@ -2097,6 +2107,33 @@ mod tests {
             qc
         );
         assert_eq!(qc.verify(&committee, claim), Ok(()));
+    }
+
+    #[test]
+    fn agent_genesis_claim_domain_is_canonical_and_separate() {
+        let voters = keys(1..=1);
+        let committee = committee(1, None, &voters, &[]);
+        let claim = AuthorityClaimCommitment::of_bytes(
+            AuthorityClaimDomain::AgentGenesis,
+            7,
+            b"exact ordinary Agent genesis",
+        );
+        let certificate = certificate(&committee, claim, &[&voters[0]]);
+        let decoded = AuthorityQuorumCertificate::decode(&certificate.encode()).unwrap();
+        assert_eq!(decoded.claim().domain(), AuthorityClaimDomain::AgentGenesis);
+        assert_eq!(decoded.verify(&committee, claim), Ok(()));
+
+        let bootstrap = AuthorityClaimCommitment::from_payload_commitment(
+            AuthorityClaimDomain::SystemAgentGenesis,
+            claim.sequence(),
+            claim.payload_commitment(),
+        )
+        .unwrap();
+        assert_ne!(claim.claim_hash(), bootstrap.claim_hash());
+        assert_eq!(
+            decoded.verify(&committee, bootstrap),
+            Err(AuthorityCommitteeError::WrongClaim)
+        );
     }
 
     #[test]
@@ -2648,6 +2685,13 @@ mod tests {
             .copy_from_slice(&((MAX_AUTHORITY_COMMITTEE_MEMBERS + 1) as u32).to_le_bytes());
         assert_eq!(
             AuthorityCommittee::decode(&encoded),
+            Err(DecodeError::LimitExceeded)
+        );
+
+        let mut oversized = committee.encode();
+        oversized.resize(MAX_AUTHORITY_COMMITTEE_WIRE_BYTES + 1, 0);
+        assert_eq!(
+            AuthorityCommittee::decode(&oversized),
             Err(DecodeError::LimitExceeded)
         );
     }

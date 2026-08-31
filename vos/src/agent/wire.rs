@@ -1494,24 +1494,39 @@ fn encode_config(encoder: &mut Encoder<'_>, config: &AgentConfig) {
 }
 
 fn decode_config(decoder: &mut Decoder<'_>) -> Result<AgentConfig, DecodeError> {
+    let identity = decode_identity(decoder)?;
+    let creation_nonce = Hash(decoder.fixed()?);
+    let authority = super::authority::decode_binding(decoder)?;
+    let runtime_package = decode_blob(decoder)?;
+    let runtime_contract = super::contract::decode_runtime_contract(decoder)?;
+    let capabilities = decode_capabilities(decoder)?;
+    let replica_count = decoder.u32()? as usize;
+    if replica_count > super::MAX_AGENT_REPLICAS {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let mut replicas = Vec::new();
+    replicas
+        .try_reserve_exact(replica_count)
+        .map_err(|_| DecodeError::LimitExceeded)?;
+    for _ in 0..replica_count {
+        replicas.push(AgentReplica {
+            node: NodeId(decoder.fixed()?),
+            principal: PrincipalId(decoder.fixed()?),
+            role: match decoder.u8()? {
+                0 => ReplicaRole::Voter,
+                1 => ReplicaRole::Observer,
+                _ => return Err(DecodeError::InvalidTag),
+            },
+        });
+    }
     let config = AgentConfig {
-        identity: decode_identity(decoder)?,
-        creation_nonce: Hash(decoder.fixed()?),
-        authority: super::authority::decode_binding(decoder)?,
-        runtime_package: decode_blob(decoder)?,
-        runtime_contract: super::contract::decode_runtime_contract(decoder)?,
-        capabilities: decode_capabilities(decoder)?,
-        replicas: decoder.list(|decoder| {
-            Ok(AgentReplica {
-                node: NodeId(decoder.fixed()?),
-                principal: PrincipalId(decoder.fixed()?),
-                role: match decoder.u8()? {
-                    0 => ReplicaRole::Voter,
-                    1 => ReplicaRole::Observer,
-                    _ => return Err(DecodeError::InvalidTag),
-                },
-            })
-        })?,
+        identity,
+        creation_nonce,
+        authority,
+        runtime_package,
+        runtime_contract,
+        capabilities,
+        replicas,
     };
     config.validate().map_err(|_| DecodeError::NonCanonical)?;
     Ok(config)
@@ -2897,6 +2912,26 @@ mod tests {
         assert_eq!(
             RuntimeCall::decode(&call.encode()),
             Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn replica_count_is_bounded_before_list_allocation() {
+        let mut config = config();
+        config.replicas = (0..=super::super::MAX_AGENT_REPLICAS)
+            .map(|index| {
+                let mut node = [0u8; 32];
+                node[..2].copy_from_slice(&(index as u16 + 1).to_le_bytes());
+                AgentReplica {
+                    node: NodeId(node),
+                    principal: PrincipalId([0x61; 32]),
+                    role: ReplicaRole::Voter,
+                }
+            })
+            .collect();
+        assert_eq!(
+            AgentConfig::decode(&config.encode()),
+            Err(DecodeError::LimitExceeded)
         );
     }
 

@@ -18,6 +18,7 @@ pub mod contract;
 #[cfg(feature = "std")]
 pub mod driver;
 pub mod execution;
+pub mod genesis;
 #[cfg(feature = "std")]
 pub mod host;
 pub(crate) mod invocation_history;
@@ -32,6 +33,7 @@ pub mod machine;
 pub mod package;
 pub(crate) mod replay;
 pub mod schema;
+pub mod shared_commit;
 pub mod standard;
 pub mod wire;
 use crate::service::{
@@ -644,6 +646,7 @@ pub trait AgentRuntime {
 pub enum AgentConfigError {
     InvalidIdentity,
     NoReplicas,
+    TooManyReplicas,
     InvalidReplicaIdentity,
     DuplicateReplica,
     ReplicaOrder,
@@ -655,6 +658,12 @@ pub enum AgentConfigError {
     InvalidRuntimeCapacity,
     InvalidRuntimePackage,
 }
+
+/// Maximum replicas admitted by one immutable Agent configuration.
+///
+/// This matches both authority-committee and Raft membership bounds. Wire
+/// decoders enforce the limit before allocating the caller-declared list.
+pub const MAX_AGENT_REPLICAS: usize = 256;
 
 /// Immutable creation descriptor consumed by an agent runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -705,6 +714,9 @@ impl AgentConfig {
         }
         if self.replicas.is_empty() {
             return Err(AgentConfigError::NoReplicas);
+        }
+        if self.replicas.len() > MAX_AGENT_REPLICAS {
+            return Err(AgentConfigError::TooManyReplicas);
         }
         if self
             .replicas
@@ -955,6 +967,19 @@ mod tests {
         );
         config.replicas[0].role = ReplicaRole::Voter;
         assert_eq!(config.validate(), Ok(()));
+
+        config.replicas = (0..=MAX_AGENT_REPLICAS)
+            .map(|index| {
+                let mut node = [0u8; 32];
+                node[..2].copy_from_slice(&(index as u16 + 1).to_be_bytes());
+                AgentReplica {
+                    node: NodeId(node),
+                    principal: owner,
+                    role: ReplicaRole::Voter,
+                }
+            })
+            .collect();
+        assert_eq!(config.validate(), Err(AgentConfigError::TooManyReplicas));
     }
 
     #[test]
