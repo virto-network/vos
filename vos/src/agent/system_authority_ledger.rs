@@ -1084,16 +1084,21 @@ mod durable {
         }
     }
 
-    /// Catalog-only input to the production signing seam. Construction
-    /// retains the exact fact and authenticated-history proof selected by
-    /// replay; decoded durable claim bytes cannot be promoted into signing
-    /// authority without passing through this constructor and a replay view.
+    /// Catalog-only input to the signing ledger. Recovery may reconstruct it
+    /// from an already durable reservation, but a fresh production request
+    /// has no raw constructor: the catalog actor integration must first mint
+    /// an opaque authenticated semantic-admission token.
     #[derive(Clone, Debug)]
     pub(crate) struct SystemAuthorityCatalogReservationRequest {
         request: SystemAuthorityLedgerClaim,
     }
 
     impl SystemAuthorityCatalogReservationRequest {
+        /// Test-only raw constructor. Production must not turn a decoded fact
+        /// into signing authority: the catalog actor integration will expose
+        /// a separate constructor which consumes its opaque, authenticated
+        /// semantic-admission token.
+        #[cfg(test)]
         pub(crate) fn new(
             committee: AuthorityCommittee,
             fact: FinalizedCatalogMutationFact,
@@ -2325,7 +2330,9 @@ mod durable {
         /// Reserve a fresh catalog finalization or reconcile its exact
         /// durable claim against the current replay-authenticated root view.
         /// Catalog, genesis, and rotation claims all share the same active row
-        /// and sequence-keyed pledge namespace.
+        /// and sequence-keyed pledge namespace. Fresh production callers
+        /// cannot construct the request until the semantic-admission gate is
+        /// installed; recovery can only reconstruct an already durable claim.
         pub(crate) fn reserve_catalog_or_reconcile(
             &self,
             view: &ReplayedSystemAuthorityView,
