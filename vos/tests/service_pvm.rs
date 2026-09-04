@@ -994,40 +994,55 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
 
     assert!(
         PRODUCTION_ARTIFACT_PROVENANCE
-            .contains("source_revision = \"c3629b50e78134b176b419514b067da777899b17\"")
+            .contains("source_revision = \"0009408275d0a889d87731c0e7471a5dfef9165f\"")
+    );
+    assert!(
+        PRODUCTION_ARTIFACT_PROVENANCE.contains(
+            "agent_runtime_source_revision = \"0009408275d0a889d87731c0e7471a5dfef9165f\""
+        )
     );
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("guest_toolchain = \"nightly-2026-03-20\""));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("host_toolchain = \"nightly-2025-05-09\""));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "service_program_id = \"7b57574c566320efba1703e2eadf2be4f7baa50ad2c23434494e52248687e379\""
+        "service_program_id = \"883f61dca53e279f78780817072422d3c96d8b3947a58c94094d5f47c3233f38\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "service_elf_blake2b_256 = \"8fdde808ecd1c3807dfb8e0a6b43c6bd2ae52ddca0c97150d4d8c24334766eb8\""
+        "service_elf_blake2b_256 = \"a22463179321198b9d435fe4575c062b72df9c9334d9a17416955cd8442dcc78\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "service_pvm_blake2b_256 = \"a6622f0ee91eeda951f71d085c549e637ec15f3a0c3f29de84e24c324c205816\""
+        "service_pvm_blake2b_256 = \"4c205e2f8849f89ffe30b670ac60289c65e4dc33956283f7b05da02022de839d\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "authority_program_id = \"36fa00f7d98179b2c8034e4d786ddace26c3cd3dcb74479cedaf77fccdffd0f9\""
+        "authority_program_id = \"c31a8dec125559cad8651c70365132125a43fd1dd95c5ab2f7a9c01871c2f656\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "authority_pvm_blake2b_256 = \"e8ecb56a28ee1306b60877fa13385a27788b9f70bb1973cd942f6bd41efc8193\""
+        "authority_pvm_blake2b_256 = \"d59455d2f638119ad4a3a6a8e127d84a0dad87d79de320a788f5783aad17b501\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "registry_elf_blake2b_256 = \"220d02cd2ba20211868837d30a48ee9d3b1158bacc82158e024def7313587e01\""
+        "agent_runtime_program_id = \"679e9e3c533612ff2fe8744a350cfc8f20d53fe7c9ac5c670d01ff2001734e35\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_actor_program_id = \"0ce632f716c05def31cbe3b65fbaef7f5e92ed50ae3160681d1f50bd36e690dd\""
+        "agent_runtime_elf_blake2b_256 = \"c7ccc66c090b33da699d458951b2c9c57ca1fc3c52ba1ddf1f2f2680f5796494\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_deployment_id = \"022ba3d06d221e3ea08363224b687ed85e8ffb8e03769e443e3f7a2ef54551da\""
+        "agent_runtime_pvm_blake2b_256 = \"ab63c08f6a43e3270eab1d99530a68219d9d9e2852672fe17ed037c65ef6048b\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_task_hash = \"e3289ae3851565b869c4f9d8c0bc3712184dd6ad35de24c912368db54a24ffa6\""
+        "registry_elf_blake2b_256 = \"b5ee809693f915fa2d3e3c3b8802afc8671af29245dbab3ef78dfb85be8321f1\""
+    ));
+    assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
+        "clerk_actor_program_id = \"b2fe8c49df540ebebaf404d50c000d22fee1a20101725edbd872127815ced687\""
+    ));
+    assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
+        "clerk_deployment_id = \"518bbc7bde496c21349d08dcd1efcac7b668acef660b683615f0afdd52bf30ea\""
+    ));
+    assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
+        "clerk_task_hash = \"e174d58588e41710d793a38088e281c374e00e7fff292fa860b9079769d072ce\""
     ));
     assert!(SERVICE_TOOLCHAIN.contains("channel = \"nightly-2026-03-20\""));
     for key in [
         "source_revision",
+        "agent_runtime_source_revision",
         "guest_toolchain",
         "host_toolchain",
         "service_program_id",
@@ -1035,6 +1050,9 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
         "service_pvm_blake2b_256",
         "authority_program_id",
         "authority_pvm_blake2b_256",
+        "agent_runtime_program_id",
+        "agent_runtime_elf_blake2b_256",
+        "agent_runtime_pvm_blake2b_256",
         "registry_elf_blake2b_256",
         "clerk_actor_program_id",
         "clerk_deployment_id",
@@ -1050,15 +1068,15 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
     let clerk = canonical_clerk_package();
     assert_eq!(
         hex(&clerk.manifest.actor_program.0),
-        "0ce632f716c05def31cbe3b65fbaef7f5e92ed50ae3160681d1f50bd36e690dd",
+        "b2fe8c49df540ebebaf404d50c000d22fee1a20101725edbd872127815ced687",
     );
     assert_eq!(
         hex(&clerk.deployment_id().0),
-        "022ba3d06d221e3ea08363224b687ed85e8ffb8e03769e443e3f7a2ef54551da",
+        "518bbc7bde496c21349d08dcd1efcac7b668acef660b683615f0afdd52bf30ea",
     );
     assert_eq!(
         hex(&clerk.task_dependencies[0].binding.task.0),
-        "e3289ae3851565b869c4f9d8c0bc3712184dd6ad35de24c912368db54a24ffa6",
+        "e174d58588e41710d793a38088e281c374e00e7fff292fa860b9079769d072ce",
     );
 }
 
