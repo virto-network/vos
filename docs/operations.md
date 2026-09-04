@@ -37,24 +37,38 @@ generation exists. Back up and restore that external archive under the
 authority operator's procedure; it is intentionally not copied into a VOS
 space backup. An unavailable, conflicting, corrupt, or mismatched archive
 aborts startup before the Local Agent journal is opened. A configured authority
-may report no archive only while no native `.agent`, `.agent-lock`, or retired
-`.agent-image` generation exists; exact empty-host scope/lock metadata alone is
-allowed before the first provider-first Create.
+may report no archive only while no native `.agent`, external `.agent-lock`,
+authority ledger, or retired `.agent-image` generation exists; exact
+empty-host scope/lock metadata alone is allowed before the first
+provider-first Create.
 
-Native journals live under `<space-data>/agents/<full-agent-id>.agent` with a
-sibling `.agent-lock`. The stable host lock is
+Native journals live at
+`<space-data>/agents/<full-agent-id>.agent`. Their stable lock and system
+authority ledger do not: they live in a closed per-lease namespace beside the
+outer host lease, named
+`.<commitment-of-root-space-node>.agent-authority/`. That directory contains
+the exact `<full-agent-id>.agent-lock` and
+`<full-agent-id>.system-authority-ledger.redb` files; a `.next` ledger name is
+used only for crash-safe first publication. The outer host lease is
 `$XDG_CONFIG_HOME/vosx/locks/<space-id>.agent-host.lock` (or the corresponding
-home-directory fallback), outside the replaceable space tree. The full Ed25519
-identity decoded once from `<space-data>/node.key`
+home-directory fallback). Its `.next` sibling is used only while publishing a
+brand-new Binding record without replacement; the canonical lease is extended
+with an Arm record only after the journal and authority state have been
+validated together. The ledger's permanent exposure marker is committed only
+after that Arm is durable. Both layers stay outside the replaceable space
+tree. Never delete or recreate either record to force startup past a mismatch.
+The full Ed25519 identity decoded once from `<space-data>/node.key`
 binds both libp2p networking and Local Merge records. Non-Ed25519 node keys are
 rejected whenever this host is enabled.
 
 This is a clean generation cutover. `.agent-image` files are retired and are
-never opened or migrated. If the two Agent flags are absent, `space up` keeps
-the legacy Service behavior only when no `.agent`, `.agent-lock`,
-`.agent-image`, or Agent-host scope residue is present; finding any such state
-fails closed and requires explicit operator configuration or removal after an
-independent archival decision.
+never opened or migrated. An `.agent-lock` or authority-ledger sidecar inside
+the journal root is also an obsolete layout and is never moved implicitly. If
+the two Agent flags are absent, `space up` keeps the legacy Service behavior
+only when no `.agent`, obsolete sidecar, `.agent-image`, Agent-host scope, or
+external host-lease residue is present; finding any such state fails closed
+and requires explicit operator configuration or removal after an independent
+archival decision.
 
 ## Built-in ingress
 
@@ -92,9 +106,17 @@ vosx space restore /safe/team-backup --data-dir /srv/vos/team
 The backup is a self-contained directory for the space-owned state, with a
 signed-content manifest, service images, local databases, private side stores,
 node identity, and the required blob cache. Restore verifies every file before
-replacing anything. A configured system-Agent genesis archive and its
-independent root-pins file are authority-owned external inputs and must be
-backed up separately as described above.
+replacing anything. A configured system-Agent genesis archive, its independent
+root-pins file, the outer Agent-host lease, and its per-lease authority
+namespace are external inputs and are not part of that replaceable tree.
+
+Treat the external Agent files as one monotonic freshness/high-water domain.
+Back them up separately while the daemon is stopped, but never replace or roll
+them back as part of restoring `<space-data>`. Startup compares replayed Local
+Agent authority state with the surviving ledger before exposing a driver. A
+journal backup that predates that ledger therefore fails closed; restore a
+journal containing the matching latest authority history rather than deleting,
+reinitializing, or downgrading the external files.
 
 A restored replicated node may be behind. This is expected: keep the same node
 identity and replication incarnation, reconnect it, and wait until its durable

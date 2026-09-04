@@ -29,6 +29,11 @@ use super::journal_store::{
     AgentJournalStore, CatalogBlobResolver, CatalogBlobResolverFactory, JournalBlobClass,
     JournalStoreError,
 };
+#[cfg(all(feature = "storage", target_os = "linux"))]
+use super::journal_store::{
+    BoundFileSystemAuthorityLedgerOwner, ReverifiedRootJournalStore, SystemAuthorityHistoryStore,
+    SystemAuthorityPublicationStore,
+};
 use super::package::{Package, PackageError};
 use super::replay::{
     MaterializeError, NoPrunedOrderedBases, ReplayCommittedRecovery, ReplayDisposition,
@@ -38,7 +43,15 @@ use super::replay::{
     ReplayTransition, derive_lane_state, materialize_current, prepare_checkpoint, prepare_local,
     prepare_merge, prepare_ordered, recover_invocation,
 };
+#[cfg(all(feature = "storage", target_os = "linux"))]
+use super::replay::{
+    PendingSystemAuthorityRotationRecovery, SystemAuthorityRecoveryError,
+    materialize_current_reverified, materialized_system_authority_view,
+    recover_pending_system_authority_rotation,
+};
 use super::standard::{StandardAgentRuntime, StandardRuntimeState};
+#[cfg(all(feature = "storage", target_os = "linux"))]
+use super::system_authority_ledger::SystemAuthorityLedgerError;
 use super::wire::{
     RuntimeCall, RuntimeJournalContext, RuntimeReturn, RuntimeState, decode_standard_runtime_state,
 };
@@ -421,8 +434,34 @@ pub(crate) enum LocalJournalDriverError {
     Replay(LocalReplayError),
     Executor(LocalReplayExecutorError),
     Lifecycle(LifecycleError),
+    AuthorityLedger,
+    AuthorityRecoveryRequired,
     Conflict,
     InvalidResult,
+}
+
+#[cfg(all(feature = "storage", target_os = "linux"))]
+pub(crate) enum LocalJournalUnexposedOpenError<E> {
+    Driver(LocalJournalDriverError),
+    BeforeExposure(E),
+}
+
+#[cfg(all(feature = "storage", target_os = "linux"))]
+impl From<SystemAuthorityLedgerError> for LocalJournalDriverError {
+    fn from(_error: SystemAuthorityLedgerError) -> Self {
+        Self::AuthorityLedger
+    }
+}
+
+#[cfg(all(feature = "storage", target_os = "linux"))]
+fn map_system_authority_recovery_error(
+    error: SystemAuthorityRecoveryError<LocalReplayExecutorError>,
+) -> LocalJournalDriverError {
+    match error {
+        SystemAuthorityRecoveryError::Journal(error) => error.into(),
+        SystemAuthorityRecoveryError::Ledger(_) => LocalJournalDriverError::AuthorityLedger,
+        SystemAuthorityRecoveryError::Replay(error) => LocalJournalDriverError::Replay(error),
+    }
 }
 
 impl core::fmt::Display for LocalJournalDriverError {
@@ -1470,6 +1509,14 @@ where
         })
     }
 
+    fn from_materialization(store: S, executor: E, materialization: ReplayMaterialization) -> Self {
+        Self {
+            store,
+            materialization,
+            executor,
+        }
+    }
+
     fn checkpoint(&mut self) -> Result<(), LocalJournalDriverError> {
         let prepared = prepare_checkpoint(&mut self.store, &self.materialization)
             .map_err(lift_checkpoint_error)?;
@@ -1970,6 +2017,7 @@ where
     /// Initialize only from a root/QC-admitted, exactly executed genesis.
     /// The complete catalog closure is made durable before genesis and heads
     /// become visible.
+    #[cfg(test)]
     pub(crate) fn create(
         mut store: S,
         sealed: ReplaySealedGenesis,
@@ -1997,6 +2045,7 @@ where
     /// Open a store whose filesystem/root adapter has already reverified the
     /// sealed genesis admission. The only state cache is rebuilt from typed
     /// journal closure and exact replay.
+    #[cfg(test)]
     pub(crate) fn open(
         store: S,
         trust: Arc<dyn AgentTrustProvider>,
@@ -3135,6 +3184,202 @@ where
             Ok(_) => Err(LocalJournalDriverError::InvalidResult),
             Err(error) => Err(LocalJournalDriverError::Lifecycle(error)),
         }
+    }
+}
+
+#[cfg(all(feature = "storage", target_os = "linux"))]
+impl<S> LocalJournalAgentDriver<S>
+where
+    S: AgentJournalStore
+        + super::replay::ReplaySource<Error = JournalStoreError>
+        + CatalogBlobResolverFactory
+        + ReverifiedRootJournalStore
+        + SystemAuthorityPublicationStore
+        + SystemAuthorityHistoryStore,
+{
+    fn validate_route_owner(
+        store: &S,
+        materialization: &ReplayMaterialization,
+        authority: &BoundFileSystemAuthorityLedgerOwner,
+    ) -> Result<(), LocalJournalDriverError> {
+        let (_, view) = materialized_system_authority_view(store, materialization)?;
+        if view.route() != authority.route()
+            || view.journal_store() != authority.journal_store()
+            || store.instance_id() != authority.journal_store()
+            || materialization.heads().node != authority.local_node()
+        {
+            return Err(LocalJournalDriverError::AuthorityLedger);
+        }
+        Ok(())
+    }
+
+    /// Initialize a reverified root store while the Host holds the owner's
+    /// no-pending mutation writer. Materialization retains the sealed root
+    /// provenance instead of taking the generic unverified replay path.
+    pub(crate) fn create_reverified_with_owner<E>(
+        mut store: S,
+        sealed: ReplaySealedGenesis,
+        catalog: &[RuntimeBlob],
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        authority: &BoundFileSystemAuthorityLedgerOwner,
+        after_validate_before_marker: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Self, LocalJournalUnexposedOpenError<E>> {
+        let system_genesis = sealed.genesis().id();
+        authority
+            .with_unexposed_journal_initialization(system_genesis, move || {
+                let driver = (|| -> Result<Self, LocalJournalDriverError> {
+                    Self::preflight_create(&sealed, catalog, &trust, &merge)?;
+                    for blob in catalog {
+                        store.put_blob(
+                            JournalBlobClass::CatalogArtifact,
+                            &blob.reference,
+                            &blob.bytes,
+                        )?;
+                    }
+                    store.initialize(&sealed)?;
+                    let resolver = store.catalog_blob_resolver()?;
+                    let mut executor = StandardLocalReplayExecutor::new(resolver, trust, merge);
+                    let materialization = materialize_current_reverified(
+                        &mut store,
+                        &mut executor,
+                        &NoPrunedOrderedBases,
+                    )?;
+                    Self::validate_route_owner(&store, &materialization, authority)?;
+                    let core =
+                        LocalJournalCore::from_materialization(store, executor, materialization);
+                    let driver = Self { core };
+                    driver.validate_opened(Some(sealed.replica()))?;
+                    Ok(driver)
+                })()
+                .map_err(LocalJournalUnexposedOpenError::Driver)?;
+                driver
+                    .core
+                    .store
+                    .sync_unexposed_generation()
+                    .map_err(LocalJournalDriverError::from)
+                    .map_err(LocalJournalUnexposedOpenError::Driver)?;
+                after_validate_before_marker()
+                    .map_err(LocalJournalUnexposedOpenError::BeforeExposure)?;
+                Ok(driver)
+            })
+            .map_err(|error| {
+                LocalJournalUnexposedOpenError::Driver(LocalJournalDriverError::from(error))
+            })?
+    }
+
+    /// Reverify a completely initialized journal left by a crash immediately
+    /// before its permanent exposure marker was committed. The owner's
+    /// pristine-unexposed writer excludes evidence creation and installs the
+    /// marker only after the rebuilt driver has passed every open invariant.
+    pub(crate) fn open_unexposed_reverified_with_owner<E>(
+        mut store: S,
+        sealed: &ReplaySealedGenesis,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        authority: &BoundFileSystemAuthorityLedgerOwner,
+        after_validate_before_marker: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Self, LocalJournalUnexposedOpenError<E>> {
+        let system_genesis = sealed.genesis().id();
+        let initial_heads = sealed.initial_heads();
+        authority
+            .with_unexposed_journal_initialization(system_genesis, move || {
+                let driver = (|| -> Result<Self, LocalJournalDriverError> {
+                    if store.heads()?.as_ref() != Some(&initial_heads) {
+                        return Err(LocalJournalDriverError::InvalidResult);
+                    }
+                    let resolver = store.catalog_blob_resolver()?;
+                    let mut executor = StandardLocalReplayExecutor::new(resolver, trust, merge);
+                    let materialization = materialize_current_reverified(
+                        &mut store,
+                        &mut executor,
+                        &NoPrunedOrderedBases,
+                    )?;
+                    if materialization.heads() != &initial_heads {
+                        return Err(LocalJournalDriverError::InvalidResult);
+                    }
+                    Self::validate_route_owner(&store, &materialization, authority)?;
+                    let core =
+                        LocalJournalCore::from_materialization(store, executor, materialization);
+                    let driver = Self { core };
+                    driver.validate_opened(None)?;
+                    Ok(driver)
+                })()
+                .map_err(LocalJournalUnexposedOpenError::Driver)?;
+                driver
+                    .core
+                    .store
+                    .sync_unexposed_generation()
+                    .map_err(LocalJournalDriverError::from)
+                    .map_err(LocalJournalUnexposedOpenError::Driver)?;
+                after_validate_before_marker()
+                    .map_err(LocalJournalUnexposedOpenError::BeforeExposure)?;
+                Ok(driver)
+            })
+            .map_err(|error| {
+                LocalJournalUnexposedOpenError::Driver(LocalJournalDriverError::from(error))
+            })?
+    }
+
+    /// Rebuild a reverified root materialization and reconcile any exact
+    /// pending rotation before exposing a mutable driver. This path uses only
+    /// the signer-independent route owner; a predecessor without durable
+    /// intent stays quarantined and no driver is returned.
+    pub(crate) fn open_reverified_with_owner(
+        mut store: S,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        authority: &BoundFileSystemAuthorityLedgerOwner,
+    ) -> Result<Self, LocalJournalDriverError> {
+        authority
+            .with_recovery_owner(move |owner| {
+                let resolver = store.catalog_blob_resolver()?;
+                let mut executor = StandardLocalReplayExecutor::new(resolver, trust, merge);
+                let current = materialize_current_reverified(
+                    &mut store,
+                    &mut executor,
+                    &NoPrunedOrderedBases,
+                )?;
+                Self::validate_route_owner(&store, &current, authority)?;
+                let materialization = match owner.recover_pending_claim()? {
+                    None => current,
+                    Some(pending) => match recover_pending_system_authority_rotation(
+                        &mut store,
+                        &mut executor,
+                        current,
+                        pending,
+                        owner,
+                    )
+                    .map_err(map_system_authority_recovery_error)?
+                    {
+                        PendingSystemAuthorityRotationRecovery::Pending(_quarantine) => {
+                            return Err(LocalJournalDriverError::AuthorityRecoveryRequired);
+                        }
+                        PendingSystemAuthorityRotationRecovery::Retired(retired) => {
+                            let (_publication, materialization, _executions) = retired.into_parts();
+                            materialization
+                        }
+                    },
+                };
+                Self::validate_route_owner(&store, &materialization, authority)?;
+                let (_, replayed_authority) =
+                    materialized_system_authority_view(&store, &materialization)?;
+                owner.validate_replayed_view(&replayed_authority)?;
+                // Filesystem crash cleanup is deliberately deferred until
+                // the current heads have survived full replay and the
+                // external authority META fence. A deleted required
+                // directory therefore fails without being recreated.
+                store.finish_reverified_open()?;
+                if store.heads()?.as_ref() != Some(materialization.heads()) {
+                    return Err(LocalJournalDriverError::InvalidResult);
+                }
+                Self::validate_route_owner(&store, &materialization, authority)?;
+                let core = LocalJournalCore::from_materialization(store, executor, materialization);
+                let driver = Self { core };
+                driver.validate_opened(None)?;
+                Ok(driver)
+            })
+            .map_err(LocalJournalDriverError::from)?
     }
 }
 

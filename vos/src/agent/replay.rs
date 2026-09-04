@@ -60,16 +60,18 @@ use super::standard::{StandardAgentRuntime, StandardSystemAuthorityWrite};
 #[cfg(all(feature = "std", feature = "storage"))]
 use super::system_authority::{
     MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORD_BYTES, MAX_SYSTEM_AUTHORITY_ROTATION_NODE_BYTES,
-    MAX_SYSTEM_AUTHORITY_ROTATION_TREE_NODES, SystemAuthorityCommitteeRecord,
-    SystemAuthorityJournalScope, SystemAuthorityRotation, SystemAuthorityRotationNode,
-    SystemAuthorityRotationNodeId, SystemAuthorityRotationRecord, SystemAuthorityRotationWritePlan,
-    prove_rotation,
+    MAX_SYSTEM_AUTHORITY_ROTATION_TREE_NODES, SystemAuthorityJournalScope, SystemAuthorityRotation,
+    SystemAuthorityRotationNode, SystemAuthorityRotationWritePlan, prove_rotation,
+};
+#[cfg(feature = "std")]
+use super::system_authority::{
+    SystemAuthorityCommitteeRecord, SystemAuthorityRotationNodeId, SystemAuthorityRotationRecord,
 };
 #[cfg(all(feature = "std", feature = "storage"))]
 use super::system_authority_ledger::{
     PendingSystemAuthorityRecovery, ReplayedSystemAuthorityView, ReservedSystemAuthorityClaim,
     RetiredSystemAuthorityRotation, SystemAuthorityLedgerClaim, SystemAuthorityLedgerError,
-    SystemAuthorityLedgerRouteOwner,
+    SystemAuthorityLedgerRoute, SystemAuthorityLedgerRouteOwner,
 };
 use super::wire::{
     RuntimeJournalContext, RuntimeState, decode_standard_runtime_state,
@@ -1212,14 +1214,14 @@ impl ReplaySystemAuthorityWrite {
 /// This value is replay-private storage data, not an admission capability.
 /// In particular, an ordinary decision fact becomes usable only after the
 /// later destination-journal bridge consumes a post-CAS receipt.
-#[cfg(all(feature = "std", feature = "storage"))]
+#[cfg(feature = "std")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReplaySystemAuthorityHistory {
     record: SystemAuthorityRotationRecord,
     root: SystemAuthorityRotationNodeId,
 }
 
-#[cfg(all(feature = "std", feature = "storage"))]
+#[cfg(feature = "std")]
 impl ReplaySystemAuthorityHistory {
     pub(crate) const fn record(&self) -> &SystemAuthorityRotationRecord {
         &self.record
@@ -1232,14 +1234,14 @@ impl ReplaySystemAuthorityHistory {
 
 /// Complete typed content-addressed dependency closure selected while binding
 /// one replay publication to its durable authority reservation.
-#[cfg(all(feature = "std", feature = "storage"))]
+#[cfg(feature = "std")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReplaySystemAuthorityStoragePlan {
     history: ReplaySystemAuthorityHistory,
     committee_records: Vec<SystemAuthorityCommitteeRecord>,
 }
 
-#[cfg(all(feature = "std", feature = "storage"))]
+#[cfg(feature = "std")]
 impl ReplaySystemAuthorityStoragePlan {
     pub(crate) const fn history(&self) -> &ReplaySystemAuthorityHistory {
         &self.history
@@ -1614,6 +1616,29 @@ impl ReplaySealedGenesis {
             genesis: self.genesis.id(),
             outer_admission: self.genesis.admission,
         })
+    }
+
+    /// Derive the signer-independent durable authority route from this exact
+    /// root-admitted seal. Host cannot assemble a route from raw IDs or a
+    /// decoded state independently of the opaque replay provenance.
+    #[cfg(all(feature = "std", feature = "storage"))]
+    pub(crate) fn system_authority_ledger_route(
+        &self,
+    ) -> Result<SystemAuthorityLedgerRoute, ReplayValidationError> {
+        let identity = self.replayed_root_identity()?;
+        let scope = SystemAuthorityJournalScope::from_replayed_root(&identity)
+            .map_err(|_| ReplayError::ScopeMismatch)?;
+        let decoded = decode_standard_runtime_state(&self.post_create)
+            .map_err(|_| ReplayError::ScopeMismatch)?;
+        let authority = decoded
+            .system_authority
+            .as_ref()
+            .ok_or(ReplayError::ScopeMismatch)?;
+        if authority.system_agent() != self.genesis.runtime().agent {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        SystemAuthorityLedgerRoute::from_authenticated_replay(scope, authority)
+            .map_err(|_| ReplayError::ScopeMismatch)
     }
 
     pub const fn replica(&self) -> AgentReplica {
@@ -8169,6 +8194,7 @@ mod aggregate {
     /// Materialize a live root journal while retaining only the process-local
     /// provenance minted by `initialize`/`open_reverified`. A raw store open
     /// has no such identity and cannot use this authority path.
+    #[cfg(feature = "storage")]
     pub(crate) fn materialize_current_reverified<S, E, R>(
         store: &mut S,
         executor: &mut E,
@@ -8212,7 +8238,7 @@ mod aggregate {
     }
 
     #[cfg(feature = "storage")]
-    fn materialized_system_authority_view<S>(
+    pub(crate) fn materialized_system_authority_view<S>(
         store: &S,
         current: &ReplayMaterialization,
     ) -> Result<(SystemAuthorityJournalScope, ReplayedSystemAuthorityView), JournalStoreError>
@@ -10945,13 +10971,16 @@ mod aggregate {
 #[cfg(feature = "std")]
 #[allow(unused_imports)]
 pub(crate) use aggregate::{
-    MaterializeError, materialize_current, materialize_current_reverified, prepare_checkpoint,
-    prepare_local, prepare_merge, prepare_ordered, prepare_shared_ordered, recover_invocation,
+    MaterializeError, materialize_current, prepare_checkpoint, prepare_local, prepare_merge,
+    prepare_ordered, prepare_shared_ordered, recover_invocation,
 };
 
 #[cfg(all(feature = "std", feature = "storage"))]
 #[allow(unused_imports)]
-pub(crate) use aggregate::recover_pending_system_authority_rotation;
+pub(crate) use aggregate::{
+    materialize_current_reverified, materialized_system_authority_view,
+    recover_pending_system_authority_rotation,
+};
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -10983,22 +11012,26 @@ pub(crate) mod tests {
     use crate::agent::invocation_index::{InvocationIndexStore, InvocationOutcomeStore};
     #[cfg(feature = "std")]
     use crate::agent::journal::InvocationHistoryNodeId;
+    #[cfg(all(feature = "std", feature = "storage"))]
+    use crate::agent::journal_store::ReverifiedRootJournalStore;
+    #[cfg(feature = "std")]
+    use crate::agent::journal_store::SystemAuthorityHistoryStore;
     #[cfg(feature = "std")]
     use crate::agent::journal_store::{
         AgentJournalGarbageCollection, AgentJournalStore, GcLimits, JournalBlobClass,
         JournalPublication, JournalStoreError, MemoryAgentJournalStore,
     };
-    #[cfg(all(feature = "std", feature = "storage"))]
-    use crate::agent::journal_store::{ReverifiedRootJournalStore, SystemAuthorityHistoryStore};
     #[cfg(feature = "std")]
     use crate::agent::shared_commit::{
         OrderedCommitClaim, ReplicaCommitSignature, ReplicaQuorumCertificate, SharedLaneProjection,
         SharedSealedMergeProjection,
     };
+    #[cfg(all(feature = "std", feature = "storage"))]
+    use crate::agent::shared_raft::AgentRaftEvidenceLedger;
     #[cfg(feature = "std")]
     use crate::agent::shared_raft::{
-        AgentRaftCommand, AgentRaftEvidenceLedger, AgentRouteKey, ArtifactBatchId,
-        CommittedAgentRaftEntry, DurableAgentRaftLogWitness,
+        AgentRaftCommand, AgentRouteKey, ArtifactBatchId, CommittedAgentRaftEntry,
+        DurableAgentRaftLogWitness,
     };
     #[cfg(feature = "std")]
     use crate::agent::system_authority::{
@@ -12965,7 +12998,7 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", feature = "storage"))]
     fn committed_shared_for_test(
         entry: OrderedEntry,
         materialized: &ReplayMaterialization,
@@ -13018,7 +13051,7 @@ pub(crate) mod tests {
         token
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", feature = "storage"))]
     fn committed_placeholder_for_test(
         entry: OrderedEntry,
         materialized: &ReplayMaterialization,
@@ -17014,7 +17047,7 @@ pub(crate) mod tests {
         assert_eq!(store.heads().unwrap().unwrap(), heads);
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", feature = "storage"))]
     #[test]
     fn shared_reservation_rejects_byte_identical_memory_store_transplant() {
         let mut authorized = initialized_shared_replay_store();
@@ -17110,7 +17143,7 @@ pub(crate) mod tests {
         assert_eq!(materialized.heads(), &heads);
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", feature = "storage"))]
     #[test]
     fn shared_ordered_pinned_projection_preserves_each_replica_active_merge() {
         let initial = initialized_shared_replay_store();
@@ -17366,7 +17399,7 @@ pub(crate) mod tests {
         assert_eq!(left_executor.executions, executions_before_retry);
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", feature = "storage"))]
     #[test]
     fn shared_ordered_missing_or_noncausal_pinned_frontier_fails_closed() {
         let mut store = initialized_shared_replay_store();
@@ -17442,7 +17475,7 @@ pub(crate) mod tests {
         assert_eq!(store.heads().unwrap().unwrap(), *base.heads());
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", feature = "storage"))]
     #[test]
     fn shared_fence_rejects_excluded_pending_owner_and_accepts_full_frontier() {
         let mut store = initialized_shared_replay_store();

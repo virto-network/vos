@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -42,6 +42,10 @@ use super::execution::{
 };
 use super::journal::ReplayOperation;
 use super::journal_store::{AgentJournalStore, FileAgentJournalStore, JournalStoreError};
+#[cfg(all(feature = "storage", target_os = "linux"))]
+use super::journal_store::{BoundFileSystemAuthorityLedgerOwner, FileAgentJournalSlot};
+#[cfg(all(feature = "storage", target_os = "linux"))]
+use super::local_journal_driver::LocalJournalUnexposedOpenError;
 use super::local_journal_driver::{
     LocalJournalAgentDriver, LocalJournalDriverError, LocalLifecycleOperation,
     LocalReplayExecutorError, LocalSettledAcknowledgementResult, LocalSettledInvocationResult,
@@ -51,6 +55,8 @@ use super::package::{
     MAX_PACKAGE_SCHEMAS_BYTES, MAX_PACKAGE_TASK_BYTES, Package, PackageError,
 };
 use super::replay::{ReplayError, ReplayMaterializationSourceError, ReplaySealedGenesis};
+#[cfg(all(feature = "storage", target_os = "linux"))]
+use super::system_authority_ledger::{SystemAuthorityLedgerError, SystemAuthorityLedgerRouteOwner};
 use super::{
     ActorDirectoryPage, ActorEntry, AgentConfig, AgentConfigError, AgentIdentity, LifecycleError,
     LifecycleReply, LifecycleRequest, PackageKind,
@@ -64,11 +70,28 @@ use crate::service::{
 const JOURNAL_SUFFIX: &str = ".agent";
 const JOURNAL_LOCK_SUFFIX: &str = ".agent-lock";
 const LEGACY_IMAGE_SUFFIX: &str = ".agent-image";
+const SYSTEM_AUTHORITY_LEDGER_SUFFIX: &str = ".system-authority-ledger.redb";
+const SYSTEM_AUTHORITY_LEDGER_STAGE_SUFFIX: &str = ".system-authority-ledger.redb.next";
 const HOST_LOCK_FILE: &str = ".agent-host.lock";
 const HOST_SCOPE_FILE: &str = ".agent-host.scope";
 const HOST_SCOPE_TEMP_FILE: &str = ".agent-host.scope.tmp";
 const HOST_SCOPE_MAGIC: &[u8; 8] = b"VOSAHST1";
 const HOST_SCOPE_ENCODED_LEN: usize = HOST_SCOPE_MAGIC.len() + 32 + 32;
+const HOST_LEASE_BINDING_MAGIC: &[u8; 8] = b"VOSAHBL1";
+const HOST_LEASE_ARM_MAGIC: &[u8; 8] = b"VOSAHAE1";
+const HOST_LEASE_RECORD_VERSION: u32 = 1;
+const HOST_LEASE_BINDING_FRESH: u32 = 1;
+const HOST_LEASE_BINDING_LEGACY_MIGRATION: u32 = 2;
+const HOST_LEASE_BINDING_PREFIX_LEN: usize = 8 + 4 + 4 + 32 + 32 + 32;
+const HOST_LEASE_BINDING_LEN: usize = HOST_LEASE_BINDING_PREFIX_LEN + 32;
+const HOST_LEASE_ARM_PREFIX_LEN: usize = 8 + 4 + 32;
+const HOST_LEASE_ARM_LEN: usize = HOST_LEASE_ARM_PREFIX_LEN + 32;
+const HOST_LEASE_ARMED_LEN: usize = HOST_LEASE_BINDING_LEN + HOST_LEASE_ARM_LEN;
+const HOST_LEASE_ROOT_DOMAIN: &[u8] = b"vos/agent-host/root-path/v1";
+const HOST_LEASE_BINDING_DOMAIN: &[u8] = b"vos/agent-host/lease-binding/v1";
+const HOST_LEASE_ARM_DOMAIN: &[u8] = b"vos/agent-host/lease-armed/v1";
+const HOST_AUTHORITY_ROOT_DOMAIN: &[u8] = b"vos/agent-host/authority-root/v1";
+const HOST_AUTHORITY_ROOT_SUFFIX: &str = ".agent-authority";
 
 /// Maximum number of Agent-host operations waiting behind the one active
 /// operation. The bounded queue is intentional: callers receive explicit
@@ -112,6 +135,8 @@ pub enum AgentHostError {
     Bootstrap(SystemAgentGenesisBootstrapError),
     Provider(SystemAgentGenesisProviderError),
     InvalidAuthority,
+    AuthorityLedger,
+    AuthorityRecoveryRequired,
     TrustUnavailable,
     Conflict,
     InvalidRuntime,
@@ -157,7 +182,30 @@ pub enum AgentHostJournalError {
 pub struct AgentHostRootLease {
     root: PathBuf,
     scope: AgentHostScope,
-    _stable_lock: File,
+    stable_lock_path: PathBuf,
+    stable_lock_parent: File,
+    stable_lock: File,
+    root_parent: File,
+    root_directory: File,
+    authority_root: PathBuf,
+    authority_directory: File,
+    binding: [u8; HOST_LEASE_BINDING_LEN],
+    state: AgentHostRootLeaseState,
+    // A failed Arm attempt can have durably advanced the on-disk record even
+    // when the caller did not observe the final sync/read.  While this bit is
+    // set, validation may reconcile only the exact forward crash states and
+    // initialization/repair remains disabled until Arm is re-synced.
+    arm_write_uncertain: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentHostRootLeaseState {
+    LegacyUnbound,
+    FreshBound,
+    FreshArmInterrupted,
+    LegacyMigrationBound,
+    FreshArmed,
+    LegacyMigrationArmed,
 }
 
 impl core::fmt::Debug for AgentHostRootLease {
@@ -182,19 +230,109 @@ impl AgentHostRootLease {
         if requested_lock.starts_with(&requested_root) {
             return Err(AgentHostError::InvalidScopeBinding);
         }
+        let (root, _) = canonical_agent_host_root_target(requested_root)?;
+        let root_parent = open_agent_host_lock_parent(&root)?;
         let stable_lock_path = canonical_lock_path(requested_lock)?;
-        let stable_lock = open_agent_host_lock(&stable_lock_path)?;
-        // Root creation and validation happen only after winning the stable
-        // slot lock. A losing daemon/backup process must not recreate or
-        // otherwise mutate a live owner's replaceable data tree.
-        let root = ensure_agent_host_root(requested_root)?;
         if stable_lock_path.starts_with(&root) {
             return Err(AgentHostError::InvalidScopeBinding);
         }
+        let stable_lock_parent = open_agent_host_lock_parent(&stable_lock_path)?;
+        let fresh_binding =
+            encode_agent_host_lease_binding(&root, scope, HOST_LEASE_BINDING_FRESH)?;
+        let migration_binding =
+            encode_agent_host_lease_binding(&root, scope, HOST_LEASE_BINDING_LEGACY_MIGRATION)?;
+        let authority_root = agent_host_authority_root(&stable_lock_path, &root, scope)?;
+        let (mut stable_lock, created) = open_agent_host_lease_file(
+            &stable_lock_path,
+            &stable_lock_parent,
+            &fresh_binding,
+            &root,
+            &root_parent,
+            &authority_root,
+        )?;
+        validate_agent_host_lock_parent_identity(&stable_lock_parent, &stable_lock_path)?;
+        let state =
+            read_agent_host_lease_state(&mut stable_lock, &fresh_binding, &migration_binding)?;
+        validate_agent_host_lock_identity(&stable_lock, &stable_lock_path)?;
+        let (binding, state) = match (created, state) {
+            (true, AgentHostRootLeaseState::FreshBound) => {
+                (fresh_binding, AgentHostRootLeaseState::FreshBound)
+            }
+            (true, _) => return Err(AgentHostError::InvalidScopeBinding),
+            (false, AgentHostRootLeaseState::LegacyUnbound) => {
+                (migration_binding, AgentHostRootLeaseState::LegacyUnbound)
+            }
+            (_, AgentHostRootLeaseState::FreshBound) => {
+                (fresh_binding, AgentHostRootLeaseState::FreshBound)
+            }
+            (_, AgentHostRootLeaseState::FreshArmInterrupted) => {
+                (fresh_binding, AgentHostRootLeaseState::FreshArmInterrupted)
+            }
+            (_, AgentHostRootLeaseState::LegacyMigrationBound) => (
+                migration_binding,
+                AgentHostRootLeaseState::LegacyMigrationBound,
+            ),
+            (_, AgentHostRootLeaseState::FreshArmed) => {
+                (fresh_binding, AgentHostRootLeaseState::FreshArmed)
+            }
+            (_, AgentHostRootLeaseState::LegacyMigrationArmed) => (
+                migration_binding,
+                AgentHostRootLeaseState::LegacyMigrationArmed,
+            ),
+        };
+        validate_agent_host_lock_identity(&stable_lock, &stable_lock_path)?;
+        validate_agent_host_lock_parent_identity(&stable_lock_parent, &stable_lock_path)?;
+        if state == AgentHostRootLeaseState::FreshBound {
+            validate_fresh_bound_tree_prefix(
+                &root,
+                &root_parent,
+                &authority_root,
+                &stable_lock_parent,
+            )?;
+        }
+        let root = match state {
+            AgentHostRootLeaseState::FreshBound => {
+                // Only a never-armed fresh binding may recover the crash
+                // window between binding the outer lease and creating the
+                // replaceable root leaf.
+                ensure_agent_host_root(root, &root_parent)?
+            }
+            AgentHostRootLeaseState::FreshArmInterrupted
+            | AgentHostRootLeaseState::LegacyUnbound
+            | AgentHostRootLeaseState::LegacyMigrationBound
+            | AgentHostRootLeaseState::FreshArmed
+            | AgentHostRootLeaseState::LegacyMigrationArmed => {
+                existing_agent_host_root(root, &root_parent)?
+            }
+        };
+        let root_directory = open_agent_host_root_directory_at(&root_parent, &root)?;
+        let authority_root = match state {
+            AgentHostRootLeaseState::FreshBound => {
+                ensure_agent_host_authority_root(authority_root, &stable_lock_parent)?
+            }
+            AgentHostRootLeaseState::FreshArmInterrupted
+            | AgentHostRootLeaseState::LegacyUnbound
+            | AgentHostRootLeaseState::LegacyMigrationBound
+            | AgentHostRootLeaseState::FreshArmed
+            | AgentHostRootLeaseState::LegacyMigrationArmed => {
+                existing_agent_host_authority_root(authority_root, &stable_lock_parent)?
+            }
+        };
+        let authority_directory =
+            open_agent_host_root_directory_at(&stable_lock_parent, &authority_root)?;
         Ok(Self {
             root,
             scope,
-            _stable_lock: stable_lock,
+            stable_lock_path,
+            stable_lock_parent,
+            stable_lock,
+            root_parent,
+            root_directory,
+            authority_root,
+            authority_directory,
+            binding,
+            state,
+            arm_write_uncertain: false,
         })
     }
 
@@ -205,19 +343,251 @@ impl AgentHostRootLease {
     pub const fn scope(&self) -> AgentHostScope {
         self.scope
     }
+
+    /// Pinned secure namespace that owns the durable per-Agent authority
+    /// lock and ledger.  This deliberately differs from the replaceable
+    /// journal root.
+    fn authority_root(&self) -> Result<&Path, AgentHostError> {
+        Ok(&self.authority_root)
+    }
+
+    const fn may_initialize_host_boundary(&self) -> bool {
+        matches!(self.state, AgentHostRootLeaseState::FreshBound) && !self.arm_write_uncertain
+    }
+
+    const fn is_armed(&self) -> bool {
+        matches!(self.state, AgentHostRootLeaseState::FreshArmed)
+    }
+
+    const fn requires_strict_unexposed_open(&self) -> bool {
+        self.arm_write_uncertain
+            || matches!(
+                self.state,
+                AgentHostRootLeaseState::FreshArmInterrupted | AgentHostRootLeaseState::FreshArmed
+            )
+    }
+
+    fn clone_generation_parents(&mut self) -> Result<(File, File), AgentHostError> {
+        self.validate_live()?;
+        let journal_parent = self
+            .root_directory
+            .try_clone()
+            .map_err(|_| AgentHostError::Unavailable)?;
+        let authority_parent = self
+            .authority_directory
+            .try_clone()
+            .map_err(|_| AgentHostError::Unavailable)?;
+        self.validate_live()?;
+        Ok((journal_parent, authority_parent))
+    }
+
+    fn rejects_generation_state(
+        &self,
+        generation_residue: bool,
+        complete_generation: bool,
+    ) -> bool {
+        if self.arm_write_uncertain {
+            return !generation_residue || !complete_generation;
+        }
+        match self.state {
+            AgentHostRootLeaseState::LegacyUnbound
+            | AgentHostRootLeaseState::LegacyMigrationBound
+            | AgentHostRootLeaseState::LegacyMigrationArmed => true,
+            AgentHostRootLeaseState::FreshBound => false,
+            AgentHostRootLeaseState::FreshArmInterrupted | AgentHostRootLeaseState::FreshArmed => {
+                !generation_residue || !complete_generation
+            }
+        }
+    }
+
+    fn arm_after_agent_open(&mut self) -> Result<(), AgentHostError> {
+        #[cfg(not(all(feature = "storage", target_os = "linux")))]
+        {
+            return Err(AgentHostError::Unavailable);
+        }
+        self.validate_live()?;
+        let fresh_binding =
+            encode_agent_host_lease_binding(&self.root, self.scope, HOST_LEASE_BINDING_FRESH)?;
+        let migration_binding = encode_agent_host_lease_binding(
+            &self.root,
+            self.scope,
+            HOST_LEASE_BINDING_LEGACY_MIGRATION,
+        )?;
+        match self.state {
+            AgentHostRootLeaseState::FreshBound => {
+                self.arm_write_uncertain = true;
+            }
+            AgentHostRootLeaseState::FreshArmInterrupted => {
+                self.arm_write_uncertain = true;
+                recover_interrupted_agent_host_lease_arm(
+                    &mut self.stable_lock,
+                    &self.stable_lock_path,
+                    &self.stable_lock_parent,
+                    &fresh_binding,
+                    &migration_binding,
+                )?;
+                self.state = AgentHostRootLeaseState::FreshBound;
+            }
+            AgentHostRootLeaseState::FreshArmed => {
+                // A previous attempt may have written the complete Arm and
+                // then reported a file/parent-sync or final-read failure.
+                // Never treat mere bytes as durable: re-sync both boundaries
+                // and re-read the exact record before permitting exposure.
+                self.arm_write_uncertain = true;
+                self.stable_lock
+                    .sync_all()
+                    .map_err(|_| AgentHostError::Unavailable)?;
+                self.stable_lock_parent
+                    .sync_all()
+                    .map_err(|_| AgentHostError::Unavailable)?;
+                validate_agent_host_lock_identity(&self.stable_lock, &self.stable_lock_path)?;
+                validate_agent_host_lock_parent_identity(
+                    &self.stable_lock_parent,
+                    &self.stable_lock_path,
+                )?;
+                let observed = read_agent_host_lease_state(
+                    &mut self.stable_lock,
+                    &fresh_binding,
+                    &migration_binding,
+                )?;
+                if observed != AgentHostRootLeaseState::FreshArmed {
+                    return Err(AgentHostError::InvalidScopeBinding);
+                }
+                self.state = observed;
+                self.arm_write_uncertain = false;
+                return self.validate_live();
+            }
+            _ => return Err(AgentHostError::InvalidScopeBinding),
+        }
+        let arm = encode_agent_host_lease_arm(&self.binding);
+        if let Err(error) = append_agent_host_lease_record(
+            &mut self.stable_lock,
+            &self.stable_lock_path,
+            &self.stable_lock_parent,
+            &arm,
+            HOST_LEASE_BINDING_LEN,
+        ) {
+            // Preserve an exact interrupted-Arm state in memory so the same
+            // Host can retry after a transient write/sync failure. Arbitrary
+            // malformed tails remain fail-closed.
+            if let Ok(observed) = read_agent_host_lease_state(
+                &mut self.stable_lock,
+                &fresh_binding,
+                &migration_binding,
+            ) {
+                self.state = observed;
+            }
+            return Err(error);
+        }
+        let observed =
+            read_agent_host_lease_state(&mut self.stable_lock, &fresh_binding, &migration_binding)?;
+        let expected = AgentHostRootLeaseState::FreshArmed;
+        if observed != expected {
+            return Err(AgentHostError::InvalidScopeBinding);
+        }
+        self.state = observed;
+        self.arm_write_uncertain = false;
+        self.validate_live()
+    }
+
+    fn validate_live(&mut self) -> Result<(), AgentHostError> {
+        validate_agent_host_lock_identity(&self.stable_lock, &self.stable_lock_path)?;
+        validate_agent_host_lock_parent_identity(&self.stable_lock_parent, &self.stable_lock_path)?;
+        validate_agent_host_lock_parent_identity(&self.root_parent, &self.root)?;
+        validate_agent_host_root_identity(&self.root_directory, &self.root)?;
+        validate_agent_host_authority_root_identity(
+            &self.authority_directory,
+            &self.authority_root,
+        )?;
+        let fresh_binding =
+            encode_agent_host_lease_binding(&self.root, self.scope, HOST_LEASE_BINDING_FRESH)?;
+        let migration_binding = encode_agent_host_lease_binding(
+            &self.root,
+            self.scope,
+            HOST_LEASE_BINDING_LEGACY_MIGRATION,
+        )?;
+        let observed =
+            read_agent_host_lease_state(&mut self.stable_lock, &fresh_binding, &migration_binding)?;
+        validate_agent_host_lock_identity(&self.stable_lock, &self.stable_lock_path)?;
+        validate_agent_host_lock_parent_identity(&self.stable_lock_parent, &self.stable_lock_path)?;
+        validate_agent_host_lock_parent_identity(&self.root_parent, &self.root)?;
+        validate_agent_host_root_identity(&self.root_directory, &self.root)?;
+        validate_agent_host_authority_root_identity(
+            &self.authority_directory,
+            &self.authority_root,
+        )?;
+        if observed != self.state {
+            let recoverable_arm_progress = self.arm_write_uncertain
+                && matches!(
+                    (self.state, observed),
+                    (
+                        AgentHostRootLeaseState::FreshBound,
+                        AgentHostRootLeaseState::FreshArmInterrupted
+                            | AgentHostRootLeaseState::FreshArmed
+                    ) | (
+                        AgentHostRootLeaseState::FreshArmInterrupted,
+                        AgentHostRootLeaseState::FreshBound | AgentHostRootLeaseState::FreshArmed
+                    )
+                );
+            if !recoverable_arm_progress {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+            self.state = observed;
+        }
+        Ok(())
+    }
 }
 
 /// One process-local owner of a directory of durable agents.
 pub struct AgentHost {
     root: PathBuf,
     scope: AgentHostScope,
-    agents: BTreeMap<AgentId, LocalJournalAgentDriver<FileAgentJournalStore>>,
+    agents: BTreeMap<AgentId, HostedSystemAgent>,
     trust: Arc<dyn AgentTrustProvider>,
     merge: Arc<dyn LocalMergeAuthenticator>,
     genesis: Arc<dyn SystemAgentGenesisProvider>,
     root_pins: RootAnchorPins,
     _directory_lock: File,
     _root_lease: AgentHostRootLease,
+}
+
+/// Root driver sealed together with the one pinned signer-independent
+/// authority owner. Read-only driver methods are available through `Deref`;
+/// there is intentionally no `DerefMut`, so every mutation must cross the
+/// wrapper's single owner-held gate.
+struct HostedSystemAgent {
+    driver: LocalJournalAgentDriver<FileAgentJournalStore>,
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    authority: BoundFileSystemAuthorityLedgerOwner,
+}
+
+impl core::ops::Deref for HostedSystemAgent {
+    type Target = LocalJournalAgentDriver<FileAgentJournalStore>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.driver
+    }
+}
+
+impl HostedSystemAgent {
+    fn with_root_mutation<T>(
+        &mut self,
+        operation: impl FnOnce(
+            &mut LocalJournalAgentDriver<FileAgentJournalStore>,
+        ) -> Result<T, AgentHostError>,
+    ) -> Result<T, AgentHostError> {
+        #[cfg(not(all(feature = "storage", target_os = "linux")))]
+        {
+            let _ = operation;
+            Err(AgentHostError::Unavailable)
+        }
+        #[cfg(all(feature = "storage", target_os = "linux"))]
+        {
+            self.authority
+                .with_root_mutation(|| operation(&mut self.driver))
+                .map_err(map_system_authority_ledger_error)?
+        }
+    }
 }
 
 /// Immutable space and exact machine boundary for one Local Agent directory.
@@ -1233,7 +1603,7 @@ impl AgentHost {
     /// a crash before the first destination write. Conversely, generation
     /// residue without its exact archive fails closed and is never re-minted.
     pub fn open(
-        lease: AgentHostRootLease,
+        mut lease: AgentHostRootLease,
         trust: Arc<dyn AgentTrustProvider>,
         merge: Arc<dyn LocalMergeAuthenticator>,
         genesis: Arc<dyn SystemAgentGenesisProvider>,
@@ -1242,25 +1612,27 @@ impl AgentHost {
         let root = lease.root().to_path_buf();
         let scope = lease.scope();
         validate_host_root_capabilities(scope, merge.as_ref(), &root_pins)?;
+        lease.validate_live()?;
         let system_agent = root_pins.record().system_agent();
-        let directory_lock = lock_agent_host_directory(&root)?;
-        let scope_state = read_agent_host_scope(&root, scope)?;
-        if scope_state.scope().is_some_and(|bound| bound != scope) {
-            return Err(AgentHostError::ScopeMismatch);
-        }
         let mut journals = Vec::new();
-        let mut journal_locks = Vec::new();
-        for entry in fs::read_dir(&root).map_err(|_| AgentHostError::Unavailable)? {
+        let mut has_host_lock = false;
+        for entry in fs::read_dir(agent_host_directory_capability_path(&lease.root_directory))
+            .map_err(|_| AgentHostError::Unavailable)?
+        {
             let entry = entry.map_err(|_| AgentHostError::Unavailable)?;
             let file_type = entry.file_type().map_err(|_| AgentHostError::Unavailable)?;
             let name = entry
                 .file_name()
                 .into_string()
                 .map_err(|_| AgentHostError::InvalidJournalName)?;
-            if matches!(
-                name.as_str(),
-                HOST_LOCK_FILE | HOST_SCOPE_FILE | HOST_SCOPE_TEMP_FILE
-            ) {
+            if name == HOST_LOCK_FILE {
+                if has_host_lock || !file_type.is_file() || file_type.is_symlink() {
+                    return Err(AgentHostError::InvalidScopeBinding);
+                }
+                has_host_lock = true;
+                continue;
+            }
+            if matches!(name.as_str(), HOST_SCOPE_FILE | HOST_SCOPE_TEMP_FILE) {
                 continue;
             }
             let folded_name = name.to_ascii_lowercase();
@@ -1273,20 +1645,17 @@ impl AgentHost {
             if folded_name.ends_with(LEGACY_IMAGE_SUFFIX) {
                 return Err(AgentHostError::LegacyGeneration);
             }
+            if folded_name.ends_with(SYSTEM_AUTHORITY_LEDGER_STAGE_SUFFIX) {
+                // Clean break: authority state is anchored beside the outer
+                // lease.  An in-root sidecar is an obsolete or spliced
+                // generation and is never migrated implicitly.
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+            if folded_name.ends_with(SYSTEM_AUTHORITY_LEDGER_SUFFIX) {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
             if folded_name.ends_with(JOURNAL_LOCK_SUFFIX) {
-                if !name.ends_with(JOURNAL_LOCK_SUFFIX) {
-                    return Err(AgentHostError::InvalidJournalName);
-                }
-                if !file_type.is_file() || file_type.is_symlink() {
-                    return Err(AgentHostError::InvalidJournalName);
-                }
-                let encoded = &name[..name.len() - JOURNAL_LOCK_SUFFIX.len()];
-                let agent = decode_agent_id(encoded).ok_or(AgentHostError::InvalidJournalName)?;
-                if agent != system_agent {
-                    return Err(AgentHostError::ScopeMismatch);
-                }
-                journal_locks.push(agent);
-                continue;
+                return Err(AgentHostError::InvalidScopeBinding);
             }
             if !folded_name.ends_with(JOURNAL_SUFFIX) {
                 continue;
@@ -1305,24 +1674,93 @@ impl AgentHost {
             journals.push(agent);
         }
         journals.sort_unstable();
-        journal_locks.sort_unstable();
-        if journals.windows(2).any(|pair| pair[0] == pair[1])
-            || journal_locks.windows(2).any(|pair| pair[0] == pair[1])
-        {
+        lease.validate_live()?;
+        if journals.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(AgentHostError::DuplicateAgent);
         }
-        let generation_residue = !journals.is_empty() || !journal_locks.is_empty();
+        let has_journal = !journals.is_empty();
+        let authority_root = lease.authority_root()?.to_path_buf();
+        let lock_name = format!("{}{}", encode_agent_id(system_agent), JOURNAL_LOCK_SUFFIX);
+        let ledger_name = format!(
+            "{}{}",
+            encode_agent_id(system_agent),
+            SYSTEM_AUTHORITY_LEDGER_SUFFIX
+        );
+        let ledger_stage_name = format!(
+            "{}{}",
+            encode_agent_id(system_agent),
+            SYSTEM_AUTHORITY_LEDGER_STAGE_SUFFIX
+        );
+        for entry in fs::read_dir(agent_host_directory_capability_path(
+            &lease.authority_directory,
+        ))
+        .map_err(|_| AgentHostError::Unavailable)?
+        {
+            let entry = entry.map_err(|_| AgentHostError::Unavailable)?;
+            let file_type = entry.file_type().map_err(|_| AgentHostError::Unavailable)?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| AgentHostError::InvalidJournalName)?;
+            if (name != lock_name && name != ledger_name && name != ledger_stage_name)
+                || !file_type.is_file()
+                || file_type.is_symlink()
+            {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+        }
+        lease.validate_live()?;
+        let has_lock = generation_regular_file_exists_at(&lease.authority_directory, &lock_name)?;
+        let has_ledger =
+            generation_regular_file_exists_at(&lease.authority_directory, &ledger_name)?;
+        let has_ledger_stage =
+            generation_regular_file_exists_at(&lease.authority_directory, &ledger_stage_name)?;
+        if has_journal && (!has_lock || !has_ledger)
+            || has_ledger && !has_lock
+            || has_lock && !has_journal && !has_ledger && !has_ledger_stage
+            || has_journal && has_ledger_stage
+        {
+            return Err(AgentHostError::InvalidScopeBinding);
+        }
+        let generation_residue = has_journal || has_lock || has_ledger || has_ledger_stage;
+        let complete_generation = has_journal && has_lock && has_ledger && !has_ledger_stage;
+        if lease.rejects_generation_state(generation_residue, complete_generation) {
+            // An armed lease with no recognized residue represents the
+            // unavoidable crash window after the permanent arm and before
+            // the first inner stage. It is deliberately fail-closed. Partial
+            // recognized states continue into the inner slot recovery matrix.
+            return Err(AgentHostError::InvalidScopeBinding);
+        }
+        if (!lease.may_initialize_host_boundary() || generation_residue) && !has_host_lock {
+            return Err(AgentHostError::InvalidScopeBinding);
+        }
+        #[cfg(not(all(feature = "storage", target_os = "linux")))]
+        if generation_residue {
+            return Err(AgentHostError::Unavailable);
+        }
+        let directory_lock = lock_agent_host_directory(
+            &root,
+            &lease.root_directory,
+            lease.may_initialize_host_boundary() && !generation_residue && !has_host_lock,
+        )?;
+        lease.validate_live()?;
+        let scope_state = read_agent_host_scope(
+            &root,
+            &lease.root_directory,
+            scope,
+            lease.may_initialize_host_boundary() && !generation_residue,
+        )?;
+        if scope_state.scope().is_some_and(|bound| bound != scope) {
+            return Err(AgentHostError::ScopeMismatch);
+        }
+        let cleanup_scope_stage = matches!(scope_state, AgentHostScopeState::BoundWithStage(_));
         match scope_state {
-            AgentHostScopeState::Bound(_) => {}
+            AgentHostScopeState::Bound(_) | AgentHostScopeState::BoundWithStage(_) => {}
             AgentHostScopeState::Staged(_) if !generation_residue => {
-                publish_agent_host_scope(
-                    &root,
-                    &root.join(HOST_SCOPE_TEMP_FILE),
-                    &root.join(HOST_SCOPE_FILE),
-                )?;
+                publish_agent_host_scope(&root, &lease.root_directory)?;
             }
             AgentHostScopeState::Absent if !generation_residue => {
-                write_agent_host_scope(&root, scope)?;
+                write_agent_host_scope(&root, &lease.root_directory, scope)?;
             }
             AgentHostScopeState::Staged(_) | AgentHostScopeState::Absent => {
                 // Never infer or overwrite the scope of a journal or stable
@@ -1330,6 +1768,7 @@ impl AgentHost {
                 return Err(AgentHostError::InvalidScopeBinding);
             }
         }
+        lease.validate_live()?;
 
         let mut agents = BTreeMap::new();
         let locator = SystemAgentGenesisLocator {
@@ -1346,8 +1785,13 @@ impl AgentHost {
                     &root_pins,
                     provision,
                 )?;
+                let (journal_parent, authority_parent) = lease.clone_generation_parents()?;
                 let driver = open_archived_system_agent(
                     &root,
+                    &authority_root,
+                    &journal_parent,
+                    &authority_parent,
+                    &mut lease,
                     scope,
                     sealed,
                     &catalog,
@@ -1358,10 +1802,16 @@ impl AgentHost {
                 if identity.agent != system_agent || identity.space != scope.space {
                     return Err(AgentHostError::IdentityMismatch);
                 }
+                lease.validate_live()?;
                 agents.insert(system_agent, driver);
             }
             Err(SystemAgentGenesisProviderError::NotConfigured) if !generation_residue => {}
             Err(error) => return Err(AgentHostError::Provider(error)),
+        }
+        lease.validate_live()?;
+        if cleanup_scope_stage {
+            cleanup_agent_host_scope_stage(&root, &lease.root_directory)?;
+            lease.validate_live()?;
         }
         Ok(Self {
             root,
@@ -1558,6 +2008,12 @@ impl AgentHost {
         runtime_package: Package,
         authority: &AgentAuthorityReceipt,
     ) -> Result<AgentIdentity, AgentHostError> {
+        #[cfg(not(all(feature = "storage", target_os = "linux")))]
+        {
+            let _ = (&config, &runtime_package, authority);
+            return Err(AgentHostError::Unavailable);
+        }
+        self._root_lease.validate_live()?;
         if !self.scope.admits(&config) {
             return Err(AgentHostError::ScopeMismatch);
         }
@@ -1577,9 +2033,28 @@ impl AgentHost {
                     provision,
                 )?,
                 Err(SystemAgentGenesisProviderError::NotConfigured) => {
-                    if generation_path_exists(&self.journal_path(agent))?
-                        || generation_path_exists(&self.journal_lock_path(agent))?
-                    {
+                    self._root_lease.validate_live()?;
+                    if generation_path_exists_at(
+                        &self._root_lease.root_directory,
+                        self.journal_path(agent)
+                            .file_name()
+                            .ok_or(AgentHostError::InvalidJournalName)?,
+                    )? || generation_path_exists_at(
+                        &self._root_lease.authority_directory,
+                        self.journal_lock_path(agent)?
+                            .file_name()
+                            .ok_or(AgentHostError::InvalidJournalName)?,
+                    )? || generation_path_exists_at(
+                        &self._root_lease.authority_directory,
+                        self.authority_ledger_path(agent)?
+                            .file_name()
+                            .ok_or(AgentHostError::InvalidJournalName)?,
+                    )? || generation_path_exists_at(
+                        &self._root_lease.authority_directory,
+                        self.authority_ledger_stage_path(agent)?
+                            .file_name()
+                            .ok_or(AgentHostError::InvalidJournalName)?,
+                    )? {
                         return Err(AgentHostError::Provider(
                             SystemAgentGenesisProviderError::NotConfigured,
                         ));
@@ -1607,10 +2082,12 @@ impl AgentHost {
                         .map_err(AgentHostError::Bootstrap)?;
                     let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared)
                         .map_err(AgentHostError::Bootstrap)?;
+                    self._root_lease.validate_live()?;
                     let returned = self
                         .genesis
                         .create(&proposal, &supplied_catalog)
                         .map_err(AgentHostError::Provider)?;
+                    self._root_lease.validate_live()?;
                     let reproduced = self
                         .genesis
                         .reproduce(locator)
@@ -1645,8 +2122,14 @@ impl AgentHost {
             }
             return Ok(current.identity);
         }
+        let (journal_parent, authority_parent) = self._root_lease.clone_generation_parents()?;
+        let authority_root = self._root_lease.authority_root()?.to_path_buf();
         let driver = open_archived_system_agent(
             &self.root,
+            &authority_root,
+            &journal_parent,
+            &authority_parent,
+            &mut self._root_lease,
             self.scope,
             sealed,
             &catalog,
@@ -1654,6 +2137,7 @@ impl AgentHost {
             self.merge.clone(),
         )?;
         let identity = driver.identity().map_err(map_local_driver_error)?;
+        self._root_lease.validate_live()?;
         if identity != config.identity {
             return Err(AgentHostError::IdentityMismatch);
         }
@@ -1667,6 +2151,7 @@ impl AgentHost {
         after: Option<ActorId>,
         limit: u16,
     ) -> Result<ActorDirectoryPage, AgentHostError> {
+        self._root_lease.validate_live()?;
         self.agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?
@@ -1682,17 +2167,20 @@ impl AgentHost {
         parent: Option<ActorId>,
         package: &Package,
     ) -> Result<ActorEntry, AgentHostError> {
-        let driver = self
+        self._root_lease.validate_live()?;
+        let hosted = self
             .agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
-        let operation = driver
-            .actor_install_operation(name, parent, package)
-            .map_err(map_local_driver_error)?;
-        match apply_local_lifecycle(driver, authority.clone(), operation)? {
-            LifecycleReply::Installed(entry) => Ok(entry),
-            _ => Err(AgentHostError::InvalidRuntime),
-        }
+        hosted.with_root_mutation(|driver| {
+            let operation = driver
+                .actor_install_operation(name, parent, package)
+                .map_err(map_local_driver_error)?;
+            match apply_local_lifecycle(driver, authority.clone(), operation)? {
+                LifecycleReply::Installed(entry) => Ok(entry),
+                _ => Err(AgentHostError::InvalidRuntime),
+            }
+        })
     }
 
     pub fn upgrade_actor(
@@ -1703,17 +2191,20 @@ impl AgentHost {
         from_deployment: DeploymentId,
         package: &Package,
     ) -> Result<ActorEntry, AgentHostError> {
-        let driver = self
+        self._root_lease.validate_live()?;
+        let hosted = self
             .agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
-        let operation = driver
-            .actor_upgrade_operation(actor, from_deployment, package)
-            .map_err(map_local_driver_error)?;
-        match apply_local_lifecycle(driver, authority.clone(), operation)? {
-            LifecycleReply::Upgraded(entry) => Ok(entry),
-            _ => Err(AgentHostError::InvalidRuntime),
-        }
+        hosted.with_root_mutation(|driver| {
+            let operation = driver
+                .actor_upgrade_operation(actor, from_deployment, package)
+                .map_err(map_local_driver_error)?;
+            match apply_local_lifecycle(driver, authority.clone(), operation)? {
+                LifecycleReply::Upgraded(entry) => Ok(entry),
+                _ => Err(AgentHostError::InvalidRuntime),
+            }
+        })
     }
 
     pub fn suspend_actor(
@@ -1722,17 +2213,20 @@ impl AgentHost {
         authority: &AgentAuthorityReceipt,
         actor: ActorId,
     ) -> Result<ActorEntry, AgentHostError> {
-        let driver = self
+        self._root_lease.validate_live()?;
+        let hosted = self
             .agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
-        let operation = driver
-            .actor_suspend_operation(actor)
-            .map_err(map_local_driver_error)?;
-        match apply_local_lifecycle(driver, authority.clone(), operation)? {
-            LifecycleReply::Suspended(entry) => Ok(entry),
-            _ => Err(AgentHostError::InvalidRuntime),
-        }
+        hosted.with_root_mutation(|driver| {
+            let operation = driver
+                .actor_suspend_operation(actor)
+                .map_err(map_local_driver_error)?;
+            match apply_local_lifecycle(driver, authority.clone(), operation)? {
+                LifecycleReply::Suspended(entry) => Ok(entry),
+                _ => Err(AgentHostError::InvalidRuntime),
+            }
+        })
     }
 
     pub fn resume_actor(
@@ -1741,17 +2235,20 @@ impl AgentHost {
         authority: &AgentAuthorityReceipt,
         actor: ActorId,
     ) -> Result<ActorEntry, AgentHostError> {
-        let driver = self
+        self._root_lease.validate_live()?;
+        let hosted = self
             .agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
-        let operation = driver
-            .actor_resume_operation(actor)
-            .map_err(map_local_driver_error)?;
-        match apply_local_lifecycle(driver, authority.clone(), operation)? {
-            LifecycleReply::Resumed(entry) => Ok(entry),
-            _ => Err(AgentHostError::InvalidRuntime),
-        }
+        hosted.with_root_mutation(|driver| {
+            let operation = driver
+                .actor_resume_operation(actor)
+                .map_err(map_local_driver_error)?;
+            match apply_local_lifecycle(driver, authority.clone(), operation)? {
+                LifecycleReply::Resumed(entry) => Ok(entry),
+                _ => Err(AgentHostError::InvalidRuntime),
+            }
+        })
     }
 
     pub fn remove_actor(
@@ -1761,17 +2258,20 @@ impl AgentHost {
         actor: ActorId,
         expected_deployment: DeploymentId,
     ) -> Result<(), AgentHostError> {
-        let driver = self
+        self._root_lease.validate_live()?;
+        let hosted = self
             .agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
-        let operation = driver
-            .actor_remove_operation(actor, expected_deployment)
-            .map_err(map_local_driver_error)?;
-        match apply_local_lifecycle(driver, authority.clone(), operation)? {
-            LifecycleReply::Removed(removed) if removed == actor => Ok(()),
-            _ => Err(AgentHostError::InvalidRuntime),
-        }
+        hosted.with_root_mutation(|driver| {
+            let operation = driver
+                .actor_remove_operation(actor, expected_deployment)
+                .map_err(map_local_driver_error)?;
+            match apply_local_lifecycle(driver, authority.clone(), operation)? {
+                LifecycleReply::Removed(removed) if removed == actor => Ok(()),
+                _ => Err(AgentHostError::InvalidRuntime),
+            }
+        })
     }
 
     pub fn upgrade_runtime(
@@ -1781,17 +2281,20 @@ impl AgentHost {
         from_deployment: DeploymentId,
         package: &Package,
     ) -> Result<AgentIdentity, AgentHostError> {
-        let driver = self
+        self._root_lease.validate_live()?;
+        let hosted = self
             .agents
             .get_mut(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
-        let operation = driver
-            .runtime_upgrade_operation(from_deployment, package)
-            .map_err(map_local_driver_error)?;
-        match apply_local_lifecycle(driver, authority.clone(), operation)? {
-            LifecycleReply::RuntimeUpgraded(identity) => Ok(identity),
-            _ => Err(AgentHostError::InvalidRuntime),
-        }
+        hosted.with_root_mutation(|driver| {
+            let operation = driver
+                .runtime_upgrade_operation(from_deployment, package)
+                .map_err(map_local_driver_error)?;
+            match apply_local_lifecycle(driver, authority.clone(), operation)? {
+                LifecycleReply::RuntimeUpgraded(identity) => Ok(identity),
+                _ => Err(AgentHostError::InvalidRuntime),
+            }
+        })
     }
 
     pub fn invoke(
@@ -1800,21 +2303,25 @@ impl AgentHost {
         invocation: ActorInvocation,
         authority: &ActorInvocationReceipt,
     ) -> Result<ActorExecutionReply, AgentHostError> {
-        match self
+        self._root_lease.validate_live()?;
+        let hosted = self
             .agents
             .get_mut(&agent)
-            .ok_or(AgentHostError::AgentNotFound)?
-            .invoke_synchronous(invocation, authority.clone())
-            .map_err(map_local_driver_error)?
-        {
-            LocalSettledInvocationResult::Final(Ok(reply)) => Ok(reply),
-            LocalSettledInvocationResult::Final(Err(error)) => {
-                Err(AgentHostError::Execution(error))
+            .ok_or(AgentHostError::AgentNotFound)?;
+        hosted.with_root_mutation(|driver| {
+            match driver
+                .invoke_synchronous(invocation, authority.clone())
+                .map_err(map_local_driver_error)?
+            {
+                LocalSettledInvocationResult::Final(Ok(reply)) => Ok(reply),
+                LocalSettledInvocationResult::Final(Err(error)) => {
+                    Err(AgentHostError::Execution(error))
+                }
+                LocalSettledInvocationResult::Acknowledged => {
+                    Err(AgentHostError::InvocationAcknowledged)
+                }
             }
-            LocalSettledInvocationResult::Acknowledged => {
-                Err(AgentHostError::InvocationAcknowledged)
-            }
-        }
+        })
     }
 
     pub fn acknowledge_invocation(
@@ -1823,24 +2330,28 @@ impl AgentHost {
         invocation: ActorInvocation,
         authority: &ActorInvocationReceipt,
     ) -> Result<(), AgentHostError> {
-        match self
+        self._root_lease.validate_live()?;
+        let hosted = self
             .agents
             .get_mut(&agent)
-            .ok_or(AgentHostError::AgentNotFound)?
-            .acknowledge_invocation_synchronous(invocation, authority.clone())
-            .map_err(map_local_driver_error)?
-        {
-            LocalSettledAcknowledgementResult::Acknowledged => Ok(()),
-            LocalSettledAcknowledgementResult::Divergent => Err(AgentHostError::Execution(
-                ActorExecutionError::DivergentInvocation,
-            )),
-        }
+            .ok_or(AgentHostError::AgentNotFound)?;
+        hosted.with_root_mutation(|driver| {
+            match driver
+                .acknowledge_invocation_synchronous(invocation, authority.clone())
+                .map_err(map_local_driver_error)?
+            {
+                LocalSettledAcknowledgementResult::Acknowledged => Ok(()),
+                LocalSettledAcknowledgementResult::Divergent => Err(AgentHostError::Execution(
+                    ActorExecutionError::DivergentInvocation,
+                )),
+            }
+        })
     }
 
     pub fn revision(&self, agent: AgentId) -> Option<u64> {
         self.agents
             .get(&agent)
-            .map(LocalJournalAgentDriver::publication_revision)
+            .map(|hosted| hosted.publication_revision())
     }
 
     fn system_agent(&self) -> AgentId {
@@ -1860,9 +2371,28 @@ impl AgentHost {
             .join(format!("{}{}", encode_agent_id(agent), JOURNAL_SUFFIX))
     }
 
-    fn journal_lock_path(&self, agent: AgentId) -> PathBuf {
-        self.root
-            .join(format!("{}{}", encode_agent_id(agent), JOURNAL_LOCK_SUFFIX))
+    fn journal_lock_path(&self, agent: AgentId) -> Result<PathBuf, AgentHostError> {
+        Ok(self._root_lease.authority_root()?.join(format!(
+            "{}{}",
+            encode_agent_id(agent),
+            JOURNAL_LOCK_SUFFIX
+        )))
+    }
+
+    fn authority_ledger_path(&self, agent: AgentId) -> Result<PathBuf, AgentHostError> {
+        Ok(self._root_lease.authority_root()?.join(format!(
+            "{}{}",
+            encode_agent_id(agent),
+            SYSTEM_AUTHORITY_LEDGER_SUFFIX
+        )))
+    }
+
+    fn authority_ledger_stage_path(&self, agent: AgentId) -> Result<PathBuf, AgentHostError> {
+        Ok(self._root_lease.authority_root()?.join(format!(
+            "{}{}",
+            encode_agent_id(agent),
+            SYSTEM_AUTHORITY_LEDGER_STAGE_SUFFIX
+        )))
     }
 }
 
@@ -2056,35 +2586,142 @@ fn require_exact_create_caller(
 
 fn open_archived_system_agent(
     root: &Path,
+    authority_root: &Path,
+    journal_parent: &File,
+    authority_parent: &File,
+    lease: &mut AgentHostRootLease,
     scope: AgentHostScope,
     sealed: ReplaySealedGenesis,
     catalog: &[RuntimeBlob],
     trust: Arc<dyn AgentTrustProvider>,
     merge: Arc<dyn LocalMergeAuthenticator>,
-) -> Result<LocalJournalAgentDriver<FileAgentJournalStore>, AgentHostError> {
-    let agent = sealed.genesis().runtime().agent;
-    let journal = root.join(format!("{}{}", encode_agent_id(agent), JOURNAL_SUFFIX));
-    let stable_lock = root.join(format!("{}{}", encode_agent_id(agent), JOURNAL_LOCK_SUFFIX));
-    let store = FileAgentJournalStore::open_reverified(journal, stable_lock, scope.node, &sealed)
+) -> Result<HostedSystemAgent, AgentHostError> {
+    #[cfg(not(all(feature = "storage", target_os = "linux")))]
+    {
+        let _ = (
+            root,
+            authority_root,
+            journal_parent,
+            authority_parent,
+            lease,
+            scope,
+            sealed,
+            catalog,
+            trust,
+            merge,
+        );
+        return Err(AgentHostError::Unavailable);
+    }
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    {
+        let agent = sealed.genesis().runtime().agent;
+        let journal = root.join(format!("{}{}", encode_agent_id(agent), JOURNAL_SUFFIX));
+        let stable_lock =
+            authority_root.join(format!("{}{}", encode_agent_id(agent), JOURNAL_LOCK_SUFFIX));
+        let slot = FileAgentJournalSlot::acquire_with_pinned_parents(
+            journal,
+            stable_lock,
+            scope.node,
+            journal_parent,
+            authority_parent,
+        )
         .map_err(map_journal_error)?;
-    let genesis = store.genesis().map_err(map_journal_error)?;
-    let heads = store.heads().map_err(map_journal_error)?;
-    match (genesis, heads) {
-        (Some(_), Some(_)) => {
-            LocalJournalAgentDriver::open(store, trust, merge).map_err(map_local_driver_error)
+        let ledger = slot
+            .open_system_authority_ledger()
+            .map_err(map_journal_error)?;
+        let owner = SystemAuthorityLedgerRouteOwner::open_file(ledger.into_owner_open(), &sealed)
+            .map_err(map_system_authority_ledger_error)?;
+        let authority = slot
+            .bind_system_authority_ledger_owner(owner, &sealed)
+            .map_err(map_journal_error)?;
+        let outer_armed = lease.is_armed();
+        let strict_unexposed = lease.requires_strict_unexposed_open();
+        if authority
+            .journal_exposure_is_committed()
+            .map_err(map_system_authority_ledger_error)?
+            && !outer_armed
+        {
+            return Err(AgentHostError::InvalidScopeBinding);
         }
-        // `initialize` publishes genesis before initial heads. Reusing the
-        // exact root-admitted seal is the one canonical repair for a crash at
-        // that boundary; both writes are immutable and conflict checked.
-        (None, None) | (Some(_), None) => {
-            // This store-bound preflight deliberately rechecks current root
-            // and package trust before installing immutable bytes. It does
-            // not re-authenticate the Create receipt or re-execute Replay;
-            // those happened exactly once while preparing `sealed`.
-            LocalJournalAgentDriver::create(store, sealed, catalog, trust, merge)
-                .map_err(map_local_driver_error)
+        let (store, journal_exposure_committed) = authority
+            .with_startup_root_recovery(|startup| {
+                let journal_exposure_committed = startup.journal_exposure_is_committed();
+                if journal_exposure_committed && !outer_armed {
+                    return Err(JournalStoreError::ScopeMismatch);
+                }
+                slot.open_reverified(&sealed, startup, strict_unexposed)
+                    .map(|store| (store, journal_exposure_committed))
+            })
+            .map_err(map_system_authority_ledger_error)?
+            .map_err(map_journal_error)?;
+        let genesis = store.genesis().map_err(map_journal_error)?;
+        let heads = store.heads().map_err(map_journal_error)?;
+        let driver = match (journal_exposure_committed, genesis, heads) {
+            (true, Some(_), Some(_)) => {
+                LocalJournalAgentDriver::open_reverified_with_owner(store, trust, merge, &authority)
+                    .map_err(map_local_driver_error)?
+            }
+            (true, _, _) => return Err(map_journal_error(JournalStoreError::Corrupt)),
+            // A complete journal can precede its exposure row only when the
+            // process crashed after durable initialization and before the
+            // marker transaction. Reverify it exactly under the pristine
+            // initialization writer, then commit the marker before return.
+            (false, Some(_), Some(_)) => {
+                LocalJournalAgentDriver::open_unexposed_reverified_with_owner(
+                    store,
+                    &sealed,
+                    trust,
+                    merge,
+                    &authority,
+                    || {
+                        lease.validate_live()?;
+                        lease.arm_after_agent_open()?;
+                        lease.validate_live()
+                    },
+                )
+                .map_err(map_unexposed_driver_open_error)?
+            }
+            // `initialize` publishes genesis before initial heads. Reusing the
+            // exact root-admitted seal is the one canonical repair for a crash at
+            // that boundary; both writes are immutable and conflict checked.
+            (false, None, None) | (false, Some(_), None) => {
+                // This store-bound preflight deliberately rechecks current root
+                // and package trust before installing immutable bytes. It does
+                // not re-authenticate the Create receipt or re-execute Replay;
+                // those happened exactly once while preparing `sealed`.
+                LocalJournalAgentDriver::create_reverified_with_owner(
+                    store,
+                    sealed,
+                    catalog,
+                    trust,
+                    merge,
+                    &authority,
+                    || {
+                        lease.validate_live()?;
+                        lease.arm_after_agent_open()?;
+                        lease.validate_live()
+                    },
+                )
+                .map_err(map_unexposed_driver_open_error)?
+            }
+            (false, None, Some(_)) => return Err(map_journal_error(JournalStoreError::Corrupt)),
+        };
+        authority.verify().map_err(map_journal_error)?;
+        lease.validate_live()?;
+        if !lease.is_armed() {
+            return Err(AgentHostError::InvalidScopeBinding);
         }
-        (None, Some(_)) => Err(map_journal_error(JournalStoreError::Corrupt)),
+        Ok(HostedSystemAgent { driver, authority })
+    }
+}
+
+#[cfg(all(feature = "storage", target_os = "linux"))]
+fn map_unexposed_driver_open_error(
+    error: LocalJournalUnexposedOpenError<AgentHostError>,
+) -> AgentHostError {
+    match error {
+        LocalJournalUnexposedOpenError::Driver(error) => map_local_driver_error(error),
+        LocalJournalUnexposedOpenError::BeforeExposure(error) => error,
     }
 }
 
@@ -2104,6 +2741,28 @@ fn apply_local_lifecycle(
 fn generation_path_exists(path: &Path) -> Result<bool, AgentHostError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(AgentHostError::Unavailable),
+    }
+}
+
+fn generation_path_exists_at(
+    parent: &File,
+    name: &std::ffi::OsStr,
+) -> Result<bool, AgentHostError> {
+    generation_path_exists(&agent_host_directory_capability_path(parent).join(name))
+}
+
+fn generation_regular_file_exists_at(parent: &File, name: &str) -> Result<bool, AgentHostError> {
+    generation_regular_file_exists(&agent_host_directory_capability_path(parent).join(name))
+}
+
+fn generation_regular_file_exists(path: &Path) -> Result<bool, AgentHostError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            Ok(true)
+        }
+        Ok(_) => Err(AgentHostError::InvalidScopeBinding),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(_) => Err(AgentHostError::Unavailable),
     }
@@ -2153,6 +2812,10 @@ fn map_local_driver_error(error: LocalJournalDriverError) -> AgentHostError {
         LocalJournalDriverError::Store(error) => map_journal_error(error),
         LocalJournalDriverError::Executor(error) => map_local_executor_error(error),
         LocalJournalDriverError::Lifecycle(error) => AgentHostError::Lifecycle(error),
+        LocalJournalDriverError::AuthorityLedger => AgentHostError::AuthorityLedger,
+        LocalJournalDriverError::AuthorityRecoveryRequired => {
+            AgentHostError::AuthorityRecoveryRequired
+        }
         LocalJournalDriverError::Conflict => AgentHostError::Conflict,
         LocalJournalDriverError::InvalidResult => AgentHostError::InvalidRuntime,
         LocalJournalDriverError::Replay(error) => match error {
@@ -2197,31 +2860,370 @@ fn map_local_driver_error(error: LocalJournalDriverError) -> AgentHostError {
     }
 }
 
-fn ensure_agent_host_root(root: PathBuf) -> Result<PathBuf, AgentHostError> {
+#[cfg(all(feature = "storage", target_os = "linux"))]
+fn map_system_authority_ledger_error(error: SystemAuthorityLedgerError) -> AgentHostError {
+    match error {
+        SystemAuthorityLedgerError::PublicationRecoveryRequired
+        | SystemAuthorityLedgerError::GcBlockedByPendingReservation => {
+            AgentHostError::AuthorityRecoveryRequired
+        }
+        _ => AgentHostError::AuthorityLedger,
+    }
+}
+
+fn canonical_agent_host_root_target(root: PathBuf) -> Result<(PathBuf, bool), AgentHostError> {
     let root = absolute_agent_host_path(root)?;
-    let created = match fs::symlink_metadata(&root) {
+    let file_name = root
+        .file_name()
+        .ok_or(AgentHostError::InvalidScopeBinding)?
+        .to_owned();
+    let parent = root.parent().ok_or(AgentHostError::InvalidScopeBinding)?;
+    // Configured parent directories are a provisioning boundary. Requiring
+    // them to pre-exist lets acquire pin and validate the exact parent before
+    // any outer record or child leaf is created.
+    let parent = fs::canonicalize(parent).map_err(|_| AgentHostError::Unavailable)?;
+    let root = parent.join(file_name);
+    match fs::symlink_metadata(&root) {
         Ok(metadata) => {
             if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
                 return Err(AgentHostError::InvalidScopeBinding);
             }
-            false
+            fs::canonicalize(root)
+                .map(|root| (root, true))
+                .map_err(|_| AgentHostError::Unavailable)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((root, false)),
+        Err(_) => Err(AgentHostError::Unavailable),
+    }
+}
+
+fn agent_host_child_capability_path(parent: &File, child: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        return PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(
+            child
+                .file_name()
+                .expect("validated Agent Host child has a leaf"),
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = parent;
+        child.to_path_buf()
+    }
+}
+
+fn ensure_agent_host_root(root: PathBuf, parent: &File) -> Result<PathBuf, AgentHostError> {
+    validate_agent_host_lock_parent_identity(parent, &root)?;
+    let capability = agent_host_child_capability_path(parent, &root);
+    match fs::symlink_metadata(&capability) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(&root).map_err(|_| AgentHostError::Unavailable)?;
-            true
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            builder
+                .create(&capability)
+                .map_err(|_| AgentHostError::Unavailable)?;
         }
         Err(_) => return Err(AgentHostError::Unavailable),
-    };
-    let metadata = fs::symlink_metadata(&root).map_err(|_| AgentHostError::Unavailable)?;
+    }
+    let metadata = fs::symlink_metadata(&capability).map_err(|_| AgentHostError::Unavailable)?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(AgentHostError::InvalidScopeBinding);
     }
-    if created && let Some(parent) = root.parent() {
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| AgentHostError::Unavailable)?;
+    let directory = open_agent_host_root_directory_at(parent, &root)?;
+    validate_agent_host_root_identity(&directory, &root)?;
+    // Repeat the parent sync even when the leaf already exists. A previous
+    // attempt may have completed mkdir but failed to observe this durability
+    // boundary.
+    parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+    validate_agent_host_lock_parent_identity(parent, &root)?;
+    Ok(root)
+}
+
+fn existing_agent_host_root(root: PathBuf, parent: &File) -> Result<PathBuf, AgentHostError> {
+    validate_agent_host_lock_parent_identity(parent, &root)?;
+    let capability = agent_host_child_capability_path(parent, &root);
+    let metadata = fs::symlink_metadata(&capability).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AgentHostError::InvalidScopeBinding
+        } else {
+            AgentHostError::Unavailable
+        }
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(AgentHostError::InvalidScopeBinding);
     }
-    fs::canonicalize(root).map_err(|_| AgentHostError::Unavailable)
+    validate_agent_host_lock_parent_identity(parent, &root)?;
+    Ok(root)
+}
+
+fn agent_host_authority_root(
+    stable_lock_path: &Path,
+    root: &Path,
+    scope: AgentHostScope,
+) -> Result<PathBuf, AgentHostError> {
+    let parent = stable_lock_path
+        .parent()
+        .ok_or(AgentHostError::InvalidScopeBinding)?;
+    let root_bytes = stable_agent_host_path_bytes(root)?;
+    let commitment = Hash::digest(
+        HOST_AUTHORITY_ROOT_DOMAIN,
+        &[&root_bytes, scope.space.as_bytes(), scope.node.as_bytes()],
+    );
+    Ok(parent.join(format!(
+        ".{}{}",
+        encode_agent_id(AgentId(commitment.0)),
+        HOST_AUTHORITY_ROOT_SUFFIX
+    )))
+}
+
+/// Derive the exact external authority namespace without creating or
+/// repairing any filesystem entry. This is used by Agent-disabled startup to
+/// detect residue that survives deletion of both the journal root and the
+/// canonical outer lease.
+pub fn agent_host_authority_root_path(
+    root: &Path,
+    stable_lock_path: &Path,
+    scope: AgentHostScope,
+) -> Result<PathBuf, AgentHostError> {
+    let scope = scope.validate()?;
+    let requested_root = absolute_agent_host_path(root.to_path_buf())?;
+    let canonical_root = match fs::symlink_metadata(&requested_root) {
+        Ok(_) => fs::canonicalize(&requested_root).map_err(|_| AgentHostError::Unavailable)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let leaf = requested_root
+                .file_name()
+                .ok_or(AgentHostError::InvalidScopeBinding)?;
+            let parent = requested_root
+                .parent()
+                .ok_or(AgentHostError::InvalidScopeBinding)?;
+            fs::canonicalize(parent)
+                .map_err(|_| AgentHostError::Unavailable)?
+                .join(leaf)
+        }
+        Err(_) => return Err(AgentHostError::Unavailable),
+    };
+    let requested_lock = absolute_agent_host_path(stable_lock_path.to_path_buf())?;
+    let lock_leaf = requested_lock
+        .file_name()
+        .ok_or(AgentHostError::InvalidScopeBinding)?;
+    let lock_parent = requested_lock
+        .parent()
+        .ok_or(AgentHostError::InvalidScopeBinding)?;
+    let canonical_lock = fs::canonicalize(lock_parent)
+        .map_err(|_| AgentHostError::Unavailable)?
+        .join(lock_leaf);
+    if canonical_lock.starts_with(&canonical_root) {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    agent_host_authority_root(&canonical_lock, &canonical_root, scope)
+}
+
+fn ensure_agent_host_authority_root(
+    authority_root: PathBuf,
+    stable_lock_parent: &File,
+) -> Result<PathBuf, AgentHostError> {
+    validate_agent_host_lock_parent_identity(stable_lock_parent, &authority_root)?;
+    let capability = agent_host_child_capability_path(stable_lock_parent, &authority_root);
+    match fs::symlink_metadata(&capability) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            builder
+                .create(&capability)
+                .map_err(|_| AgentHostError::Unavailable)?;
+        }
+        Err(_) => return Err(AgentHostError::Unavailable),
+    }
+    let directory = open_agent_host_root_directory_at(stable_lock_parent, &authority_root)?;
+    validate_agent_host_authority_root_identity(&directory, &authority_root)?;
+    // This is also a retry barrier for mkdir-success/parent-fsync-failure.
+    stable_lock_parent
+        .sync_all()
+        .map_err(|_| AgentHostError::Unavailable)?;
+    validate_agent_host_lock_parent_identity(stable_lock_parent, &authority_root)?;
+    Ok(authority_root)
+}
+
+fn validate_fresh_bound_tree_prefix(
+    root: &Path,
+    root_parent: &File,
+    authority_root: &Path,
+    authority_parent: &File,
+) -> Result<(), AgentHostError> {
+    fn state(parent: &File, path: &Path) -> Result<Option<bool>, AgentHostError> {
+        validate_agent_host_lock_parent_identity(parent, path)?;
+        let capability = agent_host_child_capability_path(parent, path);
+        match fs::symlink_metadata(&capability) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                    return Err(AgentHostError::InvalidScopeBinding);
+                }
+                let directory = open_agent_host_root_directory_at(parent, path)?;
+                validate_agent_host_root_identity(&directory, path)?;
+                let empty = fs::read_dir(agent_host_directory_capability_path(&directory))
+                    .map_err(|_| AgentHostError::Unavailable)?
+                    .next()
+                    .transpose()
+                    .map_err(|_| AgentHostError::Unavailable)?
+                    .is_none();
+                validate_agent_host_root_identity(&directory, path)?;
+                Ok(Some(empty))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(AgentHostError::Unavailable),
+        }
+    }
+
+    let root_state = state(root_parent, root)?;
+    let authority_state = state(authority_parent, authority_root)?;
+    match (root_state, authority_state) {
+        (None, None) | (Some(true), None) | (Some(true), Some(true)) | (Some(false), Some(_)) => {
+            Ok(())
+        }
+        // Authority creation follows root creation, and every Host sidecar
+        // follows authority creation. These impossible prefixes represent a
+        // deleted/restored side and are never repaired.
+        (None, Some(_)) | (Some(false), None) | (Some(true), Some(false)) => {
+            Err(AgentHostError::InvalidScopeBinding)
+        }
+    }
+}
+
+fn existing_agent_host_authority_root(
+    authority_root: PathBuf,
+    parent: &File,
+) -> Result<PathBuf, AgentHostError> {
+    validate_agent_host_lock_parent_identity(parent, &authority_root)?;
+    let capability = agent_host_child_capability_path(parent, &authority_root);
+    let metadata = fs::symlink_metadata(&capability).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AgentHostError::InvalidScopeBinding
+        } else {
+            AgentHostError::Unavailable
+        }
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    validate_agent_host_lock_parent_identity(parent, &authority_root)?;
+    Ok(authority_root)
+}
+
+fn agent_host_directory_capability_path(directory: &File) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        return PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = directory;
+        PathBuf::new()
+    }
+}
+
+fn open_agent_host_root_directory_at(parent: &File, root: &Path) -> Result<File, AgentHostError> {
+    validate_agent_host_lock_parent_identity(parent, root)?;
+    let capability = agent_host_child_capability_path(parent, root);
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    }
+    // `/proc/self/fd/<parent>/leaf` is only the descriptor-relative open
+    // mechanism. Do not run ancestor validation against that synthetic path
+    // (the fd component is intentionally a symlink); validate the opened
+    // inode against the real canonical name and pinned parent below.
+    let directory = options
+        .open(capability)
+        .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    validate_agent_host_root_identity(&directory, root)?;
+    validate_agent_host_lock_parent_identity(parent, root)?;
+    Ok(directory)
+}
+
+fn validate_agent_host_authority_root_identity(
+    directory: &File,
+    authority_root: &Path,
+) -> Result<(), AgentHostError> {
+    validate_agent_host_root_identity(directory, authority_root)
+}
+
+fn validate_agent_host_root_identity(directory: &File, root: &Path) -> Result<(), AgentHostError> {
+    let opened = directory
+        .metadata()
+        .map_err(|_| AgentHostError::Unavailable)?;
+    let named = fs::symlink_metadata(root).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    if !opened.file_type().is_dir() || !named.file_type().is_dir() || named.file_type().is_symlink()
+    {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let effective_user = unsafe { libc::geteuid() };
+        if opened.dev() != named.dev()
+            || opened.ino() != named.ino()
+            || opened.uid() != effective_user
+            || named.uid() != effective_user
+            || opened.mode() & 0o022 != 0
+            || named.mode() & 0o022 != 0
+        {
+            return Err(AgentHostError::InvalidScopeBinding);
+        }
+        for ancestor in root
+            .parent()
+            .ok_or(AgentHostError::InvalidScopeBinding)?
+            .ancestors()
+        {
+            let metadata =
+                fs::symlink_metadata(ancestor).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+            let trusted_owner = metadata.uid() == 0 || metadata.uid() == effective_user || {
+                #[cfg(target_os = "linux")]
+                {
+                    super::journal_store::uid_is_unmapped_overflow(metadata.uid())
+                        .map_err(|_| AgentHostError::InvalidScopeBinding)?
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    false
+                }
+            };
+            let writable = metadata.mode() & 0o022 != 0;
+            let protected_sticky = metadata.mode() & libc::S_ISVTX != 0 && trusted_owner;
+            if !metadata.file_type().is_dir()
+                || metadata.file_type().is_symlink()
+                || !trusted_owner
+                || writable && !protected_sticky
+            {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn absolute_agent_host_path(path: PathBuf) -> Result<PathBuf, AgentHostError> {
@@ -2247,40 +3249,726 @@ fn canonical_lock_path(path: PathBuf) -> Result<PathBuf, AgentHostError> {
         .ok_or(AgentHostError::InvalidScopeBinding)?
         .to_owned();
     let parent = path.parent().ok_or(AgentHostError::InvalidScopeBinding)?;
-    fs::create_dir_all(parent).map_err(|_| AgentHostError::Unavailable)?;
     let parent = fs::canonicalize(parent).map_err(|_| AgentHostError::Unavailable)?;
     Ok(parent.join(file_name))
 }
 
-fn open_agent_host_lock(path: &Path) -> Result<File, AgentHostError> {
-    let existed = match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-                return Err(AgentHostError::InvalidScopeBinding);
-            }
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => return Err(AgentHostError::Unavailable),
-    };
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
+fn encode_agent_host_lease_binding(
+    root: &Path,
+    scope: AgentHostScope,
+    origin: u32,
+) -> Result<[u8; HOST_LEASE_BINDING_LEN], AgentHostError> {
+    let root_bytes = stable_agent_host_path_bytes(root)?;
+    let root_commitment = Hash::digest(HOST_LEASE_ROOT_DOMAIN, &[&root_bytes]);
+    let mut encoded = [0; HOST_LEASE_BINDING_LEN];
+    encoded[..8].copy_from_slice(HOST_LEASE_BINDING_MAGIC);
+    encoded[8..12].copy_from_slice(&HOST_LEASE_RECORD_VERSION.to_be_bytes());
+    encoded[12..16].copy_from_slice(&origin.to_be_bytes());
+    encoded[16..48].copy_from_slice(root_commitment.as_bytes());
+    encoded[48..80].copy_from_slice(scope.space.as_bytes());
+    encoded[80..112].copy_from_slice(scope.node.as_bytes());
+    let commitment = Hash::digest(
+        HOST_LEASE_BINDING_DOMAIN,
+        &[&encoded[..HOST_LEASE_BINDING_PREFIX_LEN]],
+    );
+    encoded[HOST_LEASE_BINDING_PREFIX_LEN..].copy_from_slice(commitment.as_bytes());
+    Ok(encoded)
+}
+
+fn stable_agent_host_path_bytes(path: &Path) -> Result<Vec<u8>, AgentHostError> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut encoded = b"unix\0".to_vec();
+        encoded.extend_from_slice(path.as_os_str().as_bytes());
+        return Ok(encoded);
     }
-    let file = options
-        .open(path)
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let mut encoded = b"windows-utf16be\0".to_vec();
+        for code_unit in path.as_os_str().encode_wide() {
+            encoded.extend_from_slice(&code_unit.to_be_bytes());
+        }
+        return Ok(encoded);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(AgentHostError::InvalidScopeBinding)
+    }
+}
+
+fn encode_agent_host_lease_arm(binding: &[u8; HOST_LEASE_BINDING_LEN]) -> [u8; HOST_LEASE_ARM_LEN] {
+    let mut encoded = [0; HOST_LEASE_ARM_LEN];
+    encoded[..8].copy_from_slice(HOST_LEASE_ARM_MAGIC);
+    encoded[8..12].copy_from_slice(&HOST_LEASE_RECORD_VERSION.to_be_bytes());
+    encoded[12..HOST_LEASE_ARM_PREFIX_LEN]
+        .copy_from_slice(&binding[HOST_LEASE_BINDING_PREFIX_LEN..]);
+    let commitment = Hash::digest(
+        HOST_LEASE_ARM_DOMAIN,
+        &[&encoded[..HOST_LEASE_ARM_PREFIX_LEN]],
+    );
+    encoded[HOST_LEASE_ARM_PREFIX_LEN..].copy_from_slice(commitment.as_bytes());
+    encoded
+}
+
+fn read_agent_host_lease_state(
+    file: &mut File,
+    fresh_binding: &[u8; HOST_LEASE_BINDING_LEN],
+    migration_binding: &[u8; HOST_LEASE_BINDING_LEN],
+) -> Result<AgentHostRootLeaseState, AgentHostError> {
+    let length = usize::try_from(
+        file.metadata()
+            .map_err(|_| AgentHostError::Unavailable)?
+            .len(),
+    )
+    .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    if length == 0 {
+        return Ok(AgentHostRootLeaseState::LegacyUnbound);
+    }
+    if !(HOST_LEASE_BINDING_LEN..=HOST_LEASE_ARMED_LEN).contains(&length) {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    file.seek(SeekFrom::Start(0))
         .map_err(|_| AgentHostError::Unavailable)?;
-    if !file
-        .metadata()
-        .map_err(|_| AgentHostError::Unavailable)?
-        .file_type()
-        .is_file()
+    let mut encoded = [0; HOST_LEASE_ARMED_LEN];
+    file.read_exact(&mut encoded[..length])
+        .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    let mut trailing = [0; 1];
+    if file
+        .read(&mut trailing)
+        .map_err(|_| AgentHostError::InvalidScopeBinding)?
+        != 0
     {
         return Err(AgentHostError::InvalidScopeBinding);
     }
+    let binding = &encoded[..HOST_LEASE_BINDING_LEN];
+    if &binding[..8] != HOST_LEASE_BINDING_MAGIC
+        || binding[8..12] != HOST_LEASE_RECORD_VERSION.to_be_bytes()
+    {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    let expected_commitment = Hash::digest(
+        HOST_LEASE_BINDING_DOMAIN,
+        &[&binding[..HOST_LEASE_BINDING_PREFIX_LEN]],
+    );
+    if binding[HOST_LEASE_BINDING_PREFIX_LEN..] != expected_commitment.0 {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    if binding[16..48] != fresh_binding[16..48] {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    if binding[48..112] != fresh_binding[48..112] {
+        return Err(AgentHostError::ScopeMismatch);
+    }
+    let origin = u32::from_be_bytes(
+        binding[12..16]
+            .try_into()
+            .map_err(|_| AgentHostError::InvalidScopeBinding)?,
+    );
+    let (expected_binding, bound, armed) = match origin {
+        HOST_LEASE_BINDING_FRESH => (
+            fresh_binding,
+            AgentHostRootLeaseState::FreshBound,
+            AgentHostRootLeaseState::FreshArmed,
+        ),
+        HOST_LEASE_BINDING_LEGACY_MIGRATION => (
+            migration_binding,
+            AgentHostRootLeaseState::LegacyMigrationBound,
+            AgentHostRootLeaseState::LegacyMigrationArmed,
+        ),
+        _ => return Err(AgentHostError::InvalidScopeBinding),
+    };
+    if binding != expected_binding {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    if length == HOST_LEASE_BINDING_LEN {
+        return Ok(bound);
+    }
+    let expected_arm = encode_agent_host_lease_arm(expected_binding);
+    let arm_bytes = &encoded[HOST_LEASE_BINDING_LEN..length];
+    if arm_bytes != &expected_arm[..arm_bytes.len()] {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    if length == HOST_LEASE_ARMED_LEN {
+        Ok(armed)
+    } else if origin == HOST_LEASE_BINDING_FRESH {
+        Ok(AgentHostRootLeaseState::FreshArmInterrupted)
+    } else {
+        // The legacy layout is a clean break and is never repaired.
+        Err(AgentHostError::InvalidScopeBinding)
+    }
+}
+
+fn append_agent_host_lease_record(
+    file: &mut File,
+    path: &Path,
+    parent: &File,
+    record: &[u8],
+    expected_length: usize,
+) -> Result<(), AgentHostError> {
+    validate_agent_host_lock_identity(file, path)?;
+    validate_agent_host_lock_parent_identity(parent, path)?;
+    if file
+        .metadata()
+        .map_err(|_| AgentHostError::Unavailable)?
+        .len()
+        != expected_length as u64
+    {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    let end = file
+        .seek(SeekFrom::End(0))
+        .map_err(|_| AgentHostError::Unavailable)?;
+    if end != expected_length as u64 {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    file.write_all(record)
+        .map_err(|_| AgentHostError::Unavailable)?;
+    file.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+    parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+    validate_agent_host_lock_identity(file, path)?;
+    validate_agent_host_lock_parent_identity(parent, path)
+}
+
+fn recover_interrupted_agent_host_lease_arm(
+    file: &mut File,
+    path: &Path,
+    parent: &File,
+    fresh_binding: &[u8; HOST_LEASE_BINDING_LEN],
+    migration_binding: &[u8; HOST_LEASE_BINDING_LEN],
+) -> Result<(), AgentHostError> {
+    validate_agent_host_lock_identity(file, path)?;
+    validate_agent_host_lock_parent_identity(parent, path)?;
+    if read_agent_host_lease_state(file, fresh_binding, migration_binding)?
+        != AgentHostRootLeaseState::FreshArmInterrupted
+    {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    file.set_len(HOST_LEASE_BINDING_LEN as u64)
+        .map_err(|_| AgentHostError::Unavailable)?;
+    file.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+    parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+    validate_agent_host_lock_identity(file, path)?;
+    validate_agent_host_lock_parent_identity(parent, path)?;
+    if read_agent_host_lease_state(file, fresh_binding, migration_binding)?
+        != AgentHostRootLeaseState::FreshBound
+    {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    Ok(())
+}
+
+fn open_agent_host_lock_parent(lock_path: &Path) -> Result<File, AgentHostError> {
+    let parent_path = lock_path
+        .parent()
+        .ok_or(AgentHostError::InvalidScopeBinding)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    }
+    let parent = options
+        .open(parent_path)
+        .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    validate_agent_host_lock_parent_identity(&parent, lock_path)?;
+    Ok(parent)
+}
+
+fn validate_agent_host_lock_parent_identity(
+    parent: &File,
+    lock_path: &Path,
+) -> Result<(), AgentHostError> {
+    let parent_path = lock_path
+        .parent()
+        .ok_or(AgentHostError::InvalidScopeBinding)?;
+    let opened = parent.metadata().map_err(|_| AgentHostError::Unavailable)?;
+    let named =
+        fs::symlink_metadata(parent_path).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    if !opened.file_type().is_dir() || !named.file_type().is_dir() || named.file_type().is_symlink()
+    {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let effective_user = unsafe { libc::geteuid() };
+        let trusted_owner = opened.uid() == 0 || opened.uid() == effective_user;
+        if opened.dev() != named.dev()
+            || opened.ino() != named.ino()
+            || opened.uid() != named.uid()
+            || opened.mode() != named.mode()
+            || !trusted_owner
+            || opened.mode() & 0o022 != 0
+        {
+            return Err(AgentHostError::InvalidScopeBinding);
+        }
+        for ancestor in parent_path
+            .parent()
+            .ok_or(AgentHostError::InvalidScopeBinding)?
+            .ancestors()
+        {
+            let metadata =
+                fs::symlink_metadata(ancestor).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+            let trusted_owner = metadata.uid() == 0 || metadata.uid() == effective_user || {
+                #[cfg(target_os = "linux")]
+                {
+                    super::journal_store::uid_is_unmapped_overflow(metadata.uid())
+                        .map_err(|_| AgentHostError::InvalidScopeBinding)?
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    false
+                }
+            };
+            let writable = metadata.mode() & 0o022 != 0;
+            let protected_sticky = metadata.mode() & libc::S_ISVTX != 0 && trusted_owner;
+            if !metadata.file_type().is_dir()
+                || metadata.file_type().is_symlink()
+                || !trusted_owner
+                || writable && !protected_sticky
+            {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deterministic crash-publication stage for the permanent outer Host lease.
+/// Disabled-Agent startup treats this sibling as durable Agent residue too.
+pub fn agent_host_lease_stage_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".next");
+    path.with_file_name(name)
+}
+
+fn preflight_new_agent_host_lease(
+    root: &Path,
+    root_parent: &File,
+    authority_root: &Path,
+    authority_parent: &File,
+) -> Result<(), AgentHostError> {
+    validate_agent_host_lock_parent_identity(root_parent, root)?;
+    let root_capability = agent_host_child_capability_path(root_parent, root);
+    match fs::symlink_metadata(&root_capability) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+            let directory = open_agent_host_root_directory_at(root_parent, root)?;
+            validate_agent_host_root_identity(&directory, root)?;
+            if fs::read_dir(agent_host_directory_capability_path(&directory))
+                .map_err(|_| AgentHostError::Unavailable)?
+                .next()
+                .transpose()
+                .map_err(|_| AgentHostError::Unavailable)?
+                .is_some()
+            {
+                // With no authenticated outer binding, even Host metadata is
+                // ambiguous restored/deleted state. Never install a new
+                // binding over it; a second attempt fails identically.
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+            validate_agent_host_root_identity(&directory, root)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(AgentHostError::Unavailable),
+    }
+    validate_agent_host_lock_parent_identity(authority_parent, authority_root)?;
+    let authority_capability = agent_host_child_capability_path(authority_parent, authority_root);
+    match fs::symlink_metadata(authority_capability) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(AgentHostError::InvalidScopeBinding),
+        Err(_) => Err(AgentHostError::Unavailable),
+    }
+}
+
+fn open_agent_host_lease_file(
+    path: &Path,
+    parent: &File,
+    expected_binding: &[u8; HOST_LEASE_BINDING_LEN],
+    root: &Path,
+    root_parent: &File,
+    authority_root: &Path,
+) -> Result<(File, bool), AgentHostError> {
+    let stage_path = agent_host_lease_stage_path(path);
+    let canonical_capability = agent_host_child_capability_path(parent, path);
+    let stage_capability = agent_host_child_capability_path(parent, &stage_path);
+    validate_agent_host_lock_parent_identity(parent, path)?;
+    for _ in 0..3 {
+        let canonical = fs::symlink_metadata(&canonical_capability);
+        let stage = fs::symlink_metadata(&stage_capability);
+        let canonical_exists = match canonical {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                    return Err(AgentHostError::InvalidScopeBinding);
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return Err(AgentHostError::Unavailable),
+        };
+        let stage_exists = match stage {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                    return Err(AgentHostError::InvalidScopeBinding);
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return Err(AgentHostError::Unavailable),
+        };
+
+        match (canonical_exists, stage_exists) {
+            (true, false) => {
+                let file = open_existing_agent_host_lease(&canonical_capability)?;
+                validate_agent_host_lock_parent_identity(parent, path)?;
+                validate_agent_host_lock_identity(&file, path)?;
+                return Ok((file, false));
+            }
+            (true, true) => {
+                let canonical = open_existing_agent_host_lease_alias(&canonical_capability, 2)?;
+                let stage = open_existing_agent_host_lease_alias(&stage_capability, 2)?;
+                if !same_agent_host_file_identity(&canonical, &stage)? {
+                    return Err(AgentHostError::InvalidScopeBinding);
+                }
+                FileExt::try_lock_exclusive(&canonical).map_err(map_agent_host_lock_error)?;
+                validate_agent_host_lease_binding_file(&canonical, expected_binding, false)?;
+                // Canonical + stage is the exact link-before-stage-unlink
+                // publication crash.  Unlike a stage-only first binding,
+                // its authenticated canonical record may already have been
+                // followed by any valid FreshBound Host-tree prefix.
+                // Classify that prefix read-only before removing the alias.
+                validate_fresh_bound_tree_prefix(root, root_parent, authority_root, parent)?;
+                validate_agent_host_lock_parent_identity(parent, path)?;
+                remove_agent_host_lease_stage_at(parent, path, &stage_path)?;
+                parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+                validate_agent_host_lock_identity(&canonical, path)?;
+                validate_agent_host_lock_parent_identity(parent, path)?;
+                return Ok((canonical, false));
+            }
+            (false, _) => {
+                // A staged publication is recoverable only while the complete
+                // data/authority boundary is still pristine. This preflight
+                // precedes every write, including completion of a prefix.
+                preflight_new_agent_host_lease(root, root_parent, authority_root, parent)?;
+                let (mut stage, newly_created) = if stage_exists {
+                    let stage = open_existing_agent_host_lease_alias(&stage_capability, 1)?;
+                    validate_agent_host_lock_identity(&stage, &stage_path)?;
+                    (stage, false)
+                } else {
+                    match create_agent_host_lease_stage_at(parent, path, &stage_path) {
+                        Ok(file) => (file, true),
+                        Err(AgentHostError::Conflict) => continue,
+                        Err(error) => return Err(error),
+                    }
+                };
+                FileExt::try_lock_exclusive(&stage).map_err(map_agent_host_lock_error)?;
+                validate_agent_host_lock_parent_identity(parent, path)?;
+                complete_agent_host_lease_binding_stage(
+                    &mut stage,
+                    &stage_path,
+                    parent,
+                    expected_binding,
+                )?;
+                publish_agent_host_lease_stage_at(parent, path, &stage_path)?;
+                parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+                validate_agent_host_lease_alias_identity(&stage, path, &stage_path, 2)?;
+                remove_agent_host_lease_stage_at(parent, path, &stage_path)?;
+                parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+                validate_agent_host_lock_identity(&stage, path)?;
+                validate_agent_host_lock_parent_identity(parent, path)?;
+                return Ok((stage, newly_created));
+            }
+        }
+    }
+    Err(AgentHostError::DirectoryInUse)
+}
+
+fn map_agent_host_lock_error(error: std::io::Error) -> AgentHostError {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        AgentHostError::DirectoryInUse
+    } else {
+        AgentHostError::Unavailable
+    }
+}
+
+fn open_existing_agent_host_lease(path: &Path) -> Result<File, AgentHostError> {
+    let file = open_existing_agent_host_lease_alias(path, 1)?;
+    FileExt::try_lock_exclusive(&file).map_err(map_agent_host_lock_error)?;
+    validate_agent_host_lock_identity(&file, path)?;
+    Ok(file)
+}
+
+fn open_existing_agent_host_lease_alias(
+    path: &Path,
+    expected_links: u64,
+) -> Result<File, AgentHostError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    validate_agent_host_lease_alias_identity(&file, path, path, expected_links)?;
+    Ok(file)
+}
+
+fn validate_agent_host_lease_alias_identity(
+    file: &File,
+    canonical_path: &Path,
+    named_path: &Path,
+    expected_links: u64,
+) -> Result<(), AgentHostError> {
+    let opened = file.metadata().map_err(|_| AgentHostError::Unavailable)?;
+    let named =
+        fs::symlink_metadata(named_path).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    if !opened.file_type().is_file()
+        || !named.file_type().is_file()
+        || named.file_type().is_symlink()
+    {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let effective_user = unsafe { libc::geteuid() };
+        if opened.dev() != named.dev()
+            || opened.ino() != named.ino()
+            || opened.nlink() != expected_links
+            || named.nlink() != expected_links
+            || opened.uid() != effective_user
+            || named.uid() != effective_user
+            || opened.mode() & 0o022 != 0
+            || named.mode() & 0o022 != 0
+        {
+            return Err(AgentHostError::InvalidScopeBinding);
+        }
+    }
+    let parent = canonical_path
+        .parent()
+        .ok_or(AgentHostError::InvalidScopeBinding)?;
+    if named_path.parent() != Some(parent) {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    Ok(())
+}
+
+fn same_agent_host_file_identity(left: &File, right: &File) -> Result<bool, AgentHostError> {
+    let left = left.metadata().map_err(|_| AgentHostError::Unavailable)?;
+    let right = right.metadata().map_err(|_| AgentHostError::Unavailable)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        Err(AgentHostError::Unavailable)
+    }
+}
+
+fn validate_agent_host_lease_binding_file(
+    file: &File,
+    expected: &[u8; HOST_LEASE_BINDING_LEN],
+    allow_prefix: bool,
+) -> Result<usize, AgentHostError> {
+    let length = usize::try_from(
+        file.metadata()
+            .map_err(|_| AgentHostError::Unavailable)?
+            .len(),
+    )
+    .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    if length > expected.len() || (!allow_prefix && length != expected.len()) {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    let mut duplicate = file.try_clone().map_err(|_| AgentHostError::Unavailable)?;
+    duplicate
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| AgentHostError::Unavailable)?;
+    let mut observed = vec![0; length];
+    duplicate
+        .read_exact(&mut observed)
+        .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    if observed != expected[..length] {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    Ok(length)
+}
+
+fn complete_agent_host_lease_binding_stage(
+    file: &mut File,
+    stage_path: &Path,
+    parent: &File,
+    expected: &[u8; HOST_LEASE_BINDING_LEN],
+) -> Result<(), AgentHostError> {
+    validate_agent_host_lease_alias_identity(file, stage_path, stage_path, 1)?;
+    let length = validate_agent_host_lease_binding_file(file, expected, true)?;
+    file.seek(SeekFrom::Start(length as u64))
+        .map_err(|_| AgentHostError::Unavailable)?;
+    file.write_all(&expected[length..])
+        .map_err(|_| AgentHostError::Unavailable)?;
+    file.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+    parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+    validate_agent_host_lease_alias_identity(file, stage_path, stage_path, 1)?;
+    validate_agent_host_lease_binding_file(file, expected, false)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn lease_leaf(path: &Path) -> Result<std::ffi::CString, AgentHostError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::ffi::CString::new(
+        path.file_name()
+            .ok_or(AgentHostError::InvalidScopeBinding)?
+            .as_bytes(),
+    )
+    .map_err(|_| AgentHostError::InvalidScopeBinding)
+}
+
+fn create_agent_host_lease_stage_at(
+    parent: &File,
+    canonical_path: &Path,
+    stage_path: &Path,
+) -> Result<File, AgentHostError> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let name = lease_leaf(stage_path)?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Err(AgentHostError::Conflict)
+            } else {
+                Err(AgentHostError::Unavailable)
+            };
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        validate_agent_host_lock_parent_identity(parent, canonical_path)?;
+        validate_agent_host_lease_alias_identity(&file, stage_path, stage_path, 1)?;
+        return Ok(file);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, canonical_path, stage_path);
+        Err(AgentHostError::Unavailable)
+    }
+}
+
+fn publish_agent_host_lease_stage_at(
+    parent: &File,
+    canonical_path: &Path,
+    stage_path: &Path,
+) -> Result<(), AgentHostError> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let canonical = lease_leaf(canonical_path)?;
+        let stage = lease_leaf(stage_path)?;
+        if unsafe {
+            libc::linkat(
+                parent.as_raw_fd(),
+                stage.as_ptr(),
+                parent.as_raw_fd(),
+                canonical.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            return Err(AgentHostError::Unavailable);
+        }
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, canonical_path, stage_path);
+        Err(AgentHostError::Unavailable)
+    }
+}
+
+fn remove_agent_host_lease_stage_at(
+    parent: &File,
+    canonical_path: &Path,
+    stage_path: &Path,
+) -> Result<(), AgentHostError> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let stage = lease_leaf(stage_path)?;
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), stage.as_ptr(), 0) } != 0 {
+            return Err(AgentHostError::Unavailable);
+        }
+        validate_agent_host_lock_parent_identity(parent, canonical_path)?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, canonical_path, stage_path);
+        Err(AgentHostError::Unavailable)
+    }
+}
+
+fn open_plain_agent_host_lock_file(path: &Path) -> Result<(File, bool), AgentHostError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let (file, created) = match options.open(path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata =
+                fs::symlink_metadata(path).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+            let mut options = OpenOptions::new();
+            options.read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            (
+                options
+                    .open(path)
+                    .map_err(|_| AgentHostError::Unavailable)?,
+                false,
+            )
+        }
+        Err(_) => return Err(AgentHostError::Unavailable),
+    };
+    validate_agent_host_lock_identity(&file, path)?;
     FileExt::try_lock_exclusive(&file).map_err(|error| {
         if error.kind() == std::io::ErrorKind::WouldBlock {
             AgentHostError::DirectoryInUse
@@ -2288,69 +3976,202 @@ fn open_agent_host_lock(path: &Path) -> Result<File, AgentHostError> {
             AgentHostError::Unavailable
         }
     })?;
-    if !existed {
-        file.sync_all().map_err(|_| AgentHostError::Unavailable)?;
-        if let Some(parent) = path.parent() {
-            File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|_| AgentHostError::Unavailable)?;
+    validate_agent_host_lock_identity(&file, path)?;
+    Ok((file, created))
+}
+
+fn validate_agent_host_lock_identity(file: &File, path: &Path) -> Result<(), AgentHostError> {
+    let opened = file.metadata().map_err(|_| AgentHostError::Unavailable)?;
+    let named = fs::symlink_metadata(path).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    if !opened.file_type().is_file()
+        || !named.file_type().is_file()
+        || named.file_type().is_symlink()
+    {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let effective_user = unsafe { libc::geteuid() };
+        if opened.dev() != named.dev()
+            || opened.ino() != named.ino()
+            || opened.nlink() != 1
+            || named.nlink() != 1
+            || opened.uid() != effective_user
+            || named.uid() != effective_user
+            || opened.mode() & 0o022 != 0
+            || named.mode() & 0o022 != 0
+        {
+            return Err(AgentHostError::InvalidScopeBinding);
         }
     }
+    Ok(())
+}
+
+fn lock_agent_host_directory(
+    root: &Path,
+    root_directory: &File,
+    allow_create: bool,
+) -> Result<File, AgentHostError> {
+    let path = root.join(HOST_LOCK_FILE);
+    let capability = agent_host_directory_capability_path(root_directory).join(HOST_LOCK_FILE);
+    if allow_create {
+        return open_agent_host_lock_at(&capability, &path, root_directory);
+    }
+    open_existing_agent_host_lock_at(&capability, &path)
+}
+
+fn open_agent_host_lock_at(
+    capability: &Path,
+    named: &Path,
+    parent: &File,
+) -> Result<File, AgentHostError> {
+    let (file, _created) = open_plain_agent_host_lock_file(capability)?;
+    validate_agent_host_lock_identity(&file, named)?;
+    // `allow_create` also authorizes retry of a prior create whose durability
+    // sync failed, so re-sync both boundaries even when the leaf now exists.
+    file.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+    parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+    validate_agent_host_lock_identity(&file, named)?;
     Ok(file)
 }
 
-fn lock_agent_host_directory(root: &Path) -> Result<File, AgentHostError> {
-    open_agent_host_lock(&root.join(HOST_LOCK_FILE))
+fn open_existing_agent_host_lock_at(
+    capability: &Path,
+    named: &Path,
+) -> Result<File, AgentHostError> {
+    let file = open_existing_agent_host_lock(capability)?;
+    validate_agent_host_lock_identity(&file, named)?;
+    Ok(file)
+}
+
+fn open_existing_agent_host_lock(path: &Path) -> Result<File, AgentHostError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AgentHostError::InvalidScopeBinding
+        } else {
+            AgentHostError::Unavailable
+        }
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    validate_agent_host_lock_identity(&file, path)?;
+    FileExt::try_lock_exclusive(&file).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            AgentHostError::DirectoryInUse
+        } else {
+            AgentHostError::Unavailable
+        }
+    })?;
+    validate_agent_host_lock_identity(&file, path)?;
+    Ok(file)
 }
 
 #[derive(Clone, Copy)]
 enum AgentHostScopeState {
     Absent,
     Bound(AgentHostScope),
+    BoundWithStage(AgentHostScope),
     Staged(AgentHostScope),
+}
+
+struct AgentHostScopeFile {
+    scope: AgentHostScope,
+    metadata: fs::Metadata,
 }
 
 impl AgentHostScopeState {
     const fn scope(self) -> Option<AgentHostScope> {
         match self {
             Self::Absent => None,
-            Self::Bound(scope) | Self::Staged(scope) => Some(scope),
+            Self::Bound(scope) | Self::BoundWithStage(scope) | Self::Staged(scope) => Some(scope),
         }
     }
 }
 
 fn read_agent_host_scope(
     root: &Path,
+    root_directory: &File,
     requested: AgentHostScope,
+    allow_partial_stage_recovery: bool,
 ) -> Result<AgentHostScopeState, AgentHostError> {
-    let path = root.join(HOST_SCOPE_FILE);
-    let temp = root.join(HOST_SCOPE_TEMP_FILE);
+    let capability = agent_host_directory_capability_path(root_directory);
+    let path = capability.join(HOST_SCOPE_FILE);
+    let temp = capability.join(HOST_SCOPE_TEMP_FILE);
     let final_scope = read_agent_host_scope_file(&path)?;
-    let staged_scope = read_agent_host_scope_file(&temp)?;
+    let staged_scope = match read_agent_host_scope_file(&temp) {
+        Ok(scope) => scope,
+        Err(AgentHostError::InvalidScopeBinding)
+            if final_scope.is_none() && allow_partial_stage_recovery =>
+        {
+            Some(complete_agent_host_scope_prefix(
+                root,
+                root_directory,
+                &temp,
+                requested,
+            )?)
+        }
+        Err(error) => return Err(error),
+    };
+    validate_agent_host_scope_link_state(final_scope.as_ref(), staged_scope.as_ref())?;
     match (final_scope, staged_scope) {
         (Some(bound), Some(staged)) => {
-            if bound != staged {
+            if bound.scope != staged.scope {
                 return Err(AgentHostError::InvalidScopeBinding);
             }
-            if bound != requested {
+            if bound.scope != requested {
                 return Err(AgentHostError::ScopeMismatch);
             }
-            fs::remove_file(temp).map_err(|_| AgentHostError::Unavailable)?;
-            sync_agent_host_directory(root)?;
-            Ok(AgentHostScopeState::Bound(bound))
+            Ok(AgentHostScopeState::BoundWithStage(bound.scope))
         }
-        (Some(bound), None) => Ok(AgentHostScopeState::Bound(bound)),
+        (Some(bound), None) => Ok(AgentHostScopeState::Bound(bound.scope)),
         (None, Some(staged)) => {
-            if staged != requested {
+            if staged.scope != requested {
                 return Err(AgentHostError::ScopeMismatch);
             }
-            Ok(AgentHostScopeState::Staged(staged))
+            Ok(AgentHostScopeState::Staged(staged.scope))
         }
         (None, None) => Ok(AgentHostScopeState::Absent),
     }
 }
 
-fn read_agent_host_scope_file(path: &Path) -> Result<Option<AgentHostScope>, AgentHostError> {
+fn cleanup_agent_host_scope_stage(
+    _root: &Path,
+    root_directory: &File,
+) -> Result<(), AgentHostError> {
+    let capability = agent_host_directory_capability_path(root_directory);
+    let path = capability.join(HOST_SCOPE_FILE);
+    let temp = capability.join(HOST_SCOPE_TEMP_FILE);
+    let bound = read_agent_host_scope_file(&path)?.ok_or(AgentHostError::InvalidScopeBinding)?;
+    let staged = read_agent_host_scope_file(&temp)?.ok_or(AgentHostError::InvalidScopeBinding)?;
+    validate_agent_host_scope_link_state(Some(&bound), Some(&staged))?;
+    if bound.scope != staged.scope {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    fs::remove_file(temp).map_err(|_| AgentHostError::Unavailable)?;
+    root_directory
+        .sync_all()
+        .map_err(|_| AgentHostError::Unavailable)?;
+    let final_scope =
+        read_agent_host_scope_file(&path)?.ok_or(AgentHostError::InvalidScopeBinding)?;
+    validate_agent_host_scope_link_state(Some(&final_scope), None)
+}
+
+fn read_agent_host_scope_file(path: &Path) -> Result<Option<AgentHostScopeFile>, AgentHostError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2378,6 +4199,7 @@ fn read_agent_host_scope_file(path: &Path) -> Result<Option<AgentHostScope>, Age
     {
         return Err(AgentHostError::InvalidScopeBinding);
     }
+    validate_agent_host_scope_metadata(&opened_metadata, &metadata)?;
     let mut encoded = [0; HOST_SCOPE_ENCODED_LEN];
     file.read_exact(&mut encoded)
         .map_err(|_| AgentHostError::InvalidScopeBinding)?;
@@ -2396,39 +4218,166 @@ fn read_agent_host_scope_file(path: &Path) -> Result<Option<AgentHostScope>, Age
     space.copy_from_slice(&encoded[HOST_SCOPE_MAGIC.len()..HOST_SCOPE_MAGIC.len() + 32]);
     let mut node = [0; 32];
     node.copy_from_slice(&encoded[HOST_SCOPE_MAGIC.len() + 32..]);
-    Ok(Some(AgentHostScope {
-        space: SpaceId(space),
-        node: NodeId(node),
+    Ok(Some(AgentHostScopeFile {
+        scope: AgentHostScope {
+            space: SpaceId(space),
+            node: NodeId(node),
+        },
+        metadata: opened_metadata,
     }))
 }
 
-fn write_agent_host_scope(root: &Path, scope: AgentHostScope) -> Result<(), AgentHostError> {
-    let path = root.join(HOST_SCOPE_FILE);
-    let temp = root.join(HOST_SCOPE_TEMP_FILE);
+fn validate_agent_host_scope_link_state(
+    final_scope: Option<&AgentHostScopeFile>,
+    staged_scope: Option<&AgentHostScopeFile>,
+) -> Result<(), AgentHostError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        match (final_scope, staged_scope) {
+            (Some(final_scope), Some(staged_scope)) => {
+                if final_scope.metadata.dev() != staged_scope.metadata.dev()
+                    || final_scope.metadata.ino() != staged_scope.metadata.ino()
+                    || final_scope.metadata.nlink() != 2
+                    || staged_scope.metadata.nlink() != 2
+                {
+                    return Err(AgentHostError::InvalidScopeBinding);
+                }
+            }
+            (Some(scope), None) | (None, Some(scope)) if scope.metadata.nlink() != 1 => {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+            _ => {}
+        }
+    }
+    #[cfg(not(unix))]
+    if final_scope.is_some() && staged_scope.is_some() {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    Ok(())
+}
+
+fn validate_agent_host_scope_single_link(metadata: &fs::Metadata) -> Result<(), AgentHostError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(AgentHostError::InvalidScopeBinding);
+        }
+    }
+    Ok(())
+}
+
+fn encoded_agent_host_scope(scope: AgentHostScope) -> [u8; HOST_SCOPE_ENCODED_LEN] {
+    let mut encoded = [0; HOST_SCOPE_ENCODED_LEN];
+    encoded[..HOST_SCOPE_MAGIC.len()].copy_from_slice(HOST_SCOPE_MAGIC);
+    encoded[HOST_SCOPE_MAGIC.len()..HOST_SCOPE_MAGIC.len() + 32].copy_from_slice(&scope.space.0);
+    encoded[HOST_SCOPE_MAGIC.len() + 32..].copy_from_slice(&scope.node.0);
+    encoded
+}
+
+fn validate_agent_host_scope_metadata(
+    opened: &fs::Metadata,
+    named: &fs::Metadata,
+) -> Result<(), AgentHostError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let effective_user = unsafe { libc::geteuid() };
+        if opened.dev() != named.dev()
+            || opened.ino() != named.ino()
+            || opened.uid() != effective_user
+            || named.uid() != effective_user
+            || opened.mode() & 0o022 != 0
+            || named.mode() & 0o022 != 0
+        {
+            return Err(AgentHostError::InvalidScopeBinding);
+        }
+    }
+    Ok(())
+}
+
+fn complete_agent_host_scope_prefix(
+    _root: &Path,
+    root_directory: &File,
+    temp: &Path,
+    scope: AgentHostScope,
+) -> Result<AgentHostScopeFile, AgentHostError> {
+    let metadata = fs::symlink_metadata(temp).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() >= HOST_SCOPE_ENCODED_LEN as u64
+    {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let mut file = options
-        .open(&temp)
+        .open(temp)
         .map_err(|_| AgentHostError::InvalidScopeBinding)?;
-    file.write_all(HOST_SCOPE_MAGIC)
-        .and_then(|()| file.write_all(&scope.space.0))
-        .and_then(|()| file.write_all(&scope.node.0))
-        .and_then(|()| file.sync_all())
+    let opened = file.metadata().map_err(|_| AgentHostError::Unavailable)?;
+    validate_agent_host_scope_metadata(&opened, &metadata)?;
+    validate_agent_host_scope_single_link(&opened)?;
+    let expected = encoded_agent_host_scope(scope);
+    let length = usize::try_from(opened.len()).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    let mut prefix = vec![0; length];
+    file.read_exact(&mut prefix)
+        .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    if prefix != expected[..length] {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    file.seek(SeekFrom::Start(length as u64))
+        .and_then(|_| file.write_all(&expected[length..]))
+        .and_then(|_| file.sync_all())
         .map_err(|_| AgentHostError::Unavailable)?;
-    publish_agent_host_scope(root, &temp, &path)
+    root_directory
+        .sync_all()
+        .map_err(|_| AgentHostError::Unavailable)?;
+    read_agent_host_scope_file(temp)?.ok_or(AgentHostError::InvalidScopeBinding)
 }
 
-fn publish_agent_host_scope(root: &Path, temp: &Path, path: &Path) -> Result<(), AgentHostError> {
+fn write_agent_host_scope(
+    _root: &Path,
+    root_directory: &File,
+    scope: AgentHostScope,
+) -> Result<(), AgentHostError> {
+    let capability = agent_host_directory_capability_path(root_directory);
+    let temp = capability.join(HOST_SCOPE_TEMP_FILE);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(&temp)
+        .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    file.write_all(&encoded_agent_host_scope(scope))
+        .and_then(|()| file.sync_all())
+        .map_err(|_| AgentHostError::Unavailable)?;
+    root_directory
+        .sync_all()
+        .map_err(|_| AgentHostError::Unavailable)?;
+    publish_agent_host_scope(_root, root_directory)
+}
+
+fn publish_agent_host_scope(_root: &Path, root_directory: &File) -> Result<(), AgentHostError> {
+    let capability = agent_host_directory_capability_path(root_directory);
+    let temp = capability.join(HOST_SCOPE_TEMP_FILE);
+    let path = capability.join(HOST_SCOPE_FILE);
     // A recovered staging inode may predate this process. Re-establish its
     // durability before making it the canonical binding, even though the
     // ordinary writer already synced it before reaching this helper.
     let staged_metadata =
-        fs::symlink_metadata(temp).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+        fs::symlink_metadata(&temp).map_err(|_| AgentHostError::InvalidScopeBinding)?;
     if !staged_metadata.file_type().is_file()
         || staged_metadata.file_type().is_symlink()
         || staged_metadata.len() != HOST_SCOPE_ENCODED_LEN as u64
@@ -2443,22 +4392,33 @@ fn publish_agent_host_scope(root: &Path, temp: &Path, path: &Path) -> Result<(),
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let staged = options
-        .open(temp)
+        .open(&temp)
         .map_err(|_| AgentHostError::InvalidScopeBinding)?;
     let metadata = staged.metadata().map_err(|_| AgentHostError::Unavailable)?;
     if !metadata.file_type().is_file() || metadata.len() != HOST_SCOPE_ENCODED_LEN as u64 {
         return Err(AgentHostError::InvalidScopeBinding);
     }
     staged.sync_all().map_err(|_| AgentHostError::Unavailable)?;
-    fs::hard_link(temp, path).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    validate_agent_host_scope_metadata(&metadata, &staged_metadata)?;
+    validate_agent_host_scope_single_link(&metadata)?;
+    fs::hard_link(&temp, &path).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    root_directory
+        .sync_all()
+        .map_err(|_| AgentHostError::Unavailable)?;
+    let canonical =
+        read_agent_host_scope_file(&path)?.ok_or(AgentHostError::InvalidScopeBinding)?;
+    let staged = read_agent_host_scope_file(&temp)?.ok_or(AgentHostError::InvalidScopeBinding)?;
+    validate_agent_host_scope_link_state(Some(&canonical), Some(&staged))?;
+    if canonical.scope != staged.scope {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
     fs::remove_file(temp).map_err(|_| AgentHostError::Unavailable)?;
-    sync_agent_host_directory(root)
-}
-
-fn sync_agent_host_directory(root: &Path) -> Result<(), AgentHostError> {
-    File::open(root)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| AgentHostError::Unavailable)
+    root_directory
+        .sync_all()
+        .map_err(|_| AgentHostError::Unavailable)?;
+    let canonical =
+        read_agent_host_scope_file(&path)?.ok_or(AgentHostError::InvalidScopeBinding)?;
+    validate_agent_host_scope_link_state(Some(&canonical), None)
 }
 
 fn encode_agent_id(agent: AgentId) -> String {
@@ -2666,6 +4626,8 @@ mod tests {
         catalog: Vec<RuntimeBlob>,
         journal: PathBuf,
         stable_lock: PathBuf,
+        authority_ledger: PathBuf,
+        authority_ledger_stage: PathBuf,
         archived: Mutex<bool>,
         create_saw_clean_destination: std::sync::atomic::AtomicBool,
         refuse_create: std::sync::atomic::AtomicBool,
@@ -2679,14 +4641,33 @@ mod tests {
             root: &Path,
         ) -> Self {
             let agent = provision.proposal().locator().agent;
+            let authority_parent = root
+                .parent()
+                .expect("fixture journal root has an authority parent");
+            let authority_root = agent_host_authority_root(
+                &authority_parent.join("fixture-host-lease"),
+                root,
+                scope(),
+            )
+            .expect("fixture authority root is deterministic");
             Self {
                 provision,
                 catalog,
                 journal: root.join(format!("{}{}", encode_agent_id(agent), JOURNAL_SUFFIX)),
-                stable_lock: root.join(format!(
+                stable_lock: authority_root.join(format!(
                     "{}{}",
                     encode_agent_id(agent),
                     JOURNAL_LOCK_SUFFIX
+                )),
+                authority_ledger: authority_root.join(format!(
+                    "{}{}",
+                    encode_agent_id(agent),
+                    SYSTEM_AUTHORITY_LEDGER_SUFFIX
+                )),
+                authority_ledger_stage: authority_root.join(format!(
+                    "{}{}",
+                    encode_agent_id(agent),
+                    SYSTEM_AUTHORITY_LEDGER_STAGE_SUFFIX
                 )),
                 archived: Mutex::new(false),
                 create_saw_clean_destination: std::sync::atomic::AtomicBool::new(false),
@@ -2717,7 +4698,10 @@ mod tests {
             if proposal != self.provision.proposal() || catalog != self.catalog {
                 return Err(SystemAgentGenesisProviderError::Conflict);
             }
-            let clean = !self.journal.exists() && !self.stable_lock.exists();
+            let clean = !self.journal.exists()
+                && !self.stable_lock.exists()
+                && !self.authority_ledger.exists()
+                && !self.authority_ledger_stage.exists();
             self.create_saw_clean_destination
                 .store(clean, Ordering::SeqCst);
             if !clean {
@@ -3085,6 +5069,50 @@ mod tests {
         (invocation, receipt)
     }
 
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    fn initialize_fixture_without_exposure_marker(fixture: &JournalFixture) {
+        let (sealed, catalog, _, _) = prepare_archived_genesis(
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.as_ref(),
+            &fixture.pins,
+            fixture.provider.provision.clone(),
+        )
+        .unwrap();
+        let slot = FileAgentJournalSlot::acquire(
+            fixture.provider.journal.clone(),
+            fixture.provider.stable_lock.clone(),
+            scope().node,
+        )
+        .unwrap();
+        let ledger = slot.open_system_authority_ledger().unwrap();
+        let owner =
+            SystemAuthorityLedgerRouteOwner::open_file(ledger.into_owner_open(), &sealed).unwrap();
+        let authority = slot
+            .bind_system_authority_ledger_owner(owner, &sealed)
+            .unwrap();
+        assert!(!authority.journal_exposure_is_committed().unwrap());
+        let store = authority
+            .with_startup_root_recovery(|startup| slot.open_reverified(&sealed, startup, false))
+            .unwrap()
+            .unwrap();
+
+        // Deliberately use the generic constructor to model a process from
+        // the crash window after the complete journal became durable but
+        // before Host committed the permanent exposure row.
+        let driver = LocalJournalAgentDriver::create(
+            store,
+            sealed,
+            &catalog,
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+        )
+        .unwrap();
+        assert!(!authority.journal_exposure_is_committed().unwrap());
+        drop(driver);
+        drop(authority);
+    }
+
     struct RemoveOnDrop(PathBuf);
 
     impl Drop for RemoveOnDrop {
@@ -3102,11 +5130,39 @@ mod tests {
             "vos-agent-host-{test}-{}-{unique}",
             std::process::id()
         ));
+        fs::create_dir(&base).unwrap();
         (
             base.join("data"),
             base.join("owner.lock"),
             RemoveOnDrop(base),
         )
+    }
+
+    fn snapshot_directory(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        fn walk(root: &Path, directory: &Path, snapshot: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+            let mut entries = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    snapshot.push((relative, None));
+                    walk(root, &path, snapshot);
+                } else if file_type.is_file() {
+                    snapshot.push((relative, Some(fs::read(path).unwrap())));
+                } else {
+                    panic!("unexpected journal entry type");
+                }
+            }
+        }
+
+        let mut snapshot = Vec::new();
+        walk(root, root, &mut snapshot);
+        snapshot
     }
 
     fn scope() -> AgentHostScope {
@@ -3264,6 +5320,7 @@ mod tests {
         assert_eq!(decode_agent_id("ab"), None);
     }
 
+    #[cfg(all(feature = "storage", target_os = "linux"))]
     #[test]
     fn provider_precedes_destination_and_advanced_heads_reopen() {
         let (directory, lock, _remove) = empty_host_directory("journal-reopen");
@@ -3271,8 +5328,12 @@ mod tests {
         let fixture_preparation_slot_reads = fixture.slot_reads.load(Ordering::SeqCst);
         let journal = fixture.provider.journal.clone();
         let journal_lock = fixture.provider.stable_lock.clone();
+        let authority_ledger = fixture.provider.authority_ledger.clone();
+        let authority_ledger_stage = fixture.provider.authority_ledger_stage.clone();
         assert!(!journal.exists());
         assert!(!journal_lock.exists());
+        assert!(!authority_ledger.exists());
+        assert!(!authority_ledger_stage.exists());
 
         let control = AgentHostControl::open(
             lease(&directory, &lock, scope()),
@@ -3307,6 +5368,8 @@ mod tests {
         );
         assert!(journal.is_dir());
         assert!(journal_lock.is_file());
+        assert!(authority_ledger.is_file());
+        assert!(!authority_ledger_stage.exists());
 
         // Response-loss retry reproduces the archived proposal and does not
         // resample or reissue genesis.
@@ -3362,9 +5425,194 @@ mod tests {
         reopened.shutdown().unwrap();
     }
 
+    #[cfg(all(feature = "storage", target_os = "linux"))]
     #[test]
-    fn archived_startup_create_and_partial_initialization_repair_are_idempotent() {
-        let (directory, lock, _remove) = empty_host_directory("journal-partial-init");
+    fn authority_namespaces_isolate_the_same_agent_across_scopes_and_roots() {
+        let (first_root, first_lock, _remove) = empty_host_directory("authority-isolation");
+        let parent = first_root.parent().unwrap();
+        let second_root = parent.join("second-data");
+        let second_lock = parent.join("second-owner.lock");
+        let second_scope = AgentHostScope {
+            space: SpaceId([9; 32]),
+            node: scope().node,
+        };
+        let first_lease = lease(&first_root, &first_lock, scope());
+        let second_lease = lease(&second_root, &second_lock, second_scope);
+        let first_authority = first_lease.authority_root().unwrap().to_path_buf();
+        let second_authority = second_lease.authority_root().unwrap().to_path_buf();
+        assert_ne!(first_authority, second_authority);
+
+        let agent = test_system_agent();
+        let leaf = format!("{}{}", encode_agent_id(agent), JOURNAL_LOCK_SUFFIX);
+        let first_slot = FileAgentJournalSlot::acquire(
+            first_root.join(format!("{}{}", encode_agent_id(agent), JOURNAL_SUFFIX)),
+            first_authority.join(&leaf),
+            scope().node,
+        )
+        .unwrap();
+        let second_slot = FileAgentJournalSlot::acquire(
+            second_root.join(format!("{}{}", encode_agent_id(agent), JOURNAL_SUFFIX)),
+            second_authority.join(&leaf),
+            second_scope.node,
+        )
+        .unwrap();
+        assert_ne!(first_slot.instance_id(), second_slot.instance_id());
+        assert!(first_authority.join(&leaf).is_file());
+        assert!(second_authority.join(&leaf).is_file());
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn live_root_and_authority_namespace_replacement_precede_mutation() {
+        let (directory, lock, _remove) = empty_host_directory("live-namespace-replacement");
+        let fixture = journal_fixture(&directory);
+        let root_lease = lease(&directory, &lock, scope());
+        let authority_root = root_lease.authority_root().unwrap().to_path_buf();
+        let mut host = AgentHost::open(
+            root_lease,
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+        host.create(
+            fixture.config.clone(),
+            fixture.runtime_package.clone(),
+            &fixture.create_receipt,
+        )
+        .unwrap();
+        let journal_before = snapshot_directory(&fixture.provider.journal);
+        let (invocation, receipt) = fixture_invocation(&fixture.config);
+
+        let displaced_root = directory.with_extension("displaced-live-root");
+        fs::rename(&directory, &displaced_root).unwrap();
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            host.invoke(fixture.config.identity.agent, invocation.clone(), &receipt),
+            Err(AgentHostError::InvalidScopeBinding)
+        );
+        assert_eq!(
+            snapshot_directory(&displaced_root.join(fixture.provider.journal.file_name().unwrap())),
+            journal_before
+        );
+        fs::remove_dir(&directory).unwrap();
+        fs::rename(&displaced_root, &directory).unwrap();
+
+        let displaced_authority = authority_root.with_extension("displaced-live-authority");
+        fs::rename(&authority_root, &displaced_authority).unwrap();
+        fs::create_dir(&authority_root).unwrap();
+        assert_eq!(
+            host.invoke(fixture.config.identity.agent, invocation, &receipt),
+            Err(AgentHostError::InvalidScopeBinding)
+        );
+        assert_eq!(
+            snapshot_directory(&fixture.provider.journal),
+            journal_before
+        );
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn live_host_rejects_sidecar_replacement_before_every_root_mutation() {
+        fn snapshot_journal(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+            fn walk(root: &Path, directory: &Path, snapshot: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+                let mut entries = fs::read_dir(directory)
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .collect::<Vec<_>>();
+                entries.sort_by_key(|entry| entry.file_name());
+                for entry in entries {
+                    let path = entry.path();
+                    let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                    let file_type = entry.file_type().unwrap();
+                    if file_type.is_dir() {
+                        snapshot.push((relative, None));
+                        walk(root, &path, snapshot);
+                    } else if file_type.is_file() {
+                        snapshot.push((relative, Some(fs::read(path).unwrap())));
+                    } else {
+                        panic!("unexpected journal entry type at {}", path.display());
+                    }
+                }
+            }
+
+            let mut snapshot = Vec::new();
+            walk(root, root, &mut snapshot);
+            snapshot
+        }
+
+        let (directory, lock, _remove) = empty_host_directory("live-ledger-replacement");
+        let fixture = journal_fixture(&directory);
+        let mut host = AgentHost::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+        host.create(
+            fixture.config.clone(),
+            fixture.runtime_package.clone(),
+            &fixture.create_receipt,
+        )
+        .unwrap();
+        let agent = fixture.config.identity.agent;
+        let revision = host.revision(agent).unwrap();
+        let journal = snapshot_journal(&fixture.provider.journal);
+
+        let displaced = directory.join("displaced-authority-ledger.redb");
+        fs::rename(&fixture.provider.authority_ledger, &displaced).unwrap();
+        fs::write(&fixture.provider.authority_ledger, b"replacement").unwrap();
+
+        macro_rules! assert_blocked_before_mutation {
+            ($operation:expr) => {{
+                assert_eq!($operation, Err(AgentHostError::AuthorityLedger));
+                assert_eq!(host.revision(agent), Some(revision));
+                assert_eq!(snapshot_journal(&fixture.provider.journal), journal);
+            }};
+        }
+
+        let actor = ActorId([0x77; 32]);
+        let deployment = DeploymentId([0x78; 32]);
+        assert_blocked_before_mutation!(host.install_actor(
+            agent,
+            &fixture.create_receipt,
+            "blocked".into(),
+            None,
+            &fixture.runtime_package,
+        ));
+        assert_blocked_before_mutation!(host.upgrade_actor(
+            agent,
+            &fixture.create_receipt,
+            actor,
+            deployment,
+            &fixture.runtime_package,
+        ));
+        assert_blocked_before_mutation!(host.suspend_actor(agent, &fixture.create_receipt, actor,));
+        assert_blocked_before_mutation!(host.resume_actor(agent, &fixture.create_receipt, actor,));
+        assert_blocked_before_mutation!(host.remove_actor(
+            agent,
+            &fixture.create_receipt,
+            actor,
+            deployment,
+        ));
+        assert_blocked_before_mutation!(host.upgrade_runtime(
+            agent,
+            &fixture.create_receipt,
+            deployment,
+            &fixture.runtime_package,
+        ));
+        let (invocation, receipt) = fixture_invocation(&fixture.config);
+        assert_blocked_before_mutation!(host.invoke(agent, invocation.clone(), &receipt));
+        assert_blocked_before_mutation!(host.acknowledge_invocation(agent, invocation, &receipt));
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn archived_startup_create_and_reopen_are_idempotent() {
+        let (directory, lock, _remove) = empty_host_directory("journal-archived-create");
         let fixture = journal_fixture(&directory);
         let journal = fixture.provider.journal.clone();
         let journal_lock = fixture.provider.stable_lock.clone();
@@ -3400,11 +5648,7 @@ mod tests {
         assert!(journal.join("genesis").is_file());
         assert!(journal.join("heads").is_file());
 
-        // `initialize` commits immutable genesis before initial heads. The
-        // exact archived seal is the sole capability allowed to repair that
-        // recoverable boundary.
-        fs::remove_file(journal.join("heads")).unwrap();
-        let repaired = AgentHostControl::open(
+        let reopened = AgentHostControl::open(
             lease(&directory, &lock, scope()),
             fixture.trust.clone(),
             fixture.merge.clone(),
@@ -3413,17 +5657,327 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            repaired
+            reopened
                 .handle()
                 .revision(fixture.config.identity.agent)
                 .unwrap(),
             Some(0)
         );
-        assert!(journal.join("heads").is_file());
         assert_eq!(fixture.provider.creates.load(Ordering::SeqCst), 1);
-        repaired.shutdown().unwrap();
+        reopened.shutdown().unwrap();
     }
 
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn unexposed_complete_and_partial_initialization_are_reverified_then_marked() {
+        for partial in [false, true] {
+            let label = if partial {
+                "journal-unexposed-partial"
+            } else {
+                "journal-unexposed-complete"
+            };
+            let (directory, lock, _remove) = empty_host_directory(label);
+            let fixture = journal_fixture(&directory);
+            let scoped = AgentHostControl::open(
+                lease(&directory, &lock, scope()),
+                fixture.trust.clone(),
+                fixture.merge.clone(),
+                fixture.provider.clone(),
+                fixture.pins.clone(),
+            )
+            .unwrap();
+            assert!(scoped.handle().identities().unwrap().is_empty());
+            scoped.shutdown().unwrap();
+            fixture.provider.archive_for_test();
+            // The outer binding is durable, but Arm is intentionally
+            // published only after a fully reverified driver is ready to
+            // escape. This models a crash during inner initialization, before
+            // that final exposure boundary.
+            let initialization_lease = lease(&directory, &lock, scope());
+            initialize_fixture_without_exposure_marker(&fixture);
+            drop(initialization_lease);
+            if partial {
+                // `initialize` publishes immutable genesis before initial
+                // heads. Absence of the still-uncommitted exposure marker is
+                // the sole capability which permits this exact repair.
+                fs::remove_file(fixture.provider.journal.join("heads")).unwrap();
+            }
+
+            let recovered = AgentHostControl::open(
+                lease(&directory, &lock, scope()),
+                fixture.trust.clone(),
+                fixture.merge.clone(),
+                fixture.provider.clone(),
+                fixture.pins.clone(),
+            )
+            .unwrap();
+            let handle = recovered.handle();
+            assert_eq!(
+                handle.revision(fixture.config.identity.agent).unwrap(),
+                Some(0)
+            );
+            assert!(fixture.provider.journal.join("heads").is_file());
+
+            // An ordinary mutation can enter only after recovery committed
+            // the marker. The semantic NotFound therefore proves that the
+            // authority gate, not an unmarked route, admitted the call.
+            let (invocation, receipt) = fixture_invocation(&fixture.config);
+            assert_eq!(
+                handle.invoke(fixture.config.identity.agent, invocation, receipt),
+                Err(AgentHostError::Execution(ActorExecutionError::NotFound))
+            );
+            recovered.shutdown().unwrap();
+        }
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn bound_outer_lease_rejects_a_committed_inner_exposure_marker_without_writes() {
+        let (directory, lock, _remove) = empty_host_directory("bound-with-exposed-marker");
+        let fixture = journal_fixture(&directory);
+        fixture.provider.archive_for_test();
+        AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap()
+        .shutdown()
+        .unwrap();
+
+        let armed = fs::read(&lock).unwrap();
+        assert_eq!(armed.len(), HOST_LEASE_ARMED_LEN);
+        let binding = armed[..HOST_LEASE_BINDING_LEN].to_vec();
+        fs::write(&lock, &binding).unwrap();
+        let journal_before = snapshot_directory(&fixture.provider.journal);
+        let authority_root = fixture.provider.stable_lock.parent().unwrap();
+        let authority_before = snapshot_directory(authority_root);
+
+        assert!(matches!(
+            AgentHostControl::open(
+                lease(&directory, &lock, scope()),
+                fixture.trust.clone(),
+                fixture.merge.clone(),
+                fixture.provider.clone(),
+                fixture.pins.clone(),
+            ),
+            Err(AgentHostError::InvalidScopeBinding)
+        ));
+        assert_eq!(fs::read(&lock).unwrap(), binding);
+        assert_eq!(
+            snapshot_directory(&fixture.provider.journal),
+            journal_before
+        );
+        assert_eq!(snapshot_directory(authority_root), authority_before);
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn interrupted_outer_arm_is_strictly_reverified_then_completed_before_exposure() {
+        let (directory, lock, _remove) = empty_host_directory("interrupted-outer-arm");
+        let fixture = journal_fixture(&directory);
+        open_empty_control(lease(&directory, &lock, scope()))
+            .unwrap()
+            .shutdown()
+            .unwrap();
+        fixture.provider.archive_for_test();
+        let initialization_lease = lease(&directory, &lock, scope());
+        initialize_fixture_without_exposure_marker(&fixture);
+        drop(initialization_lease);
+
+        let binding = fs::read(&lock).unwrap();
+        assert_eq!(binding.len(), HOST_LEASE_BINDING_LEN);
+        let binding: [u8; HOST_LEASE_BINDING_LEN] = binding.try_into().unwrap();
+        let arm = encode_agent_host_lease_arm(&binding);
+        let mut interrupted = binding.to_vec();
+        interrupted.extend_from_slice(&arm[..HOST_LEASE_ARM_LEN - 1]);
+        fs::write(&lock, &interrupted).unwrap();
+
+        let recovered = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&lock).unwrap().len(),
+            HOST_LEASE_ARMED_LEN as u64
+        );
+        assert_eq!(
+            recovered
+                .handle()
+                .revision(fixture.config.identity.agent)
+                .unwrap(),
+            Some(0)
+        );
+        recovered.shutdown().unwrap();
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn exposed_journal_deletion_is_quarantined_without_recreation() {
+        for whole_generation in [false, true] {
+            let label = if whole_generation {
+                "journal-exposed-root-missing"
+            } else {
+                "journal-exposed-heads-missing"
+            };
+            let (directory, lock, _remove) = empty_host_directory(label);
+            let fixture = journal_fixture(&directory);
+            fixture.provider.archive_for_test();
+            let created = AgentHostControl::open(
+                lease(&directory, &lock, scope()),
+                fixture.trust.clone(),
+                fixture.merge.clone(),
+                fixture.provider.clone(),
+                fixture.pins.clone(),
+            )
+            .unwrap();
+            created.shutdown().unwrap();
+
+            let genesis = fs::read(fixture.provider.journal.join("genesis")).unwrap();
+            let displaced = directory.join("displaced-exposed-journal");
+            if whole_generation {
+                fs::rename(&fixture.provider.journal, &displaced).unwrap();
+            } else {
+                fs::remove_file(fixture.provider.journal.join("heads")).unwrap();
+            }
+            let error = match AgentHostControl::open(
+                lease(&directory, &lock, scope()),
+                fixture.trust.clone(),
+                fixture.merge.clone(),
+                fixture.provider.clone(),
+                fixture.pins.clone(),
+            ) {
+                Ok(control) => {
+                    control.shutdown().unwrap();
+                    panic!("an exposed journal deletion was recreated")
+                }
+                Err(error) => error,
+            };
+            if whole_generation {
+                assert_eq!(error, AgentHostError::InvalidScopeBinding);
+            } else {
+                assert_eq!(
+                    error,
+                    AgentHostError::Journal(AgentHostJournalError::Corrupt)
+                );
+            }
+            if whole_generation {
+                assert!(!fixture.provider.journal.exists());
+                assert_eq!(fs::read(displaced.join("genesis")).unwrap(), genesis);
+            } else {
+                assert!(!fixture.provider.journal.join("heads").exists());
+                assert_eq!(
+                    fs::read(fixture.provider.journal.join("genesis")).unwrap(),
+                    genesis
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn armed_lease_quarantines_complete_generation_deletion() {
+        let (directory, lock, _remove) = empty_host_directory("outer-lease-generation-deletion");
+        let fixture = journal_fixture(&directory);
+        fixture.provider.archive_for_test();
+        AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap()
+        .shutdown()
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&lock).unwrap().len(),
+            HOST_LEASE_ARMED_LEN as u64
+        );
+
+        fs::remove_dir_all(&fixture.provider.journal).unwrap();
+        fs::remove_file(&fixture.provider.stable_lock).unwrap();
+        fs::remove_file(&fixture.provider.authority_ledger).unwrap();
+        assert!(directory.join(HOST_SCOPE_FILE).is_file());
+
+        let mut before = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        before.sort_unstable();
+        let error = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error, AgentHostError::InvalidScopeBinding);
+        let mut after = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        after.sort_unstable();
+        assert_eq!(after, before, "quarantine must perform zero root writes");
+        assert!(!fixture.provider.journal.exists());
+        assert!(!fixture.provider.stable_lock.exists());
+        assert!(!fixture.provider.authority_ledger.exists());
+        assert!(!fixture.provider.authority_ledger_stage.exists());
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn armed_lease_quarantines_missing_and_recreated_root() {
+        let (directory, lock, _remove) = empty_host_directory("outer-lease-root-deletion");
+        let fixture = journal_fixture(&directory);
+        fixture.provider.archive_for_test();
+        AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap()
+        .shutdown()
+        .unwrap();
+
+        fs::remove_dir_all(&directory).unwrap();
+        assert!(matches!(
+            AgentHostRootLease::acquire(&directory, &lock, scope()),
+            Err(AgentHostError::InvalidScopeBinding)
+        ));
+        assert!(
+            !directory.exists(),
+            "acquire must not recreate an armed root"
+        );
+
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join(HOST_SCOPE_FILE), encoded_scope(scope())).unwrap();
+        let error = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error, AgentHostError::InvalidScopeBinding);
+        assert!(!directory.join(HOST_LOCK_FILE).exists());
+        assert_eq!(
+            fs::read(directory.join(HOST_SCOPE_FILE)).unwrap(),
+            encoded_scope(scope())
+        );
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
     #[test]
     fn provider_refusal_precedes_every_agent_destination_write() {
         let (directory, lock, _remove) = empty_host_directory("journal-provider-refusal");
@@ -3456,6 +6010,80 @@ mod tests {
         assert_eq!(fixture.provider.creates.load(Ordering::SeqCst), 1);
         assert!(!fixture.provider.journal.exists());
         assert!(!fixture.provider.stable_lock.exists());
+        assert!(!fixture.provider.authority_ledger.exists());
+        assert!(!fixture.provider.authority_ledger_stage.exists());
+        control.shutdown().unwrap();
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn authority_sidecar_residue_appearing_after_open_blocks_provider_creation() {
+        for staged in [false, true] {
+            let (directory, lock, _remove) = empty_host_directory(if staged {
+                "late-ledger-stage"
+            } else {
+                "late-ledger"
+            });
+            let fixture = journal_fixture(&directory);
+            let control = AgentHostControl::open(
+                lease(&directory, &lock, scope()),
+                fixture.trust.clone(),
+                fixture.merge.clone(),
+                fixture.provider.clone(),
+                fixture.pins.clone(),
+            )
+            .unwrap();
+            let residue = if staged {
+                &fixture.provider.authority_ledger_stage
+            } else {
+                &fixture.provider.authority_ledger
+            };
+            fs::write(residue, b"unexpected authority residue").unwrap();
+
+            assert_eq!(
+                control.handle().create(
+                    fixture.config.clone(),
+                    fixture.runtime_package.clone(),
+                    fixture.create_receipt.clone(),
+                ),
+                Err(AgentHostError::Provider(
+                    SystemAgentGenesisProviderError::NotConfigured
+                ))
+            );
+            assert_eq!(fixture.provider.creates.load(Ordering::SeqCst), 0);
+            assert!(!fixture.provider.journal.exists());
+            assert!(!fixture.provider.stable_lock.exists());
+            control.shutdown().unwrap();
+        }
+    }
+
+    #[cfg(not(all(feature = "storage", target_os = "linux")))]
+    #[test]
+    fn system_agent_create_without_durable_authority_storage_is_zero_write() {
+        let (directory, lock, _remove) = empty_host_directory("no-authority-storage");
+        let fixture = journal_fixture(&directory);
+        let control = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            control.handle().create(
+                fixture.config.clone(),
+                fixture.runtime_package.clone(),
+                fixture.create_receipt.clone(),
+            ),
+            Err(AgentHostError::Unavailable)
+        );
+        assert_eq!(fixture.provider.creates.load(Ordering::SeqCst), 0);
+        assert!(!fixture.provider.journal.exists());
+        assert!(!fixture.provider.stable_lock.exists());
+        assert!(!fixture.provider.authority_ledger.exists());
+        assert!(!fixture.provider.authority_ledger_stage.exists());
         control.shutdown().unwrap();
     }
 
@@ -3495,9 +6123,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             open_empty_control(lease(&directory, &lock, scope())),
-            Err(AgentHostError::Provider(
-                SystemAgentGenesisProviderError::NotConfigured
-            ))
+            Err(AgentHostError::InvalidScopeBinding)
         ));
     }
 
@@ -3520,9 +6146,22 @@ mod tests {
         fs::write(&uppercase_lock, b"alias").unwrap();
         assert!(matches!(
             open_empty_control(lease(&directory, &lock, scope())),
-            Err(AgentHostError::InvalidJournalName)
+            Err(AgentHostError::InvalidScopeBinding)
         ));
         fs::remove_file(&uppercase_lock).unwrap();
+
+        for suffix in [
+            ".SYSTEM-AUTHORITY-LEDGER.REDB",
+            ".SYSTEM-AUTHORITY-LEDGER.REDB.NEXT",
+        ] {
+            let uppercase_ledger = directory.join(format!("{encoded}{suffix}"));
+            fs::write(&uppercase_ledger, b"authority alias").unwrap();
+            assert!(matches!(
+                open_empty_control(lease(&directory, &lock, scope())),
+                Err(AgentHostError::InvalidScopeBinding)
+            ));
+            fs::remove_file(&uppercase_ledger).unwrap();
+        }
 
         let uppercase_legacy = directory.join(format!("{encoded}.AGENT-IMAGE"));
         fs::write(&uppercase_legacy, b"retired alias").unwrap();
@@ -3926,7 +6565,7 @@ mod tests {
             node: NodeId([3; 32]),
         };
         assert!(matches!(
-            open_empty_control(lease(&directory, &lock, wrong_scope)),
+            AgentHostRootLease::acquire(&directory, &lock, wrong_scope),
             Err(AgentHostError::ScopeMismatch)
         ));
 
@@ -3934,6 +6573,423 @@ mod tests {
             .unwrap()
             .shutdown()
             .unwrap();
+    }
+
+    #[test]
+    fn stable_lease_binding_is_immutable_for_root_and_scope() {
+        let (directory, lock, _remove) = empty_host_directory("lease-binding");
+        drop(lease(&directory, &lock, scope()));
+        assert_eq!(
+            fs::metadata(&lock).unwrap().len(),
+            HOST_LEASE_BINDING_LEN as u64
+        );
+
+        let other_root = directory.with_extension("other-root");
+        assert!(matches!(
+            AgentHostRootLease::acquire(&other_root, &lock, scope()),
+            Err(AgentHostError::InvalidScopeBinding)
+        ));
+        assert!(!other_root.exists());
+
+        let wrong_scope = AgentHostScope {
+            space: scope().space,
+            node: NodeId([3; 32]),
+        };
+        assert!(matches!(
+            AgentHostRootLease::acquire(&directory, &lock, wrong_scope),
+            Err(AgentHostError::ScopeMismatch)
+        ));
+        assert_eq!(
+            fs::metadata(&lock).unwrap().len(),
+            HOST_LEASE_BINDING_LEN as u64
+        );
+    }
+
+    #[test]
+    fn lease_pins_root_inode_before_host_open() {
+        let (directory, lock, _remove) = empty_host_directory("lease-root-inode");
+        let root_lease = lease(&directory, &lock, scope());
+        let displaced = directory.with_extension("displaced");
+        fs::rename(&directory, &displaced).unwrap();
+        fs::create_dir(&directory).unwrap();
+
+        assert!(matches!(
+            open_empty_control(root_lease),
+            Err(AgentHostError::InvalidScopeBinding)
+        ));
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_lease_rejects_untrusted_writable_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (directory, lock, _remove) = empty_host_directory("lease-parent-mode");
+        let parent = directory.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            AgentHostRootLease::acquire(&directory, &lock, scope()),
+            Err(AgentHostError::InvalidScopeBinding)
+        ));
+        assert!(!directory.exists());
+        assert!(!lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_host_files_have_private_modes_even_under_umask_zero() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD_ROOT: &str = "VOS_AGENT_HOST_UMASK_CHILD_ROOT";
+        const CHILD_LOCK: &str = "VOS_AGENT_HOST_UMASK_CHILD_LOCK";
+        if let (Some(root), Some(lock)) =
+            (std::env::var_os(CHILD_ROOT), std::env::var_os(CHILD_LOCK))
+        {
+            // SAFETY: this branch runs in a dedicated child process, so the
+            // process-global umask cannot race any other test.
+            unsafe { libc::umask(0) };
+            let root = PathBuf::from(root);
+            let lock = PathBuf::from(lock);
+            let root_lease = lease(&root, &lock, scope());
+            let authority_root = root_lease.authority_root().unwrap().to_path_buf();
+            open_empty_control(root_lease).unwrap().shutdown().unwrap();
+            assert_eq!(
+                fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(authority_root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(root.join(HOST_SCOPE_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(root.join(HOST_LOCK_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            return;
+        }
+
+        let (directory, lock, _remove) = empty_host_directory("umask-zero");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("agent::host::tests::fresh_host_files_have_private_modes_even_under_umask_zero")
+            .arg("--test-threads=1")
+            .env(CHILD_ROOT, &directory)
+            .env(CHILD_LOCK, &lock)
+            .status()
+            .unwrap();
+        assert!(status.success(), "umask-zero child failed: {status}");
+    }
+
+    #[test]
+    fn missing_configured_parents_are_not_created() {
+        let (directory, lock, _remove) = empty_host_directory("missing-configured-parent");
+        let missing_root_parent = directory.parent().unwrap().join("missing-root-parent");
+        let nested_root = missing_root_parent.join("data");
+        assert!(matches!(
+            AgentHostRootLease::acquire(&nested_root, &lock, scope()),
+            Err(AgentHostError::Unavailable | AgentHostError::InvalidScopeBinding)
+        ));
+        assert!(!missing_root_parent.exists());
+        assert!(!lock.exists());
+
+        let missing_lock_parent = directory.parent().unwrap().join("missing-lock-parent");
+        let nested_lock = missing_lock_parent.join("owner.lock");
+        assert!(matches!(
+            AgentHostRootLease::acquire(&directory, &nested_lock, scope()),
+            Err(AgentHostError::Unavailable | AgentHostError::InvalidScopeBinding)
+        ));
+        assert!(!missing_lock_parent.exists());
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn malformed_and_partial_stable_lease_records_fail_closed() {
+        for (label, corrupt) in [
+            ("lease-partial", 0u8),
+            ("lease-checksum", 1u8),
+            ("lease-trailing", 2u8),
+        ] {
+            let (directory, lock, _remove) = empty_host_directory(label);
+            drop(AgentHostRootLease::acquire(&directory, &lock, scope()).unwrap());
+            let mut encoded = fs::read(&lock).unwrap();
+            match corrupt {
+                0 => encoded.truncate(HOST_LEASE_BINDING_LEN - 1),
+                1 => encoded[HOST_LEASE_BINDING_PREFIX_LEN] ^= 1,
+                2 => encoded.push(0),
+                _ => unreachable!(),
+            }
+            fs::write(&lock, &encoded).unwrap();
+            assert!(matches!(
+                AgentHostRootLease::acquire(&directory, &lock, scope()),
+                Err(AgentHostError::InvalidScopeBinding)
+            ));
+            assert_eq!(fs::read(&lock).unwrap(), encoded);
+        }
+    }
+
+    #[test]
+    fn atomic_lease_binding_recovers_exact_stage_prefixes_and_alias() {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
+        for length in [0, 1, HOST_LEASE_BINDING_LEN - 1, HOST_LEASE_BINDING_LEN] {
+            let (directory, lock, _remove) =
+                empty_host_directory(&format!("lease-stage-prefix-{length}"));
+            let canonical_root = canonical_agent_host_root_target(directory.clone())
+                .unwrap()
+                .0;
+            let expected =
+                encode_agent_host_lease_binding(&canonical_root, scope(), HOST_LEASE_BINDING_FRESH)
+                    .unwrap();
+            let stage = agent_host_lease_stage_path(&lock);
+            fs::write(&stage, &expected[..length]).unwrap();
+
+            drop(lease(&directory, &lock, scope()));
+            assert_eq!(fs::read(&lock).unwrap(), expected);
+            assert!(!stage.exists());
+        }
+
+        let (directory, lock, _remove) = empty_host_directory("lease-stage-alias");
+        drop(
+            AgentHostRootLease::acquire(&directory, &lock, scope())
+                .unwrap_or_else(|error| panic!("lease alias recovery: {error:?}")),
+        );
+        let stage = agent_host_lease_stage_path(&lock);
+        fs::hard_link(&lock, &stage).unwrap();
+        assert_eq!(fs::metadata(&lock).unwrap().nlink(), 2);
+        drop(lease(&directory, &lock, scope()));
+        assert!(!stage.exists());
+        assert_eq!(fs::metadata(&lock).unwrap().nlink(), 1);
+    }
+
+    #[test]
+    fn malformed_lease_binding_stage_is_never_published_or_rewritten() {
+        let (directory, lock, _remove) = empty_host_directory("lease-stage-malformed");
+        let canonical_root = canonical_agent_host_root_target(directory.clone())
+            .unwrap()
+            .0;
+        let expected =
+            encode_agent_host_lease_binding(&canonical_root, scope(), HOST_LEASE_BINDING_FRESH)
+                .unwrap();
+        let stage = agent_host_lease_stage_path(&lock);
+        let mut malformed = expected[..HOST_LEASE_BINDING_LEN - 1].to_vec();
+        malformed[0] ^= 1;
+        fs::write(&stage, &malformed).unwrap();
+
+        for _ in 0..2 {
+            assert!(matches!(
+                AgentHostRootLease::acquire(&directory, &lock, scope()),
+                Err(AgentHostError::InvalidScopeBinding)
+            ));
+            assert!(!lock.exists());
+            assert_eq!(fs::read(&stage).unwrap(), malformed);
+            assert!(!directory.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_publication_alias_is_recoverable_but_a_third_link_is_rejected() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (directory, lock, _remove) = empty_host_directory("scope-link-alias");
+        let root_lease = lease(&directory, &lock, scope());
+        let final_path = directory.join(HOST_SCOPE_FILE);
+        let stage_path = directory.join(HOST_SCOPE_TEMP_FILE);
+        fs::write(&stage_path, encoded_scope(scope())).unwrap();
+        fs::hard_link(&stage_path, &final_path).unwrap();
+        assert_eq!(fs::metadata(&final_path).unwrap().nlink(), 2);
+        assert!(matches!(
+            read_agent_host_scope(
+                &directory,
+                &root_lease.root_directory,
+                scope(),
+                false,
+            ),
+            Ok(AgentHostScopeState::BoundWithStage(bound)) if bound == scope()
+        ));
+        cleanup_agent_host_scope_stage(&directory, &root_lease.root_directory).unwrap();
+        assert!(!stage_path.exists());
+        assert_eq!(fs::metadata(&final_path).unwrap().nlink(), 1);
+        drop(root_lease);
+
+        let (directory, lock, _remove) = empty_host_directory("scope-third-link");
+        let root_lease = lease(&directory, &lock, scope());
+        let final_path = directory.join(HOST_SCOPE_FILE);
+        let stage_path = directory.join(HOST_SCOPE_TEMP_FILE);
+        let third_path = directory.join("scope-third-link");
+        fs::write(&stage_path, encoded_scope(scope())).unwrap();
+        fs::hard_link(&stage_path, &final_path).unwrap();
+        fs::hard_link(&stage_path, &third_path).unwrap();
+        assert!(matches!(
+            read_agent_host_scope(&directory, &root_lease.root_directory, scope(), false,),
+            Err(AgentHostError::InvalidScopeBinding)
+        ));
+        assert_eq!(fs::metadata(&stage_path).unwrap().nlink(), 3);
+    }
+
+    #[test]
+    fn every_exact_scope_stage_prefix_is_completed_and_malformed_prefixes_are_unchanged() {
+        let expected = encoded_scope(scope());
+        for length in 0..HOST_SCOPE_ENCODED_LEN {
+            let (directory, lock, _remove) =
+                empty_host_directory(&format!("scope-prefix-{length}"));
+            let root_lease = lease(&directory, &lock, scope());
+            let stage = directory.join(HOST_SCOPE_TEMP_FILE);
+            fs::write(&stage, &expected[..length]).unwrap();
+            assert!(matches!(
+                read_agent_host_scope(
+                    &directory,
+                    &root_lease.root_directory,
+                    scope(),
+                    true,
+                ),
+                Ok(AgentHostScopeState::Staged(staged)) if staged == scope()
+            ));
+            assert_eq!(fs::read(stage).unwrap(), expected);
+        }
+
+        let (directory, lock, _remove) = empty_host_directory("scope-prefix-malformed");
+        let root_lease = lease(&directory, &lock, scope());
+        let stage = directory.join(HOST_SCOPE_TEMP_FILE);
+        let mut malformed = expected[..HOST_SCOPE_ENCODED_LEN - 1].to_vec();
+        malformed[0] ^= 1;
+        fs::write(&stage, &malformed).unwrap();
+        assert!(matches!(
+            read_agent_host_scope(&directory, &root_lease.root_directory, scope(), true,),
+            Err(AgentHostError::InvalidScopeBinding)
+        ));
+        assert_eq!(fs::read(stage).unwrap(), malformed);
+    }
+
+    #[test]
+    fn empty_legacy_lease_cannot_claim_an_ambiguous_empty_root() {
+        let (directory, lock, _remove) = empty_host_directory("legacy-empty-lease");
+        open_empty_control(lease(&directory, &lock, scope()))
+            .unwrap()
+            .shutdown()
+            .unwrap();
+        fs::write(&lock, b"").unwrap();
+        let mut before = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        before.sort_unstable();
+
+        assert!(matches!(
+            open_empty_control(lease(&directory, &lock, scope())),
+            Err(AgentHostError::InvalidScopeBinding)
+        ));
+        assert_eq!(fs::metadata(&lock).unwrap().len(), 0);
+        let mut after = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        after.sort_unstable();
+        assert_eq!(after, before);
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn complete_legacy_generation_is_rejected_by_the_clean_break() {
+        let (directory, lock, _remove) = empty_host_directory("legacy-complete-generation");
+        let fixture = journal_fixture(&directory);
+        fixture.provider.archive_for_test();
+        AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap()
+        .shutdown()
+        .unwrap();
+
+        // A zero-byte pre-versioned lease has no authenticated binding to the
+        // relocated authority namespace. The clean-break format therefore
+        // never mutates or adopts even a complete-looking generation.
+        fs::write(&lock, b"").unwrap();
+        let journal_before = snapshot_directory(&fixture.provider.journal);
+        let authority_root = fixture.provider.stable_lock.parent().unwrap();
+        let authority_before = snapshot_directory(authority_root);
+        assert!(matches!(
+            AgentHostControl::open(
+                lease(&directory, &lock, scope()),
+                fixture.trust.clone(),
+                fixture.merge.clone(),
+                fixture.provider.clone(),
+                fixture.pins.clone(),
+            ),
+            Err(AgentHostError::InvalidScopeBinding)
+        ));
+        assert_eq!(fs::metadata(&lock).unwrap().len(), 0);
+        assert_eq!(
+            snapshot_directory(&fixture.provider.journal),
+            journal_before
+        );
+        assert_eq!(snapshot_directory(authority_root), authority_before);
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn legacy_generation_with_ledger_stage_is_not_migrated() {
+        let (directory, lock, _remove) = empty_host_directory("legacy-ledger-stage");
+        let fixture = journal_fixture(&directory);
+        fixture.provider.archive_for_test();
+        AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap()
+        .shutdown()
+        .unwrap();
+        fs::write(&lock, b"").unwrap();
+        fs::hard_link(
+            &fixture.provider.authority_ledger,
+            &fixture.provider.authority_ledger_stage,
+        )
+        .unwrap();
+        let mut before = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        before.sort_unstable();
+
+        assert!(matches!(
+            AgentHostControl::open(
+                lease(&directory, &lock, scope()),
+                fixture.trust.clone(),
+                fixture.merge.clone(),
+                fixture.provider.clone(),
+                fixture.pins.clone(),
+            ),
+            Err(AgentHostError::InvalidScopeBinding)
+        ));
+        assert_eq!(fs::metadata(&lock).unwrap().len(), 0);
+        let mut after = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        after.sort_unstable();
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -3993,10 +7049,10 @@ mod tests {
     #[test]
     fn malformed_directory_scope_fails_closed() {
         let (directory, lock, _remove) = empty_host_directory("malformed-scope");
-        fs::create_dir_all(&directory).unwrap();
+        let root_lease = lease(&directory, &lock, scope());
         fs::write(directory.join(HOST_SCOPE_FILE), b"truncated").unwrap();
         assert!(matches!(
-            open_empty_control(lease(&directory, &lock, scope())),
+            open_empty_control(root_lease),
             Err(AgentHostError::InvalidScopeBinding)
         ));
     }
@@ -4012,15 +7068,19 @@ mod tests {
         )))
         .unwrap();
         assert!(matches!(
-            open_empty_control(lease(&directory, &lock, scope())),
+            AgentHostRootLease::acquire(&directory, &lock, scope()),
             Err(AgentHostError::InvalidScopeBinding)
         ));
+        assert!(!lock.exists());
+        assert!(!agent_host_lease_stage_path(&lock).exists());
         assert!(!directory.join(HOST_SCOPE_FILE).exists());
         fs::write(directory.join(HOST_SCOPE_TEMP_FILE), encoded_scope(scope())).unwrap();
         assert!(matches!(
-            open_empty_control(lease(&directory, &lock, scope())),
+            AgentHostRootLease::acquire(&directory, &lock, scope()),
             Err(AgentHostError::InvalidScopeBinding)
         ));
+        assert!(!lock.exists());
+        assert!(!agent_host_lease_stage_path(&lock).exists());
         assert!(!directory.join(HOST_SCOPE_FILE).exists());
         assert!(directory.join(HOST_SCOPE_TEMP_FILE).is_file());
     }

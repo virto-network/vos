@@ -86,7 +86,7 @@ pub(crate) struct SystemAuthorityLedgerRoute {
 
 impl SystemAuthorityLedgerRoute {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    fn new(
         root_anchor: super::committee::RootAnchorId,
         root_anchor_config_version: u64,
         root_anchor_config: super::committee::RootAnchorConfigCommitment,
@@ -114,6 +114,39 @@ impl SystemAuthorityLedgerRoute {
             authority_scope,
         };
         route.validate()?;
+        Ok(route)
+    }
+
+    /// Derive the durable route only from an opaque replayed-root scope and
+    /// the exact authenticated system-authority state carried by that root.
+    /// A decoded state without replay provenance cannot call this safely.
+    pub(crate) fn from_authenticated_replay(
+        trusted_scope: SystemAuthorityJournalScope,
+        state: &SystemAuthorityState,
+    ) -> Result<Self, SystemAuthorityLedgerWireError> {
+        state
+            .validate()
+            .map_err(|_| SystemAuthorityLedgerWireError::InvalidStateView)?;
+        let route = Self::new(
+            state.root_anchor(),
+            state.root_anchor_config_version(),
+            state.root_anchor_config(),
+            state.space(),
+            state.system_agent(),
+            state.authority_binding(),
+            trusted_scope.system_genesis(),
+            trusted_scope.agent_admission(),
+        )?;
+        if trusted_scope
+            .commitment(state.root_anchor())
+            .map_err(|_| SystemAuthorityLedgerWireError::InvalidStateView)?
+            != route.authority_scope
+            || state
+                .journal_binding()
+                .is_some_and(|binding| binding != trusted_scope.binding())
+        {
+            return Err(SystemAuthorityLedgerWireError::InvalidStateView);
+        }
         Ok(route)
     }
 
@@ -520,26 +553,7 @@ impl ReplayedSystemAuthorityView {
         {
             return Err(SystemAuthorityLedgerWireError::InvalidStateView);
         }
-        let route = SystemAuthorityLedgerRoute::new(
-            state.root_anchor(),
-            state.root_anchor_config_version(),
-            state.root_anchor_config(),
-            state.space(),
-            state.system_agent(),
-            state.authority_binding(),
-            trusted_scope.system_genesis(),
-            trusted_scope.agent_admission(),
-        )?;
-        if trusted_scope
-            .commitment(state.root_anchor())
-            .map_err(|_| SystemAuthorityLedgerWireError::InvalidStateView)?
-            != route.authority_scope
-            || state
-                .journal_binding()
-                .is_some_and(|binding| binding != trusted_scope.binding())
-        {
-            return Err(SystemAuthorityLedgerWireError::InvalidStateView);
-        }
+        let route = SystemAuthorityLedgerRoute::from_authenticated_replay(trusted_scope, state)?;
         let mut view = Self {
             route,
             journal_store,
@@ -754,7 +768,7 @@ mod durable {
     use alloc::vec::Vec;
 
     use ed25519_dalek::VerifyingKey;
-    use redb::{Database, ReadableTable, TableDefinition};
+    use redb::{Database, ReadableTable, TableDefinition, TableHandle};
 
     use super::*;
     use crate::agent::committee::{
@@ -764,7 +778,7 @@ mod durable {
     use crate::agent::journal_store::{AgentJournalStore, JournalPublication};
     use crate::agent::replay::{
         PublishedSystemAuthorityRotation, RecoveredSystemAuthorityRotation, ReplayExecutionResult,
-        ReplayMaterialization, RetiredSystemAuthorityRotationRecovery,
+        ReplayMaterialization, ReplaySealedGenesis, RetiredSystemAuthorityRotationRecovery,
         SystemAuthorityRotationPublicationFacts,
     };
     use crate::agent::system_authority::{
@@ -775,11 +789,12 @@ mod durable {
     use crate::agent::{LifecycleReply, LifecycleRequest};
     use crate::service::NodeId;
 
-    // Clean-break schema: v4 intents retain the complete bounded ordered
-    // replay payload. The permanent Config sentinel makes both v2 and v3
-    // writers reject this route before they can install a signer or mutate
-    // evidence rows.
-    const LEDGER_SCHEMA_VERSION: u32 = 4;
+    // Clean-break schema: v5 adds the permanent journal-exposure marker while
+    // retaining v4's complete bounded publication intent. The Config sentinel
+    // and empty legacy route tables make every older writer reject this route
+    // before it can install a signer or mutate evidence rows.
+    const LEDGER_SCHEMA_VERSION: u32 = 5;
+    const JOURNAL_EXPOSURE_RECORD_VERSION: u32 = 1;
     // Config rows are permanent: a key that was ever local must never later be
     // admitted through the remote-share path and bypass its durable pledge.
     // One initial committee plus every protocol-bounded rotation can introduce
@@ -789,6 +804,7 @@ mod durable {
     const MAX_QC_ROWS_PER_CLAIM: usize = 2;
     const MAX_CONFIG_RECORD_BYTES: usize = 1024;
     const MAX_ROUTE_CONFIG_RECORD_BYTES: usize = 1024;
+    const MAX_JOURNAL_EXPOSURE_RECORD_BYTES: usize = 1024;
     const MAX_META_RECORD_BYTES: usize = 1024;
     // One complete canonical OrderedEntry plus fixed publication facts and a
     // bounded route. Keep this an explicit protocol bound: intent decoding
@@ -811,9 +827,13 @@ mod durable {
     const CONFIG_TABLE: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_config_v1");
     const ROUTE_CONFIG_TABLE: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("system_authority_ledger_route_config_v5");
+    const LEGACY_ROUTE_CONFIG_TABLE_V4: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_route_config_v4");
     const LEGACY_ROUTE_CONFIG_TABLE_V3: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_route_config_v3");
+    const JOURNAL_EXPOSURE_TABLE: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("system_authority_ledger_journal_exposure_v1");
     const META_TABLE: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_meta_v1");
     const RESERVATION_TABLE: TableDefinition<&[u8], &[u8]> =
@@ -1247,11 +1267,97 @@ mod durable {
     }
 
     impl SystemAuthorityLedgerRouteOwner {
+        /// Open the exact descriptor-pinned file ledger represented by an
+        /// opaque capability. The capability fixes both the database and its
+        /// filesystem-derived initialization policy before this constructor
+        /// sees either value.
+        #[cfg(target_os = "linux")]
+        pub(crate) fn open_file(
+            owner_open: crate::agent::journal_store::FileSystemAuthorityLedgerOwnerOpen,
+            sealed: &ReplaySealedGenesis,
+        ) -> Result<
+            crate::agent::journal_store::OpenedFileSystemAuthorityLedgerOwner,
+            SystemAuthorityLedgerError,
+        > {
+            let route = sealed
+                .system_authority_ledger_route()
+                .map_err(|_| SystemAuthorityLedgerError::ConfigurationMismatch)?;
+            owner_open.open_owner(route)
+        }
+
+        /// Initialize or exactly reopen a database whose freshness is proven
+        /// by the journal slot's unpublished `.next` inode. Production must
+        /// never call this for a canonical sidecar.
+        #[cfg(test)]
+        pub(crate) fn open_staged(
+            database: Arc<Database>,
+            route: SystemAuthorityLedgerRoute,
+            journal_store: JournalStoreInstanceId,
+            local_node: NodeId,
+        ) -> Result<Arc<Self>, SystemAuthorityLedgerError> {
+            Self::open_with_policy(database, route, journal_store, local_node, true)
+        }
+
+        /// Strictly reopen an already-canonical sidecar. Missing route rows,
+        /// an empty/truncated database, or any mismatch fail without a commit;
+        /// canonical existence never carries initialization authority.
+        #[cfg(test)]
+        pub(crate) fn open_existing(
+            database: Arc<Database>,
+            route: SystemAuthorityLedgerRoute,
+            journal_store: JournalStoreInstanceId,
+            local_node: NodeId,
+        ) -> Result<Arc<Self>, SystemAuthorityLedgerError> {
+            Self::open_with_policy(database, route, journal_store, local_node, false)
+        }
+
+        /// Database-level implementation for the descriptor-backed file
+        /// capability. Its permit has a private constructor in
+        /// `journal_store`, so production callers cannot select a policy for
+        /// an arbitrary database.
+        #[cfg(target_os = "linux")]
+        pub(crate) fn open_file_database(
+            _permit: crate::agent::journal_store::FileSystemAuthorityLedgerOwnerOpenPermit,
+            database: Arc<Database>,
+            route: SystemAuthorityLedgerRoute,
+            journal_store: JournalStoreInstanceId,
+            local_node: NodeId,
+            allow_staged_initialization: bool,
+        ) -> Result<Arc<Self>, SystemAuthorityLedgerError> {
+            Self::open_with_policy(
+                database,
+                route,
+                journal_store,
+                local_node,
+                allow_staged_initialization,
+            )
+        }
+
+        #[cfg(test)]
         pub(crate) fn open(
             database: Arc<Database>,
             route: SystemAuthorityLedgerRoute,
             journal_store: JournalStoreInstanceId,
             local_node: NodeId,
+        ) -> Result<Arc<Self>, SystemAuthorityLedgerError> {
+            let owner = Self::open_staged(database, route, journal_store, local_node)?;
+            if !owner.journal_exposure_is_committed()? {
+                match owner.with_unexposed_journal_initialization(route.system_genesis(), || {
+                    Ok::<(), core::convert::Infallible>(())
+                })? {
+                    Ok(()) => {}
+                    Err(never) => match never {},
+                }
+            }
+            Ok(owner)
+        }
+
+        fn open_with_policy(
+            database: Arc<Database>,
+            route: SystemAuthorityLedgerRoute,
+            journal_store: JournalStoreInstanceId,
+            local_node: NodeId,
+            allow_staged_initialization: bool,
         ) -> Result<Arc<Self>, SystemAuthorityLedgerError> {
             route.validate()?;
             if local_node == NodeId::ZERO
@@ -1277,6 +1383,7 @@ mod durable {
             let sentinel_key = route_owner_sentinel_key(route);
             let _write = owner.lock_writes()?;
             let transaction = database.begin_write()?;
+            owner.ensure_exact_table_schema(&transaction)?;
             let existing = {
                 let table = transaction.open_table(ROUTE_CONFIG_TABLE)?;
                 table
@@ -1300,9 +1407,13 @@ mod durable {
                     if sentinel != expected {
                         return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
                     }
-                    if owner.table_has_route_residue(&transaction, LEGACY_ROUTE_CONFIG_TABLE_V3)? {
+                    if owner.table_has_route_residue(&transaction, LEGACY_ROUTE_CONFIG_TABLE_V4)?
+                        || owner
+                            .table_has_route_residue(&transaction, LEGACY_ROUTE_CONFIG_TABLE_V3)?
+                    {
                         return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
                     }
+                    owner.ensure_dedicated_route_database(&transaction)?;
                     // Holding this writer makes the committed snapshot stable
                     // while the independent read audit runs. Exact reopen is
                     // deliberately zero-write: drop instead of committing.
@@ -1312,7 +1423,10 @@ mod durable {
                     return Ok(owner);
                 }
                 None => {
-                    if owner.route_has_residue(&transaction)? {
+                    if !allow_staged_initialization {
+                        return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                    }
+                    if owner.database_has_any_residue(&transaction)? {
                         return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
                     }
                     transaction
@@ -1330,6 +1444,9 @@ mod durable {
             // Pin every table schema atomically with first route ownership.
             {
                 let _ = transaction.open_table(CONFIG_TABLE)?;
+            }
+            {
+                let _ = transaction.open_table(JOURNAL_EXPOSURE_TABLE)?;
             }
             {
                 let _ = transaction.open_table(META_TABLE)?;
@@ -1367,6 +1484,10 @@ mod durable {
 
         pub(crate) const fn journal_store(&self) -> JournalStoreInstanceId {
             self.journal_store
+        }
+
+        pub(crate) fn owns_database(&self, database: &Arc<Database>) -> bool {
+            Arc::ptr_eq(&self.database, database)
         }
 
         pub(crate) fn open_signer(
@@ -1457,14 +1578,86 @@ mod durable {
             Ok(ledger)
         }
 
-        fn route_has_residue(
+        fn ensure_exact_table_schema(
+            &self,
+            transaction: &redb::WriteTransaction,
+        ) -> Result<(), SystemAuthorityLedgerError> {
+            let definitions = [
+                ROUTE_CONFIG_TABLE,
+                LEGACY_ROUTE_CONFIG_TABLE_V4,
+                LEGACY_ROUTE_CONFIG_TABLE_V3,
+                JOURNAL_EXPOSURE_TABLE,
+                CONFIG_TABLE,
+                META_TABLE,
+                RESERVATION_TABLE,
+                PLEDGE_TABLE,
+                SHARE_TABLE,
+                QC_TABLE,
+                FAIL_STOP_TABLE,
+                PUBLICATION_INTENT_TABLE,
+            ];
+            // Open the complete clean-break schema in this uncommitted writer.
+            // On strict reopen the independent read audit below still proves
+            // every table was already durable; these opens cannot normalize a
+            // missing table because the transaction is dropped on failure.
+            for definition in definitions {
+                drop(transaction.open_table(definition)?);
+            }
+            let expected = definitions
+                .into_iter()
+                .map(|definition| definition.name().to_owned())
+                .collect::<alloc::collections::BTreeSet<_>>();
+            let mut observed = alloc::collections::BTreeSet::new();
+            for table in transaction.list_tables()? {
+                if !observed.insert(table.name().to_owned()) || observed.len() > expected.len() {
+                    return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                }
+            }
+            if observed != expected || transaction.list_multimap_tables()?.next().is_some() {
+                return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
+            Ok(())
+        }
+
+        /// A staged per-Agent sidecar may be initialized only when the whole
+        /// ledger is empty, not merely when the requested route prefix is
+        /// absent. This prevents publishing a foreign/transplanted database
+        /// alongside a newly installed target route.
+        fn database_has_any_residue(
             &self,
             transaction: &redb::WriteTransaction,
         ) -> Result<bool, SystemAuthorityLedgerError> {
+            for definition in [
+                ROUTE_CONFIG_TABLE,
+                LEGACY_ROUTE_CONFIG_TABLE_V4,
+                LEGACY_ROUTE_CONFIG_TABLE_V3,
+                JOURNAL_EXPOSURE_TABLE,
+                CONFIG_TABLE,
+                META_TABLE,
+                RESERVATION_TABLE,
+                PLEDGE_TABLE,
+                SHARE_TABLE,
+                QC_TABLE,
+                FAIL_STOP_TABLE,
+                PUBLICATION_INTENT_TABLE,
+            ] {
+                if transaction.open_table(definition)?.first()?.is_some() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        fn ensure_dedicated_route_database(
+            &self,
+            transaction: &redb::WriteTransaction,
+        ) -> Result<(), SystemAuthorityLedgerError> {
             let route_key = route_storage_key(self.route);
             for definition in [
                 ROUTE_CONFIG_TABLE,
+                LEGACY_ROUTE_CONFIG_TABLE_V4,
                 LEGACY_ROUTE_CONFIG_TABLE_V3,
+                JOURNAL_EXPOSURE_TABLE,
                 CONFIG_TABLE,
                 META_TABLE,
                 RESERVATION_TABLE,
@@ -1475,16 +1668,13 @@ mod durable {
                 PUBLICATION_INTENT_TABLE,
             ] {
                 let table = transaction.open_table(definition)?;
-                let mut rows = table.range(route_key.as_slice()..)?;
-                let Some(row) = rows.next() else {
-                    continue;
-                };
-                let (key, _) = row?;
-                if key.value().starts_with(route_key.as_slice()) {
-                    return Ok(true);
+                for row in [table.first()?, table.last()?].into_iter().flatten() {
+                    if !row.0.value().starts_with(route_key.as_slice()) {
+                        return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                    }
                 }
             }
-            Ok(false)
+            Ok(())
         }
 
         fn table_has_route_residue(
@@ -1501,7 +1691,45 @@ mod durable {
             Ok(row?.0.value().starts_with(route_key.as_slice()))
         }
 
-        fn recheck_route_config(
+        fn journal_exposure_in_write(
+            &self,
+            transaction: &redb::WriteTransaction,
+        ) -> Result<Option<JournalExposureRecord>, SystemAuthorityLedgerError> {
+            let bytes = transaction
+                .open_table(JOURNAL_EXPOSURE_TABLE)?
+                .get(route_storage_key(self.route).as_slice())?
+                .map(|value| value.value().to_vec());
+            let Some(bytes) = bytes else {
+                return Ok(None);
+            };
+            let marker = JournalExposureRecord::decode(&bytes)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            if marker != JournalExposureRecord::for_owner(self) {
+                return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
+            Ok(Some(marker))
+        }
+
+        fn journal_exposure_in_read(
+            &self,
+            transaction: &redb::ReadTransaction,
+        ) -> Result<Option<JournalExposureRecord>, SystemAuthorityLedgerError> {
+            let bytes = transaction
+                .open_table(JOURNAL_EXPOSURE_TABLE)?
+                .get(route_storage_key(self.route).as_slice())?
+                .map(|value| value.value().to_vec());
+            let Some(bytes) = bytes else {
+                return Ok(None);
+            };
+            let marker = JournalExposureRecord::decode(&bytes)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            if marker != JournalExposureRecord::for_owner(self) {
+                return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
+            Ok(Some(marker))
+        }
+
+        fn recheck_route_config_allow_unexposed(
             &self,
             transaction: &redb::WriteTransaction,
         ) -> Result<(), SystemAuthorityLedgerError> {
@@ -1528,9 +1756,128 @@ mod durable {
                 .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
             if route != expected
                 || sentinel != expected
+                || self.table_has_route_residue(transaction, LEGACY_ROUTE_CONFIG_TABLE_V4)?
                 || self.table_has_route_residue(transaction, LEGACY_ROUTE_CONFIG_TABLE_V3)?
             {
                 return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
+            Ok(())
+        }
+
+        fn recheck_route_config(
+            &self,
+            transaction: &redb::WriteTransaction,
+        ) -> Result<(), SystemAuthorityLedgerError> {
+            self.recheck_route_config_allow_unexposed(transaction)?;
+            if self.journal_exposure_in_write(transaction)?.is_none() {
+                return Err(SystemAuthorityLedgerError::JournalExposureRequired);
+            }
+            Ok(())
+        }
+
+        pub(crate) fn journal_exposure_is_committed(
+            &self,
+        ) -> Result<bool, SystemAuthorityLedgerError> {
+            let _write = self.lock_writes()?;
+            let transaction = self.database.begin_write()?;
+            self.recheck_route_config_allow_unexposed(&transaction)?;
+            self.audit_recovery_preflight()?;
+            let committed = self.journal_exposure_in_write(&transaction)?.is_some();
+            if !committed {
+                // Host uses this as the pre-open discriminator. An unmarked
+                // route is eligible for filesystem initialization only while
+                // its evidence state is still pristine; reject residue before
+                // the journal driver gets an opportunity to repair anything.
+                self.ensure_unexposed_initialization_pristine(&transaction)?;
+            }
+            drop(transaction);
+            Ok(committed)
+        }
+
+        /// Run the one transition which may expose an initialized journal for
+        /// a previously unexposed route. The redb writer spans the complete
+        /// external operation. An operation error drops the transaction and
+        /// therefore cannot install the permanent exposure row.
+        pub(crate) fn with_unexposed_journal_initialization<T, E>(
+            &self,
+            system_genesis: AgentJournalGenesisId,
+            operation: impl FnOnce() -> Result<T, E>,
+        ) -> Result<Result<T, E>, SystemAuthorityLedgerError> {
+            if system_genesis == AgentJournalGenesisId::ZERO
+                || system_genesis != self.route.system_genesis()
+            {
+                return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
+            let _write = self.lock_writes()?;
+            let transaction = self.database.begin_write()?;
+            self.recheck_route_config_allow_unexposed(&transaction)?;
+            self.audit_recovery_preflight()?;
+            if self.journal_exposure_in_write(&transaction)?.is_some() {
+                return Err(SystemAuthorityLedgerError::JournalExposureAlreadyCommitted);
+            }
+            self.ensure_unexposed_initialization_pristine(&transaction)?;
+
+            let result = operation();
+            let value = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    drop(transaction);
+                    return Ok(Err(error));
+                }
+            };
+
+            // The writer excludes every supported ledger mutation while the
+            // filesystem driver runs. Recheck the complete ledger snapshot
+            // before making the irreversible marker durable nonetheless.
+            self.recheck_route_config_allow_unexposed(&transaction)?;
+            self.audit_recovery_preflight()?;
+            if self.journal_exposure_in_write(&transaction)?.is_some() {
+                return Err(SystemAuthorityLedgerError::JournalExposureAlreadyCommitted);
+            }
+            self.ensure_unexposed_initialization_pristine(&transaction)?;
+            let marker = JournalExposureRecord::for_owner(self);
+            marker.validate()?;
+            transaction.open_table(JOURNAL_EXPOSURE_TABLE)?.insert(
+                route_storage_key(self.route).as_slice(),
+                marker.encode().as_slice(),
+            )?;
+            transaction.commit()?;
+            Ok(Ok(value))
+        }
+
+        fn ensure_unexposed_initialization_pristine(
+            &self,
+            transaction: &redb::WriteTransaction,
+        ) -> Result<(), SystemAuthorityLedgerError> {
+            let route_key = route_storage_key(self.route);
+            for definition in [
+                META_TABLE,
+                RESERVATION_TABLE,
+                PLEDGE_TABLE,
+                SHARE_TABLE,
+                QC_TABLE,
+                FAIL_STOP_TABLE,
+                PUBLICATION_INTENT_TABLE,
+            ] {
+                if self.table_has_route_residue(transaction, definition)? {
+                    return Err(SystemAuthorityLedgerError::CorruptLedger);
+                }
+            }
+            let sentinel_key = route_owner_sentinel_key(self.route);
+            let mut signer_rows = 0_usize;
+            let table = transaction.open_table(CONFIG_TABLE)?;
+            for row in table.range(route_key.as_slice()..)? {
+                let (key, _) = row?;
+                if !key.value().starts_with(route_key.as_slice()) {
+                    break;
+                }
+                if key.value() != sentinel_key.as_slice() || signer_rows != 0 {
+                    return Err(SystemAuthorityLedgerError::CorruptLedger);
+                }
+                signer_rows += 1;
+            }
+            if signer_rows != 1 {
+                return Err(SystemAuthorityLedgerError::CorruptLedger);
             }
             Ok(())
         }
@@ -1553,7 +1900,7 @@ mod durable {
             Ok(true)
         }
 
-        fn recheck_route_config_read(
+        fn recheck_route_config_read_allow_unexposed(
             &self,
             transaction: &redb::ReadTransaction,
         ) -> Result<(), SystemAuthorityLedgerError> {
@@ -1584,13 +1931,33 @@ mod durable {
                 return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
             }
             {
+                let legacy = transaction.open_table(LEGACY_ROUTE_CONFIG_TABLE_V4)?;
+                let mut rows = legacy.range(route_key.as_slice()..)?;
+                if let Some(row) = rows.next()
+                    && row?.0.value().starts_with(route_key.as_slice())
+                {
+                    return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                }
+            }
+            {
                 let legacy = transaction.open_table(LEGACY_ROUTE_CONFIG_TABLE_V3)?;
                 let mut rows = legacy.range(route_key.as_slice()..)?;
-                if let Some(row) = rows.next() {
-                    if row?.0.value().starts_with(route_key.as_slice()) {
-                        return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
-                    }
+                if let Some(row) = rows.next()
+                    && row?.0.value().starts_with(route_key.as_slice())
+                {
+                    return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
                 }
+            }
+            Ok(())
+        }
+
+        fn recheck_route_config_read(
+            &self,
+            transaction: &redb::ReadTransaction,
+        ) -> Result<(), SystemAuthorityLedgerError> {
+            self.recheck_route_config_read_allow_unexposed(transaction)?;
+            if self.journal_exposure_in_read(transaction)?.is_none() {
+                return Err(SystemAuthorityLedgerError::JournalExposureRequired);
             }
             Ok(())
         }
@@ -1847,6 +2214,68 @@ mod durable {
     }
 
     impl SystemAuthorityLedgerRouteOwner {
+        /// Fence an exposed replay materialization against the authority
+        /// high-water which survived outside the replaceable journal root.
+        ///
+        /// A clean ledger has no `Meta` row until the first reservation and
+        /// therefore has no newer authority state to constrain. Once any
+        /// reservation has installed `Meta`, every successful retirement
+        /// advances it atomically with clearing the active evidence. An idle
+        /// owner may expose a driver only when replay reconstructs that exact
+        /// retired high-water and authority-state commitment. This rejects an
+        /// otherwise internally valid snapshot containing older authority
+        /// state before the Host can expose it.
+        pub(crate) fn validate_replayed_view(
+            &self,
+            view: &ReplayedSystemAuthorityView,
+        ) -> Result<(), SystemAuthorityLedgerError> {
+            view.validate()?;
+            if view.route() != self.route || view.journal_store() != self.journal_store {
+                return Err(SystemAuthorityLedgerError::WrongRoute);
+            }
+
+            let _write = self.lock_writes()?;
+            let route_key = route_storage_key(self.route);
+            let transaction = self.database.begin_read()?;
+            self.recheck_route_config_read(&transaction)?;
+            if transaction
+                .open_table(RESERVATION_TABLE)?
+                .get(route_key.as_slice())?
+                .is_some()
+            {
+                return Err(SystemAuthorityLedgerError::PublicationRecoveryRequired);
+            }
+            if transaction
+                .open_table(PUBLICATION_INTENT_TABLE)?
+                .get(route_key.as_slice())?
+                .is_some()
+            {
+                return Err(SystemAuthorityLedgerError::CorruptLedger);
+            }
+            let Some(bytes) = transaction
+                .open_table(META_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+            else {
+                // No reservation has ever been admitted for this route, so
+                // the durable ledger has no later authority state than the
+                // root-admitted replay view.
+                return Ok(());
+            };
+            let meta = MetaRecord::decode(&bytes)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            meta.validate()?;
+            if meta.route != self.route || meta.journal_store != self.journal_store {
+                return Err(SystemAuthorityLedgerError::CorruptLedger);
+            }
+            if meta.retired_high_water != view.committee_sequence_high_water()
+                || meta.authority_state != view.authority_state_commitment()
+            {
+                return Err(SystemAuthorityLedgerError::StaleStateView);
+            }
+            Ok(())
+        }
+
         /// Return the durable active row only as non-sign-capable recovery
         /// evidence. The caller must feed its rotation request and a current
         /// replay-authenticated view through `reserve_or_reconcile` before any
@@ -1856,7 +2285,7 @@ mod durable {
         ) -> Result<Option<PendingSystemAuthorityRecovery>, SystemAuthorityLedgerError> {
             let route_key = route_storage_key(self.route);
             let transaction = self.database.begin_read()?;
-            self.recheck_route_config_read(&transaction)?;
+            self.recheck_route_config_read_allow_unexposed(&transaction)?;
             let Some(bytes) = transaction
                 .open_table(RESERVATION_TABLE)?
                 .get(route_key.as_slice())?
@@ -2134,15 +2563,44 @@ mod durable {
             .map_err(|_| SystemAuthorityLedgerError::InvalidCertificate)
         }
 
-        /// Run a root-journal checkpoint/GC operation only while reservation
-        /// insertion is excluded by redb's global writer. A TargetConflict may
-        /// leave no permanent decision-tree leaf, so its exact publication
-        /// suffix must remain available until retirement clears the row.
+        /// Run only deterministic journal-open recovery while the exact route
+        /// configuration and ledger snapshot are stable. Unlike the ordinary
+        /// mutation gate this permits an absent exposure marker, but only for
+        /// a pristine evidence state. Once exposed it permits a reservation so
+        /// cold authority reconciliation can run after the store is opened.
+        pub(crate) fn with_startup_root_recovery<T>(
+            &self,
+            operation: impl FnOnce(bool) -> T,
+        ) -> Result<T, SystemAuthorityLedgerError> {
+            let _write = self.lock_writes()?;
+            let transaction = self.database.begin_write()?;
+            self.recheck_route_config_allow_unexposed(&transaction)?;
+            // Existing route ownership pins every table. Holding the writer
+            // makes this independent read audit stable while deterministic
+            // filesystem stage/layout recovery runs, including when an exact
+            // authority reservation is pending.
+            self.audit_recovery_preflight()?;
+            let journal_exposure_committed =
+                self.journal_exposure_in_write(&transaction)?.is_some();
+            if !journal_exposure_committed {
+                // This path is marker-agnostic, not evidence-agnostic. Before
+                // first exposure only the permanent route sentinels may exist;
+                // marked routes may legitimately carry pending recovery rows.
+                self.ensure_unexposed_initialization_pristine(&transaction)?;
+            }
+            let result = operation(journal_exposure_committed);
+            drop(transaction);
+            Ok(result)
+        }
+
+        /// Run a complete root mutation only while reservation insertion is
+        /// excluded by redb's global writer. A TargetConflict may leave no
+        /// permanent decision-tree leaf, so its exact publication suffix must
+        /// remain available until retirement clears the row.
         ///
-        /// The journal operation normally targets its own store. It executes
-        /// inside this closure while the evidence database writer remains
-        /// held; every ledger handle's reservation path must acquire that same
-        /// redb writer and therefore cannot race the no-reservation check.
+        /// The journal operation executes inside this closure while the
+        /// evidence database writer remains held; every signer child must
+        /// acquire that same redb writer and cannot race the no-pending check.
         pub(crate) fn with_no_pending_root_mutation<T>(
             &self,
             operation: impl FnOnce() -> T,
@@ -3241,14 +3699,40 @@ mod durable {
             }
             if !rows_for_prefix_bounded_maybe_missing(
                 &self.database,
-                LEGACY_ROUTE_CONFIG_TABLE_V3,
+                LEGACY_ROUTE_CONFIG_TABLE_V4,
                 route_key.as_slice(),
                 1,
                 allow_missing_tables,
             )?
             .is_empty()
+                || !rows_for_prefix_bounded_maybe_missing(
+                    &self.database,
+                    LEGACY_ROUTE_CONFIG_TABLE_V3,
+                    route_key.as_slice(),
+                    1,
+                    allow_missing_tables,
+                )?
+                .is_empty()
             {
                 return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
+            let exposure_rows = rows_for_prefix_bounded_maybe_missing(
+                &self.database,
+                JOURNAL_EXPOSURE_TABLE,
+                route_key.as_slice(),
+                1,
+                allow_missing_tables,
+            )?;
+            match exposure_rows.as_slice() {
+                [] => {}
+                [(key, bytes)] if key.as_slice() == route_key.as_slice() => {
+                    let marker = JournalExposureRecord::decode(bytes)
+                        .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                    if marker != JournalExposureRecord::for_owner(self) {
+                        return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                    }
+                }
+                _ => return Err(SystemAuthorityLedgerError::CorruptLedger),
             }
             let config_rows = rows_for_prefix_bounded_maybe_missing(
                 &self.database,
@@ -3536,8 +4020,73 @@ mod durable {
         }
     }
 
+    /// Permanent proof that the exact root journal reached its externally
+    /// visible initialized state. Absence is meaningful only during startup;
+    /// once committed this row is never removed by any supported operation.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct JournalExposureRecord {
+        version: u32,
+        route: SystemAuthorityLedgerRoute,
+        journal_store: JournalStoreInstanceId,
+        local_node: NodeId,
+        system_genesis: AgentJournalGenesisId,
+    }
+
+    impl JournalExposureRecord {
+        fn for_owner(owner: &SystemAuthorityLedgerRouteOwner) -> Self {
+            Self {
+                version: JOURNAL_EXPOSURE_RECORD_VERSION,
+                route: owner.route,
+                journal_store: owner.journal_store,
+                local_node: owner.local_node,
+                system_genesis: owner.route.system_genesis(),
+            }
+        }
+
+        fn validate(&self) -> Result<(), SystemAuthorityLedgerError> {
+            self.route.validate()?;
+            if self.version != JOURNAL_EXPOSURE_RECORD_VERSION
+                || JournalStoreInstanceId::from_bytes(*self.journal_store.as_bytes()).is_none()
+                || self.local_node == NodeId::ZERO
+                || self.system_genesis == AgentJournalGenesisId::ZERO
+                || self.system_genesis != self.route.system_genesis()
+                || self.encode().len() > MAX_JOURNAL_EXPOSURE_RECORD_BYTES
+            {
+                return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+            }
+            Ok(())
+        }
+    }
+
+    impl ServiceWire for JournalExposureRecord {
+        const MAGIC: [u8; 4] = *b"AULJ";
+
+        fn encode_body(&self, output: &mut Vec<u8>) {
+            let mut encoder = Encoder(output);
+            encoder.u32(self.version);
+            encoder.bytes(&self.route.encode());
+            encoder.fixed(self.journal_store.as_bytes());
+            encoder.fixed(&self.local_node.0);
+            encoder.fixed(self.system_genesis.as_bytes());
+        }
+
+        fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+            enforce_complete_bound(decoder, MAX_JOURNAL_EXPOSURE_RECORD_BYTES)?;
+            let record = Self {
+                version: decoder.u32()?,
+                route: decode_nested(decoder, MAX_SYSTEM_AUTHORITY_LEDGER_ROUTE_BYTES)?,
+                journal_store: JournalStoreInstanceId::from_bytes(decoder.fixed()?)
+                    .ok_or(DecodeError::NonCanonical)?,
+                local_node: NodeId(decoder.fixed()?),
+                system_genesis: AgentJournalGenesisId::new(decoder.fixed()?),
+            };
+            record.validate().map_err(|_| DecodeError::NonCanonical)?;
+            Ok(record)
+        }
+    }
+
     /// Permanent signer-independent route ownership. The identical bytes are
-    /// stored in the v4 route table and under the reserved all-zero signer key
+    /// stored in the v5 route table and under the reserved all-zero signer key
     /// in legacy Config as a mutual rollback fence.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RouteConfigRecord {
@@ -4375,6 +4924,8 @@ mod durable {
         Wire(SystemAuthorityLedgerWireError),
         Authority(AuthorityCommitteeError),
         ConfigurationMismatch,
+        JournalExposureRequired,
+        JournalExposureAlreadyCommitted,
         InvalidLocalSigner,
         WrongRoute,
         StaleStateView,
@@ -5072,7 +5623,7 @@ mod durable {
             );
             assert!(
                 ConfigRecord::decode(&sentinel_bytes).is_err(),
-                "a legacy writer must reject the permanent v4 owner sentinel"
+                "a legacy writer must reject the permanent v5 owner sentinel"
             );
 
             // Exact owner reopen audits the already-pinned route without
@@ -5097,6 +5648,285 @@ mod durable {
                     .unwrap(),
                 sentinel_bytes
             );
+        }
+
+        #[test]
+        fn journal_exposure_marker_is_permanent_error_sensitive_and_gates_mutation() {
+            let fixture = Fixture::new();
+            let directory = TempDirectory::new("journal_exposure_lifecycle");
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+            let owner = SystemAuthorityLedgerRouteOwner::open_staged(
+                database.clone(),
+                fixture.route,
+                fixture.store,
+                fixture.local_node(),
+            )
+            .unwrap();
+
+            assert!(!owner.journal_exposure_is_committed().unwrap());
+            assert!(owner.recover_pending_claim().unwrap().is_none());
+            let entered = Cell::new(false);
+            assert!(matches!(
+                owner.with_no_pending_root_mutation(|| entered.set(true)),
+                Err(SystemAuthorityLedgerError::JournalExposureRequired)
+            ));
+            assert!(!entered.get());
+            assert!(matches!(
+                owner.open_signer(fixture.local_signer()),
+                Err(SystemAuthorityLedgerError::JournalExposureRequired)
+            ));
+
+            let wrong_genesis_entered = Cell::new(false);
+            assert!(matches!(
+                owner.with_unexposed_journal_initialization(FOREIGN_GENESIS, || {
+                    wrong_genesis_entered.set(true);
+                    Ok::<_, u8>(())
+                }),
+                Err(SystemAuthorityLedgerError::ConfigurationMismatch)
+            ));
+            assert!(!wrong_genesis_entered.get());
+            assert!(!owner.journal_exposure_is_committed().unwrap());
+
+            assert_eq!(
+                owner
+                    .with_unexposed_journal_initialization(GENESIS, || Err::<(), _>(7_u8))
+                    .unwrap(),
+                Err(7)
+            );
+            assert!(!owner.journal_exposure_is_committed().unwrap());
+            assert_eq!(
+                owner
+                    .with_unexposed_journal_initialization(GENESIS, || Ok::<_, u8>(11_u8))
+                    .unwrap(),
+                Ok(11)
+            );
+            assert!(owner.journal_exposure_is_committed().unwrap());
+
+            let marker = read_exact(
+                &database,
+                JOURNAL_EXPOSURE_TABLE,
+                route_storage_key(fixture.route).as_slice(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                JournalExposureRecord::decode(&marker).unwrap(),
+                JournalExposureRecord::for_owner(&owner)
+            );
+            assert!(matches!(
+                owner.with_unexposed_journal_initialization(GENESIS, || Ok::<_, u8>(())),
+                Err(SystemAuthorityLedgerError::JournalExposureAlreadyCommitted)
+            ));
+
+            let reopened = SystemAuthorityLedgerRouteOwner::open_existing(
+                database,
+                fixture.route,
+                fixture.store,
+                fixture.local_node(),
+            )
+            .unwrap();
+            assert!(reopened.journal_exposure_is_committed().unwrap());
+            assert_eq!(
+                reopened.with_no_pending_root_mutation(|| 13_u8).unwrap(),
+                13
+            );
+        }
+
+        #[test]
+        fn unexposed_evidence_residue_rejects_preopen_and_startup_without_running_operations() {
+            let fixture = Fixture::new();
+            let directory = TempDirectory::new("unexposed_evidence_preopen");
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+            let owner = SystemAuthorityLedgerRouteOwner::open_staged(
+                database.clone(),
+                fixture.route,
+                fixture.store,
+                fixture.local_node(),
+            )
+            .unwrap();
+            let route_key = route_storage_key(fixture.route);
+            let meta = MetaRecord {
+                route: fixture.route,
+                journal_store: fixture.store,
+                retired_high_water: fixture.view.committee_sequence_high_water(),
+                authority_state: fixture.view.authority_state_commitment(),
+                last_claim: None,
+                last_publication: None,
+            };
+            meta.validate().unwrap();
+            let meta_bytes = meta.encode();
+            let transaction = database.begin_write().unwrap();
+            transaction
+                .open_table(META_TABLE)
+                .unwrap()
+                .insert(route_key.as_slice(), meta_bytes.as_slice())
+                .unwrap();
+            transaction.commit().unwrap();
+
+            assert!(matches!(
+                owner.journal_exposure_is_committed(),
+                Err(SystemAuthorityLedgerError::CorruptLedger)
+            ));
+
+            let startup_entered = Cell::new(false);
+            assert!(matches!(
+                owner.with_startup_root_recovery(|_| startup_entered.set(true)),
+                Err(SystemAuthorityLedgerError::CorruptLedger)
+            ));
+            assert!(!startup_entered.get());
+
+            let initialization_entered = Cell::new(false);
+            assert!(matches!(
+                owner.with_unexposed_journal_initialization(GENESIS, || {
+                    initialization_entered.set(true);
+                    Ok::<_, u8>(())
+                }),
+                Err(SystemAuthorityLedgerError::CorruptLedger)
+            ));
+            assert!(!initialization_entered.get());
+            assert_eq!(
+                read_exact(&database, META_TABLE, route_key.as_slice())
+                    .unwrap()
+                    .unwrap(),
+                meta_bytes
+            );
+            assert!(
+                read_exact(&database, JOURNAL_EXPOSURE_TABLE, route_key.as_slice())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn malformed_or_mismatched_journal_exposure_residue_rejects_without_writes() {
+            let fixture = Fixture::new();
+            let foreign_store = JournalStoreInstanceId::from_bytes([0xa2; 32]).unwrap();
+            let foreign_node = NodeId([0xa3; 32]);
+            let foreign_route = SystemAuthorityLedgerRoute::new(
+                ROOT,
+                1,
+                ROOT_CONFIG,
+                SPACE,
+                SYSTEM_AGENT,
+                BINDING,
+                FOREIGN_GENESIS,
+                ADMISSION,
+            )
+            .unwrap();
+
+            let expected = JournalExposureRecord {
+                version: JOURNAL_EXPOSURE_RECORD_VERSION,
+                route: fixture.route,
+                journal_store: fixture.store,
+                local_node: fixture.local_node(),
+                system_genesis: GENESIS,
+            };
+            let mut foreign_route_record = expected.clone();
+            foreign_route_record.route = foreign_route;
+            foreign_route_record.system_genesis = FOREIGN_GENESIS;
+            let mut foreign_store_record = expected.clone();
+            foreign_store_record.journal_store = foreign_store;
+            let mut foreign_node_record = expected.clone();
+            foreign_node_record.local_node = foreign_node;
+            let mut mismatched_genesis_record = expected.clone();
+            mismatched_genesis_record.system_genesis = FOREIGN_GENESIS;
+
+            for (label, key, bytes, configuration_mismatch) in [
+                (
+                    "marker_foreign_route",
+                    route_storage_key(fixture.route).to_vec(),
+                    foreign_route_record.encode(),
+                    true,
+                ),
+                (
+                    "marker_foreign_store",
+                    route_storage_key(fixture.route).to_vec(),
+                    foreign_store_record.encode(),
+                    true,
+                ),
+                (
+                    "marker_foreign_node",
+                    route_storage_key(fixture.route).to_vec(),
+                    foreign_node_record.encode(),
+                    true,
+                ),
+                (
+                    "marker_mismatched_genesis",
+                    route_storage_key(fixture.route).to_vec(),
+                    mismatched_genesis_record.encode(),
+                    false,
+                ),
+                (
+                    "marker_malformed",
+                    route_storage_key(fixture.route).to_vec(),
+                    b"not-a-journal-exposure-record".to_vec(),
+                    false,
+                ),
+                (
+                    "marker_unknown_key",
+                    {
+                        let mut key = route_storage_key(fixture.route).to_vec();
+                        key.push(0xff);
+                        key
+                    },
+                    expected.encode(),
+                    false,
+                ),
+            ] {
+                let directory = TempDirectory::new(label);
+                let database = Arc::new(Database::create(directory.database()).unwrap());
+                let owner = SystemAuthorityLedgerRouteOwner::open_staged(
+                    database.clone(),
+                    fixture.route,
+                    fixture.store,
+                    fixture.local_node(),
+                )
+                .unwrap();
+                let transaction = database.begin_write().unwrap();
+                transaction
+                    .open_table(JOURNAL_EXPOSURE_TABLE)
+                    .unwrap()
+                    .insert(key.as_slice(), bytes.as_slice())
+                    .unwrap();
+                transaction.commit().unwrap();
+
+                let before = read_exact(&database, JOURNAL_EXPOSURE_TABLE, key.as_slice())
+                    .unwrap()
+                    .unwrap();
+                let result = owner.journal_exposure_is_committed();
+                if configuration_mismatch {
+                    assert!(matches!(
+                        result,
+                        Err(SystemAuthorityLedgerError::ConfigurationMismatch)
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(SystemAuthorityLedgerError::CorruptLedger)
+                    ));
+                }
+                assert_eq!(
+                    read_exact(&database, JOURNAL_EXPOSURE_TABLE, key.as_slice())
+                        .unwrap()
+                        .unwrap(),
+                    before
+                );
+                assert!(
+                    SystemAuthorityLedgerRouteOwner::open_existing(
+                        database.clone(),
+                        fixture.route,
+                        fixture.store,
+                        fixture.local_node(),
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    read_exact(&database, JOURNAL_EXPOSURE_TABLE, key.as_slice())
+                        .unwrap()
+                        .unwrap(),
+                    before
+                );
+            }
         }
 
         #[test]
@@ -5184,7 +6014,7 @@ mod durable {
             );
 
             // A route containing a v2 signer Config cannot be upgraded in
-            // place. Failed v4 open neither installs RouteConfig nor replaces
+            // place. Failed v5 open neither installs RouteConfig nor replaces
             // the pre-existing signer row with the owner sentinel.
             let legacy_directory = TempDirectory::new("legacy_residue");
             let legacy_database = Arc::new(Database::create(legacy_directory.database()).unwrap());
@@ -5235,9 +6065,68 @@ mod durable {
                     .is_none()
             );
 
-            // A v3 route-owner marker is an equally permanent clean-break
-            // fence. Its exact bytes survive a failed v4 open, while neither
-            // the v4 route row nor its Config sentinel is installed.
+            // The immediately preceding v4 route owner is retained as an
+            // expected-empty rollback fence. Its exact bytes survive a failed
+            // v5 open, while neither the v5 route row nor Config sentinel is
+            // installed.
+            let v4_directory = TempDirectory::new("v4_route_residue");
+            let v4_database = Arc::new(Database::create(v4_directory.database()).unwrap());
+            let v4 = RouteConfigRecord {
+                version: 4,
+                route: fixture.route,
+                journal_store: fixture.store,
+                local_node: fixture.local_node(),
+            }
+            .encode();
+            let transaction = v4_database.begin_write().unwrap();
+            transaction
+                .open_table(LEGACY_ROUTE_CONFIG_TABLE_V4)
+                .unwrap()
+                .insert(route_key.as_slice(), v4.as_slice())
+                .unwrap();
+            transaction.commit().unwrap();
+            assert!(matches!(
+                SystemAuthorityLedgerRouteOwner::open(
+                    v4_database.clone(),
+                    fixture.route,
+                    fixture.store,
+                    fixture.local_node(),
+                ),
+                Err(SystemAuthorityLedgerError::ConfigurationMismatch)
+            ));
+            assert_eq!(
+                read_exact(
+                    &v4_database,
+                    LEGACY_ROUTE_CONFIG_TABLE_V4,
+                    route_key.as_slice(),
+                )
+                .unwrap()
+                .unwrap(),
+                v4
+            );
+            assert!(
+                read_exact_maybe_missing(
+                    &v4_database,
+                    ROUTE_CONFIG_TABLE,
+                    route_key.as_slice(),
+                    true,
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                read_exact_maybe_missing(
+                    &v4_database,
+                    CONFIG_TABLE,
+                    sentinel_key.as_slice(),
+                    true,
+                )
+                .unwrap()
+                .is_none()
+            );
+
+            // A v3 route-owner marker remains an equally permanent rollback
+            // fence. Its exact bytes survive a failed v5 open as well.
             let v3_directory = TempDirectory::new("v3_route_residue");
             let v3_database = Arc::new(Database::create(v3_directory.database()).unwrap());
             let v3 = RouteConfigRecord {
@@ -5440,6 +6329,60 @@ mod durable {
             owner.retire_published_claim(receipt).unwrap();
             assert!(owner.recover_pending_claim().unwrap().is_none());
             assert_eq!(owner.with_no_pending_root_mutation(|| 9_u8).unwrap(), 9);
+        }
+
+        #[test]
+        fn replayed_view_must_match_surviving_retired_high_water_before_exposure() {
+            let fixture = Fixture::new();
+            let directory = TempDirectory::new("replayed_view_retired_fence");
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+            let owner = SystemAuthorityLedgerRouteOwner::open(
+                database.clone(),
+                fixture.route,
+                fixture.store,
+                fixture.local_node(),
+            )
+            .unwrap();
+            assert!(owner.validate_replayed_view(&fixture.view).is_ok());
+
+            let ledger = owner.open_signer(fixture.local_signer()).unwrap();
+            let reserved = ledger
+                .reserve_or_reconcile(&fixture.view, fixture.rotation_request())
+                .unwrap()
+                .into_reserved();
+            assert!(matches!(
+                owner.validate_replayed_view(&fixture.view),
+                Err(SystemAuthorityLedgerError::PublicationRecoveryRequired)
+            ));
+            let (signer, joint) = certify_both_legs(&ledger, database.clone(), &fixture, &reserved);
+            let pending = owner.recover_pending_claim().unwrap().unwrap();
+            let successor = fixture.successor_view(joint);
+            drop(signer);
+            drop(ledger);
+            let receipt = PublishedSystemAuthorityClaim::for_test_after_exact_cas(
+                pending,
+                fixture.request.claim(),
+                &successor,
+            )
+            .unwrap();
+            owner.retire_published_claim(receipt).unwrap();
+            assert!(owner.validate_replayed_view(&successor).is_ok());
+
+            let route_key = route_storage_key(fixture.route);
+            let meta_before = read_exact(&database, META_TABLE, route_key.as_slice())
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                owner.validate_replayed_view(&fixture.view),
+                Err(SystemAuthorityLedgerError::StaleStateView)
+            ));
+            assert_eq!(
+                read_exact(&database, META_TABLE, route_key.as_slice())
+                    .unwrap()
+                    .unwrap(),
+                meta_before,
+                "a stale replay rejection must not rewrite the surviving high-water",
+            );
         }
 
         #[test]

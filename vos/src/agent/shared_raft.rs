@@ -2832,12 +2832,17 @@ pub(crate) use evidence_ledger::{
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "storage")]
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
+    #[cfg(feature = "storage")]
     use core::cell::Cell;
 
-    use ed25519_dalek::{Signer as _, SigningKey};
+    #[cfg(feature = "storage")]
+    use ed25519_dalek::Signer as _;
+    use ed25519_dalek::SigningKey;
+    #[cfg(feature = "storage")]
     use redb::Database;
 
     use super::*;
@@ -2916,6 +2921,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "storage")]
     fn runtime() -> RuntimeBinding {
         RuntimeBinding {
             space: SpaceId([0x11; 32]),
@@ -2929,6 +2935,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "storage")]
     fn ordered_entry(route: AgentRouteKey) -> OrderedEntry {
         OrderedEntry {
             genesis: route.genesis(),
@@ -2943,6 +2950,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "storage")]
     fn ordinary_ordered_entry(route: AgentRouteKey, parent: OrderedEntryId) -> OrderedEntry {
         let invocation = ActorInvocation {
             invocation: InvocationId([0x61; 32]),
@@ -2995,18 +3003,22 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "storage")]
     fn lane(byte: u8, state: &[u8]) -> SharedLaneProjection {
         SharedLaneProjection::new(LaneStateId([byte; 32]), BlobRef::of_bytes(state)).unwrap()
     }
 
+    #[cfg(feature = "storage")]
     fn successor(byte: u8) -> JournalHeadsId {
         JournalHeadsId([byte; 32])
     }
 
+    #[cfg(feature = "storage")]
     fn journal_store(byte: u8) -> JournalStoreInstanceId {
         JournalStoreInstanceId::from_bytes([byte; 32]).unwrap()
     }
 
+    #[cfg(feature = "storage")]
     fn claim(
         route: AgentRouteKey,
         entry: &OrderedEntry,
@@ -3049,6 +3061,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "storage")]
     fn retained_seal_claim(
         route: AgentRouteKey,
         fence: &OrderedEntry,
@@ -3109,6 +3122,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "storage")]
     fn committed(command: AgentRaftCommand, index: u64, term: u64) -> CommittedAgentRaftEntry {
         CommittedAgentRaftEntry::from_durable_log(
             &TestWitness {
@@ -3119,6 +3133,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "storage")]
     fn ordered_fixture(
         committee: &AgentReplicaCommittee,
     ) -> (CommittedAgentRaftEntry, OrderedCommitClaim) {
@@ -3237,6 +3252,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "storage")]
     #[test]
     fn ordinary_ordered_successor_accepts_the_prior_retained_merge_seal() {
         let voters = [key(1)];
@@ -3265,8 +3281,10 @@ mod tests {
         evidence_ledger::validate_claim_link(route, &committed, &claim).unwrap();
     }
 
+    #[cfg(feature = "storage")]
     struct TempDirectory(std::path::PathBuf);
 
+    #[cfg(feature = "storage")]
     impl TempDirectory {
         fn new(label: &str) -> Self {
             let path = std::env::temp_dir().join(alloc::format!(
@@ -3286,23 +3304,28 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "storage")]
     impl Drop for TempDirectory {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
+    #[cfg(feature = "storage")]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct TestSignFailure;
 
+    #[cfg(feature = "storage")]
     impl fmt::Display for TestSignFailure {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("injected signer failure")
         }
     }
 
+    #[cfg(feature = "storage")]
     impl core::error::Error for TestSignFailure {}
 
+    #[cfg(feature = "storage")]
     struct CheckingSigner<'a> {
         ledger: &'a AgentRaftEvidenceLedger,
         key: &'a SigningKey,
@@ -3312,6 +3335,7 @@ mod tests {
         fail: bool,
     }
 
+    #[cfg(feature = "storage")]
     impl ReplicaCommitSigner for CheckingSigner<'_> {
         type Error = TestSignFailure;
 
@@ -3335,10 +3359,12 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "storage")]
     struct PanicSigner {
         node: NodeId,
     }
 
+    #[cfg(feature = "storage")]
     impl ReplicaCommitSigner for PanicSigner {
         type Error = TestSignFailure;
 
@@ -3351,6 +3377,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "storage")]
     #[test]
     fn pledge_survives_crash_window_and_exact_retry_never_resigns() {
         let directory = TempDirectory::new("pledge_reopen");
@@ -3485,6 +3512,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "storage")]
     #[test]
     fn reservation_from_another_journal_instance_cannot_anchor() {
         let first_directory = TempDirectory::new("journal_binding_a");
@@ -3521,6 +3549,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "storage")]
     #[test]
     fn ordered_artifact_batch_is_rejected_before_phase_one_reservation() {
         let directory = TempDirectory::new("ordered_artifact_batch");
@@ -3573,6 +3602,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "storage")]
     #[test]
     fn divergent_anchored_claim_persists_fail_stop_across_reopen() {
         let directory = TempDirectory::new("equivocation");
@@ -3642,6 +3672,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "storage")]
     #[test]
     fn conflicting_reservation_fail_stops_but_the_admitted_exact_slot_can_drain() {
         let directory = TempDirectory::new("reservation_equivocation");
@@ -3730,6 +3761,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "storage")]
     #[test]
     fn reopen_rejects_a_gap_in_the_permanent_contiguous_anchor_history() {
         let directory = TempDirectory::new("anchor_gap");
@@ -3795,6 +3827,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "storage")]
     fn share(claim: &OrderedCommitClaim, key: &SigningKey) -> ReplicaCommitSignature {
         let message =
             ReplicaQuorumCertificate::signing_message(claim.committee(), claim.commitment());
@@ -3805,6 +3838,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "storage")]
     #[test]
     fn remote_voter_shares_form_and_recover_exact_quorum_certificate() {
         let directory = TempDirectory::new("remote_shares");
@@ -3893,6 +3927,7 @@ mod tests {
         assert!(recovered.encode().len() <= MAX_REPLICA_QUORUM_CERTIFICATE_BYTES);
     }
 
+    #[cfg(feature = "storage")]
     #[test]
     fn observer_applies_and_verifies_quorum_but_never_pledges_or_signs() {
         let voters = [key(1)];
