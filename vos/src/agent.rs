@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
 pub mod authority;
 pub mod bootstrap;
+pub mod catalog_finality;
 pub mod committee;
 pub mod contract;
 #[cfg(feature = "std")]
@@ -40,12 +41,12 @@ pub mod system_authority;
 pub(crate) mod system_authority_ledger;
 pub mod wire;
 use crate::service::{
-    ActorId, AgentId, BlobRef, DeploymentId, Hash, NodeId, PrincipalId, ProducerId, ProgramId,
-    SpaceId,
+    ActorId, AgentId, BlobRef, DeploymentId, Hash, InstallationId, NodeId, PrincipalId, ProducerId,
+    ProgramId, SpaceId,
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260831r6");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260904r7");
 
 /// Consensus-visible execution semantics for standard-PVM agent packages.
 ///
@@ -425,6 +426,13 @@ pub struct ActorEntry {
 pub struct ActorDirectoryRecord {
     pub entry: ActorEntry,
     pub incarnation: Hash,
+    /// Stable catalog identity of the install operation which created this
+    /// actor. It does not change across an in-place actor upgrade.
+    pub installation_id: InstallationId,
+    /// Commitment of the finality-backed registry reservation which admitted
+    /// this install. Hosts compare this exact value when completing/retrying
+    /// the registry lifecycle protocol.
+    pub registry_reservation: Hash,
 }
 
 /// One deterministic page of the potentially large actor forest.
@@ -437,6 +445,8 @@ pub struct ActorDirectoryPage {
 /// Canonical install request consumed by an agent runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallActor {
+    pub installation_id: InstallationId,
+    pub registry_reservation: Hash,
     pub entry: ActorEntry,
     pub producer: ProducerId,
     pub package: BlobRef,
@@ -471,6 +481,14 @@ pub struct ActorRecord {
     /// upgrades and prevents sparse lane bytes left by a removed actor from
     /// being attached to a later install which reuses the same [`ActorId`].
     pub state_generation: Hash,
+    /// Stable catalog install identity retained across upgrades and reopen.
+    pub installation_id: InstallationId,
+    /// Exact finality-backed registry reservation which admitted the install.
+    pub registry_reservation: Hash,
+    /// Immutable commitment of the complete original [`InstallActor`]
+    /// request. Mutable actor deployment state must never redefine what an
+    /// exact retry of this installation means.
+    pub install_request_commitment: Hash,
     pub producer: ProducerId,
     pub package: BlobRef,
     pub agent_schema: BlobRef,

@@ -8,12 +8,65 @@
 
 use vos::abi::service::ServiceId;
 use vos::node::Consistency;
+use vos::registry::PublicationId;
+use vos::service::InstallationId;
+
+fn mint_nonzero_registry_nonce(label: &str) -> anyhow::Result<[u8; 32]> {
+    loop {
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes)
+            .map_err(|error| anyhow::anyhow!("mint {label}: {error}"))?;
+        if bytes != [0; 32] {
+            return Ok(bytes);
+        }
+    }
+}
+
+/// Mint the unique generation carried by one successful catalog tag move.
+pub fn mint_publication_id() -> anyhow::Result<PublicationId> {
+    mint_nonzero_registry_nonce("catalog publication ID").map(PublicationId::new)
+}
+
+/// Mint the permanently burned identity of one installation attempt.
+pub fn mint_installation_id() -> anyhow::Result<InstallationId> {
+    mint_nonzero_registry_nonce("registry installation ID").map(InstallationId::new)
+}
 
 /// Validate a catalog name. Package hashes, not user-chosen tags, identify
 /// immutable artifacts; a name is only the movable catalog pointer.
 pub fn parse_program_name(s: &str) -> anyhow::Result<String> {
-    if s.is_empty() || s.contains([':', '@']) {
-        anyhow::bail!("program name must be non-empty and contain neither ':' nor '@'");
+    parse_registry_slug("program name", s)
+}
+
+/// Validate an installed service/system-actor name at the CLI boundary.
+pub fn parse_instance_name(s: &str) -> anyhow::Result<String> {
+    parse_registry_slug("instance name", s)
+}
+
+/// Parse the clean-cutover replication identity accepted by service installs.
+/// Zero formerly doubled as an "off" sentinel; it is no longer an identity.
+pub fn parse_nonzero_replication_id(value: &str) -> anyhow::Result<[u8; 32]> {
+    if value == "off" {
+        anyhow::bail!(
+            "replication_id = 'off' is not supported; use consistency = 'local' with a nonzero identity"
+        );
+    }
+    let bytes = hex::decode(value.trim_start_matches("0x"))
+        .map_err(|_| anyhow::anyhow!("replication_id must be hex"))?;
+    let id: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("replication_id must be 32 bytes"))?;
+    if id == [0; 32] {
+        anyhow::bail!("replication_id must be nonzero");
+    }
+    Ok(id)
+}
+
+fn parse_registry_slug(label: &str, s: &str) -> anyhow::Result<String> {
+    if !vos::registry::is_canonical_registry_slug(s) {
+        anyhow::bail!(
+            "{label} must be a canonical registry slug: 1..=63 ASCII bytes, start and end with a lowercase letter or digit, and contain only lowercase letters, digits, or '-'"
+        );
     }
     Ok(s.to_string())
 }
@@ -122,13 +175,15 @@ pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
 }
 
 /// A [`NodeValidator`](vos::commit::NodeValidator) that binds the
-/// registry's two genesis anchors to `space_id`: it rejects any
-/// peer-merged `set_root` DAG node whose CID doesn't derive `space_id`,
-/// rejects any `set_space_id` node carrying a value other than
-/// `space_id`, and passes every other node through.
+/// registry's replay boundary and two genesis anchors to `space_id`: it
+/// rejects malformed/non-canonical DAG and dynamic-message wires, unknown or
+/// misshapen registry methods, impossible reply transcripts, any peer-merged
+/// `set_root` DAG node whose CID doesn't derive `space_id`, and any
+/// `set_space_id` node carrying a value other than `space_id`.
 ///
-/// `insert_node` only checks `CID == hash(bytes)`, and replay orders
-/// concurrent origin nodes by ascending CID — so without this gate a
+/// `insert_node` checks the generic current node wire and
+/// `CID == hash(bytes)`, but neither check authenticates registry semantics;
+/// replay orders concurrent origin nodes by ascending CID — so without this gate a
 /// space member could author a second `set_root{attacker}`, grind its
 /// `origin` until the node's CID sorts below the genuine genesis, serve
 /// it as a head, and on the next sync→replay see the forged root applied
@@ -148,22 +203,15 @@ pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
 /// node never enters the DAG regardless of replay ordering.
 pub fn genesis_node_validator(space_id: [u8; 32]) -> vos::commit::NodeValidator {
     std::sync::Arc::new(move |cid: &[u8; 32], node_bytes: &[u8]| -> bool {
-        // DagNode wire: [payload_len:u64 LE][payload(CrdtEvent)][children…].
-        if node_bytes.len() < 8 {
-            return true;
-        }
-        let payload_len = u64::from_le_bytes(node_bytes[..8].try_into().unwrap()) as usize;
-        let Some(payload) = node_bytes.get(8..8 + payload_len) else {
-            return true;
+        // The typed decoder validates the complete DagNode, including hostile
+        // length fields and child framing. The inner predicate is also used by
+        // cold and mid-flight registry replay, so ingress cannot admit a log
+        // that replay will later fail-stop on.
+        let Ok(decoded) = vos::node::registry_replay_node_request(node_bytes) else {
+            return false;
         };
-        let Some(event) = vos::effect_log::CrdtEvent::from_bytes(payload) else {
-            return true;
-        };
-        let msg = &event.log.msg; // [TAG_DYNAMIC][rkyv Msg]
-        if msg.first() != Some(&vos::value::TAG_DYNAMIC) {
-            return true;
-        }
-        let Some(decoded) = <vos::value::Msg as vos::Decode>::try_decode(&msg[1..]) else {
+        let Some(decoded) = decoded else {
+            // The host's empty on-start kick is the sole non-dynamic log.
             return true;
         };
         // `set_space_id` anchors the value `redeem_invite` binds: accept
@@ -171,11 +219,19 @@ pub fn genesis_node_validator(space_id: [u8; 32]) -> vos::commit::NodeValidator 
         if decoded.name == "set_space_id" {
             return decoded.args.get_bytes("space_id").as_deref() == Some(space_id.as_slice());
         }
-        // `set_root` is genesis-bound by CID; every other op flows through.
+        // `set_root` is both replay-schema-checked and genesis-bound by CID;
+        // every other current, exactly shaped registry op flows through.
         if decoded.name != "set_root" {
             return true;
         }
-        derive_space_id(cid) == space_id
+        decoded.args.get_u32("schema_version") == Some(vos::registry::REGISTRY_SCHEMA_VERSION)
+            && decoded.args.get_bytes("schema_hash").as_deref()
+                == Some(vos::registry::REGISTRY_SCHEMA_HASH.as_slice())
+            && decoded
+                .args
+                .get_bytes("root")
+                .is_some_and(|root| !root.is_empty())
+            && derive_space_id(cid) == space_id
     })
 }
 
@@ -235,12 +291,92 @@ pub fn parse_consistency(name: &str) -> Option<u8> {
 mod tests {
     use super::*;
 
+    fn registry_log(message: vos::value::Msg) -> vos::effect_log::EffectLog {
+        use vos::Encode as _;
+
+        let mut payload = vec![vos::value::TAG_DYNAMIC];
+        payload.extend_from_slice(&message.encode());
+        vos::effect_log::EffectLog::for_msg(payload)
+    }
+
+    fn registry_node(
+        log: vos::effect_log::EffectLog,
+        seq: u64,
+        children: &[[u8; 32]],
+    ) -> ([u8; 32], Vec<u8>) {
+        let event = vos::effect_log::CrdtEvent::new([0x71; 32], seq, log);
+        let payload = event.to_bytes();
+        let mut node = (payload.len() as u64).to_le_bytes().to_vec();
+        node.extend_from_slice(&payload);
+        node.extend_from_slice(&(children.len() as u64).to_le_bytes());
+        for child in children {
+            node.extend_from_slice(child);
+        }
+        let hash = blake2b_simd::Params::new().hash_length(32).hash(&node);
+        let cid = hash
+            .as_bytes()
+            .try_into()
+            .expect("blake2b was configured for a 32-byte CID");
+        (cid, node)
+    }
+
+    struct RemoveTempDir(std::path::PathBuf);
+
+    impl Drop for RemoveTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_registry_db(label: &str) -> (std::path::PathBuf, RemoveTempDir) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "vosx-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        (dir.join("registry.redb"), RemoveTempDir(dir))
+    }
+
     #[test]
-    fn validates_plain_program_names() {
-        assert_eq!(parse_program_name("counter").unwrap(), "counter");
-        assert!(parse_program_name("").is_err());
-        assert!(parse_program_name("counter:tag").is_err());
-        assert!(parse_program_name("counter@hash").is_err());
+    fn cli_registry_names_use_the_canonical_shared_slug_predicate() {
+        for valid in ["a", "0", "counter", "counter-v2", &"a".repeat(63)] {
+            assert_eq!(parse_program_name(valid).unwrap(), valid);
+            assert_eq!(parse_instance_name(valid).unwrap(), valid);
+            assert!(vos::registry::is_canonical_registry_slug(valid));
+        }
+        for invalid in [
+            "",
+            "Counter",
+            "counter_name",
+            "counter/name",
+            "counter:tag",
+            "counter@hash",
+            "-counter",
+            "counter-",
+            "é",
+            &"a".repeat(64),
+        ] {
+            assert!(parse_program_name(invalid).is_err(), "accepted {invalid:?}");
+            assert!(
+                parse_instance_name(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+            assert!(!vos::registry::is_canonical_registry_slug(invalid));
+        }
+    }
+
+    #[test]
+    fn explicit_replication_identity_rejects_legacy_off_and_zero() {
+        assert!(parse_nonzero_replication_id("off").is_err());
+        assert!(parse_nonzero_replication_id(&"00".repeat(32)).is_err());
+        assert_eq!(
+            parse_nonzero_replication_id(&format!("0x{}", "11".repeat(32))).unwrap(),
+            [0x11; 32],
+        );
     }
 
     #[test]
@@ -302,30 +438,22 @@ mod tests {
 
     #[test]
     fn genesis_validator_binds_set_root_to_space_id() {
-        use vos::Encode;
         // A DagNode wire ([payload_len:u64][CrdtEvent][n_children:u64])
-        // wrapping a registry op named `name`.
-        fn node_for(name: &str) -> Vec<u8> {
-            let m = vos::value::Msg::new(name).with("root", vec![0xAAu8; 38]);
-            let mut msg = vec![vos::value::TAG_DYNAMIC];
-            msg.extend_from_slice(&m.encode());
-            let event = vos::effect_log::CrdtEvent::new(
-                [0u8; 32],
-                0,
-                vos::effect_log::EffectLog::for_msg(msg),
-            );
-            let payload = event.to_bytes();
-            let mut node = (payload.len() as u64).to_le_bytes().to_vec();
-            node.extend_from_slice(&payload);
-            node.extend_from_slice(&0u64.to_le_bytes()); // no children
-            node
+        // wrapping one canonical registry request.
+        fn node_for(message: vos::value::Msg) -> Vec<u8> {
+            registry_node(registry_log(message), 0, &[]).1
         }
 
         let genuine_cid = [7u8; 32];
         let space_id = derive_space_id(&genuine_cid);
         let v = genesis_node_validator(space_id);
 
-        let set_root = node_for("set_root");
+        let set_root = node_for(
+            vos::value::Msg::new("set_root")
+                .with("root", vec![0xAAu8; 38])
+                .with("schema_version", vos::registry::REGISTRY_SCHEMA_VERSION)
+                .with("schema_hash", vos::registry::REGISTRY_SCHEMA_HASH.to_vec()),
+        );
         // The genuine genesis: its CID derives the advertised space_id.
         assert!(v(&genuine_cid, &set_root), "genuine genesis accepted");
         // A forged set_root: any other CID derives a different space_id.
@@ -335,28 +463,32 @@ mod tests {
         );
         // Non-genesis ops flow through regardless of CID.
         assert!(
-            v(&[9u8; 32], &node_for("grant_role")),
+            v(&[9u8; 32], &node_for(vos::value::Msg::new("protocol"))),
             "non-set_root op is not genesis-gated",
+        );
+        assert!(
+            !v(
+                &genuine_cid,
+                &node_for(
+                    vos::value::Msg::new("set_root")
+                        .with("root", vec![0xAAu8; 38])
+                        .with("schema_version", vos::registry::REGISTRY_SCHEMA_VERSION - 1)
+                        .with("schema_hash", vos::registry::REGISTRY_SCHEMA_HASH.to_vec(),),
+                ),
+            ),
+            "schema-incompatible genesis is rejected before replay",
         );
     }
 
     #[test]
     fn genesis_validator_binds_set_space_id_to_the_known_value() {
-        use vos::Encode;
         fn set_space_id_node(value: &[u8]) -> Vec<u8> {
-            let m = vos::value::Msg::new("set_space_id").with("space_id", value.to_vec());
-            let mut msg = vec![vos::value::TAG_DYNAMIC];
-            msg.extend_from_slice(&m.encode());
-            let event = vos::effect_log::CrdtEvent::new(
-                [0u8; 32],
+            registry_node(
+                registry_log(vos::value::Msg::new("set_space_id").with("space_id", value.to_vec())),
                 0,
-                vos::effect_log::EffectLog::for_msg(msg),
-            );
-            let payload = event.to_bytes();
-            let mut node = (payload.len() as u64).to_le_bytes().to_vec();
-            node.extend_from_slice(&payload);
-            node.extend_from_slice(&0u64.to_le_bytes());
-            node
+                &[],
+            )
+            .1
         }
 
         let space_id = [0x5au8; 32];
@@ -377,6 +509,124 @@ mod tests {
             !v(&[0u8; 32], &set_space_id_node(&[0xFFu8; 32])),
             "forged set_space_id(bogus id) rejected — closes the invite-DoS vector",
         );
+    }
+
+    #[test]
+    fn registry_replay_allowlist_matches_the_actor_entrypoints() {
+        let actor_methods = space_registry::SpaceRegistryMsg::META.messages;
+        assert_eq!(
+            vos::node::REGISTRY_REPLAY_METHODS.len(),
+            actor_methods.len(),
+            "registry replay allowlist and actor entrypoint count drifted",
+        );
+        for (allowed, actor) in vos::node::REGISTRY_REPLAY_METHODS.iter().zip(actor_methods) {
+            assert_eq!(allowed.name, actor.name);
+            assert_eq!(allowed.fields.len(), actor.fields.len(), "{}", actor.name);
+            for ((allowed_name, allowed_kind), actor_field) in
+                allowed.fields.iter().zip(actor.fields)
+            {
+                assert_eq!(*allowed_name, actor_field.name, "{}", actor.name);
+                assert_eq!(
+                    allowed_kind.metadata_type(),
+                    actor_field.ty,
+                    "{}.{allowed_name}",
+                    actor.name,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn genesis_validator_fails_closed_on_hostile_and_noncanonical_node_wires() {
+        let validator = genesis_node_validator([0x61; 32]);
+
+        let huge_length = u64::MAX.to_le_bytes();
+        assert!(
+            !validator(&[0; 32], &huge_length),
+            "u64::MAX payload length must return false without offset overflow",
+        );
+
+        let (_, mut trailing) =
+            registry_node(registry_log(vos::value::Msg::new("protocol")), 0, &[]);
+        trailing.push(0);
+        assert!(!validator(&[0; 32], &trailing));
+
+        let (_, mut zero_invocation) =
+            registry_node(registry_log(vos::value::Msg::new("protocol")), 1, &[]);
+        let payload_len =
+            usize::try_from(u64::from_le_bytes(zero_invocation[..8].try_into().unwrap())).unwrap();
+        zero_invocation[8 + payload_len - 32..8 + payload_len].fill(0);
+        assert!(
+            !validator(&[0; 32], &zero_invocation),
+            "a zero invocation id that typed decode would normalize is non-canonical",
+        );
+    }
+
+    #[test]
+    fn rejected_registry_nodes_never_advance_or_persist_roots() {
+        use vos::commit::CommitStrategy as _;
+
+        let (path, _remove) = temp_registry_db("registry-admission");
+        let space_id = [0x62; 32];
+        let validator = genesis_node_validator(space_id);
+        let mut commit = vos::commit::CrdtCommit::open(&path, [0x70; 32]).unwrap();
+        commit.set_node_validator(Some(validator));
+
+        let (good_cid, good_node) = registry_node(
+            registry_log(vos::value::Msg::new("set_space_id").with("space_id", space_id.to_vec())),
+            0,
+            &[],
+        );
+        assert!(commit.insert_node(&good_cid, &good_node).unwrap());
+        commit.compact_roots().unwrap();
+        assert_eq!(commit.root_bytes(), vec![good_cid]);
+
+        let mut forged_reply = registry_log(vos::value::Msg::new("protocol"));
+        forged_reply.record_reply(vec![0x99]);
+        let bad_logs = vec![
+            vos::effect_log::EffectLog::for_msg(vec![vos::value::TAG_DYNAMIC, 0xff, 0x00, 0x01]),
+            vos::effect_log::EffectLog::for_msg(b"nondynamic result".to_vec()),
+            registry_log(vos::value::Msg::new("unknown_registry_method")),
+            registry_log(vos::value::Msg::new("set_space_id")),
+            forged_reply,
+        ];
+
+        let mut rejected_cids = Vec::new();
+        for (index, log) in bad_logs.into_iter().enumerate() {
+            let (cid, node) = registry_node(log, index as u64 + 1, &[good_cid]);
+            assert!(
+                !commit.insert_node(&cid, &node).unwrap(),
+                "bad node #{index} was admitted",
+            );
+            assert!(commit.get_node_bytes(&cid).unwrap().is_none());
+            assert_eq!(
+                commit.root_bytes(),
+                vec![good_cid],
+                "rejected node #{index} advanced the in-memory root",
+            );
+            rejected_cids.push(cid);
+        }
+        commit.compact_roots().unwrap();
+        assert_eq!(commit.root_bytes(), vec![good_cid]);
+        drop(commit);
+
+        let reopened = vos::commit::CrdtCommit::open(&path, [0x70; 32]).unwrap();
+        assert_eq!(
+            reopened.root_bytes(),
+            vec![good_cid],
+            "rejected heads must not become durable roots",
+        );
+        for cid in rejected_cids {
+            assert!(reopened.get_node_bytes(&cid).unwrap().is_none());
+        }
+        let logs = reopened
+            .replay_logs()
+            .expect("reopen must retain a healthy replay history");
+        assert_eq!(logs.len(), 1);
+        assert!(matches!(
+            vos::node::registry_replay_request(&logs[0]),
+            Ok(Some(message)) if message.name == "set_space_id"
+        ));
     }
 
     #[test]

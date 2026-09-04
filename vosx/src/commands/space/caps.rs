@@ -20,6 +20,11 @@ use crate::spaces_index;
 use anyhow::anyhow;
 
 pub fn run(space: &str, instance: Option<&str>) -> anyhow::Result<()> {
+    // The endpoint entry is keyed by the same canonical instance namespace as
+    // registry-backed commands. Validate before reading any daemon state.
+    let instance = instance
+        .map(super::common::parse_instance_name)
+        .transpose()?;
     let index = spaces_index::load()?;
     let entry = spaces_index::find(&index, space)?;
     let data_dir = std::path::PathBuf::from(&entry.data_dir);
@@ -35,7 +40,7 @@ pub fn run(space: &str, instance: Option<&str>) -> anyhow::Result<()> {
         })?;
 
     // Filter to the requested instance, if any.
-    let shown: Vec<&endpoint::ExtensionCaps> = match instance {
+    let shown: Vec<&endpoint::ExtensionCaps> = match instance.as_deref() {
         Some(name) => {
             let hit = ep
                 .extensions
@@ -73,4 +78,18 @@ pub fn run(space: &str, instance: Option<&str>) -> anyhow::Result<()> {
         println!("{:<width$}  {}", e.name, rendered, width = width);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caps_rejects_noncanonical_instance_before_endpoint_lookup() {
+        let error = run("does-not-exist", Some("Bad_Instance"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("instance name"), "{error}");
+        assert!(error.contains("canonical registry slug"), "{error}");
+    }
 }

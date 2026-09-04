@@ -8,20 +8,29 @@
 //! the genesis (`space new`) and recipe-reconcile paths.
 //!
 //! The canonical bytes are built by the shared
-//! [`vos::registry::canonical_op_bytes`], so the signer and the
+//! [`vos::registry::registry_mutation_signed_bytes`], so the signer and the
 //! verifier stay in lockstep without re-encoding the wire `Msg`.
 
 use libp2p::identity::Keypair;
-use vos::registry::{OP_SIG_LEN, canonical_op_bytes, pack_auth};
+use vos::registry::{OP_SIG_LEN, pack_auth, registry_mutation_signed_bytes};
 
 /// Build the `auth` blob for a signed registry op: the signer's
 /// PeerId bytes followed by an ed25519 signature over the op's
-/// canonical bytes (`domain || op || fields`).
+/// canonical bytes (`domain || schema || space_id || op || fields`).
 ///
 /// `fields` must match — byte for byte, in order — what the
-/// corresponding registry handler passes to `canonical_op_bytes`.
-pub fn op_auth(keypair: &Keypair, op: &str, fields: &[&[u8]]) -> anyhow::Result<Vec<u8>> {
-    let canonical = canonical_op_bytes(op, fields);
+/// corresponding registry handler passes to
+/// `registry_mutation_signed_bytes`.
+pub fn op_auth(
+    keypair: &Keypair,
+    space_id: &[u8; 32],
+    op: &str,
+    fields: &[&[u8]],
+) -> anyhow::Result<Vec<u8>> {
+    if *space_id == [0; 32] {
+        anyhow::bail!("registry mutation space_id must be nonzero");
+    }
+    let canonical = registry_mutation_signed_bytes(space_id, op, fields);
     let sig: [u8; OP_SIG_LEN] = keypair
         .sign(&canonical)
         .map_err(|e| anyhow::anyhow!("sign registry op '{op}': {e}"))?
@@ -51,9 +60,10 @@ mod tests {
     fn op_auth_verifies_under_the_registry() {
         let kp = Keypair::generate_ed25519();
         let peer = libp2p::PeerId::from(kp.public()).to_bytes();
+        let space_id = [0x5a; 32];
         let fields: [&[u8]; 2] = [&[1u8, 2, 3], &[3u8]];
 
-        let auth = op_auth(&kp, "grant_role", &fields).expect("sign");
+        let auth = op_auth(&kp, &space_id, "grant_role", &fields).expect("sign");
 
         // Split exactly as the actor's `unpack_auth` does.
         let (signer, sig) = auth.split_at(auth.len() - OP_SIG_LEN);
@@ -61,7 +71,7 @@ mod tests {
         let mut sig_arr = [0u8; OP_SIG_LEN];
         sig_arr.copy_from_slice(sig);
 
-        let canonical = canonical_op_bytes("grant_role", &fields);
+        let canonical = registry_mutation_signed_bytes(&space_id, "grant_role", &fields);
         assert!(
             verify_op_sig(signer, &canonical, &sig_arr),
             "libp2p-produced signature verifies under the registry",
@@ -72,7 +82,10 @@ mod tests {
         );
 
         // A signature is not transferable to a different op.
-        let other = canonical_op_bytes("revoke_role", &[&[1u8, 2, 3]]);
+        let other = registry_mutation_signed_bytes(&space_id, "revoke_role", &[&[1u8, 2, 3]]);
         assert!(!verify_op_sig(signer, &other, &sig_arr));
+
+        let sibling = registry_mutation_signed_bytes(&[0x6b; 32], "grant_role", &fields);
+        assert!(!verify_op_sig(signer, &sibling, &sig_arr));
     }
 }

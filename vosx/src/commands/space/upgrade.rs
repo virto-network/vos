@@ -1,18 +1,7 @@
-//! `space upgrade` — move an actor to the package currently named in the catalog.
+//! `space upgrade` — reject the retired legacy service-upgrade path and direct
+//! operators to the Agent lifecycle.
 
-use serde::Serialize;
-use vos::registry::Status;
-
-use crate::commands::space::client::DaemonClient;
-use crate::commands::space::common::parse_program_name;
-use crate::output;
-
-#[derive(Serialize)]
-struct UpgradedView<'a> {
-    instance_name: &'a str,
-    program_name: &'a str,
-    program_hash: String,
-}
+use crate::commands::space::common::{parse_instance_name, parse_program_name};
 
 pub struct Args {
     pub space: String,
@@ -22,36 +11,43 @@ pub struct Args {
 
 pub fn run(args: Args) -> anyhow::Result<()> {
     let program_name = parse_program_name(&args.program_ref)?;
+    let instance_name = parse_instance_name(&args.instance)?;
 
-    DaemonClient::with_connect(&args.space, |client| {
-        let program = client
-            .program(&program_name)?
-            .ok_or_else(|| anyhow::anyhow!("program {program_name} is not published"))?;
+    // The former two-phase path could commit the guest upgrade and crash
+    // before moving the registry row. Clean cutover refuses before dialing or
+    // reading either side; the Agent lifecycle owns the atomic transition.
+    let _ = (args.space, program_name, instance_name);
+    Err(super::client::legacy_service_upgrade_cutover_error())
+}
 
-        let status = client.upgrade(
-            args.instance.clone(),
-            program_name.clone(),
-            program.hash.to_vec(),
-        )?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        match status {
-            Status::Ok => {
-                if output::is_json() {
-                    output::print_json(&UpgradedView {
-                        instance_name: &args.instance,
-                        program_name: &program_name,
-                        program_hash: hex::encode(program.hash),
-                    });
-                } else {
-                    println!("upgraded {} → {program_name}", args.instance);
-                }
-                Ok(())
-            }
-            Status::NotFound => anyhow::bail!("no agent named '{}' installed", args.instance),
-            Status::ProgramNotFound => {
-                anyhow::bail!("program {program_name} is no longer published")
-            }
-            other => anyhow::bail!("upgrade returned status {other}"),
-        }
-    })
+    #[test]
+    fn upgrade_rejects_noncanonical_instance_before_connecting() {
+        let error = run(Args {
+            space: "does-not-exist".into(),
+            instance: "bad/instance".into(),
+            program_ref: "worker-program".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("instance name"), "{error}");
+        assert!(error.contains("canonical registry slug"), "{error}");
+    }
+
+    #[test]
+    fn legacy_upgrade_refuses_at_clean_cutover_before_connecting() {
+        let error = run(Args {
+            space: "does-not-exist".into(),
+            instance: "worker".into(),
+            program_ref: "worker-v2".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("clean cutover"), "{error}");
+        assert!(error.contains("Agent lifecycle"), "{error}");
+        assert!(error.contains("no guest mutation"), "{error}");
+    }
 }

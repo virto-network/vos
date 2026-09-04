@@ -260,14 +260,17 @@ fn handle_schema(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> 
 
 /// Drain the registry's paginated `agent_names` into one list, in
 /// `instance_name` order. `None` means the registry was unreachable (a
-/// dropped dispatch); a malformed/misaligned page degrades to the names
-/// gathered so far rather than panicking the connection task.
+/// dropped dispatch); malformed, stale-protocol, or non-advancing pages fail
+/// closed rather than returning a partial directory or looping forever. The
+/// shared registry page/row/byte budget also bounds a hostile stream of
+/// individually valid, advancing pages.
 fn drain_agent_names(ctx: &mut HttpIngressContext) -> Option<Vec<String>> {
     let mut names: Vec<String> = Vec::new();
+    let mut drain = crate::registry::RegistryDrainBudget::default();
     loop {
         let after = names.last().cloned().unwrap_or_default();
-        let msg = Msg::new("agent_names")
-            .with("after_name", after)
+        let msg = Msg::new("service_actor_names")
+            .with("after_name", after.clone())
             .with("budget", 0u32);
         let encoded = msg.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
@@ -275,16 +278,11 @@ fn drain_agent_names(ctx: &mut HttpIngressContext) -> Option<Vec<String>> {
         payload.extend_from_slice(&encoded);
         let bytes = ctx.ask_registry(&payload)?;
         // Reply is `Value::Bytes(rkyv(AgentNamePage))`; anything else (empty,
-        // Unit, non-decodable) ends the drain with what we have.
-        let page = match <crate::value::Value as crate::Decode>::try_decode(&bytes) {
-            Some(crate::value::Value::Bytes(inner)) if !inner.is_empty() => {
-                match <crate::registry::AgentNamePage as crate::Decode>::try_decode(&inner) {
-                    Some(page) => page,
-                    None => break,
-                }
-            }
-            _ => break,
-        };
+        // Unit, non-decodable) fails the whole discovery response closed.
+        let page = decode_agent_name_page_reply(&bytes)?;
+        if !agent_name_page_is_acceptable(&after, &mut drain, &page) {
+            return None;
+        }
         let more = page.more;
         names.extend(page.names);
         if !more {
@@ -292,6 +290,41 @@ fn drain_agent_names(ctx: &mut HttpIngressContext) -> Option<Vec<String>> {
         }
     }
     Some(names)
+}
+
+fn decode_agent_name_page_reply(bytes: &[u8]) -> Option<crate::registry::AgentNamePage> {
+    let crate::value::Value::Bytes(inner) =
+        <crate::value::Value as crate::Decode>::try_decode(bytes)?
+    else {
+        return None;
+    };
+    if inner.is_empty() {
+        return None;
+    }
+    <crate::registry::AgentNamePage as crate::Decode>::try_decode(&inner)
+}
+
+fn agent_name_page_advances(after: &str, page: &crate::registry::AgentNamePage) -> bool {
+    page.protocol.is_current()
+        && !page
+            .names
+            .iter()
+            .any(|name| !crate::registry::is_canonical_registry_slug(name))
+        && !page
+            .names
+            .first()
+            .is_some_and(|first| !after.is_empty() && first.as_str() <= after)
+        && !page.names.windows(2).any(|pair| pair[0] >= pair[1])
+        && !(page.more && page.names.is_empty())
+}
+
+fn agent_name_page_is_acceptable(
+    after: &str,
+    drain: &mut crate::registry::RegistryDrainBudget,
+    page: &crate::registry::AgentNamePage,
+) -> bool {
+    drain.record_page(page.names.len(), page.encode().len())
+        && agent_name_page_advances(after, page)
 }
 
 fn list_schemas(ctx: &mut HttpIngressContext) -> Response {
@@ -592,7 +625,14 @@ fn mutation_idempotency_key(req: &Request, is_query: bool) -> Result<Option<Stri
 /// Resolve only roots attached to this node. HTTP listeners are host-local;
 /// they do not turn registry aliases into implicit cross-node routes.
 fn resolve(ctx: &mut HttpIngressContext, name: &str) -> Option<ActorId> {
+    if !is_canonical_ingress_actor_name(name) {
+        return None;
+    }
     ctx.resolve_actor(name)
+}
+
+fn is_canonical_ingress_actor_name(name: &str) -> bool {
+    crate::registry::is_canonical_registry_slug(name)
 }
 
 // The Err variant is the terminal 400 response, built once on the
@@ -1128,5 +1168,119 @@ mod tests {
             required_route_capability("/counter/add"),
             crate::capability::AGENT_INVOKE,
         );
+    }
+
+    #[test]
+    fn registry_name_pages_fail_closed_on_protocol_or_progress_faults() {
+        let current = crate::registry::RegistryProtocol::CURRENT;
+        let page = |protocol, names: &[&str], more| crate::registry::AgentNamePage {
+            protocol,
+            names: names.iter().map(|name| (*name).to_string()).collect(),
+            more,
+        };
+
+        assert!(agent_name_page_advances(
+            "",
+            &page(current, &["a", "b"], true)
+        ));
+        assert!(agent_name_page_advances("b", &page(current, &["c"], false)));
+
+        assert!(!agent_name_page_advances(
+            "",
+            &page(
+                crate::registry::RegistryProtocol::UNSUPPORTED,
+                &["a"],
+                false
+            ),
+        ));
+        assert!(!agent_name_page_advances(
+            "a",
+            &page(current, &["a"], false)
+        ));
+        assert!(!agent_name_page_advances(
+            "",
+            &page(current, &["b", "a"], false)
+        ));
+        assert!(!agent_name_page_advances("", &page(current, &[""], false)));
+        assert!(!agent_name_page_advances(
+            "",
+            &page(current, &["Bad_Name"], false)
+        ));
+        assert!(!agent_name_page_advances("", &page(current, &["é"], false)));
+        assert!(!agent_name_page_advances("", &page(current, &[], true)));
+    }
+
+    #[test]
+    fn registry_name_page_drain_rejects_endless_full_pages_and_byte_overflow() {
+        let page = |number: usize| crate::registry::AgentNamePage {
+            protocol: crate::registry::RegistryProtocol::CURRENT,
+            names: (0..128)
+                .map(|offset| format!("n{:05}", number * 128 + offset))
+                .collect(),
+            more: true,
+        };
+        let mut drain = crate::registry::RegistryDrainBudget::with_limits(2, 256, usize::MAX);
+        let first = page(0);
+        assert!(agent_name_page_is_acceptable("", &mut drain, &first));
+        let second = page(1);
+        assert!(agent_name_page_is_acceptable(
+            first.names.last().unwrap(),
+            &mut drain,
+            &second,
+        ));
+        let third = page(2);
+        assert!(!agent_name_page_is_acceptable(
+            second.names.last().unwrap(),
+            &mut drain,
+            &third,
+        ));
+
+        let terminal = crate::registry::AgentNamePage {
+            protocol: crate::registry::RegistryProtocol::CURRENT,
+            names: vec!["worker".into()],
+            more: false,
+        };
+        let mut byte_limited =
+            crate::registry::RegistryDrainBudget::with_limits(1, 1, terminal.encode().len() - 1);
+        assert!(!agent_name_page_is_acceptable(
+            "",
+            &mut byte_limited,
+            &terminal,
+        ));
+    }
+
+    #[test]
+    fn registry_name_page_reply_rejects_wrong_shapes_and_malformed_archives() {
+        use crate::Encode as _;
+
+        assert!(decode_agent_name_page_reply(&crate::value::Value::Unit.encode()).is_none());
+        assert!(
+            decode_agent_name_page_reply(&crate::value::Value::Bytes(Vec::new()).encode())
+                .is_none()
+        );
+        assert!(
+            decode_agent_name_page_reply(&crate::value::Value::Bytes(vec![1, 2, 3]).encode())
+                .is_none()
+        );
+
+        let page = crate::registry::AgentNamePage {
+            protocol: crate::registry::RegistryProtocol::CURRENT,
+            names: vec!["worker".into()],
+            more: false,
+        };
+        assert_eq!(
+            decode_agent_name_page_reply(&crate::value::Value::Bytes(page.encode()).encode()),
+            Some(page),
+        );
+    }
+
+    #[test]
+    fn direct_http_actor_names_share_the_registry_slug_boundary() {
+        for valid in ["a", "worker-01", "space-authority"] {
+            assert!(is_canonical_ingress_actor_name(valid));
+        }
+        for invalid in ["", "Bad_Name", "worker/other", "é"] {
+            assert!(!is_canonical_ingress_actor_name(invalid));
+        }
     }
 }

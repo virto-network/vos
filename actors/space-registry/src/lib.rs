@@ -1,20 +1,25 @@
 //! Space registry — the per-space source of truth.
 //!
-//! Holds three tables, all replicated via the registry actor's
-//! own consistency strategy (Raft today, BFT-swappable later):
+//! Holds four primary tables, replicated through the registry actor's Merge
+//! journal. Mutation signatures are checked again inside the guest; immutable
+//! authority-finality receipts are the separate admission boundary for the
+//! clean-cutover catalog protocol.
 //!
 //! 1. **Programs** — named pointers to content-addressed PVM packages.
-//!    Installed actors retain the exact package hash they started from.
-//! 2. **Agents** — installed *instances* of programs, each with
+//!    Every row has an immutable service/AgentActor kind and publication
+//!    generation; installed actors retain the exact generation they use.
+//! 2. **Agents** — installed conventional service replicas, each with
 //!    its own `instance_name`, `replication_id`, consistency,
 //!    and state. Multiple agents can share one program.
-//! 3. **Members** — Nodes (libp2p peers, may vote in consensus)
+//! 3. **System actors** — actors installed inside the Local system Agent
+//!    Host, with host-returned `AgentId`/`ActorId` identities.
+//! 4. **Members** — Nodes (libp2p peers, may vote in consensus)
 //!    and Identities (people / bots, author signed messages
 //!    with a Merkle-inclusion or ZK proof of set membership).
 //!
 //! Init args for an installed agent are NOT stored in the
 //! Agents table; they live in the registry's own DAG as the
-//! genesis effect of the `install` operation. Auditable via
+//! genesis effect of the typed install operation. Auditable via
 //! the DAG; not part of the queryable schema.
 //!
 //! Hashes (`program_hash`, `replication_id`, `peer_id`) cross
@@ -38,15 +43,25 @@ pub const SERVICE_ID_RAW: u32 = 0;
 // actor's own state + handlers keep referring to the same names. The
 // verifier-side `verify_op_sig` (ed25519) stays here (below), consuming
 // the moved `ed25519_pubkey_from_peer_id`.
+pub use vos::InstallationId;
 pub use vos::registry::{
-    AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, AgentNamePage,
-    AgentPage, AgentRow, AuthGrantPage, AuthGrantRow, InvitePage, InviteRow, MEMBER_KIND_IDENTITY,
-    MEMBER_KIND_NODE, MemberPage, MemberRow, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN,
-    PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, ProgramPage, ProgramRow, REGISTRY_OP_DOMAIN,
-    SPACE_ID_DOMAIN_TAG, Status, SyncFloor, canonical_op_bytes, ed25519_pubkey_from_peer_id,
-    instance_service_id, invite_signed_bytes, pack_auth,
+    AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, AgentLookup,
+    AgentNamePage, AgentPage, AgentRow, AuthGrantPage, AuthGrantRow, InvitePage, InviteRow,
+    MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberPage, MemberRow, NODE_ROLE_OBSERVER,
+    NODE_ROLE_VOTER, OP_SIG_LEN, PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK,
+    ProgramBlobAuthorization, ProgramKind, ProgramLookup, ProgramPage, ProgramRow, ProgramTag,
+    PublicationId, REGISTRY_MUTATION_DOMAIN, REGISTRY_SCHEMA_HASH, REGISTRY_SCHEMA_VERSION,
+    RegistryProtocol, SPACE_ID_DOMAIN_TAG, Status, SyncFloor, SystemActorInstallReceipt,
+    SystemActorLookup, SystemActorPage, SystemActorRow, ed25519_pubkey_from_peer_id,
+    install_service_actor_signed_bytes, install_system_actor_signed_bytes, instance_service_id,
+    invite_signed_bytes, is_canonical_registry_slug, is_defined_auth_role, is_grantable_auth_role,
+    is_offline_invite_role, pack_auth, publish_agent_actor_program_signed_bytes,
+    publish_service_program_signed_bytes, registry_mutation_signed_bytes,
     role_authority_invite_attestation_signed_bytes, role_authority_signed_bytes,
-    role_grant_supersedes,
+    role_grant_supersedes, uninstall_service_actor_signed_bytes,
+    uninstall_system_actor_signed_bytes, unpublish_agent_actor_program_signed_bytes,
+    unpublish_service_program_signed_bytes, upgrade_service_actor_signed_bytes,
+    upgrade_system_actor_signed_bytes,
 };
 
 // ── Programs ──────────────────────────────────────────────────────
@@ -221,13 +236,17 @@ pub const SPACE_REGISTRY_SPACE_ROLE_MAP: vos::SpaceRoleMap<SpaceRegistryRole> = 
 #[actor(
     role = SpaceRegistryRole,
     default_role = SpaceRegistryRole::Reader,
-    space_role_map = SPACE_REGISTRY_SPACE_ROLE_MAP
+    space_role_map = SPACE_REGISTRY_SPACE_ROLE_MAP,
+    state_version = 2
 )]
 pub struct SpaceRegistry {
     /// Sorted by name for fast lookup.
     programs: Vec<ProgramRow>,
-    /// Sorted by `instance_name`.
+    /// Installed service-actor replicas, sorted by `instance_name`.
     agents: Vec<AgentRow>,
+    /// Actors installed inside the Local system Agent Host, sorted by
+    /// `instance_name` and kept separate from replicated services.
+    system_actors: Vec<SystemActorRow>,
     /// Node members, one `#[storage]` row per node keyed by its `u16`
     /// `prefix` (a fixed-width key, so iteration is prefix-ordered).
     /// `node_role` point-gets; `members()` pages nodes before identities.
@@ -332,6 +351,26 @@ pub struct SpaceRegistry {
     /// tested, so the burn/refuse pair is two point ops.
     #[storage]
     used_replication_ids: StorageSet<[u8; 32]>,
+    /// Grow-only burn set for service and system-actor installation
+    /// identities. The identity is consumed before a row becomes visible and
+    /// survives uninstall, so a captured install cannot resurrect either
+    /// class of actor.
+    #[storage]
+    used_installation_ids: StorageSet<[u8; 32]>,
+    /// Grow-only generation map for catalog tag movements. A publication id
+    /// maps to a digest of its complete signed CAS preimage, so it can name
+    /// exactly one attempted movement. Exact successful retries remain
+    /// idempotent, while a retry that changes even the expected base is
+    /// refused. Losing ids stay present and cannot become latent work after
+    /// an A -> B -> A hash cycle.
+    #[storage]
+    used_publication_ids: StorageMap<[u8; 32], [u8; 32]>,
+    /// Grow-only authorization set for immutable package blob serving.
+    /// Catalog names are mutable, while installed/replay/proof records remain
+    /// pinned to historical content. Retaining the hash entitlement lets a
+    /// fresh replica recover those bytes after a name is moved or removed.
+    #[storage]
+    authorized_program_hashes: StorageSet<[u8; 32]>,
     /// Wave-1 invite tokens, one row per `token_pub`. A `#[storage]`
     /// map keyed by the 32-byte token public key: point redeem/revoke,
     /// `invites()` pages. The `revoked` flag is grow-only and lives on
@@ -349,6 +388,7 @@ impl SpaceRegistry {
         Self {
             programs: Vec::new(),
             agents: Vec::new(),
+            system_actors: Vec::new(),
             nodes: StorageMap::default(),
             identities: StorageMap::default(),
             metas: StorageMap::default(),
@@ -362,6 +402,9 @@ impl SpaceRegistry {
             role_authority: StorageValue::default(),
             space_id: StorageValue::default(),
             used_replication_ids: StorageSet::default(),
+            used_installation_ids: StorageSet::default(),
+            used_publication_ids: StorageMap::default(),
+            authorized_program_hashes: StorageSet::default(),
             invites: StorageMap::default(),
         }
     }
@@ -376,17 +419,43 @@ impl SpaceRegistry {
     /// This op carries no `auth` of its own — it *is* the anchor;
     /// its integrity comes from being part of the immutable genesis
     /// commit that `space verify` recomputes against the advertised
-    /// `space_id`.
+    /// `space_id`. The explicit schema identity is part of the dynamic
+    /// message shape, so replaying a historical one-argument `set_root`
+    /// cannot cause new code to wrap v1 state in a current v2 envelope.
     #[msg]
-    async fn set_root(&mut self, root: Vec<u8>) -> Status {
-        if root.is_empty() {
+    async fn set_root(
+        &mut self,
+        root: Vec<u8>,
+        schema_version: u32,
+        schema_hash: Vec<u8>,
+    ) -> Status {
+        if schema_version != REGISTRY_SCHEMA_VERSION
+            || bytes_to_32(&schema_hash) != Some(REGISTRY_SCHEMA_HASH)
+        {
+            return Status::ProtocolMismatch;
+        }
+        if ed25519_pubkey_from_peer_id(&root).is_none() {
             return Status::BadHash;
         }
-        if !self.root_bytes().is_empty() {
+        // Inspect the raw cell, not `root_bytes()`: a v1 root deliberately
+        // decodes as unsupported, but it must never become overwriteable.
+        if self.root.get().is_some_and(|stored| !stored.is_empty()) {
             return Status::Forbidden;
         }
-        self.root.set(&root);
+        self.root.set(&encode_registry_root(&root));
         Status::Ok
+    }
+
+    /// Exact wire/state generation opened by this persisted registry. A new
+    /// actor over pre-v2 state returns `UNSUPPORTED`; callers must not treat
+    /// that state as an empty v2 registry.
+    #[msg]
+    async fn protocol(&self) -> RegistryProtocol {
+        if self.schema_ready() {
+            RegistryProtocol::CURRENT
+        } else {
+            RegistryProtocol::UNSUPPORTED
+        }
     }
 
     /// The genesis root PeerId, or empty if none is set. Read surface
@@ -406,25 +475,34 @@ impl SpaceRegistry {
     /// own boot, before any peer is invited).
     #[msg]
     async fn set_space_id(&mut self, space_id: Vec<u8>) -> Status {
-        if space_id.is_empty() {
-            return Status::BadHash;
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
         }
+        let Some(space_id) = nonzero_32(&space_id) else {
+            return Status::BadHash;
+        };
         if !self.space_id_bytes().is_empty() {
             return Status::Forbidden;
         }
-        self.space_id.set(&space_id);
+        self.space_id.set(&space_id.to_vec());
         Status::Ok
     }
 
     /// This space's anchored `space_id`, or empty if never set.
     #[msg]
     async fn space_id(&self) -> Vec<u8> {
+        if !self.schema_ready() {
+            return Vec::new();
+        }
         self.space_id_bytes()
     }
 
     /// Exact canonical role-authority incarnation bound to this registry.
     #[msg]
     async fn role_authority(&self) -> Vec<u8> {
+        if !self.schema_ready() {
+            return Vec::new();
+        }
         self.role_authority_id()
             .map(|id| id.to_vec())
             .unwrap_or_default()
@@ -438,14 +516,14 @@ impl SpaceRegistry {
         authority_replication_id: Vec<u8>,
         auth: Vec<u8>,
     ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
         let Some(authority_replication_id) = bytes_to_32(&authority_replication_id) else {
             return Status::BadHash;
         };
         if authority_replication_id == [0; 32]
-            || !self.authorize_root_op(
-                &role_authority_signed_bytes(&authority_replication_id),
-                &auth,
-            )
+            || !self.authorize_root_op("set_role_authority", &[&authority_replication_id], &auth)
         {
             return Status::Forbidden;
         }
@@ -462,87 +540,182 @@ impl SpaceRegistry {
 
     // ── Programs catalog ────────────────────────────────────────
 
-    /// Publish a named program. A repeated identical publication is
-    /// idempotent; a different artifact atomically moves the name while
-    /// installed agents remain pinned to their exact hash.
+    /// Publish a service package. The distinct verb fixes the row kind; the
+    /// signed expected tag is a full generation+hash CAS precondition.
     #[msg]
-    async fn publish(&mut self, name: String, hash: Vec<u8>, crdt: bool, auth: Vec<u8>) -> Status {
+    async fn publish_service_program(
+        &mut self,
+        name: String,
+        hash: Vec<u8>,
+        crdt: bool,
+        publication_id: Vec<u8>,
+        expected_publication_id: Vec<u8>,
+        expected_hash: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
         if !self.authorize_op(
-            &canonical_op_bytes("publish", &[name.as_bytes(), &hash, &[crdt as u8]]),
+            "publish_service_program",
+            &[
+                name.as_bytes(),
+                &hash,
+                &[crdt as u8],
+                &publication_id,
+                &expected_publication_id,
+                &expected_hash,
+            ],
             &auth,
         ) {
             return Status::Forbidden;
         }
-        // An empty program name is the `programs` pager's start-of-table
-        // sentinel, so a stored row carrying
-        // it would wedge the catalog drain — reject it up front.
-        if name.is_empty() {
-            return Status::BadHash;
-        }
-        let Some(hash) = bytes_to_32(&hash) else {
-            return Status::BadHash;
-        };
-        let mut idx = 0usize;
-        while idx < self.programs.len() {
-            let cur = &self.programs[idx];
-            let cmp = cur.name.as_str().cmp(name.as_str());
-            if cmp.is_eq() {
-                if cur.hash == hash && cur.crdt == crdt {
-                    return Status::Ok;
-                }
-                self.programs[idx] = ProgramRow { name, hash, crdt };
-                return Status::Ok;
-            }
-            if cmp.is_gt() {
-                break;
-            }
-            idx += 1;
-        }
-        self.programs.insert(idx, ProgramRow { name, hash, crdt });
-        Status::Ok
+        self.publish_program_cas(
+            name,
+            hash,
+            ProgramKind::Service { crdt },
+            publication_id,
+            expected_publication_id,
+            expected_hash,
+        )
     }
 
-    /// Remove a program from the catalog. Errors with
-    /// `Status::InUse` if any agent still references the artifact.
+    /// Publish an AgentActor package. No service/CRDT flag exists on this
+    /// wire, so kind confusion cannot be encoded.
     #[msg]
-    async fn unpublish(&mut self, name: String, auth: Vec<u8>) -> Status {
-        if !self.authorize_op(&canonical_op_bytes("unpublish", &[name.as_bytes()]), &auth) {
+    async fn publish_agent_actor_program(
+        &mut self,
+        name: String,
+        hash: Vec<u8>,
+        publication_id: Vec<u8>,
+        expected_publication_id: Vec<u8>,
+        expected_hash: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        if !self.authorize_op(
+            "publish_agent_actor_program",
+            &[
+                name.as_bytes(),
+                &hash,
+                &publication_id,
+                &expected_publication_id,
+                &expected_hash,
+            ],
+            &auth,
+        ) {
             return Status::Forbidden;
         }
-        let mut idx = 0usize;
-        while idx < self.programs.len() {
-            let cur = &self.programs[idx];
-            if cur.name == name {
-                let hash = cur.hash;
-                let mut ai = 0usize;
-                while ai < self.agents.len() {
-                    if self.agents[ai].program_hash == hash {
-                        return Status::InUse;
-                    }
-                    ai += 1;
-                }
-                self.programs.remove(idx);
-                return Status::Ok;
-            }
-            idx += 1;
+        self.publish_program_cas(
+            name,
+            hash,
+            ProgramKind::AgentActor,
+            publication_id,
+            expected_publication_id,
+            expected_hash,
+        )
+    }
+
+    /// Remove an exact service-program tag generation.
+    #[msg]
+    async fn unpublish_service_program(
+        &mut self,
+        name: String,
+        expected_publication_id: Vec<u8>,
+        expected_hash: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
         }
-        Status::NotFound
+        if !self.authorize_op(
+            "unpublish_service_program",
+            &[name.as_bytes(), &expected_publication_id, &expected_hash],
+            &auth,
+        ) {
+            return Status::Forbidden;
+        }
+        self.unpublish_program_cas(
+            &name,
+            &expected_publication_id,
+            &expected_hash,
+            ProgramClass::Service,
+        )
     }
 
-    /// Look up a single program by name.
+    /// Remove an exact AgentActor tag generation.
     #[msg]
-    async fn program(&self, name: String) -> Option<ProgramRow> {
-        self.programs.iter().find(|p| p.name == name).cloned()
+    async fn unpublish_agent_actor_program(
+        &mut self,
+        name: String,
+        expected_publication_id: Vec<u8>,
+        expected_hash: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        if !self.authorize_op(
+            "unpublish_agent_actor_program",
+            &[name.as_bytes(), &expected_publication_id, &expected_hash],
+            &auth,
+        ) {
+            return Status::Forbidden;
+        }
+        self.unpublish_program_cas(
+            &name,
+            &expected_publication_id,
+            &expected_hash,
+            ProgramClass::AgentActor,
+        )
     }
 
-    /// The catalogued program (if any) with this `hash` — a targeted
-    /// lookup so a caller checking hash membership (e.g. the host's
-    /// cross-space CAS guard) needn't drain the whole catalog. Returns
-    /// `None` for a non-32-byte hash or no match.
+    /// Look up one discriminated program row by name.
     #[msg]
-    async fn program_by_hash(&self, hash: Vec<u8>) -> Option<ProgramRow> {
-        let hash = bytes_to_32(&hash)?;
-        self.programs.iter().find(|p| p.hash == hash).cloned()
+    async fn catalog_program(&self, name: String) -> ProgramLookup {
+        ProgramLookup {
+            protocol: self.protocol_descriptor(),
+            row: self
+                .schema_ready()
+                .then(|| self.programs.iter().find(|p| p.name == name).cloned())
+                .flatten(),
+        }
+    }
+
+    /// Look up one discriminated program row by immutable hash.
+    #[msg]
+    async fn catalog_program_by_hash(&self, hash: Vec<u8>) -> ProgramLookup {
+        let row = if self.schema_ready() {
+            bytes_to_32(&hash)
+                .and_then(|hash| self.programs.iter().find(|p| p.hash == hash).cloned())
+        } else {
+            None
+        };
+        ProgramLookup {
+            protocol: self.protocol_descriptor(),
+            row,
+        }
+    }
+
+    /// Authorize serving an immutable program blob that was admitted by any
+    /// successful publication generation. This intentionally outlives the
+    /// mutable name tag so pinned actors and replay/proof history can recover
+    /// displaced packages.
+    #[msg]
+    async fn program_blob_authorized(&self, hash: Vec<u8>) -> ProgramBlobAuthorization {
+        if !self.schema_ready() {
+            return ProgramBlobAuthorization {
+                protocol: RegistryProtocol::UNSUPPORTED,
+                authorized: false,
+            };
+        }
+        ProgramBlobAuthorization {
+            protocol: RegistryProtocol::CURRENT,
+            authorized: bytes_to_32(&hash)
+                .is_some_and(|hash| self.authorized_program_hashes.contains(&hash)),
+        }
     }
 
     /// Page the program catalog in name order. Pass an empty name to start;
@@ -552,7 +725,14 @@ impl SpaceRegistry {
     /// backing `programs` is kept sorted on insert, so a natural cursor over
     /// the last emitted row pages the whole catalog without a per-page sort.
     #[msg]
-    async fn programs(&self, after_name: String, budget: u32) -> ProgramPage {
+    async fn catalog_programs(&self, after_name: String, budget: u32) -> ProgramPage {
+        if !self.schema_ready() {
+            return ProgramPage {
+                protocol: RegistryProtocol::UNSUPPORTED,
+                rows: Vec::new(),
+                more: false,
+            };
+        }
         let started = after_name.is_empty();
         let mut it = self
             .programs
@@ -560,7 +740,11 @@ impl SpaceRegistry {
             .filter(|p| started || p.name > after_name)
             .cloned();
         let (rows, more) = fill_page(&mut it, page_rows(budget), PAGE_BYTE_BUDGET);
-        ProgramPage { rows, more }
+        ProgramPage {
+            protocol: self.protocol_descriptor(),
+            rows,
+            more,
+        }
     }
 
     // ── Metadata blobs ──────────────────────────────────────────
@@ -578,10 +762,10 @@ impl SpaceRegistry {
         blob: Vec<u8>,
         auth: Vec<u8>,
     ) -> Status {
-        if !self.authorize_op(
-            &canonical_op_bytes("register_meta", &[&program_hash, &blob]),
-            &auth,
-        ) {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        if !self.authorize_op("register_meta", &[&program_hash, &blob], &auth) {
             return Status::Forbidden;
         }
         let Some(program_hash) = bytes_to_32(&program_hash) else {
@@ -600,6 +784,9 @@ impl SpaceRegistry {
     /// empty vector when no entry exists.
     #[msg]
     async fn meta_for_program(&self, program_hash: Vec<u8>) -> Vec<u8> {
+        if !self.schema_ready() {
+            return Vec::new();
+        }
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return Vec::new();
         };
@@ -624,6 +811,9 @@ impl SpaceRegistry {
     /// shadowed.
     #[msg]
     async fn meta_for_instance(&self, name: String) -> Vec<u8> {
+        if !self.schema_ready() {
+            return Vec::new();
+        }
         let mut ai = 0usize;
         while ai < self.agents.len() {
             if self.agents[ai].instance_name == name {
@@ -631,6 +821,14 @@ impl SpaceRegistry {
                 return self.metas.get(&hash).map(|m| m.blob).unwrap_or_default();
             }
             ai += 1;
+        }
+        let mut si = 0usize;
+        while si < self.system_actors.len() {
+            if self.system_actors[si].instance_name == name {
+                let hash = self.system_actors[si].program_hash;
+                return self.metas.get(&hash).map(|m| m.blob).unwrap_or_default();
+            }
+            si += 1;
         }
         // Fall through to the extension-meta table (keyed by name).
         self.extension_metas
@@ -652,14 +850,18 @@ impl SpaceRegistry {
         blob: Vec<u8>,
         auth: Vec<u8>,
     ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
         if !self.authorize_op(
-            &canonical_op_bytes(
-                "register_extension_meta",
-                &[instance_name.as_bytes(), &blob],
-            ),
+            "register_extension_meta",
+            &[instance_name.as_bytes(), &blob],
             &auth,
         ) {
             return Status::Forbidden;
+        }
+        if !is_canonical_registry_slug(&instance_name) {
+            return Status::BadHash;
         }
         // An empty blob removes the row; otherwise upsert. Both are one
         // point op, keyed by the instance name.
@@ -681,245 +883,362 @@ impl SpaceRegistry {
         Status::Ok
     }
 
-    // ── Agents (instances) ──────────────────────────────────────
+    // ── Installed service actors / Local system actors ─────────
 
-    /// Instantiate a program as an agent. The caller resolves
-    /// `program_name` to a hash and passes
-    /// the hash so the install pins to a specific blob.
+    /// Admit a conventional service actor. The catalog generation and opaque
+    /// installation id are both signed; the latter is burned forever.
     #[msg]
-    async fn install(
+    async fn install_service_actor(
         &mut self,
         instance_name: String,
         program_name: String,
         program_hash: Vec<u8>,
+        program_publication_id: Vec<u8>,
+        installation_id: Vec<u8>,
         replication_id: Vec<u8>,
         consistency: u8,
         network_reachable: bool,
         sync_role: u8,
         auth: Vec<u8>,
     ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
         if !self.authorize_op(
-            &canonical_op_bytes(
-                "install",
-                &[
-                    instance_name.as_bytes(),
-                    program_name.as_bytes(),
-                    &program_hash,
-                    &replication_id,
-                    &[consistency],
-                    &[network_reachable as u8],
-                    &[sync_role],
-                ],
-            ),
+            "install_service_actor",
+            &[
+                instance_name.as_bytes(),
+                program_name.as_bytes(),
+                &program_hash,
+                &program_publication_id,
+                &installation_id,
+                &replication_id,
+                &[consistency],
+                &[network_reachable as u8],
+                &[sync_role],
+            ],
             &auth,
         ) {
             return Status::Forbidden;
         }
-        // An empty instance name is the `agents`/`agent_names` pagers'
-        // start-of-table sentinel, so a stored row carrying it would wedge
-        // every cursor drain that follows the documented protocol (same
-        // reason `register_remote` rejects it).
-        if instance_name.is_empty() {
+        if !is_canonical_registry_slug(&instance_name) || !is_canonical_registry_slug(&program_name)
+        {
             return Status::BadHash;
         }
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return Status::BadHash;
         };
-        let Some(replication_id) = bytes_to_32(&replication_id) else {
+        let Some(program_publication_id) = nonzero_32(&program_publication_id) else {
             return Status::BadHash;
         };
-
-        // Verify program exists with the claimed hash.
-        let mut program_crdt = None;
-        let mut pi = 0usize;
-        while pi < self.programs.len() {
-            let p = &self.programs[pi];
-            if p.name == program_name && p.hash == program_hash {
-                program_crdt = Some(p.crdt);
-                break;
-            }
-            pi += 1;
+        let Some(installation_id) = nonzero_32(&installation_id) else {
+            return Status::BadHash;
+        };
+        let Some(replication_id) = nonzero_32(&replication_id) else {
+            return Status::BadHash;
+        };
+        if consistency > 3 {
+            return Status::BadHash;
         }
-        let Some(program_crdt) = program_crdt else {
+        let Some(sync_role) = SyncFloor::from_u8(sync_role) else {
+            return Status::BadHash;
+        };
+        let position = self
+            .agents
+            .binary_search_by(|row| row.instance_name.as_str().cmp(&instance_name));
+        if let Ok(idx) = position {
+            let row = &self.agents[idx];
+            if row.installation_id.as_bytes() == &installation_id
+                && row.program_name == program_name
+                && row.program_hash == program_hash
+                && row.program_publication_id.as_bytes() == &program_publication_id
+                && row.replication_id == replication_id
+                && row.consistency == consistency
+                && row.network_reachable == network_reachable
+                && row.sync_role == sync_role
+            {
+                return if self.used_installation_ids.contains(&installation_id)
+                    && self.used_replication_ids.contains(&replication_id)
+                {
+                    Status::Ok
+                } else {
+                    Status::ProtocolMismatch
+                };
+            }
+        }
+        // Once every argument has a canonical structural shape, consume both
+        // opaque identities before consulting mutable semantic state. In
+        // particular, ProgramNotFound/CrdtOptInRequired/name conflicts and a
+        // locality-floor refusal must not leave a captured signed install as
+        // latent work that can succeed after the relevant state changes.
+        let installation_id_reused = self.used_installation_ids.contains(&installation_id);
+        let replication_id_reused = self.used_replication_ids.contains(&replication_id);
+        self.used_installation_ids.insert(&installation_id);
+        self.used_replication_ids.insert(&replication_id);
+        let Some(program) = self.programs.iter().find(|program| {
+            program.name == program_name
+                && program.hash == program_hash
+                && program.publication_id.as_bytes() == &program_publication_id
+        }) else {
             return Status::ProgramNotFound;
         };
-
-        // CRDT is an immutable, signed package capability. Schema metadata is
-        // best-effort transport and must never decide replication semantics.
-        if consistency == 2 && !program_crdt {
+        let ProgramKind::Service { crdt } = program.kind else {
+            return Status::ProgramKindMismatch;
+        };
+        if consistency == 2 && !crdt {
             return Status::CrdtOptInRequired;
         }
-
-        let mut idx = 0usize;
-        while idx < self.agents.len() {
-            let cur = &self.agents[idx];
-            if cur.instance_name == instance_name {
-                return Status::InstanceExists;
-            }
-            if cur.instance_name.as_str() > instance_name.as_str() {
-                break;
-            }
-            idx += 1;
+        if self
+            .system_actors
+            .iter()
+            .any(|row| row.instance_name == instance_name)
+        {
+            // Service and system actors share one externally visible name
+            // namespace.
+            return Status::InstanceExists;
         }
-
-        // Anti-replay guard: the `replication_id` is a grow-only
-        // tombstone. A captured `install` op replayed after the agent
-        // was uninstalled reuses its id, so refuse any id already
-        // consumed. Order-independent — the original install seeds the
-        // id, so the replay is blocked regardless of merge order, and
-        // the tombstone outlives the `AgentRow` that `uninstall` removes.
-        if self.used_replication_ids.contains(&replication_id) {
+        if position.is_ok() {
+            return Status::InstanceExists;
+        }
+        if installation_id_reused {
+            return Status::InstallationIdReused;
+        }
+        if replication_id_reused {
             return Status::ReplicationIdReused;
         }
-
-        // Monotone-locality guard (defense-in-depth): if this name was
-        // ever installed before, its shareability may only narrow. A
-        // reused name can't be *widened* into replication — that needs a
-        // fresh name (and a fresh `replication_id`), so private-era state
-        // is never folded into a now-shared DAG. The floor outlives the
-        // row, so this fires on the uninstall→reinstall-wider path; a live
-        // row already returned `Status::InstanceExists` above.
         let floor_key = name_key(&instance_name);
         match self.consistency_floors.get(&floor_key) {
-            Some(floor) => {
-                if !may_transition_to(floor, consistency) {
-                    return Status::ConsistencyWidenDenied;
-                }
-                // Narrow (never widen) the recorded floor; a lateral
-                // re-install leaves it unchanged.
-                if shareability(consistency) < shareability(floor) {
-                    self.consistency_floors.insert(&floor_key, &consistency);
-                }
+            Some(floor) if !may_transition_to(floor, consistency) => {
+                return Status::ConsistencyWidenDenied;
+            }
+            Some(floor) if shareability(consistency) < shareability(floor) => {
+                self.consistency_floors.insert(&floor_key, &consistency);
             }
             None => {
                 self.consistency_floors.insert(&floor_key, &consistency);
             }
+            Some(_) => {}
         }
-
+        // Both identities were burned before semantic validation. Expose the
+        // row only after every precondition has passed in this atomic dispatch.
         self.agents.insert(
-            idx,
+            position.expect_err("occupied position returned above"),
             AgentRow {
                 instance_name,
+                installation_id: InstallationId::new(installation_id),
+                revision: 0,
                 program_hash,
                 program_name,
+                program_publication_id: PublicationId::new(program_publication_id),
                 replication_id,
                 consistency,
                 network_reachable,
-                sync_role: SyncFloor::from_u8(sync_role).unwrap_or_default(),
+                sync_role,
             },
         );
-        // Burn the replication_id so it can never seed a second install.
-        self.used_replication_ids.insert(&replication_id);
         Status::Ok
     }
 
-    /// Tombstone an agent. Local data on each replica moves to
-    /// trash on the host side; the registry just removes the row.
+    /// The loose registry-only system install wire is retained solely so old
+    /// clients receive an explicit fail-closed status. A production install
+    /// must reserve the intent at finality and present Node-authenticated Host
+    /// completion evidence; accepting a root-wrapped opaque receipt here
+    /// would permit registry state to diverge from the Local Agent Host.
     #[msg]
-    async fn uninstall(&mut self, instance_name: String, auth: Vec<u8>) -> Status {
-        if !self.authorize_op(
-            &canonical_op_bytes("uninstall", &[instance_name.as_bytes()]),
-            &auth,
-        ) {
+    async fn install_system_actor(&mut self, receipt: Vec<u8>, auth: Vec<u8>) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        if !self.authorize_root_op("install_system_actor", &[&receipt], &auth) {
             return Status::Forbidden;
         }
-        let mut idx = 0usize;
-        while idx < self.agents.len() {
-            if self.agents[idx].instance_name == instance_name {
-                self.agents.remove(idx);
-                return Status::Ok;
-            }
-            idx += 1;
-        }
-        Status::NotFound
+        Status::HostLifecycleRequired
     }
 
-    /// Repoint an agent at a different program. State
-    /// is preserved (same `replication_id`, same redb); replicas
-    /// restart their agent thread on the next sync.
-    ///
-    /// `from_hash` is the program hash the caller observed the instance
-    /// currently running — a compare-and-swap precondition. The upgrade
-    /// applies only if the live `AgentRow.program_hash` still equals
-    /// `from_hash`, so a captured `upgrade` op replayed (e.g. to roll an
-    /// instance back to a superseded artifact) finds a stale base and is
-    /// refused. Each upgrade is
-    /// pinned to the exact state it was authored against.
     #[msg]
-    async fn upgrade(
+    async fn uninstall_service_actor(
         &mut self,
         instance_name: String,
-        new_program_name: String,
-        new_program_hash: Vec<u8>,
-        from_hash: Vec<u8>,
+        installation_id: Vec<u8>,
+        expected_revision: u64,
+        expected_program_hash: Vec<u8>,
+        expected_program_publication_id: Vec<u8>,
         auth: Vec<u8>,
     ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
         if !self.authorize_op(
-            &canonical_op_bytes(
-                "upgrade",
-                &[
-                    instance_name.as_bytes(),
-                    new_program_name.as_bytes(),
-                    &new_program_hash,
-                    &from_hash,
-                ],
-            ),
+            "uninstall_service_actor",
+            &[
+                instance_name.as_bytes(),
+                &installation_id,
+                &expected_revision.to_le_bytes(),
+                &expected_program_hash,
+                &expected_program_publication_id,
+            ],
             &auth,
         ) {
             return Status::Forbidden;
         }
-        let Some(new_program_hash) = bytes_to_32(&new_program_hash) else {
+        if !is_canonical_registry_slug(&instance_name) {
+            return Status::BadHash;
+        }
+        let (
+            Some(installation_id),
+            Some(expected_program_hash),
+            Some(expected_program_publication_id),
+        ) = (
+            bytes_to_32(&installation_id),
+            bytes_to_32(&expected_program_hash),
+            bytes_to_32(&expected_program_publication_id),
+        )
+        else {
             return Status::BadHash;
         };
-        let Some(from_hash) = bytes_to_32(&from_hash) else {
-            return Status::BadHash;
+        let Some(idx) = self
+            .agents
+            .iter()
+            .position(|row| row.instance_name == instance_name)
+        else {
+            return Status::NotFound;
         };
-
-        // Verify the target program exists.
-        let mut program_crdt = None;
-        let mut pi = 0usize;
-        while pi < self.programs.len() {
-            let p = &self.programs[pi];
-            if p.name == new_program_name && p.hash == new_program_hash {
-                program_crdt = Some(p.crdt);
-                break;
-            }
-            pi += 1;
+        let row = &self.agents[idx];
+        if validate_installation_precondition(
+            row.installation_id,
+            row.revision,
+            ProgramTag {
+                publication_id: row.program_publication_id,
+                hash: row.program_hash,
+            },
+            installation_id,
+            expected_revision,
+            ProgramTag {
+                publication_id: PublicationId::new(expected_program_publication_id),
+                hash: expected_program_hash,
+            },
+        )
+        .is_err()
+        {
+            return Status::StaleInstallation;
         }
-        let Some(program_crdt) = program_crdt else {
-            return Status::ProgramNotFound;
-        };
-
-        let mut idx = 0usize;
-        while idx < self.agents.len() {
-            if self.agents[idx].instance_name == instance_name {
-                // Compare-and-swap on the live program hash: a replayed
-                // or stale upgrade whose `from_hash` no longer matches is
-                // refused, so an instance can't be rolled back by
-                // re-injecting a superseded `upgrade` op.
-                if self.agents[idx].program_hash != from_hash {
-                    return Status::StaleUpgrade;
-                }
-                if self.agents[idx].consistency == 2 {
-                    if !program_crdt {
-                        return Status::CrdtOptInRequired;
-                    }
-                }
-                self.agents[idx].program_name = new_program_name;
-                self.agents[idx].program_hash = new_program_hash;
-                return Status::Ok;
-            }
-            idx += 1;
-        }
-        Status::NotFound
+        self.agents.remove(idx);
+        Status::Ok
     }
 
     #[msg]
-    async fn agent(&self, instance_name: String) -> Option<AgentRow> {
-        self.agents
-            .iter()
-            .find(|a| a.instance_name == instance_name)
-            .cloned()
+    async fn uninstall_system_actor(
+        &mut self,
+        instance_name: String,
+        installation_id: Vec<u8>,
+        expected_revision: u64,
+        expected_program_hash: Vec<u8>,
+        expected_program_publication_id: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        if !self.authorize_root_op(
+            "uninstall_system_actor",
+            &[
+                instance_name.as_bytes(),
+                &installation_id,
+                &expected_revision.to_le_bytes(),
+                &expected_program_hash,
+                &expected_program_publication_id,
+            ],
+            &auth,
+        ) {
+            return Status::Forbidden;
+        }
+        Status::HostLifecycleRequired
+    }
+
+    #[msg]
+    async fn upgrade_service_actor(
+        &mut self,
+        instance_name: String,
+        installation_id: Vec<u8>,
+        expected_revision: u64,
+        from_program_hash: Vec<u8>,
+        from_program_publication_id: Vec<u8>,
+        new_program_name: String,
+        new_program_hash: Vec<u8>,
+        new_program_publication_id: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        if !self.authorize_op(
+            "upgrade_service_actor",
+            &[
+                instance_name.as_bytes(),
+                &installation_id,
+                &expected_revision.to_le_bytes(),
+                &from_program_hash,
+                &from_program_publication_id,
+                new_program_name.as_bytes(),
+                &new_program_hash,
+                &new_program_publication_id,
+            ],
+            &auth,
+        ) {
+            return Status::Forbidden;
+        }
+        Status::HostLifecycleRequired
+    }
+
+    #[msg]
+    async fn upgrade_system_actor(
+        &mut self,
+        instance_name: String,
+        installation_id: Vec<u8>,
+        expected_revision: u64,
+        from_program_hash: Vec<u8>,
+        from_program_publication_id: Vec<u8>,
+        new_program_name: String,
+        new_program_hash: Vec<u8>,
+        new_program_publication_id: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        if !self.authorize_root_op(
+            "upgrade_system_actor",
+            &[
+                instance_name.as_bytes(),
+                &installation_id,
+                &expected_revision.to_le_bytes(),
+                &from_program_hash,
+                &from_program_publication_id,
+                new_program_name.as_bytes(),
+                &new_program_hash,
+                &new_program_publication_id,
+            ],
+            &auth,
+        ) {
+            return Status::Forbidden;
+        }
+        Status::HostLifecycleRequired
+    }
+
+    #[msg]
+    async fn service_actor(&self, instance_name: String) -> AgentLookup {
+        AgentLookup {
+            protocol: self.protocol_descriptor(),
+            row: self
+                .schema_ready()
+                .then(|| {
+                    self.agents
+                        .iter()
+                        .find(|a| a.instance_name == instance_name)
+                        .cloned()
+                })
+                .flatten(),
+        }
     }
 
     /// The first installed agent (in `instance_name` order) whose name
@@ -928,11 +1247,22 @@ impl SpaceRegistry {
     /// `msg-*-log`/`-ctl` pair) needn't drain the whole roster. `agents` is
     /// kept sorted on insert, so "first" is deterministic.
     #[msg]
-    async fn agent_by_pattern(&self, prefix: String, suffix: String) -> Option<AgentRow> {
-        self.agents
-            .iter()
-            .find(|a| a.instance_name.starts_with(&prefix) && a.instance_name.ends_with(&suffix))
-            .cloned()
+    async fn service_actor_by_pattern(&self, prefix: String, suffix: String) -> AgentLookup {
+        AgentLookup {
+            protocol: self.protocol_descriptor(),
+            row: self
+                .schema_ready()
+                .then(|| {
+                    self.agents
+                        .iter()
+                        .find(|a| {
+                            a.instance_name.starts_with(&prefix)
+                                && a.instance_name.ends_with(&suffix)
+                        })
+                        .cloned()
+                })
+                .flatten(),
+        }
     }
 
     /// Page the installed-agent roster, in `instance_name` order. Pass an
@@ -942,7 +1272,14 @@ impl SpaceRegistry {
     /// insert, so a natural cursor over the last emitted row pages the whole
     /// roster without a per-page sort.
     #[msg]
-    async fn agents(&self, after_name: String, budget: u32) -> AgentPage {
+    async fn service_actors(&self, after_name: String, budget: u32) -> AgentPage {
+        if !self.schema_ready() {
+            return AgentPage {
+                protocol: RegistryProtocol::UNSUPPORTED,
+                rows: Vec::new(),
+                more: false,
+            };
+        }
         let started = after_name.is_empty();
         let mut it = self
             .agents
@@ -950,15 +1287,66 @@ impl SpaceRegistry {
             .filter(|a| started || a.instance_name.as_str() > after_name.as_str())
             .cloned();
         let (rows, more) = fill_page(&mut it, page_rows(budget), PAGE_BYTE_BUDGET);
-        AgentPage { rows, more }
+        AgentPage {
+            protocol: self.protocol_descriptor(),
+            rows,
+            more,
+        }
+    }
+
+    #[msg]
+    async fn system_actor(&self, instance_name: String) -> SystemActorLookup {
+        SystemActorLookup {
+            protocol: self.protocol_descriptor(),
+            row: self
+                .schema_ready()
+                .then(|| {
+                    self.system_actors
+                        .iter()
+                        .find(|row| row.instance_name == instance_name)
+                        .cloned()
+                })
+                .flatten(),
+        }
+    }
+
+    #[msg]
+    async fn system_actors(&self, after_name: String, budget: u32) -> SystemActorPage {
+        if !self.schema_ready() {
+            return SystemActorPage {
+                protocol: RegistryProtocol::UNSUPPORTED,
+                rows: Vec::new(),
+                more: false,
+            };
+        }
+        let started = after_name.is_empty();
+        let mut it = self
+            .system_actors
+            .iter()
+            .filter(|row| started || row.instance_name.as_str() > after_name.as_str())
+            .cloned();
+        let (rows, more) = fill_page(&mut it, page_rows(budget), PAGE_BYTE_BUDGET);
+        SystemActorPage {
+            protocol: self.protocol_descriptor(),
+            rows,
+            more,
+        }
     }
 
     /// Page installed-agent names (names only), in `instance_name` order —
     /// so cross-actor callers without `AgentRow` schema knowledge (e.g. the
     /// HTTP ingress rendering `/__schema`) pull the list without an rkyv dance.
-    /// Same cursor/`more` contract as [`agents`](Self::agents).
+    /// Same cursor/`more` contract as
+    /// [`service_actors`](Self::service_actors).
     #[msg]
-    async fn agent_names(&self, after_name: String, budget: u32) -> AgentNamePage {
+    async fn service_actor_names(&self, after_name: String, budget: u32) -> AgentNamePage {
+        if !self.schema_ready() {
+            return AgentNamePage {
+                protocol: RegistryProtocol::UNSUPPORTED,
+                names: Vec::new(),
+                more: false,
+            };
+        }
         let started = after_name.is_empty();
         let mut it = self
             .agents
@@ -966,7 +1354,11 @@ impl SpaceRegistry {
             .filter(|a| started || a.instance_name.as_str() > after_name.as_str())
             .map(|a| a.instance_name.clone());
         let (names, more) = fill_page(&mut it, page_rows(budget), PAGE_BYTE_BUDGET);
-        AgentNamePage { names, more }
+        AgentNamePage {
+            protocol: self.protocol_descriptor(),
+            names,
+            more,
+        }
     }
 
     /// Resolve an installed agent's name to the `ServiceId` it
@@ -996,9 +1388,15 @@ impl SpaceRegistry {
     /// `id().node_prefix()`).
     #[msg]
     async fn resolve(&self, name: String, caller_prefix: u64) -> u32 {
+        if !self.schema_ready() {
+            return 0;
+        }
+        let Ok(caller_prefix) = u16::try_from(caller_prefix) else {
+            return 0;
+        };
         // 1. Local catalog wins.
         if self.agents.iter().any(|a| a.instance_name == name) {
-            return instance_service_id(&name, caller_prefix as u16);
+            return instance_service_id(&name, caller_prefix);
         }
         // 2. Hyperspace host mapping (agent hosted on a peer node).
         if let Some(h) = self.host_mappings.get(&name_key(&name)) {
@@ -1018,21 +1416,25 @@ impl SpaceRegistry {
     /// `host_prefix` overwrites (covers the case where a space
     /// re-keys or migrates between nodes).
     ///
-    /// **Trust gap**: this handler is currently unauthenticated. Any
-    /// actor on any hyperspace member can call `register_remote` for
-    /// any name, including one belonging to another member-space, and
-    /// silently redirect that name's resolution to a node of their
-    /// choosing. This is acceptable for trusted-deployments testing
-    /// (local development, single-operator federations) but NOT for
-    /// mixed-trust federations like the cipher-clerk bank case. The
-    /// bridge actor pattern is intended to address this by binding
-    /// register_remote calls to a known clerk pubkey signature; until
-    /// that lands, do not deploy this surface to untrusted peers.
-    ///
     /// Returns `Status::BadPrefix` when `host_prefix` doesn't fit in
     /// a u16. Otherwise `Status::Ok`.
     #[msg]
-    async fn register_remote(&mut self, instance_name: String, host_prefix: u32) -> Status {
+    async fn register_remote(
+        &mut self,
+        instance_name: String,
+        host_prefix: u32,
+        auth: Vec<u8>,
+    ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        if !self.authorize_op(
+            "register_remote",
+            &[instance_name.as_bytes(), &host_prefix.to_le_bytes()],
+            &auth,
+        ) {
+            return Status::Forbidden;
+        }
         if host_prefix > u16::MAX as u32 {
             return Status::BadPrefix;
         }
@@ -1040,7 +1442,7 @@ impl SpaceRegistry {
         // host_mappings() pager's start-of-table sentinel, so a row
         // carrying it would wedge every drain that follows the
         // documented cursor protocol.
-        if instance_name.is_empty() {
+        if !is_canonical_registry_slug(&instance_name) {
             return Status::BadHash;
         }
         let host_prefix = host_prefix as u16;
@@ -1064,6 +1466,12 @@ impl SpaceRegistry {
     /// order, not name order — the cursor round-trips regardless.
     #[msg]
     async fn host_mappings(&self, after_name: String, budget: u32) -> HostMappingPage {
+        if !self.schema_ready() {
+            return HostMappingPage {
+                mappings: Vec::new(),
+                more: false,
+            };
+        }
         let skip = (!after_name.is_empty()).then(|| name_key(&after_name));
         let start = skip.unwrap_or([0u8; 32]);
         let mut it = self
@@ -1082,11 +1490,21 @@ impl SpaceRegistry {
     /// `NODE_ROLE_VOTER` or `NODE_ROLE_OBSERVER`.
     #[msg]
     async fn add_node(&mut self, prefix: u32, peer_id: Vec<u8>, role: u8, auth: Vec<u8>) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
         if !self.authorize_op(
-            &canonical_op_bytes("add_node", &[&prefix.to_le_bytes(), &peer_id, &[role]]),
+            "add_node",
+            &[&prefix.to_le_bytes(), &peer_id, &[role]],
             &auth,
         ) {
             return Status::Forbidden;
+        }
+        if prefix > u16::MAX as u32
+            || ed25519_pubkey_from_peer_id(&peer_id).is_none()
+            || (role != NODE_ROLE_VOTER && role != NODE_ROLE_OBSERVER)
+        {
+            return Status::BadHash;
         }
         let prefix = prefix as u16;
         // Idempotent upsert keyed by the node prefix.
@@ -1106,11 +1524,14 @@ impl SpaceRegistry {
 
     #[msg]
     async fn remove_node(&mut self, prefix: u32, auth: Vec<u8>) -> Status {
-        if !self.authorize_op(
-            &canonical_op_bytes("remove_node", &[&prefix.to_le_bytes()]),
-            &auth,
-        ) {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        if !self.authorize_op("remove_node", &[&prefix.to_le_bytes()], &auth) {
             return Status::Forbidden;
+        }
+        if prefix > u16::MAX as u32 {
+            return Status::BadPrefix;
         }
         if self.nodes.remove(&(prefix as u16)) {
             Status::Ok
@@ -1131,15 +1552,21 @@ impl SpaceRegistry {
         proof_data: Vec<u8>,
         auth: Vec<u8>,
     ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
         if !self.authorize_op(
-            &canonical_op_bytes("add_identity", &[&public_key, &[proof_kind], &proof_data]),
+            "add_identity",
+            &[&public_key, &[proof_kind], &proof_data],
             &auth,
         ) {
             return Status::Forbidden;
         }
         // An empty key is not an identity — and defense in depth for
         // the members() pager, whose phase-start sentinel is empty.
-        if public_key.is_empty() {
+        if public_key.is_empty()
+            || (proof_kind != PROOF_KIND_MERKLE_INCLUSION && proof_kind != PROOF_KIND_ZK)
+        {
             return Status::BadHash;
         }
         // Idempotent upsert keyed by the identity public key.
@@ -1159,11 +1586,14 @@ impl SpaceRegistry {
 
     #[msg]
     async fn remove_identity(&mut self, public_key: Vec<u8>, auth: Vec<u8>) -> Status {
-        if !self.authorize_op(
-            &canonical_op_bytes("remove_identity", &[&public_key]),
-            &auth,
-        ) {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        if !self.authorize_op("remove_identity", &[&public_key], &auth) {
             return Status::Forbidden;
+        }
+        if public_key.is_empty() {
+            return Status::BadHash;
         }
         if self.identities.remove(&identity_key(&public_key)) {
             Status::Ok
@@ -1178,6 +1608,14 @@ impl SpaceRegistry {
     /// `(next_kind, next_key)` while `more` is true. `budget` caps the page.
     #[msg]
     async fn members(&self, after_kind: u8, after_key: Vec<u8>, budget: u32) -> MemberPage {
+        if !self.schema_ready() {
+            return MemberPage {
+                members: Vec::new(),
+                next_kind: 0,
+                next_key: Vec::new(),
+                more: false,
+            };
+        }
         let cap = page_rows(budget);
         // Node phase: whenever the cursor isn't already in the identity
         // phase (a fresh start, or resuming a node prefix).
@@ -1269,8 +1707,14 @@ impl SpaceRegistry {
     /// itself stays Admin-gated at [`add_node`](Self::add_node).
     #[msg]
     async fn node_role(&self, prefix: u64) -> u8 {
+        if !self.schema_ready() {
+            return 0;
+        }
+        let Ok(prefix) = u16::try_from(prefix) else {
+            return 0;
+        };
         self.nodes
-            .get(&(prefix as u16))
+            .get(&prefix)
             .map(|m| m.role.saturating_add(1))
             .unwrap_or(0)
     }
@@ -1290,16 +1734,21 @@ impl SpaceRegistry {
         authority_replication_id: Vec<u8>,
         auth: Vec<u8>,
     ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
         let Some(authority) = bytes_to_32(&authority_replication_id) else {
             return Status::BadHash;
         };
-        let canonical = canonical_op_bytes(
-            "grant_role",
-            &[&peer_id, &[role], &epoch.to_le_bytes(), &authority],
-        );
-        if peer_id.is_empty()
-            || self.role_authority_id() != Some(authority)
-            || !self.authorize_root_op(&canonical, &auth)
+        if ed25519_pubkey_from_peer_id(&peer_id).is_none() || !is_grantable_auth_role(role) {
+            return Status::BadHash;
+        }
+        if self.role_authority_id() != Some(authority)
+            || !self.authorize_root_op(
+                "grant_role",
+                &[&peer_id, &[role], &epoch.to_le_bytes(), &authority],
+                &auth,
+            )
         {
             return Status::Forbidden;
         }
@@ -1321,14 +1770,21 @@ impl SpaceRegistry {
         authority_replication_id: Vec<u8>,
         auth: Vec<u8>,
     ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
         let Some(authority) = bytes_to_32(&authority_replication_id) else {
             return Status::BadHash;
         };
-        let canonical =
-            canonical_op_bytes("revoke_role", &[&peer_id, &epoch.to_le_bytes(), &authority]);
-        if peer_id.is_empty()
-            || self.role_authority_id() != Some(authority)
-            || !self.authorize_root_op(&canonical, &auth)
+        if ed25519_pubkey_from_peer_id(&peer_id).is_none() {
+            return Status::BadHash;
+        }
+        if self.role_authority_id() != Some(authority)
+            || !self.authorize_root_op(
+                "revoke_role",
+                &[&peer_id, &epoch.to_le_bytes(), &authority],
+                &auth,
+            )
         {
             return Status::Forbidden;
         }
@@ -1343,6 +1799,9 @@ impl SpaceRegistry {
     /// "deny".
     #[msg]
     async fn peer_role(&self, peer_id: Vec<u8>) -> u8 {
+        if !self.schema_ready() {
+            return AUTH_ROLE_NONE;
+        }
         self.effective_role(&peer_id)
     }
 
@@ -1354,6 +1813,9 @@ impl SpaceRegistry {
     /// metadata is non-secret).
     #[msg]
     async fn peer_epoch(&self, peer_id: Vec<u8>) -> u64 {
+        if !self.schema_ready() {
+            return 0;
+        }
         let grant_hw = self
             .auth_grants
             .get(&peer_key(&peer_id))
@@ -1370,6 +1832,12 @@ impl SpaceRegistry {
     /// continue until `next` is empty. `budget` caps the page.
     #[msg]
     async fn auth_grants(&self, after_peer: Vec<u8>, budget: u32) -> AuthGrantPage {
+        if !self.schema_ready() {
+            return AuthGrantPage {
+                grants: Vec::new(),
+                next: Vec::new(),
+            };
+        }
         let skip = (!after_peer.is_empty()).then(|| peer_key(&after_peer));
         let start = skip.unwrap_or([0u8; 32]);
         let mut raw = self
@@ -1456,10 +1924,15 @@ impl SpaceRegistry {
         node_sig: Vec<u8>,
         authority_attestation: Vec<u8>,
     ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
         let Some(token_pub_key) = bytes_to_32(&token_pub) else {
             return Status::BadHash;
         };
-        if peer_id.is_empty() || admin_peer_id.is_empty() {
+        if ed25519_pubkey_from_peer_id(&peer_id).is_none()
+            || ed25519_pubkey_from_peer_id(&admin_peer_id).is_none()
+        {
             return Status::BadHash;
         }
         let Some(admin_sig) = bytes_to_64(&admin_sig) else {
@@ -1473,9 +1946,15 @@ impl SpaceRegistry {
         };
         // Offline tiers only. `admin`/voter enrollment need the serving
         // daemon to countersign online (decision 5); refuse them here.
-        if role != AUTH_ROLE_READONLY && role != AUTH_ROLE_DEVELOPER {
+        if !is_defined_auth_role(role) {
+            return Status::BadHash;
+        }
+        if !is_offline_invite_role(role) {
             return Status::Forbidden;
         }
+        let Some(space_id) = self.anchored_space_id() else {
+            return Status::Forbidden;
+        };
         // (2) Token possession AND peer-id control: the redeem canonical
         // is signed BOTH by the token secret (`redeem_sig`, under
         // `token_pub`) and by the joining node's own key (`node_sig`,
@@ -1487,7 +1966,8 @@ impl SpaceRegistry {
         // subtree). Requiring a signature under `peer_id` binds the grant
         // to a node the redeemer actually controls. Both checks are
         // deterministic, so they re-verify identically on CRDT replay.
-        let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &peer_id]);
+        let redeem_canon =
+            registry_mutation_signed_bytes(&space_id, "redeem_invite", &[&token_pub, &peer_id]);
         if !verify_raw_sig(&token_pub_key, &redeem_canon, &redeem_sig)
             || !verify_op_sig(&peer_id, &redeem_canon, &node_sig)
         {
@@ -1503,9 +1983,6 @@ impl SpaceRegistry {
         // shared operator identity); `space_id` (a fresh per-space genesis
         // origin) can, so a mismatched space rebuilds a different canonical
         // and the signature fails.
-        let Some(space_id) = bytes_to_32(&self.space_id_bytes()) else {
-            return Status::Forbidden;
-        };
         let Some(authority_replication_id) = bytes_to_32(&authority_replication_id) else {
             return Status::BadHash;
         };
@@ -1516,18 +1993,21 @@ impl SpaceRegistry {
         // authority has durably returned `true` for the exact redemption.
         // It is recorded in the CRDT message, so every replay verifies the
         // same attestation without consulting a node-local availability set.
-        let authority_canonical = role_authority_invite_attestation_signed_bytes(
-            &authority_replication_id,
-            &token_pub,
-            role,
-            expires_at,
-            &admin_peer_id,
-            &admin_sig,
-            &peer_id,
-            &redeem_sig,
-            &node_sig,
-        );
-        if !self.authorize_root_op(&authority_canonical, &authority_attestation) {
+        if !self.authorize_root_op(
+            "attest_role_authority_invite",
+            &[
+                &authority_replication_id,
+                &token_pub,
+                &[role],
+                &expires_at.to_le_bytes(),
+                &admin_peer_id,
+                &admin_sig,
+                &peer_id,
+                &redeem_sig,
+                &node_sig,
+            ],
+            &authority_attestation,
+        ) {
             return Status::Forbidden;
         }
         let invite_canon = invite_signed_bytes(
@@ -1582,7 +2062,10 @@ impl SpaceRegistry {
     /// that is `revoke_role`'s job (decision 6).
     #[msg]
     async fn revoke_invite(&mut self, token_pub: Vec<u8>, auth: Vec<u8>) -> Status {
-        if !self.authorize_op(&canonical_op_bytes("revoke_invite", &[&token_pub]), &auth) {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        if !self.authorize_op("revoke_invite", &[&token_pub], &auth) {
             return Status::Forbidden;
         }
         let Some(token_pub_key) = bytes_to_32(&token_pub) else {
@@ -1608,6 +2091,12 @@ impl SpaceRegistry {
     /// read (invite metadata is non-secret).
     #[msg]
     async fn invites(&self, after: Vec<u8>, budget: u32) -> InvitePage {
+        if !self.schema_ready() {
+            return InvitePage {
+                invites: Vec::new(),
+                next: Vec::new(),
+            };
+        }
         let skip = bytes_to_32(&after);
         let start = skip.unwrap_or([0u8; 32]);
         let mut it = self
@@ -1691,7 +2180,7 @@ impl SpaceRegistry {
     }
 
     /// Authorize a mutation: the `auth` blob's signature must be valid
-    /// for `canonical` (the op's [`canonical_op_bytes`]), AND the
+    /// for the exact anchored-space canonical preimage, AND the
     /// signer must be an *effective* admin — the genesis root, or a
     /// peer whose grant chain bottoms out at the root and is not
     /// dominated by a revoke (see [`effective_role`](Self::effective_role)).
@@ -1701,41 +2190,216 @@ impl SpaceRegistry {
     /// — is refused on each honest node unless it carries a signature
     /// an admin (or the root) actually produced.
     ///
-    /// Because `effective_role` is computed on demand from the stored
-    /// grant graph and the grow-only revoke high-waters — never from a
-    /// cached "is admin" flag — authority is *replay-position
-    /// independent*: a signer who was revoked anywhere in the merged
-    /// DAG is not an effective admin here, even when a forged node is
-    /// ground to sort causally *before* its own revoke. That closes the
-    /// re-grant-revoked-admin and revoked-delegator escalation vectors.
-    fn authorize_op(&self, canonical: &[u8], auth: &[u8]) -> bool {
+    /// `effective_role` is computed on demand from the stored grant graph and
+    /// grow-only revoke high-waters, never from a cached "is admin" flag.
+    /// This signature check is defense in depth, not immutable finality:
+    /// replay must eventually consume an authority-certified catalog receipt
+    /// rather than reinterpret an author's historical signature against the
+    /// current grant graph.
+    fn authorize_op(&self, op: &str, fields: &[&[u8]], auth: &[u8]) -> bool {
+        if !self.schema_ready() {
+            return false;
+        }
+        let Some(space_id) = self.anchored_space_id() else {
+            return false;
+        };
         let Some((signer, sig)) = unpack_auth(auth) else {
             return false;
         };
-        if !verify_op_sig(signer, canonical, &sig) {
+        let canonical = registry_mutation_signed_bytes(&space_id, op, fields);
+        if !verify_op_sig(signer, &canonical, &sig) {
             return false;
         }
         self.is_effective_admin(signer)
     }
 
-    fn authorize_root_op(&self, canonical: &[u8], auth: &[u8]) -> bool {
+    fn authorize_root_op(&self, op: &str, fields: &[&[u8]], auth: &[u8]) -> bool {
+        if !self.schema_ready() {
+            return false;
+        }
+        let Some(space_id) = self.anchored_space_id() else {
+            return false;
+        };
         let root = self.root_bytes();
         let Some((signer, signature)) = unpack_auth(auth) else {
             return false;
         };
-        !root.is_empty() && signer == root && verify_op_sig(signer, canonical, &signature)
+        let canonical = registry_mutation_signed_bytes(&space_id, op, fields);
+        !root.is_empty() && signer == root && verify_op_sig(signer, &canonical, &signature)
     }
 
     /// The anchored genesis root PeerId, or empty before genesis.
     /// A point read; the dispatch read-cache makes repeated calls
     /// (one per delegation-chain hop) cost a single row.
     fn root_bytes(&self) -> Vec<u8> {
-        self.root.get().unwrap_or_default()
+        self.root
+            .get()
+            .and_then(|stored| decode_registry_root(&stored).map(<[u8]>::to_vec))
+            .unwrap_or_default()
+    }
+
+    fn schema_ready(&self) -> bool {
+        self.root
+            .get()
+            .is_some_and(|stored| decode_registry_root(&stored).is_some())
+    }
+
+    fn protocol_descriptor(&self) -> RegistryProtocol {
+        if self.schema_ready() {
+            RegistryProtocol::CURRENT
+        } else {
+            RegistryProtocol::UNSUPPORTED
+        }
+    }
+
+    fn publish_program_cas(
+        &mut self,
+        name: String,
+        hash: Vec<u8>,
+        kind: ProgramKind,
+        publication_id: Vec<u8>,
+        expected_publication_id: Vec<u8>,
+        expected_hash: Vec<u8>,
+    ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        let Some(space_id) = self.anchored_space_id() else {
+            return Status::ProtocolMismatch;
+        };
+        if !is_canonical_registry_slug(&name) {
+            return Status::BadHash;
+        }
+        let Some(hash) = nonzero_32(&hash) else {
+            return Status::BadHash;
+        };
+        let Some(publication_id) = nonzero_32(&publication_id) else {
+            return Status::BadHash;
+        };
+        let Ok(expected) = decode_optional_program_tag(&expected_publication_id, &expected_hash)
+        else {
+            return Status::BadHash;
+        };
+        let preimage_binding = publication_cas_preimage_binding(
+            &space_id,
+            &name,
+            &hash,
+            &kind,
+            &publication_id,
+            &expected_publication_id,
+            &expected_hash,
+        );
+        let position = self
+            .programs
+            .binary_search_by(|row| row.name.as_str().cmp(&name));
+        if let Ok(idx) = position {
+            let current = &self.programs[idx];
+            if current.hash == hash
+                && current.publication_id.as_bytes() == &publication_id
+                && &current.kind == &kind
+            {
+                return match self.used_publication_ids.get(&publication_id) {
+                    Some(binding) if binding == preimage_binding => Status::Ok,
+                    Some(_) => Status::PublicationIdReused,
+                    None => Status::ProtocolMismatch,
+                };
+            }
+        }
+        if self.used_publication_ids.get(&publication_id).is_some() {
+            return Status::PublicationIdReused;
+        }
+        // Consume a valid signed operation identity before evaluating its CAS
+        // precondition. A losing publication must never become latent work
+        // that succeeds after a later absent/present cycle.
+        self.used_publication_ids
+            .insert(&publication_id, &preimage_binding);
+        let idx = match position {
+            Ok(idx) => {
+                let current = &self.programs[idx];
+                if let Err(status) =
+                    validate_catalog_precondition(Some(current), expected, ProgramClass::of(&kind))
+                {
+                    return status;
+                }
+                idx
+            }
+            Err(idx) => {
+                if let Err(status) =
+                    validate_catalog_precondition(None, expected, ProgramClass::of(&kind))
+                {
+                    return status;
+                }
+                idx
+            }
+        };
+        self.authorized_program_hashes.insert(&hash);
+        let row = ProgramRow {
+            name,
+            hash,
+            publication_id: PublicationId::new(publication_id),
+            kind,
+        };
+        if idx < self.programs.len() && self.programs[idx].name == row.name {
+            self.programs[idx] = row;
+        } else {
+            self.programs.insert(idx, row);
+        }
+        Status::Ok
+    }
+
+    fn unpublish_program_cas(
+        &mut self,
+        name: &str,
+        expected_publication_id: &[u8],
+        expected_hash: &[u8],
+        class: ProgramClass,
+    ) -> Status {
+        if !self.schema_ready() {
+            return Status::ProtocolMismatch;
+        }
+        if !is_canonical_registry_slug(name) {
+            return Status::BadHash;
+        }
+        let Ok(Some(expected)) =
+            decode_optional_program_tag(expected_publication_id, expected_hash)
+        else {
+            return Status::BadHash;
+        };
+        let Ok(idx) = self
+            .programs
+            .binary_search_by(|row| row.name.as_str().cmp(name))
+        else {
+            return Status::NotFound;
+        };
+        let row = &self.programs[idx];
+        if !program_kind_matches(&row.kind, class) {
+            return Status::ProgramKindMismatch;
+        }
+        if row.tag() != expected {
+            return Status::StaleCatalog;
+        }
+        let in_use = match class {
+            ProgramClass::Service => self.agents.iter().any(|agent| {
+                agent.program_hash == row.hash && agent.program_publication_id == row.publication_id
+            }),
+            ProgramClass::AgentActor => self.system_actors.iter().any(|actor| {
+                actor.program_hash == row.hash && actor.program_publication_id == row.publication_id
+            }),
+        };
+        if in_use {
+            return Status::InUse;
+        }
+        self.programs.remove(idx);
+        Status::Ok
     }
 
     /// This space's anchored `space_id`, or empty before it is set.
     fn space_id_bytes(&self) -> Vec<u8> {
         self.space_id.get().unwrap_or_default()
+    }
+
+    fn anchored_space_id(&self) -> Option<[u8; 32]> {
+        nonzero_32(&self.space_id_bytes())
     }
 
     /// Grow-only revoke high-water for `peer_id`, or 0 if never revoked.
@@ -1762,8 +2426,8 @@ impl SpaceRegistry {
         self.effective_role(signer) == AUTH_ROLE_ADMIN
     }
 
-    /// Effective space-level role of `peer_id`, resolving revoke-
-    /// dominance and delegation *order-independently*. A stored grant
+    /// Effective current space-level role of `peer_id`, resolving revoke-
+    /// dominance and delegation across the merged grant state. A stored grant
     /// counts only if its epoch is strictly above the peer's grow-only
     /// revoke high-water AND its `grantor` is itself effective (the
     /// genesis root, or a transitively-effective admin). Computed on
@@ -1828,6 +2492,164 @@ impl SpaceRegistry {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
+const REGISTRY_ROOT_MAGIC: &[u8; 8] = b"VOSREG2\0";
+const REGISTRY_ROOT_HEADER_BYTES: usize =
+    REGISTRY_ROOT_MAGIC.len() + core::mem::size_of::<u32>() + REGISTRY_SCHEMA_HASH.len();
+
+fn encode_registry_root(root: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(REGISTRY_ROOT_HEADER_BYTES + root.len());
+    encoded.extend_from_slice(REGISTRY_ROOT_MAGIC);
+    encoded.extend_from_slice(&REGISTRY_SCHEMA_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&REGISTRY_SCHEMA_HASH);
+    encoded.extend_from_slice(root);
+    encoded
+}
+
+fn decode_registry_root(stored: &[u8]) -> Option<&[u8]> {
+    if stored.len() <= REGISTRY_ROOT_HEADER_BYTES
+        || &stored[..REGISTRY_ROOT_MAGIC.len()] != REGISTRY_ROOT_MAGIC
+        || stored[REGISTRY_ROOT_MAGIC.len()..REGISTRY_ROOT_MAGIC.len() + 4]
+            != REGISTRY_SCHEMA_VERSION.to_le_bytes()
+        || stored[REGISTRY_ROOT_MAGIC.len() + 4..REGISTRY_ROOT_HEADER_BYTES] != REGISTRY_SCHEMA_HASH
+    {
+        return None;
+    }
+    Some(&stored[REGISTRY_ROOT_HEADER_BYTES..])
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgramClass {
+    Service,
+    AgentActor,
+}
+
+impl ProgramClass {
+    fn of(kind: &ProgramKind) -> Self {
+        match kind {
+            ProgramKind::Service { .. } => Self::Service,
+            ProgramKind::AgentActor => Self::AgentActor,
+        }
+    }
+}
+
+fn program_kind_matches(kind: &ProgramKind, class: ProgramClass) -> bool {
+    matches!(
+        (kind, class),
+        (ProgramKind::Service { .. }, ProgramClass::Service)
+            | (ProgramKind::AgentActor, ProgramClass::AgentActor)
+    )
+}
+
+/// Durable identity of the complete canonical bytes authorized for one
+/// publication attempt. `publication_id` alone prevents reuse across names,
+/// while this binding makes the successful idempotency shortcut exact over
+/// the original CAS base as well as the resulting row.
+fn publication_cas_preimage_binding(
+    space_id: &[u8; 32],
+    name: &str,
+    hash: &[u8; 32],
+    kind: &ProgramKind,
+    publication_id: &[u8; 32],
+    expected_publication_id: &[u8],
+    expected_hash: &[u8],
+) -> [u8; 32] {
+    let canonical = match kind {
+        ProgramKind::Service { crdt } => publish_service_program_signed_bytes(
+            space_id,
+            name,
+            hash,
+            *crdt,
+            publication_id,
+            expected_publication_id,
+            expected_hash,
+        ),
+        ProgramKind::AgentActor => publish_agent_actor_program_signed_bytes(
+            space_id,
+            name,
+            hash,
+            publication_id,
+            expected_publication_id,
+            expected_hash,
+        ),
+    };
+    vos::crypto::blake2b_hash::<32>(b"space-registry/publication-cas-preimage", &[&canonical])
+}
+
+fn validate_catalog_precondition(
+    current: Option<&ProgramRow>,
+    expected: Option<ProgramTag>,
+    class: ProgramClass,
+) -> core::result::Result<(), Status> {
+    match current {
+        Some(row) if !program_kind_matches(&row.kind, class) => Err(Status::ProgramKindMismatch),
+        Some(row) if expected != Some(row.tag()) => Err(Status::StaleCatalog),
+        None if expected.is_some() => Err(Status::StaleCatalog),
+        _ => Ok(()),
+    }
+}
+
+fn valid_system_actor_install_receipt(receipt: &SystemActorInstallReceipt) -> bool {
+    receipt.protocol.is_current()
+        && receipt.installation_id != InstallationId::ZERO
+        && receipt.system_agent_id != AgentId::ZERO
+        && receipt.actor_id != ActorId::ZERO
+        && is_canonical_registry_slug(&receipt.instance_name)
+        && is_canonical_registry_slug(&receipt.program_name)
+        && !receipt.host_receipt.is_empty()
+        && receipt.actor_id == ActorId::top_level(receipt.system_agent_id, &receipt.instance_name)
+}
+
+fn next_installation_revision(
+    installation_id: InstallationId,
+    revision: u64,
+    program: ProgramTag,
+    expected_installation_id: [u8; 32],
+    expected_revision: u64,
+    expected_program: ProgramTag,
+) -> core::result::Result<u64, Status> {
+    validate_installation_precondition(
+        installation_id,
+        revision,
+        program,
+        expected_installation_id,
+        expected_revision,
+        expected_program,
+    )?;
+    revision.checked_add(1).ok_or(Status::StaleInstallation)
+}
+
+fn validate_installation_precondition(
+    installation_id: InstallationId,
+    revision: u64,
+    program: ProgramTag,
+    expected_installation_id: [u8; 32],
+    expected_revision: u64,
+    expected_program: ProgramTag,
+) -> core::result::Result<(), Status> {
+    if installation_id.as_bytes() != &expected_installation_id
+        || revision != expected_revision
+        || program != expected_program
+    {
+        return Err(Status::StaleInstallation);
+    }
+    Ok(())
+}
+
+fn decode_optional_program_tag(
+    publication_id: &[u8],
+    hash: &[u8],
+) -> core::result::Result<Option<ProgramTag>, ()> {
+    if publication_id.is_empty() && hash.is_empty() {
+        return Ok(None);
+    }
+    let publication_id = nonzero_32(publication_id).ok_or(())?;
+    let hash = nonzero_32(hash).ok_or(())?;
+    Ok(Some(ProgramTag {
+        publication_id: PublicationId::new(publication_id),
+        hash,
+    }))
+}
+
 fn bytes_to_32(b: &[u8]) -> Option<[u8; 32]> {
     if b.len() != 32 {
         return None;
@@ -1835,6 +2657,10 @@ fn bytes_to_32(b: &[u8]) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(b);
     Some(out)
+}
+
+fn nonzero_32(b: &[u8]) -> Option<[u8; 32]> {
+    bytes_to_32(b).filter(|bytes| *bytes != [0; 32])
 }
 
 fn bytes_to_64(b: &[u8]) -> Option<[u8; OP_SIG_LEN]> {
@@ -1961,27 +2787,27 @@ fn may_transition_to(floor: u8, requested: u8) -> bool {
 // MemberRow{VOTER} to self-escalate or seize consensus.
 //
 // The signing seam is the operator's libp2p identity key (held by
-// the CLI, and by the daemon at boot). Authority is anchored at the
+// the CLI, and by the daemon's explicit boot/reconcile caller). Authority is anchored at the
 // genesis `set_root` and delegates through the already-verified
 // `auth_grants` table — see [`SpaceRegistry::authorize_op`].
 //
-// The program/agent CATALOG mutators (`publish`/`unpublish`/`install`/
-// `uninstall`/`upgrade`) carry the same `auth` blob, closing the
+// The class-specific program/installation CATALOG mutators carry the same
+// `auth` blob, closing the
 // catalog-forgery vector (a forged AgentRow/ProgramRow merged via CRDT
 // that drives every peer's reconcile to spawn an agent). They are
-// reachable from a PVM agent that holds no operator key (the messenger
-// clones a channel's actor pair via `create` → `install`) and from the
-// daemon's own in-process manifest reconcile, so the signature can't
-// always originate at the CLI. The daemon signs them on relay: when a
-// catalog mutation reaches the registry it rebuilds these canonical
-// bytes from the dispatch `Msg` and signs with the operator key it
-// loaded at boot, before the op is recorded into the DAG. Because the
-// signature is the operator's, `authorize_op` passes on the operator's
-// (admin) node and fails on a joined non-admin node — which is correct:
+// authored either by the one-shot CLI before network dispatch or by the
+// daemon's explicit in-process boot/reconcile call. The network host binds
+// the embedded signer to its authenticated ingress identity without changing
+// the payload. A keyless PVM actor cannot borrow ambient daemon authority and
+// its empty/forged authorization is refused. Because the signature is the
+// actual caller's, `authorize_op` passes on an admin node and fails for a
+// joined non-admin node — which is correct:
 // a non-admin never authors a catalog row, it consumes the admin's
 // already-signed rows via sync, and the reconcile path tolerates the
-// resulting Status::Forbidden. `register_remote` stays unsigned: it is
-// the hyperspace/federation surface and has a separate trust model.
+// resulting Status::Forbidden. `register_remote` is subject to the same
+// anchored-space authorization. A federation registry without a durable
+// root/space anchor therefore rejects advertisements rather than accepting an
+// unauthenticated mapping.
 
 /// Split an auth blob into `(signer_peer_id, signature)`. `None` if
 /// it's too short to hold a signature.
@@ -2021,6 +2847,129 @@ pub fn verify_raw_sig(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; OP_SIG_LEN]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "bin")]
+    use crate::__vos_worker::{
+        vos_extension_create, vos_extension_drop, vos_extension_free, vos_extension_load,
+        vos_extension_state_v2,
+    };
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use vos::Message;
+    use vos::abi::service::ServiceId;
+    use vos::value::FromDynamic as _;
+
+    const TEST_SPACE_ID: [u8; 32] = [0xa5; 32];
+
+    fn dispatch<M>(
+        registry: &mut SpaceRegistry,
+        message: M,
+    ) -> <SpaceRegistry as Message<M>>::Output
+    where
+        SpaceRegistry: Message<M>,
+    {
+        let mut context = Context::new(ServiceId(0));
+        vos::block_on(<SpaceRegistry as Message<M>>::handle(
+            registry,
+            message,
+            &mut context,
+        ))
+    }
+
+    fn root_peer(signing: &SigningKey) -> Vec<u8> {
+        let mut peer = vec![0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
+        peer.extend_from_slice(signing.verifying_key().as_bytes());
+        peer
+    }
+
+    fn root_auth(signing: &SigningKey, canonical: &[u8]) -> Vec<u8> {
+        pack_auth(&root_peer(signing), &signing.sign(canonical).to_bytes())
+    }
+
+    fn anchor_test_space(registry: &mut SpaceRegistry, prefix: &'static [u8]) {
+        registry.space_id.__init(prefix);
+        registry.space_id.set(&TEST_SPACE_ID.to_vec());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_service_for_test(
+        registry: &mut SpaceRegistry,
+        signing: &SigningKey,
+        instance_name: &str,
+        program_name: &str,
+        program: ProgramTag,
+        installation_id: [u8; 32],
+        replication_id: [u8; 32],
+    ) -> Status {
+        install_service_with_consistency_for_test(
+            registry,
+            signing,
+            instance_name,
+            program_name,
+            program,
+            installation_id,
+            replication_id,
+            1,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_service_with_consistency_for_test(
+        registry: &mut SpaceRegistry,
+        signing: &SigningKey,
+        instance_name: &str,
+        program_name: &str,
+        program: ProgramTag,
+        installation_id: [u8; 32],
+        replication_id: [u8; 32],
+        consistency: u8,
+    ) -> Status {
+        let network_reachable = false;
+        let sync_role = SyncFloor::Member as u8;
+        let canonical = install_service_actor_signed_bytes(
+            &registry.anchored_space_id().expect("test space anchor"),
+            instance_name,
+            program_name,
+            &program.hash,
+            program.publication_id.as_bytes(),
+            &installation_id,
+            &replication_id,
+            consistency,
+            network_reachable,
+            sync_role,
+        );
+        dispatch(
+            registry,
+            InstallServiceActor {
+                instance_name: instance_name.into(),
+                program_name: program_name.into(),
+                program_hash: program.hash.to_vec(),
+                program_publication_id: program.publication_id.as_bytes().to_vec(),
+                installation_id: installation_id.to_vec(),
+                replication_id: replication_id.to_vec(),
+                consistency,
+                network_reachable,
+                sync_role,
+                auth: root_auth(signing, &canonical),
+            },
+        )
+    }
+
+    #[test]
+    fn v1_registry_read_verbs_are_absent() {
+        for method in [
+            "program",
+            "program_by_hash",
+            "programs",
+            "agent",
+            "agent_by_pattern",
+            "agents",
+            "agent_names",
+        ] {
+            assert!(
+                SpaceRegistryMsg::from_dynamic(&Msg::new(method)).is_none(),
+                "legacy read verb {method} must fail closed",
+            );
+        }
+    }
 
     #[test]
     fn consistency_can_only_narrow() {
@@ -2041,5 +2990,1929 @@ mod tests {
         assert_eq!(page_rows(0), PAGE_MAX_ROWS);
         assert_eq!(page_rows(1), 1);
         assert_eq!(page_rows(u32::MAX), PAGE_MAX_ROWS);
+    }
+
+    fn program(kind: ProgramKind, publication: u8, hash: u8) -> ProgramRow {
+        ProgramRow {
+            name: "program".into(),
+            hash: [hash; 32],
+            publication_id: PublicationId::new([publication; 32]),
+            kind,
+        }
+    }
+
+    #[test]
+    fn catalog_cas_binds_kind_hash_and_generation() {
+        let current = program(ProgramKind::Service { crdt: true }, 1, 7);
+        assert_eq!(
+            validate_catalog_precondition(
+                Some(&current),
+                Some(current.tag()),
+                ProgramClass::Service,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_catalog_precondition(Some(&current), None, ProgramClass::Service),
+            Err(Status::StaleCatalog),
+        );
+        // Same hash after an A -> B -> A cycle is not the same tag generation.
+        assert_eq!(
+            validate_catalog_precondition(
+                Some(&current),
+                Some(ProgramTag {
+                    publication_id: PublicationId::new([2; 32]),
+                    hash: current.hash,
+                }),
+                ProgramClass::Service,
+            ),
+            Err(Status::StaleCatalog),
+        );
+        assert_eq!(
+            validate_catalog_precondition(
+                Some(&current),
+                Some(current.tag()),
+                ProgramClass::AgentActor,
+            ),
+            Err(Status::ProgramKindMismatch),
+        );
+        assert_eq!(
+            validate_catalog_precondition(None, Some(current.tag()), ProgramClass::Service),
+            Err(Status::StaleCatalog),
+        );
+        assert_eq!(
+            validate_catalog_precondition(None, None, ProgramClass::Service),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn expected_tag_wire_rejects_partial_zero_or_drifted_shapes() {
+        assert_eq!(decode_optional_program_tag(&[], &[]), Ok(None));
+        assert!(decode_optional_program_tag(&[1; 32], &[]).is_err());
+        assert!(decode_optional_program_tag(&[], &[1; 32]).is_err());
+        assert!(decode_optional_program_tag(&[0; 32], &[1; 32]).is_err());
+        assert!(decode_optional_program_tag(&[1; 32], &[0; 32]).is_err());
+        assert!(decode_optional_program_tag(&[1; 31], &[2; 32]).is_err());
+    }
+
+    #[test]
+    fn live_installation_cas_rejects_replayed_revision_after_aba() {
+        let installation_id = InstallationId::new([3; 32]);
+        let program = ProgramTag {
+            publication_id: PublicationId::new([4; 32]),
+            hash: [5; 32],
+        };
+        assert_eq!(
+            next_installation_revision(installation_id, 0, program, [3; 32], 0, program,),
+            Ok(1),
+        );
+        // Even if a later upgrade returns to this exact named program tag,
+        // the captured revision-zero signature can no longer apply.
+        assert_eq!(
+            next_installation_revision(installation_id, 2, program, [3; 32], 0, program,),
+            Err(Status::StaleInstallation),
+        );
+        assert_eq!(
+            next_installation_revision(
+                installation_id,
+                u64::MAX,
+                program,
+                [3; 32],
+                u64::MAX,
+                program,
+            ),
+            Err(Status::StaleInstallation),
+        );
+    }
+
+    #[test]
+    fn v2_root_envelope_rejects_old_or_drifted_archives() {
+        let root = [0x42; 38];
+        assert!(
+            decode_registry_root(&root).is_none(),
+            "raw v1 root must fail closed"
+        );
+        let encoded = encode_registry_root(&root);
+        assert_eq!(decode_registry_root(&encoded), Some(root.as_slice()));
+
+        let mut wrong_version = encoded.clone();
+        wrong_version[REGISTRY_ROOT_MAGIC.len()] ^= 1;
+        assert!(decode_registry_root(&wrong_version).is_none());
+        let mut wrong_schema = encoded;
+        wrong_schema[REGISTRY_ROOT_MAGIC.len() + 4] ^= 1;
+        assert!(decode_registry_root(&wrong_schema).is_none());
+        assert!(decode_registry_root(&wrong_schema[..REGISTRY_ROOT_HEADER_BYTES]).is_none());
+
+        assert_eq!(<SpaceRegistry as vos::Actor>::STATE_SCHEMA_VERSION, 2);
+        assert_ne!(<SpaceRegistry as vos::Actor>::STATE_SCHEMA_FINGERPRINT, 0);
+    }
+
+    #[test]
+    fn set_root_requires_current_schema_identity_on_wire() {
+        let signing = SigningKey::from_bytes(&[0x2e; 32]);
+        let root = root_peer(&signing);
+
+        let historical = Msg::new("set_root").with("root", root.clone());
+        assert!(
+            SpaceRegistryMsg::from_dynamic(&historical).is_none(),
+            "the historical one-argument v1 wire must not decode as current genesis",
+        );
+        let current = Msg::new("set_root")
+            .with("root", root.clone())
+            .with("schema_version", REGISTRY_SCHEMA_VERSION)
+            .with("schema_hash", REGISTRY_SCHEMA_HASH.to_vec());
+        assert!(SpaceRegistryMsg::from_dynamic(&current).is_some());
+
+        let mut registry = SpaceRegistry::new();
+        registry.root.__init(b"test/versioned-set-root/root/");
+        let mut oversized_root = root.clone();
+        oversized_root.push(0);
+        for malformed_root in [
+            Vec::new(),
+            vec![0x2f; 38],
+            root[..root.len() - 1].to_vec(),
+            oversized_root,
+        ] {
+            assert_eq!(
+                dispatch(
+                    &mut registry,
+                    SetRoot {
+                        root: malformed_root,
+                        schema_version: REGISTRY_SCHEMA_VERSION,
+                        schema_hash: REGISTRY_SCHEMA_HASH.to_vec(),
+                    },
+                ),
+                Status::BadHash,
+            );
+            assert!(registry.root.get().is_none());
+        }
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                SetRoot {
+                    root: root.clone(),
+                    schema_version: REGISTRY_SCHEMA_VERSION - 1,
+                    schema_hash: REGISTRY_SCHEMA_HASH.to_vec(),
+                },
+            ),
+            Status::ProtocolMismatch,
+        );
+        assert!(registry.root.get().is_none());
+        let mut wrong_hash = REGISTRY_SCHEMA_HASH;
+        wrong_hash[0] ^= 1;
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                SetRoot {
+                    root: root.clone(),
+                    schema_version: REGISTRY_SCHEMA_VERSION,
+                    schema_hash: wrong_hash.to_vec(),
+                },
+            ),
+            Status::ProtocolMismatch,
+        );
+        assert!(registry.root.get().is_none());
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                SetRoot {
+                    root: root.clone(),
+                    schema_version: REGISTRY_SCHEMA_VERSION,
+                    schema_hash: REGISTRY_SCHEMA_HASH.to_vec(),
+                },
+            ),
+            Status::Ok,
+        );
+        assert_eq!(registry.root_bytes(), root);
+    }
+
+    #[test]
+    fn stale_schema_gates_behavior_reads_and_invite_redemption_before_other_storage() {
+        let admin = SigningKey::from_bytes(&[0x31; 32]);
+        let mut registry = SpaceRegistry::new();
+
+        // Initialize ONLY the root handle. Every other storage handle remains
+        // deliberately unusable, so a read that crosses its schema gate will
+        // panic instead of accidentally consulting stale rows. The raw v1 root
+        // is nevertheless a valid PeerId so it cannot be mistaken for merely
+        // malformed caller data.
+        registry.root.__init(b"test/stale-schema/root/");
+        registry.root.set(&root_peer(&admin));
+
+        let catalogued = program(ProgramKind::Service { crdt: false }, 0x32, 0x33);
+        registry.programs.push(catalogued.clone());
+        registry.agents.push(AgentRow {
+            instance_name: "stale-service".into(),
+            installation_id: InstallationId::new([0x34; 32]),
+            revision: 7,
+            program_hash: catalogued.hash,
+            program_name: catalogued.name.clone(),
+            program_publication_id: catalogued.publication_id,
+            replication_id: [0x35; 32],
+            consistency: 1,
+            network_reachable: false,
+            sync_role: SyncFloor::Member,
+        });
+        let system_agent_id = AgentId::new([0x36; 32]);
+        registry.system_actors.push(SystemActorRow {
+            instance_name: "stale-system".into(),
+            installation_id: InstallationId::new([0x37; 32]),
+            revision: 9,
+            system_agent_id,
+            actor_id: ActorId::top_level(system_agent_id, "stale-system"),
+            program_hash: [0x38; 32],
+            program_name: "stale-agent-program".into(),
+            program_publication_id: PublicationId::new([0x39; 32]),
+            host_receipt_hash: [0x3a; 32],
+        });
+
+        assert_eq!(
+            dispatch(&mut registry, Protocol),
+            RegistryProtocol::UNSUPPORTED
+        );
+        assert!(dispatch(&mut registry, Root).is_empty());
+        assert!(dispatch(&mut registry, SpaceId).is_empty());
+        assert!(dispatch(&mut registry, RoleAuthority).is_empty());
+
+        let lookup = dispatch(
+            &mut registry,
+            CatalogProgram {
+                name: catalogued.name.clone(),
+            },
+        );
+        assert_eq!(lookup.protocol, RegistryProtocol::UNSUPPORTED);
+        assert!(lookup.row.is_none());
+        let lookup = dispatch(
+            &mut registry,
+            CatalogProgramByHash {
+                hash: catalogued.hash.to_vec(),
+            },
+        );
+        assert_eq!(lookup.protocol, RegistryProtocol::UNSUPPORTED);
+        assert!(lookup.row.is_none());
+        let authorization = dispatch(
+            &mut registry,
+            ProgramBlobAuthorized {
+                hash: catalogued.hash.to_vec(),
+            },
+        );
+        assert_eq!(authorization.protocol, RegistryProtocol::UNSUPPORTED);
+        assert!(!authorization.authorized);
+        let page = dispatch(
+            &mut registry,
+            CatalogPrograms {
+                after_name: String::new(),
+                budget: 0,
+            },
+        );
+        assert_eq!(page.protocol, RegistryProtocol::UNSUPPORTED);
+        assert!(page.rows.is_empty());
+        assert!(!page.more);
+
+        assert!(
+            dispatch(
+                &mut registry,
+                MetaForProgram {
+                    program_hash: catalogued.hash.to_vec(),
+                },
+            )
+            .is_empty()
+        );
+        assert!(
+            dispatch(
+                &mut registry,
+                MetaForInstance {
+                    name: "stale-service".into(),
+                },
+            )
+            .is_empty()
+        );
+
+        let service = dispatch(
+            &mut registry,
+            ServiceActor {
+                instance_name: "stale-service".into(),
+            },
+        );
+        assert_eq!(service.protocol, RegistryProtocol::UNSUPPORTED);
+        assert!(service.row.is_none());
+        let service = dispatch(
+            &mut registry,
+            ServiceActorByPattern {
+                prefix: "stale".into(),
+                suffix: "service".into(),
+            },
+        );
+        assert_eq!(service.protocol, RegistryProtocol::UNSUPPORTED);
+        assert!(service.row.is_none());
+        let services = dispatch(
+            &mut registry,
+            ServiceActors {
+                after_name: String::new(),
+                budget: 0,
+            },
+        );
+        assert_eq!(services.protocol, RegistryProtocol::UNSUPPORTED);
+        assert!(services.rows.is_empty());
+        assert!(!services.more);
+        let names = dispatch(
+            &mut registry,
+            ServiceActorNames {
+                after_name: String::new(),
+                budget: 0,
+            },
+        );
+        assert_eq!(names.protocol, RegistryProtocol::UNSUPPORTED);
+        assert!(names.names.is_empty());
+        assert!(!names.more);
+
+        let system = dispatch(
+            &mut registry,
+            SystemActor {
+                instance_name: "stale-system".into(),
+            },
+        );
+        assert_eq!(system.protocol, RegistryProtocol::UNSUPPORTED);
+        assert!(system.row.is_none());
+        let systems = dispatch(
+            &mut registry,
+            SystemActors {
+                after_name: String::new(),
+                budget: 0,
+            },
+        );
+        assert_eq!(systems.protocol, RegistryProtocol::UNSUPPORTED);
+        assert!(systems.rows.is_empty());
+        assert!(!systems.more);
+
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                Resolve {
+                    name: "stale-service".into(),
+                    caller_prefix: 7,
+                },
+            ),
+            0
+        );
+        let mappings = dispatch(
+            &mut registry,
+            HostMappings {
+                after_name: String::new(),
+                budget: 0,
+            },
+        );
+        assert!(mappings.mappings.is_empty());
+        assert!(!mappings.more);
+        let members = dispatch(
+            &mut registry,
+            Members {
+                after_kind: 0,
+                after_key: Vec::new(),
+                budget: 0,
+            },
+        );
+        assert!(members.members.is_empty());
+        assert!(!members.more);
+        assert_eq!(dispatch(&mut registry, NodeRole { prefix: 7 }), 0);
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                PeerRole {
+                    peer_id: root_peer(&admin),
+                },
+            ),
+            AUTH_ROLE_NONE
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                PeerEpoch {
+                    peer_id: root_peer(&admin),
+                },
+            ),
+            0
+        );
+        let grants = dispatch(
+            &mut registry,
+            AuthGrants {
+                after_peer: Vec::new(),
+                budget: 0,
+            },
+        );
+        assert!(grants.grants.is_empty());
+        assert!(grants.next.is_empty());
+        let invites = dispatch(
+            &mut registry,
+            Invites {
+                after: Vec::new(),
+                budget: 0,
+            },
+        );
+        assert!(invites.invites.is_empty());
+        assert!(invites.next.is_empty());
+
+        // redeem_invite is intentionally role-ungated. Its protocol gate
+        // must still run before invite/authority storage is touched. Valid
+        // possession signatures ensure that removing/reordering the gate
+        // would advance to the deliberately uninitialized `space_id` handle.
+        let token = SigningKey::from_bytes(&[0x3b; 32]);
+        let joining_node = SigningKey::from_bytes(&[0x3c; 32]);
+        let token_pub = token.verifying_key().as_bytes().to_vec();
+        let joining_peer = root_peer(&joining_node);
+        let redeem = registry_mutation_signed_bytes(
+            &TEST_SPACE_ID,
+            "redeem_invite",
+            &[&token_pub, &joining_peer],
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                RedeemInvite {
+                    token_pub,
+                    role: AUTH_ROLE_READONLY,
+                    expires_at: 100,
+                    authority_replication_id: vec![0x3d; 32],
+                    admin_peer_id: root_peer(&admin),
+                    admin_sig: vec![0; OP_SIG_LEN],
+                    peer_id: joining_peer,
+                    redeem_sig: token.sign(&redeem).to_bytes().to_vec(),
+                    node_sig: joining_node.sign(&redeem).to_bytes().to_vec(),
+                    authority_attestation: vec![0; OP_SIG_LEN],
+                },
+            ),
+            Status::ProtocolMismatch,
+        );
+    }
+
+    #[test]
+    fn losing_publication_and_install_ids_are_burned_while_live_retries_are_idempotent() {
+        let signing = SigningKey::from_bytes(&[0x51; 32]);
+        let mut registry = SpaceRegistry::new();
+        registry.root.__init(b"test/id-burn/root/");
+        registry
+            .root
+            .set(&encode_registry_root(&root_peer(&signing)));
+        anchor_test_space(&mut registry, b"test/id-burn/space/");
+        registry
+            .used_publication_ids
+            .__init(b"test/id-burn/publications/");
+        registry
+            .authorized_program_hashes
+            .__init(b"test/id-burn/blobs/");
+        registry
+            .used_installation_ids
+            .__init(b"test/id-burn/installations/");
+        registry
+            .used_replication_ids
+            .__init(b"test/id-burn/replications/");
+        registry
+            .consistency_floors
+            .__init(b"test/id-burn/consistency/");
+
+        let winner = ProgramTag {
+            publication_id: PublicationId::new([0x52; 32]),
+            hash: [0x53; 32],
+        };
+        assert_eq!(
+            registry.publish_program_cas(
+                "program".into(),
+                winner.hash.to_vec(),
+                ProgramKind::Service { crdt: false },
+                winner.publication_id.as_bytes().to_vec(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Status::Ok,
+        );
+        assert_eq!(
+            registry.publish_program_cas(
+                "program".into(),
+                winner.hash.to_vec(),
+                ProgramKind::Service { crdt: false },
+                winner.publication_id.as_bytes().to_vec(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Status::Ok,
+            "an exact retry of the live publication is idempotent",
+        );
+        assert_eq!(
+            registry.publish_program_cas(
+                "program".into(),
+                winner.hash.to_vec(),
+                ProgramKind::Service { crdt: false },
+                winner.publication_id.as_bytes().to_vec(),
+                winner.publication_id.as_bytes().to_vec(),
+                winner.hash.to_vec(),
+            ),
+            Status::PublicationIdReused,
+            "the same result with a different signed CAS base is not an exact retry",
+        );
+        assert_eq!(
+            registry.publish_program_cas(
+                "program".into(),
+                winner.hash.to_vec(),
+                ProgramKind::Service { crdt: false },
+                winner.publication_id.as_bytes().to_vec(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Status::Ok,
+            "a preimage mismatch must not disturb the original retry binding",
+        );
+
+        let losing_publication = PublicationId::new([0x54; 32]);
+        assert_eq!(
+            registry.publish_program_cas(
+                "program".into(),
+                vec![0x55; 32],
+                ProgramKind::Service { crdt: false },
+                losing_publication.as_bytes().to_vec(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Status::StaleCatalog,
+        );
+        assert_eq!(
+            registry.unpublish_program_cas(
+                "program",
+                winner.publication_id.as_bytes(),
+                &winner.hash,
+                ProgramClass::Service,
+            ),
+            Status::Ok,
+        );
+        assert_eq!(
+            registry.publish_program_cas(
+                "program".into(),
+                vec![0x55; 32],
+                ProgramKind::Service { crdt: false },
+                losing_publication.as_bytes().to_vec(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Status::PublicationIdReused,
+            "a losing CAS cannot become latent work after the name is removed",
+        );
+
+        let future_program = ProgramTag {
+            publication_id: PublicationId::new([0x5d; 32]),
+            hash: [0x5e; 32],
+        };
+        let future_installation = [0x5f; 32];
+        let future_replication = [0x60; 32];
+        assert_eq!(
+            install_service_for_test(
+                &mut registry,
+                &signing,
+                "future-service",
+                "future-code",
+                future_program,
+                future_installation,
+                future_replication,
+            ),
+            Status::ProgramNotFound,
+        );
+        assert!(
+            registry
+                .used_installation_ids
+                .contains(&future_installation)
+        );
+        assert!(registry.used_replication_ids.contains(&future_replication));
+        assert_eq!(
+            registry.publish_program_cas(
+                "future-code".into(),
+                future_program.hash.to_vec(),
+                ProgramKind::Service { crdt: false },
+                future_program.publication_id.as_bytes().to_vec(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Status::Ok,
+        );
+        assert_eq!(
+            install_service_for_test(
+                &mut registry,
+                &signing,
+                "future-service",
+                "future-code",
+                future_program,
+                future_installation,
+                future_replication,
+            ),
+            Status::InstallationIdReused,
+            "a structurally valid install cannot become latent work after its program appears",
+        );
+        assert!(
+            registry
+                .agents
+                .iter()
+                .all(|row| row.instance_name != "future-service")
+        );
+
+        let install_program = ProgramTag {
+            publication_id: PublicationId::new([0x56; 32]),
+            hash: [0x57; 32],
+        };
+        assert_eq!(
+            registry.publish_program_cas(
+                "service-code".into(),
+                install_program.hash.to_vec(),
+                ProgramKind::Service { crdt: false },
+                install_program.publication_id.as_bytes().to_vec(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Status::Ok,
+        );
+        let crdt_loser_installation = [0x61; 32];
+        let crdt_loser_replication = [0x62; 32];
+        assert_eq!(
+            install_service_with_consistency_for_test(
+                &mut registry,
+                &signing,
+                "crdt-required",
+                "service-code",
+                install_program,
+                crdt_loser_installation,
+                crdt_loser_replication,
+                2,
+            ),
+            Status::CrdtOptInRequired,
+        );
+        assert!(
+            registry
+                .used_installation_ids
+                .contains(&crdt_loser_installation)
+        );
+        assert!(
+            registry
+                .used_replication_ids
+                .contains(&crdt_loser_replication)
+        );
+        let winning_installation = [0x58; 32];
+        let winning_replication = [0x59; 32];
+        assert_eq!(
+            install_service_for_test(
+                &mut registry,
+                &signing,
+                "service",
+                "service-code",
+                install_program,
+                winning_installation,
+                winning_replication,
+            ),
+            Status::Ok,
+        );
+        assert_eq!(
+            install_service_for_test(
+                &mut registry,
+                &signing,
+                "service",
+                "service-code",
+                install_program,
+                winning_installation,
+                winning_replication,
+            ),
+            Status::Ok,
+            "an exact retry of the live installation is idempotent",
+        );
+
+        let losing_installation = [0x5a; 32];
+        let losing_replication = [0x5b; 32];
+        assert_eq!(
+            install_service_for_test(
+                &mut registry,
+                &signing,
+                "service",
+                "service-code",
+                install_program,
+                losing_installation,
+                losing_replication,
+            ),
+            Status::InstanceExists,
+        );
+        registry.agents.clear();
+        assert_eq!(
+            install_service_for_test(
+                &mut registry,
+                &signing,
+                "service",
+                "service-code",
+                install_program,
+                losing_installation,
+                losing_replication,
+            ),
+            Status::InstallationIdReused,
+            "the losing installation identity remains burned after removal",
+        );
+        assert_eq!(
+            install_service_for_test(
+                &mut registry,
+                &signing,
+                "service",
+                "service-code",
+                install_program,
+                [0x5c; 32],
+                losing_replication,
+            ),
+            Status::ReplicationIdReused,
+            "the losing replication identity remains burned after removal",
+        );
+    }
+
+    #[test]
+    fn blob_authorization_retains_successful_history_but_excludes_failed_admission() {
+        let mut registry = SpaceRegistry::new();
+        registry.root.__init(b"test/blob-history/root/");
+        registry.root.set(&encode_registry_root(&[0x61; 38]));
+        anchor_test_space(&mut registry, b"test/blob-history/space/");
+        registry
+            .used_publication_ids
+            .__init(b"test/blob-history/publications/");
+        registry
+            .authorized_program_hashes
+            .__init(b"test/blob-history/authorized/");
+
+        let first = ProgramTag {
+            publication_id: PublicationId::new([0x62; 32]),
+            hash: [0x63; 32],
+        };
+        let second = ProgramTag {
+            publication_id: PublicationId::new([0x64; 32]),
+            hash: [0x65; 32],
+        };
+        assert_eq!(
+            registry.publish_program_cas(
+                "moving".into(),
+                first.hash.to_vec(),
+                ProgramKind::AgentActor,
+                first.publication_id.as_bytes().to_vec(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Status::Ok,
+        );
+        assert_eq!(
+            registry.publish_program_cas(
+                "moving".into(),
+                second.hash.to_vec(),
+                ProgramKind::AgentActor,
+                second.publication_id.as_bytes().to_vec(),
+                first.publication_id.as_bytes().to_vec(),
+                first.hash.to_vec(),
+            ),
+            Status::Ok,
+        );
+
+        let losing_hash = [0x66; 32];
+        assert_eq!(
+            registry.publish_program_cas(
+                "moving".into(),
+                losing_hash.to_vec(),
+                ProgramKind::AgentActor,
+                vec![0x67; 32],
+                first.publication_id.as_bytes().to_vec(),
+                first.hash.to_vec(),
+            ),
+            Status::StaleCatalog,
+        );
+        let invalid_hash = [0; 32];
+        assert_eq!(
+            registry.publish_program_cas(
+                "invalid".into(),
+                invalid_hash.to_vec(),
+                ProgramKind::AgentActor,
+                vec![0x68; 32],
+                Vec::new(),
+                Vec::new(),
+            ),
+            Status::BadHash,
+        );
+        assert_eq!(
+            registry.unpublish_program_cas(
+                "moving",
+                second.publication_id.as_bytes(),
+                &second.hash,
+                ProgramClass::AgentActor,
+            ),
+            Status::Ok,
+        );
+
+        for retained in [first.hash, second.hash] {
+            let authorization = dispatch(
+                &mut registry,
+                ProgramBlobAuthorized {
+                    hash: retained.to_vec(),
+                },
+            );
+            assert_eq!(authorization.protocol, RegistryProtocol::CURRENT);
+            assert!(authorization.authorized);
+        }
+        for rejected in [losing_hash, invalid_hash] {
+            let authorization = dispatch(
+                &mut registry,
+                ProgramBlobAuthorized {
+                    hash: rejected.to_vec(),
+                },
+            );
+            assert_eq!(authorization.protocol, RegistryProtocol::CURRENT);
+            assert!(!authorization.authorized);
+        }
+    }
+
+    #[test]
+    fn space_id_rejects_zero_and_noncanonical_lengths() {
+        let mut registry = SpaceRegistry::new();
+        registry.root.__init(b"test/space-id/root/");
+        registry.root.set(&encode_registry_root(&[0x71; 38]));
+        registry.space_id.__init(b"test/space-id/value/");
+
+        for invalid in [Vec::new(), vec![0x72; 31], vec![0; 32], vec![0x72; 33]] {
+            assert_eq!(
+                dispatch(&mut registry, SetSpaceId { space_id: invalid },),
+                Status::BadHash,
+            );
+            assert!(dispatch(&mut registry, SpaceId).is_empty());
+        }
+
+        let valid = vec![0x73; 32];
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                SetSpaceId {
+                    space_id: valid.clone(),
+                },
+            ),
+            Status::Ok,
+        );
+        assert_eq!(dispatch(&mut registry, SpaceId), valid);
+        for replacement in [vec![0x73; 32], vec![0x74; 32]] {
+            assert_eq!(
+                dispatch(
+                    &mut registry,
+                    SetSpaceId {
+                        space_id: replacement,
+                    },
+                ),
+                Status::Forbidden,
+                "the exact first space anchor is immutable",
+            );
+            assert_eq!(dispatch(&mut registry, SpaceId), vec![0x73; 32]);
+        }
+    }
+
+    #[test]
+    fn signed_mutations_require_the_exact_durable_space_anchor() {
+        let signing = SigningKey::from_bytes(&[0x75; 32]);
+        let root = encode_registry_root(&root_peer(&signing));
+        let space_a = [0x76; 32];
+        let space_b = [0x77; 32];
+        let prefix = 23u32;
+        let node_peer = root_peer(&SigningKey::from_bytes(&[0x78; 32]));
+        let canonical = registry_mutation_signed_bytes(
+            &space_a,
+            "add_node",
+            &[&prefix.to_le_bytes(), &node_peer, &[NODE_ROLE_VOTER]],
+        );
+        let auth = root_auth(&signing, &canonical);
+
+        let mut unanchored = SpaceRegistry::new();
+        unanchored.root.__init(b"test/scoped-auth/unanchored/root/");
+        unanchored.root.set(&root);
+        unanchored
+            .space_id
+            .__init(b"test/scoped-auth/unanchored/space/");
+        unanchored
+            .nodes
+            .__init(b"test/scoped-auth/unanchored/nodes/");
+        unanchored
+            .host_mappings
+            .__init(b"test/scoped-auth/unanchored/remotes/");
+        assert_eq!(
+            dispatch(
+                &mut unanchored,
+                AddNode {
+                    prefix,
+                    peer_id: node_peer.clone(),
+                    role: NODE_ROLE_VOTER,
+                    auth: auth.clone(),
+                },
+            ),
+            Status::Forbidden,
+            "no signed mutation is admissible before the space anchor",
+        );
+        assert_eq!(
+            dispatch(
+                &mut unanchored,
+                SetSpaceId {
+                    space_id: space_a.to_vec(),
+                },
+            ),
+            Status::Ok,
+        );
+        assert_eq!(
+            dispatch(
+                &mut unanchored,
+                AddNode {
+                    prefix,
+                    peer_id: node_peer.clone(),
+                    role: NODE_ROLE_VOTER,
+                    auth: auth.clone(),
+                },
+            ),
+            Status::Ok,
+            "the identical operation is valid after the durable anchor exists",
+        );
+
+        let mut sibling = SpaceRegistry::new();
+        sibling.root.__init(b"test/scoped-auth/sibling/root/");
+        sibling.root.set(&root);
+        sibling.space_id.__init(b"test/scoped-auth/sibling/space/");
+        sibling.space_id.set(&space_b.to_vec());
+        sibling.nodes.__init(b"test/scoped-auth/sibling/nodes/");
+        sibling
+            .host_mappings
+            .__init(b"test/scoped-auth/sibling/remotes/");
+        assert_eq!(
+            dispatch(
+                &mut sibling,
+                AddNode {
+                    prefix,
+                    peer_id: node_peer.clone(),
+                    role: NODE_ROLE_VOTER,
+                    auth,
+                },
+            ),
+            Status::Forbidden,
+            "an operation signed by the same root for another space must not transplant",
+        );
+        let sibling_canonical = registry_mutation_signed_bytes(
+            &space_b,
+            "add_node",
+            &[&prefix.to_le_bytes(), &node_peer, &[NODE_ROLE_VOTER]],
+        );
+        assert_eq!(
+            dispatch(
+                &mut sibling,
+                AddNode {
+                    prefix,
+                    peer_id: node_peer,
+                    role: NODE_ROLE_VOTER,
+                    auth: root_auth(&signing, &sibling_canonical),
+                },
+            ),
+            Status::Ok,
+        );
+
+        let host_prefix = 29u32;
+        let remote_canonical = registry_mutation_signed_bytes(
+            &space_a,
+            "register_remote",
+            &[b"counter", &host_prefix.to_le_bytes()],
+        );
+        let remote_auth = root_auth(&signing, &remote_canonical);
+        assert_eq!(
+            dispatch(
+                &mut unanchored,
+                RegisterRemote {
+                    instance_name: "counter".into(),
+                    host_prefix,
+                    auth: remote_auth.clone(),
+                },
+            ),
+            Status::Ok,
+        );
+        assert_eq!(
+            dispatch(
+                &mut sibling,
+                RegisterRemote {
+                    instance_name: "counter".into(),
+                    host_prefix,
+                    auth: remote_auth,
+                },
+            ),
+            Status::Forbidden,
+            "a federation advertisement also binds its registry's exact space anchor",
+        );
+    }
+
+    #[test]
+    fn membership_mutations_reject_lossy_or_undocumented_shapes() {
+        let signing = SigningKey::from_bytes(&[0x79; 32]);
+        let mut registry = SpaceRegistry::new();
+        registry.root.__init(b"test/member-shapes/root/");
+        registry
+            .root
+            .set(&encode_registry_root(&root_peer(&signing)));
+        anchor_test_space(&mut registry, b"test/member-shapes/space/");
+        registry.nodes.__init(b"test/member-shapes/nodes/");
+        registry
+            .identities
+            .__init(b"test/member-shapes/identities/");
+
+        let valid_peer = root_peer(&SigningKey::from_bytes(&[0x7a; 32]));
+        for (prefix, peer_id, role) in [
+            (u16::MAX as u32 + 1, valid_peer.clone(), NODE_ROLE_VOTER),
+            (7, vec![0x7b; 38], NODE_ROLE_VOTER),
+            (7, valid_peer.clone(), 99),
+        ] {
+            let canonical = registry_mutation_signed_bytes(
+                &TEST_SPACE_ID,
+                "add_node",
+                &[&prefix.to_le_bytes(), &peer_id, &[role]],
+            );
+            assert_eq!(
+                dispatch(
+                    &mut registry,
+                    AddNode {
+                        prefix,
+                        peer_id,
+                        role,
+                        auth: root_auth(&signing, &canonical),
+                    },
+                ),
+                Status::BadHash,
+            );
+        }
+
+        let prefix = u16::MAX as u32 + 1;
+        let canonical =
+            registry_mutation_signed_bytes(&TEST_SPACE_ID, "remove_node", &[&prefix.to_le_bytes()]);
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                RemoveNode {
+                    prefix,
+                    auth: root_auth(&signing, &canonical),
+                },
+            ),
+            Status::BadPrefix,
+        );
+
+        let public_key = vec![0x7c; 32];
+        let proof_kind = 99;
+        let proof_data = vec![0x7d];
+        let canonical = registry_mutation_signed_bytes(
+            &TEST_SPACE_ID,
+            "add_identity",
+            &[&public_key, &[proof_kind], &proof_data],
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                AddIdentity {
+                    public_key,
+                    proof_kind,
+                    proof_data,
+                    auth: root_auth(&signing, &canonical),
+                },
+            ),
+            Status::BadHash,
+        );
+    }
+
+    #[test]
+    fn prefix_queries_reject_values_that_do_not_fit_the_persisted_u16_key() {
+        let signing = SigningKey::from_bytes(&[0x7e; 32]);
+        let mut registry = SpaceRegistry::new();
+        registry.root.__init(b"test/prefix-query-shapes/root/");
+        registry
+            .root
+            .set(&encode_registry_root(&root_peer(&signing)));
+        registry.nodes.__init(b"test/prefix-query-shapes/nodes/");
+
+        let prefix = 7u16;
+        registry.nodes.insert(
+            &prefix,
+            &MemberRow {
+                kind: MEMBER_KIND_NODE,
+                key: root_peer(&SigningKey::from_bytes(&[0x7f; 32])),
+                prefix,
+                role: NODE_ROLE_VOTER,
+                proof_kind: 0,
+                proof_data: Vec::new(),
+            },
+        );
+        registry.agents.push(AgentRow {
+            instance_name: "counter".into(),
+            installation_id: InstallationId::new([0x70; 32]),
+            revision: 0,
+            program_hash: [0x71; 32],
+            program_name: "counter-program".into(),
+            program_publication_id: PublicationId::new([0x72; 32]),
+            replication_id: [0x73; 32],
+            consistency: 1,
+            network_reachable: false,
+            sync_role: SyncFloor::Member,
+        });
+
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                NodeRole {
+                    prefix: u64::from(prefix),
+                },
+            ),
+            NODE_ROLE_VOTER + 1,
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                Resolve {
+                    name: "counter".into(),
+                    caller_prefix: u64::from(prefix),
+                },
+            ),
+            instance_service_id("counter", prefix),
+        );
+
+        for aliased in [u64::from(u16::MAX) + 1 + u64::from(prefix), u64::MAX] {
+            assert_eq!(dispatch(&mut registry, NodeRole { prefix: aliased }), 0);
+            assert_eq!(
+                dispatch(
+                    &mut registry,
+                    Resolve {
+                        name: "counter".into(),
+                        caller_prefix: aliased,
+                    },
+                ),
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn role_mutations_reject_bad_shapes_and_replay_cannot_restore_a_revoked_grant() {
+        let signing = SigningKey::from_bytes(&[0x80; 32]);
+        let authority = [0x81; 32];
+        let mut registry = SpaceRegistry::new();
+        registry.root.__init(b"test/role-shapes/root/");
+        registry
+            .root
+            .set(&encode_registry_root(&root_peer(&signing)));
+        anchor_test_space(&mut registry, b"test/role-shapes/space/");
+        registry
+            .role_authority
+            .__init(b"test/role-shapes/authority/");
+        registry.role_authority.set(&authority);
+        registry.auth_grants.__init(b"test/role-shapes/grants/");
+        registry.revoke_epochs.__init(b"test/role-shapes/revokes/");
+        registry
+            .authority_grant_witnesses
+            .__init(b"test/role-shapes/witnesses/");
+
+        let rejected_target = root_peer(&SigningKey::from_bytes(&[0x82; 32]));
+        for role in [AUTH_ROLE_NONE, AUTH_ROLE_ADMIN + 1, u8::MAX] {
+            let epoch = 1u64;
+            let canonical = registry_mutation_signed_bytes(
+                &TEST_SPACE_ID,
+                "grant_role",
+                &[&rejected_target, &[role], &epoch.to_le_bytes(), &authority],
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    dispatch(
+                        &mut registry,
+                        GrantRole {
+                            peer_id: rejected_target.clone(),
+                            role,
+                            epoch,
+                            authority_replication_id: authority.to_vec(),
+                            auth: root_auth(&signing, &canonical),
+                        },
+                    ),
+                    Status::BadHash,
+                );
+            }
+        }
+        assert!(
+            registry
+                .auth_grants
+                .get(&peer_key(&rejected_target))
+                .is_none(),
+            "malformed or non-grantable role must not create replayable state",
+        );
+
+        let malformed_target = rejected_target[..rejected_target.len() - 1].to_vec();
+        let role = AUTH_ROLE_READONLY;
+        let epoch = 1u64;
+        let canonical = registry_mutation_signed_bytes(
+            &TEST_SPACE_ID,
+            "grant_role",
+            &[&malformed_target, &[role], &epoch.to_le_bytes(), &authority],
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                GrantRole {
+                    peer_id: malformed_target.clone(),
+                    role,
+                    epoch,
+                    authority_replication_id: authority.to_vec(),
+                    auth: root_auth(&signing, &canonical),
+                },
+            ),
+            Status::BadHash,
+        );
+        assert!(
+            registry
+                .auth_grants
+                .get(&peer_key(&malformed_target))
+                .is_none()
+        );
+
+        let mut granted = Vec::new();
+        for (seed, role, epoch) in [
+            (0x83, AUTH_ROLE_READONLY, 1u64),
+            (0x84, AUTH_ROLE_DEVELOPER, 2u64),
+            (0x85, AUTH_ROLE_ADMIN, 3u64),
+        ] {
+            let peer_id = root_peer(&SigningKey::from_bytes(&[seed; 32]));
+            let canonical = registry_mutation_signed_bytes(
+                &TEST_SPACE_ID,
+                "grant_role",
+                &[&peer_id, &[role], &epoch.to_le_bytes(), &authority],
+            );
+            assert_eq!(
+                dispatch(
+                    &mut registry,
+                    GrantRole {
+                        peer_id: peer_id.clone(),
+                        role,
+                        epoch,
+                        authority_replication_id: authority.to_vec(),
+                        auth: root_auth(&signing, &canonical),
+                    },
+                ),
+                Status::Ok,
+            );
+            assert_eq!(
+                dispatch(
+                    &mut registry,
+                    PeerRole {
+                        peer_id: peer_id.clone(),
+                    },
+                ),
+                role,
+            );
+            granted.push((peer_id, role, epoch, canonical));
+        }
+
+        let malformed_revoke = vec![0x86; 38];
+        let revoke_epoch = 10u64;
+        let canonical = registry_mutation_signed_bytes(
+            &TEST_SPACE_ID,
+            "revoke_role",
+            &[&malformed_revoke, &revoke_epoch.to_le_bytes(), &authority],
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                RevokeRole {
+                    peer_id: malformed_revoke.clone(),
+                    epoch: revoke_epoch,
+                    authority_replication_id: authority.to_vec(),
+                    auth: root_auth(&signing, &canonical),
+                },
+            ),
+            Status::BadHash,
+        );
+        assert_eq!(registry.revoke_floor(&malformed_revoke), 0);
+
+        let (peer_id, role, grant_epoch, grant_canonical) = &granted[0];
+        let canonical = registry_mutation_signed_bytes(
+            &TEST_SPACE_ID,
+            "revoke_role",
+            &[peer_id, &revoke_epoch.to_le_bytes(), &authority],
+        );
+        let revoke = || RevokeRole {
+            peer_id: peer_id.clone(),
+            epoch: revoke_epoch,
+            authority_replication_id: authority.to_vec(),
+            auth: root_auth(&signing, &canonical),
+        };
+        assert_eq!(dispatch(&mut registry, revoke()), Status::Ok);
+        assert_eq!(dispatch(&mut registry, revoke()), Status::Ok);
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                PeerRole {
+                    peer_id: peer_id.clone(),
+                },
+            ),
+            AUTH_ROLE_NONE,
+        );
+
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                GrantRole {
+                    peer_id: peer_id.clone(),
+                    role: *role,
+                    epoch: *grant_epoch,
+                    authority_replication_id: authority.to_vec(),
+                    auth: root_auth(&signing, grant_canonical),
+                },
+            ),
+            Status::Ok,
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                PeerRole {
+                    peer_id: peer_id.clone(),
+                },
+            ),
+            AUTH_ROLE_NONE,
+            "replaying a pre-revoke grant must not restore its capability",
+        );
+    }
+
+    #[test]
+    fn invite_role_shape_is_distinct_from_offline_invite_policy_and_replays_idempotently() {
+        let admin = SigningKey::from_bytes(&[0x87; 32]);
+        let joining = SigningKey::from_bytes(&[0x88; 32]);
+        let token = SigningKey::from_bytes(&[0x89; 32]);
+        let admin_peer_id = root_peer(&admin);
+        let peer_id = root_peer(&joining);
+        let token_pub = token.verifying_key().as_bytes().to_vec();
+        let authority = [0x8a; 32];
+        let expires_at = 100u64;
+
+        let mut registry = SpaceRegistry::new();
+        registry.root.__init(b"test/invite-role-shapes/root/");
+        registry.root.set(&encode_registry_root(&admin_peer_id));
+        anchor_test_space(&mut registry, b"test/invite-role-shapes/space/");
+        registry
+            .role_authority
+            .__init(b"test/invite-role-shapes/authority/");
+        registry.role_authority.set(&authority);
+        registry
+            .auth_grants
+            .__init(b"test/invite-role-shapes/grants/");
+        registry
+            .revoke_epochs
+            .__init(b"test/invite-role-shapes/revokes/");
+        registry
+            .authority_grant_witnesses
+            .__init(b"test/invite-role-shapes/witnesses/");
+        registry.invites.__init(b"test/invite-role-shapes/invites/");
+
+        let malformed_role_message = |role| RedeemInvite {
+            token_pub: token_pub.clone(),
+            role,
+            expires_at,
+            authority_replication_id: authority.to_vec(),
+            admin_peer_id: admin_peer_id.clone(),
+            admin_sig: vec![0; OP_SIG_LEN],
+            peer_id: peer_id.clone(),
+            redeem_sig: vec![0; OP_SIG_LEN],
+            node_sig: vec![0; OP_SIG_LEN],
+            authority_attestation: vec![0; OP_SIG_LEN],
+        };
+        for role in [AUTH_ROLE_ADMIN + 1, u8::MAX] {
+            assert_eq!(
+                dispatch(&mut registry, malformed_role_message(role)),
+                Status::BadHash,
+            );
+        }
+        for role in [AUTH_ROLE_NONE, AUTH_ROLE_ADMIN] {
+            assert_eq!(
+                dispatch(&mut registry, malformed_role_message(role)),
+                Status::Forbidden,
+            );
+        }
+        assert_eq!(registry.invites.len(), 0);
+        assert_eq!(registry.auth_grants.len(), 0);
+
+        let role = AUTH_ROLE_READONLY;
+        let token_pub_key = bytes_to_32(&token_pub).unwrap();
+        let invite_canonical =
+            invite_signed_bytes(&TEST_SPACE_ID, role, expires_at, &token_pub_key, &authority);
+        let admin_sig = admin.sign(&invite_canonical).to_bytes().to_vec();
+        let redeem_canonical = registry_mutation_signed_bytes(
+            &TEST_SPACE_ID,
+            "redeem_invite",
+            &[&token_pub, &peer_id],
+        );
+        let redeem_sig = token.sign(&redeem_canonical).to_bytes().to_vec();
+        let node_sig = joining.sign(&redeem_canonical).to_bytes().to_vec();
+        let attestation_canonical = registry_mutation_signed_bytes(
+            &TEST_SPACE_ID,
+            "attest_role_authority_invite",
+            &[
+                &authority,
+                &token_pub,
+                &[role],
+                &expires_at.to_le_bytes(),
+                &admin_peer_id,
+                &admin_sig,
+                &peer_id,
+                &redeem_sig,
+                &node_sig,
+            ],
+        );
+        let redeem = || RedeemInvite {
+            token_pub: token_pub.clone(),
+            role,
+            expires_at,
+            authority_replication_id: authority.to_vec(),
+            admin_peer_id: admin_peer_id.clone(),
+            admin_sig: admin_sig.clone(),
+            peer_id: peer_id.clone(),
+            redeem_sig: redeem_sig.clone(),
+            node_sig: node_sig.clone(),
+            authority_attestation: root_auth(&admin, &attestation_canonical),
+        };
+        assert_eq!(dispatch(&mut registry, redeem()), Status::Ok);
+        assert_eq!(dispatch(&mut registry, redeem()), Status::Ok);
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                PeerRole {
+                    peer_id: peer_id.clone(),
+                },
+            ),
+            role,
+        );
+        let invite = registry.invites.get(&token_pub_key).unwrap();
+        assert_eq!(invite.role, role);
+        assert_eq!(invite.redeemed_by, vec![peer_id]);
+    }
+
+    #[test]
+    fn registry_storage_boundaries_accept_only_canonical_slugs() {
+        for valid in [
+            "a".to_owned(),
+            "0".to_owned(),
+            "agent-01".to_owned(),
+            "a--b".to_owned(),
+            format!("a{}z", "0".repeat(61)),
+        ] {
+            assert!(
+                is_canonical_registry_slug(&valid),
+                "valid slug rejected: {valid}"
+            );
+        }
+        for invalid in [
+            String::new(),
+            "-agent".into(),
+            "agent-".into(),
+            "Agent".into(),
+            "agent_actor".into(),
+            "agent.actor".into(),
+            "agent/actor".into(),
+            "agent actor".into(),
+            "é".into(),
+            "a".repeat(64),
+        ] {
+            assert!(
+                !is_canonical_registry_slug(&invalid),
+                "noncanonical slug accepted: {invalid:?}",
+            );
+        }
+
+        let signing = SigningKey::from_bytes(&[0x74; 32]);
+        let mut registry = SpaceRegistry::new();
+        registry.root.__init(b"test/slug-boundary/root/");
+        registry
+            .root
+            .set(&encode_registry_root(&root_peer(&signing)));
+        anchor_test_space(&mut registry, b"test/slug-boundary/space/");
+        registry
+            .used_publication_ids
+            .__init(b"test/slug-boundary/publications/");
+        registry
+            .authorized_program_hashes
+            .__init(b"test/slug-boundary/authorized/");
+
+        assert_eq!(
+            registry.publish_program_cas(
+                "Bad-Program".into(),
+                vec![0x75; 32],
+                ProgramKind::Service { crdt: false },
+                vec![0x76; 32],
+                Vec::new(),
+                Vec::new(),
+            ),
+            Status::BadHash,
+        );
+
+        // These maps remain intentionally uninitialized. BadHash therefore
+        // proves validation ran before either invalid name could become a
+        // storage key.
+        let remote_canonical = registry_mutation_signed_bytes(
+            &TEST_SPACE_ID,
+            "register_remote",
+            &["bad_name".as_bytes(), &7u32.to_le_bytes()],
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                RegisterRemote {
+                    instance_name: "bad_name".into(),
+                    host_prefix: 7,
+                    auth: root_auth(&signing, &remote_canonical),
+                },
+            ),
+            Status::BadHash,
+        );
+        let extension_name = "bad.extension";
+        let extension_blob = Vec::new();
+        let extension_canonical = registry_mutation_signed_bytes(
+            &TEST_SPACE_ID,
+            "register_extension_meta",
+            &[extension_name.as_bytes(), &extension_blob],
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                RegisterExtensionMeta {
+                    instance_name: extension_name.into(),
+                    blob: extension_blob,
+                    auth: root_auth(&signing, &extension_canonical),
+                },
+            ),
+            Status::BadHash,
+        );
+
+        let program = ProgramTag {
+            publication_id: PublicationId::new([0x77; 32]),
+            hash: [0x78; 32],
+        };
+        assert_eq!(
+            install_service_for_test(
+                &mut registry,
+                &signing,
+                "Bad-Instance",
+                "program",
+                program,
+                [0x79; 32],
+                [0x7a; 32],
+            ),
+            Status::BadHash,
+        );
+        assert_eq!(
+            install_service_for_test(
+                &mut registry,
+                &signing,
+                "instance",
+                "bad_program",
+                program,
+                [0x7b; 32],
+                [0x7c; 32],
+            ),
+            Status::BadHash,
+        );
+
+        let system_agent = AgentId::new([0x7d; 32]);
+        let mut receipt = SystemActorInstallReceipt {
+            protocol: RegistryProtocol::CURRENT,
+            installation_id: InstallationId::new([0x7e; 32]),
+            system_agent_id: system_agent,
+            actor_id: ActorId::top_level(system_agent, "system-actor"),
+            instance_name: "system-actor".into(),
+            program_name: "system-program".into(),
+            program_hash: [0x7f; 32],
+            program_publication_id: PublicationId::new([0x80; 32]),
+            host_receipt: vec![0x81],
+        };
+        assert!(valid_system_actor_install_receipt(&receipt));
+        receipt.instance_name = "system_actor".into();
+        assert!(!valid_system_actor_install_receipt(&receipt));
+        receipt.instance_name = "system-actor".into();
+        receipt.program_name = "System-Program".into();
+        assert!(!valid_system_actor_install_receipt(&receipt));
+    }
+
+    #[test]
+    fn service_and_system_actors_share_one_instance_name_namespace() {
+        let signing = SigningKey::from_bytes(&[0x82; 32]);
+        let mut registry = SpaceRegistry::new();
+        registry.root.__init(b"test/shared-name/root/");
+        registry
+            .root
+            .set(&encode_registry_root(&root_peer(&signing)));
+        anchor_test_space(&mut registry, b"test/shared-name/space/");
+        registry
+            .used_publication_ids
+            .__init(b"test/shared-name/publications/");
+        registry
+            .authorized_program_hashes
+            .__init(b"test/shared-name/authorized/");
+        registry
+            .used_installation_ids
+            .__init(b"test/shared-name/installations/");
+        registry
+            .used_replication_ids
+            .__init(b"test/shared-name/replications/");
+        registry
+            .consistency_floors
+            .__init(b"test/shared-name/consistency/");
+
+        let program = ProgramTag {
+            publication_id: PublicationId::new([0x83; 32]),
+            hash: [0x84; 32],
+        };
+        assert_eq!(
+            registry.publish_program_cas(
+                "service-program".into(),
+                program.hash.to_vec(),
+                ProgramKind::Service { crdt: false },
+                program.publication_id.as_bytes().to_vec(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Status::Ok,
+        );
+        let system_agent = AgentId::new([0x85; 32]);
+        registry.system_actors.push(SystemActorRow {
+            instance_name: "shared-name".into(),
+            installation_id: InstallationId::new([0x86; 32]),
+            revision: 0,
+            system_agent_id: system_agent,
+            actor_id: ActorId::top_level(system_agent, "shared-name"),
+            program_hash: [0x87; 32],
+            program_name: "system-program".into(),
+            program_publication_id: PublicationId::new([0x88; 32]),
+            host_receipt_hash: [0x89; 32],
+        });
+
+        let losing_installation = [0x8a; 32];
+        let losing_replication = [0x8b; 32];
+        assert_eq!(
+            install_service_for_test(
+                &mut registry,
+                &signing,
+                "shared-name",
+                "service-program",
+                program,
+                losing_installation,
+                losing_replication,
+            ),
+            Status::InstanceExists,
+        );
+        assert!(registry.agents.is_empty());
+        assert!(
+            registry
+                .used_installation_ids
+                .contains(&losing_installation)
+        );
+        assert!(registry.used_replication_ids.contains(&losing_replication));
+    }
+
+    #[test]
+    fn loose_host_lifecycle_handlers_fail_closed_after_schema_and_auth() {
+        let signing = SigningKey::from_bytes(&[0x91; 32]);
+        let mut registry = SpaceRegistry::new();
+        registry.root.__init(b"test/host-lifecycle/root/");
+        registry
+            .root
+            .set(&encode_registry_root(&root_peer(&signing)));
+        anchor_test_space(&mut registry, b"test/host-lifecycle/space/");
+
+        // No lifecycle-related storage handle is initialized. An authorized
+        // call can return HostLifecycleRequired only if the obsolete registry
+        // mutation path is completely side-effect free.
+        let receipt = vec![0x92; 32];
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                InstallSystemActor {
+                    receipt: receipt.clone(),
+                    auth: Vec::new(),
+                },
+            ),
+            Status::Forbidden,
+        );
+        let canonical = install_system_actor_signed_bytes(&TEST_SPACE_ID, &receipt);
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                InstallSystemActor {
+                    receipt,
+                    auth: root_auth(&signing, &canonical),
+                },
+            ),
+            Status::HostLifecycleRequired,
+        );
+
+        let instance_name = "system-actor";
+        let installation_id = vec![0x93; 32];
+        let expected_program_hash = vec![0x94; 32];
+        let expected_publication_id = vec![0x95; 32];
+        let canonical = uninstall_system_actor_signed_bytes(
+            &TEST_SPACE_ID,
+            instance_name,
+            &installation_id,
+            4,
+            &expected_program_hash,
+            &expected_publication_id,
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                UninstallSystemActor {
+                    instance_name: instance_name.into(),
+                    installation_id: installation_id.clone(),
+                    expected_revision: 4,
+                    expected_program_hash: expected_program_hash.clone(),
+                    expected_program_publication_id: expected_publication_id.clone(),
+                    auth: Vec::new(),
+                },
+            ),
+            Status::Forbidden,
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                UninstallSystemActor {
+                    instance_name: instance_name.into(),
+                    installation_id: installation_id.clone(),
+                    expected_revision: 4,
+                    expected_program_hash: expected_program_hash.clone(),
+                    expected_program_publication_id: expected_publication_id.clone(),
+                    auth: root_auth(&signing, &canonical),
+                },
+            ),
+            Status::HostLifecycleRequired,
+        );
+
+        let new_program_name = "system-program-v2";
+        let new_program_hash = vec![0x96; 32];
+        let new_publication_id = vec![0x97; 32];
+        let canonical = upgrade_system_actor_signed_bytes(
+            &TEST_SPACE_ID,
+            instance_name,
+            &installation_id,
+            4,
+            &expected_program_hash,
+            &expected_publication_id,
+            new_program_name,
+            &new_program_hash,
+            &new_publication_id,
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                UpgradeSystemActor {
+                    instance_name: instance_name.into(),
+                    installation_id: installation_id.clone(),
+                    expected_revision: 4,
+                    from_program_hash: expected_program_hash.clone(),
+                    from_program_publication_id: expected_publication_id.clone(),
+                    new_program_name: new_program_name.into(),
+                    new_program_hash: new_program_hash.clone(),
+                    new_program_publication_id: new_publication_id.clone(),
+                    auth: Vec::new(),
+                },
+            ),
+            Status::Forbidden,
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                UpgradeSystemActor {
+                    instance_name: instance_name.into(),
+                    installation_id: installation_id.clone(),
+                    expected_revision: 4,
+                    from_program_hash: expected_program_hash.clone(),
+                    from_program_publication_id: expected_publication_id.clone(),
+                    new_program_name: new_program_name.into(),
+                    new_program_hash: new_program_hash.clone(),
+                    new_program_publication_id: new_publication_id.clone(),
+                    auth: root_auth(&signing, &canonical),
+                },
+            ),
+            Status::HostLifecycleRequired,
+        );
+
+        let service_canonical = upgrade_service_actor_signed_bytes(
+            &TEST_SPACE_ID,
+            "service-actor",
+            &installation_id,
+            2,
+            &expected_program_hash,
+            &expected_publication_id,
+            "service-program-v2",
+            &new_program_hash,
+            &new_publication_id,
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                UpgradeServiceActor {
+                    instance_name: "service-actor".into(),
+                    installation_id: installation_id.clone(),
+                    expected_revision: 2,
+                    from_program_hash: expected_program_hash.clone(),
+                    from_program_publication_id: expected_publication_id.clone(),
+                    new_program_name: "service-program-v2".into(),
+                    new_program_hash: new_program_hash.clone(),
+                    new_program_publication_id: new_publication_id.clone(),
+                    auth: Vec::new(),
+                },
+            ),
+            Status::Forbidden,
+        );
+        assert_eq!(
+            dispatch(
+                &mut registry,
+                UpgradeServiceActor {
+                    instance_name: "service-actor".into(),
+                    installation_id,
+                    expected_revision: 2,
+                    from_program_hash: expected_program_hash,
+                    from_program_publication_id: expected_publication_id,
+                    new_program_name: "service-program-v2".into(),
+                    new_program_hash,
+                    new_program_publication_id: new_publication_id,
+                    auth: root_auth(&signing, &service_canonical),
+                },
+            ),
+            Status::HostLifecycleRequired,
+        );
+        assert!(registry.agents.is_empty());
+        assert!(registry.system_actors.is_empty());
+
+        let mut stale = SpaceRegistry::new();
+        stale.root.__init(b"test/host-lifecycle/stale-root/");
+        stale.root.set(&root_peer(&signing));
+        let stale_receipt = vec![0x98; 32];
+        let stale_canonical = install_system_actor_signed_bytes(&TEST_SPACE_ID, &stale_receipt);
+        assert_eq!(
+            dispatch(
+                &mut stale,
+                InstallSystemActor {
+                    receipt: stale_receipt,
+                    auth: root_auth(&signing, &stale_canonical),
+                },
+            ),
+            Status::ProtocolMismatch,
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "bin")]
+    fn extension_restart_refuses_old_state_header() {
+        let live = vos_extension_create(core::ptr::null(), 0);
+        assert!(!live.is_null());
+
+        let mut ptr = core::ptr::null_mut();
+        let mut len = 0usize;
+        let mut capacity = 0usize;
+        vos_extension_state_v2(live, &mut ptr, &mut len, &mut capacity);
+        assert!(!ptr.is_null());
+        let mut state = unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec();
+        vos_extension_free(ptr, len, capacity);
+        vos_extension_drop(live);
+
+        assert_eq!(&state[..8], b"VOSXST02");
+        assert_eq!(
+            u64::from_le_bytes(state[8..16].try_into().unwrap()),
+            <SpaceRegistry as vos::Actor>::STATE_SCHEMA_VERSION,
+        );
+        let restored = vos_extension_load(state.as_ptr(), state.len());
+        assert!(!restored.is_null(), "current state header must restart");
+        vos_extension_drop(restored);
+
+        state[8..16].copy_from_slice(&1u64.to_le_bytes());
+        assert!(
+            vos_extension_load(state.as_ptr(), state.len()).is_null(),
+            "a v1 actor snapshot must fail closed at restart",
+        );
+
+        state[8..16]
+            .copy_from_slice(&<SpaceRegistry as vos::Actor>::STATE_SCHEMA_VERSION.to_le_bytes());
+        state[16] ^= 1;
+        assert!(
+            vos_extension_load(state.as_ptr(), state.len()).is_null(),
+            "a drifted v2 state fingerprint must fail closed at restart",
+        );
+    }
+
+    #[test]
+    fn system_install_receipt_binds_host_derived_actor_identity() {
+        let agent = AgentId::new([0x31; 32]);
+        let mut receipt = SystemActorInstallReceipt {
+            protocol: RegistryProtocol::CURRENT,
+            installation_id: InstallationId::new([0x32; 32]),
+            system_agent_id: agent,
+            actor_id: ActorId::top_level(agent, "worker"),
+            instance_name: "worker".into(),
+            program_name: "worker-code".into(),
+            program_hash: [0x33; 32],
+            program_publication_id: PublicationId::new([0x34; 32]),
+            host_receipt: vec![0x35],
+        };
+        assert!(valid_system_actor_install_receipt(&receipt));
+        receipt.actor_id = ActorId::new([0x99; 32]);
+        assert!(!valid_system_actor_install_receipt(&receipt));
+        receipt.actor_id = ActorId::top_level(agent, "worker");
+        receipt.protocol = RegistryProtocol::UNSUPPORTED;
+        assert!(!valid_system_actor_install_receipt(&receipt));
     }
 }

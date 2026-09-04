@@ -167,8 +167,8 @@ those packages and recreate local development Agent images. The related
 lifecycle wire first moved from
 `vos-agent-runtime-abi-20260829r1` to `vos-agent-runtime-abi-20260829r2`, then
 to `vos-agent-runtime-abi-20260831r3`, `vos-agent-runtime-abi-20260831r4`,
-`vos-agent-runtime-abi-20260831r5`, and now
-`vos-agent-runtime-abi-20260831r6`. Generation r3 binds Suspend and Resume
+`vos-agent-runtime-abi-20260831r5`, `vos-agent-runtime-abi-20260831r6`, and now
+`vos-agent-runtime-abi-20260904r7`. Generation r3 binds Suspend and Resume
 authority to the actor's exact expected deployment, so a receipt prepared
 before an actor upgrade cannot mutate its replacement. Generation r4 makes
 the three actor-state lanes independently sparse, binds their entries to a
@@ -186,11 +186,21 @@ lengths is rejected. Generation r6 adds the replay-authenticated journal
 generation/admission context and the root-pinned live system-authority Control
 state. Finalize and committee-rotation commands execute deterministically in
 the guest, but only independently authenticated replay may persist their
-history plans or mint post-publication authority. An r6 host deliberately
-rejects r1/r2/r3/r4/r5 runtime packages and persisted Agent images; rebuild the
-runtime and actor packages and recreate those images. The actor ABI itself
-remains unchanged. This cutover does not change the frozen Service execution
-identity or artifacts.
+history plans or mint post-publication authority. Generation r7 makes the
+nonzero catalog `InstallationId` and finality-backed registry reservation
+commitment part of the signed install request, durable actor record, and
+inspected directory record. The runtime retains an immutable commitment to the
+original install request, so an exact fresh-sequence retry remains idempotent
+after suspension, actor upgrade, and Agent reopen; later mutable deployment
+state cannot redefine the accepted install preimage. Removed installation IDs
+become grow-only durable tombstones, preventing an old install request from
+resurrecting after `RemoveLeaf`; reinstalling the same actor name requires a
+fresh installation ID and registry reservation and creates a new incarnation.
+Identifier reuse, altered install fields, and reservation drift are rejected.
+An r7 host deliberately rejects r1/r2/r3/r4/r5/r6 runtime packages and
+persisted Agent images; rebuild the runtime and actor packages and recreate
+those images. The actor ABI itself remains unchanged. This cutover does not
+change the frozen Service execution identity or artifacts.
 
 Portable invocation continuations now use kernel snapshot version 5, which
 preserves sparse IPC DATA mappings exactly. Before upgrading a host, let every

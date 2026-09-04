@@ -11550,6 +11550,9 @@ pub(crate) mod tests {
                 record: crate::agent::ActorRecord {
                     entry,
                     state_generation: Hash([0x50; 32]),
+                    installation_id: crate::service::InstallationId([0x55; 32]),
+                    registry_reservation: Hash([0x56; 32]),
+                    install_request_commitment: Hash([0x57; 32]),
                     producer: ProducerId([0x39; 32]),
                     package,
                     agent_schema,

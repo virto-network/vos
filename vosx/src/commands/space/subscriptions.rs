@@ -215,10 +215,13 @@ fn data_dir_of(space: &str) -> anyhow::Result<(SpaceEntry, std::path::PathBuf)> 
 }
 
 fn run_subscribe(space: &str, agent: &str) -> anyhow::Result<()> {
+    // A subscription is a persisted registry instance selector. Reject an
+    // invalid selector before resolving the space or touching local.toml.
+    let agent = super::common::parse_instance_name(agent)?;
     let (entry, dir) = data_dir_of(space)?;
     let mut cfg = load(&dir)?;
-    if !cfg.subscriptions.iter().any(|s| s == agent) {
-        cfg.subscriptions.push(agent.to_string());
+    if !cfg.subscriptions.iter().any(|s| s == &agent) {
+        cfg.subscriptions.push(agent.clone());
         cfg.subscriptions.sort();
         save(&dir, &cfg)?;
     }
@@ -239,11 +242,12 @@ fn run_subscribe(space: &str, agent: &str) -> anyhow::Result<()> {
 }
 
 fn run_unsubscribe(space: &str, agent: &str) -> anyhow::Result<()> {
+    // Removal deliberately accepts any exact stored spelling. It cannot add a
+    // selector, and keeping it permissive lets operators clean up entries
+    // written by older clients or by a manual local.toml edit.
     let (entry, dir) = data_dir_of(space)?;
     let mut cfg = load(&dir)?;
-    let before = cfg.subscriptions.len();
-    cfg.subscriptions.retain(|s| s != agent);
-    if cfg.subscriptions.len() == before {
+    if !remove_subscription(&mut cfg, agent) {
         anyhow::bail!("space '{}' wasn't subscribed to '{agent}'", entry.name);
     }
     save(&dir, &cfg)?;
@@ -265,6 +269,12 @@ fn run_unsubscribe(space: &str, agent: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn remove_subscription(cfg: &mut LocalConfig, agent: &str) -> bool {
+    let before = cfg.subscriptions.len();
+    cfg.subscriptions.retain(|stored| stored != agent);
+    cfg.subscriptions.len() != before
 }
 
 fn run_list(space: &str) -> anyhow::Result<()> {
@@ -302,6 +312,26 @@ fn run_list(space: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscribe_rejects_noncanonical_instance_before_space_lookup() {
+        let error = run_subscribe("does-not-exist", "Bad_Instance")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("instance name"), "{error}");
+        assert!(error.contains("canonical registry slug"), "{error}");
+    }
+
+    #[test]
+    fn unsubscribe_can_remove_a_legacy_noncanonical_entry() {
+        let mut cfg = LocalConfig {
+            subscriptions: vec!["Bad_Instance".into(), "worker".into()],
+            ..Default::default()
+        };
+        assert!(remove_subscription(&mut cfg, "Bad_Instance"));
+        assert_eq!(cfg.subscriptions, vec!["worker".to_string()]);
+        assert!(!remove_subscription(&mut cfg, "Bad_Instance"));
+    }
 
     #[test]
     fn empty_config_should_spawn_everything() {

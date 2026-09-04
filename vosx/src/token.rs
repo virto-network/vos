@@ -36,8 +36,8 @@
 use anyhow::{Context, anyhow};
 use libp2p::identity::Keypair;
 use vos::registry::{
-    AUTH_ROLE_DEVELOPER, AUTH_ROLE_READONLY, OP_SIG_LEN, canonical_op_bytes,
-    ed25519_pubkey_from_peer_id,
+    AUTH_ROLE_DEVELOPER, AUTH_ROLE_READONLY, OP_SIG_LEN, ed25519_pubkey_from_peer_id,
+    registry_mutation_signed_bytes,
 };
 
 /// Human-readable prefix. A space name may not start with `vos-`, which
@@ -205,7 +205,11 @@ pub fn redeem_sig(
 ) -> anyhow::Result<[u8; OP_SIG_LEN]> {
     let token_kp = Keypair::ed25519_from_bytes(payload.token_secret)
         .map_err(|e| anyhow!("reconstruct invite token keypair: {e}"))?;
-    let canon = canonical_op_bytes("redeem_invite", &[&payload.token_pub, node_peer_id]);
+    let canon = registry_mutation_signed_bytes(
+        &payload.space_id,
+        "redeem_invite",
+        &[&payload.token_pub, node_peer_id],
+    );
     sig64(
         &token_kp
             .sign(&canon)
@@ -454,7 +458,8 @@ mod tests {
         // (node_sig, under the node peer-id).
         let node_kp = Keypair::generate_ed25519();
         let node = libp2p::PeerId::from(node_kp.public()).to_bytes();
-        let redeem_canon = canonical_op_bytes("redeem_invite", &[&p.token_pub, &node]);
+        let redeem_canon =
+            registry_mutation_signed_bytes(&space_id, "redeem_invite", &[&p.token_pub, &node]);
 
         let rsig = redeem_sig(&p, &node).unwrap();
         assert!(
@@ -472,10 +477,18 @@ mod tests {
             verify_op_sig(&node, &redeem_canon, &node_sig),
             "node_sig must verify under the joining node's peer-id",
         );
+        let sibling_redeem =
+            registry_mutation_signed_bytes(&other_space, "redeem_invite", &[&p.token_pub, &node]);
+        assert!(
+            !verify_raw_sig(&p.token_pub, &sibling_redeem, &rsig)
+                && !verify_op_sig(&node, &sibling_redeem, &node_sig),
+            "neither possession signature can be transplanted to a sibling space",
+        );
 
         // A redeem_sig for one node must not verify for another.
         let other = libp2p::PeerId::from(Keypair::generate_ed25519().public()).to_bytes();
-        let other_canon = canonical_op_bytes("redeem_invite", &[&p.token_pub, &other]);
+        let other_canon =
+            registry_mutation_signed_bytes(&space_id, "redeem_invite", &[&p.token_pub, &other]);
         assert!(!verify_raw_sig(&p.token_pub, &other_canon, &rsig));
         // …and a node_sig made by a DIFFERENT key must not verify under
         // this node's peer-id (peer-id control is unforgeable).

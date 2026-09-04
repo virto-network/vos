@@ -20,8 +20,8 @@ use vos::agent::{
 };
 use vos::service::{
     ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, DeploymentSignature, Hash,
-    InvocationId, NodeId, Origin, PrincipalId, ProducerId, ServiceWire, SpaceId, SubjectId,
-    artifact_hash, task_dependencies_hash,
+    InstallationId, InvocationId, NodeId, Origin, PrincipalId, ProducerId, ServiceWire, SpaceId,
+    SubjectId, artifact_hash, task_dependencies_hash,
 };
 use vos::{Decode, Encode};
 
@@ -370,8 +370,16 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
     .unwrap();
     let actor = ActorId::top_level(agent, "counter");
     let deployment = package.deployment_id();
+    let installation_id = InstallationId([0x31; 32]);
+    let registry_reservation = Hash([0x32; 32]);
     let install = driver
-        .actor_install_request("counter".into(), None, &package)
+        .actor_install_request(
+            installation_id,
+            registry_reservation,
+            "counter".into(),
+            None,
+            &package,
+        )
         .unwrap();
     let receipt = authority_receipt(
         &agent_config,
@@ -380,7 +388,14 @@ fn canonical_actor_package_installs_and_executes_in_an_empty_agent() {
         2,
     );
     driver
-        .install_actor(&receipt, "counter".into(), None, &package)
+        .install_actor(
+            &receipt,
+            installation_id,
+            registry_reservation,
+            "counter".into(),
+            None,
+            &package,
+        )
         .unwrap();
     let incarnation = installed_incarnation(&mut driver, actor, deployment);
 
@@ -596,8 +611,16 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
     .unwrap();
     let actor = ActorId::top_level(agent, "board");
     let deployment = package.deployment_id();
+    let installation_id = InstallationId([0x41; 32]);
+    let registry_reservation = Hash([0x42; 32]);
     let install = driver
-        .actor_install_request("board".into(), None, &package)
+        .actor_install_request(
+            installation_id,
+            registry_reservation,
+            "board".into(),
+            None,
+            &package,
+        )
         .unwrap();
     let receipt = authority_receipt(
         &agent_config,
@@ -606,7 +629,14 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
         2,
     );
     driver
-        .install_actor(&receipt, "board".into(), None, &package)
+        .install_actor(
+            &receipt,
+            installation_id,
+            registry_reservation,
+            "board".into(),
+            None,
+            &package,
+        )
         .unwrap();
     let incarnation = installed_incarnation(&mut driver, actor, deployment);
 

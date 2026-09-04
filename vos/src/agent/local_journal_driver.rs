@@ -2142,11 +2142,15 @@ where
     /// Construct an exact actor-install request and its complete catalog.
     pub(crate) fn actor_install_operation(
         &self,
+        installation_id: crate::service::InstallationId,
+        registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
         package: &Package,
     ) -> Result<LocalLifecycleOperation, LocalJournalDriverError> {
-        if name.is_empty()
+        if installation_id == crate::service::InstallationId::ZERO
+            || registry_reservation == Hash::ZERO
+            || name.is_empty()
             || name.len() > crate::service::MAX_ACTOR_NAME_BYTES
             || parent == Some(ActorId::ZERO)
         {
@@ -2179,6 +2183,8 @@ where
         let state_layout = schema.state_layout_hash();
         self.lifecycle_operation(
             LifecycleRequest::Install(InstallActor {
+                installation_id,
+                registry_reservation,
                 entry: ActorEntry {
                     actor,
                     name,
@@ -3136,10 +3142,11 @@ where
                 }
                 None => true,
             }
-            && page
-                .entries
-                .iter()
-                .all(|record| record.incarnation != Hash::ZERO)
+            && page.entries.iter().all(|record| {
+                record.incarnation != Hash::ZERO
+                    && record.installation_id != crate::service::InstallationId::ZERO
+                    && record.registry_reservation != Hash::ZERO
+            })
     }
 
     /// Read-only Standard-runtime directory inspection. Any byte change in
@@ -4181,6 +4188,67 @@ mod tests {
         assert_eq!(restored.system_authority, Some(expected));
     }
 
+    #[test]
+    fn install_identity_is_idempotent_and_exact_across_journal_reopen() {
+        let (mut driver, config, trust, merge) = host_surface_driver();
+        let package = host_surface_actor_package();
+        let installation_id = crate::service::InstallationId([0xa1; 32]);
+        let registry_reservation = Hash([0xa2; 32]);
+        let operation = driver
+            .actor_install_operation(
+                installation_id,
+                registry_reservation,
+                "journal-identity".into(),
+                None,
+                &package,
+            )
+            .unwrap();
+        let request = operation.request().clone();
+        let catalog = operation.catalog().to_vec();
+
+        let first = driver
+            .lifecycle(
+                lifecycle_receipt(&config, &request, 2),
+                request.clone(),
+                &catalog,
+            )
+            .unwrap();
+        let entry = match first.result.unwrap() {
+            LifecycleReply::Installed(entry) => entry,
+            other => panic!("unexpected install result: {other:?}"),
+        };
+        let first_record = driver.inspect_actor(entry.actor).unwrap();
+        assert_eq!(first_record.installation_id, installation_id);
+        assert_eq!(first_record.registry_reservation, registry_reservation);
+
+        let retry = driver
+            .lifecycle(
+                lifecycle_receipt(&config, &request, 3),
+                request.clone(),
+                &catalog,
+            )
+            .unwrap();
+        assert_eq!(retry.result, Ok(LifecycleReply::Installed(entry.clone())));
+        let retry_record = driver.inspect_actor(entry.actor).unwrap();
+        assert_eq!(retry_record, first_record);
+
+        let mut mismatch = match request {
+            LifecycleRequest::Install(install) => install,
+            _ => unreachable!("fixture constructs an install"),
+        };
+        mismatch.registry_reservation = Hash([0xa3; 32]);
+        let mismatch = LifecycleRequest::Install(mismatch);
+        let rejected = driver
+            .lifecycle(lifecycle_receipt(&config, &mismatch, 4), mismatch, &catalog)
+            .unwrap();
+        assert_eq!(rejected.result, Err(LifecycleError::InvalidRequest));
+        assert_eq!(driver.inspect_actor(entry.actor).unwrap(), first_record);
+
+        let store = driver.core.store;
+        let reopened = LocalJournalAgentDriver::open(store, trust, merge).unwrap();
+        assert_eq!(reopened.inspect_actor(entry.actor).unwrap(), first_record);
+    }
+
     #[cfg(feature = "network")]
     #[test]
     fn ed25519_node_merge_authenticator_binds_the_full_peer_and_exact_event() {
@@ -4246,7 +4314,13 @@ mod tests {
         let actor_package = host_surface_actor_package();
         actor_package.validate().unwrap();
         let operation = driver
-            .actor_install_operation("merge-fixture".into(), None, &actor_package)
+            .actor_install_operation(
+                crate::service::InstallationId([0x91; 32]),
+                Hash([0x92; 32]),
+                "merge-fixture".into(),
+                None,
+                &actor_package,
+            )
             .unwrap();
         assert_eq!(operation.catalog().len(), 3);
         assert!(
@@ -4932,6 +5006,8 @@ mod tests {
             proofs: false,
         };
         let install = LifecycleRequest::Install(InstallActor {
+            installation_id: crate::service::InstallationId([0xd8; 32]),
+            registry_reservation: Hash([0xd9; 32]),
             entry: ActorEntry {
                 actor,
                 name: "historical-actor".into(),
@@ -5409,6 +5485,8 @@ mod tests {
         let state_layout = Hash([0xf3; 32]);
         let actor = ActorId::top_level(config.identity.agent, "catalog-admission");
         let install = InstallActor {
+            installation_id: crate::service::InstallationId([0xed; 32]),
+            registry_reservation: Hash([0xee; 32]),
             entry: ActorEntry {
                 actor,
                 name: "catalog-admission".into(),

@@ -1143,7 +1143,7 @@ fn install_test_voter_registry(
     voters: &[(u16, Vec<u8>)],
 ) {
     use ed25519_dalek::{Signer, SigningKey};
-    use space_registry::{NODE_ROLE_VOTER, Status, canonical_op_bytes, pack_auth};
+    use space_registry::{NODE_ROLE_VOTER, Status, pack_auth, registry_mutation_signed_bytes};
 
     node.register_at_id(
         vos::node::AgentConfig::new(registry_pvm),
@@ -1157,9 +1157,15 @@ fn install_test_voter_registry(
         vos::block_on(registry.set_root(&mut &*node, root_peer.clone())).unwrap(),
         Status::Ok,
     );
+    let space_id = [0xb8; 32];
+    assert_eq!(
+        vos::block_on(registry.set_space_id(&mut &*node, space_id.to_vec())).unwrap(),
+        Status::Ok,
+    );
     for (prefix, peer) in voters {
         let prefix = u32::from(*prefix);
-        let canonical = canonical_op_bytes(
+        let canonical = registry_mutation_signed_bytes(
+            &space_id,
             "add_node",
             &[&prefix.to_le_bytes(), peer, &[NODE_ROLE_VOTER]],
         );
@@ -5197,8 +5203,11 @@ fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
         &token_pub,
         &authority_replication_id,
     );
-    let redeem =
-        vos::registry::canonical_op_bytes("redeem_invite", &[&token_pub, &invited_peer_id]);
+    let redeem = vos::registry::registry_mutation_signed_bytes(
+        &binding.service.space.0,
+        "redeem_invite",
+        &[&token_pub, &invited_peer_id],
+    );
     let redemption = RoleAuthorityInviteRedemption {
         space: binding.service.space,
         authority_replication_id,
@@ -5247,8 +5256,11 @@ fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
 
     let second_invited = libp2p::identity::Keypair::generate_ed25519();
     let second_peer_id = libp2p::PeerId::from(second_invited.public()).to_bytes();
-    let second_redeem =
-        vos::registry::canonical_op_bytes("redeem_invite", &[&token_pub, &second_peer_id]);
+    let second_redeem = vos::registry::registry_mutation_signed_bytes(
+        &binding.service.space.0,
+        "redeem_invite",
+        &[&token_pub, &second_peer_id],
+    );
     let second_redemption = RoleAuthorityInviteRedemption {
         holder_peer_id: second_peer_id,
         redeem_signature: token.sign(&second_redeem).unwrap().try_into().unwrap(),

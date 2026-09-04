@@ -33,8 +33,8 @@ use vos::agent::{
 };
 use vos::service::{
     ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, DeploymentSignature, Hash,
-    InvocationId, MethodPolicy, NodeId, Origin, PackageRolePolicies, PrincipalId, ProducerId,
-    ProgramId, ServiceWire, SpaceId, SubjectId, artifact_hash, task_dependencies_hash,
+    InstallationId, InvocationId, MethodPolicy, NodeId, Origin, PackageRolePolicies, PrincipalId,
+    ProducerId, ProgramId, ServiceWire, SpaceId, SubjectId, artifact_hash, task_dependencies_hash,
 };
 use vos_pvm::ExitReason;
 use vos_pvm::refine_host::RefineContext;
@@ -643,6 +643,8 @@ fn reopen_rejects_a_previous_actor_package_in_the_catalog_closure() {
         suspended: false,
     };
     let install = LifecycleRequest::Install(InstallActor {
+        installation_id: InstallationId([0x71; 32]),
+        registry_reservation: Hash([0x72; 32]),
         entry: entry.clone(),
         producer: legacy_actor.deployment_signature.producer,
         package: package_reference.clone(),
@@ -904,6 +906,9 @@ fn lane_probe_call(
             record: ActorRecord {
                 entry,
                 state_generation: Hash([0xa4; 32]),
+                installation_id: InstallationId([0xa5; 32]),
+                registry_reservation: Hash([0xa6; 32]),
+                install_request_commitment: Hash([0xa7; 32]),
                 producer: ProducerId([0xa3; 32]),
                 package,
                 agent_schema: schema_reference.clone(),
@@ -1102,6 +1107,8 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
         suspended: false,
     };
     let install = LifecycleRequest::Install(InstallActor {
+        installation_id: InstallationId([0xb1; 32]),
+        registry_reservation: Hash([0xb2; 32]),
         entry: installed_entry.clone(),
         producer: package.deployment_signature.producer,
         package: package_reference.clone(),

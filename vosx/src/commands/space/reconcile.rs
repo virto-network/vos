@@ -11,10 +11,9 @@
 //!   published if not already in the catalog.
 //! - Each agent gets `install()`'d if no instance with that
 //!   `name` is already registered.
-//! - Agents already in the registry are left alone (their
-//!   state takes precedence over the recipe). An explicit
-//!   `space upgrade` is required to re-point at a different
-//!   blob.
+//! - Agents already in the registry are left alone (their state takes
+//!   precedence over the recipe). Replacing one now belongs to the Agent
+//!   lifecycle; the retired legacy `space upgrade` path fails closed.
 //!
 //! Recipes are dev-time conveniences — the registry stays
 //! the runtime source of truth. This module's only job is to
@@ -28,11 +27,16 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use vos::abi::service::ServiceId;
 use vos::node::{ExtensionConfig, VosNode};
-use vos::registry::{ProgramRow, RegistryRef, Status};
+use vos::registry::{
+    AgentRow, ProgramKind, ProgramRow, ProgramTag, RegistryRef, Status, SyncFloor,
+};
 use vos::value::Args;
 
 use crate::blob_store;
-use crate::commands::space::common::{auto_replication_id, instance_service_id, parse_consistency};
+use crate::commands::space::common::{
+    auto_replication_id, instance_service_id, parse_consistency, parse_instance_name,
+    parse_nonzero_replication_id, parse_program_name,
+};
 
 /// Slim view of the recipe TOML — only the fields the
 /// reconciler cares about. Extra fields are silently ignored
@@ -128,7 +132,7 @@ pub struct AgentDef {
     /// replica's state is served to and the default spawn set.
     #[serde(default)]
     pub sync: Option<String>,
-    /// Override replication id (`auto` / `off` / 64-hex).
+    /// Override replication id (`auto` / nonzero 64-hex).
     /// `auto` (default) hashes `(name, blob_hash)`.
     #[serde(default)]
     pub replication_id: Option<String>,
@@ -166,8 +170,12 @@ pub(crate) fn register_extension(
     ext: &ExtensionDef,
     data_dir: &Path,
     daemon_prefix: u16,
+    space_id: &[u8; 32],
     known_names: &std::collections::HashSet<String>,
+    operator: Option<&libp2p::identity::Keypair>,
 ) -> anyhow::Result<Vec<String>> {
+    parse_instance_name(&ext.name)
+        .map_err(|error| anyhow::anyhow!("extension '{}': {error}", ext.name))?;
     // `local.toml` stores absolute extension paths, so joining with the space
     // data directory preserves that path while also giving this function the
     // durable state root for the installed instance.
@@ -287,14 +295,25 @@ pub(crate) fn register_extension(
     );
 
     if !meta_blob.is_empty() {
-        // Empty `auth`: the daemon signs on relay with the operator key
-        // (see the catalog mutators). A non-admin node's metadata write
-        // is refused and arrives via sync instead — non-fatal below.
+        // Author the exact mutation at its source. A non-admin node's
+        // signature is refused and the row arrives via sync instead; a
+        // missing operator key deliberately sends no ambient authority.
+        let auth = operator
+            .map(|operator| {
+                crate::commands::space::op_sign::op_auth(
+                    operator,
+                    space_id,
+                    "register_extension_meta",
+                    &[ext.name.as_bytes(), &meta_blob],
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         let status = vos::block_on(reg.register_extension_meta(
             &mut &*node,
             ext.name.clone(),
             meta_blob,
-            Vec::new(),
+            auth,
         ))
         .map_err(|e| anyhow::anyhow!("registry.register_extension_meta('{}'): {e}", ext.name))?;
         if status != Status::Ok {
@@ -417,6 +436,7 @@ pub(crate) fn install_agents(
     recipe_dir: &Path,
     daemon_prefix: u16,
     space_id: &[u8; 32],
+    operator: Option<&libp2p::identity::Keypair>,
 ) -> anyhow::Result<()> {
     validate_recipe_names(recipe)?;
 
@@ -431,9 +451,9 @@ pub(crate) fn install_agents(
     tracing::info!("genesis apply ({} service package(s))", recipe.agents.len());
 
     // Is this daemon the space's admin authoring node? True when its
-    // operator is the genesis root or holds an ADMIN grant. The daemon
-    // signs catalog ops on relay with the operator key; on an admin node
-    // a Status::Forbidden therefore means the signer can't author (key
+    // operator is the genesis root or holds an ADMIN grant. This path signs
+    // catalog ops directly with that operator key; on an admin node a
+    // Status::Forbidden therefore means the signer can't author (key
     // absent/unreadable/wrong) — a misconfiguration to surface loudly,
     // NOT the benign "non-admin joiner awaiting sync" case. (A node that
     // is the admin machine but loaded the wrong key reads as non-admin
@@ -450,7 +470,15 @@ pub(crate) fn install_agents(
     };
 
     for agent in &recipe.agents {
-        reconcile_one(node, &reg, agent, recipe_dir, node_is_admin, space_id)?;
+        reconcile_one(
+            node,
+            &reg,
+            agent,
+            recipe_dir,
+            node_is_admin,
+            space_id,
+            operator,
+        )?;
     }
 
     Ok(())
@@ -463,6 +491,7 @@ fn reconcile_one(
     recipe_dir: &Path,
     node_is_admin: bool,
     space_id: &[u8; 32],
+    operator: Option<&libp2p::identity::Keypair>,
 ) -> anyhow::Result<()> {
     // Genesis recipes must carry the exact signed package bytes. A path-less
     // exported recipe can only reconcile an already-running space.
@@ -493,23 +522,49 @@ fn reconcile_one(
     let existing: Option<ProgramRow> =
         vos::block_on(reg.program(&mut &*node, program_name.clone()))
             .map_err(|e| anyhow::anyhow!("registry.program('{program_name}'): {e}"))?;
-    let program_hash = match existing {
-        Some(p) if p.hash == hash.0 && p.crdt == crdt => {
+    let program = match existing {
+        Some(p) if p.hash == hash.0 && p.kind == (ProgramKind::Service { crdt }) => {
             tracing::debug!("{program_name} already published");
-            p.hash
+            p.tag()
         }
-        Some(_) | None => {
-            // Empty `auth`: the daemon signs catalog mutations on relay
-            // with its operator key. On the admin (operator) node that
-            // signature authorizes the op; on a joined non-admin node it
-            // doesn't, yielding Status::Forbidden — which is expected, the
-            // row arrives via registry sync instead (handled below).
-            let status = vos::block_on(reg.publish(
+        current => {
+            let publication_id = super::common::mint_publication_id()?;
+            let expected_current = current.as_ref().map(|row| row.tag());
+            let expected_publication_id = expected_current
+                .map(|tag| tag.publication_id.into_bytes().to_vec())
+                .unwrap_or_default();
+            let expected_hash = expected_current
+                .map(|tag| tag.hash.to_vec())
+                .unwrap_or_default();
+            // Sign at the authoring call site. On a joined non-admin node the
+            // signature is valid but lacks authority, yielding Forbidden;
+            // the root-authored row then arrives through registry sync.
+            let auth = operator
+                .map(|operator| {
+                    crate::commands::space::op_sign::op_auth(
+                        operator,
+                        space_id,
+                        "publish_service_program",
+                        &[
+                            program_name.as_bytes(),
+                            &hash.0,
+                            &[crdt as u8],
+                            publication_id.as_bytes(),
+                            &expected_publication_id,
+                            &expected_hash,
+                        ],
+                    )
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let status = vos::block_on(reg.publish_service_program(
                 &mut &*node,
                 program_name.clone(),
-                hash.0.to_vec(),
+                hash.0,
                 crdt,
-                Vec::new(),
+                publication_id,
+                expected_current,
+                auth,
             ))
             .map_err(|e| anyhow::anyhow!("registry.publish('{program_name}'): {e}"))?;
             match status {
@@ -517,8 +572,8 @@ fn reconcile_one(
                     tracing::info!("published {program_name}");
                 }
                 Status::Forbidden if node_is_admin => {
-                    // This node IS the space admin, yet the daemon's
-                    // on-relay signature was refused — the operator key
+                    // This node IS the space admin, yet its directly authored
+                    // signature was refused — the operator key
                     // can't author catalog ops. Fail loud rather than
                     // silently install nothing (no peer will supply the
                     // rows for the authoring node).
@@ -541,7 +596,10 @@ fn reconcile_one(
                 }
                 other => anyhow::bail!("publish status {other}"),
             }
-            hash.0
+            ProgramTag {
+                publication_id,
+                hash: hash.0,
+            }
         }
     };
 
@@ -555,12 +613,22 @@ fn reconcile_one(
         // the row arrives via sync) and a transport failure (e.g. a large
         // `.vos_meta` that overflows the registry guest's FETCH buffer) are
         // tolerated: log and move on, agent still spawns without a schema.
-        // Empty `auth`: signed on relay by the daemon (operator key).
+        let auth = operator
+            .map(|operator| {
+                crate::commands::space::op_sign::op_auth(
+                    operator,
+                    space_id,
+                    "register_meta",
+                    &[&program.hash, &package.schemas],
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         match vos::block_on(reg.register_meta(
             &mut &*node,
-            program_hash.to_vec(),
+            program.hash.to_vec(),
             package.schemas,
-            Vec::new(),
+            auth,
         )) {
             Ok(Status::Ok) => {
                 tracing::debug!("registered meta for {program_name}");
@@ -579,11 +647,6 @@ fn reconcile_one(
     // 3. Ensure installed.
     let already_installed = vos::block_on(reg.agent(&mut &*node, agent.name.clone()))
         .map_err(|e| anyhow::anyhow!("registry.agent('{}'): {e}", agent.name))?;
-    if already_installed.is_some() {
-        tracing::debug!("{} already installed", agent.name);
-        return Ok(());
-    }
-
     let consistency = parse_consistency(&agent.consistency).ok_or_else(|| {
         anyhow::anyhow!(
             "agent '{}': unknown consistency '{}', expected local|crdt|raft",
@@ -598,21 +661,7 @@ fn reconcile_one(
         );
     }
 
-    let replication_id = match agent.replication_id.as_deref() {
-        Some("auto") | None => auto_replication_id(space_id, &agent.name, &program_hash),
-        Some("off") => [0u8; 32],
-        Some(hex) => {
-            let v = hex::decode(hex.trim_start_matches("0x")).map_err(|_| {
-                anyhow::anyhow!("agent '{}': replication_id must be hex", agent.name)
-            })?;
-            if v.len() != 32 {
-                anyhow::bail!("agent '{}': replication_id must be 32 bytes", agent.name);
-            }
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&v);
-            out
-        }
-    };
+    let replication_id = resolve_replication_id(agent, space_id, &program.hash)?;
 
     let sync_role = match agent.sync.as_deref() {
         Some(s) => vos::registry::SyncFloor::parse(s).ok_or_else(|| {
@@ -625,31 +674,92 @@ fn reconcile_one(
         None => vos::registry::SyncFloor::Member,
     };
 
-    // Empty `auth`: the daemon signs on relay (see the publish call
-    // above). Status::Forbidden here means this isn't the admin node, so
-    // the agent row is authored on the operator's node and arrives via
-    // sync — tolerated the same way as Status::InstanceExists below.
-    let status = vos::block_on(reg.install(
+    if let Some(installed) = already_installed {
+        if service_install_matches(
+            &installed,
+            &agent.name,
+            &program_name,
+            program,
+            replication_id,
+            consistency,
+            agent.network_reachable,
+            sync_role,
+        ) {
+            tracing::debug!("{} already installed", agent.name);
+            return Ok(());
+        }
+        anyhow::bail!(
+            "agent '{}' is already installed with a different program or service configuration",
+            agent.name,
+        );
+    }
+
+    // Bind the exact installation fields before dispatch. Status::Forbidden
+    // means this is not an authoring admin (or no operator key was available),
+    // so the root-authored row must arrive via sync.
+    let installation_id = super::common::mint_installation_id()?;
+    let auth = operator
+        .map(|operator| {
+            crate::commands::space::op_sign::op_auth(
+                operator,
+                space_id,
+                "install_service_actor",
+                &[
+                    agent.name.as_bytes(),
+                    program_name.as_bytes(),
+                    &program.hash,
+                    program.publication_id.as_bytes(),
+                    installation_id.as_bytes(),
+                    &replication_id,
+                    &[consistency],
+                    &[agent.network_reachable as u8],
+                    &[sync_role as u8],
+                ],
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let status = vos::block_on(reg.install_service_actor(
         &mut &*node,
         agent.name.clone(),
         program_name.clone(),
-        program_hash.to_vec(),
-        replication_id.to_vec(),
+        program,
+        installation_id,
+        replication_id,
         consistency,
         agent.network_reachable,
         sync_role,
-        Vec::new(),
+        auth,
     ))
     .map_err(|e| anyhow::anyhow!("registry.install('{}'): {e}", agent.name))?;
 
-    // A joining node's registry replica may already carry this
-    // agent (the creator installed it and it arrived via CRDT sync
-    // before — or during — this reconcile). `install` is not
-    // idempotent in the registry; it reports Status::InstanceExists.
-    // That's the agent already being present, which is exactly the
-    // post-condition we want, so treat it as success and proceed to
-    // spawn. Only an unexpected status is fatal.
+    // A joining node's registry replica may acquire the row during this
+    // request. Treat that race as success only after checking the exact
+    // semantic postcondition.
     if status == Status::InstanceExists {
+        let observed = vos::block_on(reg.agent(&mut &*node, agent.name.clone()))
+            .map_err(|error| anyhow::anyhow!("registry.agent('{}'): {error}", agent.name))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "install '{}' raced with a row that is no longer readable",
+                    agent.name,
+                )
+            })?;
+        if !service_install_matches(
+            &observed,
+            &agent.name,
+            &program_name,
+            program,
+            replication_id,
+            consistency,
+            agent.network_reachable,
+            sync_role,
+        ) {
+            anyhow::bail!(
+                "install '{}' raced with a different live installation",
+                agent.name,
+            );
+        }
         tracing::info!(
             "agent {} already installed (synced from a peer) — reusing",
             agent.name,
@@ -703,6 +813,38 @@ fn reconcile_one(
         agent.consistency,
     );
     Ok(())
+}
+
+fn service_install_matches(
+    row: &AgentRow,
+    instance_name: &str,
+    program_name: &str,
+    program: ProgramTag,
+    replication_id: [u8; 32],
+    consistency: u8,
+    network_reachable: bool,
+    sync_role: SyncFloor,
+) -> bool {
+    row.instance_name == instance_name
+        && row.program_name == program_name
+        && row.program_hash == program.hash
+        && row.program_publication_id == program.publication_id
+        && row.replication_id == replication_id
+        && row.consistency == consistency
+        && row.network_reachable == network_reachable
+        && row.sync_role == sync_role
+}
+
+fn resolve_replication_id(
+    agent: &AgentDef,
+    space_id: &[u8; 32],
+    program_hash: &[u8; 32],
+) -> anyhow::Result<[u8; 32]> {
+    Ok(match agent.replication_id.as_deref() {
+        Some("auto") | None => auto_replication_id(space_id, &agent.name, program_hash),
+        Some(value) => parse_nonzero_replication_id(value)
+            .map_err(|error| anyhow::anyhow!("agent '{}': {error}", agent.name))?,
+    })
 }
 
 /// Resolve `$env:VAR` indirection in recipe init values. String values
@@ -766,6 +908,34 @@ fn resolve_env_indirection(
 /// single clear error before any side-effects land.
 pub(crate) fn validate_recipe_names(recipe: &Recipe) -> anyhow::Result<()> {
     use std::collections::BTreeMap;
+
+    // Validate the whole recipe before any package is cached, catalog row is
+    // authored, or node-local route is installed. The registry guest uses the
+    // same shared predicate, so the signer and verifier accept one exact set.
+    for agent in &recipe.agents {
+        parse_instance_name(&agent.name)
+            .map_err(|error| anyhow::anyhow!("recipe agent '{}': {error}", agent.name))?;
+        let requested_program = agent.program.as_deref().unwrap_or(&agent.name);
+        parse_program_name(requested_program).map_err(|error| {
+            anyhow::anyhow!(
+                "recipe agent '{}' program '{}': {error}",
+                agent.name,
+                requested_program,
+            )
+        })?;
+        if let Some(replication_id) = agent
+            .replication_id
+            .as_deref()
+            .filter(|replication_id| *replication_id != "auto")
+        {
+            parse_nonzero_replication_id(replication_id)
+                .map_err(|error| anyhow::anyhow!("recipe agent '{}': {error}", agent.name))?;
+        }
+    }
+    for extension in &recipe.extensions {
+        parse_instance_name(&extension.name)
+            .map_err(|error| anyhow::anyhow!("recipe extension '{}': {error}", extension.name))?;
+    }
 
     // Preserve first-seen order so duplicates list the original
     // declaration kind first. BTreeMap keys sort lexically — fine
@@ -1156,6 +1326,124 @@ mod tests {
         .unwrap();
         let err = validate_recipe_names(&m).unwrap_err();
         assert!(err.to_string().contains("'counter' appears 2×"), "{}", err);
+    }
+
+    #[test]
+    fn recipe_validation_rejects_noncanonical_instance_and_program_names() {
+        for recipe in [
+            r#"
+                [[agent]]
+                name = "Bad_Agent"
+                path = "a.vos"
+            "#,
+            r#"
+                [[agent]]
+                name = "worker"
+                program = "bad/program"
+                path = "a.vos"
+            "#,
+            r#"
+                [[extension]]
+                name = "native_worker"
+                path = "a.so"
+            "#,
+        ] {
+            let recipe: Recipe = toml::from_str(recipe).unwrap();
+            let error = validate_recipe_names(&recipe).unwrap_err().to_string();
+            assert!(error.contains("canonical registry slug"), "{error}");
+        }
+    }
+
+    #[test]
+    fn boot_replication_identity_rejects_off_and_zero() {
+        let mut agent = AgentDef {
+            name: "worker".into(),
+            replication_id: Some("off".into()),
+            ..Default::default()
+        };
+        let error = resolve_replication_id(&agent, &[1; 32], &[2; 32]).unwrap_err();
+        assert!(error.to_string().contains("not supported"));
+
+        agent.replication_id = Some("00".repeat(32));
+        let error = resolve_replication_id(&agent, &[1; 32], &[2; 32]).unwrap_err();
+        assert!(error.to_string().contains("must be nonzero"));
+
+        for value in ["off".to_string(), "00".repeat(32)] {
+            let recipe = Recipe {
+                agents: vec![AgentDef {
+                    name: "worker".into(),
+                    replication_id: Some(value),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert!(
+                validate_recipe_names(&recipe).is_err(),
+                "whole-recipe preflight must reject invalid replication identity before writes",
+            );
+        }
+    }
+
+    #[test]
+    fn boot_install_race_binds_the_exact_program_generation_and_configuration() {
+        use vos::registry::{PublicationId, SyncFloor};
+        use vos::service::InstallationId;
+
+        let program = ProgramTag {
+            publication_id: PublicationId::new([0x41; 32]),
+            hash: [0x42; 32],
+        };
+        let replication_id = [0x43; 32];
+        let mut row = AgentRow {
+            instance_name: "worker".into(),
+            installation_id: InstallationId::new([0x44; 32]),
+            revision: 3,
+            program_hash: program.hash,
+            program_name: "worker-program".into(),
+            program_publication_id: program.publication_id,
+            replication_id,
+            consistency: vos::node::Consistency::Crdt as u8,
+            network_reachable: true,
+            sync_role: SyncFloor::Private,
+        };
+        let matches = |row: &AgentRow| {
+            service_install_matches(
+                row,
+                "worker",
+                "worker-program",
+                program,
+                replication_id,
+                vos::node::Consistency::Crdt as u8,
+                true,
+                SyncFloor::Private,
+            )
+        };
+        assert!(matches(&row));
+
+        row.instance_name = "other-worker".into();
+        assert!(!matches(&row));
+        row.instance_name = "worker".into();
+
+        row.program_publication_id = PublicationId::new([0x51; 32]);
+        assert!(!matches(&row));
+        row.program_publication_id = program.publication_id;
+        row.program_hash[0] ^= 1;
+        assert!(!matches(&row));
+        row.program_hash = program.hash;
+        row.program_name = "other".into();
+        assert!(!matches(&row));
+        row.program_name = "worker-program".into();
+        row.replication_id[0] ^= 1;
+        assert!(!matches(&row));
+        row.replication_id = replication_id;
+        row.consistency = vos::node::Consistency::Local as u8;
+        assert!(!matches(&row));
+        row.consistency = vos::node::Consistency::Crdt as u8;
+        row.network_reachable = false;
+        assert!(!matches(&row));
+        row.network_reachable = true;
+        row.sync_role = SyncFloor::Member;
+        assert!(!matches(&row));
     }
 
     // ── $env:VAR indirection ──────────────────────

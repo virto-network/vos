@@ -531,7 +531,8 @@ impl SpaceAuthority {
         ) {
             return false;
         }
-        let redeem = vos::registry::canonical_op_bytes(
+        let redeem = vos::registry::registry_mutation_signed_bytes(
+            &redemption.space.0,
             "redeem_invite",
             &[&redemption.token_pub, &redemption.holder_peer_id],
         );
@@ -1167,7 +1168,7 @@ mod tests {
         SpaceAuthority: Message<M>,
     {
         let mut context = Context::new(ServiceId(0));
-        context.__set_origin(origin, None);
+        context.__set_origin(origin, None, None);
         vos::block_on(<SpaceAuthority as Message<M>>::handle(
             actor,
             message,
@@ -1203,8 +1204,11 @@ mod tests {
             &token_pub,
             &authority_replication_id,
         );
-        let redeem =
-            vos::registry::canonical_op_bytes("redeem_invite", &[&token_pub, &holder_peer_id]);
+        let redeem = vos::registry::registry_mutation_signed_bytes(
+            &space.0,
+            "redeem_invite",
+            &[&token_pub, &holder_peer_id],
+        );
         RoleAuthorityInviteRedemption {
             space,
             authority_replication_id,

@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use vos::agent::authority::AgentAuthorityBinding;
+use vos::agent::authority::{AgentAuthorityBinding, AgentAuthorityReceipt};
 use vos::agent::bootstrap::{
     MAX_SYSTEM_AGENT_GENESIS_PROPOSAL_BYTES, MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES,
     SystemAgentGenesisLocator, SystemAgentGenesisProposal, SystemAgentGenesisProvider,
@@ -17,7 +17,9 @@ use vos::agent::bootstrap::{
 };
 use vos::agent::driver::{AgentTrustProvider, MAX_AGENT_CONFIG_BYTES};
 use vos::agent::execution::RuntimeBlob;
+use vos::agent::host::PreparedLifecycleRequest;
 use vos::agent::package::{MAX_ENCODED_PACKAGE_BYTES, Package};
+use vos::agent::wire::{RuntimeCall, RuntimeState};
 use vos::agent::{AgentConfig, MAX_CATALOG_ARTIFACT_BYTES};
 use vos::service::{BlobRef, Hash, ServiceWire, SpaceId};
 
@@ -33,6 +35,13 @@ pub(super) const VERIFY_PACKAGE: u8 = 3;
 pub(super) const CREATE_SYSTEM_GENESIS: u8 = 4;
 pub(super) const REPRODUCE_SYSTEM_GENESIS: u8 = 5;
 pub(super) const LOAD_SYSTEM_GENESIS_CATALOG: u8 = 6;
+/// Issue or reproduce the authority receipt for one exact Host-prepared
+/// lifecycle operation. The authority service must durably return the same
+/// receipt for the same operation commitment.
+pub(super) const ISSUE_LIFECYCLE: u8 = 7;
+
+const LIFECYCLE_ISSUE_MAGIC: [u8; 4] = *b"ALI1";
+const MAX_LIFECYCLE_RECEIPT_BYTES: usize = 4 * 1024;
 
 // Every non-OK status has an empty payload. NOT_FOUND is meaningful only for
 // LOAD_SYSTEM_GENESIS_CATALOG; accepting it elsewhere would erase the
@@ -89,6 +98,56 @@ impl SocketAgentAuthority {
 
     fn request_trust(&self, tag: u8, payload: &[u8]) -> Option<Vec<u8>> {
         self.request_provider(tag, payload, false).ok().flatten()
+    }
+
+    /// Ask the startup-pinned production authority to approve one exact
+    /// operation prepared through the privately owned Agent Host.
+    ///
+    /// The socket receives both the canonical lifecycle request and all claim
+    /// selectors. Its response is accepted only when the guest-verifiable
+    /// signature and every selector match the prepared operation byte for
+    /// byte. Policy refusal and authority unavailability remain distinct from
+    /// malformed evidence.
+    pub(super) fn issue_lifecycle(
+        &self,
+        prepared: &PreparedLifecycleRequest,
+    ) -> Result<AgentAuthorityReceipt, SystemAgentGenesisProviderError> {
+        self.issue_lifecycle_exact(
+            prepared.authority(),
+            prepared.space(),
+            prepared.agent(),
+            prepared.capability(),
+            prepared.operation(),
+            prepared.request(),
+        )
+    }
+
+    fn issue_lifecycle_exact(
+        &self,
+        authority: &AgentAuthorityBinding,
+        space: SpaceId,
+        agent: vos::service::AgentId,
+        capability: vos::service::CapabilityId,
+        operation: Hash,
+        lifecycle: &vos::agent::LifecycleRequest,
+    ) -> Result<AgentAuthorityReceipt, SystemAgentGenesisProviderError> {
+        if lifecycle
+            .required_capability()
+            .map(vos::service::CapabilityId::named)
+            != Some(capability)
+            || lifecycle.commitment() != operation
+        {
+            return Err(SystemAgentGenesisProviderError::Corrupt);
+        }
+        let request = RuntimeCall::new(RuntimeState::default(), lifecycle.clone()).encode();
+        let payload = encode_lifecycle_issue_payload(
+            authority, space, agent, capability, operation, &request,
+        )
+        .ok_or(SystemAgentGenesisProviderError::Corrupt)?;
+        let response = self
+            .request_provider(ISSUE_LIFECYCLE, &payload, false)?
+            .ok_or(SystemAgentGenesisProviderError::Corrupt)?;
+        validate_lifecycle_receipt(&response, authority, space, agent, capability, operation)
     }
 }
 
@@ -266,6 +325,70 @@ fn encode_catalog_request(locator: &[u8], reference: &BlobRef) -> Option<Vec<u8>
     Some(payload)
 }
 
+fn encode_lifecycle_issue_payload(
+    authority: &AgentAuthorityBinding,
+    space: SpaceId,
+    agent: vos::service::AgentId,
+    capability: vos::service::CapabilityId,
+    operation: Hash,
+    canonical_request: &[u8],
+) -> Option<Vec<u8>> {
+    if !authority.validate()
+        || space == SpaceId::ZERO
+        || agent == vos::service::AgentId::ZERO
+        || capability == vos::service::CapabilityId::ZERO
+        || operation == Hash::ZERO
+        || canonical_request.is_empty()
+    {
+        return None;
+    }
+    let authority = authority.encode();
+    let capacity = LIFECYCLE_ISSUE_MAGIC
+        .len()
+        .checked_add(4 + authority.len())?
+        .checked_add(4 * 32)?
+        .checked_add(4 + canonical_request.len())?;
+    if capacity > MAX_SOCKET_PAYLOAD_BYTES {
+        return None;
+    }
+    let mut payload = Vec::with_capacity(capacity);
+    payload.extend_from_slice(&LIFECYCLE_ISSUE_MAGIC);
+    push_bytes(&mut payload, &authority)?;
+    payload.extend_from_slice(&space.0);
+    payload.extend_from_slice(&agent.0);
+    payload.extend_from_slice(&capability.0);
+    payload.extend_from_slice(&operation.0);
+    push_bytes(&mut payload, canonical_request)?;
+    Some(payload)
+}
+
+fn validate_lifecycle_receipt(
+    bytes: &[u8],
+    authority: &AgentAuthorityBinding,
+    space: SpaceId,
+    agent: vos::service::AgentId,
+    capability: vos::service::CapabilityId,
+    operation: Hash,
+) -> Result<AgentAuthorityReceipt, SystemAgentGenesisProviderError> {
+    if bytes.len() > MAX_LIFECYCLE_RECEIPT_BYTES {
+        return Err(SystemAgentGenesisProviderError::Corrupt);
+    }
+    let receipt = AgentAuthorityReceipt::decode(bytes)
+        .map_err(|_| SystemAgentGenesisProviderError::Corrupt)?;
+    let claim = &receipt.claim;
+    if receipt.encode() != bytes
+        || claim.authority != *authority
+        || claim.space != space
+        || claim.agent != agent
+        || claim.capability != capability
+        || claim.operation != operation
+        || receipt.verify_guest_signature(authority).is_err()
+    {
+        return Err(SystemAgentGenesisProviderError::Corrupt);
+    }
+    Ok(receipt)
+}
+
 fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Option<()> {
     let len = u32::try_from(bytes.len()).ok()?;
     let required = output.len().checked_add(4)?.checked_add(bytes.len())?;
@@ -301,15 +424,16 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use vos::agent::authority::ed25519_public_key_wire;
+    use ed25519_dalek::{Signer, SigningKey};
+    use vos::agent::authority::{AgentAuthorityClaim, ed25519_public_key_wire};
     use vos::agent::contract::RuntimePackageContract;
     use vos::agent::package::PackageManifest;
     use vos::agent::{
         AgentIdentity, AgentProfile, AgentReplica, PackageKind, ReplicaRole, RuntimeCapabilities,
     };
     use vos::service::{
-        ActorId, AgentId, DeploymentId, DeploymentSignature, NodeId, PrincipalId, ProducerId,
-        ProgramId, artifact_hash, task_dependencies_hash,
+        ActorId, AgentId, CapabilityId, CredentialId, DeploymentId, DeploymentSignature, NodeId,
+        PrincipalId, ProducerId, ProgramId, artifact_hash, task_dependencies_hash,
     };
 
     use super::super::authority_socket::{
@@ -537,6 +661,191 @@ mod tests {
                 signature: vec![6],
             },
         }
+    }
+
+    fn signed_lifecycle_receipt(
+        signing: &SigningKey,
+        authority: AgentAuthorityBinding,
+        space: SpaceId,
+        agent: AgentId,
+        capability: CapabilityId,
+        operation: Hash,
+    ) -> AgentAuthorityReceipt {
+        let claim = AgentAuthorityClaim {
+            authority,
+            space,
+            agent,
+            principal: PrincipalId([0x51; 32]),
+            credential: CredentialId([0x52; 32]),
+            capability,
+            operation,
+            sequence: 7,
+            valid_from: 10,
+            valid_until: 20,
+        };
+        let signature = signing.sign(&claim.signing_message().0).to_bytes().to_vec();
+        AgentAuthorityReceipt { claim, signature }
+    }
+
+    #[test]
+    fn lifecycle_issue_payload_and_receipt_bind_every_prepared_selector() {
+        let signing = SigningKey::from_bytes(&[0x53; 32]);
+        let public_key = ed25519_public_key_wire(signing.verifying_key().to_bytes());
+        let agent = AgentId([0x54; 32]);
+        let authority = AgentAuthorityBinding {
+            agent: AgentId([0x55; 32]),
+            actor: ActorId([0x56; 32]),
+            deployment: DeploymentId([0x57; 32]),
+            program: ProgramId([0x58; 32]),
+            producer: ProducerId::of_public_key(&public_key),
+            public_key,
+        };
+        let space = SpaceId([0x59; 32]);
+        let capability = CapabilityId::named(vos::agent::authority::CAPABILITY_ACTOR_LIFECYCLE);
+        let lifecycle = vos::agent::LifecycleRequest::Suspend {
+            actor: ActorId([0x5a; 32]),
+            expected_deployment: DeploymentId([0x5b; 32]),
+        };
+        let operation = lifecycle.commitment();
+        let request = RuntimeCall::new(RuntimeState::default(), lifecycle).encode();
+        let payload = encode_lifecycle_issue_payload(
+            &authority, space, agent, capability, operation, &request,
+        )
+        .unwrap();
+
+        assert_eq!(&payload[..4], &LIFECYCLE_ISSUE_MAGIC);
+        let authority_len = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+        assert_eq!(&payload[8..8 + authority_len], authority.encode());
+        let fixed = 8 + authority_len;
+        assert_eq!(&payload[fixed..fixed + 32], &space.0);
+        assert_eq!(&payload[fixed + 32..fixed + 64], &agent.0);
+        assert_eq!(&payload[fixed + 64..fixed + 96], &capability.0);
+        assert_eq!(&payload[fixed + 96..fixed + 128], &operation.0);
+        let request_len =
+            u32::from_le_bytes(payload[fixed + 128..fixed + 132].try_into().unwrap()) as usize;
+        assert_eq!(request_len, request.len());
+        assert_eq!(&payload[fixed + 132..], request);
+
+        let receipt = signed_lifecycle_receipt(
+            &signing,
+            authority.clone(),
+            space,
+            agent,
+            capability,
+            operation,
+        );
+        assert_eq!(
+            validate_lifecycle_receipt(
+                &receipt.encode(),
+                &authority,
+                space,
+                agent,
+                capability,
+                operation,
+            ),
+            Ok(receipt.clone()),
+        );
+
+        let mismatches = [
+            (SpaceId([0x60; 32]), agent, capability, operation),
+            (space, AgentId([0x61; 32]), capability, operation),
+            (space, agent, CapabilityId([0x62; 32]), operation),
+            (space, agent, capability, Hash([0x63; 32])),
+        ];
+        for (wrong_space, wrong_agent, wrong_capability, wrong_operation) in mismatches {
+            assert_eq!(
+                validate_lifecycle_receipt(
+                    &receipt.encode(),
+                    &authority,
+                    wrong_space,
+                    wrong_agent,
+                    wrong_capability,
+                    wrong_operation,
+                ),
+                Err(SystemAgentGenesisProviderError::Corrupt),
+            );
+        }
+
+        let mut forged = receipt;
+        forged.signature[0] ^= 1;
+        assert_eq!(
+            validate_lifecycle_receipt(
+                &forged.encode(),
+                &authority,
+                space,
+                agent,
+                capability,
+                operation,
+            ),
+            Err(SystemAgentGenesisProviderError::Corrupt),
+        );
+    }
+
+    #[test]
+    fn lifecycle_issue_transport_reproduces_one_exact_receipt_for_one_request() {
+        let signing = SigningKey::from_bytes(&[0x64; 32]);
+        let public_key = ed25519_public_key_wire(signing.verifying_key().to_bytes());
+        let agent = AgentId([0x65; 32]);
+        let authority_binding = AgentAuthorityBinding {
+            agent: AgentId([0x66; 32]),
+            actor: ActorId([0x67; 32]),
+            deployment: DeploymentId([0x68; 32]),
+            program: ProgramId([0x69; 32]),
+            producer: ProducerId::of_public_key(&public_key),
+            public_key,
+        };
+        let space = SpaceId([0x6a; 32]);
+        let capability = CapabilityId::named(vos::agent::authority::CAPABILITY_ACTOR_LIFECYCLE);
+        let lifecycle = vos::agent::LifecycleRequest::Resume {
+            actor: ActorId([0x6b; 32]),
+            expected_deployment: DeploymentId([0x6c; 32]),
+        };
+        let operation = lifecycle.commitment();
+        let receipt = signed_lifecycle_receipt(
+            &signing,
+            authority_binding.clone(),
+            space,
+            agent,
+            capability,
+            operation,
+        );
+
+        let path = socket_path("lifecycle-reproduce");
+        let policy = Hash([0x6d; 32]);
+        let server = serve(
+            &path,
+            vec![
+                Reply::exact(policy, STATUS_OK, Vec::new()),
+                Reply::exact(policy, STATUS_OK, receipt.encode()),
+                Reply::exact(policy, STATUS_OK, receipt.encode()),
+            ],
+        );
+        let authority = SocketAgentAuthority::open(&path).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                authority.issue_lifecycle_exact(
+                    &authority_binding,
+                    space,
+                    agent,
+                    capability,
+                    operation,
+                    &lifecycle,
+                ),
+                Ok(receipt.clone()),
+            );
+        }
+        let requests = cleanup(path, server);
+        assert_eq!(
+            requests[1], requests[2],
+            "retry request bytes must be stable"
+        );
+        let request = parse_request(&requests[1]);
+        assert_eq!(request.policy, policy);
+        assert_eq!(request.tag, ISSUE_LIFECYCLE);
+        assert_eq!(
+            request.payload.get(..4),
+            Some(LIFECYCLE_ISSUE_MAGIC.as_slice())
+        );
     }
 
     #[test]

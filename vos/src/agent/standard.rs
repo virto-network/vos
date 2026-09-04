@@ -5,7 +5,7 @@
 //! and keeps lifecycle safety independent of the 63 live-machine limit.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::ops::Bound::{Excluded, Unbounded};
 
@@ -15,14 +15,20 @@ use super::{
     LifecycleRequest, RuntimeRequirements, StateLane,
 };
 use crate::service::{
-    ActorId, AgentId, BlobRef, CredentialId, DeploymentId, Hash, InvocationId, ProducerId,
-    ProgramId,
+    ActorId, AgentId, BlobRef, CredentialId, DeploymentId, Hash, InstallationId, InvocationId,
+    ProducerId, ProgramId,
 };
 
 pub const MAX_DIRECTORY_PAGE: u16 = 256;
 pub const MAX_INVOCATION_RESULTS_PER_LANE: usize = 32;
 pub const MAX_INVOCATION_RESULT_BYTES_PER_LANE: usize = 64 * 1024;
 pub const MAX_AUTHORITY_DISPOSITIONS: usize = 256;
+/// Maximum number of retired installation identities representable in one
+/// canonical runtime image. The aggregate encoded-state limit is stricter once
+/// any other state is present, while this explicit cap rejects hostile list
+/// declarations before allocation.
+pub const MAX_RETIRED_INSTALLATION_IDS: usize =
+    super::execution::MAX_RUNTIME_STATE_BYTES / core::mem::size_of::<InstallationId>();
 /// Explicit cap below both the runtime-image byte limit and the generic wire
 /// item limit. Historical entries are retained until checkpoint compaction.
 pub const MAX_LANE_STATE_ENTRIES: usize = 16_384;
@@ -96,6 +102,13 @@ fn actor_artifact_references(actor: &ManagedActor) -> [&BlobRef; 3] {
     ]
 }
 
+fn install_matches(record: &ActorRecord, install: &super::InstallActor) -> bool {
+    record.installation_id == install.installation_id
+        && record.registry_reservation == install.registry_reservation
+        && record.install_request_commitment
+            == LifecycleRequest::Install(install.clone()).commitment()
+}
+
 #[derive(Clone, Debug)]
 struct ManagedActor {
     record: ActorRecord,
@@ -108,6 +121,10 @@ pub struct StandardAgentRuntime {
     config: Option<AgentConfig>,
     system_authority: Option<super::system_authority::SystemAuthorityState>,
     actors: BTreeMap<ActorId, ManagedActor>,
+    /// Installation identities remain consumed after their actor leaves the
+    /// live directory, preventing an install replay from becoming a new
+    /// incarnation after `RemoveLeaf`.
+    retired_installation_ids: BTreeSet<InstallationId>,
     lane_state: StandardLaneState,
     invocation_results: BTreeMap<(InvocationScope, InvocationId), StandardInvocationResult>,
     lane_revisions: StandardLaneRevisions,
@@ -124,6 +141,8 @@ pub struct StandardRuntimeState {
     pub config: Option<AgentConfig>,
     pub system_authority: Option<super::system_authority::SystemAuthorityState>,
     pub actors: Vec<StandardActorState>,
+    /// Strictly ordered grow-only tombstones for removed installations.
+    pub retired_installation_ids: Vec<InstallationId>,
     pub lane_state: StandardLaneState,
     pub invocation_results: Vec<StandardInvocationResult>,
     pub lane_revisions: StandardLaneRevisions,
@@ -289,6 +308,7 @@ impl StandardAgentRuntime {
             config: None,
             system_authority: None,
             actors: BTreeMap::new(),
+            retired_installation_ids: BTreeSet::new(),
             lane_state: StandardLaneState {
                 linear: Vec::new(),
                 merge: Vec::new(),
@@ -348,6 +368,7 @@ impl StandardAgentRuntime {
                     debt: actor.debt,
                 })
                 .collect(),
+            retired_installation_ids: self.retired_installation_ids.iter().copied().collect(),
             lane_state: self.lane_state.clone(),
             invocation_results: self.invocation_results.values().cloned().collect(),
             lane_revisions: self.lane_revisions,
@@ -380,6 +401,7 @@ impl StandardAgentRuntime {
     pub fn restore(state: StandardRuntimeState) -> Result<Self, LifecycleError> {
         let Some(config) = state.config else {
             return if state.actors.is_empty()
+                && state.retired_installation_ids.is_empty()
                 && state.system_authority.is_none()
                 && state.lane_state == StandardLaneState::default()
                 && state.invocation_results.is_empty()
@@ -399,7 +421,24 @@ impl StandardAgentRuntime {
             .windows(2)
             .any(|pair| pair[0].record.entry.actor >= pair[1].record.entry.actor)
             || state.actors.iter().any(|actor| {
-                actor.debt.children != 0 || actor.record.state_generation == Hash::ZERO
+                actor.debt.children != 0
+                    || actor.record.state_generation == Hash::ZERO
+                    || actor.record.install_request_commitment == Hash::ZERO
+            })
+            || state.retired_installation_ids.len() > MAX_RETIRED_INSTALLATION_IDS
+            || state
+                .retired_installation_ids
+                .iter()
+                .any(|installation_id| *installation_id == InstallationId::ZERO)
+            || state
+                .retired_installation_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || state.actors.iter().any(|actor| {
+                state
+                    .retired_installation_ids
+                    .binary_search(&actor.record.installation_id)
+                    .is_ok()
             })
             || state.invocation_results.windows(2).any(|pair| {
                 (pair[0].scope, pair[0].invocation) >= (pair[1].scope, pair[1].invocation)
@@ -453,8 +492,11 @@ impl StandardAgentRuntime {
             }
             let actor_id = entry.actor;
             let state_generation = actor.record.state_generation;
+            let install_request_commitment = actor.record.install_request_commitment;
             runtime.install(
                 super::InstallActor {
+                    installation_id: actor.record.installation_id,
+                    registry_reservation: actor.record.registry_reservation,
                     entry,
                     producer: actor.record.producer,
                     package: actor.record.package,
@@ -466,8 +508,15 @@ impl StandardAgentRuntime {
                 },
                 state_generation,
             )?;
+            runtime
+                .actors
+                .get_mut(&actor_id)
+                .expect("restored actor was just installed")
+                .record
+                .install_request_commitment = install_request_commitment;
             runtime.set_lifecycle_debt(actor_id, actor.debt)?;
         }
+        runtime.retired_installation_ids = state.retired_installation_ids.into_iter().collect();
         for (actor, expected_deployment) in suspended {
             runtime.set_suspended(actor, expected_deployment, true)?;
         }
@@ -712,6 +761,8 @@ impl StandardAgentRuntime {
             entries.push(super::ActorDirectoryRecord {
                 entry: actor.record.entry.clone(),
                 incarnation: actor.record.state_generation,
+                installation_id: actor.record.installation_id,
+                registry_reservation: actor.record.registry_reservation,
             });
         }
         let next = if entries.len() == usize::from(limit) && iterator.next().is_some() {
@@ -730,15 +781,10 @@ impl StandardAgentRuntime {
         install: super::InstallActor,
         state_generation: Hash,
     ) -> Result<LifecycleReply, LifecycleError> {
-        self.validate_requirements(install.requirements)?;
         let config = self.created()?;
-        if !config.runtime_contract.supports(install.contract) {
-            return Err(LifecycleError::UnsupportedRuntime);
-        }
-        if self.actors.len() >= config.capabilities.max_actors as usize {
-            return Err(LifecycleError::DirectoryFull);
-        }
-        if install.entry.name.is_empty()
+        if install.installation_id == InstallationId::ZERO
+            || install.registry_reservation == Hash::ZERO
+            || install.entry.name.is_empty()
             || install.entry.name.len() > crate::service::MAX_ACTOR_NAME_BYTES
             || install.entry.lanes != install.requirements.lanes
             || install.entry.deployment == DeploymentId::ZERO
@@ -763,8 +809,38 @@ impl StandardAgentRuntime {
         {
             return Err(LifecycleError::InvalidRequest);
         }
+
+        // InstallationId is a stable operation identity, not an alias for an
+        // ActorId. Reusing it for another actor, or changing any committed
+        // install input while retaining it, is never a new installation.
+        if let Some((actor_id, existing)) = self
+            .actors
+            .iter()
+            .find(|(_, actor)| actor.record.installation_id == install.installation_id)
+        {
+            if *actor_id != install.entry.actor || !install_matches(&existing.record, &install) {
+                return Err(LifecycleError::InvalidRequest);
+            }
+            // The install disposition is defined by the immutable request,
+            // not by a later suspension or in-place upgrade. Return the exact
+            // original reply while leaving current actor state untouched.
+            return Ok(LifecycleReply::Installed(install.entry));
+        }
+        if self
+            .retired_installation_ids
+            .contains(&install.installation_id)
+        {
+            return Err(LifecycleError::InvalidRequest);
+        }
         if self.actors.contains_key(&install.entry.actor) {
             return Err(LifecycleError::AlreadyExists);
+        }
+        self.validate_requirements(install.requirements)?;
+        if !config.runtime_contract.supports(install.contract) {
+            return Err(LifecycleError::UnsupportedRuntime);
+        }
+        if self.actors.len() >= config.capabilities.max_actors as usize {
+            return Err(LifecycleError::DirectoryFull);
         }
         if let Some(parent) = install.entry.parent {
             let parent = self.actors.get(&parent).ok_or(LifecycleError::NotFound)?;
@@ -785,12 +861,16 @@ impl StandardAgentRuntime {
                 ]),
         )?;
         let entry = install.entry.clone();
+        let install_request_commitment = LifecycleRequest::Install(install.clone()).commitment();
         self.actors.insert(
             entry.actor,
             ManagedActor {
                 record: ActorRecord {
                     entry: install.entry,
                     state_generation,
+                    installation_id: install.installation_id,
+                    registry_reservation: install.registry_reservation,
+                    install_request_commitment,
                     producer: install.producer,
                     package: install.package,
                     agent_schema: install.agent_schema,
@@ -1428,7 +1508,13 @@ impl StandardAgentRuntime {
         if !debt.is_clear() {
             return Err(LifecycleError::Busy(debt));
         }
+        if self.retired_installation_ids.len() >= MAX_RETIRED_INSTALLATION_IDS {
+            return Err(LifecycleError::ResourceLimit);
+        }
+        let installation_id = managed.record.installation_id;
         self.actors.remove(&actor);
+        let inserted = self.retired_installation_ids.insert(installation_id);
+        debug_assert!(inserted, "a live installation cannot already be retired");
         Ok(LifecycleReply::Removed(actor))
     }
 
@@ -2993,6 +3079,11 @@ mod tests {
             len: 100,
         };
         InstallActor {
+            installation_id: InstallationId::new(actor.0),
+            registry_reservation: Hash::digest(
+                b"vos/test/registry-reservation",
+                &[actor.as_bytes()],
+            ),
             entry: ActorEntry {
                 actor,
                 name: name.into(),
@@ -3292,6 +3383,305 @@ mod tests {
     }
 
     #[test]
+    fn install_identity_is_exact_idempotent_across_upgrade_suspend_and_reopen() {
+        let config = config(1);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+
+        let install_request = install(config.identity.agent, None, "identity-anchor");
+        let actor = install_request.entry.actor;
+        let installation_id = install_request.installation_id;
+        let registry_reservation = install_request.registry_reservation;
+        let install_request_commitment =
+            LifecycleRequest::Install(install_request.clone()).commitment();
+
+        let mut zero_id = install_request.clone();
+        zero_id.installation_id = InstallationId::ZERO;
+        assert_eq!(
+            apply_authorized(&mut runtime, &config, LifecycleRequest::Install(zero_id),),
+            Err(LifecycleError::InvalidRequest)
+        );
+        let mut zero_reservation = install_request.clone();
+        zero_reservation.registry_reservation = Hash::ZERO;
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::Install(zero_reservation),
+            ),
+            Err(LifecycleError::InvalidRequest)
+        );
+        assert!(runtime.actor_record(actor).is_none());
+
+        let installed = apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::Install(install_request.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            installed,
+            LifecycleReply::Installed(install_request.entry.clone())
+        );
+        let generation = runtime.actor_record(actor).unwrap().state_generation;
+        assert_eq!(
+            runtime
+                .actor_record(actor)
+                .unwrap()
+                .install_request_commitment,
+            install_request_commitment
+        );
+
+        // A retry may carry a fresh authority sequence. The stable install
+        // identity still resolves to the original successful installation
+        // without creating a new incarnation.
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::Install(install_request.clone()),
+            ),
+            Ok(LifecycleReply::Installed(install_request.entry.clone()))
+        );
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(
+            runtime.actor_record(actor).unwrap().state_generation,
+            generation
+        );
+
+        let mut mismatched_reservation = install_request.clone();
+        mismatched_reservation.registry_reservation = Hash([0xee; 32]);
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::Install(mismatched_reservation),
+            ),
+            Err(LifecycleError::InvalidRequest)
+        );
+
+        let mut reused_id = install(config.identity.agent, None, "different-actor");
+        reused_id.installation_id = installation_id;
+        assert_eq!(
+            apply_authorized(&mut runtime, &config, LifecycleRequest::Install(reused_id),),
+            Err(LifecycleError::InvalidRequest)
+        );
+
+        let upgraded_deployment = DeploymentId([0xec; 32]);
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::UpgradeActor(UpgradeActor {
+                actor,
+                from_deployment: install_request.entry.deployment,
+                to_deployment: upgraded_deployment,
+                to_program: install_request.entry.program,
+                producer: install_request.producer,
+                package: install_request.package.clone(),
+                agent_schema: install_request.agent_schema.clone(),
+                role_policies: install_request.role_policies.clone(),
+                state_layout: install_request.state_layout,
+                contract: install_request.contract,
+                requirements: install_request.requirements,
+            }),
+        )
+        .unwrap();
+        let upgraded = runtime.actor_record(actor).unwrap().clone();
+        assert_eq!(upgraded.installation_id, installation_id);
+        assert_eq!(upgraded.registry_reservation, registry_reservation);
+        assert_eq!(
+            upgraded.install_request_commitment,
+            install_request_commitment
+        );
+        assert_eq!(upgraded.state_generation, generation);
+
+        // Upgrade-mutated deployment state cannot redefine the immutable
+        // creation request. The original install is still an exact retry, but
+        // an InstallActor rewritten to match the current upgraded record is a
+        // conflicting reuse of the same InstallationId.
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::Install(install_request.clone()),
+            ),
+            Ok(LifecycleReply::Installed(install_request.entry.clone()))
+        );
+        assert_eq!(runtime.actor_record(actor), Some(&upgraded));
+        let mut rewritten_as_upgrade = install_request.clone();
+        rewritten_as_upgrade.entry.deployment = upgraded_deployment;
+        assert_ne!(
+            LifecycleRequest::Install(rewritten_as_upgrade.clone()).commitment(),
+            install_request_commitment
+        );
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::Install(rewritten_as_upgrade),
+            ),
+            Err(LifecycleError::InvalidRequest)
+        );
+        assert_eq!(runtime.actor_record(actor), Some(&upgraded));
+
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::Suspend {
+                actor,
+                expected_deployment: upgraded_deployment,
+            },
+        )
+        .unwrap();
+        let suspended = runtime.actor_record(actor).unwrap().clone();
+        assert!(suspended.entry.suspended);
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::Install(install_request.clone()),
+            ),
+            Ok(LifecycleReply::Installed(install_request.entry.clone()))
+        );
+        assert_eq!(runtime.actor_record(actor), Some(&suspended));
+
+        let encoded = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+        let decoded = super::super::wire::decode_standard_runtime_state(&encoded).unwrap();
+        let mut reopened = StandardAgentRuntime::restore(decoded).unwrap();
+        let reopened_record = reopened.actor_record(actor).unwrap();
+        assert_eq!(reopened_record.installation_id, installation_id);
+        assert_eq!(reopened_record.registry_reservation, registry_reservation);
+        assert_eq!(
+            reopened_record.install_request_commitment,
+            install_request_commitment
+        );
+        assert_eq!(reopened_record.state_generation, generation);
+        assert_eq!(reopened_record.entry.deployment, upgraded_deployment);
+        assert!(reopened_record.entry.suspended);
+        let reopened_record = reopened_record.clone();
+        assert_eq!(
+            apply_authorized(
+                &mut reopened,
+                &config,
+                LifecycleRequest::Install(install_request.clone()),
+            ),
+            Ok(LifecycleReply::Installed(install_request.entry.clone()))
+        );
+        assert_eq!(reopened.actor_record(actor), Some(&reopened_record));
+        let mut altered_after_reopen = install_request.clone();
+        altered_after_reopen.entry.deployment = upgraded_deployment;
+        assert_eq!(
+            apply_authorized(
+                &mut reopened,
+                &config,
+                LifecycleRequest::Install(altered_after_reopen),
+            ),
+            Err(LifecycleError::InvalidRequest),
+            "restore must retain the original install commitment, not derive one from current state"
+        );
+        assert_eq!(reopened.actor_record(actor), Some(&reopened_record));
+
+        let page = reopened
+            .apply(LifecycleRequest::Inspect {
+                after: None,
+                limit: 8,
+            })
+            .unwrap();
+        let LifecycleReply::Directory(page) = page else {
+            panic!("inspect returned a non-directory reply");
+        };
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].installation_id, installation_id);
+        assert_eq!(page.entries[0].registry_reservation, registry_reservation);
+        assert_eq!(page.entries[0].incarnation, generation);
+    }
+
+    #[test]
+    fn removed_installation_id_is_burned_across_reopen() {
+        let config = config(2);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+
+        let request = install(config.identity.agent, None, "retired-install");
+        let actor = request.entry.actor;
+        let retired_id = request.installation_id;
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::Install(request.clone()),
+        )
+        .unwrap();
+        let retired_generation = runtime.actor_record(actor).unwrap().state_generation;
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::RemoveLeaf {
+                actor,
+                expected_deployment: request.entry.deployment,
+            },
+        )
+        .unwrap();
+        assert!(runtime.actor_record(actor).is_none());
+        assert_eq!(
+            runtime.snapshot().retired_installation_ids,
+            vec![retired_id]
+        );
+
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::Install(request.clone()),
+            ),
+            Err(LifecycleError::InvalidRequest),
+            "a fresh-sequence retry cannot resurrect a removed installation"
+        );
+        assert!(runtime.actor_record(actor).is_none());
+
+        let encoded = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+        let decoded = super::super::wire::decode_standard_runtime_state(&encoded).unwrap();
+        let mut reopened = StandardAgentRuntime::restore(decoded).unwrap();
+        assert_eq!(
+            reopened.snapshot().retired_installation_ids,
+            vec![retired_id]
+        );
+        assert_eq!(
+            apply_authorized(
+                &mut reopened,
+                &config,
+                LifecycleRequest::Install(request.clone()),
+            ),
+            Err(LifecycleError::InvalidRequest)
+        );
+
+        let mut other_actor_reuse = install(config.identity.agent, None, "other-actor");
+        other_actor_reuse.installation_id = retired_id;
+        assert_eq!(
+            apply_authorized(
+                &mut reopened,
+                &config,
+                LifecycleRequest::Install(other_actor_reuse),
+            ),
+            Err(LifecycleError::InvalidRequest)
+        );
+
+        let mut replacement = request;
+        replacement.installation_id = InstallationId([0xd1; 32]);
+        replacement.registry_reservation = Hash([0xd2; 32]);
+        apply_authorized(
+            &mut reopened,
+            &config,
+            LifecycleRequest::Install(replacement),
+        )
+        .unwrap();
+        assert_ne!(
+            reopened.actor_record(actor).unwrap().state_generation,
+            retired_generation,
+            "a genuinely new installation receives a fresh incarnation"
+        );
+    }
+
+    #[test]
     fn standard_directory_physically_encodes_and_restores_its_signed_capacity() {
         let config = config(super::super::RuntimeCapabilities::STANDARD_MAX_ACTORS);
         let mut runtime = StandardAgentRuntime::new();
@@ -3476,10 +3866,22 @@ mod tests {
         .unwrap();
         assert_eq!(runtime.lane_state.linear.len(), 1);
 
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::Install(request.clone()),
+            ),
+            Err(LifecycleError::InvalidRequest),
+            "the retired installation identity must never become a new incarnation"
+        );
+        let mut replacement = request.clone();
+        replacement.installation_id = InstallationId([0x77; 32]);
+        replacement.registry_reservation = Hash([0x78; 32]);
         apply_authorized(
             &mut runtime,
             &config,
-            LifecycleRequest::Install(request.clone()),
+            LifecycleRequest::Install(replacement.clone()),
         )
         .unwrap();
         let new_generation = runtime.actors[&actor].record.state_generation;
@@ -3510,6 +3912,11 @@ mod tests {
         let current = directory.entries.into_iter().next().unwrap();
         assert_eq!(current.entry.actor, actor);
         assert_eq!(current.incarnation, new_generation);
+        assert_eq!(current.installation_id, replacement.installation_id);
+        assert_eq!(
+            current.registry_reservation,
+            replacement.registry_reservation
+        );
         let invocation = ActorInvocation {
             invocation: InvocationId([0x76; 32]),
             actor: current.entry.actor,

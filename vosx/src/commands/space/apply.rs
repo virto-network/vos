@@ -21,18 +21,22 @@
 //!
 //! Idempotent: a second `apply` of the same recipe is all-skips.
 //! `--diff` prints the plan and exits without touching anything.
-//! `--upgrade` re-points installed agents whose blob differs (otherwise
-//! a differing blob is flagged, never silently overwritten).
+//! A differing installed blob is flagged, never silently overwritten. The
+//! retained `--upgrade` compatibility flag fails closed before any write when
+//! a legacy service upgrade would be required; the Agent lifecycle owns that
+//! transition after the clean cutover.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use vos::registry::{Status, SyncFloor};
+use vos::registry::{ProgramKind, ProgramTag, Status, SyncFloor};
 
 use crate::blob_store;
 use crate::commands::space::client::DaemonClient;
-use crate::commands::space::common::{auto_replication_id, parse_consistency};
+use crate::commands::space::common::{
+    auto_replication_id, parse_consistency, parse_nonzero_replication_id,
+};
 use crate::commands::space::reconcile::{self, AgentDef, Recipe};
 use crate::commands::space::subscriptions::{self, ExtensionLocal, LocalConfig};
 use crate::output;
@@ -43,8 +47,9 @@ pub struct Args {
     /// Print the plan and exit without mutating the registry or
     /// `local.toml`.
     pub diff: bool,
-    /// Re-point installed agents whose recipe blob differs from the
-    /// catalog. Without it, a differing blob is flagged, not applied.
+    /// Compatibility guard for the retired service-upgrade path. If an
+    /// installed blob differs, this fails before writes and directs the
+    /// operator to the Agent lifecycle.
     pub upgrade: bool,
 }
 
@@ -56,10 +61,10 @@ pub(crate) struct ApplyReport {
     installed: Vec<String>,
     /// Instances already present with the recipe's blob — no-ops.
     skipped: Vec<String>,
-    /// Instances re-pointed at a new blob (only with `--upgrade`).
+    /// Legacy compatibility field. The clean-cutover path never populates it.
     upgraded: Vec<String>,
-    /// Instances whose catalog blob differs from the recipe but that
-    /// weren't upgraded (needs `--upgrade`).
+    /// Instances whose catalog blob differs from the recipe and must move
+    /// through the Agent lifecycle.
     upgrade_pending: Vec<String>,
     /// Whether `local.toml` changed (or would change, under `--diff`).
     local_changed: bool,
@@ -118,21 +123,13 @@ pub(crate) fn apply_recipe(
     // Validate the entire plan before the first cache, catalog, instance,
     // or local-config write.
     let mut plans = Vec::new();
-    let mut planned_names: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+    let mut planned_names: BTreeMap<String, ([u8; 32], ProgramTag)> = BTreeMap::new();
     for agent in &recipe.agents {
         let mut plan = preflight_one(client, agent, recipe_dir, &space_id, upgrade)?;
-        if plan.needs_publish {
-            let name = plan.program_name.clone();
-            match planned_names.get(&name) {
-                Some(hash) if hash == &plan.hash => plan.needs_publish = false,
-                Some(_) => anyhow::bail!("recipe assigns program {name} to more than one package",),
-                None => {
-                    planned_names.insert(name, plan.hash);
-                }
-            }
-        }
+        deduplicate_publication_plan(&mut planned_names, &mut plan)?;
         plans.push(plan);
     }
+    reject_legacy_upgrade_plans(&plans)?;
 
     let mut report = ApplyReport {
         local_changed,
@@ -193,10 +190,49 @@ struct PreparedAgent {
     hash: [u8; 32],
     /// Signed catalog capability copied from the service package.
     crdt: bool,
+    /// Exact catalog generation the install/upgrade must pin.
+    program: ProgramTag,
+    /// CAS base observed before a requested publication move.
+    expected_program: Option<ProgramTag>,
     package_bytes: Option<Vec<u8>>,
     schemas: Option<Vec<u8>>,
     needs_publish: bool,
     action: ApplyAction,
+}
+
+fn deduplicate_publication_plan(
+    planned_names: &mut BTreeMap<String, ([u8; 32], ProgramTag)>,
+    plan: &mut PreparedAgent,
+) -> anyhow::Result<()> {
+    if !plan.needs_publish {
+        return Ok(());
+    }
+    let name = plan.program_name.clone();
+    match planned_names.get(&name) {
+        Some((hash, tag)) if hash == &plan.hash => {
+            // Every install sharing one newly-published package must pin the
+            // single generation actually emitted by the first plan, rather
+            // than its own never-published nonce.
+            plan.program = *tag;
+            plan.expected_program = None;
+            plan.needs_publish = false;
+        }
+        Some(_) => anyhow::bail!("recipe assigns program {name} to more than one package"),
+        None => {
+            planned_names.insert(name, (plan.hash, plan.program));
+        }
+    }
+    Ok(())
+}
+
+fn reject_legacy_upgrade_plans(plans: &[PreparedAgent]) -> anyhow::Result<()> {
+    if plans
+        .iter()
+        .any(|plan| matches!(&plan.action, ApplyAction::Upgrade))
+    {
+        return Err(super::client::legacy_service_upgrade_cutover_error());
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -211,7 +247,7 @@ fn preflight_one(
     // exported recipes. Path-less recipes can reconcile existing rows but
     // cannot publish or install bytes they do not contain.
     let program_name = program_name(agent)?;
-    let (hash, package_bytes, package_crdt, schemas) = if !agent.path.is_empty() {
+    let (hash, package_bytes, package_kind, schemas) = if !agent.path.is_empty() {
         let package_path = recipe_dir.join(&agent.path);
         let bytes = std::fs::read(&package_path).map_err(|e| {
             anyhow::anyhow!(
@@ -220,14 +256,24 @@ fn preflight_one(
                 agent.name
             )
         })?;
-        let package = super::publish::validate_package(&program_name, &bytes)?;
         let h = blob_store::BlobHash::of(&bytes);
-        (
-            h.0,
-            Some(bytes),
-            Some(package.manifest.crdt),
-            Some(package.schemas),
-        )
+        match super::publish::canonical_program(&program_name, h, bytes)? {
+            super::publish::AdmittedProgram::Service {
+                hash,
+                exact_bytes,
+                metadata,
+                crdt,
+            } => (
+                hash.0,
+                Some(exact_bytes),
+                Some(ProgramKind::Service { crdt }),
+                Some(metadata),
+            ),
+            super::publish::AdmittedProgram::AgentActor { .. } => anyhow::bail!(
+                "agent '{}': recipes currently describe service actors; publish AgentActor packages with `vosx space publish` and install them through the system Agent lifecycle",
+                agent.name,
+            ),
+        }
     } else if let Some(ph) = &agent.program_hash {
         let h = blob_store::BlobHash::from_hex(ph)
             .map_err(|_| anyhow::anyhow!("agent '{}': program_hash must be 64 hex", agent.name))?;
@@ -242,15 +288,21 @@ fn preflight_one(
     // Resolve the instance first. An unchanged instance is already at the
     // requested content and does not need a synthetic catalog rewrite.
     let existing = client.agent(&agent.name)?;
-    if existing
-        .as_ref()
-        .is_some_and(|row| row.program_hash == hash)
-    {
+    if let Some(row) = existing.as_ref().filter(|row| row.program_hash == hash) {
         return Ok(PreparedAgent {
             instance_name: agent.name.clone(),
             program_name,
             hash,
-            crdt: package_crdt.unwrap_or(false),
+            crdt: match package_kind {
+                Some(ProgramKind::Service { crdt }) => crdt,
+                Some(ProgramKind::AgentActor) => unreachable!("AgentActor recipe rejected above"),
+                None => false,
+            },
+            program: ProgramTag {
+                publication_id: row.program_publication_id,
+                hash: row.program_hash,
+            },
+            expected_program: None,
             package_bytes,
             schemas,
             needs_publish: false,
@@ -258,8 +310,16 @@ fn preflight_one(
         });
     }
 
-    let needs_publish = match client.program(&program_name)? {
-        Some(p) if p.hash == hash && package_crdt.is_none_or(|crdt| p.crdt == crdt) => false,
+    let current_program = client.program(&program_name)?;
+    let needs_publish = match current_program.as_ref() {
+        Some(p)
+            if p.hash == hash
+                && package_kind
+                    .as_ref()
+                    .is_none_or(|expected| &p.kind == expected) =>
+        {
+            false
+        }
         Some(_) if package_bytes.is_some() => true,
         Some(_) => anyhow::bail!(
             "agent '{}': catalog name {program_name} points at another package and this recipe \
@@ -278,13 +338,43 @@ fn preflight_one(
             true
         }
     };
+    let crdt = match package_kind
+        .as_ref()
+        .or_else(|| current_program.as_ref().map(|row| &row.kind))
+    {
+        Some(ProgramKind::Service { crdt }) => *crdt,
+        Some(ProgramKind::AgentActor) => anyhow::bail!(
+            "agent '{}': an AgentActor program cannot be installed through the legacy recipe service slot",
+            agent.name,
+        ),
+        None => anyhow::bail!(
+            "agent '{}': cannot classify its path-less unpublished program",
+            agent.name,
+        ),
+    };
+    let expected_program = needs_publish
+        .then(|| current_program.as_ref().map(|row| row.tag()))
+        .flatten();
+    let program = if needs_publish {
+        ProgramTag {
+            publication_id: super::common::mint_publication_id()?,
+            hash,
+        }
+    } else {
+        current_program
+            .as_ref()
+            .expect("non-published program was resolved above")
+            .tag()
+    };
 
     if existing.is_some() {
         return Ok(PreparedAgent {
             instance_name: agent.name.clone(),
             program_name,
             hash,
-            crdt: package_crdt.unwrap_or(false),
+            crdt,
+            program,
+            expected_program,
             package_bytes,
             schemas,
             needs_publish,
@@ -332,7 +422,9 @@ fn preflight_one(
         instance_name: agent.name.clone(),
         program_name,
         hash,
-        crdt: package_crdt.expect("package bytes have package metadata"),
+        crdt,
+        program,
+        expected_program,
         package_bytes,
         schemas,
         needs_publish,
@@ -351,7 +443,13 @@ fn execute_one(
     report: &mut ApplyReport,
 ) -> anyhow::Result<()> {
     if plan.needs_publish {
-        match client.publish(plan.program_name.clone(), plan.hash.to_vec(), plan.crdt)? {
+        match client.publish_service_program(
+            plan.program_name.clone(),
+            plan.hash,
+            plan.crdt,
+            plan.program.publication_id,
+            plan.expected_program,
+        )? {
             Status::Ok => {
                 if let Some(schemas) = &plan.schemas {
                     forward_meta(client, &blob_store::BlobHash(plan.hash), schemas);
@@ -368,30 +466,22 @@ fn execute_one(
 
     match &plan.action {
         ApplyAction::Skip | ApplyAction::UpgradePending => Ok(()),
-        ApplyAction::Upgrade => match client.upgrade(
-            plan.instance_name.clone(),
-            plan.program_name.clone(),
-            plan.hash.to_vec(),
-        )? {
-            Status::Ok => Ok(()),
-            Status::Forbidden => anyhow::bail!(
-                "upgrade '{}' refused (Status::Forbidden) — the operator key is not an admin of \
-                 this space",
-                plan.instance_name,
-            ),
-            other => anyhow::bail!("upgrade '{}' returned status {other}", plan.instance_name),
-        },
+        // Defense in depth: `apply_recipe` rejects the whole plan before its
+        // first write, and the executor itself has no legacy upgrade transport
+        // path if a future caller bypasses that preflight.
+        ApplyAction::Upgrade => Err(super::client::legacy_service_upgrade_cutover_error()),
         ApplyAction::Install {
             consistency,
             replication_id,
             network_reachable,
             sync_role,
         } => {
-            let status = client.install(
+            let status = client.install_service_actor(
                 plan.instance_name.clone(),
                 plan.program_name.clone(),
-                plan.hash.to_vec(),
-                replication_id.to_vec(),
+                plan.program,
+                super::common::mint_installation_id()?,
+                *replication_id,
                 *consistency,
                 *network_reachable,
                 *sync_role,
@@ -399,8 +489,30 @@ fn execute_one(
             match status {
                 Status::Ok => Ok(()),
                 // A peer's row synced in after preflight. The instance now
-                // exists; report the race as an idempotent skip.
+                // exists; accept the race only if it established the exact
+                // semantic postcondition this plan requested.
                 Status::InstanceExists => {
+                    let observed = client.agent(&plan.instance_name)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "install '{}' raced with a row that is no longer readable",
+                            plan.instance_name,
+                        )
+                    })?;
+                    if !service_install_matches(
+                        &observed,
+                        &plan.instance_name,
+                        &plan.program_name,
+                        plan.program,
+                        *replication_id,
+                        *consistency,
+                        *network_reachable,
+                        *sync_role,
+                    ) {
+                        anyhow::bail!(
+                            "install '{}' raced with a different live installation; rerun after reconciling the conflict",
+                            plan.instance_name,
+                        );
+                    }
                     report.installed.retain(|n| n != &plan.instance_name);
                     report.skipped.push(plan.instance_name.clone());
                     Ok(())
@@ -432,8 +544,8 @@ fn program_name(agent: &AgentDef) -> anyhow::Result<String> {
 }
 
 /// Recipe replication-id → 32 bytes: `auto`/absent hashes
-/// `(space_id, name, hash)`; `off` disables; an explicit 64-hex value
-/// is used verbatim.
+/// `(space_id, name, hash)`; an explicit nonzero 64-hex value is used
+/// verbatim. The clean-break registry has no zero/off identity.
 fn resolve_replication_id(
     agent: &AgentDef,
     space_id: &[u8; 32],
@@ -441,19 +553,29 @@ fn resolve_replication_id(
 ) -> anyhow::Result<[u8; 32]> {
     Ok(match agent.replication_id.as_deref() {
         Some("auto") | None => auto_replication_id(space_id, &agent.name, program_hash),
-        Some("off") => [0u8; 32],
-        Some(hex) => {
-            let v = hex::decode(hex.trim_start_matches("0x")).map_err(|_| {
-                anyhow::anyhow!("agent '{}': replication_id must be hex", agent.name)
-            })?;
-            if v.len() != 32 {
-                anyhow::bail!("agent '{}': replication_id must be 32 bytes", agent.name);
-            }
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&v);
-            out
-        }
+        Some(value) => parse_nonzero_replication_id(value)
+            .map_err(|error| anyhow::anyhow!("agent '{}': {error}", agent.name))?,
     })
+}
+
+fn service_install_matches(
+    row: &vos::registry::AgentRow,
+    instance_name: &str,
+    program_name: &str,
+    program: ProgramTag,
+    replication_id: [u8; 32],
+    consistency: u8,
+    network_reachable: bool,
+    sync_role: SyncFloor,
+) -> bool {
+    row.instance_name == instance_name
+        && row.program_name == program_name
+        && row.program_hash == program.hash
+        && row.program_publication_id == program.publication_id
+        && row.replication_id == replication_id
+        && row.consistency == consistency
+        && row.network_reachable == network_reachable
+        && row.sync_role == sync_role
 }
 
 /// MERGE the recipe's node-local half onto `base`. Reconcile semantics
@@ -552,7 +674,10 @@ fn emit(space: &str, report: &ApplyReport) {
         println!("  {verb}upgrade {u}");
     }
     for u in &report.upgrade_pending {
-        println!("  {u}: catalog blob differs — run with --upgrade to re-point");
+        println!(
+            "  {u}: catalog blob differs — migrate it through the Agent lifecycle \
+             (the legacy --upgrade path is retired)"
+        );
     }
     for s in &report.skipped {
         println!("  skip {s} (already installed)");
@@ -642,6 +767,153 @@ mod tests {
             ..Default::default()
         };
         assert!(program_name(&invalid).is_err());
+    }
+
+    fn publication_plan(name: &str, hash: [u8; 32], publication: u8) -> PreparedAgent {
+        PreparedAgent {
+            instance_name: format!("{name}-{publication}"),
+            program_name: name.into(),
+            hash,
+            crdt: false,
+            program: ProgramTag {
+                publication_id: vos::registry::PublicationId::new([publication; 32]),
+                hash,
+            },
+            expected_program: Some(ProgramTag {
+                publication_id: vos::registry::PublicationId::new([0xEE; 32]),
+                hash: [0xDD; 32],
+            }),
+            package_bytes: Some(vec![publication]),
+            schemas: None,
+            needs_publish: true,
+            action: ApplyAction::Install {
+                consistency: vos::node::Consistency::Local as u8,
+                replication_id: [publication; 32],
+                network_reachable: false,
+                sync_role: SyncFloor::Member,
+            },
+        }
+    }
+
+    #[test]
+    fn shared_publication_plans_pin_one_exact_program_tag() {
+        let mut names = BTreeMap::new();
+        let mut first = publication_plan("worker", [0x11; 32], 0x21);
+        let mut second = publication_plan("worker", [0x11; 32], 0x22);
+
+        deduplicate_publication_plan(&mut names, &mut first).unwrap();
+        deduplicate_publication_plan(&mut names, &mut second).unwrap();
+
+        assert!(first.needs_publish);
+        assert!(!second.needs_publish);
+        assert_eq!(second.program, first.program);
+        assert_eq!(second.expected_program, None);
+        assert_eq!(names["worker"], (first.hash, first.program));
+    }
+
+    #[test]
+    fn shared_catalog_name_rejects_two_different_packages() {
+        let mut names = BTreeMap::new();
+        let mut first = publication_plan("worker", [0x11; 32], 0x21);
+        let mut second = publication_plan("worker", [0x12; 32], 0x22);
+        deduplicate_publication_plan(&mut names, &mut first).unwrap();
+        let error = deduplicate_publication_plan(&mut names, &mut second).unwrap_err();
+        assert!(error.to_string().contains("more than one package"));
+    }
+
+    #[test]
+    fn apply_upgrade_plan_is_rejected_before_execution() {
+        let mut plan = publication_plan("worker", [0x11; 32], 0x21);
+        plan.action = ApplyAction::Upgrade;
+        let error = reject_legacy_upgrade_plans(&[plan])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("clean cutover"), "{error}");
+        assert!(error.contains("Agent lifecycle"), "{error}");
+        assert!(error.contains("no guest mutation"), "{error}");
+    }
+
+    #[test]
+    fn install_race_requires_the_complete_semantic_postcondition() {
+        use vos::service::InstallationId;
+
+        let program = ProgramTag {
+            publication_id: vos::registry::PublicationId::new([0x31; 32]),
+            hash: [0x32; 32],
+        };
+        let replication_id = [0x33; 32];
+        let mut row = vos::registry::AgentRow {
+            instance_name: "worker".into(),
+            installation_id: InstallationId::new([0x34; 32]),
+            revision: 7,
+            program_hash: program.hash,
+            program_name: "worker-program".into(),
+            program_publication_id: program.publication_id,
+            replication_id,
+            consistency: vos::node::Consistency::Raft as u8,
+            network_reachable: true,
+            sync_role: SyncFloor::Private,
+        };
+        let matches = |row: &vos::registry::AgentRow| {
+            service_install_matches(
+                row,
+                "worker",
+                "worker-program",
+                program,
+                replication_id,
+                vos::node::Consistency::Raft as u8,
+                true,
+                SyncFloor::Private,
+            )
+        };
+        assert!(matches(&row));
+
+        row.instance_name = "other-worker".into();
+        assert!(!matches(&row));
+        row.instance_name = "worker".into();
+
+        row.program_name = "other".into();
+        assert!(!matches(&row));
+        row.program_name = "worker-program".into();
+        row.program_hash[0] ^= 1;
+        assert!(!matches(&row));
+        row.program_hash = program.hash;
+        row.program_publication_id = vos::registry::PublicationId::new([0x41; 32]);
+        assert!(!matches(&row));
+        row.program_publication_id = program.publication_id;
+        row.replication_id[0] ^= 1;
+        assert!(!matches(&row));
+        row.replication_id = replication_id;
+        row.consistency = vos::node::Consistency::Local as u8;
+        assert!(!matches(&row));
+        row.consistency = vos::node::Consistency::Raft as u8;
+        row.network_reachable = false;
+        assert!(!matches(&row));
+        row.network_reachable = true;
+        row.sync_role = SyncFloor::Member;
+        assert!(!matches(&row));
+
+        // The concurrent installation owns its own identity/revision; logical
+        // idempotence is defined by the requested service semantics above.
+        row.sync_role = SyncFloor::Private;
+        row.installation_id = InstallationId::new([0x51; 32]);
+        row.revision += 1;
+        assert!(matches(&row));
+    }
+
+    #[test]
+    fn recipe_replication_identity_rejects_off_and_zero() {
+        let mut agent = AgentDef {
+            name: "worker".into(),
+            replication_id: Some("off".into()),
+            ..Default::default()
+        };
+        let error = resolve_replication_id(&agent, &[1; 32], &[2; 32]).unwrap_err();
+        assert!(error.to_string().contains("not supported"));
+
+        agent.replication_id = Some("00".repeat(32));
+        let error = resolve_replication_id(&agent, &[1; 32], &[2; 32]).unwrap_err();
+        assert!(error.to_string().contains("must be nonzero"));
     }
 
     #[test]

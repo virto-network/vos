@@ -15,7 +15,7 @@ use vos::abi::service::ServiceId;
 use vos::actors::client::ClientError;
 use vos::node::{AgentConfig, Consistency, VosNode};
 use vos::registry::RegistryInvoker;
-use vos::registry::{RegistryRef, Status};
+use vos::registry::{ProgramKind, ProgramTag, RegistryRef, Status};
 
 use crate::blob_store::{self, BlobHash};
 use crate::commands::space::common::{
@@ -272,7 +272,9 @@ fn agent_residue(
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
         let generation = name.ends_with(".agent")
             || name.ends_with(".agent-lock")
-            || name.ends_with(".agent-image");
+            || name.ends_with(".agent-image")
+            || name.ends_with(".system-authority-ledger.redb")
+            || name.ends_with(".system-authority-ledger.redb.next");
         let host_sidecar = matches!(
             name.as_str(),
             ".agent-host.scope" | ".agent-host.scope.tmp" | ".agent-host.lock"
@@ -292,13 +294,74 @@ fn agent_host_residue(agent_root: &Path) -> anyhow::Result<Option<PathBuf>> {
     agent_residue(agent_root, true)
 }
 
-fn reject_agent_host_residue_without_authority(agent_root: &Path) -> anyhow::Result<()> {
+fn reject_agent_host_residue_without_authority(
+    agent_root: &Path,
+    stable_host_lease: &Path,
+    scope: vos::agent::host::AgentHostScope,
+) -> anyhow::Result<()> {
     if let Some(residue) = agent_host_residue(agent_root)? {
         anyhow::bail!(
             "Agent host residue {} requires both --agent-root-pins and \
              --agent-authority-socket; legacy .agent-image generations are never migrated",
             residue.display(),
         );
+    }
+
+    let stable_host_lease_stage = vos::agent::host::agent_host_lease_stage_path(stable_host_lease);
+    for residue in [stable_host_lease, stable_host_lease_stage.as_path()] {
+        match std::fs::symlink_metadata(residue) {
+            Ok(_) => anyhow::bail!(
+                "Agent host lease residue {} requires both --agent-root-pins and \
+                 --agent-authority-socket",
+                residue.display(),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "inspect Agent host lease {}: {error}",
+                    residue.display(),
+                ));
+            }
+        }
+    }
+
+    // The per-Agent authority lock and ledger deliberately live outside the
+    // replaceable space-data tree. Derive exactly this root/space/node
+    // namespace: scanning every sibling `.agent-authority` directory would
+    // make disabling one space depend on unrelated spaces owned by the same
+    // vosx installation.
+    let Some(stable_host_lease_parent) = stable_host_lease.parent() else {
+        anyhow::bail!(
+            "Agent host lease has no parent directory: {}",
+            stable_host_lease.display(),
+        );
+    };
+    match std::fs::symlink_metadata(stable_host_lease_parent) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect Agent host lease directory {}: {error}",
+                stable_host_lease_parent.display(),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let authority_root =
+        vos::agent::host::agent_host_authority_root_path(agent_root, stable_host_lease, scope)
+            .map_err(|error| anyhow::anyhow!("derive Agent authority namespace: {error}"))?;
+    match std::fs::symlink_metadata(&authority_root) {
+        Ok(_) => anyhow::bail!(
+            "Agent authority namespace residue {} requires both --agent-root-pins and \
+             --agent-authority-socket",
+            authority_root.display(),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect Agent authority namespace {}: {error}",
+                authority_root.display(),
+            ));
+        }
     }
     Ok(())
 }
@@ -470,10 +533,39 @@ fn bound_role_authority_replication(authority: &[u8], fresh: [u8; 32]) -> anyhow
         .map_err(|_| anyhow::anyhow!("registry role-authority binding is malformed"))
 }
 
+fn role_authority_install_matches(
+    row: &vos::registry::AgentRow,
+    instance_name: &str,
+    program_name: &str,
+    program: ProgramTag,
+    replication_id: [u8; 32],
+) -> bool {
+    row.instance_name == instance_name
+        && row.program_name == program_name
+        && row.program_hash == program.hash
+        && row.program_publication_id == program.publication_id
+        && row.replication_id == replication_id
+        && row.consistency == Consistency::Raft as u8
+        && !row.network_reachable
+        && row.sync_role == vos::registry::SyncFloor::Member
+}
+
+fn require_boot_registry_handshake(
+    result: Result<vos::registry::RegistryProtocol, vos::actors::client::ClientError>,
+) -> anyhow::Result<()> {
+    result
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("registry protocol handshake failed: {error}"))
+}
+
 /// On the immutable-root node, publish and install the canonical authority
 /// before application roots are resolved. Joiners wait for those signed
 /// registry rows rather than constructing another deployment.
-fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::Result<()> {
+fn ensure_service_role_authority(
+    node: &VosNode,
+    space_id: [u8; 32],
+    operator: Option<&libp2p::identity::Keypair>,
+) -> anyhow::Result<()> {
     use crate::commands::space::common::auto_replication_id;
     use vos::service::ServiceWire;
 
@@ -487,7 +579,11 @@ fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::
         );
         return Ok(());
     }
-    let root = crate::identity::load_or_create()?;
+    let root = operator.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the immutable-root node cannot author its role-authority catalog rows without the loaded operator key"
+        )
+    })?;
     if libp2p::PeerId::from(root.public()).to_bytes() != root_peer {
         anyhow::bail!("loaded operator key no longer matches the registry's immutable space root");
     }
@@ -507,7 +603,7 @@ fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::
     } else {
         vos::service::VOS_SERVICE_PROGRAM_ID
     };
-    let package = root_signed_role_authority_package_for_service(&root, service_program)?;
+    let package = root_signed_role_authority_package_for_service(root, service_program)?;
     let exact_package = package.encode();
     let package_hash = blob_store::cache_put(&exact_package)
         .map_err(|error| anyhow::anyhow!("cache canonical space-authority package: {error}"))?;
@@ -520,7 +616,8 @@ fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::
         .map_err(|error| anyhow::anyhow!("query role authority: {error}"))?;
     let replication_id = if authority.is_empty() {
         let auth = crate::commands::space::op_sign::op_auth(
-            &root,
+            root,
+            &space_id,
             "set_role_authority",
             &[&fresh_replication_id],
         )?;
@@ -544,44 +641,114 @@ fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::
     let program_name = package.manifest.name.clone();
     let existing = vos::block_on(reg.program(&mut &*node, program_name.clone()))
         .map_err(|error| anyhow::anyhow!("query canonical space-authority package: {error}"))?;
-    match existing {
-        Some(row) if row.hash == package_hash.0 => {}
-        Some(_) | None => {
-            let status = vos::block_on(reg.publish(
+    let program = match existing {
+        Some(row)
+            if row.hash == package_hash.0 && row.kind == (ProgramKind::Service { crdt: false }) =>
+        {
+            row.tag()
+        }
+        current => {
+            let publication_id = super::common::mint_publication_id()?;
+            let expected_current = current.as_ref().map(|row| row.tag());
+            let expected_publication_id = expected_current
+                .map(|tag| tag.publication_id.into_bytes().to_vec())
+                .unwrap_or_default();
+            let expected_hash = expected_current
+                .map(|tag| tag.hash.to_vec())
+                .unwrap_or_default();
+            let auth = crate::commands::space::op_sign::op_auth(
+                root,
+                &space_id,
+                "publish_service_program",
+                &[
+                    program_name.as_bytes(),
+                    &package_hash.0,
+                    &[0],
+                    publication_id.as_bytes(),
+                    &expected_publication_id,
+                    &expected_hash,
+                ],
+            )?;
+            let status = vos::block_on(reg.publish_service_program(
                 &mut &*node,
                 program_name.clone(),
-                package_hash.0.to_vec(),
+                package_hash.0,
                 false,
-                Vec::new(),
+                publication_id,
+                expected_current,
+                auth,
             ))
             .map_err(|error| anyhow::anyhow!("publish canonical space-authority: {error}"))?;
             if status != Status::Ok {
                 anyhow::bail!("publishing canonical space-authority returned status {status}");
             }
+            ProgramTag {
+                publication_id,
+                hash: package_hash.0,
+            }
         }
-    }
+    };
     if installed.is_some() {
         // The replication incarnation is the immutable authority binding,
-        // not a function of the latest package. Existing spaces deliberately
-        // keep it across an explicit `space upgrade`; publishing the current
-        // package here makes that upgrade available without rewriting the
-        // catalog ahead of the guest-owned UpgradeActor transition.
+        // not a function of the latest package. Publishing the current package
+        // preserves catalog availability but never rewrites the installed
+        // generation at boot; the Agent lifecycle owns any replacement after
+        // the legacy service-upgrade clean cutover.
         return Ok(());
     }
-    let status = vos::block_on(reg.install(
+    let installation_id = super::common::mint_installation_id()?;
+    let auth = crate::commands::space::op_sign::op_auth(
+        root,
+        &space_id,
+        "install_service_actor",
+        &[
+            vos::service::ROLE_AUTHORITY_INSTANCE_.as_bytes(),
+            program_name.as_bytes(),
+            &program.hash,
+            program.publication_id.as_bytes(),
+            installation_id.as_bytes(),
+            &replication_id,
+            &[Consistency::Raft as u8],
+            &[0],
+            &[vos::registry::SyncFloor::Member as u8],
+        ],
+    )?;
+    let status = vos::block_on(reg.install_service_actor(
         &mut &*node,
         vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
-        program_name,
-        package_hash.0.to_vec(),
-        replication_id.to_vec(),
+        program_name.clone(),
+        program,
+        installation_id,
+        replication_id,
         Consistency::Raft as u8,
         false,
         vos::registry::SyncFloor::Member,
-        Vec::new(),
+        auth,
     ))
     .map_err(|error| anyhow::anyhow!("install canonical space-authority: {error}"))?;
-    if !matches!(status, Status::Ok | Status::InstanceExists) {
-        anyhow::bail!("installing canonical space-authority returned status {status}");
+    match status {
+        Status::Ok => {}
+        Status::InstanceExists => {
+            let observed = vos::block_on(
+                reg.agent(&mut &*node, vos::service::ROLE_AUTHORITY_INSTANCE_.into()),
+            )
+            .map_err(|error| anyhow::anyhow!("recheck raced space-authority install: {error}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "space-authority install raced with a row that is no longer readable"
+                )
+            })?;
+            if !role_authority_install_matches(
+                &observed,
+                vos::service::ROLE_AUTHORITY_INSTANCE_,
+                &program_name,
+                program,
+                replication_id,
+            ) {
+                anyhow::bail!("space-authority install raced with a different live installation");
+            }
+        }
+        other => anyhow::bail!("installing canonical space-authority returned status {other}"),
     }
     tracing::info!(
         deployment = %hex::encode(package.deployment_id().0),
@@ -693,6 +860,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut pending_token = load_pending_token(&data_dir)?;
 
     let agent_root = data_dir.join("agents");
+    let stable_agent_host_lease = crate::paths::agent_host_lock_path(&space_id);
+
+    // Decode the per-space identity exactly once. The same keypair object is
+    // cloned into the libp2p NetworkConfig and, in Agent mode, the Local Merge
+    // authenticator. Disabled mode also needs the exact node-scoped identity
+    // to find its external authority namespace without rejecting unrelated
+    // namespaces beside the stable lease.
+    let daemon_keypair = load_daemon_keypair(&data_dir)?;
+    let daemon_peer = libp2p::PeerId::from(daemon_keypair.public());
+    let agent_host_scope = vos::agent::host::AgentHostScope {
+        space: vos::service::SpaceId(space_id),
+        node: vos::service::NodeId::of_authenticated_peer(&daemon_peer.to_bytes()),
+    };
     let configured_agent_pins = match agent_host_selection.as_ref() {
         Some(selection) => Some(load_agent_root_pins(
             &selection.root_pins,
@@ -700,16 +880,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             vos::service::SpaceId(space_id),
         )?),
         None => {
-            reject_agent_host_residue_without_authority(&agent_root)?;
+            reject_agent_host_residue_without_authority(
+                &agent_root,
+                &stable_agent_host_lease,
+                agent_host_scope,
+            )?;
             None
         }
     };
 
-    // Decode the per-space identity exactly once. The same keypair object is
-    // cloned into the libp2p NetworkConfig and, in Agent mode, the Local Merge
-    // authenticator. This prevents a compact prefix or a separately loaded key
-    // from becoming the journal's node identity.
-    let daemon_keypair = load_daemon_keypair(&data_dir)?;
     let prepared_agent_host = match configured_agent_pins {
         Some(pins) => {
             let merge =
@@ -717,11 +896,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     .map_err(|error| {
                         anyhow::anyhow!("Local Agent host requires an Ed25519 node.key: {error:?}")
                     })?;
-            let peer = libp2p::PeerId::from(daemon_keypair.public());
-            let scope = vos::agent::host::AgentHostScope {
-                space: vos::service::SpaceId(space_id),
-                node: vos::service::NodeId::of_authenticated_peer(&peer.to_bytes()),
-            };
             let authority = agent_authority
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Agent authority selection was lost"))?;
@@ -730,8 +904,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             // this preflight guarantees an unavailable, absent, or mismatched
             // provider cannot leave a new local scope/journal generation.
             let archive_expected =
-                preflight_agent_genesis_archive(authority, &pins, scope, &agent_root)?;
-            Some((pins, merge, scope, archive_expected))
+                preflight_agent_genesis_archive(authority, &pins, agent_host_scope, &agent_root)?;
+            Some((pins, merge, agent_host_scope, archive_expected))
         }
         None => None,
     };
@@ -804,7 +978,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         VosNode::with_prefix(local_prefix).with_program_blobs_dir(blob_store::cache_dir());
 
     if let Some((pins, merge, scope, archive_expected)) = prepared_agent_host {
-        let stable_lock = crate::paths::agent_host_lock_path(&space_id);
+        let stable_lock = stable_agent_host_lease;
         let stable_lock_parent = stable_lock
             .parent()
             .ok_or_else(|| anyhow::anyhow!("Agent host lock has no parent directory"))?;
@@ -828,7 +1002,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let control = vos::agent::host::AgentHostControl::open(lease, trust, merge, provider, pins)
             .map_err(|error| anyhow::anyhow!("open Local Agent host: {error}"))?;
         let archive_opened = control
-            .handle()
             .identity(system_agent)
             .map_err(|error| anyhow::anyhow!("inspect Local system Agent after open: {error}"))?
             .is_some();
@@ -840,42 +1013,39 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     // Record this daemon's operator — the CLI identity that ran `vosx space
-    // up` (the same `vosx/identity.key` the operator later presents when
-    // driving agents with `vosx <agent> …`). Two roles: (1) the locality
-    // gate admits this caller, and only this caller, to a device-local
-    // (`consistency = local`) agent such as the messenger, so the operator
-    // can drive their own E2EE messenger while every remote peer is refused;
-    // (2) the registry agent author-signs catalog mutators on relay with
-    // this key — a keyless PVM agent (the messenger cloning a channel's
-    // actor pair) or the in-process reconcile can't carry a CLI signature,
-    // so the daemon signs `install`/`publish`/… before recording. Set BEFORE
-    // registering the registry so its thread captures the signer. A
-    // best-effort load: if the operator identity can't be resolved the
-    // daemon still boots, but no caller reaches a confined agent and no
-    // catalog op is signed (fail closed).
-    match crate::identity::load_or_create() {
+    // up` (the same `vosx/identity.key` later presented by one-shot clients).
+    // It drives the device-local ingress gate, directly authors boot-time
+    // catalog mutations, and signs the root-host invite attestation. Catalog
+    // payloads are never rewritten by an agent thread. A best-effort load
+    // preserves fail-closed boot behavior: without the key no remote caller
+    // reaches a confined agent and local catalog mutations carry no authority.
+    let operator_keypair = match crate::identity::load_or_create() {
         Ok(kp) => {
             let operator = libp2p::PeerId::from(kp.public());
             let operator_bytes = operator.to_bytes();
             node.set_operator_peer(operator_bytes.clone());
+            let attestation_key = kp.clone();
+            let attestation_peer = operator_bytes.clone();
             node.set_operator_signer(move |canonical: &[u8]| {
                 // libp2p ed25519 sign interops with the registry's
                 // ed25519-dalek verify_strict; pack as signer_peer_id || sig(64).
-                let sig = kp.sign(canonical).ok()?;
+                let sig = attestation_key.sign(canonical).ok()?;
                 let sig: [u8; 64] = sig.as_slice().try_into().ok()?;
-                Some(vos::registry::pack_auth(&operator_bytes, &sig))
+                Some(vos::registry::pack_auth(&attestation_peer, &sig))
             });
             tracing::info!(%operator, "auth: recorded operator for device-local agents");
+            Some(kp)
         }
         Err(e) => {
             tracing::warn!(
                 "auth: could not load operator identity ({e}); device-local agents will be \
                  unreachable AND this node cannot author registry catalog ops \
-                 (install/publish/upgrade/…) — if this is the space-admin node its recipe \
+                 (install/publish/uninstall/…) — if this is the space-admin node its recipe \
                  agents will not install. Restart with a readable identity matching the space root.",
             );
+            None
         }
-    }
+    };
 
     // Bind the registry's genesis to this space so a member can't grind a
     // low-CID forged `set_root` and hijack the registry root on replay
@@ -891,19 +1061,34 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .persist(&data_dir);
     let id = node.register_at_id(cfg, ServiceId::REGISTRY);
 
+    // No other boot action may observe or mutate registry-derived state until
+    // the embedded actor proves it is this exact clean-break generation.
+    let reg = vos::registry::RegistryRef::at(ServiceId::REGISTRY);
+    require_boot_registry_handshake(vos::block_on(reg.protocol(&mut &node)))?;
+
     // Anchor this space's space_id into the registry (first-write-wins;
     // idempotent on later boots). `redeem_invite` binds it so an invite
     // minted here can't be replayed at a sibling space the same operator
     // runs — the genesis root is the shared operator identity and can't
     // tell them apart. Without this the invite canonical would bind an
-    // empty id and every redemption would fail. Best-effort: a warn, not
-    // a boot-wedging error, on the unusual failure paths.
+    // empty id and every redemption would fail. Every restart reads the
+    // durable anchor back and requires an exact match before proceeding.
     {
-        let reg = vos::registry::RegistryRef::at(ServiceId::REGISTRY);
-        match vos::block_on(reg.set_space_id(&mut &node, space_id.to_vec())) {
-            Ok(vos::registry::Status::Ok) => tracing::info!("anchored space_id into the registry"),
-            Ok(_) => {} // already anchored — idempotent
-            Err(e) => tracing::warn!("could not anchor space_id into the registry: {e}"),
+        match vos::block_on(reg.set_space_id(&mut &node, space_id.to_vec()))
+            .map_err(|error| anyhow::anyhow!("anchor space_id into registry: {error}"))?
+        {
+            vos::registry::Status::Ok => tracing::info!("anchored space_id into the registry"),
+            vos::registry::Status::Forbidden => {} // already anchored; verified below
+            status => anyhow::bail!("registry refused space_id anchor: {status}"),
+        }
+        let anchored = vos::block_on(reg.space_id(&mut &node))
+            .map_err(|error| anyhow::anyhow!("read registry space_id anchor: {error}"))?;
+        if anchored.as_slice() != space_id {
+            anyhow::bail!(
+                "registry space_id anchor mismatch: expected {}, found {}",
+                hex::encode(space_id),
+                hex::encode(anchored),
+            );
         }
     }
 
@@ -950,6 +1135,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             local_prefix,
             &space_id,
             &data_dir,
+            operator_keypair.as_ref(),
         )?;
         clear_pending_recipe(&entry.id)?;
     }
@@ -966,11 +1152,17 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Register node-local `.so` extensions from `local.toml`, returning
     // each one's effective relay caps for the endpoint descriptor
     // (`space describe` / `space caps`).
-    let extension_caps =
-        register_extensions_from_local(&mut node, &local_cfg, &data_dir, local_prefix)?;
+    let extension_caps = register_extensions_from_local(
+        &mut node,
+        &local_cfg,
+        &data_dir,
+        local_prefix,
+        &space_id,
+        operator_keypair.as_ref(),
+    )?;
 
     if pinned_service_service.is_some() {
-        ensure_service_role_authority(&node, space_id)?;
+        ensure_service_role_authority(&node, space_id, operator_keypair.as_ref())?;
     }
 
     // Spawn every installed agent recorded in the registry.
@@ -982,6 +1174,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         space_id,
         local_prefix,
         hyperspace.is_some(),
+        operator_keypair.as_ref(),
         &agent_policies,
         pinned_service_service.as_ref(),
         production_trust.clone(),
@@ -991,9 +1184,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     register_http_ingress_from_local(&mut node, &local_cfg)?;
     register_ssh_ingress_from_local(&mut node, &local_cfg, &data_dir)?;
 
-    // The space creator's operator key is granted ADMIN at genesis
-    // (a signed `grant_role` baked into the DAG by `space new`),
-    // so there's no first-boot bootstrap file to consume here.
+    // The immutable root is intrinsically ADMIN. `space new` commits that
+    // unsigned sequence-zero anchor, then anchors the derived space id before
+    // it submits the root-signed first-voter enrollment.
 
     // Wait for the swarm to bind, then publish endpoint info
     // so client commands (`space publish`, `space install`, …)
@@ -1296,10 +1489,11 @@ fn genesis_apply(
     prefix: u16,
     space_id: &[u8; 32],
     data_dir: &Path,
+    operator: Option<&libp2p::identity::Keypair>,
 ) -> anyhow::Result<()> {
     let path = Path::new(recipe_path);
     let (recipe, dir) = reconcile::parse_recipe_file(path)?;
-    reconcile::install_agents(node, &recipe, &dir, prefix, space_id)?;
+    reconcile::install_agents(node, &recipe, &dir, prefix, space_id, operator)?;
     let base = subscriptions::load(data_dir).unwrap_or_default();
     let next = crate::commands::space::apply::project_node_local(&base, &recipe, &dir);
     if next != base {
@@ -1318,6 +1512,8 @@ fn register_extensions_from_local(
     cfg: &subscriptions::LocalConfig,
     data_dir: &Path,
     prefix: u16,
+    space_id: &[u8; 32],
+    operator: Option<&libp2p::identity::Keypair>,
 ) -> anyhow::Result<Vec<crate::commands::space::endpoint::ExtensionCaps>> {
     use crate::commands::space::endpoint::ExtensionCaps;
     if cfg.extensions.is_empty() {
@@ -1346,8 +1542,16 @@ fn register_extensions_from_local(
             intra_caps: e.intra_caps.clone(),
             tick_ms: e.tick_ms,
         };
-        let effective =
-            reconcile::register_extension(node, &reg, &ext_def, data_dir, prefix, &known_names)?;
+        let effective = reconcile::register_extension(
+            node,
+            &reg,
+            &ext_def,
+            data_dir,
+            prefix,
+            space_id,
+            &known_names,
+            operator,
+        )?;
         caps.push(ExtensionCaps {
             name: e.name.clone(),
             caps: effective,
@@ -1551,8 +1755,11 @@ fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Resul
     // Both signatures cover the same canonical: the token secret proves
     // possession, the node key proves control of the granted peer-id.
     let redeem_sig = crate::token::redeem_sig(&payload, &node_peer_id)?;
-    let redeem_canon =
-        vos::registry::canonical_op_bytes("redeem_invite", &[&payload.token_pub, &node_peer_id]);
+    let redeem_canon = vos::registry::registry_mutation_signed_bytes(
+        &payload.space_id,
+        "redeem_invite",
+        &[&payload.token_pub, &node_peer_id],
+    );
     let node_sig = node_kp
         .sign(&redeem_canon)
         .map_err(|e| anyhow::anyhow!("node_sig sign: {e}"))?;
@@ -1811,6 +2018,7 @@ fn spawn_installed_agents(
     space_id: [u8; 32],
     local_prefix: u16,
     has_hyperspace: bool,
+    operator: Option<&libp2p::identity::Keypair>,
     policies: &AgentPolicies,
     pinned_service_service: Option<&PinnedService>,
     production_trust: Option<std::sync::Arc<dyn vos::service::ProductionTrust>>,
@@ -2030,11 +2238,30 @@ fn spawn_installed_agents(
     // cross-space addressing.
     if has_hyperspace {
         let hs_reg = RegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
+        let hs_space_id = vos::block_on(hs_reg.space_id(&mut &*node))
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .filter(|space_id| *space_id != [0; 32]);
+        let Some((hs_space_id, operator)) = hs_space_id.zip(operator) else {
+            tracing::warn!(
+                "hyperspace advertisements disabled: the federation registry needs a nonzero durable space anchor and a local operator key"
+            );
+            sweep_orphan_redbs(data_dir, &live_svc_ids);
+            sweep_orphan_service_services(data_dir, &live_service_services);
+            return Ok(());
+        };
         for name in agent_names {
+            let auth = crate::commands::space::op_sign::op_auth(
+                operator,
+                &hs_space_id,
+                "register_remote",
+                &[name.as_bytes(), &(local_prefix as u32).to_le_bytes()],
+            )?;
             match vos::block_on(hs_reg.register_remote(
                 &mut &*node,
                 name.clone(),
                 local_prefix as u32,
+                auth,
             )) {
                 Ok(Status::Ok) => {
                     tracing::info!("hyperspace: registered '{name}' @ prefix {local_prefix:#06x}",)
@@ -4494,6 +4721,18 @@ mod tests {
     }
 
     #[test]
+    fn boot_handshake_context_preserves_protocol_failure() {
+        assert!(
+            require_boot_registry_handshake(Ok(vos::registry::RegistryProtocol::CURRENT)).is_ok()
+        );
+        let error = require_boot_registry_handshake(Err(vos::actors::client::ClientError::Decode))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("registry protocol handshake failed"));
+        assert!(error.contains("failed to decode reply"));
+    }
+
+    #[test]
     fn root_pins_are_bounded_canonical_external_and_space_matched() {
         use vos::service::{ServiceWire as _, SpaceId};
 
@@ -4562,14 +4801,24 @@ mod tests {
     #[test]
     fn disabled_agent_host_rejects_native_residue_but_ignores_service_databases() {
         let directory = agent_test_directory("residue");
+        let stable_host_lease = directory.with_extension("agent-host-lease");
+        let scope = vos::agent::host::AgentHostScope {
+            space: vos::service::SpaceId([0x71; 32]),
+            node: vos::service::NodeId([0x72; 32]),
+        };
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("00000000.redb"), b"legacy service").unwrap();
-        assert!(reject_agent_host_residue_without_authority(&directory).is_ok());
+        assert!(
+            reject_agent_host_residue_without_authority(&directory, &stable_host_lease, scope)
+                .is_ok()
+        );
 
         for name in [
             format!("{}.agent", "11".repeat(32)),
             format!("{}.agent-lock", "22".repeat(32)),
             format!("{}.agent-image", "33".repeat(32)),
+            format!("{}.system-authority-ledger.redb", "55".repeat(32)),
+            format!("{}.system-authority-ledger.redb.next", "66".repeat(32)),
             ".agent-host.scope".into(),
             ".agent-host.scope.tmp".into(),
             ".agent-host.lock".into(),
@@ -4577,13 +4826,95 @@ mod tests {
         ] {
             let path = directory.join(&name);
             std::fs::write(&path, b"residue").unwrap();
-            let error = reject_agent_host_residue_without_authority(&directory).unwrap_err();
+            let error =
+                reject_agent_host_residue_without_authority(&directory, &stable_host_lease, scope)
+                    .unwrap_err();
             assert!(
                 error.to_string().contains("requires both"),
                 "{name}: {error}"
             );
             std::fs::remove_file(path).unwrap();
         }
+        // Canonical-lease existence is intentionally content agnostic: a
+        // Binding-only record, partial Arm tail, and complete Arm all mean an
+        // Agent host may have owned this space and disabled mode must not
+        // repair or interpret any of them.
+        std::fs::write(&stable_host_lease, b"binding plus interrupted arm").unwrap();
+        let error =
+            reject_agent_host_residue_without_authority(&directory, &stable_host_lease, scope)
+                .unwrap_err();
+        assert!(error.to_string().contains("lease residue"), "{error}");
+        std::fs::remove_file(&stable_host_lease).unwrap();
+
+        let stable_host_lease_stage =
+            vos::agent::host::agent_host_lease_stage_path(&stable_host_lease);
+        std::fs::write(&stable_host_lease_stage, b"interrupted binding publication").unwrap();
+        let error =
+            reject_agent_host_residue_without_authority(&directory, &stable_host_lease, scope)
+                .unwrap_err();
+        assert!(error.to_string().contains("lease residue"), "{error}");
+        assert!(error.to_string().contains(".next"), "{error}");
+        std::fs::remove_file(stable_host_lease_stage).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn disabled_agent_host_rejects_only_its_exact_external_authority_namespace() {
+        let directory = agent_test_directory("external-authority-residue");
+        let agent_root = directory.join("data/agents");
+        let stable_host_lease = directory.join("locks/space.agent-host.lock");
+        std::fs::create_dir_all(&agent_root).unwrap();
+        std::fs::create_dir_all(stable_host_lease.parent().unwrap()).unwrap();
+        let scope = vos::agent::host::AgentHostScope {
+            space: vos::service::SpaceId([0x81; 32]),
+            node: vos::service::NodeId([0x82; 32]),
+        };
+        let other_scope = vos::agent::host::AgentHostScope {
+            space: vos::service::SpaceId([0x83; 32]),
+            node: scope.node,
+        };
+        let authority_root = vos::agent::host::agent_host_authority_root_path(
+            &agent_root,
+            &stable_host_lease,
+            scope,
+        )
+        .unwrap();
+        let other_authority_root = vos::agent::host::agent_host_authority_root_path(
+            &agent_root,
+            &stable_host_lease,
+            other_scope,
+        )
+        .unwrap();
+        assert_ne!(authority_root, other_authority_root);
+
+        std::fs::create_dir(&other_authority_root).unwrap();
+        std::fs::write(
+            other_authority_root.join("unrelated.system-authority-ledger.redb"),
+            b"other space",
+        )
+        .unwrap();
+        std::fs::remove_dir(&agent_root).unwrap();
+        assert!(
+            reject_agent_host_residue_without_authority(&agent_root, &stable_host_lease, scope)
+                .is_ok()
+        );
+        assert!(!agent_root.exists());
+
+        std::fs::create_dir(&authority_root).unwrap();
+        let error =
+            reject_agent_host_residue_without_authority(&agent_root, &stable_host_lease, scope)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("authority namespace residue"),
+            "{error}",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&authority_root.display().to_string())
+        );
+        assert!(!agent_root.exists());
+
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4606,6 +4937,8 @@ mod tests {
             format!("{}.agent", "11".repeat(32)),
             format!("{}.agent-lock", "22".repeat(32)),
             format!("{}.agent-image", "33".repeat(32)),
+            format!("{}.system-authority-ledger.redb", "44".repeat(32)),
+            format!("{}.system-authority-ledger.redb.next", "55".repeat(32)),
         ] {
             let path = directory.join(name);
             std::fs::write(&path, b"generation").unwrap();
@@ -4892,8 +5225,11 @@ mod tests {
         let program_hash = BlobHash::of(&exact_package).0;
         let row = vos::registry::AgentRow {
             instance_name: vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
+            installation_id: vos::service::InstallationId([0xA1; 32]),
+            revision: 0,
             program_hash,
             program_name: package.manifest.name.clone(),
+            program_publication_id: vos::registry::PublicationId::new([0xA2; 32]),
             replication_id: [91; 32],
             consistency: Consistency::Raft as u8,
             network_reachable: false,
@@ -4981,6 +5317,62 @@ mod tests {
             current
         );
         assert!(bound_role_authority_replication(&[1; 31], current).is_err());
+    }
+
+    #[test]
+    fn raced_role_authority_install_requires_the_exact_service_postcondition() {
+        let program = ProgramTag {
+            publication_id: vos::registry::PublicationId::new([0x81; 32]),
+            hash: [0x82; 32],
+        };
+        let replication_id = [0x83; 32];
+        let mut row = vos::registry::AgentRow {
+            instance_name: vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
+            installation_id: vos::service::InstallationId::new([0x84; 32]),
+            revision: 0,
+            program_hash: program.hash,
+            program_name: "space-authority".into(),
+            program_publication_id: program.publication_id,
+            replication_id,
+            consistency: Consistency::Raft as u8,
+            network_reachable: false,
+            sync_role: vos::registry::SyncFloor::Member,
+        };
+        assert!(role_authority_install_matches(
+            &row,
+            vos::service::ROLE_AUTHORITY_INSTANCE_,
+            "space-authority",
+            program,
+            replication_id,
+        ));
+
+        row.instance_name = "other-authority".into();
+        assert!(!role_authority_install_matches(
+            &row,
+            vos::service::ROLE_AUTHORITY_INSTANCE_,
+            "space-authority",
+            program,
+            replication_id,
+        ));
+        row.instance_name = vos::service::ROLE_AUTHORITY_INSTANCE_.into();
+
+        row.program_publication_id = vos::registry::PublicationId::new([0x91; 32]);
+        assert!(!role_authority_install_matches(
+            &row,
+            vos::service::ROLE_AUTHORITY_INSTANCE_,
+            "space-authority",
+            program,
+            replication_id,
+        ));
+        row.program_publication_id = program.publication_id;
+        row.sync_role = vos::registry::SyncFloor::Private;
+        assert!(!role_authority_install_matches(
+            &row,
+            vos::service::ROLE_AUTHORITY_INSTANCE_,
+            "space-authority",
+            program,
+            replication_id,
+        ));
     }
 
     #[test]
@@ -5108,8 +5500,11 @@ mod tests {
         let package = signed_service_package(vos::service::VOS_SERVICE_PROGRAM_ID);
         let row = vos::registry::AgentRow {
             instance_name: "counter".into(),
+            installation_id: vos::service::InstallationId([0xB1; 32]),
+            revision: 0,
             program_hash: [1; 32],
             program_name: "counter".into(),
+            program_publication_id: vos::registry::PublicationId::new([0xB2; 32]),
             replication_id: [2; 32],
             consistency: Consistency::Raft as u8,
             network_reachable: true,
@@ -5155,8 +5550,11 @@ mod tests {
         let original = signed_service_package(vos::service::VOS_SERVICE_PROGRAM_ID);
         let mut row = vos::registry::AgentRow {
             instance_name: "counter".into(),
+            installation_id: vos::service::InstallationId([0xC1; 32]),
+            revision: 0,
             program_hash: BlobHash::of(&original.encode()).0,
             program_name: original.manifest.name.clone(),
+            program_publication_id: vos::registry::PublicationId::new([0xC2; 32]),
             replication_id: [0xD1; 32],
             consistency: Consistency::Raft as u8,
             network_reachable: false,
@@ -5336,6 +5734,8 @@ mod tests {
 
         row.program_hash = BlobHash::of(&package_wire).0;
         row.program_name = replacement.manifest.name.clone();
+        row.program_publication_id = vos::registry::PublicationId::new([0xC3; 32]);
+        row.revision += 1;
         let cache_path = blob_store::cache_path_for(&BlobHash(row.program_hash));
         let _ = std::fs::remove_file(&cache_path);
         let RowConfig::Service { config, .. } = agent_config_from_row(
@@ -5416,8 +5816,11 @@ mod tests {
         let package = signed_service_package(vos::service::VOS_SERVICE_PROGRAM_ID);
         let row = vos::registry::AgentRow {
             instance_name: "production-counter".into(),
+            installation_id: vos::service::InstallationId([0xD1; 32]),
+            revision: 0,
             program_hash: [31; 32],
             program_name: "counter".into(),
+            program_publication_id: vos::registry::PublicationId::new([0xD2; 32]),
             replication_id: [32; 32],
             consistency: Consistency::Local as u8,
             network_reachable: false,
@@ -5570,8 +5973,11 @@ mod tests {
         let replication_id = [42; 32];
         let row = vos::registry::AgentRow {
             instance_name: "production-raft-counter".into(),
+            installation_id: vos::service::InstallationId([0xE1; 32]),
+            revision: 0,
             program_hash: [41; 32],
             program_name: "counter".into(),
+            program_publication_id: vos::registry::PublicationId::new([0xE2; 32]),
             replication_id,
             consistency: Consistency::Raft as u8,
             network_reachable: false,
@@ -5664,8 +6070,11 @@ mod tests {
             signed_service_package_with_consistency(vos::service::VOS_SERVICE_PROGRAM_ID, true);
         let row = vos::registry::AgentRow {
             instance_name: "shared-counter".into(),
+            installation_id: vos::service::InstallationId([0xF1; 32]),
+            revision: 0,
             program_hash: [11; 32],
             program_name: "shared-counter".into(),
+            program_publication_id: vos::registry::PublicationId::new([0xF2; 32]),
             replication_id: [12; 32],
             consistency: Consistency::Crdt as u8,
             network_reachable: true,

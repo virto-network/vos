@@ -46,8 +46,8 @@ pub mod prelude {
     // Available for explicit actor helper methods and manual Actor impls.
     pub use crate::Context;
     pub use crate::{
-        ActorId, AgentId, CallError, CallId, CapabilityId, CredentialId, InvocationId, NodeId,
-        Origin, PrincipalId, SpaceRole,
+        ActorId, AgentId, CallError, CallId, CapabilityId, CredentialId, InstallationId,
+        InvocationId, NodeId, Origin, PrincipalId, SpaceRole,
     };
     pub use crate::{Attestation, AttestationError, Verified};
     #[cfg(feature = "macros")]
@@ -97,8 +97,8 @@ pub mod jobs;
 // Space-registry protocol — wire rows, status/role consts, and the
 // consensus-critical canonical signing-byte encodings. Always available
 // (no_std) so the space-registry actor's service/wasm builds can
-// `pub use` them back; the daemon's sign-on-relay path is std-gated
-// inside the module.
+// `pub use` them back; the daemon's read-only catalog ingress parser is
+// std-gated inside the module.
 pub mod provable;
 pub mod refine_payload;
 pub mod registry;
@@ -173,8 +173,8 @@ pub use attestation::{
     Verified, VerifyAttestationBuilder, VerifyAttestationFrom, verify_once,
 };
 pub use service::{
-    ActorId, AgentId, CallId, CapabilityId, CredentialId, InvocationId, NodeId, Origin,
-    PrincipalId, ProducerId, ProgramId, RoleId, SubjectId,
+    ActorId, AgentId, CallId, CapabilityId, CredentialId, InstallationId, InvocationId, NodeId,
+    Origin, PrincipalId, ProducerId, ProgramId, RoleId, SubjectId,
 };
 // Per-task future machinery for native extensions: the scheduler lives
 // host-side (see node.rs). Re-exported at the crate root so the
@@ -257,7 +257,7 @@ mod host_invoker {
             async move {
                 match outcome {
                     Ok(bytes) if bytes.is_empty() => Ok(Value::Unit),
-                    Ok(bytes) => Ok(<Value as Decode>::decode(&bytes)),
+                    Ok(bytes) => <Value as Decode>::try_decode(&bytes).ok_or(ClientError::Decode),
                     Err(error) => Err(error),
                 }
             }
@@ -645,6 +645,9 @@ macro_rules! __vos_emit_worker_glue {
                 state_len: usize,
             ) -> *mut () {
                 use $crate::Actor as _;
+                if state_ptr.is_null() || state_len == 0 {
+                    return core::ptr::null_mut();
+                }
                 let bytes = unsafe { core::slice::from_raw_parts(state_ptr, state_len) };
                 const STATE_MAGIC: &[u8; 8] = b"VOSXST02";
                 const STATE_HEADER_LEN: usize = 24;
@@ -824,6 +827,9 @@ macro_rules! __vos_emit_wasm_glue {
 
             #[unsafe(no_mangle)]
             pub extern "C" fn vos_wasm_dispatch(state: u32, msg_ptr: u32, msg_len: u32) {
+                if state == 0 || msg_ptr == 0 || msg_len == 0 {
+                    return;
+                }
                 let ws = unsafe { &mut *(state as *mut WasmState) };
                 let raw =
                     unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, msg_len as usize) };
@@ -915,11 +921,23 @@ macro_rules! __vos_emit_wasm_glue {
             #[unsafe(no_mangle)]
             pub extern "C" fn vos_wasm_load(state_ptr: u32, state_len: u32) -> u32 {
                 use $crate::Actor as _;
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(state_ptr as *const u8, state_len as usize)
+                let mut actor: $actor_name = if state_len == 0 {
+                    <$actor_name as $crate::Actor>::create()
+                } else {
+                    if state_ptr == 0 {
+                        return 0;
+                    }
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(state_ptr as *const u8, state_len as usize)
+                    };
+                    let Some(actor) = $crate::Decode::try_decode(bytes) else {
+                        // A non-empty state argument denotes an existing actor.
+                        // Corrupt/schema-incompatible bytes must not silently
+                        // manufacture a replacement default instance.
+                        return 0;
+                    };
+                    actor
                 };
-                let mut actor: $actor_name = $crate::Decode::try_decode(bytes)
-                    .unwrap_or_else(<$actor_name as $crate::Actor>::create);
                 let mut ctx =
                     $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
                 let _ = $crate::run_blocking(actor.on_start(&mut ctx));

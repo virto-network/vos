@@ -1,13 +1,11 @@
 //! `space new` — scaffold a fresh space.
 //!
-//! Boots the registry actor in a temp data dir, sends an
-//! `add_node` for the creator (the first entry in the
-//! members table), reads the genesis DAG root from the
-//! resulting redb, derives `space_id =
-//! derive_space_id(genesis_dag_root)`, then renames the temp
-//! dir to `~/.local/share/vosx/<space_id>/`. The first commit
-//! IS the genesis — joiners syncing this space see the same
-//! root and can verify the advertised space_id matches.
+//! Boots the registry actor in a temp data dir and commits only the
+//! versioned `set_root` anchor at sequence zero. It then derives
+//! `space_id = derive_space_id(genesis_dag_root)`, reopens the registry,
+//! anchors that id, and finally submits the creator's space-bound signed
+//! `add_node`. Joiners therefore derive the same id from the same sole
+//! genesis operation before accepting any signed mutation.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -108,9 +106,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 }
 
 /// Scaffold a fresh space: boot the registry in a temp dir, run the
-/// genesis commits (`set_root` + operator ADMIN grant + first
-/// `add_node`), derive `space_id` from the genesis root, move the dir
-/// into place, persist the node key, and upsert the spaces-index entry.
+/// versioned `set_root` genesis anchor, derive `space_id` from its DAG root,
+/// reopen and anchor that id, then submit the first signed `add_node` before
+/// moving the directory into place, persisting the node key, and upserting
+/// the spaces-index entry.
 /// The registry is *not* left running — the caller boots it via `space
 /// up`. Reused by the `space up <recipe>` create-if-unknown path.
 pub(crate) fn scaffold(
@@ -156,21 +155,16 @@ pub(crate) fn scaffold(
     //    engaged for this offline boot. The space_id-derived
     //    replication_id will be used on subsequent `space up`.
     let mut node = VosNode::with_prefix(local_prefix);
-    let cfg = AgentConfig::new(registry_blob)
+    let cfg = AgentConfig::new(registry_blob.clone())
         .with_name(vos::node::REGISTRY_AGENT_NAME)
         .with_consistency(Consistency::Crdt)
         .with_replication_id([0u8; 32])
         .persist(&temp_dir);
     let _id = node.register_at_id(cfg, ServiceId::REGISTRY);
 
-    // 5. Genesis commits: anchor the operator's CLI identity as
-    //    the signing root, grant it ADMIN, and enrol the node as the
-    //    first voter. All three ride the genesis DAG, so they're pinned
-    //    into `space_id` — a joiner verifies the root the same way it
-    //    verifies the space id, and from then on every gated registry
-    //    mutation must be signed by the root or an admin it delegated
-    //    to. The operator key signs the two gated ops; `set_root` is
-    //    the unsigned anchor (first-write-wins, refused thereafter).
+    // 5. Commit exactly one genesis operation: the versioned immutable
+    //    signing root. No signed mutation can precede the space-id anchor,
+    //    whose value is necessarily derived from this sequence-zero node.
     let operator_kp = crate::identity::load_or_create()?;
     let operator_peer_id = libp2p::PeerId::from(operator_kp.public()).to_bytes();
     let reg = RegistryRef::at(ServiceId::REGISTRY);
@@ -181,9 +175,48 @@ pub(crate) fn scaffold(
         anyhow::bail!("genesis set_root returned status {status}");
     }
 
+    // 6. Drain the first runtime so sequence zero is fully flushed.
+    node.shutdown();
+    let results = node.collect();
+    for r in &results {
+        if let Some(err) = &r.error {
+            anyhow::bail!("genesis registry boot: {err}");
+        }
+    }
+
+    // 7. Read the sequence-zero DAG root and derive the durable space id.
+    let registry_db = temp_dir
+        .join("agents")
+        .join(format!("{:08x}.redb", ServiceId::REGISTRY.0));
+    let genesis_root = read_genesis_root(&registry_db)?;
+    let space_id = crate::commands::space::common::derive_space_id(&genesis_root);
+
+    // 8. Reopen the same registry, anchor the derived id, and only then
+    //    produce the first scoped signature. This second runtime also proves
+    //    that the root anchor survived a cold replay before membership is
+    //    enrolled.
+    let mut node = VosNode::with_prefix(local_prefix);
+    let cfg = AgentConfig::new(registry_blob)
+        .with_name(vos::node::REGISTRY_AGENT_NAME)
+        .with_consistency(Consistency::Crdt)
+        .with_replication_id(space_id)
+        .persist(&temp_dir);
+    let _id = node.register_at_id(cfg, ServiceId::REGISTRY);
+    let status = vos::block_on(reg.set_space_id(&mut &node, space_id.to_vec()))
+        .map_err(|e| anyhow::anyhow!("genesis set_space_id failed: {e}"))?;
+    if status != Status::Ok {
+        anyhow::bail!("genesis set_space_id returned status {status}");
+    }
+    let anchored_space_id = vos::block_on(reg.space_id(&mut &node))
+        .map_err(|e| anyhow::anyhow!("verify genesis space_id anchor: {e}"))?;
+    if anchored_space_id.as_slice() != space_id {
+        anyhow::bail!("genesis registry did not retain the derived space_id anchor");
+    }
+
     let node_peer_id = peer_id.to_bytes();
     let node_auth = op_auth(
         &operator_kp,
+        &space_id,
         "add_node",
         &[
             &(local_prefix as u32).to_le_bytes(),
@@ -202,24 +235,15 @@ pub(crate) fn scaffold(
     if status != Status::Ok {
         anyhow::bail!("genesis add_node returned status {status}");
     }
-
-    // 6. Drain the runtime so the commit is fully flushed.
     node.shutdown();
     let results = node.collect();
     for r in &results {
         if let Some(err) = &r.error {
-            anyhow::bail!("genesis registry boot: {err}");
+            anyhow::bail!("genesis registry enrollment: {err}");
         }
     }
 
-    // 7. Read the genesis DAG root from the registry's redb.
-    let registry_db = temp_dir
-        .join("agents")
-        .join(format!("{:08x}.redb", ServiceId::REGISTRY.0));
-    let genesis_root = read_genesis_root(&registry_db)?;
-    let space_id = crate::commands::space::common::derive_space_id(&genesis_root);
-
-    // 8. Move temp dir to the canonical location. Disarm the
+    // 9. Move temp dir to the canonical location. Disarm the
     //    guard once the rename succeeds — the destination dir
     //    is now legitimate state, not a temp leftover.
     let final_dir = data_dir.unwrap_or_else(|| paths::space_dir(&space_id));
@@ -243,14 +267,14 @@ pub(crate) fn scaffold(
     })?;
     temp_guard.disarm();
 
-    // 9. Persist the keypair under the final dir.
+    // 10. Persist the keypair under the final dir.
     let key_path = final_dir.join("node.key");
     let key_bytes = keypair
         .to_protobuf_encoding()
         .map_err(|e| anyhow::anyhow!("encode keypair: {e}"))?;
     std::fs::write(&key_path, key_bytes)?;
 
-    // 10. Append to the spaces index.
+    // 11. Append to the spaces index.
     spaces_index::upsert(&mut index, entry.clone());
     index.save()?;
 
@@ -315,9 +339,9 @@ impl Drop for TempDirGuard {
 /// Open the registry's redb and return the CID of the `seq == 0`
 /// commit — the genesis anchor `space_id` derives from.
 ///
-/// Genesis is now several commits (`set_root`, the operator's ADMIN
-/// grant, the first `add_node`); the `seq == 0` event is `set_root`,
-/// so `space_id` binds to the root identity. This MUST key on
+/// Genesis has exactly one commit (`set_root`); the space-id anchor and
+/// first signed `add_node` are deliberately committed only after deriving
+/// this root and reopening the registry. This MUST key on
 /// `seq == 0` (not the DAG tip): `space up` and joiners verify the
 /// space via the same `seq == 0` scan in `verify.rs`, and the tip
 /// moves with every post-genesis commit.

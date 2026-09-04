@@ -1493,11 +1493,15 @@ impl<S: AgentImageStore> AgentDriver<S> {
     /// this signed package and target location.
     pub fn actor_install_request(
         &self,
+        installation_id: crate::service::InstallationId,
+        registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
         package: &Package,
     ) -> Result<LifecycleRequest, AgentDriverError> {
-        if name.is_empty()
+        if installation_id == crate::service::InstallationId::ZERO
+            || registry_reservation == Hash::ZERO
+            || name.is_empty()
             || name.len() > crate::service::MAX_ACTOR_NAME_BYTES
             || parent == Some(ActorId::ZERO)
         {
@@ -1522,6 +1526,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
             AgentDriverError::Package(PackageError::InvalidActorArtifacts),
         )?;
         Ok(LifecycleRequest::Install(InstallActor {
+            installation_id,
+            registry_reservation,
             entry: ActorEntry {
                 actor,
                 name,
@@ -1548,11 +1554,19 @@ impl<S: AgentImageStore> AgentDriver<S> {
     pub fn install_actor(
         &mut self,
         authority: &AgentAuthorityReceipt,
+        installation_id: crate::service::InstallationId,
+        registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
         package: &Package,
     ) -> Result<ActorEntry, AgentDriverError> {
-        let request = self.actor_install_request(name, parent, package)?;
+        let request = self.actor_install_request(
+            installation_id,
+            registry_reservation,
+            name,
+            parent,
+            package,
+        )?;
         let admission = self.authorize(authority, &request)?;
         let LifecycleRequest::Install(install) = request else {
             return Err(AgentDriverError::InvalidRuntime);
@@ -2602,10 +2616,11 @@ fn validate_actor_directory_page(
     let seen = seen
         .checked_add(page.entries.len())
         .ok_or(AgentDriverError::InvalidRuntime)?;
-    let incarnations_are_valid = page
-        .entries
-        .iter()
-        .all(|record| record.incarnation != Hash::ZERO);
+    let incarnations_are_valid = page.entries.iter().all(|record| {
+        record.incarnation != Hash::ZERO
+            && record.installation_id != crate::service::InstallationId::ZERO
+            && record.registry_reservation != Hash::ZERO
+    });
     if page_size_is_valid
         && ordered
         && starts_after_cursor
@@ -2773,6 +2788,8 @@ mod tests {
         let record = |entry: ActorEntry, seed| super::super::ActorDirectoryRecord {
             entry,
             incarnation: Hash([seed; 32]),
+            installation_id: crate::service::InstallationId([seed.wrapping_add(1); 32]),
+            registry_reservation: Hash([seed.wrapping_add(2); 32]),
         };
 
         let backwards = super::super::ActorDirectoryPage {
@@ -2808,6 +2825,38 @@ mod tests {
         };
         assert_eq!(
             validate_actor_directory_page(None, &oversized, 1, 0, 2),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let mut zero_installation = record(first.clone(), 1);
+        zero_installation.installation_id = crate::service::InstallationId::ZERO;
+        assert_eq!(
+            validate_actor_directory_page(
+                None,
+                &super::super::ActorDirectoryPage {
+                    entries: vec![zero_installation],
+                    next: None,
+                },
+                2,
+                0,
+                2,
+            ),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let mut zero_reservation = record(first.clone(), 1);
+        zero_reservation.registry_reservation = Hash::ZERO;
+        assert_eq!(
+            validate_actor_directory_page(
+                None,
+                &super::super::ActorDirectoryPage {
+                    entries: vec![zero_reservation],
+                    next: None,
+                },
+                2,
+                0,
+                2,
+            ),
             Err(AgentDriverError::InvalidRuntime)
         );
 

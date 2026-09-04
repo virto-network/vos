@@ -6,7 +6,9 @@
 //! formats the result as TOML to stdout. Same model as every
 //! other `space *` command — the daemon is the source of truth.
 
-use vos::registry::{AgentRow, MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberRow, ProgramRow};
+use vos::registry::{
+    AgentRow, MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberRow, ProgramKind, ProgramRow,
+};
 
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::consistency_name;
@@ -41,7 +43,17 @@ fn print_recipe(
         println!("[[program]]");
         println!("name    = {:?}", p.name);
         println!("hash    = {:?}", hex::encode(p.hash));
-        println!("crdt    = {}", p.crdt);
+        println!(
+            "publication_id = {:?}",
+            hex::encode(p.publication_id.as_bytes())
+        );
+        match &p.kind {
+            ProgramKind::Service { crdt } => {
+                println!("kind    = \"service\"");
+                println!("crdt    = {crdt}");
+            }
+            ProgramKind::AgentActor => println!("kind    = \"agent-actor\""),
+        }
         println!();
     }
 

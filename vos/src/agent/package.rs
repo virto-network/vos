@@ -388,7 +388,18 @@ pub struct Ed25519PackageVerifier;
 #[cfg(feature = "network")]
 impl PackageSignatureVerifier for Ed25519PackageVerifier {
     fn verify(&self, public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
-        libp2p::identity::PublicKey::try_decode_protobuf(public_key)
+        let Ok(decoded) = libp2p::identity::PublicKey::try_decode_protobuf(public_key) else {
+            return false;
+        };
+        // The package format promises an Ed25519 producer, not merely any
+        // key algorithm understood by the host's libp2p feature set. Also
+        // require the embedded protobuf to be the canonical encoding so one
+        // producer key cannot acquire multiple signed package identities.
+        if decoded.encode_protobuf() != public_key {
+            return false;
+        }
+        decoded
+            .try_into_ed25519()
             .is_ok_and(|public_key| public_key.verify(message, signature))
     }
 }
@@ -1202,5 +1213,41 @@ mod tests {
             Err(PackageError::InvalidSignature)
         );
         assert!(runtime_package().verify_signature(&Verifier(true)).is_ok());
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn default_verifier_requires_a_canonical_ed25519_producer_key() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let mut package = actor_package(
+            &ACTOR_META,
+            &ACTOR_SCHEMA,
+            super::super::schema::ExecutionEntryKind::AgentActor,
+        );
+        package.deployment_signature.public_key = keypair.public().encode_protobuf();
+        package.deployment_signature.producer =
+            ProducerId::of_public_key(&package.deployment_signature.public_key);
+        package.deployment_signature.signature = keypair.sign(&package.signing_message()).unwrap();
+        assert!(package.verify_signature(&Ed25519PackageVerifier).is_ok());
+
+        package.deployment_signature.signature[0] ^= 0xff;
+        assert_eq!(
+            package.verify_signature(&Ed25519PackageVerifier),
+            Err(PackageError::InvalidSignature),
+        );
+
+        package.deployment_signature.signature[0] ^= 0xff;
+        // Prost accepts and discards unknown protobuf fields. Reject that
+        // alternate byte spelling even though it decodes to the same key.
+        package
+            .deployment_signature
+            .public_key
+            .extend_from_slice(&[0x18, 0x00]);
+        package.deployment_signature.producer =
+            ProducerId::of_public_key(&package.deployment_signature.public_key);
+        assert_eq!(
+            package.verify_signature(&Ed25519PackageVerifier),
+            Err(PackageError::InvalidSignature),
+        );
     }
 }

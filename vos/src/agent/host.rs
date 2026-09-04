@@ -1,9 +1,10 @@
 //! Durable Local system-Agent host.
 //!
-//! An [`AgentHost`] owns one filesystem directory and the one system Agent
-//! selected by independently configured root pins. The clean generation is a
-//! journal rooted at `<full-agent-id>.agent`; retired `.agent-image` files are
-//! rejected and are never migrated implicitly.
+//! One internal serialized host owns a filesystem directory and the one system
+//! Agent selected by independently configured root pins. The public
+//! [`AgentHostControl`] retains that worker's unique ownership. The clean
+//! generation is a journal rooted at `<full-agent-id>.agent`; retired
+//! `.agent-image` files are rejected and are never migrated implicitly.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -63,8 +64,8 @@ use super::{
 };
 use crate::service::wire::ServiceWire;
 use crate::service::{
-    ActorId, AgentId, BlobRef, CapabilityId, DeploymentId, Hash, InvocationId, NodeId, ProgramId,
-    SpaceId,
+    ActorId, AgentId, BlobRef, CapabilityId, DeploymentId, Hash, InstallationId, InvocationId,
+    NodeId, ProgramId, SpaceId,
 };
 
 const JOURNAL_SUFFIX: &str = ".agent";
@@ -174,8 +175,8 @@ pub enum AgentHostJournalError {
 ///
 /// `stable_lock_path` must live outside `root`. The token therefore remains
 /// exclusive if a backup/restore workflow renames and replaces the complete
-/// data directory. [`AgentHost`] additionally locks an inode inside `root` as
-/// defense in depth. Production setup must durably create the configured
+/// data directory. [`AgentHostControl`] additionally owns a worker which locks
+/// an inode inside `root` as defense in depth. Production setup must durably create the configured
 /// parent directories first; this helper syncs the immediate parent of any
 /// leaf it creates, but cannot make an arbitrarily deep new ancestor chain
 /// crash-durable.
@@ -539,7 +540,7 @@ impl AgentHostRootLease {
 }
 
 /// One process-local owner of a directory of durable agents.
-pub struct AgentHost {
+pub(crate) struct AgentHost {
     root: PathBuf,
     scope: AgentHostScope,
     agents: BTreeMap<AgentId, HostedSystemAgent>,
@@ -625,7 +626,7 @@ impl AgentHostScope {
 /// Private construction makes the tuple internally consistent, but does not
 /// prove which [`AgentHostControl`] produced it: callers can legitimately open
 /// generic hosts with their own trust providers. A production issuer must
-/// prepare through its own privately held handle and must never accept this
+/// prepare through its own sealed coordinator path and must never accept this
 /// value from an untrusted caller as provenance. Principal, credential,
 /// sequence, and validity remain authority-owned inputs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -756,7 +757,7 @@ impl Drop for AgentHostActivity {
 /// use full [`AgentId`] / [`ActorId`] values; this handle never projects an
 /// Agent into the transitional 32-bit service routing namespace.
 #[derive(Clone)]
-pub struct AgentHostHandle {
+pub(crate) struct AgentHostHandle {
     commands: SyncSender<AgentHostCommand>,
     state: Arc<AtomicU8>,
     active_requests: Arc<AtomicUsize>,
@@ -866,15 +867,25 @@ impl AgentHostHandle {
     pub fn prepare_actor_install(
         &self,
         agent: AgentId,
+        installation_id: InstallationId,
+        registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
         package: Package,
     ) -> Result<PreparedLifecycleRequest, AgentHostError> {
+        validate_install_identity(installation_id, registry_reservation)?;
         validate_actor_name_and_parent(&name, parent)?;
         validate_package_shape_before_reservation(&package)?;
         let payload_bytes = payload_sum([name.capacity(), package_heap_payload_bytes(&package)]);
         self.request(payload_bytes, move |host| {
-            host.prepare_actor_install(agent, name, parent, &package)
+            host.prepare_actor_install(
+                agent,
+                installation_id,
+                registry_reservation,
+                name,
+                parent,
+                &package,
+            )
         })
     }
 
@@ -976,11 +987,14 @@ impl AgentHostHandle {
         &self,
         agent: AgentId,
         authority: AgentAuthorityReceipt,
+        installation_id: InstallationId,
+        registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
         package: Package,
     ) -> Result<ActorEntry, AgentHostError> {
         validate_agent_receipt_shape(&authority)?;
+        validate_install_identity(installation_id, registry_reservation)?;
         validate_actor_name_and_parent(&name, parent)?;
         validate_package_shape_before_reservation(&package)?;
         let payload_bytes = payload_sum([
@@ -989,7 +1003,15 @@ impl AgentHostHandle {
             package_heap_payload_bytes(&package),
         ]);
         self.request(payload_bytes, move |host| {
-            host.install_actor(agent, &authority, name, parent, &package)
+            host.install_actor(
+                agent,
+                &authority,
+                installation_id,
+                registry_reservation,
+                name,
+                parent,
+                &package,
+            )
         })
     }
 
@@ -1370,6 +1392,16 @@ fn validate_actor(actor: ActorId) -> Result<(), AgentHostError> {
     Ok(())
 }
 
+fn validate_install_identity(
+    installation_id: InstallationId,
+    registry_reservation: Hash,
+) -> Result<(), AgentHostError> {
+    if installation_id == InstallationId::ZERO || registry_reservation == Hash::ZERO {
+        return Err(invalid_lifecycle_request());
+    }
+    Ok(())
+}
+
 fn validate_actor_and_deployment(
     actor: ActorId,
     deployment: DeploymentId,
@@ -1424,11 +1456,28 @@ fn cancel_agent_host_admission(command: &mut AgentHostCommand) {
     }
 }
 
-/// Owning lifecycle guard for an [`AgentHostHandle`] worker.
+/// Owning lifecycle guard for the serialized Local Agent worker.
 ///
 /// Dropping this value requests terminal shutdown and joins the worker. A
 /// restart deliberately creates a new control with [`Self::open`]; cloned old
-/// handles remain stopped and cannot race commands into the reopened image.
+/// internal senders remain stopped and cannot race commands into the reopened
+/// image. The raw host and cloneable sender are deliberately not public API:
+///
+/// ```compile_fail
+/// use vos::agent::host::AgentHost;
+/// ```
+///
+/// ```compile_fail
+/// use vos::agent::host::AgentHostHandle;
+/// ```
+///
+/// Nor can callers extract the internal sender from this owner:
+///
+/// ```compile_fail
+/// fn extract(control: &vos::agent::host::AgentHostControl) {
+///     let _ = control.handle();
+/// }
+/// ```
 pub struct AgentHostControl {
     handle: AgentHostHandle,
     worker: Option<JoinHandle<()>>,
@@ -1499,8 +1548,47 @@ impl AgentHostControl {
         })
     }
 
-    pub fn handle(&self) -> AgentHostHandle {
+    #[cfg(test)]
+    pub(crate) fn handle_for_test(&self) -> AgentHostHandle {
         self.handle.clone()
+    }
+
+    /// Time since the last admitted operation completed. Active or queued
+    /// work reports zero so node idle policy cannot stop durable work.
+    pub fn idle_for(&self) -> Duration {
+        self.handle.idle_for()
+    }
+
+    /// List the Local Agents currently owned by this host.
+    pub fn identities(&self) -> Result<Vec<AgentIdentity>, AgentHostError> {
+        self.handle.identities()
+    }
+
+    /// Read one Local Agent identity without exposing the cloneable command
+    /// sender which owns the worker protocol.
+    pub fn identity(&self, agent: AgentId) -> Result<Option<AgentIdentity>, AgentHostError> {
+        self.handle.identity(agent)
+    }
+
+    /// Invoke one full-ID actor and return only its settled durable outcome.
+    pub fn invoke(
+        &self,
+        agent: AgentId,
+        invocation: ActorInvocation,
+        authority: ActorInvocationReceipt,
+    ) -> Result<ActorExecutionReply, AgentHostError> {
+        self.handle.invoke(agent, invocation, authority)
+    }
+
+    /// Durably acknowledge one full-ID actor invocation.
+    pub fn acknowledge_invocation(
+        &self,
+        agent: AgentId,
+        invocation: ActorInvocation,
+        authority: ActorInvocationReceipt,
+    ) -> Result<(), AgentHostError> {
+        self.handle
+            .acknowledge_invocation(agent, invocation, authority)
     }
 
     /// Stop admitting operations and wake an idle worker. The operation which
@@ -1890,6 +1978,8 @@ impl AgentHost {
     pub fn prepare_actor_install(
         &self,
         agent: AgentId,
+        installation_id: InstallationId,
+        registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
         package: &Package,
@@ -1899,7 +1989,7 @@ impl AgentHost {
             .get(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
         let operation = driver
-            .actor_install_operation(name, parent, package)
+            .actor_install_operation(installation_id, registry_reservation, name, parent, package)
             .map_err(map_local_driver_error)?;
         PreparedLifecycleRequest::new(
             &driver.config().map_err(map_local_driver_error)?,
@@ -2163,6 +2253,8 @@ impl AgentHost {
         &mut self,
         agent: AgentId,
         authority: &AgentAuthorityReceipt,
+        installation_id: InstallationId,
+        registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
         package: &Package,
@@ -2174,7 +2266,13 @@ impl AgentHost {
             .ok_or(AgentHostError::AgentNotFound)?;
         hosted.with_root_mutation(|driver| {
             let operation = driver
-                .actor_install_operation(name, parent, package)
+                .actor_install_operation(
+                    installation_id,
+                    registry_reservation,
+                    name,
+                    parent,
+                    package,
+                )
                 .map_err(map_local_driver_error)?;
             match apply_local_lifecycle(driver, authority.clone(), operation)? {
                 LifecycleReply::Installed(entry) => Ok(entry),
@@ -5343,7 +5441,7 @@ mod tests {
             fixture.pins.clone(),
         )
         .unwrap();
-        let handle = control.handle();
+        let handle = control.handle_for_test();
         assert!(handle.identities().unwrap().is_empty());
         let identity = handle
             .create(
@@ -5414,7 +5512,7 @@ mod tests {
             fixture.pins.clone(),
         )
         .unwrap();
-        let reopened_handle = reopened.handle();
+        let reopened_handle = reopened.handle_for_test();
         assert_eq!(
             reopened_handle
                 .revision(fixture.config.identity.agent)
@@ -5579,6 +5677,8 @@ mod tests {
         assert_blocked_before_mutation!(host.install_actor(
             agent,
             &fixture.create_receipt,
+            InstallationId([0x75; 32]),
+            Hash([0x76; 32]),
             "blocked".into(),
             None,
             &fixture.runtime_package,
@@ -5639,7 +5739,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             created
-                .handle()
+                .handle_for_test()
                 .revision(fixture.config.identity.agent)
                 .unwrap(),
             Some(0)
@@ -5658,7 +5758,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             reopened
-                .handle()
+                .handle_for_test()
                 .revision(fixture.config.identity.agent)
                 .unwrap(),
             Some(0)
@@ -5686,7 +5786,7 @@ mod tests {
                 fixture.pins.clone(),
             )
             .unwrap();
-            assert!(scoped.handle().identities().unwrap().is_empty());
+            assert!(scoped.handle_for_test().identities().unwrap().is_empty());
             scoped.shutdown().unwrap();
             fixture.provider.archive_for_test();
             // The outer binding is durable, but Arm is intentionally
@@ -5711,7 +5811,7 @@ mod tests {
                 fixture.pins.clone(),
             )
             .unwrap();
-            let handle = recovered.handle();
+            let handle = recovered.handle_for_test();
             assert_eq!(
                 handle.revision(fixture.config.identity.agent).unwrap(),
                 Some(0)
@@ -5809,7 +5909,7 @@ mod tests {
         );
         assert_eq!(
             recovered
-                .handle()
+                .handle_for_test()
                 .revision(fixture.config.identity.agent)
                 .unwrap(),
             Some(0)
@@ -5992,7 +6092,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            control.handle().create(
+            control.handle_for_test().create(
                 fixture.config.clone(),
                 fixture.runtime_package.clone(),
                 fixture.create_receipt.clone(),
@@ -6041,7 +6141,7 @@ mod tests {
             fs::write(residue, b"unexpected authority residue").unwrap();
 
             assert_eq!(
-                control.handle().create(
+                control.handle_for_test().create(
                     fixture.config.clone(),
                     fixture.runtime_package.clone(),
                     fixture.create_receipt.clone(),
@@ -6072,7 +6172,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            control.handle().create(
+            control.handle_for_test().create(
                 fixture.config.clone(),
                 fixture.runtime_package.clone(),
                 fixture.create_receipt.clone(),
@@ -6205,7 +6305,7 @@ mod tests {
         let (directory, lock, _remove) = empty_host_directory("bounded-worker");
         let control =
             open_empty_control_with_capacity(lease(&directory, &lock, scope()), 1).unwrap();
-        let handle = control.handle();
+        let handle = control.handle_for_test();
 
         let (active, active_rx) = mpsc::sync_channel(0);
         let (release, release_rx) = mpsc::sync_channel(0);
@@ -6263,7 +6363,7 @@ mod tests {
         let (directory, lock, _remove) = empty_host_directory("payload-budget");
         let control =
             open_empty_control_with_capacity(lease(&directory, &lock, scope()), 4).unwrap();
-        let handle = control.handle();
+        let handle = control.handle_for_test();
 
         let (active, active_rx) = mpsc::sync_channel(0);
         let (release, release_rx) = mpsc::sync_channel(0);
@@ -6299,7 +6399,7 @@ mod tests {
     fn nested_package_capacity_is_rejected_without_leaking_reservation() {
         let (directory, lock, _remove) = empty_host_directory("nested-payload-budget");
         let control = open_empty_control(lease(&directory, &lock, scope())).unwrap();
-        let handle = control.handle();
+        let handle = control.handle_for_test();
 
         let mut package = payload_test_runtime_package();
         package.diagnostics = Some(crate::service::PackageDiagnostics {
@@ -6398,7 +6498,7 @@ mod tests {
 
         let (directory, lock, _remove) = empty_host_directory("oversized-shapes");
         let control = open_empty_control(lease(&directory, &lock, scope())).unwrap();
-        let handle = control.handle();
+        let handle = control.handle_for_test();
 
         let (active, active_rx) = mpsc::sync_channel(0);
         let (release, release_rx) = mpsc::sync_channel(0);
@@ -6472,7 +6572,7 @@ mod tests {
         let (directory, lock, _remove) = empty_host_directory("payload-panic");
         let control =
             open_empty_control_with_capacity(lease(&directory, &lock, scope()), 4).unwrap();
-        let handle = control.handle();
+        let handle = control.handle_for_test();
 
         let (active, active_rx) = mpsc::sync_channel(0);
         let (release, release_rx) = mpsc::sync_channel(0);

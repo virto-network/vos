@@ -10,12 +10,14 @@
 //! - **Daemon**: `up` runs the libp2p server that owns the
 //!   redb. One daemon per space, identified by an
 //!   `<data_dir>/.endpoint` file.
-//! - **Client**: `publish`, `install`, `upgrade`, `uninstall`,
+//! - **Client**: `publish`, `install`, `uninstall`,
 //!   `unpublish`, `programs`, `agents`, `members`, `call`.
 //!   Each spawns a tiny libp2p peer, dials the daemon's
 //!   endpoint, sends one registry invoke, and exits. Same
 //!   plumbing under `DaemonClient` — `call` is the floor
 //!   primitive, the rest are typed sugar.
+//!   `upgrade` is retained only as a pre-dial, fail-closed migration guard
+//!   directing operators to the Agent lifecycle.
 
 use clap::Subcommand;
 use std::path::PathBuf;
@@ -238,12 +240,12 @@ pub enum SpaceCommand {
         space: String,
         /// Recipe TOML path.
         recipe: PathBuf,
-        /// Print the plan (create / skip / upgrade + local.toml
+        /// Print the plan (create / skip / replacement-required + local.toml
         /// changes) and exit without mutating anything.
         #[arg(long)]
         diff: bool,
-        /// Re-point installed agents whose catalog blob differs from the
-        /// recipe. Without it, a differing blob is flagged, not applied.
+        /// Compatibility guard for the retired service-upgrade path. Fails
+        /// before writes and directs replacements to the Agent lifecycle.
         #[arg(long)]
         upgrade: bool,
     },
@@ -289,8 +291,8 @@ pub enum SpaceCommand {
     },
     /// Tombstone an installed agent.
     Uninstall { space: String, instance: String },
-    /// Upgrade an installed actor to the package currently under a name.
-    /// State and replication identity are preserved.
+    /// Reject the retired legacy service-upgrade path and show the Agent
+    /// lifecycle migration guidance.
     Upgrade {
         space: String,
         instance: String,

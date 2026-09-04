@@ -151,20 +151,22 @@ pub enum DispatchResult {
 
 // ── State lifecycle ───────────────────────────────────────────────
 
-/// Deserialize an actor from state bytes, or create a fresh instance.
+/// Deserialize an actor from state bytes, or create a fresh instance only
+/// when no persisted state exists.
 ///
 /// This is the first step of any actor lifecycle — both services and
 /// invoked actors use it. The caller provides state bytes from wherever
 /// they came (storage, input protocol, etc.).
 ///
-/// Uses validating `try_decode` so a hand-corrupted, truncated, or
-/// schema-drifted persisted blob falls back to `A::create()` instead
-/// of decoding silently to garbage. The probe in
-/// `crdt_counter_survives_corrupted_persisted_state` exercises this.
+/// A non-empty persisted blob is an existing actor incarnation. If it is
+/// corrupt or belongs to another schema generation, fail-stop the guest;
+/// silently replacing it with `A::create()` would turn a read-only protocol
+/// probe into a durable state wipe on the next refine output.
 #[cfg(feature = "pvm")]
 pub fn load_or_create<A: Actor>(state: Option<&[u8]>) -> A {
     let mut actor = match state {
-        Some(bytes) if !bytes.is_empty() => A::try_decode(bytes).unwrap_or_else(A::create),
+        Some(bytes) if !bytes.is_empty() => A::try_decode(bytes)
+            .unwrap_or_else(|| panic!("persisted actor state is corrupt or schema-incompatible")),
         _ => A::create(),
     };
     actor.__init_storage();
@@ -215,7 +217,9 @@ pub fn read_persisted_state(state_buf: &mut [u8]) -> usize {
 /// Read persisted state, growing onto the heap when it exceeds the
 /// stack probe buffer. The READ hostcall copies `min(len, buf)` and
 /// returns the FULL value length, so one retry with an exact-size
-/// buffer always lands it.
+/// buffer always lands it. A length change between the probe and retry
+/// is corruption and traps; it must never be collapsed into `None`, which
+/// is reserved for genuinely absent/empty state.
 ///
 /// This is the cold-start state loader. The fixed-buffer variant
 /// above treats a too-long value as missing — correct for callers
@@ -235,12 +239,14 @@ pub fn read_persisted_state_owned() -> Option<alloc::vec::Vec<u8>> {
     if n <= BUF_SIZE as u64 {
         return Some(probe[..n as usize].to_vec());
     }
-    let mut full = alloc::vec![0u8; n as usize];
+    let len = usize::try_from(n).expect("persisted actor state exceeds the guest address space");
+    let mut full = alloc::vec![0u8; len];
     let m = hostcalls::read(STATE_KEY, &mut full);
-    // A different length on the re-read means the value changed
-    // under us — impossible within one dispatch, so treat it as
-    // corruption and let the caller fall back to a fresh actor.
-    (m == n).then_some(full)
+    assert_eq!(
+        m, n,
+        "persisted actor state changed while it was being read"
+    );
+    Some(full)
 }
 
 /// Read the committed-storage composite root recorded by the previous
@@ -339,6 +345,7 @@ pub fn load<T: super::codec::Decode>(key: &[u8]) -> Option<T> {
 
 /// Result of invoking a child actor.
 #[cfg(feature = "pvm")]
+#[derive(Debug, PartialEq, Eq)]
 pub enum InvokeResult {
     /// Actor completed normally.
     Done { state: Vec<u8>, reply: Vec<u8> },
@@ -354,6 +361,60 @@ pub enum InvokeResult {
     TooBig,
     /// Unknown error status byte.
     Error(u8),
+}
+
+/// Parse the canonical child-invoke reply envelope.
+///
+/// Success and yield replies require the complete
+/// `[status][state_len:u32][state][reply]` shape. Error statuses are exactly
+/// one byte. Any truncated, overlong error, or otherwise malformed frame is
+/// treated as a child panic so it can never supply replacement state.
+#[cfg(feature = "pvm")]
+fn decode_invoke_output(output: &[u8]) -> InvokeResult {
+    use super::run::{
+        STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED,
+        STATUS_TOO_BIG, STATUS_YIELDED,
+    };
+
+    let Some((&status, payload)) = output.split_first() else {
+        return InvokeResult::Panicked;
+    };
+    match status {
+        STATUS_DONE | STATUS_YIELDED => {
+            let Some(length) = payload.get(..4) else {
+                return InvokeResult::Panicked;
+            };
+            let state_len = u32::from_le_bytes(length.try_into().expect("length was checked"));
+            let Ok(state_len) = usize::try_from(state_len) else {
+                return InvokeResult::Panicked;
+            };
+            let Some(state_end) = 5usize.checked_add(state_len) else {
+                return InvokeResult::Panicked;
+            };
+            let Some(state) = output.get(5..state_end) else {
+                return InvokeResult::Panicked;
+            };
+            let reply = &output[state_end..];
+            if status == STATUS_YIELDED {
+                InvokeResult::Yielded {
+                    state: state.to_vec(),
+                    reply: reply.to_vec(),
+                }
+            } else {
+                InvokeResult::Done {
+                    state: state.to_vec(),
+                    reply: reply.to_vec(),
+                }
+            }
+        }
+        STATUS_PANICKED if payload.is_empty() => InvokeResult::Panicked,
+        STATUS_NOT_FOUND if payload.is_empty() => InvokeResult::NotFound,
+        STATUS_OOG if payload.is_empty() => InvokeResult::OutOfGas,
+        STATUS_FORBIDDEN if payload.is_empty() => InvokeResult::Error(STATUS_FORBIDDEN),
+        STATUS_TOO_BIG if payload.is_empty() => InvokeResult::TooBig,
+        status if payload.is_empty() => InvokeResult::Error(status),
+        _ => InvokeResult::Panicked,
+    }
 }
 
 /// Invoke a child actor with a dynamic message.
@@ -500,59 +561,14 @@ fn invoke_hash_full(
     // growing the guest heap. A reply past BUF_SIZE still surfaces as
     // STATUS_TOO_BIG (below) rather than a truncated crash.
     let mut output = [0u8; BUF_SIZE];
-    let n = crate::abi::pvm::hostcalls::invoke(&hash, &input, 0, &mut output) as usize;
-
-    use super::run::{
-        STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED,
-        STATUS_TOO_BIG, STATUS_YIELDED,
+    let returned = crate::abi::pvm::hostcalls::invoke(&hash, &input, 0, &mut output);
+    let Some(n) = usize::try_from(returned)
+        .ok()
+        .filter(|length| *length <= output.len())
+    else {
+        return InvokeResult::Panicked;
     };
-
-    // Short output = error status byte only (no state/reply envelope)
-    if n < 5 {
-        if n >= 1 {
-            return match output[0] {
-                STATUS_PANICKED => InvokeResult::Panicked,
-                STATUS_NOT_FOUND => InvokeResult::NotFound,
-                STATUS_OOG => InvokeResult::OutOfGas,
-                STATUS_TOO_BIG => InvokeResult::TooBig,
-                STATUS_DONE => InvokeResult::Done {
-                    state: Vec::new(),
-                    reply: Vec::new(),
-                },
-                STATUS_YIELDED => InvokeResult::Yielded {
-                    state: Vec::new(),
-                    reply: Vec::new(),
-                },
-                other => InvokeResult::Error(other),
-            };
-        }
-        return InvokeResult::Done {
-            state: Vec::new(),
-            reply: Vec::new(),
-        };
-    }
-
-    let state_len = u32::from_le_bytes([output[1], output[2], output[3], output[4]]) as usize;
-    let state_end = (5 + state_len).min(n);
-    let state = if state_len > 0 && state_end <= n {
-        output[5..state_end].to_vec()
-    } else {
-        Vec::new()
-    };
-    let reply = if state_end < n {
-        output[state_end..n].to_vec()
-    } else {
-        Vec::new()
-    };
-
-    match output[0] {
-        STATUS_YIELDED => InvokeResult::Yielded { state, reply },
-        STATUS_PANICKED => InvokeResult::Panicked,
-        STATUS_NOT_FOUND => InvokeResult::NotFound,
-        STATUS_OOG => InvokeResult::OutOfGas,
-        STATUS_FORBIDDEN => InvokeResult::Error(STATUS_FORBIDDEN),
-        _ => InvokeResult::Done { state, reply },
-    }
+    decode_invoke_output(&output[..n])
 }
 
 // ── Message dispatch ──────────────────────────────────────────────
@@ -652,7 +668,11 @@ fn dispatch_one_inner<A: Actor>(
     if raw.first() != Some(&TAG_DYNAMIC) {
         return DispatchResult::Skipped;
     }
-    let dynamic: super::value::Msg = Decode::decode(&raw[1..]);
+    // FETCH is an ingress boundary. Use the fallible checked decoder so an
+    // attacker-controlled malformed archive is rejected without dispatch.
+    let Some(dynamic) = <super::value::Msg as Decode>::try_decode(&raw[1..]) else {
+        return DispatchResult::Skipped;
+    };
     let msg = match A::Message::from_dynamic(&dynamic) {
         Some(m) => m,
         None => return DispatchResult::Skipped,
@@ -782,6 +802,88 @@ mod tests {
         assert!(ctx.has_space_role(crate::SpaceRole::Member));
         assert!(!ctx.has_space_role(crate::SpaceRole::Admin));
         assert_eq!(ctx.invocation_id(), invocation);
+    }
+
+    #[test]
+    fn malformed_dynamic_archive_is_skipped_before_actor_dispatch() {
+        let invocation = crate::service::InvocationId::derive(b"actor-slice", b"malformed");
+        let mut actor = InvocationProbe::create();
+        let mut ctx = Context::new(ServiceId(0));
+
+        let malformed = [TAG_DYNAMIC, 0xff, 0x00, 0x01];
+        assert!(matches!(
+            dispatch_one_with_invocation(&malformed, &mut actor, &mut ctx, invocation),
+            DispatchResult::Skipped
+        ));
+        assert_eq!(actor.dispatches, 0);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn nonempty_incompatible_state_fails_stop_instead_of_recreating() {
+        let result = std::panic::catch_unwind(|| {
+            let _ = load_or_create::<InvocationProbe>(Some(&[0xff, 0x00, 0x01]));
+        });
+        assert!(result.is_err());
+
+        let fresh = load_or_create::<InvocationProbe>(None);
+        assert_eq!(fresh.dispatches, 0);
+
+        let empty = load_or_create::<InvocationProbe>(Some(&[]));
+        assert_eq!(empty.dispatches, 0);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn child_invoke_output_requires_a_complete_canonical_envelope() {
+        use super::super::run::{
+            STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_PANICKED, STATUS_YIELDED,
+        };
+
+        let mut done = vec![STATUS_DONE];
+        done.extend_from_slice(&2u32.to_le_bytes());
+        done.extend_from_slice(&[0xaa, 0xbb]);
+        done.extend_from_slice(&[0xcc]);
+        assert_eq!(
+            decode_invoke_output(&done),
+            InvokeResult::Done {
+                state: vec![0xaa, 0xbb],
+                reply: vec![0xcc],
+            }
+        );
+
+        let mut yielded = done;
+        yielded[0] = STATUS_YIELDED;
+        assert_eq!(
+            decode_invoke_output(&yielded),
+            InvokeResult::Yielded {
+                state: vec![0xaa, 0xbb],
+                reply: vec![0xcc],
+            }
+        );
+        assert_eq!(
+            decode_invoke_output(&[STATUS_NOT_FOUND]),
+            InvokeResult::NotFound
+        );
+        assert_eq!(
+            decode_invoke_output(&[STATUS_FORBIDDEN]),
+            InvokeResult::Error(STATUS_FORBIDDEN)
+        );
+
+        for malformed in [
+            Vec::new(),
+            vec![STATUS_DONE],
+            vec![STATUS_DONE, 2, 0, 0, 0, 0xaa],
+            vec![STATUS_YIELDED, 0, 0, 0],
+            vec![STATUS_NOT_FOUND, 0],
+            vec![STATUS_PANICKED, 0],
+        ] {
+            assert_eq!(
+                decode_invoke_output(&malformed),
+                InvokeResult::Panicked,
+                "malformed child reply {malformed:?} must fail closed"
+            );
+        }
     }
 }
 

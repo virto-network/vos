@@ -446,6 +446,9 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
     encoder.list(&state.actors, |encoder, actor| {
         encode_entry(encoder, &actor.record.entry);
         encoder.fixed(&actor.record.state_generation.0);
+        encoder.fixed(actor.record.installation_id.as_bytes());
+        encoder.fixed(&actor.record.registry_reservation.0);
+        encoder.fixed(&actor.record.install_request_commitment.0);
         encoder.fixed(&actor.record.producer.0);
         encode_blob(encoder, &actor.record.package);
         encode_blob(encoder, &actor.record.agent_schema);
@@ -455,6 +458,10 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
         encode_requirements(encoder, actor.record.requirements);
         encode_debt(encoder, actor.debt);
     });
+    encoder.list(
+        &state.retired_installation_ids,
+        |encoder, installation_id| encoder.fixed(installation_id.as_bytes()),
+    );
     encoder.option(&state.authority_slot_high_water, |encoder, slot| {
         encoder.u64(*slot)
     });
@@ -541,10 +548,25 @@ pub fn decode_standard_runtime_state(
         &mut decoder,
         super::contract::STANDARD_MAX_ACTORS as usize,
         |decoder| {
+            let entry = decode_entry(decoder)?;
+            let state_generation = Hash(decoder.fixed()?);
+            let installation_id = crate::service::InstallationId(decoder.fixed()?);
+            let registry_reservation = Hash(decoder.fixed()?);
+            let install_request_commitment = Hash(decoder.fixed()?);
+            if state_generation == Hash::ZERO
+                || installation_id == crate::service::InstallationId::ZERO
+                || registry_reservation == Hash::ZERO
+                || install_request_commitment == Hash::ZERO
+            {
+                return Err(DecodeError::NonCanonical);
+            }
             Ok(StandardActorState {
                 record: super::ActorRecord {
-                    entry: decode_entry(decoder)?,
-                    state_generation: Hash(decoder.fixed()?),
+                    entry,
+                    state_generation,
+                    installation_id,
+                    registry_reservation,
+                    install_request_commitment,
                     producer: ProducerId(decoder.fixed()?),
                     package: decode_blob(decoder)?,
                     agent_schema: decode_blob(decoder)?,
@@ -557,6 +579,23 @@ pub fn decode_standard_runtime_state(
             })
         },
     )?;
+    let retired_installation_ids = decode_bounded_list(
+        &mut decoder,
+        super::standard::MAX_RETIRED_INSTALLATION_IDS,
+        |decoder| {
+            let installation_id = crate::service::InstallationId(decoder.fixed()?);
+            if installation_id == crate::service::InstallationId::ZERO {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(installation_id)
+        },
+    )?;
+    if retired_installation_ids
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(DecodeError::NonCanonical);
+    }
     let authority_slot_high_water = decoder.option(|decoder| decoder.u64())?;
     let authority_sequence_high_water = decoder.option(|decoder| decoder.u64())?;
     let authority_dispositions = decode_bounded_list(
@@ -656,6 +695,7 @@ pub fn decode_standard_runtime_state(
         config,
         system_authority,
         actors,
+        retired_installation_ids,
         lane_state,
         invocation_results,
         lane_revisions,
@@ -1327,6 +1367,8 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
         }
         LifecycleRequest::Install(install) => {
             encoder.u8(2);
+            encoder.fixed(install.installation_id.as_bytes());
+            encoder.fixed(&install.registry_reservation.0);
             encode_entry(encoder, &install.entry);
             encoder.fixed(&install.producer.0);
             encode_blob(encoder, &install.package);
@@ -1435,16 +1477,27 @@ fn decode_request_at_depth(
             after: decoder.option(|decoder| Ok(ActorId(decoder.fixed()?)))?,
             limit: decoder.u16()?,
         }),
-        2 => Ok(LifecycleRequest::Install(super::InstallActor {
-            entry: decode_entry(decoder)?,
-            producer: ProducerId(decoder.fixed()?),
-            package: decode_blob(decoder)?,
-            agent_schema: decode_blob(decoder)?,
-            role_policies: decode_blob(decoder)?,
-            state_layout: Hash(decoder.fixed()?),
-            contract: super::contract::decode_actor_contract(decoder)?,
-            requirements: decode_requirements(decoder)?,
-        })),
+        2 => {
+            let installation_id = crate::service::InstallationId(decoder.fixed()?);
+            let registry_reservation = Hash(decoder.fixed()?);
+            if installation_id == crate::service::InstallationId::ZERO
+                || registry_reservation == Hash::ZERO
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(LifecycleRequest::Install(super::InstallActor {
+                installation_id,
+                registry_reservation,
+                entry: decode_entry(decoder)?,
+                producer: ProducerId(decoder.fixed()?),
+                package: decode_blob(decoder)?,
+                agent_schema: decode_blob(decoder)?,
+                role_policies: decode_blob(decoder)?,
+                state_layout: Hash(decoder.fixed()?),
+                contract: super::contract::decode_actor_contract(decoder)?,
+                requirements: decode_requirements(decoder)?,
+            }))
+        }
         3 => Ok(LifecycleRequest::UpgradeActor(super::UpgradeActor {
             actor: ActorId(decoder.fixed()?),
             from_deployment: DeploymentId(decoder.fixed()?),
@@ -2025,6 +2078,8 @@ fn encode_directory_page(encoder: &mut Encoder<'_>, page: &ActorDirectoryPage) {
     encoder.list(&page.entries, |encoder, record| {
         encode_entry(encoder, &record.entry);
         encoder.fixed(&record.incarnation.0);
+        encoder.fixed(record.installation_id.as_bytes());
+        encoder.fixed(&record.registry_reservation.0);
     });
     encoder.option(&page.next, |encoder, next| encoder.fixed(&next.0));
 }
@@ -2036,10 +2091,20 @@ fn decode_directory_page(decoder: &mut Decoder<'_>) -> Result<ActorDirectoryPage
         |decoder| {
             let entry = decode_entry(decoder)?;
             let incarnation = Hash(decoder.fixed()?);
-            if incarnation == Hash::ZERO {
+            let installation_id = crate::service::InstallationId(decoder.fixed()?);
+            let registry_reservation = Hash(decoder.fixed()?);
+            if incarnation == Hash::ZERO
+                || installation_id == crate::service::InstallationId::ZERO
+                || registry_reservation == Hash::ZERO
+            {
                 return Err(DecodeError::NonCanonical);
             }
-            Ok(ActorDirectoryRecord { entry, incarnation })
+            Ok(ActorDirectoryRecord {
+                entry,
+                incarnation,
+                installation_id,
+                registry_reservation,
+            })
         },
     )?;
     if entries
@@ -2220,6 +2285,9 @@ mod tests {
                         suspended: false,
                     },
                     state_generation: generation,
+                    installation_id: crate::service::InstallationId([0x89; 32]),
+                    registry_reservation: Hash([0x8a; 32]),
+                    install_request_commitment: Hash([0x8b; 32]),
                     producer: ProducerId([0x88; 32]),
                     package,
                     agent_schema,
@@ -2508,6 +2576,55 @@ mod tests {
             decode_standard_runtime_state(&encode_standard_runtime_state(&explicit_empty)),
             Err(DecodeError::NonCanonical),
             "explicit empty and missing must never encode the same logical state"
+        );
+    }
+
+    #[test]
+    fn install_commitments_and_retired_ids_are_canonical_durable_state() {
+        let mut state = sparse_standard_state();
+        let active_id = state.actors[0].record.installation_id;
+        state.retired_installation_ids = vec![
+            crate::service::InstallationId([0x91; 32]),
+            crate::service::InstallationId([0x92; 32]),
+        ];
+        let encoded = encode_standard_runtime_state(&state);
+        assert_eq!(decode_standard_runtime_state(&encoded).unwrap(), state);
+
+        let mut zero_commitment = state.clone();
+        zero_commitment.actors[0].record.install_request_commitment = Hash::ZERO;
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&zero_commitment)),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut zero_tombstone = state.clone();
+        zero_tombstone.retired_installation_ids[0] = crate::service::InstallationId::ZERO;
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&zero_tombstone)),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut duplicate_tombstone = state.clone();
+        duplicate_tombstone.retired_installation_ids[1] =
+            duplicate_tombstone.retired_installation_ids[0];
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&duplicate_tombstone)),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut unsorted_tombstones = state.clone();
+        unsorted_tombstones.retired_installation_ids.reverse();
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&unsorted_tombstones)),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut active_and_retired = state;
+        active_and_retired.retired_installation_ids = vec![active_id];
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&active_and_retired)),
+            Err(DecodeError::NonCanonical),
+            "one installation identity cannot be both live and retired"
         );
     }
 
@@ -2966,6 +3083,46 @@ mod tests {
     }
 
     #[test]
+    fn install_wire_requires_and_preserves_exact_registry_identity() {
+        let state = sparse_standard_state();
+        let record = &state.actors[0].record;
+        let install = super::super::InstallActor {
+            installation_id: record.installation_id,
+            registry_reservation: record.registry_reservation,
+            entry: record.entry.clone(),
+            producer: record.producer,
+            package: record.package.clone(),
+            agent_schema: record.agent_schema.clone(),
+            role_policies: record.role_policies.clone(),
+            state_layout: record.state_layout,
+            contract: record.contract,
+            requirements: record.requirements,
+        };
+        let call = RuntimeCall::new(RuntimeState::default(), LifecycleRequest::Install(install));
+        assert_eq!(RuntimeCall::decode(&call.encode()), Ok(call.clone()));
+
+        let mut zero_id = call.clone();
+        let LifecycleRequest::Install(install) = &mut zero_id.request else {
+            unreachable!()
+        };
+        install.installation_id = crate::service::InstallationId::ZERO;
+        assert_eq!(
+            RuntimeCall::decode(&zero_id.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut zero_reservation = call;
+        let LifecycleRequest::Install(install) = &mut zero_reservation.request else {
+            unreachable!()
+        };
+        install.registry_reservation = Hash::ZERO;
+        assert_eq!(
+            RuntimeCall::decode(&zero_reservation.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
     fn journal_context_round_trips_but_zero_ids_are_noncanonical() {
         let scope = super::super::system_authority::SystemAuthorityJournalScope::for_test(
             super::super::journal::AgentJournalGenesisId::new([0x31; 32]),
@@ -3191,6 +3348,8 @@ mod tests {
                 entries: vec![ActorDirectoryRecord {
                     entry: entry.clone(),
                     incarnation: Hash([0x44; 32]),
+                    installation_id: crate::service::InstallationId([0x45; 32]),
+                    registry_reservation: Hash([0x46; 32]),
                 }],
                 next: Some(entry.actor),
             })),
@@ -3509,7 +3668,7 @@ mod tests {
     fn immediate_prior_runtime_abi_is_rejected_without_a_compatibility_decoder() {
         let mut bytes =
             RuntimeCall::new(RuntimeState::default(), LifecycleRequest::Create(config())).encode();
-        bytes[36..68].copy_from_slice(b"vos-agent-runtime-abi-20260831r5");
+        bytes[36..68].copy_from_slice(b"vos-agent-runtime-abi-20260831r6");
         assert_eq!(
             RuntimeCall::decode(&bytes),
             Err(DecodeError::InvalidPlatform)

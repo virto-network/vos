@@ -62,8 +62,8 @@ pub use guest_accumulate::{
 };
 pub use identity::{
     ActorId, AgentId, CallId, CapabilityId, ChangeId, CredentialId, DeploymentId, Hash,
-    InvocationId, NodeId, OperationId, Origin, PrincipalId, ProducerId, ProgramId, RoleId,
-    RootServiceId, SpaceId, SubjectId, SystemCapabilityId,
+    InstallationId, InvocationId, NodeId, OperationId, Origin, PrincipalId, ProducerId, ProgramId,
+    RoleId, RootServiceId, SpaceId, SubjectId, SystemCapabilityId,
 };
 #[cfg(feature = "std")]
 pub use local_store::{

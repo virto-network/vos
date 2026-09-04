@@ -772,23 +772,94 @@ fn registry_value(
 }
 
 fn registry_page<T: Decode>(handle: &IngressHandle, message: crate::value::Msg) -> Option<T> {
-    let crate::value::Value::Bytes(bytes) = registry_value(handle, message)? else {
+    decode_registry_page_value(registry_value(handle, message)?)
+}
+
+fn decode_registry_page_value<T: Decode>(value: crate::value::Value) -> Option<T> {
+    let crate::value::Value::Bytes(bytes) = value else {
         return None;
     };
     T::try_decode(&bytes)
 }
 
+fn agent_page_advances(after: &str, page: &crate::registry::AgentPage) -> bool {
+    page.protocol.is_current()
+        && !page.rows.iter().any(|row| {
+            !crate::registry::is_canonical_registry_slug(&row.instance_name)
+                || !crate::registry::is_canonical_registry_slug(&row.program_name)
+        })
+        && !page
+            .rows
+            .first()
+            .is_some_and(|row| !after.is_empty() && row.instance_name.as_str() <= after)
+        && !page
+            .rows
+            .windows(2)
+            .any(|pair| pair[0].instance_name >= pair[1].instance_name)
+        && !(page.more && page.rows.is_empty())
+}
+
+fn agent_page_is_acceptable(
+    after: &str,
+    drain: &mut crate::registry::RegistryDrainBudget,
+    page: &crate::registry::AgentPage,
+) -> bool {
+    drain.record_page(page.rows.len(), page.encode().len()) && agent_page_advances(after, page)
+}
+
+fn program_page_advances(after: &str, page: &crate::registry::ProgramPage) -> bool {
+    page.protocol.is_current()
+        && !page
+            .rows
+            .iter()
+            .any(|row| !crate::registry::is_canonical_registry_slug(&row.name))
+        && !page
+            .rows
+            .first()
+            .is_some_and(|row| !after.is_empty() && row.name.as_str() <= after)
+        && !page
+            .rows
+            .windows(2)
+            .any(|pair| pair[0].name >= pair[1].name)
+        && !(page.more && page.rows.is_empty())
+}
+
+fn program_page_is_acceptable(
+    after: &str,
+    drain: &mut crate::registry::RegistryDrainBudget,
+    page: &crate::registry::ProgramPage,
+) -> bool {
+    drain.record_page(page.rows.len(), page.encode().len()) && program_page_advances(after, page)
+}
+
+fn member_page_is_acceptable(
+    after_kind: u8,
+    after_key: &[u8],
+    drain: &mut crate::registry::RegistryDrainBudget,
+    page: &crate::registry::MemberPage,
+) -> bool {
+    drain.record_page(page.members.len(), page.encode().len())
+        && crate::registry::member_page_advances(after_kind, after_key, page)
+}
+
 fn describe_agents(handle: &IngressHandle) -> Result<String, HostServiceError> {
     let mut after = String::new();
     let mut rows = Vec::new();
+    let mut drain = crate::registry::RegistryDrainBudget::default();
     loop {
         let page: crate::registry::AgentPage = registry_page(
             handle,
-            crate::value::Msg::new("agents")
-                .with("after_name", after)
+            crate::value::Msg::new("service_actors")
+                .with("after_name", after.clone())
                 .with("budget", 128_u32),
         )
         .ok_or_else(|| service_error("vos.registry-unavailable", "agent catalogue unavailable"))?;
+        if !agent_page_is_acceptable(&after, &mut drain, &page) {
+            return Err(service_error(
+                "vos.registry-protocol",
+                "agent catalogue returned an invalid, non-advancing, or oversized page stream",
+            ));
+        }
         let more = page.more;
         after = page
             .rows
@@ -818,16 +889,23 @@ fn describe_agents(handle: &IngressHandle) -> Result<String, HostServiceError> {
 fn describe_programs(handle: &IngressHandle) -> Result<String, HostServiceError> {
     let mut after = String::new();
     let mut rows = Vec::new();
+    let mut drain = crate::registry::RegistryDrainBudget::default();
     loop {
         let page: crate::registry::ProgramPage = registry_page(
             handle,
-            crate::value::Msg::new("programs")
-                .with("after_name", after)
+            crate::value::Msg::new("catalog_programs")
+                .with("after_name", after.clone())
                 .with("budget", 128_u32),
         )
         .ok_or_else(|| {
             service_error("vos.registry-unavailable", "program catalogue unavailable")
         })?;
+        if !program_page_is_acceptable(&after, &mut drain, &page) {
+            return Err(service_error(
+                "vos.registry-protocol",
+                "program catalogue returned an invalid, non-advancing, or oversized page stream",
+            ));
+        }
         let more = page.more;
         after = page
             .rows
@@ -853,15 +931,22 @@ fn describe_members(handle: &IngressHandle) -> Result<String, HostServiceError> 
     let mut kind = 0_u8;
     let mut key = Vec::new();
     let mut rows = Vec::new();
+    let mut drain = crate::registry::RegistryDrainBudget::default();
     loop {
         let page: crate::registry::MemberPage = registry_page(
             handle,
             crate::value::Msg::new("members")
                 .with("after_kind", kind)
-                .with("after_key", key)
+                .with("after_key", key.clone())
                 .with("budget", 128_u32),
         )
         .ok_or_else(|| service_error("vos.registry-unavailable", "member roster unavailable"))?;
+        if !member_page_is_acceptable(kind, &key, &mut drain, &page) {
+            return Err(service_error(
+                "vos.registry-protocol",
+                "member roster returned an invalid, non-advancing, or oversized page stream",
+            ));
+        }
         let more = page.more;
         kind = page.next_kind;
         key = page.next_key;
@@ -940,6 +1025,7 @@ fn agent_metadata(
     handle: &IngressHandle,
     name: &str,
 ) -> Result<crate::metadata::ParsedMeta, HostServiceError> {
+    require_canonical_agent_name(name)?;
     if handle.resolve_actor(name).is_none() {
         return Err(service_error(
             "vos.not-found",
@@ -984,6 +1070,7 @@ fn invoke(
     };
     let agent =
         text("agent").ok_or_else(|| service_error("vos.invalid-request", "missing agent"))?;
+    require_canonical_agent_name(agent)?;
     let method = text("method")
         .filter(|value| !value.is_empty())
         .ok_or_else(|| service_error("vos.invalid-request", "method must not be empty"))?;
@@ -1020,6 +1107,17 @@ fn invoke(
     }
     .map_err(|error| service_error("vos.invoke-failed", format!("{error:?}")))?;
     ssh_invoke_result(reply, method_meta.attested)
+}
+
+fn require_canonical_agent_name(name: &str) -> Result<(), HostServiceError> {
+    if crate::registry::is_canonical_registry_slug(name) {
+        Ok(())
+    } else {
+        Err(service_error(
+            "vos.invalid-request",
+            "agent name is not a canonical registry slug",
+        ))
+    }
 }
 
 fn ssh_invoke_result(reply: Vec<u8>, attested: bool) -> Result<Value, HostServiceError> {
@@ -1163,6 +1261,313 @@ mod tests {
         );
         assert!(ssh_invocation_key(&method(false, false), &"x".repeat(129)).is_err());
         assert!(method(false, true).attested);
+    }
+
+    #[test]
+    fn ssh_registry_pages_fail_closed_on_protocol_or_progress_faults() {
+        use crate::registry::{AgentPage, AgentRow, ProgramKind, ProgramPage, ProgramRow};
+        use crate::service::InstallationId;
+
+        let agent = |name: &str| AgentRow {
+            instance_name: name.into(),
+            installation_id: InstallationId::new([0x11; 32]),
+            revision: 0,
+            program_hash: [0x22; 32],
+            program_name: "worker-program".into(),
+            program_publication_id: crate::registry::PublicationId::new([0x33; 32]),
+            replication_id: [0x44; 32],
+            consistency: crate::node::Consistency::Local as u8,
+            network_reachable: false,
+            sync_role: crate::registry::SyncFloor::Member,
+        };
+        let program = |name: &str| ProgramRow {
+            name: name.into(),
+            hash: [0x55; 32],
+            publication_id: crate::registry::PublicationId::new([0x66; 32]),
+            kind: ProgramKind::Service { crdt: false },
+        };
+        let current = crate::registry::RegistryProtocol::CURRENT;
+
+        assert!(agent_page_advances(
+            "a",
+            &AgentPage {
+                protocol: current,
+                rows: vec![agent("b")],
+                more: false,
+            }
+        ));
+        assert!(!agent_page_advances(
+            "",
+            &AgentPage {
+                protocol: crate::registry::RegistryProtocol::UNSUPPORTED,
+                rows: vec![agent("a")],
+                more: false,
+            }
+        ));
+        assert!(!agent_page_advances(
+            "a",
+            &AgentPage {
+                protocol: current,
+                rows: vec![agent("a")],
+                more: false,
+            }
+        ));
+        assert!(!agent_page_advances(
+            "",
+            &AgentPage {
+                protocol: current,
+                rows: vec![agent("Bad_Name")],
+                more: false,
+            }
+        ));
+        let mut bad_program = agent("worker");
+        bad_program.program_name = "bad/program".into();
+        assert!(!agent_page_advances(
+            "",
+            &AgentPage {
+                protocol: current,
+                rows: vec![bad_program],
+                more: false,
+            }
+        ));
+        assert!(!agent_page_advances(
+            "",
+            &AgentPage {
+                protocol: current,
+                rows: Vec::new(),
+                more: true,
+            }
+        ));
+
+        assert!(program_page_advances(
+            "a",
+            &ProgramPage {
+                protocol: current,
+                rows: vec![program("b")],
+                more: false,
+            }
+        ));
+        assert!(!program_page_advances(
+            "",
+            &ProgramPage {
+                protocol: crate::registry::RegistryProtocol::UNSUPPORTED,
+                rows: vec![program("a")],
+                more: false,
+            }
+        ));
+        assert!(!program_page_advances(
+            "a",
+            &ProgramPage {
+                protocol: current,
+                rows: vec![program("a")],
+                more: false,
+            }
+        ));
+        assert!(!program_page_advances(
+            "",
+            &ProgramPage {
+                protocol: current,
+                rows: vec![program("Bad_Name")],
+                more: false,
+            }
+        ));
+        assert!(!program_page_advances(
+            "",
+            &ProgramPage {
+                protocol: current,
+                rows: Vec::new(),
+                more: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn ssh_catalog_drains_reject_endless_full_pages_and_byte_overflow() {
+        use crate::registry::{AgentPage, AgentRow, ProgramKind, ProgramPage, ProgramRow};
+        use crate::service::InstallationId;
+
+        let names = |prefix: char, page: usize| {
+            (0..128)
+                .map(|offset| format!("{prefix}{:05}", page * 128 + offset))
+                .collect::<Vec<_>>()
+        };
+        let agent_page = |page: usize| AgentPage {
+            protocol: crate::registry::RegistryProtocol::CURRENT,
+            rows: names('a', page)
+                .into_iter()
+                .map(|instance_name| AgentRow {
+                    instance_name,
+                    installation_id: InstallationId::new([0x11; 32]),
+                    revision: 0,
+                    program_hash: [0x12; 32],
+                    program_name: "worker-program".into(),
+                    program_publication_id: crate::registry::PublicationId::new([0x13; 32]),
+                    replication_id: [0x14; 32],
+                    consistency: crate::node::Consistency::Local as u8,
+                    network_reachable: false,
+                    sync_role: crate::registry::SyncFloor::Member,
+                })
+                .collect(),
+            more: true,
+        };
+        let mut agent_budget =
+            crate::registry::RegistryDrainBudget::with_limits(2, 256, usize::MAX);
+        let first = agent_page(0);
+        assert!(agent_page_is_acceptable("", &mut agent_budget, &first));
+        let second = agent_page(1);
+        assert!(agent_page_is_acceptable(
+            &first.rows.last().unwrap().instance_name,
+            &mut agent_budget,
+            &second,
+        ));
+        let third = agent_page(2);
+        assert!(!agent_page_is_acceptable(
+            &second.rows.last().unwrap().instance_name,
+            &mut agent_budget,
+            &third,
+        ));
+
+        let program_page = |page: usize| ProgramPage {
+            protocol: crate::registry::RegistryProtocol::CURRENT,
+            rows: names('p', page)
+                .into_iter()
+                .map(|name| ProgramRow {
+                    name,
+                    hash: [0x21; 32],
+                    publication_id: crate::registry::PublicationId::new([0x22; 32]),
+                    kind: ProgramKind::Service { crdt: false },
+                })
+                .collect(),
+            more: true,
+        };
+        let mut program_budget =
+            crate::registry::RegistryDrainBudget::with_limits(2, 256, usize::MAX);
+        let first = program_page(0);
+        assert!(program_page_is_acceptable("", &mut program_budget, &first,));
+        let second = program_page(1);
+        assert!(program_page_is_acceptable(
+            &first.rows.last().unwrap().name,
+            &mut program_budget,
+            &second,
+        ));
+        let third = program_page(2);
+        assert!(!program_page_is_acceptable(
+            &second.rows.last().unwrap().name,
+            &mut program_budget,
+            &third,
+        ));
+
+        let terminal = ProgramPage {
+            protocol: crate::registry::RegistryProtocol::CURRENT,
+            rows: vec![ProgramRow {
+                name: "worker".into(),
+                hash: [0x31; 32],
+                publication_id: crate::registry::PublicationId::new([0x32; 32]),
+                kind: ProgramKind::Service { crdt: false },
+            }],
+            more: false,
+        };
+        let mut byte_limited =
+            crate::registry::RegistryDrainBudget::with_limits(1, 1, terminal.encode().len() - 1);
+        assert!(!program_page_is_acceptable(
+            "",
+            &mut byte_limited,
+            &terminal,
+        ));
+    }
+
+    #[test]
+    fn ssh_registry_page_decoder_rejects_wrong_shapes_and_malformed_archives() {
+        use crate::registry::{ProgramPage, RegistryProtocol};
+
+        assert!(decode_registry_page_value::<ProgramPage>(crate::value::Value::Unit).is_none());
+        assert!(
+            decode_registry_page_value::<ProgramPage>(crate::value::Value::Bytes(vec![1, 2, 3]))
+                .is_none()
+        );
+
+        let page = ProgramPage {
+            protocol: RegistryProtocol::CURRENT,
+            rows: Vec::new(),
+            more: false,
+        };
+        assert_eq!(
+            decode_registry_page_value::<ProgramPage>(crate::value::Value::Bytes(page.encode())),
+            Some(page),
+        );
+    }
+
+    #[test]
+    fn ssh_member_pages_fail_closed_on_progress_shape_and_bounds_faults() {
+        use crate::registry::{
+            MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberPage, MemberRow, NODE_ROLE_VOTER,
+        };
+
+        let node = |prefix: u16| MemberRow {
+            kind: MEMBER_KIND_NODE,
+            key: vec![prefix as u8 + 1],
+            prefix,
+            role: NODE_ROLE_VOTER,
+            proof_kind: 0,
+            proof_data: Vec::new(),
+        };
+        let valid = MemberPage {
+            members: vec![node(1)],
+            next_kind: MEMBER_KIND_IDENTITY,
+            next_key: Vec::new(),
+            more: true,
+        };
+        let mut budget = crate::registry::RegistryDrainBudget::default();
+        assert!(member_page_is_acceptable(0, &[], &mut budget, &valid,));
+        let mut budget = crate::registry::RegistryDrainBudget::default();
+        assert!(!member_page_is_acceptable(
+            MEMBER_KIND_NODE,
+            &1_u16.to_be_bytes(),
+            &mut budget,
+            &valid,
+        ));
+
+        let empty_more = MemberPage {
+            members: Vec::new(),
+            next_kind: MEMBER_KIND_IDENTITY,
+            next_key: Vec::new(),
+            more: true,
+        };
+        let mut budget = crate::registry::RegistryDrainBudget::default();
+        assert!(!member_page_is_acceptable(
+            MEMBER_KIND_NODE,
+            &[],
+            &mut budget,
+            &empty_more,
+        ));
+
+        let mut malformed = valid.clone();
+        malformed.members[0].kind = 99;
+        let mut budget = crate::registry::RegistryDrainBudget::default();
+        assert!(!member_page_is_acceptable(
+            MEMBER_KIND_NODE,
+            &[],
+            &mut budget,
+            &malformed,
+        ));
+        let mut exhausted =
+            crate::registry::RegistryDrainBudget::with_limits(0, usize::MAX, usize::MAX);
+        assert!(!member_page_is_acceptable(
+            MEMBER_KIND_NODE,
+            &[],
+            &mut exhausted,
+            &valid,
+        ));
+    }
+
+    #[test]
+    fn direct_ssh_actor_names_share_the_registry_slug_boundary() {
+        for valid in ["a", "worker-01", "space-authority"] {
+            assert!(require_canonical_agent_name(valid).is_ok());
+        }
+        for invalid in ["", "Bad_Name", "worker/other", "é"] {
+            assert!(require_canonical_agent_name(invalid).is_err());
+        }
     }
 
     #[test]

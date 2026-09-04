@@ -1217,15 +1217,12 @@ pub struct VosNode {
     /// [`attach_network`](Self::attach_network).
     #[cfg(feature = "network")]
     operator_peer: Option<Vec<u8>>,
-    /// Signs the space-registry's catalog mutators on relay with the
-    /// operator key the daemon loaded at boot (the "sign on relay"
-    /// seam). Handed to the registry agent thread, which injects the
-    /// `auth` blob before recording so a keyless PVM agent's (or the
-    /// in-process reconcile's) `install`/`publish`/… authorizes on the
-    /// operator's node. `None` (a raw `vosx run` or a test node) leaves
-    /// catalog ops unsigned, so the registry refuses them — fail closed.
-    /// Set by [`set_operator_signer`](Self::set_operator_signer).
-    operator_signer: Option<crate::registry::CatalogOpSigner>,
+    /// Signs root-host attestations after the canonical role authority has
+    /// durably accepted an invite. Catalog mutations are signed directly by
+    /// their author and this callback is never shared with an agent thread.
+    /// `None` makes host attestation fail closed. Set by
+    /// [`set_operator_signer`](Self::set_operator_signer).
+    operator_signer: Option<crate::registry::OperatorSigner>,
     /// Map: replication group → local replica handle.
     /// Populated by `register` whenever a CRDT actor with a
     /// `replication_id` is added. Read by [`NodeService`] (db
@@ -2570,7 +2567,7 @@ struct NodeService {
     /// redemption was durably accepted by the canonical role authority before
     /// it enters the registry CRDT. Non-root operators produce a signature the
     /// registry rejects under its immutable-root check.
-    operator_signer: Option<crate::registry::CatalogOpSigner>,
+    operator_signer: Option<crate::registry::OperatorSigner>,
     /// Per-instance-name `SyncFloor` cache for the sync-serve gate. The
     /// floor is a static install-time property, but resolving it hits the
     /// registry with a blocking probe (up to ~5 s); caching keeps
@@ -2734,6 +2731,7 @@ impl NodeService {
         }
 
         let canonical = crate::registry::role_authority_invite_attestation_signed_bytes(
+            &space.0,
             &authority_replication_id,
             &token_pub,
             role_byte,
@@ -2861,6 +2859,24 @@ impl NodeService {
         lookup_node_member_from_routes(&self.invoke_routes, prefix)
     }
 
+    /// Read the registry-owned, nonzero space anchor used by every scoped
+    /// registry-management signature. It must never come from an inbound
+    /// request because sibling spaces may share operator keys and replica ids.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn registry_space_id(&self) -> Option<[u8; 32]> {
+        use crate::actors::codec::{Decode, Encode};
+        use crate::value::{Msg, TAG_DYNAMIC, Value};
+
+        let mut payload = vec![TAG_DYNAMIC];
+        payload.extend_from_slice(&Msg::new("space_id").encode());
+        let reply = registry_probe_reply(&self.invoke_routes, payload)?;
+        let Value::Bytes(bytes) = <Value as Decode>::try_decode(&reply)? else {
+            return None;
+        };
+        let space_id: [u8; 32] = bytes.as_slice().try_into().ok()?;
+        (space_id != [0; 32]).then_some(space_id)
+    }
+
     /// Membership gate for serving a replica's sync data (heads / nodes),
     /// keyed on the replica's [`SyncFloor`](crate::registry::SyncFloor):
     /// `Public` serves any connected peer; `Member` requires enrollment or a
@@ -2954,12 +2970,16 @@ impl NodeService {
     fn probe_agent_floor(&self, name: &str) -> Option<crate::registry::SyncFloor> {
         use crate::actors::codec::Encode;
         use crate::value::{Msg, TAG_DYNAMIC};
-        let msg = Msg::new("agent").with("instance_name", name);
+        let msg = Msg::new("service_actor").with("instance_name", name);
         let mut payload = Vec::with_capacity(1 + 64);
         payload.push(TAG_DYNAMIC);
         payload.extend_from_slice(&msg.encode());
         let reply = registry_probe_reply(&self.invoke_routes, payload)?;
-        let row = decode_registry_option_reply::<crate::registry::AgentRow>(&reply)??;
+        let lookup = decode_registry_bytes_reply::<crate::registry::AgentLookup>(&reply)?;
+        if !lookup.protocol.is_current() {
+            return None;
+        }
+        let row = lookup.row?;
         Some(row.sync_role)
     }
 
@@ -2980,25 +3000,23 @@ impl NodeService {
         registry_probe_u8(&self.invoke_routes, payload)
     }
 
-    /// True only when the local space registry currently catalogs `hash`.
-    /// A missing/unreachable registry fails closed so the global host cache
-    /// never becomes an open cross-space CAS.
-    fn program_hash_catalogued(&self, hash: &[u8; 32]) -> bool {
+    /// True only when the local space registry has durably authorized `hash`.
+    /// The entitlement survives catalog retags so an installed actor or
+    /// replay/proof record can recover its pinned historical package. A
+    /// missing, stale, or unreachable registry fails closed so the global
+    /// host cache never becomes an open cross-space CAS.
+    fn program_hash_authorized(&self, hash: &[u8; 32]) -> bool {
         use crate::actors::codec::Encode;
         use crate::value::{Msg, TAG_DYNAMIC};
-        // Targeted hash lookup — the registry answers with just the matching
-        // row (or none), so this stays a bounded single-reply probe rather
-        // than draining the whole (now paginated) catalog.
-        let msg = Msg::new("program_by_hash").with("hash", hash.to_vec());
+        let msg = Msg::new("program_blob_authorized").with("hash", hash.to_vec());
         let mut payload = Vec::with_capacity(1 + 64);
         payload.push(TAG_DYNAMIC);
         payload.extend_from_slice(&msg.encode());
         let Some(reply) = registry_probe_reply(&self.invoke_routes, payload) else {
             return false;
         };
-        decode_registry_option_reply::<crate::registry::ProgramRow>(&reply)
-            .flatten()
-            .is_some_and(|program| &program.hash == hash)
+        decode_registry_bytes_reply::<crate::registry::ProgramBlobAuthorization>(&reply)
+            .is_some_and(|decision| decision.protocol.is_current() && decision.authorized)
     }
 
     /// Resolve a (possibly prefix-scoped) target `ServiceId` value back
@@ -3292,23 +3310,18 @@ fn lookup_node_member_from_routes_with_timeout(
         .filter(|member| member.kind == MEMBER_KIND_NODE && member.prefix == prefix)
 }
 
-/// Decode a registry handler's `Option<T>` reply after the outer invoke
-/// envelope has been removed. Guests emit `[0]` / `[1] || rkyv(T)`.
+/// Decode one typed registry response after the outer invoke envelope has
+/// been removed. Clean-break lookup responses carry their protocol identity
+/// inside this rkyv payload; callers must still check it before using rows.
 #[cfg(feature = "network")]
-fn decode_registry_option_reply<T: crate::actors::codec::Decode>(
-    reply: &[u8],
-) -> Option<Option<T>> {
+fn decode_registry_bytes_reply<T: crate::actors::codec::Decode>(reply: &[u8]) -> Option<T> {
     use crate::value::Value;
 
     let value = <Value as crate::actors::codec::Decode>::try_decode(reply)?;
     let Value::Bytes(bytes) = value else {
         return None;
     };
-    if bytes.as_slice() == [0] {
-        return Some(None);
-    }
-    let payload = bytes.strip_prefix(&[1])?;
-    T::try_decode(payload).map(Some)
+    T::try_decode(&bytes)
 }
 
 #[cfg(feature = "network")]
@@ -3350,6 +3363,7 @@ fn node_member_authenticates_voter(
 #[allow(clippy::too_many_arguments)]
 fn verifies_raft_voter_replacement_operator(
     operator: &libp2p::PeerId,
+    space_id: &[u8; 32],
     replication_id: &[u8; 32],
     old_prefix: u16,
     old_peer: &libp2p::PeerId,
@@ -3363,6 +3377,7 @@ fn verifies_raft_voter_replacement_operator(
         return false;
     };
     let message = crate::registry::raft_voter_replacement_signed_bytes(
+        space_id,
         replication_id,
         old_prefix,
         &old_peer.to_bytes(),
@@ -3491,6 +3506,31 @@ fn intercepted_msg(msg: &[u8]) -> Option<crate::value::Msg> {
     <crate::value::Msg as crate::Decode>::try_decode(&msg[1..])
 }
 
+/// Bind a catalog mutation's embedded author to the transport identity that
+/// actually admitted it. A direct hop compares the complete PeerId bytes. A
+/// Raft leader hop receives only the authenticated member subject carried by
+/// the voter wrapper, so it compares the canonical subject derived from those
+/// same signer bytes. Actor/System origins can never borrow a member's signed
+/// catalog request.
+#[cfg(feature = "network")]
+fn catalog_author_matches_ingress(
+    signer: &[u8],
+    caller: Option<&libp2p::PeerId>,
+    delegated_origin: Option<crate::service::Origin>,
+) -> bool {
+    match delegated_origin {
+        Some(crate::service::Origin::Member(subject)) => {
+            crate::service::SubjectId::of_authenticated_peer(signer) == subject
+        }
+        Some(
+            crate::service::Origin::Anonymous
+            | crate::service::Origin::Actor(_)
+            | crate::service::Origin::System,
+        ) => false,
+        None => caller.is_some_and(|caller| caller.to_bytes() == signer),
+    }
+}
+
 /// Peek the dynamic-dispatch `Msg.name` out of an invoke payload
 /// (`[TAG_DYNAMIC][rkyv Msg]`) for the lifecycle interceptor, without
 /// disturbing the original bytes (they're still forwarded verbatim on a
@@ -3610,6 +3650,8 @@ impl crate::network::NetworkService for NodeService {
                 Ok(None) => (None, false, false, false),
             };
         #[cfg(not(feature = "storage"))]
+        let delegated_origin: Option<crate::service::Origin> = None;
+        #[cfg(not(feature = "storage"))]
         let preserve_envelope = false;
         #[cfg(not(feature = "storage"))]
         let role_authority_request = false;
@@ -3620,6 +3662,27 @@ impl crate::network::NetworkService for NodeService {
             delegated_origin.is_some() && self.target_is_local_service_raft_root(to, to_unscoped);
         #[cfg(not(feature = "storage"))]
         let authenticated_raft_delegation = false;
+
+        // Catalog mutations carry their author's signature before they reach
+        // the host. Bind that embedded signer to the Noise-authenticated
+        // caller on the first hop, or to the original authenticated member
+        // carried by an accepted voter delegation on the leader hop. The
+        // payload remains byte-for-byte unchanged for recording and replay.
+        if to_unscoped == ServiceId::REGISTRY.local_id() as u32 {
+            match crate::registry::catalog_op_auth_signer(&msg) {
+                Ok(None) => {}
+                Ok(Some(signer))
+                    if catalog_author_matches_ingress(
+                        &signer,
+                        caller_peer_id.as_ref(),
+                        delegated_origin,
+                    ) => {}
+                Ok(Some(_)) | Err(()) => {
+                    warn!(peer = ?caller_peer_id, "catalog mutation author does not match authenticated ingress");
+                    return forbidden_envelope().into();
+                }
+            }
+        }
 
         // Expiry is checked once, on the serving host, before the operation is
         // admitted into the registry DAG. The signed deadline is re-verified
@@ -3955,7 +4018,7 @@ impl crate::network::NetworkService for NodeService {
         {
             return None;
         }
-        if !self.program_hash_catalogued(hash) {
+        if !self.program_hash_authorized(hash) {
             return None;
         }
         let dir = self.program_blobs_dir.as_ref()?;
@@ -4141,8 +4204,12 @@ impl crate::network::NetworkService for NodeService {
         if caller != operator_peer && !caller_is_voter {
             return RaftReplaceVoterResult::NotAuthorized;
         }
+        let Some(space_id) = self.registry_space_id() else {
+            return RaftReplaceVoterResult::NotAuthorized;
+        };
         if !verifies_raft_voter_replacement_operator(
             &operator_peer,
+            &space_id,
             replication_id,
             old_prefix,
             &old_peer,
@@ -4301,9 +4368,518 @@ fn replay_dag_into_runtime(
     svc_id: ServiceId,
     strategy: &dyn crate::commit::CommitStrategy,
 ) -> Result<(), String> {
+    let logs = validated_replay_logs(svc_id, strategy)?;
+    replay_logs_into_runtime(runtime, svc_id, strategy, logs)
+}
+
+/// One argument kind in the space-registry's dynamic inbound request surface.
+///
+/// This is deliberately the same vocabulary used by the `#[messages]`
+/// generated dynamic decoder. Numeric kinds accept the lossless widening and
+/// narrowing conversions implemented by [`crate::value::Value`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryReplayArgKind {
+    /// A `bool` argument.
+    Bool,
+    /// A losslessly representable `u8` argument.
+    U8,
+    /// A losslessly representable `u32` argument.
+    U32,
+    /// A losslessly representable `u64` argument.
+    U64,
+    /// A `String` argument.
+    String,
+    /// A `Vec<u8>` argument.
+    Bytes,
+}
+
+impl RegistryReplayArgKind {
+    /// Canonical type spelling emitted into actor metadata by `#[messages]`.
+    pub const fn metadata_type(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::U8 => "u8",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
+            Self::String => "String",
+            Self::Bytes => "Vec<u8>",
+        }
+    }
+
+    fn accepts(self, value: &crate::value::Value) -> bool {
+        match self {
+            Self::Bool => value.as_bool().is_some(),
+            Self::U8 => value.as_u8().is_some(),
+            Self::U32 => value.as_u32().is_some(),
+            Self::U64 => value.as_u64().is_some(),
+            Self::String => value.as_str().is_some(),
+            Self::Bytes => value.as_bytes().is_some(),
+        }
+    }
+}
+
+/// Exact dynamic request shape accepted into a registry replay history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegistryReplayMethod {
+    /// Dynamic method name.
+    pub name: &'static str,
+    /// Required named arguments. Every field must occur exactly once and no
+    /// unrecognized field is accepted; field order remains semantically free.
+    pub fields: &'static [(&'static str, RegistryReplayArgKind)],
+}
+
+use RegistryReplayArgKind::{Bool, Bytes, String as RegistryString, U8, U32, U64};
+
+/// Complete allowlist of the current space-registry's inbound methods.
+///
+/// A `vosx` cross-crate test compares this table to the actor macro's emitted
+/// metadata, including every field name and type. Keeping the table here lets
+/// peer admission and cold/mid-flight replay use one predicate without making
+/// the foundational `vos` crate depend on the registry actor crate.
+pub const REGISTRY_REPLAY_METHODS: &[RegistryReplayMethod] = &[
+    RegistryReplayMethod {
+        name: "set_root",
+        fields: &[
+            ("root", Bytes),
+            ("schema_version", U32),
+            ("schema_hash", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "protocol",
+        fields: &[],
+    },
+    RegistryReplayMethod {
+        name: "root",
+        fields: &[],
+    },
+    RegistryReplayMethod {
+        name: "set_space_id",
+        fields: &[("space_id", Bytes)],
+    },
+    RegistryReplayMethod {
+        name: "space_id",
+        fields: &[],
+    },
+    RegistryReplayMethod {
+        name: "role_authority",
+        fields: &[],
+    },
+    RegistryReplayMethod {
+        name: "set_role_authority",
+        fields: &[("authority_replication_id", Bytes), ("auth", Bytes)],
+    },
+    RegistryReplayMethod {
+        name: "publish_service_program",
+        fields: &[
+            ("name", RegistryString),
+            ("hash", Bytes),
+            ("crdt", Bool),
+            ("publication_id", Bytes),
+            ("expected_publication_id", Bytes),
+            ("expected_hash", Bytes),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "publish_agent_actor_program",
+        fields: &[
+            ("name", RegistryString),
+            ("hash", Bytes),
+            ("publication_id", Bytes),
+            ("expected_publication_id", Bytes),
+            ("expected_hash", Bytes),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "unpublish_service_program",
+        fields: &[
+            ("name", RegistryString),
+            ("expected_publication_id", Bytes),
+            ("expected_hash", Bytes),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "unpublish_agent_actor_program",
+        fields: &[
+            ("name", RegistryString),
+            ("expected_publication_id", Bytes),
+            ("expected_hash", Bytes),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "catalog_program",
+        fields: &[("name", RegistryString)],
+    },
+    RegistryReplayMethod {
+        name: "catalog_program_by_hash",
+        fields: &[("hash", Bytes)],
+    },
+    RegistryReplayMethod {
+        name: "program_blob_authorized",
+        fields: &[("hash", Bytes)],
+    },
+    RegistryReplayMethod {
+        name: "catalog_programs",
+        fields: &[("after_name", RegistryString), ("budget", U32)],
+    },
+    RegistryReplayMethod {
+        name: "register_meta",
+        fields: &[("program_hash", Bytes), ("blob", Bytes), ("auth", Bytes)],
+    },
+    RegistryReplayMethod {
+        name: "meta_for_program",
+        fields: &[("program_hash", Bytes)],
+    },
+    RegistryReplayMethod {
+        name: "meta_for_instance",
+        fields: &[("name", RegistryString)],
+    },
+    RegistryReplayMethod {
+        name: "register_extension_meta",
+        fields: &[
+            ("instance_name", RegistryString),
+            ("blob", Bytes),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "install_service_actor",
+        fields: &[
+            ("instance_name", RegistryString),
+            ("program_name", RegistryString),
+            ("program_hash", Bytes),
+            ("program_publication_id", Bytes),
+            ("installation_id", Bytes),
+            ("replication_id", Bytes),
+            ("consistency", U8),
+            ("network_reachable", Bool),
+            ("sync_role", U8),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "install_system_actor",
+        fields: &[("receipt", Bytes), ("auth", Bytes)],
+    },
+    RegistryReplayMethod {
+        name: "uninstall_service_actor",
+        fields: &[
+            ("instance_name", RegistryString),
+            ("installation_id", Bytes),
+            ("expected_revision", U64),
+            ("expected_program_hash", Bytes),
+            ("expected_program_publication_id", Bytes),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "uninstall_system_actor",
+        fields: &[
+            ("instance_name", RegistryString),
+            ("installation_id", Bytes),
+            ("expected_revision", U64),
+            ("expected_program_hash", Bytes),
+            ("expected_program_publication_id", Bytes),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "upgrade_service_actor",
+        fields: &[
+            ("instance_name", RegistryString),
+            ("installation_id", Bytes),
+            ("expected_revision", U64),
+            ("from_program_hash", Bytes),
+            ("from_program_publication_id", Bytes),
+            ("new_program_name", RegistryString),
+            ("new_program_hash", Bytes),
+            ("new_program_publication_id", Bytes),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "upgrade_system_actor",
+        fields: &[
+            ("instance_name", RegistryString),
+            ("installation_id", Bytes),
+            ("expected_revision", U64),
+            ("from_program_hash", Bytes),
+            ("from_program_publication_id", Bytes),
+            ("new_program_name", RegistryString),
+            ("new_program_hash", Bytes),
+            ("new_program_publication_id", Bytes),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "service_actor",
+        fields: &[("instance_name", RegistryString)],
+    },
+    RegistryReplayMethod {
+        name: "service_actor_by_pattern",
+        fields: &[("prefix", RegistryString), ("suffix", RegistryString)],
+    },
+    RegistryReplayMethod {
+        name: "service_actors",
+        fields: &[("after_name", RegistryString), ("budget", U32)],
+    },
+    RegistryReplayMethod {
+        name: "system_actor",
+        fields: &[("instance_name", RegistryString)],
+    },
+    RegistryReplayMethod {
+        name: "system_actors",
+        fields: &[("after_name", RegistryString), ("budget", U32)],
+    },
+    RegistryReplayMethod {
+        name: "service_actor_names",
+        fields: &[("after_name", RegistryString), ("budget", U32)],
+    },
+    RegistryReplayMethod {
+        name: "resolve",
+        fields: &[("name", RegistryString), ("caller_prefix", U64)],
+    },
+    RegistryReplayMethod {
+        name: "register_remote",
+        fields: &[
+            ("instance_name", RegistryString),
+            ("host_prefix", U32),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "host_mappings",
+        fields: &[("after_name", RegistryString), ("budget", U32)],
+    },
+    RegistryReplayMethod {
+        name: "add_node",
+        fields: &[
+            ("prefix", U32),
+            ("peer_id", Bytes),
+            ("role", U8),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "remove_node",
+        fields: &[("prefix", U32), ("auth", Bytes)],
+    },
+    RegistryReplayMethod {
+        name: "add_identity",
+        fields: &[
+            ("public_key", Bytes),
+            ("proof_kind", U8),
+            ("proof_data", Bytes),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "remove_identity",
+        fields: &[("public_key", Bytes), ("auth", Bytes)],
+    },
+    RegistryReplayMethod {
+        name: "members",
+        fields: &[("after_kind", U8), ("after_key", Bytes), ("budget", U32)],
+    },
+    RegistryReplayMethod {
+        name: "node_role",
+        fields: &[("prefix", U64)],
+    },
+    RegistryReplayMethod {
+        name: "grant_role",
+        fields: &[
+            ("peer_id", Bytes),
+            ("role", U8),
+            ("epoch", U64),
+            ("authority_replication_id", Bytes),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "revoke_role",
+        fields: &[
+            ("peer_id", Bytes),
+            ("epoch", U64),
+            ("authority_replication_id", Bytes),
+            ("auth", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "peer_role",
+        fields: &[("peer_id", Bytes)],
+    },
+    RegistryReplayMethod {
+        name: "peer_epoch",
+        fields: &[("peer_id", Bytes)],
+    },
+    RegistryReplayMethod {
+        name: "auth_grants",
+        fields: &[("after_peer", Bytes), ("budget", U32)],
+    },
+    RegistryReplayMethod {
+        name: "redeem_invite",
+        fields: &[
+            ("token_pub", Bytes),
+            ("role", U8),
+            ("expires_at", U64),
+            ("authority_replication_id", Bytes),
+            ("admin_peer_id", Bytes),
+            ("admin_sig", Bytes),
+            ("peer_id", Bytes),
+            ("redeem_sig", Bytes),
+            ("node_sig", Bytes),
+            ("authority_attestation", Bytes),
+        ],
+    },
+    RegistryReplayMethod {
+        name: "revoke_invite",
+        fields: &[("token_pub", Bytes), ("auth", Bytes)],
+    },
+    RegistryReplayMethod {
+        name: "invites",
+        fields: &[("after", Bytes), ("budget", U32)],
+    },
+];
+
+fn registry_replay_message_has_exact_shape(message: &crate::value::Msg) -> bool {
+    let Some(method) = REGISTRY_REPLAY_METHODS
+        .iter()
+        .find(|method| method.name == message.name)
+    else {
+        return false;
+    };
+    if message.args.0.len() != method.fields.len() {
+        return false;
+    }
+    method.fields.iter().all(|(expected_name, kind)| {
+        let mut matches = message
+            .args
+            .0
+            .iter()
+            .filter(|(actual_name, value)| actual_name == expected_name && kind.accepts(value));
+        matches.next().is_some() && matches.next().is_none()
+    })
+}
+
+/// Decode and validate one effect log that may enter registry replay.
+///
+/// Empty messages are the host's on-start kick and are the sole non-dynamic
+/// exception. Every other message must be the canonical checked encoding of a
+/// current, exactly shaped registry request. The registry actor has no
+/// `Context::ask`/child-invoke entrypoint, so reply transcripts and folded
+/// invoke effects cannot have been produced by a legitimate registry dispatch;
+/// admitting them would make replay leave entries unconsumed and fail-stop.
+/// Host-recorded caller, invocation, and work-result anchor fields remain
+/// accepted because those are legitimate effects of dispatch recording.
+pub fn registry_replay_request(
+    log: &crate::effect_log::EffectLog,
+) -> Result<Option<crate::value::Msg>, &'static str> {
+    if !log.replies.is_empty() || !log.invoke_effects.is_empty() {
+        return Err("registry replay contains an impossible reply/result transcript");
+    }
+    if log.msg.is_empty() {
+        return Ok(None);
+    }
+    if log.msg.first() != Some(&crate::value::TAG_DYNAMIC) {
+        return Err("registry replay contains a non-dynamic application message");
+    }
+    let Some(message) = <crate::value::Msg as crate::Decode>::try_decode(&log.msg[1..]) else {
+        return Err("registry replay contains a malformed dynamic message");
+    };
+    if crate::Encode::encode(&message).as_slice() != &log.msg[1..] {
+        return Err("registry replay contains a non-canonical dynamic message");
+    }
+    if !registry_replay_message_has_exact_shape(&message) {
+        return Err("registry replay contains an unknown or malformed registry request");
+    }
+    Ok(Some(message))
+}
+
+/// Decode a complete peer DAG node and apply [`registry_replay_request`] to
+/// its event log. This is the live-ingress half of the shared registry replay
+/// boundary; using the typed decoder also makes hostile length fields fail
+/// closed without unchecked offset arithmetic.
+#[cfg(feature = "storage")]
+pub fn registry_replay_node_request(
+    node_bytes: &[u8],
+) -> Result<Option<crate::value::Msg>, &'static str> {
+    let Some(node) =
+        merkle_crdt::DagNode::<crate::commit::Blake2b, crate::effect_log::CrdtEvent>::from_bytes(
+            node_bytes,
+        )
+    else {
+        return Err("registry peer node uses a malformed or retired DAG wire");
+    };
+    if node.to_bytes().as_slice() != node_bytes {
+        return Err("registry peer node uses a non-canonical DAG wire");
+    }
+    registry_replay_request(&node.payload.log)
+}
+
+/// Load and validate one durable history without changing the strategy's
+/// canonical causal order.
+///
+/// In particular, do not sort role revocations ahead of data mutations. Such
+/// a sort makes a mutation which was validly committed before a later revoke
+/// disappear on cold replay, while still being unable to distinguish captured
+/// signed bytes which were never committed. The clean catalog protocol closes
+/// that gap with immutable authority-finalization evidence; CID or method-name
+/// ordering is not an authorization proof.
+fn validated_replay_logs(
+    svc_id: ServiceId,
+    strategy: &dyn crate::commit::CommitStrategy,
+) -> Result<Vec<crate::effect_log::EffectLog>, String> {
     let logs = strategy
         .replay_logs()
         .map_err(|e| format!("replay_logs failed: {e}"))?;
+    if !matches!(
+        svc_id.local_id(),
+        id if id == ServiceId::REGISTRY.local_id()
+            || id == ServiceId::HYPERSPACE_REGISTRY.local_id()
+    ) {
+        return Ok(logs);
+    }
+
+    let mut saw_root = false;
+    let mut saw_current_root = false;
+    for log in &logs {
+        let Some(message) = registry_replay_request(log).map_err(str::to_owned)? else {
+            continue;
+        };
+        if message.name == "set_root" {
+            if saw_root {
+                return Err("registry replay contains more than one genesis-root operation".into());
+            }
+            saw_root = true;
+            saw_current_root = message.args.get_u32("schema_version")
+                == Some(crate::registry::REGISTRY_SCHEMA_VERSION)
+                && message.args.get_bytes("schema_hash").as_deref()
+                    == Some(crate::registry::REGISTRY_SCHEMA_HASH.as_slice())
+                && message
+                    .args
+                    .get_bytes("root")
+                    .is_some_and(|root| !root.is_empty());
+        }
+    }
+    if saw_root && !saw_current_root {
+        return Err(
+            "registry replay contains a legacy or schema-incompatible genesis-root operation"
+                .into(),
+        );
+    }
+
+    Ok(logs)
+}
+fn replay_logs_into_runtime(
+    runtime: &mut VosRuntime,
+    svc_id: ServiceId,
+    strategy: &dyn crate::commit::CommitStrategy,
+    logs: Vec<crate::effect_log::EffectLog>,
+) -> Result<(), String> {
     if logs.is_empty() {
         return Ok(());
     }
@@ -4420,6 +4996,11 @@ fn soft_restart_crdt(
     strategy
         .reload()
         .map_err(|e| format!("strategy.reload: {e}"))?;
+    // Validate and order the complete merged history before clearing a live
+    // keyspace. A stale-generation registry must remain diagnostically
+    // readable on disk; discovering it only after `clear_service` would turn
+    // a clean-break refusal into data loss.
+    let logs = validated_replay_logs(svc_id, strategy)?;
     // Replay rebuilds every row by re-executing the guest from genesis,
     // so it must run against the empty slate a cold-boot replay sees —
     // not just a STATE_KEY-less one. The storage-type meta/index and
@@ -4440,7 +5021,7 @@ fn soft_restart_crdt(
             .storage
             .write(svc_id, crate::lifecycle::INIT_KEY, &init);
     }
-    replay_dag_into_runtime(runtime, svc_id, strategy)?;
+    replay_logs_into_runtime(runtime, svc_id, strategy, logs)?;
     let state = runtime
         .storage
         .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
@@ -4842,7 +5423,8 @@ impl VosNode {
         authority: crate::agent::authority::ActorInvocationReceipt,
     ) -> Result<crate::agent::execution::ActorExecutionReply, crate::agent::host::AgentHostError>
     {
-        self.local_agent_host_handle()
+        self.local_agent_host
+            .as_ref()
             .ok_or(crate::agent::host::AgentHostError::Unavailable)?
             .invoke(agent, invocation, authority)
     }
@@ -4855,14 +5437,10 @@ impl VosNode {
         invocation: crate::agent::execution::ActorInvocation,
         authority: crate::agent::authority::ActorInvocationReceipt,
     ) -> Result<(), crate::agent::host::AgentHostError> {
-        self.local_agent_host_handle()
+        self.local_agent_host
+            .as_ref()
             .ok_or(crate::agent::host::AgentHostError::Unavailable)?
             .acknowledge_invocation(agent, invocation, authority)
-    }
-
-    /// Clone the private command handle used by the narrow forwarding methods.
-    fn local_agent_host_handle(&self) -> Option<crate::agent::host::AgentHostHandle> {
-        self.local_agent_host.as_ref().map(|host| host.handle())
     }
 
     /// Insert `bytes` into the proof-blob store. Returns the
@@ -4949,15 +5527,10 @@ impl VosNode {
         self.operator_peer.as_deref()
     }
 
-    /// Install the operator's catalog-op signer (the "sign on relay"
-    /// seam). `signer` produces the packed `auth` blob for a registry
-    /// op's canonical bytes; the space-registry agent thread calls it to
-    /// author-sign `install`/`publish`/`upgrade`/`uninstall`/`unpublish`
-    /// before recording, so a keyless PVM agent's or the in-process
-    /// reconcile's catalog mutation authorizes on the operator's node.
-    /// Must be set before the registry agent is registered so its thread
-    /// captures the signer. Unset (the default) leaves catalog ops
-    /// unsigned — the registry then refuses them (fail closed).
+    /// Install the operator callback used for root-host attestations. The
+    /// callback remains in [`NodeService`] and is never exposed to a guest or
+    /// registry agent thread. Catalog mutations must already contain their
+    /// caller-authored signature when dispatched.
     pub fn set_operator_signer<F>(&mut self, signer: F)
     where
         F: Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync + 'static,
@@ -6824,16 +7397,6 @@ impl VosNode {
             #[cfg(all(feature = "network", feature = "storage"))]
             hosts: self.raft_hosts.clone(),
         };
-        // Only the space-registry (local id 0) author-signs catalog
-        // mutations on relay; no other agent holds the operator key.
-        // Excludes the hyperspace registry (local id 1), whose
-        // register_remote has a separate trust model.
-        let operator_signer = if id.local_id() == ServiceId::REGISTRY.local_id() {
-            self.operator_signer.clone()
-        } else {
-            None
-        };
-
         let join = thread::spawn(move || {
             agent_thread(
                 id,
@@ -6846,7 +7409,6 @@ impl VosNode {
                 raft_fwd,
                 shutdown,
                 activity,
-                operator_signer,
                 #[cfg(feature = "network")]
                 shared_network,
                 #[cfg(all(feature = "network", feature = "storage"))]
@@ -7063,7 +7625,7 @@ impl VosNode {
                     let idle = self
                         .local_agent_host
                         .as_ref()
-                        .map_or(idle, |host| idle.min(host.handle().idle_for()));
+                        .map_or(idle, |host| idle.min(host.idle_for()));
                     if idle >= threshold {
                         self.signal_node_shutdown();
                         break;
@@ -8863,13 +9425,14 @@ fn service_crdt_sync_floor(
         HYPERSPACE_REGISTRY_AGENT_NAME => return Some(SyncFloor::Public),
         _ => {}
     }
-    let msg = Msg::new("agent").with("instance_name", name);
+    let msg = Msg::new("service_actor").with("instance_name", name);
     let mut payload = Vec::with_capacity(1 + 64);
     payload.push(TAG_DYNAMIC);
     payload.extend_from_slice(&msg.encode());
     registry_probe_reply_with_timeout(invoke_routes, payload, timeout)
-        .and_then(|reply| decode_registry_option_reply::<crate::registry::AgentRow>(&reply))
-        .flatten()
+        .and_then(|reply| decode_registry_bytes_reply::<crate::registry::AgentLookup>(&reply))
+        .filter(|lookup| lookup.protocol.is_current())
+        .and_then(|lookup| lookup.row)
         .filter(|row| row.instance_name == name)
         .map(|row| row.sync_role)
 }
@@ -11811,7 +12374,6 @@ fn agent_thread(
     raft_fwd: RaftFwd,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
-    operator_signer: Option<crate::registry::CatalogOpSigner>,
     #[cfg(feature = "network")] shared_network: SharedNetwork,
     #[cfg(all(feature = "network", feature = "storage"))] sync_rx: Option<mpsc::Receiver<()>>,
 ) -> AgentResult {
@@ -12191,7 +12753,6 @@ fn agent_thread(
                         req,
                         strategy.as_mut(),
                         recording_enabled,
-                        operator_signer.as_ref(),
                     );
                     if let Err(e) = outcome {
                         fatal_error = Some(format!("commit failed during invoke: {e}"));
@@ -12389,26 +12950,10 @@ fn handle_invoke_request(
     svc_id: ServiceId,
     outbox: &mpsc::Sender<Envelope>,
     from_id: ServiceId,
-    mut req: InvokeRequest,
+    req: InvokeRequest,
     strategy: &mut dyn crate::commit::CommitStrategy,
     recording_enabled: bool,
-    operator_signer: Option<&crate::registry::CatalogOpSigner>,
 ) -> Result<(), crate::commit::CommitError> {
-    // Only the space-registry thread holds the operator signer for catalog ops.
-    // If this dispatch is a signed catalog mutator, author-sign it with
-    // the operator key here — at the funnel every invoke to the registry
-    // converges on — and inject the `auth` blob BEFORE `begin_recording`
-    // so the recorded (and thus replicated) op carries the signature.
-    // The role gate + authorize_op still run inside the handler; an
-    // unauthorized op mutates no state, so `write_atomic` records no DAG
-    // node and nothing escapes the node. On a joined non-admin daemon
-    // the signature is its own (non-admin) operator's, so authorize_op
-    // refuses it and the row is consumed from sync instead.
-    if let Some(signer) = operator_signer {
-        if let Some(signed) = crate::registry::sign_catalog_op_on_relay(&req.msg, signer) {
-            req.msg = signed;
-        }
-    }
     let dispatch_caller_prefix = caller_prefix_bytes(&req);
     let invocation_id = next_dispatch_invocation_id(strategy, svc_id);
     if recording_enabled {
@@ -14605,6 +15150,90 @@ fn persist(
 mod tests {
     use super::*;
 
+    fn registry_replay_log(message: crate::value::Msg) -> crate::effect_log::EffectLog {
+        use crate::Encode as _;
+
+        let mut payload = vec![crate::value::TAG_DYNAMIC];
+        payload.extend_from_slice(&message.encode());
+        crate::effect_log::EffectLog::for_msg(payload)
+    }
+
+    #[test]
+    fn registry_replay_rejects_malformed_dynamic_archives() {
+        let malformed = crate::effect_log::EffectLog::for_msg(vec![
+            crate::value::TAG_DYNAMIC,
+            0xff,
+            0x00,
+            0x01,
+        ]);
+        assert!(registry_replay_request(&malformed).is_err());
+    }
+
+    #[test]
+    fn registry_replay_default_denies_non_requests_and_misshapen_methods() {
+        let nondynamic = crate::effect_log::EffectLog::for_msg(b"reply bytes".to_vec());
+        assert!(registry_replay_request(&nondynamic).is_err());
+
+        let unknown = registry_replay_log(crate::value::Msg::new("future_or_forged_method"));
+        assert!(registry_replay_request(&unknown).is_err());
+
+        let missing = registry_replay_log(crate::value::Msg::new("set_space_id"));
+        assert!(registry_replay_request(&missing).is_err());
+
+        let wrong_type = registry_replay_log(
+            crate::value::Msg::new("set_space_id").with("space_id", "not bytes"),
+        );
+        assert!(registry_replay_request(&wrong_type).is_err());
+
+        let extra = registry_replay_log(
+            crate::value::Msg::new("set_space_id")
+                .with("space_id", vec![1u8; 32])
+                .with("unexpected", true),
+        );
+        assert!(registry_replay_request(&extra).is_err());
+
+        let duplicate = registry_replay_log(
+            crate::value::Msg::new("set_space_id")
+                .with("space_id", vec![1u8; 32])
+                .with("space_id", vec![1u8; 32]),
+        );
+        assert!(registry_replay_request(&duplicate).is_err());
+    }
+
+    #[test]
+    fn registry_replay_rejects_impossible_effect_transcripts() {
+        let mut reply = registry_replay_log(crate::value::Msg::new("protocol"));
+        reply.record_reply(vec![1, 2, 3]);
+        assert!(registry_replay_request(&reply).is_err());
+
+        let mut child_result = registry_replay_log(crate::value::Msg::new("protocol"));
+        child_result
+            .invoke_effects
+            .push(crate::effect_log::InvokeEffects {
+                reply_idx: 0,
+                svc_id: 1,
+                effects: vec![],
+            });
+        assert!(registry_replay_request(&child_result).is_err());
+    }
+
+    #[test]
+    fn registry_replay_accepts_kicks_and_legitimate_host_record_fields() {
+        assert!(matches!(
+            registry_replay_request(&crate::effect_log::EffectLog::for_msg(Vec::new())),
+            Ok(None),
+        ));
+
+        let mut request = registry_replay_log(crate::value::Msg::new("protocol"));
+        request.set_anchor(crate::refine_payload::ANCHOR_SMT_ROOT, [0x51; 32]);
+        request.set_caller_prefix([0, 1, 3, 1, 2]);
+        request.set_invocation_id(crate::service::InvocationId::new([0x52; 32]));
+        assert!(matches!(
+            registry_replay_request(&request),
+            Ok(Some(message)) if message.name == "protocol"
+        ));
+    }
+
     struct NoAgentTrust;
 
     impl crate::agent::driver::AgentTrustProvider for NoAgentTrust {
@@ -14750,6 +15379,7 @@ mod tests {
             std::process::id()
         ));
         let remove = RemoveAgentHostDirectory(base.clone());
+        std::fs::create_dir(&base).unwrap();
         let scope = crate::agent::host::AgentHostScope {
             space: crate::service::SpaceId([0x31; 32]),
             node: crate::service::NodeId([0x32; 32]),
@@ -14855,14 +15485,14 @@ mod tests {
         stopped.request_shutdown();
         let mut node = VosNode::new();
         assert!(node.attach_local_agent_host(stopped).is_err());
-        let handle = control.handle();
+        let handle = control.handle_for_test();
         node.attach_local_agent_host(control).unwrap();
         assert!(node.attach_local_agent_host(duplicate).is_err());
 
         let mut ticks = 0;
         node.run_forever_with(|node| {
             ticks += 1;
-            assert!(node.local_agent_host_handle().unwrap().identities().is_ok());
+            assert!(node.local_agent_host.as_ref().unwrap().identities().is_ok());
             node.shutdown_handle().store(true, Ordering::Release);
         });
         assert_eq!(ticks, 1, "the Local Agent host kept the router alive");
@@ -14881,7 +15511,7 @@ mod tests {
     fn checked_node_collection_surfaces_an_agent_host_worker_crash() {
         let (control, _remove) = empty_agent_host_control("worker-crash");
         let mut node = VosNode::new();
-        let handle = control.handle();
+        let handle = control.handle_for_test();
         node.attach_local_agent_host(control).unwrap();
         assert_eq!(
             handle.crash_worker_for_test(),
@@ -14897,7 +15527,7 @@ mod tests {
     fn agent_host_crash_stops_a_node_even_while_a_legacy_worker_is_live() {
         let (control, _remove) = empty_agent_host_control("mixed-worker-crash");
         let mut node = VosNode::new();
-        let handle = control.handle();
+        let handle = control.handle_for_test();
         node.attach_local_agent_host(control).unwrap();
         let shutdown = node.shutdown_handle();
         let worker_shutdown = shutdown.clone();
@@ -14961,7 +15591,7 @@ mod tests {
     fn run_until_idle_fans_out_an_agent_host_crash_without_waiting_for_threshold() {
         let (control, _remove) = empty_agent_host_control("idle-worker-crash");
         let mut node = VosNode::new();
-        let handle = control.handle();
+        let handle = control.handle_for_test();
         node.attach_local_agent_host(control).unwrap();
         assert_eq!(
             handle.crash_worker_for_test(),
@@ -14981,7 +15611,7 @@ mod tests {
     fn active_agent_host_work_defers_the_complete_node_idle_window() {
         let (control, _remove) = empty_agent_host_control("active-idle-window");
         let mut node = VosNode::new();
-        let handle = control.handle();
+        let handle = control.handle_for_test();
         node.attach_local_agent_host(control).unwrap();
         let (active_tx, active_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
@@ -15644,19 +16274,22 @@ mod tests {
         };
         let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
         let attacker_peer = peer_id_for(attacker_key.verifying_key().to_bytes());
+        let replay_space_id = [0x12; 32];
 
-        // auth blob = signer_peer_id || ed25519_sig(canonical_op_bytes).
+        // auth blob = signer_peer_id || ed25519_sig(space-bound canonical).
         let auth_as =
             |key: &SigningKey, signer_peer: &[u8], op: &str, fields: &[&[u8]]| -> Vec<u8> {
-                let canonical = space_registry::canonical_op_bytes(op, fields);
+                let canonical =
+                    space_registry::registry_mutation_signed_bytes(&replay_space_id, op, fields);
                 let sig = key.sign(&canonical).to_bytes();
                 space_registry::pack_auth(signer_peer, &sig)
             };
 
-        // A shared program the installs pin to.
+        // A shared service program the installs pin to.
         let prog = "p";
         let hash = vec![7u8; 32];
         let rep = vec![9u8; 32];
+        let publication = vec![8u8; 32];
         let consistency = Consistency::Crdt.as_u8();
 
         // ── Registry op messages (bare `[TAG_DYNAMIC][Msg]`, the shape
@@ -15667,11 +16300,14 @@ mod tests {
             p
         };
         let install_msg = |key: &SigningKey, signer: &[u8], inst: &str| {
+            let installation = vec![if inst == "good" { 10 } else { 11 }; 32];
             dyn_payload(
-                Msg::new("install")
+                Msg::new("install_service_actor")
                     .with("instance_name", inst.to_string())
                     .with("program_name", prog.to_string())
                     .with("program_hash", hash.clone())
+                    .with("program_publication_id", publication.clone())
+                    .with("installation_id", installation.clone())
                     .with("replication_id", rep.clone())
                     .with("consistency", consistency as u64)
                     .with("network_reachable", false)
@@ -15681,11 +16317,13 @@ mod tests {
                         auth_as(
                             key,
                             signer,
-                            "install",
+                            "install_service_actor",
                             &[
                                 inst.as_bytes(),
                                 prog.as_bytes(),
                                 &hash,
+                                &publication,
+                                &installation,
                                 &rep,
                                 &[consistency],
                                 &[0u8], // network_reachable = false
@@ -15696,24 +16334,38 @@ mod tests {
             )
         };
 
-        let set_root = dyn_payload(Msg::new("set_root").with("root", root_peer.clone()));
+        let set_root = dyn_payload(
+            Msg::new("set_root")
+                .with("root", root_peer.clone())
+                .with("schema_version", crate::registry::REGISTRY_SCHEMA_VERSION)
+                .with(
+                    "schema_hash",
+                    crate::registry::REGISTRY_SCHEMA_HASH.to_vec(),
+                ),
+        );
+        let set_space_id =
+            dyn_payload(Msg::new("set_space_id").with("space_id", replay_space_id.to_vec()));
         let publish = dyn_payload(
-            Msg::new("publish")
+            Msg::new("publish_service_program")
                 .with("name", prog.to_string())
                 .with("hash", hash.clone())
                 .with("crdt", true)
+                .with("publication_id", publication.clone())
+                .with("expected_publication_id", Vec::<u8>::new())
+                .with("expected_hash", Vec::<u8>::new())
                 .with(
                     "auth",
                     auth_as(
                         &root_key,
                         &root_peer,
-                        "publish",
-                        &[prog.as_bytes(), &hash, &[1u8]],
+                        "publish_service_program",
+                        &[prog.as_bytes(), &hash, &[1u8], &publication, &[], &[]],
                     ),
                 ),
         );
         let ops = [
             set_root,
+            set_space_id,
             publish,
             install_msg(&root_key, &root_peer, "good"), // valid install
             install_msg(&attacker_key, &attacker_peer, "evil"), // forged install
@@ -15773,7 +16425,7 @@ mod tests {
             node.invoke(ServiceId::REGISTRY, p).expect("registry reply")
         };
         let agent_reply =
-            |inst: &str| invoke(Msg::new("agent").with("instance_name", inst.to_string()));
+            |inst: &str| invoke(Msg::new("service_actor").with("instance_name", inst.to_string()));
         let none_reply = agent_reply("does-not-exist"); // canonical `None` for this type
 
         // Positive controls: the root-signed ops survived replay —
@@ -17812,6 +18464,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "storage", feature = "network"))]
     #[test]
     fn raft_redirect_and_delegation_preserve_the_observed_origin() {
         for origin in [
@@ -19618,9 +20271,11 @@ mod tests {
         };
         let remote_replacement_prefix = crate::network::derive_node_prefix(&remote_replacement);
         let operation_epoch = 4;
+        let space_id = [0x51; 32];
         let sign_replacement =
             |replacement_prefix: u16, replacement_peer: &libp2p::PeerId, epoch: u64| -> [u8; 64] {
                 let message = crate::registry::raft_voter_replacement_signed_bytes(
+                    &space_id,
                     &[0x73; 32],
                     old_prefix,
                     &old.to_bytes(),
@@ -19639,6 +20294,20 @@ mod tests {
         );
         let stale_operator_signature =
             sign_replacement(replacement_prefix, &replacement, operation_epoch - 1);
+        assert!(
+            !verifies_raft_voter_replacement_operator(
+                &operator,
+                &[0x52; 32],
+                &[0x73; 32],
+                old_prefix,
+                &old,
+                replacement_prefix,
+                &replacement,
+                operation_epoch,
+                &operator_signature,
+            ),
+            "a voter-replacement attestation cannot be transplanted to a sibling space",
+        );
         let rows = vec![
             crate::registry::MemberRow {
                 kind: crate::registry::MEMBER_KIND_NODE,
@@ -19678,6 +20347,7 @@ mod tests {
             while let Ok(request) = registry_rx.recv() {
                 let msg = intercepted_msg(&request.msg).unwrap();
                 let value = match msg.name.as_str() {
+                    "space_id" => Value::Bytes(space_id.to_vec()),
                     "peer_role" => Value::U8(AUTH_ROLE_ADMIN),
                     "members" => {
                         let after = msg.args.get_bytes("after_key").unwrap();
@@ -20201,7 +20871,8 @@ mod tests {
         space_role: u8,
     ) -> (InvokeRoutes, thread::JoinHandle<()>) {
         use crate::actors::codec::Encode;
-        use crate::registry::AgentRow;
+        use crate::registry::{AgentLookup, AgentRow, PublicationId, RegistryProtocol};
+        use crate::service::InstallationId;
         use crate::value::Value;
 
         let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
@@ -20210,24 +20881,24 @@ mod tests {
         let handle = thread::spawn(move || {
             while let Ok(req) = rx.recv() {
                 let value = match intercepted_method_name(&req.msg).as_deref() {
-                    Some("agent") => {
-                        let mut tagged = vec![u8::from(floor.is_some())];
-                        if let Some(sync_role) = floor {
-                            tagged.extend_from_slice(
-                                &AgentRow {
-                                    instance_name: "private-board".into(),
-                                    program_hash: [1; 32],
-                                    program_name: "board".into(),
-                                    replication_id: [2; 32],
-                                    consistency: Consistency::Crdt as u8,
-                                    network_reachable: true,
-                                    sync_role,
-                                }
-                                .encode(),
-                            );
+                    Some("service_actor") => Value::Bytes(
+                        AgentLookup {
+                            protocol: RegistryProtocol::CURRENT,
+                            row: floor.map(|sync_role| AgentRow {
+                                instance_name: "private-board".into(),
+                                installation_id: InstallationId([3; 32]),
+                                revision: 0,
+                                program_hash: [1; 32],
+                                program_name: "board".into(),
+                                program_publication_id: PublicationId::new([4; 32]),
+                                replication_id: [2; 32],
+                                consistency: Consistency::Crdt as u8,
+                                network_reachable: true,
+                                sync_role,
+                            }),
                         }
-                        Value::Bytes(tagged)
-                    }
+                        .encode(),
+                    ),
                     _ => Value::U8(space_role),
                 };
                 let reply =
@@ -20243,8 +20914,7 @@ mod tests {
     fn spawn_stub_blob_registry(
         peer_role: u8,
         node_role: u8,
-        catalogued: bool,
-        hash: [u8; 32],
+        authorized: bool,
     ) -> (InvokeRoutes, thread::JoinHandle<()>) {
         use crate::actors::codec::Encode;
         use crate::value::Value;
@@ -20255,25 +20925,13 @@ mod tests {
             while let Ok(req) = rx.recv() {
                 let value = match intercepted_method_name(&req.msg).as_deref() {
                     Some("node_role") => Value::U8(node_role),
-                    // Targeted hash lookup: `Some(row)` for a catalogued hash,
-                    // `Unit` (→ not catalogued) otherwise — matching the real
-                    // `program_by_hash` verb's `Option<ProgramRow>` wire shape.
-                    Some("program_by_hash") => {
-                        if catalogued {
-                            let mut tagged = vec![1];
-                            tagged.extend_from_slice(
-                                &crate::registry::ProgramRow {
-                                    name: "program".into(),
-                                    hash,
-                                    crdt: false,
-                                }
-                                .encode(),
-                            );
-                            Value::Bytes(tagged)
-                        } else {
-                            Value::Bytes(vec![0])
+                    Some("program_blob_authorized") => Value::Bytes(
+                        crate::registry::ProgramBlobAuthorization {
+                            protocol: crate::registry::RegistryProtocol::CURRENT,
+                            authorized,
                         }
-                    }
+                        .encode(),
+                    ),
                     _ => Value::U8(peer_role),
                 };
                 let reply =
@@ -20334,10 +20992,11 @@ mod tests {
         );
     }
 
-    /// Program blobs require both space membership and a catalogued hash.
+    /// Program blobs require both space membership and a retained registry
+    /// authorization, including displaced historical publications.
     #[test]
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn get_program_blob_requires_member_and_catalogued_hash() {
+    fn get_program_blob_requires_member_and_authorized_hash() {
         use crate::network::NetworkService;
         // A temp dir standing in for vosx's content-addressed blob cache,
         // holding one ELF keyed by its hex hash (the layout the node reads).
@@ -20352,8 +21011,8 @@ mod tests {
         let hash = crate::crypto::blake2b_hash::<32>(&[], &[&bytes]);
         std::fs::write(dir.join(proof_blob_filename(&hash)), &bytes).unwrap();
 
-        let make = |peer_role, node_role, catalogued| {
-            let (routes, _reg) = spawn_stub_blob_registry(peer_role, node_role, catalogued, hash);
+        let make = |peer_role, node_role, authorized| {
+            let (routes, _reg) = spawn_stub_blob_registry(peer_role, node_role, authorized);
             let mut svc = lifecycle_service(
                 routes,
                 Arc::new(Mutex::new(HashMap::new())),
@@ -20369,7 +21028,7 @@ mod tests {
                 .get_program_blob(Some(libp2p::PeerId::random()), &hash)
                 .as_deref(),
             Some(bytes.as_slice()),
-            "a member gets a catalogued ELF",
+            "a member gets an authorized ELF",
         );
         let enrolled = make(AUTH_ROLE_NONE, NODE_ROLE_REPLY_VOTER, true);
         assert_eq!(
@@ -20377,7 +21036,7 @@ mod tests {
                 .get_program_blob(Some(libp2p::PeerId::random()), &hash)
                 .as_deref(),
             Some(bytes.as_slice()),
-            "an enrolled node gets a catalogued ELF",
+            "an enrolled node gets an authorized ELF",
         );
         assert!(
             make(AUTH_ROLE_NONE, 0, true)
@@ -20393,7 +21052,7 @@ mod tests {
             make(AUTH_ROLE_READONLY, 0, false)
                 .get_program_blob(Some(libp2p::PeerId::random()), &hash)
                 .is_none(),
-            "an uncatalogued hash is refused even when cached",
+            "an unauthorized hash is refused even when cached",
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -20477,6 +21136,116 @@ mod tests {
             operator_signer: None,
             #[cfg(feature = "storage")]
             sync_floor_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn catalog_ingress_binds_author_and_preserves_exact_payload() {
+        use crate::actors::codec::Encode;
+        use crate::network::NetworkService;
+        use crate::value::{Msg, TAG_DYNAMIC, Value};
+
+        let author_key = libp2p::identity::Keypair::generate_ed25519();
+        let author = libp2p::PeerId::from(author_key.public());
+        let other = libp2p::PeerId::random();
+        let author_bytes = author.to_bytes();
+        let auth = crate::registry::pack_auth(&author_bytes, &[0xA5; crate::registry::OP_SIG_LEN]);
+        let mut payload = vec![TAG_DYNAMIC];
+        payload.extend_from_slice(
+            &Msg::new("unpublish_service_program")
+                .with("name", "mailbox")
+                .with("expected_publication_id", vec![0xB1_u8; 32])
+                .with("expected_hash", vec![0xB2_u8; 32])
+                .with("auth", auth)
+                .encode(),
+        );
+
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(ServiceId::REGISTRY.0, tx);
+        let expected = payload.clone();
+        let registry = thread::spawn(move || {
+            loop {
+                let request = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let decoded = intercepted_msg(&request.msg).unwrap();
+                if decoded.name == "peer_role" {
+                    let reply = Value::U8(AUTH_ROLE_ADMIN).encode();
+                    assert!(request.reply.send(encode_invoke_envelope(
+                        crate::STATUS_DONE,
+                        &[],
+                        &reply,
+                    )));
+                    continue;
+                }
+                assert_eq!(decoded.name, "unpublish_service_program");
+                assert_eq!(request.msg, expected, "host must not rewrite signed bytes");
+                assert!(request.reply.send(encode_invoke_envelope(
+                    crate::STATUS_DONE,
+                    &[],
+                    b"accepted",
+                )));
+                break;
+            }
+        });
+        let service = lifecycle_service(
+            routes,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+        );
+
+        let rejected = service.dispatch_invoke(
+            Some(other),
+            0,
+            ServiceId::REGISTRY.0,
+            vec![],
+            payload.clone(),
+        );
+        assert_eq!(rejected, forbidden_envelope());
+        assert_eq!(
+            service.dispatch_invoke(Some(author), 0, ServiceId::REGISTRY.0, vec![], payload,),
+            b"accepted",
+        );
+        registry.join().unwrap();
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn catalog_ingress_matches_authenticated_delegated_member_only() {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let peer = libp2p::PeerId::from(key.public());
+        let signer = peer.to_bytes();
+        let subject = crate::service::SubjectId::of_authenticated_peer(&signer);
+        let forwarder = libp2p::PeerId::random();
+
+        assert!(catalog_author_matches_ingress(&signer, Some(&peer), None));
+        assert!(!catalog_author_matches_ingress(
+            &signer,
+            Some(&forwarder),
+            None,
+        ));
+        assert!(catalog_author_matches_ingress(
+            &signer,
+            Some(&forwarder),
+            Some(crate::service::Origin::Member(subject)),
+        ));
+        assert!(!catalog_author_matches_ingress(
+            &signer,
+            Some(&peer),
+            Some(crate::service::Origin::Member(crate::service::SubjectId(
+                [0x55; 32]
+            ),)),
+        ));
+        for origin in [
+            crate::service::Origin::Anonymous,
+            crate::service::Origin::Actor(crate::service::ActorId([0x66; 32])),
+            crate::service::Origin::System,
+        ] {
+            assert!(!catalog_author_matches_ingress(
+                &signer,
+                Some(&peer),
+                Some(origin),
+            ));
         }
     }
 

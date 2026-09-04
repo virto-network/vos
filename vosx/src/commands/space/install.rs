@@ -2,10 +2,13 @@
 //! installed agent.
 
 use serde::Serialize;
-use vos::registry::Status;
+use vos::registry::{ProgramKind, Status};
 
 use crate::commands::space::client::DaemonClient;
-use crate::commands::space::common::{auto_replication_id, parse_consistency, parse_program_name};
+use crate::commands::space::common::{
+    auto_replication_id, parse_consistency, parse_instance_name, parse_nonzero_replication_id,
+    parse_program_name,
+};
 use crate::output;
 
 #[derive(Serialize)]
@@ -36,7 +39,7 @@ pub struct Args {
 
 pub fn run(args: Args) -> anyhow::Result<()> {
     let program_name = parse_program_name(&args.program_ref)?;
-    let instance_name = args.name.unwrap_or_else(|| program_name.clone());
+    let instance_name = parse_instance_name(args.name.as_deref().unwrap_or(&program_name))?;
 
     let consistency = parse_consistency(&args.consistency).ok_or_else(|| {
         anyhow::anyhow!(
@@ -54,18 +57,25 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             args.sync,
         )
     })?;
+    let explicit_replication_id = args
+        .replication_id
+        .as_deref()
+        .map(parse_nonzero_replication_id)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("--replication-id: {error}"))?;
 
     DaemonClient::with_connect(&args.space, |client| {
         let program = client
             .program(&program_name)?
             .ok_or_else(|| anyhow::anyhow!("program {program_name} is not published"))?;
+        if !matches!(&program.kind, ProgramKind::Service { .. }) {
+            anyhow::bail!(
+                "program {program_name} is an AgentActor package; `space install` only installs service actors"
+            );
+        }
 
-        let replication_id = match &args.replication_id {
-            Some(hex) => {
-                crate::blob_store::BlobHash::from_hex(hex)
-                    .map_err(|_| anyhow::anyhow!("--replication-id must be 64 hex"))?
-                    .0
-            }
+        let replication_id = match explicit_replication_id {
+            Some(value) => value,
             None => {
                 let space_id = client
                     .entry
@@ -75,11 +85,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             }
         };
 
-        let status = client.install(
+        let installation_id = super::common::mint_installation_id()?;
+        let status = client.install_service_actor(
             instance_name.clone(),
             program_name.clone(),
-            program.hash.to_vec(),
-            replication_id.to_vec(),
+            program.tag(),
+            installation_id,
+            replication_id,
             consistency,
             false, // network_reachable — CLI installs stay confined by default
             sync_role,
@@ -123,4 +135,46 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             other => anyhow::bail!("install returned status {other}"),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_rejects_noncanonical_instance_before_connecting() {
+        let error = run(Args {
+            space: "does-not-exist".into(),
+            program_ref: "worker-program".into(),
+            name: Some("Bad_Instance".into()),
+            consistency: "local".into(),
+            replication_id: None,
+            sync: "member".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("instance name"), "{error}");
+        assert!(error.contains("canonical registry slug"), "{error}");
+    }
+
+    #[test]
+    fn install_rejects_off_and_zero_replication_ids_before_connecting() {
+        for replication_id in ["off".to_string(), "00".repeat(32)] {
+            let error = run(Args {
+                space: "does-not-exist".into(),
+                program_ref: "worker-program".into(),
+                name: Some("worker".into()),
+                consistency: "local".into(),
+                replication_id: Some(replication_id),
+                sync: "member".into(),
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("--replication-id"), "{error}");
+            assert!(
+                error.contains("not supported") || error.contains("nonzero"),
+                "{error}"
+            );
+        }
+    }
 }

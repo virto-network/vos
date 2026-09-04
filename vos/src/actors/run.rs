@@ -167,11 +167,14 @@ impl Ask {
     }
 }
 
-fn decode_reply(bytes: alloc::vec::Vec<u8>) -> super::value::Value {
+fn decode_reply(
+    bytes: alloc::vec::Vec<u8>,
+) -> Result<super::value::Value, super::value::InvokeError> {
     if bytes.is_empty() {
-        super::value::Value::Unit
+        Ok(super::value::Value::Unit)
     } else {
-        <super::value::Value as super::codec::Decode>::decode(bytes.as_slice())
+        <super::value::Value as super::codec::Decode>::try_decode(bytes.as_slice())
+            .ok_or(super::value::InvokeError::Panicked)
     }
 }
 
@@ -184,17 +187,17 @@ impl Future for Ask {
             AskInner::Immediate(result) => {
                 let result = core::mem::replace(result, Err(super::value::InvokeError::Panicked));
                 match result {
-                    Ok(bytes) => Poll::Ready(Ok(decode_reply(bytes))),
+                    Ok(bytes) => Poll::Ready(decode_reply(bytes)),
                     Err(e) => Poll::Ready(Err(e)),
                 }
             }
             AskInner::HostIo(io) => match Pin::new(io).poll(cx) {
-                Poll::Ready(bytes) => Poll::Ready(Ok(decode_reply(bytes))),
+                Poll::Ready(bytes) => Poll::Ready(decode_reply(bytes)),
                 Poll::Pending => Poll::Pending,
             },
             AskInner::HostIoResult(io) => match Pin::new(io).poll(cx) {
                 Poll::Ready(bytes) => match crate::effects::result::decode(&bytes) {
-                    Ok(reply) => Poll::Ready(Ok(decode_reply(reply))),
+                    Ok(reply) => Poll::Ready(decode_reply(reply)),
                     Err(crate::actors::run::STATUS_NOT_FOUND) => {
                         Poll::Ready(Err(super::value::InvokeError::NotFound))
                     }
@@ -1249,4 +1252,28 @@ pub fn service_code_hash(service_id: u32) -> [u8; 32] {
     let mut hash = [0u8; 32];
     hash[..4].copy_from_slice(&service_id.to_le_bytes());
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Ask, run_blocking};
+    use crate::actors::{codec::Encode as _, value::InvokeError};
+    use crate::value::Value;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn ask_rejects_malformed_typed_replies() {
+        assert_eq!(
+            run_blocking(Ask::ready(Value::U32(17).encode())),
+            Ok(Value::U32(17))
+        );
+        assert_eq!(run_blocking(Ask::ready(Vec::new())), Ok(Value::Unit));
+
+        for malformed in [vec![0xff], vec![0xff; 32], vec![0, 1, 2]] {
+            assert_eq!(
+                run_blocking(Ask::ready(malformed)),
+                Err(InvokeError::Panicked)
+            );
+        }
+    }
 }
