@@ -9,6 +9,10 @@
 use alloc::{vec, vec::Vec};
 use core::fmt;
 
+use super::catalog_finality::{
+    CatalogBinding, CatalogFinalityError, FinalizedCatalogMutationFact,
+    FinalizedCatalogMutationReceipt, MAX_FINALIZED_CATALOG_MUTATION_RECEIPT_BYTES,
+};
 use super::committee::{
     AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommittee, AuthorityCommitteeError,
     AuthorityQuorumCertificate, MAX_AUTHORITY_COMMITTEE_WIRE_BYTES, MAX_AUTHORITY_QC_WIRE_BYTES,
@@ -23,30 +27,45 @@ use super::genesis::{
 use super::journal::{AgentJournalGenesisId, MAX_REPLAY_INPUT_BYTES};
 use super::{AgentConfig, AgentProfile};
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
-use crate::service::{AgentId, Hash, SpaceId};
+use crate::service::{AgentId, Hash, OperationId, SpaceId};
 
 const SERVICE_WIRE_HEADER_BYTES: usize = 4 + 32;
 const DECISION_TREE_DEPTH: u16 = 256;
 const MAX_DECISION_PROOF_SIBLINGS: usize = DECISION_TREE_DEPTH as usize;
 const ROTATION_TREE_DEPTH: u16 = 64;
 const MAX_ROTATION_PROOF_SIBLINGS: usize = ROTATION_TREE_DEPTH as usize;
+const CATALOG_TREE_DEPTH: u16 = 256;
+const MAX_CATALOG_PROOF_SIBLINGS: usize = CATALOG_TREE_DEPTH as usize;
 
 pub const MAX_SYSTEM_AUTHORITY_DECISIONS: u32 = 65_536;
 pub const MAX_SYSTEM_AUTHORITY_ROTATIONS: u32 = 4_096;
+pub const MAX_SYSTEM_AUTHORITY_CATALOG_RECORDS: u32 = 65_536;
 pub(crate) const MAX_SYSTEM_AUTHORITY_DECISION_TREE_NODES: usize =
     MAX_SYSTEM_AUTHORITY_DECISIONS as usize * (DECISION_TREE_DEPTH as usize + 1);
 pub(crate) const MAX_SYSTEM_AUTHORITY_ROTATION_TREE_NODES: usize =
     MAX_SYSTEM_AUTHORITY_ROTATIONS as usize * (ROTATION_TREE_DEPTH as usize + 1);
+pub(crate) const MAX_SYSTEM_AUTHORITY_CATALOG_TREE_NODES: usize =
+    MAX_SYSTEM_AUTHORITY_CATALOG_RECORDS as usize * (CATALOG_TREE_DEPTH as usize + 1);
 
 /// Maximum complete root-seeding descriptor.
-pub const MAX_SYSTEM_AUTHORITY_GENESIS_BYTES: usize =
-    SERVICE_WIRE_HEADER_BYTES + 32 + 8 + 32 + 8 + 4 + 4 + 4 + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES;
+pub const MAX_SYSTEM_AUTHORITY_GENESIS_BYTES: usize = SERVICE_WIRE_HEADER_BYTES
+    + 32
+    + 8
+    + 32
+    + 4
+    + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES
+    + 8
+    + 32
+    + 32
+    + 4
+    + 4
+    + 4;
 /// Maximum data-only root-journal identity binding. Decoding this record does
 /// not attest that replay materialized the named journal generation.
 pub const MAX_SYSTEM_AUTHORITY_JOURNAL_BINDING_BYTES: usize = SERVICE_WIRE_HEADER_BYTES + 32 + 32;
 /// Maximum complete replay-authenticated authority state in Standard Control.
 pub const MAX_SYSTEM_AUTHORITY_STATE_BYTES: usize =
-    320 + MAX_SYSTEM_AUTHORITY_JOURNAL_BINDING_BYTES + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES;
+    460 + MAX_SYSTEM_AUTHORITY_JOURNAL_BINDING_BYTES + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES;
 /// Maximum complete finalized-decision fact.
 pub const MAX_SYSTEM_AUTHORITY_DECISION_FACT_BYTES: usize = 470;
 /// Maximum one permanent decision-history node.
@@ -95,10 +114,27 @@ pub const MAX_SYSTEM_AUTHORITY_ROTATION_NODE_BYTES: usize =
 /// Maximum one content-addressed committee record.
 pub const MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORD_BYTES: usize =
     SERVICE_WIRE_HEADER_BYTES + 4 + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES;
+/// Maximum complete content-addressed catalog record. The complete verified
+/// receipt is retained rather than only its mutable projection or hashes.
+pub const MAX_SYSTEM_AUTHORITY_CATALOG_RECORD_BYTES: usize =
+    SERVICE_WIRE_HEADER_BYTES + 4 + MAX_FINALIZED_CATALOG_MUTATION_RECEIPT_BYTES;
+/// Maximum one immutable catalog-history node.
+pub const MAX_SYSTEM_AUTHORITY_CATALOG_NODE_BYTES: usize =
+    SERVICE_WIRE_HEADER_BYTES + 1 + 4 + MAX_SYSTEM_AUTHORITY_CATALOG_RECORD_BYTES;
+/// Maximum compressed membership/nonmembership proof keyed by OperationId.
+pub const MAX_SYSTEM_AUTHORITY_CATALOG_PROOF_BYTES: usize =
+    SERVICE_WIRE_HEADER_BYTES + 32 + 1 + 32 + 4 + MAX_CATALOG_PROOF_SIBLINGS * (2 + 32);
+/// Maximum proof-carrying catalog finalization command.
+pub const MAX_SYSTEM_AUTHORITY_CATALOG_FINALIZE_BYTES: usize = SERVICE_WIRE_HEADER_BYTES
+    + 4
+    + MAX_FINALIZED_CATALOG_MUTATION_RECEIPT_BYTES
+    + 4
+    + MAX_SYSTEM_AUTHORITY_CATALOG_PROOF_BYTES;
 
 // A rotation is itself the Management payload. Keep explicit headroom for
 // its lifecycle tag and RuntimeBinding instead of silently increasing AGJI.
 const _: () = assert!(MAX_SYSTEM_AUTHORITY_ROTATION_BYTES + 4096 <= MAX_REPLAY_INPUT_BYTES);
+const _: () = assert!(MAX_SYSTEM_AUTHORITY_CATALOG_FINALIZE_BYTES + 4096 <= MAX_REPLAY_INPUT_BYTES);
 
 const ROTATION_ID_DOMAIN: &[u8] = b"vos/agent/system-authority/rotation/v1";
 const AUTHORITY_SCOPE_DOMAIN: &[u8] = b"vos/agent/system-authority/journal-scope/v1";
@@ -110,6 +146,20 @@ const DECISION_BRANCH_ID_DOMAIN: &[u8] = b"vos/agent/system-authority/decision-b
 const DECISION_EMPTY_ID_DOMAIN: &[u8] = b"vos/agent/system-authority/decision-empty/v1";
 const FINALIZE_OPERATION_DOMAIN: &[u8] = b"vos/agent/system-authority/finalize/v1";
 const ROTATION_OPERATION_DOMAIN: &[u8] = b"vos/agent/system-authority/rotation-operation/v1";
+const AUTHORITY_GENESIS_GENERATION_DOMAIN: &[u8] =
+    b"vos/agent/system-authority/generation/genesis/v1";
+const AUTHORITY_DECISION_GENERATION_DOMAIN: &[u8] =
+    b"vos/agent/system-authority/generation/decision/v1";
+const AUTHORITY_ROTATION_GENERATION_DOMAIN: &[u8] =
+    b"vos/agent/system-authority/generation/rotation/v1";
+const AUTHORITY_DECISION_RESULT_DOMAIN: &[u8] = b"vos/agent/system-authority/decision-result/v1";
+const AUTHORITY_ROTATION_RESULT_DOMAIN: &[u8] = b"vos/agent/system-authority/rotation-result/v1";
+const CATALOG_RECORD_ID_DOMAIN: &[u8] = b"vos/agent/system-authority/catalog-record/v1";
+const CATALOG_LEAF_ID_DOMAIN: &[u8] = b"vos/agent/system-authority/catalog-leaf/v1";
+const CATALOG_BRANCH_ID_DOMAIN: &[u8] = b"vos/agent/system-authority/catalog-branch/v1";
+const CATALOG_EMPTY_ID_DOMAIN: &[u8] = b"vos/agent/system-authority/catalog-empty/v1";
+const CATALOG_FINALIZE_OPERATION_DOMAIN: &[u8] =
+    b"vos/agent/system-authority/catalog-finalize-operation/v1";
 
 macro_rules! authority_id_type {
     ($name:ident, $label:literal) => {
@@ -152,6 +202,10 @@ authority_id_type!(
 );
 authority_id_type!(SystemAuthorityRotationId, "SystemAuthorityRotationId");
 authority_id_type!(
+    SystemAuthorityCatalogRecordId,
+    "SystemAuthorityCatalogRecordId"
+);
+authority_id_type!(
     SystemAuthorityDecisionNodeId,
     "SystemAuthorityDecisionNodeId"
 );
@@ -159,6 +213,7 @@ authority_id_type!(
     SystemAuthorityRotationNodeId,
     "SystemAuthorityRotationNodeId"
 );
+authority_id_type!(SystemAuthorityCatalogNodeId, "SystemAuthorityCatalogNodeId");
 
 impl SystemAuthorityCommitteeId {
     pub fn of(committee: &AuthorityCommittee) -> Self {
@@ -209,8 +264,11 @@ pub struct SystemAuthorityGenesis {
     root_anchor_config: RootAnchorConfigCommitment,
     initial_committee: AuthorityCommittee,
     initial_sequence: u64,
+    catalog_binding: Hash,
+    initial_catalog_commitment: Hash,
     decision_limit: u32,
     rotation_limit: u32,
+    catalog_limit: u32,
 }
 
 impl SystemAuthorityGenesis {
@@ -220,8 +278,11 @@ impl SystemAuthorityGenesis {
         root_anchor_config: RootAnchorConfigCommitment,
         initial_committee: AuthorityCommittee,
         initial_sequence: u64,
+        catalog_binding: Hash,
+        initial_catalog_commitment: Hash,
         decision_limit: u32,
         rotation_limit: u32,
+        catalog_limit: u32,
     ) -> Result<Self, SystemAuthorityError> {
         let genesis = Self {
             root_anchor,
@@ -229,8 +290,11 @@ impl SystemAuthorityGenesis {
             root_anchor_config,
             initial_committee,
             initial_sequence,
+            catalog_binding,
+            initial_catalog_commitment,
             decision_limit,
             rotation_limit,
+            catalog_limit,
         };
         genesis.validate()?;
         Ok(genesis)
@@ -256,6 +320,14 @@ impl SystemAuthorityGenesis {
         self.initial_sequence
     }
 
+    pub const fn catalog_binding(&self) -> Hash {
+        self.catalog_binding
+    }
+
+    pub const fn initial_catalog_commitment(&self) -> Hash {
+        self.initial_catalog_commitment
+    }
+
     pub const fn decision_limit(&self) -> u32 {
         self.decision_limit
     }
@@ -264,18 +336,31 @@ impl SystemAuthorityGenesis {
         self.rotation_limit
     }
 
+    pub const fn catalog_limit(&self) -> u32 {
+        self.catalog_limit
+    }
+
     pub fn validate(&self) -> Result<(), SystemAuthorityError> {
         self.initial_committee
             .validate()
             .map_err(SystemAuthorityError::Authority)?;
+        CatalogBinding::new(
+            self.initial_committee.space(),
+            self.catalog_binding,
+            self.initial_committee.authority_binding(),
+        )
+        .map_err(SystemAuthorityError::Catalog)?;
         if self.root_anchor == RootAnchorId::ZERO
             || self.root_anchor_config_version == 0
             || self.root_anchor_config == RootAnchorConfigCommitment::ZERO
             || self.initial_sequence == 0
+            || self.initial_catalog_commitment == Hash::ZERO
             || self.decision_limit == 0
             || self.decision_limit > MAX_SYSTEM_AUTHORITY_DECISIONS
             || self.rotation_limit == 0
             || self.rotation_limit > MAX_SYSTEM_AUTHORITY_ROTATIONS
+            || self.catalog_limit == 0
+            || self.catalog_limit > MAX_SYSTEM_AUTHORITY_CATALOG_RECORDS
             || self.initial_committee.epoch() != 1
             || self.initial_committee.previous_committee().is_some()
         {
@@ -323,8 +408,11 @@ impl ServiceWire for SystemAuthorityGenesis {
         encoder.fixed(self.root_anchor_config.as_bytes());
         encoder.bytes(&self.initial_committee.encode());
         encoder.u64(self.initial_sequence);
+        encoder.fixed(&self.catalog_binding.0);
+        encoder.fixed(&self.initial_catalog_commitment.0);
         encoder.u32(self.decision_limit);
         encoder.u32(self.rotation_limit);
+        encoder.u32(self.catalog_limit);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -335,8 +423,11 @@ impl ServiceWire for SystemAuthorityGenesis {
             root_anchor_config: RootAnchorConfigCommitment::from_bytes(decoder.fixed()?),
             initial_committee: decode_nested(decoder, MAX_AUTHORITY_COMMITTEE_WIRE_BYTES)?,
             initial_sequence: decoder.u64()?,
+            catalog_binding: Hash(decoder.fixed()?),
+            initial_catalog_commitment: Hash(decoder.fixed()?),
             decision_limit: decoder.u32()?,
             rotation_limit: decoder.u32()?,
+            catalog_limit: decoder.u32()?,
         };
         genesis.validate().map_err(map_decode_error)?;
         Ok(genesis)
@@ -1027,6 +1118,444 @@ impl ServiceWire for SystemAuthorityFinalize {
         };
         finalize.validate().map_err(map_decode_error)?;
         Ok(finalize)
+    }
+}
+
+/// Permanent authority record for one catalog OperationId. The complete
+/// quorum-certified receipt is retained so an exact retry can return the
+/// historical result without consulting current roles, committee, or heads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemAuthorityCatalogRecord {
+    receipt: FinalizedCatalogMutationReceipt,
+}
+
+impl SystemAuthorityCatalogRecord {
+    /// Construct a record only after verifying the complete receipt against
+    /// the independently selected committee for its epoch.
+    pub fn new(
+        receipt: FinalizedCatalogMutationReceipt,
+        expected_binding: CatalogBinding,
+        historical_committee: &AuthorityCommittee,
+    ) -> Result<Self, SystemAuthorityError> {
+        receipt
+            .verify(expected_binding, historical_committee)
+            .map_err(SystemAuthorityError::Catalog)?;
+        let record = Self { receipt };
+        record.validate_shape()?;
+        Ok(record)
+    }
+
+    fn from_receipt_shape(
+        receipt: FinalizedCatalogMutationReceipt,
+    ) -> Result<Self, SystemAuthorityError> {
+        let record = Self { receipt };
+        record.validate_shape()?;
+        Ok(record)
+    }
+
+    pub const fn receipt(&self) -> &FinalizedCatalogMutationReceipt {
+        &self.receipt
+    }
+
+    pub fn operation_id(&self) -> OperationId {
+        self.receipt.fact().intent().operation_id()
+    }
+
+    pub fn id(&self) -> SystemAuthorityCatalogRecordId {
+        SystemAuthorityCatalogRecordId(
+            Hash::digest(CATALOG_RECORD_ID_DOMAIN, &[&self.receipt.encode()]).0,
+        )
+    }
+
+    pub fn leaf_id(&self) -> SystemAuthorityCatalogNodeId {
+        catalog_leaf_id(self.operation_id(), self.id())
+    }
+
+    pub fn verify(
+        &self,
+        expected_binding: CatalogBinding,
+        historical_committee: &AuthorityCommittee,
+    ) -> Result<(), SystemAuthorityError> {
+        self.validate_shape()?;
+        self.receipt
+            .verify(expected_binding, historical_committee)
+            .map_err(SystemAuthorityError::Catalog)
+    }
+
+    fn validate_shape(&self) -> Result<(), SystemAuthorityError> {
+        let fact = self.receipt.fact();
+        fact.validate().map_err(SystemAuthorityError::Catalog)?;
+        let certificate = self.receipt.certificate();
+        if certificate.authority_binding() != fact.intent().binding().authority_binding()
+            || certificate.claim() != fact.authority_claim()
+        {
+            return Err(SystemAuthorityError::InvalidCatalogRecord);
+        }
+        enforce_encoded_bound(self, MAX_SYSTEM_AUTHORITY_CATALOG_RECORD_BYTES)
+    }
+}
+
+impl ServiceWire for SystemAuthorityCatalogRecord {
+    const MAGIC: [u8; 4] = *b"SACR";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        Encoder(output).bytes(&self.receipt.encode());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_SYSTEM_AUTHORITY_CATALOG_RECORD_BYTES)?;
+        Self::from_receipt_shape(decode_nested(
+            decoder,
+            MAX_FINALIZED_CATALOG_MUTATION_RECEIPT_BYTES,
+        )?)
+        .map_err(map_decode_error)
+    }
+}
+
+/// One non-default sibling in an OperationId-keyed catalog history path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemAuthorityCatalogSibling {
+    depth: u16,
+    node: SystemAuthorityCatalogNodeId,
+}
+
+impl SystemAuthorityCatalogSibling {
+    pub fn new(
+        depth: u16,
+        node: SystemAuthorityCatalogNodeId,
+    ) -> Result<Self, SystemAuthorityError> {
+        let empty = catalog_empty_ladder();
+        if depth >= CATALOG_TREE_DEPTH
+            || node == SystemAuthorityCatalogNodeId::ZERO
+            || node == empty[usize::from(depth + 1)]
+        {
+            return Err(SystemAuthorityError::InvalidCatalogProof);
+        }
+        Ok(Self { depth, node })
+    }
+
+    pub const fn depth(self) -> u16 {
+        self.depth
+    }
+
+    pub const fn node(self) -> SystemAuthorityCatalogNodeId {
+        self.node
+    }
+}
+
+/// Bounded catalog-history membership/nonmembership proof. Occupied proofs
+/// carry only the content ID of the separately stored full receipt, keeping a
+/// proof-carrying RuntimeCall below the replay-input bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemAuthorityCatalogProof {
+    operation_id: OperationId,
+    occupied: Option<SystemAuthorityCatalogRecordId>,
+    siblings: Vec<SystemAuthorityCatalogSibling>,
+}
+
+impl SystemAuthorityCatalogProof {
+    pub fn vacant(
+        operation_id: OperationId,
+        siblings: Vec<SystemAuthorityCatalogSibling>,
+    ) -> Result<Self, SystemAuthorityError> {
+        Self::new(operation_id, None, siblings)
+    }
+
+    pub fn occupied(
+        operation_id: OperationId,
+        record: SystemAuthorityCatalogRecordId,
+        siblings: Vec<SystemAuthorityCatalogSibling>,
+    ) -> Result<Self, SystemAuthorityError> {
+        Self::new(operation_id, Some(record), siblings)
+    }
+
+    fn new(
+        operation_id: OperationId,
+        occupied: Option<SystemAuthorityCatalogRecordId>,
+        siblings: Vec<SystemAuthorityCatalogSibling>,
+    ) -> Result<Self, SystemAuthorityError> {
+        let proof = Self {
+            operation_id,
+            occupied,
+            siblings,
+        };
+        proof.validate()?;
+        Ok(proof)
+    }
+
+    pub const fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    pub const fn occupied_record_id(&self) -> Option<SystemAuthorityCatalogRecordId> {
+        self.occupied
+    }
+
+    pub fn siblings(&self) -> &[SystemAuthorityCatalogSibling] {
+        &self.siblings
+    }
+
+    pub fn root(&self) -> Result<SystemAuthorityCatalogNodeId, SystemAuthorityError> {
+        self.validate()?;
+        let leaf = self.occupied.map_or_else(
+            || empty_catalog_node(CATALOG_TREE_DEPTH),
+            |record| catalog_leaf_id(self.operation_id, record),
+        );
+        Ok(catalog_root_from_path(
+            self.operation_id,
+            leaf,
+            &self.siblings,
+        ))
+    }
+
+    pub fn verifies(
+        &self,
+        expected_root: SystemAuthorityCatalogNodeId,
+    ) -> Result<(), SystemAuthorityError> {
+        if expected_root == SystemAuthorityCatalogNodeId::ZERO || self.root()? != expected_root {
+            Err(SystemAuthorityError::InvalidCatalogProof)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate(&self) -> Result<(), SystemAuthorityError> {
+        let empty = catalog_empty_ladder();
+        if self.operation_id == OperationId::ZERO
+            || self.siblings.len() > MAX_CATALOG_PROOF_SIBLINGS
+            || self
+                .occupied
+                .is_some_and(|record| record == SystemAuthorityCatalogRecordId::ZERO)
+        {
+            return Err(SystemAuthorityError::InvalidCatalogProof);
+        }
+        let mut previous = None;
+        for sibling in &self.siblings {
+            if sibling.depth >= CATALOG_TREE_DEPTH
+                || sibling.node == SystemAuthorityCatalogNodeId::ZERO
+                || sibling.node == empty[usize::from(sibling.depth + 1)]
+                || previous.is_some_and(|depth| depth >= sibling.depth)
+            {
+                return Err(SystemAuthorityError::InvalidCatalogProof);
+            }
+            previous = Some(sibling.depth);
+        }
+        enforce_encoded_bound(self, MAX_SYSTEM_AUTHORITY_CATALOG_PROOF_BYTES)
+    }
+}
+
+impl ServiceWire for SystemAuthorityCatalogProof {
+    const MAGIC: [u8; 4] = *b"SACP";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.operation_id.0);
+        encoder.option(&self.occupied, |encoder, record| {
+            encoder.fixed(record.as_bytes())
+        });
+        encoder.u32(self.siblings.len() as u32);
+        for sibling in &self.siblings {
+            encoder.u16(sibling.depth);
+            encoder.fixed(sibling.node.as_bytes());
+        }
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_SYSTEM_AUTHORITY_CATALOG_PROOF_BYTES)?;
+        let operation_id = OperationId(decoder.fixed()?);
+        let occupied = decoder
+            .option(|decoder| Ok(SystemAuthorityCatalogRecordId::from_bytes(decoder.fixed()?)))?;
+        let count = decoder.u32()? as usize;
+        if count > MAX_CATALOG_PROOF_SIBLINGS {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let mut siblings = Vec::new();
+        siblings
+            .try_reserve_exact(count)
+            .map_err(|_| DecodeError::LimitExceeded)?;
+        for _ in 0..count {
+            siblings.push(SystemAuthorityCatalogSibling {
+                depth: decoder.u16()?,
+                node: SystemAuthorityCatalogNodeId::from_bytes(decoder.fixed()?),
+            });
+        }
+        let proof = Self {
+            operation_id,
+            occupied,
+            siblings,
+        };
+        proof.validate().map_err(map_decode_error)?;
+        Ok(proof)
+    }
+}
+
+/// Immutable catalog-history node written before publishing successor
+/// Control state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SystemAuthorityCatalogNode {
+    Leaf(SystemAuthorityCatalogRecord),
+    Branch {
+        depth: u16,
+        left: SystemAuthorityCatalogNodeId,
+        right: SystemAuthorityCatalogNodeId,
+    },
+}
+
+impl SystemAuthorityCatalogNode {
+    pub fn id(&self) -> SystemAuthorityCatalogNodeId {
+        match self {
+            Self::Leaf(record) => record.leaf_id(),
+            Self::Branch { depth, left, right } => catalog_branch_id(*depth, *left, *right),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), SystemAuthorityError> {
+        match self {
+            Self::Leaf(record) => record.validate_shape(),
+            Self::Branch { depth, left, right }
+                if *depth < CATALOG_TREE_DEPTH
+                    && *left != SystemAuthorityCatalogNodeId::ZERO
+                    && *right != SystemAuthorityCatalogNodeId::ZERO
+                    && *left != *right =>
+            {
+                Ok(())
+            }
+            Self::Branch { .. } => Err(SystemAuthorityError::InvalidCatalogNode),
+        }
+    }
+}
+
+impl ServiceWire for SystemAuthorityCatalogNode {
+    const MAGIC: [u8; 4] = *b"SACN";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        match self {
+            Self::Leaf(record) => {
+                encoder.u8(0);
+                encoder.bytes(&record.encode());
+            }
+            Self::Branch { depth, left, right } => {
+                encoder.u8(1);
+                encoder.u16(*depth);
+                encoder.fixed(left.as_bytes());
+                encoder.fixed(right.as_bytes());
+            }
+        }
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_SYSTEM_AUTHORITY_CATALOG_NODE_BYTES)?;
+        let node = match decoder.u8()? {
+            0 => Self::Leaf(decode_nested(
+                decoder,
+                MAX_SYSTEM_AUTHORITY_CATALOG_RECORD_BYTES,
+            )?),
+            1 => Self::Branch {
+                depth: decoder.u16()?,
+                left: SystemAuthorityCatalogNodeId::from_bytes(decoder.fixed()?),
+                right: SystemAuthorityCatalogNodeId::from_bytes(decoder.fixed()?),
+            },
+            _ => return Err(DecodeError::InvalidTag),
+        };
+        node.validate().map_err(map_decode_error)?;
+        Ok(node)
+    }
+}
+
+/// Proof-carrying catalog finalization command. Its logical operation is the
+/// signed receipt; the sparse proof may be refreshed after later insertions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemAuthorityCatalogFinalize {
+    receipt: FinalizedCatalogMutationReceipt,
+    proof: SystemAuthorityCatalogProof,
+}
+
+impl SystemAuthorityCatalogFinalize {
+    pub fn new(
+        receipt: FinalizedCatalogMutationReceipt,
+        proof: SystemAuthorityCatalogProof,
+    ) -> Result<Self, SystemAuthorityError> {
+        let finalize = Self { receipt, proof };
+        finalize.validate()?;
+        Ok(finalize)
+    }
+
+    pub const fn receipt(&self) -> &FinalizedCatalogMutationReceipt {
+        &self.receipt
+    }
+
+    pub const fn proof(&self) -> &SystemAuthorityCatalogProof {
+        &self.proof
+    }
+
+    pub fn operation_id(&self) -> OperationId {
+        self.receipt.fact().intent().operation_id()
+    }
+
+    /// Logical operation identity excludes the replaceable sparse proof.
+    pub fn operation_commitment(&self) -> Hash {
+        Hash::digest(CATALOG_FINALIZE_OPERATION_DOMAIN, &[&self.receipt.encode()])
+    }
+
+    pub fn validate(&self) -> Result<(), SystemAuthorityError> {
+        SystemAuthorityCatalogRecord::from_receipt_shape(self.receipt.clone())?;
+        self.proof.validate()?;
+        if self.proof.operation_id != self.operation_id() {
+            return Err(SystemAuthorityError::InvalidCatalogFinalize);
+        }
+        enforce_encoded_bound(self, MAX_SYSTEM_AUTHORITY_CATALOG_FINALIZE_BYTES)
+    }
+}
+
+impl ServiceWire for SystemAuthorityCatalogFinalize {
+    const MAGIC: [u8; 4] = *b"SACF";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.bytes(&self.receipt.encode());
+        encoder.bytes(&self.proof.encode());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_SYSTEM_AUTHORITY_CATALOG_FINALIZE_BYTES)?;
+        Self::new(
+            decode_nested(decoder, MAX_FINALIZED_CATALOG_MUTATION_RECEIPT_BYTES)?,
+            decode_nested(decoder, MAX_SYSTEM_AUTHORITY_CATALOG_PROOF_BYTES)?,
+        )
+        .map_err(map_decode_error)
+    }
+}
+
+/// Deterministic permanent-node write plan for one catalog insertion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SystemAuthorityCatalogWritePlan {
+    previous_root: SystemAuthorityCatalogNodeId,
+    root: SystemAuthorityCatalogNodeId,
+    inserted: bool,
+    nodes: Vec<SystemAuthorityCatalogNode>,
+    retired_node_ids: Vec<SystemAuthorityCatalogNodeId>,
+}
+
+impl SystemAuthorityCatalogWritePlan {
+    pub(crate) const fn previous_root(&self) -> SystemAuthorityCatalogNodeId {
+        self.previous_root
+    }
+
+    pub(crate) const fn root(&self) -> SystemAuthorityCatalogNodeId {
+        self.root
+    }
+
+    pub(crate) const fn inserted(&self) -> bool {
+        self.inserted
+    }
+
+    pub(crate) fn nodes(&self) -> &[SystemAuthorityCatalogNode] {
+        &self.nodes
+    }
+
+    pub(crate) fn retired_node_ids(&self) -> &[SystemAuthorityCatalogNodeId] {
+        &self.retired_node_ids
     }
 }
 
@@ -1855,6 +2384,10 @@ pub struct SystemAuthorityState {
     space: SpaceId,
     system_agent: AgentId,
     authority_binding: Hash,
+    authority_generation: Hash,
+    catalog_binding: Hash,
+    catalog_head: Hash,
+    catalog_limit: u32,
     decision_limit: u32,
     rotation_limit: u32,
     /// Data-only generation identity. The opaque replay witness is supplied
@@ -1870,12 +2403,14 @@ pub struct SystemAuthorityState {
     decision_count: u64,
     rotations_root: SystemAuthorityRotationNodeId,
     rotation_count: u64,
+    catalog_history_root: SystemAuthorityCatalogNodeId,
+    catalog_count: u64,
 }
 
 impl SystemAuthorityState {
-    /// Version 2 separates durable journal identity from the non-serializable
-    /// replay provenance witness used to authorize transitions.
-    pub const VERSION: u16 = 2;
+    /// Version 3 commits the cross-domain authority generation and catalog
+    /// CAS/history state. Older Control state has no compatibility decoder.
+    pub const VERSION: u16 = 3;
 
     pub fn from_genesis(
         system_agent: AgentId,
@@ -1893,6 +2428,10 @@ impl SystemAuthorityState {
             space: genesis.initial_committee.space(),
             system_agent,
             authority_binding: genesis.initial_committee.authority_binding(),
+            authority_generation: initial_authority_generation(system_agent, genesis),
+            catalog_binding: genesis.catalog_binding,
+            catalog_head: genesis.initial_catalog_commitment,
+            catalog_limit: genesis.catalog_limit,
             decision_limit: genesis.decision_limit,
             rotation_limit: genesis.rotation_limit,
             journal_binding: None,
@@ -1903,6 +2442,8 @@ impl SystemAuthorityState {
             decision_count: 0,
             rotations_root: empty_rotation_root(),
             rotation_count: 0,
+            catalog_history_root: empty_catalog_root(),
+            catalog_count: 0,
         };
         state.validate()?;
         Ok(state)
@@ -1918,6 +2459,27 @@ impl SystemAuthorityState {
 
     pub const fn authority_binding(&self) -> Hash {
         self.authority_binding
+    }
+
+    pub const fn authority_generation(&self) -> Hash {
+        self.authority_generation
+    }
+
+    pub const fn catalog_binding(&self) -> Hash {
+        self.catalog_binding
+    }
+
+    pub fn catalog_binding_record(&self) -> Result<CatalogBinding, SystemAuthorityError> {
+        CatalogBinding::new(self.space, self.catalog_binding, self.authority_binding)
+            .map_err(SystemAuthorityError::Catalog)
+    }
+
+    pub const fn catalog_head(&self) -> Hash {
+        self.catalog_head
+    }
+
+    pub const fn catalog_limit(&self) -> u32 {
+        self.catalog_limit
     }
 
     pub const fn decision_limit(&self) -> u32 {
@@ -1976,6 +2538,14 @@ impl SystemAuthorityState {
         self.rotation_count
     }
 
+    pub const fn catalog_history_root(&self) -> SystemAuthorityCatalogNodeId {
+        self.catalog_history_root
+    }
+
+    pub const fn catalog_count(&self) -> u64 {
+        self.catalog_count
+    }
+
     /// Re-anchor decoded Control state to the exact cycle-free Create seed on
     /// every Standard restore/checkpoint import. History may advance the
     /// committee and H, but it cannot replace immutable root identity.
@@ -1986,19 +2556,29 @@ impl SystemAuthorityState {
     ) -> Result<(), SystemAuthorityError> {
         self.validate()?;
         genesis.validate()?;
+        let initial_generation = initial_authority_generation(system_agent, genesis);
+        let pristine = self.authority_generation == initial_generation;
         if self.system_agent != system_agent
             || self.root_anchor != genesis.root_anchor
             || self.root_anchor_config_version != genesis.root_anchor_config_version
             || self.root_anchor_config != genesis.root_anchor_config
             || self.space != genesis.initial_committee.space()
             || self.authority_binding != genesis.initial_committee.authority_binding()
+            || self.catalog_binding != genesis.catalog_binding
+            || self.catalog_limit != genesis.catalog_limit
             || self.decision_limit != genesis.decision_limit
             || self.rotation_limit != genesis.rotation_limit
-            || (self.decision_count == 0
-                && self.rotation_count == 0
-                && self.committee_sequence_high_water != genesis.initial_sequence)
-            || ((self.decision_count != 0 || self.rotation_count != 0)
-                && self.committee_sequence_high_water <= genesis.initial_sequence)
+            || (pristine
+                && (self.decision_count != 0
+                    || self.rotation_count != 0
+                    || self.catalog_count != 0
+                    || self.catalog_head != genesis.initial_catalog_commitment
+                    || self.committee_sequence_high_water != genesis.initial_sequence
+                    || self.current_committee != genesis.initial_committee
+                    || self.journal_binding.is_some()))
+            || (!pristine
+                && (self.committee_sequence_high_water <= genesis.initial_sequence
+                    || self.journal_binding.is_none()))
             || (self.rotation_count == 0 && self.current_committee != genesis.initial_committee)
         {
             Err(SystemAuthorityError::InvalidState)
@@ -2111,6 +2691,136 @@ impl SystemAuthorityState {
         verify_provision_fact_with_committee(provision, fact, committee)
     }
 
+    /// Validate the state-dependent portion of a catalog claim before the
+    /// current committee reserves its global sequence. Only replay can mint
+    /// `trusted_scope`; a decoded state and caller-supplied proof are data.
+    pub(crate) fn validate_catalog_claim_for_signing(
+        &self,
+        trusted_scope: SystemAuthorityJournalScope,
+        fact: &FinalizedCatalogMutationFact,
+        proof: &SystemAuthorityCatalogProof,
+    ) -> Result<(), SystemAuthorityError> {
+        self.validate()?;
+        trusted_scope.validate()?;
+        fact.validate().map_err(SystemAuthorityError::Catalog)?;
+        self.validate_catalog_fact_scope(trusted_scope.binding(), fact)?;
+        proof.verifies(self.catalog_history_root)?;
+        if proof.operation_id() != fact.intent().operation_id() {
+            return Err(SystemAuthorityError::InvalidCatalogProof);
+        }
+        if proof.occupied_record_id().is_some() {
+            return Err(SystemAuthorityError::CatalogOperationConflict);
+        }
+        self.validate_fresh_catalog_fact(fact)?;
+        if self.catalog_count >= u64::from(self.catalog_limit) {
+            Err(SystemAuthorityError::Capacity)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Reverify a permanently stored catalog receipt against the exact
+    /// historical committee selected by authenticated authority history.
+    pub(crate) fn verify_historical_catalog_receipt(
+        &self,
+        trusted_scope: SystemAuthorityJournalScope,
+        receipt: &FinalizedCatalogMutationReceipt,
+        historical_committee: &AuthorityCommittee,
+    ) -> Result<(), SystemAuthorityError> {
+        self.validate()?;
+        trusted_scope.validate()?;
+        self.validate_catalog_fact_scope(trusted_scope.binding(), receipt.fact())?;
+        receipt
+            .verify(self.catalog_binding_record()?, historical_committee)
+            .map_err(SystemAuthorityError::Catalog)
+    }
+
+    /// Apply one proof-carrying catalog finalization. Occupied membership is
+    /// resolved before current generation/head, committee, sequence, or
+    /// capacity checks: exact retries return the stored receipt, while reuse
+    /// of an OperationId with divergent bytes is a permanent conflict.
+    pub(crate) fn apply_catalog_finalize(
+        &self,
+        trusted_scope: SystemAuthorityJournalScope,
+        finalize: &SystemAuthorityCatalogFinalize,
+    ) -> Result<SystemAuthorityCatalogFinalizeTransition, SystemAuthorityError> {
+        trusted_scope.validate()?;
+        self.apply_catalog_finalize_binding(trusted_scope.binding(), finalize)
+    }
+
+    fn apply_catalog_finalize_binding(
+        &self,
+        binding: SystemAuthorityJournalBinding,
+        finalize: &SystemAuthorityCatalogFinalize,
+    ) -> Result<SystemAuthorityCatalogFinalizeTransition, SystemAuthorityError> {
+        self.validate()?;
+        binding.validate()?;
+        finalize.validate()?;
+        let fact = finalize.receipt().fact();
+        self.validate_catalog_fact_scope(binding, fact)?;
+        finalize.proof().verifies(self.catalog_history_root)?;
+        let candidate =
+            SystemAuthorityCatalogRecord::from_receipt_shape(finalize.receipt().clone())?;
+
+        if let Some(existing) = finalize.proof().occupied_record_id() {
+            if existing == candidate.id() {
+                let outcome =
+                    SystemAuthorityCatalogFinalizeOutcome::from_exact_retry(candidate.receipt());
+                return Ok(SystemAuthorityCatalogFinalizeTransition {
+                    state: self.clone(),
+                    outcome,
+                    record: Some(candidate),
+                    history: unchanged_catalog_history(self.catalog_history_root),
+                });
+            } else {
+                let outcome = SystemAuthorityCatalogFinalizeOutcome::operation_conflict(
+                    finalize.operation_id(),
+                    existing,
+                );
+                return Ok(SystemAuthorityCatalogFinalizeTransition {
+                    state: self.clone(),
+                    outcome,
+                    record: None,
+                    history: unchanged_catalog_history(self.catalog_history_root),
+                });
+            }
+        }
+
+        self.validate_fresh_catalog_fact(fact)?;
+        if self.catalog_count >= u64::from(self.catalog_limit) {
+            return Err(SystemAuthorityError::Capacity);
+        }
+        finalize
+            .receipt()
+            .verify(self.catalog_binding_record()?, &self.current_committee)
+            .map_err(SystemAuthorityError::Catalog)?;
+        let record = SystemAuthorityCatalogRecord::new(
+            finalize.receipt().clone(),
+            self.catalog_binding_record()?,
+            &self.current_committee,
+        )?;
+        let history = insert_catalog(self.catalog_history_root, finalize.proof(), record.clone())?;
+
+        let mut next = self.clone();
+        next.bind_journal(binding)?;
+        next.authority_generation = fact.resulting_authority_generation();
+        next.catalog_head = fact.resulting_catalog_head();
+        next.committee_sequence_high_water = fact.sequence();
+        next.rotation_first_sequence = None;
+        next.catalog_history_root = history.root;
+        next.catalog_count = next
+            .catalog_count
+            .checked_add(1)
+            .ok_or(SystemAuthorityError::Capacity)?;
+        next.validate()?;
+        Ok(SystemAuthorityCatalogFinalizeTransition {
+            state: next,
+            outcome: SystemAuthorityCatalogFinalizeOutcome::finalized(record.receipt()),
+            record: Some(record),
+            history,
+        })
+    }
+
     pub(crate) fn apply_finalize(
         &self,
         trusted_scope: SystemAuthorityJournalScope,
@@ -2153,10 +2863,16 @@ impl SystemAuthorityState {
             next.bind_journal(binding)?;
             next.committee_sequence_high_water = fact.claim.sequence();
             next.rotation_first_sequence = None;
+            let outcome = SystemAuthorityFinalizeOutcome::TargetConflict(existing.decision);
+            next.authority_generation = derive_decision_authority_generation(
+                self.authority_generation,
+                finalize.operation_commitment(),
+                outcome,
+            );
             next.validate()?;
             return Ok(SystemAuthorityFinalizeTransition {
                 state: next,
-                outcome: SystemAuthorityFinalizeOutcome::TargetConflict(existing.decision),
+                outcome,
                 admitted_fact: None,
                 history: unchanged_history(self.decisions_root),
             });
@@ -2180,6 +2896,11 @@ impl SystemAuthorityState {
             .checked_add(1)
             .ok_or(SystemAuthorityError::Capacity)?;
         let outcome = SystemAuthorityFinalizeOutcome::Admitted(fact.decision);
+        next.authority_generation = derive_decision_authority_generation(
+            self.authority_generation,
+            finalize.operation_commitment(),
+            outcome,
+        );
         next.validate()?;
         Ok(SystemAuthorityFinalizeTransition {
             state: next,
@@ -2253,6 +2974,11 @@ impl SystemAuthorityState {
             .rotation_count
             .checked_add(1)
             .ok_or(SystemAuthorityError::Capacity)?;
+        next.authority_generation = derive_rotation_authority_generation(
+            self.authority_generation,
+            rotation.operation_commitment(),
+            &record,
+        );
         next.validate()?;
         Ok(SystemAuthorityRotationTransition {
             state: next,
@@ -2298,10 +3024,25 @@ impl SystemAuthorityState {
         ))
     }
 
+    /// Data-only catalog companion used by the guest runtime. Replay must
+    /// independently reapply the same command with an opaque root-journal
+    /// scope before persisting the write plan or publishing its receipt.
+    pub(crate) fn simulate_catalog_finalize_untrusted(
+        &self,
+        system_genesis: AgentJournalGenesisId,
+        agent_admission: AgentGenesisAdmissionId,
+        finalize: &SystemAuthorityCatalogFinalize,
+    ) -> Result<(Self, SystemAuthorityCatalogFinalizeOutcome), SystemAuthorityError> {
+        let binding = SystemAuthorityJournalBinding::new(system_genesis, agent_admission)?;
+        let transition = self.apply_catalog_finalize_binding(binding, finalize)?;
+        Ok((transition.state().clone(), transition.outcome()))
+    }
+
     pub fn validate(&self) -> Result<(), SystemAuthorityError> {
         self.current_committee
             .validate()
             .map_err(SystemAuthorityError::Authority)?;
+        self.catalog_binding_record()?;
         if self.version != Self::VERSION
             || self.root_anchor == RootAnchorId::ZERO
             || self.root_anchor_config_version == 0
@@ -2309,26 +3050,36 @@ impl SystemAuthorityState {
             || self.space == SpaceId::ZERO
             || self.system_agent == AgentId::ZERO
             || self.authority_binding == Hash::ZERO
+            || self.authority_generation == Hash::ZERO
+            || self.catalog_binding == Hash::ZERO
+            || self.catalog_head == Hash::ZERO
+            || self.catalog_limit == 0
+            || self.catalog_limit > MAX_SYSTEM_AUTHORITY_CATALOG_RECORDS
             || self.decision_limit == 0
             || self.decision_limit > MAX_SYSTEM_AUTHORITY_DECISIONS
             || self.rotation_limit == 0
             || self.rotation_limit > MAX_SYSTEM_AUTHORITY_ROTATIONS
             || self.decision_count > u64::from(self.decision_limit)
             || self.rotation_count > u64::from(self.rotation_limit)
+            || self.catalog_count > u64::from(self.catalog_limit)
             || self.committee_sequence_high_water == 0
             || self.decisions_root == SystemAuthorityDecisionNodeId::ZERO
             || self.rotations_root == SystemAuthorityRotationNodeId::ZERO
+            || self.catalog_history_root == SystemAuthorityCatalogNodeId::ZERO
             || self
                 .rotation_first_sequence
                 .is_some_and(|first| first <= self.committee_sequence_high_water)
             || (self.decision_count == 0) != (self.decisions_root == empty_decision_root())
             || (self.rotation_count == 0) != (self.rotations_root == empty_rotation_root())
+            || (self.catalog_count == 0) != (self.catalog_history_root == empty_catalog_root())
             || self.current_committee.space() != self.space
             || self.current_committee.authority_binding() != self.authority_binding
             || self.rotation_count.checked_add(1) != Some(self.current_committee.epoch())
             || (self.rotation_first_sequence.is_some() && self.rotation_count == 0)
-            || (self.journal_binding.is_some()
-                != (self.decision_count != 0 || self.rotation_count != 0))
+            || (self.journal_binding.is_none()
+                && (self.decision_count != 0
+                    || self.rotation_count != 0
+                    || self.catalog_count != 0))
         {
             return Err(SystemAuthorityError::InvalidState);
         }
@@ -2356,6 +3107,37 @@ impl SystemAuthorityState {
         } else {
             Ok(())
         }
+    }
+
+    fn validate_catalog_fact_scope(
+        &self,
+        binding: SystemAuthorityJournalBinding,
+        fact: &FinalizedCatalogMutationFact,
+    ) -> Result<(), SystemAuthorityError> {
+        let expected_catalog = self.catalog_binding_record()?;
+        if fact.intent().binding() != expected_catalog
+            || self
+                .journal_binding
+                .is_some_and(|existing| existing != binding)
+        {
+            Err(SystemAuthorityError::WrongSystemAgent)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_fresh_catalog_fact(
+        &self,
+        fact: &FinalizedCatalogMutationFact,
+    ) -> Result<(), SystemAuthorityError> {
+        fact.validate().map_err(SystemAuthorityError::Catalog)?;
+        if fact.actual_predecessor_authority_generation() != self.authority_generation {
+            return Err(SystemAuthorityError::StaleAuthorityGeneration);
+        }
+        if fact.actual_predecessor_catalog_head() != self.catalog_head {
+            return Err(SystemAuthorityError::StaleCatalogHead);
+        }
+        self.validate_fresh_committee_sequence(fact.sequence())
     }
 
     fn verify_current_certificate(
@@ -2432,6 +3214,10 @@ impl ServiceWire for SystemAuthorityState {
         encoder.fixed(&self.space.0);
         encoder.fixed(&self.system_agent.0);
         encoder.fixed(&self.authority_binding.0);
+        encoder.fixed(&self.authority_generation.0);
+        encoder.fixed(&self.catalog_binding.0);
+        encoder.fixed(&self.catalog_head.0);
+        encoder.u32(self.catalog_limit);
         encoder.u32(self.decision_limit);
         encoder.u32(self.rotation_limit);
         encoder.option(&self.journal_binding, |encoder, binding| {
@@ -2446,6 +3232,8 @@ impl ServiceWire for SystemAuthorityState {
         encoder.u64(self.decision_count);
         encoder.fixed(self.rotations_root.as_bytes());
         encoder.u64(self.rotation_count);
+        encoder.fixed(self.catalog_history_root.as_bytes());
+        encoder.u64(self.catalog_count);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -2457,6 +3245,10 @@ impl ServiceWire for SystemAuthorityState {
         let space = SpaceId(decoder.fixed()?);
         let system_agent = AgentId(decoder.fixed()?);
         let authority_binding = Hash(decoder.fixed()?);
+        let authority_generation = Hash(decoder.fixed()?);
+        let catalog_binding = Hash(decoder.fixed()?);
+        let catalog_head = Hash(decoder.fixed()?);
+        let catalog_limit = decoder.u32()?;
         let decision_limit = decoder.u32()?;
         let rotation_limit = decoder.u32()?;
         let journal_binding = decoder
@@ -2468,6 +3260,8 @@ impl ServiceWire for SystemAuthorityState {
         let decision_count = decoder.u64()?;
         let rotations_root = SystemAuthorityRotationNodeId::from_bytes(decoder.fixed()?);
         let rotation_count = decoder.u64()?;
+        let catalog_history_root = SystemAuthorityCatalogNodeId::from_bytes(decoder.fixed()?);
+        let catalog_count = decoder.u64()?;
         let state = Self {
             version,
             root_anchor,
@@ -2476,6 +3270,10 @@ impl ServiceWire for SystemAuthorityState {
             space,
             system_agent,
             authority_binding,
+            authority_generation,
+            catalog_binding,
+            catalog_head,
+            catalog_limit,
             decision_limit,
             rotation_limit,
             journal_binding,
@@ -2486,6 +3284,8 @@ impl ServiceWire for SystemAuthorityState {
             decision_count,
             rotations_root,
             rotation_count,
+            catalog_history_root,
+            catalog_count,
         };
         state.validate().map_err(map_decode_error)?;
         Ok(state)
@@ -2525,6 +3325,190 @@ impl SystemAuthorityFinalizeTransition {
     }
 
     pub(crate) const fn history(&self) -> &SystemAuthorityDecisionWritePlan {
+        &self.history
+    }
+
+    pub fn into_state(self) -> SystemAuthorityState {
+        self.state
+    }
+}
+
+/// Stable runtime-visible result of catalog finalization. An exact retry
+/// reproduces the permanent receipt fields; a divergent reuse exposes only
+/// the authenticated occupied record ID until replay loads that full record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemAuthorityCatalogFinalizeOutcome {
+    Finalized {
+        operation: OperationId,
+        result: Hash,
+        catalog_head: Hash,
+        authority_generation: Hash,
+        sequence: u64,
+    },
+    ExactRetry {
+        operation: OperationId,
+        result: Hash,
+        catalog_head: Hash,
+        authority_generation: Hash,
+        sequence: u64,
+    },
+    OperationConflict {
+        operation: OperationId,
+        occupied_record: SystemAuthorityCatalogRecordId,
+    },
+}
+
+impl SystemAuthorityCatalogFinalizeOutcome {
+    fn fields(receipt: &FinalizedCatalogMutationReceipt) -> (OperationId, Hash, Hash, Hash, u64) {
+        let fact = receipt.fact();
+        (
+            fact.intent().operation_id(),
+            fact.result().commitment(),
+            fact.resulting_catalog_head(),
+            fact.resulting_authority_generation(),
+            fact.sequence(),
+        )
+    }
+
+    fn finalized(receipt: &FinalizedCatalogMutationReceipt) -> Self {
+        let (operation, result, catalog_head, authority_generation, sequence) =
+            Self::fields(receipt);
+        Self::Finalized {
+            operation,
+            result,
+            catalog_head,
+            authority_generation,
+            sequence,
+        }
+    }
+
+    fn from_exact_retry(receipt: &FinalizedCatalogMutationReceipt) -> Self {
+        let (operation, result, catalog_head, authority_generation, sequence) =
+            Self::fields(receipt);
+        Self::ExactRetry {
+            operation,
+            result,
+            catalog_head,
+            authority_generation,
+            sequence,
+        }
+    }
+
+    fn operation_conflict(
+        operation: OperationId,
+        occupied_record: SystemAuthorityCatalogRecordId,
+    ) -> Self {
+        Self::OperationConflict {
+            operation,
+            occupied_record,
+        }
+    }
+
+    pub const fn operation(self) -> OperationId {
+        match self {
+            Self::Finalized { operation, .. }
+            | Self::ExactRetry { operation, .. }
+            | Self::OperationConflict { operation, .. } => operation,
+        }
+    }
+
+    pub const fn result(self) -> Option<Hash> {
+        match self {
+            Self::Finalized { result, .. } | Self::ExactRetry { result, .. } => Some(result),
+            Self::OperationConflict { .. } => None,
+        }
+    }
+
+    pub const fn catalog_head(self) -> Option<Hash> {
+        match self {
+            Self::Finalized { catalog_head, .. } | Self::ExactRetry { catalog_head, .. } => {
+                Some(catalog_head)
+            }
+            Self::OperationConflict { .. } => None,
+        }
+    }
+
+    pub const fn authority_generation(self) -> Option<Hash> {
+        match self {
+            Self::Finalized {
+                authority_generation,
+                ..
+            }
+            | Self::ExactRetry {
+                authority_generation,
+                ..
+            } => Some(authority_generation),
+            Self::OperationConflict { .. } => None,
+        }
+    }
+
+    pub const fn sequence(self) -> Option<u64> {
+        match self {
+            Self::Finalized { sequence, .. } | Self::ExactRetry { sequence, .. } => Some(sequence),
+            Self::OperationConflict { .. } => None,
+        }
+    }
+
+    pub const fn occupied_record_id(self) -> Option<SystemAuthorityCatalogRecordId> {
+        match self {
+            Self::OperationConflict {
+                occupied_record, ..
+            } => Some(occupied_record),
+            _ => None,
+        }
+    }
+
+    pub const fn exact_retry(self) -> bool {
+        matches!(self, Self::ExactRetry { .. })
+    }
+
+    pub const fn operation_conflicted(self) -> bool {
+        matches!(self, Self::OperationConflict { .. })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemAuthorityCatalogFinalizeTransition {
+    state: SystemAuthorityState,
+    outcome: SystemAuthorityCatalogFinalizeOutcome,
+    record: Option<SystemAuthorityCatalogRecord>,
+    history: SystemAuthorityCatalogWritePlan,
+}
+
+impl SystemAuthorityCatalogFinalizeTransition {
+    pub const fn state(&self) -> &SystemAuthorityState {
+        &self.state
+    }
+
+    pub const fn outcome(&self) -> SystemAuthorityCatalogFinalizeOutcome {
+        self.outcome
+    }
+
+    /// The newly admitted record or the permanent record selected by an
+    /// occupied proof for retry/conflict.
+    pub const fn record(&self) -> Option<&SystemAuthorityCatalogRecord> {
+        self.record.as_ref()
+    }
+
+    pub const fn receipt(&self) -> Option<&FinalizedCatalogMutationReceipt> {
+        match &self.record {
+            Some(record) => Some(record.receipt()),
+            None => None,
+        }
+    }
+
+    pub fn occupied_record_id(&self) -> SystemAuthorityCatalogRecordId {
+        self.record.as_ref().map_or_else(
+            || {
+                self.outcome
+                    .occupied_record_id()
+                    .expect("recordless catalog transition is a conflict")
+            },
+            SystemAuthorityCatalogRecord::id,
+        )
+    }
+
+    pub(crate) const fn history(&self) -> &SystemAuthorityCatalogWritePlan {
         &self.history
     }
 
@@ -2618,15 +3602,23 @@ pub enum SystemAuthorityError {
     InvalidDecisionProof,
     InvalidRotationNode,
     InvalidRotationProof,
+    InvalidCatalogRecord,
+    InvalidCatalogNode,
+    InvalidCatalogProof,
+    InvalidCatalogFinalize,
     InvalidFinalize,
     InvalidProvision,
     WrongSystemAgent,
     StaleCommittee,
+    StaleAuthorityGeneration,
+    StaleCatalogHead,
+    CatalogOperationConflict,
     SequenceConflict,
     RotationFirstSequencePending,
     Capacity,
     LimitExceeded,
     Authority(AuthorityCommitteeError),
+    Catalog(CatalogFinalityError),
     Genesis(AgentGenesisError),
 }
 
@@ -2644,6 +3636,7 @@ impl core::error::Error for SystemAuthorityError {}
 pub(crate) enum SystemAuthorityTreeNodeId {
     Decision(SystemAuthorityDecisionNodeId),
     Rotation(SystemAuthorityRotationNodeId),
+    Catalog(SystemAuthorityCatalogNodeId),
 }
 
 /// Store-independent failure vocabulary. `Missing` and `Corrupt` identify the
@@ -2804,6 +3797,73 @@ pub(crate) fn prove_decision<E>(
             _ => {
                 return Err(SystemAuthorityTreeError::Corrupt(
                     SystemAuthorityTreeNodeId::Decision(current),
+                ));
+            }
+        }
+    }
+    Err(SystemAuthorityTreeError::Limit)
+}
+
+/// Build the canonical compressed catalog path for one OperationId from
+/// sealed immutable nodes.
+pub(crate) fn prove_catalog<E>(
+    root: SystemAuthorityCatalogNodeId,
+    operation_id: OperationId,
+    mut load_node: impl FnMut(SystemAuthorityCatalogNodeId) -> Result<Option<Vec<u8>>, E>,
+) -> Result<SystemAuthorityCatalogProof, SystemAuthorityTreeError<E>> {
+    let root_ref = SystemAuthorityTreeNodeId::Catalog(root);
+    if root == SystemAuthorityCatalogNodeId::ZERO || operation_id == OperationId::ZERO {
+        return Err(SystemAuthorityTreeError::Corrupt(root_ref));
+    }
+    let empty = catalog_empty_ladder();
+    let mut current = root;
+    let mut siblings = Vec::new();
+    siblings
+        .try_reserve_exact(MAX_CATALOG_PROOF_SIBLINGS)
+        .map_err(|_| SystemAuthorityTreeError::Limit)?;
+    for depth in 0..=CATALOG_TREE_DEPTH {
+        if current == empty[usize::from(depth)] {
+            let proof = SystemAuthorityCatalogProof::vacant(operation_id, siblings)
+                .map_err(|_| SystemAuthorityTreeError::Corrupt(root_ref))?;
+            proof
+                .verifies(root)
+                .map_err(|_| SystemAuthorityTreeError::Corrupt(root_ref))?;
+            return Ok(proof);
+        }
+        let node = load_catalog_node(current, &mut load_node)?;
+        match node {
+            SystemAuthorityCatalogNode::Branch {
+                depth: stored_depth,
+                left,
+                right,
+            } if depth < CATALOG_TREE_DEPTH && stored_depth == depth => {
+                let (next, sibling) = if bit_at(&operation_id.0, depth) {
+                    (right, left)
+                } else {
+                    (left, right)
+                };
+                if sibling != empty[usize::from(depth + 1)] {
+                    siblings.push(
+                        SystemAuthorityCatalogSibling::new(depth, sibling)
+                            .map_err(|_| SystemAuthorityTreeError::Corrupt(root_ref))?,
+                    );
+                }
+                current = next;
+            }
+            SystemAuthorityCatalogNode::Leaf(record)
+                if depth == CATALOG_TREE_DEPTH && record.operation_id() == operation_id =>
+            {
+                let proof =
+                    SystemAuthorityCatalogProof::occupied(operation_id, record.id(), siblings)
+                        .map_err(|_| SystemAuthorityTreeError::Corrupt(root_ref))?;
+                proof
+                    .verifies(root)
+                    .map_err(|_| SystemAuthorityTreeError::Corrupt(root_ref))?;
+                return Ok(proof);
+            }
+            _ => {
+                return Err(SystemAuthorityTreeError::Corrupt(
+                    SystemAuthorityTreeNodeId::Catalog(current),
                 ));
             }
         }
@@ -3228,9 +4288,230 @@ fn load_rotation_node<E>(
     }
 }
 
+fn load_catalog_node<E>(
+    id: SystemAuthorityCatalogNodeId,
+    load_node: &mut impl FnMut(SystemAuthorityCatalogNodeId) -> Result<Option<Vec<u8>>, E>,
+) -> Result<SystemAuthorityCatalogNode, SystemAuthorityTreeError<E>> {
+    let reference = SystemAuthorityTreeNodeId::Catalog(id);
+    let bytes = load_node(id)
+        .map_err(SystemAuthorityTreeError::Load)?
+        .ok_or(SystemAuthorityTreeError::Missing(reference))?;
+    if bytes.len() > MAX_SYSTEM_AUTHORITY_CATALOG_NODE_BYTES {
+        return Err(SystemAuthorityTreeError::Limit);
+    }
+    let node = SystemAuthorityCatalogNode::decode(&bytes).map_err(|error| match error {
+        DecodeError::LimitExceeded => SystemAuthorityTreeError::Limit,
+        _ => SystemAuthorityTreeError::Corrupt(reference),
+    })?;
+    if node.id() != id {
+        Err(SystemAuthorityTreeError::Corrupt(reference))
+    } else {
+        Ok(node)
+    }
+}
+
 fn set_decision_prefix_bit(prefix: &mut [u8; 32], depth: u16) {
     let depth = usize::from(depth);
     prefix[depth / 8] |= 0x80 >> (depth % 8);
+}
+
+fn initial_authority_generation(system_agent: AgentId, genesis: &SystemAuthorityGenesis) -> Hash {
+    Hash::digest(
+        AUTHORITY_GENESIS_GENERATION_DOMAIN,
+        &[&system_agent.0, &genesis.encode()],
+    )
+}
+
+fn derive_decision_authority_generation(
+    predecessor: Hash,
+    operation: Hash,
+    outcome: SystemAuthorityFinalizeOutcome,
+) -> Hash {
+    let (tag, decision) = match outcome {
+        SystemAuthorityFinalizeOutcome::Admitted(decision) => (0_u8, decision),
+        SystemAuthorityFinalizeOutcome::TargetConflict(decision) => (1_u8, decision),
+        SystemAuthorityFinalizeOutcome::ExactRetry(_) => {
+            debug_assert!(false, "exact retry must not advance authority generation");
+            return predecessor;
+        }
+    };
+    let result = Hash::digest(
+        AUTHORITY_DECISION_RESULT_DOMAIN,
+        &[&[tag], decision.as_bytes()],
+    );
+    Hash::digest(
+        AUTHORITY_DECISION_GENERATION_DOMAIN,
+        &[&predecessor.0, &operation.0, &result.0],
+    )
+}
+
+fn derive_rotation_authority_generation(
+    predecessor: Hash,
+    operation: Hash,
+    record: &SystemAuthorityRotationRecord,
+) -> Hash {
+    let result = Hash::digest(
+        AUTHORITY_ROTATION_RESULT_DOMAIN,
+        &[
+            record.id().as_bytes(),
+            record.new_committee().as_bytes(),
+            &record.new_epoch().to_le_bytes(),
+        ],
+    );
+    Hash::digest(
+        AUTHORITY_ROTATION_GENERATION_DOMAIN,
+        &[&predecessor.0, &operation.0, &result.0],
+    )
+}
+
+fn insert_catalog(
+    current_root: SystemAuthorityCatalogNodeId,
+    proof: &SystemAuthorityCatalogProof,
+    record: SystemAuthorityCatalogRecord,
+) -> Result<SystemAuthorityCatalogWritePlan, SystemAuthorityError> {
+    proof.verifies(current_root)?;
+    if proof.occupied.is_some() || proof.operation_id != record.operation_id() {
+        return Err(SystemAuthorityError::InvalidCatalogProof);
+    }
+    let mut nodes = Vec::new();
+    nodes
+        .try_reserve_exact(usize::from(CATALOG_TREE_DEPTH) + 1)
+        .map_err(|_| SystemAuthorityError::Capacity)?;
+    let empty = catalog_empty_ladder();
+    let mut child = record.leaf_id();
+    let mut old_child = empty[usize::from(CATALOG_TREE_DEPTH)];
+    let mut retired_node_ids = Vec::new();
+    nodes.push(SystemAuthorityCatalogNode::Leaf(record));
+    let mut sibling_index = proof.siblings.len();
+    for depth in (0..CATALOG_TREE_DEPTH).rev() {
+        let sibling = if sibling_index != 0 && proof.siblings[sibling_index - 1].depth == depth {
+            sibling_index -= 1;
+            proof.siblings[sibling_index].node
+        } else {
+            empty[usize::from(depth + 1)]
+        };
+        let (left, right) = if bit_at(&proof.operation_id.0, depth) {
+            (sibling, child)
+        } else {
+            (child, sibling)
+        };
+        let branch = SystemAuthorityCatalogNode::Branch { depth, left, right };
+        child = branch.id();
+        nodes.push(branch);
+
+        let (old_left, old_right) = if bit_at(&proof.operation_id.0, depth) {
+            (sibling, old_child)
+        } else {
+            (old_child, sibling)
+        };
+        old_child = catalog_branch_id(depth, old_left, old_right);
+        if old_child != empty[usize::from(depth)] {
+            retired_node_ids.push(old_child);
+        }
+    }
+    debug_assert_eq!(sibling_index, 0);
+    let root = child;
+    nodes.sort_by_key(SystemAuthorityCatalogNode::id);
+    retired_node_ids.sort();
+    retired_node_ids.dedup();
+    retired_node_ids.retain(|id| {
+        nodes
+            .binary_search_by_key(id, SystemAuthorityCatalogNode::id)
+            .is_err()
+    });
+    Ok(SystemAuthorityCatalogWritePlan {
+        previous_root: current_root,
+        root,
+        inserted: true,
+        nodes,
+        retired_node_ids,
+    })
+}
+
+fn unchanged_catalog_history(
+    root: SystemAuthorityCatalogNodeId,
+) -> SystemAuthorityCatalogWritePlan {
+    SystemAuthorityCatalogWritePlan {
+        previous_root: root,
+        root,
+        inserted: false,
+        nodes: Vec::new(),
+        retired_node_ids: Vec::new(),
+    }
+}
+
+fn catalog_root_from_path(
+    key: OperationId,
+    mut child: SystemAuthorityCatalogNodeId,
+    siblings: &[SystemAuthorityCatalogSibling],
+) -> SystemAuthorityCatalogNodeId {
+    let empty = catalog_empty_ladder();
+    let mut sibling_index = siblings.len();
+    for depth in (0..CATALOG_TREE_DEPTH).rev() {
+        let sibling = if sibling_index != 0 && siblings[sibling_index - 1].depth == depth {
+            sibling_index -= 1;
+            siblings[sibling_index].node
+        } else {
+            empty[usize::from(depth + 1)]
+        };
+        child = if bit_at(&key.0, depth) {
+            catalog_branch_id(depth, sibling, child)
+        } else {
+            catalog_branch_id(depth, child, sibling)
+        };
+    }
+    child
+}
+
+pub fn empty_catalog_root() -> SystemAuthorityCatalogNodeId {
+    catalog_empty_ladder()[0]
+}
+
+fn empty_catalog_node(depth: u16) -> SystemAuthorityCatalogNodeId {
+    catalog_empty_ladder()[usize::from(depth)]
+}
+
+fn catalog_empty_ladder() -> Vec<SystemAuthorityCatalogNodeId> {
+    let mut ladder = vec![SystemAuthorityCatalogNodeId::ZERO; usize::from(CATALOG_TREE_DEPTH) + 1];
+    ladder[usize::from(CATALOG_TREE_DEPTH)] = SystemAuthorityCatalogNodeId(
+        Hash::digest(
+            CATALOG_EMPTY_ID_DOMAIN,
+            &[&CATALOG_TREE_DEPTH.to_le_bytes()],
+        )
+        .0,
+    );
+    for depth in (0..CATALOG_TREE_DEPTH).rev() {
+        let child = ladder[usize::from(depth + 1)];
+        ladder[usize::from(depth)] = catalog_branch_id(depth, child, child);
+    }
+    ladder
+}
+
+fn catalog_branch_id(
+    depth: u16,
+    left: SystemAuthorityCatalogNodeId,
+    right: SystemAuthorityCatalogNodeId,
+) -> SystemAuthorityCatalogNodeId {
+    SystemAuthorityCatalogNodeId(
+        Hash::digest(
+            CATALOG_BRANCH_ID_DOMAIN,
+            &[&depth.to_le_bytes(), left.as_bytes(), right.as_bytes()],
+        )
+        .0,
+    )
+}
+
+fn catalog_leaf_id(
+    operation_id: OperationId,
+    record: SystemAuthorityCatalogRecordId,
+) -> SystemAuthorityCatalogNodeId {
+    SystemAuthorityCatalogNodeId(
+        Hash::digest(
+            CATALOG_LEAF_ID_DOMAIN,
+            &[&operation_id.0, record.as_bytes()],
+        )
+        .0,
+    )
 }
 
 fn insert_decision(
@@ -3636,6 +4917,10 @@ mod tests {
         CAPABILITY_AGENT_CREATE_PRIVATE, CAPABILITY_AGENT_CREATE_SHARED, ED25519_SIGNATURE_BYTES,
         ed25519_public_key_wire,
     };
+    use crate::agent::catalog_finality::{
+        CatalogMutation, CatalogMutationDisposition, CatalogMutationIntent, CatalogMutationKind,
+        CatalogMutationResult,
+    };
     use crate::agent::committee::{
         AuthorityCommitteeMember, AuthorityMemberRole, AuthoritySignature, AuthoritySignerId,
     };
@@ -3661,6 +4946,8 @@ mod tests {
     const ROOT_ANCHOR: RootAnchorId = RootAnchorId::from_bytes([0x71; 32]);
     const ROOT_CONFIG: RootAnchorConfigCommitment =
         RootAnchorConfigCommitment::from_bytes([0x72; 32]);
+    const CATALOG_BINDING: Hash = Hash([0x73; 32]);
+    const INITIAL_CATALOG_HEAD: Hash = Hash([0x74; 32]);
     const RUNTIME_BYTES: &[u8] = b"ordinary-agent-runtime";
     const PEER_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
 
@@ -3743,8 +5030,67 @@ mod tests {
     }
 
     fn system_genesis(committee: &AuthorityCommittee) -> SystemAuthorityGenesis {
-        SystemAuthorityGenesis::new(ROOT_ANCHOR, 1, ROOT_CONFIG, committee.clone(), 1, 64, 16)
-            .unwrap()
+        SystemAuthorityGenesis::new(
+            ROOT_ANCHOR,
+            1,
+            ROOT_CONFIG,
+            committee.clone(),
+            1,
+            CATALOG_BINDING,
+            INITIAL_CATALOG_HEAD,
+            64,
+            16,
+            64,
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn catalog_receipt(
+        state: &SystemAuthorityState,
+        committee: &AuthorityCommittee,
+        committee_keys: &[SigningKey],
+        operation_byte: u8,
+        sequence: u64,
+        mutation_byte: u8,
+        expected_authority_generation: Hash,
+        expected_catalog_head: Hash,
+        disposition: CatalogMutationDisposition,
+    ) -> FinalizedCatalogMutationReceipt {
+        let intent = CatalogMutationIntent::new(
+            state.catalog_binding_record().unwrap(),
+            expected_authority_generation,
+            expected_catalog_head,
+            PrincipalId([0xb1; 32]),
+            CredentialId([0xb2; 32]),
+            CapabilityId([0xb3; 32]),
+            OperationId([operation_byte; 32]),
+            CatalogMutation::new(CatalogMutationKind::UpdateMetadata, vec![mutation_byte; 8])
+                .unwrap(),
+        )
+        .unwrap();
+        let projection = if disposition == CatalogMutationDisposition::Applied {
+            vec![mutation_byte.wrapping_add(1); 8]
+        } else {
+            Vec::new()
+        };
+        let result = CatalogMutationResult::new(disposition, projection).unwrap();
+        let fact = FinalizedCatalogMutationFact::new(
+            intent,
+            state.authority_generation(),
+            state.catalog_head(),
+            result,
+            sequence,
+        )
+        .unwrap();
+        let qc = certificate(committee, fact.authority_claim(), committee_keys);
+        FinalizedCatalogMutationReceipt::new(
+            fact,
+            qc,
+            state.catalog_binding_record().unwrap(),
+            committee,
+        )
+        .unwrap()
     }
 
     fn journal_scope() -> SystemAuthorityJournalScope {
@@ -4035,6 +5381,18 @@ mod tests {
         }
     }
 
+    fn install_catalog_nodes(
+        nodes: &mut BTreeMap<SystemAuthorityCatalogNodeId, Vec<u8>>,
+        plan: &SystemAuthorityCatalogWritePlan,
+    ) {
+        for node in plan.nodes() {
+            nodes.insert(node.id(), node.encode());
+        }
+        for retired in plan.retired_node_ids() {
+            nodes.remove(retired);
+        }
+    }
+
     fn decision_tree_with_leaf_at(
         key: AgentId,
         leaf: SystemAuthorityDecisionNode,
@@ -4091,6 +5449,10 @@ mod tests {
         let committee = authority_committee(1, None, &keys);
         let genesis = system_genesis(&committee);
         let state = SystemAuthorityState::from_genesis(SYSTEM_AGENT, &genesis).unwrap();
+        assert_ne!(state.authority_generation(), Hash::ZERO);
+        assert_eq!(state.catalog_binding(), CATALOG_BINDING);
+        assert_eq!(state.catalog_head(), INITIAL_CATALOG_HEAD);
+        assert_eq!(state.catalog_history_root(), empty_catalog_root());
         let mut empty_high_water_tamper = state.clone();
         empty_high_water_tamper.committee_sequence_high_water += 1;
         let decoded_empty_high_water =
@@ -4136,6 +5498,18 @@ mod tests {
         assert_eq!(admitted.admitted_fact(), Some(&fact));
         assert!(admitted.history().inserted());
         assert_eq!(admitted.state().decision_count(), 1);
+        assert_ne!(
+            admitted.state().authority_generation(),
+            state.authority_generation()
+        );
+        assert_eq!(
+            state
+                .apply_finalize(scope, &finalize)
+                .unwrap()
+                .state()
+                .authority_generation(),
+            admitted.state().authority_generation()
+        );
         verify_provision_fact(&fixture.provision, &fact).unwrap();
 
         let mut nonempty_high_water_tamper = admitted.state().clone();
@@ -4172,6 +5546,10 @@ mod tests {
         );
         assert_eq!(retried.admitted_fact(), Some(&fact));
         assert!(!retried.history().inserted());
+        assert_eq!(
+            retried.state().authority_generation(),
+            reopened.authority_generation()
+        );
 
         // Raw SAST/SAJB bytes recover only identity data. They never recover
         // the replay provenance needed by `apply_finalize`: presenting a
@@ -4213,6 +5591,10 @@ mod tests {
         );
         assert_eq!(conflicted.admitted_fact(), None);
         assert_eq!(conflicted.state().committee_sequence_high_water(), 8);
+        assert_ne!(
+            conflicted.state().authority_generation(),
+            reopened.authority_generation()
+        );
         assert_eq!(
             conflicted.state().decisions_root(),
             reopened.decisions_root()
@@ -4298,6 +5680,227 @@ mod tests {
             verify_provision_fact(&private.provision, &shared_fact),
             Err(SystemAuthorityError::InvalidProvision)
         );
+    }
+
+    #[test]
+    fn catalog_finality_is_generation_scoped_permanent_and_retry_stable() {
+        let keys = vec![key(1)];
+        let committee = authority_committee(1, None, &keys);
+        let genesis = system_genesis(&committee);
+        let state = SystemAuthorityState::from_genesis(SYSTEM_AGENT, &genesis).unwrap();
+        let scope = journal_scope();
+        assert_ne!(
+            empty_catalog_root().as_hash(),
+            empty_decision_root().as_hash()
+        );
+
+        let receipt = catalog_receipt(
+            &state,
+            &committee,
+            &keys,
+            0xc1,
+            7,
+            0xd1,
+            state.authority_generation(),
+            state.catalog_head(),
+            CatalogMutationDisposition::Applied,
+        );
+        let fact = receipt.fact().clone();
+        let finalize = SystemAuthorityCatalogFinalize::new(
+            receipt.clone(),
+            SystemAuthorityCatalogProof::vacant(fact.intent().operation_id(), vec![]).unwrap(),
+        )
+        .unwrap();
+        state
+            .validate_catalog_claim_for_signing(scope, &fact, finalize.proof())
+            .unwrap();
+        let transition = state.apply_catalog_finalize(scope, &finalize).unwrap();
+        assert_eq!(
+            transition.outcome(),
+            SystemAuthorityCatalogFinalizeOutcome::Finalized {
+                operation: fact.intent().operation_id(),
+                result: fact.result().commitment(),
+                catalog_head: fact.resulting_catalog_head(),
+                authority_generation: fact.resulting_authority_generation(),
+                sequence: fact.sequence(),
+            }
+        );
+        assert_eq!(transition.receipt(), Some(&receipt));
+        assert_eq!(transition.record().unwrap().receipt(), &receipt);
+        assert!(transition.history().inserted());
+        assert_eq!(transition.state().catalog_count(), 1);
+        assert_eq!(
+            transition.state().catalog_head(),
+            fact.resulting_catalog_head()
+        );
+        assert_eq!(
+            transition.state().authority_generation(),
+            fact.resulting_authority_generation()
+        );
+        assert_eq!(
+            transition.state().committee_sequence_high_water(),
+            fact.sequence()
+        );
+        assert_eq!(transition.state().journal_binding(), Some(scope.binding()));
+        assert_eq!(
+            SystemAuthorityCatalogFinalize::decode(&finalize.encode()).unwrap(),
+            finalize
+        );
+        assert_ne!(
+            finalize.operation_commitment(),
+            Hash::digest(CATALOG_RECORD_ID_DOMAIN, &[&receipt.encode()])
+        );
+
+        let mut catalog_nodes = BTreeMap::new();
+        install_catalog_nodes(&mut catalog_nodes, transition.history());
+        let occupied = prove_catalog(
+            transition.state().catalog_history_root(),
+            fact.intent().operation_id(),
+            |id| Ok::<_, ()>(catalog_nodes.get(&id).cloned()),
+        )
+        .unwrap();
+        assert_eq!(
+            occupied.occupied_record_id(),
+            Some(transition.occupied_record_id())
+        );
+        let retry = SystemAuthorityCatalogFinalize::new(receipt.clone(), occupied.clone()).unwrap();
+        let retried = transition
+            .state()
+            .apply_catalog_finalize(scope, &retry)
+            .unwrap();
+        assert!(retried.outcome().exact_retry());
+        assert_eq!(retried.receipt(), Some(&receipt));
+        assert_eq!(retried.state(), transition.state());
+        assert!(!retried.history().inserted());
+
+        transition
+            .state()
+            .verify_historical_catalog_receipt(scope, &receipt, &committee)
+            .unwrap();
+        let foreign_scope = SystemAuthorityJournalScope::new(
+            AgentJournalGenesisId::new([0xe1; 32]),
+            scope.agent_admission(),
+        )
+        .unwrap();
+        assert_eq!(
+            transition
+                .state()
+                .apply_catalog_finalize(foreign_scope, &retry),
+            Err(SystemAuthorityError::WrongSystemAgent)
+        );
+
+        // Reusing the permanent OperationId with different signed bytes is a
+        // stable conflict. It returns the authenticated permanent record ID
+        // before considering the candidate's now-stale predecessor generation
+        // and catalog head; storage can resolve the full record by that ID.
+        let divergent_receipt = catalog_receipt(
+            &state,
+            &committee,
+            &keys,
+            0xc1,
+            8,
+            0xd2,
+            state.authority_generation(),
+            state.catalog_head(),
+            CatalogMutationDisposition::Applied,
+        );
+        let divergent = SystemAuthorityCatalogFinalize::new(divergent_receipt, occupied).unwrap();
+        let conflicted = transition
+            .state()
+            .apply_catalog_finalize(scope, &divergent)
+            .unwrap();
+        assert!(conflicted.outcome().operation_conflicted());
+        assert_eq!(conflicted.receipt(), None);
+        assert_eq!(
+            conflicted.outcome().occupied_record_id(),
+            Some(transition.occupied_record_id())
+        );
+        assert_eq!(conflicted.state(), transition.state());
+        assert!(!conflicted.history().inserted());
+
+        let stale_new_operation = catalog_receipt(
+            &state,
+            &committee,
+            &keys,
+            0xc2,
+            8,
+            0xd3,
+            state.authority_generation(),
+            state.catalog_head(),
+            CatalogMutationDisposition::Applied,
+        );
+        let vacant = prove_catalog(
+            transition.state().catalog_history_root(),
+            stale_new_operation.fact().intent().operation_id(),
+            |id| Ok::<_, ()>(catalog_nodes.get(&id).cloned()),
+        )
+        .unwrap();
+        let stale_new_operation =
+            SystemAuthorityCatalogFinalize::new(stale_new_operation, vacant).unwrap();
+        assert_eq!(
+            transition
+                .state()
+                .apply_catalog_finalize(scope, &stale_new_operation),
+            Err(SystemAuthorityError::StaleAuthorityGeneration)
+        );
+
+        let mut stale_head_basis = transition.state().clone();
+        stale_head_basis.catalog_head = state.catalog_head();
+        let stale_head_receipt = catalog_receipt(
+            &stale_head_basis,
+            &committee,
+            &keys,
+            0xc3,
+            8,
+            0xd4,
+            stale_head_basis.authority_generation(),
+            stale_head_basis.catalog_head(),
+            CatalogMutationDisposition::Applied,
+        );
+        let stale_head_proof = prove_catalog(
+            transition.state().catalog_history_root(),
+            stale_head_receipt.fact().intent().operation_id(),
+            |id| Ok::<_, ()>(catalog_nodes.get(&id).cloned()),
+        )
+        .unwrap();
+        let stale_head_finalize =
+            SystemAuthorityCatalogFinalize::new(stale_head_receipt, stale_head_proof).unwrap();
+        assert_eq!(
+            transition
+                .state()
+                .apply_catalog_finalize(scope, &stale_head_finalize),
+            Err(SystemAuthorityError::StaleCatalogHead)
+        );
+
+        let foreign_keys = vec![key(9)];
+        let foreign_committee = authority_committee(1, None, &foreign_keys);
+        let foreign_receipt = catalog_receipt(
+            transition.state(),
+            &foreign_committee,
+            &foreign_keys,
+            0xc4,
+            8,
+            0xd5,
+            transition.state().authority_generation(),
+            transition.state().catalog_head(),
+            CatalogMutationDisposition::Applied,
+        );
+        let foreign_proof = prove_catalog(
+            transition.state().catalog_history_root(),
+            foreign_receipt.fact().intent().operation_id(),
+            |id| Ok::<_, ()>(catalog_nodes.get(&id).cloned()),
+        )
+        .unwrap();
+        let foreign_finalize =
+            SystemAuthorityCatalogFinalize::new(foreign_receipt, foreign_proof).unwrap();
+        assert!(matches!(
+            transition
+                .state()
+                .apply_catalog_finalize(scope, &foreign_finalize),
+            Err(SystemAuthorityError::Catalog(
+                CatalogFinalityError::Authority(AuthorityCommitteeError::WrongCommittee)
+            ))
+        ));
     }
 
     #[test]
@@ -4408,6 +6011,10 @@ mod tests {
         );
         let t1 = state.apply_rotation(scope, &r1).unwrap();
         let record1 = t1.record().clone();
+        assert_ne!(
+            t1.state().authority_generation(),
+            state.authority_generation()
+        );
         assert_eq!(t1.state().rotation_first_sequence(), Some(12));
         assert_eq!(t1.state().rotation_count(), 1);
         assert!(t1.history().inserted());
@@ -4422,6 +6029,39 @@ mod tests {
         let retried = t1.state().apply_rotation(scope, &retry1).unwrap();
         assert!(retried.exact_retry());
         assert!(!retried.history().inserted());
+        assert_eq!(
+            retried.state().authority_generation(),
+            t1.state().authority_generation()
+        );
+
+        // Catalog finalization shares the committee sequence namespace. The
+        // first current-committee catalog claim after a rotation must consume
+        // the pending first-sequence marker just like a decision does; keeping
+        // `Some(first)` after raising the high-water to `first` would make the
+        // successor state internally invalid.
+        let first_catalog_receipt = catalog_receipt(
+            t1.state(),
+            &c2,
+            &key_sets[1],
+            0xa1,
+            12,
+            0xa2,
+            t1.state().authority_generation(),
+            t1.state().catalog_head(),
+            CatalogMutationDisposition::Applied,
+        );
+        let first_catalog = SystemAuthorityCatalogFinalize::new(
+            first_catalog_receipt,
+            SystemAuthorityCatalogProof::vacant(OperationId([0xa1; 32]), vec![]).unwrap(),
+        )
+        .unwrap();
+        let catalog_at_first = t1
+            .state()
+            .apply_catalog_finalize(scope, &first_catalog)
+            .unwrap();
+        assert_eq!(catalog_at_first.state().current_committee(), &c2);
+        assert_eq!(catalog_at_first.state().rotation_first_sequence(), None);
+        assert_eq!(catalog_at_first.state().committee_sequence_high_water(), 12);
 
         // Any first valid incoming-current-committee command may consume F.
         // A joint next rotation at exactly F is therefore live (important
@@ -4594,7 +6234,7 @@ mod tests {
             SystemAuthorityState::from_genesis(SYSTEM_AGENT, &genesis).unwrap();
         impossible_prebind.journal_binding = Some(scope.binding());
         assert_eq!(
-            impossible_prebind.validate(),
+            impossible_prebind.validate_against_genesis(SYSTEM_AGENT, &genesis),
             Err(SystemAuthorityError::InvalidState)
         );
     }
@@ -4605,12 +6245,33 @@ mod tests {
         let committee = authority_committee(1, None, &keys);
         let scope = journal_scope();
         assert_eq!(
-            SystemAuthorityGenesis::new(ROOT_ANCHOR, 1, ROOT_CONFIG, committee.clone(), 1, 0, 1,),
+            SystemAuthorityGenesis::new(
+                ROOT_ANCHOR,
+                1,
+                ROOT_CONFIG,
+                committee.clone(),
+                1,
+                CATALOG_BINDING,
+                INITIAL_CATALOG_HEAD,
+                0,
+                1,
+                1,
+            ),
             Err(SystemAuthorityError::InvalidGenesis)
         );
-        let decision_genesis =
-            SystemAuthorityGenesis::new(ROOT_ANCHOR, 1, ROOT_CONFIG, committee.clone(), 1, 1, 1)
-                .unwrap();
+        let decision_genesis = SystemAuthorityGenesis::new(
+            ROOT_ANCHOR,
+            1,
+            ROOT_CONFIG,
+            committee.clone(),
+            1,
+            CATALOG_BINDING,
+            INITIAL_CATALOG_HEAD,
+            1,
+            1,
+            1,
+        )
+        .unwrap();
         let decision_state =
             SystemAuthorityState::from_genesis(SYSTEM_AGENT, &decision_genesis).unwrap();
         let first = ordinary_fixture(
@@ -4744,9 +6405,19 @@ mod tests {
                 .outcome(),
             SystemAuthorityFinalizeOutcome::TargetConflict(_)
         ));
-        let different_limits =
-            SystemAuthorityGenesis::new(ROOT_ANCHOR, 1, ROOT_CONFIG, committee.clone(), 1, 2, 1)
-                .unwrap();
+        let different_limits = SystemAuthorityGenesis::new(
+            ROOT_ANCHOR,
+            1,
+            ROOT_CONFIG,
+            committee.clone(),
+            1,
+            CATALOG_BINDING,
+            INITIAL_CATALOG_HEAD,
+            2,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(
             first_transition
                 .state()
@@ -4754,9 +6425,19 @@ mod tests {
             Err(SystemAuthorityError::InvalidState)
         );
 
-        let rotation_genesis =
-            SystemAuthorityGenesis::new(ROOT_ANCHOR, 1, ROOT_CONFIG, committee.clone(), 1, 2, 1)
-                .unwrap();
+        let rotation_genesis = SystemAuthorityGenesis::new(
+            ROOT_ANCHOR,
+            1,
+            ROOT_CONFIG,
+            committee.clone(),
+            1,
+            CATALOG_BINDING,
+            INITIAL_CATALOG_HEAD,
+            2,
+            1,
+            1,
+        )
+        .unwrap();
         let rotation_state =
             SystemAuthorityState::from_genesis(SYSTEM_AGENT, &rotation_genesis).unwrap();
         let second_keys = vec![key(2)];
@@ -4847,6 +6528,84 @@ mod tests {
         );
         assert_eq!(
             after_clear.apply_rotation(scope, &fresh_rotation),
+            Err(SystemAuthorityError::Capacity)
+        );
+
+        let catalog_state =
+            SystemAuthorityState::from_genesis(SYSTEM_AGENT, &rotation_genesis).unwrap();
+        let first_catalog_receipt = catalog_receipt(
+            &catalog_state,
+            &committee,
+            &keys,
+            0x91,
+            7,
+            0x92,
+            catalog_state.authority_generation(),
+            catalog_state.catalog_head(),
+            CatalogMutationDisposition::Applied,
+        );
+        let first_catalog = SystemAuthorityCatalogFinalize::new(
+            first_catalog_receipt.clone(),
+            SystemAuthorityCatalogProof::vacant(OperationId([0x91; 32]), vec![]).unwrap(),
+        )
+        .unwrap();
+        let first_catalog_transition = catalog_state
+            .apply_catalog_finalize(scope, &first_catalog)
+            .unwrap();
+        let mut catalog_nodes = BTreeMap::new();
+        install_catalog_nodes(&mut catalog_nodes, first_catalog_transition.history());
+        let catalog_retry_proof = prove_catalog(
+            first_catalog_transition.state().catalog_history_root(),
+            OperationId([0x91; 32]),
+            |id| Ok::<_, ()>(catalog_nodes.get(&id).cloned()),
+        )
+        .unwrap();
+        let catalog_retry =
+            SystemAuthorityCatalogFinalize::new(first_catalog_receipt, catalog_retry_proof)
+                .unwrap();
+        assert!(
+            first_catalog_transition
+                .state()
+                .apply_catalog_finalize(scope, &catalog_retry)
+                .unwrap()
+                .outcome()
+                .exact_retry()
+        );
+
+        let second_catalog_receipt = catalog_receipt(
+            first_catalog_transition.state(),
+            &committee,
+            &keys,
+            0x93,
+            8,
+            0x94,
+            first_catalog_transition.state().authority_generation(),
+            first_catalog_transition.state().catalog_head(),
+            CatalogMutationDisposition::Applied,
+        );
+        let second_catalog_proof = prove_catalog(
+            first_catalog_transition.state().catalog_history_root(),
+            OperationId([0x93; 32]),
+            |id| Ok::<_, ()>(catalog_nodes.get(&id).cloned()),
+        )
+        .unwrap();
+        assert_eq!(
+            first_catalog_transition
+                .state()
+                .validate_catalog_claim_for_signing(
+                    scope,
+                    second_catalog_receipt.fact(),
+                    &second_catalog_proof,
+                ),
+            Err(SystemAuthorityError::Capacity)
+        );
+        let second_catalog =
+            SystemAuthorityCatalogFinalize::new(second_catalog_receipt, second_catalog_proof)
+                .unwrap();
+        assert_eq!(
+            first_catalog_transition
+                .state()
+                .apply_catalog_finalize(scope, &second_catalog),
             Err(SystemAuthorityError::Capacity)
         );
     }
@@ -5404,12 +7163,12 @@ mod tests {
         let state = SystemAuthorityState::from_genesis(SYSTEM_AGENT, &genesis).unwrap();
         assert_eq!(
             MAX_SYSTEM_AUTHORITY_STATE_BYTES,
-            420 + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES
+            560 + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES
         );
         assert_eq!(MAX_SYSTEM_AUTHORITY_JOURNAL_BINDING_BYTES, 100);
         assert_eq!(
             MAX_SYSTEM_AUTHORITY_GENESIS_BYTES,
-            128 + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES
+            196 + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES
         );
         assert_eq!(
             MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORD_BYTES,
@@ -5421,8 +7180,13 @@ mod tests {
         );
         assert!(genesis.encode().len() <= MAX_SYSTEM_AUTHORITY_GENESIS_BYTES);
         assert!(state.encode().len() <= MAX_SYSTEM_AUTHORITY_STATE_BYTES);
+        assert_eq!(SystemAuthorityState::VERSION, 3);
+        assert_ne!(state.authority_generation(), Hash::ZERO);
+        assert_eq!(state.catalog_binding(), CATALOG_BINDING);
+        assert_eq!(state.catalog_head(), INITIAL_CATALOG_HEAD);
         assert_eq!(state.decision_limit(), 64);
         assert_eq!(state.rotation_limit(), 16);
+        assert_eq!(state.catalog_limit(), 64);
         let binding = journal_scope().binding();
         assert_eq!(
             binding.encode().len(),
@@ -5497,5 +7261,29 @@ mod tests {
             SystemAuthorityRotationProof::decode(&rotation_proof.encode()).unwrap(),
             rotation_proof
         );
+
+        let catalog_siblings = (0..CATALOG_TREE_DEPTH)
+            .map(|depth| {
+                let id = SystemAuthorityCatalogNodeId::from_bytes(
+                    Hash::digest(b"catalog-proof-work", &[&depth.to_le_bytes()]).0,
+                );
+                SystemAuthorityCatalogSibling::new(depth, id).unwrap()
+            })
+            .collect();
+        let catalog_proof = SystemAuthorityCatalogProof::occupied(
+            OperationId([0xef; 32]),
+            SystemAuthorityCatalogRecordId::from_bytes([0xf0; 32]),
+            catalog_siblings,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog_proof.encode().len(),
+            MAX_SYSTEM_AUTHORITY_CATALOG_PROOF_BYTES
+        );
+        assert_eq!(
+            SystemAuthorityCatalogProof::decode(&catalog_proof.encode()).unwrap(),
+            catalog_proof
+        );
+        assert!(MAX_SYSTEM_AUTHORITY_CATALOG_FINALIZE_BYTES + 4096 <= MAX_REPLAY_INPUT_BYTES);
     }
 }

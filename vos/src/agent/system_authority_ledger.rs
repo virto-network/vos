@@ -19,6 +19,9 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+use super::catalog_finality::{
+    FinalizedCatalogMutationFact, MAX_FINALIZED_CATALOG_MUTATION_FACT_BYTES,
+};
 use super::committee::{
     AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommittee, AuthorityCommitteeError,
     MAX_AUTHORITY_COMMITTEE_WIRE_BYTES,
@@ -35,7 +38,8 @@ use super::journal::{
 };
 use super::shared_raft::JournalStoreInstanceId;
 use super::system_authority::{
-    MAX_SYSTEM_AUTHORITY_DECISION_PROOF_BYTES, MAX_SYSTEM_AUTHORITY_ROTATION_CLAIM_BYTES,
+    MAX_SYSTEM_AUTHORITY_CATALOG_PROOF_BYTES, MAX_SYSTEM_AUTHORITY_DECISION_PROOF_BYTES,
+    MAX_SYSTEM_AUTHORITY_ROTATION_CLAIM_BYTES, SystemAuthorityCatalogProof,
     SystemAuthorityDecisionProof, SystemAuthorityJournalScope, SystemAuthorityRotationClaim,
     SystemAuthorityScopeCommitment, SystemAuthorityState,
 };
@@ -49,21 +53,37 @@ const AUTHORITY_LEDGER_STATE_DOMAIN: &[u8] = b"vos/agent/system-authority-ledger
 
 /// Maximum complete generation-bound authority-ledger route.
 pub(crate) const MAX_SYSTEM_AUTHORITY_LEDGER_ROUTE_BYTES: usize = 512;
-/// Maximum one reserved authority claim, including two complete committees
-/// for a generation-scoped rotation.
-pub(crate) const MAX_SYSTEM_AUTHORITY_LEDGER_CLAIM_BYTES: usize = SERVICE_WIRE_HEADER_BYTES
-    + 1
-    + 2 * (4 + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES)
-    + 4
-    + MAX_SYSTEM_AUTHORITY_ROTATION_CLAIM_BYTES
-    + 4
-    + MAX_AGENT_GENESIS_CLAIM_BYTES
-    + 4
+const MAX_AGENT_GENESIS_LEDGER_CLAIM_BODY_BYTES: usize = 1
+    + 5 * 4
+    + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES
     + MAX_AGENT_GENESIS_PROPOSAL_BYTES
-    + 4
     + MAX_AGENT_REPLICA_COMMITTEE_BYTES
-    + 4
+    + MAX_AGENT_GENESIS_CLAIM_BYTES
     + MAX_SYSTEM_AUTHORITY_DECISION_PROOF_BYTES;
+const MAX_ROTATION_LEDGER_CLAIM_BODY_BYTES: usize =
+    1 + 3 * 4 + 2 * MAX_AUTHORITY_COMMITTEE_WIRE_BYTES + MAX_SYSTEM_AUTHORITY_ROTATION_CLAIM_BYTES;
+const MAX_CATALOG_LEDGER_CLAIM_BODY_BYTES: usize = 1
+    + 3 * 4
+    + MAX_AUTHORITY_COMMITTEE_WIRE_BYTES
+    + MAX_FINALIZED_CATALOG_MUTATION_FACT_BYTES
+    + MAX_SYSTEM_AUTHORITY_CATALOG_PROOF_BYTES;
+
+const fn maximum(left: usize, right: usize) -> usize {
+    if left > right { left } else { right }
+}
+
+/// Maximum one tagged reserved authority claim. The bound is the largest
+/// variant rather than the sum of mutually exclusive variant envelopes.
+pub(crate) const MAX_SYSTEM_AUTHORITY_LEDGER_CLAIM_BYTES: usize = SERVICE_WIRE_HEADER_BYTES
+    + maximum(
+        MAX_AGENT_GENESIS_LEDGER_CLAIM_BODY_BYTES,
+        maximum(
+            MAX_ROTATION_LEDGER_CLAIM_BODY_BYTES,
+            MAX_CATALOG_LEDGER_CLAIM_BODY_BYTES,
+        ),
+    );
+const MAX_CATALOG_LEDGER_CLAIM_BYTES: usize =
+    SERVICE_WIRE_HEADER_BYTES + MAX_CATALOG_LEDGER_CLAIM_BODY_BYTES;
 
 /// Canonical route of the one live system-authority journal generation.
 ///
@@ -278,6 +298,11 @@ pub(crate) enum SystemAuthorityLedgerClaim {
         incoming: AuthorityCommittee,
         transition: SystemAuthorityRotationClaim,
     },
+    Catalog {
+        committee: AuthorityCommittee,
+        fact: FinalizedCatalogMutationFact,
+        proof: SystemAuthorityCatalogProof,
+    },
 }
 
 impl SystemAuthorityLedgerClaim {
@@ -329,10 +354,25 @@ impl SystemAuthorityLedgerClaim {
         Ok(request)
     }
 
+    fn catalog(
+        committee: AuthorityCommittee,
+        fact: FinalizedCatalogMutationFact,
+        proof: SystemAuthorityCatalogProof,
+    ) -> Result<Self, SystemAuthorityLedgerWireError> {
+        let request = Self::Catalog {
+            committee,
+            fact,
+            proof,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
     pub(crate) fn claim(&self) -> AuthorityClaimCommitment {
         match self {
             Self::AgentGenesis { claim, .. } => claim.authority_claim(),
             Self::CommitteeRotation { transition, .. } => transition.authority_claim(),
+            Self::Catalog { fact, .. } => fact.authority_claim(),
         }
     }
 
@@ -354,6 +394,9 @@ impl SystemAuthorityLedgerClaim {
             (Self::CommitteeRotation { incoming, .. }, SystemAuthorityCommitteeLeg::Incoming) => {
                 Some(incoming)
             }
+            (Self::Catalog { committee, .. }, SystemAuthorityCommitteeLeg::Current) => {
+                Some(committee)
+            }
             _ => None,
         }
     }
@@ -365,6 +408,7 @@ impl SystemAuthorityLedgerClaim {
                 SystemAuthorityCommitteeLeg::Retiring,
                 SystemAuthorityCommitteeLeg::Incoming,
             ],
+            Self::Catalog { .. } => &[SystemAuthorityCommitteeLeg::Current],
         }
     }
 
@@ -372,6 +416,7 @@ impl SystemAuthorityLedgerClaim {
         match self {
             Self::AgentGenesis { .. } => None,
             Self::CommitteeRotation { transition, .. } => Some(transition),
+            Self::Catalog { .. } => None,
         }
     }
 
@@ -391,7 +436,16 @@ impl SystemAuthorityLedgerClaim {
                 proof,
                 ..
             } => Some((proposal, replicas, claim, proof)),
-            Self::CommitteeRotation { .. } => None,
+            Self::CommitteeRotation { .. } | Self::Catalog { .. } => None,
+        }
+    }
+
+    pub(crate) fn catalog_preimages(
+        &self,
+    ) -> Option<(&FinalizedCatalogMutationFact, &SystemAuthorityCatalogProof)> {
+        match self {
+            Self::Catalog { fact, proof, .. } => Some((fact, proof)),
+            Self::AgentGenesis { .. } | Self::CommitteeRotation { .. } => None,
         }
     }
 
@@ -453,6 +507,29 @@ impl SystemAuthorityLedgerClaim {
                     return Err(SystemAuthorityLedgerWireError::InvalidClaim);
                 }
             }
+            Self::Catalog {
+                committee,
+                fact,
+                proof,
+            } => {
+                committee
+                    .validate()
+                    .map_err(SystemAuthorityLedgerWireError::Authority)?;
+                fact.validate()
+                    .map_err(|_| SystemAuthorityLedgerWireError::InvalidClaim)?;
+                proof
+                    .root()
+                    .map_err(|_| SystemAuthorityLedgerWireError::InvalidClaim)?;
+                let binding = fact.intent().binding();
+                if fact.authority_claim().domain() != AuthorityClaimDomain::Catalog
+                    || committee.space() != binding.space()
+                    || committee.authority_binding() != binding.authority_binding()
+                    || proof.operation_id() != fact.intent().operation_id()
+                    || proof.occupied_record_id().is_some()
+                {
+                    return Err(SystemAuthorityLedgerWireError::InvalidClaim);
+                }
+            }
         }
         enforce_wire_bound(self, MAX_SYSTEM_AUTHORITY_LEDGER_CLAIM_BYTES)
     }
@@ -488,6 +565,16 @@ impl ServiceWire for SystemAuthorityLedgerClaim {
                 encoder.bytes(&incoming.encode());
                 encoder.bytes(&transition.encode());
             }
+            Self::Catalog {
+                committee,
+                fact,
+                proof,
+            } => {
+                encoder.u8(2);
+                encoder.bytes(&committee.encode());
+                encoder.bytes(&fact.encode());
+                encoder.bytes(&proof.encode());
+            }
         }
     }
 
@@ -505,6 +592,11 @@ impl ServiceWire for SystemAuthorityLedgerClaim {
                 retiring: decode_nested(decoder, MAX_AUTHORITY_COMMITTEE_WIRE_BYTES)?,
                 incoming: decode_nested(decoder, MAX_AUTHORITY_COMMITTEE_WIRE_BYTES)?,
                 transition: decode_nested(decoder, MAX_SYSTEM_AUTHORITY_ROTATION_CLAIM_BYTES)?,
+            },
+            2 => Self::Catalog {
+                committee: decode_nested(decoder, MAX_AUTHORITY_COMMITTEE_WIRE_BYTES)?,
+                fact: decode_nested(decoder, MAX_FINALIZED_CATALOG_MUTATION_FACT_BYTES)?,
+                proof: decode_nested(decoder, MAX_SYSTEM_AUTHORITY_CATALOG_PROOF_BYTES)?,
             },
             _ => return Err(DecodeError::InvalidTag),
         };
@@ -650,6 +742,11 @@ impl ReplayedSystemAuthorityView {
                     .validate_rotation_claim_for_signing(self.trusted_scope, transition, incoming)
                     .map_err(|_| SystemAuthorityLedgerWireError::InvalidClaim)?;
             }
+            SystemAuthorityLedgerClaim::Catalog { fact, proof, .. } => {
+                self.state
+                    .validate_catalog_claim_for_signing(self.trusted_scope, fact, proof)
+                    .map_err(|_| SystemAuthorityLedgerWireError::InvalidClaim)?;
+            }
         }
         Ok(())
     }
@@ -777,23 +874,28 @@ mod durable {
     };
     use crate::agent::journal_store::{AgentJournalStore, JournalPublication};
     use crate::agent::replay::{
-        PublishedSystemAuthorityRotation, RecoveredSystemAuthorityRotation, ReplayExecutionResult,
-        ReplayMaterialization, ReplaySealedGenesis, RetiredSystemAuthorityRotationRecovery,
+        PublishedSystemAuthorityCatalog, PublishedSystemAuthorityRotation,
+        RecoveredSystemAuthorityCatalog, RecoveredSystemAuthorityRotation, ReplayExecutionResult,
+        ReplayMaterialization, ReplaySealedGenesis, RetiredSystemAuthorityCatalogRecovery,
+        RetiredSystemAuthorityRotationRecovery, SystemAuthorityCatalogPublicationFacts,
         SystemAuthorityRotationPublicationFacts,
     };
     use crate::agent::system_authority::{
-        MAX_SYSTEM_AUTHORITY_ROTATIONS, SystemAuthorityCommitteeId,
-        SystemAuthorityRotationCertificate, SystemAuthorityRotationId,
+        MAX_SYSTEM_AUTHORITY_CATALOG_FINALIZE_BYTES, MAX_SYSTEM_AUTHORITY_ROTATION_BYTES,
+        MAX_SYSTEM_AUTHORITY_ROTATIONS, SystemAuthorityCatalogFinalizeOutcome,
+        SystemAuthorityCatalogNodeId, SystemAuthorityCatalogRecord, SystemAuthorityCatalogRecordId,
+        SystemAuthorityCommitteeId, SystemAuthorityRotationCertificate, SystemAuthorityRotationId,
         SystemAuthorityRotationNodeId,
     };
     use crate::agent::{LifecycleReply, LifecycleRequest};
     use crate::service::NodeId;
 
-    // Clean-break schema: v5 adds the permanent journal-exposure marker while
-    // retaining v4's complete bounded publication intent. The Config sentinel
-    // and empty legacy route tables make every older writer reject this route
-    // before it can install a signer or mutate evidence rows.
-    const LEDGER_SCHEMA_VERSION: u32 = 5;
+    // Clean-break schema: v6 makes publication intent a bounded tagged union
+    // covering committee rotation and catalog finality. The Config sentinel,
+    // versioned route table, and empty legacy route tables make every older
+    // writer reject this route before it can install a signer or mutate
+    // evidence rows.
+    const LEDGER_SCHEMA_VERSION: u32 = 6;
     const JOURNAL_EXPOSURE_RECORD_VERSION: u32 = 1;
     // Config rows are permanent: a key that was ever local must never later be
     // admitted through the remote-share path and bypass its durable pledge.
@@ -806,16 +908,31 @@ mod durable {
     const MAX_ROUTE_CONFIG_RECORD_BYTES: usize = 1024;
     const MAX_JOURNAL_EXPOSURE_RECORD_BYTES: usize = 1024;
     const MAX_META_RECORD_BYTES: usize = 1024;
-    // One complete canonical OrderedEntry plus fixed publication facts and a
-    // bounded route. Keep this an explicit protocol bound: intent decoding
-    // must never allocate based on an attacker-controlled length alone.
-    const MAX_PUBLICATION_INTENT_RECORD_BYTES: usize = SERVICE_WIRE_HEADER_BYTES
-        + 4
+    // Only the two publication-bearing system-authority commands can inhabit
+    // this OrderedEntry. Eight KiB covers its ReplayInput/runtime/call and
+    // ordered-entry framing; another four KiB covers the intent's route,
+    // predecessor/successor commitments, variant tag, and wire framing. This
+    // is deliberately smaller than the generic journal record envelope and
+    // prevents a decoded intent from allocating against an unrelated maximum.
+    const MAX_PUBLICATION_ORDERED_ENTRY_BYTES: usize = maximum(
+        MAX_SYSTEM_AUTHORITY_ROTATION_BYTES,
+        MAX_SYSTEM_AUTHORITY_CATALOG_FINALIZE_BYTES,
+    ) + 8 * 1024;
+    const MAX_PUBLICATION_INTENT_RECORD_BYTES: usize =
+        MAX_PUBLICATION_ORDERED_ENTRY_BYTES + 4 * 1024;
+    const _: () = assert!(MAX_PUBLICATION_INTENT_RECORD_BYTES <= MAX_JOURNAL_RECORD_BYTES);
+    // Exact catalog-variant envelope: record header, nested route, five
+    // predecessor/view identifiers, sequence marker, and the tagged claim.
+    const MAX_CATALOG_RESERVATION_RECORD_BYTES: usize = SERVICE_WIRE_HEADER_BYTES
         + 4
         + MAX_SYSTEM_AUTHORITY_LEDGER_ROUTE_BYTES
-        + 19 * 32
+        + 5 * 32
+        + 8
+        + 1
+        + 8
         + 4
-        + MAX_JOURNAL_RECORD_BYTES;
+        + MAX_CATALOG_LEDGER_CLAIM_BYTES;
+    const _: () = assert!(MAX_CATALOG_RESERVATION_RECORD_BYTES <= MAX_JOURNAL_RECORD_BYTES);
     const MAX_RESERVATION_RECORD_BYTES: usize =
         MAX_SYSTEM_AUTHORITY_LEDGER_ROUTE_BYTES + MAX_SYSTEM_AUTHORITY_LEDGER_CLAIM_BYTES + 512;
     const MAX_PLEDGE_RECORD_BYTES: usize = 1024;
@@ -827,6 +944,8 @@ mod durable {
     const CONFIG_TABLE: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_config_v1");
     const ROUTE_CONFIG_TABLE: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("system_authority_ledger_route_config_v6");
+    const LEGACY_ROUTE_CONFIG_TABLE_V5: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_route_config_v5");
     const LEGACY_ROUTE_CONFIG_TABLE_V4: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_route_config_v4");
@@ -847,6 +966,8 @@ mod durable {
     const FAIL_STOP_TABLE: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_fail_stop_v1");
     const PUBLICATION_INTENT_TABLE: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("system_authority_ledger_publication_intent_v3");
+    const LEGACY_PUBLICATION_INTENT_TABLE_V2: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("system_authority_ledger_publication_intent_v2");
 
     const ROUTE_KEY_BYTES: usize = 32;
@@ -963,6 +1084,31 @@ mod durable {
         }
     }
 
+    /// Catalog-only input to the production signing seam. Construction
+    /// retains the exact fact and authenticated-history proof selected by
+    /// replay; decoded durable claim bytes cannot be promoted into signing
+    /// authority without passing through this constructor and a replay view.
+    #[derive(Clone, Debug)]
+    pub(crate) struct SystemAuthorityCatalogReservationRequest {
+        request: SystemAuthorityLedgerClaim,
+    }
+
+    impl SystemAuthorityCatalogReservationRequest {
+        pub(crate) fn new(
+            committee: AuthorityCommittee,
+            fact: FinalizedCatalogMutationFact,
+            proof: SystemAuthorityCatalogProof,
+        ) -> Result<Self, SystemAuthorityLedgerWireError> {
+            Ok(Self {
+                request: SystemAuthorityLedgerClaim::catalog(committee, fact, proof)?,
+            })
+        }
+
+        pub(crate) fn claim(&self) -> AuthorityClaimCommitment {
+            self.request.claim()
+        }
+    }
+
     /// Read-only crash-recovery evidence. It deliberately is not convertible
     /// to [`ReservedSystemAuthorityClaim`]: replay must first reconcile the
     /// current authenticated store view through `reserve_or_reconcile`.
@@ -1021,6 +1167,16 @@ mod durable {
             })
         }
 
+        pub(crate) fn catalog_request(&self) -> Option<SystemAuthorityCatalogReservationRequest> {
+            matches!(
+                &self.record.request,
+                SystemAuthorityLedgerClaim::Catalog { .. }
+            )
+            .then(|| SystemAuthorityCatalogReservationRequest {
+                request: self.record.request.clone(),
+            })
+        }
+
         pub(crate) const fn expected_successor_heads(&self) -> Option<JournalHeadsId> {
             match &self.publication_intent {
                 Some(intent) => Some(intent.successor_heads),
@@ -1047,7 +1203,17 @@ mod durable {
             facts: &SystemAuthorityRotationPublicationFacts,
         ) -> bool {
             self.publication_intent.as_ref()
-                == PublicationIntentRecord::for_facts(&self.record, facts)
+                == PublicationIntentRecord::for_rotation_facts(&self.record, facts)
+                    .ok()
+                    .as_ref()
+        }
+
+        pub(crate) fn matches_catalog_publication_facts(
+            &self,
+            facts: &SystemAuthorityCatalogPublicationFacts,
+        ) -> bool {
+            self.publication_intent.as_ref()
+                == PublicationIntentRecord::for_catalog_facts(&self.record, facts)
                     .ok()
                     .as_ref()
         }
@@ -1093,6 +1259,12 @@ mod durable {
     /// been durably retired. Its private field prevents ordinary crate code
     /// from using replay's result-release seam as a retirement bypass.
     pub(crate) struct RetiredSystemAuthorityRotation {
+        _private: (),
+    }
+
+    /// One-shot unlock minted only after an exact catalog publication has
+    /// durably retired its reservation, intent, pledge, shares, and frozen QC.
+    pub(crate) struct RetiredSystemAuthorityCatalog {
         _private: (),
     }
 
@@ -1190,7 +1362,10 @@ mod durable {
             }
             Ok(Self {
                 reservation: reservation.clone(),
-                publication_intent: Some(PublicationIntentRecord::for_facts(reservation, facts)?),
+                publication_intent: Some(PublicationIntentRecord::for_rotation_facts(
+                    reservation,
+                    facts,
+                )?),
                 journal_store: facts.journal_store(),
                 successor_heads: facts.successor_heads(),
                 successor_control: facts.successor_control(),
@@ -1202,13 +1377,100 @@ mod durable {
             })
         }
 
+        fn for_catalog_receipt(
+            reserved: &ReservedSystemAuthorityClaim,
+            facts: &SystemAuthorityCatalogPublicationFacts,
+            frozen_certificate: &AuthorityQuorumCertificate,
+        ) -> Result<Self, SystemAuthorityLedgerError> {
+            Self::for_catalog_record(&reserved.record, facts, frozen_certificate)
+        }
+
+        fn for_recovered_catalog(
+            pending: &PendingSystemAuthorityRecovery,
+            facts: &SystemAuthorityCatalogPublicationFacts,
+            frozen_certificate: &AuthorityQuorumCertificate,
+        ) -> Result<Self, SystemAuthorityLedgerError> {
+            if !pending.matches_catalog_publication_facts(facts) {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            }
+            Self::for_catalog_record(&pending.record, facts, frozen_certificate)
+        }
+
+        fn for_catalog_record(
+            reservation: &ReservationRecord,
+            facts: &SystemAuthorityCatalogPublicationFacts,
+            frozen_certificate: &AuthorityQuorumCertificate,
+        ) -> Result<Self, SystemAuthorityLedgerError> {
+            let SystemAuthorityLedgerClaim::Catalog {
+                committee,
+                fact,
+                proof,
+            } = &reservation.request
+            else {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            };
+            let record = facts.record();
+            let command = facts.command();
+            let receipt = record.receipt();
+            let finalized = SystemAuthorityCatalogFinalizeOutcome::Finalized {
+                operation: record.operation_id(),
+                result: fact.result().commitment(),
+                catalog_head: fact.resulting_catalog_head(),
+                authority_generation: fact.resulting_authority_generation(),
+                sequence: fact.sequence(),
+            };
+            if facts.journal_store() != reservation.journal_store
+                || facts.predecessor_heads() != reservation.predecessor_heads
+                || facts.predecessor_control() != reservation.control_state
+                || facts.predecessor_view() != reservation.state_view
+                || facts.predecessor_authority_state() != reservation.authority_state
+                || facts.successor_heads() == JournalHeadsId::ZERO
+                || facts.successor_heads() == facts.predecessor_heads()
+                || facts.successor_control() == LaneStateId::ZERO
+                || facts.successor_control() == facts.predecessor_control()
+                || facts.successor_view() == Hash::ZERO
+                || facts.successor_view() == facts.predecessor_view()
+                || facts.successor_authority_state() == Hash::ZERO
+                || facts.successor_authority_state() == facts.predecessor_authority_state()
+                || facts.claim() != reservation.request.claim()
+                || command.operation_commitment() != facts.operation()
+                || command.proof() != proof
+                || command.receipt() != receipt
+                || receipt.fact() != fact
+                || receipt.certificate() != frozen_certificate
+                || receipt.certificate().committee().0 != committee.commitment().0
+                || facts.root() == SystemAuthorityCatalogNodeId::ZERO
+                || facts.result() != &LifecycleReply::CatalogFinalized(finalized)
+            {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            }
+            Ok(Self {
+                reservation: reservation.clone(),
+                publication_intent: Some(PublicationIntentRecord::for_catalog_facts(
+                    reservation,
+                    facts,
+                )?),
+                journal_store: facts.journal_store(),
+                successor_heads: facts.successor_heads(),
+                successor_control: facts.successor_control(),
+                successor_view: facts.successor_view(),
+                successor_authority_state: facts.successor_authority_state(),
+                resulting_high_water: fact.sequence(),
+                resulting_first_sequence: None,
+                resulting_committee: committee.commitment(),
+            })
+        }
+
         #[cfg(test)]
         fn for_test_after_exact_cas(
             pending: PendingSystemAuthorityRecovery,
             exact_executed_claim: AuthorityClaimCommitment,
             successor: &ReplayedSystemAuthorityView,
         ) -> Result<Self, SystemAuthorityLedgerError> {
-            let reservation = pending.record;
+            let PendingSystemAuthorityRecovery {
+                record: reservation,
+                publication_intent,
+            } = pending;
             let request = &reservation.request;
             if request.claim() != exact_executed_claim
                 || successor.route() != reservation.route
@@ -1238,12 +1500,19 @@ mod durable {
                         return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
                     }
                 }
+                SystemAuthorityLedgerClaim::Catalog { committee, .. } => {
+                    if successor.committee() != committee
+                        || successor.rotation_first_sequence().is_some()
+                    {
+                        return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+                    }
+                }
             }
             Ok(Self {
                 journal_store: successor.journal_store(),
                 successor_heads: successor.heads(),
                 reservation,
-                publication_intent: None,
+                publication_intent,
                 successor_control: successor.control_state(),
                 successor_view: successor.commitment(),
                 successor_authority_state: successor.authority_state_commitment(),
@@ -1407,9 +1676,15 @@ mod durable {
                     if sentinel != expected {
                         return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
                     }
-                    if owner.table_has_route_residue(&transaction, LEGACY_ROUTE_CONFIG_TABLE_V4)?
+                    if owner.table_has_route_residue(&transaction, LEGACY_ROUTE_CONFIG_TABLE_V5)?
+                        || owner
+                            .table_has_route_residue(&transaction, LEGACY_ROUTE_CONFIG_TABLE_V4)?
                         || owner
                             .table_has_route_residue(&transaction, LEGACY_ROUTE_CONFIG_TABLE_V3)?
+                        || owner.table_has_route_residue(
+                            &transaction,
+                            LEGACY_PUBLICATION_INTENT_TABLE_V2,
+                        )?
                     {
                         return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
                     }
@@ -1584,6 +1859,7 @@ mod durable {
         ) -> Result<(), SystemAuthorityLedgerError> {
             let definitions = [
                 ROUTE_CONFIG_TABLE,
+                LEGACY_ROUTE_CONFIG_TABLE_V5,
                 LEGACY_ROUTE_CONFIG_TABLE_V4,
                 LEGACY_ROUTE_CONFIG_TABLE_V3,
                 JOURNAL_EXPOSURE_TABLE,
@@ -1595,6 +1871,7 @@ mod durable {
                 QC_TABLE,
                 FAIL_STOP_TABLE,
                 PUBLICATION_INTENT_TABLE,
+                LEGACY_PUBLICATION_INTENT_TABLE_V2,
             ];
             // Open the complete clean-break schema in this uncommitted writer.
             // On strict reopen the independent read audit below still proves
@@ -1629,6 +1906,7 @@ mod durable {
         ) -> Result<bool, SystemAuthorityLedgerError> {
             for definition in [
                 ROUTE_CONFIG_TABLE,
+                LEGACY_ROUTE_CONFIG_TABLE_V5,
                 LEGACY_ROUTE_CONFIG_TABLE_V4,
                 LEGACY_ROUTE_CONFIG_TABLE_V3,
                 JOURNAL_EXPOSURE_TABLE,
@@ -1640,6 +1918,7 @@ mod durable {
                 QC_TABLE,
                 FAIL_STOP_TABLE,
                 PUBLICATION_INTENT_TABLE,
+                LEGACY_PUBLICATION_INTENT_TABLE_V2,
             ] {
                 if transaction.open_table(definition)?.first()?.is_some() {
                     return Ok(true);
@@ -1655,6 +1934,7 @@ mod durable {
             let route_key = route_storage_key(self.route);
             for definition in [
                 ROUTE_CONFIG_TABLE,
+                LEGACY_ROUTE_CONFIG_TABLE_V5,
                 LEGACY_ROUTE_CONFIG_TABLE_V4,
                 LEGACY_ROUTE_CONFIG_TABLE_V3,
                 JOURNAL_EXPOSURE_TABLE,
@@ -1666,6 +1946,7 @@ mod durable {
                 QC_TABLE,
                 FAIL_STOP_TABLE,
                 PUBLICATION_INTENT_TABLE,
+                LEGACY_PUBLICATION_INTENT_TABLE_V2,
             ] {
                 let table = transaction.open_table(definition)?;
                 for row in [table.first()?, table.last()?].into_iter().flatten() {
@@ -1756,8 +2037,10 @@ mod durable {
                 .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
             if route != expected
                 || sentinel != expected
+                || self.table_has_route_residue(transaction, LEGACY_ROUTE_CONFIG_TABLE_V5)?
                 || self.table_has_route_residue(transaction, LEGACY_ROUTE_CONFIG_TABLE_V4)?
                 || self.table_has_route_residue(transaction, LEGACY_ROUTE_CONFIG_TABLE_V3)?
+                || self.table_has_route_residue(transaction, LEGACY_PUBLICATION_INTENT_TABLE_V2)?
             {
                 return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
             }
@@ -1931,6 +2214,15 @@ mod durable {
                 return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
             }
             {
+                let legacy = transaction.open_table(LEGACY_ROUTE_CONFIG_TABLE_V5)?;
+                let mut rows = legacy.range(route_key.as_slice()..)?;
+                if let Some(row) = rows.next()
+                    && row?.0.value().starts_with(route_key.as_slice())
+                {
+                    return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                }
+            }
+            {
                 let legacy = transaction.open_table(LEGACY_ROUTE_CONFIG_TABLE_V4)?;
                 let mut rows = legacy.range(route_key.as_slice()..)?;
                 if let Some(row) = rows.next()
@@ -1941,6 +2233,15 @@ mod durable {
             }
             {
                 let legacy = transaction.open_table(LEGACY_ROUTE_CONFIG_TABLE_V3)?;
+                let mut rows = legacy.range(route_key.as_slice()..)?;
+                if let Some(row) = rows.next()
+                    && row?.0.value().starts_with(route_key.as_slice())
+                {
+                    return Err(SystemAuthorityLedgerError::ConfigurationMismatch);
+                }
+            }
+            {
+                let legacy = transaction.open_table(LEGACY_PUBLICATION_INTENT_TABLE_V2)?;
                 let mut rows = legacy.range(route_key.as_slice()..)?;
                 if let Some(row) = rows.next()
                     && row?.0.value().starts_with(route_key.as_slice())
@@ -2021,6 +2322,18 @@ mod durable {
             self.reserve_or_reconcile_claim(view, request.request)
         }
 
+        /// Reserve a fresh catalog finalization or reconcile its exact
+        /// durable claim against the current replay-authenticated root view.
+        /// Catalog, genesis, and rotation claims all share the same active row
+        /// and sequence-keyed pledge namespace.
+        pub(crate) fn reserve_catalog_or_reconcile(
+            &self,
+            view: &ReplayedSystemAuthorityView,
+            request: SystemAuthorityCatalogReservationRequest,
+        ) -> Result<SystemAuthorityReservationOutcome, SystemAuthorityLedgerError> {
+            self.reserve_or_reconcile_claim(view, request.request)
+        }
+
         fn reserve_or_reconcile_claim(
             &self,
             view: &ReplayedSystemAuthorityView,
@@ -2087,21 +2400,7 @@ mod durable {
                     return Err(SystemAuthorityLedgerError::CorruptLedger);
                 }
                 if let Some(intent) = &publication_intent {
-                    intent.validate()?;
-                    if intent.route != active.route
-                        || intent.journal_store != active.journal_store
-                        || intent.predecessor_heads != active.predecessor_heads
-                        || intent.predecessor_control != active.control_state
-                        || intent.predecessor_view != active.state_view
-                        || intent.predecessor_authority_state != active.authority_state
-                        || intent.claim != active.request.claim().claim_hash()
-                        || !matches!(
-                            &active.request,
-                            SystemAuthorityLedgerClaim::CommitteeRotation { .. }
-                        )
-                    {
-                        return Err(SystemAuthorityLedgerError::CorruptLedger);
-                    }
+                    intent.validate_for_reservation(&active)?;
                 }
                 if view.authority_state_commitment() != active.authority_state {
                     return Err(SystemAuthorityLedgerError::PublicationRecoveryRequired);
@@ -2330,21 +2629,7 @@ mod durable {
             record.validate()?;
             meta.validate()?;
             if let Some(intent) = &publication_intent {
-                intent.validate()?;
-                if intent.route != record.route
-                    || intent.journal_store != record.journal_store
-                    || intent.predecessor_heads != record.predecessor_heads
-                    || intent.predecessor_control != record.control_state
-                    || intent.predecessor_view != record.state_view
-                    || intent.predecessor_authority_state != record.authority_state
-                    || intent.claim != record.request.claim().claim_hash()
-                    || !matches!(
-                        &record.request,
-                        SystemAuthorityLedgerClaim::CommitteeRotation { .. }
-                    )
-                {
-                    return Err(SystemAuthorityLedgerError::CorruptLedger);
-                }
+                intent.validate_for_reservation(&record)?;
             }
             Ok(Some(PendingSystemAuthorityRecovery {
                 record,
@@ -2385,7 +2670,7 @@ mod durable {
             if &frozen != expected_certificate {
                 return Err(SystemAuthorityLedgerError::InvalidCertificate);
             }
-            let intent = PublicationIntentRecord::for_facts(&reserved.record, facts)?;
+            let intent = PublicationIntentRecord::for_rotation_facts(&reserved.record, facts)?;
             {
                 let mut table = transaction.open_table(PUBLICATION_INTENT_TABLE)?;
                 let existing = table
@@ -2428,6 +2713,67 @@ mod durable {
             // This second writer is intentionally never committed: it fences
             // the exact reservation, QCs, Meta, FailStop, and intent across
             // dependency staging, Heads CAS, and post-CAS readback.
+            drop(transaction);
+            Ok(result)
+        }
+
+        /// Catalog counterpart to `with_active_publication_reservation`.
+        /// Commit the exact replay-derived catalog intent before journal
+        /// dependencies or Heads can become durable, then keep the active row
+        /// and its frozen current-committee QC stable across the caller's
+        /// complete publication and readback operation.
+        pub(crate) fn with_active_catalog_publication_reservation<T, E>(
+            &self,
+            reserved: &ReservedSystemAuthorityClaim,
+            expected_certificate: &AuthorityQuorumCertificate,
+            facts: &SystemAuthorityCatalogPublicationFacts,
+            operation: impl FnOnce() -> Result<T, E>,
+        ) -> Result<Result<T, E>, SystemAuthorityLedgerError> {
+            let _write = self.lock_writes()?;
+
+            let transaction = self.database.begin_write()?;
+            let route_key = route_storage_key(self.route);
+            let frozen = self.validate_active_catalog_snapshot(&transaction, &reserved.record)?;
+            if &frozen != expected_certificate {
+                return Err(SystemAuthorityLedgerError::InvalidCertificate);
+            }
+            let intent = PublicationIntentRecord::for_catalog_facts(&reserved.record, facts)?;
+            {
+                let mut table = transaction.open_table(PUBLICATION_INTENT_TABLE)?;
+                let existing = table
+                    .get(route_key.as_slice())?
+                    .map(|value| value.value().to_vec());
+                match existing {
+                    Some(bytes) => {
+                        let existing = PublicationIntentRecord::decode(&bytes)
+                            .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                        if existing != intent {
+                            return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+                        }
+                    }
+                    None => {
+                        table.insert(route_key.as_slice(), intent.encode().as_slice())?;
+                    }
+                }
+            }
+            transaction.commit()?;
+
+            let transaction = self.database.begin_write()?;
+            let frozen = self.validate_active_catalog_snapshot(&transaction, &reserved.record)?;
+            if &frozen != expected_certificate {
+                return Err(SystemAuthorityLedgerError::InvalidCertificate);
+            }
+            let persisted = transaction
+                .open_table(PUBLICATION_INTENT_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::PublicationRecoveryRequired)?;
+            let persisted = PublicationIntentRecord::decode(&persisted)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            if persisted != intent {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            }
+            let result = operation();
             drop(transaction);
             Ok(result)
         }
@@ -2477,6 +2823,53 @@ mod durable {
             self.retire_validated_in_transaction(&transaction, &published)?;
             transaction.commit()?;
             Ok(Ok(recovered.into_retired(RetiredSystemAuthorityRotation {
+                _private: (),
+            })))
+        }
+
+        /// Catalog cold recovery keeps the exact immutable intent, active
+        /// reservation, and frozen current-committee QC under one ledger
+        /// writer until replay has either persisted/reverified the complete
+        /// history closure and the matching claim is atomically retired.
+        pub(crate) fn with_pending_catalog_recovery_and_retirement<'store, S, E>(
+            &self,
+            pending: &PendingSystemAuthorityRecovery,
+            operation: impl FnOnce(
+                &AuthorityQuorumCertificate,
+            ) -> Result<RecoveredSystemAuthorityCatalog<'store, S>, E>,
+        ) -> Result<Result<RetiredSystemAuthorityCatalogRecovery, E>, SystemAuthorityLedgerError>
+        where
+            S: AgentJournalStore + 'store,
+        {
+            let _write = self.lock_writes()?;
+            let transaction = self.database.begin_write()?;
+            let frozen = self.validate_active_catalog_snapshot(&transaction, &pending.record)?;
+            let expected = pending
+                .publication_intent
+                .as_ref()
+                .ok_or(SystemAuthorityLedgerError::PublicationRecoveryRequired)?;
+            let persisted = transaction
+                .open_table(PUBLICATION_INTENT_TABLE)?
+                .get(route_storage_key(self.route).as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::PublicationRecoveryRequired)?;
+            let persisted = PublicationIntentRecord::decode(&persisted)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            if &persisted != expected {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            }
+            let recovered = match operation(&frozen) {
+                Ok(recovered) => recovered,
+                Err(error) => return Ok(Err(error)),
+            };
+            let published = PublishedSystemAuthorityClaim::for_recovered_catalog(
+                recovered.pending(),
+                recovered.facts(),
+                &frozen,
+            )?;
+            self.retire_validated_in_transaction(&transaction, &published)?;
+            transaction.commit()?;
+            Ok(Ok(recovered.into_retired(RetiredSystemAuthorityCatalog {
                 _private: (),
             })))
         }
@@ -2561,6 +2954,84 @@ mod durable {
                 certificates.remove(0),
             )
             .map_err(|_| SystemAuthorityLedgerError::InvalidCertificate)
+        }
+
+        fn validate_active_catalog_snapshot(
+            &self,
+            transaction: &redb::WriteTransaction,
+            expected: &ReservationRecord,
+        ) -> Result<AuthorityQuorumCertificate, SystemAuthorityLedgerError> {
+            self.recheck_route_config(transaction)?;
+            let route_key = route_storage_key(self.route);
+            let active = transaction
+                .open_table(RESERVATION_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::ClaimNotReserved)?;
+            let active = ReservationRecord::decode(&active)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            if &active != expected
+                || active.route != self.route
+                || active.journal_store != self.journal_store
+            {
+                return Err(SystemAuthorityLedgerError::ClaimNotReserved);
+            }
+            active.validate()?;
+            let meta = transaction
+                .open_table(META_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::CorruptLedger)?;
+            let meta =
+                MetaRecord::decode(&meta).map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            meta.validate()?;
+            if meta.route != self.route
+                || meta.journal_store != self.journal_store
+                || meta.retired_high_water != active.prior_high_water
+                || meta.authority_state != active.authority_state
+            {
+                return Err(SystemAuthorityLedgerError::CorruptLedger);
+            }
+            if let Some(bytes) = transaction
+                .open_table(FAIL_STOP_TABLE)?
+                .get(route_key.as_slice())?
+                .map(|value| value.value().to_vec())
+            {
+                let fail_stop = FailStopRecord::decode(&bytes)
+                    .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                fail_stop.validate()?;
+                if fail_stop.route != self.route {
+                    return Err(SystemAuthorityLedgerError::CorruptLedger);
+                }
+                // As with rotation, a later fail-stop prevents new work but
+                // cannot revoke an already frozen exact publication intent.
+            }
+            let SystemAuthorityLedgerClaim::Catalog { committee, .. } = &active.request else {
+                return Err(SystemAuthorityLedgerError::WrongCommitteeLeg);
+            };
+            let claim = active.request.claim();
+            let bytes = transaction
+                .open_table(QC_TABLE)?
+                .get(
+                    leg_storage_key(
+                        self.route,
+                        claim.sequence(),
+                        SystemAuthorityCommitteeLeg::Current,
+                    )
+                    .as_slice(),
+                )?
+                .map(|value| value.value().to_vec())
+                .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
+            let row = CertificateRecord::decode(&bytes)
+                .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+            row.validate_for(
+                self.route,
+                claim.sequence(),
+                SystemAuthorityCommitteeLeg::Current,
+                committee,
+                claim,
+            )?;
+            Ok(row.certificate)
         }
 
         /// Run only deterministic journal-open recovery while the exact route
@@ -2885,6 +3356,34 @@ mod durable {
             )?;
             self.retire_published_claim(claim)?;
             Ok(published.into_results(RetiredSystemAuthorityRotation { _private: () }))
+        }
+
+        /// Retire an exact fresh catalog finalization only after replay's
+        /// opaque receipt proves that the complete catalog history closure and
+        /// successor journal head are durable. Results remain borrow-locked
+        /// until the reservation, intent, and current-committee QC are removed
+        /// atomically with the monotone authority high-water update.
+        pub(crate) fn retire_published_catalog<S: AgentJournalStore>(
+            &self,
+            published: PublishedSystemAuthorityCatalog<'_, S>,
+        ) -> Result<
+            (
+                JournalPublication,
+                ReplayMaterialization,
+                Vec<ReplayExecutionResult>,
+            ),
+            SystemAuthorityLedgerError,
+        > {
+            let frozen = self
+                .certificate(published.reserved(), SystemAuthorityCommitteeLeg::Current)?
+                .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
+            let claim = PublishedSystemAuthorityClaim::for_catalog_receipt(
+                published.reserved(),
+                published.facts(),
+                &frozen,
+            )?;
+            self.retire_published_claim(claim)?;
+            Ok(published.into_results(RetiredSystemAuthorityCatalog { _private: () }))
         }
 
         /// Advance the durable retired high-water and clear the active claim
@@ -3357,6 +3856,13 @@ mod durable {
                         return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
                     }
                 }
+                SystemAuthorityLedgerClaim::Catalog { committee, .. } => {
+                    if published.resulting_first_sequence.is_some()
+                        || published.resulting_committee != committee.commitment()
+                    {
+                        return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+                    }
+                }
             }
 
             let route_key = route_storage_key(self.route);
@@ -3699,7 +4205,7 @@ mod durable {
             }
             if !rows_for_prefix_bounded_maybe_missing(
                 &self.database,
-                LEGACY_ROUTE_CONFIG_TABLE_V4,
+                LEGACY_ROUTE_CONFIG_TABLE_V5,
                 route_key.as_slice(),
                 1,
                 allow_missing_tables,
@@ -3707,7 +4213,23 @@ mod durable {
             .is_empty()
                 || !rows_for_prefix_bounded_maybe_missing(
                     &self.database,
+                    LEGACY_ROUTE_CONFIG_TABLE_V4,
+                    route_key.as_slice(),
+                    1,
+                    allow_missing_tables,
+                )?
+                .is_empty()
+                || !rows_for_prefix_bounded_maybe_missing(
+                    &self.database,
                     LEGACY_ROUTE_CONFIG_TABLE_V3,
+                    route_key.as_slice(),
+                    1,
+                    allow_missing_tables,
+                )?
+                .is_empty()
+                || !rows_for_prefix_bounded_maybe_missing(
+                    &self.database,
+                    LEGACY_PUBLICATION_INTENT_TABLE_V2,
                     route_key.as_slice(),
                     1,
                     allow_missing_tables,
@@ -3831,21 +4353,7 @@ mod durable {
                 return Err(SystemAuthorityLedgerError::CorruptLedger);
             }
             if let (Some(intent), Some(reservation)) = (&publication_intent, &reservation) {
-                intent.validate()?;
-                if intent.route != reservation.route
-                    || intent.journal_store != reservation.journal_store
-                    || intent.predecessor_heads != reservation.predecessor_heads
-                    || intent.predecessor_control != reservation.control_state
-                    || intent.predecessor_view != reservation.state_view
-                    || intent.predecessor_authority_state != reservation.authority_state
-                    || intent.claim != reservation.request.claim().claim_hash()
-                    || !matches!(
-                        &reservation.request,
-                        SystemAuthorityLedgerClaim::CommitteeRotation { .. }
-                    )
-                {
-                    return Err(SystemAuthorityLedgerError::CorruptLedger);
-                }
+                intent.validate_for_reservation(reservation)?;
             }
 
             let pledge_rows = rows_for_prefix_bounded_maybe_missing(
@@ -3957,39 +4465,67 @@ mod durable {
                     }
                 }
                 if publication_intent.is_some() {
-                    let SystemAuthorityLedgerClaim::CommitteeRotation {
-                        incoming,
-                        transition,
-                        ..
-                    } = request
-                    else {
-                        return Err(SystemAuthorityLedgerError::CorruptLedger);
-                    };
-                    let old = certificates
-                        .get(&SystemAuthorityCommitteeLeg::Retiring)
-                        .cloned()
-                        .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
-                    let new = certificates
-                        .get(&SystemAuthorityCommitteeLeg::Incoming)
-                        .cloned()
-                        .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
-                    let frozen =
-                        SystemAuthorityRotationCertificate::new(transition.clone(), old, new)
-                            .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
                     let intent = publication_intent
                         .as_ref()
                         .ok_or(SystemAuthorityLedgerError::CorruptLedger)?;
-                    let ReplayOperation::Management {
-                        request: LifecycleRequest::RotateSystemAuthority(command),
-                    } = &intent.ordered_entry_payload.input.operation
-                    else {
-                        return Err(SystemAuthorityLedgerError::CorruptLedger);
-                    };
-                    if command.certificate() != &frozen
-                        || command.certificate().transition() != transition
-                        || command.new_committee() != incoming
-                    {
-                        return Err(SystemAuthorityLedgerError::CorruptLedger);
+                    match request {
+                        SystemAuthorityLedgerClaim::CommitteeRotation {
+                            incoming,
+                            transition,
+                            ..
+                        } => {
+                            let old = certificates
+                                .get(&SystemAuthorityCommitteeLeg::Retiring)
+                                .cloned()
+                                .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
+                            let new = certificates
+                                .get(&SystemAuthorityCommitteeLeg::Incoming)
+                                .cloned()
+                                .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
+                            let frozen = SystemAuthorityRotationCertificate::new(
+                                transition.clone(),
+                                old,
+                                new,
+                            )
+                            .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                            let ReplayOperation::Management {
+                                request: LifecycleRequest::RotateSystemAuthority(command),
+                            } = &intent.ordered_entry_payload.input.operation
+                            else {
+                                return Err(SystemAuthorityLedgerError::CorruptLedger);
+                            };
+                            if command.certificate() != &frozen
+                                || command.certificate().transition() != transition
+                                || command.new_committee() != incoming
+                            {
+                                return Err(SystemAuthorityLedgerError::CorruptLedger);
+                            }
+                        }
+                        SystemAuthorityLedgerClaim::Catalog {
+                            committee,
+                            fact,
+                            proof,
+                        } => {
+                            let frozen = certificates
+                                .get(&SystemAuthorityCommitteeLeg::Current)
+                                .ok_or(SystemAuthorityLedgerError::CertificateNotReady)?;
+                            let ReplayOperation::Management {
+                                request: LifecycleRequest::FinalizeCatalog(command),
+                            } = &intent.ordered_entry_payload.input.operation
+                            else {
+                                return Err(SystemAuthorityLedgerError::CorruptLedger);
+                            };
+                            if command.receipt().certificate() != frozen
+                                || command.receipt().fact() != fact
+                                || command.proof() != proof
+                                || frozen.committee().0 != committee.commitment().0
+                            {
+                                return Err(SystemAuthorityLedgerError::CorruptLedger);
+                            }
+                        }
+                        SystemAuthorityLedgerClaim::AgentGenesis { .. } => {
+                            return Err(SystemAuthorityLedgerError::CorruptLedger);
+                        }
                     }
                 }
             }
@@ -4186,9 +4722,30 @@ mod durable {
         }
     }
 
-    /// Immutable exact publication candidate committed after both frozen QCs
-    /// and before any journal dependency or Heads CAS. Its facts commitment
-    /// is produced only by replay's private native-transition object.
+    /// Transition-specific identity retained inside one bounded publication
+    /// intent. The complete command already lives in the canonical ordered
+    /// entry, so this tag stores only the independently checked permanent
+    /// history identifiers needed for exact recovery.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum PublicationIntentKind {
+        Rotation {
+            rotation: SystemAuthorityRotationId,
+            leaf: SystemAuthorityRotationNodeId,
+            root: SystemAuthorityRotationNodeId,
+            old_committee: SystemAuthorityCommitteeId,
+            new_committee: SystemAuthorityCommitteeId,
+        },
+        Catalog {
+            record: SystemAuthorityCatalogRecordId,
+            leaf: SystemAuthorityCatalogNodeId,
+            root: SystemAuthorityCatalogNodeId,
+        },
+    }
+
+    /// Immutable exact publication candidate committed after the required
+    /// frozen QC(s) and before any journal dependency or Heads CAS. Its facts
+    /// commitment is produced only by replay's private native-transition
+    /// object.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct PublicationIntentRecord {
         version: u32,
@@ -4206,17 +4763,13 @@ mod durable {
         successor_authority_state: Hash,
         claim: Hash,
         operation: Hash,
-        rotation: SystemAuthorityRotationId,
-        leaf: SystemAuthorityRotationNodeId,
-        root: SystemAuthorityRotationNodeId,
-        old_committee: SystemAuthorityCommitteeId,
-        new_committee: SystemAuthorityCommitteeId,
+        kind: PublicationIntentKind,
         storage_plan: Hash,
         facts: Hash,
     }
 
     impl PublicationIntentRecord {
-        fn for_facts(
+        fn for_rotation_facts(
             reservation: &ReservationRecord,
             facts: &SystemAuthorityRotationPublicationFacts,
         ) -> Result<Self, SystemAuthorityLedgerError> {
@@ -4281,15 +4834,102 @@ mod durable {
                 successor_authority_state: facts.successor_authority_state(),
                 claim: facts.claim().claim_hash(),
                 operation: facts.operation(),
-                rotation: record.id(),
-                leaf: record.leaf_id(),
-                root: facts.root(),
-                old_committee: record.old_committee(),
-                new_committee: record.new_committee(),
+                kind: PublicationIntentKind::Rotation {
+                    rotation: record.id(),
+                    leaf: record.leaf_id(),
+                    root: facts.root(),
+                    old_committee: record.old_committee(),
+                    new_committee: record.new_committee(),
+                },
                 storage_plan: facts.storage_plan(),
                 facts: facts.commitment(),
             };
             intent.validate()?;
+            intent.validate_for_reservation(reservation)?;
+            Ok(intent)
+        }
+
+        fn for_catalog_facts(
+            reservation: &ReservationRecord,
+            facts: &SystemAuthorityCatalogPublicationFacts,
+        ) -> Result<Self, SystemAuthorityLedgerError> {
+            let SystemAuthorityLedgerClaim::Catalog {
+                committee,
+                fact,
+                proof,
+            } = &reservation.request
+            else {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            };
+            let record = facts.record();
+            let ordered_entry = facts.ordered_entry();
+            let ReplayOperation::Management {
+                request: LifecycleRequest::FinalizeCatalog(command),
+            } = &ordered_entry.input.operation
+            else {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            };
+            let receipt = record.receipt();
+            let finalized = SystemAuthorityCatalogFinalizeOutcome::Finalized {
+                operation: record.operation_id(),
+                result: fact.result().commitment(),
+                catalog_head: fact.resulting_catalog_head(),
+                authority_generation: fact.resulting_authority_generation(),
+                sequence: fact.sequence(),
+            };
+            if facts.journal_store() != reservation.journal_store
+                || facts.predecessor_heads() != reservation.predecessor_heads
+                || facts.predecessor_control() != reservation.control_state
+                || facts.predecessor_view() != reservation.state_view
+                || facts.predecessor_authority_state() != reservation.authority_state
+                || facts.claim() != reservation.request.claim()
+                || facts.successor_heads() == JournalHeadsId::ZERO
+                || facts.successor_heads() == facts.predecessor_heads()
+                || ordered_entry.validate().is_err()
+                || facts.ordered_entry_id() == OrderedEntryId::ZERO
+                || command != facts.command()
+                || command.operation_commitment() != facts.operation()
+                || command.receipt() != receipt
+                || command.proof() != proof
+                || receipt.fact() != fact
+                || receipt.certificate().claim() != fact.authority_claim()
+                || receipt.certificate().committee().0 != committee.commitment().0
+                || facts.successor_control() == LaneStateId::ZERO
+                || facts.successor_view() == Hash::ZERO
+                || facts.successor_authority_state() == Hash::ZERO
+                || facts.operation() == Hash::ZERO
+                || facts.root() == SystemAuthorityCatalogNodeId::ZERO
+                || facts.storage_plan() == Hash::ZERO
+                || facts.result() != &LifecycleReply::CatalogFinalized(finalized)
+            {
+                return Err(SystemAuthorityLedgerError::InvalidPublicationReceipt);
+            }
+            let intent = Self {
+                version: LEDGER_SCHEMA_VERSION,
+                route: reservation.route,
+                journal_store: facts.journal_store(),
+                predecessor_heads: facts.predecessor_heads(),
+                predecessor_control: facts.predecessor_control(),
+                predecessor_view: facts.predecessor_view(),
+                predecessor_authority_state: facts.predecessor_authority_state(),
+                successor_heads: facts.successor_heads(),
+                ordered_entry: facts.ordered_entry_id(),
+                ordered_entry_payload: ordered_entry.clone(),
+                successor_control: facts.successor_control(),
+                successor_view: facts.successor_view(),
+                successor_authority_state: facts.successor_authority_state(),
+                claim: facts.claim().claim_hash(),
+                operation: facts.operation(),
+                kind: PublicationIntentKind::Catalog {
+                    record: record.id(),
+                    leaf: record.leaf_id(),
+                    root: facts.root(),
+                },
+                storage_plan: facts.storage_plan(),
+                facts: facts.commitment(),
+            };
+            intent.validate()?;
+            intent.validate_for_reservation(reservation)?;
             Ok(intent)
         }
 
@@ -4311,46 +4951,146 @@ mod durable {
                 || self.ordered_entry_payload.id() != self.ordered_entry
                 || self.claim == Hash::ZERO
                 || self.operation == Hash::ZERO
-                || self.rotation == SystemAuthorityRotationId::ZERO
-                || self.leaf == SystemAuthorityRotationNodeId::ZERO
-                || self.root == SystemAuthorityRotationNodeId::ZERO
-                || self.old_committee == SystemAuthorityCommitteeId::ZERO
-                || self.new_committee == SystemAuthorityCommitteeId::ZERO
-                || self.old_committee == self.new_committee
                 || self.storage_plan == Hash::ZERO
                 || self.facts == Hash::ZERO
                 || self.encode().len() > MAX_PUBLICATION_INTENT_RECORD_BYTES
             {
-                Err(SystemAuthorityLedgerError::CorruptLedger)
-            } else {
-                let ReplayOperation::Management {
-                    request: LifecycleRequest::RotateSystemAuthority(command),
-                } = &self.ordered_entry_payload.input.operation
-                else {
-                    return Err(SystemAuthorityLedgerError::CorruptLedger);
-                };
-                let transition = command.certificate().transition();
-                if command.operation_commitment() != self.operation
-                    || transition.authority_claim().claim_hash() != self.claim
-                    || transition.old_committee() != self.old_committee
-                    || transition.new_committee() != self.new_committee
-                    || command.new_committee().commitment().0 != *self.new_committee.as_bytes()
-                    || self.ordered_entry_payload.genesis != self.route.system_genesis()
-                    || self.ordered_entry_payload.input.runtime.space != self.route.space()
-                    || self.ordered_entry_payload.input.runtime.agent != self.route.system_agent()
-                    || transition.root_anchor() != self.route.root_anchor()
-                    || transition.root_anchor_config_version()
-                        != self.route.root_anchor_config_version()
-                    || transition.root_anchor_config() != self.route.root_anchor_config()
-                    || transition.authority_scope() != self.route.authority_scope()
-                    || transition.space() != self.route.space()
-                    || transition.authority_binding() != self.route.authority_binding()
-                {
-                    Err(SystemAuthorityLedgerError::CorruptLedger)
-                } else {
-                    Ok(())
-                }
+                return Err(SystemAuthorityLedgerError::CorruptLedger);
             }
+            if self.ordered_entry_payload.genesis != self.route.system_genesis()
+                || self.ordered_entry_payload.input.runtime.space != self.route.space()
+                || self.ordered_entry_payload.input.runtime.agent != self.route.system_agent()
+            {
+                return Err(SystemAuthorityLedgerError::CorruptLedger);
+            }
+            match (&self.kind, &self.ordered_entry_payload.input.operation) {
+                (
+                    PublicationIntentKind::Rotation {
+                        rotation,
+                        leaf,
+                        root,
+                        old_committee,
+                        new_committee,
+                    },
+                    ReplayOperation::Management {
+                        request: LifecycleRequest::RotateSystemAuthority(command),
+                    },
+                ) => {
+                    let transition = command.certificate().transition();
+                    if *rotation == SystemAuthorityRotationId::ZERO
+                        || *leaf == SystemAuthorityRotationNodeId::ZERO
+                        || *root == SystemAuthorityRotationNodeId::ZERO
+                        || *old_committee == SystemAuthorityCommitteeId::ZERO
+                        || *new_committee == SystemAuthorityCommitteeId::ZERO
+                        || old_committee == new_committee
+                        || command.operation_commitment() != self.operation
+                        || transition.authority_claim().claim_hash() != self.claim
+                        || transition.old_committee() != *old_committee
+                        || transition.new_committee() != *new_committee
+                        || command.new_committee().commitment().0 != *new_committee.as_bytes()
+                        || transition.root_anchor() != self.route.root_anchor()
+                        || transition.root_anchor_config_version()
+                            != self.route.root_anchor_config_version()
+                        || transition.root_anchor_config() != self.route.root_anchor_config()
+                        || transition.authority_scope() != self.route.authority_scope()
+                        || transition.space() != self.route.space()
+                        || transition.authority_binding() != self.route.authority_binding()
+                    {
+                        return Err(SystemAuthorityLedgerError::CorruptLedger);
+                    }
+                }
+                (
+                    PublicationIntentKind::Catalog { record, leaf, root },
+                    ReplayOperation::Management {
+                        request: LifecycleRequest::FinalizeCatalog(command),
+                    },
+                ) => {
+                    let fact = command.receipt().fact();
+                    let binding = fact.intent().binding();
+                    if *record == SystemAuthorityCatalogRecordId::ZERO
+                        || *leaf == SystemAuthorityCatalogNodeId::ZERO
+                        || *root == SystemAuthorityCatalogNodeId::ZERO
+                        || command.operation_commitment() != self.operation
+                        || fact.authority_claim().claim_hash() != self.claim
+                        || command.proof().occupied_record_id().is_some()
+                        || command.proof().operation_id() != fact.intent().operation_id()
+                        || binding.space() != self.route.space()
+                        || binding.authority_binding() != self.route.authority_binding()
+                    {
+                        return Err(SystemAuthorityLedgerError::CorruptLedger);
+                    }
+                }
+                _ => return Err(SystemAuthorityLedgerError::CorruptLedger),
+            }
+            Ok(())
+        }
+
+        fn validate_for_reservation(
+            &self,
+            reservation: &ReservationRecord,
+        ) -> Result<(), SystemAuthorityLedgerError> {
+            self.validate()?;
+            if self.route != reservation.route
+                || self.journal_store != reservation.journal_store
+                || self.predecessor_heads != reservation.predecessor_heads
+                || self.predecessor_control != reservation.control_state
+                || self.predecessor_view != reservation.state_view
+                || self.predecessor_authority_state != reservation.authority_state
+                || self.claim != reservation.request.claim().claim_hash()
+            {
+                return Err(SystemAuthorityLedgerError::CorruptLedger);
+            }
+            match (
+                &self.kind,
+                &reservation.request,
+                &self.ordered_entry_payload.input.operation,
+            ) {
+                (
+                    PublicationIntentKind::Rotation {
+                        old_committee,
+                        new_committee,
+                        ..
+                    },
+                    SystemAuthorityLedgerClaim::CommitteeRotation {
+                        retiring,
+                        incoming,
+                        transition,
+                    },
+                    ReplayOperation::Management {
+                        request: LifecycleRequest::RotateSystemAuthority(command),
+                    },
+                ) if old_committee.as_bytes() == &retiring.commitment().0
+                    && new_committee.as_bytes() == &incoming.commitment().0
+                    && command.new_committee() == incoming
+                    && command.certificate().transition() == transition => {}
+                (
+                    PublicationIntentKind::Catalog { record, leaf, .. },
+                    SystemAuthorityLedgerClaim::Catalog {
+                        committee,
+                        fact,
+                        proof,
+                    },
+                    ReplayOperation::Management {
+                        request: LifecycleRequest::FinalizeCatalog(command),
+                    },
+                ) => {
+                    let candidate = SystemAuthorityCatalogRecord::new(
+                        command.receipt().clone(),
+                        fact.intent().binding(),
+                        committee,
+                    )
+                    .map_err(|_| SystemAuthorityLedgerError::CorruptLedger)?;
+                    if command.receipt().fact() != fact
+                        || command.proof() != proof
+                        || candidate.id() != *record
+                        || candidate.leaf_id() != *leaf
+                    {
+                        return Err(SystemAuthorityLedgerError::CorruptLedger);
+                    }
+                }
+                _ => return Err(SystemAuthorityLedgerError::CorruptLedger),
+            }
+            Ok(())
         }
     }
 
@@ -4374,11 +5114,28 @@ mod durable {
             encoder.fixed(&self.successor_authority_state.0);
             encoder.fixed(&self.claim.0);
             encoder.fixed(&self.operation.0);
-            encoder.fixed(self.rotation.as_bytes());
-            encoder.fixed(self.leaf.as_bytes());
-            encoder.fixed(self.root.as_bytes());
-            encoder.fixed(self.old_committee.as_bytes());
-            encoder.fixed(self.new_committee.as_bytes());
+            match &self.kind {
+                PublicationIntentKind::Rotation {
+                    rotation,
+                    leaf,
+                    root,
+                    old_committee,
+                    new_committee,
+                } => {
+                    encoder.u8(0);
+                    encoder.fixed(rotation.as_bytes());
+                    encoder.fixed(leaf.as_bytes());
+                    encoder.fixed(root.as_bytes());
+                    encoder.fixed(old_committee.as_bytes());
+                    encoder.fixed(new_committee.as_bytes());
+                }
+                PublicationIntentKind::Catalog { record, leaf, root } => {
+                    encoder.u8(1);
+                    encoder.fixed(record.as_bytes());
+                    encoder.fixed(leaf.as_bytes());
+                    encoder.fixed(root.as_bytes());
+                }
+            }
             encoder.fixed(&self.storage_plan.0);
             encoder.fixed(&self.facts.0);
         }
@@ -4396,17 +5153,27 @@ mod durable {
                 predecessor_authority_state: Hash(decoder.fixed()?),
                 successor_heads: JournalHeadsId::new(decoder.fixed()?),
                 ordered_entry: OrderedEntryId::new(decoder.fixed()?),
-                ordered_entry_payload: decode_nested(decoder, MAX_JOURNAL_RECORD_BYTES)?,
+                ordered_entry_payload: decode_nested(decoder, MAX_PUBLICATION_ORDERED_ENTRY_BYTES)?,
                 successor_control: LaneStateId::new(decoder.fixed()?),
                 successor_view: Hash(decoder.fixed()?),
                 successor_authority_state: Hash(decoder.fixed()?),
                 claim: Hash(decoder.fixed()?),
                 operation: Hash(decoder.fixed()?),
-                rotation: SystemAuthorityRotationId::from_bytes(decoder.fixed()?),
-                leaf: SystemAuthorityRotationNodeId::from_bytes(decoder.fixed()?),
-                root: SystemAuthorityRotationNodeId::from_bytes(decoder.fixed()?),
-                old_committee: SystemAuthorityCommitteeId::from_bytes(decoder.fixed()?),
-                new_committee: SystemAuthorityCommitteeId::from_bytes(decoder.fixed()?),
+                kind: match decoder.u8()? {
+                    0 => PublicationIntentKind::Rotation {
+                        rotation: SystemAuthorityRotationId::from_bytes(decoder.fixed()?),
+                        leaf: SystemAuthorityRotationNodeId::from_bytes(decoder.fixed()?),
+                        root: SystemAuthorityRotationNodeId::from_bytes(decoder.fixed()?),
+                        old_committee: SystemAuthorityCommitteeId::from_bytes(decoder.fixed()?),
+                        new_committee: SystemAuthorityCommitteeId::from_bytes(decoder.fixed()?),
+                    },
+                    1 => PublicationIntentKind::Catalog {
+                        record: SystemAuthorityCatalogRecordId::from_bytes(decoder.fixed()?),
+                        leaf: SystemAuthorityCatalogNodeId::from_bytes(decoder.fixed()?),
+                        root: SystemAuthorityCatalogNodeId::from_bytes(decoder.fixed()?),
+                    },
+                    _ => return Err(DecodeError::InvalidTag),
+                },
                 storage_plan: Hash(decoder.fixed()?),
                 facts: Hash(decoder.fixed()?),
             };
@@ -4602,6 +5369,28 @@ mod durable {
                             != self.route.root_anchor_config_version
                         || transition.root_anchor_config() != self.route.root_anchor_config
                         || transition.authority_scope() != self.route.authority_scope
+                    {
+                        return Err(SystemAuthorityLedgerError::CorruptLedger);
+                    }
+                }
+                SystemAuthorityLedgerClaim::Catalog {
+                    committee,
+                    fact,
+                    proof,
+                } => {
+                    let valid_sequence = match self.prior_first_sequence {
+                        Some(first) => sequence == first,
+                        None => sequence > self.prior_high_water,
+                    };
+                    let binding = fact.intent().binding();
+                    if !valid_sequence
+                        || committee.space() != self.route.space
+                        || committee.authority_binding() != self.route.authority_binding
+                        || binding.space() != self.route.space
+                        || binding.authority_binding() != self.route.authority_binding
+                        || proof.operation_id() != fact.intent().operation_id()
+                        || proof.occupied_record_id().is_some()
+                        || self.encode().len() > MAX_CATALOG_RESERVATION_RECORD_BYTES
                     {
                         return Err(SystemAuthorityLedgerError::CorruptLedger);
                     }
@@ -5181,13 +5970,25 @@ mod durable {
         use core::cell::Cell;
 
         use super::*;
+        use crate::agent::catalog_finality::{
+            CatalogMutation, CatalogMutationDisposition, CatalogMutationIntent,
+            CatalogMutationKind, CatalogMutationResult, FinalizedCatalogMutationReceipt,
+            MAX_CATALOG_TRANSITION_DATA_BYTES,
+        };
         use crate::agent::committee::{
-            AuthorityCommitteeMember, AuthorityMemberRole, RootAnchorConfigCommitment, RootAnchorId,
+            AuthorityCommitteeMember, AuthorityMemberRole, MAX_AUTHORITY_COMMITTEE_MEMBERS,
+            RootAnchorConfigCommitment, RootAnchorId,
         };
+        use crate::agent::journal::{MergeFrontierId, MergeSealId, ReplayInput, RuntimeBinding};
         use crate::agent::system_authority::{
-            SystemAuthorityGenesis, SystemAuthorityRotation, SystemAuthorityRotationProof,
+            SystemAuthorityCatalogFinalize, SystemAuthorityCatalogRecord,
+            SystemAuthorityCatalogRecordId, SystemAuthorityCatalogSibling, SystemAuthorityGenesis,
+            SystemAuthorityRotation, SystemAuthorityRotationProof,
         };
-        use crate::service::NodeId;
+        use crate::service::{
+            BlobRef, CapabilityId, CredentialId, DeploymentId, NodeId, OperationId, PrincipalId,
+            ProducerId, ProgramId,
+        };
         use ed25519_dalek::{Signer as _, SigningKey};
 
         const SPACE: SpaceId = SpaceId([0x11; 32]);
@@ -5308,9 +6109,19 @@ mod durable {
                     .collect::<Vec<_>>();
                 let old = committee(1, None, &roles);
                 let incoming = committee(2, Some(old.commitment()), &roles);
-                let genesis =
-                    SystemAuthorityGenesis::new(ROOT, 1, ROOT_CONFIG, old.clone(), 1, 8, 8)
-                        .unwrap();
+                let genesis = SystemAuthorityGenesis::new(
+                    ROOT,
+                    1,
+                    ROOT_CONFIG,
+                    old.clone(),
+                    1,
+                    Hash([0x75; 32]),
+                    Hash([0x76; 32]),
+                    8,
+                    8,
+                    8,
+                )
+                .unwrap();
                 let state = SystemAuthorityState::from_genesis(SYSTEM_AGENT, &genesis).unwrap();
                 let scope = SystemAuthorityJournalScope::for_test(GENESIS, ADMISSION).unwrap();
                 let route = SystemAuthorityLedgerRoute::new(
@@ -5440,6 +6251,97 @@ mod durable {
                     transition.clone(),
                 )
                 .unwrap()
+            }
+
+            fn catalog_request(
+                &self,
+                operation_byte: u8,
+                mutation_byte: u8,
+            ) -> SystemAuthorityCatalogReservationRequest {
+                let operation = OperationId([operation_byte; 32]);
+                let intent = CatalogMutationIntent::new(
+                    self.state.catalog_binding_record().unwrap(),
+                    self.state.authority_generation(),
+                    self.state.catalog_head(),
+                    PrincipalId([0x81; 32]),
+                    CredentialId([0x82; 32]),
+                    CapabilityId([0x83; 32]),
+                    operation,
+                    CatalogMutation::new(CatalogMutationKind::UpdateMetadata, vec![mutation_byte])
+                        .unwrap(),
+                )
+                .unwrap();
+                let fact = FinalizedCatalogMutationFact::new(
+                    intent,
+                    self.state.authority_generation(),
+                    self.state.catalog_head(),
+                    CatalogMutationResult::new(CatalogMutationDisposition::Rejected, Vec::new())
+                        .unwrap(),
+                    2,
+                )
+                .unwrap();
+                SystemAuthorityCatalogReservationRequest::new(
+                    self.old.clone(),
+                    fact,
+                    SystemAuthorityCatalogProof::vacant(operation, vec![]).unwrap(),
+                )
+                .unwrap()
+            }
+
+            fn certified_catalog_command(
+                &self,
+                request: &SystemAuthorityCatalogReservationRequest,
+            ) -> (
+                SystemAuthorityCatalogFinalize,
+                SystemAuthorityCatalogRecord,
+                AuthorityQuorumCertificate,
+            ) {
+                let (fact, proof) = request.request.catalog_preimages().unwrap();
+                let claim = fact.authority_claim();
+                let mut signatures = vec![
+                    signed_share(&self.keys[0], &self.old, claim),
+                    signed_share(&self.keys[1], &self.old, claim),
+                ];
+                signatures.sort_by_key(AuthoritySignature::signer);
+                let certificate =
+                    AuthorityQuorumCertificate::new(&self.old, claim, signatures).unwrap();
+                certificate.verify(&self.old, claim).unwrap();
+                let receipt = FinalizedCatalogMutationReceipt::new(
+                    fact.clone(),
+                    certificate.clone(),
+                    self.state.catalog_binding_record().unwrap(),
+                    &self.old,
+                )
+                .unwrap();
+                let record = SystemAuthorityCatalogRecord::new(
+                    receipt.clone(),
+                    self.state.catalog_binding_record().unwrap(),
+                    &self.old,
+                )
+                .unwrap();
+                let command = SystemAuthorityCatalogFinalize::new(receipt, proof.clone()).unwrap();
+                (command, record, certificate)
+            }
+
+            fn catalog_successor_view(
+                &self,
+                command: &SystemAuthorityCatalogFinalize,
+            ) -> (ReplayedSystemAuthorityView, SystemAuthorityCatalogNodeId) {
+                let transition = self
+                    .state
+                    .apply_catalog_finalize(self.scope, command)
+                    .unwrap();
+                let root = transition.history().root();
+                let next = transition.into_state();
+                assert_eq!(next.journal_binding(), Some(self.scope.binding()));
+                assert_eq!(next.rotation_first_sequence(), None);
+                (
+                    ReplayedSystemAuthorityView::for_test_from_authenticated_replay(
+                        self.scope, &next, self.store, HEADS_2, CONTROL_2,
+                    )
+                    .unwrap(),
+                    root,
+                )
             }
 
             fn successor_view(
@@ -5581,6 +6483,462 @@ mod durable {
                 .unwrap()
                 .unwrap();
             (signer, joint)
+        }
+
+        fn catalog_ordered_entry(command: SystemAuthorityCatalogFinalize) -> OrderedEntry {
+            OrderedEntry {
+                genesis: GENESIS,
+                index: 1,
+                parent: None,
+                merge_frontier: MergeFrontierId::new([0x91; 32]),
+                merge_seal: Some(MergeSealId::new([0x92; 32])),
+                input: ReplayInput {
+                    runtime: RuntimeBinding {
+                        space: SPACE,
+                        agent: SYSTEM_AGENT,
+                        deployment: DeploymentId([0x93; 32]),
+                        program: ProgramId([0x94; 32]),
+                        producer: ProducerId([0x95; 32]),
+                        package: BlobRef::of_bytes(b"catalog-ledger-test-runtime"),
+                        runtime_abi: crate::agent::RUNTIME_ABI_ID,
+                        execution_semantics: crate::agent::EXECUTION_SEMANTICS_ID,
+                    },
+                    operation: ReplayOperation::Management {
+                        request: LifecycleRequest::FinalizeCatalog(command),
+                    },
+                },
+            }
+        }
+
+        fn catalog_publication_intent_for_test(
+            reservation: &ReservationRecord,
+            successor: &ReplayedSystemAuthorityView,
+            command: SystemAuthorityCatalogFinalize,
+            record: &SystemAuthorityCatalogRecord,
+            root: SystemAuthorityCatalogNodeId,
+        ) -> PublicationIntentRecord {
+            let entry = catalog_ordered_entry(command.clone());
+            let intent = PublicationIntentRecord {
+                version: LEDGER_SCHEMA_VERSION,
+                route: reservation.route,
+                journal_store: reservation.journal_store,
+                predecessor_heads: reservation.predecessor_heads,
+                predecessor_control: reservation.control_state,
+                predecessor_view: reservation.state_view,
+                predecessor_authority_state: reservation.authority_state,
+                successor_heads: successor.heads(),
+                ordered_entry: entry.id(),
+                ordered_entry_payload: entry,
+                successor_control: successor.control_state(),
+                successor_view: successor.commitment(),
+                successor_authority_state: successor.authority_state_commitment(),
+                claim: reservation.request.claim().claim_hash(),
+                operation: command.operation_commitment(),
+                kind: PublicationIntentKind::Catalog {
+                    record: record.id(),
+                    leaf: record.leaf_id(),
+                    root,
+                },
+                storage_plan: Hash([0x96; 32]),
+                facts: Hash([0x97; 32]),
+            };
+            intent.validate().unwrap();
+            intent.validate_for_reservation(reservation).unwrap();
+            intent
+        }
+
+        #[test]
+        fn catalog_claim_round_trips_and_uses_only_the_current_committee_leg() {
+            let fixture = Fixture::new();
+            let request = fixture.catalog_request(0x84, 0x85);
+            let claim = request.claim();
+            let (fact, proof) = request.request.catalog_preimages().unwrap();
+            assert_eq!(claim.domain(), AuthorityClaimDomain::Catalog);
+            assert_eq!(claim.sequence(), 2);
+            assert_eq!(fact.authority_claim(), claim);
+            assert_eq!(proof.operation_id(), OperationId([0x84; 32]));
+            assert_eq!(
+                request.request.legs(),
+                &[SystemAuthorityCommitteeLeg::Current]
+            );
+            assert_eq!(
+                request
+                    .request
+                    .committee(SystemAuthorityCommitteeLeg::Current),
+                Some(&fixture.old)
+            );
+            assert!(
+                request
+                    .request
+                    .committee(SystemAuthorityCommitteeLeg::Retiring)
+                    .is_none()
+            );
+            assert_eq!(
+                SystemAuthorityLedgerClaim::decode(&request.request.encode()),
+                Ok(request.request.clone())
+            );
+            assert!(request.request.encode().len() <= MAX_SYSTEM_AUTHORITY_LEDGER_CLAIM_BYTES);
+
+            let occupied = SystemAuthorityCatalogProof::occupied(
+                OperationId([0x84; 32]),
+                SystemAuthorityCatalogRecordId::from_bytes([0x86; 32]),
+                vec![],
+            )
+            .unwrap();
+            assert!(matches!(
+                SystemAuthorityCatalogReservationRequest::new(
+                    fixture.old.clone(),
+                    fact.clone(),
+                    occupied,
+                ),
+                Err(SystemAuthorityLedgerWireError::InvalidClaim)
+            ));
+        }
+
+        #[test]
+        fn catalog_reservation_signs_once_and_conflicts_globally_at_the_same_sequence() {
+            let fixture = Fixture::new();
+            let directory = TempDirectory::new("catalog_reservation");
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+            let ledger = open_ledger(database.clone(), &fixture);
+            let request = fixture.catalog_request(0x87, 0x88);
+            let claim = request.claim();
+            let outcome = ledger
+                .reserve_catalog_or_reconcile(&fixture.view, request)
+                .unwrap();
+            assert_eq!(
+                outcome.disposition(),
+                SystemAuthorityReservationDisposition::New
+            );
+            let reserved = outcome.into_reserved();
+            let pending = ledger.recover_pending_claim().unwrap().unwrap();
+            assert_eq!(pending.claim(), claim);
+            assert_eq!(pending.catalog_request().unwrap().claim(), claim);
+
+            let signer = PledgeCheckingSigner {
+                key: fixture.keys[0].clone(),
+                calls: Cell::new(0),
+                database,
+                pledge_key: pledge_storage_key(
+                    fixture.route,
+                    fixture.local_signer().as_bytes(),
+                    claim.sequence(),
+                ),
+            };
+            assert!(
+                ledger
+                    .sign_reserved_leg(&reserved, SystemAuthorityCommitteeLeg::Current, &signer,)
+                    .unwrap()
+                    .certificate()
+                    .is_none()
+            );
+            assert_eq!(signer.calls.get(), 1);
+            assert!(matches!(
+                ledger
+                    .sign_reserved_leg(&reserved, SystemAuthorityCommitteeLeg::Retiring, &signer,),
+                Err(SystemAuthoritySignError::Ledger(
+                    SystemAuthorityLedgerError::WrongCommitteeLeg
+                ))
+            ));
+            let remote = signed_share(&fixture.keys[1], &fixture.old, claim);
+            let certificate = ledger
+                .record_remote_share(&reserved, SystemAuthorityCommitteeLeg::Current, remote)
+                .unwrap()
+                .certificate()
+                .cloned()
+                .unwrap();
+            certificate.verify(&fixture.old, claim).unwrap();
+
+            assert!(matches!(
+                ledger.reserve_or_reconcile(&fixture.view, fixture.rotation_request()),
+                Err(SystemAuthorityLedgerError::DivergentReservation)
+            ));
+            assert!(ledger.is_fail_stopped().unwrap());
+        }
+
+        #[test]
+        fn catalog_intent_survives_reopen_and_retires_without_resigning() {
+            let fixture = Fixture::new();
+            let directory = TempDirectory::new("catalog_intent_recovery");
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+            let ledger = open_ledger(database.clone(), &fixture);
+            let request = fixture.catalog_request(0x89, 0x8a);
+            let claim = request.claim();
+            let (command, record, expected_certificate) =
+                fixture.certified_catalog_command(&request);
+            let reserved = ledger
+                .reserve_catalog_or_reconcile(&fixture.view, request.clone())
+                .unwrap()
+                .into_reserved();
+            let signer = PledgeCheckingSigner {
+                key: fixture.keys[0].clone(),
+                calls: Cell::new(0),
+                database: database.clone(),
+                pledge_key: pledge_storage_key(
+                    fixture.route,
+                    fixture.local_signer().as_bytes(),
+                    claim.sequence(),
+                ),
+            };
+            assert!(
+                ledger
+                    .sign_reserved_leg(&reserved, SystemAuthorityCommitteeLeg::Current, &signer,)
+                    .unwrap()
+                    .certificate()
+                    .is_none()
+            );
+            let remote = signed_share(&fixture.keys[1], &fixture.old, claim);
+            let frozen = ledger
+                .record_remote_share(&reserved, SystemAuthorityCommitteeLeg::Current, remote)
+                .unwrap()
+                .certificate()
+                .cloned()
+                .unwrap();
+            assert_eq!(frozen, expected_certificate);
+            assert_eq!(signer.calls.get(), 1);
+            assert_eq!(
+                ledger
+                    .reserve_catalog_or_reconcile(&fixture.view, request.clone())
+                    .unwrap()
+                    .disposition(),
+                SystemAuthorityReservationDisposition::Exact
+            );
+            ledger
+                .sign_reserved_leg(&reserved, SystemAuthorityCommitteeLeg::Current, &signer)
+                .unwrap();
+            assert_eq!(
+                signer.calls.get(),
+                1,
+                "exact retry reused the durable share"
+            );
+
+            let (successor, root) = fixture.catalog_successor_view(&command);
+            let intent = catalog_publication_intent_for_test(
+                &reserved.record,
+                &successor,
+                command,
+                &record,
+                root,
+            );
+            assert_eq!(
+                PublicationIntentRecord::decode(&intent.encode()).unwrap(),
+                intent
+            );
+            assert!(intent.encode().len() <= MAX_PUBLICATION_INTENT_RECORD_BYTES);
+            let mut wrong_record = intent.clone();
+            let PublicationIntentKind::Catalog { record, .. } = &mut wrong_record.kind else {
+                unreachable!()
+            };
+            *record = SystemAuthorityCatalogRecordId::from_bytes([0x9a; 32]);
+            wrong_record.validate().unwrap();
+            assert!(matches!(
+                wrong_record.validate_for_reservation(&reserved.record),
+                Err(SystemAuthorityLedgerError::CorruptLedger)
+            ));
+
+            let transaction = database.begin_write().unwrap();
+            transaction
+                .open_table(PUBLICATION_INTENT_TABLE)
+                .unwrap()
+                .insert(
+                    route_storage_key(fixture.route).as_slice(),
+                    intent.encode().as_slice(),
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            drop(ledger);
+
+            let reopened = open_ledger(database.clone(), &fixture);
+            let pending = reopened.recover_pending_claim().unwrap().unwrap();
+            assert_eq!(pending.claim(), claim);
+            assert!(pending.catalog_request().is_some());
+            assert_eq!(pending.expected_successor_heads(), Some(successor.heads()));
+            assert_eq!(
+                pending.expected_ordered_entry(),
+                Some(&intent.ordered_entry_payload)
+            );
+            assert_eq!(
+                reopened
+                    .pending_certificate(&pending, SystemAuthorityCommitteeLeg::Current)
+                    .unwrap(),
+                Some(expected_certificate)
+            );
+            assert!(matches!(
+                reopened.reserve_catalog_or_reconcile(&fixture.view, request),
+                Err(SystemAuthorityLedgerError::PublicationRecoveryRequired)
+            ));
+
+            let published =
+                PublishedSystemAuthorityClaim::for_test_after_exact_cas(pending, claim, &successor)
+                    .unwrap();
+            reopened.retire_published_claim(published).unwrap();
+            assert!(reopened.recover_pending_claim().unwrap().is_none());
+            reopened.validate_replayed_view(&successor).unwrap();
+            let meta = MetaRecord::decode(
+                &read_exact(
+                    &database,
+                    META_TABLE,
+                    route_storage_key(fixture.route).as_slice(),
+                )
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(meta.retired_high_water, claim.sequence());
+            assert_eq!(meta.authority_state, successor.authority_state_commitment());
+        }
+
+        #[test]
+        fn catalog_v6_record_sizes_are_bounded_without_duplicate_receipt() {
+            let fixture = Fixture::new();
+            let mut keys = Vec::with_capacity(MAX_AUTHORITY_COMMITTEE_MEMBERS);
+            let mut members = Vec::with_capacity(MAX_AUTHORITY_COMMITTEE_MEMBERS);
+            for index in 0..MAX_AUTHORITY_COMMITTEE_MEMBERS {
+                let ordinal = u16::try_from(index + 1).unwrap().to_le_bytes();
+                let key_seed = Hash::digest(b"catalog-ledger-max-key", &[&ordinal]).0;
+                let key = SigningKey::from_bytes(&key_seed);
+                let node = NodeId(Hash::digest(b"catalog-ledger-max-node", &[&ordinal]).0);
+                members.push(
+                    AuthorityCommitteeMember::new(
+                        node,
+                        key.verifying_key().to_bytes(),
+                        AuthorityMemberRole::Voter,
+                    )
+                    .unwrap(),
+                );
+                keys.push(key);
+            }
+            members.sort_by_key(AuthorityCommitteeMember::signer);
+            let committee = AuthorityCommittee::new(SPACE, BINDING, 1, None, members).unwrap();
+
+            let operation = OperationId([0xa4; 32]);
+            let mutation = CatalogMutation::new(
+                CatalogMutationKind::UpdateMetadata,
+                vec![0xa5; MAX_CATALOG_TRANSITION_DATA_BYTES],
+            )
+            .unwrap();
+            let intent = CatalogMutationIntent::new(
+                fixture.state.catalog_binding_record().unwrap(),
+                fixture.state.authority_generation(),
+                fixture.state.catalog_head(),
+                PrincipalId([0xa6; 32]),
+                CredentialId([0xa7; 32]),
+                CapabilityId([0xa8; 32]),
+                operation,
+                mutation,
+            )
+            .unwrap();
+            let fact = FinalizedCatalogMutationFact::new(
+                intent,
+                fixture.state.authority_generation(),
+                fixture.state.catalog_head(),
+                CatalogMutationResult::new(CatalogMutationDisposition::Rejected, Vec::new())
+                    .unwrap(),
+                2,
+            )
+            .unwrap();
+            let siblings = (0_u16..256)
+                .map(|depth| {
+                    let depth_bytes = depth.to_le_bytes();
+                    let node = SystemAuthorityCatalogNodeId::from_bytes(
+                        Hash::digest(
+                            b"catalog-ledger-max-proof-node",
+                            &[&operation.0, &depth_bytes],
+                        )
+                        .0,
+                    );
+                    SystemAuthorityCatalogSibling::new(depth, node).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let proof = SystemAuthorityCatalogProof::vacant(operation, siblings).unwrap();
+            let request = SystemAuthorityCatalogReservationRequest::new(
+                committee.clone(),
+                fact.clone(),
+                proof.clone(),
+            )
+            .unwrap()
+            .request;
+            let reservation = ReservationRecord {
+                route: fixture.route,
+                journal_store: fixture.store,
+                predecessor_heads: fixture.view.heads(),
+                state_view: fixture.view.commitment(),
+                authority_state: fixture.view.authority_state_commitment(),
+                control_state: fixture.view.control_state(),
+                prior_high_water: fixture.view.committee_sequence_high_water(),
+                prior_first_sequence: fixture.view.rotation_first_sequence(),
+                request,
+            };
+            reservation.validate().unwrap();
+
+            let mut signatures = keys
+                .iter()
+                .map(|key| signed_share(key, &committee, fact.authority_claim()))
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(AuthoritySignature::signer);
+            let certificate =
+                AuthorityQuorumCertificate::new(&committee, fact.authority_claim(), signatures)
+                    .unwrap();
+            let receipt = FinalizedCatalogMutationReceipt::new(
+                fact,
+                certificate,
+                fixture.state.catalog_binding_record().unwrap(),
+                &committee,
+            )
+            .unwrap();
+            let record = SystemAuthorityCatalogRecord::new(
+                receipt.clone(),
+                fixture.state.catalog_binding_record().unwrap(),
+                &committee,
+            )
+            .unwrap();
+            let command = SystemAuthorityCatalogFinalize::new(receipt, proof.clone()).unwrap();
+            let entry = catalog_ordered_entry(command.clone());
+            let publication = PublicationIntentRecord {
+                version: LEDGER_SCHEMA_VERSION,
+                route: fixture.route,
+                journal_store: fixture.store,
+                predecessor_heads: fixture.view.heads(),
+                predecessor_control: fixture.view.control_state(),
+                predecessor_view: fixture.view.commitment(),
+                predecessor_authority_state: fixture.view.authority_state_commitment(),
+                successor_heads: HEADS_2,
+                ordered_entry: entry.id(),
+                ordered_entry_payload: entry,
+                successor_control: CONTROL_2,
+                successor_view: Hash([0xa9; 32]),
+                successor_authority_state: Hash([0xaa; 32]),
+                claim: reservation.request.claim().claim_hash(),
+                operation: command.operation_commitment(),
+                kind: PublicationIntentKind::Catalog {
+                    record: record.id(),
+                    leaf: record.leaf_id(),
+                    root: proof.root().unwrap(),
+                },
+                storage_plan: Hash([0xab; 32]),
+                facts: Hash([0xac; 32]),
+            };
+            publication.validate().unwrap();
+            publication.validate_for_reservation(&reservation).unwrap();
+
+            let reservation_bytes = reservation.encode().len();
+            let publication_bytes = publication.encode().len();
+            assert!(reservation_bytes <= MAX_CATALOG_RESERVATION_RECORD_BYTES);
+            assert!(publication_bytes <= MAX_PUBLICATION_INTENT_RECORD_BYTES);
+            assert!(publication.ordered_entry_payload.encode().len() <= MAX_JOURNAL_RECORD_BYTES);
+            assert_eq!(
+                ReservationRecord::decode(&reservation.encode()).unwrap(),
+                reservation
+            );
+            assert_eq!(
+                PublicationIntentRecord::decode(&publication.encode()).unwrap(),
+                publication
+            );
+            eprintln!(
+                "catalog v6 sizes: reservation={reservation_bytes}/{MAX_CATALOG_RESERVATION_RECORD_BYTES}, publication={publication_bytes}/{MAX_PUBLICATION_INTENT_RECORD_BYTES}, ordered_entry={}/{}",
+                publication.ordered_entry_payload.encode().len(),
+                MAX_PUBLICATION_ORDERED_ENTRY_BYTES,
+            );
         }
 
         #[test]
@@ -7236,7 +8594,8 @@ mod durable {
 #[cfg(all(feature = "std", feature = "storage"))]
 #[allow(unused_imports)]
 pub(crate) use durable::{
-    PendingSystemAuthorityRecovery, ReservedSystemAuthorityClaim, RetiredSystemAuthorityRotation,
+    PendingSystemAuthorityRecovery, ReservedSystemAuthorityClaim, RetiredSystemAuthorityCatalog,
+    RetiredSystemAuthorityRotation, SystemAuthorityCatalogReservationRequest,
     SystemAuthorityEvidenceLedger, SystemAuthorityLedgerError, SystemAuthorityLedgerRouteOwner,
     SystemAuthorityReservationDisposition, SystemAuthorityReservationOutcome,
     SystemAuthorityRotationReservationRequest, SystemAuthorityShareOutcome,

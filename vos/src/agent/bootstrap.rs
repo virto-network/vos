@@ -686,6 +686,9 @@ mod tests {
             root.config_commitment(),
             root.initial_committee().clone(),
             1,
+            Hash([0x75; 32]),
+            Hash([0x76; 32]),
+            8,
             8,
             8,
         )
@@ -1139,6 +1142,9 @@ mod tests {
                 foreign_root.config_commitment(),
                 foreign_root.initial_committee().clone(),
                 1,
+                Hash([0x75; 32]),
+                Hash([0x76; 32]),
+                8,
                 8,
                 8,
             )

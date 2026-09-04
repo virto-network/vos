@@ -165,6 +165,10 @@ pub(crate) enum StandardSystemAuthorityWrite {
         record: super::system_authority::SystemAuthorityRotationRecord,
         history: super::system_authority::SystemAuthorityRotationWritePlan,
     },
+    Catalog {
+        record: Option<super::system_authority::SystemAuthorityCatalogRecord>,
+        history: super::system_authority::SystemAuthorityCatalogWritePlan,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1812,6 +1816,9 @@ impl StandardAgentRuntime {
             LifecycleRequest::RotateSystemAuthority(rotation) => {
                 self.apply_system_authority_rotation(trusted_scope, rotation)
             }
+            LifecycleRequest::FinalizeCatalog(finalize) => {
+                self.apply_catalog_finalize(trusted_scope, finalize)
+            }
             request => StandardScopedApply {
                 result: self.apply(request),
                 system_authority_write: None,
@@ -1835,6 +1842,10 @@ impl StandardAgentRuntime {
             LifecycleRequest::RotateSystemAuthority(rotation) => match context {
                 Some(context) => self.simulate_system_authority_rotation(context, rotation),
                 None => self.apply(LifecycleRequest::RotateSystemAuthority(rotation)),
+            },
+            LifecycleRequest::FinalizeCatalog(finalize) => match context {
+                Some(context) => self.simulate_catalog_finalize(context, finalize),
+                None => self.apply(LifecycleRequest::FinalizeCatalog(finalize)),
             },
             request => self.apply(request),
         }
@@ -1920,6 +1931,43 @@ impl StandardAgentRuntime {
         }
     }
 
+    fn apply_catalog_finalize(
+        &mut self,
+        trusted_scope: super::system_authority::SystemAuthorityJournalScope,
+        finalize: super::system_authority::SystemAuthorityCatalogFinalize,
+    ) -> StandardScopedApply {
+        let transition = match self.live_system_authority().and_then(|state| {
+            state
+                .apply_catalog_finalize(trusted_scope, &finalize)
+                .map_err(LifecycleError::SystemAuthority)
+        }) {
+            Ok(transition) => transition,
+            Err(error) => {
+                return StandardScopedApply {
+                    result: Err(error),
+                    system_authority_write: None,
+                };
+            }
+        };
+        let before = self.system_authority.clone();
+        self.system_authority = Some(transition.state().clone());
+        let result = Ok(LifecycleReply::CatalogFinalized(transition.outcome()));
+        if self.validate_signed_state_resource().is_err() {
+            self.system_authority = before;
+            return StandardScopedApply {
+                result: Err(LifecycleError::ResourceLimit),
+                system_authority_write: None,
+            };
+        }
+        StandardScopedApply {
+            result,
+            system_authority_write: Some(StandardSystemAuthorityWrite::Catalog {
+                record: transition.record().cloned(),
+                history: transition.history().clone(),
+            }),
+        }
+    }
+
     fn simulate_system_authority_finalize(
         &mut self,
         context: super::wire::RuntimeJournalContext,
@@ -1956,6 +2004,27 @@ impl StandardAgentRuntime {
             epoch,
             exact_retry,
         })
+    }
+
+    fn simulate_catalog_finalize(
+        &mut self,
+        context: super::wire::RuntimeJournalContext,
+        finalize: super::system_authority::SystemAuthorityCatalogFinalize,
+    ) -> Result<LifecycleReply, LifecycleError> {
+        let (state, outcome) = self
+            .live_system_authority()?
+            .simulate_catalog_finalize_untrusted(
+                context.genesis(),
+                context.agent_admission(),
+                &finalize,
+            )
+            .map_err(LifecycleError::SystemAuthority)?;
+        let before = self.system_authority.replace(state);
+        if self.validate_signed_state_resource().is_err() {
+            self.system_authority = before;
+            return Err(LifecycleError::ResourceLimit);
+        }
+        Ok(LifecycleReply::CatalogFinalized(outcome))
     }
 
     fn apply_mutation(
@@ -2034,6 +2103,7 @@ impl StandardAgentRuntime {
             | LifecycleRequest::AcknowledgeInvocation { .. }
             | LifecycleRequest::FinalizeSystemAuthority(_)
             | LifecycleRequest::RotateSystemAuthority(_)
+            | LifecycleRequest::FinalizeCatalog(_)
             | LifecycleRequest::Authorized { .. } => Err(LifecycleError::InvalidRequest),
         }
     }
@@ -2159,7 +2229,8 @@ impl AgentRuntime for StandardAgentRuntime {
             | LifecycleRequest::RemoveLeaf { .. }
             | LifecycleRequest::UpgradeRuntime { .. } => Err(LifecycleError::InvalidRequest),
             LifecycleRequest::FinalizeSystemAuthority(_)
-            | LifecycleRequest::RotateSystemAuthority(_) => Err(LifecycleError::SystemAuthority(
+            | LifecycleRequest::RotateSystemAuthority(_)
+            | LifecycleRequest::FinalizeCatalog(_) => Err(LifecycleError::SystemAuthority(
                 super::system_authority::SystemAuthorityError::InvalidScope,
             )),
         }
@@ -2212,6 +2283,11 @@ mod tests {
         AgentAuthorityClaim, AgentAuthorityReceipt, CAPABILITY_AGENT_CREATE_SHARED,
         ED25519_SIGNATURE_BYTES,
     };
+    use crate::agent::catalog_finality::{
+        CatalogBinding, CatalogMutation, CatalogMutationDisposition, CatalogMutationIntent,
+        CatalogMutationKind, CatalogMutationResult, FinalizedCatalogMutationFact,
+        FinalizedCatalogMutationReceipt,
+    };
     use crate::agent::committee::{
         AuthorityClaimCommitment, AuthorityCommittee, AuthorityCommitteeMember,
         AuthorityMemberRole, AuthorityQuorumCertificate, AuthoritySignature, AuthoritySignerId,
@@ -2227,9 +2303,10 @@ mod tests {
         system_genesis_artifact_closure_commitment,
     };
     use crate::agent::system_authority::{
-        SystemAuthorityDecisionProof, SystemAuthorityFinalize, SystemAuthorityGenesis,
-        SystemAuthorityJournalScope, SystemAuthorityRotation, SystemAuthorityRotationCertificate,
-        SystemAuthorityRotationClaim, SystemAuthorityRotationProof,
+        SystemAuthorityCatalogFinalize, SystemAuthorityCatalogProof, SystemAuthorityDecisionProof,
+        SystemAuthorityFinalize, SystemAuthorityGenesis, SystemAuthorityJournalScope,
+        SystemAuthorityRotation, SystemAuthorityRotationCertificate, SystemAuthorityRotationClaim,
+        SystemAuthorityRotationProof,
     };
     use crate::agent::{
         AgentIdentity, AgentProfile, AgentReplica, InstallActor, LaneSet,
@@ -2237,7 +2314,8 @@ mod tests {
     };
     use crate::service::wire::ServiceWire;
     use crate::service::{
-        BlobRef, CapabilityId, CredentialId, Hash, NodeId, PrincipalId, ProducerId, SpaceId,
+        BlobRef, CapabilityId, CredentialId, Hash, NodeId, OperationId, PrincipalId, ProducerId,
+        SpaceId,
     };
     use alloc::{collections::BTreeMap, vec, vec::Vec};
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -2383,8 +2461,11 @@ mod tests {
                 RootAnchorConfigCommitment::from_bytes([0x72; 32]),
                 committee.clone(),
                 1,
+                Hash([0x75; 32]),
+                Hash([0x76; 32]),
                 decision_limit,
                 16,
+                64,
             )
             .unwrap(),
         );
@@ -2580,6 +2661,59 @@ mod tests {
         .unwrap()
     }
 
+    fn catalog_command(
+        state: &crate::agent::system_authority::SystemAuthorityState,
+        committee: &AuthorityCommittee,
+        keys: &[SigningKey],
+        operation: OperationId,
+        sequence: u64,
+        mutation_byte: u8,
+    ) -> SystemAuthorityCatalogFinalize {
+        let binding = CatalogBinding::new(
+            state.space(),
+            state.catalog_binding(),
+            state.authority_binding(),
+        )
+        .unwrap();
+        let intent = CatalogMutationIntent::new(
+            binding,
+            state.authority_generation(),
+            state.catalog_head(),
+            PrincipalId([0x81; 32]),
+            CredentialId([0x82; 32]),
+            CapabilityId([0x83; 32]),
+            operation,
+            CatalogMutation::new(CatalogMutationKind::UpdateMetadata, vec![mutation_byte; 8])
+                .unwrap(),
+        )
+        .unwrap();
+        let result = CatalogMutationResult::new(
+            CatalogMutationDisposition::Applied,
+            vec![mutation_byte.wrapping_add(1); 8],
+        )
+        .unwrap();
+        let fact = FinalizedCatalogMutationFact::new(
+            intent,
+            state.authority_generation(),
+            state.catalog_head(),
+            result,
+            sequence,
+        )
+        .unwrap();
+        let receipt = FinalizedCatalogMutationReceipt::new(
+            fact.clone(),
+            authority_certificate(committee, fact.authority_claim(), keys),
+            binding,
+            committee,
+        )
+        .unwrap();
+        SystemAuthorityCatalogFinalize::new(
+            receipt,
+            SystemAuthorityCatalogProof::vacant(operation, vec![]).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn system_authority_seed_is_exactly_bound_to_config_and_restore() {
         let (config, _, _) = system_config();
@@ -2650,6 +2784,10 @@ mod tests {
             + 32
             + 32
             + 32
+            + 32
+            + 32
+            + 32
+            + 4
             + 4
             + 4
             + 1
@@ -2680,8 +2818,11 @@ mod tests {
                 genesis.root_anchor_config(),
                 genesis.initial_committee().clone(),
                 genesis.initial_sequence(),
+                genesis.catalog_binding(),
+                genesis.initial_catalog_commitment(),
                 genesis.decision_limit() - 1,
                 genesis.rotation_limit(),
+                genesis.catalog_limit(),
             )
             .unwrap(),
         );
@@ -2933,6 +3074,104 @@ mod tests {
             panic!("rotation retry must retain rotation metadata")
         };
         assert!(!history.inserted());
+    }
+
+    #[test]
+    fn scoped_catalog_finality_matches_guest_and_keeps_retry_conflict_bounded() {
+        let (config, committee, keys) = system_config();
+        let scope = journal_scope(0x91);
+        let context = journal_context(scope);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let predecessor = runtime.system_authority().unwrap().clone();
+        let operation = OperationId([0x92; 32]);
+        let command = catalog_command(&predecessor, &committee, &keys, operation, 2, 0x93);
+        let request = LifecycleRequest::FinalizeCatalog(command.clone());
+        let before = crate::agent::wire::encode_standard_runtime_state(&runtime.snapshot());
+
+        let guest_call = crate::agent::wire::RuntimeCall::scoped_system_authority(
+            before,
+            request.clone(),
+            scope,
+        );
+        let guest_call = crate::agent::wire::RuntimeCall::decode(&guest_call.encode()).unwrap();
+        let guest = crate::agent::wire::apply_standard(guest_call).unwrap();
+        let applied = runtime.apply_scoped(context, scope, request.clone());
+        assert_eq!(applied.result(), &guest.result);
+        assert_eq!(
+            crate::agent::wire::encode_standard_runtime_state(&runtime.snapshot()),
+            guest.state
+        );
+        let StandardSystemAuthorityWrite::Catalog {
+            record: Some(record),
+            history,
+        } = applied.system_authority_write().unwrap()
+        else {
+            panic!("fresh catalog finality must return its permanent record and history")
+        };
+        assert!(history.inserted());
+        assert_eq!(record.receipt(), command.receipt());
+        let nodes = history
+            .nodes()
+            .iter()
+            .map(|node| (node.id(), node.encode()))
+            .collect::<BTreeMap<_, _>>();
+        let occupied = crate::agent::system_authority::prove_catalog(
+            runtime.system_authority().unwrap().catalog_history_root(),
+            operation,
+            |id| Ok::<_, ()>(nodes.get(&id).cloned()),
+        )
+        .unwrap();
+        assert_eq!(occupied.occupied_record_id(), Some(record.id()));
+
+        let retry =
+            SystemAuthorityCatalogFinalize::new(command.receipt().clone(), occupied.clone())
+                .unwrap();
+        let retry_request = LifecycleRequest::FinalizeCatalog(retry);
+        assert_eq!(request.commitment(), retry_request.commitment());
+        let stable = crate::agent::wire::encode_standard_runtime_state(&runtime.snapshot());
+        let retried = runtime.apply_scoped(context, scope, retry_request);
+        assert!(matches!(
+            retried.result(),
+            Ok(LifecycleReply::CatalogFinalized(outcome)) if outcome.exact_retry()
+        ));
+        let StandardSystemAuthorityWrite::Catalog {
+            record: Some(retry_record),
+            history: retry_history,
+        } = retried.system_authority_write().unwrap()
+        else {
+            panic!("catalog retry must retain the exact permanent record identity")
+        };
+        assert_eq!(retry_record.id(), record.id());
+        assert!(!retry_history.inserted());
+        assert_eq!(
+            crate::agent::wire::encode_standard_runtime_state(&runtime.snapshot()),
+            stable
+        );
+
+        let divergent = catalog_command(&predecessor, &committee, &keys, operation, 2, 0x94);
+        let conflict =
+            SystemAuthorityCatalogFinalize::new(divergent.receipt().clone(), occupied).unwrap();
+        let conflicted =
+            runtime.apply_scoped(context, scope, LifecycleRequest::FinalizeCatalog(conflict));
+        assert!(matches!(
+            conflicted.result(),
+            Ok(LifecycleReply::CatalogFinalized(outcome))
+                if outcome.operation_conflicted()
+                    && outcome.occupied_record_id() == Some(record.id())
+        ));
+        let StandardSystemAuthorityWrite::Catalog {
+            record: None,
+            history: conflict_history,
+        } = conflicted.system_authority_write().unwrap()
+        else {
+            panic!("catalog conflict must expose only the bounded occupied record ID")
+        };
+        assert!(!conflict_history.inserted());
+        assert_eq!(
+            crate::agent::wire::encode_standard_runtime_state(&runtime.snapshot()),
+            stable
+        );
     }
 
     #[test]

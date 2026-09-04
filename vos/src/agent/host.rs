@@ -5007,6 +5007,9 @@ mod tests {
             root_record.config_commitment(),
             committee.clone(),
             1,
+            Hash([0x75; 32]),
+            Hash([0x76; 32]),
+            8,
             8,
             8,
         )

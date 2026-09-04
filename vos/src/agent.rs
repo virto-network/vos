@@ -46,7 +46,7 @@ use crate::service::{
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260904r7");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260904r8");
 
 /// Consensus-visible execution semantics for standard-PVM agent packages.
 ///
@@ -55,7 +55,8 @@ pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260904r7");
 /// capability-manifest profile, while Agent Actor and AgentRuntime packages
 /// execute the standard SPI profile. A semantics change in one profile must
 /// not silently accept—or unnecessarily invalidate—packages for the other
-/// profile. Generation `r03` additionally binds exact durable terminal and
+/// profile. Generation `r05` adds globally ordered, quorum-certified catalog
+/// finalization to Standard Control. Generation `r03` additionally binds exact durable terminal and
 /// execution-error outcomes to their authenticated invocation ownership and
 /// acknowledgement protocol. Generation `r02` introduced the full v0.8
 /// reorder-buffer gas scheduler, full-Ψ deblob/entry failure boundary, and
@@ -64,7 +65,7 @@ pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260904r7");
 /// context and the root-seeded live system-authority state machine to
 /// Standard Control; its direct finalize/rotate operations are therefore
 /// incompatible with every earlier Standard runtime image.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r04");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r05");
 
 /// Maximum bytes named by one content-addressed artifact reference in an
 /// authenticated Agent catalog closure.
@@ -570,6 +571,11 @@ pub enum LifecycleRequest {
     /// Rotate the live system-authority committee under the retiring and
     /// incoming committees' joint certificate.
     RotateSystemAuthority(system_authority::SystemAuthorityRotation),
+    /// Finalize one exact catalog mutation result in the root system Agent's
+    /// globally ordered authority state. The embedded QC is the authority;
+    /// the sparse proof is replaceable transport evidence for permanent
+    /// OperationId membership and must not be wrapped in a lifecycle receipt.
+    FinalizeCatalog(system_authority::SystemAuthorityCatalogFinalize),
     /// Authority-signed lifecycle operation. The bundled runtime verifies
     /// its sequence exactly once and retains a bounded durable disposition so
     /// retries cannot reapply an older transition after later operations.
@@ -614,6 +620,7 @@ impl LifecycleRequest {
             | Self::AcknowledgeInvocation { .. }
             | Self::FinalizeSystemAuthority(_)
             | Self::RotateSystemAuthority(_)
+            | Self::FinalizeCatalog(_)
             | Self::Authorized { .. } => None,
         }
     }
@@ -628,6 +635,7 @@ impl LifecycleRequest {
         match self {
             Self::FinalizeSystemAuthority(finalize) => return finalize.operation_commitment(),
             Self::RotateSystemAuthority(rotation) => return rotation.operation_commitment(),
+            Self::FinalizeCatalog(finalize) => return finalize.operation_commitment(),
             _ => {}
         }
         let call = wire::RuntimeCall::new(wire::RuntimeState::default(), self.clone());
@@ -680,6 +688,7 @@ pub enum LifecycleReply {
         epoch: u64,
         exact_retry: bool,
     },
+    CatalogFinalized(system_authority::SystemAuthorityCatalogFinalizeOutcome),
 }
 
 /// Public Rust contract custom agent runtimes implement. The PVM entry glue

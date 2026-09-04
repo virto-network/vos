@@ -2766,7 +2766,9 @@ fn validate_management_request(
     // would create a second, drifting authority domain.
     if matches!(
         request,
-        LifecycleRequest::FinalizeSystemAuthority(_) | LifecycleRequest::RotateSystemAuthority(_)
+        LifecycleRequest::FinalizeSystemAuthority(_)
+            | LifecycleRequest::RotateSystemAuthority(_)
+            | LifecycleRequest::FinalizeCatalog(_)
     ) {
         return Ok(());
     }
@@ -2780,6 +2782,7 @@ fn validate_management_request(
             | LifecycleRequest::AcknowledgeInvocation { .. }
             | LifecycleRequest::FinalizeSystemAuthority(_)
             | LifecycleRequest::RotateSystemAuthority(_)
+            | LifecycleRequest::FinalizeCatalog(_)
             | LifecycleRequest::Authorized { .. }
     ) {
         return Err(DecodeError::NonCanonical);

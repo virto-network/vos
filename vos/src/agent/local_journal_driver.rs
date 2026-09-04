@@ -45,8 +45,9 @@ use super::replay::{
 };
 #[cfg(all(feature = "storage", target_os = "linux"))]
 use super::replay::{
-    PendingSystemAuthorityRotationRecovery, SystemAuthorityRecoveryError,
-    materialize_current_reverified, materialized_system_authority_view,
+    PendingSystemAuthorityCatalogRecovery, PendingSystemAuthorityRotationRecovery,
+    SystemAuthorityRecoveryError, materialize_current_reverified,
+    materialized_system_authority_view, recover_pending_system_authority_catalog,
     recover_pending_system_authority_rotation,
 };
 use super::standard::{StandardAgentRuntime, StandardRuntimeState};
@@ -847,6 +848,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             | LifecycleRequest::RemoveLeaf { .. }
             | LifecycleRequest::FinalizeSystemAuthority(_)
             | LifecycleRequest::RotateSystemAuthority(_)
+            | LifecycleRequest::FinalizeCatalog(_)
             | LifecycleRequest::Authorized { .. } => Vec::new(),
         };
         let mut expected_by_id = BTreeMap::new();
@@ -987,7 +989,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             | LifecycleRequest::AcknowledgeInvocation { .. }
             | LifecycleRequest::RemoveLeaf { .. }
             | LifecycleRequest::FinalizeSystemAuthority(_)
-            | LifecycleRequest::RotateSystemAuthority(_) => {}
+            | LifecycleRequest::RotateSystemAuthority(_)
+            | LifecycleRequest::FinalizeCatalog(_) => {}
             LifecycleRequest::Authorized { .. } => {
                 return Err(LocalReplayExecutorError::InvalidRequest);
             }
@@ -1039,7 +1042,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
     ) -> Result<(), LocalReplayExecutorError> {
         let (admission, request) = match request {
             LifecycleRequest::FinalizeSystemAuthority(_)
-            | LifecycleRequest::RotateSystemAuthority(_) => return Ok(()),
+            | LifecycleRequest::RotateSystemAuthority(_)
+            | LifecycleRequest::FinalizeCatalog(_) => return Ok(()),
             LifecycleRequest::Authorized { admission, request } => (admission, request),
             _ => return Err(LocalReplayExecutorError::InvalidRequest),
         };
@@ -1340,6 +1344,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                     request,
                     LifecycleRequest::FinalizeSystemAuthority(_)
                         | LifecycleRequest::RotateSystemAuthority(_)
+                        | LifecycleRequest::FinalizeCatalog(_)
                 );
                 if direct_system_authority != journal_context.is_some() {
                     return Err(LocalReplayExecutorError::InvalidState);
@@ -2128,6 +2133,7 @@ where
                 | LifecycleRequest::AcknowledgeInvocation { .. }
                 | LifecycleRequest::FinalizeSystemAuthority(_)
                 | LifecycleRequest::RotateSystemAuthority(_)
+                | LifecycleRequest::FinalizeCatalog(_)
                 | LifecycleRequest::Authorized { .. }
         ) {
             return Err(LocalReplayExecutorError::InvalidRequest.into());
@@ -2395,6 +2401,7 @@ where
                 | LifecycleRequest::AcknowledgeInvocation { .. }
                 | LifecycleRequest::FinalizeSystemAuthority(_)
                 | LifecycleRequest::RotateSystemAuthority(_)
+                | LifecycleRequest::FinalizeCatalog(_)
                 | LifecycleRequest::Authorized { .. }
         ) {
             return Err(LocalReplayExecutorError::InvalidRequest.into());
@@ -3329,9 +3336,10 @@ where
     }
 
     /// Rebuild a reverified root materialization and reconcile any exact
-    /// pending rotation before exposing a mutable driver. This path uses only
-    /// the signer-independent route owner; a predecessor without durable
-    /// intent stays quarantined and no driver is returned.
+    /// pending rotation or catalog publication before exposing a mutable
+    /// driver. This path uses only the signer-independent route owner; a
+    /// predecessor without durable intent stays quarantined and no driver is
+    /// returned.
     pub(crate) fn open_reverified_with_owner(
         mut store: S,
         trust: Arc<dyn AgentTrustProvider>,
@@ -3350,23 +3358,47 @@ where
                 Self::validate_route_owner(&store, &current, authority)?;
                 let materialization = match owner.recover_pending_claim()? {
                     None => current,
-                    Some(pending) => match recover_pending_system_authority_rotation(
-                        &mut store,
-                        &mut executor,
-                        current,
-                        pending,
-                        owner,
-                    )
-                    .map_err(map_system_authority_recovery_error)?
-                    {
-                        PendingSystemAuthorityRotationRecovery::Pending(_quarantine) => {
-                            return Err(LocalJournalDriverError::AuthorityRecoveryRequired);
+                    Some(pending) if pending.catalog_request().is_some() => {
+                        match recover_pending_system_authority_catalog(
+                            &mut store,
+                            &mut executor,
+                            current,
+                            pending,
+                            owner,
+                        )
+                        .map_err(map_system_authority_recovery_error)?
+                        {
+                            PendingSystemAuthorityCatalogRecovery::Pending(_quarantine) => {
+                                return Err(LocalJournalDriverError::AuthorityRecoveryRequired);
+                            }
+                            PendingSystemAuthorityCatalogRecovery::Retired(retired) => {
+                                let (_publication, materialization, _executions) =
+                                    retired.into_parts();
+                                materialization
+                            }
                         }
-                        PendingSystemAuthorityRotationRecovery::Retired(retired) => {
-                            let (_publication, materialization, _executions) = retired.into_parts();
-                            materialization
+                    }
+                    Some(pending) if pending.rotation_request().is_some() => {
+                        match recover_pending_system_authority_rotation(
+                            &mut store,
+                            &mut executor,
+                            current,
+                            pending,
+                            owner,
+                        )
+                        .map_err(map_system_authority_recovery_error)?
+                        {
+                            PendingSystemAuthorityRotationRecovery::Pending(_quarantine) => {
+                                return Err(LocalJournalDriverError::AuthorityRecoveryRequired);
+                            }
+                            PendingSystemAuthorityRotationRecovery::Retired(retired) => {
+                                let (_publication, materialization, _executions) =
+                                    retired.into_parts();
+                                materialization
+                            }
                         }
-                    },
+                    }
+                    Some(_) => return Err(LocalJournalDriverError::AuthorityLedger),
                 };
                 Self::validate_route_owner(&store, &materialization, authority)?;
                 let (_, replayed_authority) =
@@ -3931,6 +3963,9 @@ mod tests {
                 root.config_commitment(),
                 root.initial_committee().clone(),
                 1,
+                Hash([0x75; 32]),
+                Hash([0x76; 32]),
+                8,
                 8,
                 8,
             )
@@ -4113,6 +4148,9 @@ mod tests {
                 divergent_record.config_commitment(),
                 divergent_record.initial_committee().clone(),
                 1,
+                Hash([0x75; 32]),
+                Hash([0x76; 32]),
+                8,
                 8,
                 8,
             )
@@ -4143,8 +4181,11 @@ mod tests {
                 marker.root_anchor_config(),
                 marker.initial_committee().clone(),
                 2,
+                marker.catalog_binding(),
+                marker.initial_catalog_commitment(),
                 marker.decision_limit(),
                 marker.rotation_limit(),
+                marker.catalog_limit(),
             )
             .unwrap(),
         );

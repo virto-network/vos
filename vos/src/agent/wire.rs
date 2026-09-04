@@ -1454,6 +1454,10 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             encoder.u8(11);
             encoder.bytes(&rotation.encode());
         }
+        LifecycleRequest::FinalizeCatalog(finalize) => {
+            encoder.u8(12);
+            encoder.bytes(&finalize.encode());
+        }
         LifecycleRequest::Authorized { admission, request } => {
             encoder.u8(9);
             encoder.bytes(&admission.receipt.encode());
@@ -1572,6 +1576,15 @@ fn decode_request_at_depth(
                 super::system_authority::SystemAuthorityRotation::decode(bytes)?,
             ))
         }
+        12 => {
+            let bytes = decoder.bytes_ref()?;
+            if bytes.len() > super::system_authority::MAX_SYSTEM_AUTHORITY_CATALOG_FINALIZE_BYTES {
+                return Err(DecodeError::LimitExceeded);
+            }
+            Ok(LifecycleRequest::FinalizeCatalog(
+                super::system_authority::SystemAuthorityCatalogFinalize::decode(bytes)?,
+            ))
+        }
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -1644,6 +1657,41 @@ fn encode_reply(encoder: &mut Encoder<'_>, reply: &LifecycleReply) {
             encoder.u64(*epoch);
             encoder.bool(*exact_retry);
         }
+        LifecycleReply::CatalogFinalized(outcome) => {
+            use super::system_authority::SystemAuthorityCatalogFinalizeOutcome;
+            encoder.u8(11);
+            match outcome {
+                SystemAuthorityCatalogFinalizeOutcome::Finalized {
+                    operation,
+                    result,
+                    catalog_head,
+                    authority_generation,
+                    sequence,
+                }
+                | SystemAuthorityCatalogFinalizeOutcome::ExactRetry {
+                    operation,
+                    result,
+                    catalog_head,
+                    authority_generation,
+                    sequence,
+                } => {
+                    encoder.u8(if outcome.exact_retry() { 1 } else { 0 });
+                    encoder.fixed(&operation.0);
+                    encoder.fixed(&result.0);
+                    encoder.fixed(&catalog_head.0);
+                    encoder.fixed(&authority_generation.0);
+                    encoder.u64(*sequence);
+                }
+                SystemAuthorityCatalogFinalizeOutcome::OperationConflict {
+                    operation,
+                    occupied_record,
+                } => {
+                    encoder.u8(2);
+                    encoder.fixed(&operation.0);
+                    encoder.fixed(occupied_record.as_bytes());
+                }
+            }
+        }
     }
 }
 
@@ -1689,6 +1737,63 @@ fn decode_reply(decoder: &mut Decoder<'_>) -> Result<LifecycleReply, DecodeError
                 epoch,
                 exact_retry,
             })
+        }
+        11 => {
+            use super::system_authority::SystemAuthorityCatalogFinalizeOutcome;
+            let disposition = decoder.u8()?;
+            let operation = crate::service::OperationId(decoder.fixed()?);
+            if operation == crate::service::OperationId::ZERO {
+                return Err(DecodeError::NonCanonical);
+            }
+            let outcome = match disposition {
+                0 | 1 => {
+                    let result = crate::service::Hash(decoder.fixed()?);
+                    let catalog_head = crate::service::Hash(decoder.fixed()?);
+                    let authority_generation = crate::service::Hash(decoder.fixed()?);
+                    let sequence = decoder.u64()?;
+                    if result == crate::service::Hash::ZERO
+                        || catalog_head == crate::service::Hash::ZERO
+                        || authority_generation == crate::service::Hash::ZERO
+                        || sequence == 0
+                    {
+                        return Err(DecodeError::NonCanonical);
+                    }
+                    if disposition == 0 {
+                        SystemAuthorityCatalogFinalizeOutcome::Finalized {
+                            operation,
+                            result,
+                            catalog_head,
+                            authority_generation,
+                            sequence,
+                        }
+                    } else {
+                        SystemAuthorityCatalogFinalizeOutcome::ExactRetry {
+                            operation,
+                            result,
+                            catalog_head,
+                            authority_generation,
+                            sequence,
+                        }
+                    }
+                }
+                2 => {
+                    let occupied_record =
+                        super::system_authority::SystemAuthorityCatalogRecordId::from_bytes(
+                            decoder.fixed()?,
+                        );
+                    if occupied_record
+                        == super::system_authority::SystemAuthorityCatalogRecordId::ZERO
+                    {
+                        return Err(DecodeError::NonCanonical);
+                    }
+                    SystemAuthorityCatalogFinalizeOutcome::OperationConflict {
+                        operation,
+                        occupied_record,
+                    }
+                }
+                _ => return Err(DecodeError::InvalidTag),
+            };
+            Ok(LifecycleReply::CatalogFinalized(outcome))
         }
         _ => Err(DecodeError::InvalidTag),
     }
@@ -1776,6 +1881,18 @@ fn encode_system_authority_error(
             encode_agent_genesis_error(encoder, error);
             return;
         }
+        SystemAuthorityError::InvalidCatalogRecord => 18,
+        SystemAuthorityError::InvalidCatalogNode => 19,
+        SystemAuthorityError::InvalidCatalogProof => 20,
+        SystemAuthorityError::InvalidCatalogFinalize => 21,
+        SystemAuthorityError::StaleAuthorityGeneration => 22,
+        SystemAuthorityError::StaleCatalogHead => 23,
+        SystemAuthorityError::CatalogOperationConflict => 24,
+        SystemAuthorityError::Catalog(error) => {
+            encoder.u8(25);
+            encode_catalog_finality_error(encoder, error);
+            return;
+        }
     };
     encoder.u8(tag);
 }
@@ -1803,6 +1920,55 @@ fn decode_system_authority_error(
         15 => SystemAuthorityError::LimitExceeded,
         16 => SystemAuthorityError::Authority(decode_authority_committee_error(decoder)?),
         17 => SystemAuthorityError::Genesis(decode_agent_genesis_error(decoder)?),
+        18 => SystemAuthorityError::InvalidCatalogRecord,
+        19 => SystemAuthorityError::InvalidCatalogNode,
+        20 => SystemAuthorityError::InvalidCatalogProof,
+        21 => SystemAuthorityError::InvalidCatalogFinalize,
+        22 => SystemAuthorityError::StaleAuthorityGeneration,
+        23 => SystemAuthorityError::StaleCatalogHead,
+        24 => SystemAuthorityError::CatalogOperationConflict,
+        25 => SystemAuthorityError::Catalog(decode_catalog_finality_error(decoder)?),
+        _ => return Err(DecodeError::InvalidTag),
+    })
+}
+
+fn encode_catalog_finality_error(
+    encoder: &mut Encoder<'_>,
+    error: super::catalog_finality::CatalogFinalityError,
+) {
+    use super::catalog_finality::CatalogFinalityError;
+    let tag = match error {
+        CatalogFinalityError::InvalidBinding => 0,
+        CatalogFinalityError::InvalidMutation => 1,
+        CatalogFinalityError::InvalidResult => 2,
+        CatalogFinalityError::InvalidIntent => 3,
+        CatalogFinalityError::InvalidFact => 4,
+        CatalogFinalityError::InvalidReceipt => 5,
+        CatalogFinalityError::WrongSpace => 6,
+        CatalogFinalityError::LimitExceeded => 7,
+        CatalogFinalityError::Authority(error) => {
+            encoder.u8(8);
+            encode_authority_committee_error(encoder, error);
+            return;
+        }
+    };
+    encoder.u8(tag);
+}
+
+fn decode_catalog_finality_error(
+    decoder: &mut Decoder<'_>,
+) -> Result<super::catalog_finality::CatalogFinalityError, DecodeError> {
+    use super::catalog_finality::CatalogFinalityError;
+    Ok(match decoder.u8()? {
+        0 => CatalogFinalityError::InvalidBinding,
+        1 => CatalogFinalityError::InvalidMutation,
+        2 => CatalogFinalityError::InvalidResult,
+        3 => CatalogFinalityError::InvalidIntent,
+        4 => CatalogFinalityError::InvalidFact,
+        5 => CatalogFinalityError::InvalidReceipt,
+        6 => CatalogFinalityError::WrongSpace,
+        7 => CatalogFinalityError::LimitExceeded,
+        8 => CatalogFinalityError::Authority(decode_authority_committee_error(decoder)?),
         _ => return Err(DecodeError::InvalidTag),
     })
 }
@@ -3173,6 +3339,10 @@ mod tests {
                 11,
                 super::super::system_authority::MAX_SYSTEM_AUTHORITY_ROTATION_BYTES,
             ),
+            (
+                12,
+                super::super::system_authority::MAX_SYSTEM_AUTHORITY_CATALOG_FINALIZE_BYTES,
+            ),
         ] {
             let mut encoded = Vec::new();
             encoded.extend_from_slice(&RuntimeCall::MAGIC);
@@ -3576,6 +3746,7 @@ mod tests {
         };
         assert_eq!(RuntimeReturn::decode(&output.encode()).unwrap(), output);
 
+        use super::super::catalog_finality::CatalogFinalityError as CatalogError;
         use super::super::committee::AuthorityCommitteeError as CommitteeError;
         use super::super::genesis::AgentGenesisError as GenesisError;
         use super::super::system_authority::SystemAuthorityError as AuthorityError;
@@ -3589,15 +3760,36 @@ mod tests {
             AuthorityError::InvalidDecisionProof,
             AuthorityError::InvalidRotationNode,
             AuthorityError::InvalidRotationProof,
+            AuthorityError::InvalidCatalogRecord,
+            AuthorityError::InvalidCatalogNode,
+            AuthorityError::InvalidCatalogProof,
+            AuthorityError::InvalidCatalogFinalize,
             AuthorityError::InvalidFinalize,
             AuthorityError::InvalidProvision,
             AuthorityError::WrongSystemAgent,
             AuthorityError::StaleCommittee,
+            AuthorityError::StaleAuthorityGeneration,
+            AuthorityError::StaleCatalogHead,
+            AuthorityError::CatalogOperationConflict,
             AuthorityError::SequenceConflict,
             AuthorityError::RotationFirstSequencePending,
             AuthorityError::Capacity,
             AuthorityError::LimitExceeded,
         ];
+        errors.extend(
+            [
+                CatalogError::InvalidBinding,
+                CatalogError::InvalidMutation,
+                CatalogError::InvalidResult,
+                CatalogError::InvalidIntent,
+                CatalogError::InvalidFact,
+                CatalogError::InvalidReceipt,
+                CatalogError::WrongSpace,
+                CatalogError::LimitExceeded,
+                CatalogError::Authority(CommitteeError::WrongClaim),
+            ]
+            .map(AuthorityError::Catalog),
+        );
         errors.extend(
             [
                 CommitteeError::InvalidBinding,
@@ -3665,10 +3857,46 @@ mod tests {
     }
 
     #[test]
+    fn catalog_finalize_outcomes_round_trip_without_expanding_conflicts() {
+        use super::super::system_authority::{
+            SystemAuthorityCatalogFinalizeOutcome, SystemAuthorityCatalogRecordId,
+        };
+
+        let operation = crate::service::OperationId([0x81; 32]);
+        let outcomes = [
+            SystemAuthorityCatalogFinalizeOutcome::Finalized {
+                operation,
+                result: Hash([0x82; 32]),
+                catalog_head: Hash([0x83; 32]),
+                authority_generation: Hash([0x84; 32]),
+                sequence: 17,
+            },
+            SystemAuthorityCatalogFinalizeOutcome::ExactRetry {
+                operation,
+                result: Hash([0x82; 32]),
+                catalog_head: Hash([0x83; 32]),
+                authority_generation: Hash([0x84; 32]),
+                sequence: 17,
+            },
+            SystemAuthorityCatalogFinalizeOutcome::OperationConflict {
+                operation,
+                occupied_record: SystemAuthorityCatalogRecordId::from_bytes([0x85; 32]),
+            },
+        ];
+        for outcome in outcomes {
+            let output = RuntimeReturn {
+                state: RuntimeState::default(),
+                result: Ok(LifecycleReply::CatalogFinalized(outcome)),
+            };
+            assert_eq!(RuntimeReturn::decode(&output.encode()), Ok(output));
+        }
+    }
+
+    #[test]
     fn immediate_prior_runtime_abi_is_rejected_without_a_compatibility_decoder() {
         let mut bytes =
             RuntimeCall::new(RuntimeState::default(), LifecycleRequest::Create(config())).encode();
-        bytes[36..68].copy_from_slice(b"vos-agent-runtime-abi-20260831r6");
+        bytes[36..68].copy_from_slice(b"vos-agent-runtime-abi-20260904r7");
         assert_eq!(
             RuntimeCall::decode(&bytes),
             Err(DecodeError::InvalidPlatform)

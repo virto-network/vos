@@ -1397,6 +1397,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             LifecycleRequest::UpgradeRuntime { .. }
                 | LifecycleRequest::FinalizeSystemAuthority(_)
                 | LifecycleRequest::RotateSystemAuthority(_)
+                | LifecycleRequest::FinalizeCatalog(_)
         ) {
             return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
         }

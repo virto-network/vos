@@ -72,12 +72,15 @@ use super::shared_commit::{MAX_ORDERED_COMMIT_CLAIM_BYTES, OrderedCommitClaim};
 use super::shared_raft::JournalStoreInstanceId;
 use super::standard::StandardSystemAuthorityWrite;
 use super::system_authority::{
+    MAX_SYSTEM_AUTHORITY_CATALOG_NODE_BYTES, MAX_SYSTEM_AUTHORITY_CATALOG_RECORD_BYTES,
+    MAX_SYSTEM_AUTHORITY_CATALOG_RECORDS, MAX_SYSTEM_AUTHORITY_CATALOG_TREE_NODES,
     MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORD_BYTES, MAX_SYSTEM_AUTHORITY_DECISION_NODE_BYTES,
     MAX_SYSTEM_AUTHORITY_DECISION_TREE_NODES, MAX_SYSTEM_AUTHORITY_ROTATION_NODE_BYTES,
     MAX_SYSTEM_AUTHORITY_ROTATION_TREE_NODES, MAX_SYSTEM_AUTHORITY_ROTATIONS,
-    SystemAuthorityCommitteeId, SystemAuthorityCommitteeRecord, SystemAuthorityDecisionNode,
-    SystemAuthorityDecisionNodeId, SystemAuthorityRotationNode, SystemAuthorityRotationNodeId,
-    prove_rotation,
+    SystemAuthorityCatalogNode, SystemAuthorityCatalogNodeId, SystemAuthorityCatalogRecord,
+    SystemAuthorityCatalogRecordId, SystemAuthorityCommitteeId, SystemAuthorityCommitteeRecord,
+    SystemAuthorityDecisionNode, SystemAuthorityDecisionNodeId, SystemAuthorityRotationNode,
+    SystemAuthorityRotationNodeId, prove_catalog, prove_rotation,
 };
 #[cfg(all(target_os = "linux", feature = "storage"))]
 use super::system_authority_ledger::{SystemAuthorityLedgerError, SystemAuthorityLedgerRouteOwner};
@@ -262,6 +265,26 @@ pub(crate) trait SystemAuthorityHistoryStore: AgentJournalStore {
         node: &SystemAuthorityRotationNode,
     ) -> Result<(), JournalStoreError>;
 
+    fn load_system_authority_catalog_node(
+        &self,
+        id: SystemAuthorityCatalogNodeId,
+    ) -> Result<Option<SystemAuthorityCatalogNode>, JournalStoreError>;
+
+    fn persist_system_authority_catalog_node(
+        &mut self,
+        node: &SystemAuthorityCatalogNode,
+    ) -> Result<(), JournalStoreError>;
+
+    fn load_system_authority_catalog_record(
+        &self,
+        id: SystemAuthorityCatalogRecordId,
+    ) -> Result<Option<SystemAuthorityCatalogRecord>, JournalStoreError>;
+
+    fn persist_system_authority_catalog_record(
+        &mut self,
+        record: &SystemAuthorityCatalogRecord,
+    ) -> Result<(), JournalStoreError>;
+
     fn load_system_authority_committee_record(
         &self,
         id: SystemAuthorityCommitteeId,
@@ -323,6 +346,8 @@ pub(crate) struct SystemAuthorityHistoryScrubReport {
     pub(crate) bytes_read: u64,
     pub(crate) decision_records: usize,
     pub(crate) rotation_records: usize,
+    pub(crate) catalog_nodes: usize,
+    pub(crate) catalog_records: usize,
     pub(crate) committee_records: usize,
 }
 
@@ -1246,6 +1271,8 @@ enum AuthorityStorageClass {
     GenesisAdmission,
     SystemDecision,
     SystemRotation,
+    SystemCatalogNode,
+    SystemCatalogRecord,
     SystemCommittee,
 }
 
@@ -1289,6 +1316,8 @@ impl CanonicalAuthorityRecord for AgentGenesisAdmissionRecord {
 
 const AUTHORITY_SYSTEM_DECISIONS_DIRECTORY: &str = "authority/system-decisions";
 const AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY: &str = "authority/system-rotations";
+const AUTHORITY_SYSTEM_CATALOG_NODES_DIRECTORY: &str = "authority/system-catalog-nodes";
+const AUTHORITY_SYSTEM_CATALOG_RECORDS_DIRECTORY: &str = "authority/system-catalog-records";
 const AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY: &str = "authority/system-committees";
 const MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORDS: usize = MAX_SYSTEM_AUTHORITY_ROTATIONS as usize + 1;
 
@@ -1306,6 +1335,26 @@ impl CanonicalAuthorityRecord for SystemAuthorityRotationNode {
     const STORAGE_CLASS: AuthorityStorageClass = AuthorityStorageClass::SystemRotation;
     const DIRECTORY: &'static str = AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY;
     const MAXIMUM: usize = MAX_SYSTEM_AUTHORITY_ROTATION_NODE_BYTES;
+
+    fn storage_id(&self) -> [u8; 32] {
+        *self.id().as_bytes()
+    }
+}
+
+impl CanonicalAuthorityRecord for SystemAuthorityCatalogNode {
+    const STORAGE_CLASS: AuthorityStorageClass = AuthorityStorageClass::SystemCatalogNode;
+    const DIRECTORY: &'static str = AUTHORITY_SYSTEM_CATALOG_NODES_DIRECTORY;
+    const MAXIMUM: usize = MAX_SYSTEM_AUTHORITY_CATALOG_NODE_BYTES;
+
+    fn storage_id(&self) -> [u8; 32] {
+        *self.id().as_bytes()
+    }
+}
+
+impl CanonicalAuthorityRecord for SystemAuthorityCatalogRecord {
+    const STORAGE_CLASS: AuthorityStorageClass = AuthorityStorageClass::SystemCatalogRecord;
+    const DIRECTORY: &'static str = AUTHORITY_SYSTEM_CATALOG_RECORDS_DIRECTORY;
+    const MAXIMUM: usize = MAX_SYSTEM_AUTHORITY_CATALOG_RECORD_BYTES;
 
     fn storage_id(&self) -> [u8; 32] {
         *self.id().as_bytes()
@@ -3262,6 +3311,22 @@ impl AuthorityRecordId for SystemAuthorityRotationNode {
     }
 }
 
+impl AuthorityRecordId for SystemAuthorityCatalogNode {
+    type Id = SystemAuthorityCatalogNodeId;
+
+    fn authority_id(&self) -> Self::Id {
+        self.id()
+    }
+}
+
+impl AuthorityRecordId for SystemAuthorityCatalogRecord {
+    type Id = SystemAuthorityCatalogRecordId;
+
+    fn authority_id(&self) -> Self::Id {
+        self.id()
+    }
+}
+
 impl AuthorityRecordId for SystemAuthorityCommitteeRecord {
     type Id = SystemAuthorityCommitteeId;
 
@@ -3279,6 +3344,183 @@ fn validate_authority_committee_closure(
     Ok(())
 }
 
+const MAX_SYSTEM_AUTHORITY_CATALOG_PATH_NODES: usize = 257;
+
+fn catalog_outcome_matches_record(
+    outcome: super::system_authority::SystemAuthorityCatalogFinalizeOutcome,
+    record: &SystemAuthorityCatalogRecord,
+    exact_retry: bool,
+) -> bool {
+    let fact = record.receipt().fact();
+    outcome.operation() == record.operation_id()
+        && outcome.result() == Some(fact.result().commitment())
+        && outcome.catalog_head() == Some(fact.resulting_catalog_head())
+        && outcome.authority_generation() == Some(fact.resulting_authority_generation())
+        && outcome.sequence() == Some(fact.sequence())
+        && outcome.exact_retry() == exact_retry
+        && !outcome.operation_conflicted()
+}
+
+fn load_catalog_record_required<S: SystemAuthorityHistoryStore>(
+    store: &S,
+    id: SystemAuthorityCatalogRecordId,
+) -> Result<SystemAuthorityCatalogRecord, JournalStoreError> {
+    store
+        .load_system_authority_catalog_record(id)?
+        .ok_or(JournalStoreError::MissingObject)
+}
+
+fn prove_stored_catalog<S: SystemAuthorityHistoryStore>(
+    store: &S,
+    root: SystemAuthorityCatalogNodeId,
+    operation: crate::service::OperationId,
+) -> Result<super::system_authority::SystemAuthorityCatalogProof, JournalStoreError> {
+    prove_catalog(root, operation, |id| {
+        store
+            .load_system_authority_catalog_node(id)
+            .map(|node| node.map(|node| node.encode()))
+    })
+    .map_err(|_| JournalStoreError::Corrupt)
+}
+
+fn stage_system_authority_catalog_dependencies<S: SystemAuthorityHistoryStore>(
+    store: &mut S,
+    command: &super::system_authority::SystemAuthorityCatalogFinalize,
+    record: Option<&SystemAuthorityCatalogRecord>,
+    history: &super::system_authority::SystemAuthorityCatalogWritePlan,
+    outcome: super::system_authority::SystemAuthorityCatalogFinalizeOutcome,
+) -> Result<bool, JournalStoreError> {
+    command
+        .validate()
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+    let operation = command.operation_id();
+    if outcome.operation() != operation
+        || history.previous_root() == SystemAuthorityCatalogNodeId::ZERO
+        || history.root() == SystemAuthorityCatalogNodeId::ZERO
+        || command
+            .proof()
+            .root()
+            .map_err(|_| JournalStoreError::NonCanonical)?
+            != history.previous_root()
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+
+    let prior = prove_stored_catalog(store, history.previous_root(), operation)?;
+    if &prior != command.proof() {
+        return Err(JournalStoreError::Corrupt);
+    }
+
+    if !history.inserted() {
+        if history.root() != history.previous_root()
+            || !history.nodes().is_empty()
+            || !history.retired_node_ids().is_empty()
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let occupied = command
+            .proof()
+            .occupied_record_id()
+            .ok_or(JournalStoreError::NonCanonical)?;
+        let stored = load_catalog_record_required(store, occupied)?;
+        if stored.operation_id() != operation {
+            return Err(JournalStoreError::Corrupt);
+        }
+        return match record {
+            Some(record)
+                if occupied == record.id()
+                    && stored == *record
+                    && record.receipt() == command.receipt()
+                    && catalog_outcome_matches_record(outcome, record, true) =>
+            {
+                Ok(false)
+            }
+            None if outcome.operation_conflicted()
+                && outcome.occupied_record_id() == Some(occupied)
+                && stored.receipt() != command.receipt() =>
+            {
+                Ok(false)
+            }
+            _ => Err(JournalStoreError::NonCanonical),
+        };
+    }
+
+    let record = record.ok_or(JournalStoreError::NonCanonical)?;
+    if command.proof().occupied_record_id().is_some()
+        || outcome.operation_conflicted()
+        || outcome.exact_retry()
+        || record.receipt() != command.receipt()
+        || !catalog_outcome_matches_record(outcome, record, false)
+        || history.root() == history.previous_root()
+        || history.nodes().len() != MAX_SYSTEM_AUTHORITY_CATALOG_PATH_NODES
+        || history.retired_node_ids().len() >= MAX_SYSTEM_AUTHORITY_CATALOG_PATH_NODES
+        || history
+            .nodes()
+            .windows(2)
+            .any(|pair| pair[0].id() >= pair[1].id())
+        || history.nodes().iter().any(|node| node.validate().is_err())
+        || history
+            .nodes()
+            .iter()
+            .all(|node| node.id() != history.root())
+        || history
+            .nodes()
+            .iter()
+            .all(|node| node != &SystemAuthorityCatalogNode::Leaf(record.clone()))
+        || history
+            .retired_node_ids()
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || history.retired_node_ids().iter().any(|id| {
+            *id == SystemAuthorityCatalogNodeId::ZERO
+                || history
+                    .nodes()
+                    .binary_search_by_key(id, SystemAuthorityCatalogNode::id)
+                    .is_ok()
+        })
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+
+    // Every displaced path node remains permanent audit history. Prove that
+    // the write plan names only already-durable nodes before creating any
+    // successor dependency.
+    for id in history.retired_node_ids() {
+        if store.load_system_authority_catalog_node(*id)?.is_none() {
+            return Err(JournalStoreError::MissingObject);
+        }
+    }
+
+    // The separately addressable receipt precedes the sparse nodes which
+    // commit to its ID. This lets conflict and exact-retry recovery resolve
+    // an occupied proof without scanning or trusting incoming receipt bytes.
+    let mut created = persist_and_read_back_authority_record(
+        store,
+        record,
+        SystemAuthorityHistoryStore::load_system_authority_catalog_record,
+        SystemAuthorityHistoryStore::persist_system_authority_catalog_record,
+    )?;
+    for node in history.nodes() {
+        created |= persist_and_read_back_authority_record(
+            store,
+            node,
+            SystemAuthorityHistoryStore::load_system_authority_catalog_node,
+            SystemAuthorityHistoryStore::persist_system_authority_catalog_node,
+        )?;
+    }
+
+    let installed = prove_stored_catalog(store, history.root(), operation)?;
+    if installed.occupied_record_id() != Some(record.id()) {
+        return Err(JournalStoreError::Corrupt);
+    }
+    for id in history.retired_node_ids() {
+        if store.load_system_authority_catalog_node(*id)?.is_none() {
+            return Err(JournalStoreError::Corrupt);
+        }
+    }
+    Ok(created)
+}
+
 fn stage_system_authority_dependencies<S: SystemAuthorityPublicationStore>(
     store: &mut S,
     publication: &ReplaySealedPublication,
@@ -3291,10 +3533,61 @@ fn stage_system_authority_dependencies<S: SystemAuthorityPublicationStore>(
     {
         return Err(JournalStoreError::NonCanonical);
     }
-    validate_authority_committee_closure(storage.committee_records())?;
     let write = publication
         .system_authority_write()
         .ok_or(JournalStoreError::NonCanonical)?;
+    if let (
+        StandardSystemAuthorityWrite::Catalog { record, history },
+        LifecycleReply::CatalogFinalized(outcome),
+    ) = (write.selected(), write.result())
+    {
+        let ReplayPublicationAnchor::Ordered(entry) = publication.anchor() else {
+            return Err(JournalStoreError::NonCanonical);
+        };
+        let ReplayOperation::Management {
+            request: LifecycleRequest::FinalizeCatalog(command),
+        } = &entry.input.operation
+        else {
+            return Err(JournalStoreError::NonCanonical);
+        };
+        let storage_history = storage
+            .catalog_history()
+            .ok_or(JournalStoreError::NonCanonical)?;
+        let record = record.as_ref().ok_or(JournalStoreError::NonCanonical)?;
+        let committee_records = storage.committee_records();
+        if !history.inserted()
+            || storage_history.record() != record
+            || storage_history.root() != history.root()
+            || committee_records.len() != 1
+            || committee_records[0].id().as_bytes() != &record.receipt().certificate().committee().0
+            || record
+                .verify(
+                    command.receipt().fact().intent().binding(),
+                    committee_records[0].committee(),
+                )
+                .is_err()
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let mut created = persist_and_read_back_authority_record(
+            store,
+            &committee_records[0],
+            SystemAuthorityHistoryStore::load_system_authority_committee_record,
+            SystemAuthorityHistoryStore::persist_system_authority_committee_record,
+        )?;
+        created |= stage_system_authority_catalog_dependencies(
+            store,
+            command,
+            Some(record),
+            history,
+            *outcome,
+        )?;
+        return Ok(created);
+    }
+    let rotation_history = storage
+        .rotation_history()
+        .ok_or(JournalStoreError::NonCanonical)?;
+    validate_authority_committee_closure(storage.committee_records())?;
 
     let mut created = false;
     let exact_retry = match (write.selected(), write.result()) {
@@ -3306,10 +3599,10 @@ fn stage_system_authority_dependencies<S: SystemAuthorityPublicationStore>(
                 exact_retry,
             },
         ) => {
-            if record != storage.history().record()
+            if record != rotation_history.record()
                 || record.id() != *rotation
                 || record.new_epoch() != *epoch
-                || history.root() != storage.history().root()
+                || history.root() != rotation_history.root()
                 || history.previous_root() == SystemAuthorityRotationNodeId::ZERO
                 || history.root() == SystemAuthorityRotationNodeId::ZERO
                 || history.inserted() == *exact_retry
@@ -3363,8 +3656,8 @@ fn stage_system_authority_dependencies<S: SystemAuthorityPublicationStore>(
         return Err(JournalStoreError::NonCanonical);
     };
     let lookup = prove_rotation(
-        storage.history().root(),
-        storage.history().record().new_epoch(),
+        rotation_history.root(),
+        rotation_history.record().new_epoch(),
         |id| {
             store
                 .load_system_authority_rotation_node(id)
@@ -3372,7 +3665,7 @@ fn stage_system_authority_dependencies<S: SystemAuthorityPublicationStore>(
         },
     )
     .map_err(|_| JournalStoreError::Corrupt)?;
-    if lookup.occupied_record() != Some(storage.history().record())
+    if lookup.occupied_record() != Some(rotation_history.record())
         || (exact_retry && lookup.proof() != command.proof())
     {
         return Err(JournalStoreError::Corrupt);
@@ -4176,6 +4469,34 @@ impl SystemAuthorityHistoryStore for MemoryAgentJournalStore {
         node: &SystemAuthorityRotationNode,
     ) -> Result<(), JournalStoreError> {
         self.persist_authority_with_readback(node)
+    }
+
+    fn load_system_authority_catalog_node(
+        &self,
+        id: SystemAuthorityCatalogNodeId,
+    ) -> Result<Option<SystemAuthorityCatalogNode>, JournalStoreError> {
+        self.read_authority(*id.as_bytes())
+    }
+
+    fn persist_system_authority_catalog_node(
+        &mut self,
+        node: &SystemAuthorityCatalogNode,
+    ) -> Result<(), JournalStoreError> {
+        self.persist_authority_with_readback(node)
+    }
+
+    fn load_system_authority_catalog_record(
+        &self,
+        id: SystemAuthorityCatalogRecordId,
+    ) -> Result<Option<SystemAuthorityCatalogRecord>, JournalStoreError> {
+        self.read_authority(*id.as_bytes())
+    }
+
+    fn persist_system_authority_catalog_record(
+        &mut self,
+        record: &SystemAuthorityCatalogRecord,
+    ) -> Result<(), JournalStoreError> {
+        self.persist_authority_with_readback(record)
     }
 
     fn load_system_authority_committee_record(
@@ -6582,6 +6903,8 @@ impl FileAgentJournalStore {
                     "genesis-admissions",
                     "system-decisions",
                     "system-rotations",
+                    "system-catalog-nodes",
+                    "system-catalog-records",
                     "system-committees",
                 ],
             )?;
@@ -6623,6 +6946,16 @@ impl FileAgentJournalStore {
                     AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY,
                     "authority",
                     "system-rotations",
+                ),
+                (
+                    AUTHORITY_SYSTEM_CATALOG_NODES_DIRECTORY,
+                    "authority",
+                    "system-catalog-nodes",
+                ),
+                (
+                    AUTHORITY_SYSTEM_CATALOG_RECORDS_DIRECTORY,
+                    "authority",
+                    "system-catalog-records",
                 ),
                 (
                     AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY,
@@ -6705,6 +7038,8 @@ impl FileAgentJournalStore {
                     "authority",
                     AUTHORITY_SYSTEM_DECISIONS_DIRECTORY,
                     AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY,
+                    AUTHORITY_SYSTEM_CATALOG_NODES_DIRECTORY,
+                    AUTHORITY_SYSTEM_CATALOG_RECORDS_DIRECTORY,
                     AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY,
                     HISTORY_CANDIDATE_DIRECTORY,
                     HISTORY_NODES_DIRECTORY,
@@ -7422,6 +7757,73 @@ impl FileAgentJournalStore {
         Ok(records)
     }
 
+    #[cfg(target_os = "linux")]
+    fn scrub_catalog_record_reference(
+        &self,
+        expected: &SystemAuthorityCatalogRecord,
+        limits: SystemAuthorityHistoryScrubLimits,
+        report: &mut SystemAuthorityHistoryScrubReport,
+    ) -> Result<(), JournalStoreError> {
+        let id = expected.id();
+        let name = encode_hex(id.as_bytes());
+        let staged_name = sibling_next_name(&name);
+        let directory = self.directory(AUTHORITY_SYSTEM_CATALOG_RECORDS_DIRECTORY)?;
+        let staged = Self::read_authority_for_scrub::<SystemAuthorityCatalogRecord>(
+            directory,
+            &staged_name,
+            *id.as_bytes(),
+            limits,
+            report,
+        )?;
+        let committed = Self::read_authority_for_scrub::<SystemAuthorityCatalogRecord>(
+            directory,
+            &name,
+            *id.as_bytes(),
+            limits,
+            report,
+        )?;
+        if let (Some(staged), Some(committed)) = (&staged, &committed)
+            && staged != committed
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        if committed.or(staged).as_ref() != Some(expected) {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scrub_catalog_leaf_record_links(
+        &self,
+        limits: SystemAuthorityHistoryScrubLimits,
+        report: &mut SystemAuthorityHistoryScrubReport,
+    ) -> Result<(), JournalStoreError> {
+        let maximum_names = MAX_SYSTEM_AUTHORITY_CATALOG_TREE_NODES
+            .checked_mul(3)
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        let directory = self.directory(AUTHORITY_SYSTEM_CATALOG_NODES_DIRECTORY)?;
+        visit_directory_names_bounded(directory, maximum_names, |name| {
+            if name.ends_with(PRIVATE_STAGE_SUFFIX) {
+                return Ok(());
+            }
+            let stem = name.strip_suffix(".next").unwrap_or(name);
+            let id = decode_hex_32(stem.as_bytes()).ok_or(JournalStoreError::Corrupt)?;
+            if id == [0; 32] || encode_hex(&id) != stem {
+                return Err(JournalStoreError::Corrupt);
+            }
+            let node = Self::read_authority_for_scrub::<SystemAuthorityCatalogNode>(
+                directory, name, id, limits, report,
+            )?
+            .ok_or(JournalStoreError::Corrupt)?;
+            if let SystemAuthorityCatalogNode::Leaf(record) = node {
+                self.scrub_catalog_record_reference(&record, limits, report)?;
+            }
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
     /// Explicitly stream and authenticate every permanent authority-history
     /// object under caller-supplied work limits.
     ///
@@ -7446,6 +7848,8 @@ impl FileAgentJournalStore {
                 bytes_read: 0,
                 decision_records: 0,
                 rotation_records: 0,
+                catalog_nodes: 0,
+                catalog_records: 0,
                 committee_records: 0,
             };
             let decision_records = self
@@ -7462,6 +7866,21 @@ impl FileAgentJournalStore {
                     &mut report,
                 )?;
             report.rotation_records = rotation_records;
+            let catalog_nodes = self
+                .scrub_authority_history_directory::<SystemAuthorityCatalogNode>(
+                    MAX_SYSTEM_AUTHORITY_CATALOG_TREE_NODES,
+                    limits,
+                    &mut report,
+                )?;
+            report.catalog_nodes = catalog_nodes;
+            self.scrub_catalog_leaf_record_links(limits, &mut report)?;
+            let catalog_records = self
+                .scrub_authority_history_directory::<SystemAuthorityCatalogRecord>(
+                    MAX_SYSTEM_AUTHORITY_CATALOG_RECORDS as usize,
+                    limits,
+                    &mut report,
+                )?;
+            report.catalog_records = catalog_records;
             let committee_records = self
                 .scrub_authority_history_directory::<SystemAuthorityCommitteeRecord>(
                     MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORDS,
@@ -8784,6 +9203,34 @@ impl SystemAuthorityHistoryStore for FileAgentJournalStore {
         self.persist_authority_with_readback(node)
     }
 
+    fn load_system_authority_catalog_node(
+        &self,
+        id: SystemAuthorityCatalogNodeId,
+    ) -> Result<Option<SystemAuthorityCatalogNode>, JournalStoreError> {
+        self.read_authority(*id.as_bytes())
+    }
+
+    fn persist_system_authority_catalog_node(
+        &mut self,
+        node: &SystemAuthorityCatalogNode,
+    ) -> Result<(), JournalStoreError> {
+        self.persist_authority_with_readback(node)
+    }
+
+    fn load_system_authority_catalog_record(
+        &self,
+        id: SystemAuthorityCatalogRecordId,
+    ) -> Result<Option<SystemAuthorityCatalogRecord>, JournalStoreError> {
+        self.read_authority(*id.as_bytes())
+    }
+
+    fn persist_system_authority_catalog_record(
+        &mut self,
+        record: &SystemAuthorityCatalogRecord,
+    ) -> Result<(), JournalStoreError> {
+        self.persist_authority_with_readback(record)
+    }
+
     fn load_system_authority_committee_record(
         &self,
         id: SystemAuthorityCommitteeId,
@@ -8977,14 +9424,22 @@ impl_replay_source!(FileAgentJournalStore);
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use ed25519_dalek::{Signer as _, SigningKey};
+
     use super::*;
     use crate::agent::authority::{
         ActorInvocationClaim, ActorInvocationReceipt, AgentAuthorityBinding, AgentAuthorityClaim,
         AgentAuthorityReceipt, ED25519_SIGNATURE_BYTES, ed25519_public_key_wire,
     };
+    use crate::agent::catalog_finality::{
+        CatalogBinding, CatalogMutation, CatalogMutationDisposition, CatalogMutationIntent,
+        CatalogMutationKind, CatalogMutationResult, FinalizedCatalogMutationFact,
+        FinalizedCatalogMutationReceipt,
+    };
     use crate::agent::committee::{
         AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommittee,
-        AuthorityCommitteeMember, AuthorityMemberRole,
+        AuthorityCommitteeMember, AuthorityMemberRole, AuthorityQuorumCertificate,
+        AuthoritySignature, AuthoritySignerId, RootAnchorConfigCommitment, RootAnchorId,
     };
     use crate::agent::contract::RuntimePackageContract;
     use crate::agent::execution::{
@@ -9002,14 +9457,18 @@ mod tests {
         InvocationResultState, ReplayInput, ReplayOperation, RuntimeBinding,
     };
     use crate::agent::shared_commit::SharedLaneProjection;
+    use crate::agent::system_authority::{
+        SystemAuthorityCatalogFinalize, SystemAuthorityCatalogProof, SystemAuthorityGenesis,
+        SystemAuthorityJournalScope, SystemAuthorityState,
+    };
     use crate::agent::{
         AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LaneSet,
         LifecycleAuthorityAdmission, LifecycleRequest, MethodMode, ReplicaRole,
         RuntimeCapabilities,
     };
     use crate::service::{
-        ActorId, CapabilityId, CredentialId, DeploymentId, InvocationId, PrincipalId, ProducerId,
-        ProgramId, SpaceId,
+        ActorId, CapabilityId, CredentialId, DeploymentId, InvocationId, OperationId, PrincipalId,
+        ProducerId, ProgramId, SpaceId,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -9919,6 +10378,161 @@ mod tests {
         (decision, rotation, committee)
     }
 
+    fn system_authority_catalog_keys() -> Vec<SigningKey> {
+        (0x31_u8..=0x33)
+            .map(|byte| SigningKey::from_bytes(&[byte; 32]))
+            .collect()
+    }
+
+    fn system_authority_catalog_committee(
+        binding: CatalogBinding,
+        keys: &[SigningKey],
+    ) -> AuthorityCommittee {
+        let mut members = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                AuthorityCommitteeMember::new(
+                    NodeId([(0x90_u8).wrapping_add(index as u8); 32]),
+                    key.verifying_key().to_bytes(),
+                    AuthorityMemberRole::Voter,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(AuthorityCommitteeMember::signer);
+        AuthorityCommittee::new(
+            binding.space(),
+            binding.authority_binding(),
+            1,
+            None,
+            members,
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn system_authority_catalog_receipt(
+        binding: CatalogBinding,
+        committee: &AuthorityCommittee,
+        keys: &[SigningKey],
+        operation: OperationId,
+        expected_authority_generation: Hash,
+        expected_catalog_head: Hash,
+        actual_authority_generation: Hash,
+        actual_catalog_head: Hash,
+        sequence: u64,
+        mutation_byte: u8,
+    ) -> FinalizedCatalogMutationReceipt {
+        let intent = CatalogMutationIntent::new(
+            binding,
+            expected_authority_generation,
+            expected_catalog_head,
+            PrincipalId([0x79; 32]),
+            CredentialId([0x7a; 32]),
+            CapabilityId([0x7b; 32]),
+            operation,
+            CatalogMutation::new(CatalogMutationKind::UpdateMetadata, vec![mutation_byte; 8])
+                .unwrap(),
+        )
+        .unwrap();
+        let fact = FinalizedCatalogMutationFact::new(
+            intent,
+            actual_authority_generation,
+            actual_catalog_head,
+            CatalogMutationResult::new(
+                CatalogMutationDisposition::Applied,
+                vec![mutation_byte.wrapping_add(1); 8],
+            )
+            .unwrap(),
+            sequence,
+        )
+        .unwrap();
+        let message = AuthorityQuorumCertificate::signing_message(
+            committee.authority_binding(),
+            committee.epoch(),
+            committee.commitment(),
+            fact.authority_claim(),
+        );
+        let mut signatures = keys
+            .iter()
+            .map(|key| {
+                AuthoritySignature::new(
+                    AuthoritySignerId::of_raw_ed25519(&key.verifying_key().to_bytes()),
+                    key.sign(&message.0).to_bytes(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(AuthoritySignature::signer);
+        let certificate =
+            AuthorityQuorumCertificate::new(committee, fact.authority_claim(), signatures).unwrap();
+        FinalizedCatalogMutationReceipt::new(fact, certificate, binding, committee).unwrap()
+    }
+
+    fn system_authority_catalog_fixture()
+    -> (SystemAuthorityCatalogRecord, SystemAuthorityCatalogNode) {
+        let binding = CatalogBinding::new(
+            SpaceId([0x75; 32]),
+            Hash([0x76; 32]),
+            authority_binding().commitment(),
+        )
+        .unwrap();
+        let keys = system_authority_catalog_keys();
+        let committee = system_authority_catalog_committee(binding, &keys);
+        let receipt = system_authority_catalog_receipt(
+            binding,
+            &committee,
+            &keys,
+            OperationId([0x7c; 32]),
+            Hash([0x77; 32]),
+            Hash([0x78; 32]),
+            Hash([0x77; 32]),
+            Hash([0x78; 32]),
+            2,
+            0x7d,
+        );
+        let record = SystemAuthorityCatalogRecord::new(receipt, binding, &committee).unwrap();
+        let node = SystemAuthorityCatalogNode::Leaf(record.clone());
+        (record, node)
+    }
+
+    fn system_authority_catalog_state_fixture() -> (
+        SystemAuthorityState,
+        SystemAuthorityJournalScope,
+        AuthorityCommittee,
+        Vec<SigningKey>,
+    ) {
+        let binding = CatalogBinding::new(
+            SpaceId([0x75; 32]),
+            Hash([0x76; 32]),
+            authority_binding().commitment(),
+        )
+        .unwrap();
+        let keys = system_authority_catalog_keys();
+        let committee = system_authority_catalog_committee(binding, &keys);
+        let genesis = SystemAuthorityGenesis::new(
+            RootAnchorId::from_bytes([0x81; 32]),
+            1,
+            RootAnchorConfigCommitment::from_bytes([0x82; 32]),
+            committee.clone(),
+            1,
+            binding.catalog_binding(),
+            Hash([0x83; 32]),
+            16,
+            16,
+            16,
+        )
+        .unwrap();
+        let state = SystemAuthorityState::from_genesis(AgentId([0x84; 32]), &genesis).unwrap();
+        let scope = SystemAuthorityJournalScope::for_test(
+            AgentJournalGenesisId::new([0x85; 32]),
+            AgentGenesisAdmissionId::from_bytes([0x86; 32]),
+        )
+        .unwrap();
+        (state, scope, committee, keys)
+    }
+
     #[cfg(target_os = "linux")]
     fn system_authority_history_path(root: &Path, directory: &str, id: &[u8; 32]) -> PathBuf {
         root.join(directory).join(encode_hex(id))
@@ -10025,6 +10639,194 @@ mod tests {
         );
     }
 
+    #[test]
+    fn memory_system_authority_catalog_history_retains_nodes_and_full_records() {
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        let (record, node) = system_authority_catalog_fixture();
+
+        assert_eq!(
+            store.load_system_authority_catalog_node(node.id()),
+            Ok(None)
+        );
+        assert_eq!(
+            store.load_system_authority_catalog_record(record.id()),
+            Ok(None)
+        );
+        store
+            .persist_system_authority_catalog_record(&record)
+            .unwrap();
+        store.persist_system_authority_catalog_node(&node).unwrap();
+        store
+            .persist_system_authority_catalog_record(&record)
+            .unwrap();
+        store.persist_system_authority_catalog_node(&node).unwrap();
+        assert_eq!(
+            store.load_system_authority_catalog_record(record.id()),
+            Ok(Some(record.clone()))
+        );
+        assert_eq!(
+            store.load_system_authority_catalog_node(node.id()),
+            Ok(Some(node.clone()))
+        );
+
+        store.authority.insert(
+            (
+                AuthorityStorageClass::SystemCatalogRecord,
+                *record.id().as_bytes(),
+            ),
+            b"tampered".to_vec(),
+        );
+        assert_eq!(
+            store.load_system_authority_catalog_record(record.id()),
+            Err(JournalStoreError::Corrupt)
+        );
+        store.authority.insert(
+            (
+                AuthorityStorageClass::SystemCatalogNode,
+                *node.id().as_bytes(),
+            ),
+            vec![0; MAX_SYSTEM_AUTHORITY_CATALOG_NODE_BYTES + 1],
+        );
+        assert_eq!(
+            store.load_system_authority_catalog_node(node.id()),
+            Err(JournalStoreError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn catalog_staging_is_ordered_read_only_on_retry_and_retains_displaced_paths() {
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        let (state, scope, committee, keys) = system_authority_catalog_state_fixture();
+        let operation = OperationId([0x91; 32]);
+        let receipt = system_authority_catalog_receipt(
+            state.catalog_binding_record().unwrap(),
+            &committee,
+            &keys,
+            operation,
+            state.authority_generation(),
+            state.catalog_head(),
+            state.authority_generation(),
+            state.catalog_head(),
+            state.committee_sequence_high_water() + 1,
+            0x92,
+        );
+        let fresh = SystemAuthorityCatalogFinalize::new(
+            receipt.clone(),
+            SystemAuthorityCatalogProof::vacant(operation, Vec::new()).unwrap(),
+        )
+        .unwrap();
+        let transition = state.apply_catalog_finalize(scope, &fresh).unwrap();
+        assert!(transition.history().inserted());
+        assert!(
+            stage_system_authority_catalog_dependencies(
+                &mut store,
+                &fresh,
+                transition.record(),
+                transition.history(),
+                transition.outcome(),
+            )
+            .unwrap()
+        );
+        let next = transition.state().clone();
+        let occupied =
+            prove_stored_catalog(&store, next.catalog_history_root(), operation).unwrap();
+        let exact = SystemAuthorityCatalogFinalize::new(receipt, occupied.clone()).unwrap();
+        let exact_transition = next.apply_catalog_finalize(scope, &exact).unwrap();
+        assert!(!exact_transition.history().inserted());
+        assert!(exact_transition.outcome().exact_retry());
+        let before_retry = store.authority.clone();
+        assert!(
+            !stage_system_authority_catalog_dependencies(
+                &mut store,
+                &exact,
+                exact_transition.record(),
+                exact_transition.history(),
+                exact_transition.outcome(),
+            )
+            .unwrap()
+        );
+        assert_eq!(store.authority, before_retry);
+
+        let divergent_receipt = system_authority_catalog_receipt(
+            next.catalog_binding_record().unwrap(),
+            &committee,
+            &keys,
+            operation,
+            next.authority_generation(),
+            next.catalog_head(),
+            next.authority_generation(),
+            next.catalog_head(),
+            next.committee_sequence_high_water() + 1,
+            0x93,
+        );
+        let divergent = SystemAuthorityCatalogFinalize::new(divergent_receipt, occupied).unwrap();
+        let conflict = next.apply_catalog_finalize(scope, &divergent).unwrap();
+        assert!(conflict.outcome().operation_conflicted());
+        assert_eq!(conflict.record(), None);
+        assert!(
+            !stage_system_authority_catalog_dependencies(
+                &mut store,
+                &divergent,
+                conflict.record(),
+                conflict.history(),
+                conflict.outcome(),
+            )
+            .unwrap()
+        );
+        assert_eq!(store.authority, before_retry);
+
+        let second_operation = OperationId([0x94; 32]);
+        let vacant =
+            prove_stored_catalog(&store, next.catalog_history_root(), second_operation).unwrap();
+        let second_receipt = system_authority_catalog_receipt(
+            next.catalog_binding_record().unwrap(),
+            &committee,
+            &keys,
+            second_operation,
+            next.authority_generation(),
+            next.catalog_head(),
+            next.authority_generation(),
+            next.catalog_head(),
+            next.committee_sequence_high_water() + 1,
+            0x95,
+        );
+        let second = SystemAuthorityCatalogFinalize::new(second_receipt, vacant).unwrap();
+        let second_transition = next.apply_catalog_finalize(scope, &second).unwrap();
+        assert!(!second_transition.history().retired_node_ids().is_empty());
+        assert!(
+            stage_system_authority_catalog_dependencies(
+                &mut store,
+                &second,
+                second_transition.record(),
+                second_transition.history(),
+                second_transition.outcome(),
+            )
+            .unwrap()
+        );
+        for retired in second_transition.history().retired_node_ids() {
+            assert!(
+                store
+                    .load_system_authority_catalog_node(*retired)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            prove_stored_catalog(
+                &store,
+                second_transition.state().catalog_history_root(),
+                second_operation,
+            )
+            .unwrap()
+            .occupied_record_id(),
+            Some(second_transition.record().unwrap().id())
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn file_system_authority_history_reopens_and_missing_stays_missing() {
@@ -10101,8 +10903,73 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn file_system_authority_catalog_history_reopens_and_scrubs_both_namespaces() {
+        let directory = TestDirectory::new("system-authority-catalog-history-reopen");
+        let (record, node) = system_authority_catalog_fixture();
+        let mut store = open_file_store(&directory);
+        store
+            .persist_system_authority_catalog_record(&record)
+            .unwrap();
+        store.persist_system_authority_catalog_node(&node).unwrap();
+        let record_path = system_authority_history_path(
+            store.root(),
+            AUTHORITY_SYSTEM_CATALOG_RECORDS_DIRECTORY,
+            record.id().as_bytes(),
+        );
+        let node_path = system_authority_history_path(
+            store.root(),
+            AUTHORITY_SYSTEM_CATALOG_NODES_DIRECTORY,
+            node.id().as_bytes(),
+        );
+        assert!(record_path.is_file());
+        assert!(node_path.is_file());
+        drop(store);
+
+        let reopened = open_file_store(&directory);
+        assert_eq!(
+            reopened.load_system_authority_catalog_record(record.id()),
+            Ok(Some(record.clone()))
+        );
+        assert_eq!(
+            reopened.load_system_authority_catalog_node(node.id()),
+            Ok(Some(node.clone()))
+        );
+        let report = reopened
+            .scrub_system_authority_history(system_authority_history_scrub_limits())
+            .unwrap();
+        assert_eq!(report.catalog_records, 1);
+        assert_eq!(report.catalog_nodes, 1);
+        drop(reopened);
+
+        fs::remove_file(record_path).unwrap();
+        let missing_record = open_file_store(&directory);
+        assert_eq!(
+            missing_record.scrub_system_authority_history(system_authority_history_scrub_limits()),
+            Err(JournalStoreError::Corrupt)
+        );
+        assert_eq!(
+            missing_record.load_system_authority_catalog_node(node.id()),
+            Ok(Some(node.clone()))
+        );
+        drop(missing_record);
+
+        fs::remove_file(node_path).unwrap();
+        let missing = open_file_store(&directory);
+        assert_eq!(
+            missing.load_system_authority_catalog_record(record.id()),
+            Ok(None)
+        );
+        assert_eq!(
+            missing.load_system_authority_catalog_node(node.id()),
+            Ok(None)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn file_system_authority_history_lazy_open_and_scrub_reject_tamper() {
         let (decision, rotation, committee) = system_authority_history_fixture();
+        let (catalog_record, catalog_node) = system_authority_catalog_fixture();
         let targets = [
             (
                 AUTHORITY_SYSTEM_DECISIONS_DIRECTORY,
@@ -10111,6 +10978,14 @@ mod tests {
             (
                 AUTHORITY_SYSTEM_ROTATIONS_DIRECTORY,
                 *rotation.id().as_bytes(),
+            ),
+            (
+                AUTHORITY_SYSTEM_CATALOG_NODES_DIRECTORY,
+                *catalog_node.id().as_bytes(),
+            ),
+            (
+                AUTHORITY_SYSTEM_CATALOG_RECORDS_DIRECTORY,
+                *catalog_record.id().as_bytes(),
             ),
             (
                 AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY,
@@ -10125,6 +11000,12 @@ mod tests {
                 .unwrap();
             store
                 .persist_system_authority_rotation_node(&rotation)
+                .unwrap();
+            store
+                .persist_system_authority_catalog_record(&catalog_record)
+                .unwrap();
+            store
+                .persist_system_authority_catalog_node(&catalog_node)
                 .unwrap();
             store
                 .persist_system_authority_committee_record(&committee)
@@ -10146,6 +11027,12 @@ mod tests {
                     .load_system_authority_rotation_node(rotation.id())
                     .map(|record| record.map(|_| ())),
                 2 => reopened
+                    .load_system_authority_catalog_node(catalog_node.id())
+                    .map(|record| record.map(|_| ())),
+                3 => reopened
+                    .load_system_authority_catalog_record(catalog_record.id())
+                    .map(|record| record.map(|_| ())),
+                4 => reopened
                     .load_system_authority_committee_record(committee.id())
                     .map(|record| record.map(|_| ())),
                 _ => unreachable!(),
@@ -10188,6 +11075,14 @@ mod tests {
                 MAX_SYSTEM_AUTHORITY_ROTATION_NODE_BYTES,
             ),
             (
+                AUTHORITY_SYSTEM_CATALOG_NODES_DIRECTORY,
+                MAX_SYSTEM_AUTHORITY_CATALOG_NODE_BYTES,
+            ),
+            (
+                AUTHORITY_SYSTEM_CATALOG_RECORDS_DIRECTORY,
+                MAX_SYSTEM_AUTHORITY_CATALOG_RECORD_BYTES,
+            ),
+            (
                 AUTHORITY_SYSTEM_COMMITTEES_DIRECTORY,
                 MAX_SYSTEM_AUTHORITY_COMMITTEE_RECORD_BYTES,
             ),
@@ -10215,6 +11110,16 @@ mod tests {
                     ))
                     .map(|record| record.map(|_| ())),
                 2 => reopened
+                    .load_system_authority_catalog_node(SystemAuthorityCatalogNodeId::from_bytes(
+                        id,
+                    ))
+                    .map(|record| record.map(|_| ())),
+                3 => reopened
+                    .load_system_authority_catalog_record(
+                        SystemAuthorityCatalogRecordId::from_bytes(id),
+                    )
+                    .map(|record| record.map(|_| ())),
+                4 => reopened
                     .load_system_authority_committee_record(SystemAuthorityCommitteeId::from_bytes(
                         id,
                     ))
@@ -14893,6 +15798,8 @@ fn validate_unexposed_initialization_namespace(root: &File) -> Result<(), Journa
             "genesis-admissions",
             "system-decisions",
             "system-rotations",
+            "system-catalog-nodes",
+            "system-catalog-records",
             "system-committees",
         ];
         validate_directory_names(&authority, &children)?;
