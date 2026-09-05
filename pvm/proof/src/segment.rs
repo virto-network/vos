@@ -442,8 +442,13 @@ mod prover {
         // at their output addresses, so a later segment's read of an
         // earlier-segment precompile result fails the memory-ledger
         // read-consistency check (`is_read · (value − prev) = 0`).
-        let mem = replay_writes(full, Some(full.steps[a].timestamp));
-        build_segment(full, a, b, mem)
+        if full.sparse_initial_memory.is_some() {
+            let mem = replay_sparse_writes(full, Some(full.steps[a].timestamp));
+            build_sparse_segment(full, a, b, mem)
+        } else {
+            let mem = replay_writes(full, Some(full.steps[a].timestamp));
+            build_segment(full, a, b, mem)
+        }
     }
 
     /// Assemble the segment `SideNote` for `[a, b)` from `full` and the
@@ -452,6 +457,24 @@ mod prover {
     /// (threaded image), so the two produce identical segments by
     /// construction — only the provenance of `mem` differs.
     fn build_segment(full: &SideNote, a: usize, b: usize, mem: Vec<u8>) -> SideNote {
+        build_segment_with_memory(full, a, b, SegmentMemory::Dense(mem))
+    }
+
+    fn build_sparse_segment(
+        full: &SideNote,
+        a: usize,
+        b: usize,
+        mem: crate::SparseMemoryImage,
+    ) -> SideNote {
+        build_segment_with_memory(full, a, b, SegmentMemory::Sparse(mem))
+    }
+
+    fn build_segment_with_memory(
+        full: &SideNote,
+        a: usize,
+        b: usize,
+        mem: SegmentMemory,
+    ) -> SideNote {
         let ts_hi = full.steps.get(b).map(|s| s.timestamp).unwrap_or(u64::MAX);
         assemble_segment(
             &ChainParts::from(full),
@@ -474,17 +497,20 @@ mod prover {
         parts: &ChainParts<'_>,
         steps: Vec<PvmStep>,
         initial_regs: [u64; NUM_REGS],
-        mem: Vec<u8>,
+        mem: SegmentMemory,
         ts_hi: u64,
     ) -> SideNote {
         let ts_lo = steps[0].timestamp;
         let in_window = move |ts: u64| ts >= ts_lo && ts < ts_hi;
 
-        let mut sn = SideNote::new(steps, parts.code.to_vec(), parts.bitmask.to_vec())
+        let sn = SideNote::new(steps, parts.code.to_vec(), parts.bitmask.to_vec())
             .with_isa_mode(parts.isa_mode)
-            .with_memory(mem)
             .with_jump_table(parts.jump_table.to_vec())
             .with_initial_regs(initial_regs);
+        let mut sn = match mem {
+            SegmentMemory::Dense(memory) => sn.with_memory(memory),
+            SegmentMemory::Sparse(memory) => sn.with_sparse_memory(memory),
+        };
 
         let (bc, bm) = filter_pair(parts.blake2b_calls, parts.blake2b_mem_ops, |m| {
             in_window(m.ts)
@@ -556,15 +582,13 @@ mod prover {
             .sparse_initial_memory
             .clone()
             .expect("sparse replay requires a sparse entering image");
-        let mut writes = collect_writes(side_note, ts_upper);
-        writes.sort_by_key(|write| write.0);
-        for (_timestamp, address, bytes, len) in writes {
-            assert!(
-                image.write(address, &bytes[..len as usize]),
-                "proof trace write lies outside its sparse memory span"
-            );
-        }
+        apply_sparse_writes(&mut image, collect_writes(side_note, ts_upper));
         image
+    }
+
+    enum SegmentMemory {
+        Dense(Vec<u8>),
+        Sparse(crate::SparseMemoryImage),
     }
 
     fn collect_writes(side_note: &SideNote, ts_upper: Option<u64>) -> Vec<PendingWrite> {
@@ -648,6 +672,16 @@ mod prover {
         }
     }
 
+    fn apply_sparse_writes(image: &mut crate::SparseMemoryImage, mut writes: Vec<PendingWrite>) {
+        writes.sort_by_key(|write| write.0);
+        for (_timestamp, address, bytes, len) in writes {
+            assert!(
+                image.write(address, &bytes[..len as usize]),
+                "proof trace write lies outside its sparse memory span"
+            );
+        }
+    }
+
     /// Streaming segment driver: yields [`segment_side_note`]-identical
     /// `SideNote`s for windows visited in ascending step order, threading
     /// the entering memory image FORWARD across windows. Where
@@ -678,7 +712,7 @@ mod prover {
         full: &'a SideNote,
         /// The carried image: `full.initial_memory` with every write at
         /// `ts < applied_upto` applied.
-        mem: Vec<u8>,
+        mem: SegmentMemory,
         /// Exclusive timestamp bound of the writes already applied.
         applied_upto: u64,
         /// Index of the first step not yet applied to `mem`.
@@ -691,9 +725,13 @@ mod prover {
     impl<'a> SegmentCursor<'a> {
         /// Start a pass over `full`'s windows from its initial memory.
         pub fn new(full: &'a SideNote) -> Self {
+            let mem = full.sparse_initial_memory.as_ref().map_or_else(
+                || SegmentMemory::Dense(full.initial_memory.clone()),
+                |image| SegmentMemory::Sparse(image.clone()),
+            );
             Self {
                 full,
-                mem: full.initial_memory.clone(),
+                mem,
                 applied_upto: 0,
                 steps_at: 0,
                 streams: StreamCursors::default(),
@@ -717,7 +755,12 @@ mod prover {
                 self.applied_upto
             );
             self.advance_to(ts_lo);
-            build_segment(self.full, a, b, self.mem.clone())
+            match &self.mem {
+                SegmentMemory::Dense(memory) => build_segment(self.full, a, b, memory.clone()),
+                SegmentMemory::Sparse(memory) => {
+                    build_sparse_segment(self.full, a, b, memory.clone())
+                }
+            }
         }
 
         /// Apply every not-yet-applied write with `ts < ts_lo` to the
@@ -738,7 +781,10 @@ mod prover {
             }
             self.streams
                 .drain_below(&ChainParts::from(full), ts_lo, &mut writes);
-            apply_writes(&mut self.mem, writes);
+            match &mut self.mem {
+                SegmentMemory::Dense(memory) => apply_writes(memory, writes),
+                SegmentMemory::Sparse(memory) => apply_sparse_writes(memory, writes),
+            }
             self.applied_upto = ts_lo;
         }
     }
@@ -886,7 +932,7 @@ mod prover {
                 &ChainParts::from(self.full),
                 steps,
                 self.regs,
-                self.mem.clone(),
+                SegmentMemory::Dense(self.mem.clone()),
                 ts_hi,
             )
         }
@@ -1341,7 +1387,7 @@ mod prover {
                     .parts(self.isa_mode, &self.code, &self.bitmask, &self.jump_table),
                 steps,
                 self.regs,
-                self.mem.clone(),
+                SegmentMemory::Dense(self.mem.clone()),
                 w.ts_hi.expect("a current window's ts bound is resolved"),
             )
         }
@@ -1727,6 +1773,10 @@ mod tests {
         assert_eq!(via_cursor.code, via_slice.code);
         assert_eq!(via_cursor.bitmask, via_slice.bitmask);
         assert_eq!(via_cursor.initial_memory, via_slice.initial_memory);
+        assert_eq!(
+            via_cursor.sparse_initial_memory,
+            via_slice.sparse_initial_memory
+        );
         assert_eq!(via_cursor.initial_regs, via_slice.initial_regs);
         assert_eq!(via_cursor.jump_table, via_slice.jump_table);
         assert_eq!(via_cursor.jump_table_counts, via_slice.jump_table_counts);
@@ -1795,6 +1845,47 @@ mod tests {
     }
 
     #[test]
+    fn sparse_direct_cursor_and_chain_roots_match_at_high_pages() {
+        let mut full = threaded_trace();
+        let high_page_index = (u32::MAX as usize / crate::SPARSE_MEMORY_PAGE_SIZE) as u32;
+        let mut high_page = crate::SparseMemoryPage {
+            page_index: high_page_index,
+            bytes: [0; crate::SPARSE_MEMORY_PAGE_SIZE],
+        };
+        high_page.bytes[crate::SPARSE_MEMORY_PAGE_SIZE - 8] = 0x5a;
+        full.initial_memory.clear();
+        full.sparse_initial_memory = Some(
+            crate::SparseMemoryImage::new(1u64 << 32, vec![high_page])
+                .expect("canonical high sparse image"),
+        );
+
+        let bounds = segment_bounds(full.steps.len(), 4);
+        let mut cursor = SegmentCursor::new(&full);
+        let mut previous_root = None;
+        for &(start, end) in &bounds {
+            let direct = segment_side_note(&full, start, end);
+            let via_cursor = cursor.side_note(start, end);
+            assert_windows_equal(&direct, &via_cursor);
+            assert!(direct.initial_memory.is_empty());
+            assert_eq!(
+                direct
+                    .sparse_initial_memory
+                    .as_ref()
+                    .expect("sparse segment")
+                    .byte(u32::MAX - 7),
+                0x5a
+            );
+            let direct_proof = page_merkle::segment_multiproof(&direct);
+            let cursor_proof = page_merkle::segment_multiproof(&via_cursor);
+            assert_eq!(direct_proof, cursor_proof);
+            if let Some(root) = previous_root {
+                assert_eq!(root, direct_proof.root_before);
+            }
+            previous_root = Some(direct_proof.root_after);
+        }
+    }
+
+    #[test]
     fn cursor_skips_windows_without_building_them() {
         let full = threaded_trace();
         let bounds = segment_bounds(full.steps.len(), 4);
@@ -1823,10 +1914,10 @@ mod tests {
             steps: full.steps.iter().map(|s| s.to_compact()).collect(),
             initial_regs: full.steps[0].regs_before,
             isa_mode: full.isa_mode,
-            code: full.code.clone(),
-            bitmask: full.bitmask.clone(),
+            code: full.code.to_vec(),
+            bitmask: full.bitmask.to_vec(),
             initial_memory: full.initial_memory.clone(),
-            jump_table: full.jump_table.clone(),
+            jump_table: full.jump_table.to_vec(),
             blake2b_calls: full.blake2b_calls.clone(),
             blake2b_mem_ops: full.blake2b_mem_ops.clone(),
             ristretto_calls: full.ristretto_calls.clone(),
@@ -1997,9 +2088,9 @@ mod tests {
         crate::segment::TraceStream::new(
             ReplaySource::from_side_note(full),
             full.isa_mode,
-            full.code.clone(),
-            full.bitmask.clone(),
-            full.jump_table.clone(),
+            full.code.to_vec(),
+            full.bitmask.to_vec(),
+            full.jump_table.to_vec(),
             full.initial_memory.clone(),
             seg_steps,
             page_budget,

@@ -220,6 +220,14 @@ impl InnerMachines {
         self.machines.is_empty()
     }
 
+    /// Generation assigned to the next successfully created machine.
+    ///
+    /// Proof-side Refine context commitments bind this counter even when the
+    /// live dictionary is empty, so expunge/recreate histories cannot alias.
+    pub fn next_generation(&self) -> u64 {
+        self.next_generation
+    }
+
     pub fn contains(&self, id: u32) -> bool {
         self.machines.contains_key(&id)
     }

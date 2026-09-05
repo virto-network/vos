@@ -4,8 +4,45 @@ use vos_pvm::interpreter::Interpreter;
 use vos_pvm::PVM_REGISTER_COUNT;
 
 use vos_pvm_proof::core::tracing::TracingPvm;
-use vos_pvm_proof::{SideNote, prove};
-use vos_pvm_proof_verifier::verify_standalone;
+use vos_pvm_proof::{Proof, SideNote, prove};
+use vos_pvm_proof_verifier::{CommitmentHash, verify_standalone};
+
+fn assert_hostile_proof_rejected_without_panic(
+    label: &str,
+    proof: Proof,
+    preprocessed_commitment: CommitmentHash,
+    side_note: &SideNote,
+) {
+    let standalone = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        verify_standalone(proof.clone(), preprocessed_commitment)
+    }));
+    assert!(standalone.is_ok(), "standalone verifier panicked: {label}");
+    assert!(
+        standalone.unwrap().is_err(),
+        "standalone verifier accepted hostile proof: {label}"
+    );
+
+    let prover_side = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        vos_pvm_proof::verify(proof, side_note)
+    }));
+    assert!(
+        prover_side.is_ok(),
+        "prover-side verifier panicked: {label}"
+    );
+    assert!(
+        prover_side.unwrap().is_err(),
+        "prover-side verifier accepted hostile proof: {label}"
+    );
+}
+
+fn mutate_pcs_config(
+    mut proof: Proof,
+    mutate: impl FnOnce(&mut stwo::core::pcs::PcsConfig),
+) -> Proof {
+    mutate(&mut proof.pcs_config);
+    proof.stark_proof.0.config = proof.pcs_config;
+    proof
+}
 
 #[test]
 fn standalone_verify_add64() {
@@ -38,7 +75,239 @@ fn standalone_verify_add64() {
     let preprocessed_commitment = proof.stark_proof.commitments[0];
 
     // Verify using standalone verifier (no SideNote needed!)
-    verify_standalone(proof, preprocessed_commitment).expect("standalone verification failed");
+    verify_standalone(proof.clone(), preprocessed_commitment)
+        .expect("standalone verification failed");
+
+    // Hostile claimed logs below the 16-lane trace floor used to reach an
+    // unchecked `log_size - LOG_N_LANES` in both verifier funnels. They are
+    // structural errors, never panics.
+    for small_log in 1..=3 {
+        let mut hostile = proof.clone();
+        hostile.log_sizes.fill(small_log);
+        assert_hostile_proof_rejected_without_panic(
+            &format!("component log {small_log}"),
+            hostile,
+            preprocessed_commitment,
+            &side_note,
+        );
+    }
+
+    // Nested hostile shapes are rejected before either verifier enters Stwo.
+    let mut hostile = proof.clone();
+    let sample = hostile.stark_proof.sampled_values[0][0][0];
+    hostile.stark_proof.0.sampled_values[0][0].resize(
+        vos_pvm_proof::proof::MAX_PROOF_SAMPLES_PER_COLUMN + 1,
+        sample,
+    );
+    assert_hostile_proof_rejected_without_panic(
+        "oversized OODS samples",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    hostile.claimed_sums[0] =
+        stwo::core::fields::qm31::SecureField::from_u32_unchecked(u32::MAX, 0, 0, 0);
+    assert_hostile_proof_rejected_without_panic(
+        "noncanonical claimed-sum limb",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    hostile.stark_proof.0.sampled_values[0][0][0] =
+        stwo::core::fields::qm31::SecureField::from_u32_unchecked(u32::MAX, 0, 0, 0);
+    assert_hostile_proof_rejected_without_panic(
+        "noncanonical OODS-sample limb",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    hostile.stark_proof.0.queried_values[0][0][0] =
+        stwo::core::fields::m31::BaseField::from_u32_unchecked(u32::MAX);
+    assert_hostile_proof_rejected_without_panic(
+        "noncanonical queried-value limb",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    hostile.stark_proof.0.commitments.clear();
+    assert_hostile_proof_rejected_without_panic(
+        "missing commitment trees",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    hostile.stark_proof.0.queried_values[0].pop();
+    assert_hostile_proof_rejected_without_panic(
+        "missing queried-value column",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    hostile.stark_proof.0.fri_proof.inner_layers.pop();
+    assert_hostile_proof_rejected_without_panic(
+        "missing FRI layer",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    hostile.stark_proof.0.config.pow_bits ^= 1;
+    assert_hostile_proof_rejected_without_panic(
+        "outer/embedded PCS mismatch",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    for (label, hostile) in [
+        (
+            "zero FRI blowup",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.log_blowup_factor = 0;
+            }),
+        ),
+        (
+            "oversized FRI blowup",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.log_blowup_factor = 17;
+            }),
+        ),
+        (
+            "oversized FRI last layer",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.log_last_layer_degree_bound = 11;
+            }),
+        ),
+        (
+            "zero FRI fold step",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.fold_step = 0;
+            }),
+        ),
+        (
+            "unsupported FRI fold step",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.fold_step = 2;
+            }),
+        ),
+        (
+            "zero FRI queries",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.n_queries = 0;
+            }),
+        ),
+        (
+            "oversized FRI queries",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.n_queries = vos_pvm_proof::proof::MAX_FRI_QUERIES + 1;
+            }),
+        ),
+        (
+            "oversized proof-of-work bits",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.pow_bits = 32;
+            }),
+        ),
+        (
+            "oversized lifting domain",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.lifting_log_size = Some(vos_pvm_proof::proof::MAX_EXTENDED_LOG_SIZE + 1);
+            }),
+        ),
+        (
+            "proof-side recommitment amplification",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.log_blowup_factor =
+                    vos_pvm_proof::proof::MAX_RECOMMIT_LOG_BLOWUP + 1;
+            }),
+        ),
+    ] {
+        assert_hostile_proof_rejected_without_panic(
+            label,
+            hostile,
+            preprocessed_commitment,
+            &side_note,
+        );
+    }
+
+    // `None` and `Some(derived)` can describe the same effective tree height
+    // for some AIR layouts, but are distinct signed protocol configurations.
+    // Relabelling both outer and embedded config must fail cryptographically.
+    let required_lifting = u32::try_from(proof.stark_proof.fri_proof.inner_layers.len()).unwrap()
+        + 1
+        + proof.pcs_config.fri_config.log_last_layer_degree_bound
+        + proof.pcs_config.fri_config.log_blowup_factor;
+    let hostile = mutate_pcs_config(proof.clone(), |config| {
+        config.lifting_log_size = Some(required_lifting);
+    });
+    assert_hostile_proof_rejected_without_panic(
+        "PCS lifting Option relabel",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    hostile.component_mask = 0;
+    assert_hostile_proof_rejected_without_panic(
+        "component-mask metadata relabel",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    // Per-vector bounds alone used to permit multi-gigabyte Cartesian
+    // products. Keep every individual vector within its protocol ceiling but
+    // exceed the named aggregate heap budget; both owned-proof verifier
+    // funnels must reject before entering Stwo. Refine's borrowed bundle
+    // funnel separately runs the same check before cloning children.
+    let mut aggregate = proof;
+    aggregate.pcs_config.fri_config.n_queries = vos_pvm_proof::proof::MAX_FRI_QUERIES;
+    aggregate.stark_proof.0.config = aggregate.pcs_config;
+    let secure = aggregate.stark_proof.sampled_values[0][0][0];
+    let base = aggregate.stark_proof.queried_values[0][0][0];
+    for tree in aggregate.stark_proof.0.sampled_values.iter_mut() {
+        for column in tree {
+            column.resize(vos_pvm_proof::proof::MAX_PROOF_SAMPLES_PER_COLUMN, secure);
+        }
+    }
+    for tree in aggregate.stark_proof.0.queried_values.iter_mut() {
+        for column in tree {
+            column.resize(vos_pvm_proof::proof::MAX_FRI_QUERIES, base);
+        }
+    }
+    aggregate.stark_proof.0.sampled_values[0].resize(
+        vos_pvm_proof::proof::MAX_PROOF_COLUMNS_PER_TREE,
+        vec![secure; vos_pvm_proof::proof::MAX_PROOF_SAMPLES_PER_COLUMN],
+    );
+    aggregate.stark_proof.0.queried_values[0].resize(
+        vos_pvm_proof::proof::MAX_PROOF_COLUMNS_PER_TREE,
+        vec![base; vos_pvm_proof::proof::MAX_FRI_QUERIES],
+    );
+    let aggregate_bytes = vos_pvm_proof::proof::proof_owned_bytes(&aggregate);
+    assert!(
+        aggregate_bytes.is_none(),
+        "aggregate hostile proof unexpectedly fit: {aggregate_bytes:?}"
+    );
+    assert_hostile_proof_rejected_without_panic(
+        "aggregate nested payload",
+        aggregate,
+        preprocessed_commitment,
+        &side_note,
+    );
 }
 
 #[test]
@@ -99,6 +368,32 @@ fn standalone_verify_rejects_format_version_mismatch() {
     let mut side_note = SideNote::new(steps, code, bitmask);
     let mut proof = prove(&mut side_note).expect("proving failed");
     let preprocessed_commitment = proof.stark_proof.commitments[0];
+
+    let mut explicitly_old = proof.clone();
+    explicitly_old.format_version = 18;
+    let old_error = verify_standalone(explicitly_old, preprocessed_commitment)
+        .expect_err("format-18 proof must be rejected by format 20");
+    assert!(format!("{old_error:?}").contains("format version"));
+
+    // Stronger regression: construct all Stwo commitments/openings under the
+    // actual pre-config-binding v18 transcript, then relabel only the outer
+    // generation as current. The version field passes structural preflight,
+    // but the current FS prefix must make cryptographic verification fail.
+    let relabelled = vos_pvm_proof::prove_pre_config_relabel_for_test(&mut side_note)
+        .expect("legacy-transcript adversarial proof generation failed");
+    assert_eq!(
+        relabelled.format_version,
+        vos_pvm_proof::PROOF_FORMAT_VERSION
+    );
+    let relabelled_commitment = relabelled.stark_proof.commitments[0];
+    assert!(
+        verify_standalone(relabelled.clone(), relabelled_commitment).is_err(),
+        "pre-config-binding transcript was accepted after relabelling"
+    );
+    assert!(
+        vos_pvm_proof::verify(relabelled, &side_note).is_err(),
+        "prover-side verifier accepted a relabelled v18 transcript"
+    );
 
     // Forge: simulate a proof from a future AIR shape.
     proof.format_version = vos_pvm_proof::PROOF_FORMAT_VERSION + 1;
@@ -238,7 +533,7 @@ fn standalone_verify_rejects_oversized_log_size() {
     )
     .expect_err("should reject — cap is zero");
     let msg = format!("{err:?}");
-    assert!(msg.contains("exceeds cap"), "got: {msg}");
+    assert!(msg.contains("outside 4..=0"), "got: {msg}");
 }
 
 #[test]

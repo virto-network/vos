@@ -16,7 +16,7 @@
 
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
-use vos_pvm::interpreter::Interpreter;
+use vos_pvm::interpreter::{Interpreter, Memory};
 
 use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::segment::segment_bounds;
@@ -52,13 +52,15 @@ fn prove_chain_verifies_as_canonical_chain() {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 100;
     regs[1] = 1;
-    let initial_memory = vec![0u8; 4 * 1024 * 1024];
-    let pvm = Interpreter::new(
+    let mut memory = Memory::sparse(1u64 << 32);
+    memory.init_copy(u32::MAX - 31, b"sparse-chain-high-page");
+    let initial_memory = memory.nonzero_page_image().into();
+    let pvm = Interpreter::with_memory(
         code.clone(),
         bitmask.clone(),
         vec![],
         regs,
-        initial_memory.clone(),
+        memory,
         10_000,
         25,
     );
@@ -67,7 +69,7 @@ fn prove_chain_verifies_as_canonical_chain() {
     let all_steps = tracing.into_trace();
     assert_eq!(all_steps.len(), 7);
 
-    let full = SideNote::new(all_steps, code, bitmask).with_memory(initial_memory);
+    let full = SideNote::new(all_steps, code, bitmask).with_sparse_memory(initial_memory);
     // Multi-window cut: 4-step windows over 7 steps ⇒ [0,4), [4,7).
     let bounds = segment_bounds(full.steps.len(), 4);
     assert_eq!(bounds, vec![(0, 4), (4, 7)], "expected a 2-window chain");
@@ -101,6 +103,7 @@ fn prove_chain_verifies_as_canonical_chain() {
     // The DEFAULT trustless chain verifier accepts the MOBILE canonical chain —
     // no PcsPolicy::MOBILE needed (the conjectured-security floor accepts it).
     let expected_root = proofs[0].initial_state.memory_root;
+    assert_ne!(expected_root, [0; 32], "the high sparse page is root-bound");
     let final_root = verify_chain_standalone(&proofs, commit, expected_root)
         .expect("honest canonical chain must verify standalone under the default floor");
     assert_eq!(

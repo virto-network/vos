@@ -1,16 +1,25 @@
 use vos_pvm_proof::{
-    MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, REFINE_BUNDLE_FORMAT_VERSION,
-    RefineHostBoundary, RefineMachineId, RefineProgramId, RefineProofBundle, RefineSliceExit,
-    RefineTraceError, prove_refine, refine_arguments_commitment,
-    refine_bundle_cardinality_is_valid, refine_bundle_commitment, refine_program_id, trace_refine,
-    verify_refine_bundle_replayed,
+    MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, PcsConfig,
+    REFINE_BUNDLE_FORMAT_VERSION, RefineHostBoundary, RefineMachineId, RefineProgramId,
+    RefineProofBundle, RefineSliceExit, RefineTraceError, production_pcs_config_mobile,
+    prove_refine, refine_arguments_commitment, refine_bundle_cardinality_is_valid,
+    refine_bundle_commitment, refine_program_id, trace_refine, verify_refine_bundle_replayed,
 };
 use vos_pvm_proof_verifier::{
     CommitmentHash, RefineBundleVerification, RefineProgramCommitmentResolver,
     verify_refine_bundle_authenticated,
 };
 
-struct TrustedPrograms(Vec<(RefineMachineId, u32, u32, Vec<u32>, CommitmentHash)>);
+struct TrustedPrograms(
+    Vec<(
+        RefineMachineId,
+        u32,
+        u32,
+        Vec<u32>,
+        PcsConfig,
+        CommitmentHash,
+    )>,
+);
 
 impl TrustedPrograms {
     fn from_bundle(bundle: &RefineProofBundle) -> Self {
@@ -24,6 +33,7 @@ impl TrustedPrograms {
                         slice.proof.format_version,
                         slice.proof.component_mask,
                         slice.proof.log_sizes.clone(),
+                        slice.proof.pcs_config,
                         slice.proof.stark_proof.commitments[0],
                     )
                 })
@@ -39,16 +49,18 @@ impl RefineProgramCommitmentResolver for TrustedPrograms {
         proof_format_version: u32,
         component_mask: u32,
         log_sizes: &[u32],
+        pcs_config: &PcsConfig,
     ) -> Option<CommitmentHash> {
         self.0
             .iter()
-            .find(|(candidate, format, mask, sizes, _)| {
+            .find(|(candidate, format, mask, sizes, config, _)| {
                 *candidate == identity
                     && *format == proof_format_version
                     && *mask == component_mask
                     && sizes == log_sizes
+                    && config == pcs_config
             })
-            .map(|(_, _, _, _, commitment)| *commitment)
+            .map(|(_, _, _, _, _, commitment)| *commitment)
     }
 }
 
@@ -61,6 +73,7 @@ impl RefineProgramCommitmentResolver for ResolverMustNotRun {
         _proof_format_version: u32,
         _component_mask: u32,
         _log_sizes: &[u32],
+        _pcs_config: &PcsConfig,
     ) -> Option<CommitmentHash> {
         panic!("cardinality preflight must precede resolver callbacks")
     }
@@ -171,9 +184,89 @@ fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
         bundle.transcript_commitment,
         "ordered boundary-vector identity must be commitment-sensitive"
     );
+    let mut changed_components = bundle.clone();
+    changed_components.slices[0].proof.num_components += 1;
+    assert_ne!(
+        refine_bundle_commitment(&changed_components),
+        bundle.transcript_commitment,
+        "child component cardinality is part of the authenticated proof shape"
+    );
+    let mut changed_sums = bundle.clone();
+    changed_sums.slices[0].proof.claimed_sums.clear();
+    assert_ne!(
+        refine_bundle_commitment(&changed_sums),
+        bundle.transcript_commitment,
+        "child claimed sums are part of the authenticated proof transcript"
+    );
     // Stand-in for an authenticated program catalog: capture it from the
     // honest admitted bundle before applying any hostile edits below.
     let trusted_programs = TrustedPrograms::from_bundle(&bundle);
+
+    // A valid proof for the exact same outer program and AIR/PCS shape, but
+    // a different initial gas budget, cannot be substituted for this
+    // execution. This is deliberately a same-program proof substitution:
+    // only exact deterministic replay distinguishes the witnesses.
+    let alternate_bundle = prove_refine(trace_refine(&outer, &arguments, gas + 1).unwrap())
+        .expect("prove alternate Refine closure");
+    assert_eq!(
+        bundle.slices[0].proof.component_mask,
+        alternate_bundle.slices[0].proof.component_mask
+    );
+    assert_eq!(
+        bundle.slices[0].proof.log_sizes,
+        alternate_bundle.slices[0].proof.log_sizes
+    );
+    assert_ne!(
+        bundle.slices[0].proof.stark_proof.commitments[1],
+        alternate_bundle.slices[0].proof.stark_proof.commitments[1],
+        "different gas witnesses must produce different main-trace commitments"
+    );
+    let mut substituted_execution = bundle.clone();
+    substituted_execution.slices[0].proof = alternate_bundle.slices[0].proof.clone();
+    reseal(&mut substituted_execution);
+    assert_replay_mismatch(
+        &substituted_execution,
+        &outer,
+        &arguments,
+        gas,
+        "child proof does not bind exact replay trace",
+    );
+
+    // The trusted resolver key includes every PCS field. STANDARD, MOBILE,
+    // and explicit lifting profiles cannot alias the same catalog entry.
+    let mut wrong_mobile = bundle.clone();
+    wrong_mobile.slices[0].proof.pcs_config = production_pcs_config_mobile();
+    wrong_mobile.slices[0].proof.stark_proof.0.config = production_pcs_config_mobile();
+    reseal(&mut wrong_mobile);
+    assert!(
+        verify_refine_bundle_authenticated(
+            &wrong_mobile,
+            refine_program_id(&outer),
+            refine_arguments_commitment(&arguments),
+            gas,
+            &trusted_programs,
+        )
+        .is_err()
+    );
+    let mut wrong_lifting = bundle.clone();
+    wrong_lifting.slices[0].proof.pcs_config.lifting_log_size = Some(30);
+    wrong_lifting.slices[0]
+        .proof
+        .stark_proof
+        .0
+        .config
+        .lifting_log_size = Some(30);
+    reseal(&mut wrong_lifting);
+    assert!(
+        verify_refine_bundle_authenticated(
+            &wrong_lifting,
+            refine_program_id(&outer),
+            refine_arguments_commitment(&arguments),
+            gas,
+            &trusted_programs,
+        )
+        .is_err()
+    );
 
     let mut oversized_shape = bundle.clone();
     oversized_shape.slices[0]
@@ -192,6 +285,52 @@ fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
         .is_err(),
         "child shape cardinality must reject before hashing or resolver callbacks"
     );
+
+    let mut oversized_nested = bundle.clone();
+    let sample = oversized_nested.slices[0].proof.stark_proof.sampled_values[0][0][0];
+    oversized_nested.slices[0]
+        .proof
+        .stark_proof
+        .0
+        .sampled_values[0][0]
+        .resize(
+            vos_pvm_proof::proof::MAX_PROOF_SAMPLES_PER_COLUMN + 1,
+            sample,
+        );
+    let preclone = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        verify_refine_bundle_authenticated(
+            &oversized_nested,
+            refine_program_id(&outer),
+            refine_arguments_commitment(&arguments),
+            gas,
+            &ResolverMustNotRun,
+        )
+    }));
+    assert!(preclone.is_ok(), "hostile nested vector must not panic");
+    assert!(preclone.unwrap().is_err());
+
+    // Forge claimed-small logs plus a correspondingly undersized explicit
+    // lifting domain. The cheap child preflight accepts its own claimed
+    // shape; exact replay discovers the larger real trace before any Stwo
+    // domain/commit constructor can assert.
+    let mut undersized_replay_lifting = bundle.clone();
+    undersized_replay_lifting.slices[0].proof.log_sizes.fill(4);
+    undersized_replay_lifting.slices[0]
+        .proof
+        .pcs_config
+        .lifting_log_size = Some(8);
+    undersized_replay_lifting.slices[0]
+        .proof
+        .stark_proof
+        .0
+        .config
+        .lifting_log_size = Some(8);
+    reseal(&mut undersized_replay_lifting);
+    let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        verify_refine_bundle_replayed(&undersized_replay_lifting, &outer, &arguments, gas)
+    }));
+    assert!(replay.is_ok(), "undersized replay lifting must not panic");
+    assert!(replay.unwrap().is_err());
 
     verify_refine_bundle_replayed(&bundle, &outer, &arguments, gas)
         .expect("exact deterministic replay closes host semantics");
@@ -361,7 +500,28 @@ fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
         "bundle format version",
     );
 
-    for old_format in [16, 17] {
+    let mut old_bundle_version = bundle.clone();
+    old_bundle_version.format_version = 1;
+    reseal(&mut old_bundle_version);
+    assert!(
+        verify_refine_bundle_authenticated(
+            &old_bundle_version,
+            refine_program_id(&outer),
+            refine_arguments_commitment(&arguments),
+            gas,
+            &trusted_programs,
+        )
+        .is_err()
+    );
+    assert_replay_mismatch(
+        &old_bundle_version,
+        &outer,
+        &arguments,
+        gas,
+        "bundle format version",
+    );
+
+    for old_format in [16, 17, 18, 19] {
         let mut old_child = bundle.clone();
         old_child.slices[0].proof.format_version = old_format;
         reseal(&mut old_child);
@@ -375,10 +535,7 @@ fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
             )
             .is_err()
         );
-        assert!(matches!(
-            verify_refine_bundle_replayed(&old_child, &outer, &arguments, gas),
-            Err(RefineTraceError::Verify(_))
-        ));
+        assert_replay_mismatch(&old_child, &outer, &arguments, gas, "bundle cardinality");
     }
 
     let mut no_commitment = bundle.clone();

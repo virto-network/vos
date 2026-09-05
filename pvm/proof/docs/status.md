@@ -211,7 +211,8 @@ items the earlier draft of this file listed have all been closed:
 - BitManip: CountSetBits 32/64 `[33]`, LeadingZeroBits +
   TrailingZeroBits 32/64 `[34]`. The retired Sbrk opcode was removed from
   the standard AIR beginning in proof format 12 and remains absent in the
-  Refine-closure/sparse-memory format 18 (Poseidon2-M31 format 19).
+  PCS-config-bound Refine-closure/sparse-memory format 20 (Poseidon2-M31
+  format 21; Refine bundle v2).
 - Smaller: 32-bit shift ShiftAmount uniqueness `[37]`;
   is_write discriminator forge tests `[39]`.
 

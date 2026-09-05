@@ -5,7 +5,7 @@
 //! prover feature supplies the one-way conversion from an interpreter
 //! snapshot at the tracing boundary.
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 
 pub const SPARSE_MEMORY_PAGE_SIZE: usize = 4096;
 
@@ -20,7 +20,7 @@ pub struct SparseMemoryPage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SparseMemoryImage {
     span: u64,
-    pages: Vec<SparseMemoryPage>,
+    pages: Arc<Vec<SparseMemoryPage>>,
 }
 
 impl SparseMemoryImage {
@@ -41,7 +41,10 @@ impl SparseMemoryImage {
             }
             previous = Some(page.page_index);
         }
-        Some(Self { span, pages })
+        Some(Self {
+            span,
+            pages: Arc::new(pages),
+        })
     }
 
     pub fn span(&self) -> u64 {
@@ -49,7 +52,7 @@ impl SparseMemoryImage {
     }
 
     pub fn pages(&self) -> &[SparseMemoryPage] {
-        &self.pages
+        self.pages.as_slice()
     }
 
     /// Return a page by index, or an all-zero page if it is absent.
@@ -82,14 +85,13 @@ impl SparseMemoryImage {
         if end > self.span {
             return false;
         }
+        let pages = Arc::make_mut(&mut self.pages);
         let mut cursor = u64::from(address);
         while !bytes.is_empty() {
             let page_index = (cursor / SPARSE_MEMORY_PAGE_SIZE as u64) as u32;
             let offset = cursor as usize % SPARSE_MEMORY_PAGE_SIZE;
             let len = (SPARSE_MEMORY_PAGE_SIZE - offset).min(bytes.len());
-            let search = self
-                .pages
-                .binary_search_by_key(&page_index, |page| page.page_index);
+            let search = pages.binary_search_by_key(&page_index, |page| page.page_index);
             let index = match search {
                 Ok(index) => index,
                 Err(index) => {
@@ -98,7 +100,7 @@ impl SparseMemoryImage {
                         bytes = &bytes[len..];
                         continue;
                     }
-                    self.pages.insert(
+                    pages.insert(
                         index,
                         SparseMemoryPage {
                             page_index,
@@ -108,9 +110,9 @@ impl SparseMemoryImage {
                     index
                 }
             };
-            self.pages[index].bytes[offset..offset + len].copy_from_slice(&bytes[..len]);
-            if self.pages[index].bytes.iter().all(|&byte| byte == 0) {
-                self.pages.remove(index);
+            pages[index].bytes[offset..offset + len].copy_from_slice(&bytes[..len]);
+            if pages[index].bytes.iter().all(|&byte| byte == 0) {
+                pages.remove(index);
             }
             cursor += len as u64;
             bytes = &bytes[len..];
@@ -153,5 +155,21 @@ mod tests {
         assert_eq!(image.byte(address), 7);
         assert!(image.write(address, &[0]));
         assert!(image.pages().is_empty());
+    }
+
+    #[test]
+    fn clones_share_pages_until_a_write() {
+        let mut page = SparseMemoryPage {
+            page_index: 7,
+            bytes: [0; SPARSE_MEMORY_PAGE_SIZE],
+        };
+        page.bytes[3] = 1;
+        let image = SparseMemoryImage::new(1 << 20, vec![page]).unwrap();
+        let mut clone = image.clone();
+        assert!(Arc::ptr_eq(&image.pages, &clone.pages));
+        assert!(clone.write(7 * SPARSE_MEMORY_PAGE_SIZE as u32 + 3, &[2]));
+        assert!(!Arc::ptr_eq(&image.pages, &clone.pages));
+        assert_eq!(image.byte(7 * SPARSE_MEMORY_PAGE_SIZE as u32 + 3), 1);
+        assert_eq!(clone.byte(7 * SPARSE_MEMORY_PAGE_SIZE as u32 + 3), 2);
     }
 }

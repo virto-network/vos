@@ -123,4 +123,18 @@ fn poseidon2_canonical_segment_round_trip() {
         verify_standalone_with_pcs_policy(tampered, commitment, &PcsPolicy::MOBILE).is_err(),
         "a tampered Poseidon2-M31 commitment root must be rejected"
     );
+
+    // Serde can construct M31's public tuple field without reduction. Shared
+    // hostile-proof preflight must reject such a root before Poseidon or field
+    // arithmetic sees it, never merely rely on a debug-overflow panic.
+    let mut noncanonical = proof;
+    noncanonical.stark_proof.0.commitments[1].0[0] = BaseField::from_u32_unchecked(u32::MAX);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        verify_standalone_with_pcs_policy(noncanonical, commitment, &PcsPolicy::MOBILE)
+    }));
+    assert!(outcome.is_ok(), "noncanonical Poseidon root panicked");
+    assert!(
+        outcome.unwrap().is_err(),
+        "noncanonical Poseidon root was accepted"
+    );
 }

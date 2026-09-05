@@ -109,7 +109,10 @@ impl SparseMemoryImage {
     /// Apply bytes to the logical image while preserving canonical ordering
     /// and dropping pages that become all-zero.
     pub fn write(&mut self, address: u32, mut bytes: &[u8]) -> bool {
-        if u64::from(address) + bytes.len() as u64 > self.span {
+        let Some(end) = u64::from(address).checked_add(bytes.len() as u64) else {
+            return false;
+        };
+        if end > self.span {
             return false;
         }
         let mut cursor = u64::from(address);
@@ -168,6 +171,10 @@ pub struct PagePerms {
     /// accessors skip the per-page table load — the flat-buffer fast path
     /// for programs with no read-only or unmapped pages.
     uniform_rw: bool,
+    /// Monotonic mutation counter used by proof observers to cache the
+    /// canonical permission commitment without rescanning the page table at
+    /// every host boundary.
+    revision: u64,
 }
 
 impl PagePerms {
@@ -175,12 +182,20 @@ impl PagePerms {
         Self {
             perms: vec![PERM_RW; pages],
             uniform_rw: true,
+            revision: 0,
         }
     }
 
     fn install(&mut self, perms: Vec<u8>) {
+        if self.perms == perms {
+            return;
+        }
         self.uniform_rw = perms.iter().all(|&p| p == PERM_RW);
         self.perms = perms;
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("permission revision cannot wrap in one invocation");
     }
 
     #[inline(always)]
@@ -193,9 +208,24 @@ impl PagePerms {
         &self.perms
     }
 
+    #[inline(always)]
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+
     fn set_range(&mut self, first: usize, count: usize, permission: u8) {
+        if self.perms[first..first + count]
+            .iter()
+            .all(|&existing| existing == permission)
+        {
+            return;
+        }
         self.perms[first..first + count].fill(permission);
         self.uniform_rw = self.perms.iter().all(|&p| p == PERM_RW);
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("permission revision cannot wrap in one invocation");
     }
 
     fn range_has_at_least(&self, addr: u32, len: usize, permission: u8) -> bool {
@@ -301,6 +331,7 @@ impl PagePerms {
 pub struct FlatMem {
     bytes: Vec<u8>,
     perms: PagePerms,
+    value_revision: u64,
 }
 
 impl FlatMem {
@@ -313,6 +344,7 @@ impl FlatMem {
         Self {
             bytes,
             perms: PagePerms::new_rw(pages),
+            value_revision: 0,
         }
     }
 
@@ -347,6 +379,10 @@ impl FlatMem {
                     val,
                 );
             }
+            self.value_revision = self
+                .value_revision
+                .checked_add(1)
+                .expect("memory revision cannot wrap in one invocation");
             Ok(())
         } else {
             Err(self.perms.fault_page(addr, N, true))
@@ -372,6 +408,7 @@ pub struct SparseMem {
     /// million-entry 32-bit page table.
     frame_pages: Vec<u32>,
     perms: PagePerms,
+    value_revision: u64,
 }
 
 impl SparseMem {
@@ -385,6 +422,7 @@ impl SparseMem {
             frames: Vec::new(),
             frame_pages: Vec::new(),
             perms: PagePerms::new_rw(pages),
+            value_revision: 0,
         }
     }
 
@@ -468,6 +506,10 @@ impl SparseMem {
         } else {
             self.write_straddle(addr, &val);
         }
+        self.value_revision = self
+            .value_revision
+            .checked_add(1)
+            .expect("memory revision cannot wrap in one invocation");
         Ok(())
     }
 
@@ -527,6 +569,18 @@ impl Memory {
         dispatch!(self, m => m.perms.as_slice())
     }
 
+    /// Monotonic identity of the logical value image. Equal revisions for
+    /// one memory object guarantee that no successful write/clear/init has
+    /// occurred between observations.
+    pub fn value_revision(&self) -> u64 {
+        dispatch!(self, m => m.value_revision)
+    }
+
+    /// Monotonic identity of the page-permission map.
+    pub fn permissions_revision(&self) -> u64 {
+        dispatch!(self, m => m.perms.revision())
+    }
+
     /// Install the per-page permission map. `perms` must have exactly one
     /// entry per 4 KiB page of the span — the accessors rely on the page
     /// bounds check doubling as the byte-range check.
@@ -566,7 +620,15 @@ impl Memory {
             return false;
         }
         match self {
-            Memory::Flat(m) => m.bytes[first * PAGE..end * PAGE].fill(0),
+            Memory::Flat(m) => {
+                m.bytes[first * PAGE..end * PAGE].fill(0);
+                if count != 0 {
+                    m.value_revision = m
+                        .value_revision
+                        .checked_add(1)
+                        .expect("memory revision cannot wrap in one invocation");
+                }
+            }
             Memory::Sparse(m) => {
                 for page in first..end {
                     let frame = m.table[page];
@@ -574,6 +636,12 @@ impl Memory {
                         let base = frame as usize * PAGE;
                         m.frames[base..base + PAGE].fill(0);
                     }
+                }
+                if count != 0 {
+                    m.value_revision = m
+                        .value_revision
+                        .checked_add(1)
+                        .expect("memory revision cannot wrap in one invocation");
                 }
             }
         }
@@ -702,9 +770,16 @@ impl Memory {
             addr as u64 + data.len() as u64 <= self.span(),
             "init_copy range exceeds guest span"
         );
+        let has_data = !data.is_empty();
         match self {
             Memory::Flat(m) => {
                 m.bytes[addr as usize..addr as usize + data.len()].copy_from_slice(data);
+                if has_data {
+                    m.value_revision = m
+                        .value_revision
+                        .checked_add(1)
+                        .expect("memory revision cannot wrap in one invocation");
+                }
             }
             Memory::Sparse(m) => {
                 let mut a = addr as u64;
@@ -716,6 +791,12 @@ impl Memory {
                     m.frames[base..base + n].copy_from_slice(&data[..n]);
                     a += n as u64;
                     data = &data[n..];
+                }
+                if has_data {
+                    m.value_revision = m
+                        .value_revision
+                        .checked_add(1)
+                        .expect("memory revision cannot wrap in one invocation");
                 }
             }
         }
@@ -822,6 +903,26 @@ mod tests {
     }
 
     #[test]
+    fn mutation_revisions_change_only_the_relevant_state_class() {
+        for mut memory in [Memory::flat(vec![0; PAGE]), Memory::sparse(PAGE as u64)] {
+            let values = memory.value_revision();
+            let permissions = memory.permissions_revision();
+            memory.write_u8(0, 7).unwrap();
+            assert_eq!(memory.value_revision(), values + 1);
+            assert_eq!(memory.permissions_revision(), permissions);
+
+            let values = memory.value_revision();
+            assert!(memory.set_page_range(0, 1, PERM_RO));
+            assert_eq!(memory.value_revision(), values);
+            assert_eq!(memory.permissions_revision(), permissions + 1);
+
+            // Idempotent permission installs do not invalidate a cached hash.
+            assert!(memory.set_page_range(0, 1, PERM_RO));
+            assert_eq!(memory.permissions_revision(), permissions + 1);
+        }
+    }
+
+    #[test]
     fn nonzero_page_image_is_canonical_and_handles_high_addresses() {
         let mut memory = Memory::sparse(1u64 << 32);
         let address = u32::MAX - 31;
@@ -863,6 +964,7 @@ mod tests {
         let mut updated = image.clone();
         assert!(updated.write(address, &[0; 9]));
         assert_eq!(updated.pages().len(), 1, "zero pages are removed");
+        assert!(!updated.write(u32::MAX - 3, &[1; 5]));
         assert!(SparseMemoryImage::new(1u64 << 32, image.pages().to_vec()).is_some());
         assert!(SparseMemoryImage::new(1u64 << 32, vec![image.pages()[0].clone(); 2]).is_none());
     }

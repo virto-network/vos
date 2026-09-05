@@ -5,13 +5,60 @@
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
-use stwo::core::{air::Component, fields::qm31::SecureField, pcs::TreeVec};
+use stwo::core::{
+    air::{Component, Components},
+    circle::CirclePoint,
+    fields::qm31::SecureField,
+    pcs::TreeVec,
+};
 use stwo_constraint_framework::TraceLocationAllocator;
 
 pub use crate::lookups::{AllLookupElements, boundary_relation_challenges};
 use crate::recursion_pcs::ProverChannel;
 
 use crate::BASE_COMPONENTS;
+
+/// Validate exact nested proof dimensions against a fully constructed set of
+/// verifier components and its three trace-tree column log-size vectors.
+/// Shared verbatim by the prover-enabled and standalone no_std verifiers.
+pub fn preflight_component_dimensions(
+    proof: &crate::Proof,
+    components: &[&dyn Component],
+    trace_log_sizes: &TreeVec<Vec<u32>>,
+) -> Result<crate::proof::ProofProtocolShape, alloc::string::String> {
+    if trace_log_sizes.len() != 3 || trace_log_sizes[0].is_empty() || components.is_empty() {
+        return Err("AIR trace layout must contain three non-empty component trees".into());
+    }
+    let aggregate = Components {
+        components: components.to_vec(),
+        n_preprocessed_columns: trace_log_sizes[0].len(),
+    };
+    let composition_log_degree_bound = aggregate.composition_log_degree_bound();
+    let (_, max_log_degree_bound) = crate::proof::derive_protocol_degree_shape(
+        &proof.pcs_config,
+        composition_log_degree_bound,
+    )?;
+    // Mask offsets, hence only these vector lengths, are independent of the
+    // sampled OODS point. Use a fixed valid point and never touch proof data.
+    let masks = aggregate.mask_points(
+        CirclePoint::<SecureField>::get_point(1),
+        max_log_degree_bound,
+        false,
+    );
+    let mut expected_samples: Vec<Vec<usize>> = masks
+        .iter()
+        .map(|columns| columns.iter().map(Vec::len).collect())
+        .collect();
+    expected_samples.push(vec![1; 8]);
+    let mut expected_logs = trace_log_sizes.0.clone();
+    expected_logs.push(vec![max_log_degree_bound; 8]);
+    crate::proof::preflight_proof_dimensions(
+        proof,
+        &expected_logs,
+        &expected_samples,
+        composition_log_degree_bound,
+    )
+}
 
 /// Select the active-chip indices from the proof's
 /// `component_mask`.  Bit i set ⇔ chip i was active.

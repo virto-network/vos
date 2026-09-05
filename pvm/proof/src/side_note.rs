@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use std::collections::HashMap;
 
 use crate::core::step::{CompactStep, NUM_REGS, PvmStep, expand_steps};
@@ -19,9 +20,9 @@ pub struct SideNote {
     /// commits this tag and authenticates it on every fetched instruction.
     pub isa_mode: vos_pvm::IsaMode,
     /// Program bytecode.
-    pub code: Vec<u8>,
+    pub code: Arc<[u8]>,
     /// Bitmask for instruction validation.
-    pub bitmask: Vec<u8>,
+    pub bitmask: Arc<[u8]>,
     /// Range check accumulator: counts of each byte value 0..255.
     pub range256_counts: Vec<u32>,
     /// Bitwise AND nibble lookup counts: (a, b) → multiplicity, for the
@@ -148,7 +149,7 @@ pub struct SideNote {
     /// commits to it via its preprocessed Addr/Target columns; CpuChip's
     /// JumpInd consumer demands `(addr=val_b+imm, target=next_pc)`
     /// against that table, balancing dispatch-by-runtime-index.
-    pub jump_table: Vec<u32>,
+    pub jump_table: Arc<[u32]>,
     /// Per-jump-table-index count of JumpInd dispatches.  Indexed
     /// by `addr/2 - 1` where `addr = (regs[reg_a] + imm) mod 2^32`; entry N
     /// = number of times the program dispatched through `jump_table[N]`.
@@ -443,6 +444,13 @@ pub struct RistrettoCombCall {
 
 impl SideNote {
     pub fn new(steps: Vec<PvmStep>, code: Vec<u8>, bitmask: Vec<u8>) -> Self {
+        Self::new_shared(steps, code.into(), bitmask.into())
+    }
+
+    /// Construct a side note while sharing immutable program artifacts.
+    /// Refine uses this across machine slices so repeated boundaries retain
+    /// one program allocation rather than one copy per child proof.
+    pub(crate) fn new_shared(steps: Vec<PvmStep>, code: Arc<[u8]>, bitmask: Arc<[u8]>) -> Self {
         Self {
             steps,
             isa_mode: vos_pvm::IsaMode::Conformance,
@@ -476,7 +484,7 @@ impl SideNote {
             final_regs: [0u64; NUM_REGS],
             closing_chip_active: false,
             program_memory_counts: HashMap::new(),
-            jump_table: Vec::new(),
+            jump_table: Arc::from([]),
             jump_table_counts: Vec::new(),
             mul_entries: Vec::new(),
             bitwise_entries: Vec::new(),
@@ -569,6 +577,11 @@ impl SideNote {
     /// table.  No-op for programs that don't use JumpInd / LoadImmJumpInd
     /// (the chip then has zero-multiplicity rows).
     pub fn with_jump_table(mut self, jump_table: Vec<u32>) -> Self {
+        self = self.with_shared_jump_table(jump_table.into());
+        self
+    }
+
+    pub(crate) fn with_shared_jump_table(mut self, jump_table: Arc<[u32]>) -> Self {
         self.jump_table_counts = vec![0u32; jump_table.len()];
         self.jump_table = jump_table;
         self

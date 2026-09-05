@@ -663,6 +663,7 @@ pub fn prove_canonical(
         component_mask,
         None,
         min_log_sizes,
+        ProofTranscriptGeneration::Current,
     )?;
     Ok(proof)
 }
@@ -699,6 +700,7 @@ pub fn program_commitment_for_profile(
             .half_coset,
     );
     let channel = &mut ProverChannel::default();
+    crate::proof::mix_proof_fs_domain(channel, PROOF_FORMAT_VERSION, &config);
     let mut scheme =
         CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(config, &twiddles);
     for &log_size in log_sizes {
@@ -726,8 +728,12 @@ pub fn prove_chain(full: &SideNote, bounds: &[(usize, usize)]) -> Option<(Vec<u3
     // commitment for the whole chain (what `verify_chain_standalone` pins).
     let profile = canonical_profile_for_bounds(full, bounds)?;
     let mut proofs = Vec::with_capacity(bounds.len());
+    // A second forward cursor is required for the proving pass. Re-slicing
+    // each window from the initial image would replay every prior sparse
+    // write again and retain/copy progressively larger page snapshots.
+    let mut cursor = crate::segment::SegmentCursor::new(full);
     for &(a, b) in bounds {
-        let mut sn = crate::segment::segment_side_note(full, a, b);
+        let mut sn = cursor.side_note(a, b);
         proofs.push(prove_canonical(&mut sn, &profile).ok()?);
     }
     Some((profile, proofs))
@@ -889,7 +895,204 @@ fn prove_impl_with_components(
         component_mask,
         None,
         min_log_sizes,
+        ProofTranscriptGeneration::Current,
     )
+}
+
+#[derive(Clone, Copy)]
+enum ProofTranscriptGeneration {
+    Current,
+    PreConfigRelabel,
+}
+
+/// Generate the exact producer/consumer main traces used by both the STARK
+/// prover and Refine's deterministic replay binding. Keeping this as one
+/// implementation prevents replay from checking a lookalike witness layout.
+fn generate_component_traces(
+    side_note: &mut SideNote,
+    components: &[&dyn crate::framework::MachineProverComponent],
+    min_log_sizes: &[u32],
+) -> Vec<ComponentTrace> {
+    let mut traces: Vec<Option<ComponentTrace>> = (0..components.len()).map(|_| None).collect();
+    for (index, component) in components.iter().enumerate() {
+        if component.is_producer() {
+            let min_log_size = min_log_sizes.get(index).copied().unwrap_or(0);
+            traces[index] = Some(component.generate_component_trace_min(side_note, min_log_size));
+        }
+    }
+    {
+        use rayon::prelude::*;
+        let consumer_indices: Vec<usize> = components
+            .iter()
+            .enumerate()
+            .filter_map(|(index, component)| (!component.is_producer()).then_some(index))
+            .collect();
+        let side_note_ref: &SideNote = side_note;
+        let consumer_traces: Vec<(usize, ComponentTrace)> = consumer_indices
+            .par_iter()
+            .map(|&index| {
+                let min_log_size = min_log_sizes.get(index).copied().unwrap_or(0);
+                (
+                    index,
+                    components[index]
+                        .generate_component_trace_immut_min(side_note_ref, min_log_size),
+                )
+            })
+            .collect();
+        for (index, trace) in consumer_traces {
+            traces[index] = Some(trace);
+        }
+    }
+    traces
+        .into_iter()
+        .map(|trace| trace.expect("every component is classified as producer or consumer"))
+        .collect()
+}
+
+/// Derive the exact public boundary states shipped by the production prover.
+/// Refine replay compares these before STARK verification, including both the
+/// sparse-image hash and in-AIR page-Merkle roots.
+fn derive_segment_states(side_note: &SideNote) -> (SegmentState, SegmentState) {
+    let (root_before, root_after) = segment_memory_roots(side_note);
+    let initial_state = if side_note.steps.is_empty() {
+        SegmentState {
+            pc: 0,
+            timestamp: 0,
+            registers: [0; 13],
+            memory_commitment: [0; 32],
+            memory_root: root_before,
+        }
+    } else {
+        let first = &side_note.steps[0];
+        SegmentState {
+            pc: first.pc,
+            timestamp: first.timestamp,
+            registers: side_note.initial_regs,
+            memory_commitment: initial_memory_commitment(side_note),
+            memory_root: root_before,
+        }
+    };
+    let final_state = if side_note.steps.is_empty() {
+        SegmentState {
+            pc: 0,
+            timestamp: 0,
+            registers: [0; 13],
+            memory_commitment: [0; 32],
+            memory_root: root_after,
+        }
+    } else {
+        let last = &side_note.steps[side_note.steps.len() - 1];
+        let mut registers = [0u64; 13];
+        registers[..last.regs_after.len().min(13)]
+            .copy_from_slice(&last.regs_after[..13.min(last.regs_after.len())]);
+        SegmentState {
+            pc: last.next_pc,
+            timestamp: last.timestamp + 1,
+            registers,
+            memory_commitment: compute_final_memory_commitment(side_note),
+            memory_root: root_after,
+        }
+    };
+    (initial_state, final_state)
+}
+
+/// Exact replay-derived statement prefix. Equality of the main commitment
+/// binds every generated witness column; ordinary STARK verification then
+/// proves the interaction/composition/FRI suffix against that exact root.
+pub(crate) struct ReplayTraceBinding {
+    pub component_mask: u32,
+    pub log_sizes: Vec<u32>,
+    pub preprocessed_commitment: crate::recursion_pcs::ProverMerkleHash,
+    pub main_commitment: crate::recursion_pcs::ProverMerkleHash,
+    pub initial_state: SegmentState,
+    pub final_state: SegmentState,
+}
+
+/// Recompute a trace's exact preprocessed/main commitments without generating
+/// interaction traces, composition columns, FRI layers, or a replacement
+/// proof. Used only to bind Refine child proofs to deterministic native replay.
+pub(crate) fn replay_trace_binding(
+    side_note: &mut SideNote,
+    config: PcsConfig,
+) -> Result<ReplayTraceBinding, ProvingError> {
+    if config.fri_config.log_blowup_factor > crate::proof::MAX_RECOMMIT_LOG_BLOWUP {
+        return Err(ProvingError::ConstraintsNotSatisfied);
+    }
+    prepare_side_note_for_verification(side_note);
+    validate_memory_witnesses(side_note)?;
+    side_note.ingest_memory_pages();
+    let components_owned = super::active_components(side_note);
+    let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
+    let component_mask = super::active_component_mask(side_note);
+    let traces = generate_component_traces(side_note, components, &[]);
+    let log_sizes: Vec<u32> = traces.iter().map(ComponentTrace::log_size).collect();
+    let max_constraint_log_degree_bound = components
+        .iter()
+        .zip(&log_sizes)
+        .map(|(component, &log_size)| component.max_constraint_log_degree_bound(log_size))
+        .max()
+        .ok_or(ProvingError::ConstraintsNotSatisfied)?;
+    if crate::proof::derive_protocol_degree_shape(&config, max_constraint_log_degree_bound).is_err()
+    {
+        return Err(ProvingError::ConstraintsNotSatisfied);
+    }
+    for &log_size in &log_sizes {
+        if log_size < crate::proof::MIN_PROOF_LOG_SIZE {
+            return Err(ProvingError::ConstraintsNotSatisfied);
+        }
+        let Some(extended) = log_size.checked_add(config.fri_config.log_blowup_factor) else {
+            return Err(ProvingError::ConstraintsNotSatisfied);
+        };
+        if extended > crate::proof::MAX_EXTENDED_LOG_SIZE
+            || config
+                .lifting_log_size
+                .is_some_and(|lifting| lifting < extended)
+        {
+            return Err(ProvingError::ConstraintsNotSatisfied);
+        }
+    }
+    let Some(domain_log_size) =
+        max_constraint_log_degree_bound.checked_add(config.fri_config.log_blowup_factor)
+    else {
+        return Err(ProvingError::ConstraintsNotSatisfied);
+    };
+    if domain_log_size > crate::proof::MAX_EXTENDED_LOG_SIZE {
+        return Err(ProvingError::ConstraintsNotSatisfied);
+    }
+    let twiddles = ProverBackend::precompute_twiddles(
+        CanonicCoset::new(domain_log_size)
+            .circle_domain()
+            .half_coset,
+    );
+    let channel = &mut ProverChannel::default();
+    crate::proof::mix_proof_fs_domain(channel, PROOF_FORMAT_VERSION, &config);
+    for &log_size in &log_sizes {
+        channel.mix_u64(u64::from(log_size));
+    }
+    let mut scheme =
+        CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(config, &twiddles);
+    let mut tree_builder = scheme.tree_builder();
+    for trace in &traces {
+        tree_builder.extend_evals(for_commit(
+            trace.to_circle_evaluation(PREPROCESSED_TRACE_IDX),
+        ));
+    }
+    tree_builder.commit(channel);
+    let mut tree_builder = scheme.tree_builder();
+    for trace in &traces {
+        tree_builder.extend_evals(for_commit(trace.to_circle_evaluation(ORIGINAL_TRACE_IDX)));
+    }
+    tree_builder.commit(channel);
+    let roots = scheme.roots();
+    let (initial_state, final_state) = derive_segment_states(side_note);
+    Ok(ReplayTraceBinding {
+        component_mask,
+        log_sizes,
+        preprocessed_commitment: roots[PREPROCESSED_TRACE_IDX],
+        main_commitment: roots[ORIGINAL_TRACE_IDX],
+        initial_state,
+        final_state,
+    })
 }
 
 /// Prove with caller-supplied boundary metadata in place of the
@@ -923,6 +1126,32 @@ pub fn prove_with_boundary_override(
         component_mask,
         Some((initial_state, final_state)),
         &[],
+        ProofTranscriptGeneration::Current,
+    )?;
+    Ok(proof)
+}
+
+/// Construct an otherwise honest proof using the immediately preceding
+/// format-18/19 Fiat–Shamir prefix and then label the outer envelope as the
+/// current generation. This exists solely for the adversarial verifier gate
+/// proving that an old proof cannot be relabelled after the PCS-config binding
+/// change; its output is intentionally unverifiable.
+#[doc(hidden)]
+pub fn prove_pre_config_relabel_for_test(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
+    install_thread_pool();
+    prepare_side_note_for_verification(side_note);
+    let components_owned = super::active_components(side_note);
+    let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
+    let component_mask = super::active_component_mask(side_note);
+    let (proof, _) = prove_impl_with_components_overridden(
+        side_note,
+        production_pcs_config(),
+        false,
+        components,
+        component_mask,
+        None,
+        &[],
+        ProofTranscriptGeneration::PreConfigRelabel,
     )?;
     Ok(proof)
 }
@@ -936,6 +1165,7 @@ fn prove_impl_with_components_overridden(
     component_mask: u32,
     boundary_override: Option<(SegmentState, SegmentState)>,
     min_log_sizes: &[u32],
+    transcript_generation: ProofTranscriptGeneration,
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     use std::time::Instant;
 
@@ -977,38 +1207,7 @@ fn prove_impl_with_components_overridden(
     // below.  Measured saving on log17 a ristretto-heavy workload (MOBILE):
     // ~130 ms → ~70 ms of trace_gen.
     let t = Instant::now();
-    let mut traces: Vec<Option<ComponentTrace>> = (0..components.len()).map(|_| None).collect();
-    // `min_log_sizes` (canonical-shape proving) is empty on the natural
-    // paths ⇒ `unwrap_or(0)` ⇒ each chip proves at its natural size.
-    for (i, c) in components.iter().enumerate() {
-        if c.is_producer() {
-            let min_log_size = min_log_sizes.get(i).copied().unwrap_or(0);
-            traces[i] = Some(c.generate_component_trace_min(side_note, min_log_size));
-        }
-    }
-    {
-        use rayon::prelude::*;
-        let consumer_idxs: Vec<usize> = components
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| (!c.is_producer()).then_some(i))
-            .collect();
-        let snr: &SideNote = side_note;
-        let consumer_traces: Vec<(usize, ComponentTrace)> = consumer_idxs
-            .par_iter()
-            .map(|&i| {
-                let min_log_size = min_log_sizes.get(i).copied().unwrap_or(0);
-                (
-                    i,
-                    components[i].generate_component_trace_immut_min(snr, min_log_size),
-                )
-            })
-            .collect();
-        for (i, t) in consumer_traces {
-            traces[i] = Some(t);
-        }
-    }
-    let traces: Vec<ComponentTrace> = traces.into_iter().map(|x| x.unwrap()).collect();
+    let traces = generate_component_traces(side_note, components, min_log_sizes);
     let log_sizes: Vec<u32> = traces.iter().map(ComponentTrace::log_size).collect();
     let trace_gen = t.elapsed();
 
@@ -1026,6 +1225,14 @@ fn prove_impl_with_components_overridden(
     );
 
     let prover_channel = &mut ProverChannel::default();
+    match transcript_generation {
+        ProofTranscriptGeneration::Current => {
+            crate::proof::mix_proof_fs_domain(prover_channel, PROOF_FORMAT_VERSION, &config);
+        }
+        ProofTranscriptGeneration::PreConfigRelabel => {
+            crate::proof::mix_pre_config_proof_fs_domain(prover_channel);
+        }
+    }
 
     let mut commitment_scheme =
         CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(config, &twiddles);
@@ -1235,47 +1442,7 @@ fn prove_impl_with_components_overridden(
     // Memory-page Merkle roots: entering root on initial_state, exit root on final_state —
     // the same values mixed into the FS transcript above and bound by
     // MemoryRootBoundaryChip, so the proof fields equal the committed columns.
-    let (root_before, root_after) = segment_memory_roots(side_note);
-    let initial_state = if side_note.steps.is_empty() {
-        SegmentState {
-            pc: 0,
-            timestamp: 0,
-            registers: [0; 13],
-            memory_commitment: [0; 32],
-            memory_root: root_before,
-        }
-    } else {
-        let first = &side_note.steps[0];
-        SegmentState {
-            pc: first.pc,
-            timestamp: first.timestamp,
-            registers: side_note.initial_regs,
-            memory_commitment: initial_memory_commitment(side_note),
-            memory_root: root_before,
-        }
-    };
-    let final_state = if side_note.steps.is_empty() {
-        SegmentState {
-            pc: 0,
-            timestamp: 0,
-            registers: [0; 13],
-            memory_commitment: [0; 32],
-            memory_root: root_after,
-        }
-    } else {
-        let last = &side_note.steps[side_note.steps.len() - 1];
-        let mut regs = [0u64; 13];
-        regs[..last.regs_after.len().min(13)]
-            .copy_from_slice(&last.regs_after[..13.min(last.regs_after.len())]);
-        // Final memory = initial memory with all writes applied.
-        SegmentState {
-            pc: last.next_pc,
-            timestamp: last.timestamp + 1,
-            registers: regs,
-            memory_commitment: compute_final_memory_commitment(side_note),
-            memory_root: root_after,
-        }
-    };
+    let (initial_state, final_state) = derive_segment_states(side_note);
 
     // The forgery seam ships the caller's states verbatim — the same
     // values the mix above committed to the transcript.

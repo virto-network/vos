@@ -568,7 +568,7 @@ pub use proof::{
 };
 #[doc(hidden)]
 #[cfg(feature = "prover")]
-pub use prove::prove_with_boundary_override;
+pub use prove::{prove_pre_config_relabel_for_test, prove_with_boundary_override};
 // ── Prove: the stable surface ────────────────────────────────────────
 // Single proof: `prove` / `prove_mobile` / `prove_with_config`.
 // Segment chain: `canonical_profile_for` (or `_for_bounds`) derives the

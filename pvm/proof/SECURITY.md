@@ -20,13 +20,15 @@ soundness reasoning.
 | `proof.claimed_sums`                             | NO       | Constrained: per-component logup must sum to 0. |
 | `proof.log_sizes`                                | NO       | Capped by `DEFAULT_MAX_LOG_SIZE` (overridable). |
 | `proof.initial_state` / `proof.final_state`      | partial  | registers/pc/timestamp bound to the committed boundary columns (boundary-binding check, v5) AND to the trace (pc/timestamp via CpuChip chaining; registers via the v6 register-ledger read-consistency); `memory_commitment` UNBOUND. Deployer must publish what *should* match. |
-| `proof.pcs_config`                               | partial  | Used as-is; affects security level.  See "Proof shape" below. |
+| `proof.pcs_config`                               | NO       | Structurally/policy checked and fully Fiat–Shamir-bound, including the lifting `Option` discriminant. See "Proof shape" below. |
 | `hash` (preprocessed commitment)                 | YES      | Caller-supplied: this IS the program identity. |
 
 The verifier accepts the proof iff:
 
-1. `format_version` matches.
-2. No `log_size` exceeds the cap.
+1. `format_version` matches and that version plus the complete `pcs_config`
+   are bound into the Fiat–Shamir prefix.
+2. Nested proof vectors, canonical M31 encodings, component/tree dimensions,
+   FRI shape, and `log_size` caps pass hostile-input preflight.
 3. `claimed_sums` length matches the verifier's component count.
 4. The proof's `commitments[0]` (preprocessed Merkle root) equals
    the caller-supplied `hash`.
@@ -40,7 +42,7 @@ The verifier accepts the proof iff:
 8. (v5, standalone) `component_mask` contains the three boundary-binding
    chips and its popcount equals `num_components`.
 
-### Nested Refine bundles (formats 18/19)
+### Nested Refine bundles (formats 20/21, bundle v2)
 
 `RefineProofBundle` is an ordered closure of single-program child STARKs.
 Its transcript binds the exact outer artifact hash and invocation
@@ -51,14 +53,17 @@ proof format/shape/commitments, sparse state/page commitments, calls 9 through
 `RefineProofBundle` derives Serde for in-memory interchange, but Serde is not a
 bounded hostile-input decoder. A network or artifact transport **must cap the
 aggregate serialized byte length before deserialization**. The 1024-slice and
-boundary/component limits are post-decode verifier preflights; they prevent
-unbounded transcript hashing, resolver callbacks, and proof verification, but
-cannot undo allocations made while deserializing an unbounded byte stream.
+boundary/component limits are post-decode verifier preflights. Each child also
+has a checked 16 MiB nested-vector payload ceiling and the child closure has a
+512 MiB aggregate ceiling before any child clone, transcript hash, resolver
+callback, or cryptographic verification. These limits bound work after decode;
+they cannot undo allocations made while deserializing an unbounded byte stream.
 
 `verify_refine_bundle_authenticated` also requires a trusted external mapping
-from every exact machine/program identity and proof shape to its
-preprocessed-trace commitment. This prevents a valid proof for arbitrary code
-from being relabelled with a signed program hash. The verifier checks those
+from every exact machine/program identity, proof format, component shape, and
+complete `PcsConfig` (including explicit lifting) to its preprocessed-trace
+commitment. This prevents a valid proof for arbitrary code or another PCS
+profile from being relabelled with a signed program hash. The verifier checks those
 child STARKs and canonical slice/boundary coverage, but deliberately returns
 `ReplayRequired`; transcript authentication alone does not bind the separately
 recorded native machine-state hashes or exit reasons to the child STARK
@@ -67,8 +72,10 @@ through 14. It must never be treated as end-to-end Refine validity. A
 prover-enabled host obtains that stronger result only from
 `verify_refine_bundle_replayed`, which reruns the standard `RefineContext` from
 the exact committed program, arguments, and gas, compares every machine
-identity/slice/boundary, and then verifies each child proof against the directly
-observed witness.
+identity/slice/boundary, regenerates each directly observed witness's exact
+preprocessed and main-trace roots plus public segment state, and then verifies
+the child STARK interaction/composition/FRI suffix against those roots. This
+replay API is the only end-to-end Refine acceptance result.
 
 ## What a verified proof guarantees
 

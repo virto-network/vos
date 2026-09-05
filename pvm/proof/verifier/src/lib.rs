@@ -81,7 +81,8 @@ pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
 /// The mapping must come from an authenticated program catalog or equivalent
 /// admission record, never from the presented bundle itself. A PVM program's
 /// preprocessed commitment also depends on its selected component/log-size
-/// profile, so the complete shape is part of the lookup key.
+/// profile and exact PCS configuration, so the complete shape (including an
+/// explicit lifting choice) is part of the lookup key.
 pub trait RefineProgramCommitmentResolver {
     fn resolve_preprocessed_commitment(
         &self,
@@ -89,12 +90,13 @@ pub trait RefineProgramCommitmentResolver {
         proof_format_version: u32,
         component_mask: u32,
         log_sizes: &[u32],
+        pcs_config: &stwo::core::pcs::PcsConfig,
     ) -> Option<CommitmentHash>;
 }
 
 impl<F> RefineProgramCommitmentResolver for F
 where
-    F: Fn(RefineMachineId, u32, u32, &[u32]) -> Option<CommitmentHash>,
+    F: Fn(RefineMachineId, u32, u32, &[u32], &stwo::core::pcs::PcsConfig) -> Option<CommitmentHash>,
 {
     fn resolve_preprocessed_commitment(
         &self,
@@ -102,8 +104,15 @@ where
         proof_format_version: u32,
         component_mask: u32,
         log_sizes: &[u32],
+        pcs_config: &stwo::core::pcs::PcsConfig,
     ) -> Option<CommitmentHash> {
-        self(identity, proof_format_version, component_mask, log_sizes)
+        self(
+            identity,
+            proof_format_version,
+            component_mask,
+            log_sizes,
+            pcs_config,
+        )
     }
 }
 
@@ -193,6 +202,7 @@ pub fn verify_refine_bundle_authenticated<R: RefineProgramCommitmentResolver + ?
                 slice.proof.format_version,
                 slice.proof.component_mask,
                 &slice.proof.log_sizes,
+                &slice.proof.pcs_config,
             )
         else {
             return Err(VerificationError::InvalidStructure(
@@ -404,11 +414,13 @@ pub fn verify_standalone_with_options(
 /// MOBILE), `Some(p)` = an exact `PcsPolicy` pin (the strict `*_with_pcs_policy`
 /// path). All four public `verify_standalone*` entry points funnel here.
 fn verify_standalone_shaped(
-    proof: Proof,
+    mut proof: Proof,
     preprocessed_commitment: CommitmentHash,
     max_log_size: u32,
     policy: Option<&PcsPolicy>,
 ) -> Result<(), VerificationError> {
+    vos_pvm_proof::proof::preflight_proof_structure(&mut proof, max_log_size)
+        .map_err(VerificationError::InvalidStructure)?;
     // Reject proofs from a different AIR shape early, before
     // any cryptographic work.  Done first because every subsequent
     // length check assumes the AIR shape this verifier was compiled
@@ -438,6 +450,14 @@ fn verify_standalone_shaped(
                 .to_string(),
         ));
     }
+    let supported_mask = 1u32
+        .checked_shl(vos_pvm_proof::chip_idx::COUNT as u32)
+        .map_or(u32::MAX, |end| end - 1);
+    if proof.component_mask & !supported_mask != 0 {
+        return Err(VerificationError::InvalidStructure(
+            "component_mask selects a component outside this AIR generation".to_string(),
+        ));
+    }
     // Cap log_sizes so a malicious prover can't force the
     // verifier into arbitrarily large Merkle commitments.  We check
     // each component's log_size individually against the cap; the
@@ -462,6 +482,44 @@ fn verify_standalone_shaped(
     if let Err(msg) = shape_check {
         return Err(VerificationError::InvalidStructure(msg));
     }
+    if proof.component_mask.count_ones() as usize != proof.num_components {
+        return Err(VerificationError::InvalidStructure(
+            "component_mask popcount does not match num_components".to_string(),
+        ));
+    }
+    let (trace_sizes, preprocessed_sizes) =
+        create_verifier_components::trace_and_preprocessed_sizes(
+            &proof.log_sizes,
+            proof.component_mask,
+        );
+    let mut expected_log_sizes = TreeVec::concat_cols(trace_sizes.into_iter());
+    if expected_log_sizes.len() != 3 {
+        return Err(VerificationError::InvalidStructure(
+            "selected AIR has a noncanonical trace-tree count".to_string(),
+        ));
+    }
+    expected_log_sizes[0] = preprocessed_sizes;
+    let mut dummy_lookup = AllLookupElements::default();
+    let mut dummy_channel = ProverChannel::default();
+    draw_all_lookup_elements(&mut dummy_lookup, &mut dummy_channel, proof.component_mask);
+    let dummy_allocator = &mut TraceLocationAllocator::default();
+    let shape_components = create_verifier_components::components(
+        dummy_allocator,
+        &dummy_lookup,
+        &proof.log_sizes,
+        &proof.claimed_sums,
+        proof.component_mask,
+    );
+    let shape_component_refs: Vec<&dyn Component> = shape_components
+        .iter()
+        .map(|component| &**component)
+        .collect();
+    let protocol_shape = vos_pvm_proof::framework_access::preflight_component_dimensions(
+        &proof,
+        &shape_component_refs,
+        &expected_log_sizes,
+    )
+    .map_err(VerificationError::InvalidStructure)?;
     let Proof {
         stark_proof,
         claimed_sums,
@@ -484,14 +542,6 @@ fn verify_standalone_shaped(
             "log sizes len mismatch".to_string(),
         ));
     }
-    // The active-component reconstruction zips mask-selected chips with
-    // the claimed sums/log sizes; require the counts to agree so a
-    // mask/num_components mismatch can't silently truncate either side.
-    if component_mask.count_ones() as usize != num_components {
-        return Err(VerificationError::InvalidStructure(
-            "component_mask popcount does not match num_components".to_string(),
-        ));
-    }
     // v7: reject `initial_state.timestamp < 1` per segment (the
     // production consumer verifies single proofs here, not only the chain
     // wrapper).  Step timestamps start at 1, so `initial_ts ≥ 1` excludes the
@@ -510,6 +560,7 @@ fn verify_standalone_shaped(
     // (Merkle::WitnessTooLong).  The proof carries its config; trust it.
     let config = pcs_config;
     let verifier_channel = &mut ProverChannel::default();
+    vos_pvm_proof::proof::mix_proof_fs_domain(verifier_channel, PROOF_FORMAT_VERSION, &config);
     claimed_log_sizes.iter().for_each(|log_size| {
         verifier_channel.mix_u64(*log_size as u64);
     });
@@ -525,13 +576,7 @@ fn verify_standalone_shaped(
     let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
 
     // Commit preprocessed and original traces
-    let (trace_sizes, preprocessed_sizes) =
-        create_verifier_components::trace_and_preprocessed_sizes(
-            &claimed_log_sizes,
-            component_mask,
-        );
-    let mut log_sizes = TreeVec::concat_cols(trace_sizes.into_iter());
-    log_sizes[0] = preprocessed_sizes; // PREPROCESSED_TRACE_IDX
+    let log_sizes = expected_log_sizes;
 
     for idx in [0, 1] {
         // PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX
@@ -633,6 +678,20 @@ fn verify_standalone_shaped(
         &log_sizes[2],
         verifier_channel,
     );
+
+    let sampled_queries = vos_pvm_proof::proof::expected_fiat_shamir_query_count(
+        verifier_channel,
+        &stark_proof,
+        &pcs_config,
+        protocol_shape,
+        &log_sizes,
+    )
+    .map_err(VerificationError::InvalidStructure)?;
+    if sampled_queries != protocol_shape.query_count {
+        return Err(VerificationError::InvalidStructure(
+            "queried-value rows differ from Fiat-Shamir query positions".to_string(),
+        ));
+    }
 
     stwo::core::verifier::verify(
         &components_ref,

@@ -69,7 +69,7 @@ const PARAM_XOR_256: u64 = 0x0101_0020;
 /// This byte string was introduced in proof formats 10 and 11 and remains
 /// stable in formats 12 through 19. Its historical crate name is intentional:
 /// moving the prover must not change committed roots. It remains unchanged in
-/// proof formats 18 and 19; those versions add the Refine closure envelope,
+/// proof formats 20 and 21; those versions add the hardened Refine closure envelope,
 /// not a page-hash permutation change.
 const TAG_LEAF: &[u8] = b"zkpvm/page-merkle/leaf/v1";
 /// Stable inner-node domain for proof formats 10 through 19; see `TAG_LEAF`.
@@ -274,7 +274,7 @@ pub struct MergeNode {
 /// bottom-up merge schedule, and the two recomputed roots.  `root_before`
 /// equals `image_root(entering)` and `root_after` equals `image_root(exiting)`
 /// whenever `touched` covers every page that differs between the two images.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MerkleMultiproof {
     /// `(page_idx, before_leaf, after_leaf)`, sorted ascending by page index.
     pub leaves: Vec<(u32, [u8; 32], [u8; 32])>,
@@ -697,8 +697,16 @@ fn boundary_blake2b_calls_with(
 pub fn segment_multiproof(side_note: &crate::side_note::SideNote) -> MerkleMultiproof {
     let mut touched = touched_pages(side_note);
     touched.insert(0); // never-empty page set (design §0)
-    let exiting = crate::segment::replay_writes(side_note, None);
-    build_multiproof(&side_note.initial_memory, &exiting, &touched)
+    match &side_note.sparse_initial_memory {
+        Some(entering) => {
+            let exiting = crate::segment::replay_sparse_writes(side_note, None);
+            build_sparse_multiproof(entering, &exiting, &touched)
+        }
+        None => {
+            let exiting = crate::segment::replay_writes(side_note, None);
+            build_multiproof(&side_note.initial_memory, &exiting, &touched)
+        }
+    }
 }
 
 #[cfg(all(test, feature = "prover"))]
