@@ -11,6 +11,7 @@ extern crate alloc;
 pub mod authority;
 pub mod contract;
 mod model;
+pub mod package;
 pub mod private;
 pub mod proof;
 mod runtime;
