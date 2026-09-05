@@ -64,8 +64,8 @@ use super::journal::{
     PersistedLane, ReplayOperation, system_genesis_post_create_state_commitment,
 };
 use super::replay::{
-    ReplayPublicationAnchor, ReplayPublicationMode, ReplaySealedGenesis, ReplaySealedPublication,
-    ReplaySealedSharedMergeProjection, ReplaySystemAuthorityStoragePlan,
+    ReplayPublicationAnchor, ReplayPublicationMode, ReplaySealedGenesis, ReplaySealedLocalGenesis,
+    ReplaySealedPublication, ReplaySealedSharedMergeProjection, ReplaySystemAuthorityStoragePlan,
     ReplayedRootJournalIdentity,
 };
 use super::shared_commit::{MAX_ORDERED_COMMIT_CLAIM_BYTES, OrderedCommitClaim};
@@ -1845,6 +1845,124 @@ fn validate_sealed_genesis_shape(
             .replicas
             .iter()
             .any(|replica| *replica == sealed.replica())
+    {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
+
+    let expected_frontier = MergeFrontier {
+        genesis: genesis.id(),
+        events: Vec::new(),
+    };
+    if sealed.empty_frontier() != &expected_frontier {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    encode_object(sealed.empty_frontier())?;
+
+    let expected_ordered =
+        InvocationIndexManifest::empty(genesis.id(), InvocationOwnershipScope::Ordered);
+    let expected_merge =
+        InvocationIndexManifest::empty(genesis.id(), InvocationOwnershipScope::Merge);
+    let local_invocations = sealed.local_invocations().clone();
+    if sealed.ordered_invocations() != &expected_ordered
+        || sealed.merge_invocations() != &expected_merge
+        || local_invocations
+            != InvocationIndexManifest::empty(genesis.id(), InvocationOwnershipScope::Local(node))
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    encode_object(sealed.ordered_invocations())?;
+    encode_object(sealed.merge_invocations())?;
+    encode_object(&local_invocations)?;
+
+    let artifacts = sealed.artifacts();
+    encode_object(artifacts)?;
+    if artifacts.genesis != genesis.id()
+        || !artifacts
+            .artifacts
+            .iter()
+            .any(|artifact| artifact == &genesis.runtime().package)
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+
+    let lanes = [
+        sealed.lane_manifest(PersistedLane::Control),
+        sealed.lane_manifest(PersistedLane::Linear),
+        sealed.lane_manifest(PersistedLane::Merge),
+        sealed.lane_manifest(PersistedLane::Local),
+    ];
+    for lane in &lanes {
+        encode_object(lane)?;
+        let bytes = genesis_state_component(post_create, lane.lane);
+        if lane.genesis != genesis.id()
+            || lane.runtime != *genesis.runtime()
+            || lane.state != BlobRef::of_bytes(bytes)
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+    }
+
+    let initial = sealed.initial_heads();
+    encode_object(&initial)?;
+    if initial
+        != JournalHeads::initial(
+            genesis.id(),
+            genesis.admission,
+            node,
+            sealed.empty_frontier().id(),
+            genesis.runtime().clone(),
+        )
+        || initial.ordered_invocations != sealed.ordered_invocations().id()
+        || initial.merge_invocations != sealed.merge_invocations().id()
+        || initial.local_invocations != local_invocations.id()
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+
+    Ok(SealedGenesisShape {
+        initial,
+        local_invocations,
+        lanes,
+    })
+}
+
+/// Validate the storage-visible closure of an opaque ordinary-Local genesis
+/// seal.  Authority is deliberately different from root bootstrap: the seal
+/// has already crossed the live receipt/package trust boundary, and storage
+/// proves its exact derived admission rather than looking for a system
+/// authority ledger owner.
+fn validate_sealed_local_genesis_shape(
+    sealed: &ReplaySealedLocalGenesis,
+    agent: AgentId,
+    node: NodeId,
+) -> Result<SealedGenesisShape, JournalStoreError> {
+    sealed
+        .validate()
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+    let genesis = sealed.genesis();
+    encode_object(genesis)?;
+    if genesis.runtime().agent != agent
+        || sealed.replica().node != node
+        || sealed.admission().node() != node
+        || sealed.admission_commitment() == Hash::ZERO
+    {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
+
+    let post_create = sealed.post_create();
+    if post_create
+        .encoded_len()
+        .is_none_or(|len| len > MAX_RUNTIME_STATE_BYTES)
+    {
+        return Err(JournalStoreError::LimitExceeded);
+    }
+    let decoded =
+        decode_standard_runtime_state(post_create).map_err(|_| JournalStoreError::NonCanonical)?;
+    let config = decoded.config.ok_or(JournalStoreError::NonCanonical)?;
+    if config.validate().is_err()
+        || config.identity.profile != super::AgentProfile::Local
+        || config.system_authority_genesis.is_some()
+        || config.replicas.as_slice() != [sealed.replica()]
     {
         return Err(JournalStoreError::ScopeMismatch);
     }
@@ -5221,7 +5339,10 @@ struct DirectoryCapabilities;
 /// lock for the same Agent. The external stable lock and authority ledger are
 /// one permanent freshness domain: neither may be rolled back, replaced, or
 /// restored with a backup of the replaceable journal root. The lock's exact
-/// 32-byte nonce is durable store-instance state. Opening acquires the lock
+/// 32-byte nonce is durable store-instance state. Ordinary Local stores append
+/// the exact 32-byte creation-intent commitment once their genesis has been
+/// reverified; that suffix is the non-rollbackable exposure witness. Opening
+/// acquires the lock
 /// before initializing or reading that nonce and before creating, repairing,
 /// or otherwise mutating anything below `root`.
 ///
@@ -5253,6 +5374,8 @@ pub struct FileAgentJournalStore {
     stable_lock_identity: FileIdentity,
     #[cfg(target_os = "linux")]
     stable_lock_nonce: [u8; STABLE_LOCK_NONCE_BYTES],
+    #[cfg(target_os = "linux")]
+    local_exposure: Option<Hash>,
     _stable_lock: File,
 }
 
@@ -5276,6 +5399,29 @@ pub(crate) struct FileAgentJournalSlot {
     stable_lock_nonce: [u8; STABLE_LOCK_NONCE_BYTES],
     stable_lock: File,
     fresh_ledger_stage: Option<(File, FileIdentity)>,
+}
+
+/// Stable filesystem slot for an ordinary Local Agent.
+///
+/// Freshness and exposure are owned by the host's durable Local-genesis
+/// intent/marker pair, so this slot deliberately has no system-authority
+/// ledger sidecar and cannot mint a root mutation owner.
+#[cfg(target_os = "linux")]
+pub(crate) struct FileLocalAgentJournalSlot {
+    root: PathBuf,
+    root_name: CString,
+    instance_id: JournalStoreInstanceId,
+    agent: AgentId,
+    node: NodeId,
+    journal_parent: AbsoluteDirectoryCapability,
+    authority_parent: AbsoluteDirectoryCapability,
+    generation_exists: bool,
+    stable_lock_name: CString,
+    stable_lock_identity: FileIdentity,
+    stable_lock_nonce: [u8; STABLE_LOCK_NONCE_BYTES],
+    intent: Hash,
+    exposure_committed: bool,
+    stable_lock: File,
 }
 
 #[cfg(all(target_os = "linux", feature = "storage"))]
@@ -5930,6 +6076,7 @@ impl FileAgentJournalSlot {
             stable_lock_name: self.stable_lock_name,
             stable_lock_identity: self.stable_lock_identity,
             stable_lock_nonce: self.stable_lock_nonce,
+            local_exposure: None,
             _stable_lock: self.stable_lock,
         };
         store.validate_recovery_state()?;
@@ -6172,6 +6319,441 @@ impl FileAgentJournalSlot {
         )?;
         require_single_link(&self.stable_lock)?;
         verify_stable_lock_nonce(&self.stable_lock, &self.stable_lock_nonce)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl FileLocalAgentJournalSlot {
+    /// Acquire an ordinary Local slot only after Host has made the exact
+    /// creation intent durable.  Consequently a missing stable lock may be
+    /// created, while a lock without that host-owned intent never reaches
+    /// this API.
+    pub(crate) fn acquire_with_pinned_parents(
+        root: impl Into<PathBuf>,
+        stable_lock_path: impl Into<PathBuf>,
+        node: NodeId,
+        intent: Hash,
+        pinned_journal_parent: &File,
+        pinned_authority_parent: &File,
+    ) -> Result<Self, JournalStoreError> {
+        if node == NodeId::ZERO || intent == Hash::ZERO {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let requested_root = clean_absolute_path(root.into())?;
+        let agent = agent_from_root_path(&requested_root)?;
+        let root_parent = requested_root
+            .parent()
+            .ok_or(JournalStoreError::InvalidPath)?
+            .to_path_buf();
+        let root_leaf = requested_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(JournalStoreError::InvalidPath)?;
+        let canonical_root = root_parent.join(root_leaf);
+        let root_name = c_name(root_leaf)?;
+
+        let stable_lock_path = clean_absolute_path(stable_lock_path.into())?;
+        if stable_lock_path.starts_with(&canonical_root) {
+            return Err(JournalStoreError::InvalidPath);
+        }
+        let expected_lock_leaf = canonical_root
+            .with_extension("agent-lock")
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(JournalStoreError::InvalidPath)?
+            .to_owned();
+        let stable_lock_leaf = stable_lock_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(JournalStoreError::InvalidPath)?;
+        if stable_lock_leaf != expected_lock_leaf {
+            return Err(JournalStoreError::InvalidPath);
+        }
+        let authority_parent_path = stable_lock_path
+            .parent()
+            .ok_or(JournalStoreError::InvalidPath)?
+            .to_path_buf();
+        let stable_lock_name = c_name(stable_lock_leaf)?;
+        let journal_parent = AbsoluteDirectoryCapability::open(&root_parent)?;
+        let authority_parent = AbsoluteDirectoryCapability::open(&authority_parent_path)?;
+        validate_owned_directory(pinned_journal_parent)?;
+        validate_owned_directory(pinned_authority_parent)?;
+        if FileIdentity::of(journal_parent.get()?)? != FileIdentity::of(pinned_journal_parent)?
+            || FileIdentity::of(authority_parent.get()?)?
+                != FileIdentity::of(pinned_authority_parent)?
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        reject_legacy_generation_at(journal_parent.get()?, agent)?;
+
+        let generation = stat_at(journal_parent.get()?, &root_name)
+            .map_err(|_| JournalStoreError::Unavailable)?;
+        let lock = stat_at(authority_parent.get()?, &stable_lock_name)
+            .map_err(|_| JournalStoreError::Unavailable)?;
+        validate_slot_entry_shapes(generation.as_ref(), None, None, lock.as_ref())?;
+        let (stable_lock, stable_lock_nonce, exposure_committed) = match lock {
+            Some(_) => open_existing_local_stable_lock_at(
+                authority_parent.get()?,
+                stable_lock_leaf,
+                generation.is_none(),
+                generation.is_some(),
+                intent,
+            )?,
+            None => {
+                if generation.is_some() {
+                    return Err(JournalStoreError::Corrupt);
+                }
+                create_local_stable_lock_at(authority_parent.get()?, stable_lock_leaf, intent)?
+            }
+        };
+        let stable_lock_identity = FileIdentity::of(&stable_lock)?;
+        verify_regular_entry(
+            authority_parent.get()?,
+            &stable_lock_name,
+            stable_lock_identity,
+        )?;
+        require_single_link(&stable_lock)?;
+        if verify_local_stable_lock(&stable_lock, &stable_lock_nonce, intent)? != exposure_committed
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let generation = stat_at(journal_parent.get()?, &root_name)
+            .map_err(|_| JournalStoreError::Unavailable)?;
+        validate_slot_entry_shapes(
+            generation.as_ref(),
+            None,
+            None,
+            Some(
+                &stat_at(authority_parent.get()?, &stable_lock_name)
+                    .map_err(|_| JournalStoreError::Unavailable)?
+                    .ok_or(JournalStoreError::Corrupt)?,
+            ),
+        )?;
+        let instance_id =
+            file_journal_store_instance_id(&canonical_root, agent, node, &stable_lock_nonce)?;
+        Ok(Self {
+            root: canonical_root,
+            root_name,
+            instance_id,
+            agent,
+            node,
+            journal_parent,
+            authority_parent,
+            generation_exists: generation.is_some(),
+            stable_lock_name,
+            stable_lock_identity,
+            stable_lock_nonce,
+            intent,
+            exposure_committed,
+            stable_lock,
+        })
+    }
+
+    pub(crate) fn generation_exists(&self) -> bool {
+        self.generation_exists
+    }
+
+    /// Open or resume an ordinary Local generation under its exact opaque
+    /// admission. `exposed` is the separately durable Host marker; an
+    /// exposed store must already be complete, while an unexposed store may
+    /// resume only a monotonic prefix of this seal.
+    pub(crate) fn open(
+        self,
+        sealed: &ReplaySealedLocalGenesis,
+        externally_exposed: bool,
+    ) -> Result<FileAgentJournalStore, JournalStoreError> {
+        self.verify_lock()?;
+        if externally_exposed && !self.exposure_committed {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let exposed = externally_exposed || self.exposure_committed;
+        let unexposed_complete = if exposed {
+            false
+        } else {
+            self.preflight_unexposed_generation_prefix(sealed)?
+        };
+        if exposed {
+            self.preflight_exposed_generation(sealed)?;
+        }
+        let read_only_open = exposed || unexposed_complete;
+        let root_leaf = self
+            .root_name
+            .to_str()
+            .map_err(|_| JournalStoreError::InvalidPath)?;
+        let journal_parent = self.journal_parent.get()?;
+        reject_legacy_generation_at(journal_parent, self.agent)?;
+        if !read_only_open {
+            ensure_directory_at(journal_parent, root_leaf)?;
+        }
+        let root_directory = open_directory_at(journal_parent, root_leaf)?;
+        validate_owned_directory(&root_directory)?;
+        verify_regular_entry(
+            self.authority_parent.get()?,
+            &self.stable_lock_name,
+            self.stable_lock_identity,
+        )?;
+        if !read_only_open {
+            discard_private_stages_at(&root_directory, is_fixed_private_stage_name)?;
+        }
+        validate_directory_names(
+            &root_directory,
+            &[
+                "records",
+                "checkpoints",
+                "lane-state",
+                "artifact-closures",
+                "invocation-index",
+                "invocation-outcomes",
+                SHARED_ORDERED_COMMIT_DIRECTORY,
+                HISTORY_DIRECTORY,
+                "catalog",
+                "authority",
+                "genesis-admission",
+                "genesis-admission.next",
+                "genesis",
+                "genesis.next",
+                "heads",
+                "heads.next",
+                GC_INTENT_NAME,
+                GC_INTENT_STAGE_NAME,
+            ],
+        )?;
+        let directories =
+            DirectoryCapabilities::new(self.journal_parent, self.root_name, root_directory)?;
+        let mut store = FileAgentJournalStore {
+            root: self.root,
+            instance_id: self.instance_id,
+            agent: self.agent,
+            node: self.node,
+            directories,
+            history_candidate: None,
+            replayed_root: None,
+            // A complete but not-yet-exposed generation was opened without
+            // mutation. Defer its private-stage cleanup until replay has
+            // authenticated the exact genesis just like an exposed reopen.
+            startup_recovery_pending: read_only_open,
+            authority_parent: self.authority_parent,
+            stable_lock_name: self.stable_lock_name,
+            stable_lock_identity: self.stable_lock_identity,
+            stable_lock_nonce: self.stable_lock_nonce,
+            local_exposure: Some(self.intent),
+            _stable_lock: self.stable_lock,
+        };
+        store.validate_recovery_state()?;
+        if read_only_open {
+            store.open_existing_layout()?;
+        } else {
+            store.ensure_layout()?;
+            store.recover_history_state()?;
+        }
+        store.validate_local_authority_recovery(sealed)?;
+        if let Some(heads) = store.heads()? {
+            validate_head_targets(&store, &heads)?;
+        }
+        if let Some(staged) = store.read_fixed::<JournalHeads>("", "heads.next")? {
+            validate_head_targets(&store, &staged)?;
+        }
+        store.verify_lock()?;
+        Ok(store)
+    }
+
+    fn preflight_unexposed_generation_prefix(
+        &self,
+        sealed: &ReplaySealedLocalGenesis,
+    ) -> Result<bool, JournalStoreError> {
+        if !self.generation_exists {
+            return Ok(false);
+        }
+        let parent = self.journal_parent.get()?;
+        let root_leaf = self
+            .root_name
+            .to_str()
+            .map_err(|_| JournalStoreError::InvalidPath)?;
+        let root_directory = open_directory_at(parent, root_leaf)?;
+        validate_owned_directory(&root_directory)?;
+        let root_identity = FileIdentity::of(&root_directory)?;
+        verify_directory_entry(parent, &self.root_name, root_identity)?;
+        validate_unexposed_initialization_namespace(&root_directory)?;
+        validate_initialization_anchor_links(&root_directory, "genesis-admission", true)?;
+        validate_initialization_anchor_links(&root_directory, "genesis", true)?;
+        validate_initialization_anchor_links(&root_directory, "heads", false)?;
+
+        let admission = read_pinned_bounded_regular_at(
+            &root_directory,
+            "genesis-admission",
+            core::mem::size_of::<Hash>(),
+        )?;
+        let staged_admission = read_pinned_bounded_regular_at(
+            &root_directory,
+            "genesis-admission.next",
+            core::mem::size_of::<Hash>(),
+        )?;
+        for value in [&admission, &staged_admission].into_iter().flatten() {
+            if value.as_slice() != sealed.admission_commitment().as_bytes() {
+                return Err(JournalStoreError::ScopeMismatch);
+            }
+        }
+        let genesis = read_pinned_bounded_regular_at(
+            &root_directory,
+            "genesis",
+            class_maximum(JournalStorageClass::Genesis),
+        )?;
+        let staged_genesis = read_pinned_bounded_regular_at(
+            &root_directory,
+            "genesis.next",
+            class_maximum(JournalStorageClass::Genesis),
+        )?;
+        for value in [&genesis, &staged_genesis].into_iter().flatten() {
+            let decoded = decode_object::<AgentJournalGenesis>(value, sealed.genesis().id())?;
+            if decoded != *sealed.genesis() {
+                return Err(JournalStoreError::ScopeMismatch);
+            }
+        }
+        let heads = read_pinned_bounded_regular_at(
+            &root_directory,
+            "heads",
+            class_maximum(JournalStorageClass::Heads),
+        )?;
+        let staged_heads = read_pinned_bounded_regular_at(
+            &root_directory,
+            "heads.next",
+            class_maximum(JournalStorageClass::Heads),
+        )?;
+        let initial_heads = sealed.initial_heads();
+        for value in [&heads, &staged_heads].into_iter().flatten() {
+            let decoded = JournalHeads::decode(value).map_err(|_| JournalStoreError::Corrupt)?;
+            let decoded = decode_object::<JournalHeads>(value, decoded.id())?;
+            if decoded != initial_heads {
+                return Err(JournalStoreError::ScopeMismatch);
+            }
+        }
+        let has_genesis = genesis.is_some() || staged_genesis.is_some();
+        let has_heads = heads.is_some() || staged_heads.is_some();
+        if has_genesis && admission.is_none()
+            || has_heads && genesis.is_none()
+            || staged_admission.is_some() && (has_genesis || has_heads)
+            || staged_genesis.is_some() && has_heads
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        validate_initialization_anchor_links(&root_directory, "genesis-admission", true)?;
+        validate_initialization_anchor_links(&root_directory, "genesis", true)?;
+        validate_initialization_anchor_links(&root_directory, "heads", false)?;
+        validate_unexposed_initialization_namespace(&root_directory)?;
+        verify_directory_entry(parent, &self.root_name, root_identity)?;
+        Ok(admission.is_some()
+            && genesis.is_some()
+            && heads.is_some()
+            && staged_admission.is_none()
+            && staged_genesis.is_none()
+            && staged_heads.is_none())
+    }
+
+    fn preflight_exposed_generation(
+        &self,
+        sealed: &ReplaySealedLocalGenesis,
+    ) -> Result<(), JournalStoreError> {
+        if !self.generation_exists {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let parent = self.journal_parent.get()?;
+        let root_leaf = self
+            .root_name
+            .to_str()
+            .map_err(|_| JournalStoreError::InvalidPath)?;
+        let root_directory = open_directory_at(parent, root_leaf)?;
+        validate_owned_directory(&root_directory)?;
+        let root_identity = FileIdentity::of(&root_directory)?;
+        verify_directory_entry(parent, &self.root_name, root_identity)?;
+        validate_initialization_anchor_links(&root_directory, "genesis-admission", true)?;
+        validate_initialization_anchor_links(&root_directory, "genesis", true)?;
+        validate_initialization_anchor_links(&root_directory, "heads", false)?;
+        for stage in ["genesis-admission.next", "genesis.next", "heads.next"] {
+            if stat_at(&root_directory, &c_name(stage)?)
+                .map_err(|_| JournalStoreError::Unavailable)?
+                .is_some()
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+        let admission = read_pinned_bounded_regular_at(
+            &root_directory,
+            "genesis-admission",
+            core::mem::size_of::<Hash>(),
+        )?
+        .ok_or(JournalStoreError::Corrupt)?;
+        if admission.as_slice() != sealed.admission_commitment().as_bytes() {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let genesis = read_pinned_bounded_regular_at(
+            &root_directory,
+            "genesis",
+            class_maximum(JournalStorageClass::Genesis),
+        )?
+        .ok_or(JournalStoreError::Corrupt)?;
+        let decoded_genesis =
+            decode_object::<AgentJournalGenesis>(&genesis, sealed.genesis().id())?;
+        if decoded_genesis != *sealed.genesis() {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let heads = read_pinned_bounded_regular_at(
+            &root_directory,
+            "heads",
+            class_maximum(JournalStorageClass::Heads),
+        )?
+        .ok_or(JournalStoreError::Corrupt)?;
+        let decoded_heads = JournalHeads::decode(&heads).map_err(|_| JournalStoreError::Corrupt)?;
+        let decoded_heads = decode_object::<JournalHeads>(&heads, decoded_heads.id())?;
+        if decoded_heads.genesis != sealed.genesis().id()
+            || decoded_heads.admission != sealed.genesis().admission
+            || decoded_heads.node != self.node
+            || decoded_heads.runtime.agent != self.agent
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        validate_directory_names(
+            &root_directory,
+            &[
+                "records",
+                "checkpoints",
+                "lane-state",
+                "artifact-closures",
+                "invocation-index",
+                "invocation-outcomes",
+                SHARED_ORDERED_COMMIT_DIRECTORY,
+                HISTORY_DIRECTORY,
+                "catalog",
+                "authority",
+                "genesis-admission",
+                "genesis-admission.next",
+                "genesis",
+                "genesis.next",
+                "heads",
+                "heads.next",
+                GC_INTENT_NAME,
+                GC_INTENT_STAGE_NAME,
+            ],
+        )?;
+        validate_initialization_anchor_links(&root_directory, "genesis-admission", true)?;
+        validate_initialization_anchor_links(&root_directory, "genesis", true)?;
+        validate_initialization_anchor_links(&root_directory, "heads", false)?;
+        verify_directory_entry(parent, &self.root_name, root_identity)?;
+        Ok(())
+    }
+
+    fn verify_lock(&self) -> Result<(), JournalStoreError> {
+        verify_regular_entry(
+            self.authority_parent.get()?,
+            &self.stable_lock_name,
+            self.stable_lock_identity,
+        )?;
+        require_single_link(&self.stable_lock)?;
+        if verify_local_stable_lock(&self.stable_lock, &self.stable_lock_nonce, self.intent)?
+            != self.exposure_committed
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(())
     }
 }
 
@@ -6480,6 +7062,7 @@ struct FileCatalogCapability {
     stable_lock_name: CString,
     stable_lock_identity: FileIdentity,
     stable_lock_nonce: [u8; STABLE_LOCK_NONCE_BYTES],
+    local_exposure: Option<Hash>,
     stable_lock: File,
 }
 
@@ -6493,7 +7076,11 @@ impl FileCatalogCapability {
             self.stable_lock_identity,
         )?;
         require_single_link(&self.stable_lock)?;
-        verify_stable_lock_nonce(&self.stable_lock, &self.stable_lock_nonce)?;
+        verify_generation_stable_lock(
+            &self.stable_lock,
+            &self.stable_lock_nonce,
+            self.local_exposure,
+        )?;
         self.directories.get("catalog/blobs")?;
         Ok(())
     }
@@ -6584,6 +7171,7 @@ impl CatalogBlobResolverFactory for FileAgentJournalStore {
                 stable_lock_name: self.stable_lock_name.clone(),
                 stable_lock_identity: self.stable_lock_identity,
                 stable_lock_nonce: self.stable_lock_nonce,
+                local_exposure: self.local_exposure,
                 stable_lock: self
                     ._stable_lock
                     .try_clone()
@@ -6609,6 +7197,134 @@ impl core::fmt::Debug for FileAgentJournalStore {
 }
 
 impl FileAgentJournalStore {
+    /// Install an ordinary Local genesis which was authenticated and exactly
+    /// executed by replay.  This path intentionally persists no root anchor,
+    /// bootstrap evidence, or system-authority ownership capability.
+    pub(crate) fn initialize_local(
+        &mut self,
+        sealed: &ReplaySealedLocalGenesis,
+    ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
+        let shape = validate_sealed_local_genesis_shape(sealed, self.agent, self.node)?;
+        if self.replayed_root.is_some() {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let genesis = sealed.genesis();
+        let encoded = encode_object(genesis)?;
+        for reference in &sealed.artifacts().artifacts {
+            require_blob(self, JournalBlobClass::CatalogArtifact, reference)?;
+        }
+        for existing in [
+            self.read_admission("genesis-admission")?,
+            self.read_admission("genesis-admission.next")?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if existing != sealed.admission_commitment() {
+                return Err(JournalStoreError::Conflict);
+            }
+        }
+        for existing in [
+            self.read_fixed::<AgentJournalGenesis>("", "genesis")?,
+            self.read_fixed::<AgentJournalGenesis>("", "genesis.next")?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if existing != *genesis {
+                return Err(JournalStoreError::Conflict);
+            }
+        }
+        for existing in [
+            self.read_fixed::<JournalHeads>("", "heads")?,
+            self.read_fixed::<JournalHeads>("", "heads.next")?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if existing != shape.initial {
+                return Err(JournalStoreError::Conflict);
+            }
+        }
+        self.persist_admission(sealed.admission_commitment())?;
+        self.persist_object(sealed.empty_frontier())?;
+        self.persist_object(sealed.ordered_invocations())?;
+        self.persist_object(sealed.merge_invocations())?;
+        self.persist_object(&shape.local_invocations)?;
+        self.persist_object(sealed.artifacts())?;
+        for lane in &shape.lanes {
+            self.persist_blob(
+                JournalBlobClass::LaneState,
+                &lane.state,
+                genesis_state_component(sealed.post_create(), lane.lane),
+            )?;
+            self.persist_object(lane)?;
+        }
+        let genesis_created = persist_immutable_at(
+            self.directory("")?,
+            "genesis",
+            &encoded.bytes,
+            class_maximum(JournalStorageClass::Genesis),
+            |bytes| {
+                let decoded =
+                    AgentJournalGenesis::decode(bytes).map_err(|_| JournalStoreError::Corrupt)?;
+                decode_object::<AgentJournalGenesis>(bytes, decoded.id()).map(|_| ())
+            },
+        )?;
+        let heads_created = self.install_initial_heads(&shape.initial)?;
+        validate_head_targets(self, &shape.initial)?;
+        Ok(genesis_created || heads_created)
+    }
+
+    /// Irreversibly bind an ordinary Local generation's successful replay to
+    /// its exact host-owned creation intent. The stable-lock suffix is made
+    /// durable before Host publishes the separately discoverable exposure
+    /// marker, so deleting or rolling that marker back cannot make an
+    /// already-exposed generation eligible for initialization repair.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn commit_local_exposure(
+        &mut self,
+        sealed: &ReplaySealedLocalGenesis,
+        intent: Hash,
+    ) -> Result<(), JournalStoreError> {
+        if intent == Hash::ZERO
+            || self.local_exposure != Some(intent)
+            || self.replayed_root.is_some()
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        validate_sealed_local_genesis_shape(sealed, self.agent, self.node)?;
+
+        // Cleanup for a read-only reopen is permitted only after the driver
+        // has authenticated and replayed its current head closure.
+        self.finish_deferred_startup_recovery()?;
+        if self.read_admission("genesis-admission")? != Some(sealed.admission_commitment())
+            || self.read_admission("genesis-admission.next")?.is_some()
+            || self.read_fixed::<AgentJournalGenesis>("", "genesis")?
+                != Some(sealed.genesis().clone())
+            || self
+                .read_fixed::<AgentJournalGenesis>("", "genesis.next")?
+                .is_some()
+            || self.read_fixed::<JournalHeads>("", "heads.next")?.is_some()
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let heads = self.heads()?.ok_or(JournalStoreError::Corrupt)?;
+        if heads.genesis != sealed.genesis().id() || heads.node != self.node {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        validate_head_targets(self, &heads)?;
+        self.sync_unexposed_generation()?;
+        commit_local_stable_lock_exposure(
+            &self._stable_lock,
+            self.authority_parent.get()?,
+            &self.stable_lock_nonce,
+            intent,
+        )?;
+        self.verify_lock()
+    }
+
     #[cfg(test)]
     fn open(
         root: impl Into<PathBuf>,
@@ -6773,6 +7489,7 @@ impl FileAgentJournalStore {
             stable_lock_name,
             stable_lock_identity,
             stable_lock_nonce,
+            local_exposure: None,
             _stable_lock: stable_lock,
         };
         store.validate_recovery_state()?;
@@ -6804,7 +7521,12 @@ impl FileAgentJournalStore {
             self.stable_lock_identity,
         )?;
         require_single_link(&self._stable_lock)?;
-        verify_stable_lock_nonce(&self._stable_lock, &self.stable_lock_nonce)
+        verify_generation_stable_lock(
+            &self._stable_lock,
+            &self.stable_lock_nonce,
+            self.local_exposure,
+        )
+        .map(|_| ())
     }
 
     fn read_gc_intent_file(&self, name: &str) -> Result<Option<GcIntent>, JournalStoreError> {
@@ -8005,6 +8727,22 @@ impl FileAgentJournalStore {
             || sealed.root_anchor() != &root
             || sealed.admission_evidence() != &evidence
             || sealed.admission_record() != &admission
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_local_authority_recovery(
+        &self,
+        sealed: &ReplaySealedLocalGenesis,
+    ) -> Result<(), JournalStoreError> {
+        validate_sealed_local_genesis_shape(sealed, self.agent, self.node)?;
+        let Some(genesis) = self.genesis()? else {
+            return Ok(());
+        };
+        if sealed.genesis() != &genesis
+            || self.read_admission("genesis-admission")? != Some(sealed.admission_commitment())
         {
             return Err(JournalStoreError::ScopeMismatch);
         }
@@ -16133,6 +16871,9 @@ fn validate_initialization_anchor_links(
 const STABLE_LOCK_NONCE_BYTES: usize = 32;
 
 #[cfg(target_os = "linux")]
+const LOCAL_STABLE_LOCK_EXPOSED_BYTES: usize = STABLE_LOCK_NONCE_BYTES + 32;
+
+#[cfg(target_os = "linux")]
 fn stable_lock_nonce(
     file: &File,
     parent: &File,
@@ -16193,6 +16934,52 @@ fn verify_stable_lock_nonce(
 }
 
 #[cfg(target_os = "linux")]
+fn verify_local_stable_lock(
+    file: &File,
+    expected_nonce: &[u8; STABLE_LOCK_NONCE_BYTES],
+    intent: Hash,
+) -> Result<bool, JournalStoreError> {
+    let length = file
+        .metadata()
+        .map_err(|_| JournalStoreError::Unavailable)?
+        .len();
+    if length != STABLE_LOCK_NONCE_BYTES as u64 && length != LOCAL_STABLE_LOCK_EXPOSED_BYTES as u64
+    {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let mut nonce = [0_u8; STABLE_LOCK_NONCE_BYTES];
+    UnixFileExt::read_exact_at(file, &mut nonce, 0).map_err(|_| JournalStoreError::Corrupt)?;
+    if nonce == [0; STABLE_LOCK_NONCE_BYTES] || nonce != *expected_nonce {
+        return Err(JournalStoreError::Corrupt);
+    }
+    if length == STABLE_LOCK_NONCE_BYTES as u64 {
+        return Ok(false);
+    }
+    let mut committed_intent = [0_u8; 32];
+    UnixFileExt::read_exact_at(file, &mut committed_intent, STABLE_LOCK_NONCE_BYTES as u64)
+        .map_err(|_| JournalStoreError::Corrupt)?;
+    if committed_intent != *intent.as_bytes() {
+        return Err(JournalStoreError::Corrupt);
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_generation_stable_lock(
+    file: &File,
+    expected_nonce: &[u8; STABLE_LOCK_NONCE_BYTES],
+    local_intent: Option<Hash>,
+) -> Result<bool, JournalStoreError> {
+    match local_intent {
+        None => {
+            verify_stable_lock_nonce(file, expected_nonce)?;
+            Ok(false)
+        }
+        Some(intent) => verify_local_stable_lock(file, expected_nonce, intent),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn lock_stable_file(file: &File) -> Result<(), JournalStoreError> {
     validate_owned_regular_file(file).map_err(|_| JournalStoreError::InvalidPath)?;
     FileExt::try_lock_exclusive(file).map_err(|error| {
@@ -16249,6 +17036,76 @@ fn open_existing_stable_lock_at(
 }
 
 #[cfg(target_os = "linux")]
+fn open_existing_local_stable_lock_at(
+    parent: &File,
+    name: &str,
+    allow_pristine_nonce_recovery: bool,
+    generation_exists: bool,
+    intent: Hash,
+) -> Result<(File, [u8; STABLE_LOCK_NONCE_BYTES], bool), JournalStoreError> {
+    let name = c_name(name)?;
+    let file = open_at(
+        parent,
+        &name,
+        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        0,
+    )
+    .map_err(|_| JournalStoreError::Corrupt)?;
+    lock_stable_file(&file)?;
+    let length = file
+        .metadata()
+        .map_err(|_| JournalStoreError::Unavailable)?
+        .len();
+    let (nonce, exposed) = match length {
+        length if length < STABLE_LOCK_NONCE_BYTES as u64 && allow_pristine_nonce_recovery => {
+            if length != 0 {
+                file.set_len(0)
+                    .and_then(|()| file.sync_all())
+                    .and_then(|()| parent.sync_all())
+                    .map_err(|_| JournalStoreError::Unavailable)?;
+            }
+            (stable_lock_nonce(&file, parent)?, false)
+        }
+        length if length == STABLE_LOCK_NONCE_BYTES as u64 => {
+            (stable_lock_nonce(&file, parent)?, false)
+        }
+        length
+            if generation_exists
+                && length > STABLE_LOCK_NONCE_BYTES as u64
+                && length <= LOCAL_STABLE_LOCK_EXPOSED_BYTES as u64 =>
+        {
+            let mut nonce = [0_u8; STABLE_LOCK_NONCE_BYTES];
+            UnixFileExt::read_exact_at(&file, &mut nonce, 0)
+                .map_err(|_| JournalStoreError::Corrupt)?;
+            if nonce == [0; STABLE_LOCK_NONCE_BYTES] {
+                return Err(JournalStoreError::Corrupt);
+            }
+            let committed = (length as usize) - STABLE_LOCK_NONCE_BYTES;
+            let mut prefix = [0_u8; 32];
+            UnixFileExt::read_exact_at(
+                &file,
+                &mut prefix[..committed],
+                STABLE_LOCK_NONCE_BYTES as u64,
+            )
+            .map_err(|_| JournalStoreError::Corrupt)?;
+            if prefix[..committed] != intent.as_bytes()[..committed] {
+                return Err(JournalStoreError::Corrupt);
+            }
+            UnixFileExt::write_all_at(&file, &intent.as_bytes()[committed..], length)
+                .and_then(|()| file.sync_all())
+                .and_then(|()| parent.sync_all())
+                .map_err(|_| JournalStoreError::Unavailable)?;
+            (nonce, true)
+        }
+        _ => return Err(JournalStoreError::Corrupt),
+    };
+    if verify_local_stable_lock(&file, &nonce, intent)? != exposed {
+        return Err(JournalStoreError::Corrupt);
+    }
+    Ok((file, nonce, exposed))
+}
+
+#[cfg(target_os = "linux")]
 fn create_stable_lock_at(
     parent: &File,
     name: &str,
@@ -16278,6 +17135,61 @@ fn create_stable_lock_at(
     lock_stable_file(&file)?;
     let nonce = stable_lock_nonce(&file, parent)?;
     Ok((file, nonce))
+}
+
+#[cfg(target_os = "linux")]
+fn create_local_stable_lock_at(
+    parent: &File,
+    name: &str,
+    intent: Hash,
+) -> Result<(File, [u8; STABLE_LOCK_NONCE_BYTES], bool), JournalStoreError> {
+    let name = c_name(name)?;
+    let file = match open_at(
+        parent,
+        &name,
+        libc::O_RDWR
+            | libc::O_CREAT
+            | libc::O_EXCL
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK,
+        0o600,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+            return open_existing_local_stable_lock_at(
+                parent,
+                name.to_str().map_err(|_| JournalStoreError::InvalidPath)?,
+                true,
+                false,
+                intent,
+            );
+        }
+        Err(_) => return Err(JournalStoreError::Unavailable),
+    };
+    lock_stable_file(&file)?;
+    let nonce = stable_lock_nonce(&file, parent)?;
+    Ok((file, nonce, false))
+}
+
+#[cfg(target_os = "linux")]
+fn commit_local_stable_lock_exposure(
+    file: &File,
+    parent: &File,
+    nonce: &[u8; STABLE_LOCK_NONCE_BYTES],
+    intent: Hash,
+) -> Result<(), JournalStoreError> {
+    if verify_local_stable_lock(file, nonce, intent)? {
+        return Ok(());
+    }
+    UnixFileExt::write_all_at(file, intent.as_bytes(), STABLE_LOCK_NONCE_BYTES as u64)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| parent.sync_all())
+        .map_err(|_| JournalStoreError::Unavailable)?;
+    if !verify_local_stable_lock(file, nonce, intent)? {
+        return Err(JournalStoreError::Corrupt);
+    }
+    Ok(())
 }
 
 #[cfg(all(test, target_os = "linux"))]

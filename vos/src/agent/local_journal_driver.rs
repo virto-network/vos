@@ -31,17 +31,17 @@ use super::journal_store::{
 };
 #[cfg(all(feature = "storage", target_os = "linux"))]
 use super::journal_store::{
-    BoundFileSystemAuthorityLedgerOwner, ReverifiedRootJournalStore, SystemAuthorityHistoryStore,
-    SystemAuthorityPublicationStore,
+    BoundFileSystemAuthorityLedgerOwner, FileAgentJournalStore, ReverifiedRootJournalStore,
+    SystemAuthorityHistoryStore, SystemAuthorityPublicationStore,
 };
 use super::package::{Package, PackageError};
 use super::replay::{
     MaterializeError, NoPrunedOrderedBases, ReplayCommittedRecovery, ReplayDisposition,
     ReplayError, ReplayExecutionResult, ReplayExecutor, ReplayInvocationRecovery,
     ReplayMaterialization, ReplayMaterializationSourceError, ReplayPosition, ReplayPreparation,
-    ReplayPreparedGenesis, ReplayProducts, ReplaySealedGenesis, ReplayStepOutcome,
-    ReplayTransition, derive_lane_state, materialize_current, prepare_checkpoint, prepare_local,
-    prepare_merge, prepare_ordered, recover_invocation,
+    ReplayPreparedGenesis, ReplayProducts, ReplaySealedGenesis, ReplaySealedLocalGenesis,
+    ReplayStepOutcome, ReplayTransition, derive_lane_state, materialize_current,
+    prepare_checkpoint, prepare_local, prepare_merge, prepare_ordered, recover_invocation,
 };
 #[cfg(all(feature = "storage", target_os = "linux"))]
 use super::replay::{
@@ -2077,6 +2077,55 @@ where
         ))
     }
 
+    /// Construct the exact Authorized<Create> replay input for an ordinary
+    /// Local Agent.  The live trust slot is sampled here and the returned
+    /// input is the only value later persisted in the host's durable creation
+    /// intent.  Root-system bootstrap data is explicitly forbidden.
+    pub(crate) fn local_genesis_input(
+        config: AgentConfig,
+        runtime_package: &Package,
+        receipt: AgentAuthorityReceipt,
+        trust: &Arc<dyn AgentTrustProvider>,
+        merge: &Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<(ReplayInput, Vec<RuntimeBlob>), LocalJournalDriverError> {
+        if config.system_authority_genesis.is_some() {
+            return Err(LocalReplayExecutorError::InvalidRequest.into());
+        }
+        let catalog = Self::runtime_package_catalog(runtime_package);
+        let runtime = RuntimeBinding {
+            space: config.identity.space,
+            agent: config.identity.agent,
+            deployment: config.identity.runtime_deployment,
+            program: config.identity.runtime_program,
+            producer: config.identity.runtime_producer,
+            package: catalog[0].reference.clone(),
+            runtime_abi: super::RUNTIME_ABI_ID,
+            execution_semantics: super::EXECUTION_SEMANTICS_ID,
+        };
+        let request = seal_lifecycle_request(
+            trust.as_ref(),
+            receipt,
+            LifecycleRequest::Create(config.clone()),
+        )?;
+        StandardLocalReplayExecutor::<SuppliedCatalogBlobResolver>::validate_local_config_shape(
+            &config,
+            &runtime,
+            merge.node(),
+        )?;
+        runtime_package
+            .validate()
+            .map_err(LocalReplayExecutorError::Package)?;
+        StandardLocalReplayExecutor::<SuppliedCatalogBlobResolver>::
+            validate_runtime_package_binding(&config, &runtime, runtime_package)?;
+        Ok((
+            ReplayInput {
+                runtime,
+                operation: ReplayOperation::Management { request },
+            },
+            catalog,
+        ))
+    }
+
     /// Execute and authenticate the bootstrap-owned Create input without
     /// writing a destination store. The returned opaque replay token is the
     /// sole input accepted by the independent genesis proposal/seal path.
@@ -2105,6 +2154,26 @@ where
             return Err(LocalJournalDriverError::InvalidResult);
         }
         Ok(prepared)
+    }
+
+    /// Authenticate and execute one ordinary Local Create, then mint the
+    /// non-root opaque genesis seal.  There is no constructor from decoded
+    /// journal bytes or caller-supplied output state.
+    pub(crate) fn prepare_local_genesis(
+        create: ReplayInput,
+        replica: AgentReplica,
+        catalog: &[RuntimeBlob],
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<ReplaySealedLocalGenesis, LocalJournalDriverError> {
+        let prepared = Self::prepare_system_genesis(create, replica, catalog, trust, merge)?;
+        ReplaySealedLocalGenesis::from_prepared(prepared).map_err(|error| {
+            LocalJournalDriverError::Replay(
+                error
+                    .map_source(|never| match never {})
+                    .map_executor(|never| match never {}),
+            )
+        })
     }
 
     fn validate_create_state(
@@ -2165,6 +2234,43 @@ where
         )
     }
 
+    fn preflight_local_create(
+        sealed: &ReplaySealedLocalGenesis,
+        catalog: &[RuntimeBlob],
+        trust: &Arc<dyn AgentTrustProvider>,
+        merge: &Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<(), LocalJournalDriverError> {
+        sealed.validate().map_err(|error| {
+            LocalJournalDriverError::Replay(
+                error
+                    .map_source(|never| match never {})
+                    .map_executor(|never| match never {}),
+            )
+        })?;
+        if sealed.replica().node != merge.node() {
+            return Err(LocalReplayExecutorError::WrongReplica.into());
+        }
+        let resolver = SuppliedCatalogBlobResolver::from_catalog(catalog)?;
+        if resolver.blobs.len() != sealed.artifacts().artifacts.len()
+            || sealed.artifacts().artifacts.iter().any(|reference| {
+                resolver
+                    .blobs
+                    .get(&(reference.hash, reference.len))
+                    .is_none_or(|bytes| !reference.matches(bytes))
+            })
+        {
+            return Err(LocalJournalDriverError::InvalidResult);
+        }
+        Self::validate_create_state(
+            sealed.post_create(),
+            sealed.genesis().runtime(),
+            sealed.replica(),
+            resolver,
+            trust,
+            merge,
+        )
+    }
+
     /// Initialize only from a root/QC-admitted, exactly executed genesis.
     /// The complete catalog closure is made durable before genesis and heads
     /// become visible.
@@ -2200,7 +2306,6 @@ where
     /// Open a store whose filesystem/root adapter has already reverified the
     /// sealed genesis admission. The only state cache is rebuilt from typed
     /// journal closure and exact replay.
-    #[cfg(test)]
     pub(crate) fn open(
         store: S,
         trust: Arc<dyn AgentTrustProvider>,
@@ -3487,6 +3592,78 @@ where
             Ok(_) => Err(LocalJournalDriverError::InvalidResult),
             Err(error) => Err(LocalJournalDriverError::Lifecycle(error)),
         }
+    }
+}
+
+#[cfg(all(feature = "storage", target_os = "linux"))]
+impl LocalJournalAgentDriver<FileAgentJournalStore> {
+    /// Initialize an ordinary Local journal from its opaque receipt-verified
+    /// seal.  The complete catalog and generation are synced before the host
+    /// may publish its external exposure marker.
+    pub(crate) fn create_local(
+        mut store: FileAgentJournalStore,
+        sealed: ReplaySealedLocalGenesis,
+        intent: Hash,
+        catalog: &[RuntimeBlob],
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<Self, LocalJournalDriverError> {
+        Self::preflight_local_create(&sealed, catalog, &trust, &merge)?;
+        for blob in catalog {
+            store.put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &blob.reference,
+                &blob.bytes,
+            )?;
+        }
+        store.initialize_local(&sealed)?;
+        store.sync_unexposed_generation()?;
+        let replica = sealed.replica();
+        let resolver = store.catalog_blob_resolver()?;
+        let executor = StandardLocalReplayExecutor::new(resolver, trust, merge);
+        let core = LocalJournalCore::open(store, executor)?;
+        let mut driver = Self {
+            core,
+            #[cfg(test)]
+            lifecycle_fault: None,
+        };
+        driver.validate_opened(Some(replica))?;
+        let materialized_heads = driver.core.materialization.heads().clone();
+        driver.core.store.finish_reverified_open()?;
+        if driver.core.store.heads()?.as_ref() != Some(&materialized_heads) {
+            return Err(LocalJournalDriverError::InvalidResult);
+        }
+        driver.core.store.commit_local_exposure(&sealed, intent)?;
+        Ok(driver)
+    }
+
+    /// Reopen an ordinary Local generation, replay and authenticate its full
+    /// current closure, then finish any deferred cleanup and make its stable
+    /// exposure witness durable. This is also the recovery boundary for a
+    /// crash after generation sync but before Host published the marker.
+    pub(crate) fn open_local(
+        store: FileAgentJournalStore,
+        sealed: &ReplaySealedLocalGenesis,
+        intent: Hash,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<Self, LocalJournalDriverError> {
+        let resolver = store.catalog_blob_resolver()?;
+        let executor = StandardLocalReplayExecutor::new(resolver, trust, merge);
+        let core = LocalJournalCore::open(store, executor)?;
+        let mut driver = Self {
+            core,
+            #[cfg(test)]
+            lifecycle_fault: None,
+        };
+        driver.validate_opened(Some(sealed.replica()))?;
+        let materialized_heads = driver.core.materialization.heads().clone();
+        driver.core.store.finish_reverified_open()?;
+        if driver.core.store.heads()?.as_ref() != Some(&materialized_heads) {
+            return Err(LocalJournalDriverError::InvalidResult);
+        }
+        driver.core.store.commit_local_exposure(sealed, intent)?;
+        Ok(driver)
     }
 }
 

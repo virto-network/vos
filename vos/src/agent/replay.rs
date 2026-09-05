@@ -88,6 +88,8 @@ use super::{
 use crate::service::wire::ServiceWire;
 use crate::service::{BlobRef, Hash, InvocationId, NodeId};
 
+const LOCAL_GENESIS_ADMISSION_DOMAIN: &[u8] = b"vos/agent/local-genesis-admission/v1";
+
 /// Maximum records replayed after one checkpoint before another checkpoint is
 /// mandatory. This independently bounds an adversarial parent chain.
 pub const MAX_REPLAY_SUFFIX_ENTRIES: usize = 1_024;
@@ -404,7 +406,7 @@ pub enum ReplayMaterializationSourceError<ResolverError> {
 }
 
 impl<SourceError, ExecutorError> ReplayError<SourceError, ExecutorError> {
-    fn map_source<NextSourceError>(
+    pub(crate) fn map_source<NextSourceError>(
         self,
         map: impl FnOnce(SourceError) -> NextSourceError,
     ) -> ReplayError<NextSourceError, ExecutorError> {
@@ -444,7 +446,7 @@ impl<SourceError, ExecutorError> ReplayError<SourceError, ExecutorError> {
         }
     }
 
-    fn map_executor<NextExecutorError>(
+    pub(crate) fn map_executor<NextExecutorError>(
         self,
         map: impl FnOnce(ExecutorError) -> NextExecutorError,
     ) -> ReplayError<SourceError, NextExecutorError> {
@@ -1563,6 +1565,271 @@ impl ReplayPreparedGenesis {
 
     pub(crate) const fn expectations(&self) -> SystemAgentGenesisExpectations {
         self.expectations
+    }
+}
+
+/// Receipt-authenticated admission for one ordinary Local Agent genesis.
+///
+/// This capability is deliberately neither wire encodable nor publicly
+/// constructible.  It can only be minted from [`ReplayPreparedGenesis`],
+/// after the replay executor has authenticated the exact Authorized<Create>
+/// receipt, trusted runtime package, Local replica, and post-Create state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplayedLocalGenesisAdmission {
+    admission: AgentGenesisAdmissionId,
+    create: super::journal::ReplayInputId,
+    authority: Hash,
+    receipt: Hash,
+    node: NodeId,
+    post_create: Hash,
+    artifacts: Hash,
+}
+
+impl ReplayedLocalGenesisAdmission {
+    pub(crate) const fn id(self) -> AgentGenesisAdmissionId {
+        self.admission
+    }
+
+    pub(crate) const fn node(self) -> NodeId {
+        self.node
+    }
+
+    fn from_prepared(prepared: &ReplayPreparedGenesis) -> Result<Self, ReplayValidationError> {
+        let ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { admission, request },
+        } = &prepared.create.operation
+        else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        let LifecycleRequest::Create(config) = request.as_ref() else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        if config.identity.profile != AgentProfile::Local
+            || config.system_authority_genesis.is_some()
+            || config.replicas.as_slice() != [prepared.replica]
+            || admission.receipt.claim.authority != config.authority
+        {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        let create = prepared.create.id();
+        let authority = config.authority.commitment();
+        let receipt = Hash::digest(
+            b"vos/agent/local-genesis-receipt/v1",
+            &[&admission.receipt.encode()],
+        );
+        let node = prepared.replica.node;
+        let post_create = prepared.expectations.post_create_state();
+        let artifacts = prepared.expectations.artifact_closure();
+        let admission = AgentGenesisAdmissionId::from_bytes(
+            Hash::digest(
+                LOCAL_GENESIS_ADMISSION_DOMAIN,
+                &[
+                    create.as_bytes(),
+                    authority.as_bytes(),
+                    receipt.as_bytes(),
+                    node.as_bytes(),
+                    post_create.as_bytes(),
+                    artifacts.as_bytes(),
+                ],
+            )
+            .0,
+        );
+        if admission == AgentGenesisAdmissionId::ZERO {
+            return Err(ReplayError::InvalidRecord);
+        }
+        Ok(Self {
+            admission,
+            create,
+            authority,
+            receipt,
+            node,
+            post_create,
+            artifacts,
+        })
+    }
+
+    pub(crate) fn validate_against(
+        self,
+        genesis: &AgentJournalGenesis,
+        post_create: &RuntimeState,
+        artifacts: &ArtifactClosure,
+    ) -> Result<(), ReplayValidationError> {
+        let ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { admission, request },
+        } = &genesis.create.operation
+        else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        let LifecycleRequest::Create(config) = request.as_ref() else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        let receipt = Hash::digest(
+            b"vos/agent/local-genesis-receipt/v1",
+            &[&admission.receipt.encode()],
+        );
+        if genesis.admission != self.admission
+            || genesis.create.id() != self.create
+            || config.identity.profile != AgentProfile::Local
+            || config.system_authority_genesis.is_some()
+            || config.authority.commitment() != self.authority
+            || receipt != self.receipt
+            || config.replicas.len() != 1
+            || config.replicas[0].node != self.node
+            || system_genesis_post_create_state_commitment(post_create)
+                .map_err(|_| ReplayError::InvalidRecord)?
+                != self.post_create
+            || artifacts
+                .system_genesis_commitment()
+                .map_err(|_| ReplayError::InvalidRecord)?
+                != self.artifacts
+        {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Opaque, receipt-verified clean-generation seal for an ordinary Local
+/// Agent.  Unlike [`ReplaySealedGenesis`], this carries no root authority or
+/// system-authority-ledger ownership capability.
+pub(crate) struct ReplaySealedLocalGenesis {
+    genesis: AgentJournalGenesis,
+    post_create: RuntimeState,
+    empty_frontier: MergeFrontier,
+    ordered_invocations: InvocationIndexManifest,
+    merge_invocations: InvocationIndexManifest,
+    local_invocations: InvocationIndexManifest,
+    artifacts: ArtifactClosure,
+    admission: ReplayedLocalGenesisAdmission,
+    replica: AgentReplica,
+}
+
+impl ReplaySealedLocalGenesis {
+    pub(crate) fn from_prepared(
+        prepared: ReplayPreparedGenesis,
+    ) -> Result<Self, ReplayValidationError> {
+        let admission = ReplayedLocalGenesisAdmission::from_prepared(&prepared)?;
+        let genesis = AgentJournalGenesis {
+            admission: admission.id(),
+            create: prepared.create,
+        };
+        genesis.validate().map_err(|_| ReplayError::InvalidRecord)?;
+        let genesis_id = genesis.id();
+        if genesis_id == AgentJournalGenesisId::ZERO {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let artifacts = ArtifactClosure {
+            genesis: genesis_id,
+            artifacts: prepared.artifacts,
+        };
+        artifacts
+            .validate()
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        let post_create = prepared.post_create;
+        admission.validate_against(&genesis, &post_create, &artifacts)?;
+        let replica = prepared.replica;
+        let empty_frontier = MergeFrontier {
+            genesis: genesis_id,
+            events: Vec::new(),
+        };
+        Ok(Self {
+            genesis,
+            post_create,
+            empty_frontier,
+            ordered_invocations: InvocationIndexManifest::empty(
+                genesis_id,
+                InvocationOwnershipScope::Ordered,
+            ),
+            merge_invocations: InvocationIndexManifest::empty(
+                genesis_id,
+                InvocationOwnershipScope::Merge,
+            ),
+            local_invocations: InvocationIndexManifest::empty(
+                genesis_id,
+                InvocationOwnershipScope::Local(replica.node),
+            ),
+            artifacts,
+            admission,
+            replica,
+        })
+    }
+
+    pub(crate) const fn genesis(&self) -> &AgentJournalGenesis {
+        &self.genesis
+    }
+
+    pub(crate) const fn post_create(&self) -> &RuntimeState {
+        &self.post_create
+    }
+
+    pub(crate) const fn empty_frontier(&self) -> &MergeFrontier {
+        &self.empty_frontier
+    }
+
+    pub(crate) const fn ordered_invocations(&self) -> &InvocationIndexManifest {
+        &self.ordered_invocations
+    }
+
+    pub(crate) const fn merge_invocations(&self) -> &InvocationIndexManifest {
+        &self.merge_invocations
+    }
+
+    pub(crate) const fn local_invocations(&self) -> &InvocationIndexManifest {
+        &self.local_invocations
+    }
+
+    pub(crate) const fn artifacts(&self) -> &ArtifactClosure {
+        &self.artifacts
+    }
+
+    pub(crate) const fn admission(&self) -> ReplayedLocalGenesisAdmission {
+        self.admission
+    }
+
+    pub(crate) const fn replica(&self) -> AgentReplica {
+        self.replica
+    }
+
+    pub(crate) fn admission_commitment(&self) -> Hash {
+        self.genesis.admission.as_hash()
+    }
+
+    pub(crate) fn lane_manifest(&self, lane: PersistedLane) -> LaneStateManifest {
+        let cursor = match lane {
+            PersistedLane::Control | PersistedLane::Linear => LaneCursor::Ordered {
+                base: OrderedBase::post_genesis(),
+            },
+            PersistedLane::Merge => LaneCursor::Merge {
+                frontier: self.empty_frontier.id(),
+            },
+            PersistedLane::Local => LaneCursor::Local {
+                node: self.replica.node,
+                revision: 0,
+                head: None,
+            },
+        };
+        LaneStateManifest {
+            genesis: self.genesis.id(),
+            runtime: self.genesis.runtime().clone(),
+            lane,
+            cursor,
+            state: BlobRef::of_bytes(state_component(&self.post_create, lane)),
+        }
+    }
+
+    pub(crate) fn initial_heads(&self) -> JournalHeads {
+        JournalHeads::initial(
+            self.genesis.id(),
+            self.genesis.admission,
+            self.replica.node,
+            self.empty_frontier.id(),
+            self.genesis.runtime().clone(),
+        )
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), ReplayValidationError> {
+        self.admission
+            .validate_against(&self.genesis, &self.post_create, &self.artifacts)
     }
 }
 

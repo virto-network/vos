@@ -41,10 +41,12 @@ use super::execution::{
     MAX_EXECUTION_POLICY_BYTES, MAX_EXECUTION_PROGRAM_BYTES, MAX_EXECUTION_STATE_BYTES,
     RuntimeBlob,
 };
-use super::journal::ReplayOperation;
+use super::journal::{CanonicalJournalRecord, ReplayOperation};
 use super::journal_store::{AgentJournalStore, FileAgentJournalStore, JournalStoreError};
 #[cfg(all(feature = "storage", target_os = "linux"))]
-use super::journal_store::{BoundFileSystemAuthorityLedgerOwner, FileAgentJournalSlot};
+use super::journal_store::{
+    BoundFileSystemAuthorityLedgerOwner, FileAgentJournalSlot, FileLocalAgentJournalSlot,
+};
 #[cfg(all(feature = "storage", target_os = "linux"))]
 use super::local_journal_driver::LocalJournalUnexposedOpenError;
 use super::local_journal_driver::{
@@ -55,14 +57,16 @@ use super::package::{
     MAX_ENCODED_PACKAGE_BYTES, MAX_PACKAGE_DIAGNOSTICS_BYTES, MAX_PACKAGE_INTERFACES_BYTES,
     MAX_PACKAGE_SCHEMAS_BYTES, MAX_PACKAGE_TASK_BYTES, Package, PackageError,
 };
-use super::replay::{ReplayError, ReplayMaterializationSourceError, ReplaySealedGenesis};
+use super::replay::{
+    ReplayError, ReplayMaterializationSourceError, ReplaySealedGenesis, ReplaySealedLocalGenesis,
+};
 #[cfg(all(feature = "storage", target_os = "linux"))]
 use super::system_authority_ledger::{SystemAuthorityLedgerError, SystemAuthorityLedgerRouteOwner};
 use super::{
     ActorDirectoryPage, ActorEntry, AgentConfig, AgentConfigError, AgentIdentity, LifecycleError,
     LifecycleReply, LifecycleRequest, PackageKind,
 };
-use crate::service::wire::ServiceWire;
+use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{
     ActorId, AgentId, BlobRef, CapabilityId, DeploymentId, Hash, InstallationId, InvocationId,
     NodeId, ProgramId, SpaceId,
@@ -71,6 +75,13 @@ use crate::service::{
 const JOURNAL_SUFFIX: &str = ".agent";
 const JOURNAL_LOCK_SUFFIX: &str = ".agent-lock";
 const LEGACY_IMAGE_SUFFIX: &str = ".agent-image";
+const LOCAL_GENESIS_INTENT_SUFFIX: &str = ".local-genesis.intent";
+const LOCAL_GENESIS_INTENT_STAGE_SUFFIX: &str = ".local-genesis.intent.next";
+const LOCAL_GENESIS_EXPOSURE_SUFFIX: &str = ".local-genesis.exposed";
+const LOCAL_GENESIS_EXPOSURE_STAGE_SUFFIX: &str = ".local-genesis.exposed.next";
+const LOCAL_GENESIS_INTENT_DOMAIN: &[u8] = b"vos/agent-host/local-genesis-intent/v1";
+const MAX_LOCAL_GENESIS_INTENT_BYTES: usize =
+    MAX_ENCODED_PACKAGE_BYTES + super::journal::MAX_REPLAY_INPUT_BYTES + 1024;
 const SYSTEM_AUTHORITY_LEDGER_SUFFIX: &str = ".system-authority-ledger.redb";
 const SYSTEM_AUTHORITY_LEDGER_STAGE_SUFFIX: &str = ".system-authority-ledger.redb.next";
 const HOST_LOCK_FILE: &str = ".agent-host.lock";
@@ -109,6 +120,143 @@ pub const DEFAULT_AGENT_HOST_PAYLOAD_CAPACITY_BYTES: usize = 32 * 1024 * 1024;
 const WORKER_RUNNING: u8 = 0;
 const WORKER_SHUTTING_DOWN: u8 = 1;
 const WORKER_STOPPED: u8 = 2;
+
+/// Durable, exact replay input for one ordinary Local creation.  The file is
+/// retained outside the replaceable journal root and therefore serves both
+/// as crash-recovery material and as the exact idempotency record.  It is not
+/// an admission capability: every open re-authenticates and exactly executes
+/// it through the configured trust provider before replay can mint a seal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalGenesisIntent {
+    create: super::journal::ReplayInput,
+    runtime_package: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LocalGenerationFiles {
+    journal: bool,
+    lock: bool,
+    intent: bool,
+    intent_stage: bool,
+    exposed: bool,
+    exposed_stage: bool,
+}
+
+impl LocalGenesisIntent {
+    fn new(
+        create: super::journal::ReplayInput,
+        runtime_package: &Package,
+    ) -> Result<Self, AgentHostError> {
+        let intent = Self {
+            create,
+            runtime_package: runtime_package.encode(),
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+
+    fn config(&self) -> Result<&AgentConfig, AgentHostError> {
+        let ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { request, .. },
+        } = &self.create.operation
+        else {
+            return Err(AgentHostError::InvalidRuntime);
+        };
+        let LifecycleRequest::Create(config) = request.as_ref() else {
+            return Err(AgentHostError::InvalidRuntime);
+        };
+        Ok(config)
+    }
+
+    fn receipt(&self) -> Result<&AgentAuthorityReceipt, AgentHostError> {
+        let ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { admission, .. },
+        } = &self.create.operation
+        else {
+            return Err(AgentHostError::InvalidRuntime);
+        };
+        Ok(&admission.receipt)
+    }
+
+    fn runtime_package(&self) -> Result<Package, AgentHostError> {
+        let package =
+            Package::decode(&self.runtime_package).map_err(|_| AgentHostError::InvalidRuntime)?;
+        if package.encode() != self.runtime_package {
+            return Err(AgentHostError::InvalidRuntime);
+        }
+        Ok(package)
+    }
+
+    fn validate(&self) -> Result<(), AgentHostError> {
+        self.create
+            .validate()
+            .map_err(|_| AgentHostError::InvalidRuntime)?;
+        let config = self.config()?;
+        config.validate().map_err(AgentHostError::InvalidConfig)?;
+        if config.identity.profile != super::AgentProfile::Local
+            || config.system_authority_genesis.is_some()
+            || config.replicas.len() != 1
+            || self.create.runtime.space != config.identity.space
+            || self.create.runtime.agent != config.identity.agent
+            || self.create.runtime.package != config.runtime_package
+            || !config.runtime_package.matches(&self.runtime_package)
+        {
+            return Err(AgentHostError::InvalidRuntime);
+        }
+        let package = self.runtime_package()?;
+        package.validate().map_err(AgentHostError::Package)?;
+        if self.encode().len() > MAX_LOCAL_GENESIS_INTENT_BYTES {
+            return Err(AgentHostError::InvalidRuntime);
+        }
+        Ok(())
+    }
+
+    fn id(&self) -> Hash {
+        Hash::digest(LOCAL_GENESIS_INTENT_DOMAIN, &[&self.encode()])
+    }
+
+    fn catalog(&self) -> Vec<RuntimeBlob> {
+        vec![RuntimeBlob {
+            reference: BlobRef::of_bytes(&self.runtime_package),
+            bytes: self.runtime_package.clone(),
+        }]
+    }
+
+    fn matches_caller(
+        &self,
+        config: &AgentConfig,
+        runtime_package: &Package,
+        receipt: &AgentAuthorityReceipt,
+    ) -> Result<bool, AgentHostError> {
+        Ok(self.config()? == config
+            && self.runtime_package == runtime_package.encode()
+            && self.receipt()? == receipt)
+    }
+}
+
+impl ServiceWire for LocalGenesisIntent {
+    const MAGIC: [u8; 4] = *b"AGLI";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.bytes(&self.create.encode());
+        encoder.bytes(&self.runtime_package);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        if decoder.remaining() > MAX_LOCAL_GENESIS_INTENT_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let create = super::journal::ReplayInput::decode(&decoder.bytes()?)?;
+        let runtime_package = decoder.bytes()?;
+        let intent = Self {
+            create,
+            runtime_package,
+        };
+        intent.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(intent)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentHostError {
@@ -543,7 +691,7 @@ impl AgentHostRootLease {
 pub(crate) struct AgentHost {
     root: PathBuf,
     scope: AgentHostScope,
-    agents: BTreeMap<AgentId, HostedSystemAgent>,
+    agents: BTreeMap<AgentId, HostedLocalAgent>,
     trust: Arc<dyn AgentTrustProvider>,
     merge: Arc<dyn LocalMergeAuthenticator>,
     genesis: Arc<dyn SystemAgentGenesisProvider>,
@@ -556,21 +704,29 @@ pub(crate) struct AgentHost {
 /// authority owner. Read-only driver methods are available through `Deref`;
 /// there is intentionally no `DerefMut`, so every mutation must cross the
 /// wrapper's single owner-held gate.
-struct HostedSystemAgent {
-    driver: LocalJournalAgentDriver<FileAgentJournalStore>,
-    #[cfg(all(feature = "storage", target_os = "linux"))]
-    authority: BoundFileSystemAuthorityLedgerOwner,
+enum HostedLocalAgent {
+    System {
+        driver: LocalJournalAgentDriver<FileAgentJournalStore>,
+        #[cfg(all(feature = "storage", target_os = "linux"))]
+        authority: BoundFileSystemAuthorityLedgerOwner,
+    },
+    Local {
+        driver: LocalJournalAgentDriver<FileAgentJournalStore>,
+        intent: LocalGenesisIntent,
+    },
 }
 
-impl core::ops::Deref for HostedSystemAgent {
+impl core::ops::Deref for HostedLocalAgent {
     type Target = LocalJournalAgentDriver<FileAgentJournalStore>;
 
     fn deref(&self) -> &Self::Target {
-        &self.driver
+        match self {
+            Self::System { driver, .. } | Self::Local { driver, .. } => driver,
+        }
     }
 }
 
-impl HostedSystemAgent {
+impl HostedLocalAgent {
     fn with_root_mutation<T>(
         &mut self,
         operation: impl FnOnce(
@@ -584,9 +740,19 @@ impl HostedSystemAgent {
         }
         #[cfg(all(feature = "storage", target_os = "linux"))]
         {
-            self.authority
-                .with_root_mutation(|| operation(&mut self.driver))
-                .map_err(map_system_authority_ledger_error)?
+            match self {
+                Self::System { driver, authority } => authority
+                    .with_root_mutation(|| operation(driver))
+                    .map_err(map_system_authority_ledger_error)?,
+                Self::Local { driver, .. } => operation(driver),
+            }
+        }
+    }
+
+    fn intent(&self) -> Option<&LocalGenesisIntent> {
+        match self {
+            Self::System { .. } => None,
+            Self::Local { intent, .. } => Some(intent),
         }
     }
 }
@@ -1711,7 +1877,7 @@ impl AgentHost {
         validate_host_root_capabilities(scope, merge.as_ref(), &root_pins)?;
         lease.validate_live()?;
         let system_agent = root_pins.record().system_agent();
-        let mut journals = Vec::new();
+        let mut generations = BTreeMap::<AgentId, LocalGenerationFiles>::new();
         let mut has_host_lock = false;
         for entry in fs::read_dir(agent_host_directory_capability_path(&lease.root_directory))
             .map_err(|_| AgentHostError::Unavailable)?
@@ -1755,7 +1921,7 @@ impl AgentHost {
                 return Err(AgentHostError::InvalidScopeBinding);
             }
             if !folded_name.ends_with(JOURNAL_SUFFIX) {
-                continue;
+                return Err(AgentHostError::InvalidJournalName);
             }
             if !name.ends_with(JOURNAL_SUFFIX) {
                 return Err(AgentHostError::InvalidJournalName);
@@ -1765,19 +1931,13 @@ impl AgentHost {
             }
             let encoded = &name[..name.len() - JOURNAL_SUFFIX.len()];
             let agent = decode_agent_id(encoded).ok_or(AgentHostError::InvalidJournalName)?;
-            if agent != system_agent {
-                return Err(AgentHostError::ScopeMismatch);
+            if generations.entry(agent).or_default().journal {
+                return Err(AgentHostError::DuplicateAgent);
             }
-            journals.push(agent);
+            generations.get_mut(&agent).expect("inserted").journal = true;
         }
-        journals.sort_unstable();
         lease.validate_live()?;
-        if journals.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(AgentHostError::DuplicateAgent);
-        }
-        let has_journal = !journals.is_empty();
         let authority_root = lease.authority_root()?.to_path_buf();
-        let lock_name = format!("{}{}", encode_agent_id(system_agent), JOURNAL_LOCK_SUFFIX);
         let ledger_name = format!(
             "{}{}",
             encode_agent_id(system_agent),
@@ -1799,15 +1959,55 @@ impl AgentHost {
                 .file_name()
                 .into_string()
                 .map_err(|_| AgentHostError::InvalidJournalName)?;
-            if (name != lock_name && name != ledger_name && name != ledger_stage_name)
-                || !file_type.is_file()
-                || file_type.is_symlink()
-            {
+            if !file_type.is_file() || file_type.is_symlink() {
                 return Err(AgentHostError::InvalidScopeBinding);
             }
+            if name == ledger_name || name == ledger_stage_name {
+                continue;
+            }
+            let folded = name.to_ascii_lowercase();
+            let suffixes = [
+                LOCAL_GENESIS_INTENT_STAGE_SUFFIX,
+                LOCAL_GENESIS_EXPOSURE_STAGE_SUFFIX,
+                LOCAL_GENESIS_INTENT_SUFFIX,
+                LOCAL_GENESIS_EXPOSURE_SUFFIX,
+                JOURNAL_LOCK_SUFFIX,
+            ];
+            let suffix = suffixes
+                .iter()
+                .find(|suffix| folded.ends_with(**suffix))
+                .copied()
+                .ok_or(AgentHostError::InvalidScopeBinding)?;
+            if !name.ends_with(suffix) {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+            let encoded = &name[..name.len() - suffix.len()];
+            let agent = decode_agent_id(encoded).ok_or(AgentHostError::InvalidScopeBinding)?;
+            let files = generations.entry(agent).or_default();
+            let flag = match suffix {
+                JOURNAL_LOCK_SUFFIX => &mut files.lock,
+                LOCAL_GENESIS_INTENT_SUFFIX => &mut files.intent,
+                LOCAL_GENESIS_INTENT_STAGE_SUFFIX => &mut files.intent_stage,
+                LOCAL_GENESIS_EXPOSURE_SUFFIX => &mut files.exposed,
+                LOCAL_GENESIS_EXPOSURE_STAGE_SUFFIX => &mut files.exposed_stage,
+                _ => unreachable!("complete Local generation suffix set"),
+            };
+            if *flag {
+                return Err(AgentHostError::DuplicateAgent);
+            }
+            *flag = true;
         }
         lease.validate_live()?;
-        let has_lock = generation_regular_file_exists_at(&lease.authority_directory, &lock_name)?;
+        let system_files = generations.get(&system_agent).copied().unwrap_or_default();
+        if system_files.intent
+            || system_files.intent_stage
+            || system_files.exposed
+            || system_files.exposed_stage
+        {
+            return Err(AgentHostError::InvalidScopeBinding);
+        }
+        let has_journal = system_files.journal;
+        let has_lock = system_files.lock;
         let has_ledger =
             generation_regular_file_exists_at(&lease.authority_directory, &ledger_name)?;
         let has_ledger_stage =
@@ -1819,15 +2019,32 @@ impl AgentHost {
         {
             return Err(AgentHostError::InvalidScopeBinding);
         }
-        let generation_residue = has_journal || has_lock || has_ledger || has_ledger_stage;
-        let complete_generation = has_journal && has_lock && has_ledger && !has_ledger_stage;
-        if lease.rejects_generation_state(generation_residue, complete_generation) {
+        for (agent, files) in &generations {
+            if *agent == system_agent {
+                continue;
+            }
+            if (!files.intent && !files.intent_stage)
+                || (files.lock && !files.intent)
+                || (files.journal && !files.lock)
+                || ((files.exposed || files.exposed_stage)
+                    && (!files.journal || !files.lock || !files.intent))
+            {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+        }
+        let system_generation_residue = has_journal || has_lock || has_ledger || has_ledger_stage;
+        let complete_system_generation = has_journal && has_lock && has_ledger && !has_ledger_stage;
+        if lease.rejects_generation_state(system_generation_residue, complete_system_generation) {
             // An armed lease with no recognized residue represents the
             // unavoidable crash window after the permanent arm and before
             // the first inner stage. It is deliberately fail-closed. Partial
             // recognized states continue into the inner slot recovery matrix.
             return Err(AgentHostError::InvalidScopeBinding);
         }
+        let generation_residue = system_generation_residue
+            || generations.iter().any(|(agent, files)| {
+                *agent != system_agent && *files != LocalGenerationFiles::default()
+            });
         if (!lease.may_initialize_host_boundary() || generation_residue) && !has_host_lock {
             return Err(AgentHostError::InvalidScopeBinding);
         }
@@ -1902,8 +2119,62 @@ impl AgentHost {
                 lease.validate_live()?;
                 agents.insert(system_agent, driver);
             }
-            Err(SystemAgentGenesisProviderError::NotConfigured) if !generation_residue => {}
+            Err(SystemAgentGenesisProviderError::NotConfigured) if !system_generation_residue => {}
             Err(error) => return Err(AgentHostError::Provider(error)),
+        }
+        let ordinary_agents = generations
+            .keys()
+            .copied()
+            .filter(|agent| *agent != system_agent)
+            .collect::<Vec<_>>();
+        if !ordinary_agents.is_empty() && !agents.contains_key(&system_agent) {
+            return Err(AgentHostError::InvalidScopeBinding);
+        }
+        for agent in ordinary_agents {
+            let files = generations
+                .get(&agent)
+                .copied()
+                .ok_or(AgentHostError::InvalidScopeBinding)?;
+            let intent = recover_local_genesis_intent(&lease.authority_directory, agent)?;
+            validate_local_intent_target(scope, system_agent, agent, &intent, trust.as_ref())?;
+            let catalog = intent.catalog();
+            let sealed =
+                prepare_local_intent_genesis(&intent, &catalog, trust.clone(), merge.clone())?;
+            let exposed = recover_local_exposure_marker(
+                &lease.authority_directory,
+                agent,
+                intent.id(),
+                files.exposed,
+                files.exposed_stage,
+            )?;
+            let (journal_parent, authority_parent) = lease.clone_generation_parents()?;
+            let driver = open_archived_local_agent(
+                &root,
+                &authority_root,
+                &journal_parent,
+                &authority_parent,
+                scope,
+                sealed,
+                intent.id(),
+                &catalog,
+                exposed,
+                trust.clone(),
+                merge.clone(),
+            )?;
+            let identity = driver.identity().map_err(map_local_driver_error)?;
+            if identity.agent != agent || identity.space != scope.space {
+                return Err(AgentHostError::IdentityMismatch);
+            }
+            if !exposed {
+                publish_local_exposure_marker(&lease.authority_directory, agent, intent.id())?;
+            }
+            lease.validate_live()?;
+            if agents
+                .insert(agent, HostedLocalAgent::Local { driver, intent })
+                .is_some()
+            {
+                return Err(AgentHostError::DuplicateAgent);
+            }
         }
         lease.validate_live()?;
         if cleanup_scope_stage {
@@ -1964,22 +2235,32 @@ impl AgentHost {
         if !self.scope.admits(config) {
             return Err(AgentHostError::ScopeMismatch);
         }
-        if config.identity.agent != self.system_agent() {
-            return Err(AgentHostError::ScopeMismatch);
-        }
         if let Some(driver) = self.agents.get(&config.identity.agent)
             && driver.config().map_err(map_local_driver_error)? != *config
         {
             return Err(AgentHostError::DuplicateAgent);
         }
-        validate_system_create_target(
-            self.scope,
-            self.system_agent(),
-            config,
-            runtime_package,
-            &self.root_pins,
-            self.trust.as_ref(),
-        )?;
+        if config.identity.agent == self.system_agent() {
+            validate_system_create_target(
+                self.scope,
+                self.system_agent(),
+                config,
+                runtime_package,
+                &self.root_pins,
+                self.trust.as_ref(),
+            )?;
+        } else {
+            if !self.agents.contains_key(&self.system_agent()) {
+                return Err(AgentHostError::InvalidAuthority);
+            }
+            validate_local_create_target(
+                self.scope,
+                self.system_agent(),
+                config,
+                runtime_package,
+                self.trust.as_ref(),
+            )?;
+        }
         let request = LifecycleRequest::Create(config.clone());
         PreparedLifecycleRequest::new(config, request)
     }
@@ -2125,7 +2406,7 @@ impl AgentHost {
             return Err(AgentHostError::ScopeMismatch);
         }
         if config.identity.agent != self.system_agent() {
-            return Err(AgentHostError::ScopeMismatch);
+            return self.create_ordinary_local(config, runtime_package, authority);
         }
         let agent = config.identity.agent;
         validate_system_create_shape(self.scope, agent, &config, &runtime_package)?;
@@ -2249,6 +2530,113 @@ impl AgentHost {
             return Err(AgentHostError::IdentityMismatch);
         }
         self.agents.insert(agent, driver);
+        Ok(identity)
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    fn create_ordinary_local(
+        &mut self,
+        config: AgentConfig,
+        runtime_package: Package,
+        authority: &AgentAuthorityReceipt,
+    ) -> Result<AgentIdentity, AgentHostError> {
+        let system_agent = self.system_agent();
+        if !self.agents.contains_key(&system_agent) {
+            return Err(AgentHostError::InvalidAuthority);
+        }
+        validate_local_create_target(
+            self.scope,
+            system_agent,
+            &config,
+            &runtime_package,
+            self.trust.as_ref(),
+        )?;
+        validate_local_create_receipt(&config, authority)?;
+        let agent = config.identity.agent;
+        if let Some(hosted) = self.agents.get(&agent) {
+            let current = hosted.config().map_err(map_local_driver_error)?;
+            let intent = hosted.intent().ok_or(AgentHostError::Conflict)?;
+            if current != config || !intent.matches_caller(&config, &runtime_package, authority)? {
+                return Err(AgentHostError::Conflict);
+            }
+            return Ok(current.identity);
+        }
+        self._root_lease.validate_live()?;
+        let intent_name = local_genesis_intent_name(agent);
+        let intent_stage_name = local_genesis_intent_stage_name(agent);
+        let exposure_name = local_genesis_exposure_name(agent);
+        let exposure_stage_name = local_genesis_exposure_stage_name(agent);
+        let journal_path = self.journal_path(agent);
+        let journal_name = journal_path
+            .file_name()
+            .ok_or(AgentHostError::InvalidJournalName)?;
+        let lock_path = self.journal_lock_path(agent)?;
+        let lock_name = lock_path
+            .file_name()
+            .ok_or(AgentHostError::InvalidJournalName)?;
+        if generation_path_exists_at(&self._root_lease.root_directory, journal_name)?
+            || generation_path_exists_at(&self._root_lease.authority_directory, lock_name)?
+            || generation_path_exists_at(
+                &self._root_lease.authority_directory,
+                std::ffi::OsStr::new(&intent_name),
+            )?
+            || generation_path_exists_at(
+                &self._root_lease.authority_directory,
+                std::ffi::OsStr::new(&intent_stage_name),
+            )?
+            || generation_path_exists_at(
+                &self._root_lease.authority_directory,
+                std::ffi::OsStr::new(&exposure_name),
+            )?
+            || generation_path_exists_at(
+                &self._root_lease.authority_directory,
+                std::ffi::OsStr::new(&exposure_stage_name),
+            )?
+        {
+            return Err(AgentHostError::Conflict);
+        }
+        let (create, catalog) =
+            LocalJournalAgentDriver::<FileAgentJournalStore>::local_genesis_input(
+                config.clone(),
+                &runtime_package,
+                authority.clone(),
+                &self.trust,
+                &self.merge,
+            )
+            .map_err(map_local_driver_error)?;
+        let intent = LocalGenesisIntent::new(create.clone(), &runtime_package)?;
+        let sealed = LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_local_genesis(
+            create,
+            config.replicas[0],
+            &catalog,
+            self.trust.clone(),
+            self.merge.clone(),
+        )
+        .map_err(map_local_driver_error)?;
+        persist_local_genesis_intent(&self._root_lease.authority_directory, agent, &intent)?;
+        self._root_lease.validate_live()?;
+        let (journal_parent, authority_parent) = self._root_lease.clone_generation_parents()?;
+        let driver = open_archived_local_agent(
+            &self.root,
+            self._root_lease.authority_root()?,
+            &journal_parent,
+            &authority_parent,
+            self.scope,
+            sealed,
+            intent.id(),
+            &catalog,
+            false,
+            self.trust.clone(),
+            self.merge.clone(),
+        )?;
+        let identity = driver.identity().map_err(map_local_driver_error)?;
+        if identity != config.identity {
+            return Err(AgentHostError::IdentityMismatch);
+        }
+        publish_local_exposure_marker(&self._root_lease.authority_directory, agent, intent.id())?;
+        self._root_lease.validate_live()?;
+        self.agents
+            .insert(agent, HostedLocalAgent::Local { driver, intent });
         Ok(identity)
     }
 
@@ -2536,6 +2924,17 @@ fn validate_system_create_shape(
     if config.identity.agent != system_agent || !scope.admits(config) {
         return Err(AgentHostError::ScopeMismatch);
     }
+    validate_local_runtime_shape(scope, config, runtime_package)
+}
+
+fn validate_local_runtime_shape(
+    scope: AgentHostScope,
+    config: &AgentConfig,
+    runtime_package: &Package,
+) -> Result<(), AgentHostError> {
+    if !scope.admits(config) {
+        return Err(AgentHostError::ScopeMismatch);
+    }
     config.validate().map_err(AgentHostError::InvalidConfig)?;
     runtime_package
         .validate()
@@ -2556,6 +2955,67 @@ fn validate_system_create_shape(
     {
         return Err(AgentHostError::InvalidRuntime);
     }
+    Ok(())
+}
+
+fn validate_local_create_target(
+    scope: AgentHostScope,
+    system_agent: AgentId,
+    config: &AgentConfig,
+    runtime_package: &Package,
+    trust: &dyn AgentTrustProvider,
+) -> Result<(), AgentHostError> {
+    if config.identity.agent == system_agent || config.system_authority_genesis.is_some() {
+        return Err(AgentHostError::ScopeMismatch);
+    }
+    validate_local_runtime_shape(scope, config, runtime_package)?;
+    let anchored = trust
+        .authority_for_space(config.identity.space)
+        .ok_or(AgentHostError::TrustUnavailable)?;
+    if anchored != config.authority {
+        return Err(AgentHostError::InvalidAuthority);
+    }
+    if !trust.verify_package(config, runtime_package) {
+        return Err(AgentHostError::Package(PackageError::InvalidSignature));
+    }
+    Ok(())
+}
+
+fn validate_local_create_receipt(
+    config: &AgentConfig,
+    receipt: &AgentAuthorityReceipt,
+) -> Result<(), AgentHostError> {
+    receipt
+        .verify_guest_signature(&config.authority)
+        .map_err(AgentHostError::Authority)?;
+    let request = LifecycleRequest::Create(config.clone());
+    let claim = &receipt.claim;
+    if claim.space != config.identity.space
+        || claim.agent != config.identity.agent
+        || claim.principal != config.identity.owner
+        || claim.capability != CapabilityId::named(super::authority::CAPABILITY_AGENT_CREATE_LOCAL)
+        || claim.operation != request.commitment()
+    {
+        return Err(AgentHostError::InvalidAuthority);
+    }
+    Ok(())
+}
+
+fn validate_local_intent_target(
+    scope: AgentHostScope,
+    system_agent: AgentId,
+    file_agent: AgentId,
+    intent: &LocalGenesisIntent,
+    trust: &dyn AgentTrustProvider,
+) -> Result<(), AgentHostError> {
+    intent.validate()?;
+    let config = intent.config()?;
+    if config.identity.agent != file_agent {
+        return Err(AgentHostError::IdentityMismatch);
+    }
+    let package = intent.runtime_package()?;
+    validate_local_create_target(scope, system_agent, config, &package, trust)?;
+    validate_local_create_receipt(config, intent.receipt()?)?;
     Ok(())
 }
 
@@ -2712,7 +3172,7 @@ fn open_archived_system_agent(
     catalog: &[RuntimeBlob],
     trust: Arc<dyn AgentTrustProvider>,
     merge: Arc<dyn LocalMergeAuthenticator>,
-) -> Result<HostedSystemAgent, AgentHostError> {
+) -> Result<HostedLocalAgent, AgentHostError> {
     #[cfg(not(all(feature = "storage", target_os = "linux")))]
     {
         let _ = (
@@ -2828,8 +3288,353 @@ fn open_archived_system_agent(
         if !lease.is_armed() {
             return Err(AgentHostError::InvalidScopeBinding);
         }
-        Ok(HostedSystemAgent { driver, authority })
+        Ok(HostedLocalAgent::System { driver, authority })
     }
+}
+
+fn prepare_local_intent_genesis(
+    intent: &LocalGenesisIntent,
+    catalog: &[RuntimeBlob],
+    trust: Arc<dyn AgentTrustProvider>,
+    merge: Arc<dyn LocalMergeAuthenticator>,
+) -> Result<ReplaySealedLocalGenesis, AgentHostError> {
+    let config = intent.config()?;
+    LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_local_genesis(
+        intent.create.clone(),
+        config.replicas[0],
+        catalog,
+        trust,
+        merge,
+    )
+    .map_err(map_local_driver_error)
+}
+
+#[cfg(all(feature = "storage", target_os = "linux"))]
+fn open_archived_local_agent(
+    root: &Path,
+    authority_root: &Path,
+    journal_parent: &File,
+    authority_parent: &File,
+    scope: AgentHostScope,
+    sealed: ReplaySealedLocalGenesis,
+    intent: Hash,
+    catalog: &[RuntimeBlob],
+    exposed: bool,
+    trust: Arc<dyn AgentTrustProvider>,
+    merge: Arc<dyn LocalMergeAuthenticator>,
+) -> Result<LocalJournalAgentDriver<FileAgentJournalStore>, AgentHostError> {
+    let agent = sealed.genesis().runtime().agent;
+    let journal = root.join(format!("{}{}", encode_agent_id(agent), JOURNAL_SUFFIX));
+    let stable_lock =
+        authority_root.join(format!("{}{}", encode_agent_id(agent), JOURNAL_LOCK_SUFFIX));
+    let slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+        journal,
+        stable_lock,
+        scope.node,
+        intent,
+        journal_parent,
+        authority_parent,
+    )
+    .map_err(map_journal_error)?;
+    if exposed && !slot.generation_exists() {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    let store = slot.open(&sealed, exposed).map_err(map_journal_error)?;
+    match (
+        store.genesis().map_err(map_journal_error)?,
+        store.heads().map_err(map_journal_error)?,
+    ) {
+        (Some(_), Some(_)) => {
+            LocalJournalAgentDriver::open_local(store, &sealed, intent, trust, merge)
+                .map_err(map_local_driver_error)
+        }
+        (None, None) | (Some(_), None) => {
+            LocalJournalAgentDriver::create_local(store, sealed, intent, catalog, trust, merge)
+                .map_err(map_local_driver_error)
+        }
+        (None, Some(_)) => Err(map_journal_error(JournalStoreError::Corrupt)),
+    }
+}
+
+fn local_genesis_intent_name(agent: AgentId) -> String {
+    format!("{}{}", encode_agent_id(agent), LOCAL_GENESIS_INTENT_SUFFIX)
+}
+
+fn local_genesis_intent_stage_name(agent: AgentId) -> String {
+    format!(
+        "{}{}",
+        encode_agent_id(agent),
+        LOCAL_GENESIS_INTENT_STAGE_SUFFIX
+    )
+}
+
+fn local_genesis_exposure_name(agent: AgentId) -> String {
+    format!(
+        "{}{}",
+        encode_agent_id(agent),
+        LOCAL_GENESIS_EXPOSURE_SUFFIX
+    )
+}
+
+fn local_genesis_exposure_stage_name(agent: AgentId) -> String {
+    format!(
+        "{}{}",
+        encode_agent_id(agent),
+        LOCAL_GENESIS_EXPOSURE_STAGE_SUFFIX
+    )
+}
+
+#[derive(Debug)]
+struct HostGenerationRecord {
+    bytes: Vec<u8>,
+    metadata: fs::Metadata,
+}
+
+fn read_host_generation_record(
+    parent: &File,
+    name: &str,
+    maximum: usize,
+) -> Result<Option<HostGenerationRecord>, AgentHostError> {
+    let path = agent_host_directory_capability_path(parent).join(name);
+    let named = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(AgentHostError::Unavailable),
+    };
+    if !named.file_type().is_file()
+        || named.file_type().is_symlink()
+        || named.len() > maximum as u64
+    {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    let opened = file.metadata().map_err(|_| AgentHostError::Unavailable)?;
+    validate_agent_host_scope_metadata(&opened, &named)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if opened.nlink() == 0 || opened.nlink() > 2 {
+            return Err(AgentHostError::InvalidScopeBinding);
+        }
+    }
+    let length = usize::try_from(opened.len()).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    let mut bytes = vec![0; length];
+    file.read_exact(&mut bytes)
+        .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    Ok(Some(HostGenerationRecord {
+        bytes,
+        metadata: opened,
+    }))
+}
+
+fn same_host_generation_record(left: &HostGenerationRecord, right: &HostGenerationRecord) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        left.metadata.dev() == right.metadata.dev() && left.metadata.ino() == right.metadata.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        false
+    }
+}
+
+fn persist_host_generation_record(
+    parent: &File,
+    canonical_name: &str,
+    stage_name: &str,
+    expected: &[u8],
+    maximum: usize,
+) -> Result<(), AgentHostError> {
+    if expected.is_empty() || expected.len() > maximum {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    let capability = agent_host_directory_capability_path(parent);
+    let canonical_path = capability.join(canonical_name);
+    let stage_path = capability.join(stage_name);
+    let canonical = read_host_generation_record(parent, canonical_name, maximum)?;
+    let mut stage = read_host_generation_record(parent, stage_name, maximum)?;
+    if let Some(canonical) = &canonical {
+        if canonical.bytes != expected {
+            return Err(AgentHostError::Conflict);
+        }
+        if let Some(staged) = &stage {
+            if staged.bytes != expected || !same_host_generation_record(canonical, staged) {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+            fs::remove_file(&stage_path).map_err(|_| AgentHostError::Unavailable)?;
+            parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+        }
+        return Ok(());
+    }
+
+    if let Some(staged) = &stage {
+        if staged.bytes.len() > expected.len()
+            || staged.bytes.as_slice() != &expected[..staged.bytes.len()]
+        {
+            return Err(AgentHostError::Conflict);
+        }
+        if staged.bytes.len() != expected.len() {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            let mut file = options
+                .open(&stage_path)
+                .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+            file.seek(SeekFrom::Start(staged.bytes.len() as u64))
+                .and_then(|_| file.write_all(&expected[staged.bytes.len()..]))
+                .and_then(|_| file.sync_all())
+                .map_err(|_| AgentHostError::Unavailable)?;
+            parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+            stage = read_host_generation_record(parent, stage_name, maximum)?;
+        }
+    } else {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut file = options
+            .open(&stage_path)
+            .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+        file.write_all(expected)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| AgentHostError::Unavailable)?;
+        parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+        stage = read_host_generation_record(parent, stage_name, maximum)?;
+    }
+    let staged = stage.ok_or(AgentHostError::InvalidScopeBinding)?;
+    if staged.bytes != expected {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    fs::hard_link(&stage_path, &canonical_path).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+    let canonical = read_host_generation_record(parent, canonical_name, maximum)?
+        .ok_or(AgentHostError::InvalidScopeBinding)?;
+    let staged = read_host_generation_record(parent, stage_name, maximum)?
+        .ok_or(AgentHostError::InvalidScopeBinding)?;
+    if canonical.bytes != expected
+        || staged.bytes != expected
+        || !same_host_generation_record(&canonical, &staged)
+    {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    fs::remove_file(stage_path).map_err(|_| AgentHostError::Unavailable)?;
+    parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+    Ok(())
+}
+
+fn persist_local_genesis_intent(
+    parent: &File,
+    agent: AgentId,
+    intent: &LocalGenesisIntent,
+) -> Result<(), AgentHostError> {
+    intent.validate()?;
+    persist_host_generation_record(
+        parent,
+        &local_genesis_intent_name(agent),
+        &local_genesis_intent_stage_name(agent),
+        &intent.encode(),
+        MAX_LOCAL_GENESIS_INTENT_BYTES,
+    )
+}
+
+fn recover_local_genesis_intent(
+    parent: &File,
+    agent: AgentId,
+) -> Result<LocalGenesisIntent, AgentHostError> {
+    let canonical_name = local_genesis_intent_name(agent);
+    let stage_name = local_genesis_intent_stage_name(agent);
+    let record = match (
+        read_host_generation_record(parent, &canonical_name, MAX_LOCAL_GENESIS_INTENT_BYTES)?,
+        read_host_generation_record(parent, &stage_name, MAX_LOCAL_GENESIS_INTENT_BYTES)?,
+    ) {
+        (Some(canonical), Some(staged)) => {
+            if canonical.bytes != staged.bytes || !same_host_generation_record(&canonical, &staged)
+            {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+            fs::remove_file(agent_host_directory_capability_path(parent).join(&stage_name))
+                .map_err(|_| AgentHostError::Unavailable)?;
+            parent.sync_all().map_err(|_| AgentHostError::Unavailable)?;
+            canonical.bytes
+        }
+        (Some(canonical), None) => canonical.bytes,
+        (None, Some(staged)) => {
+            let intent = LocalGenesisIntent::decode(&staged.bytes)
+                .map_err(|_| AgentHostError::InvalidScopeBinding)?;
+            if intent.encode() != staged.bytes {
+                return Err(AgentHostError::InvalidScopeBinding);
+            }
+            persist_host_generation_record(
+                parent,
+                &canonical_name,
+                &stage_name,
+                &staged.bytes,
+                MAX_LOCAL_GENESIS_INTENT_BYTES,
+            )?;
+            staged.bytes
+        }
+        (None, None) => return Err(AgentHostError::InvalidScopeBinding),
+    };
+    let intent =
+        LocalGenesisIntent::decode(&record).map_err(|_| AgentHostError::InvalidScopeBinding)?;
+    if intent.encode() != record {
+        return Err(AgentHostError::InvalidScopeBinding);
+    }
+    Ok(intent)
+}
+
+fn recover_local_exposure_marker(
+    parent: &File,
+    agent: AgentId,
+    intent: Hash,
+    has_canonical: bool,
+    has_stage: bool,
+) -> Result<bool, AgentHostError> {
+    if !has_canonical && !has_stage {
+        return Ok(false);
+    }
+    persist_host_generation_record(
+        parent,
+        &local_genesis_exposure_name(agent),
+        &local_genesis_exposure_stage_name(agent),
+        intent.as_bytes(),
+        core::mem::size_of::<Hash>(),
+    )?;
+    Ok(true)
+}
+
+fn publish_local_exposure_marker(
+    parent: &File,
+    agent: AgentId,
+    intent: Hash,
+) -> Result<(), AgentHostError> {
+    persist_host_generation_record(
+        parent,
+        &local_genesis_exposure_name(agent),
+        &local_genesis_exposure_stage_name(agent),
+        intent.as_bytes(),
+        core::mem::size_of::<Hash>(),
+    )
 }
 
 #[cfg(all(feature = "storage", target_os = "linux"))]
@@ -4976,6 +5781,31 @@ mod tests {
         }
     }
 
+    fn ordinary_local_fixture(
+        fixture: &JournalFixture,
+        discriminator: u8,
+        sequence: u64,
+    ) -> (AgentConfig, AgentAuthorityReceipt) {
+        let owner = crate::service::PrincipalId([discriminator; 32]);
+        let creation_nonce = Hash([discriminator.wrapping_add(1); 32]);
+        let agent = AgentId::derive(scope().space, owner, &creation_nonce.0);
+        let mut config = fixture.config.clone();
+        config.identity.agent = agent;
+        config.identity.owner = owner;
+        config.creation_nonce = creation_nonce;
+        config.system_authority_genesis = None;
+        config.replicas = vec![super::super::AgentReplica {
+            node: scope().node,
+            principal: owner,
+            role: super::super::ReplicaRole::Voter,
+        }];
+        config.validate().unwrap();
+        let request = LifecycleRequest::Create(config.clone());
+        let key = ed25519_dalek::SigningKey::from_bytes(&FIXTURE_AUTHORITY_SEED);
+        let receipt = fixture_receipt(&key, &config, &request, sequence);
+        (config, receipt)
+    }
+
     fn journal_fixture(journal_root: &Path) -> JournalFixture {
         use super::super::committee::{
             AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommittee,
@@ -5542,6 +6372,202 @@ mod tests {
             Some(advanced),
             "advanced heads must use Local open, never genesis re-initialization"
         );
+        reopened.shutdown().unwrap();
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn multiple_ordinary_local_agents_are_isolated_idempotent_and_restartable() {
+        let (directory, lock, _remove) = empty_host_directory("ordinary-local-restart");
+        let fixture = journal_fixture(&directory);
+        let control = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+        let handle = control.handle_for_test();
+        handle
+            .create(
+                fixture.config.clone(),
+                fixture.runtime_package.clone(),
+                fixture.create_receipt.clone(),
+            )
+            .unwrap();
+
+        let (first, first_receipt) = ordinary_local_fixture(&fixture, 0x81, 2);
+        let (second, second_receipt) = ordinary_local_fixture(&fixture, 0x83, 3);
+        assert_eq!(
+            handle
+                .create(
+                    first.clone(),
+                    fixture.runtime_package.clone(),
+                    first_receipt.clone(),
+                )
+                .unwrap(),
+            first.identity
+        );
+        let reads_after_first = fixture.slot_reads.load(Ordering::SeqCst);
+        assert_eq!(
+            handle
+                .create(
+                    first.clone(),
+                    fixture.runtime_package.clone(),
+                    first_receipt.clone(),
+                )
+                .unwrap(),
+            first.identity
+        );
+        assert_eq!(fixture.slot_reads.load(Ordering::SeqCst), reads_after_first);
+        assert_eq!(
+            handle
+                .create(
+                    second.clone(),
+                    fixture.runtime_package.clone(),
+                    second_receipt.clone(),
+                )
+                .unwrap(),
+            second.identity
+        );
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&FIXTURE_AUTHORITY_SEED);
+        let divergent_receipt = fixture_receipt(
+            &signing_key,
+            &first,
+            &LifecycleRequest::Create(first.clone()),
+            4,
+        );
+        assert_eq!(
+            handle.create(
+                first.clone(),
+                fixture.runtime_package.clone(),
+                divergent_receipt,
+            ),
+            Err(AgentHostError::Conflict)
+        );
+
+        let second_journal = directory.join(format!(
+            "{}{}",
+            encode_agent_id(second.identity.agent),
+            JOURNAL_SUFFIX
+        ));
+        let second_before = snapshot_directory(&second_journal);
+        let (invocation, invocation_receipt) = fixture_invocation(&first);
+        assert_eq!(
+            handle.invoke(first.identity.agent, invocation, invocation_receipt),
+            Err(AgentHostError::Execution(ActorExecutionError::NotFound))
+        );
+        let first_revision = handle.revision(first.identity.agent).unwrap().unwrap();
+        assert!(first_revision > 0);
+        assert_eq!(handle.revision(second.identity.agent).unwrap(), Some(0));
+        assert_eq!(snapshot_directory(&second_journal), second_before);
+        assert_eq!(handle.identities().unwrap().len(), 3);
+        control.shutdown().unwrap();
+
+        let reopened = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+        let reopened_handle = reopened.handle_for_test();
+        let identities = reopened_handle.identities().unwrap();
+        assert_eq!(identities.len(), 3);
+        assert!(identities.contains(&fixture.config.identity));
+        assert!(identities.contains(&first.identity));
+        assert!(identities.contains(&second.identity));
+        assert_eq!(
+            reopened_handle.revision(first.identity.agent).unwrap(),
+            Some(first_revision)
+        );
+        assert_eq!(
+            reopened_handle.revision(second.identity.agent).unwrap(),
+            Some(0)
+        );
+        let reads_before_retry = fixture.slot_reads.load(Ordering::SeqCst);
+        assert_eq!(
+            reopened_handle
+                .create(
+                    first.clone(),
+                    fixture.runtime_package.clone(),
+                    first_receipt,
+                )
+                .unwrap(),
+            first.identity
+        );
+        assert_eq!(
+            fixture.slot_reads.load(Ordering::SeqCst),
+            reads_before_retry
+        );
+        reopened.shutdown().unwrap();
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    #[test]
+    fn interrupted_ordinary_local_exposure_is_completed_before_restart_visibility() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let (directory, lock, _remove) = empty_host_directory("ordinary-local-exposure");
+        let fixture = journal_fixture(&directory);
+        let control = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+        let handle = control.handle_for_test();
+        handle
+            .create(
+                fixture.config.clone(),
+                fixture.runtime_package.clone(),
+                fixture.create_receipt.clone(),
+            )
+            .unwrap();
+        let (local, receipt) = ordinary_local_fixture(&fixture, 0x85, 2);
+        handle
+            .create(local.clone(), fixture.runtime_package.clone(), receipt)
+            .unwrap();
+        control.shutdown().unwrap();
+
+        let authority_root = fixture.provider.stable_lock.parent().unwrap();
+        let exposed = authority_root.join(local_genesis_exposure_name(local.identity.agent));
+        let staged = authority_root.join(local_genesis_exposure_stage_name(local.identity.agent));
+        fs::rename(&exposed, &staged).unwrap();
+        let staged_file = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&staged)
+            .unwrap();
+        staged_file.set_len(7).unwrap();
+        staged_file.sync_all().unwrap();
+        File::open(authority_root).unwrap().sync_all().unwrap();
+
+        let reopened = AgentHostControl::open(
+            lease(&directory, &lock, scope()),
+            fixture.trust.clone(),
+            fixture.merge.clone(),
+            fixture.provider.clone(),
+            fixture.pins.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .handle_for_test()
+                .revision(local.identity.agent)
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            fs::read(&exposed).unwrap().len(),
+            core::mem::size_of::<Hash>()
+        );
+        assert!(!staged.exists());
         reopened.shutdown().unwrap();
     }
 
