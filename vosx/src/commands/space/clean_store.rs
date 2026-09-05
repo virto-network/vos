@@ -418,8 +418,7 @@ impl ExactFileStore {
             return Err(CleanFileStoreError::Corrupt);
         }
         let mut header = [0_u8; STORE_HEADER_BYTES];
-        file.read_exact(&mut header)
-            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        read_exact_or_corrupt(&mut file, &mut header)?;
         let payload_length = decode_payload_length(self.role, &header, maximum_bytes)?;
         if STORE_HEADER_BYTES
             .checked_add(payload_length)
@@ -433,8 +432,7 @@ impl ExactFileStore {
             .try_reserve_exact(payload_length)
             .map_err(|_| CleanFileStoreError::Oversized)?;
         payload.resize(payload_length, 0);
-        file.read_exact(&mut payload)
-            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        read_exact_or_corrupt(&mut file, &mut payload)?;
         let mut trailing = [0_u8; 1];
         if file.read(&mut trailing).map_err(CleanFileStoreError::Io)? != 0 {
             return Err(CleanFileStoreError::Corrupt);
@@ -543,6 +541,19 @@ impl ExactFileStore {
         validate_opened_file(&file, &named)?;
         file.sync_all()?;
         Ok(())
+    }
+}
+
+fn read_exact_or_corrupt(
+    reader: &mut impl Read,
+    buffer: &mut [u8],
+) -> Result<(), CleanFileStoreError> {
+    match reader.read_exact(buffer) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(CleanFileStoreError::Corrupt)
+        }
+        Err(error) => Err(CleanFileStoreError::Io(error)),
     }
 }
 
@@ -693,8 +704,7 @@ fn validate_new_path(path: &Path) -> Result<(), CleanFileStoreError> {
         return Err(CleanFileStoreError::InvalidPath);
     }
     let parent = path.parent().ok_or(CleanFileStoreError::InvalidPath)?;
-    let canonical_parent =
-        fs::canonicalize(parent).map_err(|_| CleanFileStoreError::InvalidPath)?;
+    let canonical_parent = fs::canonicalize(parent).map_err(CleanFileStoreError::Io)?;
     if canonical_parent != parent {
         return Err(CleanFileStoreError::Alias);
     }
@@ -1074,6 +1084,48 @@ mod tests {
         let staged = decode_envelope(store.role, &encoded, payload.len()).expect("decode stage");
         store.write_stage(&encoded).expect("write stage");
         staged
+    }
+
+    #[test]
+    fn exact_reads_distinguish_truncation_from_io_failure() {
+        let mut truncated = &b"short"[..];
+        let mut target = [0_u8; 6];
+        assert!(matches!(
+            read_exact_or_corrupt(&mut truncated, &mut target),
+            Err(CleanFileStoreError::Corrupt)
+        ));
+
+        struct FailedReader;
+
+        impl Read for FailedReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected read failure",
+                ))
+            }
+        }
+
+        let error = read_exact_or_corrupt(&mut FailedReader, &mut target)
+            .expect_err("non-truncation read failures remain I/O errors");
+        assert!(matches!(
+            error,
+            CleanFileStoreError::Io(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn missing_parent_canonicalization_preserves_io_failure() {
+        let fixture = Fixture::new("missing-parent");
+        let root = fixture.parent.join("absent").join("state");
+        match CleanSystemAgentFileStores::open_or_create(root) {
+            Err(CleanFileStoreError::Io(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            }
+            Err(error) => panic!("missing parent was misclassified: {error}"),
+            Ok(_) => panic!("missing parent unexpectedly opened"),
+        }
     }
 
     fn flip_first_predecessor_byte(path: &Path) {

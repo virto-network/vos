@@ -41,7 +41,8 @@ const OWNER_FAILED: u8 = 3;
 pub enum CleanLocalHostControlError {
     /// The sole waiting slot is occupied. The request was not admitted.
     Busy,
-    /// Shutdown began before the request was admitted or completed.
+    /// Shutdown closed the request before it began executing. A read which was
+    /// already executing may still complete successfully.
     Closed,
     /// The owner thread panicked, disconnected, or could not be started.
     OwnerFailed,
@@ -151,7 +152,8 @@ impl CleanLocalHostControl {
         self.request(|reply| Command::Show { agent, reply })
     }
 
-    /// Read immutable system pins, creation evidence, and issuer progress.
+    /// Revalidate the exact pinned system Agent in the live host, then read its
+    /// immutable pins, creation evidence, and issuer progress.
     pub fn status(&self) -> Result<CleanLocalHostStatus, CleanLocalHostControlError> {
         self.request(Command::Status)
     }
@@ -424,13 +426,23 @@ where
             let _ = reply.send(result);
         }
         Command::Status(reply) => {
-            let _ = reply.send(Ok(CleanLocalHostStatus {
-                pins: owner.pins().clone(),
-                creation_receipt: owner.creation_receipt().clone(),
-                phase: CleanLocalHostBootstrapPhase::Complete,
-                issuer_sequence_high_water: owner.issuer_sequence_high_water(),
-                issuer_acknowledged_through: owner.issuer_acknowledged_through(),
-            }));
+            let result = owner
+                .host()
+                .show(owner.pins().agent())
+                .map_err(|_| CleanLocalHostControlError::QueryFailed)
+                .and_then(|descriptor| {
+                    if descriptor != owner.pins().descriptor() {
+                        return Err(CleanLocalHostControlError::QueryFailed);
+                    }
+                    Ok(CleanLocalHostStatus {
+                        pins: owner.pins().clone(),
+                        creation_receipt: owner.creation_receipt().clone(),
+                        phase: CleanLocalHostBootstrapPhase::Complete,
+                        issuer_sequence_high_water: owner.issuer_sequence_high_water(),
+                        issuer_acknowledged_through: owner.issuer_acknowledged_through(),
+                    })
+                });
+            let _ = reply.send(result);
         }
         Command::Wake => {}
         #[cfg(test)]
@@ -855,6 +867,24 @@ mod tests {
         assert_eq!(control.list(), Err(CleanLocalHostControlError::Closed));
         assert_eq!(control.show(wrong), Err(CleanLocalHostControlError::Closed));
         assert_eq!(control.status(), Err(CleanLocalHostControlError::Closed));
+    }
+
+    #[test]
+    fn status_fails_closed_after_live_host_root_replacement() {
+        let (directory, _fixture, _receipt, lifecycle, control) =
+            start_control("status-root-replacement", 0x55, None);
+        assert!(control.status().is_ok());
+
+        let root = directory.host_root();
+        let displaced = directory.0.join("displaced-agents");
+        fs::rename(&root, displaced).unwrap();
+        fs::create_dir(&root).unwrap();
+
+        assert_eq!(
+            control.status(),
+            Err(CleanLocalHostControlError::QueryFailed)
+        );
+        lifecycle.shutdown_and_join().unwrap();
     }
 
     #[test]
