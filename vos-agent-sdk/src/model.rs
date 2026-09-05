@@ -2,6 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::contract::{ActorPackageContract, RuntimePackageContract};
+use crate::proof_system::ProofSystemSet;
 use crate::{
     ActorId, AgentId, BlobRef, DeploymentId, Hash, InstallationId, NodeId, PrincipalId, ProducerId,
     ProgramId, STANDARD_MAX_ACTORS, SpaceId,
@@ -61,7 +62,7 @@ pub enum StateLane {
     Local = 2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, core::hash::Hash)]
 #[repr(u8)]
 pub enum InvocationScope {
     Ordered = 0,
@@ -285,7 +286,7 @@ pub struct AgentReplica {
 pub struct RuntimeRequirements {
     pub lanes: LaneSet,
     pub scheduling: bool,
-    pub proofs: bool,
+    pub proof_systems: ProofSystemSet,
 }
 
 impl RuntimeRequirements {
@@ -298,7 +299,7 @@ impl RuntimeRequirements {
 pub struct RuntimeCapabilities {
     pub lanes: LaneSet,
     pub scheduling: bool,
-    pub proofs: bool,
+    pub proof_systems: ProofSystemSet,
     pub max_actors: u32,
 }
 
@@ -309,15 +310,23 @@ impl RuntimeCapabilities {
         Self {
             lanes: LaneSet::ALL,
             scheduling: false,
-            proofs: false,
+            proof_systems: ProofSystemSet::EMPTY,
             max_actors: Self::STANDARD_MAX_ACTORS,
         }
     }
 
-    pub const fn satisfies(self, requirements: RuntimeRequirements) -> bool {
+    pub fn validate(self) -> Result<(), ModelError> {
+        if self.max_actors == 0 || self.max_actors > Self::STANDARD_MAX_ACTORS {
+            Err(ModelError::InvalidRuntime)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn satisfies(self, requirements: RuntimeRequirements) -> bool {
         (requirements.lanes.bits() & !self.lanes.bits()) == 0
             && (!requirements.scheduling || self.scheduling)
-            && (!requirements.proofs || self.proofs)
+            && requirements.proof_systems.is_subset_of(&self.proof_systems)
     }
 }
 
@@ -462,7 +471,7 @@ pub struct ActorEntry {
     pub program: ProgramId,
     pub package: BlobRef,
     pub agent_schema: BlobRef,
-    pub role_policies: BlobRef,
+    pub method_policy: BlobRef,
     /// Nonzero commitment of the exact signed constructor ABI. This binds
     /// zero-argument, raw-byte, and named typed constructors distinctly.
     pub constructor_abi: Hash,
@@ -493,7 +502,7 @@ impl ActorEntry {
         }
         if !valid_blob(&self.package)
             || !valid_blob(&self.agent_schema)
-            || !valid_blob(&self.role_policies)
+            || !valid_blob(&self.method_policy)
             || self
                 .installation_data
                 .as_ref()
@@ -572,7 +581,7 @@ pub struct InstallActor {
     pub producer: ProducerId,
     pub package: BlobRef,
     pub agent_schema: BlobRef,
-    pub role_policies: BlobRef,
+    pub method_policy: BlobRef,
     pub constructor_abi: Hash,
     pub installation_data: Option<InstallationData>,
     pub state_layout: Hash,
@@ -599,7 +608,7 @@ pub struct UpgradeActor {
     pub producer: ProducerId,
     pub package: BlobRef,
     pub agent_schema: BlobRef,
-    pub role_policies: BlobRef,
+    pub method_policy: BlobRef,
     /// Exact signed target constructor ABI. An in-place upgrade must preserve
     /// this commitment so existing immutable argument bytes retain meaning.
     pub constructor_abi: Hash,
@@ -618,7 +627,7 @@ pub struct ActorRecord {
     pub producer: ProducerId,
     pub package: BlobRef,
     pub agent_schema: BlobRef,
-    pub role_policies: BlobRef,
+    pub method_policy: BlobRef,
     pub constructor_abi: Hash,
     pub installation_data: Option<BlobRef>,
     pub state_layout: Hash,
@@ -687,13 +696,38 @@ mod tests {
         assert!(runtime.satisfies(RuntimeRequirements {
             lanes: LaneSet::of(StateLane::Linear),
             scheduling: false,
-            proofs: false,
+            proof_systems: ProofSystemSet::EMPTY,
         }));
         assert!(!runtime.satisfies(RuntimeRequirements {
             lanes: LaneSet::NONE,
             scheduling: true,
-            proofs: false,
+            proof_systems: ProofSystemSet::EMPTY,
         }));
+
+        let proof = Hash([9; 32]);
+        let proof_runtime = RuntimeCapabilities {
+            proof_systems: ProofSystemSet::from_sorted(&[proof]).unwrap(),
+            ..runtime
+        };
+        assert!(proof_runtime.satisfies(RuntimeRequirements {
+            lanes: LaneSet::NONE,
+            scheduling: false,
+            proof_systems: ProofSystemSet::from_sorted(&[proof]).unwrap(),
+        }));
+        assert!(!runtime.satisfies(RuntimeRequirements {
+            lanes: LaneSet::NONE,
+            scheduling: false,
+            proof_systems: ProofSystemSet::from_sorted(&[proof]).unwrap(),
+        }));
+        assert_eq!(runtime.validate(), Ok(()));
+        assert_eq!(
+            RuntimeCapabilities {
+                max_actors: 0,
+                ..runtime
+            }
+            .validate(),
+            Err(ModelError::InvalidRuntime)
+        );
     }
 
     #[test]
@@ -731,7 +765,7 @@ mod tests {
             !RuntimeRequirements {
                 lanes: LaneSet::of(StateLane::Linear),
                 scheduling: false,
-                proofs: false,
+                proof_systems: ProofSystemSet::EMPTY,
             }
             .supported_by(AgentProfile::Private)
         );

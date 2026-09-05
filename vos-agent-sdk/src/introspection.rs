@@ -2,7 +2,7 @@
 //!
 //! AAI1 contains only operator-facing documentation and dispatch hints. The
 //! executable method ABI and authorization contract remain owned by AMP2, and
-//! state/mode declarations remain owned by AAS1. This artifact binds both by
+//! state/mode declarations remain owned by AAS2. This artifact binds both by
 //! exact content reference and is accepted only after all three complete
 //! method surfaces agree.
 
@@ -74,7 +74,7 @@ impl ActorMethodIntrospection {
 /// Complete AAI1 artifact inserted into an Actor package's signed closure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActorIntrospectionArtifact {
-    /// Exact AAS1 bytes described by this artifact.
+    /// Exact AAS2 bytes described by this artifact.
     pub actor_schema: BlobRef,
     /// Exact AMP2 bytes described by this artifact.
     pub method_policy: BlobRef,
@@ -141,7 +141,7 @@ impl ActorIntrospectionArtifact {
             .and_then(|position| self.methods.get(position))
     }
 
-    /// Authenticate and decode the exact referenced AAS1 and AMP2 bytes, then
+    /// Authenticate and decode the exact referenced AAS2 and AMP2 bytes, then
     /// require this artifact to describe their complete method set.
     pub fn validate_against_artifact_bytes(
         &self,
@@ -180,7 +180,7 @@ impl ActorIntrospectionArtifact {
         Ok(())
     }
 
-    /// Content identity for the later VOS2 exact-closure integration.
+    /// Content identity for the VOS3 exact package closure.
     pub fn artifact_ref(&self) -> Result<BlobRef, WireError> {
         Ok(BlobRef::of_bytes(&self.encode()?))
     }
@@ -306,6 +306,7 @@ mod tests {
 
     fn artifacts() -> (Vec<u8>, Vec<u8>) {
         let schema = ParsedSchema {
+            constructor: crate::schema::ConstructorContract::Forbidden,
             fields: Vec::new(),
             methods: alloc::vec![
                 ParsedMethod {
@@ -448,6 +449,7 @@ mod tests {
     #[test]
     fn empty_actor_has_one_canonical_introspection_table() {
         let schema = ParsedSchema {
+            constructor: crate::schema::ConstructorContract::Forbidden,
             fields: Vec::new(),
             methods: Vec::new(),
         }

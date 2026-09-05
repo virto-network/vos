@@ -178,21 +178,21 @@ fn decode_method_mode(decoder: &mut Decoder<'_>) -> Result<MethodMode, DecodeErr
 fn encode_requirements(encoder: &mut Encoder<'_>, value: RuntimeRequirements) {
     encoder.u8(value.lanes.bits());
     encoder.bool(value.scheduling);
-    encoder.bool(value.proofs);
+    value.proof_systems.encode_embedded(encoder);
 }
 
 fn decode_requirements(decoder: &mut Decoder<'_>) -> Result<RuntimeRequirements, DecodeError> {
     Ok(RuntimeRequirements {
         lanes: LaneSet::from_bits(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
         scheduling: decoder.bool()?,
-        proofs: decoder.bool()?,
+        proof_systems: ProofSystemSet::decode_embedded(decoder)?,
     })
 }
 
 fn encode_capabilities(encoder: &mut Encoder<'_>, value: RuntimeCapabilities) {
     encoder.u8(value.lanes.bits());
     encoder.bool(value.scheduling);
-    encoder.bool(value.proofs);
+    value.proof_systems.encode_embedded(encoder);
     encoder.u32(value.max_actors);
 }
 
@@ -200,7 +200,7 @@ fn decode_capabilities(decoder: &mut Decoder<'_>) -> Result<RuntimeCapabilities,
     let value = RuntimeCapabilities {
         lanes: LaneSet::from_bits(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
         scheduling: decoder.bool()?,
-        proofs: decoder.bool()?,
+        proof_systems: ProofSystemSet::decode_embedded(decoder)?,
         max_actors: decoder.u32()?,
     };
     if value.max_actors == 0 || value.max_actors > STANDARD_MAX_ACTORS {
@@ -402,7 +402,7 @@ fn encode_actor_entry(encoder: &mut Encoder<'_>, value: &ActorEntry) {
     encoder.fixed(value.program.as_bytes());
     encode_blob(encoder, &value.package);
     encode_blob(encoder, &value.agent_schema);
-    encode_blob(encoder, &value.role_policies);
+    encode_blob(encoder, &value.method_policy);
     encoder.fixed(value.constructor_abi.as_bytes());
     encode_optional_blob(encoder, &value.installation_data);
     encoder.fixed(value.state_layout.as_bytes());
@@ -419,7 +419,7 @@ fn decode_actor_entry(decoder: &mut Decoder<'_>) -> Result<ActorEntry, DecodeErr
         program: ProgramId(decoder.fixed()?),
         package: decode_blob(decoder)?,
         agent_schema: decode_blob(decoder)?,
-        role_policies: decode_blob(decoder)?,
+        method_policy: decode_blob(decoder)?,
         constructor_abi: Hash(decoder.fixed()?),
         installation_data: decode_optional_blob(decoder)?,
         state_layout: Hash(decoder.fixed()?),
@@ -724,7 +724,7 @@ fn install_valid(value: &InstallActor) -> bool {
         && value.producer != ProducerId::ZERO
         && value.package == value.entry.package
         && value.agent_schema == value.entry.agent_schema
-        && value.role_policies == value.entry.role_policies
+        && value.method_policy == value.entry.method_policy
         && value.constructor_abi == value.entry.constructor_abi
         && value.constructor_abi != Hash::ZERO
         && value.installation_data.as_ref().map(|data| &data.reference)
@@ -734,7 +734,7 @@ fn install_valid(value: &InstallActor) -> bool {
             .as_ref()
             .is_none_or(|data| data.validate().is_ok())
         && value.installation_data.as_ref().is_none_or(|data| {
-            [&value.package, &value.agent_schema, &value.role_policies]
+            [&value.package, &value.agent_schema, &value.method_policy]
                 .into_iter()
                 .all(|artifact| artifact.hash != data.reference.hash)
         })
@@ -750,7 +750,7 @@ fn encode_install(encoder: &mut Encoder<'_>, value: &InstallActor) {
     encoder.fixed(value.producer.as_bytes());
     encode_blob(encoder, &value.package);
     encode_blob(encoder, &value.agent_schema);
-    encode_blob(encoder, &value.role_policies);
+    encode_blob(encoder, &value.method_policy);
     encoder.fixed(value.constructor_abi.as_bytes());
     encoder.option(&value.installation_data, encode_installation_data);
     encoder.fixed(value.state_layout.as_bytes());
@@ -766,7 +766,7 @@ fn decode_install(decoder: &mut Decoder<'_>) -> Result<InstallActor, DecodeError
         producer: ProducerId(decoder.fixed()?),
         package: decode_blob(decoder)?,
         agent_schema: decode_blob(decoder)?,
-        role_policies: decode_blob(decoder)?,
+        method_policy: decode_blob(decoder)?,
         constructor_abi: Hash(decoder.fixed()?),
         installation_data: decoder.option(decode_installation_data)?,
         state_layout: Hash(decoder.fixed()?),
@@ -787,7 +787,7 @@ fn upgrade_actor_valid(value: &UpgradeActor) -> bool {
         && value.producer != ProducerId::ZERO
         && crate::model::valid_blob(&value.package)
         && crate::model::valid_blob(&value.agent_schema)
-        && crate::model::valid_blob(&value.role_policies)
+        && crate::model::valid_blob(&value.method_policy)
         && value.constructor_abi != Hash::ZERO
         && value.state_layout != Hash::ZERO
         && value.contract.is_valid()
@@ -801,7 +801,7 @@ fn encode_upgrade_actor(encoder: &mut Encoder<'_>, value: &UpgradeActor) {
     encoder.fixed(value.producer.as_bytes());
     encode_blob(encoder, &value.package);
     encode_blob(encoder, &value.agent_schema);
-    encode_blob(encoder, &value.role_policies);
+    encode_blob(encoder, &value.method_policy);
     encoder.fixed(value.constructor_abi.as_bytes());
     encoder.fixed(value.state_layout.as_bytes());
     encode_actor_contract(encoder, value.contract);
@@ -817,7 +817,7 @@ fn decode_upgrade_actor(decoder: &mut Decoder<'_>) -> Result<UpgradeActor, Decod
         producer: ProducerId(decoder.fixed()?),
         package: decode_blob(decoder)?,
         agent_schema: decode_blob(decoder)?,
-        role_policies: decode_blob(decoder)?,
+        method_policy: decode_blob(decoder)?,
         constructor_abi: Hash(decoder.fixed()?),
         state_layout: Hash(decoder.fixed()?),
         contract: decode_actor_contract(decoder)?,
@@ -2266,7 +2266,7 @@ mod tests {
             program: ProgramId([byte.wrapping_add(2); 32]),
             package: blob(byte.wrapping_add(3)),
             agent_schema: blob(byte.wrapping_add(4)),
-            role_policies: blob(byte.wrapping_add(5)),
+            method_policy: blob(byte.wrapping_add(5)),
             constructor_abi: Hash([byte.wrapping_add(6); 32]),
             installation_data: Some(blob(byte.wrapping_add(7))),
             state_layout: Hash([byte.wrapping_add(8); 32]),
@@ -2313,7 +2313,7 @@ mod tests {
             producer: ProducerId([33; 32]),
             package: entry.package.clone(),
             agent_schema: entry.agent_schema.clone(),
-            role_policies: entry.role_policies.clone(),
+            method_policy: entry.method_policy.clone(),
             constructor_abi: entry.constructor_abi,
             installation_data: Some(InstallationData {
                 reference: entry.installation_data.clone().unwrap(),
@@ -2324,7 +2324,7 @@ mod tests {
             requirements: RuntimeRequirements {
                 lanes: entry.lanes,
                 scheduling: false,
-                proofs: false,
+                proof_systems: ProofSystemSet::EMPTY,
             },
             entry,
         };

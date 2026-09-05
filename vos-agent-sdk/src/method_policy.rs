@@ -1,10 +1,10 @@
 //! Canonical per-method execution and authorization policy for AgentActors.
 //!
-//! The AAS1 actor schema owns state layout and the declaration-ordered method
+//! The AAS2 actor schema owns state layout and the declaration-ordered method
 //! names/modes. This artifact binds that exact schema by content reference and
 //! adds the method contract which an agent runtime enforces before dispatch.
 //! Entries are name-ordered for deterministic lookup; validation requires the
-//! same complete name/mode set as the referenced AAS1 schema.
+//! same complete name/mode set as the referenced AAS2 schema.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -14,7 +14,7 @@ use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
 use crate::schema::{self, ParsedSchema};
 use crate::wire::{CanonicalWire, WireError};
-use crate::{BlobRef, CapabilityId, Hash, MethodMode, RoleId};
+use crate::{BlobRef, CapabilityId, Hash, MethodMode, ProofSystemSet, RoleId};
 
 /// The only accepted clean-generation method-policy wire magic.
 pub const METHOD_POLICY_MAGIC: [u8; 4] = *b"AMP2";
@@ -260,7 +260,7 @@ impl ActorMethodPolicy {
 /// Exact method-policy artifact named by an Actor package manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActorMethodPolicyArtifact {
-    /// Exact AAS1 preimage whose method surface this artifact completes.
+    /// Exact AAS2 preimage whose method surface this artifact completes.
     pub actor_schema: BlobRef,
     /// Strict UTF-8 byte/name order, with no duplicate names.
     pub methods: Vec<ActorMethodPolicy>,
@@ -333,8 +333,24 @@ impl ActorMethodPolicyArtifact {
             .any(|method| method.attestation.is_required())
     }
 
+    /// Exact sorted proof-system requirements selected by method
+    /// attestations. More than sixteen distinct systems cannot be represented
+    /// by the runtime capability contract and is rejected.
+    pub fn proof_systems(&self) -> Result<ProofSystemSet, MethodPolicyError> {
+        self.validate()?;
+        let mut systems = ProofSystemSet::EMPTY;
+        for method in &self.methods {
+            if let AttestationRequirement::Required { proof_system } = method.attestation {
+                systems
+                    .insert(proof_system)
+                    .map_err(|_| MethodPolicyError::LimitExceeded)?;
+            }
+        }
+        Ok(systems)
+    }
+
     /// Require this policy to describe exactly the same method names and
-    /// modes as a validated AAS1 schema. AAS1 source order and the policy's
+    /// modes as a validated AAS2 schema. AAS2 source order and the policy's
     /// name order are intentionally independent canonical projections.
     pub fn validate_against_schema(
         &self,
@@ -358,7 +374,7 @@ impl ActorMethodPolicyArtifact {
         Ok(())
     }
 
-    /// Authenticate and decode the exact referenced AAS1 bytes before
+    /// Authenticate and decode the exact referenced AAS2 bytes before
     /// comparing its complete method surface.
     pub fn validate_against_schema_bytes(
         &self,
@@ -608,6 +624,7 @@ mod tests {
 
     fn schema() -> (ParsedSchema, Vec<u8>) {
         let parsed = ParsedSchema {
+            constructor: schema::ConstructorContract::Forbidden,
             fields: Vec::new(),
             methods: alloc::vec![
                 ParsedMethod {
@@ -729,6 +746,7 @@ mod tests {
     #[test]
     fn empty_policy_is_canonical_only_for_an_empty_referenced_schema() {
         let empty_schema = ParsedSchema {
+            constructor: schema::ConstructorContract::Forbidden,
             fields: Vec::new(),
             methods: Vec::new(),
         }
@@ -954,10 +972,31 @@ mod tests {
         };
         assert!(artifact.validate().is_ok());
         assert!(artifact.requires_attestation());
+        assert_eq!(
+            artifact.proof_systems().unwrap().as_slice(),
+            &[Hash([9; 32])]
+        );
         artifact.methods[1].attestation = AttestationRequirement::Required {
             proof_system: Hash::ZERO,
         };
         assert_eq!(artifact.validate(), Err(MethodPolicyError::InvalidMethod));
+
+        let (mut too_many, _) = policy_artifact();
+        let template = too_many.methods[0].clone();
+        too_many.methods.clear();
+        for index in 0..=crate::MAX_PROOF_SYSTEMS {
+            let mut method = template.clone();
+            method.name = alloc::format!("method_{index:02}");
+            method.attestation = AttestationRequirement::Required {
+                proof_system: Hash([(index + 1) as u8; 32]),
+            };
+            too_many.methods.push(method);
+        }
+        assert!(too_many.validate().is_ok());
+        assert_eq!(
+            too_many.proof_systems(),
+            Err(MethodPolicyError::LimitExceeded)
+        );
     }
 
     #[test]

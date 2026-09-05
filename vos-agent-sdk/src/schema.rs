@@ -15,16 +15,42 @@ pub use crate::{FieldPersistence, MethodMode, StateLane};
 use crate::{Hash, LaneSet, RUNTIME_ABI_ID, RuntimeRequirements};
 
 /// The only accepted clean-generation AgentActor schema magic.
-pub const MAGIC: [u8; 4] = *b"AAS1";
+pub const MAGIC: [u8; 4] = *b"AAS2";
 /// The only accepted clean-generation AgentActor schema version.
 pub const VERSION: u16 = 1;
 pub const MAX_FIELDS: usize = 256;
 pub const MAX_METHODS: usize = 256;
+pub const MAX_CONSTRUCTOR_ARGUMENTS: usize = 256;
 pub const MAX_ENCODED_BYTES: usize = 16 * 1024;
 pub const MAX_NAME_BYTES: usize = crate::MAX_ACTOR_NAME_BYTES;
 pub const MAX_TYPE_IDENTITY_BYTES: usize = 512;
 pub const MAX_STORAGE_PREFIX_BYTES: usize = crate::MAX_STORAGE_PREFIX_BYTES;
 pub const MAX_STORAGE_DOMAIN_BYTES: usize = 128;
+/// Raw constructor parameters use this exact ABI spelling. The type is
+/// implicit in execution but retained in the signed schema for introspection.
+pub const RAW_CONSTRUCTOR_TYPE_IDENTITY: &str = "&[u8]";
+/// Domain for the exact AAS2 constructor subsection identity.
+pub const CONSTRUCTOR_ABI_DOMAIN: &[u8] = b"vos/agent/constructor-abi/v2";
+
+/// Compile-time constructor argument metadata in declaration order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConstructorArgumentMeta {
+    pub name: &'static str,
+    pub type_identity: &'static str,
+}
+
+/// Exact compile-time installation-data contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstructorMeta {
+    /// No installation-data object is accepted. Constant fields are rebuilt
+    /// deterministically by the no-argument constructor.
+    Forbidden,
+    /// One raw byte-slice argument; a present object is required, including
+    /// when its byte string is empty.
+    RequiredRaw(ConstructorArgumentMeta),
+    /// One or more named typed arguments in declaration order.
+    RequiredNamed(&'static [ConstructorArgumentMeta]),
+}
 
 /// Compile-time descriptor for a declaration-ordered inline, constant, or
 /// skipped actor field.
@@ -91,6 +117,7 @@ pub struct MethodMeta {
 
 /// Complete compile-time AgentActor schema consumed by [`encode`].
 pub struct SchemaMeta {
+    pub constructor: ConstructorMeta,
     pub fields: &'static [FieldMeta],
     pub methods: &'static [MethodMeta],
 }
@@ -154,12 +181,83 @@ pub struct ParsedMethod {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstructorArgument {
+    pub name: String,
+    pub type_identity: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConstructorContract {
+    Forbidden,
+    RequiredRaw(ConstructorArgument),
+    RequiredNamed(Vec<ConstructorArgument>),
+}
+
+impl ConstructorContract {
+    pub const fn requires_installation_data(&self) -> bool {
+        !matches!(self, Self::Forbidden)
+    }
+
+    pub fn validate(&self) -> Result<(), SchemaError> {
+        match self {
+            Self::Forbidden => Ok(()),
+            Self::RequiredRaw(argument) => {
+                if valid_name(&argument.name)
+                    && argument.type_identity == RAW_CONSTRUCTOR_TYPE_IDENTITY
+                {
+                    Ok(())
+                } else {
+                    Err(SchemaError::InvalidConstructor)
+                }
+            }
+            Self::RequiredNamed(arguments) => {
+                if arguments.is_empty()
+                    || arguments.len() > MAX_CONSTRUCTOR_ARGUMENTS
+                    || arguments.iter().any(|argument| {
+                        !valid_name(&argument.name) || !valid_type_identity(&argument.type_identity)
+                    })
+                    || arguments.iter().enumerate().any(|(index, argument)| {
+                        arguments[index + 1..]
+                            .iter()
+                            .any(|other| argument.name == other.name)
+                    })
+                {
+                    Err(SchemaError::InvalidConstructor)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedSchema {
+    pub constructor: ConstructorContract,
     pub fields: Vec<ParsedField>,
     pub methods: Vec<ParsedMethod>,
 }
 
 impl ParsedSchema {
+    pub const fn requires_installation_data(&self) -> bool {
+        self.constructor.requires_installation_data()
+    }
+
+    /// Stable nonzero commitment of the exact AAS2 constructor subsection.
+    pub fn constructor_abi(&self) -> Result<Hash, SchemaError> {
+        self.validate()?;
+        let subsection = encode_constructor_subsection(&self.constructor)?;
+        let identity = Hash::digest(
+            CONSTRUCTOR_ABI_DOMAIN,
+            &[RUNTIME_ABI_ID.as_bytes(), &subsection],
+        );
+        if identity == Hash::ZERO {
+            Err(SchemaError::InvalidConstructor)
+        } else {
+            Ok(identity)
+        }
+    }
+
     pub fn inline_fields(&self) -> impl Iterator<Item = &ParsedInlineField> {
         self.fields.iter().filter_map(|field| match field {
             ParsedField::Inline(field) => Some(field),
@@ -204,11 +302,15 @@ impl ParsedSchema {
         lanes
     }
 
-    pub fn runtime_requirements(&self, scheduling: bool, proofs: bool) -> RuntimeRequirements {
+    pub fn runtime_requirements(
+        &self,
+        scheduling: bool,
+        proof_systems: crate::ProofSystemSet,
+    ) -> RuntimeRequirements {
         RuntimeRequirements {
             lanes: self.lanes(),
             scheduling,
-            proofs,
+            proof_systems,
         }
     }
 
@@ -234,6 +336,7 @@ impl ParsedSchema {
     }
 
     pub fn validate(&self) -> Result<(), SchemaError> {
+        self.constructor.validate()?;
         if self.fields.len() > MAX_FIELDS || self.methods.len() > MAX_METHODS {
             return Err(SchemaError::LimitExceeded);
         }
@@ -274,14 +377,19 @@ impl ParsedSchema {
 
     pub fn encode(&self) -> Result<Vec<u8>, SchemaError> {
         self.validate()?;
+        let capacity = self.encoded_len().ok_or(SchemaError::LimitExceeded)?;
+        if capacity > MAX_ENCODED_BYTES {
+            return Err(SchemaError::LimitExceeded);
+        }
         let mut bytes = Vec::new();
         bytes
-            .try_reserve(MAX_ENCODED_BYTES.min(4096))
+            .try_reserve_exact(capacity)
             .map_err(|_| SchemaError::LimitExceeded)?;
         bytes.extend_from_slice(&MAGIC);
         let mut encoder = Encoder(&mut bytes);
         encoder.u16(VERSION);
         encoder.fixed(RUNTIME_ABI_ID.as_bytes());
+        encode_parsed_constructor(&mut encoder, &self.constructor);
         encoder.u16(self.fields.len() as u16);
         for field in &self.fields {
             encode_parsed_field(&mut encoder, field);
@@ -290,10 +398,41 @@ impl ParsedSchema {
         for method in &self.methods {
             encode_parsed_method(&mut encoder, method);
         }
-        if bytes.len() > MAX_ENCODED_BYTES {
+        if bytes.len() != capacity {
             return Err(SchemaError::LimitExceeded);
         }
         Ok(bytes)
+    }
+
+    fn encoded_len(&self) -> Option<usize> {
+        let mut length = (4usize + 2 + 32)
+            .checked_add(constructor_encoded_len(&self.constructor)?)?
+            .checked_add(2)?;
+        for field in &self.fields {
+            length = length.checked_add(match field {
+                ParsedField::Inline(field) => 12usize
+                    .checked_add(field.name.len())?
+                    .checked_add(field.type_identity.len())?,
+                ParsedField::Storage(field) => {
+                    let mut field_length = 18usize
+                        .checked_add(field.name.len())?
+                        .checked_add(field.type_identity.len())?
+                        .checked_add(field.prefix.len())?;
+                    if let (Some(leaf), Some(node)) = (&field.leaf_domain, &field.node_domain) {
+                        field_length = field_length
+                            .checked_add(8)?
+                            .checked_add(leaf.len())?
+                            .checked_add(node.len())?;
+                    }
+                    field_length
+                }
+            })?;
+        }
+        length = length.checked_add(2)?;
+        for method in &self.methods {
+            length = length.checked_add(8usize.checked_add(method.name.len())?)?;
+        }
+        Some(length)
     }
 
     fn field_lanes(&self) -> LaneSet {
@@ -314,6 +453,7 @@ impl ParsedSchema {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchemaError {
     Decode(DecodeError),
+    InvalidConstructor,
     InvalidField,
     InvalidMethod,
     DuplicateName,
@@ -326,6 +466,7 @@ impl fmt::Display for SchemaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Decode(error) => error.fmt(formatter),
+            Self::InvalidConstructor => formatter.write_str("invalid AgentActor constructor"),
             Self::InvalidField => formatter.write_str("invalid AgentActor schema field"),
             Self::InvalidMethod => formatter.write_str("invalid AgentActor schema method"),
             Self::DuplicateName => formatter.write_str("duplicate AgentActor schema name"),
@@ -353,6 +494,7 @@ pub const fn encode<const N: usize>(schema: &SchemaMeta) -> ([u8; N], usize) {
     position = write_bytes_unframed(&mut output, position, &MAGIC);
     position = write_bytes_unframed(&mut output, position, &VERSION.to_le_bytes());
     position = write_bytes_unframed(&mut output, position, RUNTIME_ABI_ID.as_bytes());
+    position = encode_meta_constructor(&mut output, position, schema.constructor);
     position = write_u16(&mut output, position, schema.fields.len() as u16);
     let mut field_position = 0usize;
     while field_position < schema.fields.len() {
@@ -388,6 +530,7 @@ pub fn decode(input: &[u8]) -> Result<ParsedSchema, SchemaError> {
     if Hash(decoder.fixed()?) != RUNTIME_ABI_ID {
         return Err(DecodeError::InvalidPlatform.into());
     }
+    let constructor = decode_constructor(&mut decoder)?;
     let field_count = decoder.u16()? as usize;
     if field_count > MAX_FIELDS {
         return Err(SchemaError::LimitExceeded);
@@ -426,7 +569,11 @@ pub fn decode(input: &[u8]) -> Result<ParsedSchema, SchemaError> {
     if !decoder.exhausted() {
         return Err(DecodeError::TrailingBytes.into());
     }
-    let schema = ParsedSchema { fields, methods };
+    let schema = ParsedSchema {
+        constructor,
+        fields,
+        methods,
+    };
     schema.validate()?;
     if schema.encode()?.as_slice() != input {
         return Err(DecodeError::NonCanonical.into());
@@ -494,6 +641,99 @@ fn validate_parsed_field(field: &ParsedField) -> Result<(), SchemaError> {
         }
     }
     Ok(())
+}
+
+fn encode_constructor_argument(encoder: &mut Encoder<'_>, argument: &ConstructorArgument) {
+    encoder.string(&argument.name);
+    encoder.string(&argument.type_identity);
+}
+
+fn encode_parsed_constructor(encoder: &mut Encoder<'_>, constructor: &ConstructorContract) {
+    match constructor {
+        ConstructorContract::Forbidden => encoder.u8(0),
+        ConstructorContract::RequiredRaw(argument) => {
+            encoder.u8(1);
+            encode_constructor_argument(encoder, argument);
+        }
+        ConstructorContract::RequiredNamed(arguments) => {
+            encoder.u8(2);
+            encoder.u16(arguments.len() as u16);
+            for argument in arguments {
+                encode_constructor_argument(encoder, argument);
+            }
+        }
+    }
+}
+
+fn encode_constructor_subsection(
+    constructor: &ConstructorContract,
+) -> Result<Vec<u8>, SchemaError> {
+    constructor.validate()?;
+    let capacity = constructor_encoded_len(constructor).ok_or(SchemaError::LimitExceeded)?;
+    if capacity > MAX_ENCODED_BYTES {
+        return Err(SchemaError::LimitExceeded);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| SchemaError::LimitExceeded)?;
+    encode_parsed_constructor(&mut Encoder(&mut bytes), constructor);
+    if bytes.len() != capacity {
+        return Err(SchemaError::LimitExceeded);
+    }
+    Ok(bytes)
+}
+
+fn constructor_encoded_len(constructor: &ConstructorContract) -> Option<usize> {
+    match constructor {
+        ConstructorContract::Forbidden => Some(1),
+        ConstructorContract::RequiredRaw(argument) => 9usize
+            .checked_add(argument.name.len())?
+            .checked_add(argument.type_identity.len()),
+        ConstructorContract::RequiredNamed(arguments) => {
+            let mut length = 3usize;
+            for argument in arguments {
+                length = length
+                    .checked_add(8)?
+                    .checked_add(argument.name.len())?
+                    .checked_add(argument.type_identity.len())?;
+            }
+            Some(length)
+        }
+    }
+}
+
+fn decode_constructor(decoder: &mut Decoder<'_>) -> Result<ConstructorContract, SchemaError> {
+    let constructor = match decoder.u8()? {
+        0 => ConstructorContract::Forbidden,
+        1 => ConstructorContract::RequiredRaw(decode_constructor_argument(decoder)?),
+        2 => {
+            let count = decoder.u16()? as usize;
+            if count == 0 || count > MAX_CONSTRUCTOR_ARGUMENTS {
+                return Err(SchemaError::InvalidConstructor);
+            }
+            let mut arguments = Vec::new();
+            arguments
+                .try_reserve_exact(count)
+                .map_err(|_| SchemaError::LimitExceeded)?;
+            for _ in 0..count {
+                arguments.push(decode_constructor_argument(decoder)?);
+            }
+            ConstructorContract::RequiredNamed(arguments)
+        }
+        _ => return Err(DecodeError::InvalidTag.into()),
+    };
+    constructor.validate()?;
+    Ok(constructor)
+}
+
+fn decode_constructor_argument(
+    decoder: &mut Decoder<'_>,
+) -> Result<ConstructorArgument, SchemaError> {
+    Ok(ConstructorArgument {
+        name: decoder.string_bounded(MAX_NAME_BYTES)?,
+        type_identity: decoder.string_bounded(MAX_TYPE_IDENTITY_BYTES)?,
+    })
 }
 
 fn duplicate_field_names(fields: &[ParsedField]) -> bool {
@@ -595,6 +835,7 @@ fn encode_parsed_method(encoder: &mut Encoder<'_>, method: &ParsedMethod) {
 }
 
 const fn assert_valid_meta(schema: &SchemaMeta) {
+    assert_valid_meta_constructor(schema.constructor);
     assert!(schema.fields.len() <= MAX_FIELDS);
     assert!(schema.methods.len() <= MAX_METHODS);
     let mut lanes = 0u8;
@@ -658,6 +899,69 @@ const fn assert_valid_meta(schema: &SchemaMeta) {
             previous += 1;
         }
         method_index += 1;
+    }
+}
+
+const fn assert_valid_meta_constructor(constructor: ConstructorMeta) {
+    match constructor {
+        ConstructorMeta::Forbidden => {}
+        ConstructorMeta::RequiredRaw(argument) => {
+            assert!(valid_meta_name(argument.name));
+            assert!(bytes_equal(
+                argument.type_identity.as_bytes(),
+                RAW_CONSTRUCTOR_TYPE_IDENTITY.as_bytes(),
+            ));
+        }
+        ConstructorMeta::RequiredNamed(arguments) => {
+            assert!(!arguments.is_empty());
+            assert!(arguments.len() <= MAX_CONSTRUCTOR_ARGUMENTS);
+            let mut index = 0usize;
+            while index < arguments.len() {
+                let argument = arguments[index];
+                assert!(valid_meta_name(argument.name));
+                assert!(valid_meta_type_identity(argument.type_identity));
+                let mut previous = 0usize;
+                while previous < index {
+                    assert!(!bytes_equal(
+                        arguments[previous].name.as_bytes(),
+                        argument.name.as_bytes(),
+                    ));
+                    previous += 1;
+                }
+                index += 1;
+            }
+        }
+    }
+}
+
+const fn encode_meta_constructor<const N: usize>(
+    output: &mut [u8; N],
+    mut position: usize,
+    constructor: ConstructorMeta,
+) -> usize {
+    match constructor {
+        ConstructorMeta::Forbidden => {
+            output[position] = 0;
+            position + 1
+        }
+        ConstructorMeta::RequiredRaw(argument) => {
+            output[position] = 1;
+            position += 1;
+            position = write_str(output, position, argument.name);
+            write_str(output, position, argument.type_identity)
+        }
+        ConstructorMeta::RequiredNamed(arguments) => {
+            output[position] = 2;
+            position += 1;
+            position = write_u16(output, position, arguments.len() as u16);
+            let mut index = 0usize;
+            while index < arguments.len() {
+                position = write_str(output, position, arguments[index].name);
+                position = write_str(output, position, arguments[index].type_identity);
+                index += 1;
+            }
+            position
+        }
     }
 }
 
@@ -926,6 +1230,7 @@ mod tests {
         },
     ];
     const SCHEMA: SchemaMeta = SchemaMeta {
+        constructor: ConstructorMeta::Forbidden,
         fields: FIELDS,
         methods: METHODS,
     };
@@ -940,6 +1245,7 @@ mod tests {
         let mut encoder = Encoder(&mut bytes);
         encoder.u16(VERSION);
         encoder.fixed(RUNTIME_ABI_ID.as_bytes());
+        encode_parsed_constructor(&mut encoder, &schema.constructor);
         encoder.u16(schema.fields.len() as u16);
         for field in &schema.fields {
             encode_parsed_field(&mut encoder, field);
@@ -997,20 +1303,181 @@ mod tests {
     }
 
     #[test]
+    fn constructor_contract_round_trips_and_binds_exact_subsection() {
+        const RAW_META: SchemaMeta = SchemaMeta {
+            constructor: ConstructorMeta::RequiredRaw(ConstructorArgumentMeta {
+                name: "arguments",
+                type_identity: RAW_CONSTRUCTOR_TYPE_IDENTITY,
+            }),
+            fields: &[],
+            methods: &[],
+        };
+        const NAMED_ARGUMENTS: &[ConstructorArgumentMeta] = &[
+            ConstructorArgumentMeta {
+                name: "initial",
+                type_identity: "core::primitive::u64",
+            },
+            ConstructorArgumentMeta {
+                name: "label",
+                type_identity: "alloc::string::String",
+            },
+        ];
+        const NAMED_META: SchemaMeta = SchemaMeta {
+            constructor: ConstructorMeta::RequiredNamed(NAMED_ARGUMENTS),
+            fields: &[],
+            methods: &[],
+        };
+        const RAW_ENCODED: ([u8; 512], usize) = encode::<512>(&RAW_META);
+        const NAMED_ENCODED: ([u8; 512], usize) = encode::<512>(&NAMED_META);
+        assert!(matches!(
+            decode(&RAW_ENCODED.0[..RAW_ENCODED.1]).unwrap().constructor,
+            ConstructorContract::RequiredRaw(_)
+        ));
+        assert!(matches!(
+            decode(&NAMED_ENCODED.0[..NAMED_ENCODED.1])
+                .unwrap()
+                .constructor,
+            ConstructorContract::RequiredNamed(_)
+        ));
+
+        let forbidden = parsed();
+        assert!(!forbidden.requires_installation_data());
+        let forbidden_abi = forbidden.constructor_abi().unwrap();
+
+        let mut raw = forbidden.clone();
+        raw.constructor = ConstructorContract::RequiredRaw(ConstructorArgument {
+            name: "arguments".into(),
+            type_identity: RAW_CONSTRUCTOR_TYPE_IDENTITY.into(),
+        });
+        assert!(raw.requires_installation_data());
+        assert_eq!(decode(&raw.encode().unwrap()).unwrap(), raw);
+        let raw_abi = raw.constructor_abi().unwrap();
+
+        let mut named = forbidden.clone();
+        named.constructor = ConstructorContract::RequiredNamed(alloc::vec![
+            ConstructorArgument {
+                name: "initial".into(),
+                type_identity: "core::primitive::u64".into(),
+            },
+            ConstructorArgument {
+                name: "label".into(),
+                type_identity: "alloc::string::String".into(),
+            },
+        ]);
+        assert_eq!(decode(&named.encode().unwrap()).unwrap(), named);
+        let named_abi = named.constructor_abi().unwrap();
+
+        assert_ne!(forbidden_abi, Hash::ZERO);
+        assert_ne!(forbidden_abi, raw_abi);
+        assert_ne!(raw_abi, named_abi);
+
+        let mut reordered = named.clone();
+        let ConstructorContract::RequiredNamed(arguments) = &mut reordered.constructor else {
+            unreachable!();
+        };
+        arguments.swap(0, 1);
+        assert_ne!(named_abi, reordered.constructor_abi().unwrap());
+
+        let mut renamed = named.clone();
+        let ConstructorContract::RequiredNamed(arguments) = &mut renamed.constructor else {
+            unreachable!();
+        };
+        arguments[0].name = "seed".into();
+        assert_ne!(named_abi, renamed.constructor_abi().unwrap());
+
+        // Constructor requiredness follows arguments only. Constant actor
+        // fields are reconstructed by a no-argument constructor.
+        let mut state_only_change = forbidden.clone();
+        let ParsedField::Inline(field) = &mut state_only_change.fields[2] else {
+            unreachable!();
+        };
+        field.type_identity = "example::OtherConfiguration".into();
+        assert_eq!(
+            forbidden.constructor_abi().unwrap(),
+            state_only_change.constructor_abi().unwrap()
+        );
+        assert!(!state_only_change.requires_installation_data());
+    }
+
+    #[test]
+    fn constructor_rejects_wrong_raw_shape_duplicate_names_and_hostile_count() {
+        let mut wrong_raw = parsed();
+        wrong_raw.constructor = ConstructorContract::RequiredRaw(ConstructorArgument {
+            name: "arguments".into(),
+            type_identity: "alloc::vec::Vec<u8>".into(),
+        });
+        assert_eq!(wrong_raw.validate(), Err(SchemaError::InvalidConstructor));
+        assert_eq!(
+            decode(&encode_unchecked(&wrong_raw)),
+            Err(SchemaError::InvalidConstructor)
+        );
+
+        let mut empty_named = parsed();
+        empty_named.constructor = ConstructorContract::RequiredNamed(Vec::new());
+        assert_eq!(empty_named.validate(), Err(SchemaError::InvalidConstructor));
+
+        let mut duplicate = parsed();
+        duplicate.constructor = ConstructorContract::RequiredNamed(alloc::vec![
+            ConstructorArgument {
+                name: "value".into(),
+                type_identity: "core::primitive::u64".into(),
+            },
+            ConstructorArgument {
+                name: "value".into(),
+                type_identity: "core::primitive::u32".into(),
+            },
+        ]);
+        assert_eq!(duplicate.validate(), Err(SchemaError::InvalidConstructor));
+
+        let mut unqualified = parsed();
+        unqualified.constructor =
+            ConstructorContract::RequiredNamed(alloc::vec![ConstructorArgument {
+                name: "value".into(),
+                type_identity: "u64".into(),
+            },]);
+        assert_eq!(unqualified.validate(), Err(SchemaError::InvalidConstructor));
+
+        let mut hostile_count = Vec::new();
+        hostile_count.extend_from_slice(&MAGIC);
+        hostile_count.extend_from_slice(&VERSION.to_le_bytes());
+        hostile_count.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+        hostile_count.push(2);
+        hostile_count.extend_from_slice(&((MAX_CONSTRUCTOR_ARGUMENTS + 1) as u16).to_le_bytes());
+        assert_eq!(decode(&hostile_count), Err(SchemaError::InvalidConstructor));
+
+        let long_type = alloc::format!("example::{}", "T".repeat(MAX_TYPE_IDENTITY_BYTES - 9));
+        let mut arguments = Vec::new();
+        for index in 0..40 {
+            arguments.push(ConstructorArgument {
+                name: alloc::format!("argument_{index}"),
+                type_identity: long_type.clone(),
+            });
+        }
+        let mut aggregate = parsed();
+        aggregate.constructor = ConstructorContract::RequiredNamed(arguments);
+        assert_eq!(aggregate.encode(), Err(SchemaError::LimitExceeded));
+        assert_eq!(aggregate.constructor_abi(), Err(SchemaError::LimitExceeded));
+    }
+
+    #[test]
     fn lanes_and_runtime_requirements_include_fields_and_method_modes() {
         let schema = parsed();
         let lanes = LaneSet::of(StateLane::Linear).union(LaneSet::of(StateLane::Merge));
         assert_eq!(schema.lanes(), lanes);
         assert_eq!(
-            schema.runtime_requirements(true, true),
+            schema.runtime_requirements(
+                true,
+                crate::ProofSystemSet::from_sorted(&[Hash([9; 32])]).unwrap(),
+            ),
             RuntimeRequirements {
                 lanes,
                 scheduling: true,
-                proofs: true,
+                proof_systems: crate::ProofSystemSet::from_sorted(&[Hash([9; 32])]).unwrap(),
             }
         );
 
         let local_query = ParsedSchema {
+            constructor: ConstructorContract::Forbidden,
             fields: Vec::new(),
             methods: alloc::vec![ParsedMethod {
                 source_index: 0,
@@ -1070,6 +1537,7 @@ mod tests {
         );
 
         let overlapping = ParsedSchema {
+            constructor: ConstructorContract::Forbidden,
             fields: alloc::vec![
                 storage(0, "rows", b"rows/"),
                 storage(1, "child", b"rows/a/")
@@ -1092,7 +1560,7 @@ mod tests {
         assert_eq!(reordered.validate(), Err(SchemaError::SourceOrder));
 
         let mut bytes = ENCODED.0[..ENCODED.1].to_vec();
-        let first_source_index = 4 + 2 + 32 + 2;
+        let first_source_index = 4 + 2 + 32 + 1 + 2;
         bytes[first_source_index..first_source_index + 2].copy_from_slice(&1u16.to_le_bytes());
         assert_eq!(decode(&bytes), Err(SchemaError::SourceOrder));
     }
@@ -1101,6 +1569,7 @@ mod tests {
     fn storage_prefix_and_commitment_domains_are_strict() {
         for prefix in [b"".as_slice(), b"\0private/", b"__vos_rows/"] {
             let schema = ParsedSchema {
+                constructor: ConstructorContract::Forbidden,
                 fields: alloc::vec![storage(0, "rows", prefix)],
                 methods: alloc::vec![ParsedMethod {
                     source_index: 0,
@@ -1151,7 +1620,7 @@ mod tests {
         let original = ENCODED.0[..ENCODED.1].to_vec();
 
         let mut old = original.clone();
-        old[..4].copy_from_slice(b"AGS2");
+        old[..4].copy_from_slice(b"AAS1");
         assert_eq!(
             decode(&old),
             Err(SchemaError::Decode(DecodeError::InvalidTag))
@@ -1171,7 +1640,14 @@ mod tests {
             Err(SchemaError::Decode(DecodeError::InvalidPlatform))
         );
 
-        let field_tag = 4 + 2 + 32 + 2 + 2;
+        let mut unknown_constructor = original.clone();
+        unknown_constructor[4 + 2 + 32] = 9;
+        assert_eq!(
+            decode(&unknown_constructor),
+            Err(SchemaError::Decode(DecodeError::InvalidTag))
+        );
+
+        let field_tag = 4 + 2 + 32 + 1 + 2 + 2;
         let mut unknown_field = original.clone();
         unknown_field[field_tag] = 9;
         assert_eq!(
@@ -1257,6 +1733,7 @@ mod tests {
         assert_eq!(decode(&encoded).unwrap(), methodless);
 
         const EMPTY_META: SchemaMeta = SchemaMeta {
+            constructor: ConstructorMeta::Forbidden,
             fields: &[],
             methods: &[],
         };
@@ -1269,6 +1746,7 @@ mod tests {
         hostile_count.extend_from_slice(&MAGIC);
         hostile_count.extend_from_slice(&VERSION.to_le_bytes());
         hostile_count.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+        hostile_count.push(0);
         hostile_count.extend_from_slice(&((MAX_FIELDS + 1) as u16).to_le_bytes());
         assert_eq!(decode(&hostile_count), Err(SchemaError::LimitExceeded));
 
@@ -1280,6 +1758,7 @@ mod tests {
     #[test]
     fn unqualified_type_identity_is_not_a_schema_contract() {
         let schema = ParsedSchema {
+            constructor: ConstructorContract::Forbidden,
             fields: alloc::vec![inline(
                 0,
                 "value",
@@ -1300,6 +1779,7 @@ mod tests {
     #[should_panic]
     fn const_encoder_rejects_noncanonical_source_order() {
         const BAD: SchemaMeta = SchemaMeta {
+            constructor: ConstructorMeta::Forbidden,
             fields: &[FieldMeta::Inline(InlineFieldMeta {
                 source_index: 1,
                 name: "value",

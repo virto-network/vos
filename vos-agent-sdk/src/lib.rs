@@ -16,13 +16,17 @@ mod model;
 pub mod package;
 pub mod private;
 pub mod proof;
+pub mod proof_system;
 mod runtime;
 pub mod scheduling;
 pub mod schema;
+pub mod task;
 pub mod wire;
 
 pub use model::*;
+pub use proof_system::*;
 pub use runtime::*;
+pub use task::*;
 pub use vos_protocol as protocol;
 pub use vos_protocol::{
     ActorId, AgentId, BlobRef, CallId, CapabilityId, ChangeId, CredentialId, DeploymentId, Hash,
@@ -31,7 +35,7 @@ pub use vos_protocol::{
 };
 
 /// Stable clean-generation management/runtime ABI identity.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260905r2");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260906r3");
 
 /// Maximum bytes named by one content-addressed artifact reference.
 pub const MAX_CATALOG_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
