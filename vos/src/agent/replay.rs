@@ -7157,6 +7157,9 @@ fn derive_standard_artifact_references<SourceError>(
         artifacts.push(actor.record.package.clone());
         artifacts.push(actor.record.agent_schema.clone());
         artifacts.push(actor.record.role_policies.clone());
+        if let Some(installation_data) = &actor.record.installation_data {
+            artifacts.push(installation_data.clone());
+        }
     }
     artifacts.sort_unstable_by_key(|artifact| (artifact.hash, artifact.len));
     artifacts.dedup_by_key(|artifact| (artifact.hash, artifact.len));
@@ -12980,6 +12983,42 @@ pub(crate) mod tests {
         };
         assert!(StandardAgentRuntime::restore(state.clone()).is_ok());
         encode_standard_runtime_state(&state)
+    }
+
+    #[test]
+    fn standard_artifact_references_retain_present_installation_data() {
+        for bytes in [&b""[..], &b"immutable-constructor-data"[..]] {
+            let installation_data = BlobRef::of_bytes(bytes);
+            let mut decoded = decode_standard_runtime_state(&standard_before()).unwrap();
+            let config = decoded.config.as_ref().unwrap().clone();
+            let actor = &mut decoded.actors[0].record;
+            actor.entry.installation_data = Some(installation_data.clone());
+            actor.installation_data = Some(installation_data.clone());
+            assert!(StandardAgentRuntime::restore(decoded.clone()).is_ok());
+
+            let runtime = RuntimeBinding {
+                space: config.identity.space,
+                agent: config.identity.agent,
+                deployment: config.identity.runtime_deployment,
+                program: config.identity.runtime_program,
+                producer: config.identity.runtime_producer,
+                package: config.runtime_package,
+                runtime_abi: super::super::RUNTIME_ABI_ID,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            };
+            let state = encode_standard_runtime_state(&decoded);
+            let artifacts =
+                derive_standard_artifact_references::<core::convert::Infallible>(&runtime, &state)
+                    .unwrap();
+
+            assert_eq!(
+                artifacts
+                    .iter()
+                    .filter(|artifact| **artifact == installation_data)
+                    .count(),
+                1
+            );
+        }
     }
 
     fn clock_only_state(input: &ReplayInput, before: &RuntimeState) -> RuntimeState {
