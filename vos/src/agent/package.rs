@@ -29,7 +29,7 @@ pub const MAX_ENCODED_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum generated public interface artifact.
 pub const MAX_PACKAGE_INTERFACES_BYTES: usize = 256 * 1024;
 /// Maximum public actor metadata/schema artifact. The agent-specific state
-/// schema has its own stricter [`super::schema::MAX_ENCODED_BYTES`] bound.
+/// schema has its own stricter [`super::sdk::schema::MAX_ENCODED_BYTES`] bound.
 pub const MAX_PACKAGE_SCHEMAS_BYTES: usize = 256 * 1024;
 /// Maximum aggregate executable bytes across signed Task dependencies.
 pub const MAX_PACKAGE_TASK_BYTES: usize = 4 * 1024 * 1024;
@@ -60,13 +60,46 @@ fn is_valid_program(program: &[u8]) -> bool {
 /// part of the public method contract. Keeping the derivation here gives the
 /// builder and package verifier one fail-closed rule: callers cannot sign a
 /// weaker requirement set than the actor metadata actually needs.
+///
+/// This existing helper remains scoped to the transitional service schema for
+/// its current build/runtime callers. Clean AgentActor package admission uses
+/// [`sdk_actor_runtime_requirements`] and has no legacy-schema fallback.
 pub fn actor_runtime_requirements(
     schema: &super::schema::ParsedSchema,
     metadata: &crate::metadata::ParsedMeta,
     has_task_dependencies: bool,
 ) -> RuntimeRequirements {
+    runtime_requirements(schema.lanes(), metadata, has_task_dependencies)
+}
+
+/// Derive host requirements from the clean SDK AgentActor schema. Lane names
+/// are matched explicitly rather than casting coincident enum discriminants.
+pub fn sdk_actor_runtime_requirements(
+    schema: &super::sdk::schema::ParsedSchema,
+    metadata: &crate::metadata::ParsedMeta,
+    has_task_dependencies: bool,
+) -> RuntimeRequirements {
+    let lanes = schema.lanes();
+    let mut mapped = LaneSet::NONE;
+    if lanes.contains(super::sdk::StateLane::Linear) {
+        mapped = mapped.union(LaneSet::of(super::StateLane::Linear));
+    }
+    if lanes.contains(super::sdk::StateLane::Merge) {
+        mapped = mapped.union(LaneSet::of(super::StateLane::Merge));
+    }
+    if lanes.contains(super::sdk::StateLane::Local) {
+        mapped = mapped.union(LaneSet::of(super::StateLane::Local));
+    }
+    runtime_requirements(mapped, metadata, has_task_dependencies)
+}
+
+fn runtime_requirements(
+    lanes: LaneSet,
+    metadata: &crate::metadata::ParsedMeta,
+    has_task_dependencies: bool,
+) -> RuntimeRequirements {
     RuntimeRequirements {
-        lanes: schema.lanes(),
+        lanes,
         scheduling: metadata.messages.iter().any(|message| message.mode != 0),
         proofs: metadata.provable
             || has_task_dependencies
@@ -123,7 +156,6 @@ pub enum PackageError {
     InvalidRuntimeResources,
     UnsupportedRuntimeMigration,
     InvalidRuntimeCapacity,
-    UnsupportedActorEntry,
     UnsupportedActorConstructor,
     UnsupportedConstantState,
     UnsupportedActorStorage,
@@ -207,7 +239,7 @@ impl Package {
         if artifact_hash(b"agent-schema", &self.agent_schema) != self.manifest.agent_schema_hash {
             return Err(PackageError::AgentSchemaHashMismatch);
         }
-        if self.agent_schema.len() > super::schema::MAX_ENCODED_BYTES {
+        if self.agent_schema.len() > super::sdk::schema::MAX_ENCODED_BYTES {
             return Err(PackageError::InvalidActorArtifacts);
         }
         if task_dependencies_hash(&self.task_dependencies) != self.manifest.dependencies_hash {
@@ -279,12 +311,9 @@ impl Package {
         }
         let metadata =
             crate::metadata::decode(&self.schemas).ok_or(PackageError::InvalidActorArtifacts)?;
-        let agent_schema =
-            super::schema::decode(&self.agent_schema).ok_or(PackageError::InvalidActorArtifacts)?;
-        if agent_schema.entry != super::schema::ExecutionEntryKind::AgentActor {
-            return Err(PackageError::UnsupportedActorEntry);
-        }
-        if agent_schema.uses_storage {
+        let agent_schema = super::sdk::schema::decode(&self.agent_schema)
+            .map_err(|_| PackageError::InvalidActorArtifacts)?;
+        if agent_schema.uses_storage() {
             // The standard runtime has no durable row-witness/effect channel.
             // The signed bit makes this a typed pre-install refusal instead
             // of letting a host ECALL fail after actor code has started.
@@ -299,20 +328,21 @@ impl Package {
             return Err(PackageError::UnsupportedActorConstructor);
         }
         if agent_schema
-            .fields
-            .iter()
-            .any(|field| field.persistence == super::FieldPersistence::Constant)
+            .inline_fields()
+            .any(|field| field.persistence == super::sdk::schema::FieldPersistence::Constant)
         {
             return Err(PackageError::UnsupportedConstantState);
         }
-        if actor_runtime_requirements(&agent_schema, &metadata, !self.task_dependencies.is_empty())
-            != match self.manifest.kind {
-                PackageKind::Actor { requirements, .. } => requirements,
-                PackageKind::AgentRuntime { .. } => {
-                    return Err(PackageError::InvalidActorArtifacts);
-                }
+        if sdk_actor_runtime_requirements(
+            &agent_schema,
+            &metadata,
+            !self.task_dependencies.is_empty(),
+        ) != match self.manifest.kind {
+            PackageKind::Actor { requirements, .. } => requirements,
+            PackageKind::AgentRuntime { .. } => {
+                return Err(PackageError::InvalidActorArtifacts);
             }
-            || agent_schema.methods.len() != metadata.messages.len()
+        } || agent_schema.methods.len() != metadata.messages.len()
             || agent_schema.methods.iter().zip(&metadata.messages).any(
                 |(agent_method, public_method)| {
                     agent_method.name != public_method.name
@@ -443,7 +473,7 @@ impl ServiceWire for Package {
         let role_policies =
             decode_bounded_bytes(decoder, super::execution::MAX_EXECUTION_POLICY_BYTES)?;
         let schemas = decode_bounded_bytes(decoder, MAX_PACKAGE_SCHEMAS_BYTES)?;
-        let agent_schema = decode_bounded_bytes(decoder, super::schema::MAX_ENCODED_BYTES)?;
+        let agent_schema = decode_bounded_bytes(decoder, super::sdk::schema::MAX_ENCODED_BYTES)?;
         let dependency_count = decoder.u32()? as usize;
         if dependency_count > crate::service::MAX_PACKAGE_TASK_DEPENDENCIES {
             return Err(DecodeError::LimitExceeded);
@@ -722,46 +752,112 @@ mod tests {
         ..ACTOR_META
     };
 
-    const ACTOR_SCHEMA: super::super::schema::SchemaMeta = super::super::schema::SchemaMeta {
-        uses_storage: false,
-        fields: &[super::super::schema::FieldMeta {
-            name: "count",
-            codec: "counter::u64",
-            persistence: super::super::FieldPersistence::State(super::super::StateLane::Linear),
-        }],
-        methods: &[super::super::schema::MethodMeta {
+    const ACTOR_METHODS: &[super::super::sdk::schema::MethodMeta] =
+        &[super::super::sdk::schema::MethodMeta {
+            source_index: 0,
             name: "increment",
-            mode: super::super::MethodMode::Linear,
+            mode: super::super::sdk::schema::MethodMode::Linear,
             explicit: false,
-        }],
-    };
-
-    const CONSTANT_SCHEMA: super::super::schema::SchemaMeta = super::super::schema::SchemaMeta {
-        uses_storage: false,
-        fields: &[super::super::schema::FieldMeta {
-            name: "unit",
-            codec: "counter::String",
-            persistence: super::super::FieldPersistence::Constant,
-        }],
-        methods: ACTOR_SCHEMA.methods,
-    };
-
-    const STORAGE_SCHEMA: super::super::schema::SchemaMeta = super::super::schema::SchemaMeta {
-        uses_storage: true,
-        fields: ACTOR_SCHEMA.fields,
-        methods: ACTOR_SCHEMA.methods,
-    };
-
-    const STORAGE_FIELDS: &[super::super::schema::StorageFieldMeta] =
-        &[super::super::schema::StorageFieldMeta {
-            name: "rows",
-            type_identity: "counter::StorageMap<u64,u64>",
-            lane: super::super::StateLane::Linear,
-            prefix: b"rows/",
-            committed: false,
-            leaf_domain: None,
-            node_domain: None,
         }];
+
+    const ACTOR_SCHEMA: super::super::sdk::schema::SchemaMeta =
+        super::super::sdk::schema::SchemaMeta {
+            fields: &[super::super::sdk::schema::FieldMeta::Inline(
+                super::super::sdk::schema::InlineFieldMeta {
+                    source_index: 0,
+                    name: "count",
+                    type_identity: "counter::u64",
+                    persistence: super::super::sdk::schema::FieldPersistence::State(
+                        super::super::sdk::schema::StateLane::Linear,
+                    ),
+                },
+            )],
+            methods: ACTOR_METHODS,
+        };
+
+    const CONSTANT_SCHEMA: super::super::sdk::schema::SchemaMeta =
+        super::super::sdk::schema::SchemaMeta {
+            fields: &[super::super::sdk::schema::FieldMeta::Inline(
+                super::super::sdk::schema::InlineFieldMeta {
+                    source_index: 0,
+                    name: "unit",
+                    type_identity: "counter::String",
+                    persistence: super::super::sdk::schema::FieldPersistence::Constant,
+                },
+            )],
+            methods: ACTOR_METHODS,
+        };
+
+    const STORAGE_SCHEMA: super::super::sdk::schema::SchemaMeta =
+        super::super::sdk::schema::SchemaMeta {
+            fields: &[
+                super::super::sdk::schema::FieldMeta::Inline(
+                    super::super::sdk::schema::InlineFieldMeta {
+                        source_index: 0,
+                        name: "count",
+                        type_identity: "counter::u64",
+                        persistence: super::super::sdk::schema::FieldPersistence::State(
+                            super::super::sdk::schema::StateLane::Linear,
+                        ),
+                    },
+                ),
+                super::super::sdk::schema::FieldMeta::Storage(
+                    super::super::sdk::schema::StorageFieldMeta {
+                        source_index: 1,
+                        name: "rows",
+                        type_identity: "counter::StorageMap<u64,u64>",
+                        prefix: b"rows/",
+                        lane: super::super::sdk::schema::StateLane::Linear,
+                        committed: false,
+                        leaf_domain: None,
+                        node_domain: None,
+                    },
+                ),
+            ],
+            methods: ACTOR_METHODS,
+        };
+
+    const ALL_LANES_SCHEMA: super::super::sdk::schema::SchemaMeta =
+        super::super::sdk::schema::SchemaMeta {
+            fields: &[
+                super::super::sdk::schema::FieldMeta::Inline(
+                    super::super::sdk::schema::InlineFieldMeta {
+                        source_index: 0,
+                        name: "linear",
+                        type_identity: "counter::LinearState",
+                        persistence: super::super::sdk::schema::FieldPersistence::State(
+                            super::super::sdk::schema::StateLane::Linear,
+                        ),
+                    },
+                ),
+                super::super::sdk::schema::FieldMeta::Inline(
+                    super::super::sdk::schema::InlineFieldMeta {
+                        source_index: 1,
+                        name: "merge",
+                        type_identity: "counter::MergeState",
+                        persistence: super::super::sdk::schema::FieldPersistence::State(
+                            super::super::sdk::schema::StateLane::Merge,
+                        ),
+                    },
+                ),
+                super::super::sdk::schema::FieldMeta::Inline(
+                    super::super::sdk::schema::InlineFieldMeta {
+                        source_index: 2,
+                        name: "local",
+                        type_identity: "counter::LocalState",
+                        persistence: super::super::sdk::schema::FieldPersistence::State(
+                            super::super::sdk::schema::StateLane::Local,
+                        ),
+                    },
+                ),
+            ],
+            methods: &[super::super::sdk::schema::MethodMeta {
+                source_index: 0,
+                name: "increment",
+                mode: super::super::sdk::schema::MethodMode::Linear,
+                explicit: true,
+            }],
+        };
 
     fn signature() -> DeploymentSignature {
         DeploymentSignature {
@@ -815,17 +911,14 @@ mod tests {
 
     fn actor_package(
         metadata: &'static crate::metadata::ActorMeta,
-        schema: &'static super::super::schema::SchemaMeta,
-        entry: super::super::schema::ExecutionEntryKind,
+        schema: &'static super::super::sdk::schema::SchemaMeta,
     ) -> Package {
-        actor_package_with_storage(metadata, schema, &[], entry)
+        actor_package_with_schema(metadata, schema)
     }
 
-    fn actor_package_with_storage(
+    fn actor_package_with_schema(
         metadata: &'static crate::metadata::ActorMeta,
-        schema: &'static super::super::schema::SchemaMeta,
-        storage: &'static [super::super::schema::StorageFieldMeta],
-        entry: super::super::schema::ExecutionEntryKind,
+        schema: &'static super::super::sdk::schema::SchemaMeta,
     ) -> Package {
         let pvm = vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
             ro_data: Vec::new(),
@@ -845,11 +938,10 @@ mod tests {
         let role_policies = PackageRolePolicies::from_metadata(&parsed_metadata)
             .unwrap()
             .encode();
-        let (agent_bytes, agent_len) =
-            super::super::schema::encode_with_storage::<1024>(schema, storage, entry);
+        let (agent_bytes, agent_len) = super::super::sdk::schema::encode::<1024>(schema);
         let agent_schema = agent_bytes[..agent_len].to_vec();
-        let requirements = actor_runtime_requirements(
-            &super::super::schema::decode(&agent_schema).unwrap(),
+        let requirements = sdk_actor_runtime_requirements(
+            &super::super::sdk::schema::decode(&agent_schema).unwrap(),
             &parsed_metadata,
             false,
         );
@@ -898,11 +990,7 @@ mod tests {
             Err(PackageError::WrongExecutionSemantics),
         );
 
-        let mut actor = actor_package(
-            &ACTOR_META,
-            &ACTOR_SCHEMA,
-            super::super::schema::ExecutionEntryKind::AgentActor,
-        );
+        let mut actor = actor_package(&ACTOR_META, &ACTOR_SCHEMA);
         actor.manifest.execution_semantics = crate::service::EXECUTION_SEMANTICS_ID;
         assert_eq!(actor.validate(), Err(PackageError::WrongExecutionSemantics),);
     }
@@ -920,11 +1008,7 @@ mod tests {
                 Err(PackageError::WrongExecutionSemantics),
             );
 
-            let mut actor = actor_package(
-                &ACTOR_META,
-                &ACTOR_SCHEMA,
-                super::super::schema::ExecutionEntryKind::AgentActor,
-            );
+            let mut actor = actor_package(&ACTOR_META, &ACTOR_SCHEMA);
             actor.manifest.execution_semantics = retired;
             assert_eq!(actor.validate(), Err(PackageError::WrongExecutionSemantics));
         }
@@ -943,11 +1027,7 @@ mod tests {
         });
         assert_eq!(package.validate(), Err(PackageError::ArtifactsTooLarge));
 
-        let mut package = actor_package(
-            &ACTOR_META,
-            &ACTOR_SCHEMA,
-            super::super::schema::ExecutionEntryKind::AgentActor,
-        );
+        let mut package = actor_package(&ACTOR_META, &ACTOR_SCHEMA);
         package.task_dependencies = (0..4_u8)
             .map(|index| PackageTaskDependency {
                 binding: crate::service::TaskDependency {
@@ -1051,11 +1131,7 @@ mod tests {
 
     #[test]
     fn actor_abi_is_signed_and_checked_against_the_runtime_range() {
-        let mut package = actor_package(
-            &ACTOR_META,
-            &ACTOR_SCHEMA,
-            super::super::schema::ExecutionEntryKind::AgentActor,
-        );
+        let mut package = actor_package(&ACTOR_META, &ACTOR_SCHEMA);
         let canonical_id = package.deployment_id();
         let requirements = match package.manifest.kind {
             PackageKind::Actor { requirements, .. } => requirements,
@@ -1112,12 +1188,25 @@ mod tests {
     }
 
     #[test]
+    fn clean_schema_lanes_are_mapped_by_name_at_actor_admission() {
+        let package = actor_package(&ACTOR_META, &ALL_LANES_SCHEMA);
+        assert!(matches!(
+            package.manifest.kind,
+            PackageKind::Actor {
+                requirements: RuntimeRequirements {
+                    lanes: LaneSet::ALL,
+                    scheduling: false,
+                    proofs: false,
+                },
+                ..
+            }
+        ));
+        assert_eq!(package.validate(), Ok(()));
+    }
+
+    #[test]
     fn signed_requirements_include_attestation_and_scheduling_contracts() {
-        let mut attested = actor_package(
-            &ATTESTED_META,
-            &ACTOR_SCHEMA,
-            super::super::schema::ExecutionEntryKind::AgentActor,
-        );
+        let mut attested = actor_package(&ATTESTED_META, &ACTOR_SCHEMA);
         assert!(matches!(
             attested.manifest.kind,
             PackageKind::Actor {
@@ -1142,11 +1231,7 @@ mod tests {
             Err(PackageError::InvalidActorArtifacts)
         );
 
-        let mut job = actor_package(
-            &JOB_META,
-            &ACTOR_SCHEMA,
-            super::super::schema::ExecutionEntryKind::AgentActor,
-        );
+        let mut job = actor_package(&JOB_META, &ACTOR_SCHEMA);
         assert!(matches!(
             job.manifest.kind,
             PackageKind::Actor {
@@ -1173,33 +1258,43 @@ mod tests {
     }
 
     #[test]
-    fn actor_packages_reject_non_agent_entry_abis() {
+    fn actor_packages_reject_every_transitional_schema_entry() {
+        const LEGACY: super::super::schema::SchemaMeta = super::super::schema::SchemaMeta {
+            uses_storage: false,
+            fields: &[super::super::schema::FieldMeta {
+                name: "count",
+                codec: "counter::u64",
+                persistence: super::super::FieldPersistence::State(super::super::StateLane::Linear),
+            }],
+            methods: &[super::super::schema::MethodMeta {
+                name: "increment",
+                mode: super::super::MethodMode::Linear,
+                explicit: false,
+            }],
+        };
         for entry in [
             super::super::schema::ExecutionEntryKind::ServiceActor,
             super::super::schema::ExecutionEntryKind::Task,
+            super::super::schema::ExecutionEntryKind::AgentActor,
         ] {
-            let package = actor_package(&ACTOR_META, &ACTOR_SCHEMA, entry);
-            assert_eq!(package.validate(), Err(PackageError::UnsupportedActorEntry));
+            let mut package = actor_package(&ACTOR_META, &ACTOR_SCHEMA);
+            let (bytes, len) = super::super::schema::encode_with_entry::<1024>(&LEGACY, entry);
+            package.agent_schema = bytes[..len].to_vec();
+            package.manifest.agent_schema_hash =
+                artifact_hash(b"agent-schema", &package.agent_schema);
+            assert_eq!(package.validate(), Err(PackageError::InvalidActorArtifacts));
         }
     }
 
     #[test]
     fn actor_packages_fail_closed_on_unimplemented_install_configuration() {
-        let constructor = actor_package(
-            &CONSTRUCTOR_META,
-            &ACTOR_SCHEMA,
-            super::super::schema::ExecutionEntryKind::AgentActor,
-        );
+        let constructor = actor_package(&CONSTRUCTOR_META, &ACTOR_SCHEMA);
         assert_eq!(
             constructor.validate(),
             Err(PackageError::UnsupportedActorConstructor)
         );
 
-        let constant = actor_package(
-            &ACTOR_META,
-            &CONSTANT_SCHEMA,
-            super::super::schema::ExecutionEntryKind::AgentActor,
-        );
+        let constant = actor_package(&ACTOR_META, &CONSTANT_SCHEMA);
         assert_eq!(
             constant.validate(),
             Err(PackageError::UnsupportedConstantState)
@@ -1208,12 +1303,7 @@ mod tests {
 
     #[test]
     fn actor_packages_reject_signed_storage_use_before_install() {
-        let storage = actor_package_with_storage(
-            &ACTOR_META,
-            &STORAGE_SCHEMA,
-            STORAGE_FIELDS,
-            super::super::schema::ExecutionEntryKind::AgentActor,
-        );
+        let storage = actor_package(&ACTOR_META, &STORAGE_SCHEMA);
         assert_eq!(
             storage.validate(),
             Err(PackageError::UnsupportedActorStorage)
@@ -1240,11 +1330,7 @@ mod tests {
     #[test]
     fn default_verifier_requires_a_canonical_ed25519_producer_key() {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
-        let mut package = actor_package(
-            &ACTOR_META,
-            &ACTOR_SCHEMA,
-            super::super::schema::ExecutionEntryKind::AgentActor,
-        );
+        let mut package = actor_package(&ACTOR_META, &ACTOR_SCHEMA);
         package.deployment_signature.public_key = keypair.public().encode_protobuf();
         package.deployment_signature.producer =
             ProducerId::of_public_key(&package.deployment_signature.public_key);

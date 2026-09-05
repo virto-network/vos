@@ -441,7 +441,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Storage handles do not enter an inline lane codec. Emit them through the
     // schema's explicit storage surface so the signed bytes carry typed,
     // independently bounded keyspace and commitment policy.
-    let agent_field_metas = state_fields
+    let legacy_field_metas = state_fields
         .fields
         .iter()
         .map(|field| {
@@ -460,7 +460,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect::<Vec<_>>();
-    let agent_storage_metas = storage_fields
+    let legacy_storage_metas = storage_fields
         .iter()
         .map(|field| {
             let name = field.ident.to_string();
@@ -485,14 +485,91 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect::<Vec<_>>();
-    let agent_entry_kind = if parsed.task_buf.is_some() {
-        quote! { vos::agent::schema::ExecutionEntryKind::Task }
-    } else if agent_actor {
-        quote! { vos::agent::schema::ExecutionEntryKind::AgentActor }
-    } else {
-        quote! { vos::agent::schema::ExecutionEntryKind::ServiceActor }
-    };
+    let mut clean_field_metas = state_fields
+        .fields
+        .iter()
+        .map(|field| {
+            let source_index = field.order as u16;
+            let name = field.ident.to_string();
+            let ty = &field.ty;
+            let persistence = field.persistence.sdk_tokens();
+            (
+                field.order,
+                quote! {
+                    vos::agent::sdk::schema::FieldMeta::Inline(
+                        vos::agent::sdk::schema::InlineFieldMeta {
+                            source_index: #source_index,
+                            name: #name,
+                            type_identity: concat!(module_path!(), "::", stringify!(#ty)),
+                            persistence: #persistence,
+                        }
+                    )
+                },
+            )
+        })
+        .chain(storage_fields.iter().map(|field| {
+            let source_index = field.order as u16;
+            let name = field.ident.to_string();
+            let ty = &field.ty;
+            let lane = field.persistence.sdk_lane_tokens();
+            let prefix = syn::LitByteStr::new(&field.prefix, proc_macro2::Span::call_site());
+            let committed = field.committed;
+            let (leaf_domain, node_domain) = match &field.domains {
+                Some((leaf, node)) => (quote! { Some(#leaf) }, quote! { Some(#node) }),
+                None => (quote! { None }, quote! { None }),
+            };
+            (
+                field.order,
+                quote! {
+                    vos::agent::sdk::schema::FieldMeta::Storage(
+                        vos::agent::sdk::schema::StorageFieldMeta {
+                            source_index: #source_index,
+                            name: #name,
+                            type_identity: concat!(module_path!(), "::", stringify!(#ty)),
+                            prefix: #prefix,
+                            lane: #lane,
+                            committed: #committed,
+                            leaf_domain: #leaf_domain,
+                            node_domain: #node_domain,
+                        }
+                    )
+                },
+            )
+        }))
+        .collect::<Vec<_>>();
+    clean_field_metas.sort_by_key(|(order, _)| *order);
+    let clean_field_metas = clean_field_metas
+        .into_iter()
+        .map(|(_, field)| field)
+        .collect::<Vec<_>>();
     let agent_uses_storage = !storage_fields.is_empty();
+    let schema_encoding = if agent_actor {
+        quote! {
+            vos::agent::sdk::schema::encode::<16384>(
+                &vos::agent::sdk::schema::SchemaMeta {
+                    fields: &[ #( #clean_field_metas ),* ],
+                    methods: <#msg_enum>::AGENT_METHODS,
+                },
+            )
+        }
+    } else {
+        let legacy_entry_kind = if parsed.task_buf.is_some() {
+            quote! { vos::agent::schema::ExecutionEntryKind::Task }
+        } else {
+            quote! { vos::agent::schema::ExecutionEntryKind::ServiceActor }
+        };
+        quote! {
+            vos::agent::schema::encode_with_storage::<16384>(
+                &vos::agent::schema::SchemaMeta {
+                    uses_storage: #agent_uses_storage,
+                    fields: &[ #( #legacy_field_metas ),* ],
+                    methods: <#msg_enum>::AGENT_METHODS,
+                },
+                &[ #( #legacy_storage_metas ),* ],
+                #legacy_entry_kind,
+            )
+        }
+    };
     let pvm_entries = quote! {
         #entry
 
@@ -515,15 +592,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[cfg(all(target_arch = "riscv64", feature = "bin"))]
         const __VOS_AGENT_SCHEMA_ENCODED: ([u8; 16384], usize) =
-            vos::agent::schema::encode_with_storage::<16384>(
-                &vos::agent::schema::SchemaMeta {
-                    uses_storage: #agent_uses_storage,
-                    fields: &[ #( #agent_field_metas ),* ],
-                    methods: <#msg_enum>::AGENT_METHODS,
-                },
-                &[ #( #agent_storage_metas ),* ],
-                #agent_entry_kind,
-            );
+            #schema_encoding;
 
         #[cfg(all(target_arch = "riscv64", feature = "bin"))]
         #[unsafe(link_section = ".vos_agent")]
@@ -889,11 +958,11 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let agent_message_assert = agent_actor.then(|| {
         quote! {
             const _: () = {
-                fn __vos_require_agent_messages<T: vos::agent::schema::AgentMessageSet>() {}
+                fn __vos_require_agent_messages<T: vos::agent::sdk::schema::AgentMessageSet>() {}
                 let _ = __vos_require_agent_messages::<#msg_enum> as fn();
                 assert!(
                     !#require_explicit_mutations
-                        || <#msg_enum as vos::agent::schema::AgentMessageSet>::ALL_MUTATIONS_EXPLICIT,
+                        || <#msg_enum as vos::agent::sdk::schema::AgentMessageSet>::ALL_MUTATIONS_EXPLICIT,
                     "mixed-lane #[actor(agent)] requires every &mut self handler to select #[msg(linear)], #[msg(merge)], or #[msg(local)]",
                 );
             };
@@ -1338,7 +1407,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
             format_ident!("__Vos{}{}View", actor_name, suffix)
         });
-        let agent_execution_mode = match execution_mode.as_ref().map(ToString::to_string) {
+        let host_execution_mode = match execution_mode.as_ref().map(ToString::to_string) {
             Some(mode) if mode == "query" && is_query => {
                 quote! { vos::agent::MethodMode::Query }
             }
@@ -1367,6 +1436,26 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             None if is_query => quote! { vos::agent::MethodMode::Query },
             None => quote! { <#actor_name as vos::Actor>::DEFAULT_MUTATION_MODE },
+        };
+        let agent_execution_mode = if agent_messages {
+            quote! {
+                match #host_execution_mode {
+                    vos::agent::MethodMode::Query =>
+                        vos::agent::sdk::schema::MethodMode::Query,
+                    vos::agent::MethodMode::LinearizableQuery =>
+                        vos::agent::sdk::schema::MethodMode::LinearizableQuery,
+                    vos::agent::MethodMode::LocalQuery =>
+                        vos::agent::sdk::schema::MethodMode::LocalQuery,
+                    vos::agent::MethodMode::Linear =>
+                        vos::agent::sdk::schema::MethodMode::Linear,
+                    vos::agent::MethodMode::Merge =>
+                        vos::agent::sdk::schema::MethodMode::Merge,
+                    vos::agent::MethodMode::Local =>
+                        vos::agent::sdk::schema::MethodMode::Local,
+                }
+            }
+        } else {
+            host_execution_mode
         };
 
         // Collect parameters (skip self, skip Context)
@@ -1759,13 +1848,25 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Metadata
         let msg_name_str = method_name.to_string();
-        agent_method_metas.push(quote! {
-            vos::agent::schema::MethodMeta {
-                name: #msg_name_str,
-                mode: #agent_execution_mode,
-                explicit: #explicit_execution_mode,
-            }
-        });
+        let source_index = agent_method_metas.len() as u16;
+        if agent_messages {
+            agent_method_metas.push(quote! {
+                vos::agent::sdk::schema::MethodMeta {
+                    source_index: #source_index,
+                    name: #msg_name_str,
+                    mode: #agent_execution_mode,
+                    explicit: #explicit_execution_mode,
+                }
+            });
+        } else {
+            agent_method_metas.push(quote! {
+                vos::agent::schema::MethodMeta {
+                    name: #msg_name_str,
+                    mode: #agent_execution_mode,
+                    explicit: #explicit_execution_mode,
+                }
+            });
+        }
         // First paragraph of the handler's `///` doc → MessageMeta.doc.
         let method_doc = first_doc_paragraph(&method.attrs);
         // Dispatch mode byte: 1 for `#[msg(job)]`, else 0 (sync).
@@ -1943,7 +2044,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let agent_message_marker = agent_messages.then(|| {
         quote! {
-            impl vos::agent::schema::AgentMessageSet for #enum_name {
+            impl vos::agent::sdk::schema::AgentMessageSet for #enum_name {
                 const ALL_MUTATIONS_EXPLICIT: bool = #all_agent_mutations_explicit;
             }
             const _: () = assert!(
@@ -1952,6 +2053,11 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
             );
         }
     });
+    let agent_schema_method_type = if agent_messages {
+        quote! { vos::agent::sdk::schema::MethodMeta }
+    } else {
+        quote! { vos::agent::schema::MethodMeta }
+    };
 
     // Generate the aggregated enum
     let aggregated_enum = quote! {
@@ -2049,7 +2155,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl #enum_name {
             #[doc(hidden)]
-            pub const AGENT_METHODS: &'static [vos::agent::schema::MethodMeta] =
+            pub const AGENT_METHODS: &'static [#agent_schema_method_type] =
                 &[ #( #agent_method_metas ),* ];
 
             pub const META: vos::metadata::ActorMeta = vos::metadata::ActorMeta {
@@ -2934,6 +3040,39 @@ impl PersistencePlan {
             Self::Linear => quote! { vos::agent::StateLane::Linear },
             Self::Merge => quote! { vos::agent::StateLane::Merge },
             Self::Local => quote! { vos::agent::StateLane::Local },
+            Self::Constant | Self::Skipped => {
+                unreachable!("storage persistence is always a durability lane")
+            }
+        }
+    }
+
+    fn sdk_tokens(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Linear => quote! {
+                vos::agent::sdk::schema::FieldPersistence::State(
+                    vos::agent::sdk::schema::StateLane::Linear
+                )
+            },
+            Self::Merge => quote! {
+                vos::agent::sdk::schema::FieldPersistence::State(
+                    vos::agent::sdk::schema::StateLane::Merge
+                )
+            },
+            Self::Local => quote! {
+                vos::agent::sdk::schema::FieldPersistence::State(
+                    vos::agent::sdk::schema::StateLane::Local
+                )
+            },
+            Self::Constant => quote! { vos::agent::sdk::schema::FieldPersistence::Constant },
+            Self::Skipped => quote! { vos::agent::sdk::schema::FieldPersistence::Skipped },
+        }
+    }
+
+    fn sdk_lane_tokens(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Linear => quote! { vos::agent::sdk::schema::StateLane::Linear },
+            Self::Merge => quote! { vos::agent::sdk::schema::StateLane::Merge },
+            Self::Local => quote! { vos::agent::sdk::schema::StateLane::Local },
             Self::Constant | Self::Skipped => {
                 unreachable!("storage persistence is always a durability lane")
             }

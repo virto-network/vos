@@ -16,6 +16,7 @@ pub mod private;
 pub mod proof;
 mod runtime;
 pub mod scheduling;
+pub mod schema;
 pub mod wire;
 
 pub use model::*;
