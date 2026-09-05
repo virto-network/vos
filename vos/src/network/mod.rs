@@ -9,6 +9,7 @@
 //! Inbound Tells are pushed into the caller-supplied
 //! [`NetworkConfig::inbox`].
 
+pub(crate) mod agent_protocol;
 mod codec;
 mod ops;
 mod wire;
