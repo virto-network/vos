@@ -3,8 +3,9 @@
 //! The clean-generation storage foundation classifies every committed physical
 //! Raft slot as a leader no-op, canonical [`AgentRaftCommand`], or bounded
 //! membership change. It advances its V2 audit cursor and Raft `last_applied`
-//! atomically for the no-op case. Command execution, authorized committee
-//! transitions, and live-worker attachment remain later integration slices.
+//! atomically for leader no-ops and the application-authorized two-slot
+//! committee-transition barrier. Ordinary command execution and live-worker
+//! attachment remain later integration slices.
 //! Applying an ordered command and publishing its exact [`OrderedCommitClaim`]
 //! are separate from signing: the evidence ledger first anchors that applied
 //! claim, then commits an immutable pledge, and only then invokes a replica
@@ -43,6 +44,8 @@ const ARTIFACT_BATCH_ID_DOMAIN: &[u8] = b"vos/agent/shared/artifact-batch/v1";
 const ARTIFACT_CHUNK_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/artifact-batch-chunk/v1";
 const AGENT_RAFT_COMMAND_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/raft-command/v1";
 const AGENT_RAFT_APPLY_RESERVATION_DOMAIN: &[u8] = b"vos/agent/shared/raft-apply-reservation/v1";
+const COMMITTEE_CHANGE_REQUEST_DOMAIN: &[u8] = b"vos/agent/shared/committee-change-request/v1";
+const COMMITTEE_TRANSITION_ID_DOMAIN: &[u8] = b"vos/agent/shared/committee-transition/v1";
 #[cfg(feature = "storage")]
 const AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/raft-physical-slot/v2";
 
@@ -58,6 +61,8 @@ pub const ARTIFACT_CHUNK_DATA_BYTES: usize = 64 * 1024;
 pub const MAX_ARTIFACT_CHUNK_WIRE_BYTES: usize = 96 * 1024;
 /// Maximum complete Shared Agent Raft command.
 pub const MAX_AGENT_RAFT_COMMAND_BYTES: usize = 192 * 1024;
+/// Maximum complete authorized committee-change preparation.
+pub const MAX_PREPARE_COMMITTEE_CHANGE_BYTES: usize = 160 * 1024;
 /// Maximum complete encoded physical `vos-raft` slot admitted by the Shared
 /// adapter. The one-byte entry-kind tag is included.
 #[cfg(feature = "storage")]
@@ -66,6 +71,33 @@ pub const MAX_AGENT_RAFT_PHYSICAL_SLOT_BYTES: usize = MAX_AGENT_RAFT_COMMAND_BYT
 pub const MAX_AGENT_RAFT_AUDIT_DISPOSITION_BYTES: usize = 256;
 /// Maximum complete durable apply metadata record.
 pub const MAX_AGENT_RAFT_APPLY_META_BYTES: usize = 1024;
+
+/// Stable identity of one exact, authority-certified committee transition.
+#[repr(transparent)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CommitteeTransitionId([u8; 32]);
+
+impl CommitteeTransitionId {
+    pub const ZERO: Self = Self([0; 32]);
+
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CommitteeTransitionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CommitteeTransitionId(")?;
+        for byte in &self.0[..4] {
+            write!(formatter, "{byte:02x}")?;
+        }
+        formatter.write_str("…)")
+    }
+}
 
 /// Phase-1 ceiling on all retained ordered-evidence entries for one route.
 ///
@@ -503,6 +535,321 @@ impl ServiceWire for ArtifactChunk {
     }
 }
 
+/// Canonical application command which opens the two-entry Raft membership
+/// barrier for one Shared Agent.
+///
+/// The authority receipt is the clean SDK receipt: its typed operation must
+/// be `ChangeReplicaSet` and its request hash must cover the stable generation,
+/// both complete committees, and both exact voter-prefix vectors. The
+/// transition ID additionally covers the complete signed receipt, so two
+/// authority decisions for the same membership intent remain distinct.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrepareCommitteeChange {
+    transition: CommitteeTransitionId,
+    generation: AgentGenerationRouteKey,
+    previous: AgentReplicaCommittee,
+    next: AgentReplicaCommittee,
+    previous_prefixes: Vec<u16>,
+    next_prefixes: Vec<u16>,
+    authority: crate::agent_sdk::authority::AuthorityReceipt,
+}
+
+impl PrepareCommitteeChange {
+    /// Request commitment which an authority actor must sign in a typed
+    /// `ChangeReplicaSet` receipt before the preparation can be constructed.
+    pub fn authority_request(
+        generation: AgentGenerationRouteKey,
+        previous: &AgentReplicaCommittee,
+        next: &AgentReplicaCommittee,
+    ) -> Result<crate::agent_sdk::Hash, AgentRaftWireError> {
+        validate_committee_change_scope(generation, previous, next)?;
+        let previous_prefixes = committee_voter_prefixes(previous)?;
+        let next_prefixes = committee_voter_prefixes(next)?;
+        Ok(committee_change_request_commitment(
+            generation,
+            previous,
+            next,
+            &previous_prefixes,
+            &next_prefixes,
+        ))
+    }
+
+    pub fn new(
+        generation: AgentGenerationRouteKey,
+        previous: AgentReplicaCommittee,
+        next: AgentReplicaCommittee,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<Self, AgentRaftWireError> {
+        validate_committee_change_scope(generation, &previous, &next)?;
+        let previous_prefixes = committee_voter_prefixes(&previous)?;
+        let next_prefixes = committee_voter_prefixes(&next)?;
+        let request = committee_change_request_commitment(
+            generation,
+            &previous,
+            &next,
+            &previous_prefixes,
+            &next_prefixes,
+        );
+        let transition = committee_transition_id(request, &authority)?;
+        let change = Self {
+            transition,
+            generation,
+            previous,
+            next,
+            previous_prefixes,
+            next_prefixes,
+            authority,
+        };
+        change.validate()?;
+        Ok(change)
+    }
+
+    pub const fn transition(&self) -> CommitteeTransitionId {
+        self.transition
+    }
+
+    pub const fn generation(&self) -> AgentGenerationRouteKey {
+        self.generation
+    }
+
+    pub const fn previous(&self) -> &AgentReplicaCommittee {
+        &self.previous
+    }
+
+    pub const fn next(&self) -> &AgentReplicaCommittee {
+        &self.next
+    }
+
+    pub fn previous_prefixes(&self) -> &[u16] {
+        &self.previous_prefixes
+    }
+
+    pub fn next_prefixes(&self) -> &[u16] {
+        &self.next_prefixes
+    }
+
+    pub const fn authority(&self) -> &crate::agent_sdk::authority::AuthorityReceipt {
+        &self.authority
+    }
+
+    pub fn authority_commitment(&self) -> Hash {
+        Hash(self.authority.commitment().0)
+    }
+
+    fn route(&self) -> AgentRouteKey {
+        AgentRouteKey {
+            space: self.generation.space,
+            agent: self.generation.agent,
+            genesis: self.generation.genesis,
+            admission: self.generation.admission,
+            committee: self.previous.id(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), AgentRaftWireError> {
+        use crate::agent_sdk::authority::AuthorityOperationKind;
+        use crate::agent_sdk::wire::CanonicalWire as _;
+
+        validate_committee_change_scope(self.generation, &self.previous, &self.next)?;
+        if committee_voter_prefixes(&self.previous)? != self.previous_prefixes
+            || committee_voter_prefixes(&self.next)? != self.next_prefixes
+        {
+            return Err(AgentRaftWireError::InvalidCommitteeTransition);
+        }
+        self.authority
+            .validate_shape()
+            .map_err(|_| AgentRaftWireError::InvalidAuthorityEvidence)?;
+        let authority_bytes = self
+            .authority
+            .encode()
+            .map_err(|_| AgentRaftWireError::InvalidAuthorityEvidence)?;
+        if crate::agent_sdk::authority::AuthorityReceipt::decode(&authority_bytes)
+            .ok()
+            .as_ref()
+            != Some(&self.authority)
+        {
+            return Err(AgentRaftWireError::InvalidAuthorityEvidence);
+        }
+        let expected_request = committee_change_request_commitment(
+            self.generation,
+            &self.previous,
+            &self.next,
+            &self.previous_prefixes,
+            &self.next_prefixes,
+        );
+        let selector = &self.authority.selector;
+        if selector.operation != AuthorityOperationKind::ChangeReplicaSet
+            || selector.space.as_bytes() != &self.generation.space.0
+            || selector.agent.as_bytes() != &self.generation.agent.0
+            || selector.request != expected_request
+            || selector.actor.is_some()
+            || selector.actor_deployment.is_some()
+            || committee_transition_id(expected_request, &self.authority)? != self.transition
+        {
+            return Err(AgentRaftWireError::InvalidAuthorityEvidence);
+        }
+        enforce_wire_bound(self, MAX_PREPARE_COMMITTEE_CHANGE_BYTES)
+    }
+}
+
+impl ServiceWire for PrepareCommitteeChange {
+    const MAGIC: [u8; 4] = *b"APC2";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+
+        let mut encoder = Encoder(output);
+        encoder.fixed(self.transition.as_bytes());
+        encode_generation_route(&mut encoder, self.generation);
+        encoder.bytes(&self.previous.encode());
+        encoder.bytes(&self.next.encode());
+        encode_raft_prefixes(&mut encoder, &self.previous_prefixes);
+        encode_raft_prefixes(&mut encoder, &self.next_prefixes);
+        // Validation precedes every public construction and decode. A value
+        // which somehow becomes invalid still encodes an impossible empty
+        // nested receipt and is rejected by the outer command validator.
+        encoder.bytes(&self.authority.encode().unwrap_or_default());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+
+        enforce_complete_bound(decoder, MAX_PREPARE_COMMITTEE_CHANGE_BYTES)?;
+        let change = Self {
+            transition: CommitteeTransitionId::from_bytes(decoder.fixed()?),
+            generation: decode_generation_route(decoder)?,
+            previous: decode_nested::<AgentReplicaCommittee>(
+                decoder,
+                MAX_AGENT_REPLICA_COMMITTEE_BYTES,
+            )?,
+            next: decode_nested::<AgentReplicaCommittee>(
+                decoder,
+                MAX_AGENT_REPLICA_COMMITTEE_BYTES,
+            )?,
+            previous_prefixes: decode_raft_prefixes(decoder)?,
+            next_prefixes: decode_raft_prefixes(decoder)?,
+            authority: {
+                let bytes = bounded_bytes(
+                    decoder,
+                    crate::agent_sdk::wire::MAX_AUTHORITY_RECEIPT_WIRE_BYTES,
+                )?;
+                crate::agent_sdk::authority::AuthorityReceipt::decode(&bytes)
+                    .map_err(|_| DecodeError::NonCanonical)?
+            },
+        };
+        change.validate().map_err(map_wire_decode_error)?;
+        Ok(change)
+    }
+}
+
+fn validate_committee_change_scope(
+    generation: AgentGenerationRouteKey,
+    previous: &AgentReplicaCommittee,
+    next: &AgentReplicaCommittee,
+) -> Result<(), AgentRaftWireError> {
+    generation.validate()?;
+    previous
+        .validate()
+        .map_err(|_| AgentRaftWireError::InvalidCommitteeTransition)?;
+    next.validate()
+        .map_err(|_| AgentRaftWireError::InvalidCommitteeTransition)?;
+    if previous.profile() != AgentProfile::Shared
+        || next.profile() != AgentProfile::Shared
+        || previous.space() != generation.space
+        || next.space() != generation.space
+        || previous.agent() != generation.agent
+        || next.agent() != generation.agent
+        || previous.id() == next.id()
+    {
+        return Err(AgentRaftWireError::InvalidCommitteeTransition);
+    }
+    Ok(())
+}
+
+fn committee_voter_prefixes(
+    committee: &AgentReplicaCommittee,
+) -> Result<Vec<u16>, AgentRaftWireError> {
+    let mut prefixes = committee
+        .members()
+        .iter()
+        .filter_map(|member| match member.replica().role {
+            ReplicaRole::Voter => member.raft_slot(),
+            ReplicaRole::Observer => None,
+        })
+        .collect::<Vec<_>>();
+    prefixes.sort_unstable();
+    validate_raft_prefixes(&prefixes)?;
+    Ok(prefixes)
+}
+
+fn validate_raft_prefixes(prefixes: &[u16]) -> Result<(), AgentRaftWireError> {
+    if prefixes.is_empty()
+        || prefixes.len() > MAX_AGENT_REPLICAS
+        || prefixes.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(AgentRaftWireError::InvalidConfiguration);
+    }
+    Ok(())
+}
+
+fn encode_raft_prefixes(encoder: &mut Encoder<'_>, prefixes: &[u16]) {
+    encoder.u16(prefixes.len() as u16);
+    for prefix in prefixes {
+        encoder.u16(*prefix);
+    }
+}
+
+fn decode_raft_prefixes(decoder: &mut Decoder<'_>) -> Result<Vec<u16>, DecodeError> {
+    let count = decoder.u16()? as usize;
+    if count == 0 || count > MAX_AGENT_REPLICAS {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let mut prefixes = Vec::new();
+    prefixes
+        .try_reserve_exact(count)
+        .map_err(|_| DecodeError::LimitExceeded)?;
+    for _ in 0..count {
+        prefixes.push(decoder.u16()?);
+    }
+    validate_raft_prefixes(&prefixes).map_err(map_wire_decode_error)?;
+    Ok(prefixes)
+}
+
+fn committee_change_request_commitment(
+    generation: AgentGenerationRouteKey,
+    previous: &AgentReplicaCommittee,
+    next: &AgentReplicaCommittee,
+    previous_prefixes: &[u16],
+    next_prefixes: &[u16],
+) -> crate::agent_sdk::Hash {
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder(&mut bytes);
+    encode_generation_route(&mut encoder, generation);
+    encoder.bytes(&previous.encode());
+    encoder.bytes(&next.encode());
+    encode_raft_prefixes(&mut encoder, previous_prefixes);
+    encode_raft_prefixes(&mut encoder, next_prefixes);
+    crate::agent_sdk::Hash::digest(COMMITTEE_CHANGE_REQUEST_DOMAIN, &[&bytes])
+}
+
+fn committee_transition_id(
+    request: crate::agent_sdk::Hash,
+    authority: &crate::agent_sdk::authority::AuthorityReceipt,
+) -> Result<CommitteeTransitionId, AgentRaftWireError> {
+    use crate::agent_sdk::wire::CanonicalWire as _;
+
+    let authority = authority
+        .encode()
+        .map_err(|_| AgentRaftWireError::InvalidAuthorityEvidence)?;
+    Ok(CommitteeTransitionId(
+        Hash::digest(
+            COMMITTEE_TRANSITION_ID_DOMAIN,
+            &[request.as_bytes(), &authority],
+        )
+        .0,
+    ))
+}
+
 /// Canonical application payload placed in the ordinary Raft data log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentRaftCommand {
@@ -516,13 +863,15 @@ pub enum AgentRaftCommand {
         artifact_batch: Option<ArtifactBatchId>,
         entry: OrderedEntry,
     },
+    PrepareCommitteeChange(PrepareCommitteeChange),
 }
 
 impl AgentRaftCommand {
-    pub const fn route(&self) -> AgentRouteKey {
+    pub fn route(&self) -> AgentRouteKey {
         match self {
             Self::ArtifactChunk(chunk) => chunk.manifest.route,
             Self::ArtifactAbort { route, .. } | Self::Ordered { route, .. } => *route,
+            Self::PrepareCommitteeChange(change) => change.route(),
         }
     }
 
@@ -556,6 +905,7 @@ impl AgentRaftCommand {
                     .validate()
                     .map_err(|_| AgentRaftWireError::InvalidOrderedCommand)?;
             }
+            Self::PrepareCommitteeChange(change) => change.validate()?,
         }
         enforce_wire_bound(self, MAX_AGENT_RAFT_COMMAND_BYTES)
     }
@@ -588,6 +938,10 @@ impl ServiceWire for AgentRaftCommand {
                 });
                 encoder.bytes(&entry.encode());
             }
+            Self::PrepareCommitteeChange(change) => {
+                encoder.u8(3);
+                encoder.bytes(&change.encode());
+            }
         }
     }
 
@@ -608,6 +962,10 @@ impl ServiceWire for AgentRaftCommand {
                     .option(|decoder| Ok(ArtifactBatchId::from_bytes(decoder.fixed()?)))?,
                 entry: decode_nested::<OrderedEntry>(decoder, MAX_JOURNAL_RECORD_BYTES)?,
             },
+            3 => Self::PrepareCommitteeChange(decode_nested::<PrepareCommitteeChange>(
+                decoder,
+                MAX_PREPARE_COMMITTEE_CHANGE_BYTES,
+            )?),
             _ => return Err(DecodeError::InvalidTag),
         };
         command.validate().map_err(map_wire_decode_error)?;
@@ -882,7 +1240,7 @@ impl CommittedAgentRaftEntry {
         &self.command
     }
 
-    pub const fn route(&self) -> AgentRouteKey {
+    pub fn route(&self) -> AgentRouteKey {
         self.command.route()
     }
 
@@ -986,8 +1344,8 @@ impl CommittedSharedRaftCommand {
 /// Opaque committed, structurally valid `vos-raft` membership slot.
 ///
 /// Structural admission here does not authorize a Shared committee change.
-/// Sequence B binds these Raft prefixes to an ordered, certified committee
-/// transition; the V2 foundation ledger rejects every such slot until then.
+/// The V2 foundation ledger admits this slot only as the exact next leg of a
+/// persisted, authority-certified committee transition.
 #[cfg(feature = "storage")]
 #[derive(Clone, Debug)]
 pub struct CommittedRaftConfiguration {
@@ -1283,22 +1641,27 @@ impl DurableSharedRaftLogWitness for RedbSharedRaftLogWitness {
 /// Clean-generation disposition for one physically applied Raft slot.
 ///
 /// Command dispositions wrap the existing deterministic Shared application
-/// result. Configuration dispositions carry the exact authorized transition
-/// identity and committee epochs; Sequence A can decode them durably but does
-/// not mint them. Until Sequence B supplies that authorization, every
-/// committed configuration slot is rejected before cursor advancement.
+/// result. Committee dispositions carry the exact authorized transition
+/// identity and complete committee epochs. Unsolicited or out-of-order
+/// configuration slots are rejected before cursor advancement.
 #[cfg(feature = "storage")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentRaftApplyDispositionV2 {
     LeaderNoop,
     Command(AgentRaftAuditDisposition),
+    CommitteeChangePrepared {
+        transition: CommitteeTransitionId,
+        previous: AgentReplicaCommitteeId,
+        next: AgentReplicaCommitteeId,
+        authority: Hash,
+    },
     CommitteeJointConfiguration {
-        transition: Hash,
+        transition: CommitteeTransitionId,
         previous: AgentReplicaCommitteeId,
         next: AgentReplicaCommitteeId,
     },
     CommitteeStableConfiguration {
-        transition: Hash,
+        transition: CommitteeTransitionId,
         committee: AgentReplicaCommitteeId,
     },
 }
@@ -1309,18 +1672,29 @@ impl AgentRaftApplyDispositionV2 {
         match self {
             Self::LeaderNoop => {}
             Self::Command(disposition) => disposition.validate()?,
+            Self::CommitteeChangePrepared {
+                transition,
+                previous,
+                next,
+                authority,
+            } if transition != CommitteeTransitionId::ZERO
+                && previous != AgentReplicaCommitteeId::ZERO
+                && next != AgentReplicaCommitteeId::ZERO
+                && previous != next
+                && authority != Hash::ZERO => {}
             Self::CommitteeJointConfiguration {
                 transition,
                 previous,
                 next,
-            } if transition != Hash::ZERO
+            } if transition != CommitteeTransitionId::ZERO
                 && previous != AgentReplicaCommitteeId::ZERO
                 && next != AgentReplicaCommitteeId::ZERO
                 && previous != next => {}
             Self::CommitteeStableConfiguration {
                 transition,
                 committee,
-            } if transition != Hash::ZERO && committee != AgentReplicaCommitteeId::ZERO => {}
+            } if transition != CommitteeTransitionId::ZERO
+                && committee != AgentReplicaCommitteeId::ZERO => {}
             _ => return Err(AgentRaftWireError::InvalidApplyMeta),
         }
         Ok(())
@@ -1495,6 +1869,302 @@ impl ServiceWire for AgentRaftApplyAuditRecordV2 {
     }
 }
 
+#[cfg(feature = "storage")]
+const MAX_COMMITTEE_AUTHORITY_BINDING_BYTES: usize = 512;
+#[cfg(feature = "storage")]
+const MAX_COMMITTEE_APPLICATION_STATE_BYTES: usize = 256 * 1024;
+
+/// Independently supplied trust root for typed committee-change receipts.
+///
+/// This binding is written into the immutable generation configuration. A
+/// receipt's embedded producer/key relationship is therefore never allowed
+/// to select its own authority. `initial_epoch` is the exact authority epoch
+/// expected for the initial committee; successful stable transitions advance
+/// it by one.
+#[cfg(feature = "storage")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CommitteeChangeAuthorityBinding {
+    policy: crate::agent_sdk::Hash,
+    issuer: crate::agent_sdk::authority::AuthorityIssuer,
+    runtime_deployment: crate::agent_sdk::DeploymentId,
+    public_key: [u8; 32],
+    initial_epoch: u64,
+}
+
+#[cfg(feature = "storage")]
+impl CommitteeChangeAuthorityBinding {
+    pub(crate) fn new(
+        policy: crate::agent_sdk::Hash,
+        issuer: crate::agent_sdk::authority::AuthorityIssuer,
+        runtime_deployment: crate::agent_sdk::DeploymentId,
+        public_key: [u8; 32],
+        initial_epoch: u64,
+    ) -> Result<Self, AgentRaftWireError> {
+        let binding = Self {
+            policy,
+            issuer,
+            runtime_deployment,
+            public_key,
+            initial_epoch,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(self) -> Result<(), AgentRaftWireError> {
+        if self.policy == crate::agent_sdk::Hash::ZERO
+            || !self.issuer.is_valid()
+            || self.runtime_deployment == crate::agent_sdk::DeploymentId::ZERO
+            || self.public_key == [0; 32]
+            || self.initial_epoch == 0
+            || crate::agent_sdk::ProducerId::of_public_key(&self.public_key) != self.issuer.producer
+        {
+            return Err(AgentRaftWireError::InvalidAuthorityEvidence);
+        }
+        enforce_wire_bound(&self, MAX_COMMITTEE_AUTHORITY_BINDING_BYTES)
+    }
+
+    fn verify(
+        self,
+        generation: AgentGenerationRouteKey,
+        expected_epoch: u64,
+        logical_slot: u64,
+        change: &PrepareCommitteeChange,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        use crate::agent_sdk::authority::AuthorityOperationKind;
+
+        let receipt = change.authority();
+        let selector = &receipt.selector;
+        if change.generation() != generation
+            || selector.policy != self.policy
+            || selector.issuer != self.issuer
+            || selector.runtime_deployment != self.runtime_deployment
+            || receipt.public_key != self.public_key
+            || selector.operation != AuthorityOperationKind::ChangeReplicaSet
+            || selector.space.as_bytes() != &generation.space.0
+            || selector.agent.as_bytes() != &generation.agent.0
+            || selector.epoch != expected_epoch
+            || selector.request
+                != committee_change_request_commitment(
+                    change.generation(),
+                    change.previous(),
+                    change.next(),
+                    change.previous_prefixes(),
+                    change.next_prefixes(),
+                )
+        {
+            return Err(AgentRaftApplicationErrorV2::WrongAuthority);
+        }
+        if !selector.is_live_at(logical_slot) {
+            return Err(AgentRaftApplicationErrorV2::StaleAuthority);
+        }
+        receipt
+            .verify_at(logical_slot, &RawCommitteeAuthorityVerifier)
+            .map_err(|_| AgentRaftApplicationErrorV2::WrongAuthority)
+    }
+}
+
+#[cfg(feature = "storage")]
+struct RawCommitteeAuthorityVerifier;
+
+#[cfg(feature = "storage")]
+impl crate::agent_sdk::authority::AuthorityVerifier for RawCommitteeAuthorityVerifier {
+    fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+        super::authority::verify_raw_ed25519(public_key, message, signature)
+    }
+}
+
+#[cfg(feature = "storage")]
+impl ServiceWire for CommitteeChangeAuthorityBinding {
+    const MAGIC: [u8; 4] = *b"ACB2";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(self.policy.as_bytes());
+        encoder.fixed(self.issuer.principal.as_bytes());
+        encoder.fixed(self.issuer.actor.as_bytes());
+        encoder.fixed(self.issuer.deployment.as_bytes());
+        encoder.fixed(self.issuer.program.as_bytes());
+        encoder.fixed(self.issuer.producer.as_bytes());
+        encoder.fixed(self.runtime_deployment.as_bytes());
+        encoder.fixed(&self.public_key);
+        encoder.u64(self.initial_epoch);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_COMMITTEE_AUTHORITY_BINDING_BYTES)?;
+        let binding = Self {
+            policy: crate::agent_sdk::Hash(decoder.fixed()?),
+            issuer: crate::agent_sdk::authority::AuthorityIssuer {
+                principal: crate::agent_sdk::PrincipalId(decoder.fixed()?),
+                actor: crate::agent_sdk::ActorId(decoder.fixed()?),
+                deployment: crate::agent_sdk::DeploymentId(decoder.fixed()?),
+                program: crate::agent_sdk::ProgramId(decoder.fixed()?),
+                producer: crate::agent_sdk::ProducerId(decoder.fixed()?),
+            },
+            runtime_deployment: crate::agent_sdk::DeploymentId(decoder.fixed()?),
+            public_key: decoder.fixed()?,
+            initial_epoch: decoder.u64()?,
+        };
+        binding.validate().map_err(map_wire_decode_error)?;
+        Ok(binding)
+    }
+}
+
+#[cfg(feature = "storage")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingCommitteePhaseV2 {
+    Prepared,
+    Joint {
+        index: u64,
+        term: u64,
+        raw_payload_commitment: Hash,
+    },
+}
+
+#[cfg(feature = "storage")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingCommitteeChangeV2 {
+    change: PrepareCommitteeChange,
+    prepare_index: u64,
+    prepare_term: u64,
+    prepare_payload_commitment: Hash,
+    phase: PendingCommitteePhaseV2,
+}
+
+#[cfg(feature = "storage")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommitteeApplicationStateV2 {
+    generation: AgentGenerationRouteKey,
+    active: AgentReplicaCommittee,
+    authority_epoch: u64,
+    pending: Option<PendingCommitteeChangeV2>,
+}
+
+#[cfg(feature = "storage")]
+impl CommitteeApplicationStateV2 {
+    fn initial(
+        generation: AgentGenerationRouteKey,
+        active: AgentReplicaCommittee,
+        authority_epoch: u64,
+    ) -> Self {
+        Self {
+            generation,
+            active,
+            authority_epoch,
+            pending: None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), AgentRaftWireError> {
+        self.generation.validate()?;
+        self.active
+            .validate()
+            .map_err(|_| AgentRaftWireError::InvalidCommitteeTransition)?;
+        if self.active.profile() != AgentProfile::Shared
+            || self.active.space() != self.generation.space
+            || self.active.agent() != self.generation.agent
+            || self.authority_epoch == 0
+        {
+            return Err(AgentRaftWireError::InvalidCommitteeTransition);
+        }
+        if let Some(pending) = &self.pending {
+            pending.change.validate()?;
+            if pending.change.generation() != self.generation
+                || pending.change.previous() != &self.active
+                || pending.change.authority().selector.epoch != self.authority_epoch
+                || pending.prepare_index == 0
+                || pending.prepare_term == 0
+                || pending.prepare_payload_commitment == Hash::ZERO
+            {
+                return Err(AgentRaftWireError::InvalidCommitteeTransition);
+            }
+            if let PendingCommitteePhaseV2::Joint {
+                index,
+                term,
+                raw_payload_commitment,
+            } = pending.phase
+                && (index != pending.prepare_index.saturating_add(1)
+                    || term < pending.prepare_term
+                    || raw_payload_commitment == Hash::ZERO)
+            {
+                return Err(AgentRaftWireError::InvalidCommitteeTransition);
+            }
+        }
+        enforce_wire_bound(self, MAX_COMMITTEE_APPLICATION_STATE_BYTES)
+    }
+}
+
+#[cfg(feature = "storage")]
+impl ServiceWire for CommitteeApplicationStateV2 {
+    const MAGIC: [u8; 4] = *b"ACS2";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encode_generation_route(&mut encoder, self.generation);
+        encoder.bytes(&self.active.encode());
+        encoder.u64(self.authority_epoch);
+        encoder.option(&self.pending, |encoder, pending| {
+            encoder.bytes(&pending.change.encode());
+            encoder.u64(pending.prepare_index);
+            encoder.u64(pending.prepare_term);
+            encoder.fixed(&pending.prepare_payload_commitment.0);
+            match pending.phase {
+                PendingCommitteePhaseV2::Prepared => encoder.u8(0),
+                PendingCommitteePhaseV2::Joint {
+                    index,
+                    term,
+                    raw_payload_commitment,
+                } => {
+                    encoder.u8(1);
+                    encoder.u64(index);
+                    encoder.u64(term);
+                    encoder.fixed(&raw_payload_commitment.0);
+                }
+            }
+        });
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_COMMITTEE_APPLICATION_STATE_BYTES)?;
+        let state = Self {
+            generation: decode_generation_route(decoder)?,
+            active: decode_nested::<AgentReplicaCommittee>(
+                decoder,
+                MAX_AGENT_REPLICA_COMMITTEE_BYTES,
+            )?,
+            authority_epoch: decoder.u64()?,
+            pending: decoder.option(|decoder| {
+                let change = decode_nested::<PrepareCommitteeChange>(
+                    decoder,
+                    MAX_PREPARE_COMMITTEE_CHANGE_BYTES,
+                )?;
+                let prepare_index = decoder.u64()?;
+                let prepare_term = decoder.u64()?;
+                let prepare_payload_commitment = Hash(decoder.fixed()?);
+                let phase = match decoder.u8()? {
+                    0 => PendingCommitteePhaseV2::Prepared,
+                    1 => PendingCommitteePhaseV2::Joint {
+                        index: decoder.u64()?,
+                        term: decoder.u64()?,
+                        raw_payload_commitment: Hash(decoder.fixed()?),
+                    },
+                    _ => return Err(DecodeError::InvalidTag),
+                };
+                Ok(PendingCommitteeChangeV2 {
+                    change,
+                    prepare_index,
+                    prepare_term,
+                    prepare_payload_commitment,
+                    phase,
+                })
+            })?,
+        };
+        state.validate().map_err(map_wire_decode_error)?;
+        Ok(state)
+    }
+}
+
 /// Opaque proof that the evidence ledger durably reserved capacity for this
 /// exact next committed application before replay may publish it.
 ///
@@ -1578,7 +2248,7 @@ impl ReservedAgentRaftApplication {
         &self.committed
     }
 
-    pub(crate) const fn route(&self) -> AgentRouteKey {
+    pub(crate) fn route(&self) -> AgentRouteKey {
         self.committed.route()
     }
 
@@ -1633,6 +2303,8 @@ pub enum AgentRaftWireError {
     InvalidArtifactBatch,
     InvalidArtifactChunk,
     InvalidOrderedCommand,
+    InvalidCommitteeTransition,
+    InvalidAuthorityEvidence,
     InvalidApplyMeta,
     InvalidCommittedEntry,
     InvalidPhysicalSlot,
@@ -1837,13 +2509,25 @@ fn encode_disposition_v2(encoder: &mut Encoder<'_>, disposition: AgentRaftApplyD
             encoder.u8(1);
             encode_disposition(encoder, disposition);
         }
+        AgentRaftApplyDispositionV2::CommitteeChangePrepared {
+            transition,
+            previous,
+            next,
+            authority,
+        } => {
+            encoder.u8(4);
+            encoder.fixed(transition.as_bytes());
+            encoder.fixed(previous.as_bytes());
+            encoder.fixed(next.as_bytes());
+            encoder.fixed(&authority.0);
+        }
         AgentRaftApplyDispositionV2::CommitteeJointConfiguration {
             transition,
             previous,
             next,
         } => {
             encoder.u8(2);
-            encoder.fixed(&transition.0);
+            encoder.fixed(transition.as_bytes());
             encoder.fixed(previous.as_bytes());
             encoder.fixed(next.as_bytes());
         }
@@ -1852,7 +2536,7 @@ fn encode_disposition_v2(encoder: &mut Encoder<'_>, disposition: AgentRaftApplyD
             committee,
         } => {
             encoder.u8(3);
-            encoder.fixed(&transition.0);
+            encoder.fixed(transition.as_bytes());
             encoder.fixed(committee.as_bytes());
         }
     }
@@ -1866,13 +2550,19 @@ fn decode_disposition_v2(
         0 => AgentRaftApplyDispositionV2::LeaderNoop,
         1 => AgentRaftApplyDispositionV2::Command(decode_disposition(decoder)?),
         2 => AgentRaftApplyDispositionV2::CommitteeJointConfiguration {
-            transition: Hash(decoder.fixed()?),
+            transition: CommitteeTransitionId::from_bytes(decoder.fixed()?),
             previous: AgentReplicaCommitteeId::from_bytes(decoder.fixed()?),
             next: AgentReplicaCommitteeId::from_bytes(decoder.fixed()?),
         },
         3 => AgentRaftApplyDispositionV2::CommitteeStableConfiguration {
-            transition: Hash(decoder.fixed()?),
+            transition: CommitteeTransitionId::from_bytes(decoder.fixed()?),
             committee: AgentReplicaCommitteeId::from_bytes(decoder.fixed()?),
+        },
+        4 => AgentRaftApplyDispositionV2::CommitteeChangePrepared {
+            transition: CommitteeTransitionId::from_bytes(decoder.fixed()?),
+            previous: AgentReplicaCommitteeId::from_bytes(decoder.fixed()?),
+            next: AgentReplicaCommitteeId::from_bytes(decoder.fixed()?),
+            authority: Hash(decoder.fixed()?),
         },
         _ => return Err(DecodeError::InvalidTag),
     };
@@ -3567,7 +4257,8 @@ mod application_ledger_v2 {
     use super::*;
 
     const APPLICATION_SCHEMA_VERSION: u32 = 2;
-    const CONFIG_RECORD_MAX_BYTES: usize = 512;
+    const CONFIG_RECORD_MAX_BYTES: usize =
+        MAX_AGENT_REPLICA_COMMITTEE_BYTES + MAX_COMMITTEE_AUTHORITY_BINDING_BYTES + 1024;
     const GENERATION_STORAGE_KEY_BYTES: usize = 32 * 4;
     const AUDIT_STORAGE_KEY_BYTES: usize = GENERATION_STORAGE_KEY_BYTES + 8;
 
@@ -3577,6 +4268,8 @@ mod application_ledger_v2 {
         TableDefinition::new("agent_shared_raft_apply_meta_v2");
     const APPLY_AUDIT_TABLE_V2: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("agent_shared_raft_apply_audit_v2");
+    const COMMITTEE_STATE_TABLE_V2: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("agent_shared_raft_committee_state_v2");
 
     // Any table from the previous committee-keyed evidence generation makes
     // this database ineligible for V2 initialization. There is deliberately
@@ -3597,13 +4290,22 @@ mod application_ledger_v2 {
         version: u32,
         generation: AgentGenerationRouteKey,
         journal_store: JournalStoreInstanceId,
+        initial_committee: AgentReplicaCommittee,
+        authority: CommitteeChangeAuthorityBinding,
     }
 
     impl ApplicationConfigV2 {
         fn validate(&self) -> Result<(), AgentRaftWireError> {
             self.generation.validate()?;
+            self.initial_committee
+                .validate()
+                .map_err(|_| AgentRaftWireError::InvalidCommitteeTransition)?;
+            self.authority.validate()?;
             if self.version != APPLICATION_SCHEMA_VERSION
                 || self.journal_store.as_bytes() == &[0; 32]
+                || self.initial_committee.profile() != AgentProfile::Shared
+                || self.initial_committee.space() != self.generation.space
+                || self.initial_committee.agent() != self.generation.agent
             {
                 return Err(AgentRaftWireError::InvalidApplyMeta);
             }
@@ -3619,6 +4321,8 @@ mod application_ledger_v2 {
             encoder.u32(self.version);
             encode_generation_route(&mut encoder, self.generation);
             encoder.fixed(self.journal_store.as_bytes());
+            encoder.bytes(&self.initial_committee.encode());
+            encoder.bytes(&self.authority.encode());
         }
 
         fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -3628,6 +4332,14 @@ mod application_ledger_v2 {
                 generation: decode_generation_route(decoder)?,
                 journal_store: JournalStoreInstanceId::from_bytes(decoder.fixed()?)
                     .ok_or(DecodeError::NonCanonical)?,
+                initial_committee: decode_nested::<AgentReplicaCommittee>(
+                    decoder,
+                    MAX_AGENT_REPLICA_COMMITTEE_BYTES,
+                )?,
+                authority: decode_nested::<CommitteeChangeAuthorityBinding>(
+                    decoder,
+                    MAX_COMMITTEE_AUTHORITY_BINDING_BYTES,
+                )?,
             };
             record.validate().map_err(map_wire_decode_error)?;
             Ok(record)
@@ -3657,6 +4369,15 @@ mod application_ledger_v2 {
         SnapshotUnsupported,
         CommandExecutionRequired,
         UnsolicitedConfiguration,
+        WrongGeneration,
+        StaleCommittee,
+        OverlappingCommitteeChange,
+        ReorderedConfiguration,
+        WrongConfigurationPrefixes,
+        TransitionBarrier,
+        WrongAuthority,
+        StaleAuthority,
+        AuthorityEpochExhausted,
         BacklogLimit,
         Backend(alloc::boxed::Box<dyn std::error::Error + Send + Sync>),
     }
@@ -3682,15 +4403,15 @@ mod application_ledger_v2 {
     /// Durable clean-generation application ledger for one Shared-Agent Raft
     /// database.
     ///
-    /// Sequence A intentionally applies only leader no-ops. A command returns
-    /// `CommandExecutionRequired`, and a configuration returns
-    /// `UnsolicitedConfiguration`, without advancing either cursor. Later
-    /// slices must provide an exact side-effect/configuration receipt before
-    /// they may extend this transaction boundary.
+    /// Leader no-ops and the exact authorized committee barrier are the only
+    /// work handled here. Ordinary commands remain a typed later-slice
+    /// refusal, as do snapshots and live-worker attachment.
     pub(crate) struct AgentRaftApplicationLedgerV2 {
         database: Arc<Database>,
         generation: AgentGenerationRouteKey,
         journal_store: JournalStoreInstanceId,
+        initial_committee: AgentReplicaCommittee,
+        authority: CommitteeChangeAuthorityBinding,
         writes: std::sync::Mutex<()>,
     }
 
@@ -3699,6 +4420,8 @@ mod application_ledger_v2 {
             database: Arc<Database>,
             generation: AgentGenerationRouteKey,
             journal_store: JournalStoreInstanceId,
+            initial_committee: AgentReplicaCommittee,
+            authority: CommitteeChangeAuthorityBinding,
         ) -> Result<Self, AgentRaftApplicationErrorV2> {
             generation
                 .validate()
@@ -3706,10 +4429,24 @@ mod application_ledger_v2 {
             if journal_store.as_bytes() == &[0; 32] {
                 return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
             }
+            initial_committee
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::ConfigurationMismatch)?;
+            authority
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::ConfigurationMismatch)?;
+            if initial_committee.profile() != AgentProfile::Shared
+                || initial_committee.space() != generation.space
+                || initial_committee.agent() != generation.agent
+            {
+                return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+            }
             let expected = ApplicationConfigV2 {
                 version: APPLICATION_SCHEMA_VERSION,
                 generation,
                 journal_store,
+                initial_committee: initial_committee.clone(),
+                authority,
             };
             let key = generation_storage_key(generation);
             let transaction = database.begin_write()?;
@@ -3725,6 +4462,7 @@ mod application_ledger_v2 {
                 drop(transaction.open_table(CONFIG_TABLE_V2)?);
                 drop(transaction.open_table(APPLY_META_TABLE_V2)?);
                 drop(transaction.open_table(APPLY_AUDIT_TABLE_V2)?);
+                drop(transaction.open_table(COMMITTEE_STATE_TABLE_V2)?);
             }
             ensure_single_generation_in_write(&transaction, &key, true)?;
 
@@ -3744,9 +4482,13 @@ mod application_ledger_v2 {
                     let meta = read_meta_in_write(&transaction, key.as_slice())?
                         .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
                     validate_bound_meta(&meta, generation, journal_store)?;
+                    let state = read_committee_state_in_write(&transaction, key.as_slice())?
+                        .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+                    validate_bound_committee_state(&state, generation, authority)?;
                 }
                 None => {
                     if read_meta_in_write(&transaction, key.as_slice())?.is_some()
+                        || read_committee_state_in_write(&transaction, key.as_slice())?.is_some()
                         || audit_prefix_has_row_in_write(&transaction, &key)?
                     {
                         return Err(AgentRaftApplicationErrorV2::CorruptLedger);
@@ -3768,6 +4510,15 @@ mod application_ledger_v2 {
                         let mut table = transaction.open_table(APPLY_META_TABLE_V2)?;
                         table.insert(key.as_slice(), meta.encode().as_slice())?;
                     }
+                    {
+                        let state = CommitteeApplicationStateV2::initial(
+                            generation,
+                            initial_committee.clone(),
+                            authority.initial_epoch,
+                        );
+                        let mut table = transaction.open_table(COMMITTEE_STATE_TABLE_V2)?;
+                        table.insert(key.as_slice(), state.encode().as_slice())?;
+                    }
                 }
             }
             transaction.commit()?;
@@ -3776,6 +4527,8 @@ mod application_ledger_v2 {
                 database,
                 generation,
                 journal_store,
+                initial_committee,
+                authority,
                 writes: std::sync::Mutex::new(()),
             };
             ledger.audit_recovery()?;
@@ -3804,6 +4557,47 @@ mod application_ledger_v2 {
             Ok(meta)
         }
 
+        pub(crate) fn active_committee(
+            &self,
+        ) -> Result<AgentReplicaCommittee, AgentRaftApplicationErrorV2> {
+            Ok(self.committee_state()?.active)
+        }
+
+        pub(crate) fn pending_transition(
+            &self,
+        ) -> Result<Option<(CommitteeTransitionId, bool)>, AgentRaftApplicationErrorV2> {
+            Ok(self.committee_state()?.pending.map(|pending| {
+                (
+                    pending.change.transition(),
+                    matches!(pending.phase, PendingCommitteePhaseV2::Joint { .. }),
+                )
+            }))
+        }
+
+        pub(crate) fn authority_epoch(&self) -> Result<u64, AgentRaftApplicationErrorV2> {
+            Ok(self.committee_state()?.authority_epoch)
+        }
+
+        fn committee_state(
+            &self,
+        ) -> Result<CommitteeApplicationStateV2, AgentRaftApplicationErrorV2> {
+            let key = generation_storage_key(self.generation);
+            let transaction = self.database.begin_read()?;
+            let table = transaction.open_table(COMMITTEE_STATE_TABLE_V2)?;
+            let bytes = table
+                .get(key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?
+                .value()
+                .to_vec();
+            let state = CommitteeApplicationStateV2::decode(&bytes)
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            if state.encode() != bytes {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            validate_bound_committee_state(&state, self.generation, self.authority)?;
+            Ok(state)
+        }
+
         /// Return the exact next committed physical slot, or `None` when the
         /// Raft commit cursor has not reached it. Callers cannot skip ahead
         /// through this API.
@@ -3822,23 +4616,10 @@ mod application_ledger_v2 {
             }
         }
 
-        /// Apply the structural work authorized in Sequence A.
+        /// Apply one exact physical slot. While a committee transition is
+        /// pending, the next slot must be its exact joint/stable barrier leg;
+        /// even leader no-ops are refused without cursor advancement.
         pub(crate) fn apply_foundation_slot(
-            &self,
-            slot: &CommittedSharedRaftSlot,
-        ) -> Result<AgentRaftFoundationApplyOutcomeV2, AgentRaftApplicationErrorV2> {
-            match slot {
-                CommittedSharedRaftSlot::LeaderNoop(_) => self.apply_leader_noop(slot),
-                CommittedSharedRaftSlot::Command(_) => {
-                    Err(AgentRaftApplicationErrorV2::CommandExecutionRequired)
-                }
-                CommittedSharedRaftSlot::Configuration(_) => {
-                    Err(AgentRaftApplicationErrorV2::UnsolicitedConfiguration)
-                }
-            }
-        }
-
-        fn apply_leader_noop(
             &self,
             slot: &CommittedSharedRaftSlot,
         ) -> Result<AgentRaftFoundationApplyOutcomeV2, AgentRaftApplicationErrorV2> {
@@ -3853,10 +4634,15 @@ mod application_ledger_v2 {
                 key.as_slice(),
                 self.generation,
                 self.journal_store,
+                &self.initial_committee,
+                self.authority,
             )?;
             let current = read_meta_in_write(&transaction, key.as_slice())?
                 .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
             validate_bound_meta(&current, self.generation, self.journal_store)?;
+            let state = read_committee_state_in_write(&transaction, key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            validate_bound_committee_state(&state, self.generation, self.authority)?;
             let mut raft = crate::raft::RaftMeta::load_from_write_transaction(&transaction)?;
             if raft.snap_last_index != 0 {
                 return Err(AgentRaftApplicationErrorV2::SnapshotUnsupported);
@@ -3868,29 +4654,21 @@ mod application_ledger_v2 {
                 });
             }
 
-            let disposition = AgentRaftApplyDispositionV2::LeaderNoop;
-            let expected_record = AgentRaftApplyAuditRecordV2 {
-                generation: self.generation,
-                index: slot.index(),
-                term: slot.term(),
-                raw_payload_commitment: slot.raw_payload_commitment(),
-                disposition,
-            };
-            expected_record
-                .validate()
-                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
-
             if slot.index() <= current.applied_index {
                 let audit_key = audit_storage_key(self.generation, slot.index());
                 let stored = read_audit_in_write(&transaction, audit_key.as_slice())?.ok_or(
                     AgentRaftApplicationErrorV2::MissingAuditRecord(slot.index()),
                 )?;
-                if stored != expected_record {
+                if stored.generation != self.generation
+                    || stored.index != slot.index()
+                    || stored.term != slot.term()
+                    || stored.raw_payload_commitment != slot.raw_payload_commitment()
+                {
                     return Err(AgentRaftApplicationErrorV2::ConflictingDuplicate(
                         slot.index(),
                     ));
                 }
-                verify_physical_row_in_write(&transaction, &raft, slot)?;
+                verify_physical_row_in_write(&transaction, &raft, slot, stored.disposition)?;
                 return Ok(AgentRaftFoundationApplyOutcomeV2::Duplicate(current));
             }
 
@@ -3910,7 +4688,23 @@ mod application_ledger_v2 {
             if current.applied_index as usize == MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES {
                 return Err(AgentRaftApplicationErrorV2::BacklogLimit);
             }
-            verify_physical_row_in_write(&transaction, &raft, slot)?;
+
+            let (disposition, next_state) = self.transition_state(&state, slot)?;
+            verify_physical_row_in_write(&transaction, &raft, slot, disposition)?;
+
+            let expected_record = AgentRaftApplyAuditRecordV2 {
+                generation: self.generation,
+                index: slot.index(),
+                term: slot.term(),
+                raw_payload_commitment: slot.raw_payload_commitment(),
+                disposition,
+            };
+            expected_record
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            next_state
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
 
             let audit_key = audit_storage_key(self.generation, slot.index());
             if read_audit_in_write(&transaction, audit_key.as_slice())?.is_some() {
@@ -3935,15 +4729,141 @@ mod application_ledger_v2 {
                 let mut table = transaction.open_table(APPLY_META_TABLE_V2)?;
                 table.insert(key.as_slice(), next_meta.encode().as_slice())?;
             }
+            {
+                let mut table = transaction.open_table(COMMITTEE_STATE_TABLE_V2)?;
+                table.insert(key.as_slice(), next_state.encode().as_slice())?;
+            }
             raft.last_applied = slot.index();
             raft.write_host_fields_in_txn(&transaction)?;
             transaction.commit()?;
             Ok(AgentRaftFoundationApplyOutcomeV2::Applied(next_meta))
         }
 
+        fn transition_state(
+            &self,
+            state: &CommitteeApplicationStateV2,
+            slot: &CommittedSharedRaftSlot,
+        ) -> Result<
+            (AgentRaftApplyDispositionV2, CommitteeApplicationStateV2),
+            AgentRaftApplicationErrorV2,
+        > {
+            match slot {
+                CommittedSharedRaftSlot::LeaderNoop(_) => {
+                    if state.pending.is_some() {
+                        return Err(AgentRaftApplicationErrorV2::TransitionBarrier);
+                    }
+                    Ok((AgentRaftApplyDispositionV2::LeaderNoop, state.clone()))
+                }
+                CommittedSharedRaftSlot::Command(command) => match command.entry().command() {
+                    AgentRaftCommand::PrepareCommitteeChange(change) => {
+                        if change.generation() != self.generation {
+                            return Err(AgentRaftApplicationErrorV2::WrongGeneration);
+                        }
+                        if state.pending.is_some() {
+                            return Err(AgentRaftApplicationErrorV2::OverlappingCommitteeChange);
+                        }
+                        if change.previous() != &state.active {
+                            return Err(AgentRaftApplicationErrorV2::StaleCommittee);
+                        }
+                        if state.authority_epoch == u64::MAX {
+                            return Err(AgentRaftApplicationErrorV2::AuthorityEpochExhausted);
+                        }
+                        self.authority.verify(
+                            self.generation,
+                            state.authority_epoch,
+                            slot.index(),
+                            change,
+                        )?;
+                        let mut next_state = state.clone();
+                        next_state.pending = Some(PendingCommitteeChangeV2 {
+                            change: change.clone(),
+                            prepare_index: slot.index(),
+                            prepare_term: slot.term(),
+                            prepare_payload_commitment: slot.raw_payload_commitment(),
+                            phase: PendingCommitteePhaseV2::Prepared,
+                        });
+                        Ok((
+                            AgentRaftApplyDispositionV2::CommitteeChangePrepared {
+                                transition: change.transition(),
+                                previous: change.previous().id(),
+                                next: change.next().id(),
+                                authority: change.authority_commitment(),
+                            },
+                            next_state,
+                        ))
+                    }
+                    _ if state.pending.is_some() => {
+                        Err(AgentRaftApplicationErrorV2::TransitionBarrier)
+                    }
+                    _ => Err(AgentRaftApplicationErrorV2::CommandExecutionRequired),
+                },
+                CommittedSharedRaftSlot::Configuration(configuration) => {
+                    let Some(pending) = state.pending.as_ref() else {
+                        return Err(AgentRaftApplicationErrorV2::UnsolicitedConfiguration);
+                    };
+                    let change = &pending.change;
+                    match pending.phase {
+                        PendingCommitteePhaseV2::Prepared => {
+                            let Some(previous) = configuration.joint_old() else {
+                                return Err(AgentRaftApplicationErrorV2::ReorderedConfiguration);
+                            };
+                            if previous != change.previous_prefixes()
+                                || configuration.members() != change.next_prefixes()
+                            {
+                                return Err(
+                                    AgentRaftApplicationErrorV2::WrongConfigurationPrefixes,
+                                );
+                            }
+                            let mut next_state = state.clone();
+                            let Some(next_pending) = next_state.pending.as_mut() else {
+                                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                            };
+                            next_pending.phase = PendingCommitteePhaseV2::Joint {
+                                index: slot.index(),
+                                term: slot.term(),
+                                raw_payload_commitment: slot.raw_payload_commitment(),
+                            };
+                            Ok((
+                                AgentRaftApplyDispositionV2::CommitteeJointConfiguration {
+                                    transition: change.transition(),
+                                    previous: change.previous().id(),
+                                    next: change.next().id(),
+                                },
+                                next_state,
+                            ))
+                        }
+                        PendingCommitteePhaseV2::Joint { .. } => {
+                            if configuration.joint_old().is_some() {
+                                return Err(AgentRaftApplicationErrorV2::ReorderedConfiguration);
+                            }
+                            if configuration.members() != change.next_prefixes() {
+                                return Err(
+                                    AgentRaftApplicationErrorV2::WrongConfigurationPrefixes,
+                                );
+                            }
+                            let mut next_state = state.clone();
+                            next_state.active = change.next().clone();
+                            next_state.authority_epoch = next_state
+                                .authority_epoch
+                                .checked_add(1)
+                                .ok_or(AgentRaftApplicationErrorV2::AuthorityEpochExhausted)?;
+                            next_state.pending = None;
+                            Ok((
+                                AgentRaftApplyDispositionV2::CommitteeStableConfiguration {
+                                    transition: change.transition(),
+                                    committee: change.next().id(),
+                                },
+                                next_state,
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+
         /// Strict restart audit: every index from one through the cursor must
         /// have exactly one canonical row, a nondecreasing term, and the exact
-        /// still-present physical Raft payload. Sequence A has no snapshot
+        /// still-present physical Raft payload. This ledger has no snapshot
         /// format, so a compacted prefix fails closed.
         pub(crate) fn audit_recovery(&self) -> Result<(), AgentRaftApplicationErrorV2> {
             let key = generation_storage_key(self.generation);
@@ -3953,6 +4873,8 @@ mod application_ledger_v2 {
                 key.as_slice(),
                 self.generation,
                 self.journal_store,
+                &self.initial_committee,
+                self.authority,
             )?;
             let meta = {
                 let table = transaction.open_table(APPLY_META_TABLE_V2)?;
@@ -3969,6 +4891,26 @@ mod application_ledger_v2 {
                 meta
             };
             validate_bound_meta(&meta, self.generation, self.journal_store)?;
+            let stored_committee_state = {
+                let table = transaction.open_table(COMMITTEE_STATE_TABLE_V2)?;
+                let bytes = table
+                    .get(key.as_slice())?
+                    .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?
+                    .value()
+                    .to_vec();
+                let state = CommitteeApplicationStateV2::decode(&bytes)
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                if state.encode() != bytes {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                validate_bound_committee_state(&state, self.generation, self.authority)?;
+                state
+            };
+            let mut replayed_committee_state = CommitteeApplicationStateV2::initial(
+                self.generation,
+                self.initial_committee.clone(),
+                self.authority.initial_epoch,
+            );
             let raft = crate::raft::RaftMeta::load_from_read_transaction(&transaction)?;
             if raft.snap_last_index != 0 {
                 return Err(AgentRaftApplicationErrorV2::SnapshotUnsupported);
@@ -4008,7 +4950,13 @@ mod application_ledger_v2 {
                 {
                     return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                 }
-                verify_audited_physical_row_in_read(&transaction, &raft, &record)?;
+                let physical = verify_audited_physical_row_in_read(&transaction, &raft, &record)?;
+                replay_committee_disposition(
+                    &mut replayed_committee_state,
+                    self.authority,
+                    &record,
+                    physical,
+                )?;
                 previous_term = record.term;
                 expected_index = expected_index.saturating_add(1);
                 last_record = Some(record);
@@ -4027,8 +4975,130 @@ mod application_ledger_v2 {
                 None if meta.applied_index == 0 => {}
                 _ => return Err(AgentRaftApplicationErrorV2::CorruptLedger),
             }
+            if replayed_committee_state != stored_committee_state {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
             Ok(())
         }
+    }
+
+    fn replay_committee_disposition(
+        state: &mut CommitteeApplicationStateV2,
+        authority: CommitteeChangeAuthorityBinding,
+        record: &AgentRaftApplyAuditRecordV2,
+        physical: vos_raft::EntryKind<u16>,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        match (record.disposition, physical) {
+            (AgentRaftApplyDispositionV2::LeaderNoop, vos_raft::EntryKind::Data { payload })
+                if payload.is_empty() && state.pending.is_none() => {}
+            (
+                AgentRaftApplyDispositionV2::CommitteeChangePrepared {
+                    transition,
+                    previous,
+                    next,
+                    authority: authority_commitment,
+                },
+                vos_raft::EntryKind::Data { payload },
+            ) => {
+                if state.pending.is_some() {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                let AgentRaftCommand::PrepareCommitteeChange(change) =
+                    AgentRaftCommand::decode(&payload)
+                        .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?
+                else {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                };
+                if change.generation() != state.generation
+                    || change.previous() != &state.active
+                    || change.transition() != transition
+                    || change.previous().id() != previous
+                    || change.next().id() != next
+                    || change.authority_commitment() != authority_commitment
+                    || state.authority_epoch == u64::MAX
+                {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                authority
+                    .verify(
+                        state.generation,
+                        state.authority_epoch,
+                        record.index,
+                        &change,
+                    )
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                state.pending = Some(PendingCommitteeChangeV2 {
+                    change,
+                    prepare_index: record.index,
+                    prepare_term: record.term,
+                    prepare_payload_commitment: record.raw_payload_commitment,
+                    phase: PendingCommitteePhaseV2::Prepared,
+                });
+            }
+            (
+                AgentRaftApplyDispositionV2::CommitteeJointConfiguration {
+                    transition,
+                    previous,
+                    next,
+                },
+                vos_raft::EntryKind::ConfigChange { joint_old, members },
+            ) => {
+                let pending = state
+                    .pending
+                    .as_mut()
+                    .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+                if !matches!(pending.phase, PendingCommitteePhaseV2::Prepared)
+                    || record.index != pending.prepare_index.saturating_add(1)
+                    || record.term < pending.prepare_term
+                    || joint_old.as_deref() != Some(pending.change.previous_prefixes())
+                    || members != pending.change.next_prefixes()
+                    || transition != pending.change.transition()
+                    || previous != pending.change.previous().id()
+                    || next != pending.change.next().id()
+                {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                pending.phase = PendingCommitteePhaseV2::Joint {
+                    index: record.index,
+                    term: record.term,
+                    raw_payload_commitment: record.raw_payload_commitment,
+                };
+            }
+            (
+                AgentRaftApplyDispositionV2::CommitteeStableConfiguration {
+                    transition,
+                    committee,
+                },
+                vos_raft::EntryKind::ConfigChange { joint_old, members },
+            ) => {
+                let pending = state
+                    .pending
+                    .as_ref()
+                    .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+                let PendingCommitteePhaseV2::Joint { index, term, .. } = pending.phase else {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                };
+                if record.index != index.saturating_add(1)
+                    || record.term < term
+                    || joint_old.is_some()
+                    || members != pending.change.next_prefixes()
+                    || transition != pending.change.transition()
+                    || committee != pending.change.next().id()
+                {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                state.active = pending.change.next().clone();
+                state.authority_epoch = state
+                    .authority_epoch
+                    .checked_add(1)
+                    .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+                state.pending = None;
+            }
+            _ => return Err(AgentRaftApplicationErrorV2::CorruptLedger),
+        }
+        state
+            .validate()
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)
     }
 
     fn validate_bound_meta(
@@ -4047,11 +5117,30 @@ mod application_ledger_v2 {
         Ok(())
     }
 
+    fn validate_bound_committee_state(
+        state: &CommitteeApplicationStateV2,
+        generation: AgentGenerationRouteKey,
+        authority: CommitteeChangeAuthorityBinding,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        state
+            .validate()
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        authority
+            .validate()
+            .map_err(|_| AgentRaftApplicationErrorV2::ConfigurationMismatch)?;
+        if state.generation != generation || state.authority_epoch < authority.initial_epoch {
+            return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+        }
+        Ok(())
+    }
+
     fn ensure_v2_config_in_read(
         transaction: &redb::ReadTransaction,
         key: &[u8],
         generation: AgentGenerationRouteKey,
         journal_store: JournalStoreInstanceId,
+        initial_committee: &AgentReplicaCommittee,
+        authority: CommitteeChangeAuthorityBinding,
     ) -> Result<(), AgentRaftApplicationErrorV2> {
         for table in transaction.list_tables()? {
             if LEGACY_V1_TABLE_NAMES.contains(&table.name()) {
@@ -4073,6 +5162,8 @@ mod application_ledger_v2 {
                     version: APPLICATION_SCHEMA_VERSION,
                     generation,
                     journal_store,
+                    initial_committee: initial_committee.clone(),
+                    authority,
                 })
         {
             return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
@@ -4085,6 +5176,8 @@ mod application_ledger_v2 {
         key: &[u8],
         generation: AgentGenerationRouteKey,
         journal_store: JournalStoreInstanceId,
+        initial_committee: &AgentReplicaCommittee,
+        authority: CommitteeChangeAuthorityBinding,
     ) -> Result<(), AgentRaftApplicationErrorV2> {
         for table in transaction.list_tables()? {
             if LEGACY_V1_TABLE_NAMES.contains(&table.name()) {
@@ -4109,6 +5202,8 @@ mod application_ledger_v2 {
                     version: APPLICATION_SCHEMA_VERSION,
                     generation,
                     journal_store,
+                    initial_committee: initial_committee.clone(),
+                    authority,
                 })
         {
             return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
@@ -4133,7 +5228,17 @@ mod application_ledger_v2 {
             let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
             exact_audit_row_count(&table, expected_key)?
         };
-        validate_single_generation_counts(config_rows, meta_rows, audit_rows, allow_empty)
+        let committee_rows = {
+            let table = transaction.open_table(COMMITTEE_STATE_TABLE_V2)?;
+            exact_generation_row_count(&table, expected_key)?
+        };
+        validate_single_generation_counts(
+            config_rows,
+            meta_rows,
+            committee_rows,
+            audit_rows,
+            allow_empty,
+        )
     }
 
     fn ensure_single_generation_in_write(
@@ -4153,7 +5258,17 @@ mod application_ledger_v2 {
             let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
             exact_audit_row_count(&table, expected_key.as_slice())?
         };
-        validate_single_generation_counts(config_rows, meta_rows, audit_rows, allow_empty)
+        let committee_rows = {
+            let table = transaction.open_table(COMMITTEE_STATE_TABLE_V2)?;
+            exact_generation_row_count(&table, expected_key.as_slice())?
+        };
+        validate_single_generation_counts(
+            config_rows,
+            meta_rows,
+            committee_rows,
+            audit_rows,
+            allow_empty,
+        )
     }
 
     fn exact_generation_row_count<T>(
@@ -4198,12 +5313,13 @@ mod application_ledger_v2 {
     fn validate_single_generation_counts(
         config_rows: usize,
         meta_rows: usize,
+        committee_rows: usize,
         audit_rows: usize,
         allow_empty: bool,
     ) -> Result<(), AgentRaftApplicationErrorV2> {
-        match (config_rows, meta_rows, audit_rows) {
-            (0, 0, 0) if allow_empty => Ok(()),
-            (1, 1, _) => Ok(()),
+        match (config_rows, meta_rows, committee_rows, audit_rows) {
+            (0, 0, 0, 0) if allow_empty => Ok(()),
+            (1, 1, 1, _) => Ok(()),
             _ => Err(AgentRaftApplicationErrorV2::CorruptLedger),
         }
     }
@@ -4223,6 +5339,23 @@ mod application_ledger_v2 {
             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
         }
         Ok(Some(meta))
+    }
+
+    fn read_committee_state_in_write(
+        transaction: &redb::WriteTransaction,
+        key: &[u8],
+    ) -> Result<Option<CommitteeApplicationStateV2>, AgentRaftApplicationErrorV2> {
+        let table = transaction.open_table(COMMITTEE_STATE_TABLE_V2)?;
+        let Some(value) = table.get(key)? else {
+            return Ok(None);
+        };
+        let bytes = value.value();
+        let state = CommitteeApplicationStateV2::decode(bytes)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        if state.encode() != bytes {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        Ok(Some(state))
     }
 
     fn read_audit_in_write(
@@ -4258,6 +5391,7 @@ mod application_ledger_v2 {
         transaction: &redb::WriteTransaction,
         raft: &crate::raft::RaftMeta,
         slot: &CommittedSharedRaftSlot,
+        disposition: AgentRaftApplyDispositionV2,
     ) -> Result<(), AgentRaftApplicationErrorV2> {
         if raft.commit_index < slot.index() {
             return Err(AgentRaftApplicationErrorV2::MissingCommittedSlot);
@@ -4270,16 +5404,17 @@ mod application_ledger_v2 {
             slot.index(),
             slot.term(),
             slot.raw_payload_commitment(),
-            AgentRaftApplyDispositionV2::LeaderNoop,
+            disposition,
             bytes.value(),
         )
+        .map(|_| ())
     }
 
     fn verify_audited_physical_row_in_read(
         transaction: &redb::ReadTransaction,
         raft: &crate::raft::RaftMeta,
         record: &AgentRaftApplyAuditRecordV2,
-    ) -> Result<(), AgentRaftApplicationErrorV2> {
+    ) -> Result<vos_raft::EntryKind<u16>, AgentRaftApplicationErrorV2> {
         if raft.commit_index < record.index {
             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
         }
@@ -4302,7 +5437,7 @@ mod application_ledger_v2 {
         expected_commitment: Hash,
         disposition: AgentRaftApplyDispositionV2,
         stored: &[u8],
-    ) -> Result<(), AgentRaftApplicationErrorV2> {
+    ) -> Result<vos_raft::EntryKind<u16>, AgentRaftApplicationErrorV2> {
         let (term, raw) = stored
             .split_at_checked(8)
             .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
@@ -4319,39 +5454,60 @@ mod application_ledger_v2 {
         if crate::raft::redb_storage::encode_entry_kind(&kind) != raw {
             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
         }
-        let compatible = match (kind, disposition) {
+        let compatible = match (&kind, disposition) {
             (vos_raft::EntryKind::Data { payload }, AgentRaftApplyDispositionV2::LeaderNoop) => {
                 payload.is_empty()
             }
             (vos_raft::EntryKind::Data { payload }, AgentRaftApplyDispositionV2::Command(_)) => {
                 !payload.is_empty()
                     && payload.len() <= MAX_AGENT_RAFT_COMMAND_BYTES
-                    && AgentRaftCommand::decode(&payload)
-                        .is_ok_and(|command| command.encode() == payload)
+                    && AgentRaftCommand::decode(&payload).is_ok_and(|command| {
+                        command.encode() == *payload
+                            && !matches!(command, AgentRaftCommand::PrepareCommitteeChange(_))
+                    })
             }
+            (
+                vos_raft::EntryKind::Data { payload },
+                AgentRaftApplyDispositionV2::CommitteeChangePrepared {
+                    transition,
+                    previous,
+                    next,
+                    authority,
+                },
+            ) => AgentRaftCommand::decode(payload).is_ok_and(|command| {
+                command.encode() == *payload
+                    && matches!(
+                        command,
+                        AgentRaftCommand::PrepareCommitteeChange(change)
+                            if change.transition() == transition
+                                && change.previous().id() == previous
+                                && change.next().id() == next
+                                && change.authority_commitment() == authority
+                    )
+            }),
             (
                 vos_raft::EntryKind::ConfigChange { joint_old, members },
                 AgentRaftApplyDispositionV2::CommitteeJointConfiguration { .. },
             ) => {
                 joint_old.is_some()
-                    && validate_raft_configuration(joint_old.as_deref(), &members).is_ok()
+                    && validate_raft_configuration(joint_old.as_deref(), members).is_ok()
             }
             (
                 vos_raft::EntryKind::ConfigChange { joint_old, members },
                 AgentRaftApplyDispositionV2::CommitteeStableConfiguration { .. },
             ) => {
                 joint_old.is_none()
-                    && validate_raft_configuration(joint_old.as_deref(), &members).is_ok()
+                    && validate_raft_configuration(joint_old.as_deref(), members).is_ok()
             }
             _ => false,
         };
         if !compatible {
             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
         }
-        Ok(())
+        Ok(kind)
     }
 
-    fn generation_storage_key(
+    pub(super) fn generation_storage_key(
         generation: AgentGenerationRouteKey,
     ) -> [u8; GENERATION_STORAGE_KEY_BYTES] {
         let mut key = [0_u8; GENERATION_STORAGE_KEY_BYTES];
@@ -4409,7 +5565,7 @@ mod tests {
     use ed25519_dalek::Signer as _;
     use ed25519_dalek::SigningKey;
     #[cfg(feature = "storage")]
-    use redb::{Database, TableDefinition};
+    use redb::{Database, ReadableTable, TableDefinition};
     #[cfg(feature = "storage")]
     use vos_raft::EntryKind;
 
@@ -4584,6 +5740,170 @@ mod tests {
     #[cfg(feature = "storage")]
     fn journal_store(byte: u8) -> JournalStoreInstanceId {
         JournalStoreInstanceId::from_bytes([byte; 32]).unwrap()
+    }
+
+    #[cfg(feature = "storage")]
+    const COMMITTEE_AUTHORITY_EPOCH: u64 = 41;
+
+    #[cfg(feature = "storage")]
+    fn committee_authority_binding() -> CommitteeChangeAuthorityBinding {
+        let key = key(0xe1);
+        let public_key = key.verifying_key().to_bytes();
+        CommitteeChangeAuthorityBinding::new(
+            crate::agent_sdk::Hash([0xe2; 32]),
+            crate::agent_sdk::authority::AuthorityIssuer {
+                principal: crate::agent_sdk::PrincipalId([0xe3; 32]),
+                actor: crate::agent_sdk::ActorId([0xe4; 32]),
+                deployment: crate::agent_sdk::DeploymentId([0xe5; 32]),
+                program: crate::agent_sdk::ProgramId([0xe6; 32]),
+                producer: crate::agent_sdk::ProducerId::of_public_key(&public_key),
+            },
+            crate::agent_sdk::DeploymentId([0xe7; 32]),
+            public_key,
+            COMMITTEE_AUTHORITY_EPOCH,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "storage")]
+    fn open_foundation_ledger(
+        database: Arc<Database>,
+        generation: AgentGenerationRouteKey,
+        store: JournalStoreInstanceId,
+    ) -> Result<AgentRaftApplicationLedgerV2, AgentRaftApplicationErrorV2> {
+        AgentRaftApplicationLedgerV2::open(
+            database,
+            generation,
+            store,
+            committee(&[key(1)], &[]),
+            committee_authority_binding(),
+        )
+    }
+
+    #[cfg(feature = "storage")]
+    fn committee_change_with(
+        generation: AgentGenerationRouteKey,
+        previous: &AgentReplicaCommittee,
+        next: &AgentReplicaCommittee,
+        signing_key: &SigningKey,
+        policy: crate::agent_sdk::Hash,
+        issuer_label: u8,
+        runtime_deployment: crate::agent_sdk::DeploymentId,
+        epoch: u64,
+        valid_from: u64,
+        expires_at: u64,
+    ) -> PrepareCommitteeChange {
+        use crate::agent_sdk::authority::{
+            AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots, AuthorityOperationKind,
+            AuthorityReceipt, AuthorityReceiptSelector,
+        };
+
+        let public_key = signing_key.verifying_key().to_bytes();
+        let request =
+            PrepareCommitteeChange::authority_request(generation, previous, next).unwrap();
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy,
+                issuer: AuthorityIssuer {
+                    principal: crate::agent_sdk::PrincipalId([issuer_label; 32]),
+                    actor: crate::agent_sdk::ActorId([issuer_label.wrapping_add(1); 32]),
+                    deployment: crate::agent_sdk::DeploymentId([issuer_label.wrapping_add(2); 32]),
+                    program: crate::agent_sdk::ProgramId([issuer_label.wrapping_add(3); 32]),
+                    producer: crate::agent_sdk::ProducerId::of_public_key(&public_key),
+                },
+                space: crate::agent_sdk::SpaceId(generation.space().0),
+                agent: crate::agent_sdk::AgentId(generation.agent().0),
+                operation: AuthorityOperationKind::ChangeReplicaSet,
+                runtime_deployment,
+                actor: None,
+                actor_deployment: None,
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: crate::agent_sdk::Hash([0xec; 32]),
+                },
+                lane_roots: AuthorityLaneRoots {
+                    control: Some(crate::agent_sdk::Hash([0xed; 32])),
+                    ..AuthorityLaneRoots::default()
+                },
+                epoch,
+                valid_from,
+                expires_at,
+                request,
+            },
+            public_key,
+            signature: [1; 64],
+        };
+        receipt.signature = signing_key.sign(&receipt.signing_bytes()).to_bytes();
+        PrepareCommitteeChange::new(generation, previous.clone(), next.clone(), receipt).unwrap()
+    }
+
+    #[cfg(feature = "storage")]
+    fn committee_change(
+        generation: AgentGenerationRouteKey,
+        previous: &AgentReplicaCommittee,
+        next: &AgentReplicaCommittee,
+        epoch: u64,
+        valid_from: u64,
+        expires_at: u64,
+    ) -> PrepareCommitteeChange {
+        let binding = committee_authority_binding();
+        committee_change_with(
+            generation,
+            previous,
+            next,
+            &key(0xe1),
+            binding.policy,
+            0xe3,
+            binding.runtime_deployment,
+            epoch,
+            valid_from,
+            expires_at,
+        )
+    }
+
+    #[cfg(feature = "storage")]
+    fn open_transition_ledger(
+        database: Arc<Database>,
+        initial: AgentReplicaCommittee,
+        store: JournalStoreInstanceId,
+    ) -> Result<AgentRaftApplicationLedgerV2, AgentRaftApplicationErrorV2> {
+        AgentRaftApplicationLedgerV2::open(
+            database,
+            route(&initial).generation(),
+            store,
+            initial,
+            committee_authority_binding(),
+        )
+    }
+
+    #[cfg(feature = "storage")]
+    fn assert_prepare_rejected_without_advance(
+        label: &str,
+        initial: AgentReplicaCommittee,
+        change: PrepareCommitteeChange,
+        store: JournalStoreInstanceId,
+        expected: impl FnOnce(&AgentRaftApplicationErrorV2) -> bool,
+    ) {
+        let directory = TempDirectory::new(label);
+        let database = Arc::new(Database::create(directory.database()).unwrap());
+        append_committed_kind(
+            &database,
+            7,
+            &EntryKind::Data {
+                payload: AgentRaftCommand::PrepareCommitteeChange(change).encode(),
+            },
+        );
+        let ledger = open_transition_ledger(Arc::clone(&database), initial, store).unwrap();
+        let slot = ledger.next_committed_slot().unwrap().unwrap();
+        let error = ledger.apply_foundation_slot(&slot).unwrap_err();
+        assert!(expected(&error), "unexpected prepare error: {error:?}");
+        assert_eq!(ledger.cursor().unwrap().applied(), (0, 0));
+        assert_eq!(ledger.pending_transition().unwrap(), None);
+        assert_eq!(
+            crate::raft::RaftMeta::load(&database).unwrap().last_applied,
+            0
+        );
     }
 
     #[cfg(feature = "storage")]
@@ -4853,6 +6173,109 @@ mod tests {
 
     #[cfg(feature = "storage")]
     #[test]
+    fn committee_prepare_wire_binds_complete_committees_prefixes_and_signed_evidence() {
+        use crate::agent_sdk::authority::AuthorityOperationKind;
+
+        let initial = committee(&[key(1), key(2)], &[key(9)]);
+        let next = committee(&[key(2), key(3)], &[key(8)]);
+        let generation = route(&initial).generation();
+        let change = committee_change(
+            generation,
+            &initial,
+            &next,
+            COMMITTEE_AUTHORITY_EPOCH,
+            1,
+            10,
+        );
+
+        assert_eq!(
+            PrepareCommitteeChange::decode(&change.encode()).unwrap(),
+            change
+        );
+        let command = AgentRaftCommand::PrepareCommitteeChange(change.clone());
+        assert_eq!(
+            AgentRaftCommand::decode(&command.encode()).unwrap(),
+            command
+        );
+        assert_eq!(command.route().committee(), initial.id());
+        assert_eq!(
+            change.previous_prefixes(),
+            committee_voter_prefixes(&initial).unwrap()
+        );
+        assert_eq!(
+            change.next_prefixes(),
+            committee_voter_prefixes(&next).unwrap()
+        );
+
+        let mut different_evidence = change.authority().clone();
+        different_evidence.selector.evidence.commitment = crate::agent_sdk::Hash([0xee; 32]);
+        different_evidence.signature = key(0xe1)
+            .sign(&different_evidence.signing_bytes())
+            .to_bytes();
+        let different_evidence = PrepareCommitteeChange::new(
+            generation,
+            initial.clone(),
+            next.clone(),
+            different_evidence,
+        )
+        .unwrap();
+        assert_ne!(different_evidence.transition(), change.transition());
+
+        let mut wrong_prefixes = change.clone();
+        wrong_prefixes.previous_prefixes = wrong_prefixes.next_prefixes.clone();
+        assert_eq!(
+            wrong_prefixes.validate(),
+            Err(AgentRaftWireError::InvalidCommitteeTransition)
+        );
+        assert_eq!(
+            PrepareCommitteeChange::decode(&wrong_prefixes.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut wrong_operation = change.authority().clone();
+        wrong_operation.selector.operation = AuthorityOperationKind::CreateAgent;
+        wrong_operation.signature = key(0xe1).sign(&wrong_operation.signing_bytes()).to_bytes();
+        assert_eq!(
+            PrepareCommitteeChange::new(generation, initial.clone(), next.clone(), wrong_operation,),
+            Err(AgentRaftWireError::InvalidAuthorityEvidence)
+        );
+
+        let mut wrong_request = change.authority().clone();
+        wrong_request.selector.request = crate::agent_sdk::Hash([0xef; 32]);
+        wrong_request.signature = key(0xe1).sign(&wrong_request.signing_bytes()).to_bytes();
+        assert_eq!(
+            PrepareCommitteeChange::new(generation, initial, next, wrong_request),
+            Err(AgentRaftWireError::InvalidAuthorityEvidence)
+        );
+
+        for (wrong_space, wrong_agent) in [
+            (
+                crate::agent_sdk::SpaceId([0xfa; 32]),
+                crate::agent_sdk::AgentId(generation.agent().0),
+            ),
+            (
+                crate::agent_sdk::SpaceId(generation.space().0),
+                crate::agent_sdk::AgentId([0xfb; 32]),
+            ),
+        ] {
+            let mut wrong_scope = change.authority().clone();
+            wrong_scope.selector.space = wrong_space;
+            wrong_scope.selector.agent = wrong_agent;
+            wrong_scope.signature = key(0xe1).sign(&wrong_scope.signing_bytes()).to_bytes();
+            assert_eq!(
+                PrepareCommitteeChange::new(
+                    generation,
+                    change.previous().clone(),
+                    change.next().clone(),
+                    wrong_scope,
+                ),
+                Err(AgentRaftWireError::InvalidAuthorityEvidence)
+            );
+        }
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
     fn physical_slot_decoder_covers_noop_and_exact_command_and_rejects_bad_data() {
         let noop = physical_slot(
             EntryKind::Data {
@@ -4925,7 +6348,7 @@ mod tests {
 
     #[cfg(feature = "storage")]
     #[test]
-    fn physical_configuration_is_bounded_sorted_unique_and_not_yet_applicable() {
+    fn physical_configuration_is_bounded_sorted_unique_and_unsolicited_is_refused() {
         let config = physical_slot(
             EntryKind::ConfigChange {
                 joint_old: Some(vec![1, 3]),
@@ -4985,7 +6408,7 @@ mod tests {
                 members: vec![2, 4],
             },
         );
-        let ledger = AgentRaftApplicationLedgerV2::open(
+        let ledger = open_foundation_ledger(
             Arc::clone(&database),
             route(&committee(&[key(1)], &[])).generation(),
             journal_store(0xa1),
@@ -5066,12 +6489,9 @@ mod tests {
                 payload: Vec::new(),
             },
         );
-        let gap_ledger = AgentRaftApplicationLedgerV2::open(
-            Arc::clone(&gap_database),
-            generation,
-            journal_store(0xa2),
-        )
-        .unwrap();
+        let gap_ledger =
+            open_foundation_ledger(Arc::clone(&gap_database), generation, journal_store(0xa2))
+                .unwrap();
         let gap_slot = CommittedSharedRaftSlot::from_durable_log(
             &RedbSharedRaftLogWitness::new(Arc::clone(&gap_database)),
             2,
@@ -5095,12 +6515,9 @@ mod tests {
                 payload: Vec::new(),
             },
         );
-        let term_ledger = AgentRaftApplicationLedgerV2::open(
-            Arc::clone(&term_database),
-            generation,
-            journal_store(0xa3),
-        )
-        .unwrap();
+        let term_ledger =
+            open_foundation_ledger(Arc::clone(&term_database), generation, journal_store(0xa3))
+                .unwrap();
         let first = term_ledger.next_committed_slot().unwrap().unwrap();
         term_ledger.apply_foundation_slot(&first).unwrap();
         append_committed_kind(
@@ -5139,7 +6556,7 @@ mod tests {
                 payload: command.encode(),
             },
         );
-        let command_ledger = AgentRaftApplicationLedgerV2::open(
+        let command_ledger = open_foundation_ledger(
             Arc::clone(&command_database),
             generation,
             journal_store(0xa4),
@@ -5169,9 +6586,7 @@ mod tests {
                     payload: Vec::new(),
                 },
             );
-            let ledger =
-                AgentRaftApplicationLedgerV2::open(Arc::clone(&database), generation, store)
-                    .unwrap();
+            let ledger = open_foundation_ledger(Arc::clone(&database), generation, store).unwrap();
             let slot = ledger.next_committed_slot().unwrap().unwrap();
             let commitment = slot.raw_payload_commitment();
             match ledger.apply_foundation_slot(&slot).unwrap() {
@@ -5198,12 +6613,615 @@ mod tests {
         }
 
         let database = Arc::new(Database::create(&path).unwrap());
-        let ledger =
-            AgentRaftApplicationLedgerV2::open(Arc::clone(&database), generation, store).unwrap();
+        let ledger = open_foundation_ledger(Arc::clone(&database), generation, store).unwrap();
         assert_eq!(ledger.generation(), generation);
         assert_eq!(ledger.cursor().unwrap().applied(), (1, 11));
         ledger.audit_recovery().unwrap();
         assert!(ledger.next_committed_slot().unwrap().is_none());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_committee_change_is_authorized_joint_stable_atomic_and_restartable() {
+        let directory = TempDirectory::new("v2_committee_restart");
+        let path = directory.database();
+        let initial = committee(&[key(1), key(2)], &[key(9)]);
+        let next = committee(&[key(2), key(3)], &[key(8)]);
+        let generation = route(&initial).generation();
+        let store = journal_store(0xc1);
+        let change = committee_change(
+            generation,
+            &initial,
+            &next,
+            COMMITTEE_AUTHORITY_EPOCH,
+            1,
+            10,
+        );
+        let transition = change.transition();
+        let previous_prefixes = change.previous_prefixes().to_vec();
+        let next_prefixes = change.next_prefixes().to_vec();
+
+        {
+            let database = Arc::new(Database::create(&path).unwrap());
+            append_committed_kind(
+                &database,
+                7,
+                &EntryKind::Data {
+                    payload: AgentRaftCommand::PrepareCommitteeChange(change.clone()).encode(),
+                },
+            );
+            let ledger =
+                open_transition_ledger(Arc::clone(&database), initial.clone(), store).unwrap();
+            let prepare = ledger.next_committed_slot().unwrap().unwrap();
+            match ledger.apply_foundation_slot(&prepare).unwrap() {
+                AgentRaftFoundationApplyOutcomeV2::Applied(meta) => assert_eq!(
+                    meta.disposition(),
+                    Some(AgentRaftApplyDispositionV2::CommitteeChangePrepared {
+                        transition,
+                        previous: initial.id(),
+                        next: next.id(),
+                        authority: change.authority_commitment(),
+                    })
+                ),
+                _ => panic!("prepare was not newly applied"),
+            }
+            assert_eq!(ledger.active_committee().unwrap(), initial);
+            assert_eq!(
+                ledger.pending_transition().unwrap(),
+                Some((transition, false))
+            );
+            assert!(matches!(
+                ledger.apply_foundation_slot(&prepare).unwrap(),
+                AgentRaftFoundationApplyOutcomeV2::Duplicate(_)
+            ));
+            assert_eq!(
+                crate::raft::RaftMeta::load(&database).unwrap().last_applied,
+                1
+            );
+        }
+
+        {
+            let database = Arc::new(Database::create(&path).unwrap());
+            let ledger =
+                open_transition_ledger(Arc::clone(&database), initial.clone(), store).unwrap();
+            assert_eq!(
+                ledger.pending_transition().unwrap(),
+                Some((transition, false))
+            );
+            append_committed_kind(
+                &database,
+                8,
+                &EntryKind::ConfigChange {
+                    joint_old: Some(previous_prefixes.clone()),
+                    members: next_prefixes.clone(),
+                },
+            );
+            let joint = ledger.next_committed_slot().unwrap().unwrap();
+            match ledger.apply_foundation_slot(&joint).unwrap() {
+                AgentRaftFoundationApplyOutcomeV2::Applied(meta) => assert_eq!(
+                    meta.disposition(),
+                    Some(AgentRaftApplyDispositionV2::CommitteeJointConfiguration {
+                        transition,
+                        previous: initial.id(),
+                        next: next.id(),
+                    })
+                ),
+                _ => panic!("joint configuration was not newly applied"),
+            }
+            assert_eq!(ledger.active_committee().unwrap(), initial);
+            assert_eq!(
+                ledger.pending_transition().unwrap(),
+                Some((transition, true))
+            );
+            assert!(matches!(
+                ledger.apply_foundation_slot(&joint).unwrap(),
+                AgentRaftFoundationApplyOutcomeV2::Duplicate(_)
+            ));
+        }
+
+        {
+            let database = Arc::new(Database::create(&path).unwrap());
+            let ledger =
+                open_transition_ledger(Arc::clone(&database), initial.clone(), store).unwrap();
+            assert_eq!(
+                ledger.pending_transition().unwrap(),
+                Some((transition, true))
+            );
+            append_committed_kind(
+                &database,
+                8,
+                &EntryKind::ConfigChange {
+                    joint_old: None,
+                    members: next_prefixes,
+                },
+            );
+            let stable = ledger.next_committed_slot().unwrap().unwrap();
+            match ledger.apply_foundation_slot(&stable).unwrap() {
+                AgentRaftFoundationApplyOutcomeV2::Applied(meta) => assert_eq!(
+                    meta.disposition(),
+                    Some(AgentRaftApplyDispositionV2::CommitteeStableConfiguration {
+                        transition,
+                        committee: next.id(),
+                    })
+                ),
+                _ => panic!("stable configuration was not newly applied"),
+            }
+            assert_eq!(ledger.active_committee().unwrap(), next);
+            assert_eq!(ledger.pending_transition().unwrap(), None);
+            assert_eq!(
+                ledger.authority_epoch().unwrap(),
+                COMMITTEE_AUTHORITY_EPOCH + 1
+            );
+            assert_eq!(
+                crate::raft::RaftMeta::load(&database).unwrap().last_applied,
+                3
+            );
+        }
+
+        let database = Arc::new(Database::create(&path).unwrap());
+        let ledger = open_transition_ledger(Arc::clone(&database), initial, store).unwrap();
+        assert_eq!(ledger.active_committee().unwrap(), next);
+        ledger.audit_recovery().unwrap();
+        let stable =
+            CommittedSharedRaftSlot::from_durable_log(&RedbSharedRaftLogWitness::new(database), 3)
+                .unwrap();
+        assert!(matches!(
+            ledger.apply_foundation_slot(&stable).unwrap(),
+            AgentRaftFoundationApplyOutcomeV2::Duplicate(_)
+        ));
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_prepare_rejects_wrong_generation_committee_and_authority_without_advance() {
+        let initial = committee(&[key(1), key(2)], &[key(9)]);
+        let next = committee(&[key(2), key(3)], &[key(8)]);
+        let generation = route(&initial).generation();
+
+        let wrong_generation = AgentGenerationRouteKey::new(
+            generation.space(),
+            generation.agent(),
+            generation.genesis(),
+            AgentGenesisAdmissionId::from_bytes([0xb1; 32]),
+        )
+        .unwrap();
+        assert_prepare_rejected_without_advance(
+            "v2_prepare_wrong_generation",
+            initial.clone(),
+            committee_change(
+                wrong_generation,
+                &initial,
+                &next,
+                COMMITTEE_AUTHORITY_EPOCH,
+                1,
+                10,
+            ),
+            journal_store(0xc2),
+            |error| matches!(error, AgentRaftApplicationErrorV2::WrongGeneration),
+        );
+
+        let stale = committee(&[key(1), key(3)], &[key(9)]);
+        let stale_next = committee(&[key(3), key(4)], &[key(8)]);
+        assert_prepare_rejected_without_advance(
+            "v2_prepare_stale_committee",
+            initial.clone(),
+            committee_change(
+                generation,
+                &stale,
+                &stale_next,
+                COMMITTEE_AUTHORITY_EPOCH,
+                1,
+                10,
+            ),
+            journal_store(0xc3),
+            |error| matches!(error, AgentRaftApplicationErrorV2::StaleCommittee),
+        );
+
+        let binding = committee_authority_binding();
+        assert_prepare_rejected_without_advance(
+            "v2_prepare_wrong_signer",
+            initial.clone(),
+            committee_change_with(
+                generation,
+                &initial,
+                &next,
+                &key(0xf1),
+                binding.policy,
+                0xe3,
+                binding.runtime_deployment,
+                COMMITTEE_AUTHORITY_EPOCH,
+                1,
+                10,
+            ),
+            journal_store(0xc4),
+            |error| matches!(error, AgentRaftApplicationErrorV2::WrongAuthority),
+        );
+        assert_prepare_rejected_without_advance(
+            "v2_prepare_wrong_policy",
+            initial.clone(),
+            committee_change_with(
+                generation,
+                &initial,
+                &next,
+                &key(0xe1),
+                crate::agent_sdk::Hash([0xf2; 32]),
+                0xe3,
+                binding.runtime_deployment,
+                COMMITTEE_AUTHORITY_EPOCH,
+                1,
+                10,
+            ),
+            journal_store(0xc5),
+            |error| matches!(error, AgentRaftApplicationErrorV2::WrongAuthority),
+        );
+        assert_prepare_rejected_without_advance(
+            "v2_prepare_wrong_issuer",
+            initial.clone(),
+            committee_change_with(
+                generation,
+                &initial,
+                &next,
+                &key(0xe1),
+                binding.policy,
+                0xd3,
+                binding.runtime_deployment,
+                COMMITTEE_AUTHORITY_EPOCH,
+                1,
+                10,
+            ),
+            journal_store(0xcc),
+            |error| matches!(error, AgentRaftApplicationErrorV2::WrongAuthority),
+        );
+        assert_prepare_rejected_without_advance(
+            "v2_prepare_wrong_runtime_deployment",
+            initial.clone(),
+            committee_change_with(
+                generation,
+                &initial,
+                &next,
+                &key(0xe1),
+                binding.policy,
+                0xe3,
+                crate::agent_sdk::DeploymentId([0xcd; 32]),
+                COMMITTEE_AUTHORITY_EPOCH,
+                1,
+                10,
+            ),
+            journal_store(0xcd),
+            |error| matches!(error, AgentRaftApplicationErrorV2::WrongAuthority),
+        );
+        assert_prepare_rejected_without_advance(
+            "v2_prepare_wrong_epoch",
+            initial.clone(),
+            committee_change(
+                generation,
+                &initial,
+                &next,
+                COMMITTEE_AUTHORITY_EPOCH + 1,
+                1,
+                10,
+            ),
+            journal_store(0xc6),
+            |error| matches!(error, AgentRaftApplicationErrorV2::WrongAuthority),
+        );
+        assert_prepare_rejected_without_advance(
+            "v2_prepare_not_live",
+            initial.clone(),
+            committee_change(
+                generation,
+                &initial,
+                &next,
+                COMMITTEE_AUTHORITY_EPOCH,
+                2,
+                10,
+            ),
+            journal_store(0xc7),
+            |error| matches!(error, AgentRaftApplicationErrorV2::StaleAuthority),
+        );
+
+        let valid = committee_change(
+            generation,
+            &initial,
+            &next,
+            COMMITTEE_AUTHORITY_EPOCH,
+            1,
+            10,
+        );
+        let mut bad_signature = valid.authority().clone();
+        bad_signature.signature[0] ^= 1;
+        let bad_signature =
+            PrepareCommitteeChange::new(generation, initial.clone(), next, bad_signature).unwrap();
+        assert_prepare_rejected_without_advance(
+            "v2_prepare_bad_signature",
+            initial,
+            bad_signature,
+            journal_store(0xc8),
+            |error| matches!(error, AgentRaftApplicationErrorV2::WrongAuthority),
+        );
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_pending_barrier_rejects_overlap_reorder_wrong_role_and_partial_prefixes() {
+        let directory = TempDirectory::new("v2_committee_hostile_barrier");
+        let database = Arc::new(Database::create(directory.database()).unwrap());
+        let initial = committee(&[key(1), key(2)], &[key(9)]);
+        let next = committee(&[key(2), key(3)], &[key(8)]);
+        let generation = route(&initial).generation();
+        let change = committee_change(
+            generation,
+            &initial,
+            &next,
+            COMMITTEE_AUTHORITY_EPOCH,
+            1,
+            10,
+        );
+        let previous_prefixes = change.previous_prefixes().to_vec();
+        let next_prefixes = change.next_prefixes().to_vec();
+        append_committed_kind(
+            &database,
+            7,
+            &EntryKind::Data {
+                payload: AgentRaftCommand::PrepareCommitteeChange(change.clone()).encode(),
+            },
+        );
+        let ledger =
+            open_transition_ledger(Arc::clone(&database), initial.clone(), journal_store(0xc9))
+                .unwrap();
+        let prepare = ledger.next_committed_slot().unwrap().unwrap();
+        ledger.apply_foundation_slot(&prepare).unwrap();
+
+        macro_rules! rejects_at_prepare_barrier {
+            ($slot:expr, $pattern:pat) => {{
+                let error = ledger.apply_foundation_slot(&$slot).unwrap_err();
+                assert!(
+                    matches!(error, $pattern),
+                    "unexpected barrier error: {error:?}"
+                );
+                assert_eq!(ledger.cursor().unwrap().applied(), (1, 7));
+                assert_eq!(
+                    ledger.pending_transition().unwrap(),
+                    Some((change.transition(), false))
+                );
+                assert_eq!(
+                    crate::raft::RaftMeta::load(&database).unwrap().last_applied,
+                    1
+                );
+            }};
+        }
+
+        rejects_at_prepare_barrier!(
+            physical_slot(
+                EntryKind::ConfigChange {
+                    joint_old: None,
+                    members: next_prefixes.clone(),
+                },
+                2,
+                8,
+            ),
+            AgentRaftApplicationErrorV2::ReorderedConfiguration
+        );
+        rejects_at_prepare_barrier!(
+            physical_slot(
+                EntryKind::ConfigChange {
+                    joint_old: Some(previous_prefixes[..1].to_vec()),
+                    members: next_prefixes.clone(),
+                },
+                2,
+                8,
+            ),
+            AgentRaftApplicationErrorV2::WrongConfigurationPrefixes
+        );
+        rejects_at_prepare_barrier!(
+            physical_slot(
+                EntryKind::ConfigChange {
+                    joint_old: Some(previous_prefixes.clone()),
+                    members: next_prefixes[..1].to_vec(),
+                },
+                2,
+                8,
+            ),
+            AgentRaftApplicationErrorV2::WrongConfigurationPrefixes
+        );
+
+        let observer_prefix = derive_replica_raft_slot(&peer_id(&key(8)));
+        assert!(!next_prefixes.contains(&observer_prefix));
+        let mut role_confused_prefixes = next_prefixes.clone();
+        role_confused_prefixes.push(observer_prefix);
+        role_confused_prefixes.sort_unstable();
+        rejects_at_prepare_barrier!(
+            physical_slot(
+                EntryKind::ConfigChange {
+                    joint_old: Some(previous_prefixes.clone()),
+                    members: role_confused_prefixes.clone(),
+                },
+                2,
+                8,
+            ),
+            AgentRaftApplicationErrorV2::WrongConfigurationPrefixes
+        );
+        rejects_at_prepare_barrier!(
+            physical_slot(
+                EntryKind::Data {
+                    payload: Vec::new()
+                },
+                2,
+                8
+            ),
+            AgentRaftApplicationErrorV2::TransitionBarrier
+        );
+        rejects_at_prepare_barrier!(
+            physical_slot(
+                EntryKind::Data {
+                    payload: AgentRaftCommand::ArtifactAbort {
+                        route: route(&initial),
+                        batch: ArtifactBatchId::from_bytes([0xca; 32]),
+                    }
+                    .encode(),
+                },
+                2,
+                8,
+            ),
+            AgentRaftApplicationErrorV2::TransitionBarrier
+        );
+        let overlapping_next = committee(&[key(1), key(4)], &[key(7)]);
+        let overlapping = committee_change(
+            generation,
+            &initial,
+            &overlapping_next,
+            COMMITTEE_AUTHORITY_EPOCH,
+            1,
+            10,
+        );
+        rejects_at_prepare_barrier!(
+            physical_slot(
+                EntryKind::Data {
+                    payload: AgentRaftCommand::PrepareCommitteeChange(overlapping).encode(),
+                },
+                2,
+                8,
+            ),
+            AgentRaftApplicationErrorV2::OverlappingCommitteeChange
+        );
+
+        append_committed_kind(
+            &database,
+            8,
+            &EntryKind::ConfigChange {
+                joint_old: Some(previous_prefixes),
+                members: next_prefixes.clone(),
+            },
+        );
+        let joint = ledger.next_committed_slot().unwrap().unwrap();
+        ledger.apply_foundation_slot(&joint).unwrap();
+        assert_eq!(
+            ledger.pending_transition().unwrap(),
+            Some((change.transition(), true))
+        );
+
+        macro_rules! rejects_at_joint_barrier {
+            ($slot:expr, $pattern:pat) => {{
+                let error = ledger.apply_foundation_slot(&$slot).unwrap_err();
+                assert!(
+                    matches!(error, $pattern),
+                    "unexpected barrier error: {error:?}"
+                );
+                assert_eq!(ledger.cursor().unwrap().applied(), (2, 8));
+                assert_eq!(
+                    ledger.pending_transition().unwrap(),
+                    Some((change.transition(), true))
+                );
+                assert_eq!(
+                    crate::raft::RaftMeta::load(&database).unwrap().last_applied,
+                    2
+                );
+            }};
+        }
+
+        rejects_at_joint_barrier!(
+            physical_slot(
+                EntryKind::ConfigChange {
+                    joint_old: Some(change.previous_prefixes().to_vec()),
+                    members: next_prefixes.clone(),
+                },
+                3,
+                8,
+            ),
+            AgentRaftApplicationErrorV2::ReorderedConfiguration
+        );
+        rejects_at_joint_barrier!(
+            physical_slot(
+                EntryKind::ConfigChange {
+                    joint_old: None,
+                    members: next_prefixes[..1].to_vec(),
+                },
+                3,
+                8,
+            ),
+            AgentRaftApplicationErrorV2::WrongConfigurationPrefixes
+        );
+        rejects_at_joint_barrier!(
+            physical_slot(
+                EntryKind::ConfigChange {
+                    joint_old: None,
+                    members: role_confused_prefixes,
+                },
+                3,
+                8,
+            ),
+            AgentRaftApplicationErrorV2::WrongConfigurationPrefixes
+        );
+
+        append_committed_kind(
+            &database,
+            8,
+            &EntryKind::ConfigChange {
+                joint_old: None,
+                members: next_prefixes,
+            },
+        );
+        let stable = ledger.next_committed_slot().unwrap().unwrap();
+        ledger.apply_foundation_slot(&stable).unwrap();
+        assert_eq!(ledger.active_committee().unwrap(), next);
+        assert_eq!(ledger.pending_transition().unwrap(), None);
+        assert_eq!(ledger.cursor().unwrap().applied(), (3, 8));
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_restart_replays_transition_and_rejects_valid_looking_state_tampering() {
+        const COMMITTEE_STATE_TABLE: TableDefinition<&[u8], &[u8]> =
+            TableDefinition::new("agent_shared_raft_committee_state_v2");
+
+        let directory = TempDirectory::new("v2_committee_state_tamper");
+        let database = Arc::new(Database::create(directory.database()).unwrap());
+        let initial = committee(&[key(1), key(2)], &[key(9)]);
+        let next = committee(&[key(2), key(3)], &[key(8)]);
+        let generation = route(&initial).generation();
+        let store = journal_store(0xcb);
+        let change = committee_change(
+            generation,
+            &initial,
+            &next,
+            COMMITTEE_AUTHORITY_EPOCH,
+            1,
+            10,
+        );
+        append_committed_kind(
+            &database,
+            7,
+            &EntryKind::Data {
+                payload: AgentRaftCommand::PrepareCommitteeChange(change).encode(),
+            },
+        );
+        let ledger = open_transition_ledger(Arc::clone(&database), initial.clone(), store).unwrap();
+        let prepare = ledger.next_committed_slot().unwrap().unwrap();
+        ledger.apply_foundation_slot(&prepare).unwrap();
+        drop(ledger);
+
+        let storage_key = application_ledger_v2::generation_storage_key(generation);
+        let transaction = database.begin_write().unwrap();
+        {
+            let mut table = transaction.open_table(COMMITTEE_STATE_TABLE).unwrap();
+            let bytes = table
+                .get(storage_key.as_slice())
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            let mut state = CommitteeApplicationStateV2::decode(&bytes).unwrap();
+            state.pending = None;
+            state.validate().unwrap();
+            table
+                .insert(storage_key.as_slice(), state.encode().as_slice())
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        assert!(matches!(
+            open_transition_ledger(database, initial, store),
+            Err(AgentRaftApplicationErrorV2::CorruptLedger)
+        ));
     }
 
     #[cfg(feature = "storage")]
@@ -5220,7 +7238,7 @@ mod tests {
                 payload: Vec::new(),
             },
         );
-        let conflict_ledger = AgentRaftApplicationLedgerV2::open(
+        let conflict_ledger = open_foundation_ledger(
             Arc::clone(&conflict_database),
             generation,
             journal_store(0xa6),
@@ -5249,7 +7267,7 @@ mod tests {
                 payload: Vec::new(),
             },
         );
-        let missing_ledger = AgentRaftApplicationLedgerV2::open(
+        let missing_ledger = open_foundation_ledger(
             Arc::clone(&missing_database),
             generation,
             journal_store(0xa7),
@@ -5280,7 +7298,7 @@ mod tests {
                 payload: Vec::new(),
             },
         );
-        let corrupt_ledger = AgentRaftApplicationLedgerV2::open(
+        let corrupt_ledger = open_foundation_ledger(
             Arc::clone(&corrupt_database),
             generation,
             journal_store(0xa8),
@@ -5336,7 +7354,7 @@ mod tests {
             transaction.commit().unwrap();
         }
         assert!(matches!(
-            AgentRaftApplicationLedgerV2::open(
+            open_foundation_ledger(
                 database,
                 route(&committee(&[key(1)], &[])).generation(),
                 journal_store(0xa9),
@@ -5347,10 +7365,11 @@ mod tests {
 
     #[cfg(feature = "storage")]
     #[test]
-    fn v2_database_cannot_be_rebound_to_another_generation_or_store_before_apply() {
+    fn v2_database_cannot_rebind_generation_store_initial_committee_or_authority() {
         let directory = TempDirectory::new("v2_generation_binding");
         let database = Arc::new(Database::create(directory.database()).unwrap());
-        let generation_a = route(&committee(&[key(1)], &[])).generation();
+        let initial = committee(&[key(1)], &[]);
+        let generation_a = route(&initial).generation();
         let generation_b = AgentGenerationRouteKey::new(
             generation_a.space(),
             generation_a.agent(),
@@ -5360,17 +7379,61 @@ mod tests {
         .unwrap();
         let store_a = journal_store(0xaa);
         let store_b = journal_store(0xbb);
-        let ledger =
-            AgentRaftApplicationLedgerV2::open(Arc::clone(&database), generation_a, store_a)
-                .unwrap();
+        let ledger = AgentRaftApplicationLedgerV2::open(
+            Arc::clone(&database),
+            generation_a,
+            store_a,
+            initial.clone(),
+            committee_authority_binding(),
+        )
+        .unwrap();
         assert_eq!(ledger.cursor().unwrap().applied(), (0, 0));
 
         assert!(matches!(
-            AgentRaftApplicationLedgerV2::open(Arc::clone(&database), generation_b, store_b,),
+            open_foundation_ledger(Arc::clone(&database), generation_b, store_b,),
             Err(AgentRaftApplicationErrorV2::ConfigurationMismatch)
         ));
         assert!(matches!(
-            AgentRaftApplicationLedgerV2::open(database, generation_a, store_b),
+            open_foundation_ledger(Arc::clone(&database), generation_a, store_b),
+            Err(AgentRaftApplicationErrorV2::ConfigurationMismatch)
+        ));
+
+        let different_initial = committee(&[key(2)], &[]);
+        assert!(matches!(
+            AgentRaftApplicationLedgerV2::open(
+                Arc::clone(&database),
+                generation_a,
+                store_a,
+                different_initial,
+                committee_authority_binding(),
+            ),
+            Err(AgentRaftApplicationErrorV2::ConfigurationMismatch)
+        ));
+
+        let alternate_key = key(0xf3);
+        let alternate_public_key = alternate_key.verifying_key().to_bytes();
+        let alternate_authority = CommitteeChangeAuthorityBinding::new(
+            crate::agent_sdk::Hash([0xf4; 32]),
+            crate::agent_sdk::authority::AuthorityIssuer {
+                principal: crate::agent_sdk::PrincipalId([0xf5; 32]),
+                actor: crate::agent_sdk::ActorId([0xf6; 32]),
+                deployment: crate::agent_sdk::DeploymentId([0xf7; 32]),
+                program: crate::agent_sdk::ProgramId([0xf8; 32]),
+                producer: crate::agent_sdk::ProducerId::of_public_key(&alternate_public_key),
+            },
+            crate::agent_sdk::DeploymentId([0xf9; 32]),
+            alternate_public_key,
+            COMMITTEE_AUTHORITY_EPOCH,
+        )
+        .unwrap();
+        assert!(matches!(
+            AgentRaftApplicationLedgerV2::open(
+                database,
+                generation_a,
+                store_a,
+                initial,
+                alternate_authority,
+            ),
             Err(AgentRaftApplicationErrorV2::ConfigurationMismatch)
         ));
     }
@@ -5392,7 +7455,7 @@ mod tests {
         }
 
         assert!(matches!(
-            AgentRaftApplicationLedgerV2::open(
+            open_foundation_ledger(
                 Arc::clone(&database),
                 route(&committee(&[key(1)], &[])).generation(),
                 journal_store(0xac),
