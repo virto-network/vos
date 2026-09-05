@@ -118,6 +118,16 @@ impl ProgramId {
     }
 }
 
+impl SpaceId {
+    /// Derive a durable space identity from its founding Principal and a
+    /// caller-generated creation nonce. The Principal is deliberately not a
+    /// transport Node or login Credential, and the space domain is distinct
+    /// from the Agent identity domain.
+    pub fn derive(creator: PrincipalId, nonce: &[u8]) -> Self {
+        Self(digest::<32>(b"vos/space/id", &[creator.as_bytes(), nonce]))
+    }
+}
+
 impl AgentId {
     /// Derive a durable agent identity from its space, owner, and
     /// caller-chosen creation nonce.
@@ -298,6 +308,19 @@ mod tests {
         assert_ne!(
             AgentId::derive(space, owner, b"nonce"),
             AgentId::derive(space, PrincipalId([3; 32]), b"nonce")
+        );
+    }
+
+    #[test]
+    fn space_ids_are_stable_principal_scoped_and_domain_separated() {
+        let creator = PrincipalId([2; 32]);
+        let space = SpaceId::derive(creator, b"nonce");
+        assert_eq!(space, SpaceId::derive(creator, b"nonce"));
+        assert_ne!(space, SpaceId::derive(creator, b"other"));
+        assert_ne!(space, SpaceId::derive(PrincipalId([3; 32]), b"nonce"));
+        assert_ne!(
+            space.0,
+            AgentId::derive(SpaceId(creator.0), creator, b"nonce").0
         );
     }
 
