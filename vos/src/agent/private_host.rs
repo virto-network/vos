@@ -768,6 +768,11 @@ impl PrivateAgentHost {
             write_new_synced(&stage.join(RUNTIME_FILE), &archive.runtime)?;
             write_new_synced(&stage.join(BOOTSTRAP_FILE), &archive.bootstrap)?;
             drop(store);
+            // The files themselves are durable, but their directory entries
+            // must also reach disk before the staging directory is published.
+            // Otherwise a power loss after the rename can expose a slot whose
+            // authenticated sidecars were never durably linked.
+            sync_directory(&stage)?;
             let hosted = open_hosted_agent(
                 &stage,
                 self.scope.space,
@@ -779,6 +784,7 @@ impl PrivateAgentHost {
             drop(hosted);
             fs::rename(&stage, self.agent_path(agent)).map_err(map_io)?;
             sync_directory(&self.root)?;
+            sync_directory(&self.root.join(CREATING_DIRECTORY))?;
             let hosted = open_hosted_agent(
                 &self.agent_path(agent),
                 self.scope.space,
@@ -797,6 +803,7 @@ impl PrivateAgentHost {
             Err(error) => {
                 if fs::symlink_metadata(&stage).is_ok_and(|metadata| metadata.is_dir()) {
                     let _ = fs::remove_dir_all(&stage);
+                    let _ = sync_directory(&self.root.join(CREATING_DIRECTORY));
                 }
                 Err(error)
             }
