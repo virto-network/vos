@@ -1,0 +1,2263 @@
+//! Root-scoped production host for clean-generation Local agents.
+//!
+//! This boundary deliberately does not reuse the transitional journal host.
+//! One locked filesystem root is bound to one exact Space and full transport
+//! Node identity, and every child is named by the lowercase canonical SDK
+//! `AgentId`.  Mutating methods require `&mut self`, so one process has a
+//! bounded, serialized admission point without an unbounded worker queue.
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use core::fmt;
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use fs2::FileExt as _;
+
+use crate::agent_sdk::authority::AuthorityReceipt;
+use crate::agent_sdk::{
+    AgentDescriptor, AgentId, AgentProfile, InvocationWork, ManagementRequest, NodeId, ResumeWork,
+    RuntimeOutcome, SpaceId,
+};
+
+use super::driver::{
+    AgentDriver, AgentDriverError, AgentStoreError, AgentTrustProvider, FileAgentStore,
+    SdkManagementArtifacts,
+};
+use super::package_admission::AdmittedRuntimePackage;
+
+/// Hard bound on directories and loaded drivers owned by one Local host.
+pub const MAX_LOCAL_HOST_AGENTS: usize = 4_096;
+
+const SCOPE_MAGIC: &[u8; 4] = b"LAH3";
+const SCOPE_VERSION: u16 = 1;
+const SCOPE_FILE: &str = "scope";
+const SCOPE_STAGE_FILE: &str = "scope.next";
+const LOCK_FILE: &str = "lock";
+const CREATING_DIRECTORY: &str = ".creating";
+const IMAGE_FILE: &str = "image";
+const IMAGE_STAGE_FILE: &str = "image.next";
+const CATALOG_DIRECTORY: &str = "image.agent-catalog";
+const CATALOG_KINDS: [&str; 5] = [
+    "packages",
+    "programs",
+    "schemas",
+    "policies",
+    "installation-data",
+];
+const SCOPE_PREFIX_BYTES: usize = 4 + 2 + 32 + 32;
+const SCOPE_BYTES: usize = SCOPE_PREFIX_BYTES + 32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalAgentHostError {
+    Io,
+    Busy,
+    AlreadyExists,
+    NotFound,
+    InvalidRoot,
+    InvalidScope,
+    InvalidDescriptor,
+    UnsupportedProfile,
+    Alias,
+    LimitExceeded,
+    Corrupt,
+    Driver(AgentDriverError),
+}
+
+impl fmt::Display for LocalAgentHostError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Local-agent host operation failed: {self:?}")
+    }
+}
+
+impl core::error::Error for LocalAgentHostError {}
+
+impl From<AgentDriverError> for LocalAgentHostError {
+    fn from(error: AgentDriverError) -> Self {
+        match error {
+            AgentDriverError::UnsupportedProfile(_) => Self::UnsupportedProfile,
+            AgentDriverError::Store(AgentStoreError::Conflict) => Self::AlreadyExists,
+            AgentDriverError::Store(AgentStoreError::Corrupt) => Self::Corrupt,
+            AgentDriverError::Store(AgentStoreError::Unavailable) => Self::Io,
+            other => Self::Driver(other),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RootScope {
+    space: SpaceId,
+    node: NodeId,
+}
+
+struct HostedLocalAgent {
+    driver: AgentDriver<FileAgentStore>,
+    descriptor: AgentDescriptor,
+}
+
+/// Single-writer owner of every clean Local agent under one physical root.
+pub struct LocalAgentHost {
+    root: PathBuf,
+    canonical_root: PathBuf,
+    root_directory: File,
+    lock: File,
+    scope: RootScope,
+    trust: Arc<dyn AgentTrustProvider>,
+    agents: BTreeMap<AgentId, HostedLocalAgent>,
+}
+
+impl LocalAgentHost {
+    /// Create a new empty root. The supplied path and its parent must already
+    /// be canonical; relative, symlinked, `.` and `..` aliases are rejected.
+    pub fn create(
+        root: impl AsRef<Path>,
+        space: SpaceId,
+        node: NodeId,
+        trust: Arc<dyn AgentTrustProvider>,
+    ) -> Result<Self, LocalAgentHostError> {
+        if space == SpaceId::ZERO || node == NodeId::ZERO {
+            return Err(LocalAgentHostError::InvalidScope);
+        }
+        let root = root.as_ref();
+        require_new_canonical_path(root)?;
+        match fs::symlink_metadata(root) {
+            Ok(_) => return Err(LocalAgentHostError::AlreadyExists),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Err(LocalAgentHostError::Io),
+        }
+        create_private_directory(root)?;
+        let root_directory = open_private_directory(root)?;
+        let lock = open_root_lock(root, &root_directory, true)?;
+        create_private_directory(&root.join(CREATING_DIRECTORY))?;
+        let scope = RootScope { space, node };
+        publish_scope(root, &root_directory, scope)?;
+        root_directory
+            .sync_all()
+            .map_err(|_| LocalAgentHostError::Io)?;
+        let canonical_root = fs::canonicalize(root).map_err(|_| LocalAgentHostError::Io)?;
+        if canonical_root != root {
+            return Err(LocalAgentHostError::InvalidRoot);
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            canonical_root,
+            root_directory,
+            lock,
+            scope,
+            trust,
+            agents: BTreeMap::new(),
+        })
+    }
+
+    /// Reopen and authenticate the complete root. A valid unpublished create
+    /// stage is promoted; an empty unpublished stage is retired. Other
+    /// partial or aliased state fails closed.
+    pub fn open(
+        root: impl AsRef<Path>,
+        expected_space: SpaceId,
+        expected_node: NodeId,
+        trust: Arc<dyn AgentTrustProvider>,
+    ) -> Result<Self, LocalAgentHostError> {
+        if expected_space == SpaceId::ZERO || expected_node == NodeId::ZERO {
+            return Err(LocalAgentHostError::InvalidScope);
+        }
+        let root = root.as_ref().to_path_buf();
+        require_existing_canonical_path(&root)?;
+        let root_directory = open_private_directory(&root)?;
+        let lock = open_root_lock(&root, &root_directory, false)?;
+        let expected = RootScope {
+            space: expected_space,
+            node: expected_node,
+        };
+        recover_scope_publication(&root, &root_directory, expected)?;
+        let scope = read_scope_file(&root.join(SCOPE_FILE))?;
+        if scope != expected {
+            return Err(LocalAgentHostError::InvalidScope);
+        }
+        let creating = root.join(CREATING_DIRECTORY);
+        require_private_directory(&creating)?;
+        let canonical_root = fs::canonicalize(&root).map_err(|_| LocalAgentHostError::Io)?;
+        let mut host = Self {
+            root,
+            canonical_root,
+            root_directory,
+            lock,
+            scope,
+            trust,
+            agents: BTreeMap::new(),
+        };
+        host.recover_creating()?;
+        for agent in scan_root(&host.root)? {
+            if host.agents.len() >= MAX_LOCAL_HOST_AGENTS {
+                return Err(LocalAgentHostError::LimitExceeded);
+            }
+            let hosted = host.open_hosted(agent, &host.agent_path(agent))?;
+            if host.agents.insert(agent, hosted).is_some() {
+                return Err(LocalAgentHostError::Alias);
+            }
+        }
+        host.verify_root_scope()?;
+        Ok(host)
+    }
+
+    pub const fn space(&self) -> SpaceId {
+        self.scope.space
+    }
+
+    pub const fn node(&self) -> NodeId {
+        self.scope.node
+    }
+
+    pub fn list(&self) -> Result<Vec<AgentId>, LocalAgentHostError> {
+        self.verify_root_scope()?;
+        Ok(self.agents.keys().copied().collect())
+    }
+
+    pub fn show(&self, agent: AgentId) -> Result<&AgentDescriptor, LocalAgentHostError> {
+        self.verify_root_scope()?;
+        self.agents
+            .get(&agent)
+            .map(|hosted| &hosted.descriptor)
+            .ok_or(LocalAgentHostError::NotFound)
+    }
+
+    /// Create one exact SDK agent. The runtime value is already VOS3-admitted
+    /// and the driver verifies the signed authority receipt again in guest
+    /// execution before any image is published.
+    pub fn create_agent(
+        &mut self,
+        runtime: AdmittedRuntimePackage,
+        descriptor: AgentDescriptor,
+        authority: AuthorityReceipt,
+    ) -> Result<AgentId, LocalAgentHostError> {
+        self.verify_root_scope()?;
+        self.validate_descriptor(&descriptor)?;
+        let agent = descriptor.identity.agent;
+        if self.agents.contains_key(&agent) {
+            let exact = self
+                .agents
+                .get(&agent)
+                .is_some_and(|hosted| hosted.descriptor == descriptor)
+                && runtime_matches_descriptor(&runtime, &descriptor);
+            if !exact {
+                return Err(LocalAgentHostError::AlreadyExists);
+            }
+            let expected_identity = descriptor.identity.clone();
+            let result = {
+                let hosted = self
+                    .agents
+                    .get_mut(&agent)
+                    .ok_or(LocalAgentHostError::NotFound)?;
+                hosted.driver.manage_sdk(
+                    ManagementRequest::Create(Box::new(descriptor)),
+                    Some(authority),
+                    SdkManagementArtifacts::None,
+                )
+            };
+            return match self.finish_driver_operation(agent, result)? {
+                RuntimeOutcome::Management(Ok(crate::agent_sdk::ManagementReply::Created(
+                    identity,
+                ))) if identity == expected_identity => Ok(agent),
+                _ => Err(LocalAgentHostError::Corrupt),
+            };
+        }
+        if self.agents.len() >= MAX_LOCAL_HOST_AGENTS {
+            return Err(LocalAgentHostError::LimitExceeded);
+        }
+        let stage = self.creating_path(agent);
+        let destination = self.agent_path(agent);
+        if path_exists(&stage)? || path_exists(&destination)? {
+            return Err(LocalAgentHostError::AlreadyExists);
+        }
+        create_agent_slot(&stage)?;
+        let image = image_path(&stage);
+        let result = AgentDriver::create_sdk(
+            runtime,
+            descriptor.clone(),
+            FileAgentStore::new(&image),
+            self.trust.clone(),
+            authority,
+        );
+        match result {
+            Ok(driver) => drop(driver),
+            Err(error) => {
+                // A failed durability sync may have lost only the result. If
+                // the exact image and admitted closure reopen, publish that
+                // committed create; otherwise retire only this unpublished
+                // canonical stage.
+                match AgentDriver::open_sdk(FileAgentStore::new(&image), self.trust.clone()) {
+                    Ok(driver)
+                        if descriptor_from_driver(&driver)? == descriptor
+                            && self.descriptor_matches_scope(&descriptor) =>
+                    {
+                        drop(driver);
+                    }
+                    _ => {
+                        remove_unpublished_slot(&stage)?;
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+        validate_agent_slot(&stage, true)?;
+        sync_directory(&stage)?;
+        fs::rename(&stage, &destination).map_err(|_| LocalAgentHostError::Io)?;
+        let publication = self
+            .root_directory
+            .sync_all()
+            .map_err(|_| LocalAgentHostError::Io)
+            .and_then(|()| sync_directory(&self.root.join(CREATING_DIRECTORY)));
+        let hosted = self.open_hosted(agent, &destination)?;
+        if self.agents.insert(agent, hosted).is_some() {
+            return Err(LocalAgentHostError::Alias);
+        }
+        publication.map(|()| agent)
+    }
+
+    pub fn manage(
+        &mut self,
+        agent: AgentId,
+        request: ManagementRequest,
+        authority: Option<AuthorityReceipt>,
+        artifacts: SdkManagementArtifacts<'_>,
+    ) -> Result<RuntimeOutcome, LocalAgentHostError> {
+        self.verify_root_scope()?;
+        if matches!(request, ManagementRequest::Create(_)) {
+            return Err(LocalAgentHostError::InvalidDescriptor);
+        }
+        if let ManagementRequest::ChangeReplicas { replicas, .. } = &request
+            && (replicas.len() != 1 || replicas[0].node != self.scope.node)
+        {
+            return Err(LocalAgentHostError::InvalidScope);
+        }
+        let result = {
+            let hosted = self
+                .agents
+                .get_mut(&agent)
+                .ok_or(LocalAgentHostError::NotFound)?;
+            hosted.driver.manage_sdk(request, authority, artifacts)
+        };
+        self.finish_driver_operation(agent, result)
+    }
+
+    pub fn invoke(
+        &mut self,
+        agent: AgentId,
+        invocation: InvocationWork,
+        authority: AuthorityReceipt,
+    ) -> Result<RuntimeOutcome, LocalAgentHostError> {
+        self.verify_root_scope()?;
+        if invocation.space != self.scope.space || invocation.agent != agent {
+            return Err(LocalAgentHostError::InvalidScope);
+        }
+        let result = {
+            let hosted = self
+                .agents
+                .get_mut(&agent)
+                .ok_or(LocalAgentHostError::NotFound)?;
+            hosted.driver.invoke_sdk(invocation, authority)
+        };
+        self.finish_driver_operation(agent, result)
+    }
+
+    pub fn resume(
+        &mut self,
+        agent: AgentId,
+        resume: ResumeWork,
+    ) -> Result<RuntimeOutcome, LocalAgentHostError> {
+        self.verify_root_scope()?;
+        let result = {
+            let hosted = self
+                .agents
+                .get_mut(&agent)
+                .ok_or(LocalAgentHostError::NotFound)?;
+            hosted.driver.resume_sdk(resume)
+        };
+        self.finish_driver_operation(agent, result)
+    }
+
+    fn finish_driver_operation(
+        &mut self,
+        agent: AgentId,
+        result: Result<RuntimeOutcome, AgentDriverError>,
+    ) -> Result<RuntimeOutcome, LocalAgentHostError> {
+        match result {
+            Ok(outcome) => {
+                self.refresh_hosted(agent)?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                if matches!(error, AgentDriverError::Store(_)) {
+                    // Recover a commit whose durable publication may have
+                    // succeeded before its final sync reported failure. The
+                    // caller still receives the original error and may retry
+                    // the exact signed request to recover its disposition.
+                    self.reload_hosted(agent)?;
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    fn refresh_hosted(&mut self, agent: AgentId) -> Result<(), LocalAgentHostError> {
+        let scope = self.scope;
+        let hosted = self
+            .agents
+            .get_mut(&agent)
+            .ok_or(LocalAgentHostError::NotFound)?;
+        let descriptor = descriptor_from_driver(&hosted.driver)?;
+        validate_descriptor_for_scope(scope, &descriptor)?;
+        if descriptor.identity.agent != agent {
+            return Err(LocalAgentHostError::Alias);
+        }
+        hosted.descriptor = descriptor;
+        validate_agent_slot(&self.agent_path(agent), false)
+    }
+
+    fn reload_hosted(&mut self, agent: AgentId) -> Result<(), LocalAgentHostError> {
+        let path = self.agent_path(agent);
+        let replacement = self.open_hosted(agent, &path)?;
+        self.agents.insert(agent, replacement);
+        Ok(())
+    }
+
+    fn open_hosted(
+        &self,
+        expected_agent: AgentId,
+        slot: &Path,
+    ) -> Result<HostedLocalAgent, LocalAgentHostError> {
+        validate_agent_slot(slot, true)?;
+        let mut driver =
+            AgentDriver::open_sdk(FileAgentStore::new(image_path(slot)), self.trust.clone())?;
+        driver.reconcile_catalog()?;
+        let descriptor = descriptor_from_driver(&driver)?;
+        self.validate_descriptor(&descriptor)?;
+        if descriptor.identity.agent != expected_agent {
+            return Err(LocalAgentHostError::Alias);
+        }
+        retire_image_stage(slot)?;
+        validate_agent_slot(slot, false)?;
+        Ok(HostedLocalAgent { driver, descriptor })
+    }
+
+    fn validate_descriptor(&self, descriptor: &AgentDescriptor) -> Result<(), LocalAgentHostError> {
+        validate_descriptor_for_scope(self.scope, descriptor)
+    }
+
+    fn descriptor_matches_scope(&self, descriptor: &AgentDescriptor) -> bool {
+        validate_descriptor_for_scope(self.scope, descriptor).is_ok()
+    }
+
+    fn recover_creating(&mut self) -> Result<(), LocalAgentHostError> {
+        let creating = self.root.join(CREATING_DIRECTORY);
+        for entry in fs::read_dir(&creating).map_err(|_| LocalAgentHostError::Io)? {
+            let entry = entry.map_err(|_| LocalAgentHostError::Io)?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| LocalAgentHostError::InvalidRoot)?;
+            let agent = decode_agent_id(&name).ok_or(LocalAgentHostError::InvalidRoot)?;
+            let file_type = entry.file_type().map_err(|_| LocalAgentHostError::Io)?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                return Err(LocalAgentHostError::InvalidRoot);
+            }
+            let stage = entry.path();
+            let destination = self.agent_path(agent);
+            if path_exists(&destination)? {
+                return Err(LocalAgentHostError::Alias);
+            }
+            match self.open_hosted(agent, &stage) {
+                Ok(hosted) => {
+                    drop(hosted);
+                    fs::rename(&stage, &destination).map_err(|_| LocalAgentHostError::Io)?;
+                    self.root_directory
+                        .sync_all()
+                        .map_err(|_| LocalAgentHostError::Io)?;
+                    sync_directory(&creating)?;
+                }
+                Err(
+                    LocalAgentHostError::Io
+                    | LocalAgentHostError::NotFound
+                    | LocalAgentHostError::Corrupt,
+                ) if unpublished_slot_is_empty(&stage)? => {
+                    remove_unpublished_slot(&stage)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_root_scope(&self) -> Result<(), LocalAgentHostError> {
+        let canonical =
+            fs::canonicalize(&self.root).map_err(|_| LocalAgentHostError::InvalidRoot)?;
+        if canonical != self.canonical_root || canonical != self.root {
+            return Err(LocalAgentHostError::InvalidRoot);
+        }
+        validate_same_directory(&self.root_directory, &self.root)
+            .map_err(|_| LocalAgentHostError::InvalidRoot)?;
+        require_private_directory(&self.root)?;
+        validate_same_file(&self.lock, &self.root.join(LOCK_FILE))?;
+        if read_scope_file(&self.root.join(SCOPE_FILE))? != self.scope {
+            return Err(LocalAgentHostError::InvalidScope);
+        }
+        require_private_file(&self.root.join(LOCK_FILE))?;
+        require_private_directory(&self.root.join(CREATING_DIRECTORY))?;
+        if fs::read_dir(self.root.join(CREATING_DIRECTORY))
+            .map_err(|_| LocalAgentHostError::Io)?
+            .next()
+            .transpose()
+            .map_err(|_| LocalAgentHostError::Io)?
+            .is_some()
+        {
+            return Err(LocalAgentHostError::Corrupt);
+        }
+        let disk_agents = scan_root(&self.root)?;
+        if disk_agents.len() != self.agents.len()
+            || !disk_agents
+                .iter()
+                .zip(self.agents.keys())
+                .all(|(disk, loaded)| disk == loaded)
+        {
+            return Err(LocalAgentHostError::Corrupt);
+        }
+        for agent in disk_agents {
+            validate_agent_slot(&self.agent_path(agent), false)?;
+        }
+        Ok(())
+    }
+
+    fn agent_path(&self, agent: AgentId) -> PathBuf {
+        self.root.join(encode_agent_id(agent))
+    }
+
+    fn creating_path(&self, agent: AgentId) -> PathBuf {
+        self.root
+            .join(CREATING_DIRECTORY)
+            .join(encode_agent_id(agent))
+    }
+}
+
+fn validate_descriptor_for_scope(
+    scope: RootScope,
+    descriptor: &AgentDescriptor,
+) -> Result<(), LocalAgentHostError> {
+    if descriptor.identity.profile != AgentProfile::Local {
+        return Err(LocalAgentHostError::UnsupportedProfile);
+    }
+    descriptor
+        .validate()
+        .map_err(|_| LocalAgentHostError::InvalidDescriptor)?;
+    if descriptor.identity.space != scope.space
+        || descriptor.replicas.len() != 1
+        || descriptor.replicas[0].node != scope.node
+    {
+        return Err(LocalAgentHostError::InvalidScope);
+    }
+    Ok(())
+}
+
+fn runtime_matches_descriptor(
+    runtime: &AdmittedRuntimePackage,
+    descriptor: &AgentDescriptor,
+) -> bool {
+    runtime.package_ref() == &descriptor.runtime_package
+        && runtime.deployment() == descriptor.identity.runtime_deployment
+        && runtime.program() == descriptor.identity.runtime_program
+        && runtime.producer() == descriptor.identity.runtime_producer
+        && runtime.manifest().contract == descriptor.runtime_contract
+        && runtime.capabilities() == descriptor.capabilities
+}
+
+fn descriptor_from_driver(
+    driver: &AgentDriver<FileAgentStore>,
+) -> Result<AgentDescriptor, LocalAgentHostError> {
+    let state = super::wire::decode_standard_runtime_state(&driver.image().runtime_state)
+        .map_err(|_| LocalAgentHostError::Corrupt)?;
+    state.clean_descriptor.ok_or(LocalAgentHostError::Corrupt)
+}
+
+fn image_path(slot: &Path) -> PathBuf {
+    slot.join(IMAGE_FILE)
+}
+
+fn create_agent_slot(path: &Path) -> Result<(), LocalAgentHostError> {
+    create_private_directory(path)?;
+    let catalog = path.join(CATALOG_DIRECTORY);
+    create_private_directory(&catalog)?;
+    for kind in CATALOG_KINDS {
+        create_private_directory(&catalog.join(kind))?;
+    }
+    sync_directory(&catalog)?;
+    sync_directory(path)
+}
+
+fn validate_agent_slot(path: &Path, allow_image_stage: bool) -> Result<(), LocalAgentHostError> {
+    require_private_directory(path)?;
+    let mut saw_image = false;
+    let mut saw_catalog = false;
+    for entry in fs::read_dir(path).map_err(|_| LocalAgentHostError::Io)? {
+        let entry = entry.map_err(|_| LocalAgentHostError::Io)?;
+        let name = entry.file_name();
+        let file_type = entry.file_type().map_err(|_| LocalAgentHostError::Io)?;
+        if name == OsStr::new(IMAGE_FILE) {
+            if file_type.is_symlink() || !file_type.is_file() {
+                return Err(LocalAgentHostError::Corrupt);
+            }
+            require_private_file(&entry.path())?;
+            saw_image = true;
+        } else if name == OsStr::new(IMAGE_STAGE_FILE) && allow_image_stage {
+            if file_type.is_symlink() || !file_type.is_file() {
+                return Err(LocalAgentHostError::Corrupt);
+            }
+            require_private_file(&entry.path())?;
+        } else if name == OsStr::new(CATALOG_DIRECTORY) {
+            if file_type.is_symlink() || !file_type.is_dir() {
+                return Err(LocalAgentHostError::Corrupt);
+            }
+            validate_catalog(&entry.path())?;
+            saw_catalog = true;
+        } else {
+            return Err(LocalAgentHostError::InvalidRoot);
+        }
+    }
+    if !saw_image || !saw_catalog {
+        return Err(LocalAgentHostError::Corrupt);
+    }
+    Ok(())
+}
+
+fn validate_catalog(path: &Path) -> Result<(), LocalAgentHostError> {
+    require_private_directory(path)?;
+    let mut seen = BTreeMap::new();
+    for entry in fs::read_dir(path).map_err(|_| LocalAgentHostError::Io)? {
+        let entry = entry.map_err(|_| LocalAgentHostError::Io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| LocalAgentHostError::InvalidRoot)?;
+        if !CATALOG_KINDS.contains(&name.as_str()) || seen.contains_key(&name) {
+            return Err(LocalAgentHostError::InvalidRoot);
+        }
+        let file_type = entry.file_type().map_err(|_| LocalAgentHostError::Io)?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return Err(LocalAgentHostError::Corrupt);
+        }
+        validate_catalog_kind(&entry.path(), &name)?;
+        seen.insert(name, ());
+    }
+    if seen.len() != CATALOG_KINDS.len() {
+        return Err(LocalAgentHostError::Corrupt);
+    }
+    Ok(())
+}
+
+fn validate_catalog_kind(path: &Path, kind: &str) -> Result<(), LocalAgentHostError> {
+    require_private_directory(path)?;
+    for entry in fs::read_dir(path).map_err(|_| LocalAgentHostError::Io)? {
+        let entry = entry.map_err(|_| LocalAgentHostError::Io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| LocalAgentHostError::InvalidRoot)?;
+        if !valid_catalog_leaf(&name, kind) {
+            return Err(LocalAgentHostError::InvalidRoot);
+        }
+        let file_type = entry.file_type().map_err(|_| LocalAgentHostError::Io)?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Err(LocalAgentHostError::Corrupt);
+        }
+        require_private_file(&entry.path())?;
+    }
+    Ok(())
+}
+
+fn valid_catalog_leaf(name: &str, kind: &str) -> bool {
+    let Some((identity, suffix)) = name.split_once('.') else {
+        return false;
+    };
+    identity.len() == 64
+        && identity
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && (suffix == "next"
+            || matches!(
+                (kind, suffix),
+                ("packages", "vos")
+                    | ("programs", "pvm")
+                    | ("schemas", "agent")
+                    | ("policies", "roles")
+                    | ("installation-data", "args")
+            ))
+}
+
+fn retire_image_stage(slot: &Path) -> Result<(), LocalAgentHostError> {
+    let stage = slot.join(IMAGE_STAGE_FILE);
+    match fs::symlink_metadata(&stage) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(LocalAgentHostError::Corrupt);
+            }
+            require_private_file(&stage)?;
+            fs::remove_file(&stage).map_err(|_| LocalAgentHostError::Io)?;
+            sync_directory(slot)
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(LocalAgentHostError::Io),
+    }
+}
+
+fn scan_root(root: &Path) -> Result<Vec<AgentId>, LocalAgentHostError> {
+    let mut agents = Vec::new();
+    for entry in fs::read_dir(root).map_err(|_| LocalAgentHostError::Io)? {
+        let entry = entry.map_err(|_| LocalAgentHostError::Io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| LocalAgentHostError::InvalidRoot)?;
+        let file_type = entry.file_type().map_err(|_| LocalAgentHostError::Io)?;
+        match name.as_str() {
+            SCOPE_FILE | LOCK_FILE => {
+                if file_type.is_symlink() || !file_type.is_file() {
+                    return Err(LocalAgentHostError::InvalidRoot);
+                }
+                require_private_file(&entry.path())?;
+            }
+            CREATING_DIRECTORY => {
+                if file_type.is_symlink() || !file_type.is_dir() {
+                    return Err(LocalAgentHostError::InvalidRoot);
+                }
+                require_private_directory(&entry.path())?;
+            }
+            _ => {
+                let agent = decode_agent_id(&name).ok_or(LocalAgentHostError::InvalidRoot)?;
+                if file_type.is_symlink() || !file_type.is_dir() {
+                    return Err(LocalAgentHostError::InvalidRoot);
+                }
+                require_private_directory(&entry.path())?;
+                agents.push(agent);
+            }
+        }
+    }
+    agents.sort_unstable();
+    if agents.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(LocalAgentHostError::Alias);
+    }
+    Ok(agents)
+}
+
+fn encode_scope(scope: RootScope) -> [u8; SCOPE_BYTES] {
+    let mut bytes = [0; SCOPE_BYTES];
+    bytes[..4].copy_from_slice(SCOPE_MAGIC);
+    bytes[4..6].copy_from_slice(&SCOPE_VERSION.to_le_bytes());
+    bytes[6..38].copy_from_slice(scope.space.as_bytes());
+    bytes[38..70].copy_from_slice(scope.node.as_bytes());
+    let checksum = crate::agent_sdk::Hash::digest(
+        b"vos/local-agent-host/root-scope/v1",
+        &[&bytes[..SCOPE_PREFIX_BYTES]],
+    );
+    bytes[SCOPE_PREFIX_BYTES..].copy_from_slice(checksum.as_bytes());
+    bytes
+}
+
+fn decode_scope(bytes: &[u8]) -> Result<RootScope, LocalAgentHostError> {
+    if bytes.len() != SCOPE_BYTES || &bytes[..4] != SCOPE_MAGIC {
+        return Err(LocalAgentHostError::InvalidScope);
+    }
+    let version = u16::from_le_bytes(
+        bytes[4..6]
+            .try_into()
+            .map_err(|_| LocalAgentHostError::InvalidScope)?,
+    );
+    if version != SCOPE_VERSION {
+        return Err(LocalAgentHostError::InvalidScope);
+    }
+    let scope = RootScope {
+        space: SpaceId(
+            bytes[6..38]
+                .try_into()
+                .map_err(|_| LocalAgentHostError::InvalidScope)?,
+        ),
+        node: NodeId(
+            bytes[38..70]
+                .try_into()
+                .map_err(|_| LocalAgentHostError::InvalidScope)?,
+        ),
+    };
+    if scope.space == SpaceId::ZERO
+        || scope.node == NodeId::ZERO
+        || encode_scope(scope).as_slice() != bytes
+    {
+        return Err(LocalAgentHostError::InvalidScope);
+    }
+    Ok(scope)
+}
+
+fn publish_scope(
+    root: &Path,
+    root_directory: &File,
+    scope: RootScope,
+) -> Result<(), LocalAgentHostError> {
+    let stage = root.join(SCOPE_STAGE_FILE);
+    write_new_private_file(&stage, &encode_scope(scope))?;
+    root_directory
+        .sync_all()
+        .map_err(|_| LocalAgentHostError::Io)?;
+    fs::rename(&stage, root.join(SCOPE_FILE)).map_err(|_| LocalAgentHostError::Io)?;
+    root_directory
+        .sync_all()
+        .map_err(|_| LocalAgentHostError::Io)
+}
+
+fn recover_scope_publication(
+    root: &Path,
+    root_directory: &File,
+    expected: RootScope,
+) -> Result<(), LocalAgentHostError> {
+    let canonical = root.join(SCOPE_FILE);
+    let stage = root.join(SCOPE_STAGE_FILE);
+    let canonical_scope = optional_scope(&canonical)?;
+    let staged_scope = optional_scope(&stage)?;
+    match (canonical_scope, staged_scope) {
+        (Some(scope), None) if scope == expected => Ok(()),
+        (Some(scope), Some(staged)) if scope == expected && staged == scope => {
+            fs::remove_file(stage).map_err(|_| LocalAgentHostError::Io)?;
+            root_directory
+                .sync_all()
+                .map_err(|_| LocalAgentHostError::Io)
+        }
+        (None, Some(scope)) if scope == expected && root_without_scope_is_pristine(root)? => {
+            fs::rename(stage, canonical).map_err(|_| LocalAgentHostError::Io)?;
+            root_directory
+                .sync_all()
+                .map_err(|_| LocalAgentHostError::Io)
+        }
+        (Some(_), _) | (None, Some(_)) => Err(LocalAgentHostError::InvalidScope),
+        (None, None) => Err(LocalAgentHostError::InvalidScope),
+    }
+}
+
+fn optional_scope(path: &Path) -> Result<Option<RootScope>, LocalAgentHostError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => read_scope_file(path).map(Some),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(LocalAgentHostError::Io),
+    }
+}
+
+fn read_scope_file(path: &Path) -> Result<RootScope, LocalAgentHostError> {
+    require_private_file(path)?;
+    let mut file = open_read_nofollow(path)?;
+    let length = file.metadata().map_err(|_| LocalAgentHostError::Io)?.len();
+    if length != SCOPE_BYTES as u64 {
+        return Err(LocalAgentHostError::InvalidScope);
+    }
+    let mut bytes = [0; SCOPE_BYTES];
+    file.read_exact(&mut bytes)
+        .map_err(|_| LocalAgentHostError::InvalidScope)?;
+    decode_scope(&bytes)
+}
+
+fn root_without_scope_is_pristine(root: &Path) -> Result<bool, LocalAgentHostError> {
+    for entry in fs::read_dir(root).map_err(|_| LocalAgentHostError::Io)? {
+        let entry = entry.map_err(|_| LocalAgentHostError::Io)?;
+        let name = entry.file_name();
+        if name != OsStr::new(LOCK_FILE)
+            && name != OsStr::new(CREATING_DIRECTORY)
+            && name != OsStr::new(SCOPE_STAGE_FILE)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn open_root_lock(
+    root: &Path,
+    root_directory: &File,
+    create: bool,
+) -> Result<File, LocalAgentHostError> {
+    let path = root.join(LOCK_FILE);
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(&path).map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            LocalAgentHostError::InvalidRoot
+        } else {
+            LocalAgentHostError::Io
+        }
+    })?;
+    require_private_file(&path)?;
+    file.try_lock_exclusive().map_err(|error| {
+        if error.kind() == ErrorKind::WouldBlock {
+            LocalAgentHostError::Busy
+        } else {
+            LocalAgentHostError::Io
+        }
+    })?;
+    validate_same_file(&file, &path)?;
+    file.sync_all().map_err(|_| LocalAgentHostError::Io)?;
+    root_directory
+        .sync_all()
+        .map_err(|_| LocalAgentHostError::Io)?;
+    validate_same_file(&file, &path)?;
+    Ok(file)
+}
+
+fn require_new_canonical_path(path: &Path) -> Result<(), LocalAgentHostError> {
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(LocalAgentHostError::InvalidRoot);
+    }
+    let parent = path.parent().ok_or(LocalAgentHostError::InvalidRoot)?;
+    require_existing_canonical_path(parent)
+}
+
+fn require_existing_canonical_path(path: &Path) -> Result<(), LocalAgentHostError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(LocalAgentHostError::InvalidRoot);
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| LocalAgentHostError::InvalidRoot)?;
+    if canonical != path {
+        return Err(LocalAgentHostError::InvalidRoot);
+    }
+    require_private_directory_or_trusted_parent(path)
+}
+
+fn require_private_directory_or_trusted_parent(path: &Path) -> Result<(), LocalAgentHostError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| LocalAgentHostError::InvalidRoot)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(LocalAgentHostError::InvalidRoot);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let effective_user = unsafe { libc::geteuid() };
+        let trusted_owner = metadata.uid() == effective_user || metadata.uid() == 0;
+        let sticky = metadata.mode() & libc::S_ISVTX != 0;
+        if !trusted_owner || metadata.mode() & 0o022 != 0 && !sticky {
+            return Err(LocalAgentHostError::InvalidRoot);
+        }
+    }
+    Ok(())
+}
+
+fn create_private_directory(path: &Path) -> Result<(), LocalAgentHostError> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|_| LocalAgentHostError::Io)?;
+    require_private_directory(path)
+}
+
+fn open_private_directory(path: &Path) -> Result<File, LocalAgentHostError> {
+    require_private_directory(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| LocalAgentHostError::InvalidRoot)?;
+    validate_same_directory(&file, path)?;
+    Ok(file)
+}
+
+fn require_private_directory(path: &Path) -> Result<(), LocalAgentHostError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| LocalAgentHostError::InvalidRoot)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(LocalAgentHostError::InvalidRoot);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(LocalAgentHostError::InvalidRoot);
+        }
+    }
+    Ok(())
+}
+
+fn require_private_file(path: &Path) -> Result<(), LocalAgentHostError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| LocalAgentHostError::Corrupt)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(LocalAgentHostError::Corrupt);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(LocalAgentHostError::Alias);
+        }
+    }
+    Ok(())
+}
+
+fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<(), LocalAgentHostError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|_| LocalAgentHostError::Io)?;
+    file.write_all(bytes).map_err(|_| LocalAgentHostError::Io)?;
+    file.sync_all().map_err(|_| LocalAgentHostError::Io)?;
+    validate_same_file(&file, path)
+}
+
+fn open_read_nofollow(path: &Path) -> Result<File, LocalAgentHostError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| LocalAgentHostError::Corrupt)?;
+    validate_same_file(&file, path)?;
+    Ok(file)
+}
+
+fn validate_same_file(file: &File, path: &Path) -> Result<(), LocalAgentHostError> {
+    let opened = file.metadata().map_err(|_| LocalAgentHostError::Io)?;
+    let named = fs::symlink_metadata(path).map_err(|_| LocalAgentHostError::Corrupt)?;
+    if !opened.is_file() || !named.is_file() || named.file_type().is_symlink() {
+        return Err(LocalAgentHostError::Corrupt);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if opened.dev() != named.dev() || opened.ino() != named.ino() {
+            return Err(LocalAgentHostError::Alias);
+        }
+    }
+    Ok(())
+}
+
+fn validate_same_directory(file: &File, path: &Path) -> Result<(), LocalAgentHostError> {
+    let opened = file.metadata().map_err(|_| LocalAgentHostError::Io)?;
+    let named = fs::symlink_metadata(path).map_err(|_| LocalAgentHostError::InvalidRoot)?;
+    if !opened.is_dir() || !named.is_dir() || named.file_type().is_symlink() {
+        return Err(LocalAgentHostError::InvalidRoot);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if opened.dev() != named.dev() || opened.ino() != named.ino() {
+            return Err(LocalAgentHostError::Alias);
+        }
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), LocalAgentHostError> {
+    open_private_directory(path)?
+        .sync_all()
+        .map_err(|_| LocalAgentHostError::Io)
+}
+
+fn path_exists(path: &Path) -> Result<bool, LocalAgentHostError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(LocalAgentHostError::Io),
+    }
+}
+
+fn unpublished_slot_is_empty(path: &Path) -> Result<bool, LocalAgentHostError> {
+    require_private_directory(path)?;
+    let image = image_path(path);
+    if path_exists(&image)? || path_exists(&path.join(IMAGE_STAGE_FILE))? {
+        return Ok(false);
+    }
+    validate_unpublished_tree(path)?;
+    Ok(true)
+}
+
+fn validate_unpublished_tree(path: &Path) -> Result<(), LocalAgentHostError> {
+    for entry in fs::read_dir(path).map_err(|_| LocalAgentHostError::Io)? {
+        let entry = entry.map_err(|_| LocalAgentHostError::Io)?;
+        let file_type = entry.file_type().map_err(|_| LocalAgentHostError::Io)?;
+        if file_type.is_symlink() {
+            return Err(LocalAgentHostError::Corrupt);
+        }
+        if file_type.is_dir() {
+            require_private_directory(&entry.path())?;
+            validate_unpublished_tree(&entry.path())?;
+        } else if file_type.is_file() {
+            require_private_file(&entry.path())?;
+        } else {
+            return Err(LocalAgentHostError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
+fn remove_unpublished_slot(path: &Path) -> Result<(), LocalAgentHostError> {
+    validate_unpublished_tree(path)?;
+    fs::remove_dir_all(path).map_err(|_| LocalAgentHostError::Io)?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn encode_agent_id(agent: AgentId) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in agent.as_bytes() {
+        use core::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn decode_agent_id(name: &str) -> Option<AgentId> {
+    if name.len() != 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut bytes = [0; 32];
+    for (index, pair) in name.as_bytes().chunks_exact(2).enumerate() {
+        bytes[index] = (decode_hex(pair[0])? << 4) | decode_hex(pair[1])?;
+    }
+    let agent = AgentId(bytes);
+    (agent != AgentId::ZERO && encode_agent_id(agent) == name).then_some(agent)
+}
+
+fn decode_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+    use super::*;
+    use crate::agent::authority::AgentAuthorityBinding as LegacyAuthorityBinding;
+    use crate::agent::driver::AgentTrustProvider;
+    use crate::agent::package::Package as LegacyPackage;
+    use crate::agent::package_admission::{
+        AdmittedActorPackage, admit_actor_package, admit_runtime_package,
+    };
+    use crate::agent_sdk as sdk;
+    use crate::agent_sdk::authority::{
+        AgentAuthorityBinding, AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots,
+        AuthorityOperationKind, AuthorityReceiptSelector,
+    };
+    use crate::agent_sdk::contract::{ActorPackageContract, RuntimePackageContract};
+    use crate::agent_sdk::introspection::{
+        ActorIntrospectionArtifact, ActorMethodIntrospection, CliExposure, MethodDispatch,
+    };
+    use crate::agent_sdk::method_policy::{
+        ActorMethodPolicy, ActorMethodPolicyArtifact, AttestationRequirement,
+        AuthorizationPolicySelector, IdempotencyRequirement,
+    };
+    use crate::agent_sdk::package::{
+        ActorPackageManifest, AgentRuntimePackageManifest, PackageArtifact, PackageEnvelope,
+        PackageManifest, PackageSigning,
+    };
+    use crate::agent_sdk::schema::{
+        ConstructorContract, ParsedField, ParsedInlineField, ParsedMethod, ParsedSchema,
+    };
+    use crate::agent_sdk::task::TaskDependencySetArtifact;
+    use crate::agent_sdk::wire::CanonicalWire as _;
+    use crate::agent_sdk::{
+        ActorEntry, ActorId, AgentIdentity, AgentReplica, BlobRef, Hash, InstallationId,
+        InvocationId, LaneSet, ManagementReply, MethodMode, PrincipalId, ReplicaRole, RuntimeBlob,
+        RuntimeCapabilities, RuntimeRequirements, StateLane,
+    };
+    use crate::service::SpaceId as LegacySpaceId;
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+    const PACKAGE_SEED: [u8; 32] = [0x71; 32];
+    const AUTHORITY_SEED: [u8; 32] = [0x72; 32];
+    const RUNTIME_PVM: &[u8] = include_bytes!("../../../vosx/blobs/agent_runtime.pvm");
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "vos-local-sdk-host-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn child(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct TestTrust;
+
+    impl AgentTrustProvider for TestTrust {
+        fn current_logical_slot(&self) -> Option<u64> {
+            Some(1)
+        }
+
+        fn authority_for_space(&self, _space: LegacySpaceId) -> Option<LegacyAuthorityBinding> {
+            None
+        }
+
+        fn verify_package(
+            &self,
+            _agent: &super::super::AgentConfig,
+            _package: &LegacyPackage,
+        ) -> bool {
+            false
+        }
+    }
+
+    fn trust() -> Arc<dyn AgentTrustProvider> {
+        Arc::new(TestTrust)
+    }
+
+    struct ClockTrust {
+        slot: Arc<AtomicU64>,
+    }
+
+    impl AgentTrustProvider for ClockTrust {
+        fn current_logical_slot(&self) -> Option<u64> {
+            Some(self.slot.load(Ordering::SeqCst))
+        }
+
+        fn authority_for_space(&self, _space: LegacySpaceId) -> Option<LegacyAuthorityBinding> {
+            None
+        }
+
+        fn verify_package(
+            &self,
+            _agent: &super::super::AgentConfig,
+            _package: &LegacyPackage,
+        ) -> bool {
+            false
+        }
+    }
+
+    fn clock_trust(initial: u64) -> (Arc<AtomicU64>, Arc<dyn AgentTrustProvider>) {
+        let slot = Arc::new(AtomicU64::new(initial));
+        let trust: Arc<dyn AgentTrustProvider> = Arc::new(ClockTrust { slot: slot.clone() });
+        (slot, trust)
+    }
+
+    fn space() -> SpaceId {
+        SpaceId([0x11; 32])
+    }
+
+    fn node() -> NodeId {
+        NodeId([0x22; 32])
+    }
+
+    fn package_signing() -> PackageSigning {
+        let key = SigningKey::from_bytes(&PACKAGE_SEED);
+        let public_key = key.verifying_key().to_bytes();
+        PackageSigning {
+            producer: sdk::ProducerId::of_public_key(&public_key),
+            public_key,
+            signature: [0; sdk::package::PACKAGE_SIGNATURE_BYTES],
+        }
+    }
+
+    fn sign_package(mut package: PackageEnvelope) -> PackageEnvelope {
+        let bytes = package.signing_bytes().unwrap();
+        package.manifest.signing_mut().signature = SigningKey::from_bytes(&PACKAGE_SEED)
+            .sign(&bytes)
+            .to_bytes();
+        package
+    }
+
+    fn artifact(bytes: &[u8]) -> PackageArtifact {
+        PackageArtifact {
+            identity: BlobRef::of_bytes(bytes),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn admitted_runtime() -> AdmittedRuntimePackage {
+        let package = sign_package(PackageEnvelope {
+            manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
+                name: "standard-local-runtime".into(),
+                outer_program: BlobRef::of_bytes(RUNTIME_PVM),
+                contract: RuntimePackageContract::canonical(),
+                capabilities: RuntimeCapabilities::standard(),
+                signing: package_signing(),
+            }),
+            artifacts: vec![artifact(RUNTIME_PVM)],
+        });
+        admit_runtime_package(&package.encode().unwrap()).unwrap()
+    }
+
+    fn authority_key() -> SigningKey {
+        SigningKey::from_bytes(&AUTHORITY_SEED)
+    }
+
+    fn descriptor(
+        runtime: &AdmittedRuntimePackage,
+        discriminator: u8,
+        profile: AgentProfile,
+        target_space: SpaceId,
+        target_node: NodeId,
+    ) -> AgentDescriptor {
+        let owner = PrincipalId([discriminator; 32]);
+        let creation_nonce = Hash([discriminator.wrapping_add(0x30); 32]);
+        let agent = AgentId::derive(target_space, owner, creation_nonce.as_bytes());
+        let authority_key = authority_key();
+        let public_key = authority_key.verifying_key().to_bytes();
+        let role = if profile == AgentProfile::Private {
+            ReplicaRole::Observer
+        } else {
+            ReplicaRole::Voter
+        };
+        let value = AgentDescriptor {
+            identity: AgentIdentity {
+                space: target_space,
+                agent,
+                owner,
+                profile,
+                runtime_deployment: runtime.deployment(),
+                runtime_program: runtime.program(),
+                runtime_producer: runtime.producer(),
+            },
+            creation_nonce,
+            authority: AgentAuthorityBinding {
+                policy: Hash([0x81; 32]),
+                issuer: AuthorityIssuer {
+                    principal: PrincipalId([0x82; 32]),
+                    actor: ActorId([0x83; 32]),
+                    deployment: sdk::DeploymentId([0x84; 32]),
+                    program: sdk::ProgramId([0x85; 32]),
+                    producer: sdk::ProducerId::of_public_key(&public_key),
+                },
+                public_key,
+                initial_epoch: 1,
+            },
+            runtime_package: runtime.package_ref().clone(),
+            runtime_contract: runtime.manifest().contract,
+            capabilities: runtime.capabilities(),
+            replicas: vec![AgentReplica {
+                node: target_node,
+                principal: owner,
+                role,
+            }],
+        };
+        value.validate().unwrap();
+        value
+    }
+
+    fn operation_for(
+        request: &ManagementRequest,
+    ) -> (
+        AuthorityOperationKind,
+        Option<ActorId>,
+        Option<sdk::DeploymentId>,
+    ) {
+        match request {
+            ManagementRequest::Create(_) => (AuthorityOperationKind::CreateAgent, None, None),
+            ManagementRequest::Install(install) => (
+                AuthorityOperationKind::InstallActor,
+                Some(install.entry.actor),
+                Some(install.entry.deployment),
+            ),
+            ManagementRequest::UpgradeActor(upgrade) => (
+                AuthorityOperationKind::UpgradeActor,
+                Some(upgrade.actor),
+                Some(upgrade.to_deployment),
+            ),
+            ManagementRequest::Suspend {
+                actor,
+                expected_deployment,
+            } => (
+                AuthorityOperationKind::SuspendActor,
+                Some(*actor),
+                Some(*expected_deployment),
+            ),
+            ManagementRequest::Resume {
+                actor,
+                expected_deployment,
+            } => (
+                AuthorityOperationKind::ResumeActor,
+                Some(*actor),
+                Some(*expected_deployment),
+            ),
+            ManagementRequest::RemoveLeaf {
+                actor,
+                expected_deployment,
+            } => (
+                AuthorityOperationKind::RemoveActor,
+                Some(*actor),
+                Some(*expected_deployment),
+            ),
+            ManagementRequest::UpgradeRuntime(_) => {
+                (AuthorityOperationKind::UpgradeRuntime, None, None)
+            }
+            ManagementRequest::ChangeReplicas { .. } => {
+                (AuthorityOperationKind::ChangeReplicaSet, None, None)
+            }
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
+                panic!("read-only management has no receipt")
+            }
+        }
+    }
+
+    fn management_receipt(
+        descriptor: &AgentDescriptor,
+        request: &ManagementRequest,
+        valid_from: u64,
+        expires_at: u64,
+    ) -> AuthorityReceipt {
+        let (operation, actor, actor_deployment) = operation_for(request);
+        let runtime_deployment = match request {
+            ManagementRequest::Create(created) => created.identity.runtime_deployment,
+            ManagementRequest::UpgradeRuntime(upgrade) => upgrade.from_deployment,
+            _ => descriptor.identity.runtime_deployment,
+        };
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: descriptor.authority.policy,
+                issuer: descriptor.authority.issuer,
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                operation,
+                runtime_deployment,
+                actor,
+                actor_deployment,
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: Hash([0x86; 32]),
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch: 1,
+                valid_from,
+                expires_at,
+                request: request.commitment(),
+            },
+            public_key: descriptor.authority.public_key,
+            signature: [0; sdk::authority::AUTHORITY_SIGNATURE_BYTES],
+        };
+        receipt.signature = authority_key().sign(&receipt.signing_bytes()).to_bytes();
+        receipt
+    }
+
+    fn create_receipt(descriptor: &AgentDescriptor, expires_at: u64) -> AuthorityReceipt {
+        management_receipt(
+            descriptor,
+            &ManagementRequest::Create(Box::new(descriptor.clone())),
+            1,
+            expires_at,
+        )
+    }
+
+    fn static_actor_program() -> Vec<u8> {
+        // Done + three lane lengths + one Linear byte + one reply byte.
+        let output = vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a, 0x63];
+        let mut actor = Assembler::new();
+        actor
+            .set_rw_data(output.clone())
+            .load_imm_64(Reg::A0, 2 * u64::from(vos_pvm::PVM_ZONE_SIZE))
+            .load_imm_64(Reg::A1, output.len() as u64)
+            .jump_ind(Reg::RA, 0);
+        actor.build_standard()
+    }
+
+    fn admitted_actor() -> AdmittedActorPackage {
+        admitted_actor_program(static_actor_program())
+    }
+
+    fn admitted_actor_program(program: Vec<u8>) -> AdmittedActorPackage {
+        let schema = ParsedSchema {
+            constructor: ConstructorContract::Forbidden,
+            fields: vec![ParsedField::Inline(ParsedInlineField {
+                source_index: 0,
+                name: "value".into(),
+                type_identity: "u8".into(),
+                persistence: sdk::FieldPersistence::State(StateLane::Linear),
+            })],
+            methods: vec![ParsedMethod {
+                source_index: 0,
+                name: "write".into(),
+                mode: MethodMode::Linear,
+                explicit: true,
+            }],
+        };
+        let schema_bytes = schema.encode().unwrap();
+        let policies = ActorMethodPolicyArtifact {
+            actor_schema: BlobRef::of_bytes(&schema_bytes),
+            methods: vec![ActorMethodPolicy {
+                name: "write".into(),
+                mode: MethodMode::Linear,
+                arguments: Vec::new(),
+                return_type_identity: "u8".into(),
+                authorization_policy: AuthorizationPolicySelector::Public,
+                idempotency: IdempotencyRequirement::Required,
+                attestation: AttestationRequirement::None,
+            }],
+        };
+        let policy_bytes = policies.encode().unwrap();
+        let introspection = ActorIntrospectionArtifact {
+            actor_schema: BlobRef::of_bytes(&schema_bytes),
+            method_policy: BlobRef::of_bytes(&policy_bytes),
+            actor_doc: "physical Local host fixture".into(),
+            methods: vec![ActorMethodIntrospection {
+                name: "write".into(),
+                doc: String::new(),
+                cli_exposure: CliExposure::Exposed,
+                timeout_ms: 0,
+                dispatch: MethodDispatch::Sync,
+            }],
+        };
+        let introspection_bytes = introspection.encode().unwrap();
+        let tasks = TaskDependencySetArtifact {
+            dependencies: Vec::new(),
+        };
+        let task_bytes = tasks.encode().unwrap();
+        let mut artifacts = vec![
+            artifact(&program),
+            artifact(&schema_bytes),
+            artifact(&policy_bytes),
+            artifact(&introspection_bytes),
+            artifact(&task_bytes),
+        ];
+        artifacts.sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+        let envelope = sign_package(PackageEnvelope {
+            manifest: PackageManifest::Actor(ActorPackageManifest {
+                name: "counter".into(),
+                program: BlobRef::of_bytes(&program),
+                contract: ActorPackageContract::canonical(),
+                state_lane_schema: BlobRef::of_bytes(&schema_bytes),
+                method_policy: BlobRef::of_bytes(&policy_bytes),
+                introspection: BlobRef::of_bytes(&introspection_bytes),
+                task_dependencies: BlobRef::of_bytes(&task_bytes),
+                scheduling: false,
+                requirements: RuntimeRequirements {
+                    lanes: LaneSet::of(StateLane::Linear),
+                    scheduling: false,
+                    proof_systems: sdk::ProofSystemSet::EMPTY,
+                },
+                signing: package_signing(),
+            }),
+            artifacts,
+        });
+        admit_actor_package(&envelope.encode().unwrap()).unwrap()
+    }
+
+    fn yielding_actor_program() -> Vec<u8> {
+        let yielded = [
+            crate::actors::STATUS_YIELDED,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+        ];
+        let done = [
+            crate::actors::STATUS_DONE,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            2,
+        ];
+        let mut data = Vec::new();
+        data.extend_from_slice(&yielded);
+        data.extend_from_slice(&yielded);
+        data.extend_from_slice(&done);
+        let base = 2 * u64::from(vos_pvm::PVM_ZONE_SIZE);
+        const FIRST_BRANCH: u32 = 5;
+        const SECOND_BRANCH: u32 = 20;
+        const FIRST_YIELD: u32 = 56;
+        const SECOND_YIELD: u32 = 82;
+        let mut actor = Assembler::new();
+        actor
+            .set_rw_data(data)
+            .ecalli(crate::abi::hostcall::SUSPEND)
+            .branch_eq_imm(Reg::A0, 0, FIRST_YIELD - FIRST_BRANCH)
+            .ecalli(crate::abi::hostcall::SUSPEND)
+            .branch_eq_imm(Reg::A0, 0, SECOND_YIELD - SECOND_BRANCH)
+            .load_imm_64(Reg::A0, base + (yielded.len() * 2) as u64)
+            .load_imm_64(Reg::A1, done.len() as u64)
+            .jump_ind(Reg::RA, 0);
+        actor
+            .load_imm_64(Reg::A0, base)
+            .load_imm_64(Reg::A1, yielded.len() as u64)
+            .jump_ind(Reg::RA, 0);
+        actor
+            .load_imm_64(Reg::A0, base + yielded.len() as u64)
+            .load_imm_64(Reg::A1, yielded.len() as u64)
+            .jump_ind(Reg::RA, 0);
+        actor.build_standard()
+    }
+
+    fn install_request(
+        descriptor: &AgentDescriptor,
+        package: &AdmittedActorPackage,
+    ) -> ManagementRequest {
+        let schema = sdk::schema::decode(package.state_lane_schema_bytes()).unwrap();
+        let actor = ActorId::top_level(descriptor.identity.agent, "counter");
+        let entry = ActorEntry {
+            actor,
+            name: "counter".into(),
+            parent: None,
+            deployment: package.deployment(),
+            program: package.program(),
+            package: package.package_ref().clone(),
+            agent_schema: package.manifest().state_lane_schema.clone(),
+            method_policy: package.manifest().method_policy.clone(),
+            constructor_abi: schema.constructor_abi().unwrap(),
+            installation_data: None,
+            state_layout: schema.state_layout_hash().unwrap(),
+            lanes: package.requirements().lanes,
+            suspended: false,
+        };
+        ManagementRequest::Install(Box::new(sdk::InstallActor {
+            installation_id: InstallationId([0x91; 32]),
+            registry_reservation: Hash([0x92; 32]),
+            entry,
+            producer: package.producer(),
+            package: package.package_ref().clone(),
+            agent_schema: package.manifest().state_lane_schema.clone(),
+            method_policy: package.manifest().method_policy.clone(),
+            constructor_abi: schema.constructor_abi().unwrap(),
+            installation_data: None,
+            state_layout: schema.state_layout_hash().unwrap(),
+            contract: package.manifest().contract,
+            requirements: package.requirements(),
+        }))
+    }
+
+    fn invocation_receipt(
+        descriptor: &AgentDescriptor,
+        invocation: &InvocationWork,
+        valid_from: u64,
+        expires_at: u64,
+    ) -> AuthorityReceipt {
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: descriptor.authority.policy,
+                issuer: descriptor.authority.issuer,
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                operation: AuthorityOperationKind::InvokeActor,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                actor: Some(invocation.actor),
+                actor_deployment: Some(invocation.deployment),
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: Hash([0x93; 32]),
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch: 1,
+                valid_from,
+                expires_at,
+                request: invocation.commitment(),
+            },
+            public_key: descriptor.authority.public_key,
+            signature: [0; sdk::authority::AUTHORITY_SIGNATURE_BYTES],
+        };
+        receipt.signature = authority_key().sign(&receipt.signing_bytes()).to_bytes();
+        receipt
+    }
+
+    fn availability(package: &AdmittedActorPackage) -> Vec<RuntimeBlob> {
+        let mut values = vec![
+            RuntimeBlob {
+                reference: BlobRef::of_bytes(package.program_bytes()),
+                bytes: package.program_bytes().to_vec(),
+            },
+            RuntimeBlob {
+                reference: BlobRef::of_bytes(package.state_lane_schema_bytes()),
+                bytes: package.state_lane_schema_bytes().to_vec(),
+            },
+            RuntimeBlob {
+                reference: BlobRef::of_bytes(package.method_policy_bytes()),
+                bytes: package.method_policy_bytes().to_vec(),
+            },
+        ];
+        values.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
+        values
+    }
+
+    fn invocation(
+        descriptor: &AgentDescriptor,
+        record: &sdk::ActorDirectoryRecord,
+        package: &AdmittedActorPackage,
+        id: u8,
+    ) -> InvocationWork {
+        InvocationWork {
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            runtime_deployment: descriptor.identity.runtime_deployment,
+            invocation: InvocationId([id; 32]),
+            actor: record.entry.actor,
+            incarnation: record.incarnation,
+            deployment: record.entry.deployment,
+            program: record.entry.program,
+            mode: MethodMode::Linear,
+            origin: sdk::InvocationOrigin::anonymous(),
+            message: vec![0x51],
+            installation_data: None,
+            availability: availability(package),
+            gas: 10_000_000,
+            recovery_only: false,
+        }
+    }
+
+    #[test]
+    fn empty_create_reopen_is_exactly_scoped_and_exclusively_locked() {
+        let directory = TestDirectory::new("empty");
+        let root = directory.child("agents");
+        let host = LocalAgentHost::create(&root, space(), node(), trust()).unwrap();
+        assert_eq!(host.space(), space());
+        assert_eq!(host.node(), node());
+        assert!(host.list().unwrap().is_empty());
+        assert!(matches!(
+            LocalAgentHost::open(&root, space(), node(), trust()),
+            Err(LocalAgentHostError::Busy)
+        ));
+        drop(host);
+
+        assert!(matches!(
+            LocalAgentHost::open(&root, SpaceId([0x12; 32]), node(), trust()),
+            Err(LocalAgentHostError::InvalidScope)
+        ));
+        assert!(matches!(
+            LocalAgentHost::open(&root, space(), NodeId([0x23; 32]), trust()),
+            Err(LocalAgentHostError::InvalidScope)
+        ));
+        let reopened = LocalAgentHost::open(&root, space(), node(), trust()).unwrap();
+        assert!(reopened.list().unwrap().is_empty());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
+            assert_eq!(
+                fs::metadata(root.join(SCOPE_FILE)).unwrap().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(root.join(LOCK_FILE)).unwrap().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn restart_retires_only_an_empty_unpublished_create_stage() {
+        let directory = TestDirectory::new("empty-stage");
+        let root = directory.child("agents");
+        drop(LocalAgentHost::create(&root, space(), node(), trust()).unwrap());
+        let staged_agent = AgentId([0x33; 32]);
+        let stage = root
+            .join(CREATING_DIRECTORY)
+            .join(encode_agent_id(staged_agent));
+        create_agent_slot(&stage).unwrap();
+
+        let host = LocalAgentHost::open(&root, space(), node(), trust()).unwrap();
+        assert!(host.list().unwrap().is_empty());
+        assert!(!stage.exists());
+    }
+
+    #[test]
+    fn root_scope_tamper_and_replacement_fail_closed() {
+        let directory = TestDirectory::new("replacement");
+        let root = directory.child("agents");
+        let host = LocalAgentHost::create(&root, space(), node(), trust()).unwrap();
+
+        let displaced = directory.child("displaced");
+        fs::rename(&root, &displaced).unwrap();
+        create_private_directory(&root).unwrap();
+        assert!(matches!(host.list(), Err(LocalAgentHostError::InvalidRoot)));
+        drop(host);
+
+        fs::remove_dir(&root).unwrap();
+        fs::rename(&displaced, &root).unwrap();
+        let scope_path = root.join(SCOPE_FILE);
+        let mut bytes = fs::read(&scope_path).unwrap();
+        bytes[10] ^= 1;
+        fs::write(&scope_path, bytes).unwrap();
+        assert!(matches!(
+            LocalAgentHost::open(&root, space(), node(), trust()),
+            Err(LocalAgentHostError::InvalidScope)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_path_child_and_hardlink_aliases_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("aliases");
+        let root = directory.child("agents");
+        drop(LocalAgentHost::create(&root, space(), node(), trust()).unwrap());
+
+        let root_alias = directory.child("root-alias");
+        symlink(&root, &root_alias).unwrap();
+        assert!(matches!(
+            LocalAgentHost::open(&root_alias, space(), node(), trust()),
+            Err(LocalAgentHostError::InvalidRoot)
+        ));
+
+        let external = directory.child("external");
+        create_private_directory(&external).unwrap();
+        symlink(&external, root.join(encode_agent_id(AgentId([0x44; 32])))).unwrap();
+        assert!(matches!(
+            LocalAgentHost::open(&root, space(), node(), trust()),
+            Err(LocalAgentHostError::InvalidRoot)
+        ));
+        fs::remove_file(root.join(encode_agent_id(AgentId([0x44; 32])))).unwrap();
+
+        fs::hard_link(root.join(SCOPE_FILE), root.join("scope-alias")).unwrap();
+        assert!(matches!(
+            LocalAgentHost::open(&root, space(), node(), trust()),
+            Err(LocalAgentHostError::Alias | LocalAgentHostError::InvalidRoot)
+        ));
+    }
+
+    #[test]
+    fn hostile_and_legacy_names_never_become_agents() {
+        let directory = TestDirectory::new("names");
+        let root = directory.child("agents");
+        drop(LocalAgentHost::create(&root, space(), node(), trust()).unwrap());
+
+        create_private_directory(
+            &root.join("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        )
+        .unwrap();
+        assert!(matches!(
+            LocalAgentHost::open(&root, space(), node(), trust()),
+            Err(LocalAgentHostError::InvalidRoot)
+        ));
+        fs::remove_dir(
+            root.join("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        )
+        .unwrap();
+
+        create_private_directory(&root.join("legacy-service-root")).unwrap();
+        assert!(matches!(
+            LocalAgentHost::open(&root, space(), node(), trust()),
+            Err(LocalAgentHostError::InvalidRoot)
+        ));
+    }
+
+    #[test]
+    fn live_host_detects_new_unowned_disk_entries() {
+        let directory = TestDirectory::new("live-injection");
+        let root = directory.child("agents");
+        let host = LocalAgentHost::create(&root, space(), node(), trust()).unwrap();
+        create_private_directory(&root.join(encode_agent_id(AgentId([0x55; 32])))).unwrap();
+        assert!(matches!(host.list(), Err(LocalAgentHostError::Corrupt)));
+    }
+
+    #[test]
+    #[ignore = "requires the clean RuntimeWork::Manage PVM repin"]
+    fn physical_sdk_create_two_agents_reopen_retry_and_profile_scope_refusals() {
+        let directory = TestDirectory::new("physical-create");
+        let root = directory.child("agents");
+        let (slot, trust) = clock_trust(1);
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust.clone()).unwrap();
+
+        let first_runtime = admitted_runtime();
+        let first = descriptor(&first_runtime, 1, AgentProfile::Local, space(), node());
+        let first_receipt = create_receipt(&first, 1);
+        let first_id = host
+            .create_agent(first_runtime, first.clone(), first_receipt.clone())
+            .unwrap();
+        assert_eq!(first_id, first.identity.agent);
+        assert_eq!(host.show(first_id).unwrap(), &first);
+
+        // Model a lost successful response. The exact Create receipt remains
+        // recoverable after expiry through the guest-owned disposition.
+        slot.store(50, Ordering::SeqCst);
+        assert_eq!(
+            host.create_agent(admitted_runtime(), first.clone(), first_receipt)
+                .unwrap(),
+            first_id
+        );
+
+        let second_runtime = admitted_runtime();
+        let second = descriptor(&second_runtime, 2, AgentProfile::Local, space(), node());
+        let second_receipt = create_receipt(&second, 100);
+        let second_id = host
+            .create_agent(second_runtime, second.clone(), second_receipt)
+            .unwrap();
+        assert_ne!(first_id, second_id);
+        assert_eq!(host.list().unwrap(), {
+            let mut ids = vec![first_id, second_id];
+            ids.sort_unstable();
+            ids
+        });
+        assert!(root.join(encode_agent_id(first_id)).is_dir());
+        assert!(root.join(encode_agent_id(second_id)).is_dir());
+        assert!(!root.join("first").exists() && !root.join("second").exists());
+
+        let shared_runtime = admitted_runtime();
+        let shared = descriptor(&shared_runtime, 3, AgentProfile::Shared, space(), node());
+        assert_eq!(
+            host.create_agent(shared_runtime, shared.clone(), create_receipt(&shared, 100)),
+            Err(LocalAgentHostError::UnsupportedProfile)
+        );
+
+        let wrong_space_runtime = admitted_runtime();
+        let wrong_space = descriptor(
+            &wrong_space_runtime,
+            4,
+            AgentProfile::Local,
+            SpaceId([0x12; 32]),
+            node(),
+        );
+        assert_eq!(
+            host.create_agent(
+                wrong_space_runtime,
+                wrong_space.clone(),
+                create_receipt(&wrong_space, 100),
+            ),
+            Err(LocalAgentHostError::InvalidScope)
+        );
+
+        let wrong_node_runtime = admitted_runtime();
+        let wrong_node = descriptor(
+            &wrong_node_runtime,
+            5,
+            AgentProfile::Local,
+            space(),
+            NodeId([0x23; 32]),
+        );
+        assert_eq!(
+            host.create_agent(
+                wrong_node_runtime,
+                wrong_node.clone(),
+                create_receipt(&wrong_node, 100),
+            ),
+            Err(LocalAgentHostError::InvalidScope)
+        );
+
+        drop(host);
+        let reopened = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+        assert_eq!(reopened.show(first_id).unwrap(), &first);
+        assert_eq!(reopened.show(second_id).unwrap(), &second);
+    }
+
+    #[test]
+    #[ignore = "requires the clean RuntimeWork::Manage PVM repin"]
+    fn physical_valid_staged_create_and_store_stages_reconcile_on_restart() {
+        let directory = TestDirectory::new("physical-stage");
+        let root = directory.child("agents");
+        let (_, trust) = clock_trust(1);
+        drop(LocalAgentHost::create(&root, space(), node(), trust.clone()).unwrap());
+
+        let runtime = admitted_runtime();
+        let descriptor = descriptor(&runtime, 6, AgentProfile::Local, space(), node());
+        let agent = descriptor.identity.agent;
+        let stage = root.join(CREATING_DIRECTORY).join(encode_agent_id(agent));
+        create_agent_slot(&stage).unwrap();
+        drop(
+            AgentDriver::create_sdk(
+                runtime,
+                descriptor.clone(),
+                FileAgentStore::new(image_path(&stage)),
+                trust.clone(),
+                create_receipt(&descriptor, 10),
+            )
+            .unwrap(),
+        );
+
+        // Model a synced-but-unpublished image candidate and an actor-artifact
+        // sidecar left by a failed stage. Opening authenticates the committed
+        // image first, then retires both unowned candidates.
+        write_new_private_file(
+            &stage.join(IMAGE_STAGE_FILE),
+            &fs::read(image_path(&stage)).unwrap(),
+        )
+        .unwrap();
+        let artifact_stage = stage
+            .join(CATALOG_DIRECTORY)
+            .join("packages")
+            .join(format!("{}.next", "a".repeat(64)));
+        write_new_private_file(&artifact_stage, b"unpublished VOS3 stage").unwrap();
+
+        let host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+        assert_eq!(host.show(agent).unwrap(), &descriptor);
+        assert!(!stage.exists());
+        let destination = root.join(encode_agent_id(agent));
+        assert!(!destination.join(IMAGE_STAGE_FILE).exists());
+        assert!(
+            !destination
+                .join(CATALOG_DIRECTORY)
+                .join("packages")
+                .join(format!("{}.next", "a".repeat(64)))
+                .exists()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the clean RuntimeWork::Manage PVM repin"]
+    fn physical_manage_invoke_retry_lifecycle_and_catalog_reconciliation() {
+        let directory = TestDirectory::new("physical-lifecycle");
+        let root = directory.child("agents");
+        let (slot, trust) = clock_trust(1);
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust.clone()).unwrap();
+        let runtime = admitted_runtime();
+        let descriptor = descriptor(&runtime, 7, AgentProfile::Local, space(), node());
+        let agent = host
+            .create_agent(runtime, descriptor.clone(), create_receipt(&descriptor, 10))
+            .unwrap();
+        let actor_package = admitted_actor();
+        let install = install_request(&descriptor, &actor_package);
+        let install_receipt = management_receipt(&descriptor, &install, 1, 2);
+        slot.store(2, Ordering::SeqCst);
+        let installed = host
+            .manage(
+                agent,
+                install.clone(),
+                Some(install_receipt.clone()),
+                SdkManagementArtifacts::Actor(&actor_package),
+            )
+            .unwrap();
+        assert!(matches!(
+            installed,
+            RuntimeOutcome::Management(Ok(ManagementReply::Installed(_)))
+        ));
+
+        // Lose the result, expire its receipt, and restart. The exact retry
+        // must return the byte-identical terminal disposition.
+        drop(host);
+        slot.store(50, Ordering::SeqCst);
+        let mut host = LocalAgentHost::open(&root, space(), node(), trust.clone()).unwrap();
+        let retried = host
+            .manage(
+                agent,
+                install.clone(),
+                Some(install_receipt),
+                SdkManagementArtifacts::Actor(&actor_package),
+            )
+            .unwrap();
+        assert_eq!(retried, installed);
+
+        let page = host
+            .manage(
+                agent,
+                ManagementRequest::InspectActors {
+                    after: None,
+                    limit: 8,
+                },
+                None,
+                SdkManagementArtifacts::None,
+            )
+            .unwrap();
+        let RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) = page else {
+            panic!("inspect did not return the canonical directory")
+        };
+        let record = page.entries.first().unwrap().clone();
+
+        let work = invocation(&descriptor, &record, &actor_package, 0xa1);
+        let authority = invocation_receipt(&descriptor, &work, 50, 50);
+        let completed = host.invoke(agent, work.clone(), authority.clone()).unwrap();
+        assert!(matches!(completed, RuntimeOutcome::Completed(Ok(_))));
+        drop(host);
+        slot.store(100, Ordering::SeqCst);
+        let mut host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+        assert_eq!(
+            host.invoke(agent, work, authority).unwrap(),
+            completed,
+            "an expired exact retry recovers the result without re-execution"
+        );
+
+        let actor = record.entry.actor;
+        let deployment = record.entry.deployment;
+        for (logical_slot, request, expected) in [
+            (
+                101,
+                ManagementRequest::Suspend {
+                    actor,
+                    expected_deployment: deployment,
+                },
+                0u8,
+            ),
+            (
+                102,
+                ManagementRequest::Resume {
+                    actor,
+                    expected_deployment: deployment,
+                },
+                1u8,
+            ),
+            (
+                103,
+                ManagementRequest::RemoveLeaf {
+                    actor,
+                    expected_deployment: deployment,
+                },
+                2u8,
+            ),
+        ] {
+            slot.store(logical_slot, Ordering::SeqCst);
+            let receipt = management_receipt(&descriptor, &request, logical_slot, logical_slot);
+            let outcome = host
+                .manage(agent, request, Some(receipt), SdkManagementArtifacts::None)
+                .unwrap();
+            assert!(matches!(
+                (expected, outcome),
+                (
+                    0,
+                    RuntimeOutcome::Management(Ok(ManagementReply::Suspended(_)))
+                ) | (
+                    1,
+                    RuntimeOutcome::Management(Ok(ManagementReply::Resumed(_)))
+                ) | (
+                    2,
+                    RuntimeOutcome::Management(Ok(ManagementReply::Removed(_)))
+                )
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the clean RuntimeWork::Manage PVM repin"]
+    fn physical_resume_boundary_replays_persisted_fifo_continuations() {
+        let directory = TestDirectory::new("physical-resume");
+        let root = directory.child("agents");
+        let (slot, trust) = clock_trust(1);
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust).unwrap();
+        let runtime = admitted_runtime();
+        let descriptor = descriptor(&runtime, 8, AgentProfile::Local, space(), node());
+        let agent = host
+            .create_agent(runtime, descriptor.clone(), create_receipt(&descriptor, 10))
+            .unwrap();
+        let actor_package = admitted_actor_program(yielding_actor_program());
+        let install = install_request(&descriptor, &actor_package);
+        slot.store(2, Ordering::SeqCst);
+        host.manage(
+            agent,
+            install.clone(),
+            Some(management_receipt(&descriptor, &install, 2, 2)),
+            SdkManagementArtifacts::Actor(&actor_package),
+        )
+        .unwrap();
+        let RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) = host
+            .manage(
+                agent,
+                ManagementRequest::InspectActors {
+                    after: None,
+                    limit: 4,
+                },
+                None,
+                SdkManagementArtifacts::None,
+            )
+            .unwrap()
+        else {
+            panic!("inspect did not return an actor")
+        };
+        let work = invocation(&descriptor, &page.entries[0], &actor_package, 0xb1);
+        slot.store(3, Ordering::SeqCst);
+        let mut outcome = host
+            .invoke(
+                agent,
+                work.clone(),
+                invocation_receipt(&descriptor, &work, 3, 3),
+            )
+            .unwrap();
+        for _ in 0..3 {
+            let RuntimeOutcome::Yielded(yielded) = outcome else {
+                assert!(matches!(outcome, RuntimeOutcome::Completed(Ok(_))));
+                return;
+            };
+            outcome = host
+                .resume(
+                    agent,
+                    ResumeWork {
+                        invocation: yielded.invocation,
+                        actor: yielded.actor,
+                        incarnation: yielded.incarnation,
+                        deployment: yielded.deployment,
+                        program: yielded.program,
+                        mode: yielded.mode,
+                        continuation: yielded.continuation,
+                        ready_sequence: yielded.ready_sequence,
+                        installation_data: yielded.installation_data,
+                        availability: work.availability.clone(),
+                        input: None,
+                    },
+                )
+                .unwrap();
+        }
+        panic!("the bounded fixture did not reach a terminal reply")
+    }
+}

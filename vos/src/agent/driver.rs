@@ -1451,9 +1451,14 @@ impl FileAgentStore {
             Some(_) => return Err(AgentStoreError::Corrupt),
             None => {}
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&next)
             .map_err(|_| AgentStoreError::Unavailable)?;
         let result = file
@@ -1537,9 +1542,14 @@ impl AgentImageStore for FileAgentStore {
             std::fs::remove_file(&next).map_err(|_| AgentStoreError::Unavailable)?;
             self.sync_parent()?;
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&next)
             .map_err(|_| AgentStoreError::Unavailable)?;
         file.write_all(&bytes)
