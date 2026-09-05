@@ -994,50 +994,50 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
 
     assert!(
         PRODUCTION_ARTIFACT_PROVENANCE
-            .contains("source_revision = \"0009408275d0a889d87731c0e7471a5dfef9165f\"")
+            .contains("source_revision = \"54ec5cca7dc5be3fc80f2f89247233719f790b95\"")
     );
     assert!(
         PRODUCTION_ARTIFACT_PROVENANCE.contains(
-            "agent_runtime_source_revision = \"0009408275d0a889d87731c0e7471a5dfef9165f\""
+            "agent_runtime_source_revision = \"54ec5cca7dc5be3fc80f2f89247233719f790b95\""
         )
     );
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("guest_toolchain = \"nightly-2026-03-20\""));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("host_toolchain = \"nightly-2025-05-09\""));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "service_program_id = \"883f61dca53e279f78780817072422d3c96d8b3947a58c94094d5f47c3233f38\""
+        "service_program_id = \"38207480731d47af5194a3e1e61b0f9667983edbbf16c90f2bde7d2153de4481\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "service_elf_blake2b_256 = \"a22463179321198b9d435fe4575c062b72df9c9334d9a17416955cd8442dcc78\""
+        "service_elf_blake2b_256 = \"e7b9a82d22702e8522e8b36faa1118fcced759cb6632b4377f4d8475890a32f0\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "service_pvm_blake2b_256 = \"4c205e2f8849f89ffe30b670ac60289c65e4dc33956283f7b05da02022de839d\""
+        "service_pvm_blake2b_256 = \"1911c5b7f5ee746cfe231a81f9ec2d5355e725faad7c578514b5580e5baf1cc6\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "authority_program_id = \"c31a8dec125559cad8651c70365132125a43fd1dd95c5ab2f7a9c01871c2f656\""
+        "authority_program_id = \"da1c25f9b2c18144a0ef346b873930a53e881429fd11cdbcbf3a3182189aba79\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "authority_pvm_blake2b_256 = \"d59455d2f638119ad4a3a6a8e127d84a0dad87d79de320a788f5783aad17b501\""
+        "authority_pvm_blake2b_256 = \"f91f993dd459a6a8107b85dc3a0b12776191faaf9cab494a443d12b92c745ac6\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "agent_runtime_program_id = \"679e9e3c533612ff2fe8744a350cfc8f20d53fe7c9ac5c670d01ff2001734e35\""
+        "agent_runtime_program_id = \"f5ecc2cd96f6dcc8b1e90454118ba4b536ff3fcb30502f7dec44595898750d17\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "agent_runtime_elf_blake2b_256 = \"c7ccc66c090b33da699d458951b2c9c57ca1fc3c52ba1ddf1f2f2680f5796494\""
+        "agent_runtime_elf_blake2b_256 = \"c28ae2dcbfca7060f010e3afb01ca20341619e59765be14f0cfb14976c82ca48\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "agent_runtime_pvm_blake2b_256 = \"ab63c08f6a43e3270eab1d99530a68219d9d9e2852672fe17ed037c65ef6048b\""
+        "agent_runtime_pvm_blake2b_256 = \"7559fd883a16dba4f1a914e7a143041d23f2cde52a383be80589f4e53d5cccbc\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "registry_elf_blake2b_256 = \"b5ee809693f915fa2d3e3c3b8802afc8671af29245dbab3ef78dfb85be8321f1\""
+        "registry_elf_blake2b_256 = \"461f2b368dd653698c8650b07800b81634b3072b37fd7a5f3708581021bbbd32\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_actor_program_id = \"b2fe8c49df540ebebaf404d50c000d22fee1a20101725edbd872127815ced687\""
+        "clerk_actor_program_id = \"8103683319d274216ce16df5a50d83778a375b7ebed36cd7ec7e5f9b92198186\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_deployment_id = \"518bbc7bde496c21349d08dcd1efcac7b668acef660b683615f0afdd52bf30ea\""
+        "clerk_deployment_id = \"983e31b8ac71d086e4cfc5892cf742ff1eedb1f2cd0cefc69cada61e5741495d\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_task_hash = \"e174d58588e41710d793a38088e281c374e00e7fff292fa860b9079769d072ce\""
+        "clerk_task_hash = \"9e7ff9caee2bdb73b1defa1217a8b14524e3c9239a4926f203affcb98df7f7a9\""
     ));
     assert!(SERVICE_TOOLCHAIN.contains("channel = \"nightly-2026-03-20\""));
     for key in [
@@ -1068,15 +1068,15 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
     let clerk = canonical_clerk_package();
     assert_eq!(
         hex(&clerk.manifest.actor_program.0),
-        "b2fe8c49df540ebebaf404d50c000d22fee1a20101725edbd872127815ced687",
+        "8103683319d274216ce16df5a50d83778a375b7ebed36cd7ec7e5f9b92198186",
     );
     assert_eq!(
         hex(&clerk.deployment_id().0),
-        "518bbc7bde496c21349d08dcd1efcac7b668acef660b683615f0afdd52bf30ea",
+        "983e31b8ac71d086e4cfc5892cf742ff1eedb1f2cd0cefc69cada61e5741495d",
     );
     assert_eq!(
         hex(&clerk.task_dependencies[0].binding.task.0),
-        "e174d58588e41710d793a38088e281c374e00e7fff292fa860b9079769d072ce",
+        "9e7ff9caee2bdb73b1defa1217a8b14524e3c9239a4926f203affcb98df7f7a9",
     );
 }
 
