@@ -7,6 +7,7 @@
 
 use alloc::vec::Vec;
 
+use crate::args::{Args, decode_args};
 use crate::cap::Access;
 use crate::instruction::Opcode;
 use crate::program::{
@@ -21,6 +22,25 @@ const SPI_RO_SLOT: u8 = 65;
 const SPI_RW_SLOT: u8 = 66;
 const SPI_STACK_SLOT: u8 = 67;
 const SPI_ARGS_SLOT: u8 = 68;
+
+/// The complete host-call surface implemented by [`crate::refine_host`].
+///
+/// Runtime package admission uses this exact set to reject even unreachable
+/// calls outside the standard inner-machine interface. Keeping the policy
+/// next to the standard-program decoder prevents a caller from accidentally
+/// inspecting a retired capability manifest under these rules.
+pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 6] = [9, 10, 11, 12, 13, 14];
+
+/// Failure while inspecting a standard program's complete static host-call
+/// surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostCallInspectionError {
+    /// The bytes are not one canonical, executor-valid standard program.
+    InvalidProgram,
+    /// An `ecalli` instruction names a call the selected host does not
+    /// implement. The full decoded immediate is retained for diagnostics.
+    UnsupportedHostCall(u64),
+}
 
 /// `true` if `blob` begins with the retired capability-manifest magic.
 ///
@@ -109,6 +129,63 @@ pub fn parse_standard_program(blob: &[u8]) -> Option<StandardProgram> {
         bitmask: program.code.bitmask.clone(),
     };
     validate_code_blob(&executable, 0).then_some(program)
+}
+
+/// Return every statically present `ecalli` immediate in instruction order.
+///
+/// The scan covers unreachable blocks as well as the entry-reachable graph:
+/// package admission must not let a later data-dependent branch expose a call
+/// which was skipped by a representative run. Dynamic `ecall` cannot appear
+/// because [`parse_standard_program`] rejects that non-standard opcode first.
+pub fn inspect_standard_program_host_calls(
+    blob: &[u8],
+) -> Result<Vec<u64>, HostCallInspectionError> {
+    let program = parse_standard_program(blob).ok_or(HostCallInspectionError::InvalidProgram)?;
+    let code = &program.code.code;
+    let bitmask = &program.code.bitmask;
+    let mut calls = Vec::new();
+
+    for pc in 0..code.len() {
+        if bitmask[pc] != 1 {
+            continue;
+        }
+        let opcode = Opcode::from_byte(code[pc]).ok_or(HostCallInspectionError::InvalidProgram)?;
+        if opcode != Opcode::Ecalli {
+            continue;
+        }
+        let next = ((pc + 1)..code.len())
+            .find(|candidate| bitmask[*candidate] == 1)
+            .unwrap_or(code.len());
+        let skip = next
+            .checked_sub(pc + 1)
+            .ok_or(HostCallInspectionError::InvalidProgram)?;
+        let Args::Imm { imm } = decode_args(code, pc, skip, opcode.category()) else {
+            return Err(HostCallInspectionError::InvalidProgram);
+        };
+        calls.push(imm);
+    }
+
+    Ok(calls)
+}
+
+/// Require every static host call in a canonical standard program to belong
+/// to `allowed`.
+pub fn validate_standard_program_host_calls(
+    blob: &[u8],
+    allowed: &[u64],
+) -> Result<(), HostCallInspectionError> {
+    for call in inspect_standard_program_host_calls(blob)? {
+        if !allowed.contains(&call) {
+            return Err(HostCallInspectionError::UnsupportedHostCall(call));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a portable outer runtime against the exact host-call interface
+/// serviced by [`crate::refine_host::RefineContext`].
+pub fn validate_refine_host_calls(blob: &[u8]) -> Result<(), HostCallInspectionError> {
+    validate_standard_program_host_calls(blob, &REFINE_HOST_CALL_ALLOWLIST)
 }
 
 /// Translate a standard program into the temporary manifest representation
@@ -204,6 +281,22 @@ mod tests {
         .unwrap()
     }
 
+    fn host_call_program(calls: &[u32]) -> Vec<u8> {
+        let mut code = Vec::new();
+        let mut bitmask = Vec::new();
+        for call in calls {
+            code.push(Opcode::Ecalli as u8);
+            bitmask.push(1);
+            for byte in call.to_le_bytes() {
+                code.push(byte);
+                bitmask.push(0);
+            }
+        }
+        code.push(Opcode::Trap as u8);
+        bitmask.push(1);
+        standard_blob(&[], &[], 0, 0, &code, &bitmask)
+    }
+
     #[test]
     fn parser_adds_opcode_validation() {
         let valid = standard_blob(&[], &[], 0, 0, &[0], &[1]);
@@ -219,6 +312,65 @@ mod tests {
         assert!(
             parse_standard_program(&retired_unary_number).is_none(),
             "opcode 111 is not in the Gray Paper v0.8.0 opcode set"
+        );
+    }
+
+    #[test]
+    fn whole_program_host_call_inspection_is_exact_and_ordered() {
+        assert_eq!(
+            REFINE_HOST_CALL_ALLOWLIST,
+            [
+                crate::inner::host_call::MACHINE as u64,
+                crate::inner::host_call::PEEK as u64,
+                crate::inner::host_call::POKE as u64,
+                crate::inner::host_call::PAGES as u64,
+                crate::inner::host_call::INVOKE as u64,
+                crate::inner::host_call::EXPUNGE as u64,
+            ]
+        );
+        let blob = host_call_program(&[14, 9, 14]);
+        assert_eq!(
+            inspect_standard_program_host_calls(&blob),
+            Ok(vec![14, 9, 14])
+        );
+        assert_eq!(validate_refine_host_calls(&blob), Ok(()));
+    }
+
+    #[test]
+    fn refine_allowlist_rejects_vos_only_and_unreachable_calls() {
+        // A trap before the forbidden call makes the call unreachable from
+        // entry, but package admission must still reject its static presence.
+        let code = [
+            Opcode::Trap as u8,
+            Opcode::Ecalli as u8,
+            118,
+            0,
+            0,
+            0,
+            Opcode::Trap as u8,
+        ];
+        let bitmask = [1, 1, 0, 0, 0, 0, 1];
+        let blob = standard_blob(&[], &[], 0, 0, &code, &bitmask);
+        assert_eq!(
+            validate_refine_host_calls(&blob),
+            Err(HostCallInspectionError::UnsupportedHostCall(118))
+        );
+    }
+
+    #[test]
+    fn inspection_rejects_non_programs_and_preserves_full_immediates() {
+        assert_eq!(
+            inspect_standard_program_host_calls(b"not a standard program"),
+            Err(HostCallInspectionError::InvalidProgram)
+        );
+        let blob = host_call_program(&[u32::MAX]);
+        assert_eq!(
+            inspect_standard_program_host_calls(&blob),
+            Ok(vec![u64::MAX])
+        );
+        assert_eq!(
+            validate_standard_program_host_calls(&blob, &[u32::MAX as u64]),
+            Err(HostCallInspectionError::UnsupportedHostCall(u64::MAX))
         );
     }
 
