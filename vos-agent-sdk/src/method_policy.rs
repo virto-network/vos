@@ -14,10 +14,10 @@ use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
 use crate::schema::{self, ParsedSchema};
 use crate::wire::{CanonicalWire, WireError};
-use crate::{BlobRef, Hash, MethodMode};
+use crate::{BlobRef, CapabilityId, Hash, MethodMode, RoleId};
 
 /// The only accepted clean-generation method-policy wire magic.
-pub const METHOD_POLICY_MAGIC: [u8; 4] = *b"AMP1";
+pub const METHOD_POLICY_MAGIC: [u8; 4] = *b"AMP2";
 pub const MAX_METHOD_POLICIES: usize = schema::MAX_METHODS;
 pub const MAX_METHOD_POLICY_NAME_BYTES: usize = schema::MAX_NAME_BYTES;
 pub const MAX_METHOD_ARGUMENTS: usize = schema::MAX_FIELDS;
@@ -30,6 +30,83 @@ pub const MAX_METHOD_POLICY_ENCODED_BYTES: usize = crate::MAX_RUNTIME_EXECUTION_
 pub const ARGUMENT_SCHEMA_ID_DOMAIN: &[u8] = b"vos/agent/method-arguments-schema/v1";
 /// Domain for a method's return-schema identity.
 pub const RETURN_SCHEMA_ID_DOMAIN: &[u8] = b"vos/agent/method-return-schema/v1";
+/// Domain for the exact typed authorization selector enforced at ingress.
+pub const AUTHORIZATION_POLICY_ID_DOMAIN: &[u8] = b"vos/agent/method-authorization-policy/v2";
+
+/// One authorization predicate for a method.
+///
+/// The variants are deliberately exclusive. A policy cannot smuggle a legacy
+/// conjunction of partially populated role/capability fields into the clean
+/// generation, and a runtime can inspect the exact predicate without an
+/// out-of-band hash preimage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorizationPolicySelector {
+    Public,
+    SpaceRole(RoleId),
+    ActorRole(RoleId),
+    Capability(CapabilityId),
+}
+
+impl AuthorizationPolicySelector {
+    pub const fn validate(self) -> bool {
+        match self {
+            Self::Public => true,
+            Self::SpaceRole(role) | Self::ActorRole(role) => !role_is_zero(role),
+            Self::Capability(capability) => !capability_is_zero(capability),
+        }
+    }
+
+    /// Stable identity of this exact selector.
+    ///
+    /// The typed tag and optional identifier are committed together with the
+    /// runtime ABI identity. Invalid zero identifiers and the unusable zero
+    /// digest are never returned as policy identities.
+    pub fn identity(self) -> Result<Hash, MethodPolicyError> {
+        if !self.validate() {
+            return Err(MethodPolicyError::InvalidAuthorizationPolicy);
+        }
+        let tag = [self.wire_tag()];
+        let identity = match self {
+            Self::Public => Hash::digest(
+                AUTHORIZATION_POLICY_ID_DOMAIN,
+                &[crate::RUNTIME_ABI_ID.as_bytes(), &tag],
+            ),
+            Self::SpaceRole(role) | Self::ActorRole(role) => Hash::digest(
+                AUTHORIZATION_POLICY_ID_DOMAIN,
+                &[crate::RUNTIME_ABI_ID.as_bytes(), &tag, role.as_bytes()],
+            ),
+            Self::Capability(capability) => Hash::digest(
+                AUTHORIZATION_POLICY_ID_DOMAIN,
+                &[
+                    crate::RUNTIME_ABI_ID.as_bytes(),
+                    &tag,
+                    capability.as_bytes(),
+                ],
+            ),
+        };
+        if hash_is_zero(identity) {
+            Err(MethodPolicyError::InvalidAuthorizationPolicy)
+        } else {
+            Ok(identity)
+        }
+    }
+
+    const fn wire_tag(self) -> u8 {
+        match self {
+            Self::Public => 0,
+            Self::SpaceRole(_) => 1,
+            Self::ActorRole(_) => 2,
+            Self::Capability(_) => 3,
+        }
+    }
+
+    const fn encoded_len(self) -> usize {
+        match self {
+            Self::Public => 1,
+            Self::SpaceRole(_) | Self::ActorRole(_) | Self::Capability(_) => 1 + 32,
+        }
+    }
+}
 
 /// Whether ingress must provide a stable idempotency identity for this
 /// method. There is deliberately no optional state without executor meaning.
@@ -142,8 +219,8 @@ pub struct ActorMethodPolicy {
     pub arguments: Vec<MethodArgument>,
     /// Canonical return-schema preimage.
     pub return_type_identity: String,
-    /// Exact policy expected in an invocation authority selector.
-    pub authorization_policy: Hash,
+    /// Exact typed policy expected in an invocation authority selector.
+    pub authorization_policy: AuthorizationPolicySelector,
     pub idempotency: IdempotencyRequirement,
     pub attestation: AttestationRequirement,
 }
@@ -152,11 +229,13 @@ impl ActorMethodPolicy {
     pub fn validate(&self) -> Result<(), MethodPolicyError> {
         if self.name.is_empty()
             || self.name.len() > MAX_METHOD_POLICY_NAME_BYTES
-            || self.authorization_policy == Hash::ZERO
             || !self.idempotency.is_valid_for(self.mode)
             || !self.attestation.is_valid()
         {
             return Err(MethodPolicyError::InvalidMethod);
+        }
+        if self.authorization_policy.identity().is_err() {
+            return Err(MethodPolicyError::InvalidAuthorizationPolicy);
         }
         validate_arguments(&self.arguments)?;
         if !valid_type_identity(&self.return_type_identity) {
@@ -171,6 +250,10 @@ impl ActorMethodPolicy {
 
     pub fn return_schema_id(&self) -> Result<Hash, MethodPolicyError> {
         return_schema_id(&self.return_type_identity)
+    }
+
+    pub fn authorization_policy_id(&self) -> Result<Hash, MethodPolicyError> {
+        self.authorization_policy.identity()
     }
 }
 
@@ -219,13 +302,16 @@ impl ActorMethodPolicyArtifact {
             .checked_add(32 + 8 + 4)?;
         for method in &self.methods {
             // Method name framing, mode, argument-list framing, return-type
-            // framing, authorization identity, idempotency, and attestation
-            // tag. A required attestation adds its proof-system identity.
-            let fixed = 4usize + 1 + 4 + 4 + 32 + 1 + 1;
+            // framing, idempotency, and attestation tag. The typed
+            // authorization encoding is added separately; non-public
+            // authorization and required attestation each add an exact
+            // 32-byte identity.
+            let fixed = 4usize + 1 + 4 + 4 + 1 + 1;
             length = length
                 .checked_add(fixed)?
                 .checked_add(method.name.len())?
                 .checked_add(method.return_type_identity.len())?
+                .checked_add(method.authorization_policy.encoded_len())?
                 .checked_add(arguments_encoded_len(&method.arguments)?.checked_sub(4)?)?;
             if method.attestation.is_required() {
                 length = length.checked_add(32)?;
@@ -323,6 +409,7 @@ pub enum MethodPolicyError {
     InvalidArtifact,
     InvalidMethod,
     InvalidMethodAbi,
+    InvalidAuthorizationPolicy,
     DuplicateArgument,
     MethodOrder,
     InvalidSchema,
@@ -336,6 +423,9 @@ impl fmt::Display for MethodPolicyError {
             Self::InvalidArtifact => formatter.write_str("invalid actor method-policy artifact"),
             Self::InvalidMethod => formatter.write_str("invalid actor method policy"),
             Self::InvalidMethodAbi => formatter.write_str("invalid actor method ABI metadata"),
+            Self::InvalidAuthorizationPolicy => {
+                formatter.write_str("invalid actor method authorization policy")
+            }
             Self::DuplicateArgument => formatter.write_str("duplicate actor method argument name"),
             Self::MethodOrder => formatter.write_str("noncanonical actor method-policy order"),
             Self::InvalidSchema => formatter.write_str("invalid referenced AgentActor schema"),
@@ -358,6 +448,14 @@ const fn hash_is_zero(value: Hash) -> bool {
         index += 1;
     }
     true
+}
+
+const fn role_is_zero(value: RoleId) -> bool {
+    hash_is_zero(Hash(value.0))
+}
+
+const fn capability_is_zero(value: CapabilityId) -> bool {
+    hash_is_zero(Hash(value.0))
 }
 
 fn encode_blob(encoder: &mut Encoder<'_>, value: &BlobRef) {
@@ -427,7 +525,7 @@ fn encode_method(encoder: &mut Encoder<'_>, method: &ActorMethodPolicy) {
     encoder.u8(method.mode as u8);
     encoder.list(&method.arguments, encode_argument);
     encoder.string(&method.return_type_identity);
-    encoder.fixed(method.authorization_policy.as_bytes());
+    encode_authorization_policy(encoder, method.authorization_policy);
     encoder.u8(method.idempotency as u8);
     match method.attestation {
         AttestationRequirement::None => encoder.u8(0),
@@ -444,7 +542,7 @@ fn decode_method(decoder: &mut Decoder<'_>) -> Result<ActorMethodPolicy, DecodeE
         mode: decode_mode(decoder.u8()?)?,
         arguments: decoder.list_bounded(MAX_METHOD_ARGUMENTS, decode_argument)?,
         return_type_identity: decoder.string_bounded(MAX_METHOD_TYPE_IDENTITY_BYTES)?,
-        authorization_policy: Hash(decoder.fixed()?),
+        authorization_policy: decode_authorization_policy(decoder)?,
         idempotency: match decoder.u8()? {
             0 => IdempotencyRequirement::NotRequired,
             1 => IdempotencyRequirement::Required,
@@ -458,6 +556,37 @@ fn decode_method(decoder: &mut Decoder<'_>) -> Result<ActorMethodPolicy, DecodeE
             _ => return Err(DecodeError::InvalidTag),
         },
     })
+}
+
+fn encode_authorization_policy(
+    encoder: &mut Encoder<'_>,
+    authorization: AuthorizationPolicySelector,
+) {
+    encoder.u8(authorization.wire_tag());
+    match authorization {
+        AuthorizationPolicySelector::Public => {}
+        AuthorizationPolicySelector::SpaceRole(role)
+        | AuthorizationPolicySelector::ActorRole(role) => encoder.fixed(role.as_bytes()),
+        AuthorizationPolicySelector::Capability(capability) => encoder.fixed(capability.as_bytes()),
+    }
+}
+
+fn decode_authorization_policy(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorizationPolicySelector, DecodeError> {
+    match decoder.u8()? {
+        0 => Ok(AuthorizationPolicySelector::Public),
+        1 => Ok(AuthorizationPolicySelector::SpaceRole(RoleId(
+            decoder.fixed()?,
+        ))),
+        2 => Ok(AuthorizationPolicySelector::ActorRole(RoleId(
+            decoder.fixed()?,
+        ))),
+        3 => Ok(AuthorizationPolicySelector::Capability(CapabilityId(
+            decoder.fixed()?,
+        ))),
+        _ => Err(DecodeError::InvalidTag),
+    }
 }
 
 fn decode_mode(value: u8) -> Result<MethodMode, DecodeError> {
@@ -508,7 +637,9 @@ mod tests {
                 type_identity: alloc::format!("example::Request{seed}"),
             }],
             return_type_identity: alloc::format!("example::Response{seed}"),
-            authorization_policy: Hash([seed.wrapping_add(2); 32]),
+            authorization_policy: AuthorizationPolicySelector::Capability(CapabilityId(
+                [seed.wrapping_add(2); 32],
+            )),
             idempotency: IdempotencyRequirement::for_mode(mode),
             attestation: AttestationRequirement::None,
         }
@@ -544,6 +675,7 @@ mod tests {
         argument_name_length: usize,
         argument_type_length: usize,
         return_type_length: usize,
+        authorization: usize,
         idempotency: usize,
         attestation: usize,
     }
@@ -558,8 +690,8 @@ mod tests {
         let argument_name_length = argument_count + 4;
         let argument_type_length = argument_name_length + 4 + argument.name.len();
         let return_type_length = argument_type_length + 4 + argument.type_identity.len();
-        let authorization_policy = return_type_length + 4 + method.return_type_identity.len();
-        let idempotency = authorization_policy + 32;
+        let authorization = return_type_length + 4 + method.return_type_identity.len();
+        let idempotency = authorization + method.authorization_policy.encoded_len();
         FirstMethodOffsets {
             method_name_length,
             mode,
@@ -567,6 +699,7 @@ mod tests {
             argument_name_length,
             argument_type_length,
             return_type_length,
+            authorization,
             idempotency,
             attestation: idempotency + 1,
         }
@@ -681,6 +814,56 @@ mod tests {
         assert_eq!(
             artifact.methods[0].return_schema_id().unwrap(),
             return_schema_id(&artifact.methods[0].return_type_identity).unwrap()
+        );
+    }
+
+    #[test]
+    fn typed_authorization_selectors_have_exact_nonzero_identities() {
+        let selectors = [
+            AuthorizationPolicySelector::Public,
+            AuthorizationPolicySelector::SpaceRole(RoleId([3; 32])),
+            AuthorizationPolicySelector::ActorRole(RoleId([3; 32])),
+            AuthorizationPolicySelector::Capability(CapabilityId([3; 32])),
+        ];
+        let mut identities = Vec::new();
+        for selector in selectors {
+            assert!(selector.validate());
+            let identity = selector.identity().unwrap();
+            assert_ne!(identity, Hash::ZERO);
+            identities.push(identity);
+
+            let (mut artifact, _) = policy_artifact();
+            artifact.methods[0].authorization_policy = selector;
+            let encoded = artifact.encode().unwrap();
+            assert_eq!(
+                ActorMethodPolicyArtifact::decode(&encoded).unwrap(),
+                artifact
+            );
+        }
+        for (index, identity) in identities.iter().enumerate() {
+            assert!(
+                identities[index + 1..]
+                    .iter()
+                    .all(|other| other != identity)
+            );
+        }
+
+        let role = RoleId([8; 32]);
+        let expected = Hash::digest(
+            AUTHORIZATION_POLICY_ID_DOMAIN,
+            &[crate::RUNTIME_ABI_ID.as_bytes(), &[1], role.as_bytes()],
+        );
+        assert_eq!(
+            AuthorizationPolicySelector::SpaceRole(role)
+                .identity()
+                .unwrap(),
+            expected
+        );
+
+        let (artifact, _) = policy_artifact();
+        assert_eq!(
+            artifact.methods[0].authorization_policy_id().unwrap(),
+            artifact.methods[0].authorization_policy.identity().unwrap()
         );
     }
 
@@ -825,7 +1008,12 @@ mod tests {
             Err(WireError::Decode(DecodeError::TrailingBytes))
         ));
 
-        for position in [offsets.mode, offsets.idempotency, offsets.attestation] {
+        for position in [
+            offsets.mode,
+            offsets.authorization,
+            offsets.idempotency,
+            offsets.attestation,
+        ] {
             let mut unknown = encoded.clone();
             unknown[position] = 0xff;
             assert!(matches!(
@@ -907,13 +1095,30 @@ mod tests {
 
     #[test]
     fn zero_identities_and_previous_generation_magic_are_rejected() {
-        let (mut artifact, _) = policy_artifact();
-        artifact.methods[0].authorization_policy = Hash::ZERO;
-        assert_eq!(artifact.validate(), Err(MethodPolicyError::InvalidMethod));
+        for selector in [
+            AuthorizationPolicySelector::SpaceRole(RoleId::ZERO),
+            AuthorizationPolicySelector::ActorRole(RoleId::ZERO),
+            AuthorizationPolicySelector::Capability(CapabilityId::ZERO),
+        ] {
+            assert_eq!(
+                selector.identity(),
+                Err(MethodPolicyError::InvalidAuthorizationPolicy)
+            );
+            let (mut artifact, _) = policy_artifact();
+            artifact.methods[0].authorization_policy = selector;
+            assert_eq!(
+                artifact.validate(),
+                Err(MethodPolicyError::InvalidAuthorizationPolicy)
+            );
+            assert!(matches!(
+                ActorMethodPolicyArtifact::decode(&encode_unchecked(&artifact)),
+                Err(WireError::Decode(DecodeError::NonCanonical))
+            ));
+        }
 
         let (artifact, _) = policy_artifact();
         let mut old = artifact.encode().unwrap();
-        old[..4].copy_from_slice(b"VRPW");
+        old[..4].copy_from_slice(b"AMP1");
         assert!(matches!(
             ActorMethodPolicyArtifact::decode(&old),
             Err(WireError::Decode(DecodeError::InvalidTag))

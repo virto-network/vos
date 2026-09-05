@@ -10,6 +10,7 @@ extern crate alloc;
 
 pub mod authority;
 pub mod contract;
+pub mod introspection;
 pub mod method_policy;
 mod model;
 pub mod package;

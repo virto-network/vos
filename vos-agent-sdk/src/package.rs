@@ -766,7 +766,8 @@ fn envelope_encoded_len(
 mod tests {
     use super::*;
     use crate::method_policy::{
-        ActorMethodPolicy, AttestationRequirement, IdempotencyRequirement, MethodArgument,
+        ActorMethodPolicy, AttestationRequirement, AuthorizationPolicySelector,
+        IdempotencyRequirement, MethodArgument,
     };
     use crate::schema::{ParsedMethod, ParsedSchema};
 
@@ -839,7 +840,9 @@ mod tests {
                     type_identity: "example::IncrementAmount".into(),
                 }],
                 return_type_identity: "example::IncrementResult".into(),
-                authorization_policy: Hash([0x33; 32]),
+                authorization_policy: AuthorizationPolicySelector::Capability(crate::CapabilityId(
+                    [0x33; 32]
+                ),),
                 idempotency: IdempotencyRequirement::Required,
                 attestation: AttestationRequirement::Required {
                     proof_system: Hash([0x34; 32]),
