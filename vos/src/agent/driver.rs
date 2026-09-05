@@ -79,6 +79,28 @@ fn clean_descriptor_from_state(
         .ok_or(AgentDriverError::InvalidRuntime)
 }
 
+fn clean_management_retry_is_retained(
+    state: &RuntimeState,
+    request: &crate::agent_sdk::ManagementRequest,
+    receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+) -> Result<bool, AgentDriverError> {
+    let decoded = super::wire::decode_standard_runtime_state(state)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let Some(disposition) = decoded
+        .clean_management_dispositions
+        .iter()
+        .find(|item| item.authority == receipt.commitment())
+    else {
+        return Ok(false);
+    };
+    if disposition.request != request.commitment() || disposition.epoch != receipt.selector.epoch {
+        return Err(AgentDriverError::SdkManagement(
+            crate::agent_sdk::ManagementError::AuthoritySequenceConflict,
+        ));
+    }
+    Ok(true)
+}
+
 fn clean_projected_config_from_state(
     state: &RuntimeState,
 ) -> Result<AgentConfig, AgentDriverError> {
@@ -174,6 +196,7 @@ fn verify_clean_management_receipt(
     request: &crate::agent_sdk::ManagementRequest,
     receipt: &crate::agent_sdk::authority::AuthorityReceipt,
     _observed_slot: u64,
+    allow_historical_runtime: bool,
 ) -> Result<(), AgentDriverError> {
     let runtime_deployment = match request {
         crate::agent_sdk::ManagementRequest::Create(descriptor) => {
@@ -183,11 +206,20 @@ fn verify_clean_management_receipt(
         _ => descriptor.identity.runtime_deployment,
     };
     let selector = &receipt.selector;
+    let runtime_is_request_bound = matches!(
+        request,
+        crate::agent_sdk::ManagementRequest::Create(_)
+            | crate::agent_sdk::ManagementRequest::UpgradeRuntime(_)
+    );
     if receipt.validate_shape().is_err()
         || !descriptor.authority.accepts(receipt)
         || selector.space != descriptor.identity.space
         || selector.agent != descriptor.identity.agent
-        || selector.runtime_deployment != runtime_deployment
+        || ((!allow_historical_runtime || runtime_is_request_bound)
+            && selector.runtime_deployment != runtime_deployment)
+        || (!allow_historical_runtime
+            && !matches!(request, crate::agent_sdk::ManagementRequest::Create(_))
+            && descriptor.identity.runtime_deployment != runtime_deployment)
         || Some(selector.operation) != clean_management_operation(request)
         || selector.actor.zip(selector.actor_deployment) != clean_management_actor(request)
         || selector.request != request.commitment()
@@ -231,6 +263,39 @@ fn validate_sdk_management_artifacts(
             Ok(())
         }
         (
+            ManagementRequest::Create(_)
+            | ManagementRequest::InspectActors { .. }
+            | ManagementRequest::InspectResources
+            | ManagementRequest::Suspend { .. }
+            | ManagementRequest::Resume { .. }
+            | ManagementRequest::RemoveLeaf { .. }
+            | ManagementRequest::ChangeReplicas { .. },
+            SdkManagementArtifacts::None,
+        ) => Ok(()),
+        _ => Err(AgentDriverError::InvalidRuntime),
+    }
+}
+
+fn validate_sdk_retry_artifact_shape(
+    request: &crate::agent_sdk::ManagementRequest,
+    artifacts: SdkManagementArtifacts<'_>,
+) -> Result<(), AgentDriverError> {
+    use crate::agent_sdk::ManagementRequest;
+
+    // A retained disposition owns the result; artifacts are not restaged or
+    // revalidated against the possibly upgraded current runtime. Permit the
+    // original admitted sidecar shape, or no sidecar at all, while rejecting
+    // cross-role ambient artifacts.
+    match (request, artifacts) {
+        (
+            ManagementRequest::Install(_) | ManagementRequest::UpgradeActor(_),
+            SdkManagementArtifacts::None | SdkManagementArtifacts::Actor(_),
+        )
+        | (
+            ManagementRequest::UpgradeRuntime(_),
+            SdkManagementArtifacts::None | SdkManagementArtifacts::Runtime(_),
+        )
+        | (
             ManagementRequest::Create(_)
             | ManagementRequest::InspectActors { .. }
             | ManagementRequest::InspectResources
@@ -1969,7 +2034,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             .current_logical_slot()
             .ok_or(AgentDriverError::TrustUnavailable)?;
         let request = crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
-        verify_clean_management_receipt(&descriptor, &request, &authority, observed_slot)?;
+        verify_clean_management_receipt(&descriptor, &request, &authority, observed_slot, false)?;
         let work = crate::agent_sdk::RuntimeWork::Manage {
             space: descriptor.identity.space,
             agent: descriptor.identity.agent,
@@ -2946,9 +3011,15 @@ impl<S: AgentImageStore> AgentDriver<S> {
             crate::agent_sdk::ManagementRequest::InspectActors { .. }
                 | crate::agent_sdk::ManagementRequest::InspectResources
         );
+        let exact_retry = match authority.as_ref() {
+            Some(receipt) => {
+                clean_management_retry_is_retained(&self.image.runtime_state, &request, receipt)?
+            }
+            None => false,
+        };
         let observed_slot = match self.trust.current_logical_slot() {
             Some(slot) => slot,
-            None if read_only => 0,
+            None if read_only || exact_retry => 0,
             None => return Err(AgentDriverError::TrustUnavailable),
         };
         match (&request, authority.as_ref()) {
@@ -2958,21 +3029,29 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 None,
             ) => {}
             (_, Some(receipt)) => {
-                verify_clean_management_receipt(&current, &request, receipt, observed_slot)?;
+                verify_clean_management_receipt(
+                    &current,
+                    &request,
+                    receipt,
+                    observed_slot,
+                    exact_retry,
+                )?;
             }
             _ => return Err(AgentDriverError::InvalidRuntime),
         }
-        validate_sdk_management_artifacts(&current, &request, artifacts)?;
-        let staged = match self.stage_sdk_management_artifacts(&request, artifacts) {
-            Ok(staged) => staged,
-            Err(error) => return Err(error),
-        };
-        let runtime_deployment = match &request {
-            crate::agent_sdk::ManagementRequest::Create(descriptor) => {
-                descriptor.identity.runtime_deployment
+        let staged = if exact_retry {
+            validate_sdk_retry_artifact_shape(&request, artifacts)?;
+            StagedSdkArtifacts::default()
+        } else {
+            validate_sdk_management_artifacts(&current, &request, artifacts)?;
+            match self.stage_sdk_management_artifacts(&request, artifacts) {
+                Ok(staged) => staged,
+                Err(error) => return Err(error),
             }
-            crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade) => upgrade.from_deployment,
-            _ => current.identity.runtime_deployment,
+        };
+        let runtime_deployment = match authority.as_ref() {
+            Some(receipt) => receipt.selector.runtime_deployment,
+            None => current.identity.runtime_deployment,
         };
         let work = crate::agent_sdk::RuntimeWork::Manage {
             space: current.identity.space,
@@ -3033,10 +3112,11 @@ impl<S: AgentImageStore> AgentDriver<S> {
             &returned.outcome,
             crate::agent_sdk::RuntimeOutcome::Management(Ok(_))
         );
-        let runtime_upgrade = match (&request, success, artifacts) {
+        let runtime_upgrade = match (&request, success, exact_retry, artifacts) {
             (
                 crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade),
                 true,
+                false,
                 SdkManagementArtifacts::Runtime(package),
             ) => Some((upgrade.as_ref(), package)),
             _ => None,
@@ -4626,6 +4706,162 @@ mod tests {
             Err(AgentDriverError::UnsupportedProfile(
                 super::super::AgentProfile::Shared
             ))
+        );
+    }
+
+    #[test]
+    fn clean_host_preflight_distinguishes_retained_historical_from_unseen_stale_receipts() {
+        use crate::agent_sdk::authority::{
+            AgentAuthorityBinding, AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots,
+            AuthorityOperationKind, AuthorityReceipt, AuthorityReceiptSelector,
+        };
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let signing = SigningKey::from_bytes(&[0x61; 32]);
+        let public_key = signing.verifying_key().to_bytes();
+        let space = crate::agent_sdk::SpaceId([0x62; 32]);
+        let owner = crate::agent_sdk::PrincipalId([0x63; 32]);
+        let nonce = crate::agent_sdk::Hash([0x64; 32]);
+        let agent = crate::agent_sdk::AgentId::derive(space, owner, nonce.as_bytes());
+        let historical_runtime = crate::agent_sdk::DeploymentId([0x65; 32]);
+        let current_runtime = crate::agent_sdk::DeploymentId([0x66; 32]);
+        let authority = AgentAuthorityBinding {
+            policy: crate::agent_sdk::Hash([0x67; 32]),
+            issuer: AuthorityIssuer {
+                principal: owner,
+                actor: crate::agent_sdk::ActorId([0x68; 32]),
+                deployment: crate::agent_sdk::DeploymentId([0x69; 32]),
+                program: crate::agent_sdk::ProgramId([0x6a; 32]),
+                producer: crate::agent_sdk::ProducerId::of_public_key(&public_key),
+            },
+            public_key,
+            initial_epoch: 1,
+        };
+        let descriptor = crate::agent_sdk::AgentDescriptor {
+            identity: crate::agent_sdk::AgentIdentity {
+                space,
+                agent,
+                owner,
+                profile: crate::agent_sdk::AgentProfile::Local,
+                runtime_deployment: current_runtime,
+                runtime_program: crate::agent_sdk::ProgramId([0x6b; 32]),
+                runtime_producer: crate::agent_sdk::ProducerId([0x6c; 32]),
+            },
+            creation_nonce: nonce,
+            authority,
+            runtime_package: crate::agent_sdk::BlobRef {
+                hash: crate::agent_sdk::Hash([0x6d; 32]),
+                len: 1,
+            },
+            runtime_contract: crate::agent_sdk::contract::RuntimePackageContract::canonical(),
+            capabilities: crate::agent_sdk::RuntimeCapabilities::standard(),
+            replicas: vec![crate::agent_sdk::AgentReplica {
+                node: crate::agent_sdk::NodeId([0x6e; 32]),
+                principal: owner,
+                role: crate::agent_sdk::ReplicaRole::Voter,
+            }],
+        };
+        descriptor.validate().unwrap();
+
+        let request = crate::agent_sdk::ManagementRequest::Suspend {
+            actor: crate::agent_sdk::ActorId([0x6f; 32]),
+            expected_deployment: crate::agent_sdk::DeploymentId([0x70; 32]),
+        };
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: descriptor.authority.policy,
+                issuer: descriptor.authority.issuer,
+                space,
+                agent,
+                operation: AuthorityOperationKind::SuspendActor,
+                runtime_deployment: historical_runtime,
+                actor: match &request {
+                    crate::agent_sdk::ManagementRequest::Suspend { actor, .. } => Some(*actor),
+                    _ => unreachable!(),
+                },
+                actor_deployment: match &request {
+                    crate::agent_sdk::ManagementRequest::Suspend {
+                        expected_deployment,
+                        ..
+                    } => Some(*expected_deployment),
+                    _ => unreachable!(),
+                },
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: crate::agent_sdk::Hash([0x71; 32]),
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch: 1,
+                valid_from: 1,
+                expires_at: 2,
+                request: request.commitment(),
+            },
+            public_key,
+            signature: [0; 64],
+        };
+        receipt.signature = signing.sign(&receipt.signing_bytes()).to_bytes();
+
+        let runtime_state = super::super::wire::encode_standard_runtime_state(
+            &super::super::standard::StandardRuntimeState {
+                config: Some(
+                    super::super::standard::clean_descriptor_to_legacy_config(&descriptor).unwrap(),
+                ),
+                clean_creation_descriptor: Some(descriptor.clone()),
+                clean_descriptor: Some(descriptor.clone()),
+                clean_authority_epoch_high_water: Some(1),
+                clean_management_dispositions: vec![
+                    super::super::standard::StandardCleanManagementDisposition {
+                        authority: crate::agent_sdk::Hash([0x72; 32]),
+                        request: crate::agent_sdk::Hash([0x73; 32]),
+                        epoch: 1,
+                        observed_slot: 1,
+                        result: Ok(crate::agent_sdk::ManagementReply::Created(
+                            descriptor.identity.clone(),
+                        )),
+                    },
+                    super::super::standard::StandardCleanManagementDisposition {
+                        authority: receipt.commitment(),
+                        request: request.commitment(),
+                        epoch: receipt.selector.epoch,
+                        observed_slot: 2,
+                        result: Err(crate::agent_sdk::ManagementError::NotFound),
+                    },
+                ],
+                authority_slot_high_water: Some(2),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            clean_management_retry_is_retained(&runtime_state, &request, &receipt),
+            Ok(true)
+        );
+        assert_eq!(
+            verify_clean_management_receipt(&descriptor, &request, &receipt, 100, true),
+            Ok(()),
+            "a retained receipt is authenticated without rebinding it to the current runtime"
+        );
+        assert_eq!(
+            verify_clean_management_receipt(&descriptor, &request, &receipt, 100, false),
+            Err(AgentDriverError::SdkManagement(
+                crate::agent_sdk::ManagementError::InvalidRequest
+            ))
+        );
+
+        let mut unseen = receipt;
+        unseen.selector.valid_from = 100;
+        unseen.selector.expires_at = 110;
+        unseen.signature = signing.sign(&unseen.signing_bytes()).to_bytes();
+        assert_eq!(
+            clean_management_retry_is_retained(&runtime_state, &request, &unseen),
+            Ok(false)
+        );
+        assert_eq!(
+            verify_clean_management_receipt(&descriptor, &request, &unseen, 100, false),
+            Err(AgentDriverError::SdkManagement(
+                crate::agent_sdk::ManagementError::InvalidRequest
+            )),
+            "an unseen receipt cannot select a retired runtime"
         );
     }
 

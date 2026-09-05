@@ -4152,12 +4152,9 @@ mod tests {
         authority: Option<crate::agent_sdk::authority::AuthorityReceipt>,
         observed_slot: u64,
     ) -> crate::agent_sdk::RuntimeTransition {
-        let runtime_deployment = match &request {
-            crate::agent_sdk::ManagementRequest::Create(requested) => {
-                requested.identity.runtime_deployment
-            }
-            crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade) => upgrade.from_deployment,
-            _ => descriptor.identity.runtime_deployment,
+        let runtime_deployment = match authority.as_ref() {
+            Some(receipt) => receipt.selector.runtime_deployment,
+            None => descriptor.identity.runtime_deployment,
         };
         apply_standard_runtime_work(crate::agent_sdk::RuntimeWork::Manage {
             space: descriptor.identity.space,
@@ -4296,13 +4293,19 @@ mod tests {
         );
 
         let create = ManagementRequest::Create(Box::new(descriptor.clone()));
-        let retried =
-            apply_clean_management_test(created, &descriptor, create, Some(create_receipt), 20);
+        let retried = apply_clean_management_test(
+            created.clone(),
+            &descriptor,
+            create,
+            Some(create_receipt),
+            20,
+        );
         assert_eq!(
             retried.outcome,
             RuntimeOutcome::Management(Ok(ManagementReply::Created(descriptor.identity.clone(),))),
             "an already committed exact retry survives receipt expiry"
         );
+        assert_eq!(retried.state, created, "exact retry is byte-identical");
 
         let inspected = apply_clean_management_test(
             retried.state.clone(),
@@ -4336,7 +4339,7 @@ mod tests {
         );
         assert_eq!(rejected.state, retried.state);
 
-        let live = clean_management_receipt(&descriptor, &request, 1, 1, 100);
+        let live = clean_management_receipt(&descriptor, &request, 1, 0, 100);
         let assert_invalid = |receipt| {
             let rejected = apply_clean_management_test(
                 retried.state.clone(),
@@ -4426,7 +4429,7 @@ mod tests {
             &descriptor,
             request.clone(),
             Some(live.clone()),
-            20,
+            1,
         );
         assert_eq!(
             divergent.outcome,
@@ -4439,7 +4442,7 @@ mod tests {
             &descriptor,
             request.clone(),
             Some(live),
-            19,
+            0,
         );
         assert_eq!(
             regressed.outcome,
@@ -4484,6 +4487,435 @@ mod tests {
             RuntimeOutcome::Management(Err(ManagementError::AuthoritySequenceRegressed))
         );
         assert_eq!(rejected.state, changed.state);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_management_capacity_never_evicts_unacknowledged_results() {
+        use crate::agent_sdk::{
+            ManagementError, ManagementReply, ManagementRequest, RuntimeOutcome,
+        };
+
+        let (descriptor, mut state, create_receipt) =
+            create_clean_management_state(crate::agent_sdk::AgentProfile::Local);
+        let install = clean_install_request(
+            &descriptor,
+            "retained-target",
+            None,
+            0x51,
+            crate::agent_sdk::LaneSet::NONE,
+        );
+        let actor = install.entry.actor;
+        let deployment = install.entry.deployment;
+        let capacity = super::super::standard::MAX_AUTHORITY_DISPOSITIONS as u64;
+
+        let retained_request = ManagementRequest::Suspend {
+            actor,
+            expected_deployment: deployment,
+        };
+        let retained_receipt =
+            clean_management_receipt(&descriptor, &retained_request, 1, 2, capacity + 4);
+        let refused = apply_clean_management_test(
+            state,
+            &descriptor,
+            retained_request.clone(),
+            Some(retained_receipt.clone()),
+            2,
+        );
+        assert_eq!(
+            refused.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::NotFound))
+        );
+        state = refused.state;
+
+        let install_request = ManagementRequest::Install(Box::new(install));
+        let installed = apply_clean_management_test(
+            state,
+            &descriptor,
+            install_request.clone(),
+            Some(clean_management_receipt(
+                &descriptor,
+                &install_request,
+                1,
+                3,
+                capacity + 10,
+            )),
+            3,
+        );
+        assert!(matches!(
+            installed.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Installed(_)))
+        ));
+        state = installed.state;
+
+        let absent_request = ManagementRequest::Suspend {
+            actor: crate::agent_sdk::ActorId([0x71; 32]),
+            expected_deployment: crate::agent_sdk::DeploymentId([0x72; 32]),
+        };
+        for slot in 4..=capacity {
+            let transition = apply_clean_management_test(
+                state,
+                &descriptor,
+                absent_request.clone(),
+                Some(clean_management_receipt(
+                    &descriptor,
+                    &absent_request,
+                    1,
+                    slot,
+                    capacity + 10,
+                )),
+                slot,
+            );
+            assert_eq!(
+                transition.outcome,
+                RuntimeOutcome::Management(Err(ManagementError::NotFound))
+            );
+            state = transition.state;
+        }
+
+        let saturated = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+        assert_eq!(
+            saturated.clean_management_dispositions.len(),
+            super::super::standard::MAX_AUTHORITY_DISPOSITIONS
+        );
+        assert_eq!(
+            saturated.clean_management_dispositions[0].authority,
+            create_receipt.commitment(),
+            "Create remains recoverable for the lifetime of the Agent"
+        );
+        assert_eq!(
+            saturated.clean_management_dispositions[1].authority,
+            retained_receipt.commitment()
+        );
+
+        let restored = StandardAgentRuntime::restore(saturated).unwrap().snapshot();
+        let restarted = legacy_state_to_clean(encode_standard_runtime_state(&restored));
+        assert_eq!(restarted, state, "restart preserves the saturated journal");
+        state = restarted;
+
+        // Two additional accepted receipts used to evict Create and then the
+        // retained refusal. Capacity admission must instead be byte-identical.
+        for slot in (capacity + 1)..=(capacity + 2) {
+            let overflow = apply_clean_management_test(
+                state.clone(),
+                &descriptor,
+                absent_request.clone(),
+                Some(clean_management_receipt(
+                    &descriptor,
+                    &absent_request,
+                    1,
+                    slot,
+                    capacity + 10,
+                )),
+                slot,
+            );
+            assert_eq!(
+                overflow.outcome,
+                RuntimeOutcome::Management(Err(ManagementError::ResourceLimit))
+            );
+            assert_eq!(overflow.state, state);
+        }
+
+        let live_retry = apply_clean_management_test(
+            state.clone(),
+            &descriptor,
+            retained_request.clone(),
+            Some(retained_receipt.clone()),
+            capacity + 3,
+        );
+        assert_eq!(
+            live_retry.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::NotFound)),
+            "a retained live refusal cannot be re-executed after saturation"
+        );
+        assert_eq!(live_retry.state, state, "live retry is byte-identical");
+        state = live_retry.state;
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+        assert!(
+            !decoded
+                .actors
+                .iter()
+                .find(|item| item.record.entry.actor.0 == actor.0)
+                .unwrap()
+                .record
+                .entry
+                .suspended,
+            "re-executing the old Suspend would have changed this actor"
+        );
+
+        let expired_retry = apply_clean_management_test(
+            state.clone(),
+            &descriptor,
+            retained_request,
+            Some(retained_receipt),
+            capacity + 5,
+        );
+        assert_eq!(
+            expired_retry.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::NotFound)),
+            "the same committed result remains available after receipt expiry"
+        );
+        assert_eq!(
+            expired_retry.state, state,
+            "expired exact retry is byte-identical"
+        );
+        assert_eq!(
+            decode_standard_runtime_state(&clean_state_to_legacy(&expired_retry.state))
+                .unwrap()
+                .clean_management_dispositions
+                .len(),
+            super::super::standard::MAX_AUTHORITY_DISPOSITIONS
+        );
+
+        let unseen_expired =
+            clean_management_receipt(&descriptor, &absent_request, 1, capacity + 1, capacity + 2);
+        let rejected = apply_clean_management_test(
+            expired_retry.state.clone(),
+            &descriptor,
+            absent_request,
+            Some(unseen_expired),
+            capacity + 6,
+        );
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::InvalidRequest))
+        );
+        assert_eq!(rejected.state, expired_retry.state);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_management_state_ceiling_refuses_before_consuming_authority() {
+        use crate::agent_sdk::{ManagementError, ManagementRequest, RuntimeOutcome};
+
+        let (descriptor, state, _) =
+            create_clean_management_state(crate::agent_sdk::AgentProfile::Local);
+        let mut constrained =
+            decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+        let exact_bytes = clean_state_to_legacy(&state).encoded_len().unwrap() as u32;
+        let mut current = constrained.clean_descriptor.clone().unwrap();
+        current.runtime_contract.resources.max_runtime_state_bytes = exact_bytes;
+        constrained.config =
+            Some(super::super::standard::clean_descriptor_to_legacy_config(&current).unwrap());
+        constrained.clean_descriptor = Some(current.clone());
+        let state = legacy_state_to_clean(encode_standard_runtime_state(&constrained));
+        assert_eq!(state.encoded_len(), Some(exact_bytes as usize));
+        StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap(),
+        )
+        .unwrap();
+
+        let request = ManagementRequest::Suspend {
+            actor: crate::agent_sdk::ActorId([0xc1; 32]),
+            expected_deployment: crate::agent_sdk::DeploymentId([0xc2; 32]),
+        };
+        let receipt = clean_management_receipt(&current, &request, 1, 2, 10);
+        for observed_slot in [2, 3] {
+            let rejected = apply_clean_management_test(
+                state.clone(),
+                &current,
+                request.clone(),
+                Some(receipt.clone()),
+                observed_slot,
+            );
+            assert_eq!(
+                rejected.outcome,
+                RuntimeOutcome::Management(Err(ManagementError::ResourceLimit))
+            );
+            assert_eq!(
+                rejected.state, state,
+                "no authority is consumed when a durable disposition cannot fit"
+            );
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_management_historical_retries_survive_two_runtime_upgrades_and_restart() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{
+            ManagementError, ManagementReply, ManagementRequest, RuntimeOutcome,
+        };
+
+        let (descriptor, mut state, _) =
+            create_clean_management_state(crate::agent_sdk::AgentProfile::Local);
+        let old_request = ManagementRequest::Suspend {
+            actor: crate::agent_sdk::ActorId([0x91; 32]),
+            expected_deployment: crate::agent_sdk::DeploymentId([0x92; 32]),
+        };
+        let old_receipt = clean_management_receipt(&descriptor, &old_request, 1, 2, 2);
+        let refused = apply_clean_management_test(
+            state,
+            &descriptor,
+            old_request.clone(),
+            Some(old_receipt.clone()),
+            2,
+        );
+        assert_eq!(
+            refused.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::NotFound))
+        );
+        state = refused.state;
+
+        let first_upgrade = crate::agent_sdk::RuntimeUpgrade {
+            from_deployment: descriptor.identity.runtime_deployment,
+            to_deployment: crate::agent_sdk::DeploymentId([0xa1; 32]),
+            to_program: crate::agent_sdk::ProgramId([0xa2; 32]),
+            producer: crate::agent_sdk::ProducerId([0xa3; 32]),
+            package: crate::agent_sdk::BlobRef::of_bytes(b"first-runtime-package"),
+            contract: crate::agent_sdk::contract::RuntimePackageContract::canonical(),
+            capabilities: crate::agent_sdk::RuntimeCapabilities::standard(),
+        };
+        let first_request = ManagementRequest::UpgradeRuntime(Box::new(first_upgrade.clone()));
+        let first_receipt = clean_management_receipt(&descriptor, &first_request, 1, 3, 3);
+        let upgraded = apply_clean_management_test(
+            state,
+            &descriptor,
+            first_request.clone(),
+            Some(first_receipt.clone()),
+            3,
+        );
+        assert!(matches!(
+            upgraded.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::RuntimeUpgraded(ref identity)))
+                if identity.runtime_deployment == first_upgrade.to_deployment
+        ));
+        state = upgraded.state;
+        let after_first = decode_standard_runtime_state(&clean_state_to_legacy(&state))
+            .unwrap()
+            .clean_descriptor
+            .unwrap();
+
+        let second_upgrade = crate::agent_sdk::RuntimeUpgrade {
+            from_deployment: after_first.identity.runtime_deployment,
+            to_deployment: crate::agent_sdk::DeploymentId([0xb1; 32]),
+            to_program: crate::agent_sdk::ProgramId([0xb2; 32]),
+            producer: crate::agent_sdk::ProducerId([0xb3; 32]),
+            package: crate::agent_sdk::BlobRef::of_bytes(b"second-runtime-package"),
+            contract: crate::agent_sdk::contract::RuntimePackageContract::canonical(),
+            capabilities: crate::agent_sdk::RuntimeCapabilities::standard(),
+        };
+        let second_request = ManagementRequest::UpgradeRuntime(Box::new(second_upgrade.clone()));
+        let upgraded = apply_clean_management_test(
+            state,
+            &after_first,
+            second_request.clone(),
+            Some(clean_management_receipt(
+                &after_first,
+                &second_request,
+                1,
+                4,
+                4,
+            )),
+            4,
+        );
+        assert!(matches!(
+            upgraded.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::RuntimeUpgraded(ref identity)))
+                if identity.runtime_deployment == second_upgrade.to_deployment
+        ));
+        let after_second = decode_standard_runtime_state(&clean_state_to_legacy(&upgraded.state))
+            .unwrap()
+            .clean_descriptor
+            .unwrap();
+
+        let decoded =
+            decode_standard_runtime_state(&clean_state_to_legacy(&upgraded.state)).unwrap();
+        let restarted = legacy_state_to_clean(encode_standard_runtime_state(
+            &StandardAgentRuntime::restore(decoded).unwrap().snapshot(),
+        ));
+
+        let old_retry = apply_clean_management_test(
+            restarted.clone(),
+            &after_second,
+            old_request.clone(),
+            Some(old_receipt.clone()),
+            100,
+        );
+        assert_eq!(
+            old_retry.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::NotFound)),
+            "a pre-upgrade lifecycle disposition remains authoritative after restart"
+        );
+        assert_eq!(old_retry.state, restarted);
+        assert_eq!(
+            decode_standard_runtime_state(&clean_state_to_legacy(&old_retry.state))
+                .unwrap()
+                .clean_descriptor
+                .as_ref(),
+            Some(&after_second)
+        );
+
+        let first_upgrade_retry = apply_clean_management_test(
+            old_retry.state.clone(),
+            &after_second,
+            first_request.clone(),
+            Some(first_receipt),
+            101,
+        );
+        assert!(matches!(
+            first_upgrade_retry.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::RuntimeUpgraded(ref identity)))
+                if identity.runtime_deployment == first_upgrade.to_deployment
+                    && identity.runtime_program == first_upgrade.to_program
+        ));
+        assert_eq!(first_upgrade_retry.state, old_retry.state);
+        assert_eq!(
+            decode_standard_runtime_state(&clean_state_to_legacy(&first_upgrade_retry.state))
+                .unwrap()
+                .clean_descriptor
+                .as_ref(),
+            Some(&after_second),
+            "recovering the first upgrade must not roll back the active runtime"
+        );
+
+        let stale_unseen = clean_management_receipt(&descriptor, &old_request, 1, 102, 110);
+        let rejected = apply_clean_management_test(
+            first_upgrade_retry.state.clone(),
+            &after_second,
+            old_request.clone(),
+            Some(stale_unseen),
+            102,
+        );
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::InvalidRequest)),
+            "an unseen receipt cannot select a retired runtime deployment"
+        );
+        assert_eq!(rejected.state, first_upgrade_retry.state);
+
+        let stale_upgrade = clean_management_receipt(&descriptor, &first_request, 1, 103, 110);
+        let rejected = apply_clean_management_test(
+            first_upgrade_retry.state.clone(),
+            &after_second,
+            first_request,
+            Some(stale_upgrade),
+            103,
+        );
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::InvalidRequest)),
+            "a newly signed upgrade cannot reuse a retired from-deployment"
+        );
+        assert_eq!(rejected.state, first_upgrade_retry.state);
+
+        let divergent = crate::agent_sdk::RuntimeWork::Manage {
+            space: after_second.identity.space,
+            agent: after_second.identity.agent,
+            runtime_deployment: old_receipt.selector.runtime_deployment,
+            state: first_upgrade_retry.state,
+            request: Box::new(ManagementRequest::Resume {
+                actor: crate::agent_sdk::ActorId([0x91; 32]),
+                expected_deployment: crate::agent_sdk::DeploymentId([0x92; 32]),
+            }),
+            authority: Some(Box::new(old_receipt)),
+            observed_slot: 104,
+        };
+        assert_eq!(
+            divergent.encode(),
+            Err(crate::agent_sdk::wire::WireError::InvalidValue),
+            "a retained receipt cannot be paired with a divergent typed request"
+        );
     }
 
     #[cfg(feature = "pvm")]

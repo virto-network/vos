@@ -1086,6 +1086,13 @@ impl StandardAgentRuntime {
                     })
                     && !clean_management_dispositions.is_empty()
                     && clean_management_dispositions.len() <= MAX_AUTHORITY_DISPOSITIONS
+                    && clean_management_dispositions.first().is_some_and(|item| {
+                        matches!(
+                            &item.result,
+                            Ok(crate::agent_sdk::ManagementReply::Created(identity))
+                                if identity == &creation.identity
+                        )
+                    })
                     && clean_management_dispositions.iter().all(|item| {
                         item.authority != crate::agent_sdk::Hash::ZERO
                             && item.request != crate::agent_sdk::Hash::ZERO
@@ -3111,6 +3118,7 @@ impl StandardAgentRuntime {
         runtime_deployment: crate::agent_sdk::DeploymentId,
         request: &crate::agent_sdk::ManagementRequest,
         authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        allow_historical_runtime: bool,
     ) -> Result<(), crate::agent_sdk::ManagementError> {
         use crate::agent_sdk::ManagementError;
         use crate::agent_sdk::authority::AuthorityOperationKind;
@@ -3187,9 +3195,18 @@ impl StandardAgentRuntime {
         };
         let selector = &authority.selector;
         let selector_actor = selector.actor.zip(selector.actor_deployment);
+        let runtime_is_request_bound = matches!(
+            request,
+            crate::agent_sdk::ManagementRequest::Create(_)
+                | crate::agent_sdk::ManagementRequest::UpgradeRuntime(_)
+        );
         if descriptor.identity.space != space
             || descriptor.identity.agent != agent
-            || expected_runtime != runtime_deployment
+            || ((!allow_historical_runtime || runtime_is_request_bound)
+                && expected_runtime != runtime_deployment)
+            || (!allow_historical_runtime
+                && !matches!(request, crate::agent_sdk::ManagementRequest::Create(_))
+                && descriptor.identity.runtime_deployment != expected_runtime)
             || !descriptor.authority.accepts(authority)
             || authority.validate_shape().is_err()
             || selector.space != space
@@ -3479,12 +3496,18 @@ impl StandardAgentRuntime {
         }
 
         let authority = authority.ok_or(ManagementError::InvalidRequest)?;
+        // Authenticate immutable trust, the exact typed request, and the
+        // receipt-selected runtime before consulting durable history. A
+        // retained receipt may name the runtime deployment under which it was
+        // originally consumed, so current-runtime validation belongs only on
+        // the unseen path below.
         self.verify_clean_management_authority(
             space,
             agent,
             runtime_deployment,
             &request,
             &authority,
+            true,
         )?;
         let authority_id = authority.commitment();
         let request_id = request.commitment();
@@ -3496,19 +3519,16 @@ impl StandardAgentRuntime {
             if disposition.request != request_id || disposition.epoch != authority.selector.epoch {
                 return Err(ManagementError::AuthoritySequenceConflict);
             }
-            let result = disposition.result.clone();
-            self.clean_authority_epoch_high_water = Some(
-                self.clean_authority_epoch_high_water
-                    .map_or(authority.selector.epoch, |current| {
-                        current.max(authority.selector.epoch)
-                    }),
-            );
-            self.authority_slot_high_water = Some(
-                self.authority_slot_high_water
-                    .map_or(observed_slot, |current| current.max(observed_slot)),
-            );
-            return result;
+            return disposition.result.clone();
         }
+        self.verify_clean_management_authority(
+            space,
+            agent,
+            runtime_deployment,
+            &request,
+            &authority,
+            false,
+        )?;
         if !authority.selector.is_live_at(observed_slot) {
             return Err(ManagementError::InvalidRequest);
         }
@@ -3527,8 +3547,43 @@ impl StandardAgentRuntime {
             }
         }
 
+        // Exact management results have no acknowledgement operation in the
+        // r4 ABI. Evicting one would therefore make a later retry
+        // indistinguishable from unseen work: a still-live receipt could be
+        // applied twice, while an expired receipt would lose its committed
+        // result. Saturate instead. This bounds signed state without ever
+        // discarding an unacknowledged disposition.
+        if self.clean_management_dispositions.len() == MAX_AUTHORITY_DISPOSITIONS {
+            return Err(ManagementError::ResourceLimit);
+        }
+
         let before = self.clone();
-        let mut result =
+        // Reserve enough signed-state headroom for the smallest durable
+        // disposition before applying any established-Agent mutation. If
+        // even the fixed ResourceLimit record cannot fit, this receipt is an
+        // unconsumed admission failure and state remains byte-identical.
+        let reserved_limit = if before.config.is_some() {
+            let mut fallback = before.clone();
+            fallback.clean_authority_epoch_high_water = Some(authority.selector.epoch);
+            fallback.authority_slot_high_water = Some(observed_slot);
+            fallback
+                .clean_management_dispositions
+                .push(StandardCleanManagementDisposition {
+                    authority: authority_id,
+                    request: request_id,
+                    epoch: authority.selector.epoch,
+                    observed_slot,
+                    result: Err(ManagementError::ResourceLimit),
+                });
+            if fallback.validate_signed_state_resource().is_err() {
+                return Err(ManagementError::ResourceLimit);
+            }
+            Some(fallback)
+        } else {
+            None
+        };
+
+        let result =
             self.clean_management_mutation(&request, authority_id, observed_slot, pristine_input);
         if result.is_err() {
             *self = before.clone();
@@ -3538,9 +3593,6 @@ impl StandardAgentRuntime {
         }
         self.clean_authority_epoch_high_water = Some(authority.selector.epoch);
         self.authority_slot_high_water = Some(observed_slot);
-        if self.clean_management_dispositions.len() == MAX_AUTHORITY_DISPOSITIONS {
-            self.clean_management_dispositions.remove(0);
-        }
         self.clean_management_dispositions
             .push(StandardCleanManagementDisposition {
                 authority: authority_id,
@@ -3553,28 +3605,8 @@ impl StandardAgentRuntime {
             return result;
         }
 
-        *self = before.clone();
-        result = Err(ManagementError::ResourceLimit);
-        if self.config.is_none() {
-            return result;
-        }
-        if self.clean_management_dispositions.len() == MAX_AUTHORITY_DISPOSITIONS {
-            self.clean_management_dispositions.remove(0);
-        }
-        self.clean_authority_epoch_high_water = Some(authority.selector.epoch);
-        self.authority_slot_high_water = Some(observed_slot);
-        self.clean_management_dispositions
-            .push(StandardCleanManagementDisposition {
-                authority: authority_id,
-                request: request_id,
-                epoch: authority.selector.epoch,
-                observed_slot,
-                result: result.clone(),
-            });
-        if self.validate_signed_state_resource().is_err() {
-            *self = before;
-        }
-        result
+        *self = reserved_limit.unwrap_or(before);
+        Err(ManagementError::ResourceLimit)
     }
 
     fn apply_authorized(
