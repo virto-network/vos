@@ -18,8 +18,8 @@ pub const ACTOR_ABI: u32 = 1;
 /// control-schema repin whenever that wire identity changes.
 pub const CONTROL_SCHEMA_DESCRIPTOR: &[u8] = &super::RUNTIME_ABI_ID.0;
 pub const CONTROL_SCHEMA_ID: Hash = Hash([
-    0xf5, 0x38, 0x67, 0xf0, 0xe9, 0xc4, 0xe9, 0x73, 0x2d, 0xb9, 0x30, 0x4b, 0x05, 0x4d, 0x83, 0x84,
-    0x5e, 0xc1, 0x9b, 0xa6, 0x52, 0x15, 0x33, 0x87, 0x87, 0x9f, 0xeb, 0xf9, 0x49, 0xae, 0x53, 0x99,
+    0x15, 0xdf, 0x7f, 0x1b, 0x70, 0xa5, 0x12, 0x9d, 0xba, 0x70, 0xca, 0x4d, 0x4b, 0xa7, 0x55, 0xf1,
+    0xe2, 0xce, 0xfe, 0xa3, 0x92, 0xe3, 0x32, 0xc7, 0xb8, 0xc1, 0xcc, 0x6c, 0x80, 0x3e, 0x60, 0x32,
 ]);
 
 /// Standard runtime directory capacity. This is an agent policy limit, not
@@ -208,11 +208,11 @@ mod tests {
     fn control_schema_pin_matches_its_canonical_descriptor() {
         assert_eq!(
             super::super::RUNTIME_ABI_ID.0,
-            *b"vos-agent-runtime-abi-20260904r7"
+            *b"vos-agent-runtime-abi-20260904r8"
         );
         assert_eq!(
             super::super::EXECUTION_SEMANTICS_ID.0,
-            *b"vos-pvm-41d31e6-standard-gas-r04"
+            *b"vos-pvm-41d31e6-standard-gas-r05"
         );
         assert_eq!(
             Hash::digest(b"vos/agent/control-schema", &[CONTROL_SCHEMA_DESCRIPTOR]),
