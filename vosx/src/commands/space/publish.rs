@@ -1,8 +1,9 @@
 //! `space publish` — add a program to the catalog.
 
 use serde::Serialize;
-use vos::agent::PackageKind;
-use vos::agent::package::Package as AgentPackage;
+use vos::agent::sdk::package::{
+    PackageEnvelope as AgentPackage, PackageManifest as AgentPackageManifest, PackageVerifier,
+};
 use vos::registry::{ProgramKind, Status};
 use vos::service::{ServiceWire, VosPackage};
 
@@ -128,30 +129,58 @@ pub(crate) fn validate_package(name: &str, bytes: &[u8]) -> anyhow::Result<VosPa
 }
 
 fn validate_agent_actor_package(name: &str, bytes: &[u8]) -> anyhow::Result<AgentPackage> {
-    if bytes.get(..4) != Some(b"VOSK") {
-        anyhow::bail!("expected a signed VOSK agent package");
+    if bytes.get(..4) != Some(b"VOS3") {
+        anyhow::bail!(
+            "expected a signed VOS3 AgentActor package; previous Agent package generations are unsupported"
+        );
     }
     let package = AgentPackage::decode(bytes)
-        .map_err(|error| anyhow::anyhow!("decode VOSK agent package: {error}"))?;
-    if package.encode() != bytes {
-        anyhow::bail!("signed VOSK agent package is not canonical");
+        .map_err(|error| anyhow::anyhow!("decode VOS3 AgentActor package: {error}"))?;
+    let canonical = package
+        .encode()
+        .map_err(|error| anyhow::anyhow!("encode VOS3 AgentActor package: {error}"))?;
+    if canonical != bytes {
+        anyhow::bail!("signed VOS3 AgentActor package is not canonical");
     }
     package
-        .validate()
-        .map_err(|error| anyhow::anyhow!("validate VOSK agent package: {error}"))?;
-    if package.manifest.name != name {
-        anyhow::bail!("package is named {}, not {name}", package.manifest.name);
+        .verify(&RawEd25519PackageVerifier)
+        .map_err(|error| anyhow::anyhow!("verify VOS3 AgentActor package: {error}"))?;
+    let AgentPackageManifest::Actor(manifest) = &package.manifest else {
+        anyhow::bail!("VOS3 AgentRuntime packages cannot be published as AgentActor programs");
+    };
+    if manifest.name != name {
+        anyhow::bail!("package is named {}, not {name}", manifest.name);
     }
-    verify_ed25519_signature(
-        "VOSK agent package",
-        &package.deployment_signature.public_key,
-        &package.signing_message(),
-        &package.deployment_signature.signature,
-    )?;
-    if !matches!(package.manifest.kind, PackageKind::Actor { .. }) {
-        anyhow::bail!("VOSK AgentRuntime packages cannot be published as AgentActor programs");
+
+    let actor_program = package
+        .actor_program_bytes()
+        .map_err(|error| anyhow::anyhow!("read VOS3 actor PVM: {error}"))?;
+    if vos_pvm::spi::parse_standard_program(actor_program).is_none() {
+        anyhow::bail!("VOS3 actor artifact is not a canonical standard PVM");
+    }
+    let task_set = package
+        .task_dependency_set()
+        .map_err(|error| anyhow::anyhow!("read VOS3 Task dependency set: {error}"))?;
+    for dependency in task_set.dependencies {
+        let program = package
+            .task_program_bytes(dependency.task)
+            .map_err(|error| anyhow::anyhow!("read VOS3 Task PVM: {error}"))?;
+        if vos_pvm::spi::parse_standard_program(program).is_none() {
+            anyhow::bail!("VOS3 Task artifact is not a canonical standard PVM");
+        }
     }
     Ok(package)
+}
+
+struct RawEd25519PackageVerifier;
+
+impl PackageVerifier for RawEd25519PackageVerifier {
+    fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+        let Ok(key) = libp2p::identity::ed25519::PublicKey::try_from_bytes(public_key) else {
+            return false;
+        };
+        key.verify(message, signature)
+    }
 }
 
 fn verify_ed25519_signature(
@@ -188,8 +217,9 @@ pub(crate) enum AdmittedProgram {
     },
     AgentActor {
         hash: BlobHash,
-        /// Exact signed VOSK envelope retained by the CAS and catalog.
+        /// Exact signed VOS3 envelope retained by the CAS and catalog.
         exact_bytes: Vec<u8>,
+        /// Exact AAI1 introspection artifact authenticated by the package.
         metadata: Vec<u8>,
     },
 }
@@ -214,18 +244,29 @@ pub(crate) fn canonical_program(
                 crdt: package.manifest.crdt,
             })
         }
-        Some(b"VOSK") => {
+        Some(b"VOS3") => {
             let package = validate_agent_actor_package(name, &bytes)?;
-            // The Local Agent Host likewise consumes the exact VOSK envelope.
-            // Public metadata remains the `.vos_meta` artifact authenticated
-            // by that package, not a caller-selected side channel.
+            let AgentPackageManifest::Actor(manifest) = &package.manifest else {
+                unreachable!("AgentRuntime package rejected during validation")
+            };
+            let metadata = package
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.identity == manifest.introspection)
+                .map(|artifact| artifact.bytes.clone())
+                .ok_or_else(|| anyhow::anyhow!("VOS3 package omitted its AAI1 introspection"))?;
+            // The Agent Host consumes the exact VOS3 envelope. Public
+            // introspection is an authenticated closure member, never a
+            // caller-selected metadata side channel.
             Ok(AdmittedProgram::AgentActor {
                 hash: source_hash,
                 exact_bytes: bytes,
-                metadata: package.schemas,
+                metadata,
             })
         }
-        _ => anyhow::bail!("expected a signed VOSP service or VOSK AgentActor package"),
+        _ => anyhow::bail!(
+            "expected a signed VOSP service or VOS3 AgentActor package; previous Agent package generations are unsupported"
+        ),
     }
 }
 
@@ -256,20 +297,26 @@ fn emit(name: &str, hash: &BlobHash, already_present: bool) {
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::{Signer as _, SigningKey};
     use libp2p::identity::Keypair;
-    use vos::agent::contract::{ActorPackageContract, RuntimePackageContract};
-    use vos::agent::package::{
-        Package as AgentPackage, PackageManifest as AgentPackageManifest,
-        actor_runtime_requirements,
+    use vos::agent::sdk::contract::{ActorPackageContract, RuntimePackageContract};
+    use vos::agent::sdk::introspection::ActorIntrospectionArtifact;
+    use vos::agent::sdk::method_policy::ActorMethodPolicyArtifact;
+    use vos::agent::sdk::package::{
+        ActorPackageManifest, AgentRuntimePackageManifest, PackageArtifact, PackageEnvelope,
+        PackageManifest as CleanPackageManifest, PackageSigning,
     };
-    use vos::agent::schema::{
-        ExecutionEntryKind, MethodMeta as AgentMethodMeta, SchemaMeta as AgentSchemaMeta,
+    use vos::agent::sdk::schema::{ConstructorContract, ParsedSchema};
+    use vos::agent::sdk::task::TaskDependencySetArtifact;
+    use vos::agent::sdk::wire::CanonicalWire as _;
+    use vos::agent::sdk::{
+        BlobRef as AgentBlobRef, LaneSet, ProducerId as AgentProducerId, ProofSystemSet,
+        RuntimeCapabilities, RuntimeRequirements,
     };
-    use vos::agent::{MethodMode, PackageKind, RuntimeCapabilities};
     use vos::metadata::{ActorMeta, MessageMeta};
     use vos::service::{
         DeploymentSignature, Hash, PackageManifest, PackageRolePolicies, ProducerId, ProgramId,
-        VosPackage, artifact_hash, task_dependencies_hash,
+        VosPackage, artifact_hash,
     };
 
     use super::*;
@@ -296,16 +343,6 @@ mod tests {
         provable: false,
     };
 
-    const AGENT_SCHEMA: AgentSchemaMeta = AgentSchemaMeta {
-        uses_storage: false,
-        fields: &[],
-        methods: &[AgentMethodMeta {
-            name: "value",
-            mode: MethodMode::Query,
-            explicit: true,
-        }],
-    };
-
     fn actor_pvm() -> Vec<u8> {
         let mut assembler = vos_pvm_compiler::assembler::Assembler::new();
         assembler
@@ -314,7 +351,7 @@ mod tests {
         assembler.build()
     }
 
-    fn agent_pvm() -> Vec<u8> {
+    fn standard_pvm() -> Vec<u8> {
         let mut assembler = vos_pvm_compiler::assembler::Assembler::new();
         assembler.trap();
         assembler.build_standard()
@@ -360,99 +397,99 @@ mod tests {
         package
     }
 
-    fn signed_agent_actor_package() -> AgentPackage {
-        let pvm = agent_pvm();
-        let (metadata_buffer, metadata_len) = vos::metadata::encode::<512>(&META);
-        let schemas = metadata_buffer[..metadata_len].to_vec();
-        let metadata = vos::metadata::decode(&schemas).unwrap();
-        let role_policies = PackageRolePolicies::from_metadata(&metadata)
-            .unwrap()
-            .encode();
-        let (agent_buffer, agent_len) = vos::agent::schema::encode_with_entry::<512>(
-            &AGENT_SCHEMA,
-            ExecutionEntryKind::AgentActor,
-        );
-        let agent_schema = agent_buffer[..agent_len].to_vec();
-        let parsed_agent_schema = vos::agent::schema::decode(&agent_schema).unwrap();
-        let generated_interfaces = Vec::new();
-        let keypair = Keypair::generate_ed25519();
-        let public_key = keypair.public().encode_protobuf();
-        let mut package = AgentPackage {
-            manifest: AgentPackageManifest {
-                name: "counter".into(),
-                platform: vos::service::PLATFORM_ID,
-                execution_semantics: vos::agent::EXECUTION_SEMANTICS_ID,
-                kind: PackageKind::Actor {
-                    contract: ActorPackageContract::canonical(),
-                    requirements: actor_runtime_requirements(
-                        &parsed_agent_schema,
-                        &metadata,
-                        false,
-                    ),
-                },
-                program: ProgramId::of_pvm(&pvm),
-                interfaces_hash: artifact_hash(b"interfaces", &generated_interfaces),
-                role_policies_hash: artifact_hash(b"role-policies", &role_policies),
-                schemas_hash: artifact_hash(b"schemas", &schemas),
-                agent_schema_hash: artifact_hash(b"agent-schema", &agent_schema),
-                dependencies_hash: task_dependencies_hash(&[]),
-            },
-            pvm,
-            generated_interfaces,
-            role_policies,
-            schemas,
-            agent_schema,
-            task_dependencies: Vec::new(),
-            diagnostics: None,
-            deployment_signature: DeploymentSignature {
-                producer: ProducerId::of_public_key(&public_key),
-                public_key,
-                signature: vec![0],
-            },
-        };
-        package.deployment_signature.signature = keypair.sign(&package.signing_message()).unwrap();
-        package.validate().unwrap();
+    fn clean_artifact(bytes: &[u8]) -> PackageArtifact {
+        PackageArtifact {
+            identity: AgentBlobRef::of_bytes(bytes),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn sign_clean(mut package: PackageEnvelope) -> PackageEnvelope {
+        let key = SigningKey::from_bytes(&[0x5a; 32]);
+        let message = package.signing_bytes().unwrap();
+        package.manifest.signing_mut().signature = key.sign(&message).to_bytes();
         package
     }
 
-    fn signed_agent_runtime_package() -> AgentPackage {
-        let pvm = agent_pvm();
-        let generated_interfaces = b"agent-runtime-lifecycle".to_vec();
-        let schemas = b"agent-runtime-schema".to_vec();
-        let keypair = Keypair::generate_ed25519();
-        let public_key = keypair.public().encode_protobuf();
-        let mut package = AgentPackage {
-            manifest: AgentPackageManifest {
-                name: "standard-runtime".into(),
-                platform: vos::service::PLATFORM_ID,
-                execution_semantics: vos::agent::EXECUTION_SEMANTICS_ID,
-                kind: PackageKind::AgentRuntime {
-                    contract: RuntimePackageContract::canonical(),
-                    capabilities: RuntimeCapabilities::standard(),
-                },
-                program: ProgramId::of_pvm(&pvm),
-                interfaces_hash: artifact_hash(b"interfaces", &generated_interfaces),
-                role_policies_hash: artifact_hash(b"role-policies", &[]),
-                schemas_hash: artifact_hash(b"schemas", &schemas),
-                agent_schema_hash: artifact_hash(b"agent-schema", &[]),
-                dependencies_hash: task_dependencies_hash(&[]),
-            },
-            pvm,
-            generated_interfaces,
-            role_policies: Vec::new(),
-            schemas,
-            agent_schema: Vec::new(),
-            task_dependencies: Vec::new(),
-            diagnostics: None,
-            deployment_signature: DeploymentSignature {
-                producer: ProducerId::of_public_key(&public_key),
-                public_key,
-                signature: vec![0],
-            },
+    fn signed_agent_actor_package() -> PackageEnvelope {
+        let program = standard_pvm();
+        let schema = ParsedSchema {
+            constructor: ConstructorContract::Forbidden,
+            fields: Vec::new(),
+            methods: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        let policy = ActorMethodPolicyArtifact {
+            actor_schema: AgentBlobRef::of_bytes(&schema),
+            methods: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        let introspection = ActorIntrospectionArtifact {
+            actor_schema: AgentBlobRef::of_bytes(&schema),
+            method_policy: AgentBlobRef::of_bytes(&policy),
+            actor_doc: "A counter actor.".into(),
+            methods: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        let tasks = TaskDependencySetArtifact {
+            dependencies: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        let key = SigningKey::from_bytes(&[0x5a; 32]);
+        let public_key = key.verifying_key().to_bytes();
+        let signing = PackageSigning {
+            producer: AgentProducerId::of_public_key(&public_key),
+            public_key,
+            signature: [0; 64],
         };
-        package.deployment_signature.signature = keypair.sign(&package.signing_message()).unwrap();
-        package.validate().unwrap();
-        package
+        let mut artifacts = [&program[..], &schema, &policy, &introspection, &tasks]
+            .into_iter()
+            .map(clean_artifact)
+            .collect::<Vec<_>>();
+        artifacts.sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+        sign_clean(PackageEnvelope {
+            manifest: CleanPackageManifest::Actor(ActorPackageManifest {
+                name: "counter".into(),
+                program: AgentBlobRef::of_bytes(&program),
+                contract: ActorPackageContract::canonical(),
+                state_lane_schema: AgentBlobRef::of_bytes(&schema),
+                method_policy: AgentBlobRef::of_bytes(&policy),
+                introspection: AgentBlobRef::of_bytes(&introspection),
+                task_dependencies: AgentBlobRef::of_bytes(&tasks),
+                scheduling: false,
+                requirements: RuntimeRequirements {
+                    lanes: LaneSet::NONE,
+                    scheduling: false,
+                    proof_systems: ProofSystemSet::EMPTY,
+                },
+                signing,
+            }),
+            artifacts,
+        })
+    }
+
+    fn signed_agent_runtime_package() -> PackageEnvelope {
+        let pvm = standard_pvm();
+        let key = SigningKey::from_bytes(&[0x5a; 32]);
+        let public_key = key.verifying_key().to_bytes();
+        sign_clean(PackageEnvelope {
+            manifest: CleanPackageManifest::AgentRuntime(AgentRuntimePackageManifest {
+                name: "standard-runtime".into(),
+                outer_program: AgentBlobRef::of_bytes(&pvm),
+                contract: RuntimePackageContract::canonical(),
+                capabilities: RuntimeCapabilities::standard(),
+                signing: PackageSigning {
+                    producer: AgentProducerId::of_public_key(&public_key),
+                    public_key,
+                    signature: [0; 64],
+                },
+            }),
+            artifacts: vec![clean_artifact(&pvm)],
+        })
     }
 
     #[test]
@@ -479,9 +516,9 @@ mod tests {
     }
 
     #[test]
-    fn publishing_agent_actor_retains_the_exact_signed_vosk_package() {
+    fn publishing_agent_actor_retains_the_exact_signed_vos3_package() {
         let package = signed_agent_actor_package();
-        let bytes = package.encode();
+        let bytes = package.encode().unwrap();
         let source_hash = BlobHash::of(&bytes);
         let admitted = canonical_program("counter", source_hash, bytes.clone()).unwrap();
 
@@ -491,36 +528,50 @@ mod tests {
             metadata,
         } = admitted
         else {
-            panic!("VOSK actor package admitted with the wrong catalog kind")
+            panic!("VOS3 actor package admitted with the wrong catalog kind")
         };
+        let CleanPackageManifest::Actor(manifest) = &package.manifest else {
+            unreachable!()
+        };
+        let expected_introspection = package
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.identity == manifest.introspection)
+            .unwrap();
         assert_eq!(hash, source_hash);
         assert_eq!(exact_bytes, bytes);
-        assert_eq!(metadata, package.schemas);
-        assert_ne!(hash, BlobHash::of(&package.pvm));
+        assert_eq!(metadata, expected_introspection.bytes);
+        assert_ne!(hash, BlobHash::of(package.actor_program_bytes().unwrap()));
     }
 
     #[test]
     fn publishing_rejects_tampered_service_and_agent_signatures() {
         let mut service = signed_package().encode();
         *service.last_mut().unwrap() ^= 0xff;
-        let mut agent = signed_agent_actor_package().encode();
-        *agent.last_mut().unwrap() ^= 0xff;
+        let mut agent = signed_agent_actor_package();
+        agent.manifest.signing_mut().signature[0] ^= 0xff;
+        let agent = agent.encode().unwrap();
 
-        for bytes in [service, agent] {
-            let error = canonical_program("counter", BlobHash::of(&bytes), bytes).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("deployment signature is invalid")
-            );
-        }
+        let service_error =
+            canonical_program("counter", BlobHash::of(&service), service).unwrap_err();
+        assert!(
+            service_error
+                .to_string()
+                .contains("deployment signature is invalid")
+        );
+        let agent_error = canonical_program("counter", BlobHash::of(&agent), agent).unwrap_err();
+        assert!(
+            agent_error
+                .to_string()
+                .contains("invalid package signature")
+        );
     }
 
     #[test]
     fn publishing_rejects_trailing_bytes_for_both_package_wires() {
         for mut bytes in [
             signed_package().encode(),
-            signed_agent_actor_package().encode(),
+            signed_agent_actor_package().encode().unwrap(),
         ] {
             bytes.push(0);
             let error = canonical_program("counter", BlobHash::of(&bytes), bytes).unwrap_err();
@@ -535,8 +586,8 @@ mod tests {
         assert_eq!(service[service_crdt], 0);
         service[service_crdt] = 2;
 
-        let mut agent = signed_agent_actor_package().encode();
-        let agent_scheduling = 36 + 4 + "counter".len() + 2 * 32 + 1 + 4 + 1;
+        let mut agent = signed_agent_actor_package().encode().unwrap();
+        let agent_scheduling = 4 + 2 + 32 + 1 + 4 + "counter".len() + 40 + 4 + 4 * 40;
         assert_eq!(agent[agent_scheduling], 0);
         agent[agent_scheduling] = 2;
 
@@ -547,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn publishing_rejects_noncanonical_producer_key_encodings() {
+    fn publishing_rejects_noncanonical_service_and_mismatched_agent_producer_keys() {
         let mut service = signed_package();
         service
             .deployment_signature
@@ -556,25 +607,27 @@ mod tests {
         service.deployment_signature.producer =
             ProducerId::of_public_key(&service.deployment_signature.public_key);
 
-        let mut agent = signed_agent_actor_package();
-        agent
-            .deployment_signature
-            .public_key
-            .extend_from_slice(&[0x18, 0x00]);
-        agent.deployment_signature.producer =
-            ProducerId::of_public_key(&agent.deployment_signature.public_key);
+        let service = service.encode();
+        let error = canonical_program("counter", BlobHash::of(&service), service).unwrap_err();
+        assert!(error.to_string().contains("not canonically encoded"));
 
-        for bytes in [service.encode(), agent.encode()] {
-            let error = canonical_program("counter", BlobHash::of(&bytes), bytes).unwrap_err();
-            assert!(error.to_string().contains("not canonically encoded"));
-        }
+        let mut agent = signed_agent_actor_package().encode().unwrap();
+        let public_key_offset =
+            4 + 2 + 32 + 1 + 4 + "counter".len() + 40 + 4 + 4 * 40 + 1 + 1 + 1 + 1 + 32;
+        agent[public_key_offset] ^= 0x01;
+        let error = canonical_program("counter", BlobHash::of(&agent), agent).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("producer does not match public key")
+        );
     }
 
     #[test]
     fn publishing_requires_the_exact_signed_manifest_name() {
         for bytes in [
             signed_package().encode(),
-            signed_agent_actor_package().encode(),
+            signed_agent_actor_package().encode().unwrap(),
         ] {
             let error = canonical_program("not-counter", BlobHash::of(&bytes), bytes).unwrap_err();
             assert!(
@@ -586,8 +639,8 @@ mod tests {
     }
 
     #[test]
-    fn publishing_rejects_vosk_agent_runtime_packages() {
-        let bytes = signed_agent_runtime_package().encode();
+    fn publishing_rejects_vos3_agent_runtime_packages() {
+        let bytes = signed_agent_runtime_package().encode().unwrap();
         let error = canonical_program("standard-runtime", BlobHash::of(&bytes), bytes).unwrap_err();
         assert!(error.to_string().contains("AgentRuntime"));
     }
@@ -599,9 +652,9 @@ mod tests {
             validate_agent_actor_package("counter", &service)
                 .unwrap_err()
                 .to_string()
-                .contains("expected a signed VOSK")
+                .contains("expected a signed VOS3")
         );
-        let agent = signed_agent_actor_package().encode();
+        let agent = signed_agent_actor_package().encode().unwrap();
         assert!(
             validate_package("counter", &agent)
                 .unwrap_err()
@@ -610,16 +663,24 @@ mod tests {
         );
 
         let mut service_as_agent = signed_package().encode();
-        service_as_agent[..4].copy_from_slice(b"VOSK");
+        service_as_agent[..4].copy_from_slice(b"VOS3");
         let error = canonical_program("counter", BlobHash::of(&service_as_agent), service_as_agent)
             .unwrap_err();
-        assert!(error.to_string().contains("VOSK"));
+        assert!(error.to_string().contains("VOS3"));
 
-        let mut agent_as_service = signed_agent_actor_package().encode();
+        let mut agent_as_service = signed_agent_actor_package().encode().unwrap();
         agent_as_service[..4].copy_from_slice(b"VOSP");
         let error = canonical_program("counter", BlobHash::of(&agent_as_service), agent_as_service)
             .unwrap_err();
         assert!(error.to_string().contains("service package"));
+
+        let legacy = b"VOSK obsolete-agent-envelope".to_vec();
+        let error = canonical_program("counter", BlobHash::of(&legacy), legacy).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("previous Agent package generations")
+        );
     }
 
     #[test]
