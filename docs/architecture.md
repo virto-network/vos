@@ -78,6 +78,14 @@ driver provides Local execution and fails closed for Shared/Private profiles
 until their consensus and causal adapters land. Consistency changes how
 accepted transitions are ordered and exchanged, not what an actor is.
 
+The Shared profile now has a storage-side Raft application foundation, but it
+is not attached to the process driver. It keys one physical Raft database to
+the stable `(space, agent, journal genesis, admission)` generation rather than
+to a replaceable committee epoch. Every committed physical index is classified
+as a leader no-op, canonical Shared command, or bounded membership change. The
+foundation can atomically audit and advance leader no-ops; command execution
+and authorized committee transitions remain fail-closed integration steps.
+
 ## Content identity
 
 Packages, programs, proofs, and state artifacts are content-addressed. Human

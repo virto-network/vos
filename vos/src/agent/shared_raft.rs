@@ -1,12 +1,14 @@
 //! Crash-safe Raft routing and application evidence for Shared Agents.
 //!
-//! This module deliberately stops short of being a Raft storage adapter.  Raw
-//! Raft bytes are first decoded as bounded canonical [`AgentRaftCommand`]s,
-//! then promoted to [`CommittedAgentRaftEntry`] only through the crate-private
-//! read-only durable-log witness.  Applying an ordered command and publishing
-//! its exact [`OrderedCommitClaim`] are separate from signing: the evidence
-//! ledger first anchors that applied claim, then commits an immutable pledge,
-//! and only then invokes a replica signer.
+//! The clean-generation storage foundation classifies every committed physical
+//! Raft slot as a leader no-op, canonical [`AgentRaftCommand`], or bounded
+//! membership change. It advances its V2 audit cursor and Raft `last_applied`
+//! atomically for the no-op case. Command execution, authorized committee
+//! transitions, and live-worker attachment remain later integration slices.
+//! Applying an ordered command and publishing its exact [`OrderedCommitClaim`]
+//! are separate from signing: the evidence ledger first anchors that applied
+//! claim, then commits an immutable pledge, and only then invokes a replica
+//! signer.
 //!
 //! `compact_safe` is durable audit state, not a compaction capability.  This
 //! file intentionally exposes no Raft snapshot, truncation, or compaction API.
@@ -41,7 +43,11 @@ const ARTIFACT_BATCH_ID_DOMAIN: &[u8] = b"vos/agent/shared/artifact-batch/v1";
 const ARTIFACT_CHUNK_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/artifact-batch-chunk/v1";
 const AGENT_RAFT_COMMAND_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/raft-command/v1";
 const AGENT_RAFT_APPLY_RESERVATION_DOMAIN: &[u8] = b"vos/agent/shared/raft-apply-reservation/v1";
+#[cfg(feature = "storage")]
+const AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/raft-physical-slot/v2";
 
+/// Maximum complete stable generation route key.
+pub const MAX_AGENT_GENERATION_ROUTE_KEY_BYTES: usize = 224;
 /// Maximum complete generation-scoped route key.
 pub const MAX_AGENT_ROUTE_KEY_BYTES: usize = 256;
 /// Maximum complete artifact-batch manifest.
@@ -52,6 +58,10 @@ pub const ARTIFACT_CHUNK_DATA_BYTES: usize = 64 * 1024;
 pub const MAX_ARTIFACT_CHUNK_WIRE_BYTES: usize = 96 * 1024;
 /// Maximum complete Shared Agent Raft command.
 pub const MAX_AGENT_RAFT_COMMAND_BYTES: usize = 192 * 1024;
+/// Maximum complete encoded physical `vos-raft` slot admitted by the Shared
+/// adapter. The one-byte entry-kind tag is included.
+#[cfg(feature = "storage")]
+pub const MAX_AGENT_RAFT_PHYSICAL_SLOT_BYTES: usize = MAX_AGENT_RAFT_COMMAND_BYTES + 1;
 /// Maximum complete apply-audit disposition.
 pub const MAX_AGENT_RAFT_AUDIT_DISPOSITION_BYTES: usize = 256;
 /// Maximum complete durable apply metadata record.
@@ -86,6 +96,80 @@ impl JournalStoreInstanceId {
 
     pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+/// Stable identity of one Shared-Agent journal generation.
+///
+/// Unlike [`AgentRouteKey`], this key deliberately excludes the active
+/// committee. Committee epochs may change while the journal generation and
+/// its physical Raft log remain the same. Durable application cursors and
+/// snapshot identities must therefore be keyed by this value, while
+/// committee-scoped commands and certificates continue to use
+/// [`AgentRouteKey`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentGenerationRouteKey {
+    space: SpaceId,
+    agent: AgentId,
+    genesis: AgentJournalGenesisId,
+    admission: AgentGenesisAdmissionId,
+}
+
+impl AgentGenerationRouteKey {
+    pub fn new(
+        space: SpaceId,
+        agent: AgentId,
+        genesis: AgentJournalGenesisId,
+        admission: AgentGenesisAdmissionId,
+    ) -> Result<Self, AgentRaftWireError> {
+        let route = Self {
+            space,
+            agent,
+            genesis,
+            admission,
+        };
+        route.validate()?;
+        Ok(route)
+    }
+
+    pub const fn space(self) -> SpaceId {
+        self.space
+    }
+
+    pub const fn agent(self) -> AgentId {
+        self.agent
+    }
+
+    pub const fn genesis(self) -> AgentJournalGenesisId {
+        self.genesis
+    }
+
+    pub const fn admission(self) -> AgentGenesisAdmissionId {
+        self.admission
+    }
+
+    pub fn validate(self) -> Result<(), AgentRaftWireError> {
+        if self.space == SpaceId::ZERO
+            || self.agent == AgentId::ZERO
+            || self.genesis == AgentJournalGenesisId::ZERO
+            || self.admission == AgentGenesisAdmissionId::ZERO
+        {
+            return Err(AgentRaftWireError::InvalidRoute);
+        }
+        enforce_wire_bound(&self, MAX_AGENT_GENERATION_ROUTE_KEY_BYTES)
+    }
+}
+
+impl ServiceWire for AgentGenerationRouteKey {
+    const MAGIC: [u8; 4] = *b"AGGR";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        encode_generation_route(&mut Encoder(output), *self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_AGENT_GENERATION_ROUTE_KEY_BYTES)?;
+        decode_generation_route(decoder)
     }
 }
 
@@ -149,6 +233,15 @@ impl AgentRouteKey {
 
     pub const fn committee(self) -> AgentReplicaCommitteeId {
         self.committee
+    }
+
+    pub const fn generation(self) -> AgentGenerationRouteKey {
+        AgentGenerationRouteKey {
+            space: self.space,
+            agent: self.agent,
+            genesis: self.genesis,
+            admission: self.admission,
+        }
     }
 
     pub fn validate(self) -> Result<(), AgentRaftWireError> {
@@ -838,6 +931,570 @@ impl CommittedAgentRaftEntry {
     }
 }
 
+/// Opaque committed empty-data slot inserted by a Raft leader.
+///
+/// The private fields prevent application code from manufacturing a durable
+/// witness. Obtain this only by matching [`CommittedSharedRaftSlot`].
+#[cfg(feature = "storage")]
+#[derive(Clone, Debug)]
+pub struct CommittedRaftLeaderNoop {
+    index: u64,
+    term: u64,
+    committed_index: u64,
+    raw_payload_commitment: Hash,
+}
+
+#[cfg(feature = "storage")]
+impl CommittedRaftLeaderNoop {
+    pub const fn index(&self) -> u64 {
+        self.index
+    }
+
+    pub const fn term(&self) -> u64 {
+        self.term
+    }
+
+    pub const fn committed_index(&self) -> u64 {
+        self.committed_index
+    }
+
+    pub const fn raw_payload_commitment(&self) -> Hash {
+        self.raw_payload_commitment
+    }
+}
+
+/// Opaque committed canonical Shared command and its complete physical-slot
+/// commitment.
+#[cfg(feature = "storage")]
+#[derive(Clone, Debug)]
+pub struct CommittedSharedRaftCommand {
+    entry: CommittedAgentRaftEntry,
+    raw_payload_commitment: Hash,
+}
+
+#[cfg(feature = "storage")]
+impl CommittedSharedRaftCommand {
+    pub const fn entry(&self) -> &CommittedAgentRaftEntry {
+        &self.entry
+    }
+
+    pub const fn raw_payload_commitment(&self) -> Hash {
+        self.raw_payload_commitment
+    }
+}
+
+/// Opaque committed, structurally valid `vos-raft` membership slot.
+///
+/// Structural admission here does not authorize a Shared committee change.
+/// Sequence B binds these Raft prefixes to an ordered, certified committee
+/// transition; the V2 foundation ledger rejects every such slot until then.
+#[cfg(feature = "storage")]
+#[derive(Clone, Debug)]
+pub struct CommittedRaftConfiguration {
+    index: u64,
+    term: u64,
+    committed_index: u64,
+    joint_old: Option<Vec<u16>>,
+    members: Vec<u16>,
+    raw_payload_commitment: Hash,
+}
+
+#[cfg(feature = "storage")]
+impl CommittedRaftConfiguration {
+    pub const fn index(&self) -> u64 {
+        self.index
+    }
+
+    pub const fn term(&self) -> u64 {
+        self.term
+    }
+
+    pub const fn committed_index(&self) -> u64 {
+        self.committed_index
+    }
+
+    pub fn joint_old(&self) -> Option<&[u16]> {
+        self.joint_old.as_deref()
+    }
+
+    pub fn members(&self) -> &[u16] {
+        &self.members
+    }
+
+    pub const fn raw_payload_commitment(&self) -> Hash {
+        self.raw_payload_commitment
+    }
+}
+
+/// One exact, committed physical `vos-raft` slot.
+///
+/// Every committed index is decoded: empty `Data` is a leader no-op,
+/// non-empty `Data` must be an exact canonical [`AgentRaftCommand`], and a
+/// `ConfigChange` must carry bounded, non-empty, sorted-unique prefix lists.
+/// There is intentionally no public or raw constructor.
+#[cfg(feature = "storage")]
+#[derive(Clone, Debug)]
+pub enum CommittedSharedRaftSlot {
+    LeaderNoop(CommittedRaftLeaderNoop),
+    Command(CommittedSharedRaftCommand),
+    Configuration(CommittedRaftConfiguration),
+}
+
+#[cfg(feature = "storage")]
+impl CommittedSharedRaftSlot {
+    pub const fn index(&self) -> u64 {
+        match self {
+            Self::LeaderNoop(slot) => slot.index,
+            Self::Command(slot) => slot.entry.index,
+            Self::Configuration(slot) => slot.index,
+        }
+    }
+
+    pub const fn term(&self) -> u64 {
+        match self {
+            Self::LeaderNoop(slot) => slot.term,
+            Self::Command(slot) => slot.entry.term,
+            Self::Configuration(slot) => slot.term,
+        }
+    }
+
+    pub const fn committed_index(&self) -> u64 {
+        match self {
+            Self::LeaderNoop(slot) => slot.committed_index,
+            Self::Command(slot) => slot.entry.committed_index,
+            Self::Configuration(slot) => slot.committed_index,
+        }
+    }
+
+    pub const fn raw_payload_commitment(&self) -> Hash {
+        match self {
+            Self::LeaderNoop(slot) => slot.raw_payload_commitment,
+            Self::Command(slot) => slot.raw_payload_commitment,
+            Self::Configuration(slot) => slot.raw_payload_commitment,
+        }
+    }
+
+    pub(crate) fn from_durable_log<W: DurableSharedRaftLogWitness>(
+        witness: &W,
+        index: u64,
+    ) -> Result<Self, CommittedSharedRaftSlotError<W::Error>> {
+        use vos_raft::EntryKind;
+
+        if index == 0 {
+            return Err(CommittedSharedRaftSlotError::Invalid(
+                AgentRaftWireError::InvalidPhysicalSlot,
+            ));
+        }
+        let (stored_index, term, committed_index, raw) = witness
+            .read_committed_physical_slot(index)
+            .map_err(CommittedSharedRaftSlotError::Witness)?
+            .ok_or(CommittedSharedRaftSlotError::Missing)?;
+        if stored_index != index
+            || term == 0
+            || committed_index < index
+            || raw.is_empty()
+            || raw.len() > MAX_AGENT_RAFT_PHYSICAL_SLOT_BYTES
+        {
+            return Err(CommittedSharedRaftSlotError::Invalid(
+                AgentRaftWireError::InvalidPhysicalSlot,
+            ));
+        }
+        preflight_raft_configuration_bytes(&raw).map_err(CommittedSharedRaftSlotError::Invalid)?;
+        let kind = crate::raft::redb_storage::decode_entry_kind(&raw).map_err(|_| {
+            CommittedSharedRaftSlotError::Invalid(AgentRaftWireError::InvalidPhysicalSlot)
+        })?;
+        if crate::raft::redb_storage::encode_entry_kind(&kind) != raw {
+            return Err(CommittedSharedRaftSlotError::Invalid(
+                AgentRaftWireError::NonCanonical,
+            ));
+        }
+        let raw_payload_commitment = Hash::digest(
+            AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN,
+            &[raw.as_slice()],
+        );
+        match kind {
+            EntryKind::Data { payload } if payload.is_empty() => {
+                Ok(Self::LeaderNoop(CommittedRaftLeaderNoop {
+                    index,
+                    term,
+                    committed_index,
+                    raw_payload_commitment,
+                }))
+            }
+            EntryKind::Data { payload } => {
+                if payload.len() > MAX_AGENT_RAFT_COMMAND_BYTES {
+                    return Err(CommittedSharedRaftSlotError::Invalid(
+                        AgentRaftWireError::LimitExceeded,
+                    ));
+                }
+                let command = AgentRaftCommand::decode(&payload).map_err(|_| {
+                    CommittedSharedRaftSlotError::Invalid(AgentRaftWireError::InvalidCommittedEntry)
+                })?;
+                if command.encode() != payload {
+                    return Err(CommittedSharedRaftSlotError::Invalid(
+                        AgentRaftWireError::NonCanonical,
+                    ));
+                }
+                let payload_commitment = command.commitment();
+                Ok(Self::Command(CommittedSharedRaftCommand {
+                    entry: CommittedAgentRaftEntry {
+                        index,
+                        term,
+                        committed_index,
+                        command,
+                        payload_commitment,
+                    },
+                    raw_payload_commitment,
+                }))
+            }
+            EntryKind::ConfigChange { joint_old, members } => {
+                validate_raft_configuration(joint_old.as_deref(), &members)
+                    .map_err(CommittedSharedRaftSlotError::Invalid)?;
+                Ok(Self::Configuration(CommittedRaftConfiguration {
+                    index,
+                    term,
+                    committed_index,
+                    joint_old,
+                    members,
+                    raw_payload_commitment,
+                }))
+            }
+            _ => Err(CommittedSharedRaftSlotError::Invalid(
+                AgentRaftWireError::InvalidPhysicalSlot,
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "storage")]
+fn preflight_raft_configuration_bytes(raw: &[u8]) -> Result<(), AgentRaftWireError> {
+    if raw.first().copied() != Some(crate::raft::redb_storage::ENTRY_KIND_CONFIG_CHANGE) {
+        return Ok(());
+    }
+    let body = raw
+        .get(1..)
+        .ok_or(AgentRaftWireError::InvalidConfiguration)?;
+    let mut position = 0_usize;
+    let joint = *body
+        .get(position)
+        .ok_or(AgentRaftWireError::InvalidConfiguration)?;
+    position += 1;
+    match joint {
+        0 => {}
+        1 => preflight_raft_prefix_list(body, &mut position)?,
+        _ => return Err(AgentRaftWireError::InvalidConfiguration),
+    }
+    preflight_raft_prefix_list(body, &mut position)?;
+    if position != body.len() {
+        return Err(AgentRaftWireError::InvalidConfiguration);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "storage")]
+fn preflight_raft_prefix_list(
+    bytes: &[u8],
+    position: &mut usize,
+) -> Result<(), AgentRaftWireError> {
+    let length = bytes
+        .get(*position..position.saturating_add(2))
+        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+        .map(u16::from_le_bytes)
+        .ok_or(AgentRaftWireError::InvalidConfiguration)? as usize;
+    *position = position.saturating_add(2);
+    if length == 0 || length > MAX_AGENT_REPLICAS {
+        return Err(AgentRaftWireError::InvalidConfiguration);
+    }
+    let width = length
+        .checked_mul(core::mem::size_of::<u16>())
+        .ok_or(AgentRaftWireError::InvalidConfiguration)?;
+    *position = position
+        .checked_add(width)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(AgentRaftWireError::InvalidConfiguration)?;
+    Ok(())
+}
+
+#[cfg(feature = "storage")]
+fn validate_raft_configuration(
+    joint_old: Option<&[u16]>,
+    members: &[u16],
+) -> Result<(), AgentRaftWireError> {
+    fn validate_list(list: &[u16]) -> bool {
+        !list.is_empty()
+            && list.len() <= MAX_AGENT_REPLICAS
+            && list.windows(2).all(|pair| pair[0] < pair[1])
+    }
+
+    if !validate_list(members) || joint_old.is_some_and(|members| !validate_list(members)) {
+        return Err(AgentRaftWireError::InvalidConfiguration);
+    }
+    Ok(())
+}
+
+/// Read-only production boundary for exact committed physical slots.
+///
+/// The tuple is `(stored_index, term, durable_commit_index,
+/// complete_encoded_entry_kind)` and must come from one durable read view.
+#[cfg(feature = "storage")]
+pub(crate) trait DurableSharedRaftLogWitness {
+    type Error;
+
+    fn read_committed_physical_slot(
+        &self,
+        index: u64,
+    ) -> Result<Option<(u64, u64, u64, Vec<u8>)>, Self::Error>;
+}
+
+#[cfg(feature = "storage")]
+#[derive(Debug)]
+pub(crate) enum CommittedSharedRaftSlotError<E> {
+    Witness(E),
+    Missing,
+    Invalid(AgentRaftWireError),
+}
+
+/// The redb-backed durable physical-slot witness. It performs no application
+/// work and is not attached to a live worker in this foundation slice.
+#[cfg(all(feature = "std", feature = "storage"))]
+pub(crate) struct RedbSharedRaftLogWitness {
+    database: alloc::sync::Arc<redb::Database>,
+}
+
+#[cfg(all(feature = "std", feature = "storage"))]
+impl RedbSharedRaftLogWitness {
+    pub(crate) const fn new(database: alloc::sync::Arc<redb::Database>) -> Self {
+        Self { database }
+    }
+}
+
+#[cfg(all(feature = "std", feature = "storage"))]
+impl DurableSharedRaftLogWitness for RedbSharedRaftLogWitness {
+    type Error = crate::commit::CommitError;
+
+    fn read_committed_physical_slot(
+        &self,
+        index: u64,
+    ) -> Result<Option<(u64, u64, u64, Vec<u8>)>, Self::Error> {
+        crate::raft::RaftLog::committed_payload_at(&self.database, index)
+    }
+}
+
+/// Clean-generation disposition for one physically applied Raft slot.
+///
+/// Command dispositions wrap the existing deterministic Shared application
+/// result. Configuration dispositions carry the exact authorized transition
+/// identity and committee epochs; Sequence A can decode them durably but does
+/// not mint them. Until Sequence B supplies that authorization, every
+/// committed configuration slot is rejected before cursor advancement.
+#[cfg(feature = "storage")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentRaftApplyDispositionV2 {
+    LeaderNoop,
+    Command(AgentRaftAuditDisposition),
+    CommitteeJointConfiguration {
+        transition: Hash,
+        previous: AgentReplicaCommitteeId,
+        next: AgentReplicaCommitteeId,
+    },
+    CommitteeStableConfiguration {
+        transition: Hash,
+        committee: AgentReplicaCommitteeId,
+    },
+}
+
+#[cfg(feature = "storage")]
+impl AgentRaftApplyDispositionV2 {
+    fn validate(self) -> Result<(), AgentRaftWireError> {
+        match self {
+            Self::LeaderNoop => {}
+            Self::Command(disposition) => disposition.validate()?,
+            Self::CommitteeJointConfiguration {
+                transition,
+                previous,
+                next,
+            } if transition != Hash::ZERO
+                && previous != AgentReplicaCommitteeId::ZERO
+                && next != AgentReplicaCommitteeId::ZERO
+                && previous != next => {}
+            Self::CommitteeStableConfiguration {
+                transition,
+                committee,
+            } if transition != Hash::ZERO && committee != AgentReplicaCommitteeId::ZERO => {}
+            _ => return Err(AgentRaftWireError::InvalidApplyMeta),
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "storage")]
+impl ServiceWire for AgentRaftApplyDispositionV2 {
+    const MAGIC: [u8; 4] = *b"AGD2";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        encode_disposition_v2(&mut Encoder(output), *self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_AGENT_RAFT_AUDIT_DISPOSITION_BYTES)?;
+        decode_disposition_v2(decoder)
+    }
+}
+
+/// Clean-generation durable cursor over every physical committed Raft index.
+#[cfg(feature = "storage")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentRaftApplyMetaV2 {
+    generation: AgentGenerationRouteKey,
+    journal_store: JournalStoreInstanceId,
+    applied_index: u64,
+    applied_term: u64,
+    raw_payload_commitment: Hash,
+    disposition: Option<AgentRaftApplyDispositionV2>,
+}
+
+#[cfg(feature = "storage")]
+impl AgentRaftApplyMetaV2 {
+    fn post_genesis(
+        generation: AgentGenerationRouteKey,
+        journal_store: JournalStoreInstanceId,
+    ) -> Self {
+        Self {
+            generation,
+            journal_store,
+            applied_index: 0,
+            applied_term: 0,
+            raw_payload_commitment: Hash::ZERO,
+            disposition: None,
+        }
+    }
+
+    pub(crate) const fn generation(&self) -> AgentGenerationRouteKey {
+        self.generation
+    }
+
+    pub(crate) const fn journal_store(&self) -> JournalStoreInstanceId {
+        self.journal_store
+    }
+
+    pub(crate) const fn applied(&self) -> (u64, u64) {
+        (self.applied_index, self.applied_term)
+    }
+
+    pub(crate) const fn raw_payload_commitment(&self) -> Hash {
+        self.raw_payload_commitment
+    }
+
+    pub(crate) const fn disposition(&self) -> Option<AgentRaftApplyDispositionV2> {
+        self.disposition
+    }
+
+    fn validate(&self) -> Result<(), AgentRaftWireError> {
+        self.generation.validate()?;
+        if self.journal_store.as_bytes() == &[0; 32] {
+            return Err(AgentRaftWireError::InvalidApplyMeta);
+        }
+        let empty = self.applied_index == 0
+            && self.applied_term == 0
+            && self.raw_payload_commitment == Hash::ZERO
+            && self.disposition.is_none();
+        let populated = self.applied_index != 0
+            && self.applied_term != 0
+            && self.raw_payload_commitment != Hash::ZERO
+            && self.disposition.is_some();
+        if !empty && !populated {
+            return Err(AgentRaftWireError::InvalidApplyMeta);
+        }
+        if let Some(disposition) = self.disposition {
+            disposition.validate()?;
+        }
+        enforce_wire_bound(self, MAX_AGENT_RAFT_APPLY_META_BYTES)
+    }
+}
+
+#[cfg(feature = "storage")]
+impl ServiceWire for AgentRaftApplyMetaV2 {
+    const MAGIC: [u8; 4] = *b"AGM2";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encode_generation_route(&mut encoder, self.generation);
+        encoder.fixed(self.journal_store.as_bytes());
+        encoder.u64(self.applied_index);
+        encoder.u64(self.applied_term);
+        encoder.fixed(&self.raw_payload_commitment.0);
+        encoder.option(&self.disposition, |encoder, disposition| {
+            encode_disposition_v2(encoder, *disposition)
+        });
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_AGENT_RAFT_APPLY_META_BYTES)?;
+        let meta = Self {
+            generation: decode_generation_route(decoder)?,
+            journal_store: JournalStoreInstanceId::from_bytes(decoder.fixed()?)
+                .ok_or(DecodeError::NonCanonical)?,
+            applied_index: decoder.u64()?,
+            applied_term: decoder.u64()?,
+            raw_payload_commitment: Hash(decoder.fixed()?),
+            disposition: decoder.option(decode_disposition_v2)?,
+        };
+        meta.validate().map_err(map_wire_decode_error)?;
+        Ok(meta)
+    }
+}
+
+/// Immutable V2 audit row. Duplicate admission compares this complete record,
+/// including the raw physical-slot commitment and final disposition.
+#[cfg(feature = "storage")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentRaftApplyAuditRecordV2 {
+    generation: AgentGenerationRouteKey,
+    index: u64,
+    term: u64,
+    raw_payload_commitment: Hash,
+    disposition: AgentRaftApplyDispositionV2,
+}
+
+#[cfg(feature = "storage")]
+impl AgentRaftApplyAuditRecordV2 {
+    fn validate(&self) -> Result<(), AgentRaftWireError> {
+        self.generation.validate()?;
+        self.disposition.validate()?;
+        if self.index == 0 || self.term == 0 || self.raw_payload_commitment == Hash::ZERO {
+            return Err(AgentRaftWireError::InvalidApplyMeta);
+        }
+        enforce_wire_bound(self, MAX_AGENT_RAFT_APPLY_META_BYTES)
+    }
+}
+
+#[cfg(feature = "storage")]
+impl ServiceWire for AgentRaftApplyAuditRecordV2 {
+    const MAGIC: [u8; 4] = *b"AGA2";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encode_generation_route(&mut encoder, self.generation);
+        encoder.u64(self.index);
+        encoder.u64(self.term);
+        encoder.fixed(&self.raw_payload_commitment.0);
+        encode_disposition_v2(&mut encoder, self.disposition);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_AGENT_RAFT_APPLY_META_BYTES)?;
+        let record = Self {
+            generation: decode_generation_route(decoder)?,
+            index: decoder.u64()?,
+            term: decoder.u64()?,
+            raw_payload_commitment: Hash(decoder.fixed()?),
+            disposition: decode_disposition_v2(decoder)?,
+        };
+        record.validate().map_err(map_wire_decode_error)?;
+        Ok(record)
+    }
+}
+
 /// Opaque proof that the evidence ledger durably reserved capacity for this
 /// exact next committed application before replay may publish it.
 ///
@@ -972,11 +1629,13 @@ pub(crate) enum CommittedAgentRaftEntryError<E> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentRaftWireError {
     InvalidRoute,
+    InvalidConfiguration,
     InvalidArtifactBatch,
     InvalidArtifactChunk,
     InvalidOrderedCommand,
     InvalidApplyMeta,
     InvalidCommittedEntry,
+    InvalidPhysicalSlot,
     NonCanonical,
     LimitExceeded,
 }
@@ -1070,20 +1729,37 @@ fn artifact_chunk_commitment(
 }
 
 fn encode_route(encoder: &mut Encoder<'_>, route: AgentRouteKey) {
-    encoder.fixed(&route.space.0);
-    encoder.fixed(&route.agent.0);
-    encoder.fixed(route.genesis.as_bytes());
-    encoder.fixed(route.admission.as_bytes());
+    encode_generation_route(encoder, route.generation());
     encoder.fixed(route.committee.as_bytes());
 }
 
 fn decode_route(decoder: &mut Decoder<'_>) -> Result<AgentRouteKey, DecodeError> {
+    let generation = decode_generation_route(decoder)?;
     AgentRouteKey::new(
+        generation.space(),
+        generation.agent(),
+        generation.genesis(),
+        generation.admission(),
+        AgentReplicaCommitteeId::from_bytes(decoder.fixed()?),
+    )
+    .map_err(map_wire_decode_error)
+}
+
+fn encode_generation_route(encoder: &mut Encoder<'_>, route: AgentGenerationRouteKey) {
+    encoder.fixed(&route.space.0);
+    encoder.fixed(&route.agent.0);
+    encoder.fixed(route.genesis.as_bytes());
+    encoder.fixed(route.admission.as_bytes());
+}
+
+fn decode_generation_route(
+    decoder: &mut Decoder<'_>,
+) -> Result<AgentGenerationRouteKey, DecodeError> {
+    AgentGenerationRouteKey::new(
         SpaceId(decoder.fixed()?),
         AgentId(decoder.fixed()?),
         AgentJournalGenesisId(decoder.fixed()?),
         AgentGenesisAdmissionId::from_bytes(decoder.fixed()?),
-        AgentReplicaCommitteeId::from_bytes(decoder.fixed()?),
     )
     .map_err(map_wire_decode_error)
 }
@@ -1146,6 +1822,57 @@ fn decode_disposition(decoder: &mut Decoder<'_>) -> Result<AgentRaftAuditDisposi
             entry: OrderedEntryId(decoder.fixed()?),
             claim: Hash(decoder.fixed()?),
             successor: JournalHeadsId(decoder.fixed()?),
+        },
+        _ => return Err(DecodeError::InvalidTag),
+    };
+    disposition.validate().map_err(map_wire_decode_error)?;
+    Ok(disposition)
+}
+
+#[cfg(feature = "storage")]
+fn encode_disposition_v2(encoder: &mut Encoder<'_>, disposition: AgentRaftApplyDispositionV2) {
+    match disposition {
+        AgentRaftApplyDispositionV2::LeaderNoop => encoder.u8(0),
+        AgentRaftApplyDispositionV2::Command(disposition) => {
+            encoder.u8(1);
+            encode_disposition(encoder, disposition);
+        }
+        AgentRaftApplyDispositionV2::CommitteeJointConfiguration {
+            transition,
+            previous,
+            next,
+        } => {
+            encoder.u8(2);
+            encoder.fixed(&transition.0);
+            encoder.fixed(previous.as_bytes());
+            encoder.fixed(next.as_bytes());
+        }
+        AgentRaftApplyDispositionV2::CommitteeStableConfiguration {
+            transition,
+            committee,
+        } => {
+            encoder.u8(3);
+            encoder.fixed(&transition.0);
+            encoder.fixed(committee.as_bytes());
+        }
+    }
+}
+
+#[cfg(feature = "storage")]
+fn decode_disposition_v2(
+    decoder: &mut Decoder<'_>,
+) -> Result<AgentRaftApplyDispositionV2, DecodeError> {
+    let disposition = match decoder.u8()? {
+        0 => AgentRaftApplyDispositionV2::LeaderNoop,
+        1 => AgentRaftApplyDispositionV2::Command(decode_disposition(decoder)?),
+        2 => AgentRaftApplyDispositionV2::CommitteeJointConfiguration {
+            transition: Hash(decoder.fixed()?),
+            previous: AgentReplicaCommitteeId::from_bytes(decoder.fixed()?),
+            next: AgentReplicaCommitteeId::from_bytes(decoder.fixed()?),
+        },
+        3 => AgentRaftApplyDispositionV2::CommitteeStableConfiguration {
+            transition: Hash(decoder.fixed()?),
+            committee: AgentReplicaCommitteeId::from_bytes(decoder.fixed()?),
         },
         _ => return Err(DecodeError::InvalidTag),
     };
@@ -2830,6 +3557,845 @@ pub(crate) use evidence_ledger::{
     AgentRaftEvidenceLedger, AgentRaftShareOutcome, AgentRaftSignError, ReplicaCommitSigner,
 };
 
+#[cfg(all(feature = "std", feature = "storage"))]
+mod application_ledger_v2 {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+
+    use redb::{Database, ReadableTable, TableDefinition, TableHandle};
+
+    use super::*;
+
+    const APPLICATION_SCHEMA_VERSION: u32 = 2;
+    const CONFIG_RECORD_MAX_BYTES: usize = 512;
+    const GENERATION_STORAGE_KEY_BYTES: usize = 32 * 4;
+    const AUDIT_STORAGE_KEY_BYTES: usize = GENERATION_STORAGE_KEY_BYTES + 8;
+
+    const CONFIG_TABLE_V2: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("agent_shared_raft_application_config_v2");
+    const APPLY_META_TABLE_V2: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("agent_shared_raft_apply_meta_v2");
+    const APPLY_AUDIT_TABLE_V2: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("agent_shared_raft_apply_audit_v2");
+
+    // Any table from the previous committee-keyed evidence generation makes
+    // this database ineligible for V2 initialization. There is deliberately
+    // no mixed-mode normalization or migration path.
+    const LEGACY_V1_TABLE_NAMES: &[&str] = &[
+        "agent_shared_raft_config",
+        "agent_shared_raft_apply_meta",
+        "agent_shared_raft_apply_reservation",
+        "agent_shared_raft_claim_anchors",
+        "agent_shared_raft_sign_pledges",
+        "agent_shared_raft_commit_shares",
+        "agent_shared_raft_quorum_certificates",
+        "agent_shared_raft_fail_stop",
+    ];
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ApplicationConfigV2 {
+        version: u32,
+        generation: AgentGenerationRouteKey,
+        journal_store: JournalStoreInstanceId,
+    }
+
+    impl ApplicationConfigV2 {
+        fn validate(&self) -> Result<(), AgentRaftWireError> {
+            self.generation.validate()?;
+            if self.version != APPLICATION_SCHEMA_VERSION
+                || self.journal_store.as_bytes() == &[0; 32]
+            {
+                return Err(AgentRaftWireError::InvalidApplyMeta);
+            }
+            enforce_wire_bound(self, CONFIG_RECORD_MAX_BYTES)
+        }
+    }
+
+    impl ServiceWire for ApplicationConfigV2 {
+        const MAGIC: [u8; 4] = *b"AGC2";
+
+        fn encode_body(&self, output: &mut Vec<u8>) {
+            let mut encoder = Encoder(output);
+            encoder.u32(self.version);
+            encode_generation_route(&mut encoder, self.generation);
+            encoder.fixed(self.journal_store.as_bytes());
+        }
+
+        fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+            enforce_complete_bound(decoder, CONFIG_RECORD_MAX_BYTES)?;
+            let record = Self {
+                version: decoder.u32()?,
+                generation: decode_generation_route(decoder)?,
+                journal_store: JournalStoreInstanceId::from_bytes(decoder.fixed()?)
+                    .ok_or(DecodeError::NonCanonical)?,
+            };
+            record.validate().map_err(map_wire_decode_error)?;
+            Ok(record)
+        }
+    }
+
+    /// Result of an atomic V2 foundation application.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum AgentRaftFoundationApplyOutcomeV2 {
+        Applied(AgentRaftApplyMetaV2),
+        Duplicate(AgentRaftApplyMetaV2),
+    }
+
+    /// Fail-closed V2 application error.
+    #[derive(Debug)]
+    pub(crate) enum AgentRaftApplicationErrorV2 {
+        LegacyGeneration,
+        ConfigurationMismatch,
+        CorruptLedger,
+        MissingCommittedSlot,
+        ApplyGap { expected: u64, actual: u64 },
+        TermRegression { previous: u64, actual: u64 },
+        MissingAuditRecord(u64),
+        ConflictingDuplicate(u64),
+        SlotDatabaseMismatch(u64),
+        RaftCursorMismatch { raft: u64, application: u64 },
+        SnapshotUnsupported,
+        CommandExecutionRequired,
+        UnsolicitedConfiguration,
+        BacklogLimit,
+        Backend(alloc::boxed::Box<dyn std::error::Error + Send + Sync>),
+    }
+
+    impl fmt::Display for AgentRaftApplicationErrorV2 {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Backend(error) => write!(formatter, "Shared Agent V2 apply backend: {error}"),
+                _ => write!(formatter, "Shared Agent V2 apply failure: {self:?}"),
+            }
+        }
+    }
+
+    impl core::error::Error for AgentRaftApplicationErrorV2 {
+        fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+            match self {
+                Self::Backend(error) => Some(&**error),
+                _ => None,
+            }
+        }
+    }
+
+    /// Durable clean-generation application ledger for one Shared-Agent Raft
+    /// database.
+    ///
+    /// Sequence A intentionally applies only leader no-ops. A command returns
+    /// `CommandExecutionRequired`, and a configuration returns
+    /// `UnsolicitedConfiguration`, without advancing either cursor. Later
+    /// slices must provide an exact side-effect/configuration receipt before
+    /// they may extend this transaction boundary.
+    pub(crate) struct AgentRaftApplicationLedgerV2 {
+        database: Arc<Database>,
+        generation: AgentGenerationRouteKey,
+        journal_store: JournalStoreInstanceId,
+        writes: std::sync::Mutex<()>,
+    }
+
+    impl AgentRaftApplicationLedgerV2 {
+        pub(crate) fn open(
+            database: Arc<Database>,
+            generation: AgentGenerationRouteKey,
+            journal_store: JournalStoreInstanceId,
+        ) -> Result<Self, AgentRaftApplicationErrorV2> {
+            generation
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::ConfigurationMismatch)?;
+            if journal_store.as_bytes() == &[0; 32] {
+                return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+            }
+            let expected = ApplicationConfigV2 {
+                version: APPLICATION_SCHEMA_VERSION,
+                generation,
+                journal_store,
+            };
+            let key = generation_storage_key(generation);
+            let transaction = database.begin_write()?;
+
+            for table in transaction.list_tables()? {
+                if LEGACY_V1_TABLE_NAMES.contains(&table.name()) {
+                    return Err(AgentRaftApplicationErrorV2::LegacyGeneration);
+                }
+            }
+
+            // Pin the complete V2 schema before inspecting any rows.
+            {
+                drop(transaction.open_table(CONFIG_TABLE_V2)?);
+                drop(transaction.open_table(APPLY_META_TABLE_V2)?);
+                drop(transaction.open_table(APPLY_AUDIT_TABLE_V2)?);
+            }
+            ensure_single_generation_in_write(&transaction, &key, true)?;
+
+            let existing_config = {
+                let table = transaction.open_table(CONFIG_TABLE_V2)?;
+                table
+                    .get(key.as_slice())?
+                    .map(|value| value.value().to_vec())
+            };
+            match existing_config {
+                Some(bytes) => {
+                    let stored = ApplicationConfigV2::decode(&bytes)
+                        .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                    if stored != expected || stored.encode() != bytes {
+                        return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+                    }
+                    let meta = read_meta_in_write(&transaction, key.as_slice())?
+                        .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+                    validate_bound_meta(&meta, generation, journal_store)?;
+                }
+                None => {
+                    if read_meta_in_write(&transaction, key.as_slice())?.is_some()
+                        || audit_prefix_has_row_in_write(&transaction, &key)?
+                    {
+                        return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                    }
+                    let raft = crate::raft::RaftMeta::load_from_write_transaction(&transaction)?;
+                    if raft.last_applied != 0 || raft.snap_last_index != 0 {
+                        return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+                    }
+                    // Materialize the zero host cursor in the same
+                    // transaction as the generation binding; absence is not
+                    // left as an ambient/default representation.
+                    raft.write_host_fields_in_txn(&transaction)?;
+                    {
+                        let mut table = transaction.open_table(CONFIG_TABLE_V2)?;
+                        table.insert(key.as_slice(), expected.encode().as_slice())?;
+                    }
+                    {
+                        let meta = AgentRaftApplyMetaV2::post_genesis(generation, journal_store);
+                        let mut table = transaction.open_table(APPLY_META_TABLE_V2)?;
+                        table.insert(key.as_slice(), meta.encode().as_slice())?;
+                    }
+                }
+            }
+            transaction.commit()?;
+
+            let ledger = Self {
+                database,
+                generation,
+                journal_store,
+                writes: std::sync::Mutex::new(()),
+            };
+            ledger.audit_recovery()?;
+            Ok(ledger)
+        }
+
+        pub(crate) const fn generation(&self) -> AgentGenerationRouteKey {
+            self.generation
+        }
+
+        pub(crate) fn cursor(&self) -> Result<AgentRaftApplyMetaV2, AgentRaftApplicationErrorV2> {
+            let key = generation_storage_key(self.generation);
+            let transaction = self.database.begin_read()?;
+            let table = transaction.open_table(APPLY_META_TABLE_V2)?;
+            let bytes = table
+                .get(key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?
+                .value()
+                .to_vec();
+            let meta = AgentRaftApplyMetaV2::decode(&bytes)
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            if meta.encode() != bytes {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            validate_bound_meta(&meta, self.generation, self.journal_store)?;
+            Ok(meta)
+        }
+
+        /// Return the exact next committed physical slot, or `None` when the
+        /// Raft commit cursor has not reached it. Callers cannot skip ahead
+        /// through this API.
+        pub(crate) fn next_committed_slot(
+            &self,
+        ) -> Result<Option<CommittedSharedRaftSlot>, AgentRaftApplicationErrorV2> {
+            let next = self.cursor()?.applied_index.saturating_add(1);
+            let witness = RedbSharedRaftLogWitness::new(Arc::clone(&self.database));
+            match CommittedSharedRaftSlot::from_durable_log(&witness, next) {
+                Ok(slot) => Ok(Some(slot)),
+                Err(CommittedSharedRaftSlotError::Missing) => Ok(None),
+                Err(CommittedSharedRaftSlotError::Invalid(_)) => {
+                    Err(AgentRaftApplicationErrorV2::CorruptLedger)
+                }
+                Err(CommittedSharedRaftSlotError::Witness(error)) => Err(error.into()),
+            }
+        }
+
+        /// Apply the structural work authorized in Sequence A.
+        pub(crate) fn apply_foundation_slot(
+            &self,
+            slot: &CommittedSharedRaftSlot,
+        ) -> Result<AgentRaftFoundationApplyOutcomeV2, AgentRaftApplicationErrorV2> {
+            match slot {
+                CommittedSharedRaftSlot::LeaderNoop(_) => self.apply_leader_noop(slot),
+                CommittedSharedRaftSlot::Command(_) => {
+                    Err(AgentRaftApplicationErrorV2::CommandExecutionRequired)
+                }
+                CommittedSharedRaftSlot::Configuration(_) => {
+                    Err(AgentRaftApplicationErrorV2::UnsolicitedConfiguration)
+                }
+            }
+        }
+
+        fn apply_leader_noop(
+            &self,
+            slot: &CommittedSharedRaftSlot,
+        ) -> Result<AgentRaftFoundationApplyOutcomeV2, AgentRaftApplicationErrorV2> {
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let key = generation_storage_key(self.generation);
+            let transaction = self.database.begin_write()?;
+            ensure_v2_config_in_write(
+                &transaction,
+                key.as_slice(),
+                self.generation,
+                self.journal_store,
+            )?;
+            let current = read_meta_in_write(&transaction, key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            validate_bound_meta(&current, self.generation, self.journal_store)?;
+            let mut raft = crate::raft::RaftMeta::load_from_write_transaction(&transaction)?;
+            if raft.snap_last_index != 0 {
+                return Err(AgentRaftApplicationErrorV2::SnapshotUnsupported);
+            }
+            if raft.last_applied != current.applied_index {
+                return Err(AgentRaftApplicationErrorV2::RaftCursorMismatch {
+                    raft: raft.last_applied,
+                    application: current.applied_index,
+                });
+            }
+
+            let disposition = AgentRaftApplyDispositionV2::LeaderNoop;
+            let expected_record = AgentRaftApplyAuditRecordV2 {
+                generation: self.generation,
+                index: slot.index(),
+                term: slot.term(),
+                raw_payload_commitment: slot.raw_payload_commitment(),
+                disposition,
+            };
+            expected_record
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+
+            if slot.index() <= current.applied_index {
+                let audit_key = audit_storage_key(self.generation, slot.index());
+                let stored = read_audit_in_write(&transaction, audit_key.as_slice())?.ok_or(
+                    AgentRaftApplicationErrorV2::MissingAuditRecord(slot.index()),
+                )?;
+                if stored != expected_record {
+                    return Err(AgentRaftApplicationErrorV2::ConflictingDuplicate(
+                        slot.index(),
+                    ));
+                }
+                verify_physical_row_in_write(&transaction, &raft, slot)?;
+                return Ok(AgentRaftFoundationApplyOutcomeV2::Duplicate(current));
+            }
+
+            let next = current.applied_index.saturating_add(1);
+            if slot.index() != next {
+                return Err(AgentRaftApplicationErrorV2::ApplyGap {
+                    expected: next,
+                    actual: slot.index(),
+                });
+            }
+            if current.applied_index != 0 && slot.term() < current.applied_term {
+                return Err(AgentRaftApplicationErrorV2::TermRegression {
+                    previous: current.applied_term,
+                    actual: slot.term(),
+                });
+            }
+            if current.applied_index as usize == MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES {
+                return Err(AgentRaftApplicationErrorV2::BacklogLimit);
+            }
+            verify_physical_row_in_write(&transaction, &raft, slot)?;
+
+            let audit_key = audit_storage_key(self.generation, slot.index());
+            if read_audit_in_write(&transaction, audit_key.as_slice())?.is_some() {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            let next_meta = AgentRaftApplyMetaV2 {
+                generation: self.generation,
+                journal_store: self.journal_store,
+                applied_index: slot.index(),
+                applied_term: slot.term(),
+                raw_payload_commitment: slot.raw_payload_commitment(),
+                disposition: Some(disposition),
+            };
+            next_meta
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            {
+                let mut table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+                table.insert(audit_key.as_slice(), expected_record.encode().as_slice())?;
+            }
+            {
+                let mut table = transaction.open_table(APPLY_META_TABLE_V2)?;
+                table.insert(key.as_slice(), next_meta.encode().as_slice())?;
+            }
+            raft.last_applied = slot.index();
+            raft.write_host_fields_in_txn(&transaction)?;
+            transaction.commit()?;
+            Ok(AgentRaftFoundationApplyOutcomeV2::Applied(next_meta))
+        }
+
+        /// Strict restart audit: every index from one through the cursor must
+        /// have exactly one canonical row, a nondecreasing term, and the exact
+        /// still-present physical Raft payload. Sequence A has no snapshot
+        /// format, so a compacted prefix fails closed.
+        pub(crate) fn audit_recovery(&self) -> Result<(), AgentRaftApplicationErrorV2> {
+            let key = generation_storage_key(self.generation);
+            let transaction = self.database.begin_read()?;
+            ensure_v2_config_in_read(
+                &transaction,
+                key.as_slice(),
+                self.generation,
+                self.journal_store,
+            )?;
+            let meta = {
+                let table = transaction.open_table(APPLY_META_TABLE_V2)?;
+                let bytes = table
+                    .get(key.as_slice())?
+                    .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?
+                    .value()
+                    .to_vec();
+                let meta = AgentRaftApplyMetaV2::decode(&bytes)
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                if meta.encode() != bytes {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                meta
+            };
+            validate_bound_meta(&meta, self.generation, self.journal_store)?;
+            let raft = crate::raft::RaftMeta::load_from_read_transaction(&transaction)?;
+            if raft.snap_last_index != 0 {
+                return Err(AgentRaftApplicationErrorV2::SnapshotUnsupported);
+            }
+            if raft.last_applied != meta.applied_index {
+                return Err(AgentRaftApplicationErrorV2::RaftCursorMismatch {
+                    raft: raft.last_applied,
+                    application: meta.applied_index,
+                });
+            }
+            if raft.commit_index < meta.applied_index {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+
+            let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+            let mut expected_index = 1_u64;
+            let mut previous_term = 0_u64;
+            let mut last_record = None;
+            for row in table.range(key.as_slice()..)? {
+                let (stored_key, value) = row?;
+                if !stored_key.value().starts_with(key.as_slice()) {
+                    break;
+                }
+                if expected_index as usize > MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES
+                    || stored_key.value().len() != AUDIT_STORAGE_KEY_BYTES
+                {
+                    return Err(AgentRaftApplicationErrorV2::BacklogLimit);
+                }
+                let record = AgentRaftApplyAuditRecordV2::decode(value.value())
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                if record.encode() != value.value()
+                    || record.generation != self.generation
+                    || record.index != expected_index
+                    || record.term < previous_term
+                    || audit_storage_key(self.generation, record.index).as_slice()
+                        != stored_key.value()
+                {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                verify_audited_physical_row_in_read(&transaction, &raft, &record)?;
+                previous_term = record.term;
+                expected_index = expected_index.saturating_add(1);
+                last_record = Some(record);
+            }
+            let observed = expected_index.saturating_sub(1);
+            if observed != meta.applied_index {
+                return Err(AgentRaftApplicationErrorV2::MissingAuditRecord(
+                    expected_index.min(meta.applied_index),
+                ));
+            }
+            match last_record {
+                Some(record)
+                    if record.term == meta.applied_term
+                        && record.raw_payload_commitment == meta.raw_payload_commitment
+                        && Some(record.disposition) == meta.disposition => {}
+                None if meta.applied_index == 0 => {}
+                _ => return Err(AgentRaftApplicationErrorV2::CorruptLedger),
+            }
+            Ok(())
+        }
+    }
+
+    fn validate_bound_meta(
+        meta: &AgentRaftApplyMetaV2,
+        generation: AgentGenerationRouteKey,
+        journal_store: JournalStoreInstanceId,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        meta.validate()
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        if meta.generation != generation || meta.journal_store != journal_store {
+            return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+        }
+        if meta.applied_index as usize > MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES {
+            return Err(AgentRaftApplicationErrorV2::BacklogLimit);
+        }
+        Ok(())
+    }
+
+    fn ensure_v2_config_in_read(
+        transaction: &redb::ReadTransaction,
+        key: &[u8],
+        generation: AgentGenerationRouteKey,
+        journal_store: JournalStoreInstanceId,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        for table in transaction.list_tables()? {
+            if LEGACY_V1_TABLE_NAMES.contains(&table.name()) {
+                return Err(AgentRaftApplicationErrorV2::LegacyGeneration);
+            }
+        }
+        ensure_single_generation_in_read(transaction, key, false)?;
+        let table = transaction.open_table(CONFIG_TABLE_V2)?;
+        let bytes = table
+            .get(key)?
+            .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?
+            .value()
+            .to_vec();
+        let stored = ApplicationConfigV2::decode(&bytes)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        if stored.encode() != bytes
+            || stored
+                != (ApplicationConfigV2 {
+                    version: APPLICATION_SCHEMA_VERSION,
+                    generation,
+                    journal_store,
+                })
+        {
+            return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+        }
+        Ok(())
+    }
+
+    fn ensure_v2_config_in_write(
+        transaction: &redb::WriteTransaction,
+        key: &[u8],
+        generation: AgentGenerationRouteKey,
+        journal_store: JournalStoreInstanceId,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        for table in transaction.list_tables()? {
+            if LEGACY_V1_TABLE_NAMES.contains(&table.name()) {
+                return Err(AgentRaftApplicationErrorV2::LegacyGeneration);
+            }
+        }
+        let key: &[u8; GENERATION_STORAGE_KEY_BYTES] = key
+            .try_into()
+            .map_err(|_| AgentRaftApplicationErrorV2::ConfigurationMismatch)?;
+        ensure_single_generation_in_write(transaction, key, false)?;
+        let table = transaction.open_table(CONFIG_TABLE_V2)?;
+        let bytes = table
+            .get(key.as_slice())?
+            .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?
+            .value()
+            .to_vec();
+        let stored = ApplicationConfigV2::decode(&bytes)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        if stored.encode() != bytes
+            || stored
+                != (ApplicationConfigV2 {
+                    version: APPLICATION_SCHEMA_VERSION,
+                    generation,
+                    journal_store,
+                })
+        {
+            return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+        }
+        Ok(())
+    }
+
+    fn ensure_single_generation_in_read(
+        transaction: &redb::ReadTransaction,
+        expected_key: &[u8],
+        allow_empty: bool,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        let config_rows = {
+            let table = transaction.open_table(CONFIG_TABLE_V2)?;
+            exact_generation_row_count(&table, expected_key)?
+        };
+        let meta_rows = {
+            let table = transaction.open_table(APPLY_META_TABLE_V2)?;
+            exact_generation_row_count(&table, expected_key)?
+        };
+        let audit_rows = {
+            let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+            exact_audit_row_count(&table, expected_key)?
+        };
+        validate_single_generation_counts(config_rows, meta_rows, audit_rows, allow_empty)
+    }
+
+    fn ensure_single_generation_in_write(
+        transaction: &redb::WriteTransaction,
+        expected_key: &[u8; GENERATION_STORAGE_KEY_BYTES],
+        allow_empty: bool,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        let config_rows = {
+            let table = transaction.open_table(CONFIG_TABLE_V2)?;
+            exact_generation_row_count(&table, expected_key.as_slice())?
+        };
+        let meta_rows = {
+            let table = transaction.open_table(APPLY_META_TABLE_V2)?;
+            exact_generation_row_count(&table, expected_key.as_slice())?
+        };
+        let audit_rows = {
+            let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+            exact_audit_row_count(&table, expected_key.as_slice())?
+        };
+        validate_single_generation_counts(config_rows, meta_rows, audit_rows, allow_empty)
+    }
+
+    fn exact_generation_row_count<T>(
+        table: &T,
+        expected_key: &[u8],
+    ) -> Result<usize, AgentRaftApplicationErrorV2>
+    where
+        T: ReadableTable<&'static [u8], &'static [u8]>,
+    {
+        let mut count = 0_usize;
+        for row in table.iter()? {
+            let (key, _) = row?;
+            count = count.saturating_add(1);
+            if count > 1 || key.value() != expected_key {
+                return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+            }
+        }
+        Ok(count)
+    }
+
+    fn exact_audit_row_count<T>(
+        table: &T,
+        expected_prefix: &[u8],
+    ) -> Result<usize, AgentRaftApplicationErrorV2>
+    where
+        T: ReadableTable<&'static [u8], &'static [u8]>,
+    {
+        let mut count = 0_usize;
+        for row in table.iter()? {
+            let (key, _) = row?;
+            count = count.saturating_add(1);
+            if count > MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES
+                || key.value().len() != AUDIT_STORAGE_KEY_BYTES
+                || !key.value().starts_with(expected_prefix)
+            {
+                return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+            }
+        }
+        Ok(count)
+    }
+
+    fn validate_single_generation_counts(
+        config_rows: usize,
+        meta_rows: usize,
+        audit_rows: usize,
+        allow_empty: bool,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        match (config_rows, meta_rows, audit_rows) {
+            (0, 0, 0) if allow_empty => Ok(()),
+            (1, 1, _) => Ok(()),
+            _ => Err(AgentRaftApplicationErrorV2::CorruptLedger),
+        }
+    }
+
+    fn read_meta_in_write(
+        transaction: &redb::WriteTransaction,
+        key: &[u8],
+    ) -> Result<Option<AgentRaftApplyMetaV2>, AgentRaftApplicationErrorV2> {
+        let table = transaction.open_table(APPLY_META_TABLE_V2)?;
+        let Some(value) = table.get(key)? else {
+            return Ok(None);
+        };
+        let bytes = value.value();
+        let meta = AgentRaftApplyMetaV2::decode(bytes)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        if meta.encode() != bytes {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        Ok(Some(meta))
+    }
+
+    fn read_audit_in_write(
+        transaction: &redb::WriteTransaction,
+        key: &[u8],
+    ) -> Result<Option<AgentRaftApplyAuditRecordV2>, AgentRaftApplicationErrorV2> {
+        let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+        let Some(value) = table.get(key)? else {
+            return Ok(None);
+        };
+        let bytes = value.value();
+        let record = AgentRaftApplyAuditRecordV2::decode(bytes)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        if record.encode() != bytes {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        Ok(Some(record))
+    }
+
+    fn audit_prefix_has_row_in_write(
+        transaction: &redb::WriteTransaction,
+        prefix: &[u8; GENERATION_STORAGE_KEY_BYTES],
+    ) -> Result<bool, AgentRaftApplicationErrorV2> {
+        let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+        let mut rows = table.range(prefix.as_slice()..)?;
+        Ok(rows
+            .next()
+            .transpose()?
+            .is_some_and(|(key, _)| key.value().starts_with(prefix.as_slice())))
+    }
+
+    fn verify_physical_row_in_write(
+        transaction: &redb::WriteTransaction,
+        raft: &crate::raft::RaftMeta,
+        slot: &CommittedSharedRaftSlot,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        if raft.commit_index < slot.index() {
+            return Err(AgentRaftApplicationErrorV2::MissingCommittedSlot);
+        }
+        let table = transaction.open_table(crate::raft::RAFT_LOG)?;
+        let bytes = table
+            .get(slot.index())?
+            .ok_or(AgentRaftApplicationErrorV2::MissingCommittedSlot)?;
+        verify_physical_bytes(
+            slot.index(),
+            slot.term(),
+            slot.raw_payload_commitment(),
+            AgentRaftApplyDispositionV2::LeaderNoop,
+            bytes.value(),
+        )
+    }
+
+    fn verify_audited_physical_row_in_read(
+        transaction: &redb::ReadTransaction,
+        raft: &crate::raft::RaftMeta,
+        record: &AgentRaftApplyAuditRecordV2,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        if raft.commit_index < record.index {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        let table = transaction.open_table(crate::raft::RAFT_LOG)?;
+        let bytes = table
+            .get(record.index)?
+            .ok_or(AgentRaftApplicationErrorV2::MissingCommittedSlot)?;
+        verify_physical_bytes(
+            record.index,
+            record.term,
+            record.raw_payload_commitment,
+            record.disposition,
+            bytes.value(),
+        )
+    }
+
+    fn verify_physical_bytes(
+        index: u64,
+        expected_term: u64,
+        expected_commitment: Hash,
+        disposition: AgentRaftApplyDispositionV2,
+        stored: &[u8],
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        let (term, raw) = stored
+            .split_at_checked(8)
+            .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+        let term = u64::from_le_bytes(
+            term.try_into()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?,
+        );
+        let commitment = Hash::digest(AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN, &[raw]);
+        if term != expected_term || commitment != expected_commitment {
+            return Err(AgentRaftApplicationErrorV2::SlotDatabaseMismatch(index));
+        }
+        let kind = crate::raft::redb_storage::decode_entry_kind(raw)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        if crate::raft::redb_storage::encode_entry_kind(&kind) != raw {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        let compatible = match (kind, disposition) {
+            (vos_raft::EntryKind::Data { payload }, AgentRaftApplyDispositionV2::LeaderNoop) => {
+                payload.is_empty()
+            }
+            (vos_raft::EntryKind::Data { payload }, AgentRaftApplyDispositionV2::Command(_)) => {
+                !payload.is_empty()
+                    && payload.len() <= MAX_AGENT_RAFT_COMMAND_BYTES
+                    && AgentRaftCommand::decode(&payload)
+                        .is_ok_and(|command| command.encode() == payload)
+            }
+            (
+                vos_raft::EntryKind::ConfigChange { joint_old, members },
+                AgentRaftApplyDispositionV2::CommitteeJointConfiguration { .. },
+            ) => {
+                joint_old.is_some()
+                    && validate_raft_configuration(joint_old.as_deref(), &members).is_ok()
+            }
+            (
+                vos_raft::EntryKind::ConfigChange { joint_old, members },
+                AgentRaftApplyDispositionV2::CommitteeStableConfiguration { .. },
+            ) => {
+                joint_old.is_none()
+                    && validate_raft_configuration(joint_old.as_deref(), &members).is_ok()
+            }
+            _ => false,
+        };
+        if !compatible {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        Ok(())
+    }
+
+    fn generation_storage_key(
+        generation: AgentGenerationRouteKey,
+    ) -> [u8; GENERATION_STORAGE_KEY_BYTES] {
+        let mut key = [0_u8; GENERATION_STORAGE_KEY_BYTES];
+        key[0..32].copy_from_slice(&generation.space.0);
+        key[32..64].copy_from_slice(&generation.agent.0);
+        key[64..96].copy_from_slice(generation.genesis.as_bytes());
+        key[96..128].copy_from_slice(generation.admission.as_bytes());
+        key
+    }
+
+    pub(super) fn audit_storage_key(
+        generation: AgentGenerationRouteKey,
+        index: u64,
+    ) -> [u8; AUDIT_STORAGE_KEY_BYTES] {
+        let mut key = [0_u8; AUDIT_STORAGE_KEY_BYTES];
+        key[..GENERATION_STORAGE_KEY_BYTES].copy_from_slice(&generation_storage_key(generation));
+        key[GENERATION_STORAGE_KEY_BYTES..].copy_from_slice(&index.to_be_bytes());
+        key
+    }
+
+    macro_rules! backend_from_v2 {
+        ($error:ty) => {
+            impl From<$error> for AgentRaftApplicationErrorV2 {
+                fn from(error: $error) -> Self {
+                    Self::Backend(alloc::boxed::Box::new(error))
+                }
+            }
+        };
+    }
+
+    backend_from_v2!(crate::commit::CommitError);
+    backend_from_v2!(redb::DatabaseError);
+    backend_from_v2!(redb::TableError);
+    backend_from_v2!(redb::StorageError);
+    backend_from_v2!(redb::TransactionError);
+    backend_from_v2!(redb::CommitError);
+}
+
+#[cfg(all(feature = "std", feature = "storage"))]
+#[allow(unused_imports)]
+pub(crate) use application_ledger_v2::{
+    AgentRaftApplicationErrorV2, AgentRaftApplicationLedgerV2, AgentRaftFoundationApplyOutcomeV2,
+};
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "storage")]
@@ -2843,7 +4409,9 @@ mod tests {
     use ed25519_dalek::Signer as _;
     use ed25519_dalek::SigningKey;
     #[cfg(feature = "storage")]
-    use redb::Database;
+    use redb::{Database, TableDefinition};
+    #[cfg(feature = "storage")]
+    use vos_raft::EntryKind;
 
     use super::*;
     use crate::agent::authority::{
@@ -3123,6 +4691,58 @@ mod tests {
     }
 
     #[cfg(feature = "storage")]
+    struct PhysicalTestWitness {
+        row: Option<(u64, u64, u64, Vec<u8>)>,
+    }
+
+    #[cfg(feature = "storage")]
+    impl DurableSharedRaftLogWitness for PhysicalTestWitness {
+        type Error = ();
+
+        fn read_committed_physical_slot(
+            &self,
+            _index: u64,
+        ) -> Result<Option<(u64, u64, u64, Vec<u8>)>, Self::Error> {
+            Ok(self.row.clone())
+        }
+    }
+
+    #[cfg(feature = "storage")]
+    fn physical_slot(kind: EntryKind<u16>, index: u64, term: u64) -> CommittedSharedRaftSlot {
+        CommittedSharedRaftSlot::from_durable_log(
+            &PhysicalTestWitness {
+                row: Some((
+                    index,
+                    term,
+                    index,
+                    crate::raft::redb_storage::encode_entry_kind(&kind),
+                )),
+            },
+            index,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "storage")]
+    fn append_committed_kind(database: &Arc<Database>, term: u64, kind: &EntryKind<u16>) -> u64 {
+        let mut log = crate::raft::RaftLog::open(Arc::clone(database)).unwrap();
+        let transaction = database.begin_write().unwrap();
+        let index = log
+            .append_in_txn(
+                &transaction,
+                term,
+                &crate::raft::redb_storage::encode_entry_kind(kind),
+            )
+            .unwrap();
+        let mut meta = crate::raft::RaftMeta::load_from_write_transaction(&transaction).unwrap();
+        meta.current_term = meta.current_term.max(term);
+        meta.commit_index = index;
+        meta.write_worker_fields_in_txn(&transaction).unwrap();
+        transaction.commit().unwrap();
+        index
+    }
+
+    #[cfg(feature = "storage")]
     fn committed(command: AgentRaftCommand, index: u64, term: u64) -> CommittedAgentRaftEntry {
         CommittedAgentRaftEntry::from_durable_log(
             &TestWitness {
@@ -3211,6 +4831,179 @@ mod tests {
     }
 
     #[test]
+    fn stable_generation_route_excludes_committee_epoch() {
+        let voters = [key(1)];
+        let route = route(&committee(&voters, &[]));
+        let next_epoch = AgentRouteKey::new(
+            route.space(),
+            route.agent(),
+            route.genesis(),
+            route.admission(),
+            AgentReplicaCommitteeId::from_bytes([0x91; 32]),
+        )
+        .unwrap();
+
+        assert_ne!(route, next_epoch);
+        assert_eq!(route.generation(), next_epoch.generation());
+        assert_eq!(
+            AgentGenerationRouteKey::decode(&route.generation().encode()).unwrap(),
+            route.generation()
+        );
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn physical_slot_decoder_covers_noop_and_exact_command_and_rejects_bad_data() {
+        let noop = physical_slot(
+            EntryKind::Data {
+                payload: Vec::new(),
+            },
+            1,
+            4,
+        );
+        assert!(matches!(noop, CommittedSharedRaftSlot::LeaderNoop(_)));
+        assert_eq!(
+            (noop.index(), noop.term(), noop.committed_index()),
+            (1, 4, 1)
+        );
+        assert_ne!(noop.raw_payload_commitment(), Hash::ZERO);
+
+        let route = route(&committee(&[key(1)], &[]));
+        let command = AgentRaftCommand::ArtifactAbort {
+            route,
+            batch: ArtifactBatchId::from_bytes([0x51; 32]),
+        };
+        let slot = physical_slot(
+            EntryKind::Data {
+                payload: command.encode(),
+            },
+            2,
+            4,
+        );
+        match slot {
+            CommittedSharedRaftSlot::Command(committed) => {
+                assert_eq!(committed.entry().command(), &command);
+                assert_eq!(committed.entry().index(), 2);
+            }
+            _ => panic!("canonical nonempty Data was not decoded as a command"),
+        }
+
+        for payload in [vec![0xff], {
+            let mut bytes = command.encode();
+            bytes.push(0);
+            bytes
+        }] {
+            assert!(matches!(
+                CommittedSharedRaftSlot::from_durable_log(
+                    &PhysicalTestWitness {
+                        row: Some((
+                            3,
+                            4,
+                            3,
+                            crate::raft::redb_storage::encode_entry_kind(&EntryKind::Data {
+                                payload,
+                            }),
+                        )),
+                    },
+                    3,
+                ),
+                Err(CommittedSharedRaftSlotError::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            CommittedSharedRaftSlot::from_durable_log(
+                &PhysicalTestWitness {
+                    row: Some((3, 4, 3, vec![0xff])),
+                },
+                3,
+            ),
+            Err(CommittedSharedRaftSlotError::Invalid(
+                AgentRaftWireError::InvalidPhysicalSlot
+            ))
+        ));
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn physical_configuration_is_bounded_sorted_unique_and_not_yet_applicable() {
+        let config = physical_slot(
+            EntryKind::ConfigChange {
+                joint_old: Some(vec![1, 3]),
+                members: vec![2, 4],
+            },
+            1,
+            9,
+        );
+        match &config {
+            CommittedSharedRaftSlot::Configuration(config) => {
+                assert_eq!(config.joint_old(), Some([1, 3].as_slice()));
+                assert_eq!(config.members(), &[2, 4]);
+            }
+            _ => panic!("configuration slot decoded as the wrong physical kind"),
+        }
+
+        let invalid = [
+            EntryKind::ConfigChange {
+                joint_old: None,
+                members: Vec::new(),
+            },
+            EntryKind::ConfigChange {
+                joint_old: None,
+                members: vec![2, 1],
+            },
+            EntryKind::ConfigChange {
+                joint_old: Some(vec![1, 1]),
+                members: vec![1, 2],
+            },
+            EntryKind::ConfigChange {
+                joint_old: None,
+                members: (0..=MAX_AGENT_REPLICAS as u16).collect(),
+            },
+        ];
+        for kind in invalid {
+            let raw = crate::raft::redb_storage::encode_entry_kind(&kind);
+            assert!(matches!(
+                CommittedSharedRaftSlot::from_durable_log(
+                    &PhysicalTestWitness {
+                        row: Some((1, 9, 1, raw)),
+                    },
+                    1,
+                ),
+                Err(CommittedSharedRaftSlotError::Invalid(
+                    AgentRaftWireError::InvalidConfiguration
+                ))
+            ));
+        }
+
+        let directory = TempDirectory::new("v2_config_refusal");
+        let database = Arc::new(Database::create(directory.database()).unwrap());
+        append_committed_kind(
+            &database,
+            9,
+            &EntryKind::ConfigChange {
+                joint_old: Some(vec![1, 3]),
+                members: vec![2, 4],
+            },
+        );
+        let ledger = AgentRaftApplicationLedgerV2::open(
+            Arc::clone(&database),
+            route(&committee(&[key(1)], &[])).generation(),
+            journal_store(0xa1),
+        )
+        .unwrap();
+        let config = ledger.next_committed_slot().unwrap().unwrap();
+        assert!(matches!(
+            ledger.apply_foundation_slot(&config),
+            Err(AgentRaftApplicationErrorV2::UnsolicitedConfiguration)
+        ));
+        assert_eq!(ledger.cursor().unwrap().applied(), (0, 0));
+        assert_eq!(
+            crate::raft::RaftMeta::load(&database).unwrap().last_applied,
+            0
+        );
+    }
+
+    #[test]
     fn chunk_commitment_and_durable_log_promotion_reject_tampering() {
         let voters = [key(1)];
         let committee = committee(&voters, &[]);
@@ -3249,6 +5042,366 @@ mod tests {
             Err(CommittedAgentRaftEntryError::Invalid(
                 AgentRaftWireError::InvalidCommittedEntry
             ))
+        ));
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_application_rejects_gap_term_regression_and_command_without_advancing() {
+        let generation = route(&committee(&[key(1)], &[])).generation();
+
+        let gap_directory = TempDirectory::new("v2_gap");
+        let gap_database = Arc::new(Database::create(gap_directory.database()).unwrap());
+        append_committed_kind(
+            &gap_database,
+            4,
+            &EntryKind::Data {
+                payload: Vec::new(),
+            },
+        );
+        append_committed_kind(
+            &gap_database,
+            4,
+            &EntryKind::Data {
+                payload: Vec::new(),
+            },
+        );
+        let gap_ledger = AgentRaftApplicationLedgerV2::open(
+            Arc::clone(&gap_database),
+            generation,
+            journal_store(0xa2),
+        )
+        .unwrap();
+        let gap_slot = CommittedSharedRaftSlot::from_durable_log(
+            &RedbSharedRaftLogWitness::new(Arc::clone(&gap_database)),
+            2,
+        )
+        .unwrap();
+        assert!(matches!(
+            gap_ledger.apply_foundation_slot(&gap_slot),
+            Err(AgentRaftApplicationErrorV2::ApplyGap {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        assert_eq!(gap_ledger.cursor().unwrap().applied(), (0, 0));
+
+        let term_directory = TempDirectory::new("v2_term_regression");
+        let term_database = Arc::new(Database::create(term_directory.database()).unwrap());
+        append_committed_kind(
+            &term_database,
+            7,
+            &EntryKind::Data {
+                payload: Vec::new(),
+            },
+        );
+        let term_ledger = AgentRaftApplicationLedgerV2::open(
+            Arc::clone(&term_database),
+            generation,
+            journal_store(0xa3),
+        )
+        .unwrap();
+        let first = term_ledger.next_committed_slot().unwrap().unwrap();
+        term_ledger.apply_foundation_slot(&first).unwrap();
+        append_committed_kind(
+            &term_database,
+            6,
+            &EntryKind::Data {
+                payload: Vec::new(),
+            },
+        );
+        let second = term_ledger.next_committed_slot().unwrap().unwrap();
+        assert!(matches!(
+            term_ledger.apply_foundation_slot(&second),
+            Err(AgentRaftApplicationErrorV2::TermRegression {
+                previous: 7,
+                actual: 6
+            })
+        ));
+        assert_eq!(term_ledger.cursor().unwrap().applied(), (1, 7));
+        assert_eq!(
+            crate::raft::RaftMeta::load(&term_database)
+                .unwrap()
+                .last_applied,
+            1
+        );
+
+        let command = AgentRaftCommand::ArtifactAbort {
+            route: route(&committee(&[key(1)], &[])),
+            batch: ArtifactBatchId::from_bytes([0x54; 32]),
+        };
+        let command_directory = TempDirectory::new("v2_command_refusal");
+        let command_database = Arc::new(Database::create(command_directory.database()).unwrap());
+        append_committed_kind(
+            &command_database,
+            8,
+            &EntryKind::Data {
+                payload: command.encode(),
+            },
+        );
+        let command_ledger = AgentRaftApplicationLedgerV2::open(
+            Arc::clone(&command_database),
+            generation,
+            journal_store(0xa4),
+        )
+        .unwrap();
+        let command_slot = command_ledger.next_committed_slot().unwrap().unwrap();
+        assert!(matches!(
+            command_ledger.apply_foundation_slot(&command_slot),
+            Err(AgentRaftApplicationErrorV2::CommandExecutionRequired)
+        ));
+        assert_eq!(command_ledger.cursor().unwrap().applied(), (0, 0));
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_noop_apply_is_atomic_restartable_and_duplicate_exact() {
+        let directory = TempDirectory::new("v2_restart_duplicate");
+        let path = directory.database();
+        let generation = route(&committee(&[key(1)], &[])).generation();
+        let store = journal_store(0xa5);
+        {
+            let database = Arc::new(Database::create(&path).unwrap());
+            append_committed_kind(
+                &database,
+                11,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            );
+            let ledger =
+                AgentRaftApplicationLedgerV2::open(Arc::clone(&database), generation, store)
+                    .unwrap();
+            let slot = ledger.next_committed_slot().unwrap().unwrap();
+            let commitment = slot.raw_payload_commitment();
+            match ledger.apply_foundation_slot(&slot).unwrap() {
+                AgentRaftFoundationApplyOutcomeV2::Applied(meta) => {
+                    assert_eq!(meta.applied(), (1, 11));
+                    assert_eq!(meta.raw_payload_commitment(), commitment);
+                    assert_eq!(
+                        meta.disposition(),
+                        Some(AgentRaftApplyDispositionV2::LeaderNoop)
+                    );
+                }
+                _ => panic!("first no-op was not newly applied"),
+            }
+            match ledger.apply_foundation_slot(&slot).unwrap() {
+                AgentRaftFoundationApplyOutcomeV2::Duplicate(meta) => {
+                    assert_eq!(meta.applied(), (1, 11));
+                }
+                _ => panic!("exact retry was not classified as a duplicate"),
+            }
+            assert_eq!(
+                crate::raft::RaftMeta::load(&database).unwrap().last_applied,
+                1
+            );
+        }
+
+        let database = Arc::new(Database::create(&path).unwrap());
+        let ledger =
+            AgentRaftApplicationLedgerV2::open(Arc::clone(&database), generation, store).unwrap();
+        assert_eq!(ledger.generation(), generation);
+        assert_eq!(ledger.cursor().unwrap().applied(), (1, 11));
+        ledger.audit_recovery().unwrap();
+        assert!(ledger.next_committed_slot().unwrap().is_none());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_duplicate_conflict_and_missing_or_corrupt_rows_fail_closed() {
+        let generation = route(&committee(&[key(1)], &[])).generation();
+
+        let conflict_directory = TempDirectory::new("v2_duplicate_conflict");
+        let conflict_database = Arc::new(Database::create(conflict_directory.database()).unwrap());
+        append_committed_kind(
+            &conflict_database,
+            12,
+            &EntryKind::Data {
+                payload: Vec::new(),
+            },
+        );
+        let conflict_ledger = AgentRaftApplicationLedgerV2::open(
+            Arc::clone(&conflict_database),
+            generation,
+            journal_store(0xa6),
+        )
+        .unwrap();
+        let exact = conflict_ledger.next_committed_slot().unwrap().unwrap();
+        conflict_ledger.apply_foundation_slot(&exact).unwrap();
+        let conflicting = physical_slot(
+            EntryKind::Data {
+                payload: Vec::new(),
+            },
+            1,
+            13,
+        );
+        assert!(matches!(
+            conflict_ledger.apply_foundation_slot(&conflicting),
+            Err(AgentRaftApplicationErrorV2::ConflictingDuplicate(1))
+        ));
+
+        let missing_directory = TempDirectory::new("v2_missing_log");
+        let missing_database = Arc::new(Database::create(missing_directory.database()).unwrap());
+        append_committed_kind(
+            &missing_database,
+            14,
+            &EntryKind::Data {
+                payload: Vec::new(),
+            },
+        );
+        let missing_ledger = AgentRaftApplicationLedgerV2::open(
+            Arc::clone(&missing_database),
+            generation,
+            journal_store(0xa7),
+        )
+        .unwrap();
+        let slot = missing_ledger.next_committed_slot().unwrap().unwrap();
+        missing_ledger.apply_foundation_slot(&slot).unwrap();
+        {
+            let transaction = missing_database.begin_write().unwrap();
+            transaction
+                .open_table(crate::raft::RAFT_LOG)
+                .unwrap()
+                .remove(1)
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert!(matches!(
+            missing_ledger.audit_recovery(),
+            Err(AgentRaftApplicationErrorV2::MissingCommittedSlot)
+        ));
+
+        let corrupt_directory = TempDirectory::new("v2_corrupt_audit");
+        let corrupt_database = Arc::new(Database::create(corrupt_directory.database()).unwrap());
+        append_committed_kind(
+            &corrupt_database,
+            15,
+            &EntryKind::Data {
+                payload: Vec::new(),
+            },
+        );
+        let corrupt_ledger = AgentRaftApplicationLedgerV2::open(
+            Arc::clone(&corrupt_database),
+            generation,
+            journal_store(0xa8),
+        )
+        .unwrap();
+        let slot = corrupt_ledger.next_committed_slot().unwrap().unwrap();
+        corrupt_ledger.apply_foundation_slot(&slot).unwrap();
+        {
+            const AUDIT_TABLE: TableDefinition<&[u8], &[u8]> =
+                TableDefinition::new("agent_shared_raft_apply_audit_v2");
+            let key = application_ledger_v2::audit_storage_key(generation, 1);
+            let transaction = corrupt_database.begin_write().unwrap();
+            transaction
+                .open_table(AUDIT_TABLE)
+                .unwrap()
+                .insert(key.as_slice(), b"corrupt".as_slice())
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert!(matches!(
+            corrupt_ledger.audit_recovery(),
+            Err(AgentRaftApplicationErrorV2::CorruptLedger)
+        ));
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_wire_and_disk_reject_v1_generation() {
+        let v1 = AgentRaftAuditDisposition::ArtifactBatchAborted {
+            batch: ArtifactBatchId::from_bytes([0x58; 32]),
+        };
+        assert_eq!(
+            AgentRaftApplyDispositionV2::decode(&v1.encode()),
+            Err(DecodeError::InvalidTag)
+        );
+        let v1_meta = AgentRaftApplyMeta::post_genesis(route(&committee(&[key(1)], &[])));
+        assert_eq!(
+            AgentRaftApplyMetaV2::decode(&v1_meta.encode()),
+            Err(DecodeError::InvalidTag)
+        );
+
+        const LEGACY_CONFIG: TableDefinition<&[u8], &[u8]> =
+            TableDefinition::new("agent_shared_raft_config");
+        let directory = TempDirectory::new("v2_reject_v1");
+        let database = Arc::new(Database::create(directory.database()).unwrap());
+        {
+            let transaction = database.begin_write().unwrap();
+            transaction
+                .open_table(LEGACY_CONFIG)
+                .unwrap()
+                .insert(b"legacy".as_slice(), b"v1".as_slice())
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert!(matches!(
+            AgentRaftApplicationLedgerV2::open(
+                database,
+                route(&committee(&[key(1)], &[])).generation(),
+                journal_store(0xa9),
+            ),
+            Err(AgentRaftApplicationErrorV2::LegacyGeneration)
+        ));
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_database_cannot_be_rebound_to_another_generation_or_store_before_apply() {
+        let directory = TempDirectory::new("v2_generation_binding");
+        let database = Arc::new(Database::create(directory.database()).unwrap());
+        let generation_a = route(&committee(&[key(1)], &[])).generation();
+        let generation_b = AgentGenerationRouteKey::new(
+            generation_a.space(),
+            generation_a.agent(),
+            generation_a.genesis(),
+            AgentGenesisAdmissionId::from_bytes([0xba; 32]),
+        )
+        .unwrap();
+        let store_a = journal_store(0xaa);
+        let store_b = journal_store(0xbb);
+        let ledger =
+            AgentRaftApplicationLedgerV2::open(Arc::clone(&database), generation_a, store_a)
+                .unwrap();
+        assert_eq!(ledger.cursor().unwrap().applied(), (0, 0));
+
+        assert!(matches!(
+            AgentRaftApplicationLedgerV2::open(Arc::clone(&database), generation_b, store_b,),
+            Err(AgentRaftApplicationErrorV2::ConfigurationMismatch)
+        ));
+        assert!(matches!(
+            AgentRaftApplicationLedgerV2::open(database, generation_a, store_b),
+            Err(AgentRaftApplicationErrorV2::ConfigurationMismatch)
+        ));
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_open_and_physical_witness_reject_malformed_raft_meta() {
+        const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
+        let directory = TempDirectory::new("v2_malformed_raft_meta");
+        let database = Arc::new(Database::create(directory.database()).unwrap());
+        {
+            let transaction = database.begin_write().unwrap();
+            transaction
+                .open_table(META_TABLE)
+                .unwrap()
+                .insert("commit_index", &[1_u8; 7][..])
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        assert!(matches!(
+            AgentRaftApplicationLedgerV2::open(
+                Arc::clone(&database),
+                route(&committee(&[key(1)], &[])).generation(),
+                journal_store(0xac),
+            ),
+            Err(AgentRaftApplicationErrorV2::Backend(_))
+        ));
+        assert!(matches!(
+            CommittedSharedRaftSlot::from_durable_log(&RedbSharedRaftLogWitness::new(database), 1,),
+            Err(CommittedSharedRaftSlotError::Witness(_))
         ));
     }
 

@@ -164,6 +164,51 @@ impl RaftLog {
         })
     }
 
+    /// Read one exact committed physical log row and the commit cursor from a
+    /// single redb snapshot.
+    ///
+    /// Application adapters must not combine an entry read with a separately
+    /// loaded `commit_index`: a concurrent worker transaction could otherwise
+    /// make an uncommitted row appear committed (or hide a newly committed
+    /// row). The returned payload is the complete encoded `EntryKind`, not an
+    /// application-specific body.
+    pub(crate) fn committed_payload_at(
+        db: &Database,
+        index: u64,
+    ) -> Result<Option<(u64, u64, u64, Vec<u8>)>, CommitError> {
+        if index == 0 {
+            return Ok(None);
+        }
+        let transaction = db.begin_read()?;
+        let meta = RaftMeta::load_from_read_transaction(&transaction)?;
+        if index > meta.commit_index {
+            return Ok(None);
+        }
+        if index <= meta.snap_last_index {
+            return Err(CommitError::Config(alloc::format!(
+                "raft_log committed entry at index {index} was compacted at snapshot {}",
+                meta.snap_last_index,
+            )));
+        }
+        let table = transaction.open_table(RAFT_LOG)?;
+        let bytes = table.get(index)?.ok_or_else(|| {
+            CommitError::Config(alloc::format!(
+                "raft_log committed entry at index {index} is missing"
+            ))
+        })?;
+        let entry = LogEntry::decode(index, bytes.value()).ok_or_else(|| {
+            CommitError::Config(alloc::format!(
+                "raft_log committed entry at index {index} failed to decode"
+            ))
+        })?;
+        Ok(Some((
+            entry.index,
+            entry.term,
+            meta.commit_index,
+            entry.payload,
+        )))
+    }
+
     /// Capture the current in-memory cache fields. Pair with
     /// [`cache_restore`](Self::cache_restore) to roll back after a
     /// txn commit failure — the `*_in_txn` helpers mutate `self`
@@ -455,6 +500,12 @@ pub struct RaftMeta {
 impl RaftMeta {
     pub fn load(db: &Database) -> Result<Self, CommitError> {
         let txn = db.begin_read()?;
+        Self::load_from_read_transaction(&txn)
+    }
+
+    pub(crate) fn load_from_read_transaction(
+        txn: &redb::ReadTransaction,
+    ) -> Result<Self, CommitError> {
         let mut m = Self::default();
         let table = match txn.open_table(RAFT_META) {
             Ok(t) => t,
@@ -462,25 +513,56 @@ impl RaftMeta {
             Err(e) => return Err(e.into()),
         };
         if let Some(v) = table.get(META_TERM)? {
-            m.current_term = u64_le(v.value());
+            m.current_term = strict_meta_u64(META_TERM, v.value())?;
         }
         if let Some(v) = table.get(META_VOTED_FOR)? {
             let bytes = v.value();
-            if bytes.len() == 2 {
-                m.voted_for = Some(u16::from_le_bytes([bytes[0], bytes[1]]));
+            if bytes.len() != 2 {
+                return Err(invalid_meta_width(META_VOTED_FOR, 2, bytes.len()));
             }
+            m.voted_for = Some(u16::from_le_bytes([bytes[0], bytes[1]]));
         }
         if let Some(v) = table.get(META_COMMIT_INDEX)? {
-            m.commit_index = u64_le(v.value());
+            m.commit_index = strict_meta_u64(META_COMMIT_INDEX, v.value())?;
         }
         if let Some(v) = table.get(META_LAST_APPLIED)? {
-            m.last_applied = u64_le(v.value());
+            m.last_applied = strict_meta_u64(META_LAST_APPLIED, v.value())?;
         }
         if let Some(v) = table.get(META_SNAP_INDEX)? {
-            m.snap_last_index = u64_le(v.value());
+            m.snap_last_index = strict_meta_u64(META_SNAP_INDEX, v.value())?;
         }
         if let Some(v) = table.get(META_SNAP_TERM)? {
-            m.snap_last_term = u64_le(v.value());
+            m.snap_last_term = strict_meta_u64(META_SNAP_TERM, v.value())?;
+        }
+        Ok(m)
+    }
+
+    pub(crate) fn load_from_write_transaction(
+        txn: &redb::WriteTransaction,
+    ) -> Result<Self, CommitError> {
+        let mut m = Self::default();
+        let table = txn.open_table(RAFT_META)?;
+        if let Some(v) = table.get(META_TERM)? {
+            m.current_term = strict_meta_u64(META_TERM, v.value())?;
+        }
+        if let Some(v) = table.get(META_VOTED_FOR)? {
+            let bytes = v.value();
+            if bytes.len() != 2 {
+                return Err(invalid_meta_width(META_VOTED_FOR, 2, bytes.len()));
+            }
+            m.voted_for = Some(u16::from_le_bytes([bytes[0], bytes[1]]));
+        }
+        if let Some(v) = table.get(META_COMMIT_INDEX)? {
+            m.commit_index = strict_meta_u64(META_COMMIT_INDEX, v.value())?;
+        }
+        if let Some(v) = table.get(META_LAST_APPLIED)? {
+            m.last_applied = strict_meta_u64(META_LAST_APPLIED, v.value())?;
+        }
+        if let Some(v) = table.get(META_SNAP_INDEX)? {
+            m.snap_last_index = strict_meta_u64(META_SNAP_INDEX, v.value())?;
+        }
+        if let Some(v) = table.get(META_SNAP_TERM)? {
+            m.snap_last_term = strict_meta_u64(META_SNAP_TERM, v.value())?;
         }
         Ok(m)
     }
@@ -555,6 +637,19 @@ fn u64_le(b: &[u8]) -> u64 {
     let n = b.len().min(8);
     a[..n].copy_from_slice(&b[..n]);
     u64::from_le_bytes(a)
+}
+
+fn strict_meta_u64(key: &str, bytes: &[u8]) -> Result<u64, CommitError> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| invalid_meta_width(key, 8, bytes.len()))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn invalid_meta_width(key: &str, expected: usize, actual: usize) -> CommitError {
+    CommitError::Config(alloc::format!(
+        "raft_meta {key}: expected {expected} bytes, found {actual}",
+    ))
 }
 
 fn encode_prefix_list(buf: &mut Vec<u8>, list: &[u16]) {
@@ -981,5 +1076,40 @@ mod tests {
         let loaded = RaftMeta::load(&db).unwrap();
         assert_eq!(loaded.voted_for, None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transaction_meta_loaders_reject_noncanonical_scalar_widths() {
+        let malformed = [
+            (META_TERM, alloc::vec![1; 7]),
+            (META_COMMIT_INDEX, alloc::vec![2; 9]),
+            (META_LAST_APPLIED, alloc::vec![3; 1]),
+            (META_SNAP_INDEX, alloc::vec![4; 16]),
+            (META_SNAP_TERM, alloc::vec![5; 0]),
+            (META_VOTED_FOR, alloc::vec![6; 1]),
+            (META_VOTED_FOR, alloc::vec![7; 3]),
+        ];
+        for (key, bytes) in malformed {
+            let (db, dir) = temp_db();
+            let transaction = db.begin_write().unwrap();
+            transaction
+                .open_table(RAFT_META)
+                .unwrap()
+                .insert(key, bytes.as_slice())
+                .unwrap();
+            transaction.commit().unwrap();
+
+            assert!(
+                RaftMeta::load(&db).is_err(),
+                "read loader admitted malformed {key}"
+            );
+            let transaction = db.begin_write().unwrap();
+            assert!(
+                RaftMeta::load_from_write_transaction(&transaction).is_err(),
+                "write loader admitted malformed {key}"
+            );
+            drop(transaction);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

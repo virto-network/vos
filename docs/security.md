@@ -61,6 +61,26 @@ before admission can commit. Lifecycle metadata distinguishes staged,
 admitted, and terminal data so restart reconciliation retains only work that
 can still execute.
 
+## Shared Raft application format
+
+The clean-generation Shared application ledger uses only the V2 redb tables
+`agent_shared_raft_application_config_v2`,
+`agent_shared_raft_apply_meta_v2`, and
+`agent_shared_raft_apply_audit_v2`. Their canonical records use the `AGC2`,
+`AGM2`, and `AGA2` tags; dispositions use `AGD2`. A database is bound to
+exactly one stable Agent generation and journal-store instance. Any V1 Shared
+evidence table, foreign V2 generation row, extra cursor row, or audit row
+outside the bound generation prefix makes open/recovery fail closed.
+
+The audit cursor covers every physical Raft index, including leader no-ops and
+membership entries. Each row binds index, term, the commitment of the complete
+encoded Raft entry kind, and the deterministic disposition. Advancing that
+row, its cursor, and Raft `last_applied` is one redb transaction. Restart
+requires a consecutive, nondecreasing-term audit chain and the exact retained
+Raft rows. This first V2 slice has no snapshot format, so it refuses a compacted
+prefix; it also refuses Shared commands without an execution receipt and every
+membership change without a later committee-transition authorization.
+
 ## Proof material
 
 Public claims, receipts, and proof references may replicate. Secret witnesses
