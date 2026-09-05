@@ -972,6 +972,10 @@ impl InvocationOutcomeRecord {
                 ActorExecutionStatus::Forbidden => InvocationDisposition::Forbidden,
                 ActorExecutionStatus::Panicked => InvocationDisposition::Panicked,
                 ActorExecutionStatus::OutOfGas => InvocationDisposition::OutOfGas,
+                // Yield is an intermediate runtime transition, never a
+                // terminal invocation outcome retained by this legacy
+                // journal record.
+                ActorExecutionStatus::Yielded => InvocationDisposition::Rejected,
             },
             Err(_) => InvocationDisposition::Rejected,
         }
@@ -1040,6 +1044,10 @@ impl InvocationOutcomeRecord {
             || !scope_matches_mode
             || !node_matches_scope
             || self.result == Err(ActorExecutionError::DivergentInvocation)
+            || matches!(
+                &self.result,
+                Ok(reply) if reply.status == ActorExecutionStatus::Yielded
+            )
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -3834,6 +3842,31 @@ mod tests {
             assert_eq!(record.before, record.after);
             roundtrip(&record);
         }
+    }
+
+    #[test]
+    fn yielded_slice_cannot_be_encoded_as_a_terminal_invocation_outcome() {
+        let input = replay_input(MethodMode::Linear, false);
+        let ReplayOperation::Invoke { invocation, .. } = &input.operation else {
+            unreachable!()
+        };
+        let state = outcome_state();
+        assert_eq!(
+            InvocationOutcomeRecord::from_runtime_states(
+                outcome_genesis(),
+                InvocationOwnershipScope::Ordered,
+                outcome_anchor(MethodMode::Linear),
+                &input,
+                &state,
+                &state,
+                Ok(exact_reply(
+                    invocation,
+                    ActorExecutionStatus::Yielded,
+                    Vec::new(),
+                )),
+            ),
+            Err(DecodeError::NonCanonical)
+        );
     }
 
     #[test]

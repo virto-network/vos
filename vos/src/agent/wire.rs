@@ -8,7 +8,8 @@ use super::execution::{
 };
 use super::standard::{
     StandardActorState, StandardAgentRuntime, StandardAuthorityDisposition,
-    StandardInvocationResult, StandardLaneEntry, StandardLaneState, StandardRuntimeState,
+    StandardInvocationResult, StandardLaneEntry, StandardLaneState, StandardMachineContinuation,
+    StandardRuntimeState,
 };
 use super::{
     ActorDirectoryPage, ActorDirectoryRecord, ActorEntry, ActorLifecycleDebt, AgentConfig,
@@ -501,6 +502,16 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
             encode_execution_reply(encoder, &result.reply);
         },
     );
+    encoder.list(
+        &state
+            .machine_continuations
+            .iter()
+            .filter(|continuation| {
+                continuation.mode.result_storage() == super::InvocationResultStorage::Control
+            })
+            .collect::<Vec<_>>(),
+        |encoder, continuation| encode_machine_continuation(encoder, continuation),
+    );
     RuntimeState {
         control,
         linear: encode_standard_lane(state, StateLane::Linear),
@@ -652,6 +663,11 @@ pub fn decode_standard_runtime_state(
     {
         return Err(DecodeError::NonCanonical);
     }
+    let mut machine_continuations = decode_bounded_list(
+        &mut decoder,
+        super::standard::MAX_MACHINE_CONTINUATIONS,
+        |decoder| decode_machine_continuation(decoder, super::InvocationResultStorage::Control),
+    )?;
     if !decoder.exhausted() {
         return Err(DecodeError::TrailingBytes);
     }
@@ -683,12 +699,30 @@ pub fn decode_standard_runtime_state(
             StateLane::Local => lane_state.local = decoded.values,
         }
         invocation_results.extend(decoded.invocation_results);
+        machine_continuations.extend(decoded.machine_continuations);
     }
     invocation_results.sort_unstable_by_key(|result| (result.scope, result.invocation));
     if invocation_results
         .windows(2)
         .any(|pair| (pair[0].scope, pair[0].invocation) >= (pair[1].scope, pair[1].invocation))
     {
+        return Err(DecodeError::NonCanonical);
+    }
+    machine_continuations.sort_unstable_by_key(|continuation| {
+        (
+            invocation_result_storage_tag(continuation.mode.result_storage()),
+            continuation.ready_sequence,
+        )
+    });
+    if machine_continuations.windows(2).any(|pair| {
+        (
+            invocation_result_storage_tag(pair[0].mode.result_storage()),
+            pair[0].ready_sequence,
+        ) >= (
+            invocation_result_storage_tag(pair[1].mode.result_storage()),
+            pair[1].ready_sequence,
+        )
+    }) {
         return Err(DecodeError::NonCanonical);
     }
     let state = StandardRuntimeState {
@@ -698,6 +732,7 @@ pub fn decode_standard_runtime_state(
         retired_installation_ids,
         lane_state,
         invocation_results,
+        machine_continuations,
         lane_revisions,
         control_authority_slot,
         authority_slot_high_water,
@@ -750,6 +785,16 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
             encode_execution_reply(encoder, &result.reply);
         },
     );
+    encoder.list(
+        &state
+            .machine_continuations
+            .iter()
+            .filter(|continuation| {
+                continuation.mode.result_storage() == super::InvocationResultStorage::Lane(lane)
+            })
+            .collect::<Vec<_>>(),
+        |encoder, continuation| encode_machine_continuation(encoder, continuation),
+    );
     output
 }
 
@@ -758,6 +803,110 @@ struct DecodedStandardLane {
     authority_slot: Option<u64>,
     values: Vec<StandardLaneEntry>,
     invocation_results: Vec<StandardInvocationResult>,
+    machine_continuations: Vec<StandardMachineContinuation>,
+}
+
+fn encode_machine_continuation(encoder: &mut Encoder<'_>, value: &StandardMachineContinuation) {
+    encoder.fixed(&value.invocation.0);
+    encoder.fixed(&value.actor.0);
+    encoder.fixed(&value.incarnation.0);
+    encoder.fixed(&value.deployment.0);
+    encoder.fixed(&value.program.0);
+    encoder.u8(encode_method_mode(value.mode));
+    encoder.fixed(&value.request.0);
+    encoder.u64(value.ready_sequence);
+    encoder.u8(value.continuation.fetch_index);
+    encoder.u32(value.continuation.host_budget.calls);
+    encoder.u32(value.continuation.host_budget.fetch_calls);
+    encoder.u32(value.continuation.host_budget.fetch_bytes);
+    encoder.u32(value.continuation.host_budget.blake2b_compressions);
+    encoder.u32(value.continuation.host_budget.debug_bytes);
+    encoder.u32(value.continuation.machine.pc);
+    encoder.u64(value.continuation.machine.gas_remaining);
+    for register in value.continuation.machine.registers {
+        encoder.u64(register);
+    }
+    encoder.list(&value.continuation.machine.memory, |encoder, region| {
+        encoder.u32(region.base);
+        encoder.bytes(&region.bytes);
+    });
+}
+
+fn decode_machine_continuation(
+    decoder: &mut Decoder<'_>,
+    expected_storage: super::InvocationResultStorage,
+) -> Result<StandardMachineContinuation, DecodeError> {
+    let invocation = crate::service::InvocationId(decoder.fixed()?);
+    let actor = ActorId(decoder.fixed()?);
+    let incarnation = Hash(decoder.fixed()?);
+    let deployment = DeploymentId(decoder.fixed()?);
+    let program = ProgramId(decoder.fixed()?);
+    let mode = decode_method_mode(decoder.u8()?)?;
+    let request = Hash(decoder.fixed()?);
+    let ready_sequence = decoder.u64()?;
+    let fetch_index = decoder.u8()?;
+    let host_budget = super::execution::ActorHostBudget {
+        calls: decoder.u32()?,
+        fetch_calls: decoder.u32()?,
+        fetch_bytes: decoder.u32()?,
+        blake2b_compressions: decoder.u32()?,
+        debug_bytes: decoder.u32()?,
+    };
+    let pc = decoder.u32()?;
+    let gas_remaining = decoder.u64()?;
+    let mut registers = [0u64; vos_pvm_program::REGISTER_COUNT];
+    for register in &mut registers {
+        *register = decoder.u64()?;
+    }
+    let memory = decode_bounded_list(
+        decoder,
+        super::execution::MAX_PORTABLE_MACHINE_REGIONS,
+        |decoder| {
+            let base = decoder.u32()?;
+            let bytes = decoder.bytes_ref()?;
+            if bytes.len() > super::execution::MAX_PORTABLE_MACHINE_MEMORY_BYTES {
+                return Err(DecodeError::LimitExceeded);
+            }
+            Ok(super::execution::PortableMemoryRegion {
+                base,
+                bytes: bytes.to_vec(),
+            })
+        },
+    )?;
+    let continuation = super::execution::ActorMachineContinuation {
+        machine: super::execution::PortableMachineSnapshot {
+            pc,
+            gas_remaining,
+            registers,
+            memory,
+        },
+        fetch_index,
+        host_budget,
+    };
+    let value = StandardMachineContinuation {
+        invocation,
+        actor,
+        incarnation,
+        deployment,
+        program,
+        mode,
+        request,
+        ready_sequence,
+        continuation,
+    };
+    if invocation == crate::service::InvocationId::ZERO
+        || actor == ActorId::ZERO
+        || incarnation == Hash::ZERO
+        || deployment == DeploymentId::ZERO
+        || program == ProgramId::ZERO
+        || request == Hash::ZERO
+        || ready_sequence == 0
+        || mode.result_storage() != expected_storage
+        || !value.continuation.validate()
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
 }
 
 fn decode_standard_lane(
@@ -832,8 +981,20 @@ fn decode_standard_lane(
     if invocation_results
         .windows(2)
         .any(|pair| (pair[0].scope, pair[0].invocation) >= (pair[1].scope, pair[1].invocation))
-        || !decoder.exhausted()
     {
+        return Err(DecodeError::NonCanonical);
+    }
+    let machine_continuations = decode_bounded_list(
+        &mut decoder,
+        super::standard::MAX_MACHINE_CONTINUATIONS,
+        |decoder| {
+            decode_machine_continuation(
+                decoder,
+                super::InvocationResultStorage::Lane(expected_lane),
+            )
+        },
+    )?;
+    if !decoder.exhausted() {
         return Err(DecodeError::NonCanonical);
     }
     Ok(DecodedStandardLane {
@@ -841,6 +1002,7 @@ fn decode_standard_lane(
         authority_slot,
         values,
         invocation_results,
+        machine_continuations,
     })
 }
 
@@ -891,6 +1053,7 @@ pub fn apply_standard_execution(
                         Err(error) => (Err(error), false),
                         Ok(()) => {
                             let pristine = runtime.clone();
+                            let mut terminal_continuation = None;
                             let mut result = match unseen {
                                 Err(error) => Err(error),
                                 Ok(None) if call.recovery_only => {
@@ -917,31 +1080,81 @@ pub fn apply_standard_execution(
                                         gas_remaining: call.invocation.gas,
                                         observation: super::execution::ActorObservation::default(),
                                     }),
-                                    Ok(true) => {
-                                        runtime.prepare_execution_state(&call.invocation).and_then(
-                                            |before| {
-                                                let actor_state =
-                                                    before.visible_for(call.invocation.mode);
-                                                super::execution::run_inner_actor(
-                                                    &call.invocation,
-                                                    &call.actor_pvm,
-                                                    &actor_state,
-                                                )
-                                                .and_then(|(mut reply, next_state)| {
-                                                    if reply.status == ActorExecutionStatus::Done {
-                                                        runtime.commit_execution(
-                                                            &call.invocation,
-                                                            &mut reply,
-                                                            &before,
-                                                            next_state,
-                                                            call.observed_slot,
-                                                        )?;
-                                                    }
-                                                    Ok(reply)
+                                    Ok(true) => runtime
+                                        .machine_continuation(&call.invocation)
+                                        .and_then(|pending| {
+                                            runtime
+                                                .prepare_execution_state(&call.invocation)
+                                                .and_then(|before| {
+                                                    let actor_state = before
+                                                        .visible_for(call.invocation.mode);
+                                                    let expected_sequence = pending
+                                                        .as_ref()
+                                                        .map(|(sequence, _)| *sequence);
+                                                    super::execution::run_inner_actor(
+                                                        &call.invocation,
+                                                        &call.actor_pvm,
+                                                        &actor_state,
+                                                        pending.map(|(_, continuation)| {
+                                                            continuation
+                                                        }),
+                                                    )
+                                                    .and_then(|outcome| match outcome {
+                                                        super::execution::ActorRunOutcome::Completed {
+                                                            mut reply,
+                                                            state: next_state,
+                                                        } => {
+                                                            if reply.status
+                                                                == ActorExecutionStatus::Done
+                                                            {
+                                                                if let Some(sequence) =
+                                                                    expected_sequence
+                                                                {
+                                                                    runtime
+                                                                        .consume_machine_continuation(
+                                                                            &call.invocation,
+                                                                            sequence,
+                                                                        )?;
+                                                                }
+                                                                runtime.commit_execution(
+                                                                    &call.invocation,
+                                                                    &mut reply,
+                                                                    &before,
+                                                                    next_state,
+                                                                    call.observed_slot,
+                                                                )?;
+                                                            } else if let Some(sequence) =
+                                                                expected_sequence
+                                                            {
+                                                                runtime
+                                                                    .consume_machine_continuation(
+                                                                        &call.invocation,
+                                                                        sequence,
+                                                                    )?;
+                                                                terminal_continuation =
+                                                                    Some(sequence);
+                                                            }
+                                                            Ok(reply)
+                                                        }
+                                                        super::execution::ActorRunOutcome::Yielded {
+                                                            reply,
+                                                            state: next_state,
+                                                            continuation,
+                                                        } => {
+                                                            runtime.commit_yielded_execution(
+                                                                &call.invocation,
+                                                                &reply,
+                                                                &before,
+                                                                next_state,
+                                                                call.observed_slot,
+                                                                expected_sequence,
+                                                                continuation,
+                                                            )?;
+                                                            Ok(reply)
+                                                        }
+                                                    })
                                                 })
-                                            },
-                                        )
-                                    }
+                                        }),
                                 },
                                 Ok(Some(_)) => unreachable!("exact recovery returned above"),
                             };
@@ -950,6 +1163,7 @@ pub fn apply_standard_execution(
                                 pristine,
                                 &call.invocation,
                                 call.observed_slot,
+                                terminal_continuation,
                                 &mut result,
                             );
                             (result, commit_candidate)
@@ -990,16 +1204,25 @@ fn finish_standard_execution_candidate(
 }
 
 /// Finish a fresh, authenticated execution result. `Done` has already passed
-/// through `commit_execution`; every externally retained terminal/error result
-/// is instead rebased on `pristine` and consumes only its owning clock.
+/// through `commit_execution`; Yielded has already committed its lane image
+/// and continuation. Every externally retained terminal/error result is
+/// instead rebased on `pristine`, consumes a resumed continuation if present,
+/// and advances only its owning clock.
 #[cfg(feature = "pvm")]
 fn finalize_unseen_standard_outcome(
     runtime: &mut StandardAgentRuntime,
     pristine: StandardAgentRuntime,
     invocation: &ActorInvocation,
     observed_slot: u64,
+    terminal_continuation: Option<u64>,
     result: &mut Result<ActorExecutionReply, ActorExecutionError>,
 ) -> bool {
+    if matches!(
+        result,
+        Ok(reply) if reply.status == ActorExecutionStatus::Yielded
+    ) {
+        return true;
+    }
     let external_exact = match result {
         Ok(reply) => reply.status != ActorExecutionStatus::Done,
         Err(error) => error.is_durable_exact_outcome(),
@@ -1009,6 +1232,12 @@ fn finalize_unseen_standard_outcome(
         // detecting a deterministic guest error. Discard every such candidate
         // before advancing the sole permitted result-component clock.
         *runtime = pristine;
+        if let Some(sequence) = terminal_continuation
+            && let Err(error) = runtime.consume_machine_continuation(invocation, sequence)
+        {
+            *result = Err(error);
+            return false;
+        }
         return match runtime.commit_exact_outcome_clock(invocation, observed_slot) {
             Ok(()) => true,
             Err(error) => {
@@ -1186,6 +1415,7 @@ pub(crate) fn decode_execution_reply(
             1 => ActorExecutionStatus::Forbidden,
             2 => ActorExecutionStatus::Panicked,
             3 => ActorExecutionStatus::OutOfGas,
+            4 => ActorExecutionStatus::Yielded,
             _ => return Err(DecodeError::InvalidTag),
         },
         reply: {
@@ -1242,6 +1472,7 @@ pub(crate) fn encode_execution_error(encoder: &mut Encoder<'_>, error: ActorExec
         ActorExecutionError::AuthoritySlotRegressed => encoder.u8(15),
         ActorExecutionError::StaleIncarnation => encoder.u8(16),
         ActorExecutionError::UnsupportedResultStorage => encoder.u8(17),
+        ActorExecutionError::ContinuationNotReady => encoder.u8(18),
     }
 }
 
@@ -1267,6 +1498,7 @@ pub(crate) fn decode_execution_error(
         15 => ActorExecutionError::AuthoritySlotRegressed,
         16 => ActorExecutionError::StaleIncarnation,
         17 => ActorExecutionError::UnsupportedResultStorage,
+        18 => ActorExecutionError::ContinuationNotReady,
         _ => return Err(DecodeError::InvalidTag),
     })
 }
@@ -1342,6 +1574,15 @@ const fn invocation_scope_for_lane(lane: StateLane) -> InvocationScope {
         StateLane::Linear => InvocationScope::Ordered,
         StateLane::Merge => InvocationScope::Merge,
         StateLane::Local => InvocationScope::Local,
+    }
+}
+
+const fn invocation_result_storage_tag(storage: super::InvocationResultStorage) -> u8 {
+    match storage {
+        super::InvocationResultStorage::Control => 0,
+        super::InvocationResultStorage::Lane(StateLane::Linear) => 1,
+        super::InvocationResultStorage::Lane(StateLane::Merge) => 2,
+        super::InvocationResultStorage::Lane(StateLane::Local) => 3,
     }
 }
 
@@ -2532,6 +2773,56 @@ mod tests {
     }
 
     #[cfg(feature = "pvm")]
+    fn portable_continuation(
+        invocation: &ActorInvocation,
+        ready_sequence: u64,
+        marker: u8,
+    ) -> StandardMachineContinuation {
+        let mut registers = [0u64; vos_pvm_program::REGISTER_COUNT];
+        for (index, register) in registers.iter_mut().enumerate() {
+            *register = u64::from(marker) << 32 | index as u64;
+        }
+        StandardMachineContinuation {
+            invocation: invocation.invocation,
+            actor: invocation.actor,
+            incarnation: invocation.incarnation,
+            deployment: invocation.deployment,
+            program: invocation.program,
+            mode: invocation.mode,
+            request: invocation.commitment(),
+            ready_sequence,
+            continuation: super::super::execution::ActorMachineContinuation {
+                machine: super::super::execution::PortableMachineSnapshot {
+                    pc: u32::from(marker) * 2,
+                    gas_remaining: 100 - u64::from(marker),
+                    registers,
+                    memory: vec![
+                        super::super::execution::PortableMemoryRegion {
+                            base: 2 * vos_pvm_program::ZONE_SIZE,
+                            bytes: vec![marker; vos_pvm_program::PAGE_SIZE as usize],
+                        },
+                        super::super::execution::PortableMemoryRegion {
+                            base: u32::MAX - (2 * vos_pvm_program::PAGE_SIZE) + 1,
+                            bytes: vec![
+                                marker.wrapping_add(1);
+                                vos_pvm_program::PAGE_SIZE as usize
+                            ],
+                        },
+                    ],
+                },
+                fetch_index: marker % 6,
+                host_budget: super::super::execution::ActorHostBudget {
+                    calls: u32::from(marker),
+                    fetch_calls: u32::from(marker % 4),
+                    fetch_bytes: u32::from(marker) * 17,
+                    blake2b_compressions: u32::from(marker % 3),
+                    debug_bytes: u32::from(marker) * 5,
+                },
+            },
+        }
+    }
+
+    #[cfg(feature = "pvm")]
     fn assert_only_result_component_changed(
         before: &RuntimeState,
         after: &RuntimeState,
@@ -2556,6 +2847,80 @@ mod tests {
             }
         };
         assert_eq!(changed, expected, "{mode:?}");
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn portable_continuations_restart_byte_identically_and_preserve_fifo() {
+        let mut state = sparse_standard_state();
+        let first = sparse_invocation(MethodMode::Linear, 0xd1);
+        let second = sparse_invocation(MethodMode::Linear, 0xd2);
+        state.machine_continuations = vec![
+            portable_continuation(&first, 7, 3),
+            portable_continuation(&second, 8, 4),
+        ];
+
+        let encoded = encode_standard_runtime_state(&state);
+        let decoded = decode_standard_runtime_state(&encoded).unwrap();
+        assert_eq!(decoded, state);
+        assert_eq!(encode_standard_runtime_state(&decoded), encoded);
+
+        let mut restarted = StandardAgentRuntime::restore(decoded).unwrap();
+        assert_eq!(
+            restarted.machine_continuation(&second),
+            Err(ActorExecutionError::ContinuationNotReady)
+        );
+        let (sequence, restored_first) = restarted
+            .machine_continuation(&first)
+            .unwrap()
+            .expect("FIFO head is ready after restart");
+        assert_eq!(sequence, 7);
+        assert_eq!(
+            restored_first,
+            portable_continuation(&first, 7, 3).continuation
+        );
+        let before = restarted.prepare_execution_state(&first).unwrap();
+        let mut after = before.clone();
+        after.linear = Some(vec![0xe1]);
+        restarted
+            .commit_yielded_execution(
+                &first,
+                &exact_reply(&first, ActorExecutionStatus::Yielded),
+                &before,
+                after,
+                20,
+                Some(sequence),
+                portable_continuation(&first, 1, 5).continuation,
+            )
+            .unwrap();
+        assert_eq!(
+            restarted.machine_continuation(&first),
+            Err(ActorExecutionError::ContinuationNotReady),
+            "a repeatedly-yielded slice moves to its component's FIFO tail"
+        );
+        assert_eq!(
+            restarted
+                .machine_continuation(&second)
+                .unwrap()
+                .map(|(sequence, _)| sequence),
+            Some(8)
+        );
+        assert_eq!(
+            restarted
+                .snapshot()
+                .machine_continuations
+                .iter()
+                .map(|record| (record.invocation, record.ready_sequence))
+                .collect::<Vec<_>>(),
+            vec![(second.invocation, 8), (first.invocation, 9)]
+        );
+        let restarted_bytes = encode_standard_runtime_state(&restarted.snapshot());
+        assert_eq!(
+            encode_standard_runtime_state(
+                &decode_standard_runtime_state(&restarted_bytes).unwrap()
+            ),
+            restarted_bytes
+        );
     }
 
     #[cfg(feature = "pvm")]
@@ -2827,6 +3192,7 @@ mod tests {
                 pristine,
                 &invocation,
                 40,
+                None,
                 &mut result,
             ));
             let snapshot = runtime.snapshot();
@@ -2876,6 +3242,7 @@ mod tests {
                 pristine,
                 &invocation,
                 41,
+                None,
                 &mut result,
             ));
             let snapshot = runtime.snapshot();
@@ -3044,6 +3411,7 @@ mod tests {
                 pristine,
                 &invocation,
                 42,
+                None,
                 &mut result,
             ));
             assert_eq!(runtime.snapshot(), base, "{error:?}");

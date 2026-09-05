@@ -7551,6 +7551,12 @@ fn validate_transition<SourceError, ExecutorError>(
                         ActorExecutionStatus::Forbidden => ReplayDisposition::Forbidden,
                         ActorExecutionStatus::Panicked => ReplayDisposition::Panicked,
                         ActorExecutionStatus::OutOfGas => ReplayDisposition::OutOfGas,
+                        // A yielded slice is not a terminal replay result.
+                        // Accept it only through the dedicated portable
+                        // Resume/Yielded transition protocol.
+                        ActorExecutionStatus::Yielded => {
+                            return Err(ReplayError::InvalidRecord);
+                        }
                     }
                 }
                 Err(error) if error.is_durable_exact_outcome() => ReplayDisposition::Rejected,

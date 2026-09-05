@@ -23,6 +23,9 @@ pub const MAX_DIRECTORY_PAGE: u16 = 256;
 pub const MAX_INVOCATION_RESULTS_PER_LANE: usize = 32;
 pub const MAX_INVOCATION_RESULT_BYTES_PER_LANE: usize = 64 * 1024;
 pub const MAX_AUTHORITY_DISPOSITIONS: usize = 256;
+/// Continuations are bounded independently of the encoded runtime image so a
+/// hostile list declaration is rejected before allocating snapshots.
+pub const MAX_MACHINE_CONTINUATIONS: usize = 4_096;
 /// Maximum number of retired installation identities representable in one
 /// canonical runtime image. The aggregate encoded-state limit is stricter once
 /// any other state is present, while this explicit cap rejects hostile list
@@ -127,6 +130,10 @@ pub struct StandardAgentRuntime {
     retired_installation_ids: BTreeSet<InstallationId>,
     lane_state: StandardLaneState,
     invocation_results: BTreeMap<(InvocationScope, InvocationId), StandardInvocationResult>,
+    /// Cooperative actor slices ordered by `(owning component, ready_sequence)`.
+    /// A yielded slice moves to the tail of its component queue on every
+    /// subsequent yield, providing deterministic FIFO round-robin behavior.
+    machine_continuations: Vec<StandardMachineContinuation>,
     lane_revisions: StandardLaneRevisions,
     control_authority_slot: Option<u64>,
     authority_slot_high_water: Option<u64>,
@@ -145,6 +152,7 @@ pub struct StandardRuntimeState {
     pub retired_installation_ids: Vec<InstallationId>,
     pub lane_state: StandardLaneState,
     pub invocation_results: Vec<StandardInvocationResult>,
+    pub(crate) machine_continuations: Vec<StandardMachineContinuation>,
     pub lane_revisions: StandardLaneRevisions,
     pub control_authority_slot: Option<u64>,
     pub authority_slot_high_water: Option<u64>,
@@ -217,6 +225,42 @@ pub struct StandardInvocationResult {
     /// Physical durable component retaining this exact result. Query replies
     /// have no logical write lane, so this cannot be inferred from `reply`.
     pub storage: InvocationResultStorage,
+}
+
+/// One guest-owned yielded inner-machine continuation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StandardMachineContinuation {
+    pub invocation: InvocationId,
+    pub actor: ActorId,
+    pub incarnation: Hash,
+    pub deployment: DeploymentId,
+    pub program: ProgramId,
+    pub mode: super::MethodMode,
+    pub request: Hash,
+    pub ready_sequence: u64,
+    pub continuation: super::execution::ActorMachineContinuation,
+}
+
+impl StandardMachineContinuation {
+    fn storage(&self) -> InvocationResultStorage {
+        self.mode.result_storage()
+    }
+}
+
+fn continuation_storage_tag(storage: InvocationResultStorage) -> u8 {
+    match storage {
+        InvocationResultStorage::Control => 0,
+        InvocationResultStorage::Lane(StateLane::Linear) => 1,
+        InvocationResultStorage::Lane(StateLane::Merge) => 2,
+        InvocationResultStorage::Lane(StateLane::Local) => 3,
+    }
+}
+
+fn continuation_order_key(continuation: &StandardMachineContinuation) -> (u8, u64) {
+    (
+        continuation_storage_tag(continuation.storage()),
+        continuation.ready_sequence,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -319,6 +363,7 @@ impl StandardAgentRuntime {
                 local: Vec::new(),
             },
             invocation_results: BTreeMap::new(),
+            machine_continuations: Vec::new(),
             lane_revisions: StandardLaneRevisions {
                 linear: 0,
                 merge: 0,
@@ -375,6 +420,7 @@ impl StandardAgentRuntime {
             retired_installation_ids: self.retired_installation_ids.iter().copied().collect(),
             lane_state: self.lane_state.clone(),
             invocation_results: self.invocation_results.values().cloned().collect(),
+            machine_continuations: self.machine_continuations.clone(),
             lane_revisions: self.lane_revisions,
             control_authority_slot: self.control_authority_slot,
             authority_slot_high_water: self.authority_slot_high_water,
@@ -409,6 +455,7 @@ impl StandardAgentRuntime {
                 && state.system_authority.is_none()
                 && state.lane_state == StandardLaneState::default()
                 && state.invocation_results.is_empty()
+                && state.machine_continuations.is_empty()
                 && state.lane_revisions == StandardLaneRevisions::default()
                 && state.control_authority_slot.is_none()
                 && state.authority_slot_high_water.is_none()
@@ -447,6 +494,33 @@ impl StandardAgentRuntime {
             || state.invocation_results.windows(2).any(|pair| {
                 (pair[0].scope, pair[0].invocation) >= (pair[1].scope, pair[1].invocation)
             })
+            || state.machine_continuations.len() > MAX_MACHINE_CONTINUATIONS
+            || state.machine_continuations.iter().any(|continuation| {
+                continuation.invocation == InvocationId::ZERO
+                    || continuation.actor == ActorId::ZERO
+                    || continuation.incarnation == Hash::ZERO
+                    || continuation.deployment == DeploymentId::ZERO
+                    || continuation.program == ProgramId::ZERO
+                    || continuation.request == Hash::ZERO
+                    || continuation.ready_sequence == 0
+                    || !continuation.continuation.validate()
+            })
+            || state
+                .machine_continuations
+                .windows(2)
+                .any(|pair| continuation_order_key(&pair[0]) >= continuation_order_key(&pair[1]))
+            || state
+                .machine_continuations
+                .iter()
+                .enumerate()
+                .any(|(index, item)| {
+                    state.machine_continuations[index + 1..]
+                        .iter()
+                        .any(|other| {
+                            item.mode.invocation_scope() == other.mode.invocation_scope()
+                                && item.invocation == other.invocation
+                        })
+                })
             || !state.lane_state.is_canonical()
             || state.authority_dispositions.len() > MAX_AUTHORITY_DISPOSITIONS
             || state
@@ -548,6 +622,27 @@ impl StandardAgentRuntime {
             runtime
                 .invocation_results
                 .insert((result.scope, result.invocation), result);
+        }
+        for continuation in state.machine_continuations {
+            let actor = runtime.actors.get(&continuation.actor);
+            if actor.is_none_or(|actor| {
+                actor.record.state_generation != continuation.incarnation
+                    || actor.record.entry.deployment != continuation.deployment
+                    || actor.record.entry.program != continuation.program
+                    || actor.record.entry.suspended
+                    || continuation
+                        .mode
+                        .write_lane()
+                        .is_some_and(|lane| !actor.record.entry.lanes.contains(lane))
+            }) || !runtime.result_storage_supported(continuation.storage())
+                || runtime.invocation_results.contains_key(&(
+                    continuation.mode.invocation_scope(),
+                    continuation.invocation,
+                ))
+            {
+                return Err(LifecycleError::InvalidRequest);
+            }
+            runtime.machine_continuations.push(continuation);
         }
         runtime.control_authority_slot = state.control_authority_slot;
         for storage in [
@@ -1036,6 +1131,188 @@ impl StandardAgentRuntime {
             return Err(ActorExecutionError::InvalidAvailability);
         }
         Ok(state)
+    }
+
+    /// Resolve an exact yielded invocation only when it is at the head of its
+    /// owning component's FIFO. Unrelated fresh work may still execute; FIFO
+    /// constrains continuation resumes rather than globally serializing all
+    /// actor messages across independent replication lanes.
+    #[cfg(feature = "pvm")]
+    pub(crate) fn machine_continuation(
+        &self,
+        invocation: &super::execution::ActorInvocation,
+    ) -> Result<
+        Option<(u64, super::execution::ActorMachineContinuation)>,
+        super::execution::ActorExecutionError,
+    > {
+        use super::execution::ActorExecutionError;
+
+        let scope = invocation.mode.invocation_scope();
+        let Some(record) = self.machine_continuations.iter().find(|record| {
+            record.mode.invocation_scope() == scope && record.invocation == invocation.invocation
+        }) else {
+            return Ok(None);
+        };
+        if record.request != invocation.commitment()
+            || record.actor != invocation.actor
+            || record.incarnation != invocation.incarnation
+            || record.deployment != invocation.deployment
+            || record.program != invocation.program
+            || record.mode != invocation.mode
+        {
+            return Err(ActorExecutionError::DivergentInvocation);
+        }
+        let storage = record.storage();
+        let head = self
+            .machine_continuations
+            .iter()
+            .find(|candidate| candidate.storage() == storage)
+            .expect("the matching continuation is in its owning component");
+        if head.ready_sequence != record.ready_sequence
+            || head.invocation != record.invocation
+            || head.mode.invocation_scope() != scope
+        {
+            return Err(ActorExecutionError::ContinuationNotReady);
+        }
+        Ok(Some((record.ready_sequence, record.continuation.clone())))
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn consume_machine_continuation(
+        &mut self,
+        invocation: &super::execution::ActorInvocation,
+        expected_sequence: u64,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+
+        let scope = invocation.mode.invocation_scope();
+        let index = self
+            .machine_continuations
+            .iter()
+            .position(|record| {
+                record.mode.invocation_scope() == scope
+                    && record.invocation == invocation.invocation
+            })
+            .ok_or(ActorExecutionError::InvalidActorOutput)?;
+        let record = &self.machine_continuations[index];
+        if record.ready_sequence != expected_sequence
+            || record.request != invocation.commitment()
+            || record.actor != invocation.actor
+            || record.incarnation != invocation.incarnation
+            || record.deployment != invocation.deployment
+            || record.program != invocation.program
+            || record.mode != invocation.mode
+        {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
+        self.machine_continuations.remove(index);
+        Ok(())
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn commit_yielded_execution(
+        &mut self,
+        invocation: &super::execution::ActorInvocation,
+        reply: &super::execution::ActorExecutionReply,
+        before: &super::execution::ActorStateLanes,
+        mut after: super::execution::ActorStateLanes,
+        observed_slot: u64,
+        expected_sequence: Option<u64>,
+        continuation: super::execution::ActorMachineContinuation,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::{ActorExecutionError, ActorExecutionStatus};
+
+        self.validate_invocation_target(invocation)?;
+        if reply.invocation != invocation.invocation
+            || reply.actor != invocation.actor
+            || reply.incarnation != invocation.incarnation
+            || reply.deployment != invocation.deployment
+            || reply.mode != invocation.mode
+            || reply.lane != invocation.mode.write_lane()
+            || reply.status != ActorExecutionStatus::Yielded
+            || reply.observation != super::execution::ActorObservation::default()
+            || !continuation.validate()
+        {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
+        let write_lane = invocation.mode.write_lane();
+        for lane in [StateLane::Linear, StateLane::Merge, StateLane::Local] {
+            let previous = before.get(lane);
+            if Some(lane) != write_lane && !invocation.mode.can_read(lane) {
+                if after.get(lane).is_some_and(|bytes| !bytes.is_empty()) {
+                    return Err(ActorExecutionError::InvalidActorOutput);
+                }
+            } else if Some(lane) != write_lane {
+                match previous {
+                    Some(previous) if after.get(lane) != Some(previous) => {
+                        return Err(ActorExecutionError::InvalidActorOutput);
+                    }
+                    None if after.get(lane).is_some_and(|bytes| !bytes.is_empty()) => {
+                        return Err(ActorExecutionError::InvalidActorOutput);
+                    }
+                    Some(_) | None => {}
+                }
+            }
+        }
+        if let Some(lane) = write_lane {
+            let state = after
+                .take(lane)
+                .ok_or(ActorExecutionError::InvalidActorOutput)?;
+            if state.len() > super::execution::MAX_EXECUTION_STATE_BYTES {
+                return Err(ActorExecutionError::InvalidActorOutput);
+            }
+            let actor = self
+                .actors
+                .get(&reply.actor)
+                .ok_or(ActorExecutionError::NotFound)?;
+            self.lane_state.upsert(
+                lane,
+                actor.record.entry.actor,
+                actor.record.state_generation,
+                state,
+            )?;
+            self.lane_revisions.increment(lane)?;
+        }
+        if let Some(sequence) = expected_sequence {
+            self.consume_machine_continuation(invocation, sequence)?;
+        } else if self.machine_continuations.iter().any(|record| {
+            record.mode.invocation_scope() == invocation.mode.invocation_scope()
+                && record.invocation == invocation.invocation
+        }) {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
+        if self.machine_continuations.len() >= MAX_MACHINE_CONTINUATIONS {
+            return Err(ActorExecutionError::ResultCapacity);
+        }
+        let storage = invocation.mode.result_storage();
+        let ready_sequence = self
+            .machine_continuations
+            .iter()
+            .filter(|record| record.storage() == storage)
+            .map(|record| record.ready_sequence)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(ActorExecutionError::ResultCapacity)?;
+        let record = StandardMachineContinuation {
+            invocation: invocation.invocation,
+            actor: invocation.actor,
+            incarnation: invocation.incarnation,
+            deployment: invocation.deployment,
+            program: invocation.program,
+            mode: invocation.mode,
+            request: invocation.commitment(),
+            ready_sequence,
+            continuation,
+        };
+        let key = continuation_order_key(&record);
+        let index = self
+            .machine_continuations
+            .binary_search_by_key(&key, continuation_order_key)
+            .unwrap_or_else(|index| index);
+        self.machine_continuations.insert(index, record);
+        self.advance_result_authority_slot(storage, observed_slot);
+        Ok(())
     }
 
     #[cfg(feature = "pvm")]
@@ -2251,6 +2528,15 @@ impl AgentRuntime for StandardAgentRuntime {
                 self.invocation_results
                     .values()
                     .filter(|result| result.reply.actor == actor)
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
+        );
+        debt.continuations = debt.continuations.saturating_add(
+            u32::try_from(
+                self.machine_continuations
+                    .iter()
+                    .filter(|continuation| continuation.actor == actor)
                     .count(),
             )
             .unwrap_or(u32::MAX),

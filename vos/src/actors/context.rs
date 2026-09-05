@@ -1338,6 +1338,12 @@ impl<A: Actor> Context<A> {
     pub fn yield_now(&mut self) -> super::run::Yield {
         #[cfg(feature = "pvm")]
         {
+            // Service actors retain their transitional service scheduler
+            // token. Agent actors are inner standard machines: SUSPEND is an
+            // actor-ABI exit handled by their guest runtime, and its sole
+            // result is the portable 0=finalize / 1=restore discriminator.
+            // No service checkpoint type crosses that boundary.
+            #[cfg(feature = "service")]
             let restored = if self.actor_id.is_some() {
                 let mut token = [0u8; crate::service::CHECKPOINT_TOKEN_CAPACITY];
                 let [resume_kind, token_len] =
@@ -1361,6 +1367,8 @@ impl<A: Actor> Context<A> {
             } else {
                 crate::abi::pvm::hostcalls::suspend() == 1
             };
+            #[cfg(not(feature = "service"))]
+            let restored = crate::abi::pvm::hostcalls::suspend() == 1;
             self.self_schedule = !restored;
             super::run::Yield::after_checkpoint(restored)
         }

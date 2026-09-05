@@ -1211,6 +1211,9 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 ActorExecutionStatus::Forbidden => ReplayDisposition::Forbidden,
                 ActorExecutionStatus::Panicked => ReplayDisposition::Panicked,
                 ActorExecutionStatus::OutOfGas => ReplayDisposition::OutOfGas,
+                // The legacy invoke journal has no intermediate-transition
+                // record. The SDK Resume/Yielded path owns this case.
+                ActorExecutionStatus::Yielded => ReplayDisposition::Rejected,
             },
             Err(_) => ReplayDisposition::Rejected,
         }

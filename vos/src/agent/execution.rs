@@ -51,15 +51,10 @@ pub const MAX_RUNTIME_STATE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EXECUTION_BLOBS: usize = 4;
 #[cfg(feature = "pvm")]
 const ACTOR_DISPATCH_CONTROL_CAPACITY: usize = 512;
-#[cfg(feature = "pvm")]
 const MAX_EXECUTION_HOST_CALLS: usize = 4 * 1024;
-#[cfg(feature = "pvm")]
 const MAX_EXECUTION_FETCH_CALLS: usize = 16;
-#[cfg(feature = "pvm")]
 const MAX_EXECUTION_FETCH_BYTES: usize = 64 * 1024;
-#[cfg(all(feature = "pvm", feature = "agent-runtime"))]
 const MAX_EXECUTION_BLAKE2B_COMPRESS_CALLS: usize = 1024;
-#[cfg(feature = "pvm")]
 const MAX_EXECUTION_DEBUG_BYTES: usize = 16 * 1024;
 
 #[cfg(feature = "pvm")]
@@ -127,6 +122,70 @@ pub(crate) fn execution_state_size<'a>(
 pub struct RuntimeBlob {
     pub reference: BlobRef,
     pub bytes: Vec<u8>,
+}
+
+/// Hard allocation ceiling while decoding one untrusted inner-machine image.
+/// The enclosing runtime applies its (possibly smaller) signed state limit to
+/// the complete encoded continuation before committing it.
+pub const MAX_PORTABLE_MACHINE_MEMORY_BYTES: usize = MAX_RUNTIME_STATE_BYTES;
+pub const MAX_PORTABLE_MACHINE_REGIONS: usize = 2;
+
+/// One complete mutable region in a portable inner-machine snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortableMemoryRegion {
+    pub base: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Runtime-independent state needed to recreate one standard inner machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortableMachineSnapshot {
+    pub pc: u32,
+    pub gas_remaining: u64,
+    pub registers: [u64; vos_pvm_program::REGISTER_COUNT],
+    pub memory: Vec<PortableMemoryRegion>,
+}
+
+impl PortableMachineSnapshot {
+    /// Validate bounds independent of a program. Restore additionally checks
+    /// exact region bases and lengths against the authenticated program.
+    pub fn is_valid(&self) -> bool {
+        if self.memory.len() > MAX_PORTABLE_MACHINE_REGIONS {
+            return false;
+        }
+        let mut total = 0usize;
+        let mut previous_end = None;
+        for region in &self.memory {
+            if region.bytes.is_empty()
+                || region.base % vos_pvm_program::PAGE_SIZE != 0
+                || region.bytes.len() % vos_pvm_program::PAGE_SIZE as usize != 0
+            {
+                return false;
+            }
+            let Ok(len) = u32::try_from(region.bytes.len()) else {
+                return false;
+            };
+            let Some(end) = region.base.checked_add(len) else {
+                return false;
+            };
+            if previous_end.is_some_and(|previous| region.base < previous) {
+                return false;
+            }
+            previous_end = Some(end);
+            let Some(next) = total.checked_add(region.bytes.len()) else {
+                return false;
+            };
+            if next > MAX_PORTABLE_MACHINE_MEMORY_BYTES {
+                return false;
+            }
+            total = next;
+        }
+        true
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        self.memory.iter().map(|region| region.bytes.len()).sum()
+    }
 }
 
 /// Caller context signed into an [`ActorInvocationReceipt`](super::authority::ActorInvocationReceipt).
@@ -240,6 +299,10 @@ pub enum ActorExecutionStatus {
     Forbidden = 1,
     Panicked = 2,
     OutOfGas = 3,
+    /// The actor committed one cooperative slice. Its exact machine
+    /// continuation is runtime-owned state, not reply payload supplied by the
+    /// caller.
+    Yielded = 4,
 }
 
 /// Durable state observation which produced one exact actor reply.
@@ -289,6 +352,9 @@ pub enum ActorExecutionError {
     InvalidAuthorization,
     AuthorityExpired,
     AuthoritySlotRegressed,
+    /// A valid continuation exists, but another continuation in the same
+    /// physical component precedes it in the deterministic FIFO.
+    ContinuationNotReady,
     UnsupportedHostCall(u64),
 }
 
@@ -430,31 +496,37 @@ impl ActorInvocation {
     }
 }
 
-#[cfg(feature = "pvm")]
-#[derive(Default)]
-struct ActorHostBudget {
-    calls: usize,
-    fetch_calls: usize,
-    fetch_bytes: usize,
-    #[cfg(feature = "agent-runtime")]
-    blake2b_compressions: usize,
-    debug_bytes: usize,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ActorHostBudget {
+    pub(crate) calls: u32,
+    pub(crate) fetch_calls: u32,
+    pub(crate) fetch_bytes: u32,
+    pub(crate) blake2b_compressions: u32,
+    pub(crate) debug_bytes: u32,
 }
 
-#[cfg(feature = "pvm")]
 impl ActorHostBudget {
-    fn charge(total: &mut usize, amount: usize, maximum: usize) -> bool {
-        let Some(next) = total.checked_add(amount).filter(|next| *next <= maximum) else {
+    #[cfg(feature = "pvm")]
+    fn charge(total: &mut u32, amount: usize, maximum: usize) -> bool {
+        let Ok(amount) = u32::try_from(amount) else {
+            return false;
+        };
+        let Some(next) = total
+            .checked_add(amount)
+            .filter(|next| *next as usize <= maximum)
+        else {
             return false;
         };
         *total = next;
         true
     }
 
+    #[cfg(feature = "pvm")]
     fn host_call(&mut self) -> bool {
         Self::charge(&mut self.calls, 1, MAX_EXECUTION_HOST_CALLS)
     }
 
+    #[cfg(feature = "pvm")]
     fn fetch(&mut self, bytes: usize) -> bool {
         Self::charge(&mut self.fetch_calls, 1, MAX_EXECUTION_FETCH_CALLS)
             && Self::charge(&mut self.fetch_bytes, bytes, MAX_EXECUTION_FETCH_BYTES)
@@ -469,9 +541,73 @@ impl ActorHostBudget {
         )
     }
 
+    #[cfg(feature = "pvm")]
     fn debug(&mut self, bytes: usize) -> bool {
         Self::charge(&mut self.debug_bytes, bytes, MAX_EXECUTION_DEBUG_BYTES)
     }
+
+    pub(crate) fn validate(self) -> bool {
+        self.calls as usize <= MAX_EXECUTION_HOST_CALLS
+            && self.fetch_calls as usize <= MAX_EXECUTION_FETCH_CALLS
+            && self.fetch_bytes as usize <= MAX_EXECUTION_FETCH_BYTES
+            && self.blake2b_compressions as usize <= MAX_EXECUTION_BLAKE2B_COMPRESS_CALLS
+            && self.debug_bytes as usize <= MAX_EXECUTION_DEBUG_BYTES
+    }
+
+    fn includes(self, earlier: Self) -> bool {
+        self.calls >= earlier.calls
+            && self.fetch_calls >= earlier.fetch_calls
+            && self.fetch_bytes >= earlier.fetch_bytes
+            && self.blake2b_compressions >= earlier.blake2b_compressions
+            && self.debug_bytes >= earlier.debug_bytes
+    }
+}
+
+/// Exact portable state captured at an actor SUSPEND exit. The fetch cursor
+/// and native-work counters are part of the continuation: resetting either on
+/// resume would make restart behavior diverge or permit budget bypass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActorMachineContinuation {
+    pub(crate) machine: PortableMachineSnapshot,
+    pub(crate) fetch_index: u8,
+    pub(crate) host_budget: ActorHostBudget,
+}
+
+impl ActorMachineContinuation {
+    pub(crate) fn validate(&self) -> bool {
+        self.fetch_index <= 5 && self.host_budget.validate() && self.machine.is_valid()
+    }
+}
+
+#[cfg(feature = "pvm")]
+fn charge_yield_finalizer(
+    continuation: &mut ActorMachineContinuation,
+    gas_remaining: u64,
+    host_budget: ActorHostBudget,
+) -> Result<(), ActorExecutionError> {
+    if gas_remaining > continuation.machine.gas_remaining
+        || !host_budget.includes(continuation.host_budget)
+        || !host_budget.validate()
+    {
+        return Err(ActorExecutionError::InvalidActorOutput);
+    }
+    continuation.machine.gas_remaining = gas_remaining;
+    continuation.host_budget = host_budget;
+    Ok(())
+}
+
+#[cfg(feature = "pvm")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ActorRunOutcome {
+    Completed {
+        reply: ActorExecutionReply,
+        state: ActorStateLanes,
+    },
+    Yielded {
+        reply: ActorExecutionReply,
+        state: ActorStateLanes,
+        continuation: ActorMachineContinuation,
+    },
 }
 
 #[cfg(feature = "pvm")]
@@ -479,7 +615,8 @@ pub(crate) fn run_inner_actor(
     invocation: &ActorInvocation,
     actor_pvm: &[u8],
     actor_state: &ActorStateLanes,
-) -> Result<(ActorExecutionReply, ActorStateLanes), ActorExecutionError> {
+    continuation: Option<ActorMachineContinuation>,
+) -> Result<ActorRunOutcome, ActorExecutionError> {
     use super::machine::{ActorMachine, InnerExit};
     use crate::abi::{error, hostcall};
 
@@ -489,8 +626,6 @@ pub(crate) fn run_inner_actor(
     {
         return Err(ActorExecutionError::InvalidInput);
     }
-    let mut machine =
-        ActorMachine::load(actor_pvm, &[]).map_err(|_| ActorExecutionError::InvalidInput)?;
     let encode_lane = |lane: Option<&[u8]>| {
         let mut item = Vec::with_capacity(lane.map_or(1, |bytes| bytes.len() + 1));
         match lane {
@@ -515,17 +650,40 @@ pub(crate) fn run_inner_actor(
     if control.len() > ACTOR_DISPATCH_CONTROL_CAPACITY {
         return Err(ActorExecutionError::InvalidInput);
     }
-    let mut fetch = [
+    let fetch = [
         linear.as_slice(),
         merge.as_slice(),
         local.as_slice(),
         control.as_slice(),
         invocation.message.as_slice(),
-    ]
-    .into_iter();
-    let mut next_fetch = fetch.next();
-    let mut gas = invocation.gas;
-    let mut host_budget = ActorHostBudget::default();
+    ];
+    let (mut machine, mut gas, mut fetch_index, mut host_budget) = match continuation {
+        Some(continuation) => {
+            if !continuation.validate() {
+                return Err(ActorExecutionError::InvalidInput);
+            }
+            let mut machine = ActorMachine::restore(actor_pvm, &[], &continuation.machine)
+                .map_err(|_| ActorExecutionError::InvalidAvailability)?;
+            // Agent SUSPEND is a private inner-actor ABI exit. Zero finalized
+            // the fork which emitted the yielded lane image; one resumes the
+            // captured successor without a service checkpoint token.
+            machine.registers_mut()[7] = 1;
+            machine.registers_mut()[8] = 0;
+            (
+                machine,
+                continuation.machine.gas_remaining,
+                continuation.fetch_index as usize,
+                continuation.host_budget,
+            )
+        }
+        None => (
+            ActorMachine::load(actor_pvm, &[]).map_err(|_| ActorExecutionError::InvalidInput)?,
+            invocation.gas,
+            0,
+            ActorHostBudget::default(),
+        ),
+    };
+    let mut yielded_continuation: Option<ActorMachineContinuation> = None;
 
     loop {
         match machine.resume(gas) {
@@ -543,23 +701,48 @@ pub(crate) fn run_inner_actor(
                 machine
                     .read(address, &mut output)
                     .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
-                return decode_actor_output(invocation, machine.gas_remaining(), output);
+                let (mut reply, state) =
+                    decode_actor_output(invocation, machine.gas_remaining(), output)?;
+                return match (reply.status, yielded_continuation.take()) {
+                    (ActorExecutionStatus::Yielded, Some(mut continuation)) => {
+                        // Memory/PC/registers remain the exact pre-result
+                        // snapshot, while gas and native work performed by
+                        // the disposable finalization fork are charged to the
+                        // continuation. Repeated yields therefore cannot make
+                        // state serialization or output construction free.
+                        charge_yield_finalizer(
+                            &mut continuation,
+                            machine.gas_remaining(),
+                            host_budget,
+                        )?;
+                        reply.gas_remaining = machine.gas_remaining();
+                        Ok(ActorRunOutcome::Yielded {
+                            reply,
+                            state,
+                            continuation,
+                        })
+                    }
+                    (ActorExecutionStatus::Yielded, None) | (_, Some(_)) => {
+                        Err(ActorExecutionError::InvalidActorOutput)
+                    }
+                    (_, None) => Ok(ActorRunOutcome::Completed { reply, state }),
+                };
             }
             InnerExit::Panic | InnerExit::Fault(_) => {
-                return Ok((
-                    terminal_reply(
+                return Ok(ActorRunOutcome::Completed {
+                    reply: terminal_reply(
                         invocation,
                         ActorExecutionStatus::Panicked,
                         machine.gas_remaining(),
                     ),
-                    actor_state.clone(),
-                ));
+                    state: actor_state.clone(),
+                });
             }
             InnerExit::OutOfGas => {
-                return Ok((
-                    terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
-                    actor_state.clone(),
-                ));
+                return Ok(ActorRunOutcome::Completed {
+                    reply: terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
+                    state: actor_state.clone(),
+                });
             }
             InnerExit::InvalidResult(_) => return Err(ActorExecutionError::InvalidActorOutput),
             InnerExit::Host(id) => {
@@ -569,12 +752,35 @@ pub(crate) fn run_inner_actor(
                 // a second deterministic per-invocation work budget so a
                 // cheap ECALL loop cannot monopolize the agent thread.
                 if !host_budget.host_call() {
-                    return Ok((
-                        terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
-                        actor_state.clone(),
-                    ));
+                    return Ok(ActorRunOutcome::Completed {
+                        reply: terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
+                        state: actor_state.clone(),
+                    });
                 }
                 let registers = *machine.registers();
+                if id == u64::from(hostcall::SUSPEND) {
+                    if yielded_continuation.is_some() {
+                        return Err(ActorExecutionError::InvalidActorOutput);
+                    }
+                    let snapshot = machine
+                        .capture()
+                        .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
+                    let continuation = ActorMachineContinuation {
+                        machine: snapshot,
+                        fetch_index: u8::try_from(fetch_index)
+                            .map_err(|_| ActorExecutionError::InvalidActorOutput)?,
+                        host_budget,
+                    };
+                    let mut finalizer =
+                        ActorMachine::restore(actor_pvm, &[], &continuation.machine)
+                            .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
+                    finalizer.registers_mut()[7] = 0;
+                    finalizer.registers_mut()[8] = 0;
+                    gas = continuation.machine.gas_remaining;
+                    yielded_continuation = Some(continuation);
+                    machine = finalizer;
+                    continue;
+                }
                 let (result0, result1) = match id {
                     value if value == u64::from(hostcall::GAS) => (gas, 0),
                     value if value == u64::from(hostcall::FETCH) => {
@@ -584,19 +790,23 @@ pub(crate) fn run_inner_actor(
                             .ok()
                             .filter(|len| *len <= MAX_EXECUTION_STATE_BYTES + 1)
                             .ok_or(ActorExecutionError::InvalidInput)?;
-                        if let Some(item) = next_fetch {
+                        if let Some(item) = fetch.get(fetch_index) {
                             let copied = item.len().min(capacity);
                             if !host_budget.fetch(copied) {
-                                return Ok((
-                                    terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
-                                    actor_state.clone(),
-                                ));
+                                return Ok(ActorRunOutcome::Completed {
+                                    reply: terminal_reply(
+                                        invocation,
+                                        ActorExecutionStatus::OutOfGas,
+                                        0,
+                                    ),
+                                    state: actor_state.clone(),
+                                });
                             }
                             machine
                                 .write(address, &item[..copied])
                                 .map_err(|_| ActorExecutionError::InvalidInput)?;
                             if item.len() <= capacity {
-                                next_fetch = fetch.next();
+                                fetch_index += 1;
                             }
                             (item.len() as u64, 0)
                         } else {
@@ -610,10 +820,14 @@ pub(crate) fn run_inner_actor(
                     #[cfg(feature = "agent-runtime")]
                     value if value == u64::from(crate::crypto::ECALL_BLAKE2B_COMPRESS) => {
                         if !host_budget.blake2b_compression() {
-                            return Ok((
-                                terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
-                                actor_state.clone(),
-                            ));
+                            return Ok(ActorRunOutcome::Completed {
+                                reply: terminal_reply(
+                                    invocation,
+                                    ActorExecutionStatus::OutOfGas,
+                                    0,
+                                ),
+                                state: actor_state.clone(),
+                            });
                         }
                         let h_address = u32::try_from(registers[7])
                             .map_err(|_| ActorExecutionError::InvalidInput)?;
@@ -649,10 +863,14 @@ pub(crate) fn run_inner_actor(
                             .filter(|len| *len <= 8 * 1024)
                             .ok_or(ActorExecutionError::InvalidInput)?;
                         if !host_budget.debug(len) {
-                            return Ok((
-                                terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
-                                actor_state.clone(),
-                            ));
+                            return Ok(ActorRunOutcome::Completed {
+                                reply: terminal_reply(
+                                    invocation,
+                                    ActorExecutionStatus::OutOfGas,
+                                    0,
+                                ),
+                                state: actor_state.clone(),
+                            });
                         }
                         let mut discarded = alloc::vec![0u8; len];
                         machine
@@ -739,10 +957,7 @@ fn decode_actor_output(
         crate::actors::STATUS_FORBIDDEN => ActorExecutionStatus::Forbidden,
         crate::actors::STATUS_PANICKED => ActorExecutionStatus::Panicked,
         crate::actors::STATUS_OOG => ActorExecutionStatus::OutOfGas,
-        // Continuations become a runtime-owned scheduling concern. Until the
-        // standard runtime persists its portable machine snapshot, fail
-        // closed instead of pretending a yielded transition completed.
-        crate::actors::STATUS_YIELDED => return Err(ActorExecutionError::UnsupportedMethod),
+        crate::actors::STATUS_YIELDED => ActorExecutionStatus::Yielded,
         _ => return Err(ActorExecutionError::InvalidActorOutput),
     };
     let next_state = ActorStateLanes {
@@ -976,12 +1191,11 @@ mod tests {
     #[test]
     fn native_host_work_has_independent_quotas() {
         let mut budget = ActorHostBudget {
-            calls: MAX_EXECUTION_HOST_CALLS - 1,
-            fetch_calls: MAX_EXECUTION_FETCH_CALLS - 1,
-            fetch_bytes: MAX_EXECUTION_FETCH_BYTES - 1,
-            #[cfg(feature = "agent-runtime")]
-            blake2b_compressions: MAX_EXECUTION_BLAKE2B_COMPRESS_CALLS - 1,
-            debug_bytes: MAX_EXECUTION_DEBUG_BYTES - 1,
+            calls: u32::try_from(MAX_EXECUTION_HOST_CALLS - 1).unwrap(),
+            fetch_calls: u32::try_from(MAX_EXECUTION_FETCH_CALLS - 1).unwrap(),
+            fetch_bytes: u32::try_from(MAX_EXECUTION_FETCH_BYTES - 1).unwrap(),
+            blake2b_compressions: u32::try_from(MAX_EXECUTION_BLAKE2B_COMPRESS_CALLS - 1).unwrap(),
+            debug_bytes: u32::try_from(MAX_EXECUTION_DEBUG_BYTES - 1).unwrap(),
         };
         assert!(budget.host_call());
         assert!(!budget.host_call());
@@ -994,6 +1208,86 @@ mod tests {
         }
         assert!(budget.debug(1));
         assert!(!budget.debug(1));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn repeated_yield_finalizers_cannot_replenish_gas_or_native_work_budget() {
+        let mut continuation = ActorMachineContinuation {
+            machine: PortableMachineSnapshot {
+                pc: 2,
+                gas_remaining: 1_000,
+                registers: [0; vos_pvm_program::REGISTER_COUNT],
+                memory: Vec::new(),
+            },
+            fetch_index: 5,
+            host_budget: ActorHostBudget {
+                calls: 2,
+                fetch_calls: 1,
+                fetch_bytes: 9,
+                blake2b_compressions: 0,
+                debug_bytes: 3,
+            },
+        };
+        charge_yield_finalizer(
+            &mut continuation,
+            800,
+            ActorHostBudget {
+                calls: 4,
+                fetch_calls: 1,
+                fetch_bytes: 9,
+                blake2b_compressions: 0,
+                debug_bytes: 7,
+            },
+        )
+        .unwrap();
+        charge_yield_finalizer(
+            &mut continuation,
+            600,
+            ActorHostBudget {
+                calls: 7,
+                fetch_calls: 2,
+                fetch_bytes: 20,
+                blake2b_compressions: 1,
+                debug_bytes: 7,
+            },
+        )
+        .unwrap();
+        assert_eq!(continuation.machine.gas_remaining, 600);
+        assert_eq!(continuation.host_budget.calls, 7);
+        assert_eq!(continuation.host_budget.fetch_bytes, 20);
+
+        let charged = continuation.clone();
+        assert_eq!(
+            charge_yield_finalizer(
+                &mut continuation,
+                601,
+                ActorHostBudget {
+                    calls: 7,
+                    fetch_calls: 2,
+                    fetch_bytes: 20,
+                    blake2b_compressions: 1,
+                    debug_bytes: 7,
+                },
+            ),
+            Err(ActorExecutionError::InvalidActorOutput)
+        );
+        assert_eq!(continuation, charged);
+        assert_eq!(
+            charge_yield_finalizer(
+                &mut continuation,
+                500,
+                ActorHostBudget {
+                    calls: 6,
+                    fetch_calls: 2,
+                    fetch_bytes: 20,
+                    blake2b_compressions: 1,
+                    debug_bytes: 7,
+                },
+            ),
+            Err(ActorExecutionError::InvalidActorOutput)
+        );
+        assert_eq!(continuation, charged);
     }
 
     #[test]
@@ -1053,6 +1347,7 @@ mod tests {
             ActorExecutionError::InvalidAuthorization,
             ActorExecutionError::AuthorityExpired,
             ActorExecutionError::AuthoritySlotRegressed,
+            ActorExecutionError::ContinuationNotReady,
         ] {
             assert!(!error.is_durable_exact_outcome(), "{error:?}");
         }
