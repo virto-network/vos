@@ -1254,6 +1254,17 @@ pub fn validate_private_runtime_work(work: &RuntimeWork) -> Result<(), PrivateSy
             }
             state
         }
+        RuntimeWork::Acknowledge {
+            state, invocation, ..
+        } => {
+            if matches!(
+                invocation.mode,
+                MethodMode::Linear | MethodMode::LinearizableQuery
+            ) {
+                return Err(PrivateSyncError::LinearUnsupported);
+            }
+            state
+        }
         RuntimeWork::Resume { state, resume } => {
             if matches!(
                 resume.mode,

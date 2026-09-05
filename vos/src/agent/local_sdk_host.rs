@@ -379,6 +379,26 @@ impl LocalAgentHost {
         self.finish_driver_operation(agent, result)
     }
 
+    pub fn acknowledge_sdk(
+        &mut self,
+        agent: AgentId,
+        invocation: InvocationWork,
+        authority: AuthorityReceipt,
+    ) -> Result<RuntimeOutcome, LocalAgentHostError> {
+        self.verify_root_scope()?;
+        if invocation.space != self.scope.space || invocation.agent != agent {
+            return Err(LocalAgentHostError::InvalidScope);
+        }
+        let result = {
+            let hosted = self
+                .agents
+                .get_mut(&agent)
+                .ok_or(LocalAgentHostError::NotFound)?;
+            hosted.driver.acknowledge_sdk(invocation, authority)
+        };
+        self.finish_driver_operation(agent, result)
+    }
+
     fn finish_driver_operation(
         &mut self,
         agent: AgentId,
@@ -2166,9 +2186,34 @@ mod tests {
         slot.store(100, Ordering::SeqCst);
         let mut host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
         assert_eq!(
-            host.invoke(agent, work, authority).unwrap(),
+            host.invoke(agent, work.clone(), authority.clone()).unwrap(),
             completed,
             "an expired exact retry recovers the result without re-execution"
+        );
+        let acknowledgement = host
+            .acknowledge_sdk(agent, work.clone(), authority.clone())
+            .unwrap();
+        assert_eq!(
+            acknowledgement,
+            RuntimeOutcome::Acknowledged(Ok(sdk::InvocationAcknowledgement {
+                invocation: work.invocation,
+                actor: work.actor,
+                incarnation: work.incarnation,
+                deployment: work.deployment,
+                mode: work.mode,
+                work: work.commitment(),
+                authority: authority.commitment(),
+            }))
+        );
+        let acknowledged_state = host.agents[&agent].driver.image().runtime_state.clone();
+        assert_eq!(
+            host.acknowledge_sdk(agent, work, authority).unwrap(),
+            RuntimeOutcome::Acknowledged(Err(sdk::InvocationError::NotFound))
+        );
+        assert_eq!(
+            host.agents[&agent].driver.image().runtime_state,
+            acknowledged_state,
+            "a missing acknowledgement attempt is byte-identical"
         );
 
         let actor = record.entry.actor;

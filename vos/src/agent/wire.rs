@@ -586,6 +586,7 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
             encoder.fixed(&result.incarnation.0);
             encoder.fixed(&result.request.0);
             encode_execution_reply(encoder, &result.reply);
+            encoder.option(&result.clean, encode_clean_invocation_result);
         },
     );
     encoder.list(
@@ -774,6 +775,7 @@ pub fn decode_standard_runtime_state(
             let incarnation = Hash(decoder.fixed()?);
             let request = Hash(decoder.fixed()?);
             let reply = decode_execution_reply(decoder)?;
+            let clean = decoder.option(decode_clean_invocation_result)?;
             if scope != InvocationScope::Ordered
                 || invocation == crate::service::InvocationId::ZERO
                 || incarnation == Hash::ZERO
@@ -792,6 +794,7 @@ pub fn decode_standard_runtime_state(
                 request,
                 reply,
                 storage: super::InvocationResultStorage::Control,
+                clean,
             })
         },
     )?;
@@ -930,6 +933,7 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
             encoder.fixed(&result.incarnation.0);
             encoder.fixed(&result.request.0);
             encode_execution_reply(encoder, &result.reply);
+            encoder.option(&result.clean, encode_clean_invocation_result);
         },
     );
     encoder.list(
@@ -1276,6 +1280,46 @@ fn decode_accepted_invocation(
         .ok_or(DecodeError::NonCanonical)
 }
 
+fn encode_clean_invocation_result(
+    encoder: &mut Encoder<'_>,
+    value: &super::standard::StandardCleanInvocationResult,
+) {
+    use crate::agent_sdk::wire::CanonicalWire as _;
+
+    encoder.fixed(value.work.as_bytes());
+    encoder.u64(value.observed_slot);
+    encode_accepted_invocation(encoder, &value.accepted);
+    encoder.bytes(&value.authority.encode().expect("validated clean authority"));
+}
+
+fn decode_clean_invocation_result(
+    decoder: &mut Decoder<'_>,
+) -> Result<super::standard::StandardCleanInvocationResult, DecodeError> {
+    use crate::agent_sdk::wire::CanonicalWire as _;
+
+    let work = crate::agent_sdk::Hash(decoder.fixed()?);
+    let observed_slot = decoder.u64()?;
+    let accepted = decode_accepted_invocation(decoder)?;
+    let bytes = decoder.bytes_ref()?;
+    if bytes.len() > crate::agent_sdk::wire::MAX_AUTHORITY_RECEIPT_WIRE_BYTES {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let authority = crate::agent_sdk::authority::AuthorityReceipt::decode(bytes)
+        .map_err(|_| DecodeError::NonCanonical)?;
+    if work == crate::agent_sdk::Hash::ZERO
+        || authority.selector.request != work
+        || !authority.selector.is_live_at(observed_slot)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(super::standard::StandardCleanInvocationResult {
+        accepted,
+        authority,
+        work,
+        observed_slot,
+    })
+}
+
 fn decode_standard_lane(
     bytes: &[u8],
     expected_lane: StateLane,
@@ -1324,6 +1368,7 @@ fn decode_standard_lane(
             let incarnation = Hash(decoder.fixed()?);
             let request = Hash(decoder.fixed()?);
             let reply = decode_execution_reply(decoder)?;
+            let clean = decoder.option(decode_clean_invocation_result)?;
             if scope != invocation_scope_for_lane(expected_lane)
                 || invocation == crate::service::InvocationId::ZERO
                 || incarnation == Hash::ZERO
@@ -1343,6 +1388,7 @@ fn decode_standard_lane(
                 request,
                 reply,
                 storage: super::InvocationResultStorage::Lane(expected_lane),
+                clean,
             })
         },
     )?;
@@ -1584,6 +1630,11 @@ pub fn apply_standard_runtime_work(
         crate::agent_sdk::RuntimeWork::Resume { state, resume } => {
             apply_clean_resume(state, *resume)
         }
+        crate::agent_sdk::RuntimeWork::Acknowledge {
+            state,
+            invocation,
+            authority,
+        } => apply_clean_acknowledge(state, *invocation, *authority),
         crate::agent_sdk::RuntimeWork::Manage {
             space,
             agent,
@@ -1670,6 +1721,24 @@ fn apply_clean_invoke(
         Err(error) => return Ok(clean_completed(state, Err(error))),
         Ok(None) => {}
     }
+    match runtime.recover_clean_execution(&work, &authority, observed_slot) {
+        Ok(Some(reply)) => {
+            let mut result = Ok(reply);
+            let successor = finish_standard_execution_candidate(
+                original_state,
+                &runtime,
+                true,
+                state_limit,
+                &mut result,
+            );
+            return Ok(clean_completed(
+                legacy_state_to_clean(successor),
+                result.map(clean_reply).map_err(clean_error),
+            ));
+        }
+        Err(error) => return Ok(clean_completed(state, Err(error))),
+        Ok(None) => {}
+    }
     let (invocation, actor_pvm, actor_schema, actor_policies, installation_data) =
         match runtime.resolve_clean_invocation(&work) {
             Ok(resolved) => resolved,
@@ -1697,8 +1766,7 @@ fn apply_clean_invoke(
         };
     let (mut result, commit_candidate) = match runtime.recover_execution(&invocation, observed_slot)
     {
-        Ok(Some(reply)) => (Ok(reply), true),
-        Err(ActorExecutionError::DivergentInvocation) => {
+        Ok(Some(_)) | Err(ActorExecutionError::DivergentInvocation) => {
             return Ok(clean_completed(
                 state,
                 Err(InvocationError::DivergentInvocation),
@@ -1756,12 +1824,15 @@ fn apply_clean_invoke(
                                                 state: next_state,
                                             } => {
                                                 if reply.status == ActorExecutionStatus::Done {
-                                                    runtime.commit_execution(
+                                                    runtime.commit_clean_execution(
+                                                        &work,
+                                                        &authority,
                                                         &invocation,
                                                         &mut reply,
                                                         &before,
                                                         next_state,
                                                         observed_slot,
+                                                        None,
                                                     )?;
                                                 }
                                                 Ok(reply)
@@ -1892,13 +1963,15 @@ fn apply_clean_resume(
                     state: next_state,
                 } => {
                     if reply.status == ActorExecutionStatus::Done {
-                        runtime.consume_machine_continuation(&invocation, record.ready_sequence)?;
-                        runtime.commit_execution(
+                        runtime.commit_clean_execution(
+                            &work,
+                            &authority,
                             &invocation,
                             &mut reply,
                             &before,
                             next_state,
                             observed_slot,
+                            Some(record.ready_sequence),
                         )?;
                     } else {
                         terminal_sequence = Some(record.ready_sequence);
@@ -1958,6 +2031,44 @@ fn apply_clean_resume(
             result.map(clean_reply).map_err(clean_error),
         ))
     }
+}
+
+#[cfg(feature = "pvm")]
+fn apply_clean_acknowledge(
+    state: crate::agent_sdk::RuntimeState,
+    work: crate::agent_sdk::InvocationWork,
+    authority: crate::agent_sdk::authority::AuthorityReceipt,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
+
+    let original_state = clean_state_to_legacy(&state);
+    let decoded = decode_standard_runtime_state(&original_state)?;
+    let state_limit = standard_state_limit(&decoded);
+    let mut runtime =
+        StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
+    let acknowledgement = match runtime.acknowledge_clean_invocation(&work, &authority) {
+        Ok(acknowledgement) => acknowledgement,
+        Err(error) => {
+            return Ok(RuntimeTransition {
+                state,
+                outcome: RuntimeOutcome::Acknowledged(Err(error)),
+            });
+        }
+    };
+    let successor = encode_standard_runtime_state(&runtime.snapshot());
+    if successor
+        .encoded_len()
+        .is_none_or(|encoded_len| encoded_len > state_limit)
+    {
+        return Ok(RuntimeTransition {
+            state,
+            outcome: RuntimeOutcome::Acknowledged(Err(InvocationError::ResultCapacity)),
+        });
+    }
+    Ok(RuntimeTransition {
+        state: legacy_state_to_clean(successor),
+        outcome: RuntimeOutcome::Acknowledged(Ok(acknowledgement)),
+    })
 }
 
 #[cfg(feature = "pvm")]
@@ -5824,6 +5935,233 @@ mod tests {
     }
 
     #[cfg(feature = "pvm")]
+    fn clean_terminal_fixture() -> (
+        crate::agent_sdk::RuntimeState,
+        crate::agent_sdk::InvocationWork,
+        crate::agent_sdk::authority::AuthorityReceipt,
+        crate::agent_sdk::InvocationReply,
+    ) {
+        let (mut runtime, work) = clean_resolvable_fixture(false);
+        let authority = clean_authority_receipt(runtime.config().unwrap(), &work);
+        runtime
+            .validate_clean_unseen_invocation_slot(&authority, 1)
+            .unwrap();
+        let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+        let before = runtime.prepare_execution_state(&invocation).unwrap();
+        let mut after = before.clone();
+        after.linear = Some(vec![0xa1]);
+        let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+        runtime
+            .commit_clean_execution(
+                &work,
+                &authority,
+                &invocation,
+                &mut reply,
+                &before,
+                after,
+                1,
+                None,
+            )
+            .unwrap();
+        (
+            legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot())),
+            work,
+            authority,
+            clean_reply(reply),
+        )
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_done_retries_restarts_and_requires_exact_acknowledgement() {
+        use crate::agent_sdk::{
+            InvocationAcknowledgement, InvocationError, RuntimeOutcome, RuntimeWork,
+        };
+
+        let (committed, work, authority, reply) = clean_terminal_fixture();
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&committed)).unwrap();
+        assert_eq!(decoded.invocation_results.len(), 1);
+        assert!(decoded.invocation_results[0].clean.is_some());
+        let restarted = StandardAgentRuntime::restore(decoded).unwrap();
+        assert_eq!(
+            legacy_state_to_clean(encode_standard_runtime_state(&restarted.snapshot())),
+            committed,
+            "the clean result binding survives restart byte-identically"
+        );
+
+        let retried = apply_standard_runtime_work(RuntimeWork::Invoke {
+            state: committed.clone(),
+            invocation: Box::new(work.clone()),
+            authority: Box::new(authority.clone()),
+            observed_slot: 99,
+        })
+        .unwrap();
+        assert_eq!(
+            retried.outcome,
+            RuntimeOutcome::Completed(Ok(reply)),
+            "an exact retry remains recoverable after the original receipt expires"
+        );
+        assert_eq!(
+            decode_standard_runtime_state(&clean_state_to_legacy(&retried.state))
+                .unwrap()
+                .invocation_results
+                .len(),
+            1,
+            "retry retains the result until explicit acknowledgement"
+        );
+
+        let acknowledged = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+            state: retried.state.clone(),
+            invocation: Box::new(work.clone()),
+            authority: Box::new(authority.clone()),
+        })
+        .unwrap();
+        assert_eq!(
+            acknowledged.outcome,
+            RuntimeOutcome::Acknowledged(Ok(InvocationAcknowledgement {
+                invocation: work.invocation,
+                actor: work.actor,
+                incarnation: work.incarnation,
+                deployment: work.deployment,
+                mode: work.mode,
+                work: work.commitment(),
+                authority: authority.commitment(),
+            }))
+        );
+        assert!(
+            decode_standard_runtime_state(&clean_state_to_legacy(&acknowledged.state))
+                .unwrap()
+                .invocation_results
+                .is_empty()
+        );
+
+        let restarted = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&acknowledged.state)).unwrap(),
+        )
+        .unwrap();
+        let after_restart =
+            legacy_state_to_clean(encode_standard_runtime_state(&restarted.snapshot()));
+        let missing = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+            state: after_restart.clone(),
+            invocation: Box::new(work),
+            authority: Box::new(authority),
+        })
+        .unwrap();
+        assert_eq!(missing.state, after_restart);
+        assert_eq!(
+            missing.outcome,
+            RuntimeOutcome::Acknowledged(Err(InvocationError::NotFound))
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_acknowledgement_errors_are_byte_identical_and_fail_closed() {
+        use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeWork};
+
+        let (state, work, authority, _) = clean_terminal_fixture();
+        let assert_error = |work: crate::agent_sdk::InvocationWork,
+                            authority: crate::agent_sdk::authority::AuthorityReceipt,
+                            expected| {
+            let transition = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+                state: state.clone(),
+                invocation: Box::new(work),
+                authority: Box::new(authority),
+            })
+            .unwrap();
+            assert_eq!(transition.state, state);
+            assert_eq!(
+                transition.outcome,
+                RuntimeOutcome::Acknowledged(Err(expected))
+            );
+        };
+
+        let mut forged = authority.clone();
+        forged.signature[0] ^= 1;
+        assert_error(work.clone(), forged, InvocationError::InvalidAuthorization);
+
+        let mut divergent = work.clone();
+        divergent.message.push(0xff);
+        let divergent_authority = clean_authority_receipt(
+            clean_sparse_standard_state().config.as_ref().unwrap(),
+            &divergent,
+        );
+        assert_error(
+            divergent,
+            divergent_authority,
+            InvocationError::DivergentInvocation,
+        );
+
+        let mut wrong_route = work.clone();
+        wrong_route.actor = crate::agent_sdk::ActorId([0xe5; 32]);
+        let wrong_route_authority = clean_authority_receipt(
+            clean_sparse_standard_state().config.as_ref().unwrap(),
+            &wrong_route,
+        );
+        assert_error(
+            wrong_route,
+            wrong_route_authority,
+            InvocationError::DivergentInvocation,
+        );
+
+        let mut cross_invocation = work.clone();
+        cross_invocation.invocation = crate::agent_sdk::InvocationId([0xe6; 32]);
+        let cross_authority = clean_authority_receipt(
+            clean_sparse_standard_state().config.as_ref().unwrap(),
+            &cross_invocation,
+        );
+        assert_error(cross_invocation, cross_authority, InvocationError::NotFound);
+
+        let mut different_window = authority;
+        different_window.selector.valid_from = 2;
+        different_window.selector.expires_at = 3;
+        different_window.signature = authority_key()
+            .sign(&different_window.signing_bytes())
+            .to_bytes();
+        assert_error(work, different_window, InvocationError::DivergentInvocation);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_result_restore_rejects_tampered_acceptance() {
+        let (state, _, _, _) = clean_terminal_fixture();
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+
+        let mut wrong_slot = decoded.clone();
+        wrong_slot.invocation_results[0]
+            .clean
+            .as_mut()
+            .unwrap()
+            .observed_slot = 3;
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&wrong_slot)),
+            Err(DecodeError::NonCanonical),
+            "the persisted acceptance slot must remain inside the signed window"
+        );
+
+        let mut forged_receipt = decoded.clone();
+        forged_receipt.invocation_results[0]
+            .clean
+            .as_mut()
+            .unwrap()
+            .authority
+            .signature[0] ^= 1;
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&forged_receipt)),
+            Err(DecodeError::NonCanonical),
+            "restore re-verifies the signature committed by the exact receipt"
+        );
+
+        let mut missing_high_water = decoded;
+        missing_high_water.lane_revisions.linear_authority_slot = None;
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&missing_high_water)),
+            Err(DecodeError::NonCanonical),
+            "a result binding cannot outrun its owning authority high-water"
+        );
+    }
+
+    #[cfg(feature = "pvm")]
     #[test]
     fn present_empty_installation_data_yields_persists_and_resumes_exactly() {
         let (runtime, mut work) = clean_resolvable_fixture(false);
@@ -7505,7 +7843,7 @@ mod tests {
     fn immediate_prior_runtime_abi_is_rejected_without_a_compatibility_decoder() {
         let mut bytes =
             RuntimeCall::new(RuntimeState::default(), LifecycleRequest::Create(config())).encode();
-        bytes[36..68].copy_from_slice(b"vos-agent-runtime-abi-20260904r8");
+        bytes[36..68].copy_from_slice(b"vos-agent-runtime-abi-20260904r9");
         assert_eq!(
             RuntimeCall::decode(&bytes),
             Err(DecodeError::InvalidPlatform)

@@ -268,6 +268,9 @@ pub struct StandardInvocationResult {
     /// Physical durable component retaining this exact result. Query replies
     /// have no logical write lane, so this cannot be inferred from `reply`.
     pub storage: InvocationResultStorage,
+    /// Clean-generation acceptance data. Legacy execution results keep this
+    /// absent and can never be retired through the clean acknowledgement ABI.
+    pub(crate) clean: Option<StandardCleanInvocationResult>,
 }
 
 /// One guest-owned yielded inner-machine continuation.
@@ -393,6 +396,46 @@ impl StandardAcceptedInvocation {
                 .is_some_and(|total| {
                     total <= crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_BYTES as u64
                 })
+    }
+}
+
+/// Immutable clean authority accepted with one retained terminal `Done`.
+///
+/// Availability payloads are represented by their canonical references so a
+/// result cannot retain caller-sized blob preimages. The signed receipt is
+/// retained in full: restore must be able to re-verify its signature and prove
+/// that `observed_slot` was inside the originally accepted window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StandardCleanInvocationResult {
+    pub accepted: StandardAcceptedInvocation,
+    pub authority: crate::agent_sdk::authority::AuthorityReceipt,
+    pub work: crate::agent_sdk::Hash,
+    pub observed_slot: u64,
+}
+
+impl StandardCleanInvocationResult {
+    fn from_work(
+        work: &crate::agent_sdk::InvocationWork,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        observed_slot: u64,
+    ) -> Self {
+        Self {
+            accepted: StandardAcceptedInvocation::from_work(work),
+            authority,
+            work: work.commitment(),
+            observed_slot,
+        }
+    }
+
+    fn matches(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> bool {
+        self.accepted == StandardAcceptedInvocation::from_work(work)
+            && self.work == work.commitment()
+            && self.authority == *authority
+            && self.authority.commitment() == authority.commitment()
     }
 }
 
@@ -1266,6 +1309,34 @@ impl StandardAgentRuntime {
         runtime.validate_restored_lane_state()?;
         for result in state.invocation_results {
             let actor = runtime.actors.get(&result.reply.actor);
+            let clean_binding_valid = match result.clean.as_ref() {
+                None => true,
+                Some(binding) => {
+                    binding.accepted.validate()
+                        && clean_origin_supported_by_actor_abi(&binding.accepted.origin)
+                        && binding.work != crate::agent_sdk::Hash::ZERO
+                        && binding.authority.commitment() != crate::agent_sdk::Hash::ZERO
+                        && binding.accepted.invocation.0 == result.invocation.0
+                        && binding.accepted.actor.0 == result.reply.actor.0
+                        && binding.accepted.incarnation.0 == result.incarnation.0
+                        && binding.accepted.deployment.0 == result.reply.deployment.0
+                        && clean_method_mode(binding.accepted.mode) == result.reply.mode
+                        && actor.is_some_and(|actor| {
+                            actor.record.entry.program.0 == binding.accepted.program.0
+                        })
+                        && runtime
+                            .verify_clean_accepted_authority(
+                                &binding.accepted,
+                                &binding.authority,
+                                Hash(binding.work.0),
+                            )
+                            .is_ok()
+                        && binding.authority.selector.is_live_at(binding.observed_slot)
+                        && runtime
+                            .result_authority_slot(result.storage)
+                            .is_some_and(|slot| slot >= binding.observed_slot)
+                }
+            };
             if result.invocation == InvocationId::ZERO
                 || result.incarnation == Hash::ZERO
                 || result.reply.invocation != result.invocation
@@ -1279,6 +1350,7 @@ impl StandardAgentRuntime {
                 || result.scope != result.reply.mode.invocation_scope()
                 || result.storage != result.reply.mode.result_storage()
                 || !runtime.result_storage_supported(result.storage)
+                || !clean_binding_valid
             {
                 return Err(LifecycleError::InvalidRequest);
             }
@@ -1796,6 +1868,55 @@ impl StandardAgentRuntime {
         Ok(None)
     }
 
+    /// Recover only a result created through the clean SDK ABI. Both the
+    /// canonical work commitment and the complete signed-receipt commitment
+    /// must match the immutable acceptance record; a legacy result with the
+    /// same invocation key is deliberately divergent rather than adaptable.
+    #[cfg(feature = "pvm")]
+    pub(crate) fn recover_clean_execution(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        observed_slot: u64,
+    ) -> Result<Option<super::execution::ActorExecutionReply>, crate::agent_sdk::InvocationError>
+    {
+        use crate::agent_sdk::InvocationError;
+
+        self.verify_clean_invocation_authority(work, authority)?;
+        let scope = clean_method_mode(work.mode).invocation_scope();
+        let key = (scope, InvocationId(work.invocation.0));
+        let Some(result) = self.invocation_results.get(&key) else {
+            return Ok(None);
+        };
+        let binding = result
+            .clean
+            .as_ref()
+            .ok_or(InvocationError::DivergentInvocation)?;
+        if !binding.matches(work, authority)
+            || !authority.selector.is_live_at(binding.observed_slot)
+            || self
+                .result_authority_slot(result.storage)
+                .is_none_or(|slot| slot < binding.observed_slot)
+        {
+            return Err(InvocationError::DivergentInvocation);
+        }
+        let (invocation, ..) = self.resolve_clean_invocation(work)?;
+        if result.request != invocation.commitment()
+            || result.scope != scope
+            || result.invocation.0 != work.invocation.0
+            || result.incarnation.0 != work.incarnation.0
+            || result.reply.actor.0 != work.actor.0
+            || result.reply.deployment.0 != work.deployment.0
+            || result.reply.mode != clean_method_mode(work.mode)
+        {
+            return Err(InvocationError::DivergentInvocation);
+        }
+        let reply = result.reply.clone();
+        let storage = result.storage;
+        self.advance_result_authority_slot(storage, observed_slot);
+        Ok(Some(reply))
+    }
+
     #[cfg(feature = "pvm")]
     pub(crate) fn verify_invocation_authority(
         &self,
@@ -1818,7 +1939,6 @@ impl StandardAgentRuntime {
             .map_err(|_| ActorExecutionError::InvalidAuthorization)
     }
 
-    #[cfg(feature = "pvm")]
     pub(crate) fn verify_clean_invocation_authority(
         &self,
         invocation: &crate::agent_sdk::InvocationWork,
@@ -2877,9 +2997,125 @@ impl StandardAgentRuntime {
                 request: invocation.commitment(),
                 reply: reply.clone(),
                 storage: result_storage,
+                clean: None,
             },
         );
         Ok(())
+    }
+
+    /// Atomically commit a clean terminal result together with the acceptance
+    /// data required for exact retry and explicit delivery acknowledgement.
+    /// A resumed terminal slice consumes its continuation in the same
+    /// candidate, so no partially bound result can enter durable state.
+    #[cfg(feature = "pvm")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_clean_execution(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        invocation: &super::execution::ActorInvocation,
+        reply: &mut super::execution::ActorExecutionReply,
+        before: &super::execution::ActorStateLanes,
+        after: super::execution::ActorStateLanes,
+        observed_slot: u64,
+        terminal_continuation: Option<u64>,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+
+        self.verify_clean_invocation_authority(work, authority)
+            .map_err(|error| match error {
+                crate::agent_sdk::InvocationError::NotCreated => ActorExecutionError::NotCreated,
+                _ => ActorExecutionError::InvalidAuthorization,
+            })?;
+        if !authority.selector.is_live_at(observed_slot) {
+            return Err(ActorExecutionError::AuthorityExpired);
+        }
+        let accepted = StandardAcceptedInvocation::from_work(work);
+        if !accepted.validate()
+            || !clean_origin_supported_by_actor_abi(&accepted.origin)
+            || invocation.invocation.0 != work.invocation.0
+            || invocation.actor.0 != work.actor.0
+            || invocation.incarnation.0 != work.incarnation.0
+            || invocation.deployment.0 != work.deployment.0
+            || invocation.program.0 != work.program.0
+            || invocation.mode != clean_method_mode(work.mode)
+        {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
+        let mut candidate = self.clone();
+        if let Some(sequence) = terminal_continuation {
+            candidate.consume_machine_continuation(invocation, sequence)?;
+        }
+        candidate.commit_execution(invocation, reply, before, after, observed_slot)?;
+        let key = (invocation.mode.invocation_scope(), invocation.invocation);
+        let result = candidate
+            .invocation_results
+            .get_mut(&key)
+            .ok_or(ActorExecutionError::InvalidActorOutput)?;
+        if result.clean.is_some() {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
+        result.clean = Some(StandardCleanInvocationResult::from_work(
+            work,
+            authority.clone(),
+            observed_slot,
+        ));
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Retire one exact clean terminal result after re-authenticating the
+    /// original work and receipt. No clock or state is touched until every
+    /// comparison has succeeded.
+    pub(crate) fn acknowledge_clean_invocation(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<crate::agent_sdk::InvocationAcknowledgement, crate::agent_sdk::InvocationError>
+    {
+        use crate::agent_sdk::{InvocationAcknowledgement, InvocationError};
+
+        self.verify_clean_invocation_authority(work, authority)?;
+        let scope = clean_method_mode(work.mode).invocation_scope();
+        let key = (scope, InvocationId(work.invocation.0));
+        let result = self
+            .invocation_results
+            .get(&key)
+            .ok_or(InvocationError::NotFound)?;
+        let binding = result
+            .clean
+            .as_ref()
+            .ok_or(InvocationError::DivergentInvocation)?;
+        if !binding.matches(work, authority)
+            || !binding.authority.selector.is_live_at(binding.observed_slot)
+            || self
+                .result_authority_slot(result.storage)
+                .is_none_or(|slot| slot < binding.observed_slot)
+        {
+            return Err(InvocationError::DivergentInvocation);
+        }
+        let (invocation, ..) = self.resolve_clean_invocation(work)?;
+        if result.request != invocation.commitment()
+            || result.scope != scope
+            || result.invocation.0 != work.invocation.0
+            || result.incarnation.0 != work.incarnation.0
+            || result.reply.actor.0 != work.actor.0
+            || result.reply.deployment.0 != work.deployment.0
+            || result.reply.mode != clean_method_mode(work.mode)
+        {
+            return Err(InvocationError::DivergentInvocation);
+        }
+        let acknowledgement = InvocationAcknowledgement {
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            mode: work.mode,
+            work: binding.work,
+            authority: binding.authority.commitment(),
+        };
+        self.invocation_results.remove(&key);
+        Ok(acknowledgement)
     }
 
     fn invocation_result_count(&self, storage: InvocationResultStorage) -> usize {
@@ -6742,6 +6978,7 @@ mod tests {
                     observation: super::super::execution::ActorObservation::default(),
                 },
                 storage: InvocationResultStorage::Lane(StateLane::Linear),
+                clean: None,
             });
         assert!(matches!(
             StandardAgentRuntime::restore(with_result),

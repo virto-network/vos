@@ -618,6 +618,50 @@ fn expected_standard_sdk_management_transition(
     })
 }
 
+fn expected_standard_sdk_acknowledgement_transition(
+    work: &crate::agent_sdk::RuntimeWork,
+) -> Result<crate::agent_sdk::RuntimeTransition, AgentDriverError> {
+    let crate::agent_sdk::RuntimeWork::Acknowledge {
+        state,
+        invocation,
+        authority,
+    } = work
+    else {
+        return Err(AgentDriverError::InvalidRuntime);
+    };
+    let decoded = super::wire::decode_standard_runtime_state(&sdk_state_as_legacy(state))
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let mut runtime = super::standard::StandardAgentRuntime::restore(decoded)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let result = runtime.acknowledge_clean_invocation(invocation, authority);
+    Ok(crate::agent_sdk::RuntimeTransition {
+        state: if result.is_ok() {
+            legacy_state_as_sdk(&super::wire::encode_standard_runtime_state(
+                &runtime.snapshot(),
+            ))
+        } else {
+            state.clone()
+        },
+        outcome: crate::agent_sdk::RuntimeOutcome::Acknowledged(result),
+    })
+}
+
+fn validate_standard_sdk_acknowledgement_transition(
+    expected: &crate::agent_sdk::RuntimeTransition,
+    returned: &crate::agent_sdk::RuntimeTransition,
+) -> Result<(), AgentDriverError> {
+    if returned == expected
+        && matches!(
+            &returned.outcome,
+            crate::agent_sdk::RuntimeOutcome::Acknowledged(_)
+        )
+    {
+        Ok(())
+    } else {
+        Err(AgentDriverError::InvalidRuntime)
+    }
+}
+
 fn stored_program_matches(program: ProgramId, bytes: &[u8]) -> bool {
     ProgramId::of_pvm(bytes) == program || crate::agent_sdk::ProgramId::of_pvm(bytes).0 == program.0
 }
@@ -3315,6 +3359,41 @@ impl<S: AgentImageStore> AgentDriver<S> {
         )
     }
 
+    /// Retire one delivered clean terminal result. The original canonical
+    /// work and exact signed authority receipt are replayed to the guest; no
+    /// host-derived legacy receipt or invocation shorthand is accepted.
+    pub fn acknowledge_sdk(
+        &mut self,
+        invocation: crate::agent_sdk::InvocationWork,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, AgentDriverError> {
+        if !invocation.validate() {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        let gas = self
+            .management_gas
+            .checked_add(invocation.gas)
+            .ok_or(AgentDriverError::InvalidRuntime)?;
+        let work = crate::agent_sdk::RuntimeWork::Acknowledge {
+            state: legacy_state_as_sdk(&self.image.runtime_state),
+            invocation: Box::new(invocation),
+            authority: Box::new(authority),
+        };
+        let encoded = work
+            .encode()
+            .map_err(|_| AgentDriverError::InvalidRuntime)?;
+        let expected = expected_standard_sdk_acknowledgement_transition(&work)?;
+        let returned: crate::agent_sdk::RuntimeTransition =
+            execute_runtime_canonical(&self.runtime_pvm, gas, &encoded)?;
+        validate_standard_sdk_acknowledgement_transition(&expected, &returned)?;
+        let next = sdk_state_as_legacy(&returned.state);
+        validate_state_size(&next, &self.image.config.runtime_contract)?;
+        if next != self.image.runtime_state {
+            self.commit_runtime_state(next)?;
+        }
+        Ok(returned.outcome)
+    }
+
     fn apply_sdk_work(
         &mut self,
         work: crate::agent_sdk::RuntimeWork,
@@ -3342,6 +3421,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 resume.mode,
             ),
             crate::agent_sdk::RuntimeWork::Manage { .. } => {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            crate::agent_sdk::RuntimeWork::Acknowledge { .. } => {
                 return Err(AgentDriverError::InvalidRuntime);
             }
         };
@@ -3399,6 +3481,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 )?;
             }
             crate::agent_sdk::RuntimeOutcome::Management(_) => {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            crate::agent_sdk::RuntimeOutcome::Acknowledged(_) => {
                 return Err(AgentDriverError::InvalidRuntime);
             }
         }
@@ -4181,7 +4266,8 @@ fn validate_standard_sdk_yielded_transition(
     let availability = match work {
         crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } => &invocation.availability,
         crate::agent_sdk::RuntimeWork::Resume { resume, .. } => &resume.availability,
-        crate::agent_sdk::RuntimeWork::Manage { .. } => {
+        crate::agent_sdk::RuntimeWork::Manage { .. }
+        | crate::agent_sdk::RuntimeWork::Acknowledge { .. } => {
             return Err(AgentDriverError::InvalidRuntime);
         }
     };
@@ -4255,7 +4341,8 @@ fn validate_sdk_exact_execution_transition(
     let mode = match work {
         crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } => invocation.mode,
         crate::agent_sdk::RuntimeWork::Resume { resume, .. } => resume.mode,
-        crate::agent_sdk::RuntimeWork::Manage { .. } => {
+        crate::agent_sdk::RuntimeWork::Manage { .. }
+        | crate::agent_sdk::RuntimeWork::Acknowledge { .. } => {
             return Err(AgentDriverError::InvalidRuntime);
         }
     };
@@ -4289,7 +4376,10 @@ fn validate_sdk_exact_execution_transition(
                 .commit_clean_exact_outcome_clock(resume.mode, record.observed_slot)
                 .map_err(|_| AgentDriverError::InvalidRuntime)?;
         }
-        crate::agent_sdk::RuntimeWork::Manage { .. } => unreachable!("rejected above"),
+        crate::agent_sdk::RuntimeWork::Manage { .. }
+        | crate::agent_sdk::RuntimeWork::Acknowledge { .. } => {
+            unreachable!("rejected above")
+        }
     }
     let expected = super::wire::encode_standard_runtime_state(&runtime.snapshot());
     if next == &expected {
@@ -4310,7 +4400,8 @@ fn validate_sdk_error_transition(
         let mode = match work {
             crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } => invocation.mode,
             crate::agent_sdk::RuntimeWork::Resume { resume, .. } => resume.mode,
-            crate::agent_sdk::RuntimeWork::Manage { .. } => {
+            crate::agent_sdk::RuntimeWork::Manage { .. }
+            | crate::agent_sdk::RuntimeWork::Acknowledge { .. } => {
                 return Err(AgentDriverError::InvalidRuntime);
             }
         };
@@ -5224,6 +5315,41 @@ mod tests {
             authority: Box::new(authority),
             observed_slot,
         }
+    }
+
+    #[test]
+    fn sdk_acknowledgement_rejects_impossible_error_and_mutated_successor() {
+        use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeWork};
+
+        let observed_slot = 9;
+        let (prior, _, invocation) = standard_exact_transition_fixture(observed_slot);
+        let RuntimeWork::Invoke {
+            invocation,
+            authority,
+            ..
+        } = sdk_exact_invoke_work(&prior, &invocation, observed_slot)
+        else {
+            unreachable!()
+        };
+        let work = RuntimeWork::Acknowledge {
+            state: legacy_state_as_sdk(&prior),
+            invocation,
+            authority,
+        };
+        let expected = expected_standard_sdk_acknowledgement_transition(&work).unwrap();
+        assert_eq!(
+            expected.outcome,
+            RuntimeOutcome::Acknowledged(Err(InvocationError::NotCreated))
+        );
+
+        let mut hostile = expected.clone();
+        hostile.state.linear.push(0xff);
+        hostile.outcome = RuntimeOutcome::Acknowledged(Err(InvocationError::AuthorityExpired));
+        assert_eq!(
+            validate_standard_sdk_acknowledgement_transition(&expected, &hostile),
+            Err(AgentDriverError::InvalidRuntime),
+            "the driver requires both the exact acknowledgement result and exact successor"
+        );
     }
 
     #[test]

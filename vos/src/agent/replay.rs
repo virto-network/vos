@@ -13736,6 +13736,7 @@ pub(crate) mod tests {
                 request: invocation.commitment(),
                 reply,
                 storage: invocation.mode.result_storage(),
+                clean: None,
             });
         encode_standard_runtime_state(&decoded)
     }

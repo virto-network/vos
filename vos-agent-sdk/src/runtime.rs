@@ -319,6 +319,14 @@ pub enum RuntimeWork {
         state: RuntimeState,
         resume: Box<ResumeWork>,
     },
+    /// Retire one delivered exact invocation result. The original work and
+    /// its authority receipt are resupplied so the guest can authenticate the
+    /// exact retained result without trusting a host-created shorthand.
+    Acknowledge {
+        state: RuntimeState,
+        invocation: Box<InvocationWork>,
+        authority: Box<AuthorityReceipt>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -454,6 +462,31 @@ impl InvocationError {
     }
 }
 
+/// Exact durable result retired by one clean acknowledgement transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvocationAcknowledgement {
+    pub invocation: InvocationId,
+    pub actor: ActorId,
+    pub incarnation: Hash,
+    pub deployment: DeploymentId,
+    pub mode: MethodMode,
+    /// Commitment of the original canonical [`InvocationWork`].
+    pub work: Hash,
+    /// Commitment of the exact signed authority receipt accepted with it.
+    pub authority: Hash,
+}
+
+impl InvocationAcknowledgement {
+    pub fn validate(&self) -> bool {
+        self.invocation != InvocationId::ZERO
+            && self.actor != ActorId::ZERO
+            && self.incarnation != Hash::ZERO
+            && self.deployment != DeploymentId::ZERO
+            && self.work != Hash::ZERO
+            && self.authority != Hash::ZERO
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct YieldedInvocation {
     pub invocation: InvocationId,
@@ -514,6 +547,15 @@ pub enum RuntimeOutcome {
     Management(Result<ManagementReply, ManagementError>),
     Completed(Result<InvocationReply, InvocationError>),
     Yielded(YieldedInvocation),
+    /// Delivery-retirement result for [`RuntimeWork::Acknowledge`].
+    ///
+    /// For canonical Standard runtime state/work, acknowledgement emits
+    /// `NotCreated`, `NotFound`, `InvalidAuthorization`, or
+    /// `DivergentInvocation`. `ResultCapacity` is reserved as a fail-closed
+    /// representation error. In particular, acknowledgement does not
+    /// reapply current-time authority expiry or authority high-water checks:
+    /// those were fixed at the retained result's acceptance slot.
+    Acknowledged(Result<InvocationAcknowledgement, InvocationError>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -538,6 +580,7 @@ impl RuntimeTransition {
                         && reply.observation.merge_frontier != Some(Hash::ZERO)
                 }
                 RuntimeOutcome::Yielded(yielded) => yielded.validate(),
+                RuntimeOutcome::Acknowledged(Ok(acknowledgement)) => acknowledgement.validate(),
                 _ => true,
             }
     }

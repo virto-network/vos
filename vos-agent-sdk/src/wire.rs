@@ -1398,6 +1398,15 @@ fn runtime_work_valid(value: &RuntimeWork) -> bool {
                 && authority_matches_invocation(authority, invocation, *observed_slot)
         }
         RuntimeWork::Resume { state, resume } => state.validate() && resume.validate(),
+        RuntimeWork::Acknowledge {
+            state,
+            invocation,
+            authority,
+        } => {
+            state.validate()
+                && invocation.validate()
+                && authority_matches_invocation(authority, invocation, 0)
+        }
     }
 }
 
@@ -1448,6 +1457,16 @@ impl CanonicalWire for RuntimeWork {
                 encode_runtime_state(encoder, state);
                 encode_resume_work(encoder, resume);
             }
+            RuntimeWork::Acknowledge {
+                state,
+                invocation,
+                authority,
+            } => {
+                encoder.u8(3);
+                encode_runtime_state(encoder, state);
+                encode_invocation_work(encoder, invocation);
+                <AuthorityReceipt as CanonicalWire>::encode_body(authority, encoder);
+            }
         }
     }
 
@@ -1475,6 +1494,13 @@ impl CanonicalWire for RuntimeWork {
             2 => RuntimeWork::Resume {
                 state: decode_runtime_state(decoder)?,
                 resume: alloc::boxed::Box::new(decode_resume_work(decoder)?),
+            },
+            3 => RuntimeWork::Acknowledge {
+                state: decode_runtime_state(decoder)?,
+                invocation: alloc::boxed::Box::new(decode_invocation_work(decoder)?),
+                authority: alloc::boxed::Box::new(
+                    <AuthorityReceipt as CanonicalWire>::decode_body(decoder)?,
+                ),
             },
             _ => return Err(DecodeError::InvalidTag),
         };
@@ -1739,6 +1765,34 @@ fn decode_invocation_reply(decoder: &mut Decoder<'_>) -> Result<InvocationReply,
         .ok_or(DecodeError::NonCanonical)
 }
 
+fn encode_invocation_acknowledgement(encoder: &mut Encoder<'_>, value: &InvocationAcknowledgement) {
+    encoder.fixed(value.invocation.as_bytes());
+    encoder.fixed(value.actor.as_bytes());
+    encoder.fixed(value.incarnation.as_bytes());
+    encoder.fixed(value.deployment.as_bytes());
+    encoder.u8(value.mode as u8);
+    encoder.fixed(value.work.as_bytes());
+    encoder.fixed(value.authority.as_bytes());
+}
+
+fn decode_invocation_acknowledgement(
+    decoder: &mut Decoder<'_>,
+) -> Result<InvocationAcknowledgement, DecodeError> {
+    let value = InvocationAcknowledgement {
+        invocation: InvocationId(decoder.fixed()?),
+        actor: ActorId(decoder.fixed()?),
+        incarnation: Hash(decoder.fixed()?),
+        deployment: DeploymentId(decoder.fixed()?),
+        mode: decode_method_mode(decoder)?,
+        work: Hash(decoder.fixed()?),
+        authority: Hash(decoder.fixed()?),
+    };
+    value
+        .validate()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
 fn encode_invocation_error(encoder: &mut Encoder<'_>, value: InvocationError) {
     match value {
         InvocationError::NotCreated => encoder.u8(0),
@@ -1893,6 +1947,19 @@ fn encode_runtime_outcome(encoder: &mut Encoder<'_>, value: &RuntimeOutcome) {
             encoder.u8(2);
             encode_yielded(encoder, value);
         }
+        RuntimeOutcome::Acknowledged(result) => {
+            encoder.u8(3);
+            match result {
+                Ok(acknowledgement) => {
+                    encoder.bool(true);
+                    encode_invocation_acknowledgement(encoder, acknowledgement);
+                }
+                Err(error) => {
+                    encoder.bool(false);
+                    encode_invocation_error(encoder, *error);
+                }
+            }
+        }
     }
 }
 
@@ -1909,6 +1976,11 @@ fn decode_runtime_outcome(decoder: &mut Decoder<'_>) -> Result<RuntimeOutcome, D
             Err(decode_invocation_error(decoder)?)
         })),
         2 => Ok(RuntimeOutcome::Yielded(decode_yielded(decoder)?)),
+        3 => Ok(RuntimeOutcome::Acknowledged(if decoder.bool()? {
+            Ok(decode_invocation_acknowledgement(decoder)?)
+        } else {
+            Err(decode_invocation_error(decoder)?)
+        })),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -2584,6 +2656,72 @@ mod tests {
             observed_slot,
         };
         assert_eq!(mismatched.encode(), Err(WireError::InvalidValue));
+    }
+
+    #[test]
+    fn acknowledgement_work_and_outcome_have_one_r6_canonical_wire() {
+        let invocation = invocation();
+        let authority = receipt_for(&invocation);
+        let work = RuntimeWork::Acknowledge {
+            state: RuntimeState::default(),
+            invocation: alloc::boxed::Box::new(invocation.clone()),
+            authority: alloc::boxed::Box::new(authority.clone()),
+        };
+        let encoded = work.encode().unwrap();
+        assert!(encoded.len() <= RuntimeWork::MAX_ENCODED_BYTES);
+        assert_eq!(encoded[HEADER_BYTES], 3, "Acknowledge owns work tag 3");
+        assert_eq!(RuntimeWork::decode(&encoded), Ok(work.clone()));
+
+        let mut previous_generation = encoded.clone();
+        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r5");
+        assert_eq!(
+            RuntimeWork::decode(&previous_generation),
+            Err(WireError::Decode(DecodeError::InvalidPlatform))
+        );
+
+        let mut unknown_tag = encoded;
+        unknown_tag[HEADER_BYTES] = 4;
+        assert_eq!(
+            RuntimeWork::decode(&unknown_tag),
+            Err(WireError::Decode(DecodeError::InvalidTag))
+        );
+
+        let mut mismatched = work;
+        let RuntimeWork::Acknowledge {
+            authority: mismatched_authority,
+            ..
+        } = &mut mismatched
+        else {
+            unreachable!()
+        };
+        mismatched_authority.selector.request = Hash([99; 32]);
+        assert_eq!(mismatched.encode(), Err(WireError::InvalidValue));
+
+        let acknowledgement = InvocationAcknowledgement {
+            invocation: invocation.invocation,
+            actor: invocation.actor,
+            incarnation: invocation.incarnation,
+            deployment: invocation.deployment,
+            mode: invocation.mode,
+            work: invocation.commitment(),
+            authority: authority.commitment(),
+        };
+        let transition = RuntimeTransition {
+            state: RuntimeState::default(),
+            outcome: RuntimeOutcome::Acknowledged(Ok(acknowledgement)),
+        };
+        let encoded = transition.encode().unwrap();
+        assert!(encoded.len() <= RuntimeTransition::MAX_ENCODED_BYTES);
+        assert_eq!(RuntimeTransition::decode(&encoded), Ok(transition));
+
+        let invalid = RuntimeTransition {
+            state: RuntimeState::default(),
+            outcome: RuntimeOutcome::Acknowledged(Ok(InvocationAcknowledgement {
+                work: Hash::ZERO,
+                ..acknowledgement
+            })),
+        };
+        assert_eq!(invalid.encode(), Err(WireError::InvalidValue));
     }
 
     #[test]
