@@ -69,8 +69,8 @@ pub fn run_nested_actor_entry<A: Actor>(input_address: u64, input_len: u64, capa
     run::run_nested_actor_service::<A>(input_address, input_len, capacity)
 }
 #[cfg(all(feature = "pvm", not(feature = "service")))]
-pub fn run_refine_entry<A: Actor>() {
-    run::run_refine::<A>()
+pub fn run_refine_entry<A: Actor>(args_address: u64, args_len: u64) {
+    run::run_refine::<A>(args_address, args_len)
 }
 
 /// Canonical actor entry. Transitional service guests retain their nested
@@ -85,8 +85,8 @@ pub fn run_actor_entry<A: Actor>(a0: u64, a1: u64, a2: u64, a3: u64) {
 }
 
 #[cfg(all(feature = "pvm", not(feature = "service")))]
-pub fn run_actor_entry<A: Actor>(_a0: u64, _a1: u64, _a2: u64, _a3: u64) {
-    run_refine_entry::<A>()
+pub fn run_actor_entry<A: Actor>(a0: u64, a1: u64, _a2: u64, _a3: u64) {
+    run_refine_entry::<A>(a0, a1)
 }
 
 /// service platform refine entry (PC=0) for **Task** blobs: input is the

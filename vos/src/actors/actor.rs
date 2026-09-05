@@ -195,10 +195,14 @@ pub trait Actor: Sized + Encode + Decode {
     /// generates field-wise loading for all three lanes.
     #[doc(hidden)]
     fn __load_agent_state(
+        installation_data: Option<&[u8]>,
         linear: Option<&[u8]>,
         _merge: Option<&[u8]>,
         _local: Option<&[u8]>,
     ) -> Option<Self> {
+        if installation_data.is_some() {
+            return None;
+        }
         match linear {
             Some(bytes) if !bytes.is_empty() => Self::try_decode(bytes),
             _ => Some(Self::create()),

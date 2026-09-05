@@ -51,7 +51,7 @@ impl ArtifactResourceUsage {
         reference: &BlobRef,
         limits: super::contract::RuntimeResourceLimits,
     ) -> Result<(), LifecycleError> {
-        if reference.hash == Hash::ZERO || reference.len == 0 {
+        if reference.hash == Hash::ZERO {
             return Err(LifecycleError::InvalidRequest);
         }
         if let Some(encoded_len) = self.lengths.get(&reference.hash) {
@@ -97,12 +97,27 @@ fn validate_artifact_resources<'a>(
     Ok(())
 }
 
-fn actor_artifact_references(actor: &ManagedActor) -> [&BlobRef; 3] {
+fn actor_artifact_references(actor: &ManagedActor) -> impl Iterator<Item = &BlobRef> {
     [
         &actor.record.package,
         &actor.record.agent_schema,
         &actor.record.role_policies,
     ]
+    .into_iter()
+    .chain(actor.record.installation_data.iter())
+}
+
+fn installation_data_aliases_actor_artifact(
+    installation_data: Option<&BlobRef>,
+    package: &BlobRef,
+    agent_schema: &BlobRef,
+    role_policies: &BlobRef,
+) -> bool {
+    installation_data.is_some_and(|data| {
+        [package, agent_schema, role_policies]
+            .into_iter()
+            .any(|artifact| data.hash == artifact.hash)
+    })
 }
 
 fn install_matches(record: &ActorRecord, install: &super::InstallActor) -> bool {
@@ -264,6 +279,7 @@ pub(crate) struct StandardAcceptedInvocation {
     pub mode: crate::agent_sdk::MethodMode,
     pub origin: crate::agent_sdk::InvocationOrigin,
     pub message: Vec<u8>,
+    pub installation_data: Option<crate::agent_sdk::BlobRef>,
     pub required: Vec<crate::agent_sdk::BlobRef>,
     pub gas: u64,
     pub recovery_only: bool,
@@ -283,6 +299,7 @@ impl StandardAcceptedInvocation {
             mode: work.mode,
             origin: work.origin,
             message: work.message.clone(),
+            installation_data: work.installation_data.clone(),
             required: work
                 .availability
                 .iter()
@@ -309,6 +326,7 @@ impl StandardAcceptedInvocation {
             mode: self.mode,
             origin: self.origin,
             message: self.message.clone(),
+            installation_data: self.installation_data.clone(),
             availability,
             gas: self.gas,
             recovery_only: self.recovery_only,
@@ -329,10 +347,15 @@ impl StandardAcceptedInvocation {
             && self.gas != 0
             && !self.recovery_only
             && self.required.len() <= crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_ITEMS
+            && self.installation_data.as_ref().is_none_or(|reference| {
+                reference.hash != crate::agent_sdk::Hash::ZERO
+                    && reference.len <= crate::agent_sdk::MAX_INSTALLATION_DATA_BYTES as u64
+                    && self.required.iter().any(|required| required == reference)
+            })
             && self.required.windows(2).all(|pair| pair[0] < pair[1])
             && self.required.iter().all(|reference| {
                 reference.hash != crate::agent_sdk::Hash::ZERO
-                    && reference.len != 0
+                    && (reference.len != 0 || self.installation_data.as_ref() == Some(reference))
                     && reference.len <= crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_BYTES as u64
             })
             && self
@@ -411,6 +434,7 @@ impl StandardMachineContinuation {
             mode: accepted.mode,
             continuation: self.clean_reference()?,
             ready_sequence: self.ready_sequence,
+            installation_data: accepted.installation_data.clone(),
             required: accepted.required.clone(),
             reason: crate::agent_sdk::YieldReason::Cooperative,
         })
@@ -743,37 +767,72 @@ impl StandardAgentRuntime {
             }) else {
                 return Err(LifecycleError::InvalidRequest);
             };
-            let actor = pending.remove(index);
-            let mut entry = actor.record.entry;
-            if entry.suspended {
-                suspended.push((entry.actor, entry.deployment));
-                entry.suspended = false;
+            let StandardActorState { mut record, debt } = pending.remove(index);
+            if record.entry.suspended {
+                suspended.push((record.entry.actor, record.entry.deployment));
+                record.entry.suspended = false;
             }
-            let actor_id = entry.actor;
-            let state_generation = actor.record.state_generation;
-            let install_request_commitment = actor.record.install_request_commitment;
-            runtime.install(
-                super::InstallActor {
-                    installation_id: actor.record.installation_id,
-                    registry_reservation: actor.record.registry_reservation,
-                    entry,
-                    producer: actor.record.producer,
-                    package: actor.record.package,
-                    agent_schema: actor.record.agent_schema,
-                    role_policies: actor.record.role_policies,
-                    state_layout: actor.record.state_layout,
-                    contract: actor.record.contract,
-                    requirements: actor.record.requirements,
-                },
-                state_generation,
+            let actor_id = record.entry.actor;
+            let config = runtime.created()?;
+            if record.installation_id == InstallationId::ZERO
+                || record.registry_reservation == Hash::ZERO
+                || record.entry.name.is_empty()
+                || record.entry.name.len() > crate::service::MAX_ACTOR_NAME_BYTES
+                || record.entry.lanes != record.requirements.lanes
+                || record.entry.deployment == DeploymentId::ZERO
+                || record.entry.program == ProgramId::ZERO
+                || record.entry.package != record.package
+                || record.entry.agent_schema != record.agent_schema
+                || record.entry.role_policies != record.role_policies
+                || record.entry.constructor_abi != record.constructor_abi
+                || record.entry.installation_data != record.installation_data
+                || record.entry.state_layout != record.state_layout
+                || record.producer == ProducerId::ZERO
+                || record.package.hash == Hash::ZERO
+                || record.package.len == 0
+                || record.agent_schema.hash == Hash::ZERO
+                || record.agent_schema.len == 0
+                || record.agent_schema.len > super::schema::MAX_ENCODED_BYTES as u64
+                || record.role_policies.hash == Hash::ZERO
+                || record.role_policies.len == 0
+                || record.role_policies.len > super::execution::MAX_EXECUTION_POLICY_BYTES as u64
+                || record.constructor_abi == Hash::ZERO
+                || record.installation_data.as_ref().is_some_and(|reference| {
+                    reference.hash == Hash::ZERO
+                        || reference.len > super::MAX_INSTALLATION_DATA_BYTES as u64
+                })
+                || installation_data_aliases_actor_artifact(
+                    record.installation_data.as_ref(),
+                    &record.package,
+                    &record.agent_schema,
+                    &record.role_policies,
+                )
+                || record.state_layout == Hash::ZERO
+                || Self::expected_actor_id(config.identity.agent, &record.entry) != actor_id
+                || runtime
+                    .actors
+                    .values()
+                    .any(|actor| actor.record.installation_id == record.installation_id)
+            {
+                return Err(LifecycleError::InvalidRequest);
+            }
+            runtime.validate_requirements(record.requirements)?;
+            if !config.runtime_contract.supports(record.contract) {
+                return Err(LifecycleError::UnsupportedRuntime);
+            }
+            if runtime.actors.len() >= config.capabilities.max_actors as usize {
+                return Err(LifecycleError::DirectoryFull);
+            }
+            validate_artifact_resources(
+                config.runtime_contract.resources,
+                core::iter::once(&config.runtime_package)
+                    .chain(runtime.actors.values().flat_map(actor_artifact_references))
+                    .chain([&record.package, &record.agent_schema, &record.role_policies])
+                    .chain(record.installation_data.iter()),
             )?;
             runtime
                 .actors
-                .get_mut(&actor_id)
-                .expect("restored actor was just installed")
-                .record
-                .install_request_commitment = install_request_commitment;
-            runtime.set_lifecycle_debt(actor_id, actor.debt)?;
+                .insert(actor_id, ManagedActor { record, debt });
         }
         runtime.retired_installation_ids = state.retired_installation_ids.into_iter().collect();
         for (actor, expected_deployment) in suspended {
@@ -1110,6 +1169,12 @@ impl StandardAgentRuntime {
             || install.entry.package != install.package
             || install.entry.agent_schema != install.agent_schema
             || install.entry.role_policies != install.role_policies
+            || install.entry.constructor_abi != install.constructor_abi
+            || install.entry.installation_data.as_ref()
+                != install
+                    .installation_data
+                    .as_ref()
+                    .map(|data| &data.reference)
             || install.entry.state_layout != install.state_layout
             || install.entry.suspended
             || install.producer == ProducerId::ZERO
@@ -1121,6 +1186,20 @@ impl StandardAgentRuntime {
             || install.role_policies.hash == Hash::ZERO
             || install.role_policies.len == 0
             || install.role_policies.len > super::execution::MAX_EXECUTION_POLICY_BYTES as u64
+            || install.constructor_abi == Hash::ZERO
+            || install
+                .installation_data
+                .as_ref()
+                .is_some_and(|data| !data.is_valid())
+            || installation_data_aliases_actor_artifact(
+                install
+                    .installation_data
+                    .as_ref()
+                    .map(|data| &data.reference),
+                &install.package,
+                &install.agent_schema,
+                &install.role_policies,
+            )
             || install.state_layout == Hash::ZERO
             || state_generation == Hash::ZERO
             || Self::expected_actor_id(config.identity.agent, &install.entry) != install.entry.actor
@@ -1176,7 +1255,13 @@ impl StandardAgentRuntime {
                     &install.package,
                     &install.agent_schema,
                     &install.role_policies,
-                ]),
+                ])
+                .chain(
+                    install
+                        .installation_data
+                        .as_ref()
+                        .map(|data| &data.reference),
+                ),
         )?;
         let entry = install.entry.clone();
         let install_request_commitment = LifecycleRequest::Install(install.clone()).commitment();
@@ -1193,6 +1278,8 @@ impl StandardAgentRuntime {
                     package: install.package,
                     agent_schema: install.agent_schema,
                     role_policies: install.role_policies,
+                    constructor_abi: install.constructor_abi,
+                    installation_data: install.installation_data.map(|data| data.reference),
                     state_layout: install.state_layout,
                     contract: install.contract,
                     requirements: install.requirements,
@@ -1387,6 +1474,7 @@ impl StandardAgentRuntime {
             Vec<u8>,
             super::execution::RuntimeBlob,
             super::execution::RuntimeBlob,
+            Option<super::execution::RuntimeBlob>,
         ),
         crate::agent_sdk::InvocationError,
     > {
@@ -1407,10 +1495,10 @@ impl StandardAgentRuntime {
         if actor.record.entry.program.0 != work.program.0 {
             return Err(InvocationError::WrongProgram);
         }
-
         let mut program_index = None;
         let mut schema_index = None;
         let mut policy_index = None;
+        let mut installation_data_index = None;
         for (index, blob) in work.availability.iter().enumerate() {
             if blob.bytes.len() <= super::execution::MAX_EXECUTION_PROGRAM_BYTES
                 && crate::service::ProgramId::of_pvm(&blob.bytes).0 == work.program.0
@@ -1430,14 +1518,37 @@ impl StandardAgentRuntime {
                     return Err(InvocationError::InvalidAvailability);
                 }
             }
+            if actor
+                .record
+                .installation_data
+                .as_ref()
+                .is_some_and(|expected| legacy == *expected)
+            {
+                if blob.bytes.len() > super::MAX_INSTALLATION_DATA_BYTES
+                    || installation_data_index.replace(index).is_some()
+                {
+                    return Err(InvocationError::InvalidAvailability);
+                }
+            }
         }
         let program_index = program_index.ok_or(InvocationError::InvalidAvailability)?;
         let schema_index = schema_index.ok_or(InvocationError::InvalidAvailability)?;
         let policy_index = policy_index.ok_or(InvocationError::InvalidAvailability)?;
-        if program_index == schema_index
-            || program_index == policy_index
-            || schema_index == policy_index
-        {
+        let installation_data_index = match (
+            actor.record.installation_data.as_ref(),
+            work.installation_data.as_ref(),
+            installation_data_index,
+        ) {
+            (Some(_), Some(role), Some(index)) if work.availability[index].reference == *role => {
+                Some(index)
+            }
+            (None, None, None) => None,
+            _ => return Err(InvocationError::InvalidAvailability),
+        };
+        let mut role_indices = Vec::from([program_index, schema_index, policy_index]);
+        role_indices.extend(installation_data_index);
+        role_indices.sort_unstable();
+        if role_indices.windows(2).any(|pair| pair[0] == pair[1]) {
             // Artifact roles are independently authenticated. Even when two
             // catalog hashes happen to alias, one availability entry cannot
             // stand in for more than one role.
@@ -1477,7 +1588,10 @@ impl StandardAgentRuntime {
             .iter()
             .enumerate()
             .filter(|(index, _)| {
-                *index != program_index && *index != schema_index && *index != policy_index
+                *index != program_index
+                    && *index != schema_index
+                    && *index != policy_index
+                    && Some(*index) != installation_data_index
             })
             .map(|(_, blob)| super::execution::RuntimeBlob {
                 reference: crate::service::BlobRef::of_bytes(&blob.bytes),
@@ -1508,11 +1622,21 @@ impl StandardAgentRuntime {
             reference: actor.record.role_policies.clone(),
             bytes: work.availability[policy_index].bytes.clone(),
         };
+        let installation_data =
+            installation_data_index.map(|index| super::execution::RuntimeBlob {
+                reference: actor
+                    .record
+                    .installation_data
+                    .clone()
+                    .expect("the selected index has an installed reference"),
+                bytes: work.availability[index].bytes.clone(),
+            });
         Ok((
             invocation,
             work.availability[program_index].bytes.clone(),
             actor_schema,
             actor_policies,
+            installation_data,
         ))
     }
 
@@ -1693,6 +1817,11 @@ impl StandardAgentRuntime {
             || record.program.0 != resume.program.0
             || record.mode != mode
             || record.clean_reference().ok().as_ref() != Some(&resume.continuation)
+            || record
+                .accepted
+                .as_ref()
+                .and_then(|accepted| accepted.installation_data.as_ref())
+                != resume.installation_data.as_ref()
         {
             return Err(InvocationError::StaleContinuation);
         }
@@ -1961,6 +2090,31 @@ impl StandardAgentRuntime {
             return Err(ActorExecutionError::UnsupportedMethod);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn validate_execution_installation_data(
+        &self,
+        invocation: &super::execution::ActorInvocation,
+        data: Option<&super::execution::RuntimeBlob>,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+
+        let actor = self
+            .actors
+            .get(&invocation.actor)
+            .ok_or(ActorExecutionError::NotFound)?;
+        match (actor.record.installation_data.as_ref(), data) {
+            (None, None) => Ok(()),
+            (Some(expected), Some(data))
+                if data.bytes.len() <= super::MAX_INSTALLATION_DATA_BYTES
+                    && data.reference == *expected
+                    && data.reference.matches(&data.bytes) =>
+            {
+                Ok(())
+            }
+            _ => Err(ActorExecutionError::InvalidAvailability),
+        }
     }
 
     /// Resolve the canonical signed method policy and enforce it against the
@@ -2289,6 +2443,7 @@ impl StandardAgentRuntime {
             || upgrade.role_policies.hash == Hash::ZERO
             || upgrade.role_policies.len == 0
             || upgrade.role_policies.len > super::execution::MAX_EXECUTION_POLICY_BYTES as u64
+            || upgrade.constructor_abi == Hash::ZERO
             || upgrade.state_layout == Hash::ZERO
         {
             return Err(LifecycleError::InvalidRequest);
@@ -2296,6 +2451,10 @@ impl StandardAgentRuntime {
         if actor.record.state_layout != upgrade.state_layout {
             return Err(LifecycleError::UnsupportedLane);
         }
+        if actor.record.constructor_abi != upgrade.constructor_abi {
+            return Err(LifecycleError::InvalidRequest);
+        }
+        let installation_data = actor.record.installation_data.as_ref();
         let config = self.created()?;
         validate_artifact_resources(
             config.runtime_contract.resources,
@@ -2310,7 +2469,8 @@ impl StandardAgentRuntime {
                     &upgrade.package,
                     &upgrade.agent_schema,
                     &upgrade.role_policies,
-                ]),
+                ])
+                .chain(installation_data),
         )?;
         let actor = self
             .actors
@@ -2321,12 +2481,14 @@ impl StandardAgentRuntime {
         actor.record.entry.package = upgrade.package.clone();
         actor.record.entry.agent_schema = upgrade.agent_schema.clone();
         actor.record.entry.role_policies = upgrade.role_policies.clone();
+        actor.record.entry.constructor_abi = upgrade.constructor_abi;
         actor.record.entry.state_layout = upgrade.state_layout;
         actor.record.entry.lanes = upgrade.requirements.lanes;
         actor.record.producer = upgrade.producer;
         actor.record.package = upgrade.package;
         actor.record.agent_schema = upgrade.agent_schema;
         actor.record.role_policies = upgrade.role_policies;
+        actor.record.constructor_abi = upgrade.constructor_abi;
         actor.record.state_layout = upgrade.state_layout;
         actor.record.contract = upgrade.contract;
         actor.record.requirements = upgrade.requirements;
@@ -4226,6 +4388,8 @@ mod tests {
                 package: package.clone(),
                 agent_schema: agent_schema.clone(),
                 role_policies: role_policies.clone(),
+                constructor_abi: Hash([14; 32]),
+                installation_data: None,
                 state_layout: Hash([12; 32]),
                 lanes: requirements.lanes,
                 suspended: false,
@@ -4234,6 +4398,8 @@ mod tests {
             package,
             agent_schema,
             role_policies,
+            constructor_abi: Hash([14; 32]),
+            installation_data: None,
             state_layout: Hash([12; 32]),
             contract: crate::agent::contract::ActorPackageContract::canonical(),
             requirements,
@@ -4252,6 +4418,15 @@ mod tests {
         install.package = package;
         install.agent_schema = agent_schema;
         install.role_policies = role_policies;
+    }
+
+    fn set_installation_data(install: &mut InstallActor, bytes: Vec<u8>) {
+        let data = super::super::InstallationData {
+            reference: BlobRef::of_bytes(&bytes),
+            bytes,
+        };
+        install.entry.installation_data = Some(data.reference.clone());
+        install.installation_data = Some(data);
     }
 
     fn suspend(actor: ActorId, expected_deployment: DeploymentId) -> LifecycleRequest {
@@ -4613,6 +4788,7 @@ mod tests {
                 package: install_request.package.clone(),
                 agent_schema: install_request.agent_schema.clone(),
                 role_policies: install_request.role_policies.clone(),
+                constructor_abi: install_request.constructor_abi,
                 state_layout: install_request.state_layout,
                 contract: install_request.contract,
                 requirements: install_request.requirements,
@@ -4727,6 +4903,214 @@ mod tests {
         assert_eq!(page.entries[0].installation_id, installation_id);
         assert_eq!(page.entries[0].registry_reservation, registry_reservation);
         assert_eq!(page.entries[0].incarnation, generation);
+    }
+
+    #[test]
+    fn immutable_installation_data_is_exact_across_retry_restore_and_upgrade() {
+        let config = config(1);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+
+        let absent = install(config.identity.agent, None, "constructor-bound");
+        let mut present_empty = absent.clone();
+        set_installation_data(&mut present_empty, Vec::new());
+        assert_ne!(
+            LifecycleRequest::Install(absent.clone()).commitment(),
+            LifecycleRequest::Install(present_empty.clone()).commitment(),
+            "present-empty is a committed object, not absence"
+        );
+        let actor = present_empty.entry.actor;
+        let original_reference = present_empty.entry.installation_data.clone().unwrap();
+        apply_authorized(
+            &mut runtime,
+            &config,
+            LifecycleRequest::Install(present_empty.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.actor_record(actor).unwrap().installation_data,
+            Some(original_reference.clone())
+        );
+
+        assert_eq!(
+            apply_authorized(&mut runtime, &config, LifecycleRequest::Install(absent),),
+            Err(LifecycleError::InvalidRequest),
+            "the same InstallationId cannot erase a present-empty object"
+        );
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::Install(present_empty.clone()),
+            ),
+            Ok(LifecycleReply::Installed(present_empty.entry.clone()))
+        );
+
+        let encoded = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+        let restored_state = super::super::wire::decode_standard_runtime_state(&encoded).unwrap();
+        let mut restored = StandardAgentRuntime::restore(restored_state).unwrap();
+        assert_eq!(
+            restored.actor_record(actor).unwrap().installation_data,
+            Some(original_reference.clone())
+        );
+
+        let upgraded_deployment = DeploymentId([0xd1; 32]);
+        apply_authorized(
+            &mut restored,
+            &config,
+            LifecycleRequest::UpgradeActor(UpgradeActor {
+                actor,
+                from_deployment: present_empty.entry.deployment,
+                to_deployment: upgraded_deployment,
+                to_program: present_empty.entry.program,
+                producer: ProducerId([0xd2; 32]),
+                package: BlobRef {
+                    hash: Hash([0xd3; 32]),
+                    len: 100,
+                },
+                agent_schema: BlobRef {
+                    hash: Hash([0xd4; 32]),
+                    len: 100,
+                },
+                role_policies: BlobRef {
+                    hash: Hash([0xd5; 32]),
+                    len: 100,
+                },
+                constructor_abi: present_empty.constructor_abi,
+                state_layout: present_empty.state_layout,
+                contract: present_empty.contract,
+                requirements: present_empty.requirements,
+            }),
+        )
+        .unwrap();
+        let upgraded = restored.actor_record(actor).unwrap();
+        assert_eq!(upgraded.entry.deployment, upgraded_deployment);
+        assert_eq!(upgraded.installation_data, Some(original_reference));
+    }
+
+    #[test]
+    fn install_rejects_corrupt_oversized_and_cross_role_installation_data() {
+        let config = config(2);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+
+        let mut mismatch = install(config.identity.agent, None, "mismatch");
+        set_installation_data(&mut mismatch, vec![1]);
+        mismatch.installation_data.as_mut().unwrap().bytes[0] = 2;
+        assert_eq!(
+            apply_authorized(&mut runtime, &config, LifecycleRequest::Install(mismatch),),
+            Err(LifecycleError::InvalidRequest)
+        );
+
+        let mut oversized = install(config.identity.agent, None, "oversized");
+        set_installation_data(
+            &mut oversized,
+            vec![0; super::super::MAX_INSTALLATION_DATA_BYTES + 1],
+        );
+        assert_eq!(
+            apply_authorized(&mut runtime, &config, LifecycleRequest::Install(oversized),),
+            Err(LifecycleError::InvalidRequest)
+        );
+
+        let mut aliased = install(config.identity.agent, None, "aliased");
+        set_installation_data(&mut aliased, vec![3]);
+        let reference = aliased
+            .installation_data
+            .as_ref()
+            .unwrap()
+            .reference
+            .clone();
+        aliased.package = reference.clone();
+        aliased.entry.package = reference;
+        assert_eq!(
+            apply_authorized(&mut runtime, &config, LifecycleRequest::Install(aliased),),
+            Err(LifecycleError::InvalidRequest)
+        );
+        assert!(runtime.is_empty());
+    }
+
+    #[test]
+    fn actor_upgrade_preserves_the_exact_signed_constructor_abi() {
+        let config = config(2);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let installed = install(config.identity.agent, None, "constructor-bound-upgrade");
+        let actor = installed.entry.actor;
+        let from_deployment = installed.entry.deployment;
+        let mut incompatible = UpgradeActor {
+            actor,
+            from_deployment,
+            to_deployment: DeploymentId([0xb1; 32]),
+            to_program: installed.entry.program,
+            producer: ProducerId([0xb2; 32]),
+            package: BlobRef {
+                hash: Hash([0xb3; 32]),
+                len: 100,
+            },
+            agent_schema: installed.agent_schema.clone(),
+            role_policies: installed.role_policies.clone(),
+            constructor_abi: Hash([0xb4; 32]),
+            state_layout: installed.state_layout,
+            contract: installed.contract,
+            requirements: installed.requirements,
+        };
+        let expected_abi = installed.constructor_abi;
+        apply_authorized(&mut runtime, &config, LifecycleRequest::Install(installed)).unwrap();
+        let before_actor = runtime.actor_record(actor).unwrap().clone();
+        let before_lanes = runtime.lane_state.clone();
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::UpgradeActor(incompatible.clone()),
+            ),
+            Err(LifecycleError::InvalidRequest)
+        );
+        assert_eq!(runtime.actor_record(actor), Some(&before_actor));
+        assert_eq!(runtime.lane_state, before_lanes);
+        assert_eq!(runtime.snapshot().authority_dispositions.len(), 3);
+        assert_eq!(
+            runtime
+                .snapshot()
+                .authority_dispositions
+                .last()
+                .unwrap()
+                .result,
+            Err(LifecycleError::InvalidRequest)
+        );
+
+        incompatible.constructor_abi = expected_abi;
+        assert!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::UpgradeActor(incompatible),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            runtime.actor_record(actor).unwrap().constructor_abi,
+            expected_abi
+        );
+    }
+
+    #[test]
+    fn present_empty_installation_data_consumes_one_closure_reference() {
+        let mut config = config(1);
+        config.runtime_contract.resources.max_artifact_references = 4;
+        config
+            .runtime_contract
+            .resources
+            .max_artifact_referenced_bytes = 400;
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let mut install = install(config.identity.agent, None, "empty-counts");
+        set_installation_data(&mut install, Vec::new());
+        assert_eq!(
+            apply_authorized(&mut runtime, &config, LifecycleRequest::Install(install),),
+            Err(LifecycleError::ResourceLimit)
+        );
+        assert!(runtime.is_empty());
     }
 
     #[test]
@@ -4916,6 +5300,7 @@ mod tests {
                 package: request.package.clone(),
                 agent_schema: request.agent_schema.clone(),
                 role_policies: request.role_policies.clone(),
+                constructor_abi: request.constructor_abi,
                 state_layout: request.state_layout,
                 contract: request.contract,
                 requirements: request.requirements,
@@ -6349,6 +6734,7 @@ mod tests {
                 hash: Hash([0x96; 32]),
                 len: 100,
             },
+            constructor_abi: first_entry.constructor_abi,
             state_layout: first_entry.state_layout,
             contract: crate::agent::contract::ActorPackageContract::canonical(),
             requirements: RuntimeRequirements {
@@ -6510,6 +6896,106 @@ mod tests {
         assert!(matches!(
             StandardAgentRuntime::restore(state_overflow),
             Err(LifecycleError::ResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn restore_revalidates_installation_data_forest_debt_and_suspension_invariants() {
+        let config = config(2);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let mut parent = install(config.identity.agent, None, "parent");
+        set_installation_data(&mut parent, Vec::new());
+        let parent_id = parent.entry.actor;
+        runtime.install(parent, Hash([0xe1; 32])).unwrap();
+        let child = install(config.identity.agent, Some(parent_id), "child");
+        runtime.install(child, Hash([0xe2; 32])).unwrap();
+        let snapshot = runtime.snapshot();
+        assert!(StandardAgentRuntime::restore(snapshot.clone()).is_ok());
+
+        let mut missing_parent = snapshot.clone();
+        missing_parent
+            .actors
+            .retain(|actor| actor.record.entry.actor != parent_id);
+        assert!(matches!(
+            StandardAgentRuntime::restore(missing_parent),
+            Err(LifecycleError::InvalidRequest)
+        ));
+
+        let mut forged_children = snapshot.clone();
+        forged_children
+            .actors
+            .iter_mut()
+            .find(|actor| actor.record.entry.actor == parent_id)
+            .unwrap()
+            .debt
+            .children += 1;
+        assert!(matches!(
+            StandardAgentRuntime::restore(forged_children),
+            Err(LifecycleError::InvalidRequest)
+        ));
+
+        let mut suspended_parent = snapshot.clone();
+        suspended_parent
+            .actors
+            .iter_mut()
+            .find(|actor| actor.record.entry.actor == parent_id)
+            .unwrap()
+            .record
+            .entry
+            .suspended = true;
+        assert!(
+            StandardAgentRuntime::restore(suspended_parent.clone()).is_ok(),
+            "suspending a non-leaf actor is a legal live-runtime state"
+        );
+        let parent = suspended_parent
+            .actors
+            .iter()
+            .find(|actor| actor.record.entry.actor == parent_id)
+            .unwrap();
+        let request = Hash([0xe3; 32]);
+        suspended_parent
+            .machine_continuations
+            .push(StandardMachineContinuation {
+                invocation: InvocationId([0xe4; 32]),
+                actor: parent_id,
+                incarnation: parent.record.state_generation,
+                deployment: parent.record.entry.deployment,
+                program: parent.record.entry.program,
+                mode: super::super::MethodMode::Query,
+                request,
+                work: request,
+                ready_sequence: 1,
+                accepted: None,
+                authority: None,
+                observed_slot: 1,
+                continuation: super::super::execution::ActorMachineContinuation {
+                    machine: super::super::execution::PortableMachineSnapshot {
+                        pc: 0,
+                        gas_remaining: 1,
+                        registers: [0; vos_pvm_program::REGISTER_COUNT],
+                        memory: Vec::new(),
+                    },
+                    fetch_index: 0,
+                    host_budget: super::super::execution::ActorHostBudget::default(),
+                },
+            });
+        assert!(matches!(
+            StandardAgentRuntime::restore(suspended_parent),
+            Err(LifecycleError::InvalidRequest)
+        ));
+
+        let mut aliased_data = snapshot;
+        let parent = aliased_data
+            .actors
+            .iter_mut()
+            .find(|actor| actor.record.entry.actor == parent_id)
+            .unwrap();
+        parent.record.installation_data = Some(parent.record.package.clone());
+        parent.record.entry.installation_data = parent.record.installation_data.clone();
+        assert!(matches!(
+            StandardAgentRuntime::restore(aliased_data),
+            Err(LifecycleError::InvalidRequest)
         ));
     }
 
@@ -6859,6 +7345,7 @@ mod tests {
                 hash: Hash([18; 32]),
                 len: 100,
             },
+            constructor_abi: Hash([14; 32]),
             state_layout: Hash([12; 32]),
             contract: crate::agent::contract::ActorPackageContract::canonical(),
             requirements,
@@ -6913,6 +7400,7 @@ mod tests {
         let program = installed.entry.program;
         let requirements = installed.requirements;
         let state_layout = installed.state_layout;
+        let constructor_abi = installed.constructor_abi;
         apply_authorized(&mut runtime, &config, LifecycleRequest::Install(installed)).unwrap();
 
         let stale_suspend = suspend(actor, deployment_a);
@@ -6938,6 +7426,7 @@ mod tests {
                     hash: Hash([0x72; 32]),
                     len: 100,
                 },
+                constructor_abi,
                 state_layout,
                 contract: crate::agent::contract::ActorPackageContract::canonical(),
                 requirements,
@@ -7018,6 +7507,7 @@ mod tests {
                         hash: Hash([18; 32]),
                         len: 100,
                     },
+                    constructor_abi: Hash([14; 32]),
                     state_layout: Hash([12; 32]),
                     contract: crate::agent::contract::ActorPackageContract::canonical(),
                     requirements,

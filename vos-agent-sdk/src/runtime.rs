@@ -24,10 +24,12 @@ pub const MAX_RUNTIME_SCHEMA_BYTES: usize = 16 * 1024;
 /// Largest signed method-policy preimage staged alongside the actor PVM.
 pub const MAX_RUNTIME_EXECUTION_ARTIFACT_BYTES: usize = 64 * 1024;
 /// Complete outer-input availability ceiling: one actor PVM, schema and
-/// policy artifacts, plus the bounded caller-selected availability map.
+/// policy artifacts, immutable installation data, plus the bounded
+/// caller-selected availability map.
 pub const MAX_RUNTIME_AVAILABILITY_BYTES: usize = MAX_RUNTIME_PROGRAM_BYTES
     + MAX_RUNTIME_SCHEMA_BYTES
     + MAX_RUNTIME_EXECUTION_ARTIFACT_BYTES
+    + crate::MAX_INSTALLATION_DATA_BYTES
     + MAX_RUNTIME_CALLER_AVAILABILITY_BYTES;
 pub const MAX_AFTER_COMMIT_MERGE_MESSAGES: usize = 256;
 
@@ -83,9 +85,19 @@ impl RuntimeBlob {
     }
 }
 
-fn availability_valid(values: &[RuntimeBlob]) -> bool {
+fn installation_reference_valid(reference: &BlobRef) -> bool {
+    reference.hash != Hash::ZERO && reference.len <= crate::MAX_INSTALLATION_DATA_BYTES as u64
+}
+
+fn availability_valid(values: &[RuntimeBlob], installation_data: Option<&BlobRef>) -> bool {
     values.len() <= MAX_RUNTIME_AVAILABILITY_ITEMS
         && values.iter().all(RuntimeBlob::validate)
+        && installation_data.is_none_or(installation_reference_valid)
+        && installation_data
+            .is_none_or(|required| values.iter().any(|blob| blob.reference == *required))
+        && values
+            .iter()
+            .all(|blob| blob.reference.len != 0 || installation_data == Some(&blob.reference))
         && values
             .windows(2)
             .all(|pair| pair[0].reference < pair[1].reference)
@@ -95,11 +107,13 @@ fn availability_valid(values: &[RuntimeBlob]) -> bool {
             .is_some_and(|total| total <= MAX_RUNTIME_AVAILABILITY_BYTES)
 }
 
-fn required_refs_valid(values: &[BlobRef]) -> bool {
+fn required_refs_valid(values: &[BlobRef], installation_data: Option<&BlobRef>) -> bool {
     values.len() <= MAX_RUNTIME_AVAILABILITY_ITEMS
+        && installation_data.is_none_or(installation_reference_valid)
+        && installation_data.is_none_or(|required| values.iter().any(|value| value == required))
         && values.iter().all(|reference| {
             reference.hash != Hash::ZERO
-                && reference.len != 0
+                && (reference.len != 0 || installation_data == Some(reference))
                 && reference.len <= MAX_RUNTIME_AVAILABILITY_BYTES as u64
         })
         && values.windows(2).all(|pair| pair[0] < pair[1])
@@ -160,6 +174,10 @@ pub struct InvocationWork {
     pub mode: MethodMode,
     pub origin: InvocationOrigin,
     pub message: Vec<u8>,
+    /// Exact installed constructor-argument object, when this actor has one.
+    /// This role marker is required because a present-empty object has a
+    /// legitimate zero-length BlobRef while all other availability does not.
+    pub installation_data: Option<BlobRef>,
     pub availability: Vec<RuntimeBlob>,
     pub gas: u64,
     /// Exact-result recovery may read an existing disposition but cannot run
@@ -179,7 +197,7 @@ impl InvocationWork {
             && self.program != ProgramId::ZERO
             && self.origin.validate()
             && self.message.len() <= MAX_INVOCATION_MESSAGE_BYTES
-            && availability_valid(&self.availability)
+            && availability_valid(&self.availability, self.installation_data.as_ref())
             && self.gas != 0
     }
 
@@ -337,6 +355,9 @@ pub struct ResumeWork {
     pub mode: MethodMode,
     pub continuation: BlobRef,
     pub ready_sequence: u64,
+    /// Role marker for the exact installation-data ref retained in the
+    /// accepted invocation. It is part of the resume tuple.
+    pub installation_data: Option<BlobRef>,
     /// Exact preimages named by the yielded continuation. This map must cover
     /// the yielded `required` set with no missing, extra, or aliased entry.
     pub availability: Vec<RuntimeBlob>,
@@ -353,7 +374,7 @@ impl ResumeWork {
             self.program,
             &self.continuation,
         ) && self.ready_sequence != 0
-            && availability_valid(&self.availability)
+            && availability_valid(&self.availability, self.installation_data.as_ref())
             && self.input.as_ref().is_none_or(ResumeInput::validate)
     }
 }
@@ -443,6 +464,9 @@ pub struct YieldedInvocation {
     pub mode: MethodMode,
     pub continuation: BlobRef,
     pub ready_sequence: u64,
+    /// Role marker permitting this exact required ref, and only this ref, to
+    /// have length zero for a present-empty constructor argument object.
+    pub installation_data: Option<BlobRef>,
     /// Strictly sorted immutable preimages which the host must re-supply on
     /// resume. The continuation retains references, never catalog bytes.
     pub required: Vec<BlobRef>,
@@ -459,7 +483,7 @@ impl YieldedInvocation {
             self.program,
             &self.continuation,
         ) && self.ready_sequence != 0
-            && required_refs_valid(&self.required)
+            && required_refs_valid(&self.required, self.installation_data.as_ref())
             && match self.reason {
                 YieldReason::Cooperative => true,
                 YieldReason::Await { call } => call != CallId::ZERO,
@@ -543,6 +567,7 @@ mod tests {
                 len: 128,
             },
             ready_sequence: 7,
+            installation_data: None,
             availability: alloc::vec![],
             input: None,
         };
@@ -571,6 +596,7 @@ mod tests {
             mode: MethodMode::Linear,
             continuation: BlobRef::of_bytes(b"continuation"),
             ready_sequence: 1,
+            installation_data: None,
             availability: availability.clone(),
             input: None,
         };
@@ -594,6 +620,7 @@ mod tests {
             mode: resume.mode,
             continuation: resume.continuation,
             ready_sequence: 1,
+            installation_data: None,
             required: required.clone(),
             reason: YieldReason::Cooperative,
         };
@@ -632,6 +659,7 @@ mod tests {
             mode: MethodMode::Linear,
             origin: InvocationOrigin::anonymous(),
             message: alloc::vec![],
+            installation_data: None,
             availability,
             gas: 1,
             recovery_only: false,
@@ -642,5 +670,47 @@ mod tests {
         assert!(!invocation.validate());
         invocation.availability[1] = invocation.availability[0].clone();
         assert!(!invocation.validate());
+    }
+
+    #[test]
+    fn present_empty_installation_data_is_the_only_zero_length_required_role() {
+        let installation = BlobRef::of_bytes(&[]);
+        let empty = RuntimeBlob {
+            reference: installation.clone(),
+            bytes: alloc::vec![],
+        };
+        let mut resume = ResumeWork {
+            invocation: InvocationId([1; 32]),
+            actor: ActorId([2; 32]),
+            incarnation: Hash([3; 32]),
+            deployment: DeploymentId([4; 32]),
+            program: ProgramId([5; 32]),
+            mode: MethodMode::Linear,
+            continuation: BlobRef::of_bytes(b"continuation"),
+            ready_sequence: 1,
+            installation_data: Some(installation.clone()),
+            availability: alloc::vec![empty],
+            input: None,
+        };
+        assert!(resume.validate());
+        resume.installation_data = None;
+        assert!(!resume.validate());
+
+        let mut yielded = YieldedInvocation {
+            invocation: resume.invocation,
+            actor: resume.actor,
+            incarnation: resume.incarnation,
+            deployment: resume.deployment,
+            program: resume.program,
+            mode: resume.mode,
+            continuation: resume.continuation,
+            ready_sequence: 1,
+            installation_data: Some(installation.clone()),
+            required: alloc::vec![installation],
+            reason: YieldReason::Cooperative,
+        };
+        assert!(yielded.validate());
+        yielded.installation_data = None;
+        assert!(!yielded.validate());
     }
 }

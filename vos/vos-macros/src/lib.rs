@@ -902,11 +902,18 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let agent_state = quote! {
         #[doc(hidden)]
         fn __load_agent_state(
+            installation_data: Option<&[u8]>,
             #linear_argument: Option<&[u8]>,
             #merge_argument: Option<&[u8]>,
             #local_argument: Option<&[u8]>,
         ) -> Option<Self> {
-            let mut actor = Self::create();
+            let mut actor = match (Self::__VOS_REQUIRES_CONSTRUCTOR_ARGS, installation_data) {
+                (true, Some(args)) => Self::__vos_create_with_args(args),
+                (false, None) => Self::__vos_create_with_args(&[]),
+                // Missing constructor bytes and unexpected bytes are
+                // both hard ABI failures; never fall back to create/default.
+                _ => return None,
+            };
             #load_linear
             #load_merge
             #load_local
@@ -1985,25 +1992,22 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     // it has no named init fields to surface in meta and bypasses the
     // per-param `.expect()` extraction below.
     let raw_args_ctor = constructor_params.len() == 1 && is_byte_slice(&constructor_params[0].1);
+    let requires_constructor_args = !constructor_params.is_empty();
 
     // Constructor field metadata
-    let ctor_field_metas: Vec<_> = if raw_args_ctor {
-        Vec::new()
-    } else {
-        constructor_params
-            .iter()
-            .map(|(name, ty)| {
-                let name_str = name.to_string();
-                let ty_str = ty_string(ty);
-                quote! {
-                    vos::metadata::FieldMeta {
-                        name: #name_str,
-                        ty: #ty_str,
-                    }
+    let ctor_field_metas: Vec<_> = constructor_params
+        .iter()
+        .map(|(name, ty)| {
+            let name_str = name.to_string();
+            let ty_str = ty_string(ty);
+            quote! {
+                vos::metadata::FieldMeta {
+                    name: #name_str,
+                    ty: #ty_str,
                 }
-            })
-            .collect()
-    };
+            }
+        })
+        .collect();
 
     // An impl with no `#[msg]` handlers has no messages, so all the
     // arm vectors are empty and the aggregated enum would be zero-variant. A
@@ -2182,7 +2186,10 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     };
 
-    // Generate __vos_create() — reads init args from storage if constructor has params
+    // Keep the no-argument symbol for legacy actor kinds. AgentActor dispatch
+    // always constructs through `__vos_create_with_args`; a parameterized
+    // AgentActor therefore leaves this symbol fail-closed and has no empty or
+    // default constructor fallback.
     let vos_create = if constructor_params.is_empty() {
         quote! {
             fn __vos_create() -> Self {
@@ -2190,16 +2197,10 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     } else if agent_messages {
-        // The standard-agent invocation ABI currently supplies only the three
-        // state lanes, invocation control, and the message. Never substitute
-        // empty/default constructor values: package admission rejects this
-        // surface until signed installation data is plumbed into the guest.
-        // Keeping the fail-closed seam here lets that follow-up replace one
-        // branch without changing constructor codecs or actor source.
         quote! {
             fn __vos_create() -> Self {
                 panic!(
-                    "parameterized #[actor(agent)] construction requires signed installation data; this runtime must reject the package until that input is available"
+                    "parameterized #[actor(agent)] construction requires its exact canonical constructor arguments; this runtime must reject the package until those bytes are available"
                 )
             }
         }
@@ -2329,6 +2330,8 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Re-emit the impl block with non-message methods + __vos_create + __vos_on_start
     let passthrough_impl = quote! {
         impl #actor_ty {
+            #[doc(hidden)]
+            const __VOS_REQUIRES_CONSTRUCTOR_ARGS: bool = #requires_constructor_args;
             #vos_create
             #vos_create_with_args
             #vos_on_start

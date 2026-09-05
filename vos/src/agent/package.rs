@@ -16,7 +16,7 @@ use super::contract::{
 };
 use super::{LaneSet, PackageKind, RuntimeCapabilities, RuntimeRequirements};
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
-use crate::service::{DeploymentId, Hash, ProducerId, ProgramId};
+use crate::service::{BlobRef, DeploymentId, Hash, ProducerId, ProgramId};
 use crate::service::{
     DeploymentSignature, PackageDiagnostics, PackageRolePolicies, PackageTaskDependency,
     artifact_hash, task_dependencies_hash,
@@ -156,8 +156,6 @@ pub enum PackageError {
     InvalidRuntimeResources,
     UnsupportedRuntimeMigration,
     InvalidRuntimeCapacity,
-    UnsupportedActorConstructor,
-    UnsupportedConstantState,
     UnsupportedActorStorage,
     ArtifactsTooLarge,
     MissingSignature,
@@ -319,20 +317,6 @@ impl Package {
             // of letting a host ECALL fail after actor code has started.
             return Err(PackageError::UnsupportedActorStorage);
         }
-        // The initial runtime creates actors through `Actor::create()` and
-        // has no authenticated installation-config channel. Accepting a
-        // constructor payload or constant field would silently replace its
-        // value with `new()` on every lane hydration, so reject both shapes
-        // until that lifecycle contract exists.
-        if !metadata.constructor.is_empty() {
-            return Err(PackageError::UnsupportedActorConstructor);
-        }
-        if agent_schema
-            .inline_fields()
-            .any(|field| field.persistence == super::sdk::schema::FieldPersistence::Constant)
-        {
-            return Err(PackageError::UnsupportedConstantState);
-        }
         if sdk_actor_runtime_requirements(
             &agent_schema,
             &metadata,
@@ -365,6 +349,98 @@ impl Package {
             return Err(PackageError::InvalidActorArtifacts);
         }
         Ok(())
+    }
+
+    /// Whether this signed actor shape requires immutable installation data
+    /// before an inner machine may be created.
+    pub fn requires_installation_data(&self) -> Result<bool, PackageError> {
+        self.has_constructor_arguments()
+    }
+
+    /// Nonzero commitment of the exact signed constructor ABI.
+    ///
+    /// The leading mode byte distinguishes zero-argument, raw `&[u8]`, and
+    /// named typed constructors. Ordered field names and canonical type
+    /// spellings then prevent an upgrade from reinterpreting already-owned
+    /// immutable argument bytes under a different decoder.
+    pub fn constructor_abi(&self) -> Result<Hash, PackageError> {
+        self.validate()?;
+        if !matches!(self.manifest.kind, PackageKind::Actor { .. }) {
+            return Err(PackageError::WrongKind);
+        }
+        let metadata =
+            crate::metadata::decode(&self.schemas).ok_or(PackageError::InvalidActorArtifacts)?;
+        let mode = match metadata.constructor.as_slice() {
+            [] => 0_u8,
+            [field] if field.ty == "&[u8]" => 1_u8,
+            _ => 2_u8,
+        };
+        let mut descriptor = Vec::new();
+        descriptor.extend_from_slice(b"VCA1");
+        descriptor.push(mode);
+        let count = u16::try_from(metadata.constructor.len())
+            .map_err(|_| PackageError::InvalidActorArtifacts)?;
+        descriptor.extend_from_slice(&count.to_le_bytes());
+        for field in &metadata.constructor {
+            let name = field.name.as_bytes();
+            let ty = field.ty.as_bytes();
+            let name_len =
+                u16::try_from(name.len()).map_err(|_| PackageError::InvalidActorArtifacts)?;
+            let ty_len =
+                u16::try_from(ty.len()).map_err(|_| PackageError::InvalidActorArtifacts)?;
+            descriptor.extend_from_slice(&name_len.to_le_bytes());
+            descriptor.extend_from_slice(name);
+            descriptor.extend_from_slice(&ty_len.to_le_bytes());
+            descriptor.extend_from_slice(ty);
+        }
+        Ok(Hash::digest(
+            b"vos/agent/constructor-abi/v1",
+            &[&descriptor],
+        ))
+    }
+
+    /// Validate the presence/length class of immutable construction bytes
+    /// against the signed actor metadata. Typed/raw constructors require a
+    /// present object. Zero-argument constructors reject every present object,
+    /// including an empty one: `#[state(const)]` controls lane persistence,
+    /// not constructor arity.
+    pub fn accepts_installation_data(
+        &self,
+        installation_data: Option<&[u8]>,
+    ) -> Result<bool, PackageError> {
+        let constructor = self.has_constructor_arguments()?;
+        Ok(match (constructor, installation_data) {
+            (true, Some(bytes)) => bytes.len() <= super::MAX_INSTALLATION_DATA_BYTES,
+            (false, None) => true,
+            _ => false,
+        })
+    }
+
+    /// Reference-only counterpart used when validating an in-place upgrade
+    /// against the immutable object already owned by the actor directory.
+    pub fn accepts_installation_data_reference(
+        &self,
+        installation_data: Option<&BlobRef>,
+    ) -> Result<bool, PackageError> {
+        let constructor = self.has_constructor_arguments()?;
+        Ok(match (constructor, installation_data) {
+            (true, Some(reference)) => {
+                reference.hash != Hash::ZERO
+                    && reference.len <= super::MAX_INSTALLATION_DATA_BYTES as u64
+            }
+            (false, None) => true,
+            _ => false,
+        })
+    }
+
+    fn has_constructor_arguments(&self) -> Result<bool, PackageError> {
+        self.validate()?;
+        if !matches!(self.manifest.kind, PackageKind::Actor { .. }) {
+            return Err(PackageError::WrongKind);
+        }
+        let metadata =
+            crate::metadata::decode(&self.schemas).ok_or(PackageError::InvalidActorArtifacts)?;
+        Ok(!metadata.constructor.is_empty())
     }
 
     /// Stable identity of signed deployment content. The signature wrapper
@@ -732,6 +808,22 @@ mod tests {
         constructor: &[crate::metadata::FieldMeta {
             name: "initial",
             ty: "u64",
+        }],
+        ..ACTOR_META
+    };
+
+    const RAW_CONSTRUCTOR_META: crate::metadata::ActorMeta = crate::metadata::ActorMeta {
+        constructor: &[crate::metadata::FieldMeta {
+            name: "args",
+            ty: "&[u8]",
+        }],
+        ..ACTOR_META
+    };
+
+    const STRING_CONSTRUCTOR_META: crate::metadata::ActorMeta = crate::metadata::ActorMeta {
+        constructor: &[crate::metadata::FieldMeta {
+            name: "initial",
+            ty: "String",
         }],
         ..ACTOR_META
     };
@@ -1138,7 +1230,9 @@ mod tests {
             PackageKind::AgentRuntime { .. } => unreachable!(),
         };
         package.manifest.kind = PackageKind::Actor {
-            contract: ActorPackageContract { actor_abi: 2 },
+            contract: ActorPackageContract {
+                actor_abi: super::super::contract::ACTOR_ABI + 1,
+            },
             requirements,
         };
         assert_ne!(package.deployment_id(), canonical_id);
@@ -1287,18 +1381,41 @@ mod tests {
     }
 
     #[test]
-    fn actor_packages_fail_closed_on_unimplemented_install_configuration() {
+    fn actor_packages_admit_immutable_install_configuration() {
         let constructor = actor_package(&CONSTRUCTOR_META, &ACTOR_SCHEMA);
+        assert_eq!(constructor.validate(), Ok(()));
+        assert_eq!(constructor.requires_installation_data(), Ok(true));
+        assert_eq!(constructor.accepts_installation_data(None), Ok(false));
+        assert_eq!(constructor.accepts_installation_data(Some(&[])), Ok(true));
         assert_eq!(
-            constructor.validate(),
-            Err(PackageError::UnsupportedActorConstructor)
+            constructor.accepts_installation_data_reference(Some(&BlobRef::of_bytes(&[]))),
+            Ok(true)
         );
 
         let constant = actor_package(&ACTOR_META, &CONSTANT_SCHEMA);
-        assert_eq!(
-            constant.validate(),
-            Err(PackageError::UnsupportedConstantState)
-        );
+        assert_eq!(constant.validate(), Ok(()));
+        assert_eq!(constant.requires_installation_data(), Ok(false));
+        assert_eq!(constant.accepts_installation_data(None), Ok(true));
+        assert_eq!(constant.accepts_installation_data(Some(&[])), Ok(false));
+
+        let ordinary = actor_package(&ACTOR_META, &ACTOR_SCHEMA);
+        assert_eq!(ordinary.requires_installation_data(), Ok(false));
+        assert_eq!(ordinary.accepts_installation_data(None), Ok(true));
+        assert_eq!(ordinary.accepts_installation_data(Some(&[])), Ok(false));
+
+        let zero_abi = ordinary.constructor_abi().unwrap();
+        let typed_abi = constructor.constructor_abi().unwrap();
+        let raw_abi = actor_package(&RAW_CONSTRUCTOR_META, &ACTOR_SCHEMA)
+            .constructor_abi()
+            .unwrap();
+        let string_abi = actor_package(&STRING_CONSTRUCTOR_META, &ACTOR_SCHEMA)
+            .constructor_abi()
+            .unwrap();
+        assert_ne!(zero_abi, Hash::ZERO);
+        assert_ne!(zero_abi, typed_abi);
+        assert_ne!(typed_abi, raw_abi);
+        assert_ne!(typed_abi, string_abi);
+        assert_ne!(raw_abi, string_abi);
     }
 
     #[test]

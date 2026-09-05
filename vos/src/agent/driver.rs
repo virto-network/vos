@@ -91,6 +91,7 @@ struct CatalogKeep {
     retained_programs: BTreeSet<ProgramId>,
     schemas: BTreeMap<DeploymentId, BlobRef>,
     policies: BTreeMap<DeploymentId, BlobRef>,
+    installation_data: BTreeMap<Hash, BlobRef>,
 }
 
 impl CatalogKeep {
@@ -138,6 +139,25 @@ impl CatalogKeep {
         let mut required_programs = BTreeSet::from([references.runtime_program]);
         let mut schemas = BTreeMap::new();
         let mut policies = BTreeMap::new();
+        let mut installation_data = BTreeMap::<Hash, BlobRef>::new();
+        for actor in &references.actors {
+            if let Some(reference) = &actor.installation_data {
+                if reference.hash == Hash::ZERO
+                    || reference.len > super::MAX_INSTALLATION_DATA_BYTES as u64
+                {
+                    return Err(AgentStoreError::Corrupt);
+                }
+                match installation_data.get(&reference.hash) {
+                    Some(existing) if existing != reference => {
+                        return Err(AgentStoreError::Corrupt);
+                    }
+                    Some(_) => {}
+                    None => {
+                        installation_data.insert(reference.hash, reference.clone());
+                    }
+                }
+            }
+        }
         for (deployment, artifacts) in deployments {
             match required_packages.get(&artifacts.package.hash) {
                 Some(existing) if existing != &artifacts.package => {
@@ -162,6 +182,7 @@ impl CatalogKeep {
             retained_programs,
             schemas,
             policies,
+            installation_data,
         })
     }
 }
@@ -314,6 +335,20 @@ pub trait AgentImageStore {
     ) -> Result<Option<RuntimeBlob>, AgentStoreError>;
     fn remove_actor_policies(&mut self, deployment: DeploymentId) -> Result<(), AgentStoreError>;
 
+    /// Persist exact immutable canonical constructor-argument bytes by
+    /// content hash. Empty bytes are valid when their ordinary BlobRef is
+    /// supplied; const fields are reconstructed by the constructor.
+    fn put_installation_data(
+        &mut self,
+        reference: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<bool, AgentStoreError>;
+    fn load_installation_data(
+        &self,
+        reference: &BlobRef,
+    ) -> Result<Option<RuntimeBlob>, AgentStoreError>;
+    fn remove_installation_data(&mut self, reference: &BlobRef) -> Result<(), AgentStoreError>;
+
     /// Persist and resolve executable actor bytes by their exact ProgramId.
     fn put_program(&mut self, program: ProgramId, bytes: &[u8]) -> Result<bool, AgentStoreError>;
     fn load_program(&self, program: ProgramId) -> Result<Option<Vec<u8>>, AgentStoreError>;
@@ -335,6 +370,7 @@ pub struct MemoryAgentStore {
     packages: BTreeMap<Hash, Vec<u8>>,
     schemas: BTreeMap<DeploymentId, RuntimeBlob>,
     policies: BTreeMap<DeploymentId, RuntimeBlob>,
+    installation_data: BTreeMap<Hash, Vec<u8>>,
     programs: BTreeMap<ProgramId, Vec<u8>>,
 }
 
@@ -465,6 +501,41 @@ impl AgentImageStore for MemoryAgentStore {
         Ok(())
     }
 
+    fn put_installation_data(
+        &mut self,
+        reference: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<bool, AgentStoreError> {
+        if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES || !reference.matches(bytes) {
+            return Err(AgentStoreError::Corrupt);
+        }
+        put_memory_artifact(&mut self.installation_data, reference.hash, bytes)
+    }
+
+    fn load_installation_data(
+        &self,
+        reference: &BlobRef,
+    ) -> Result<Option<RuntimeBlob>, AgentStoreError> {
+        match self.installation_data.get(&reference.hash) {
+            Some(bytes)
+                if bytes.len() <= super::MAX_INSTALLATION_DATA_BYTES
+                    && reference.matches(bytes) =>
+            {
+                Ok(Some(RuntimeBlob {
+                    reference: reference.clone(),
+                    bytes: bytes.clone(),
+                }))
+            }
+            Some(_) => Err(AgentStoreError::Corrupt),
+            None => Ok(None),
+        }
+    }
+
+    fn remove_installation_data(&mut self, reference: &BlobRef) -> Result<(), AgentStoreError> {
+        self.installation_data.remove(&reference.hash);
+        Ok(())
+    }
+
     fn put_program(&mut self, program: ProgramId, bytes: &[u8]) -> Result<bool, AgentStoreError> {
         if bytes.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
             || ProgramId::of_pvm(bytes) != program
@@ -527,6 +598,15 @@ impl AgentImageStore for MemoryAgentStore {
                 return Err(AgentStoreError::Corrupt);
             }
         }
+        for (hash, reference) in &keep.installation_data {
+            let bytes = self
+                .installation_data
+                .get(hash)
+                .ok_or(AgentStoreError::Corrupt)?;
+            if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES || !reference.matches(bytes) {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
 
         self.packages
             .retain(|hash, _| keep.retained_packages.contains(hash));
@@ -536,6 +616,8 @@ impl AgentImageStore for MemoryAgentStore {
             .retain(|deployment, _| keep.schemas.contains_key(deployment));
         self.policies
             .retain(|deployment, _| keep.policies.contains_key(deployment));
+        self.installation_data
+            .retain(|hash, _| keep.installation_data.contains_key(hash));
         Ok(())
     }
 }
@@ -673,7 +755,7 @@ impl FileAgentStore {
             };
             if !matches!(
                 name.as_str(),
-                "packages" | "programs" | "schemas" | "policies"
+                "packages" | "programs" | "schemas" | "policies" | "installation-data"
             ) {
                 return Err(AgentStoreError::Corrupt);
             }
@@ -983,6 +1065,39 @@ impl AgentImageStore for FileAgentStore {
         self.remove_artifact(&self.catalog_path("policies", &deployment.0, "roles"))
     }
 
+    fn put_installation_data(
+        &mut self,
+        reference: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<bool, AgentStoreError> {
+        if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES || !reference.matches(bytes) {
+            return Err(AgentStoreError::Corrupt);
+        }
+        self.put_artifact(
+            &self.catalog_path("installation-data", &reference.hash.0, "args"),
+            bytes,
+        )
+    }
+
+    fn load_installation_data(
+        &self,
+        reference: &BlobRef,
+    ) -> Result<Option<RuntimeBlob>, AgentStoreError> {
+        let path = self.catalog_path("installation-data", &reference.hash.0, "args");
+        match self.read_bounded_regular(&path, super::MAX_INSTALLATION_DATA_BYTES)? {
+            Some(bytes) if reference.matches(&bytes) => Ok(Some(RuntimeBlob {
+                reference: reference.clone(),
+                bytes,
+            })),
+            Some(_) => Err(AgentStoreError::Corrupt),
+            None => Ok(None),
+        }
+    }
+
+    fn remove_installation_data(&mut self, reference: &BlobRef) -> Result<(), AgentStoreError> {
+        self.remove_artifact(&self.catalog_path("installation-data", &reference.hash.0, "args"))
+    }
+
     fn put_program(&mut self, program: ProgramId, bytes: &[u8]) -> Result<bool, AgentStoreError> {
         if bytes.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
             || ProgramId::of_pvm(bytes) != program
@@ -1011,7 +1126,13 @@ impl AgentImageStore for FileAgentStore {
     ) -> Result<(), AgentStoreError> {
         let keep = CatalogKeep::from_references(references)?;
         self.validate_catalog_shape()?;
-        for kind in ["packages", "programs", "schemas", "policies"] {
+        for kind in [
+            "packages",
+            "programs",
+            "schemas",
+            "policies",
+            "installation-data",
+        ] {
             self.validate_catalog_directory(kind)?;
         }
 
@@ -1056,6 +1177,15 @@ impl AgentImageStore for FileAgentStore {
                 return Err(AgentStoreError::Corrupt);
             }
         }
+        for (hash, reference) in &keep.installation_data {
+            let path = self.catalog_path("installation-data", &hash.0, "args");
+            let bytes = self
+                .read_bounded_regular(&path, super::MAX_INSTALLATION_DATA_BYTES)?
+                .ok_or(AgentStoreError::Corrupt)?;
+            if !reference.matches(&bytes) {
+                return Err(AgentStoreError::Corrupt);
+            }
+        }
 
         let retained_packages = keep
             .retained_packages
@@ -1077,11 +1207,17 @@ impl AgentImageStore for FileAgentStore {
             .keys()
             .map(|deployment| self.catalog_path("policies", &deployment.0, "roles"))
             .collect::<BTreeSet<_>>();
+        let retained_installation_data = keep
+            .installation_data
+            .keys()
+            .map(|hash| self.catalog_path("installation-data", &hash.0, "args"))
+            .collect::<BTreeSet<_>>();
 
         self.reconcile_directory("packages", &retained_packages)?;
         self.reconcile_directory("programs", &retained_programs)?;
         self.reconcile_directory("schemas", &retained_schemas)?;
         self.reconcile_directory("policies", &retained_policies)?;
+        self.reconcile_directory("installation-data", &retained_installation_data)?;
         Ok(())
     }
 }
@@ -1500,6 +1636,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
+        installation_data: Option<Vec<u8>>,
         package: &Package,
     ) -> Result<LifecycleRequest, AgentDriverError> {
         if installation_id == crate::service::InstallationId::ZERO
@@ -1511,6 +1648,16 @@ impl<S: AgentImageStore> AgentDriver<S> {
             return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
         }
         verify_trusted_package(self.trust.as_ref(), &self.image.config, package)?;
+        if installation_data
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() > super::MAX_INSTALLATION_DATA_BYTES)
+            || package
+                .accepts_installation_data(installation_data.as_deref())
+                .map_err(AgentDriverError::Package)?
+                == false
+        {
+            return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
+        }
         let PackageKind::Actor {
             contract,
             requirements,
@@ -1528,6 +1675,26 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let agent_schema = super::schema::decode(&package.agent_schema).ok_or(
             AgentDriverError::Package(PackageError::InvalidActorArtifacts),
         )?;
+        let installation_data = installation_data.map(|bytes| super::InstallationData {
+            reference: BlobRef::of_bytes(&bytes),
+            bytes,
+        });
+        let installation_reference = installation_data
+            .as_ref()
+            .map(|data| data.reference.clone());
+        let package_reference = BlobRef::of_bytes(&package.encode());
+        let schema_reference = BlobRef::of_bytes(&package.agent_schema);
+        let policy_reference = BlobRef::of_bytes(&package.role_policies);
+        let constructor_abi = package
+            .constructor_abi()
+            .map_err(AgentDriverError::Package)?;
+        if installation_reference.as_ref().is_some_and(|data| {
+            [&package_reference, &schema_reference, &policy_reference]
+                .into_iter()
+                .any(|artifact| artifact.hash == data.hash)
+        }) {
+            return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
+        }
         Ok(LifecycleRequest::Install(InstallActor {
             installation_id,
             registry_reservation,
@@ -1537,17 +1704,21 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 parent,
                 deployment: package.deployment_id(),
                 program: package.manifest.program,
-                package: BlobRef::of_bytes(&package.encode()),
-                agent_schema: BlobRef::of_bytes(&package.agent_schema),
-                role_policies: BlobRef::of_bytes(&package.role_policies),
+                package: package_reference.clone(),
+                agent_schema: schema_reference.clone(),
+                role_policies: policy_reference.clone(),
+                constructor_abi,
+                installation_data: installation_reference,
                 state_layout: agent_schema.state_layout_hash(),
                 lanes: requirements.lanes,
                 suspended: false,
             },
             producer: package.deployment_signature.producer,
-            package: BlobRef::of_bytes(&package.encode()),
-            agent_schema: BlobRef::of_bytes(&package.agent_schema),
-            role_policies: BlobRef::of_bytes(&package.role_policies),
+            package: package_reference,
+            agent_schema: schema_reference,
+            role_policies: policy_reference,
+            constructor_abi,
+            installation_data,
             state_layout: agent_schema.state_layout_hash(),
             contract,
             requirements,
@@ -1561,6 +1732,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
+        installation_data: Option<Vec<u8>>,
         package: &Package,
     ) -> Result<ActorEntry, AgentDriverError> {
         let request = self.actor_install_request(
@@ -1568,6 +1740,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             registry_reservation,
             name,
             parent,
+            installation_data,
             package,
         )?;
         let admission = self.authorize(authority, &request)?;
@@ -1578,6 +1751,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let package_reference = install.package.clone();
         let schema_reference = install.agent_schema.clone();
         let policy_reference = install.role_policies.clone();
+        let installation_data = install.installation_data.clone();
         let deployment = install.entry.deployment;
         let package_bytes = package.encode();
         let created_package = self.store.put_package(&package_reference, &package_bytes)?;
@@ -1628,6 +1802,30 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 return Err(error.into());
             }
         };
+        let created_installation_data = match installation_data.as_ref() {
+            Some(data) => match self
+                .store
+                .put_installation_data(&data.reference, &data.bytes)
+            {
+                Ok(created) => created,
+                Err(error) => {
+                    if created_policies {
+                        let _ = self.store.remove_actor_policies(deployment);
+                    }
+                    if created_schema {
+                        let _ = self.store.remove_actor_schema(deployment);
+                    }
+                    if created_program {
+                        let _ = self.store.remove_program(package.manifest.program);
+                    }
+                    if created_package {
+                        let _ = self.store.remove_package(&package_reference);
+                    }
+                    return Err(error.into());
+                }
+            },
+            None => false,
+        };
         let reply = self.lifecycle(LifecycleRequest::Authorized {
             admission,
             request: Box::new(LifecycleRequest::Install(install)),
@@ -1641,6 +1839,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 // have reached durable storage before a directory sync error,
                 // and deleting its program would make that image unusable.
                 if matches!(error, AgentDriverError::Lifecycle(_)) {
+                    if created_installation_data && let Some(data) = &installation_data {
+                        let _ = self.store.remove_installation_data(&data.reference);
+                    }
                     if created_policies {
                         let _ = self.store.remove_actor_policies(deployment);
                     }
@@ -1684,6 +1885,25 @@ impl<S: AgentImageStore> AgentDriver<S> {
         else {
             return Err(AgentDriverError::Package(PackageError::WrongKind));
         };
+        let constructor_abi = package
+            .constructor_abi()
+            .map_err(AgentDriverError::Package)?;
+        match self.inspect_actor(actor) {
+            Ok(record) if record.entry.deployment == from_deployment => {
+                if package
+                    .accepts_installation_data_reference(record.entry.installation_data.as_ref())
+                    .map_err(AgentDriverError::Package)?
+                    == false
+                {
+                    return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
+                }
+                if record.entry.constructor_abi != constructor_abi {
+                    return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
+                }
+            }
+            Ok(_) | Err(AgentDriverError::Lifecycle(LifecycleError::NotFound)) => {}
+            Err(error) => return Err(error),
+        }
         if !self.image.config.runtime_contract.supports(contract) {
             return Err(AgentDriverError::Package(PackageError::InvalidActorAbi));
         }
@@ -1699,6 +1919,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             package: BlobRef::of_bytes(&package.encode()),
             agent_schema: BlobRef::of_bytes(&package.agent_schema),
             role_policies: BlobRef::of_bytes(&package.role_policies),
+            constructor_abi,
             state_layout: agent_schema.state_layout_hash(),
             contract,
             requirements,
@@ -1908,7 +2129,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
     fn validate_invocation_directory(
         &self,
         invocation: &ActorInvocation,
-    ) -> Result<(), AgentDriverError> {
+    ) -> Result<ActorDirectoryRecord, AgentDriverError> {
         let directory = match self.inspect_actor(invocation.actor) {
             Ok(record) => record,
             Err(AgentDriverError::Lifecycle(LifecycleError::NotFound)) => {
@@ -1931,7 +2152,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 ActorExecutionError::WrongProgram,
             ));
         }
-        Ok(())
+        Ok(directory)
     }
 
     fn authorized_actor_lifecycle(
@@ -2191,7 +2412,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         // adding caller-selected gas to the outer runtime budget. The guest
         // repeats this check when decoding the execution wire.
         invocation.validate().map_err(AgentDriverError::Execution)?;
-        self.validate_invocation_directory(&invocation)?;
+        let directory = self.validate_invocation_directory(&invocation)?;
         let expected_invocation = invocation.invocation;
         let expected_actor = invocation.actor;
         let expected_incarnation = invocation.incarnation;
@@ -2201,8 +2422,16 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let actor_pvm = self.store.load_program(invocation.program)?;
         let actor_schema = self.store.load_actor_schema(invocation.deployment)?;
         let actor_policies = self.store.load_actor_policies(invocation.deployment)?;
-        let recovery_only =
-            actor_pvm.is_none() || actor_schema.is_none() || actor_policies.is_none();
+        let installation_data = match directory.entry.installation_data.as_ref() {
+            Some(reference) => self.store.load_installation_data(reference)?,
+            None => None,
+        };
+        let installation_missing =
+            directory.entry.installation_data.is_some() && installation_data.is_none();
+        let recovery_only = actor_pvm.is_none()
+            || actor_schema.is_none()
+            || actor_policies.is_none()
+            || installation_missing;
         let empty_blob = || RuntimeBlob {
             reference: BlobRef {
                 hash: Hash::ZERO,
@@ -2210,13 +2439,14 @@ impl<S: AgentImageStore> AgentDriver<S> {
             },
             bytes: Vec::new(),
         };
-        let (actor_pvm, actor_schema, actor_policies) = if recovery_only {
-            (Vec::new(), empty_blob(), empty_blob())
+        let (actor_pvm, actor_schema, actor_policies, installation_data) = if recovery_only {
+            (Vec::new(), empty_blob(), empty_blob(), None)
         } else {
             (
                 actor_pvm.expect("checked above"),
                 actor_schema.expect("checked above"),
                 actor_policies.expect("checked above"),
+                installation_data,
             )
         };
         let output: RuntimeExecutionReturn = execute_runtime_wire(
@@ -2231,6 +2461,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 actor_pvm,
                 actor_schema,
                 actor_policies,
+                installation_data,
             }
             .encode(),
         )?;
@@ -2306,7 +2537,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 &invocation,
             )
             .map_err(AgentDriverError::Authority)?;
-        self.validate_invocation_directory(&invocation)?;
+        let _ = self.validate_invocation_directory(&invocation)?;
         let reply = self.lifecycle(LifecycleRequest::AcknowledgeInvocation {
             scope: invocation.mode.invocation_scope(),
             invocation: invocation.invocation,
@@ -2573,6 +2804,18 @@ fn validate_loaded_actor<S: AgentImageStore>(
         || BlobRef::of_bytes(&package.role_policies) != actor.role_policies
         || artifacts.schema.bytes != package.agent_schema
         || artifacts.policies.bytes != package.role_policies
+        || package
+            .constructor_abi()
+            .map_err(AgentDriverError::Package)?
+            != actor.constructor_abi
+        || artifacts
+            .installation_data
+            .as_ref()
+            .map(|data| &data.reference)
+            != actor.installation_data.as_ref()
+        || !package
+            .accepts_installation_data_reference(actor.installation_data.as_ref())
+            .map_err(AgentDriverError::Package)?
         || requirements.lanes != actor.lanes
     {
         return Err(AgentDriverError::Package(
@@ -2586,6 +2829,7 @@ struct LoadedActorArtifacts {
     program: Vec<u8>,
     schema: RuntimeBlob,
     policies: RuntimeBlob,
+    installation_data: Option<RuntimeBlob>,
 }
 
 fn load_actor_artifacts<S: AgentImageStore>(
@@ -2616,10 +2860,19 @@ fn load_actor_artifacts<S: AgentImageStore>(
     {
         return Err(AgentDriverError::PolicyMismatch(actor.deployment));
     }
+    let installation_data = match actor.installation_data.as_ref() {
+        Some(reference) => Some(
+            store
+                .load_installation_data(reference)?
+                .ok_or(AgentDriverError::PackageUnavailable(reference.hash))?,
+        ),
+        None => None,
+    };
     Ok(LoadedActorArtifacts {
         program,
         schema: schema_blob,
         policies: policy_blob,
+        installation_data,
     })
 }
 
@@ -2775,6 +3028,7 @@ fn validate_standard_sdk_yielded_transition(
         mode: yielded.mode,
         continuation: yielded.continuation.clone(),
         ready_sequence: yielded.ready_sequence,
+        installation_data: yielded.installation_data.clone(),
         availability: availability.clone(),
         input: None,
     };
@@ -2855,7 +3109,7 @@ fn validate_sdk_exact_execution_transition(
             let (record, accepted) = runtime
                 .resolve_clean_resume(resume)
                 .map_err(|_| AgentDriverError::InvalidRuntime)?;
-            let (invocation, _, _, _) = runtime
+            let (invocation, _, _, _, _) = runtime
                 .resolve_clean_invocation(&accepted)
                 .map_err(|_| AgentDriverError::InvalidRuntime)?;
             runtime
@@ -3117,6 +3371,8 @@ mod tests {
                     package: BlobRef::of_bytes(&package_bytes),
                     agent_schema: BlobRef::of_bytes(&schema_bytes),
                     role_policies: BlobRef::of_bytes(&policy_bytes),
+                    constructor_abi: Hash([seed.wrapping_add(1); 32]),
+                    installation_data: None,
                     state_layout: schema.state_layout_hash(),
                     lanes: schema.lanes(),
                     suspended: false,
@@ -3551,6 +3807,7 @@ mod tests {
             mode: crate::agent_sdk::MethodMode::Linear,
             origin: crate::agent_sdk::InvocationOrigin::anonymous(),
             message: invocation.message.clone(),
+            installation_data: None,
             availability: Vec::new(),
             gas: invocation.gas,
             recovery_only: false,
@@ -3884,6 +4141,8 @@ mod tests {
             package: package_reference,
             agent_schema: schema_reference.clone(),
             role_policies: policy_reference.clone(),
+            constructor_abi: Hash([0x33; 32]),
+            installation_data: None,
             state_layout: schema.state_layout_hash(),
             lanes: schema.lanes(),
             suspended: false,
@@ -4023,6 +4282,96 @@ mod tests {
         assert!(store.programs.contains_key(&orphan.entry.program));
         assert!(store.schemas.contains_key(&orphan.entry.deployment));
         assert!(store.policies.contains_key(&orphan.entry.deployment));
+    }
+
+    #[test]
+    fn installation_data_sidecars_preserve_present_empty_and_reject_hostile_content() {
+        let empty_reference = BlobRef::of_bytes(&[]);
+        let bytes = b"immutable constructor args";
+        let reference = BlobRef::of_bytes(bytes);
+
+        let mut memory = MemoryAgentStore::default();
+        assert_eq!(memory.load_installation_data(&empty_reference), Ok(None));
+        assert_eq!(
+            memory.put_installation_data(&empty_reference, &[]),
+            Ok(true)
+        );
+        assert_eq!(
+            memory.load_installation_data(&empty_reference),
+            Ok(Some(RuntimeBlob {
+                reference: empty_reference.clone(),
+                bytes: Vec::new(),
+            }))
+        );
+        assert_eq!(memory.put_installation_data(&reference, bytes), Ok(true));
+        assert_eq!(
+            memory.put_installation_data(&empty_reference, bytes),
+            Err(AgentStoreError::Corrupt)
+        );
+        let oversized = vec![0; super::super::MAX_INSTALLATION_DATA_BYTES + 1];
+        assert_eq!(
+            memory.put_installation_data(&BlobRef::of_bytes(&oversized), &oversized),
+            Err(AgentStoreError::Corrupt)
+        );
+
+        put_runtime_catalog(&mut memory);
+        let mut actor = CatalogFixture::new(0x73, ActorId([0x74; 32]));
+        actor.entry.installation_data = Some(reference.clone());
+        actor.put(&mut memory);
+        memory
+            .reconcile_catalog(&catalog_references(vec![actor.entry.clone()]))
+            .unwrap();
+        assert_eq!(
+            memory
+                .load_installation_data(&reference)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            bytes
+        );
+        memory
+            .reconcile_catalog(&catalog_references(Vec::new()))
+            .unwrap();
+        assert_eq!(memory.load_installation_data(&reference), Ok(None));
+    }
+
+    #[test]
+    fn physical_installation_data_sidecar_reopens_exactly_and_is_pruned_with_its_actor() {
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "vos-agent-installation-data-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let image = directory.join("agent.image");
+        let bytes = b"restart-stable constructor args";
+        let reference = BlobRef::of_bytes(bytes);
+        let mut actor = CatalogFixture::new(0x75, ActorId([0x76; 32]));
+        actor.entry.installation_data = Some(reference.clone());
+
+        {
+            let mut store = FileAgentStore::new(&image);
+            put_runtime_catalog(&mut store);
+            actor.put(&mut store);
+            store.put_installation_data(&reference, bytes).unwrap();
+            store
+                .reconcile_catalog(&catalog_references(vec![actor.entry.clone()]))
+                .unwrap();
+        }
+        let mut reopened = FileAgentStore::new(&image);
+        assert_eq!(
+            reopened.load_installation_data(&reference),
+            Ok(Some(RuntimeBlob {
+                reference: reference.clone(),
+                bytes: bytes.to_vec(),
+            }))
+        );
+        reopened
+            .reconcile_catalog(&catalog_references(Vec::new()))
+            .unwrap();
+        assert_eq!(reopened.load_installation_data(&reference), Ok(None));
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -638,6 +638,8 @@ fn reopen_rejects_a_previous_actor_package_in_the_catalog_closure() {
         package: package_reference.clone(),
         agent_schema: schema_reference.clone(),
         role_policies: policy_reference.clone(),
+        constructor_abi: Hash([0x73; 32]),
+        installation_data: None,
         state_layout: parsed_schema.state_layout_hash(),
         lanes: requirements.lanes,
         suspended: false,
@@ -650,6 +652,8 @@ fn reopen_rejects_a_previous_actor_package_in_the_catalog_closure() {
         package: package_reference.clone(),
         agent_schema: schema_reference.clone(),
         role_policies: policy_reference.clone(),
+        constructor_abi: entry.constructor_abi,
+        installation_data: None,
         state_layout: entry.state_layout,
         contract,
         requirements,
@@ -896,63 +900,66 @@ fn lane_probe_call(
         package: package.clone(),
         agent_schema: schema_reference.clone(),
         role_policies: policy_reference.clone(),
+        constructor_abi: Hash([0xa8; 32]),
+        installation_data: None,
         state_layout: parsed_schema.state_layout_hash(),
         lanes: LaneSet::ALL,
         suspended: false,
     };
-    let state = encode_standard_runtime_state(&StandardRuntimeState {
-        config: Some(config.clone()),
-        actors: vec![StandardActorState {
-            record: ActorRecord {
-                entry,
-                state_generation: Hash([0xa4; 32]),
-                installation_id: InstallationId([0xa5; 32]),
-                registry_reservation: Hash([0xa6; 32]),
-                install_request_commitment: Hash([0xa7; 32]),
-                producer: ProducerId([0xa3; 32]),
-                package,
-                agent_schema: schema_reference.clone(),
-                role_policies: policy_reference.clone(),
-                state_layout: parsed_schema.state_layout_hash(),
-                contract: ActorPackageContract::canonical(),
-                requirements,
-            },
-            debt: ActorLifecycleDebt::default(),
-        }],
-        lane_state: StandardLaneState {
-            linear: vec![StandardLaneEntry {
-                actor,
-                state_generation: Hash([0xa4; 32]),
-                value: vec![linear],
-            }],
-            merge: vec![StandardLaneEntry {
-                actor,
-                state_generation: Hash([0xa4; 32]),
-                value: vec![merge],
-            }],
-            local: vec![StandardLaneEntry {
-                actor,
-                state_generation: Hash([0xa4; 32]),
-                value: vec![local],
-            }],
+    let mut runtime_state = StandardRuntimeState::default();
+    runtime_state.config = Some(config.clone());
+    runtime_state.actors = vec![StandardActorState {
+        record: ActorRecord {
+            entry,
+            state_generation: Hash([0xa4; 32]),
+            installation_id: InstallationId([0xa5; 32]),
+            registry_reservation: Hash([0xa6; 32]),
+            install_request_commitment: Hash([0xa7; 32]),
+            producer: ProducerId([0xa3; 32]),
+            package,
+            agent_schema: schema_reference.clone(),
+            role_policies: policy_reference.clone(),
+            constructor_abi: Hash([0xa8; 32]),
+            installation_data: None,
+            state_layout: parsed_schema.state_layout_hash(),
+            contract: ActorPackageContract::canonical(),
+            requirements,
         },
-        lane_revisions: StandardLaneRevisions {
-            linear: 1,
-            merge: 1,
-            local: 1,
-            ..Default::default()
-        },
-        authority_slot_high_water: Some(1),
-        authority_sequence_high_water: Some(1),
-        authority_dispositions: vec![StandardAuthorityDisposition {
-            credential: CredentialId([0xa5; 32]),
-            sequence: 1,
-            claim: Hash([0xa6; 32]),
-            operation: Hash([0xa7; 32]),
-            result: Ok(LifecycleReply::Created(config.identity.clone())),
+        debt: ActorLifecycleDebt::default(),
+    }];
+    runtime_state.lane_state = StandardLaneState {
+        linear: vec![StandardLaneEntry {
+            actor,
+            state_generation: Hash([0xa4; 32]),
+            value: vec![linear],
         }],
+        merge: vec![StandardLaneEntry {
+            actor,
+            state_generation: Hash([0xa4; 32]),
+            value: vec![merge],
+        }],
+        local: vec![StandardLaneEntry {
+            actor,
+            state_generation: Hash([0xa4; 32]),
+            value: vec![local],
+        }],
+    };
+    runtime_state.lane_revisions = StandardLaneRevisions {
+        linear: 1,
+        merge: 1,
+        local: 1,
         ..Default::default()
-    });
+    };
+    runtime_state.authority_slot_high_water = Some(1);
+    runtime_state.authority_sequence_high_water = Some(1);
+    runtime_state.authority_dispositions = vec![StandardAuthorityDisposition {
+        credential: CredentialId([0xa5; 32]),
+        sequence: 1,
+        claim: Hash([0xa6; 32]),
+        operation: Hash([0xa7; 32]),
+        result: Ok(LifecycleReply::Created(config.identity.clone())),
+    }];
+    let state = encode_standard_runtime_state(&runtime_state);
     let mut message = vec![vos::value::TAG_DYNAMIC];
     message.extend_from_slice(&vos::value::Msg::new("probe").encode());
     let invocation = ActorInvocation {
@@ -983,6 +990,7 @@ fn lane_probe_call(
             reference: policy_reference,
             bytes: policies,
         },
+        installation_data: None,
     }
 }
 
@@ -1102,6 +1110,8 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
         package: package_reference.clone(),
         agent_schema: schema_reference.clone(),
         role_policies: policy_reference.clone(),
+        constructor_abi: Hash([0xb3; 32]),
+        installation_data: None,
         state_layout: parsed_schema.state_layout_hash(),
         lanes: LaneSet::of(vos::agent::StateLane::Linear),
         suspended: false,
@@ -1114,6 +1124,8 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
         package: package_reference.clone(),
         agent_schema: schema_reference.clone(),
         role_policies: policy_reference.clone(),
+        constructor_abi: installed_entry.constructor_abi,
+        installation_data: None,
         state_layout: parsed_schema.state_layout_hash(),
         contract,
         requirements,
@@ -1281,6 +1293,7 @@ fn bundled_runtime_enforces_signed_evidence_and_recovers_exact_queries() {
             reference: policy_reference.clone(),
             bytes: policies.clone(),
         },
+        installation_data: None,
     });
     assert_eq!(
         forged_execution.result,

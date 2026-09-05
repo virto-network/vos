@@ -519,6 +519,33 @@ pub trait AgentJournalStore:
     ) -> Result<JournalPublication, JournalStoreError>;
 }
 
+/// Unforgeable authority to remove one catalog blob created while journal
+/// heads were exactly `predecessor`. Fields are private to this storage
+/// module; callers can only obtain a token from the atomic staging method and
+/// must consume it to roll back.
+pub(crate) struct UnpublishedCatalogBlob {
+    store: JournalStoreInstanceId,
+    predecessor: JournalHeadsId,
+    reference: BlobRef,
+}
+
+/// Crate-private staging transaction used by the Local lifecycle driver.
+/// Preexisting content yields no token and can therefore never be deleted by
+/// rollback. Memory and pinned-file stores implement the same capability.
+pub(crate) trait UnpublishedCatalogBlobStore: AgentJournalStore {
+    fn stage_catalog_blob(
+        &mut self,
+        predecessor: JournalHeadsId,
+        reference: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<Option<UnpublishedCatalogBlob>, JournalStoreError>;
+
+    fn rollback_catalog_blob(
+        &mut self,
+        token: UnpublishedCatalogBlob,
+    ) -> Result<(), JournalStoreError>;
+}
+
 const GC_INTENT_NAME: &str = "gc-intent";
 const GC_INTENT_STAGE_NAME: &str = "gc-intent.next";
 const MAX_GC_INTENT_BYTES: usize = 100;
@@ -4387,6 +4414,44 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         publication: &ReplaySealedPublication,
     ) -> Result<JournalPublication, JournalStoreError> {
         self.publish_sealed_internal(publication, None)
+    }
+}
+
+impl UnpublishedCatalogBlobStore for MemoryAgentJournalStore {
+    fn stage_catalog_blob(
+        &mut self,
+        predecessor: JournalHeadsId,
+        reference: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<Option<UnpublishedCatalogBlob>, JournalStoreError> {
+        if self.heads()?.ok_or(JournalStoreError::NotInitialized)?.id() != predecessor {
+            return Err(JournalStoreError::Conflict);
+        }
+        self.put_blob(JournalBlobClass::CatalogArtifact, reference, bytes)
+            .map(|created| {
+                created.then(|| UnpublishedCatalogBlob {
+                    store: self.instance_id(),
+                    predecessor,
+                    reference: reference.clone(),
+                })
+            })
+    }
+
+    fn rollback_catalog_blob(
+        &mut self,
+        token: UnpublishedCatalogBlob,
+    ) -> Result<(), JournalStoreError> {
+        self.ensure_no_gc_pending()?;
+        if token.store != self.instance_id()
+            || self.heads()?.ok_or(JournalStoreError::NotInitialized)?.id() != token.predecessor
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        let key = (JournalBlobClass::CatalogArtifact, token.reference.hash);
+        let bytes = self.blobs.get(&key).ok_or(JournalStoreError::Corrupt)?;
+        validate_stored_blob(JournalBlobClass::CatalogArtifact, &token.reference, bytes)?;
+        Arc::make_mut(&mut self.blobs).remove(&key);
+        Ok(())
     }
 }
 
@@ -9153,6 +9218,47 @@ impl AgentJournalStore for FileAgentJournalStore {
     }
 }
 
+impl UnpublishedCatalogBlobStore for FileAgentJournalStore {
+    fn stage_catalog_blob(
+        &mut self,
+        predecessor: JournalHeadsId,
+        reference: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<Option<UnpublishedCatalogBlob>, JournalStoreError> {
+        if self.heads()?.ok_or(JournalStoreError::NotInitialized)?.id() != predecessor {
+            return Err(JournalStoreError::Conflict);
+        }
+        self.put_blob(JournalBlobClass::CatalogArtifact, reference, bytes)
+            .map(|created| {
+                created.then(|| UnpublishedCatalogBlob {
+                    store: self.instance_id(),
+                    predecessor,
+                    reference: reference.clone(),
+                })
+            })
+    }
+
+    fn rollback_catalog_blob(
+        &mut self,
+        token: UnpublishedCatalogBlob,
+    ) -> Result<(), JournalStoreError> {
+        self.ensure_no_gc_pending()?;
+        if token.store != self.instance_id()
+            || self.heads()?.ok_or(JournalStoreError::NotInitialized)?.id() != token.predecessor
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        self.read_blob(JournalBlobClass::CatalogArtifact, &token.reference)?
+            .ok_or(JournalStoreError::Corrupt)?;
+        let directory = self.directory(self.blob_directory(JournalBlobClass::CatalogArtifact))?;
+        let name = encode_hex(token.reference.hash.as_bytes());
+        unlink_file_at(directory, &name)?;
+        directory
+            .sync_all()
+            .map_err(|_| JournalStoreError::Unavailable)
+    }
+}
+
 impl SharedOrderedCommitStore for FileAgentJournalStore {
     fn shared_ordered_commit(
         &self,
@@ -11629,6 +11735,142 @@ mod tests {
             ..current.clone()
         };
         validate_publication_shape(&current, &sealed, &sealed_next).unwrap();
+    }
+
+    #[test]
+    fn unpublished_catalog_tokens_preserve_preexisting_foreign_and_moved_head_content() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let predecessor = store.heads().unwrap().unwrap().id();
+
+        let preexisting = BlobRef::of_bytes(b"preexisting-catalog");
+        assert!(
+            store
+                .put_blob(
+                    JournalBlobClass::CatalogArtifact,
+                    &preexisting,
+                    b"preexisting-catalog",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .stage_catalog_blob(predecessor, &preexisting, b"preexisting-catalog")
+                .unwrap()
+                .is_none()
+        );
+
+        let first = BlobRef::of_bytes(b"first-new-catalog");
+        let second = BlobRef::of_bytes(b"second-new-catalog");
+        let first_token = store
+            .stage_catalog_blob(predecessor, &first, b"first-new-catalog")
+            .unwrap()
+            .unwrap();
+        let second_token = store
+            .stage_catalog_blob(predecessor, &second, b"second-new-catalog")
+            .unwrap()
+            .unwrap();
+
+        let mut foreign =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut foreign, &genesis);
+        let forged_for_foreign = UnpublishedCatalogBlob {
+            store: store.instance_id(),
+            predecessor,
+            reference: first.clone(),
+        };
+        assert_eq!(
+            foreign.rollback_catalog_blob(forged_for_foreign),
+            Err(JournalStoreError::Conflict)
+        );
+
+        // Reverse rollback models a partial multi-blob staging failure. The
+        // identical preexisting object never had a token and survives.
+        store.rollback_catalog_blob(second_token).unwrap();
+        store.rollback_catalog_blob(first_token).unwrap();
+        assert_eq!(
+            store.load_blob(JournalBlobClass::CatalogArtifact, &first),
+            Ok(None)
+        );
+        assert_eq!(
+            store.load_blob(JournalBlobClass::CatalogArtifact, &second),
+            Ok(None)
+        );
+        assert_eq!(
+            store.load_blob(JournalBlobClass::CatalogArtifact, &preexisting),
+            Ok(Some(b"preexisting-catalog".to_vec()))
+        );
+
+        let moved = BlobRef::of_bytes(b"moved-head-catalog");
+        let moved_token = store
+            .stage_catalog_blob(predecessor, &moved, b"moved-head-catalog")
+            .unwrap()
+            .unwrap();
+        let mut heads = store.heads().unwrap().unwrap();
+        heads.publication_revision += 1;
+        heads.previous = Some(predecessor);
+        store.heads = Some(encode_object(&heads).unwrap().bytes);
+        assert_eq!(
+            store.rollback_catalog_blob(moved_token),
+            Err(JournalStoreError::Conflict)
+        );
+        assert_eq!(
+            store.load_blob(JournalBlobClass::CatalogArtifact, &moved),
+            Ok(Some(b"moved-head-catalog".to_vec()))
+        );
+    }
+
+    #[test]
+    fn unreadable_heads_preserve_a_staged_catalog_blob_for_reopen_reconciliation() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let predecessor = store.heads().unwrap().unwrap().id();
+        let reference = BlobRef::of_bytes(b"ambiguous-catalog");
+        let token = store
+            .stage_catalog_blob(predecessor, &reference, b"ambiguous-catalog")
+            .unwrap()
+            .unwrap();
+        store.heads = Some(vec![0xff]);
+        assert_eq!(
+            store.rollback_catalog_blob(token),
+            Err(JournalStoreError::Corrupt)
+        );
+        assert_eq!(
+            store.load_blob(JournalBlobClass::CatalogArtifact, &reference),
+            Ok(Some(b"ambiguous-catalog".to_vec()))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_unpublished_catalog_token_unlinks_and_syncs_only_new_content() {
+        let directory = TestDirectory::new("catalog-stage-rollback");
+        let genesis = genesis();
+        let mut store = open_file_store(&directory);
+        initialize(&mut store, &genesis);
+        let predecessor = store.heads().unwrap().unwrap().id();
+        let reference = BlobRef::of_bytes(b"physical-unpublished-catalog");
+        let token = store
+            .stage_catalog_blob(predecessor, &reference, b"physical-unpublished-catalog")
+            .unwrap()
+            .unwrap();
+        let path = store
+            .root()
+            .join("catalog/blobs")
+            .join(encode_hex(reference.hash.as_bytes()));
+        assert!(path.is_file());
+        store.rollback_catalog_blob(token).unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            store.load_blob(JournalBlobClass::CatalogArtifact, &reference),
+            Ok(None)
+        );
     }
 
     #[test]

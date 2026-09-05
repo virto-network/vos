@@ -1029,7 +1029,7 @@ const fn pvm_page_size_for_guest() -> usize {
 /// Output: `[status:u8][linear_len:u32][merge_len:u32][local_len:u32]`
 /// followed by the three lane images and the typed reply.
 #[cfg(feature = "pvm")]
-pub fn run_refine<A: super::Actor>() {
+pub fn run_refine<A: super::Actor>(args_address: u64, args_len: u64) {
     use super::context::ServiceId;
     use super::lifecycle;
     use crate::service::wire::ServiceWire as _;
@@ -1073,6 +1073,23 @@ pub fn run_refine<A: super::Actor>() {
         }
     }
 
+    let args_len = usize::try_from(args_len)
+        .ok()
+        .filter(|len| *len <= crate::agent::MAX_INSTALLATION_DATA_BYTES + 1)
+        .expect("invalid agent installation-data frame length");
+    let args_address = usize::try_from(args_address)
+        .ok()
+        .filter(|address| *address != 0)
+        .expect("invalid agent installation-data frame address");
+    // The standard program loader owns this immutable argument mapping and
+    // passes its exact base/length in the initial ABI registers.
+    let args_frame = unsafe { core::slice::from_raw_parts(args_address as *const u8, args_len) };
+    let installation_data = match args_frame {
+        [0] => None,
+        [1, bytes @ ..] => Some(bytes),
+        _ => panic!("invalid agent installation-data frame tag"),
+    };
+
     const LANE_ITEM_CAPACITY: usize = crate::agent::execution::MAX_EXECUTION_STATE_BYTES + 1;
     let linear_item = fetch_owned(LANE_ITEM_CAPACITY).expect("missing linear agent lane");
     let merge_item = fetch_owned(LANE_ITEM_CAPACITY).expect("missing merge agent lane");
@@ -1091,8 +1108,8 @@ pub fn run_refine<A: super::Actor>() {
     let linear_was_fresh_or_absent = linear.is_none_or(<[u8]>::is_empty);
     let merge_was_fresh_or_absent = merge.is_none_or(<[u8]>::is_empty);
     let local_was_fresh_or_absent = local.is_none_or(<[u8]>::is_empty);
-    let mut actor =
-        A::__load_agent_state(linear, merge, local).expect("invalid field-wise agent state");
+    let mut actor = A::__load_agent_state(installation_data, linear, merge, local)
+        .expect("invalid field-wise agent state or installation data");
     // Snapshot canonical field frames, rather than the host's fresh empty
     // sentinels, before application code runs. This is the only point that can
     // distinguish an untouched constructor default from a handler mutating a

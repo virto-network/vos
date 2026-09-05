@@ -871,12 +871,17 @@ impl AgentHostHandle {
         registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
+        installation_data: Option<Vec<u8>>,
         package: Package,
     ) -> Result<PreparedLifecycleRequest, AgentHostError> {
         validate_install_identity(installation_id, registry_reservation)?;
         validate_actor_name_and_parent(&name, parent)?;
         validate_package_shape_before_reservation(&package)?;
-        let payload_bytes = payload_sum([name.capacity(), package_heap_payload_bytes(&package)]);
+        let payload_bytes = payload_sum([
+            name.capacity(),
+            installation_data.as_ref().map_or(0, Vec::capacity),
+            package_heap_payload_bytes(&package),
+        ]);
         self.request(payload_bytes, move |host| {
             host.prepare_actor_install(
                 agent,
@@ -884,6 +889,7 @@ impl AgentHostHandle {
                 registry_reservation,
                 name,
                 parent,
+                installation_data,
                 &package,
             )
         })
@@ -991,6 +997,7 @@ impl AgentHostHandle {
         registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
+        installation_data: Option<Vec<u8>>,
         package: Package,
     ) -> Result<ActorEntry, AgentHostError> {
         validate_agent_receipt_shape(&authority)?;
@@ -1000,6 +1007,7 @@ impl AgentHostHandle {
         let payload_bytes = payload_sum([
             agent_receipt_heap_payload_bytes(&authority),
             name.capacity(),
+            installation_data.as_ref().map_or(0, Vec::capacity),
             package_heap_payload_bytes(&package),
         ]);
         self.request(payload_bytes, move |host| {
@@ -1010,6 +1018,7 @@ impl AgentHostHandle {
                 registry_reservation,
                 name,
                 parent,
+                installation_data,
                 &package,
             )
         })
@@ -1982,6 +1991,7 @@ impl AgentHost {
         registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
+        installation_data: Option<Vec<u8>>,
         package: &Package,
     ) -> Result<PreparedLifecycleRequest, AgentHostError> {
         let driver = self
@@ -1989,7 +1999,14 @@ impl AgentHost {
             .get(&agent)
             .ok_or(AgentHostError::AgentNotFound)?;
         let operation = driver
-            .actor_install_operation(installation_id, registry_reservation, name, parent, package)
+            .actor_install_operation(
+                installation_id,
+                registry_reservation,
+                name,
+                parent,
+                installation_data,
+                package,
+            )
             .map_err(map_local_driver_error)?;
         PreparedLifecycleRequest::new(
             &driver.config().map_err(map_local_driver_error)?,
@@ -2257,6 +2274,7 @@ impl AgentHost {
         registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
+        installation_data: Option<Vec<u8>>,
         package: &Package,
     ) -> Result<ActorEntry, AgentHostError> {
         self._root_lease.validate_live()?;
@@ -2271,6 +2289,7 @@ impl AgentHost {
                     registry_reservation,
                     name,
                     parent,
+                    installation_data,
                     package,
                 )
                 .map_err(map_local_driver_error)?;
@@ -5683,6 +5702,7 @@ mod tests {
             InstallationId([0x75; 32]),
             Hash([0x76; 32]),
             "blocked".into(),
+            None,
             None,
             &fixture.runtime_package,
         ));

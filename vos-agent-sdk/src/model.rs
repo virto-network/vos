@@ -12,6 +12,26 @@ pub const MAX_ACTOR_NAME_BYTES: usize = 128;
 pub const MAX_DIRECTORY_PAGE_ENTRIES: usize = 256;
 pub const MAX_STORAGE_PREFIX_BYTES: usize = 128;
 
+/// Exact immutable bytes supplied to an actor constructor on every fresh
+/// machine load. `None` and `Some` with an empty byte string are distinct.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallationData {
+    pub reference: BlobRef,
+    pub bytes: Vec<u8>,
+}
+
+impl InstallationData {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.reference.hash == Hash::ZERO
+            || self.bytes.len() > crate::MAX_INSTALLATION_DATA_BYTES
+            || !self.reference.matches(&self.bytes)
+        {
+            return Err(ModelError::InvalidArtifact);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AgentProfile {
@@ -443,9 +463,12 @@ pub struct ActorEntry {
     pub package: BlobRef,
     pub agent_schema: BlobRef,
     pub role_policies: BlobRef,
-    /// Immutable constructor parameters and `#[state(const)]` bytes. The
-    /// runtime replays this exact content-addressed object on every fresh
-    /// inner-machine load.
+    /// Nonzero commitment of the exact signed constructor ABI. This binds
+    /// zero-argument, raw-byte, and named typed constructors distinctly.
+    pub constructor_abi: Hash,
+    /// Exact canonical constructor-argument bytes. The runtime replays this
+    /// content-addressed object on every fresh inner-machine load; const fields
+    /// are reconstructed by the constructor and are never serialized here.
     pub installation_data: Option<BlobRef>,
     pub state_layout: Hash,
     pub lanes: LaneSet,
@@ -464,6 +487,7 @@ impl ActorEntry {
             || self.deployment == DeploymentId::ZERO
             || self.program == ProgramId::ZERO
             || self.state_layout == Hash::ZERO
+            || self.constructor_abi == Hash::ZERO
         {
             return Err(ModelError::InvalidActor);
         }
@@ -473,7 +497,7 @@ impl ActorEntry {
             || self
                 .installation_data
                 .as_ref()
-                .is_some_and(|value| !valid_blob(value))
+                .is_some_and(|value| !valid_installation_data_blob(value))
         {
             return Err(ModelError::InvalidArtifact);
         }
@@ -549,7 +573,8 @@ pub struct InstallActor {
     pub package: BlobRef,
     pub agent_schema: BlobRef,
     pub role_policies: BlobRef,
-    pub installation_data: Option<BlobRef>,
+    pub constructor_abi: Hash,
+    pub installation_data: Option<InstallationData>,
     pub state_layout: Hash,
     pub contract: ActorPackageContract,
     pub requirements: RuntimeRequirements,
@@ -575,6 +600,9 @@ pub struct UpgradeActor {
     pub package: BlobRef,
     pub agent_schema: BlobRef,
     pub role_policies: BlobRef,
+    /// Exact signed target constructor ABI. An in-place upgrade must preserve
+    /// this commitment so existing immutable argument bytes retain meaning.
+    pub constructor_abi: Hash,
     pub state_layout: Hash,
     pub contract: ActorPackageContract,
     pub requirements: RuntimeRequirements,
@@ -591,6 +619,7 @@ pub struct ActorRecord {
     pub package: BlobRef,
     pub agent_schema: BlobRef,
     pub role_policies: BlobRef,
+    pub constructor_abi: Hash,
     pub installation_data: Option<BlobRef>,
     pub state_layout: Hash,
     pub contract: ActorPackageContract,
@@ -624,6 +653,10 @@ pub(crate) fn valid_blob(reference: &BlobRef) -> bool {
     reference.hash != Hash::ZERO
         && reference.len != 0
         && reference.len <= crate::MAX_CATALOG_ARTIFACT_BYTES
+}
+
+pub(crate) fn valid_installation_data_blob(reference: &BlobRef) -> bool {
+    reference.hash != Hash::ZERO && reference.len <= crate::MAX_INSTALLATION_DATA_BYTES as u64
 }
 
 #[cfg(test)]

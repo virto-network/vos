@@ -58,7 +58,7 @@ use crate::service::{
 };
 
 /// Stable lifecycle contract implemented by every agent runtime.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260904r8");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260904r9");
 
 /// Consensus-visible execution semantics for standard-PVM agent packages.
 ///
@@ -76,15 +76,22 @@ pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260904r8");
 /// incompatible. Generation `r04` adds the replay-authenticated journal
 /// context and the root-seeded live system-authority state machine to
 /// Standard Control; its direct finalize/rotate operations are therefore
-/// incompatible with every earlier Standard runtime image.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r05");
+/// incompatible with every earlier Standard runtime image. Generation `r06`
+/// passes the exact immutable constructor-argument frame to every fresh or
+/// restored inner actor machine.
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-pvm-41d31e6-standard-gas-r06");
 
 /// Maximum bytes named by one content-addressed artifact reference in an
 /// authenticated Agent catalog closure.
 pub const MAX_CATALOG_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum canonical constructor-argument bytes attached to one actor
+/// installation. The bytes are catalog data, never a mutable lane;
+/// `#[state(const)]` fields are reconstructed by the constructor.
+pub const MAX_INSTALLATION_DATA_BYTES: usize = 64 * 1024;
 /// Maximum distinct `(hash, encoded_len)` references in a Standard Agent
-/// catalog: one runtime package plus package/schema/policy for every actor.
-pub const MAX_CATALOG_ARTIFACT_REFERENCES: u32 = 1 + 3 * contract::STANDARD_MAX_ACTORS;
+/// catalog: one runtime package plus package/schema/policy/constructor data
+/// for every actor.
+pub const MAX_CATALOG_ARTIFACT_REFERENCES: u32 = 1 + 4 * contract::STANDARD_MAX_ACTORS;
 /// Maximum aggregate bytes reachable through one authenticated Agent catalog
 /// closure, independently of its encoded manifest size.
 pub const MAX_CATALOG_ARTIFACT_REFERENCED_BYTES: u64 = 64 * 1024 * 1024;
@@ -422,10 +429,34 @@ pub struct ActorEntry {
     /// package. The agent runtime, rather than application actor code,
     /// enforces this policy before dispatch.
     pub role_policies: BlobRef,
+    /// Nonzero commitment of the exact signed constructor ABI, including the
+    /// zero-argument/raw-byte/named-typed encoding mode and ordered fields.
+    pub constructor_abi: Hash,
+    /// Exact canonical constructor-argument object replayed verbatim on each
+    /// fresh inner-machine load. `Some(empty)` is distinct from `None`; const
+    /// fields are reconstructed by the constructor rather than stored here.
+    pub installation_data: Option<BlobRef>,
     /// State-layout commitment derived from `agent_schema`.
     pub state_layout: Hash,
     pub lanes: LaneSet,
     pub suspended: bool,
+}
+
+/// Atomic content-addressed installation input. Keeping the bytes beside the
+/// reference in the install request makes commitment and catalog admission a
+/// single canonical operation; durable directory state stores only the ref.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallationData {
+    pub reference: BlobRef,
+    pub bytes: Vec<u8>,
+}
+
+impl InstallationData {
+    pub fn is_valid(&self) -> bool {
+        self.reference.hash != Hash::ZERO
+            && self.bytes.len() <= MAX_INSTALLATION_DATA_BYTES
+            && self.reference.matches(&self.bytes)
+    }
 }
 
 /// One installed actor together with the immutable identity of this exact
@@ -465,6 +496,8 @@ pub struct InstallActor {
     pub package: BlobRef,
     pub agent_schema: BlobRef,
     pub role_policies: BlobRef,
+    pub constructor_abi: Hash,
+    pub installation_data: Option<InstallationData>,
     pub state_layout: Hash,
     pub contract: contract::ActorPackageContract,
     pub requirements: RuntimeRequirements,
@@ -481,6 +514,9 @@ pub struct UpgradeActor {
     pub package: BlobRef,
     pub agent_schema: BlobRef,
     pub role_policies: BlobRef,
+    /// Exact signed target constructor ABI. Upgrades preserve the meaning of
+    /// the original immutable constructor-argument object byte for byte.
+    pub constructor_abi: Hash,
     pub state_layout: Hash,
     pub contract: contract::ActorPackageContract,
     pub requirements: RuntimeRequirements,
@@ -506,6 +542,8 @@ pub struct ActorRecord {
     pub package: BlobRef,
     pub agent_schema: BlobRef,
     pub role_policies: BlobRef,
+    pub constructor_abi: Hash,
+    pub installation_data: Option<BlobRef>,
     pub state_layout: Hash,
     pub contract: contract::ActorPackageContract,
     pub requirements: RuntimeRequirements,

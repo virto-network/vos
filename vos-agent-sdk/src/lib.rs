@@ -31,15 +31,18 @@ pub use vos_protocol::{
 };
 
 /// Stable clean-generation management/runtime ABI identity.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260905r1");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260905r2");
 
 /// Maximum bytes named by one content-addressed artifact reference.
 pub const MAX_CATALOG_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum canonical constructor-argument bytes admitted for one actor
+/// installation. This object is replay input, not mutable actor state;
+/// `#[state(const)]` fields are reconstructed by the constructor.
+pub const MAX_INSTALLATION_DATA_BYTES: usize = 64 * 1024;
 /// Maximum actor records supported by the standard runtime policy.
 pub const STANDARD_MAX_ACTORS: u32 = 4_096;
-/// One runtime package plus package/schema/policy/installation-data for every
-/// actor. Optional installation data still reserves a closure slot so the
-/// signed ceiling cannot drift with directory contents.
+/// One runtime package plus package/schema/policy/constructor arguments for
+/// every actor. The optional argument object is included in the signed ceiling.
 pub const MAX_CATALOG_ARTIFACT_REFERENCES: u32 = 1 + 4 * STANDARD_MAX_ACTORS;
 /// Maximum aggregate bytes in one authenticated package closure.
 pub const MAX_CATALOG_ARTIFACT_REFERENCED_BYTES: u64 = 64 * 1024 * 1024;

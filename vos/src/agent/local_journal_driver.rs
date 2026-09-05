@@ -27,7 +27,7 @@ use super::journal::{
 };
 use super::journal_store::{
     AgentJournalStore, CatalogBlobResolver, CatalogBlobResolverFactory, JournalBlobClass,
-    JournalStoreError,
+    JournalStoreError, UnpublishedCatalogBlob, UnpublishedCatalogBlobStore,
 };
 #[cfg(all(feature = "storage", target_os = "linux"))]
 use super::journal_store::{
@@ -251,6 +251,9 @@ fn validate_prospective_artifact_closure(
         artifacts.push(actor.record.package.clone());
         artifacts.push(actor.record.agent_schema.clone());
         artifacts.push(actor.record.role_policies.clone());
+        if let Some(installation_data) = &actor.record.installation_data {
+            artifacts.push(installation_data.clone());
+        }
     }
     artifacts.sort_unstable_by_key(|artifact| (artifact.hash, artifact.len));
     artifacts.dedup_by_key(|artifact| (artifact.hash, artifact.len));
@@ -555,6 +558,11 @@ pub(crate) struct LocalLifecycleOperation {
     catalog: Vec<RuntimeBlob>,
 }
 
+struct StagedCatalog {
+    predecessor: super::journal::JournalHeadsId,
+    created: Vec<UnpublishedCatalogBlob>,
+}
+
 impl LocalLifecycleOperation {
     pub(crate) fn request(&self) -> &LifecycleRequest {
         &self.request
@@ -614,6 +622,7 @@ struct ActorCatalogAdmission<'a> {
     package: &'a BlobRef,
     schema: &'a BlobRef,
     policies: &'a BlobRef,
+    constructor_abi: Hash,
     deployment: crate::service::DeploymentId,
     program: crate::service::ProgramId,
     producer: crate::service::ProducerId,
@@ -791,6 +800,10 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             || BlobRef::of_bytes(&package.role_policies) != *admission.policies
             || package.agent_schema != schema
             || package.role_policies != policies
+            || package
+                .constructor_abi()
+                .map_err(LocalReplayExecutorError::Package)?
+                != admission.constructor_abi
             || package_contract != admission.contract
             || package_requirements != admission.requirements
             || !config.runtime_contract.supports(admission.contract)
@@ -813,13 +826,78 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
     fn validate_lifecycle_catalog(
         &self,
         config: &AgentConfig,
+        state: &RuntimeState,
         request: &LifecycleRequest,
         catalog: &[RuntimeBlob],
     ) -> Result<(), LocalReplayExecutorError> {
         let LifecycleRequest::Authorized { request, .. } = request else {
             return Err(LocalReplayExecutorError::InvalidRequest);
         };
-        self.validate_lifecycle_operation_catalog(config, request, catalog)
+        self.validate_lifecycle_operation_catalog(config, request, catalog)?;
+        self.validate_upgrade_installation_shape(state, request, Some(catalog))
+    }
+
+    fn validate_upgrade_installation_shape(
+        &self,
+        state: &RuntimeState,
+        request: &LifecycleRequest,
+        supplied_catalog: Option<&[RuntimeBlob]>,
+    ) -> Result<(), LocalReplayExecutorError> {
+        let request = match request {
+            LifecycleRequest::Authorized { request, .. } => request.as_ref(),
+            request => request,
+        };
+        let LifecycleRequest::UpgradeActor(upgrade) = request else {
+            return Ok(());
+        };
+        let decoded = decode_standard_runtime_state(state)
+            .map_err(|_| LocalReplayExecutorError::InvalidState)?;
+        let Some(actor) = decoded.actors.iter().find(|actor| {
+            actor.record.entry.actor == upgrade.actor
+                && actor.record.entry.deployment == upgrade.from_deployment
+        }) else {
+            // NotFound/StaleDeployment remain exact guest lifecycle outcomes.
+            return Ok(());
+        };
+        let package = match supplied_catalog {
+            Some(catalog) => {
+                let blob = catalog
+                    .iter()
+                    .find(|blob| blob.reference == upgrade.package)
+                    .ok_or_else(|| {
+                        LocalReplayExecutorError::ArtifactUnavailable(upgrade.package.clone())
+                    })?;
+                Package::decode(&blob.bytes)
+            }
+            None => Package::decode(&self.load(&upgrade.package)?),
+        }
+        .map_err(|_| LocalReplayExecutorError::InvalidArtifact(upgrade.package.clone()))?;
+        if !package
+            .accepts_installation_data_reference(actor.record.installation_data.as_ref())
+            .map_err(LocalReplayExecutorError::Package)?
+            || package
+                .constructor_abi()
+                .map_err(LocalReplayExecutorError::Package)?
+                != actor.record.constructor_abi
+        {
+            return Err(LocalReplayExecutorError::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    fn validate_replayed_upgrade_target(
+        &self,
+        state: &RuntimeState,
+        request: &LifecycleRequest,
+        expected_result: &Result<LifecycleReply, LifecycleError>,
+    ) -> Result<(), LocalReplayExecutorError> {
+        if expected_result.is_ok() {
+            self.validate_upgrade_installation_shape(state, request, None)
+        } else {
+            // Live admission never staged a target for an exact rejection,
+            // so replay must not invent a dependency on unavailable bytes.
+            Ok(())
+        }
     }
 
     fn validate_lifecycle_operation_catalog(
@@ -829,11 +907,17 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         catalog: &[RuntimeBlob],
     ) -> Result<(), LocalReplayExecutorError> {
         let expected = match request {
-            LifecycleRequest::Install(install) => vec![
-                &install.package,
-                &install.agent_schema,
-                &install.role_policies,
-            ],
+            LifecycleRequest::Install(install) => {
+                let mut expected = vec![
+                    &install.package,
+                    &install.agent_schema,
+                    &install.role_policies,
+                ];
+                if let Some(data) = &install.installation_data {
+                    expected.push(&data.reference);
+                }
+                expected
+            }
             LifecycleRequest::UpgradeActor(upgrade) => vec![
                 &upgrade.package,
                 &upgrade.agent_schema,
@@ -903,6 +987,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                         package: &install.package,
                         schema: &install.agent_schema,
                         policies: &install.role_policies,
+                        constructor_abi: install.constructor_abi,
                         deployment: install.entry.deployment,
                         program: install.entry.program,
                         producer: install.producer,
@@ -914,6 +999,18 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 if install.entry.package != install.package
                     || install.entry.agent_schema != install.agent_schema
                     || install.entry.role_policies != install.role_policies
+                    || install.entry.constructor_abi != install.constructor_abi
+                    || install.entry.installation_data.as_ref()
+                        != install
+                            .installation_data
+                            .as_ref()
+                            .map(|data| &data.reference)
+                    || install.installation_data.as_ref().is_some_and(|data| {
+                        !data.is_valid()
+                            || supplied
+                                .get(&(data.reference.hash, data.reference.len))
+                                .is_none_or(|bytes| *bytes != data.bytes.as_slice())
+                    })
                     || install.entry.state_layout != install.state_layout
                     || install.entry.lanes != install.requirements.lanes
                 {
@@ -930,6 +1027,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                         package: &upgrade.package,
                         schema: &upgrade.agent_schema,
                         policies: &upgrade.role_policies,
+                        constructor_abi: upgrade.constructor_abi,
                         deployment: upgrade.to_deployment,
                         program: upgrade.to_program,
                         producer: upgrade.producer,
@@ -1082,7 +1180,10 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         config: &AgentConfig,
         state: &StandardRuntimeState,
         invocation: &ActorInvocation,
-    ) -> Result<Option<(Vec<u8>, RuntimeBlob, RuntimeBlob)>, LocalReplayExecutorError> {
+    ) -> Result<
+        Option<(Vec<u8>, RuntimeBlob, RuntimeBlob, Option<RuntimeBlob>)>,
+        LocalReplayExecutorError,
+    > {
         let Some(actor) = state
             .actors
             .iter()
@@ -1120,10 +1221,16 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             || record.entry.package != record.package
             || record.entry.agent_schema != record.agent_schema
             || record.entry.role_policies != record.role_policies
+            || record.entry.constructor_abi != record.constructor_abi
+            || record.entry.installation_data != record.installation_data
             || BlobRef::of_bytes(&package.agent_schema) != record.agent_schema
             || BlobRef::of_bytes(&package.role_policies) != record.role_policies
             || package.agent_schema != schema
             || package.role_policies != policies
+            || package
+                .constructor_abi()
+                .map_err(LocalReplayExecutorError::Package)?
+                != record.constructor_abi
             || record.contract != contract
             || record.requirements != requirements
             || record.entry.lanes != requirements.lanes
@@ -1133,11 +1240,27 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             || parsed_schema.state_layout_hash() != record.state_layout
             || parsed_schema.lanes() != record.entry.lanes
             || crate::service::PackageRolePolicies::decode(&policies).is_err()
+            || !package
+                .accepts_installation_data_reference(record.installation_data.as_ref())
+                .map_err(LocalReplayExecutorError::Package)?
         {
             return Err(LocalReplayExecutorError::InvalidArtifact(
                 record.package.clone(),
             ));
         }
+        let installation_data = match record.installation_data.as_ref() {
+            Some(reference) => {
+                let bytes = self.load(reference)?;
+                if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES {
+                    return Err(LocalReplayExecutorError::InvalidArtifact(reference.clone()));
+                }
+                Some(RuntimeBlob {
+                    reference: reference.clone(),
+                    bytes,
+                })
+            }
+            None => None,
+        };
         Ok(Some((
             package.pvm,
             RuntimeBlob {
@@ -1148,6 +1271,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 reference: record.role_policies.clone(),
                 bytes: policies,
             },
+            installation_data,
         )))
     }
 
@@ -1356,6 +1480,11 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                     Some(context) => expected.apply_guest(Some(context), request.clone()),
                     None => expected.apply(request.clone()),
                 };
+                // Live admission stages and validates a fresh upgrade target
+                // only when the exact Standard preflight succeeds. Historical
+                // Busy/NotFound/Stale outcomes therefore must not resolve an
+                // artifact which was intentionally never made durable.
+                self.validate_replayed_upgrade_target(before, request, &expected_result)?;
                 let call = match journal_context {
                     Some(context) => {
                         RuntimeCall::from_replay_context(before.clone(), request.clone(), context)
@@ -1430,8 +1559,8 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                 let artifacts = self.actor_artifacts(&config, &decoded, invocation)?;
                 let recovery_only = artifacts.is_none();
                 let empty = Self::empty_blob;
-                let (actor_pvm, actor_schema, actor_policies) =
-                    artifacts.unwrap_or_else(|| (Vec::new(), empty(), empty()));
+                let (actor_pvm, actor_schema, actor_policies, installation_data) =
+                    artifacts.unwrap_or_else(|| (Vec::new(), empty(), empty(), None));
                 let returned: RuntimeExecutionReturn = self.execute_wire(
                     &runtime.pvm,
                     self.management_gas.saturating_add(invocation.gas),
@@ -1444,6 +1573,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                         actor_pvm,
                         actor_schema,
                         actor_policies,
+                        installation_data,
                     }
                     .encode(),
                 )?;
@@ -1504,7 +1634,8 @@ impl<S, E> LocalJournalCore<S, E>
 where
     S: AgentJournalStore
         + super::replay::ReplaySource<Error = JournalStoreError>
-        + CatalogBlobResolverFactory,
+        + CatalogBlobResolverFactory
+        + UnpublishedCatalogBlobStore,
     E: ReplayExecutor<Error = LocalReplayExecutorError>,
 {
     fn open(mut store: S, mut executor: E) -> Result<Self, LocalJournalDriverError> {
@@ -1859,16 +1990,28 @@ pub(crate) struct LocalJournalAgentDriver<S>
 where
     S: AgentJournalStore
         + super::replay::ReplaySource<Error = JournalStoreError>
-        + CatalogBlobResolverFactory,
+        + CatalogBlobResolverFactory
+        + UnpublishedCatalogBlobStore,
 {
     core: LocalJournalCore<S, StandardLocalReplayExecutor<S::Resolver>>,
+    #[cfg(test)]
+    lifecycle_fault: Option<TestLifecycleFault>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TestLifecycleFault {
+    CatalogPutAfterFirst,
+    BeforeMergeSeal,
+    BeforeOrderedPublish,
 }
 
 impl<S> LocalJournalAgentDriver<S>
 where
     S: AgentJournalStore
         + super::replay::ReplaySource<Error = JournalStoreError>
-        + CatalogBlobResolverFactory,
+        + CatalogBlobResolverFactory
+        + UnpublishedCatalogBlobStore,
 {
     /// Construct the exact bootstrap-owned Authorized<Create> input and its
     /// single runtime-package catalog. The trusted logical slot is sampled at
@@ -2045,7 +2188,11 @@ where
         let resolver = store.catalog_blob_resolver()?;
         let executor = StandardLocalReplayExecutor::new(resolver, trust, merge);
         let core = LocalJournalCore::open(store, executor)?;
-        let driver = Self { core };
+        let driver = Self {
+            core,
+            #[cfg(test)]
+            lifecycle_fault: None,
+        };
         driver.validate_opened(Some(sealed.replica()))?;
         Ok(driver)
     }
@@ -2062,7 +2209,11 @@ where
         let resolver = store.catalog_blob_resolver()?;
         let executor = StandardLocalReplayExecutor::new(resolver, trust, merge);
         let core = LocalJournalCore::open(store, executor)?;
-        let driver = Self { core };
+        let driver = Self {
+            core,
+            #[cfg(test)]
+            lifecycle_fault: None,
+        };
         driver.validate_opened(None)?;
         Ok(driver)
     }
@@ -2155,6 +2306,7 @@ where
         registry_reservation: Hash,
         name: String,
         parent: Option<ActorId>,
+        installation_data: Option<Vec<u8>>,
         package: &Package,
     ) -> Result<LocalLifecycleOperation, LocalJournalDriverError> {
         if installation_id == crate::service::InstallationId::ZERO
@@ -2170,6 +2322,18 @@ where
         package
             .validate()
             .map_err(LocalReplayExecutorError::Package)?;
+        if installation_data
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() > super::MAX_INSTALLATION_DATA_BYTES)
+            || package
+                .accepts_installation_data(installation_data.as_deref())
+                .map_err(LocalReplayExecutorError::Package)?
+                == false
+        {
+            return Err(LocalJournalDriverError::Lifecycle(
+                LifecycleError::InvalidRequest,
+            ));
+        }
         let PackageKind::Actor {
             contract,
             requirements,
@@ -2185,11 +2349,24 @@ where
             Some(parent) => ActorId::owned_child(parent, &name),
             None => ActorId::top_level(config.identity.agent, &name),
         };
-        let catalog = Self::actor_package_catalog(package);
+        let mut catalog = Self::actor_package_catalog(package);
+        let installation_data = installation_data.map(|bytes| super::InstallationData {
+            reference: BlobRef::of_bytes(&bytes),
+            bytes,
+        });
+        if let Some(data) = &installation_data {
+            catalog.push(RuntimeBlob {
+                reference: data.reference.clone(),
+                bytes: data.bytes.clone(),
+            });
+        }
         let package_reference = catalog[0].reference.clone();
         let schema_reference = catalog[1].reference.clone();
         let policies_reference = catalog[2].reference.clone();
         let state_layout = schema.state_layout_hash();
+        let constructor_abi = package
+            .constructor_abi()
+            .map_err(LocalReplayExecutorError::Package)?;
         self.lifecycle_operation(
             LifecycleRequest::Install(InstallActor {
                 installation_id,
@@ -2203,6 +2380,10 @@ where
                     package: package_reference.clone(),
                     agent_schema: schema_reference.clone(),
                     role_policies: policies_reference.clone(),
+                    constructor_abi,
+                    installation_data: installation_data
+                        .as_ref()
+                        .map(|data| data.reference.clone()),
                     state_layout,
                     lanes: requirements.lanes,
                     suspended: false,
@@ -2211,6 +2392,8 @@ where
                 package: package_reference,
                 agent_schema: schema_reference,
                 role_policies: policies_reference,
+                constructor_abi,
+                installation_data,
                 state_layout,
                 contract,
                 requirements,
@@ -2244,6 +2427,25 @@ where
         let schema = super::schema::decode(&package.agent_schema).ok_or(
             LocalReplayExecutorError::Package(PackageError::InvalidActorArtifacts),
         )?;
+        let constructor_abi = package
+            .constructor_abi()
+            .map_err(LocalReplayExecutorError::Package)?;
+        match self.inspect_actor(actor) {
+            Ok(record) if record.entry.deployment == from_deployment => {
+                if package
+                    .accepts_installation_data_reference(record.entry.installation_data.as_ref())
+                    .map_err(LocalReplayExecutorError::Package)?
+                    == false
+                {
+                    return Err(LocalReplayExecutorError::InvalidRequest.into());
+                }
+                if record.entry.constructor_abi != constructor_abi {
+                    return Err(LocalReplayExecutorError::InvalidRequest.into());
+                }
+            }
+            Ok(_) | Err(LocalJournalDriverError::Lifecycle(LifecycleError::NotFound)) => {}
+            Err(error) => return Err(error),
+        }
         let catalog = Self::actor_package_catalog(package);
         self.lifecycle_operation(
             LifecycleRequest::UpgradeActor(UpgradeActor {
@@ -2255,6 +2457,7 @@ where
                 package: catalog[0].reference.clone(),
                 agent_schema: catalog[1].reference.clone(),
                 role_policies: catalog[2].reference.clone(),
+                constructor_abi,
                 state_layout: schema.state_layout_hash(),
                 contract,
                 requirements,
@@ -2347,7 +2550,31 @@ where
         )
     }
 
-    fn stage_catalog(&mut self, catalog: &[RuntimeBlob]) -> Result<(), LocalJournalDriverError> {
+    fn rollback_staged_catalog(
+        &mut self,
+        staged: StagedCatalog,
+    ) -> Result<(), LocalJournalDriverError> {
+        // A publication error can occur after its durable CAS. Authenticate
+        // the physical head before deleting anything; an unreadable or moved
+        // head leaves the bytes for normal reopen reconciliation.
+        let Ok(Some(current)) = self.core.store.heads() else {
+            return Ok(());
+        };
+        if current.id() != staged.predecessor {
+            return Ok(());
+        }
+        for token in staged.created.into_iter().rev() {
+            self.core.store.rollback_catalog_blob(token)?;
+        }
+        let resolver = self.core.store.catalog_blob_resolver()?;
+        self.core.executor.replace_resolver(resolver);
+        Ok(())
+    }
+
+    fn stage_catalog(
+        &mut self,
+        catalog: &[RuntimeBlob],
+    ) -> Result<StagedCatalog, LocalJournalDriverError> {
         let mut staged = BTreeMap::new();
         for blob in catalog {
             if !blob.reference.matches(&blob.bytes) {
@@ -2367,18 +2594,53 @@ where
                 _ => {}
             }
         }
+        let predecessor = self.core.materialization.heads().id();
+        let mut created = Vec::new();
         for blob in catalog {
-            self.core.store.put_blob(
-                JournalBlobClass::CatalogArtifact,
-                &blob.reference,
-                &blob.bytes,
-            )?;
+            match self
+                .core
+                .store
+                .stage_catalog_blob(predecessor, &blob.reference, &blob.bytes)
+            {
+                Ok(Some(token)) => {
+                    created.push(token);
+                    #[cfg(test)]
+                    if self.lifecycle_fault == Some(TestLifecycleFault::CatalogPutAfterFirst) {
+                        self.lifecycle_fault = None;
+                        self.rollback_staged_catalog(StagedCatalog {
+                            predecessor,
+                            created,
+                        })?;
+                        return Err(JournalStoreError::Unavailable.into());
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.rollback_staged_catalog(StagedCatalog {
+                        predecessor,
+                        created,
+                    })?;
+                    return Err(error.into());
+                }
+            }
         }
         // Memory snapshots are copy-on-write and file snapshots own pinned
         // descriptors. Refresh only after every requested byte is durable.
-        let resolver = self.core.store.catalog_blob_resolver()?;
+        let resolver = match self.core.store.catalog_blob_resolver() {
+            Ok(resolver) => resolver,
+            Err(error) => {
+                self.rollback_staged_catalog(StagedCatalog {
+                    predecessor,
+                    created,
+                })?;
+                return Err(error.into());
+            }
+        };
         self.core.executor.replace_resolver(resolver);
-        Ok(())
+        Ok(StagedCatalog {
+            predecessor,
+            created,
+        })
     }
 
     fn persist_merge_seal(
@@ -2422,67 +2684,91 @@ where
                 finalized_merge_invocations: Vec::new(),
             });
         }
-        if retained_lifecycle_disposition(self.core.materialization.state(), &request)?.is_none()
+        let staged = if retained_lifecycle_disposition(self.core.materialization.state(), &request)?
+            .is_none()
             && preflight.result.is_ok()
         {
-            self.core
-                .executor
-                .validate_lifecycle_catalog(&config, &request, catalog)?;
+            self.core.executor.validate_lifecycle_catalog(
+                &config,
+                self.core.materialization.state(),
+                &request,
+                catalog,
+            )?;
             validate_prospective_artifact_closure(
                 self.core.materialization.heads().genesis,
                 &preflight.successor,
             )?;
-            self.stage_catalog(catalog)?;
-        }
-        let input = ReplayInput {
-            runtime: self.core.materialization.runtime().clone(),
-            operation: ReplayOperation::Management {
-                request: request.clone(),
-            },
+            Some(self.stage_catalog(catalog)?)
+        } else {
+            None
         };
-        let input_id = input.id();
-        let merge_seal = self.persist_merge_seal()?;
-        let heads = self.core.materialization.heads();
-        let entry = OrderedEntry {
-            genesis: heads.genesis,
-            index: heads
-                .ordered_index
-                .checked_add(1)
-                .ok_or(LocalJournalDriverError::InvalidResult)?,
-            parent: heads.ordered_head,
-            merge_frontier: heads.merge_frontier,
-            merge_seal: Some(merge_seal),
-            input,
-        };
-        self.core.executor.clear_management_result();
-        let executions = self.core.publish_ordered(&entry)?.executions;
-        let finalized_merge_invocations = executions
-            .iter()
-            .filter_map(|execution| {
-                execution
-                    .result()
-                    .cloned()
-                    .map(|result| FinalizedMergeInvocation {
-                        input: execution.input(),
-                        position: execution.position(),
-                        result,
-                    })
+        let result = (|| -> Result<LocalLifecycleResult, LocalJournalDriverError> {
+            #[cfg(test)]
+            if self.lifecycle_fault == Some(TestLifecycleFault::BeforeMergeSeal) {
+                self.lifecycle_fault = None;
+                return Err(JournalStoreError::Unavailable.into());
+            }
+            let input = ReplayInput {
+                runtime: self.core.materialization.runtime().clone(),
+                operation: ReplayOperation::Management {
+                    request: request.clone(),
+                },
+            };
+            let input_id = input.id();
+            let merge_seal = self.persist_merge_seal()?;
+            let heads = self.core.materialization.heads();
+            let entry = OrderedEntry {
+                genesis: heads.genesis,
+                index: heads
+                    .ordered_index
+                    .checked_add(1)
+                    .ok_or(LocalJournalDriverError::InvalidResult)?,
+                parent: heads.ordered_head,
+                merge_frontier: heads.merge_frontier,
+                merge_seal: Some(merge_seal),
+                input,
+            };
+            #[cfg(test)]
+            if self.lifecycle_fault == Some(TestLifecycleFault::BeforeOrderedPublish) {
+                self.lifecycle_fault = None;
+                return Err(JournalStoreError::Unavailable.into());
+            }
+            self.core.executor.clear_management_result();
+            let executions = self.core.publish_ordered(&entry)?.executions;
+            let finalized_merge_invocations = executions
+                .iter()
+                .filter_map(|execution| {
+                    execution
+                        .result()
+                        .cloned()
+                        .map(|result| FinalizedMergeInvocation {
+                            input: execution.input(),
+                            position: execution.position(),
+                            result,
+                        })
+                })
+                .collect::<Vec<_>>();
+            if executions
+                .iter()
+                .any(|execution| !execution.products().is_empty())
+            {
+                return Err(LocalJournalDriverError::InvalidResult);
+            }
+            let result = match self.core.executor.take_management_result(input_id) {
+                Some(result) => result,
+                None => self.lifecycle_result(&request)?,
+            };
+            Ok(LocalLifecycleResult {
+                result,
+                finalized_merge_invocations,
             })
-            .collect::<Vec<_>>();
-        if executions
-            .iter()
-            .any(|execution| !execution.products().is_empty())
+        })();
+        if result.is_err()
+            && let Some(staged) = staged
         {
-            return Err(LocalJournalDriverError::InvalidResult);
+            self.rollback_staged_catalog(staged)?;
         }
-        let result = match self.core.executor.take_management_result(input_id) {
-            Some(result) => result,
-            None => self.lifecycle_result(&request)?,
-        };
-        Ok(LocalLifecycleResult {
-            result,
-            finalized_merge_invocations,
-        })
+        result
     }
 
     fn lifecycle_result(
@@ -3210,6 +3496,7 @@ where
     S: AgentJournalStore
         + super::replay::ReplaySource<Error = JournalStoreError>
         + CatalogBlobResolverFactory
+        + UnpublishedCatalogBlobStore
         + ReverifiedRootJournalStore
         + SystemAuthorityPublicationStore
         + SystemAuthorityHistoryStore,
@@ -3265,7 +3552,11 @@ where
                     Self::validate_route_owner(&store, &materialization, authority)?;
                     let core =
                         LocalJournalCore::from_materialization(store, executor, materialization);
-                    let driver = Self { core };
+                    let driver = Self {
+                        core,
+                        #[cfg(test)]
+                        lifecycle_fault: None,
+                    };
                     driver.validate_opened(Some(sealed.replica()))?;
                     Ok(driver)
                 })()
@@ -3318,7 +3609,11 @@ where
                     Self::validate_route_owner(&store, &materialization, authority)?;
                     let core =
                         LocalJournalCore::from_materialization(store, executor, materialization);
-                    let driver = Self { core };
+                    let driver = Self {
+                        core,
+                        #[cfg(test)]
+                        lifecycle_fault: None,
+                    };
                     driver.validate_opened(None)?;
                     Ok(driver)
                 })()
@@ -3417,7 +3712,11 @@ where
                 }
                 Self::validate_route_owner(&store, &materialization, authority)?;
                 let core = LocalJournalCore::from_materialization(store, executor, materialization);
-                let driver = Self { core };
+                let driver = Self {
+                    core,
+                    #[cfg(test)]
+                    lifecycle_fault: None,
+                };
                 driver.validate_opened(None)?;
                 Ok(driver)
             })
@@ -3748,6 +4047,37 @@ mod tests {
         provable: false,
     };
 
+    const HOST_SURFACE_PARAMETERIZED_META: crate::metadata::ActorMeta =
+        crate::metadata::ActorMeta {
+            constructor: &[crate::metadata::FieldMeta {
+                name: "tenant",
+                ty: "u64",
+            }],
+            ..HOST_SURFACE_ACTOR_META
+        };
+
+    const HOST_SURFACE_STRING_PARAMETER_META: crate::metadata::ActorMeta =
+        crate::metadata::ActorMeta {
+            constructor: &[crate::metadata::FieldMeta {
+                name: "tenant",
+                ty: "String",
+            }],
+            ..HOST_SURFACE_ACTOR_META
+        };
+
+    const FRESH_UPGRADE_METHODS: &[crate::agent_sdk::schema::MethodMeta] =
+        &[crate::agent_sdk::schema::MethodMeta {
+            source_index: 0,
+            name: "mutate",
+            mode: crate::agent_sdk::MethodMode::Merge,
+            explicit: false,
+        }];
+    const FRESH_UPGRADE_SCHEMA: crate::agent_sdk::schema::SchemaMeta =
+        crate::agent_sdk::schema::SchemaMeta {
+            fields: &[],
+            methods: FRESH_UPGRADE_METHODS,
+        };
+
     const HOST_SURFACE_ACTOR_SCHEMA: super::super::schema::SchemaMeta =
         super::super::schema::SchemaMeta {
             uses_storage: false,
@@ -3764,6 +4094,10 @@ mod tests {
         };
 
     fn host_surface_actor_package() -> Package {
+        host_surface_actor_package_with_meta(&HOST_SURFACE_ACTOR_META)
+    }
+
+    fn host_surface_actor_package_with_meta(meta: &crate::metadata::ActorMeta) -> Package {
         let pvm = vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
             ro_data: Vec::new(),
             rw_data: Vec::new(),
@@ -3776,8 +4110,7 @@ mod tests {
             },
         })
         .unwrap();
-        let (metadata_bytes, metadata_len) =
-            crate::metadata::encode::<1024>(&HOST_SURFACE_ACTOR_META);
+        let (metadata_bytes, metadata_len) = crate::metadata::encode::<1024>(meta);
         let schemas = metadata_bytes[..metadata_len].to_vec();
         let metadata = crate::metadata::decode(&schemas).unwrap();
         let role_policies = PackageRolePolicies::from_metadata(&metadata)
@@ -3793,7 +4126,7 @@ mod tests {
         let generated_interfaces = b"host-surface-actor-interface".to_vec();
         Package {
             manifest: PackageManifest {
-                name: "merge-fixture".into(),
+                name: meta.actor_name.into(),
                 platform: crate::service::PLATFORM_ID,
                 execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
                 kind: PackageKind::Actor {
@@ -3816,6 +4149,45 @@ mod tests {
             diagnostics: None,
             deployment_signature: deployment_signature(0x72),
         }
+    }
+
+    fn fresh_upgrade_actor_package(
+        meta: &crate::metadata::ActorMeta,
+        discriminator: u8,
+    ) -> Package {
+        let mut package = host_surface_actor_package_with_meta(meta);
+        let (schema, schema_len) = crate::agent_sdk::schema::encode::<1024>(&FRESH_UPGRADE_SCHEMA);
+        package.agent_schema = schema[..schema_len].to_vec();
+        package.manifest.agent_schema_hash = artifact_hash(b"agent-schema", &package.agent_schema);
+        package.manifest.kind = PackageKind::Actor {
+            contract: ActorPackageContract::canonical(),
+            requirements: RuntimeRequirements {
+                lanes: LaneSet::of(StateLane::Merge),
+                scheduling: false,
+                proofs: false,
+            },
+        };
+        package.pvm = vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
+            ro_data: vec![discriminator],
+            rw_data: Vec::new(),
+            heap_pages: 0,
+            stack_size: vos_pvm_program::PAGE_SIZE,
+            code: vos_pvm_program::CodeBlob {
+                jump_table: Vec::new(),
+                code: vec![0],
+                bitmask: vec![1],
+            },
+        })
+        .unwrap();
+        package.manifest.program = ProgramId::of_pvm(&package.pvm);
+        package.deployment_signature = deployment_signature(discriminator);
+        package.validate().unwrap_or_else(|error| {
+            panic!(
+                "fresh actor package with {} constructor fields: {error:?}",
+                meta.constructor.len()
+            )
+        });
+        package
     }
 
     fn host_surface_root_material(config: &AgentConfig) -> (RootAnchorRecord, [SigningKey; 3]) {
@@ -4244,6 +4616,7 @@ mod tests {
                 registry_reservation,
                 "journal-identity".into(),
                 None,
+                None,
                 &package,
             )
             .unwrap();
@@ -4291,6 +4664,300 @@ mod tests {
         let store = driver.core.store;
         let reopened = LocalJournalAgentDriver::open(store, trust, merge).unwrap();
         assert_eq!(reopened.inspect_actor(entry.actor).unwrap(), first_record);
+    }
+
+    #[test]
+    fn fresh_upgrade_catalog_preserves_the_installed_constructor_argument_shape() {
+        fn installed_state(
+            driver: &LocalJournalAgentDriver<MemoryAgentJournalStore>,
+            config: &AgentConfig,
+            package: &Package,
+            installation_data: Option<Vec<u8>>,
+            discriminator: u8,
+        ) -> (RuntimeState, ActorEntry) {
+            let catalog =
+                LocalJournalAgentDriver::<MemoryAgentJournalStore>::actor_package_catalog(package);
+            let PackageKind::Actor {
+                contract,
+                requirements,
+            } = package.manifest.kind
+            else {
+                panic!("fixture is an actor package")
+            };
+            let name = format!("upgrade-shape-{discriminator}");
+            let installation_data = installation_data.map(|bytes| super::super::InstallationData {
+                reference: BlobRef::of_bytes(&bytes),
+                bytes,
+            });
+            let parsed_schema = crate::agent_sdk::schema::decode(&package.agent_schema).unwrap();
+            let constructor_abi = package.constructor_abi().unwrap();
+            let entry = ActorEntry {
+                actor: ActorId::top_level(config.identity.agent, &name),
+                name,
+                parent: None,
+                deployment: package.deployment_id(),
+                program: package.manifest.program,
+                package: catalog[0].reference.clone(),
+                agent_schema: catalog[1].reference.clone(),
+                role_policies: catalog[2].reference.clone(),
+                constructor_abi,
+                installation_data: installation_data
+                    .as_ref()
+                    .map(|data| data.reference.clone()),
+                state_layout: Hash(parsed_schema.state_layout_hash().unwrap().0),
+                lanes: requirements.lanes,
+                suspended: false,
+            };
+            let request = LifecycleRequest::Install(InstallActor {
+                installation_id: crate::service::InstallationId([discriminator; 32]),
+                registry_reservation: Hash([discriminator.wrapping_add(1); 32]),
+                entry: entry.clone(),
+                producer: package.deployment_signature.producer,
+                package: catalog[0].reference.clone(),
+                agent_schema: catalog[1].reference.clone(),
+                role_policies: catalog[2].reference.clone(),
+                constructor_abi,
+                installation_data,
+                state_layout: entry.state_layout,
+                contract,
+                requirements,
+            });
+            let request = authorized_at(config, request, 2, 20);
+            let mut runtime = StandardAgentRuntime::restore(
+                decode_standard_runtime_state(driver.core.materialization.state()).unwrap(),
+            )
+            .unwrap();
+            let reply = runtime.apply(request).unwrap();
+            let LifecycleReply::Installed(entry) = reply else {
+                panic!("expected installed actor")
+            };
+            (encode_standard_runtime_state(&runtime.snapshot()), entry)
+        }
+
+        fn upgrade_validation(
+            driver: &LocalJournalAgentDriver<MemoryAgentJournalStore>,
+            config: &AgentConfig,
+            state: &RuntimeState,
+            installed: &ActorEntry,
+            target: &Package,
+        ) -> Result<(), LocalReplayExecutorError> {
+            let catalog =
+                LocalJournalAgentDriver::<MemoryAgentJournalStore>::actor_package_catalog(target);
+            let PackageKind::Actor {
+                contract,
+                requirements,
+            } = target.manifest.kind
+            else {
+                panic!("fixture is an actor package")
+            };
+            let parsed_schema = crate::agent_sdk::schema::decode(&target.agent_schema).unwrap();
+            let constructor_abi = target.constructor_abi().unwrap();
+            let request = LifecycleRequest::UpgradeActor(UpgradeActor {
+                actor: installed.actor,
+                from_deployment: installed.deployment,
+                to_deployment: target.deployment_id(),
+                to_program: target.manifest.program,
+                producer: target.deployment_signature.producer,
+                package: catalog[0].reference.clone(),
+                agent_schema: catalog[1].reference.clone(),
+                role_policies: catalog[2].reference.clone(),
+                constructor_abi,
+                state_layout: Hash(parsed_schema.state_layout_hash().unwrap().0),
+                contract,
+                requirements,
+            });
+            let target_reference = catalog[0].reference.clone();
+            assert!(matches!(
+                driver.core.executor.load(&target_reference),
+                Err(LocalReplayExecutorError::ArtifactUnavailable(reference))
+                    if reference == target_reference
+            ));
+            let authorized = authorized_at(config, request, 3, 20);
+            driver.core.executor.validate_upgrade_installation_shape(
+                state,
+                &authorized,
+                Some(&catalog),
+            )
+        }
+
+        let driver = standard_test_driver();
+        let config = current_test_config(&driver.core.materialization);
+        let ordinary = fresh_upgrade_actor_package(&HOST_SURFACE_ACTOR_META, 0xb0);
+        let ordinary_target = fresh_upgrade_actor_package(&HOST_SURFACE_ACTOR_META, 0xb1);
+        let required = fresh_upgrade_actor_package(&HOST_SURFACE_PARAMETERIZED_META, 0xb2);
+        let incompatible_typed =
+            fresh_upgrade_actor_package(&HOST_SURFACE_STRING_PARAMETER_META, 0xb5);
+
+        let (absent_state, absent_actor) = installed_state(&driver, &config, &ordinary, None, 0xb3);
+        assert_eq!(
+            upgrade_validation(
+                &driver,
+                &config,
+                &absent_state,
+                &absent_actor,
+                &ordinary_target,
+            ),
+            Ok(()),
+            "live admission must authenticate a fresh package from the supplied catalog"
+        );
+        assert_eq!(
+            upgrade_validation(&driver, &config, &absent_state, &absent_actor, &required),
+            Err(LocalReplayExecutorError::InvalidRequest),
+            "an absent argument object cannot upgrade into a parameterized constructor"
+        );
+
+        let (present_state, present_actor) =
+            installed_state(&driver, &config, &required, Some(vec![0x44]), 0xb4);
+        assert_eq!(
+            upgrade_validation(
+                &driver,
+                &config,
+                &present_state,
+                &present_actor,
+                &ordinary_target,
+            ),
+            Err(LocalReplayExecutorError::InvalidRequest),
+            "immutable constructor arguments cannot be stranded by an upgrade"
+        );
+        assert_eq!(
+            upgrade_validation(
+                &driver,
+                &config,
+                &present_state,
+                &present_actor,
+                &incompatible_typed,
+            ),
+            Err(LocalReplayExecutorError::InvalidRequest),
+            "equal constructor presence cannot reinterpret typed argument bytes"
+        );
+
+        let target_catalog =
+            LocalJournalAgentDriver::<MemoryAgentJournalStore>::actor_package_catalog(
+                &ordinary_target,
+            );
+        let PackageKind::Actor {
+            contract,
+            requirements,
+        } = ordinary_target.manifest.kind
+        else {
+            unreachable!()
+        };
+        let target_schema =
+            crate::agent_sdk::schema::decode(&ordinary_target.agent_schema).unwrap();
+        let busy_upgrade = authorized_at(
+            &config,
+            LifecycleRequest::UpgradeActor(UpgradeActor {
+                actor: absent_actor.actor,
+                from_deployment: absent_actor.deployment,
+                to_deployment: ordinary_target.deployment_id(),
+                to_program: ordinary_target.manifest.program,
+                producer: ordinary_target.deployment_signature.producer,
+                package: target_catalog[0].reference.clone(),
+                agent_schema: target_catalog[1].reference.clone(),
+                role_policies: target_catalog[2].reference.clone(),
+                constructor_abi: ordinary_target.constructor_abi().unwrap(),
+                state_layout: Hash(target_schema.state_layout_hash().unwrap().0),
+                contract,
+                requirements,
+            }),
+            4,
+            20,
+        );
+        let mut busy = decode_standard_runtime_state(&absent_state).unwrap();
+        busy.actors[0].debt.lifecycle_operations = 1;
+        let busy_state = encode_standard_runtime_state(&busy);
+        let preflight = preflight_lifecycle_transition(&busy_state, &busy_upgrade).unwrap();
+        assert!(matches!(preflight.result, Err(LifecycleError::Busy(_))));
+        assert!(matches!(
+            driver.core.executor.load(&target_catalog[0].reference),
+            Err(LocalReplayExecutorError::ArtifactUnavailable(_))
+        ));
+        assert_eq!(
+            driver.core.executor.validate_replayed_upgrade_target(
+                &busy_state,
+                &busy_upgrade,
+                &preflight.result,
+            ),
+            Ok(()),
+            "historical Busy replay must not resolve an unstaged target"
+        );
+    }
+
+    #[test]
+    fn lifecycle_catalog_staging_rolls_back_each_prepublication_failure_boundary() {
+        for (index, fault) in [
+            TestLifecycleFault::CatalogPutAfterFirst,
+            TestLifecycleFault::BeforeMergeSeal,
+            TestLifecycleFault::BeforeOrderedPublish,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut driver = standard_test_driver();
+            let catalog = (0..3_u8)
+                .map(|item| {
+                    let bytes = vec![0xc0 + index as u8, item];
+                    RuntimeBlob {
+                        reference: BlobRef::of_bytes(&bytes),
+                        bytes,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let predecessor = driver.core.store.heads().unwrap().unwrap();
+
+            // Content which predates the attempted transaction mints no
+            // deletion capability and must survive every cleanup boundary.
+            assert!(
+                driver
+                    .core
+                    .store
+                    .put_blob(
+                        JournalBlobClass::CatalogArtifact,
+                        &catalog[0].reference,
+                        &catalog[0].bytes,
+                    )
+                    .unwrap()
+            );
+            if fault == TestLifecycleFault::CatalogPutAfterFirst {
+                driver.lifecycle_fault = Some(fault);
+                assert!(matches!(
+                    driver.stage_catalog(&catalog),
+                    Err(LocalJournalDriverError::Store(
+                        JournalStoreError::Unavailable
+                    ))
+                ));
+            } else {
+                // These are the two error boundaries immediately after
+                // staging in `lifecycle`: merge-seal preparation and ordered
+                // publication. Both consume the same opaque transaction.
+                let staged = driver.stage_catalog(&catalog).unwrap();
+                driver.rollback_staged_catalog(staged).unwrap();
+            }
+            assert_eq!(driver.core.store.heads().unwrap(), Some(predecessor));
+            assert_eq!(
+                driver
+                    .core
+                    .store
+                    .load_blob(JournalBlobClass::CatalogArtifact, &catalog[0].reference)
+                    .unwrap(),
+                Some(catalog[0].bytes.clone())
+            );
+            for blob in &catalog[1..] {
+                assert_eq!(
+                    driver
+                        .core
+                        .store
+                        .load_blob(JournalBlobClass::CatalogArtifact, &blob.reference)
+                        .unwrap(),
+                    None,
+                    "{fault:?} left an unpublished catalog orphan"
+                );
+                assert!(matches!(
+                    driver.core.executor.load(&blob.reference),
+                    Err(LocalReplayExecutorError::ArtifactUnavailable(_))
+                ));
+            }
+        }
     }
 
     #[cfg(feature = "network")]
@@ -4362,6 +5029,7 @@ mod tests {
                 crate::service::InstallationId([0x91; 32]),
                 Hash([0x92; 32]),
                 "merge-fixture".into(),
+                None,
                 None,
                 &actor_package,
             )
@@ -4517,6 +5185,7 @@ mod tests {
                 materialization,
                 executor,
             },
+            lifecycle_fault: None,
         }
     }
 
@@ -5061,6 +5730,8 @@ mod tests {
                 package: package.clone(),
                 agent_schema: schema.clone(),
                 role_policies: policies.clone(),
+                constructor_abi: Hash([0xe1; 32]),
+                installation_data: None,
                 state_layout: Hash([0xe0; 32]),
                 lanes: requirements.lanes,
                 suspended: false,
@@ -5069,6 +5740,8 @@ mod tests {
             package,
             agent_schema: schema,
             role_policies: policies,
+            constructor_abi: Hash([0xe1; 32]),
+            installation_data: None,
             state_layout: Hash([0xe0; 32]),
             contract: super::super::contract::ActorPackageContract::canonical(),
             requirements,
@@ -5414,6 +6087,7 @@ mod tests {
                 materialization: core.materialization,
                 executor,
             },
+            lifecycle_fault: None,
         };
         *mutable_trust.authority.lock().unwrap() = None;
         let recovery_input = input.clone();
@@ -5540,6 +6214,8 @@ mod tests {
                 package: package_blob.reference.clone(),
                 agent_schema: schema_blob.reference.clone(),
                 role_policies: policies_blob.reference.clone(),
+                constructor_abi: Hash([0xf4; 32]),
+                installation_data: None,
                 state_layout,
                 lanes: requirements.lanes,
                 suspended: false,
@@ -5548,6 +6224,8 @@ mod tests {
             package: package_blob.reference.clone(),
             agent_schema: schema_blob.reference.clone(),
             role_policies: policies_blob.reference.clone(),
+            constructor_abi: Hash([0xf4; 32]),
+            installation_data: None,
             state_layout,
             contract: super::super::contract::ActorPackageContract::canonical(),
             requirements,
@@ -5570,6 +6248,7 @@ mod tests {
         assert_eq!(
             driver.core.executor.validate_lifecycle_catalog(
                 &config,
+                driver.core.materialization.state(),
                 &authorized,
                 &[package_blob.clone(), schema_blob.clone()],
             ),
@@ -5583,6 +6262,7 @@ mod tests {
         assert_eq!(
             driver.core.executor.validate_lifecycle_catalog(
                 &config,
+                driver.core.materialization.state(),
                 &authorized,
                 &[
                     package_blob.clone(),
@@ -5598,6 +6278,7 @@ mod tests {
         assert!(matches!(
             driver.core.executor.validate_lifecycle_catalog(
                 &config,
+                driver.core.materialization.state(),
                 &authorized,
                 &[package_blob.clone(), schema_blob.clone(), policies_blob.clone()],
             ),

@@ -8,7 +8,7 @@ use crate::service::Hash;
 use crate::service::wire::{DecodeError, Decoder, Encoder};
 
 /// Actor entry ABI emitted by the canonical actor toolchain.
-pub const ACTOR_ABI: u32 = 1;
+pub const ACTOR_ABI: u32 = 2;
 
 /// Canonical management schema implemented by every agent runtime.
 ///
@@ -18,8 +18,8 @@ pub const ACTOR_ABI: u32 = 1;
 /// control-schema repin whenever that wire identity changes.
 pub const CONTROL_SCHEMA_DESCRIPTOR: &[u8] = &super::RUNTIME_ABI_ID.0;
 pub const CONTROL_SCHEMA_ID: Hash = Hash([
-    0x15, 0xdf, 0x7f, 0x1b, 0x70, 0xa5, 0x12, 0x9d, 0xba, 0x70, 0xca, 0x4d, 0x4b, 0xa7, 0x55, 0xf1,
-    0xe2, 0xce, 0xfe, 0xa3, 0x92, 0xe3, 0x32, 0xc7, 0xb8, 0xc1, 0xcc, 0x6c, 0x80, 0x3e, 0x60, 0x32,
+    0xd7, 0x2c, 0x09, 0xc8, 0x48, 0x00, 0xb9, 0x9f, 0x7e, 0xac, 0xbf, 0x14, 0x92, 0x55, 0x47, 0xfa,
+    0x7e, 0xf4, 0x66, 0xa4, 0x2d, 0x71, 0x41, 0xf1, 0xe9, 0x42, 0x49, 0x05, 0x73, 0xc9, 0xea, 0x20,
 ]);
 
 /// Standard runtime directory capacity. This is an agent policy limit, not
@@ -208,11 +208,11 @@ mod tests {
     fn control_schema_pin_matches_its_canonical_descriptor() {
         assert_eq!(
             super::super::RUNTIME_ABI_ID.0,
-            *b"vos-agent-runtime-abi-20260904r8"
+            *b"vos-agent-runtime-abi-20260904r9"
         );
         assert_eq!(
             super::super::EXECUTION_SEMANTICS_ID.0,
-            *b"vos-pvm-41d31e6-standard-gas-r05"
+            *b"vos-pvm-41d31e6-standard-gas-r06"
         );
         assert_eq!(
             Hash::digest(b"vos/agent/control-schema", &[CONTROL_SCHEMA_DESCRIPTOR]),
@@ -245,7 +245,7 @@ mod tests {
         assert!(contract.is_valid());
         assert!(contract.supports(ActorPackageContract::canonical()));
         assert_eq!(STANDARD_MAX_ACTORS, 4_096);
-        assert_eq!(super::super::MAX_CATALOG_ARTIFACT_REFERENCES, 12_289);
+        assert_eq!(super::super::MAX_CATALOG_ARTIFACT_REFERENCES, 16_385);
         assert_eq!(
             contract.resources.max_runtime_state_bytes,
             super::super::execution::MAX_RUNTIME_STATE_BYTES as u32

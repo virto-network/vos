@@ -123,6 +123,25 @@ fn decode_optional_blob(decoder: &mut Decoder<'_>) -> Result<Option<BlobRef>, De
     decoder.option(decode_blob)
 }
 
+fn encode_installation_data(encoder: &mut Encoder<'_>, value: &InstallationData) {
+    encode_blob(encoder, &value.reference);
+    encoder.bytes(&value.bytes);
+}
+
+fn decode_installation_data(decoder: &mut Decoder<'_>) -> Result<InstallationData, DecodeError> {
+    let reference = decode_blob(decoder)?;
+    // Bound the declared frame before allocating its owned representation.
+    let bytes = decoder
+        .bytes_ref_bounded(MAX_INSTALLATION_DATA_BYTES)?
+        .to_vec();
+    let value = InstallationData { reference, bytes };
+    value
+        .validate()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
 fn encode_optional_hash(encoder: &mut Encoder<'_>, value: &Option<Hash>) {
     encoder.option(value, |encoder, value| encoder.fixed(value.as_bytes()));
 }
@@ -384,6 +403,7 @@ fn encode_actor_entry(encoder: &mut Encoder<'_>, value: &ActorEntry) {
     encode_blob(encoder, &value.package);
     encode_blob(encoder, &value.agent_schema);
     encode_blob(encoder, &value.role_policies);
+    encoder.fixed(value.constructor_abi.as_bytes());
     encode_optional_blob(encoder, &value.installation_data);
     encoder.fixed(value.state_layout.as_bytes());
     encoder.u8(value.lanes.bits());
@@ -400,6 +420,7 @@ fn decode_actor_entry(decoder: &mut Decoder<'_>) -> Result<ActorEntry, DecodeErr
         package: decode_blob(decoder)?,
         agent_schema: decode_blob(decoder)?,
         role_policies: decode_blob(decoder)?,
+        constructor_abi: Hash(decoder.fixed()?),
         installation_data: decode_optional_blob(decoder)?,
         state_layout: Hash(decoder.fixed()?),
         lanes: LaneSet::from_bits(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
@@ -704,7 +725,19 @@ fn install_valid(value: &InstallActor) -> bool {
         && value.package == value.entry.package
         && value.agent_schema == value.entry.agent_schema
         && value.role_policies == value.entry.role_policies
-        && value.installation_data == value.entry.installation_data
+        && value.constructor_abi == value.entry.constructor_abi
+        && value.constructor_abi != Hash::ZERO
+        && value.installation_data.as_ref().map(|data| &data.reference)
+            == value.entry.installation_data.as_ref()
+        && value
+            .installation_data
+            .as_ref()
+            .is_none_or(|data| data.validate().is_ok())
+        && value.installation_data.as_ref().is_none_or(|data| {
+            [&value.package, &value.agent_schema, &value.role_policies]
+                .into_iter()
+                .all(|artifact| artifact.hash != data.reference.hash)
+        })
         && value.state_layout == value.entry.state_layout
         && value.contract.is_valid()
         && value.requirements.lanes.bits() == value.entry.lanes.bits()
@@ -718,7 +751,8 @@ fn encode_install(encoder: &mut Encoder<'_>, value: &InstallActor) {
     encode_blob(encoder, &value.package);
     encode_blob(encoder, &value.agent_schema);
     encode_blob(encoder, &value.role_policies);
-    encode_optional_blob(encoder, &value.installation_data);
+    encoder.fixed(value.constructor_abi.as_bytes());
+    encoder.option(&value.installation_data, encode_installation_data);
     encoder.fixed(value.state_layout.as_bytes());
     encode_actor_contract(encoder, value.contract);
     encode_requirements(encoder, value.requirements);
@@ -733,7 +767,8 @@ fn decode_install(decoder: &mut Decoder<'_>) -> Result<InstallActor, DecodeError
         package: decode_blob(decoder)?,
         agent_schema: decode_blob(decoder)?,
         role_policies: decode_blob(decoder)?,
-        installation_data: decode_optional_blob(decoder)?,
+        constructor_abi: Hash(decoder.fixed()?),
+        installation_data: decoder.option(decode_installation_data)?,
         state_layout: Hash(decoder.fixed()?),
         contract: decode_actor_contract(decoder)?,
         requirements: decode_requirements(decoder)?,
@@ -753,6 +788,7 @@ fn upgrade_actor_valid(value: &UpgradeActor) -> bool {
         && crate::model::valid_blob(&value.package)
         && crate::model::valid_blob(&value.agent_schema)
         && crate::model::valid_blob(&value.role_policies)
+        && value.constructor_abi != Hash::ZERO
         && value.state_layout != Hash::ZERO
         && value.contract.is_valid()
 }
@@ -766,6 +802,7 @@ fn encode_upgrade_actor(encoder: &mut Encoder<'_>, value: &UpgradeActor) {
     encode_blob(encoder, &value.package);
     encode_blob(encoder, &value.agent_schema);
     encode_blob(encoder, &value.role_policies);
+    encoder.fixed(value.constructor_abi.as_bytes());
     encoder.fixed(value.state_layout.as_bytes());
     encode_actor_contract(encoder, value.contract);
     encode_requirements(encoder, value.requirements);
@@ -781,6 +818,7 @@ fn decode_upgrade_actor(decoder: &mut Decoder<'_>) -> Result<UpgradeActor, Decod
         package: decode_blob(decoder)?,
         agent_schema: decode_blob(decoder)?,
         role_policies: decode_blob(decoder)?,
+        constructor_abi: Hash(decoder.fixed()?),
         state_layout: Hash(decoder.fixed()?),
         contract: decode_actor_contract(decoder)?,
         requirements: decode_requirements(decoder)?,
@@ -1116,13 +1154,18 @@ fn encode_required_refs(encoder: &mut Encoder<'_>, values: &[BlobRef]) {
     encoder.list(values, encode_blob);
 }
 
-fn decode_required_refs(decoder: &mut Decoder<'_>) -> Result<Vec<BlobRef>, DecodeError> {
+fn decode_required_refs(
+    decoder: &mut Decoder<'_>,
+    installation_data: Option<&BlobRef>,
+) -> Result<Vec<BlobRef>, DecodeError> {
     let values = decoder.list_bounded(MAX_RUNTIME_AVAILABILITY_ITEMS, decode_blob)?;
     let valid = values.iter().all(|reference| {
         reference.hash != Hash::ZERO
-            && reference.len != 0
+            && (reference.len != 0 || installation_data == Some(reference))
             && reference.len <= MAX_RUNTIME_AVAILABILITY_BYTES as u64
-    }) && values.windows(2).all(|pair| pair[0] < pair[1])
+    }) && installation_data
+        .is_none_or(|required| values.iter().any(|value| value == required))
+        && values.windows(2).all(|pair| pair[0] < pair[1])
         && values
             .iter()
             .try_fold(0u64, |total, reference| total.checked_add(reference.len))
@@ -1142,6 +1185,7 @@ fn encode_invocation_work(encoder: &mut Encoder<'_>, value: &InvocationWork) {
     encoder.u8(value.mode as u8);
     encode_origin(encoder, value.origin);
     encoder.bytes(&value.message);
+    encode_optional_blob(encoder, &value.installation_data);
     encoder.list(&value.availability, encode_runtime_blob);
     encoder.u64(value.gas);
     encoder.bool(value.recovery_only);
@@ -1160,6 +1204,7 @@ fn decode_invocation_work(decoder: &mut Decoder<'_>) -> Result<InvocationWork, D
         mode: decode_method_mode(decoder)?,
         origin: decode_origin(decoder)?,
         message: decoder.bytes_bounded(MAX_INVOCATION_MESSAGE_BYTES)?,
+        installation_data: decode_optional_blob(decoder)?,
         availability: decode_runtime_availability(decoder)?,
         gas: decoder.u64()?,
         recovery_only: decoder.bool()?,
@@ -1227,6 +1272,7 @@ fn encode_resume_work(encoder: &mut Encoder<'_>, value: &ResumeWork) {
     encoder.u8(value.mode as u8);
     encode_blob(encoder, &value.continuation);
     encoder.u64(value.ready_sequence);
+    encode_optional_blob(encoder, &value.installation_data);
     encoder.list(&value.availability, encode_runtime_blob);
     encoder.option(&value.input, encode_resume_input);
 }
@@ -1241,6 +1287,7 @@ fn decode_resume_work(decoder: &mut Decoder<'_>) -> Result<ResumeWork, DecodeErr
         mode: decode_method_mode(decoder)?,
         continuation: decode_blob(decoder)?,
         ready_sequence: decoder.u64()?,
+        installation_data: decode_optional_blob(decoder)?,
         availability: decode_runtime_availability(decoder)?,
         input: decoder.option(decode_resume_input)?,
     };
@@ -1731,21 +1778,33 @@ fn encode_yielded(encoder: &mut Encoder<'_>, value: &YieldedInvocation) {
     encoder.u8(value.mode as u8);
     encode_blob(encoder, &value.continuation);
     encoder.u64(value.ready_sequence);
+    encode_optional_blob(encoder, &value.installation_data);
     encode_required_refs(encoder, &value.required);
     encode_yield_reason(encoder, value.reason);
 }
 
 fn decode_yielded(decoder: &mut Decoder<'_>) -> Result<YieldedInvocation, DecodeError> {
+    let invocation = InvocationId(decoder.fixed()?);
+    let actor = ActorId(decoder.fixed()?);
+    let incarnation = Hash(decoder.fixed()?);
+    let deployment = DeploymentId(decoder.fixed()?);
+    let program = ProgramId(decoder.fixed()?);
+    let mode = decode_method_mode(decoder)?;
+    let continuation = decode_blob(decoder)?;
+    let ready_sequence = decoder.u64()?;
+    let installation_data = decode_optional_blob(decoder)?;
+    let required = decode_required_refs(decoder, installation_data.as_ref())?;
     let value = YieldedInvocation {
-        invocation: InvocationId(decoder.fixed()?),
-        actor: ActorId(decoder.fixed()?),
-        incarnation: Hash(decoder.fixed()?),
-        deployment: DeploymentId(decoder.fixed()?),
-        program: ProgramId(decoder.fixed()?),
-        mode: decode_method_mode(decoder)?,
-        continuation: decode_blob(decoder)?,
-        ready_sequence: decoder.u64()?,
-        required: decode_required_refs(decoder)?,
+        invocation,
+        actor,
+        incarnation,
+        deployment,
+        program,
+        mode,
+        continuation,
+        ready_sequence,
+        installation_data,
+        required,
         reason: decode_yield_reason(decoder)?,
     };
     value
@@ -2208,8 +2267,9 @@ mod tests {
             package: blob(byte.wrapping_add(3)),
             agent_schema: blob(byte.wrapping_add(4)),
             role_policies: blob(byte.wrapping_add(5)),
-            installation_data: Some(blob(byte.wrapping_add(6))),
-            state_layout: Hash([byte.wrapping_add(7); 32]),
+            constructor_abi: Hash([byte.wrapping_add(6); 32]),
+            installation_data: Some(blob(byte.wrapping_add(7))),
+            state_layout: Hash([byte.wrapping_add(8); 32]),
             lanes: LaneSet::of(StateLane::Linear),
             suspended: false,
         }
@@ -2244,7 +2304,9 @@ mod tests {
 
     #[test]
     fn installation_data_is_bounded_and_committed_by_install_request() {
-        let entry = actor(3);
+        let mut entry = actor(3);
+        let installation_bytes = alloc::vec![0x5a, 0xa5];
+        entry.installation_data = Some(BlobRef::of_bytes(&installation_bytes));
         let install = InstallActor {
             installation_id: InstallationId([31; 32]),
             registry_reservation: Hash([32; 32]),
@@ -2252,7 +2314,11 @@ mod tests {
             package: entry.package.clone(),
             agent_schema: entry.agent_schema.clone(),
             role_policies: entry.role_policies.clone(),
-            installation_data: entry.installation_data.clone(),
+            constructor_abi: entry.constructor_abi,
+            installation_data: Some(InstallationData {
+                reference: entry.installation_data.clone().unwrap(),
+                bytes: installation_bytes,
+            }),
             state_layout: entry.state_layout,
             contract: ActorPackageContract::canonical(),
             requirements: RuntimeRequirements {
@@ -2272,13 +2338,99 @@ mod tests {
         assert!(management_request_valid(&without_data));
         assert_ne!(with_data.commitment(), without_data.commitment());
 
+        let mut present_empty = install.clone();
+        let empty_reference = BlobRef::of_bytes(&[]);
+        present_empty.entry.installation_data = Some(empty_reference.clone());
+        present_empty.installation_data = Some(InstallationData {
+            reference: empty_reference,
+            bytes: alloc::vec![],
+        });
+        let present_empty_request =
+            ManagementRequest::Install(alloc::boxed::Box::new(present_empty.clone()));
+        assert!(management_request_valid(&present_empty_request));
+        assert_ne!(
+            present_empty_request.commitment(),
+            without_data.commitment()
+        );
+
+        let mut encoded = alloc::vec![];
+        encode_install(&mut Encoder(&mut encoded), &present_empty);
+        let mut decoder = Decoder::new(&encoded);
+        assert_eq!(decode_install(&mut decoder).unwrap(), present_empty);
+        assert!(decoder.exhausted());
+
+        let mut aliased = install.clone();
+        let data_reference = aliased
+            .installation_data
+            .as_ref()
+            .unwrap()
+            .reference
+            .clone();
+        aliased.package = data_reference.clone();
+        aliased.entry.package = data_reference;
+        assert!(!management_request_valid(&ManagementRequest::Install(
+            alloc::boxed::Box::new(aliased)
+        )));
+
         let mut oversized = install;
-        oversized.entry.installation_data.as_mut().unwrap().len =
-            crate::MAX_CATALOG_ARTIFACT_BYTES + 1;
-        oversized.installation_data = oversized.entry.installation_data.clone();
+        let bytes = alloc::vec![0; crate::MAX_INSTALLATION_DATA_BYTES + 1];
+        let reference = BlobRef::of_bytes(&bytes);
+        oversized.entry.installation_data = Some(reference.clone());
+        oversized.installation_data = Some(InstallationData { reference, bytes });
         assert!(!management_request_valid(&ManagementRequest::Install(
             alloc::boxed::Box::new(oversized)
         )));
+    }
+
+    #[test]
+    fn installation_data_decoder_rejects_declared_oversize_mismatch_truncation_and_trailing() {
+        let empty = InstallationData {
+            reference: BlobRef::of_bytes(&[]),
+            bytes: alloc::vec![],
+        };
+        let mut canonical = alloc::vec![];
+        encode_installation_data(&mut Encoder(&mut canonical), &empty);
+        let mut decoder = Decoder::new(&canonical);
+        assert_eq!(decode_installation_data(&mut decoder), Ok(empty));
+        assert!(decoder.exhausted());
+
+        let mut oversized_declaration = alloc::vec![];
+        encode_blob(
+            &mut Encoder(&mut oversized_declaration),
+            &BlobRef {
+                hash: Hash([1; 32]),
+                len: (MAX_INSTALLATION_DATA_BYTES + 1) as u64,
+            },
+        );
+        Encoder(&mut oversized_declaration).u32((MAX_INSTALLATION_DATA_BYTES + 1) as u32);
+        assert_eq!(
+            decode_installation_data(&mut Decoder::new(&oversized_declaration)),
+            Err(DecodeError::LimitExceeded)
+        );
+
+        let mut truncated = alloc::vec![];
+        encode_blob(&mut Encoder(&mut truncated), &BlobRef::of_bytes(&[0x51]));
+        Encoder(&mut truncated).u32(1);
+        assert_eq!(
+            decode_installation_data(&mut Decoder::new(&truncated)),
+            Err(DecodeError::Truncated)
+        );
+
+        let mut mismatch = alloc::vec![];
+        encode_blob(&mut Encoder(&mut mismatch), &BlobRef::of_bytes(&[]));
+        Encoder(&mut mismatch).bytes(&[0x51]);
+        assert_eq!(
+            decode_installation_data(&mut Decoder::new(&mismatch)),
+            Err(DecodeError::NonCanonical)
+        );
+
+        canonical.push(0xff);
+        let mut decoder = Decoder::new(&canonical);
+        assert!(decode_installation_data(&mut decoder).is_ok());
+        assert!(
+            !decoder.exhausted(),
+            "the enclosing canonical wire rejects trailing bytes"
+        );
     }
 
     fn invocation() -> InvocationWork {
@@ -2300,6 +2452,7 @@ mod tests {
                 capability: Some(CapabilityId([12; 32])),
             },
             message: alloc::vec![13, 14],
+            installation_data: None,
             availability: alloc::vec![],
             gas: 1_000,
             recovery_only: false,
@@ -2467,6 +2620,12 @@ mod tests {
 
     #[test]
     fn yielded_transition_round_trip_and_old_generation_rejection() {
+        let installation_data = BlobRef::of_bytes(&[]);
+        let mut required = alloc::vec![
+            BlobRef::of_bytes(b"actor program"),
+            installation_data.clone(),
+        ];
+        required.sort();
         let transition = RuntimeTransition {
             state: RuntimeState::default(),
             outcome: RuntimeOutcome::Yielded(YieldedInvocation {
@@ -2481,7 +2640,8 @@ mod tests {
                     len: 512,
                 },
                 ready_sequence: 7,
-                required: alloc::vec![BlobRef::of_bytes(b"actor program")],
+                installation_data: Some(installation_data),
+                required,
                 reason: YieldReason::Await {
                     call: CallId([8; 32]),
                 },

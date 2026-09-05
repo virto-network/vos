@@ -290,6 +290,10 @@ impl ServiceWire for RuntimeExecutionCall {
         encoder.bytes(&self.actor_schema.bytes);
         encode_blob(&mut encoder, &self.actor_policies.reference);
         encoder.bytes(&self.actor_policies.bytes);
+        encoder.option(&self.installation_data, |encoder, data| {
+            encode_blob(encoder, &data.reference);
+            encoder.bytes(&data.bytes);
+        });
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -331,6 +335,18 @@ impl ServiceWire for RuntimeExecutionCall {
                     bytes.to_vec()
                 },
             },
+            installation_data: decoder.option(|decoder| {
+                let reference = decode_blob(decoder)?;
+                let len = decoder.u32()? as usize;
+                if len > super::MAX_INSTALLATION_DATA_BYTES {
+                    return Err(DecodeError::LimitExceeded);
+                }
+                let bytes = decoder.take(len)?;
+                Ok(RuntimeBlob {
+                    reference,
+                    bytes: bytes.to_vec(),
+                })
+            })?,
         };
         call.invocation
             .validate()
@@ -341,7 +357,8 @@ impl ServiceWire for RuntimeExecutionCall {
             && call.actor_schema.bytes.is_empty()
             && call.actor_policies.reference.hash == Hash::ZERO
             && call.actor_policies.reference.len == 0
-            && call.actor_policies.bytes.is_empty();
+            && call.actor_policies.bytes.is_empty()
+            && call.installation_data.is_none();
         let artifacts_valid = !call.actor_pvm.is_empty()
             && call.actor_pvm.len() <= super::execution::MAX_EXECUTION_PROGRAM_BYTES
             && ProgramId::of_pvm(&call.actor_pvm) == call.invocation.program
@@ -354,7 +371,12 @@ impl ServiceWire for RuntimeExecutionCall {
                 .actor_policies
                 .reference
                 .matches(&call.actor_policies.bytes)
-            && crate::service::PackageRolePolicies::decode(&call.actor_policies.bytes).is_ok();
+            && crate::service::PackageRolePolicies::decode(&call.actor_policies.bytes).is_ok()
+            && call.installation_data.as_ref().is_none_or(|data| {
+                data.bytes.len() <= super::MAX_INSTALLATION_DATA_BYTES
+                    && data.reference.hash != Hash::ZERO
+                    && data.reference.matches(&data.bytes)
+            });
         if (call.recovery_only && !artifacts_absent) || (!call.recovery_only && !artifacts_valid) {
             return Err(DecodeError::NonCanonical);
         }
@@ -454,6 +476,8 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
         encode_blob(encoder, &actor.record.package);
         encode_blob(encoder, &actor.record.agent_schema);
         encode_blob(encoder, &actor.record.role_policies);
+        encoder.fixed(&actor.record.constructor_abi.0);
+        encoder.option(&actor.record.installation_data, encode_blob);
         encoder.fixed(&actor.record.state_layout.0);
         super::contract::encode_actor_contract(encoder, actor.record.contract);
         encode_requirements(encoder, actor.record.requirements);
@@ -582,6 +606,8 @@ pub fn decode_standard_runtime_state(
                     package: decode_blob(decoder)?,
                     agent_schema: decode_blob(decoder)?,
                     role_policies: decode_blob(decoder)?,
+                    constructor_abi: Hash(decoder.fixed()?),
+                    installation_data: decoder.option(decode_blob)?,
                     state_layout: Hash(decoder.fixed()?),
                     contract: super::contract::decode_actor_contract(decoder)?,
                     requirements: decode_requirements(decoder)?,
@@ -1090,6 +1116,7 @@ fn encode_accepted_invocation(
     encoder.u8(value.mode as u8);
     encode_sdk_origin(encoder, value.origin);
     encoder.bytes(&value.message);
+    encoder.option(&value.installation_data, encode_sdk_blob);
     encoder.list(&value.required, encode_sdk_blob);
     encoder.u64(value.gas);
     encoder.bool(value.recovery_only);
@@ -1116,6 +1143,7 @@ fn decode_accepted_invocation(
             }
             bytes.to_vec()
         },
+        installation_data: decoder.option(decode_sdk_blob)?,
         required: decode_bounded_list(
             decoder,
             crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_ITEMS,
@@ -1285,7 +1313,16 @@ pub fn apply_standard_execution(
                                     Err(ActorExecutionError::InvalidAvailability)
                                 }
                                 Ok(None) => match runtime
-                                    .validate_execution_schema(&call.invocation, &call.actor_schema)
+                                    .validate_execution_installation_data(
+                                        &call.invocation,
+                                        call.installation_data.as_ref(),
+                                    )
+                                    .and_then(|()| {
+                                        runtime.validate_execution_schema(
+                                            &call.invocation,
+                                            &call.actor_schema,
+                                        )
+                                    })
                                     .and_then(|()| {
                                         runtime.authorize_execution(
                                             &call.invocation,
@@ -1319,6 +1356,9 @@ pub fn apply_standard_execution(
                                                     super::execution::run_inner_actor(
                                                         &call.invocation,
                                                         &call.actor_pvm,
+                                                        call.installation_data
+                                                            .as_ref()
+                                                            .map(|data| data.bytes.as_slice()),
                                                         &actor_state,
                                                         pending.map(|(_, continuation)| {
                                                             continuation
@@ -1464,7 +1504,7 @@ fn apply_clean_invoke(
         Err(error) => return Ok(clean_completed(state, Err(error))),
         Ok(None) => {}
     }
-    let (invocation, actor_pvm, actor_schema, actor_policies) =
+    let (invocation, actor_pvm, actor_schema, actor_policies, installation_data) =
         match runtime.resolve_clean_invocation(&work) {
             Ok(resolved) => resolved,
             Err(error) if error.is_durable_exact_outcome() => {
@@ -1506,7 +1546,13 @@ fn apply_clean_invoke(
                     Err(error) => Err(error),
                     Ok(None) if work.recovery_only => Err(ActorExecutionError::InvalidAvailability),
                     Ok(None) => match runtime
-                        .validate_execution_schema(&invocation, &actor_schema)
+                        .validate_execution_installation_data(
+                            &invocation,
+                            installation_data.as_ref(),
+                        )
+                        .and_then(|()| {
+                            runtime.validate_execution_schema(&invocation, &actor_schema)
+                        })
                         .and_then(|()| runtime.authorize_execution(&invocation, &actor_policies))
                     {
                         Err(error) => Err(error),
@@ -1530,6 +1576,9 @@ fn apply_clean_invoke(
                                     super::execution::run_inner_actor(
                                         &invocation,
                                         &actor_pvm,
+                                        installation_data
+                                            .as_ref()
+                                            .map(|data| data.bytes.as_slice()),
                                         &visible,
                                         None,
                                     )
@@ -1635,7 +1684,7 @@ fn apply_clean_resume(
         Ok(value) => value,
         Err(error) => return Ok(clean_completed(state, Err(error))),
     };
-    let (invocation, actor_pvm, actor_schema, actor_policies) =
+    let (invocation, actor_pvm, actor_schema, actor_policies, installation_data) =
         match runtime.resolve_clean_invocation(&work) {
             Ok(value) => value,
             Err(error) => return Ok(clean_completed(state, Err(error))),
@@ -1652,7 +1701,8 @@ fn apply_clean_resume(
     let pristine = runtime.clone();
     let mut terminal_sequence = None;
     let mut result = runtime
-        .validate_execution_schema(&invocation, &actor_schema)
+        .validate_execution_installation_data(&invocation, installation_data.as_ref())
+        .and_then(|()| runtime.validate_execution_schema(&invocation, &actor_schema))
         .and_then(|()| runtime.authorize_execution(&invocation, &actor_policies))
         .and_then(|authorized| {
             if !authorized {
@@ -1665,6 +1715,7 @@ fn apply_clean_resume(
             super::execution::run_inner_actor(
                 &invocation,
                 &actor_pvm,
+                installation_data.as_ref().map(|data| data.bytes.as_slice()),
                 &visible,
                 Some(record.continuation.clone()),
             )
@@ -2291,6 +2342,8 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             encode_blob(encoder, &install.package);
             encode_blob(encoder, &install.agent_schema);
             encode_blob(encoder, &install.role_policies);
+            encoder.fixed(&install.constructor_abi.0);
+            encoder.option(&install.installation_data, encode_installation_data);
             encoder.fixed(&install.state_layout.0);
             super::contract::encode_actor_contract(encoder, install.contract);
             encode_requirements(encoder, install.requirements);
@@ -2305,6 +2358,7 @@ fn encode_request(encoder: &mut Encoder<'_>, request: &LifecycleRequest) {
             encode_blob(encoder, &upgrade.package);
             encode_blob(encoder, &upgrade.agent_schema);
             encode_blob(encoder, &upgrade.role_policies);
+            encoder.fixed(&upgrade.constructor_abi.0);
             encoder.fixed(&upgrade.state_layout.0);
             super::contract::encode_actor_contract(encoder, upgrade.contract);
             encode_requirements(encoder, upgrade.requirements);
@@ -2414,6 +2468,8 @@ fn decode_request_at_depth(
                 package: decode_blob(decoder)?,
                 agent_schema: decode_blob(decoder)?,
                 role_policies: decode_blob(decoder)?,
+                constructor_abi: Hash(decoder.fixed()?),
+                installation_data: decoder.option(decode_installation_data)?,
                 state_layout: Hash(decoder.fixed()?),
                 contract: super::contract::decode_actor_contract(decoder)?,
                 requirements: decode_requirements(decoder)?,
@@ -2428,6 +2484,7 @@ fn decode_request_at_depth(
             package: decode_blob(decoder)?,
             agent_schema: decode_blob(decoder)?,
             role_policies: decode_blob(decoder)?,
+            constructor_abi: Hash(decoder.fixed()?),
             state_layout: Hash(decoder.fixed()?),
             contract: super::contract::decode_actor_contract(decoder)?,
             requirements: decode_requirements(decoder)?,
@@ -3121,6 +3178,8 @@ fn encode_entry(encoder: &mut Encoder<'_>, entry: &ActorEntry) {
     encode_blob(encoder, &entry.package);
     encode_blob(encoder, &entry.agent_schema);
     encode_blob(encoder, &entry.role_policies);
+    encoder.fixed(&entry.constructor_abi.0);
+    encoder.option(&entry.installation_data, encode_blob);
     encoder.fixed(&entry.state_layout.0);
     encoder.u8(entry.lanes.bits());
     encoder.bool(entry.suspended);
@@ -3136,6 +3195,8 @@ fn decode_entry(decoder: &mut Decoder<'_>) -> Result<ActorEntry, DecodeError> {
         package: decode_blob(decoder)?,
         agent_schema: decode_blob(decoder)?,
         role_policies: decode_blob(decoder)?,
+        constructor_abi: Hash(decoder.fixed()?),
+        installation_data: decoder.option(decode_blob)?,
         state_layout: Hash(decoder.fixed()?),
         lanes: decode_lanes(decoder)?,
         suspended: decoder.bool()?,
@@ -3150,6 +3211,11 @@ fn decode_entry(decoder: &mut Decoder<'_>) -> Result<ActorEntry, DecodeError> {
         || entry.role_policies.hash == Hash::ZERO
         || entry.role_policies.len == 0
         || entry.role_policies.len > super::execution::MAX_EXECUTION_POLICY_BYTES as u64
+        || entry.constructor_abi == Hash::ZERO
+        || entry.installation_data.as_ref().is_some_and(|reference| {
+            reference.hash == Hash::ZERO
+                || reference.len > super::MAX_INSTALLATION_DATA_BYTES as u64
+        })
         || entry.state_layout == Hash::ZERO
     {
         return Err(DecodeError::NonCanonical);
@@ -3213,6 +3279,31 @@ fn decode_blob(decoder: &mut Decoder<'_>) -> Result<BlobRef, DecodeError> {
         hash: Hash(decoder.fixed()?),
         len: decoder.u64()?,
     })
+}
+
+fn encode_installation_data(encoder: &mut Encoder<'_>, data: &super::InstallationData) {
+    encode_blob(encoder, &data.reference);
+    encoder.bytes(&data.bytes);
+}
+
+fn decode_installation_data(
+    decoder: &mut Decoder<'_>,
+) -> Result<super::InstallationData, DecodeError> {
+    let reference = decode_blob(decoder)?;
+    // Inspect the declared frame before copying attacker-controlled bytes.
+    let len = decoder.u32()? as usize;
+    if len > super::MAX_INSTALLATION_DATA_BYTES {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let bytes = decoder.take(len)?;
+    let data = super::InstallationData {
+        reference,
+        bytes: bytes.to_vec(),
+    };
+    if !data.is_valid() {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(data)
 }
 
 fn encode_requirements(encoder: &mut Encoder<'_>, requirements: RuntimeRequirements) {
@@ -3363,6 +3454,8 @@ mod tests {
                         package: package.clone(),
                         agent_schema: agent_schema.clone(),
                         role_policies: role_policies.clone(),
+                        constructor_abi: Hash([0x8c; 32]),
+                        installation_data: None,
                         state_layout: Hash([0x87; 32]),
                         lanes: LaneSet::ALL,
                         suspended: false,
@@ -3375,6 +3468,8 @@ mod tests {
                     package,
                     agent_schema,
                     role_policies,
+                    constructor_abi: Hash([0x8c; 32]),
+                    installation_data: None,
                     state_layout: Hash([0x87; 32]),
                     contract: super::super::contract::ActorPackageContract::canonical(),
                     requirements: RuntimeRequirements {
@@ -3724,6 +3819,7 @@ mod tests {
             mode: crate::agent_sdk::MethodMode::Linear,
             origin: crate::agent_sdk::InvocationOrigin::anonymous(),
             message: invocation.message.clone(),
+            installation_data: None,
             availability,
             gas: invocation.gas,
             recovery_only: false,
@@ -3774,6 +3870,7 @@ mod tests {
             mode: yielded.mode,
             continuation: yielded.continuation.clone(),
             ready_sequence: yielded.ready_sequence,
+            installation_data: yielded.installation_data.clone(),
             availability,
             input: None,
         }
@@ -3825,6 +3922,7 @@ mod tests {
             mode: crate::agent_sdk::MethodMode::Linear,
             origin: crate::agent_sdk::InvocationOrigin::anonymous(),
             message: vec![1],
+            installation_data: None,
             availability,
             gas: 100,
             recovery_only: false,
@@ -3955,6 +4053,85 @@ mod tests {
         assert_eq!(
             rejected.outcome,
             RuntimeOutcome::Completed(Err(InvocationError::DivergentInvocation))
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn present_empty_installation_data_yields_persists_and_resumes_exactly() {
+        let (runtime, mut work) = clean_resolvable_fixture(false);
+        let mut snapshot = runtime.snapshot();
+        let empty = crate::service::BlobRef::of_bytes(&[]);
+        snapshot.actors[0].record.entry.installation_data = Some(empty.clone());
+        snapshot.actors[0].record.installation_data = Some(empty.clone());
+        let mut runtime = StandardAgentRuntime::restore(snapshot).unwrap();
+        let empty = crate::agent_sdk::RuntimeBlob {
+            // Clean availability has its own canonical BlobRef domain; the
+            // Standard bridge authenticates the same bytes again against the
+            // installed service-domain reference before dispatch.
+            reference: crate::agent_sdk::BlobRef::of_bytes(&[]),
+            bytes: Vec::new(),
+        };
+        work.installation_data = Some(empty.reference.clone());
+        work.availability.push(empty);
+        work.availability
+            .sort_unstable_by_key(|blob| blob.reference.clone());
+        assert!(work.validate());
+        let config = runtime.config().unwrap().clone();
+        let authority = clean_authority_receipt(&config, &work);
+        let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+        let before = runtime.prepare_execution_state(&invocation).unwrap();
+        runtime
+            .commit_yielded_execution(
+                &invocation,
+                &exact_reply(&invocation, ActorExecutionStatus::Yielded),
+                &before,
+                before.clone(),
+                1,
+                None,
+                portable_continuation(&invocation, 1, 3).continuation,
+                Some((
+                    super::super::standard::StandardAcceptedInvocation::from_work(&work),
+                    authority.clone(),
+                )),
+            )
+            .unwrap();
+        let yielded = runtime
+            .recover_clean_yield(&work, &authority)
+            .unwrap()
+            .unwrap();
+        assert_eq!(yielded.installation_data, work.installation_data);
+        assert!(yielded.validate());
+
+        let mut missing_persisted_role = runtime.snapshot();
+        missing_persisted_role.machine_continuations[0]
+            .accepted
+            .as_mut()
+            .unwrap()
+            .installation_data = None;
+        assert!(matches!(
+            StandardAgentRuntime::restore(missing_persisted_role),
+            Err(super::super::LifecycleError::InvalidRequest)
+        ));
+
+        let encoded = encode_standard_runtime_state(&runtime.snapshot());
+        let restarted =
+            StandardAgentRuntime::restore(decode_standard_runtime_state(&encoded).unwrap())
+                .unwrap();
+        assert_eq!(
+            encode_standard_runtime_state(&restarted.snapshot()),
+            encoded
+        );
+        let resume = clean_resume(&yielded, work.availability.clone());
+        let (_, restored_work) = restarted.resolve_clean_resume(&resume).unwrap();
+        assert_eq!(restored_work, work);
+
+        let mut missing_role = resume;
+        missing_role.installation_data = None;
+        assert!(!missing_role.validate());
+        assert_eq!(
+            restarted.resolve_clean_resume(&missing_role),
+            Err(crate::agent_sdk::InvocationError::StaleContinuation)
         );
     }
 
@@ -4240,6 +4417,7 @@ mod tests {
             actor_pvm,
             actor_schema: schema_blob,
             actor_policies: policy_blob,
+            installation_data: None,
         }
     }
 
@@ -4815,12 +4993,51 @@ mod tests {
             package: record.package.clone(),
             agent_schema: record.agent_schema.clone(),
             role_policies: record.role_policies.clone(),
+            constructor_abi: record.constructor_abi,
+            installation_data: None,
             state_layout: record.state_layout,
             contract: record.contract,
             requirements: record.requirements,
         };
-        let call = RuntimeCall::new(RuntimeState::default(), LifecycleRequest::Install(install));
+        let call = RuntimeCall::new(
+            RuntimeState::default(),
+            LifecycleRequest::Install(install.clone()),
+        );
         assert_eq!(RuntimeCall::decode(&call.encode()), Ok(call.clone()));
+
+        let empty_reference = BlobRef::of_bytes(&[]);
+        let mut present_empty_install = install;
+        present_empty_install.entry.installation_data = Some(empty_reference.clone());
+        present_empty_install.installation_data = Some(super::super::InstallationData {
+            reference: empty_reference,
+            bytes: Vec::new(),
+        });
+        let present_empty = RuntimeCall::new(
+            RuntimeState::default(),
+            LifecycleRequest::Install(present_empty_install.clone()),
+        );
+        assert_eq!(
+            RuntimeCall::decode(&present_empty.encode()),
+            Ok(present_empty.clone())
+        );
+        assert_ne!(
+            present_empty.request.commitment(),
+            call.request.commitment()
+        );
+
+        let mut mismatched = present_empty;
+        let LifecycleRequest::Install(install) = &mut mismatched.request else {
+            unreachable!()
+        };
+        install.installation_data.as_mut().unwrap().reference = BlobRef::of_bytes(&[1]);
+        install.entry.installation_data = install
+            .installation_data
+            .as_ref()
+            .map(|data| data.reference.clone());
+        assert_eq!(
+            RuntimeCall::decode(&mismatched.encode()),
+            Err(DecodeError::NonCanonical)
+        );
 
         let mut zero_id = call.clone();
         let LifecycleRequest::Install(install) = &mut zero_id.request else {
@@ -4839,6 +5056,39 @@ mod tests {
         install.registry_reservation = Hash::ZERO;
         assert_eq!(
             RuntimeCall::decode(&zero_reservation.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn installation_data_decoder_rejects_hostile_declared_lengths_before_copying() {
+        let mut declared_oversize = Vec::new();
+        encode_blob(
+            &mut Encoder(&mut declared_oversize),
+            &BlobRef {
+                hash: Hash([0x71; 32]),
+                len: (super::super::MAX_INSTALLATION_DATA_BYTES + 1) as u64,
+            },
+        );
+        Encoder(&mut declared_oversize).u32((super::super::MAX_INSTALLATION_DATA_BYTES + 1) as u32);
+        assert_eq!(
+            decode_installation_data(&mut Decoder::new(&declared_oversize)),
+            Err(DecodeError::LimitExceeded)
+        );
+
+        let mut truncated = Vec::new();
+        encode_blob(&mut Encoder(&mut truncated), &BlobRef::of_bytes(&[0x72]));
+        Encoder(&mut truncated).u32(1);
+        assert_eq!(
+            decode_installation_data(&mut Decoder::new(&truncated)),
+            Err(DecodeError::Truncated)
+        );
+
+        let mut mismatched = Vec::new();
+        encode_blob(&mut Encoder(&mut mismatched), &BlobRef::of_bytes(&[]));
+        Encoder(&mut mismatched).bytes(&[0x73]);
+        assert_eq!(
+            decode_installation_data(&mut Decoder::new(&mismatched)),
             Err(DecodeError::NonCanonical)
         );
     }
@@ -5058,6 +5308,8 @@ mod tests {
                 len: 123,
             },
             role_policies,
+            constructor_abi: Hash([0x28; 32]),
+            installation_data: None,
             state_layout: Hash([0x25; 32]),
             lanes: LaneSet::of(StateLane::Linear),
             suspended: false,
@@ -5150,8 +5402,39 @@ mod tests {
                 reference: BlobRef::of_bytes(&policies),
                 bytes: policies,
             },
+            installation_data: None,
         };
         assert_eq!(RuntimeExecutionCall::decode(&call.encode()).unwrap(), call);
+
+        let absent = call.encode();
+        let mut present_empty = call.clone();
+        present_empty.installation_data = Some(RuntimeBlob {
+            reference: BlobRef::of_bytes(&[]),
+            bytes: Vec::new(),
+        });
+        assert_eq!(
+            RuntimeExecutionCall::decode(&present_empty.encode()),
+            Ok(present_empty.clone())
+        );
+        assert_ne!(present_empty.encode(), absent);
+
+        let mut mismatch = present_empty.clone();
+        mismatch.installation_data.as_mut().unwrap().bytes.push(1);
+        assert_eq!(
+            RuntimeExecutionCall::decode(&mismatch.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut oversized = present_empty;
+        let bytes = vec![0; super::super::MAX_INSTALLATION_DATA_BYTES + 1];
+        oversized.installation_data = Some(RuntimeBlob {
+            reference: BlobRef::of_bytes(&bytes),
+            bytes,
+        });
+        assert_eq!(
+            RuntimeExecutionCall::decode(&oversized.encode()),
+            Err(DecodeError::LimitExceeded)
+        );
     }
 
     #[test]
@@ -5451,7 +5734,7 @@ mod tests {
     fn immediate_prior_runtime_abi_is_rejected_without_a_compatibility_decoder() {
         let mut bytes =
             RuntimeCall::new(RuntimeState::default(), LifecycleRequest::Create(config())).encode();
-        bytes[36..68].copy_from_slice(b"vos-agent-runtime-abi-20260904r7");
+        bytes[36..68].copy_from_slice(b"vos-agent-runtime-abi-20260904r8");
         assert_eq!(
             RuntimeCall::decode(&bytes),
             Err(DecodeError::InvalidPlatform)

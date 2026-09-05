@@ -406,6 +406,10 @@ pub struct RuntimeExecutionCall {
     /// authenticates these bytes against the guest-owned reference and
     /// enforces the selected method before entering application code.
     pub actor_policies: RuntimeBlob,
+    /// Exact canonical constructor-argument object selected by the installed
+    /// directory entry. Absence and present-empty remain distinct; const fields
+    /// are reconstructed by the constructor and are not serialized here.
+    pub installation_data: Option<RuntimeBlob>,
 }
 
 /// Complete deterministic runtime execution result.
@@ -614,6 +618,7 @@ pub(crate) enum ActorRunOutcome {
 pub(crate) fn run_inner_actor(
     invocation: &ActorInvocation,
     actor_pvm: &[u8],
+    installation_data: Option<&[u8]>,
     actor_state: &ActorStateLanes,
     continuation: Option<ActorMachineContinuation>,
 ) -> Result<ActorRunOutcome, ActorExecutionError> {
@@ -657,12 +662,24 @@ pub(crate) fn run_inner_actor(
         control.as_slice(),
         invocation.message.as_slice(),
     ];
+    let mut actor_args =
+        Vec::with_capacity(installation_data.map_or(1, |bytes| bytes.len().saturating_add(1)));
+    match installation_data {
+        None => actor_args.push(0),
+        Some(bytes) => {
+            if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES {
+                return Err(ActorExecutionError::InvalidInput);
+            }
+            actor_args.push(1);
+            actor_args.extend_from_slice(bytes);
+        }
+    }
     let (mut machine, mut gas, mut fetch_index, mut host_budget) = match continuation {
         Some(continuation) => {
             if !continuation.validate() {
                 return Err(ActorExecutionError::InvalidInput);
             }
-            let mut machine = ActorMachine::restore(actor_pvm, &[], &continuation.machine)
+            let mut machine = ActorMachine::restore(actor_pvm, &actor_args, &continuation.machine)
                 .map_err(|_| ActorExecutionError::InvalidAvailability)?;
             // Agent SUSPEND is a private inner-actor ABI exit. Zero finalized
             // the fork which emitted the yielded lane image; one resumes the
@@ -677,7 +694,8 @@ pub(crate) fn run_inner_actor(
             )
         }
         None => (
-            ActorMachine::load(actor_pvm, &[]).map_err(|_| ActorExecutionError::InvalidInput)?,
+            ActorMachine::load(actor_pvm, &actor_args)
+                .map_err(|_| ActorExecutionError::InvalidInput)?,
             invocation.gas,
             0,
             ActorHostBudget::default(),
@@ -772,7 +790,7 @@ pub(crate) fn run_inner_actor(
                         host_budget,
                     };
                     let mut finalizer =
-                        ActorMachine::restore(actor_pvm, &[], &continuation.machine)
+                        ActorMachine::restore(actor_pvm, &actor_args, &continuation.machine)
                             .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
                     finalizer.registers_mut()[7] = 0;
                     finalizer.registers_mut()[8] = 0;

@@ -277,6 +277,151 @@ mod crdt_fixture {
     }
 }
 
+mod installation_data_fixture {
+    use vos::prelude::*;
+
+    mod parameterized_actor {
+        use vos::prelude::*;
+
+        #[actor(agent)]
+        pub struct Parameterized {
+            #[state(const)]
+            pub(super) tenant: u64,
+            pub(super) value: u64,
+        }
+
+        #[messages(agent)]
+        impl Parameterized {
+            fn new(tenant: u64) -> Self {
+                Self { tenant, value: 0 }
+            }
+
+            #[msg]
+            fn value(&self) -> u64 {
+                self.value
+            }
+        }
+    }
+
+    mod unconfigured_actor {
+        use vos::prelude::*;
+
+        #[actor(agent)]
+        pub struct Unconfigured {
+            value: u64,
+        }
+
+        #[messages(agent)]
+        impl Unconfigured {
+            fn new() -> Self {
+                Self { value: 0 }
+            }
+
+            #[msg]
+            fn value(&self) -> u64 {
+                self.value
+            }
+        }
+    }
+
+    mod const_only_actor {
+        use vos::prelude::*;
+
+        #[actor(agent)]
+        pub struct ConstOnly {
+            #[state(const)]
+            pub(super) tenant: u64,
+        }
+
+        #[messages(agent)]
+        impl ConstOnly {
+            fn new() -> Self {
+                Self { tenant: 17 }
+            }
+
+            #[msg]
+            fn tenant(&self) -> u64 {
+                self.tenant
+            }
+        }
+    }
+
+    use const_only_actor::ConstOnly;
+    use parameterized_actor::Parameterized;
+    use unconfigured_actor::Unconfigured;
+
+    #[test]
+    fn generated_agent_construction_uses_exact_installation_args_on_every_hydration() {
+        let args = vos::value::Args::new().with("tenant", 7_u64).encode();
+        let mut fresh =
+            <Parameterized as vos::Actor>::__load_agent_state(Some(&args), None, None, None)
+                .unwrap();
+        assert_eq!(fresh.tenant, 7);
+        assert_eq!(fresh.value, 0);
+
+        fresh.value = 91;
+        let linear =
+            <Parameterized as vos::Actor>::__save_agent_lane(&fresh, vos::agent::StateLane::Linear);
+        let restarted = <Parameterized as vos::Actor>::__load_agent_state(
+            Some(&args),
+            Some(&linear),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            restarted.tenant, 7,
+            "const state is reconstructed from args"
+        );
+        assert_eq!(
+            restarted.value, 91,
+            "row-free mutable state remains lane-backed"
+        );
+
+        assert!(
+            <Parameterized as vos::Actor>::__load_agent_state(None, None, None, None).is_none(),
+            "a parameterized/const actor has no default-construction fallback"
+        );
+        assert!(
+            <Unconfigured as vos::Actor>::__load_agent_state(Some(&[]), None, None, None,)
+                .is_none(),
+            "unexpected present-empty data is distinct from absence"
+        );
+        assert!(<Unconfigured as vos::Actor>::__load_agent_state(None, None, None, None).is_some());
+
+        assert_eq!(
+            <ConstOnly as vos::Actor>::__load_agent_state(None, None, None, None,)
+                .unwrap()
+                .tenant,
+            17,
+            "const state follows the zero-argument constructor and needs no payload"
+        );
+        assert!(
+            <ConstOnly as vos::Actor>::__load_agent_state(Some(&[]), None, None, None,).is_none(),
+            "even present-empty data is unexpected for a zero-argument constructor"
+        );
+        assert!(
+            <ConstOnly as vos::Actor>::__load_agent_state(Some(&[1]), None, None, None,).is_none(),
+            "const-only zero-argument construction cannot ignore non-empty bytes"
+        );
+    }
+
+    #[test]
+    fn malformed_typed_installation_args_never_fall_back_to_new_defaults() {
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _ = <Parameterized as vos::Actor>::__load_agent_state(
+                    Some(&[0xff]),
+                    None,
+                    None,
+                    None,
+                );
+            })
+            .is_err()
+        );
+    }
+}
+
 /// An `Invoker` that ignores the request and hands back a canned
 /// reply `Value`, so a `{Actor}Ref` method can be driven end-to-end
 /// on the host without a live daemon.
