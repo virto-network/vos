@@ -18,6 +18,8 @@ use crate::contract::{
     ActorAbiRange, ActorPackageContract, RuntimeMigrationPolicy, RuntimePackageContract,
     RuntimeResourceLimits,
 };
+use crate::method_policy::ActorMethodPolicyArtifact;
+use crate::wire::CanonicalWire;
 use crate::{
     BlobRef, Hash, LaneSet, MAX_ACTOR_NAME_BYTES, MAX_CATALOG_ARTIFACT_BYTES,
     MAX_CATALOG_ARTIFACT_REFERENCED_BYTES, MAX_CATALOG_ARTIFACT_REFERENCES, PackageKind,
@@ -82,14 +84,14 @@ pub struct ActorPackageManifest {
     pub program: BlobRef,
     pub contract: ActorPackageContract,
     pub state_lane_schema: BlobRef,
-    pub role_policy: BlobRef,
+    pub method_policy: BlobRef,
     /// Content-addressed Task dependencies, in strict BlobRef order.
     pub task_dependencies: Vec<BlobRef>,
     pub requirements: RuntimeRequirements,
     pub signing: PackageSigning,
 }
 
-/// AgentRuntime-only manifest. Actor schema, role policy, Task dependencies,
+/// AgentRuntime-only manifest. Actor schema, method policy, Task dependencies,
 /// and a selected runtime pin are absent by construction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentRuntimePackageManifest {
@@ -159,7 +161,7 @@ impl PackageManifest {
                     .map_err(|_| PackageError::LimitExceeded)?;
                 references.push(manifest.program.clone());
                 references.push(manifest.state_lane_schema.clone());
-                references.push(manifest.role_policy.clone());
+                references.push(manifest.method_policy.clone());
                 references.extend(manifest.task_dependencies.iter().cloned());
             }
             Self::AgentRuntime(manifest) => {
@@ -198,7 +200,8 @@ impl PackageEnvelope {
     /// content-addressed closure. This does not perform signature verification.
     pub fn validate_shape(&self) -> Result<(), PackageError> {
         let expected = self.manifest.validate(true)?;
-        validate_owned_closure(&expected, &self.artifacts)
+        validate_owned_closure(&expected, &self.artifacts)?;
+        self.validate_actor_artifacts()
     }
 
     /// Canonical bytes covered by the Ed25519 signature. The signature field
@@ -207,6 +210,7 @@ impl PackageEnvelope {
     pub fn signing_bytes(&self) -> Result<Vec<u8>, PackageError> {
         let expected = self.manifest.validate(false)?;
         validate_owned_closure(&expected, &self.artifacts)?;
+        self.validate_actor_artifacts()?;
         let capacity = signing_encoded_len(&self.manifest, expected.len())?;
         let mut bytes = Vec::new();
         bytes
@@ -372,6 +376,30 @@ impl PackageEnvelope {
     pub fn package_ref(&self) -> Result<BlobRef, PackageError> {
         Ok(BlobRef::of_bytes(&self.encode()?))
     }
+
+    fn validate_actor_artifacts(&self) -> Result<(), PackageError> {
+        let PackageManifest::Actor(manifest) = &self.manifest else {
+            return Ok(());
+        };
+        let schema_bytes = artifact_bytes(&self.artifacts, &manifest.state_lane_schema)?;
+        let actor_schema =
+            crate::schema::decode(schema_bytes).map_err(|_| PackageError::InvalidActorSchema)?;
+        let policy_bytes = artifact_bytes(&self.artifacts, &manifest.method_policy)?;
+        let method_policy = ActorMethodPolicyArtifact::decode(policy_bytes)
+            .map_err(|_| PackageError::InvalidMethodPolicy)?;
+        if method_policy.actor_schema != manifest.state_lane_schema {
+            return Err(PackageError::ActorArtifactMismatch);
+        }
+        method_policy
+            .validate_against_schema(&actor_schema)
+            .map_err(|_| PackageError::ActorArtifactMismatch)?;
+        if actor_schema.lanes() != manifest.requirements.lanes
+            || (method_policy.requires_attestation() && !manifest.requirements.proofs)
+        {
+            return Err(PackageError::ActorArtifactMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Signature verifier supplied by a no_std guest or host. Implementations are
@@ -388,6 +416,9 @@ pub enum PackageError {
     InvalidSignature,
     InvalidClosure,
     ArtifactMismatch,
+    InvalidActorSchema,
+    InvalidMethodPolicy,
+    ActorArtifactMismatch,
     LimitExceeded,
     IncompatibleRuntime,
 }
@@ -404,6 +435,11 @@ impl fmt::Display for PackageError {
             }
             Self::ArtifactMismatch => {
                 formatter.write_str("package artifact does not match its content identity")
+            }
+            Self::InvalidActorSchema => formatter.write_str("invalid package actor schema"),
+            Self::InvalidMethodPolicy => formatter.write_str("invalid package method policy"),
+            Self::ActorArtifactMismatch => {
+                formatter.write_str("package actor schema and method policy do not match")
             }
             Self::LimitExceeded => formatter.write_str("package limit exceeded"),
             Self::IncompatibleRuntime => {
@@ -487,6 +523,19 @@ fn validate_owned_closure(
         }
     }
     Ok(())
+}
+
+fn artifact_bytes<'a>(
+    artifacts: &'a [PackageArtifact],
+    identity: &BlobRef,
+) -> Result<&'a [u8], PackageError> {
+    let position = artifacts
+        .binary_search_by(|artifact| artifact.identity.cmp(identity))
+        .map_err(|_| PackageError::InvalidClosure)?;
+    artifacts
+        .get(position)
+        .map(|artifact| artifact.bytes.as_slice())
+        .ok_or(PackageError::InvalidClosure)
 }
 
 fn encode_blob(encoder: &mut Encoder<'_>, value: &BlobRef) {
@@ -612,7 +661,7 @@ fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifest, includ
             encode_blob(encoder, &manifest.program);
             encode_actor_contract(encoder, manifest.contract);
             encode_blob(encoder, &manifest.state_lane_schema);
-            encode_blob(encoder, &manifest.role_policy);
+            encode_blob(encoder, &manifest.method_policy);
             encoder.list(&manifest.task_dependencies, encode_blob);
             encode_requirements(encoder, manifest.requirements);
             encode_signing(encoder, &manifest.signing, include_signature);
@@ -635,7 +684,7 @@ fn decode_manifest(decoder: &mut Decoder<'_>) -> Result<PackageManifest, DecodeE
             program: decode_blob(decoder)?,
             contract: decode_actor_contract(decoder)?,
             state_lane_schema: decode_blob(decoder)?,
-            role_policy: decode_blob(decoder)?,
+            method_policy: decode_blob(decoder)?,
             task_dependencies: decoder.list_bounded(MAX_TASK_DEPENDENCIES, decode_blob)?,
             requirements: decode_requirements(decoder)?,
             signing: decode_signing(decoder)?,
@@ -716,6 +765,8 @@ fn envelope_encoded_len(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::method_policy::{ActorMethodPolicy, AttestationRequirement, IdempotencyRequirement};
+    use crate::schema::{ParsedMethod, ParsedSchema};
 
     struct TestVerifier;
 
@@ -765,8 +816,33 @@ mod tests {
 
     fn actor_package() -> PackageEnvelope {
         let program = b"canonical actor pvm".as_slice();
-        let schema = b"state lane schema".as_slice();
-        let policy = b"role policy".as_slice();
+        let schema = ParsedSchema {
+            fields: Vec::new(),
+            methods: alloc::vec![ParsedMethod {
+                source_index: 0,
+                name: "increment".into(),
+                mode: crate::MethodMode::Merge,
+                explicit: true,
+            }],
+        }
+        .encode()
+        .unwrap();
+        let policy = ActorMethodPolicyArtifact {
+            actor_schema: BlobRef::of_bytes(&schema),
+            methods: alloc::vec![ActorMethodPolicy {
+                name: "increment".into(),
+                mode: crate::MethodMode::Merge,
+                argument_schema: Hash([0x31; 32]),
+                return_schema: Hash([0x32; 32]),
+                authorization_policy: Hash([0x33; 32]),
+                idempotency: IdempotencyRequirement::Required,
+                attestation: AttestationRequirement::Required {
+                    proof_system: Hash([0x34; 32]),
+                },
+            }],
+        }
+        .encode()
+        .unwrap();
         let task_a = b"task dependency a".as_slice();
         let task_b = b"task dependency b".as_slice();
         let mut dependencies = alloc::vec![BlobRef::of_bytes(task_a), BlobRef::of_bytes(task_b)];
@@ -776,8 +852,8 @@ mod tests {
                 name: "counter".into(),
                 program: BlobRef::of_bytes(program),
                 contract: ActorPackageContract::canonical(),
-                state_lane_schema: BlobRef::of_bytes(schema),
-                role_policy: BlobRef::of_bytes(policy),
+                state_lane_schema: BlobRef::of_bytes(&schema),
+                method_policy: BlobRef::of_bytes(&policy),
                 task_dependencies: dependencies,
                 requirements: RuntimeRequirements {
                     lanes: LaneSet::of(crate::StateLane::Merge),
@@ -786,8 +862,29 @@ mod tests {
                 },
                 signing: unsigned_signing(),
             }),
-            artifacts: sorted_artifacts(&[program, schema, policy, task_a, task_b]),
+            artifacts: sorted_artifacts(&[program, &schema, &policy, task_a, task_b]),
         })
+    }
+
+    fn replace_artifact(
+        package: &mut PackageEnvelope,
+        old_identity: &BlobRef,
+        bytes: Vec<u8>,
+    ) -> BlobRef {
+        let replacement = PackageArtifact {
+            identity: BlobRef::of_bytes(&bytes),
+            bytes,
+        };
+        let artifact = package
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.identity == *old_identity)
+            .unwrap();
+        *artifact = replacement.clone();
+        package
+            .artifacts
+            .sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+        replacement.identity
     }
 
     fn runtime_package() -> PackageEnvelope {
@@ -859,6 +956,90 @@ mod tests {
     }
 
     #[test]
+    fn actor_schema_and_method_policy_are_semantically_bound_in_the_closure() {
+        let package = actor_package();
+        let PackageManifest::Actor(manifest) = &package.manifest else {
+            unreachable!();
+        };
+        let policy = ActorMethodPolicyArtifact::decode(
+            artifact_bytes(&package.artifacts, &manifest.method_policy).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(policy.actor_schema, manifest.state_lane_schema);
+        assert!(policy.requires_attestation());
+
+        let mut renamed = package.clone();
+        let old_policy = match &renamed.manifest {
+            PackageManifest::Actor(manifest) => manifest.method_policy.clone(),
+            PackageManifest::AgentRuntime(_) => unreachable!(),
+        };
+        let mut policy = ActorMethodPolicyArtifact::decode(
+            artifact_bytes(&renamed.artifacts, &old_policy).unwrap(),
+        )
+        .unwrap();
+        policy.methods[0].name = "decrement".into();
+        let replacement = replace_artifact(&mut renamed, &old_policy, policy.encode().unwrap());
+        let PackageManifest::Actor(manifest) = &mut renamed.manifest else {
+            unreachable!();
+        };
+        manifest.method_policy = replacement;
+        assert_eq!(
+            renamed.validate_shape(),
+            Err(PackageError::ActorArtifactMismatch)
+        );
+        assert_eq!(
+            PackageEnvelope::decode(&encode_unchecked(&renamed)),
+            Err(PackageError::ActorArtifactMismatch)
+        );
+
+        let mut weaker_proofs = package.clone();
+        let PackageManifest::Actor(manifest) = &mut weaker_proofs.manifest else {
+            unreachable!();
+        };
+        manifest.requirements.proofs = false;
+        assert_eq!(
+            weaker_proofs.validate_shape(),
+            Err(PackageError::ActorArtifactMismatch)
+        );
+
+        let mut wrong_lanes = package;
+        let PackageManifest::Actor(manifest) = &mut wrong_lanes.manifest else {
+            unreachable!();
+        };
+        manifest.requirements.lanes = LaneSet::of(crate::StateLane::Linear);
+        assert_eq!(
+            wrong_lanes.validate_shape(),
+            Err(PackageError::ActorArtifactMismatch)
+        );
+    }
+
+    #[test]
+    fn previous_generation_role_policy_wire_has_no_actor_package_fallback() {
+        let mut package = actor_package();
+        let old_policy = match &package.manifest {
+            PackageManifest::Actor(manifest) => manifest.method_policy.clone(),
+            PackageManifest::AgentRuntime(_) => unreachable!(),
+        };
+        let replacement = replace_artifact(
+            &mut package,
+            &old_policy,
+            b"VRPW legacy role policy".to_vec(),
+        );
+        let PackageManifest::Actor(manifest) = &mut package.manifest else {
+            unreachable!();
+        };
+        manifest.method_policy = replacement;
+        assert_eq!(
+            package.validate_shape(),
+            Err(PackageError::InvalidMethodPolicy)
+        );
+        assert_eq!(
+            PackageEnvelope::decode(&encode_unchecked(&package)),
+            Err(PackageError::InvalidMethodPolicy)
+        );
+    }
+
+    #[test]
     fn actor_manifest_cannot_represent_a_runtime_pin() {
         let PackageManifest::Actor(manifest) = &actor_package().manifest else {
             panic!("fixture must be an actor");
@@ -871,7 +1052,7 @@ mod tests {
             program: _,
             contract: _,
             state_lane_schema: _,
-            role_policy: _,
+            method_policy: _,
             task_dependencies: _,
             requirements: _,
             signing: _,
