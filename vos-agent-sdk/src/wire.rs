@@ -25,6 +25,7 @@ pub const MAX_DIRECTORY_PAGE_WIRE_BYTES: usize =
     HEADER_BYTES + 4 + MAX_DIRECTORY_PAGE_ENTRIES * (MAX_ACTOR_ENTRY_WIRE_BYTES + 128) + 33;
 pub const MAX_AUTHORITY_RECEIPT_WIRE_BYTES: usize = 1_024;
 pub const MAX_AGENT_DESCRIPTOR_WIRE_BYTES: usize = 64 * 1024;
+pub const MAX_INVOCATION_CONTEXT_WIRE_BYTES: usize = 512;
 pub const MAX_RUNTIME_WORK_WIRE_BYTES: usize =
     HEADER_BYTES + MAX_RUNTIME_STATE_BYTES + MAX_RUNTIME_AVAILABILITY_BYTES + 512 * 1024;
 pub const MAX_RUNTIME_TRANSITION_WIRE_BYTES: usize =
@@ -1179,6 +1180,67 @@ fn decode_origin(decoder: &mut Decoder<'_>) -> Result<InvocationOrigin, DecodeEr
         .ok_or(DecodeError::NonCanonical)
 }
 
+fn encode_invocation_roles(encoder: &mut Encoder<'_>, value: InvocationRoleClaims) {
+    encoder.option(&value.space, |encoder, value| {
+        encoder.fixed(value.as_bytes())
+    });
+    encoder.option(&value.actor, |encoder, value| {
+        encoder.fixed(value.as_bytes())
+    });
+}
+
+fn decode_invocation_roles(
+    decoder: &mut Decoder<'_>,
+    origin: InvocationOrigin,
+) -> Result<InvocationRoleClaims, DecodeError> {
+    let value = InvocationRoleClaims {
+        space: decoder.option(|decoder| Ok(RoleId(decoder.fixed()?)))?,
+        actor: decoder.option(|decoder| Ok(RoleId(decoder.fixed()?)))?,
+    };
+    value
+        .validate_for(origin)
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+impl CanonicalWire for InvocationContext {
+    const MAGIC: [u8; 4] = *b"AIC1";
+    const MAX_ENCODED_BYTES: usize = MAX_INVOCATION_CONTEXT_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encoder.fixed(self.invocation.as_bytes());
+        encoder.fixed(self.actor.as_bytes());
+        encoder.u8(self.mode as u8);
+        encode_origin(encoder, self.origin);
+        encode_invocation_roles(encoder, self.roles);
+        encoder.u64(self.observed_slot);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let invocation = InvocationId(decoder.fixed()?);
+        let actor = ActorId(decoder.fixed()?);
+        let mode = decode_method_mode(decoder)?;
+        let origin = decode_origin(decoder)?;
+        let roles = decode_invocation_roles(decoder, origin)?;
+        let value = Self {
+            invocation,
+            actor,
+            mode,
+            origin,
+            roles,
+            observed_slot: decoder.u64()?,
+        };
+        value
+            .validate()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
 fn encode_runtime_blob(encoder: &mut Encoder<'_>, value: &RuntimeBlob) {
     encode_blob(encoder, &value.reference);
     encoder.bytes(&value.bytes);
@@ -1232,6 +1294,7 @@ fn encode_invocation_work(encoder: &mut Encoder<'_>, value: &InvocationWork) {
     encoder.fixed(value.program.as_bytes());
     encoder.u8(value.mode as u8);
     encode_origin(encoder, value.origin);
+    encode_invocation_roles(encoder, value.roles);
     encoder.bytes(&value.message);
     encode_optional_blob(encoder, &value.installation_data);
     encoder.list(&value.availability, encode_runtime_blob);
@@ -1240,17 +1303,29 @@ fn encode_invocation_work(encoder: &mut Encoder<'_>, value: &InvocationWork) {
 }
 
 fn decode_invocation_work(decoder: &mut Decoder<'_>) -> Result<InvocationWork, DecodeError> {
+    let space = SpaceId(decoder.fixed()?);
+    let agent = AgentId(decoder.fixed()?);
+    let runtime_deployment = DeploymentId(decoder.fixed()?);
+    let invocation = InvocationId(decoder.fixed()?);
+    let actor = ActorId(decoder.fixed()?);
+    let incarnation = Hash(decoder.fixed()?);
+    let deployment = DeploymentId(decoder.fixed()?);
+    let program = ProgramId(decoder.fixed()?);
+    let mode = decode_method_mode(decoder)?;
+    let origin = decode_origin(decoder)?;
+    let roles = decode_invocation_roles(decoder, origin)?;
     let value = InvocationWork {
-        space: SpaceId(decoder.fixed()?),
-        agent: AgentId(decoder.fixed()?),
-        runtime_deployment: DeploymentId(decoder.fixed()?),
-        invocation: InvocationId(decoder.fixed()?),
-        actor: ActorId(decoder.fixed()?),
-        incarnation: Hash(decoder.fixed()?),
-        deployment: DeploymentId(decoder.fixed()?),
-        program: ProgramId(decoder.fixed()?),
-        mode: decode_method_mode(decoder)?,
-        origin: decode_origin(decoder)?,
+        space,
+        agent,
+        runtime_deployment,
+        invocation,
+        actor,
+        incarnation,
+        deployment,
+        program,
+        mode,
+        origin,
+        roles,
         message: decoder.bytes_bounded(MAX_INVOCATION_MESSAGE_BYTES)?,
         installation_data: decode_optional_blob(decoder)?,
         availability: decode_runtime_availability(decoder)?,
@@ -2573,12 +2648,138 @@ mod tests {
                 actor: None,
                 capability: Some(CapabilityId([12; 32])),
             },
+            roles: InvocationRoleClaims::none(),
             message: alloc::vec![13, 14],
             installation_data: None,
             availability: alloc::vec![],
             gas: 1_000,
             recovery_only: false,
         }
+    }
+
+    fn invocation_context() -> InvocationContext {
+        InvocationContext {
+            invocation: InvocationId([41; 32]),
+            actor: ActorId([42; 32]),
+            mode: MethodMode::Merge,
+            origin: InvocationOrigin {
+                principal: Some(PrincipalId([43; 32])),
+                transport_node: Some(NodeId([44; 32])),
+                credential: Some(CredentialId([45; 32])),
+                actor: Some(ActorId([46; 32])),
+                capability: None,
+            },
+            roles: InvocationRoleClaims {
+                space: None,
+                actor: Some(RoleId([47; 32])),
+            },
+            observed_slot: 48,
+        }
+    }
+
+    #[test]
+    fn aic1_invocation_context_has_one_bounded_golden_wire() {
+        let context = invocation_context();
+        let encoded = context.encode().unwrap();
+        assert_eq!(encoded.get(..4), Some(b"AIC1".as_slice()));
+        assert_eq!(
+            encoded.get(4..HEADER_BYTES),
+            Some(RUNTIME_ABI_ID.as_bytes().as_slice())
+        );
+        assert!(encoded.len() <= MAX_INVOCATION_CONTEXT_WIRE_BYTES);
+        assert_eq!(InvocationContext::decode(&encoded), Ok(context));
+        let golden = Hash::digest(b"vos/test/aic1-golden", &[&encoded]);
+        assert_eq!(
+            golden.0,
+            [
+                180, 54, 249, 211, 225, 179, 175, 169, 116, 42, 253, 217, 4, 121, 244, 111, 15, 17,
+                224, 9, 230, 92, 101, 194, 205, 166, 19, 236, 120, 113, 166, 175,
+            ]
+        );
+
+        let mut variants = [context; 8];
+        variants[0].invocation = InvocationId([51; 32]);
+        variants[1].actor = ActorId([52; 32]);
+        variants[2].origin.principal = Some(PrincipalId([53; 32]));
+        variants[3].origin.transport_node = Some(NodeId([54; 32]));
+        variants[4].origin.credential = Some(CredentialId([55; 32]));
+        variants[5].origin.actor = Some(ActorId([56; 32]));
+        variants[6].roles.actor = Some(RoleId([57; 32]));
+        variants[7].observed_slot += 1;
+        for variant in variants {
+            let variant = variant.encode().unwrap();
+            assert_ne!(
+                Hash::digest(b"vos/test/aic1-golden", &[&variant]),
+                golden,
+                "every authenticated identity, role, and slot is wire-bound"
+            );
+        }
+    }
+
+    #[test]
+    fn aic1_invocation_context_rejects_hostile_and_ambiguous_claims() {
+        let context = invocation_context();
+        let encoded = context.encode().unwrap();
+
+        let mut previous_generation = encoded.clone();
+        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r6");
+        assert_eq!(
+            InvocationContext::decode(&previous_generation),
+            Err(WireError::Decode(DecodeError::InvalidPlatform))
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            InvocationContext::decode(&trailing),
+            Err(WireError::Decode(DecodeError::TrailingBytes))
+        );
+        assert!(matches!(
+            InvocationContext::decode(&encoded[..encoded.len() - 1]),
+            Err(WireError::Decode(DecodeError::Truncated))
+        ));
+
+        let role_at = encoded
+            .windows(32)
+            .position(|window| window == [47; 32])
+            .expect("unique actor role preimage");
+        let mut zero_role = encoded.clone();
+        zero_role[role_at..role_at + 32].fill(0);
+        assert_eq!(
+            InvocationContext::decode(&zero_role),
+            Err(WireError::Decode(DecodeError::NonCanonical))
+        );
+        let mut invalid_role_tag = encoded;
+        invalid_role_tag[role_at - 1] = 2;
+        assert_eq!(
+            InvocationContext::decode(&invalid_role_tag),
+            Err(WireError::Decode(DecodeError::NonCanonical))
+        );
+
+        let mut both_roles = context;
+        both_roles.roles.space = Some(RoleId([49; 32]));
+        assert_eq!(both_roles.encode(), Err(WireError::InvalidValue));
+        let mut role_and_capability = context;
+        role_and_capability.origin.capability = Some(CapabilityId([50; 32]));
+        assert_eq!(role_and_capability.encode(), Err(WireError::InvalidValue));
+    }
+
+    #[test]
+    fn invocation_commitment_binds_exact_role_scope_and_identity() {
+        let mut public = invocation();
+        public.origin.capability = None;
+        let public_commitment = public.commitment();
+
+        let mut space = public.clone();
+        space.roles.space = Some(RoleId([51; 32]));
+        let mut actor = public;
+        actor.roles.actor = Some(RoleId([51; 32]));
+        assert_ne!(space.commitment(), public_commitment);
+        assert_ne!(actor.commitment(), public_commitment);
+        assert_ne!(actor.commitment(), space.commitment());
+
+        actor.roles.actor = Some(RoleId([52; 32]));
+        assert_ne!(actor.commitment(), space.commitment());
     }
 
     fn receipt_for(invocation: &InvocationWork) -> AuthorityReceipt {
@@ -2661,7 +2862,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgement_work_and_outcome_have_one_r6_canonical_wire() {
+    fn acknowledgement_work_and_outcome_have_one_r7_canonical_wire() {
         let invocation = invocation();
         let authority = receipt_for(&invocation);
         let work = RuntimeWork::Acknowledge {
@@ -2675,7 +2876,7 @@ mod tests {
         assert_eq!(RuntimeWork::decode(&encoded), Ok(work.clone()));
 
         let mut previous_generation = encoded.clone();
-        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r5");
+        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r6");
         assert_eq!(
             RuntimeWork::decode(&previous_generation),
             Err(WireError::Decode(DecodeError::InvalidPlatform))

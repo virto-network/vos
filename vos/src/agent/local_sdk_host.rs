@@ -1862,6 +1862,7 @@ mod tests {
             program: record.entry.program,
             mode: MethodMode::Linear,
             origin: sdk::InvocationOrigin::anonymous(),
+            roles: sdk::InvocationRoleClaims::none(),
             message,
             installation_data: None,
             availability: availability(package),

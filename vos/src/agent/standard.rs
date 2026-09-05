@@ -309,6 +309,7 @@ pub(crate) struct StandardAcceptedInvocation {
     pub program: crate::agent_sdk::ProgramId,
     pub mode: crate::agent_sdk::MethodMode,
     pub origin: crate::agent_sdk::InvocationOrigin,
+    pub roles: crate::agent_sdk::InvocationRoleClaims,
     pub message: Vec<u8>,
     pub installation_data: Option<crate::agent_sdk::BlobRef>,
     pub required: Vec<crate::agent_sdk::BlobRef>,
@@ -329,6 +330,7 @@ impl StandardAcceptedInvocation {
             program: work.program,
             mode: work.mode,
             origin: work.origin,
+            roles: work.roles,
             message: work.message.clone(),
             installation_data: work.installation_data.clone(),
             required: work
@@ -356,6 +358,7 @@ impl StandardAcceptedInvocation {
             program: self.program,
             mode: self.mode,
             origin: self.origin,
+            roles: self.roles,
             message: self.message.clone(),
             installation_data: self.installation_data.clone(),
             availability,
@@ -374,6 +377,7 @@ impl StandardAcceptedInvocation {
             && self.deployment != crate::agent_sdk::DeploymentId::ZERO
             && self.program != crate::agent_sdk::ProgramId::ZERO
             && self.origin.validate()
+            && self.roles.validate_for(self.origin)
             && self.message.len() <= crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES
             && self.gas != 0
             && !self.recovery_only
@@ -448,7 +452,6 @@ impl StandardMachineContinuation {
         let clean_pair = match (&self.accepted, &self.authority) {
             (Some(accepted), Some(authority)) => {
                 accepted.validate()
-                    && clean_origin_supported_by_actor_abi(&accepted.origin)
                     && accepted.invocation.0 == self.invocation.0
                     && accepted.actor.0 == self.actor.0
                     && accepted.incarnation.0 == self.incarnation.0
@@ -834,12 +837,6 @@ const fn clean_method_mode(mode: crate::agent_sdk::MethodMode) -> super::MethodM
         crate::agent_sdk::MethodMode::Merge => super::MethodMode::Merge,
         crate::agent_sdk::MethodMode::Local => super::MethodMode::Local,
     }
-}
-
-pub(crate) const fn clean_origin_supported_by_actor_abi(
-    origin: &crate::agent_sdk::InvocationOrigin,
-) -> bool {
-    origin.transport_node.is_none() && origin.credential.is_none() && origin.actor.is_none()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1313,7 +1310,6 @@ impl StandardAgentRuntime {
                 None => true,
                 Some(binding) => {
                     binding.accepted.validate()
-                        && clean_origin_supported_by_actor_abi(&binding.accepted.origin)
                         && binding.work != crate::agent_sdk::Hash::ZERO
                         && binding.authority.commitment() != crate::agent_sdk::Hash::ZERO
                         && binding.accepted.invocation.0 == result.invocation.0
@@ -2059,7 +2055,6 @@ impl StandardAgentRuntime {
         crate::agent_sdk::InvocationError,
     > {
         use crate::agent_sdk::InvocationError;
-        use crate::service::{Origin, SubjectId};
 
         let actor_id = ActorId(work.actor.0);
         let actor = self
@@ -2141,34 +2136,6 @@ impl StandardAgentRuntime {
             return Err(InvocationError::InvalidAvailability);
         }
 
-        // The legacy actor dispatch frame has no authenticated transport-node
-        // or credential slots, and its actor origin additionally requires a
-        // complete ServiceIdentity which the clean envelope intentionally
-        // does not pretend to provide. Fail closed until the actor dispatch
-        // ABI can preserve these identities without projection.
-        if !clean_origin_supported_by_actor_abi(&work.origin) {
-            return Err(InvocationError::InvalidInput);
-        }
-
-        let auth = match (work.origin.principal, work.origin.capability) {
-            (Some(principal), capability) => super::execution::ActorInvocationAuth {
-                origin: Origin::Member(SubjectId(principal.0)),
-                principal: Some(crate::service::PrincipalId(principal.0)),
-                origin_service: None,
-                space_role: None,
-                actor_role: None,
-                capability: capability.map(|value| crate::service::CapabilityId(value.0)),
-            },
-            (None, Some(capability)) => super::execution::ActorInvocationAuth {
-                origin: Origin::System,
-                principal: None,
-                origin_service: None,
-                space_role: None,
-                actor_role: None,
-                capability: Some(crate::service::CapabilityId(capability.0)),
-            },
-            (None, None) => super::execution::ActorInvocationAuth::anonymous(),
-        };
         let mut application_availability = work
             .availability
             .iter()
@@ -2192,7 +2159,10 @@ impl StandardAgentRuntime {
             deployment: DeploymentId(work.deployment.0),
             program: ProgramId(work.program.0),
             mode: clean_method_mode(work.mode),
-            auth,
+            // Clean authentication is carried only by the exact AIC1
+            // invocation context. Do not project it into the transitional
+            // service-era authorization frame.
+            auth: super::execution::ActorInvocationAuth::anonymous(),
             message: work.message.clone(),
             availability: application_availability,
             gas: work.gas,
@@ -2746,14 +2716,24 @@ impl StandardAgentRuntime {
             return Err(ActorExecutionError::UnsupportedMethod);
         }
         Ok(match policy.authorization_policy {
-            AuthorizationPolicySelector::Public => true,
+            AuthorizationPolicySelector::Public => {
+                work.origin.capability.is_none()
+                    && work.roles == crate::agent_sdk::InvocationRoleClaims::none()
+            }
             AuthorizationPolicySelector::Capability(required) => {
                 work.origin.capability == Some(required)
+                    && work.roles == crate::agent_sdk::InvocationRoleClaims::none()
             }
-            // InvocationOrigin carries no authenticated RoleId. Do not
-            // project principals or any transport identity into a role.
-            AuthorizationPolicySelector::SpaceRole(_)
-            | AuthorizationPolicySelector::ActorRole(_) => false,
+            AuthorizationPolicySelector::SpaceRole(required) => {
+                work.origin.capability.is_none()
+                    && work.roles.space == Some(required)
+                    && work.roles.actor.is_none()
+            }
+            AuthorizationPolicySelector::ActorRole(required) => {
+                work.origin.capability.is_none()
+                    && work.roles.actor == Some(required)
+                    && work.roles.space.is_none()
+            }
         })
     }
 
@@ -3032,7 +3012,6 @@ impl StandardAgentRuntime {
         }
         let accepted = StandardAcceptedInvocation::from_work(work);
         if !accepted.validate()
-            || !clean_origin_supported_by_actor_abi(&accepted.origin)
             || invocation.invocation.0 != work.invocation.0
             || invocation.actor.0 != work.actor.0
             || invocation.incarnation.0 != work.incarnation.0
@@ -8023,6 +8002,7 @@ mod tests {
             program: crate::agent_sdk::ProgramId(program.0),
             mode: CleanMethodMode::Linear,
             origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
             message,
             availability: Vec::new(),
             gas: 1,
@@ -8041,6 +8021,22 @@ mod tests {
             runtime.authorize_clean_execution(&work, &schema_blob, &public_policy),
             Ok(true)
         );
+        work.origin.principal = Some(crate::agent_sdk::PrincipalId([0x60; 32]));
+        work.roles.space = Some(CleanRoleId([0x61; 32]));
+        assert_eq!(
+            runtime.authorize_clean_execution(&work, &schema_blob, &public_policy),
+            Ok(false),
+            "AMP2 Public means no role or capability claim"
+        );
+        work.roles = crate::agent_sdk::InvocationRoleClaims::none();
+        work.origin.principal = None;
+        work.origin.capability = Some(crate::agent_sdk::CapabilityId([0x62; 32]));
+        assert_eq!(
+            runtime.authorize_clean_execution(&work, &schema_blob, &public_policy),
+            Ok(false),
+            "AMP2 Public cannot ignore a capability claim"
+        );
+        work.origin.capability = None;
 
         let mut tampered_schema = schema_blob.clone();
         *tampered_schema.bytes.last_mut().unwrap() ^= 1;
@@ -8082,19 +8078,46 @@ mod tests {
             Ok(false)
         );
 
-        for selector in [
-            AuthorizationPolicySelector::SpaceRole(CleanRoleId([0x65; 32])),
-            AuthorizationPolicySelector::ActorRole(CleanRoleId([0x66; 32])),
-        ] {
-            let role_policy = policy_blob(&clean_schema_ref, selector);
-            runtime.actors.get_mut(&actor).unwrap().record.role_policies =
-                clean_blob_to_legacy(&role_policy.reference);
-            assert_eq!(
-                runtime.authorize_clean_execution(&work, &schema_blob, &role_policy),
-                Ok(false),
-                "clean InvocationOrigin has no RoleId to authorize a role selector"
-            );
-        }
+        work.origin.capability = None;
+        work.origin.principal = Some(crate::agent_sdk::PrincipalId([0x65; 32]));
+        let space_role = CleanRoleId([0x66; 32]);
+        let space_policy = policy_blob(
+            &clean_schema_ref,
+            AuthorizationPolicySelector::SpaceRole(space_role),
+        );
+        runtime.actors.get_mut(&actor).unwrap().record.role_policies =
+            clean_blob_to_legacy(&space_policy.reference);
+        work.roles.space = Some(space_role);
+        assert_eq!(
+            runtime.authorize_clean_execution(&work, &schema_blob, &space_policy),
+            Ok(true)
+        );
+        work.roles.space = Some(CleanRoleId([0x67; 32]));
+        assert_eq!(
+            runtime.authorize_clean_execution(&work, &schema_blob, &space_policy),
+            Ok(false)
+        );
+
+        let actor_role = CleanRoleId([0x68; 32]);
+        let actor_policy = policy_blob(
+            &clean_schema_ref,
+            AuthorizationPolicySelector::ActorRole(actor_role),
+        );
+        runtime.actors.get_mut(&actor).unwrap().record.role_policies =
+            clean_blob_to_legacy(&actor_policy.reference);
+        work.roles.space = None;
+        work.roles.actor = Some(actor_role);
+        assert_eq!(
+            runtime.authorize_clean_execution(&work, &schema_blob, &actor_policy),
+            Ok(true)
+        );
+        work.roles.actor = None;
+        work.roles.space = Some(actor_role);
+        assert_eq!(
+            runtime.authorize_clean_execution(&work, &schema_blob, &actor_policy),
+            Ok(false),
+            "equal role bytes in a different scope must not authorize"
+        );
     }
 
     #[test]

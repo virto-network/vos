@@ -1827,7 +1827,19 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         // `__mark_forbidden + return false` is short and
         // side-effect-free so a refused call leaves no trace
         // behind beyond the wire status.
-        let actor_role_check = if let Some(role) = &role_expr {
+        let actor_role_check = if agent_messages {
+            if let Some(identity) = actor_role_id {
+                let bytes = identity.iter();
+                quote! {
+                    if !ctx.has_agent_actor_role(vos::agent_sdk::RoleId([#(#bytes),*])) {
+                        ctx.__mark_forbidden();
+                        return false;
+                    }
+                }
+            } else {
+                quote! {}
+            }
+        } else if let Some(role) = &role_expr {
             quote! {
                 if !ctx.has_role_byte(
                     <<#actor_name as vos::Actor>::Role as vos::RoleByte>::as_byte(#role)
@@ -1839,7 +1851,19 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        let space_role_check = if let Some(role) = &space_role_expr {
+        let space_role_check = if agent_messages {
+            if let Some(identity) = space_role_id {
+                let bytes = identity.iter();
+                quote! {
+                    if !ctx.has_agent_space_role(vos::agent_sdk::RoleId([#(#bytes),*])) {
+                        ctx.__mark_forbidden();
+                        return false;
+                    }
+                }
+            } else {
+                quote! {}
+            }
+        } else if let Some(role) = &space_role_expr {
             quote! {
                 if !ctx.has_space_role(#role) {
                     ctx.__mark_forbidden();
@@ -1850,10 +1874,19 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
         let capability_check = if let Some(name) = &capability {
-            quote! {
-                if !ctx.has_capability(vos::CapabilityId::named(#name)) {
-                    ctx.__mark_forbidden();
-                    return false;
+            if agent_messages {
+                quote! {
+                    if !ctx.has_agent_capability(vos::agent_sdk::CapabilityId::named(#name)) {
+                        ctx.__mark_forbidden();
+                        return false;
+                    }
+                }
+            } else {
+                quote! {
+                    if !ctx.has_capability(vos::CapabilityId::named(#name)) {
+                        ctx.__mark_forbidden();
+                        return false;
+                    }
                 }
             }
         } else {

@@ -272,7 +272,7 @@ fn invocation_receipt(
 }
 
 fn apply_runtime(work: RuntimeWork) -> RuntimeTransition {
-    let input = work.encode().expect("encode canonical r6 RuntimeWork");
+    let input = work.encode().expect("encode canonical r7 RuntimeWork");
     let invocation = RefineContext::load(AGENT_RUNTIME_PVM, &input, GAS)
         .expect("load bundled AgentRuntime")
         .run();
@@ -288,7 +288,7 @@ fn apply_runtime(work: RuntimeWork) -> RuntimeTransition {
             .output()
             .expect("bundled AgentRuntime published an output window"),
     )
-    .expect("decode canonical r6 RuntimeTransition")
+    .expect("decode canonical r7 RuntimeTransition")
 }
 
 fn apply_management(
@@ -597,6 +597,7 @@ fn actor_invocation(
         program: record.entry.program,
         mode: MethodMode::Linear,
         origin: sdk::InvocationOrigin::anonymous(),
+        roles: sdk::InvocationRoleClaims::none(),
         message,
         installation_data: None,
         availability: availability(package),
@@ -664,7 +665,7 @@ fn bundled_runtime_identity_and_vos3_package_are_exactly_pinned() {
     );
     assert_eq!(
         sdk::RUNTIME_ABI_ID,
-        Hash(*b"vos-agent-runtime-abi-20260906r6")
+        Hash(*b"vos-agent-runtime-abi-20260906r7")
     );
 
     let mut previous_generation = bytes;

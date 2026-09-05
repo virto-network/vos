@@ -615,8 +615,49 @@ pub(crate) enum ActorRunOutcome {
 }
 
 #[cfg(feature = "pvm")]
+fn encode_inner_actor_control(
+    invocation: &ActorInvocation,
+    clean_context: Option<crate::agent_sdk::InvocationContext>,
+) -> Result<Vec<u8>, ActorExecutionError> {
+    match clean_context {
+        Some(context) => {
+            use crate::agent_sdk::wire::CanonicalWire as _;
+
+            let context_mode = match context.mode {
+                crate::agent_sdk::MethodMode::Query => super::MethodMode::Query,
+                crate::agent_sdk::MethodMode::LinearizableQuery => {
+                    super::MethodMode::LinearizableQuery
+                }
+                crate::agent_sdk::MethodMode::LocalQuery => super::MethodMode::LocalQuery,
+                crate::agent_sdk::MethodMode::Linear => super::MethodMode::Linear,
+                crate::agent_sdk::MethodMode::Merge => super::MethodMode::Merge,
+                crate::agent_sdk::MethodMode::Local => super::MethodMode::Local,
+            };
+            if !context.validate()
+                || context.invocation.0 != invocation.invocation.0
+                || context.actor.0 != invocation.actor.0
+                || context_mode != invocation.mode
+            {
+                return Err(ActorExecutionError::InvalidInput);
+            }
+            context
+                .encode()
+                .map_err(|_| ActorExecutionError::InvalidInput)
+        }
+        None => Ok(super::wire::ActorDispatchControl {
+            invocation: invocation.invocation,
+            actor: invocation.actor,
+            mode: invocation.mode,
+            auth: invocation.auth.clone(),
+        }
+        .encode()),
+    }
+}
+
+#[cfg(feature = "pvm")]
 pub(crate) fn run_inner_actor(
     invocation: &ActorInvocation,
+    clean_context: Option<crate::agent_sdk::InvocationContext>,
     actor_pvm: &[u8],
     installation_data: Option<&[u8]>,
     actor_state: &ActorStateLanes,
@@ -645,13 +686,9 @@ pub(crate) fn run_inner_actor(
     let linear = encode_lane(actor_state.linear.as_deref());
     let merge = encode_lane(actor_state.merge.as_deref());
     let local = encode_lane(actor_state.local.as_deref());
-    let control = super::wire::ActorDispatchControl {
-        invocation: invocation.invocation,
-        actor: invocation.actor,
-        mode: invocation.mode,
-        auth: invocation.auth.clone(),
-    }
-    .encode();
+    // FETCH item #4 is this exact frame. Clean calls use only AIC1; AGDC is
+    // retained exclusively for the transitional legacy caller above us.
+    let control = encode_inner_actor_control(invocation, clean_context)?;
     if control.len() > ACTOR_DISPATCH_CONTROL_CAPACITY {
         return Err(ActorExecutionError::InvalidInput);
     }
@@ -1201,6 +1238,51 @@ mod tests {
         invocation.gas = MAX_EXECUTION_GAS + 1;
         assert_eq!(
             invocation.validate(),
+            Err(ActorExecutionError::InvalidInput)
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn inner_actor_control_uses_exact_aic1_only_for_clean_calls() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+
+        let invocation = invocation();
+        let context = crate::agent_sdk::InvocationContext {
+            invocation: crate::agent_sdk::InvocationId(invocation.invocation.0),
+            actor: crate::agent_sdk::ActorId(invocation.actor.0),
+            mode: crate::agent_sdk::MethodMode::Linear,
+            origin: crate::agent_sdk::InvocationOrigin {
+                principal: Some(crate::agent_sdk::PrincipalId([0x81; 32])),
+                transport_node: Some(crate::agent_sdk::NodeId([0x82; 32])),
+                credential: Some(crate::agent_sdk::CredentialId([0x83; 32])),
+                actor: Some(crate::agent_sdk::ActorId([0x84; 32])),
+                capability: None,
+            },
+            roles: crate::agent_sdk::InvocationRoleClaims {
+                space: None,
+                actor: Some(crate::agent_sdk::RoleId([0x85; 32])),
+            },
+            observed_slot: 86,
+        };
+        let clean = encode_inner_actor_control(&invocation, Some(context)).unwrap();
+        assert_eq!(clean, context.encode().unwrap());
+        assert_eq!(clean.get(..4), Some(b"AIC1".as_slice()));
+
+        let legacy = encode_inner_actor_control(&invocation, None).unwrap();
+        assert_eq!(legacy.get(..4), Some(b"AGDC".as_slice()));
+        assert_ne!(legacy, clean);
+
+        let mut wrong_target = context;
+        wrong_target.actor = crate::agent_sdk::ActorId([0x87; 32]);
+        assert_eq!(
+            encode_inner_actor_control(&invocation, Some(wrong_target)),
+            Err(ActorExecutionError::InvalidInput)
+        );
+        let mut wrong_mode = context;
+        wrong_mode.mode = crate::agent_sdk::MethodMode::Merge;
+        assert_eq!(
+            encode_inner_actor_control(&invocation, Some(wrong_mode)),
             Err(ActorExecutionError::InvalidInput)
         );
     }

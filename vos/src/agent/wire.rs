@@ -1211,6 +1211,32 @@ fn decode_sdk_origin(
         .ok_or(DecodeError::NonCanonical)
 }
 
+fn encode_sdk_invocation_roles(
+    encoder: &mut Encoder<'_>,
+    value: crate::agent_sdk::InvocationRoleClaims,
+) {
+    encoder.option(&value.space, |encoder, value| {
+        encoder.fixed(value.as_bytes())
+    });
+    encoder.option(&value.actor, |encoder, value| {
+        encoder.fixed(value.as_bytes())
+    });
+}
+
+fn decode_sdk_invocation_roles(
+    decoder: &mut Decoder<'_>,
+    origin: crate::agent_sdk::InvocationOrigin,
+) -> Result<crate::agent_sdk::InvocationRoleClaims, DecodeError> {
+    let value = crate::agent_sdk::InvocationRoleClaims {
+        space: decoder.option(|decoder| Ok(crate::agent_sdk::RoleId(decoder.fixed()?)))?,
+        actor: decoder.option(|decoder| Ok(crate::agent_sdk::RoleId(decoder.fixed()?)))?,
+    };
+    value
+        .validate_for(origin)
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
 fn decode_sdk_method_mode(value: u8) -> Result<crate::agent_sdk::MethodMode, DecodeError> {
     match value {
         0 => Ok(crate::agent_sdk::MethodMode::Query),
@@ -1237,6 +1263,7 @@ fn encode_accepted_invocation(
     encoder.fixed(value.program.as_bytes());
     encoder.u8(value.mode as u8);
     encode_sdk_origin(encoder, value.origin);
+    encode_sdk_invocation_roles(encoder, value.roles);
     encoder.bytes(&value.message);
     encoder.option(&value.installation_data, encode_sdk_blob);
     encoder.list(&value.required, encode_sdk_blob);
@@ -1247,17 +1274,29 @@ fn encode_accepted_invocation(
 fn decode_accepted_invocation(
     decoder: &mut Decoder<'_>,
 ) -> Result<super::standard::StandardAcceptedInvocation, DecodeError> {
+    let space = crate::agent_sdk::SpaceId(decoder.fixed()?);
+    let agent = crate::agent_sdk::AgentId(decoder.fixed()?);
+    let runtime_deployment = crate::agent_sdk::DeploymentId(decoder.fixed()?);
+    let invocation = crate::agent_sdk::InvocationId(decoder.fixed()?);
+    let actor = crate::agent_sdk::ActorId(decoder.fixed()?);
+    let incarnation = crate::agent_sdk::Hash(decoder.fixed()?);
+    let deployment = crate::agent_sdk::DeploymentId(decoder.fixed()?);
+    let program = crate::agent_sdk::ProgramId(decoder.fixed()?);
+    let mode = decode_sdk_method_mode(decoder.u8()?)?;
+    let origin = decode_sdk_origin(decoder)?;
+    let roles = decode_sdk_invocation_roles(decoder, origin)?;
     let value = super::standard::StandardAcceptedInvocation {
-        space: crate::agent_sdk::SpaceId(decoder.fixed()?),
-        agent: crate::agent_sdk::AgentId(decoder.fixed()?),
-        runtime_deployment: crate::agent_sdk::DeploymentId(decoder.fixed()?),
-        invocation: crate::agent_sdk::InvocationId(decoder.fixed()?),
-        actor: crate::agent_sdk::ActorId(decoder.fixed()?),
-        incarnation: crate::agent_sdk::Hash(decoder.fixed()?),
-        deployment: crate::agent_sdk::DeploymentId(decoder.fixed()?),
-        program: crate::agent_sdk::ProgramId(decoder.fixed()?),
-        mode: decode_sdk_method_mode(decoder.u8()?)?,
-        origin: decode_sdk_origin(decoder)?,
+        space,
+        agent,
+        runtime_deployment,
+        invocation,
+        actor,
+        incarnation,
+        deployment,
+        program,
+        mode,
+        origin,
+        roles,
         message: {
             let bytes = decoder.bytes_ref()?;
             if bytes.len() > crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES {
@@ -1519,6 +1558,7 @@ pub fn apply_standard_execution(
                                                         .map(|(sequence, _)| *sequence);
                                                     super::execution::run_inner_actor(
                                                         &call.invocation,
+                                                        None,
                                                         &call.actor_pvm,
                                                         call.installation_data
                                                             .as_ref()
@@ -1810,6 +1850,10 @@ fn apply_clean_invoke(
                                     let visible = before.visible_for(invocation.mode);
                                     super::execution::run_inner_actor(
                                         &invocation,
+                                        Some(crate::agent_sdk::InvocationContext::from_work(
+                                            &work,
+                                            observed_slot,
+                                        )),
                                         &actor_pvm,
                                         installation_data
                                             .as_ref()
@@ -1952,6 +1996,10 @@ fn apply_clean_resume(
             let visible = before.visible_for(invocation.mode);
             super::execution::run_inner_actor(
                 &invocation,
+                Some(crate::agent_sdk::InvocationContext::from_work(
+                    &work,
+                    observed_slot,
+                )),
                 &actor_pvm,
                 installation_data.as_ref().map(|data| data.bytes.as_slice()),
                 &visible,
@@ -5685,6 +5733,7 @@ mod tests {
             program: crate::agent_sdk::ProgramId(invocation.program.0),
             mode: crate::agent_sdk::MethodMode::Linear,
             origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
             message: invocation.message.clone(),
             installation_data: None,
             availability,
@@ -5797,6 +5846,7 @@ mod tests {
             program: crate::agent_sdk::ProgramId(actor.entry.program.0),
             mode: crate::agent_sdk::MethodMode::Linear,
             origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
             message: vec![1],
             installation_data: None,
             availability,
@@ -5808,31 +5858,27 @@ mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
-    fn clean_resolution_rejects_origin_projection_and_artifact_role_aliases() {
+    fn clean_resolution_preserves_exact_origin_for_aic1_and_rejects_artifact_role_aliases() {
         use crate::agent_sdk::InvocationError;
 
         let (runtime, work) = clean_resolvable_fixture(false);
-        assert!(runtime.resolve_clean_invocation(&work).is_ok());
+        let resolved = runtime.resolve_clean_invocation(&work).unwrap();
+        assert_eq!(
+            resolved.0.auth,
+            super::super::execution::ActorInvocationAuth::anonymous(),
+            "clean identity must not be projected into the legacy auth frame"
+        );
 
         let mut actor_origin = work.clone();
         actor_origin.origin.actor = Some(crate::agent_sdk::ActorId([0xd5; 32]));
-        assert_eq!(
-            runtime.resolve_clean_invocation(&actor_origin),
-            Err(InvocationError::InvalidInput)
-        );
+        assert!(runtime.resolve_clean_invocation(&actor_origin).is_ok());
         let mut transport_origin = work.clone();
         transport_origin.origin.transport_node = Some(crate::agent_sdk::NodeId([0xd6; 32]));
-        assert_eq!(
-            runtime.resolve_clean_invocation(&transport_origin),
-            Err(InvocationError::InvalidInput)
-        );
+        assert!(runtime.resolve_clean_invocation(&transport_origin).is_ok());
         let mut credential_origin = work;
         credential_origin.origin.principal = Some(crate::agent_sdk::PrincipalId([0xd7; 32]));
         credential_origin.origin.credential = Some(crate::agent_sdk::CredentialId([0xd8; 32]));
-        assert_eq!(
-            runtime.resolve_clean_invocation(&credential_origin),
-            Err(InvocationError::InvalidInput)
-        );
+        assert!(runtime.resolve_clean_invocation(&credential_origin).is_ok());
 
         let (runtime, aliased) = clean_resolvable_fixture(true);
         assert_eq!(

@@ -161,6 +161,75 @@ impl InvocationOrigin {
     }
 }
 
+/// Exact portable role claims authenticated by the authority receipt which
+/// selects an [`InvocationWork`]. A call carries at most one role claim; the
+/// target actor scopes an actor-local role without another caller-selected
+/// identifier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InvocationRoleClaims {
+    pub space: Option<crate::RoleId>,
+    pub actor: Option<crate::RoleId>,
+}
+
+impl InvocationRoleClaims {
+    pub const fn none() -> Self {
+        Self {
+            space: None,
+            actor: None,
+        }
+    }
+
+    pub fn validate_for(self, origin: InvocationOrigin) -> bool {
+        self.space.is_none_or(|role| role != crate::RoleId::ZERO)
+            && self.actor.is_none_or(|role| role != crate::RoleId::ZERO)
+            && !(self.space.is_some() && self.actor.is_some())
+            // Roles belong to Principals. Neither a transport Node nor a
+            // Credential may stand in for the application identity.
+            && (self.space.is_none() && self.actor.is_none() || origin.principal.is_some())
+            // AMP2 selects one exact authorization predicate. Carrying a
+            // role and a capability together would leave an ambiguous claim
+            // for actor code to reinterpret.
+            && (self.space.is_none() && self.actor.is_none() || origin.capability.is_none())
+    }
+}
+
+/// Authenticated invocation context delivered unchanged across the standard
+/// runtime's private inner-actor ABI.
+///
+/// These fields become trusted only after the runtime verifies the enclosing
+/// authority receipt against the exact [`InvocationWork`] commitment. The
+/// logical slot is the monotonic observation at which unseen work was
+/// accepted, not an actor message field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvocationContext {
+    pub invocation: InvocationId,
+    pub actor: ActorId,
+    pub mode: MethodMode,
+    pub origin: InvocationOrigin,
+    pub roles: InvocationRoleClaims,
+    pub observed_slot: u64,
+}
+
+impl InvocationContext {
+    pub fn from_work(work: &InvocationWork, observed_slot: u64) -> Self {
+        Self {
+            invocation: work.invocation,
+            actor: work.actor,
+            mode: work.mode,
+            origin: work.origin,
+            roles: work.roles,
+            observed_slot,
+        }
+    }
+
+    pub fn validate(self) -> bool {
+        self.invocation != InvocationId::ZERO
+            && self.actor != ActorId::ZERO
+            && self.origin.validate()
+            && self.roles.validate_for(self.origin)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvocationWork {
     pub space: SpaceId,
@@ -173,6 +242,7 @@ pub struct InvocationWork {
     pub program: ProgramId,
     pub mode: MethodMode,
     pub origin: InvocationOrigin,
+    pub roles: InvocationRoleClaims,
     pub message: Vec<u8>,
     /// Exact installed constructor-argument object, when this actor has one.
     /// This role marker is required because a present-empty object has a
@@ -196,6 +266,7 @@ impl InvocationWork {
             && self.deployment != DeploymentId::ZERO
             && self.program != ProgramId::ZERO
             && self.origin.validate()
+            && self.roles.validate_for(self.origin)
             && self.message.len() <= MAX_INVOCATION_MESSAGE_BYTES
             && availability_valid(&self.availability, self.installation_data.as_ref())
             && self.gas != 0
@@ -726,6 +797,49 @@ mod tests {
     }
 
     #[test]
+    fn invocation_roles_are_exact_single_predicates_owned_by_a_principal() {
+        let principal = InvocationOrigin {
+            principal: Some(PrincipalId([1; 32])),
+            transport_node: Some(NodeId([2; 32])),
+            credential: Some(CredentialId([3; 32])),
+            actor: Some(ActorId([4; 32])),
+            capability: None,
+        };
+        let space = InvocationRoleClaims {
+            space: Some(crate::RoleId([5; 32])),
+            actor: None,
+        };
+        let actor = InvocationRoleClaims {
+            space: None,
+            actor: Some(crate::RoleId([6; 32])),
+        };
+        assert!(space.validate_for(principal));
+        assert!(actor.validate_for(principal));
+        assert!(!space.validate_for(InvocationOrigin::anonymous()));
+        assert!(
+            !InvocationRoleClaims {
+                space: space.space,
+                actor: actor.actor,
+            }
+            .validate_for(principal)
+        );
+        assert!(
+            !InvocationRoleClaims {
+                space: Some(crate::RoleId::ZERO),
+                actor: None,
+            }
+            .validate_for(principal)
+        );
+
+        let capability = InvocationOrigin {
+            capability: Some(CapabilityId([7; 32])),
+            ..principal
+        };
+        assert!(!space.validate_for(capability));
+        assert!(InvocationRoleClaims::none().validate_for(capability));
+    }
+
+    #[test]
     fn invocation_availability_is_a_strictly_sorted_content_map() {
         let blob = |bytes: &[u8]| RuntimeBlob {
             reference: BlobRef::of_bytes(bytes),
@@ -744,6 +858,7 @@ mod tests {
             program: ProgramId([8; 32]),
             mode: MethodMode::Linear,
             origin: InvocationOrigin::anonymous(),
+            roles: InvocationRoleClaims::none(),
             message: alloc::vec![],
             installation_data: None,
             availability,

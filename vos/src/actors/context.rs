@@ -32,6 +32,11 @@ pub struct Context<A: Actor> {
     /// before the guest runs and reconstruct the same value during replay.
     invocation_id: crate::service::InvocationId,
 
+    /// Exact clean-generation invocation context authenticated by AMP2 and
+    /// delivered through the private AIC1 runtime-to-actor frame. Legacy
+    /// service dispatches leave this absent.
+    agent_invocation_context: Option<crate::agent_sdk::InvocationContext>,
+
     /// Identity of whoever invoked the handler currently running.
     /// `Unauthenticated` by default until per-invoke plumbing
     /// overwrites it from the [`InvokeRequest`].
@@ -138,6 +143,7 @@ impl<A: Actor> Context<A> {
             actor_id: None,
             stop_requested: false,
             invocation_id: crate::service::InvocationId::ZERO,
+            agent_invocation_context: None,
             caller: Caller::Unauthenticated,
             origin: crate::service::Origin::Anonymous,
             principal: None,
@@ -278,6 +284,55 @@ impl<A: Actor> Context<A> {
     /// the same durable invocation remains idempotent.
     pub fn invocation_id(&self) -> crate::service::InvocationId {
         self.invocation_id
+    }
+
+    /// Exact clean-generation invocation context, when this actor was entered
+    /// through the standard AgentRuntime ABI. No service-era identity is
+    /// synthesized when this value is present.
+    pub fn agent_invocation_context(&self) -> Option<&crate::agent_sdk::InvocationContext> {
+        self.agent_invocation_context.as_ref()
+    }
+
+    /// Exact clean origin authenticated for this invocation.
+    pub fn agent_origin(&self) -> Option<crate::agent_sdk::InvocationOrigin> {
+        self.agent_invocation_context.map(|context| context.origin)
+    }
+
+    /// Exact clean role claims authenticated for this invocation.
+    pub fn agent_roles(&self) -> Option<crate::agent_sdk::InvocationRoleClaims> {
+        self.agent_invocation_context.map(|context| context.roles)
+    }
+
+    /// Logical slot at which the clean runtime accepted unseen work.
+    pub fn agent_observed_slot(&self) -> Option<u64> {
+        self.agent_invocation_context
+            .map(|context| context.observed_slot)
+    }
+
+    /// Exact equality check for one authenticated clean space-role claim.
+    pub fn has_agent_space_role(&self, required: crate::agent_sdk::RoleId) -> bool {
+        self.agent_invocation_context
+            .is_some_and(|context| context.roles.space == Some(required))
+    }
+
+    /// Exact equality check for one authenticated clean actor-role claim.
+    pub fn has_agent_actor_role(&self, required: crate::agent_sdk::RoleId) -> bool {
+        self.agent_invocation_context
+            .is_some_and(|context| context.roles.actor == Some(required))
+    }
+
+    /// Exact equality check for one authenticated clean capability claim.
+    pub fn has_agent_capability(&self, required: crate::agent_sdk::CapabilityId) -> bool {
+        self.agent_invocation_context
+            .is_some_and(|context| context.origin.capability == Some(required))
+    }
+
+    /// Install the already authenticated AIC1 context for the next clean
+    /// dispatch. The runner never calls this for a legacy AGDC frame.
+    #[doc(hidden)]
+    pub fn __set_agent_invocation_context(&mut self, context: crate::agent_sdk::InvocationContext) {
+        assert!(context.validate(), "invalid clean agent invocation context");
+        self.agent_invocation_context = Some(context);
     }
 
     /// Set the identity for the next handler dispatch.
@@ -2505,5 +2560,58 @@ mod tests {
             "Rust ordering must not authorize a threshold rejected by the wire ordering"
         );
         assert!(!ctx.has_role_byte(ReversedWireRole::Low.as_byte()));
+    }
+
+    #[test]
+    fn clean_agent_claim_accessors_use_exact_sdk_identities_only() {
+        let mut ctx: Context<FixtureActor> = Context::new(ServiceId(1));
+        let space_role = crate::agent_sdk::RoleId([0x71; 32]);
+        let actor_role = crate::agent_sdk::RoleId([0x72; 32]);
+        let context = crate::agent_sdk::InvocationContext {
+            invocation: crate::agent_sdk::InvocationId([0x73; 32]),
+            actor: crate::agent_sdk::ActorId([0x74; 32]),
+            mode: crate::agent_sdk::MethodMode::Linear,
+            origin: crate::agent_sdk::InvocationOrigin {
+                principal: Some(crate::agent_sdk::PrincipalId([0x75; 32])),
+                transport_node: Some(crate::agent_sdk::NodeId([0x76; 32])),
+                credential: Some(crate::agent_sdk::CredentialId([0x77; 32])),
+                actor: Some(crate::agent_sdk::ActorId([0x78; 32])),
+                capability: None,
+            },
+            roles: crate::agent_sdk::InvocationRoleClaims {
+                space: Some(space_role),
+                actor: None,
+            },
+            observed_slot: 79,
+        };
+        ctx.__set_agent_invocation_context(context);
+
+        assert_eq!(ctx.agent_invocation_context(), Some(&context));
+        assert_eq!(ctx.agent_origin(), Some(context.origin));
+        assert_eq!(ctx.agent_roles(), Some(context.roles));
+        assert_eq!(ctx.agent_observed_slot(), Some(79));
+        assert!(ctx.has_agent_space_role(space_role));
+        assert!(!ctx.has_agent_space_role(actor_role));
+        assert!(!ctx.has_agent_actor_role(space_role));
+
+        let capability = crate::agent_sdk::CapabilityId([0x7a; 32]);
+        let capability_context = crate::agent_sdk::InvocationContext {
+            origin: crate::agent_sdk::InvocationOrigin {
+                principal: None,
+                transport_node: None,
+                credential: None,
+                actor: None,
+                capability: Some(capability),
+            },
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            ..context
+        };
+        ctx.__set_agent_invocation_context(capability_context);
+        assert!(ctx.has_agent_capability(capability));
+        assert!(!ctx.has_agent_space_role(space_role));
+        assert!(
+            !ctx.has_capability(crate::service::CapabilityId(capability.0)),
+            "clean capabilities are never copied into the service-era slot"
+        );
     }
 }

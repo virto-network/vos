@@ -394,7 +394,47 @@ mod installation_data_fixture {
     mod portable_role_actor {
         use vos::prelude::*;
 
-        #[actor(agent)]
+        #[derive(
+            vos::rkyv::Archive,
+            vos::rkyv::Serialize,
+            vos::rkyv::Deserialize,
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+        )]
+        #[rkyv(crate = vos::rkyv)]
+        #[repr(u8)]
+        pub enum PortableRoleTier {
+            Member = 0,
+        }
+
+        impl vos::RoleByte for PortableRoleTier {
+            fn from_byte(byte: u8) -> Option<Self> {
+                (byte == Self::Member as u8).then_some(Self::Member)
+            }
+
+            fn as_byte(self) -> u8 {
+                self as u8
+            }
+        }
+
+        const SPACE_ROLE_MAP: vos::SpaceRoleMap<PortableRoleTier> = vos::SpaceRoleMap {
+            admin: Some(PortableRoleTier::Member),
+            developer: Some(PortableRoleTier::Member),
+            member: Some(PortableRoleTier::Member),
+            guest: None,
+        };
+
+        #[actor(
+            agent,
+            role = PortableRoleTier,
+            default_role = PortableRoleTier::Member,
+            space_role_map = SPACE_ROLE_MAP
+        )]
         pub struct PortableRole;
 
         #[messages(agent)]
@@ -409,13 +449,23 @@ mod installation_data_fixture {
                 space_role_id = "3131313131313131313131313131313131313131313131313131313131313131"
             )]
             fn guarded(&self) {}
+
+            #[msg(
+                query,
+                role = PortableRoleTier::Member,
+                actor_role_id = "3232323232323232323232323232323232323232323232323232323232323232"
+            )]
+            fn actor_guarded(&self) {}
+
+            #[msg(query, capability = "portable.read")]
+            fn capability_guarded(&self) {}
         }
     }
 
     use const_only_actor::{ConstOnly, ConstOnlyMsg};
     use fixed_array_actor::FixedArrayConfigured;
     use parameterized_actor::{Parameterized, ParameterizedMsg};
-    use portable_role_actor::PortableRoleMsg;
+    use portable_role_actor::{PortableRole, PortableRoleMsg};
     use raw_actor::{RawConfigured, RawConfiguredMsg};
     use unconfigured_actor::{Unconfigured, UnconfiguredMsg};
 
@@ -484,12 +534,121 @@ mod installation_data_fixture {
             PortableRoleMsg::AGENT_AUTHORIZATIONS,
         );
         let parsed = vos::metadata::decode_agent_authorizations(&encoded[..len]).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].name, "guarded");
+        assert_eq!(parsed.len(), 3);
+        let guarded = parsed
+            .iter()
+            .find(|method| method.name == "guarded")
+            .expect("space-role method");
         assert_eq!(
-            parsed[0].selector,
+            guarded.selector,
             vos::metadata::ParsedAgentAuthorizationSelector::SpaceRole([0x31; 32])
         );
+        let actor_guarded = parsed
+            .iter()
+            .find(|method| method.name == "actor_guarded")
+            .expect("actor-role method");
+        assert_eq!(
+            actor_guarded.selector,
+            vos::metadata::ParsedAgentAuthorizationSelector::ActorRole([0x32; 32])
+        );
+        let capability_guarded = parsed
+            .iter()
+            .find(|method| method.name == "capability_guarded")
+            .expect("capability method");
+        assert_eq!(
+            capability_guarded.selector,
+            vos::metadata::ParsedAgentAuthorizationSelector::Capability("portable.read".into())
+        );
+    }
+
+    #[test]
+    fn agent_macro_enforces_exact_portable_role_without_u8_fallback() {
+        let message = || PortableRoleMsg::from_msg(&Msg::new("guarded")).expect("message");
+
+        let mut actor = <PortableRole as vos::Actor>::create();
+        let mut legacy = vos::Context::new(super::ServiceId(7));
+        legacy.set_caller_roles(Some(SpaceRole::Member.as_u8()), None);
+        assert!(matches!(
+            vos::Actor::dispatch(&mut actor, message(), &mut legacy),
+            vos::RunResult::Complete(false)
+        ));
+        assert!(
+            legacy.was_forbidden(),
+            "legacy role bytes must not satisfy an Agent role policy"
+        );
+
+        let mut actor = <PortableRole as vos::Actor>::create();
+        let mut clean = vos::Context::new(super::ServiceId(7));
+        clean.__set_agent_invocation_context(vos::agent_sdk::InvocationContext {
+            invocation: vos::agent_sdk::InvocationId([0x41; 32]),
+            actor: vos::agent_sdk::ActorId([0x42; 32]),
+            mode: vos::agent_sdk::MethodMode::Query,
+            origin: vos::agent_sdk::InvocationOrigin {
+                principal: Some(vos::agent_sdk::PrincipalId([0x43; 32])),
+                ..vos::agent_sdk::InvocationOrigin::anonymous()
+            },
+            roles: vos::agent_sdk::InvocationRoleClaims {
+                space: Some(vos::agent_sdk::RoleId([0x31; 32])),
+                actor: None,
+            },
+            observed_slot: 44,
+        });
+        assert!(matches!(
+            vos::Actor::dispatch(&mut actor, message(), &mut clean),
+            vos::RunResult::Complete(false)
+        ));
+        assert!(!clean.was_forbidden());
+
+        let actor_message =
+            || PortableRoleMsg::from_msg(&Msg::new("actor_guarded")).expect("actor-role message");
+        let mut legacy = vos::Context::new(super::ServiceId(7));
+        legacy.set_caller_roles(None, Some(0));
+        assert!(matches!(
+            vos::Actor::dispatch(&mut actor, actor_message(), &mut legacy),
+            vos::RunResult::Complete(false)
+        ));
+        assert!(legacy.was_forbidden());
+
+        let context = *clean.agent_invocation_context().unwrap();
+        clean.__set_agent_invocation_context(vos::agent_sdk::InvocationContext {
+            roles: vos::agent_sdk::InvocationRoleClaims {
+                space: None,
+                actor: Some(vos::agent_sdk::RoleId([0x32; 32])),
+            },
+            ..context
+        });
+        assert!(matches!(
+            vos::Actor::dispatch(&mut actor, actor_message(), &mut clean),
+            vos::RunResult::Complete(false)
+        ));
+        assert!(!clean.was_forbidden());
+
+        let capability = vos::agent_sdk::CapabilityId::named("portable.read");
+        let capability_message = || {
+            PortableRoleMsg::from_msg(&Msg::new("capability_guarded")).expect("capability message")
+        };
+        let mut legacy = vos::Context::new(super::ServiceId(7));
+        legacy.set_caller_capability(Some(vos::CapabilityId(capability.0)));
+        assert!(matches!(
+            vos::Actor::dispatch(&mut actor, capability_message(), &mut legacy),
+            vos::RunResult::Complete(false)
+        ));
+        assert!(legacy.was_forbidden());
+
+        let context = *clean.agent_invocation_context().unwrap();
+        clean.__set_agent_invocation_context(vos::agent_sdk::InvocationContext {
+            origin: vos::agent_sdk::InvocationOrigin {
+                capability: Some(capability),
+                ..vos::agent_sdk::InvocationOrigin::anonymous()
+            },
+            roles: vos::agent_sdk::InvocationRoleClaims::none(),
+            ..context
+        });
+        assert!(matches!(
+            vos::Actor::dispatch(&mut actor, capability_message(), &mut clean),
+            vos::RunResult::Complete(false)
+        ));
+        assert!(!clean.was_forbidden());
     }
 
     #[test]

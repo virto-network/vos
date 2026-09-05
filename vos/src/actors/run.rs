@@ -1029,10 +1029,33 @@ const fn pvm_page_size_for_guest() -> usize {
 /// Output: `[status:u8][linear_len:u32][merge_len:u32][local_len:u32]`
 /// followed by the three lane images and the typed reply.
 #[cfg(feature = "pvm")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AgentInvocationControl {
+    Clean(crate::agent_sdk::InvocationContext),
+    Legacy(crate::agent::wire::ActorDispatchControl),
+}
+
+#[cfg(feature = "pvm")]
+fn decode_agent_invocation_control(input: &[u8]) -> Result<AgentInvocationControl, ()> {
+    if input.get(..4) == Some(b"AIC1") {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+
+        // Declaring AIC1 selects exactly one decoder. In particular, a
+        // malformed clean context cannot be reinterpreted as legacy AGDC.
+        return crate::agent_sdk::InvocationContext::decode(input)
+            .map(AgentInvocationControl::Clean)
+            .map_err(|_| ());
+    }
+    use crate::service::wire::ServiceWire as _;
+    crate::agent::wire::ActorDispatchControl::decode(input)
+        .map(AgentInvocationControl::Legacy)
+        .map_err(|_| ())
+}
+
+#[cfg(feature = "pvm")]
 pub fn run_refine<A: super::Actor>(args_address: u64, args_len: u64) {
     use super::context::ServiceId;
     use super::lifecycle;
-    use crate::service::wire::ServiceWire as _;
 
     fn fetch_owned(limit: usize) -> Option<alloc::vec::Vec<u8>> {
         // Most control items and freshly-created lanes are tiny. Keeping a
@@ -1127,25 +1150,44 @@ pub fn run_refine<A: super::Actor>(args_address: u64, args_len: u64) {
     let mut ctx = super::Context::new(ServiceId(0));
 
     let control = fetch_owned(512).expect("missing agent invocation control");
-    let control = crate::agent::wire::ActorDispatchControl::decode(&control)
-        .expect("invalid agent invocation control");
-    let invocation = control.invocation;
-    let mode = control.mode;
-    ctx.__set_actor_id(control.actor);
-    let caller = match control.auth.origin {
-        crate::service::Origin::Anonymous => super::auth::Caller::Unauthenticated,
-        crate::service::Origin::Member(subject) => super::auth::Caller::Member(subject),
-        crate::service::Origin::Actor(_) => super::auth::Caller::Actor(ServiceId(0)),
-        crate::service::Origin::System => super::auth::Caller::System,
+    let (invocation, mode) = match decode_agent_invocation_control(&control)
+        .expect("invalid agent invocation control")
+    {
+        AgentInvocationControl::Clean(clean) => {
+            let invocation = crate::service::InvocationId(clean.invocation.0);
+            let mode = match clean.mode {
+                crate::agent_sdk::MethodMode::Query => crate::agent::MethodMode::Query,
+                crate::agent_sdk::MethodMode::LinearizableQuery => {
+                    crate::agent::MethodMode::LinearizableQuery
+                }
+                crate::agent_sdk::MethodMode::LocalQuery => crate::agent::MethodMode::LocalQuery,
+                crate::agent_sdk::MethodMode::Linear => crate::agent::MethodMode::Linear,
+                crate::agent_sdk::MethodMode::Merge => crate::agent::MethodMode::Merge,
+                crate::agent_sdk::MethodMode::Local => crate::agent::MethodMode::Local,
+            };
+            ctx.__set_actor_id(crate::service::ActorId(clean.actor.0));
+            ctx.__set_agent_invocation_context(clean);
+            (invocation, mode)
+        }
+        AgentInvocationControl::Legacy(legacy) => {
+            let caller = match legacy.auth.origin {
+                crate::service::Origin::Anonymous => super::auth::Caller::Unauthenticated,
+                crate::service::Origin::Member(subject) => super::auth::Caller::Member(subject),
+                crate::service::Origin::Actor(_) => super::auth::Caller::Actor(ServiceId(0)),
+                crate::service::Origin::System => super::auth::Caller::System,
+            };
+            ctx.__set_actor_id(legacy.actor);
+            ctx.set_caller(caller);
+            ctx.__set_origin(
+                legacy.auth.origin,
+                legacy.auth.principal,
+                legacy.auth.origin_service,
+            );
+            ctx.set_caller_roles(legacy.auth.space_role, legacy.auth.actor_role);
+            ctx.set_caller_capability(legacy.auth.capability);
+            (legacy.invocation, legacy.mode)
+        }
     };
-    ctx.set_caller(caller);
-    ctx.__set_origin(
-        control.auth.origin,
-        control.auth.principal,
-        control.auth.origin_service,
-    );
-    ctx.set_caller_roles(control.auth.space_role, control.auth.actor_role);
-    ctx.set_caller_capability(control.auth.capability);
 
     let message = fetch_owned(crate::agent::execution::MAX_EXECUTION_MESSAGE_BYTES)
         .expect("missing agent message");
@@ -1292,5 +1334,48 @@ mod tests {
                 Err(InvokeError::Panicked)
             );
         }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_agent_control_decoder_never_falls_back_from_aic1() {
+        use super::{AgentInvocationControl, decode_agent_invocation_control};
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::service::wire::ServiceWire as _;
+
+        let context = crate::agent_sdk::InvocationContext {
+            invocation: crate::agent_sdk::InvocationId([0x91; 32]),
+            actor: crate::agent_sdk::ActorId([0x92; 32]),
+            mode: crate::agent_sdk::MethodMode::Merge,
+            origin: crate::agent_sdk::InvocationOrigin {
+                principal: Some(crate::agent_sdk::PrincipalId([0x93; 32])),
+                ..crate::agent_sdk::InvocationOrigin::anonymous()
+            },
+            roles: crate::agent_sdk::InvocationRoleClaims {
+                space: Some(crate::agent_sdk::RoleId([0x94; 32])),
+                actor: None,
+            },
+            observed_slot: 95,
+        };
+        let encoded = context.encode().unwrap();
+        assert_eq!(
+            decode_agent_invocation_control(&encoded),
+            Ok(AgentInvocationControl::Clean(context))
+        );
+
+        let mut corrupt_aic1 = encoded;
+        corrupt_aic1.push(0);
+        assert_eq!(decode_agent_invocation_control(&corrupt_aic1), Err(()));
+
+        let legacy = crate::agent::wire::ActorDispatchControl {
+            invocation: crate::service::InvocationId([0x96; 32]),
+            actor: crate::service::ActorId([0x97; 32]),
+            mode: crate::agent::MethodMode::Linear,
+            auth: crate::agent::execution::ActorInvocationAuth::anonymous(),
+        };
+        assert!(matches!(
+            decode_agent_invocation_control(&legacy.encode()),
+            Ok(AgentInvocationControl::Legacy(value)) if value == legacy
+        ));
     }
 }

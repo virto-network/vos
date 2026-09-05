@@ -4220,11 +4220,6 @@ fn validate_standard_sdk_invoke_preflight(
     prior: &RuntimeState,
     invocation: &crate::agent_sdk::InvocationWork,
 ) -> Result<(), AgentDriverError> {
-    // Unsupported clean identities are a host admission failure, not a
-    // fabricated terminal guest outcome: no exact-result clock has advanced.
-    if !super::standard::clean_origin_supported_by_actor_abi(&invocation.origin) {
-        return Err(AgentDriverError::InvalidRuntime);
-    }
     let state = super::wire::decode_standard_runtime_state(prior)
         .map_err(|_| AgentDriverError::InvalidRuntime)?;
     let runtime = super::standard::StandardAgentRuntime::restore(state)
@@ -5265,6 +5260,7 @@ mod tests {
             program: crate::agent_sdk::ProgramId(invocation.program.0),
             mode: crate::agent_sdk::MethodMode::Linear,
             origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
             message: invocation.message.clone(),
             installation_data: None,
             availability: Vec::new(),
