@@ -1,0 +1,5 @@
+error: policy identity must be nonzero
+ --> tests/ui/agent_policy_zero_id.rs:8:66
+  |
+8 |     #[msg(query, space_role = SpaceRole::Member, space_role_id = "0000000000000000000000000000000000000000000000000000000000000000")]
+  |                                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

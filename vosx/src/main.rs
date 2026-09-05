@@ -152,8 +152,7 @@ struct BuildOptions {
     interfaces: Option<PathBuf>,
     #[arg(long)]
     role_policies: Option<PathBuf>,
-    /// Exact `.vos_meta` bytes. Required with an already-linked PVM in
-    /// `agent build`.
+    /// Exact `.vos_meta` bytes for a pre-linked Service PVM.
     #[arg(long)]
     schemas: Option<PathBuf>,
     #[arg(long)]
@@ -183,14 +182,95 @@ impl BuildOptions {
             out_dir: self.out_dir,
             interfaces: self.interfaces,
             role_policies: self.role_policies,
+            method_policy: None,
             schemas: self.schemas,
             agent_schema,
+            agent_authorizations: None,
             source_map: self.source_map,
             tasks: self.tasks,
             include_elf: self.include_elf,
             crdt: self.crdt,
+            scheduling: false,
+            proof_system: None,
         }
     }
+}
+
+#[derive(ClapArgs)]
+struct AgentBuildOptions {
+    /// AgentActor project directory, ELF, or canonical standard PVM.
+    program: PathBuf,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long, default_value = "dist")]
+    out_dir: PathBuf,
+    /// Exact `.vos_meta` producer metadata when PROGRAM is a PVM.
+    #[arg(long)]
+    metadata: Option<PathBuf>,
+    /// Exact AAS2 `.vos_agent` bytes when PROGRAM is a PVM.
+    #[arg(long)]
+    agent_schema: Option<PathBuf>,
+    /// Exact AAM1 `.vos_agent_auth` bytes when PROGRAM is a PVM.
+    #[arg(long)]
+    agent_authorizations: Option<PathBuf>,
+    /// Prebuilt AMP2 accepted only when it byte-equals generated policy.
+    #[arg(long)]
+    method_policy: Option<PathBuf>,
+    /// Canonical Task project directory or ELF dependency. May be repeated.
+    #[arg(long = "task")]
+    tasks: Vec<PathBuf>,
+    /// Validate that the actor's derived state lanes are merge-only.
+    #[arg(long)]
+    crdt: bool,
+    /// Explicitly require scheduler support; never inferred from Job methods.
+    #[arg(long)]
+    scheduling: bool,
+    /// Exact nonzero proof-system identity used by every attested method and
+    /// provable Task dependency (64 lowercase hexadecimal characters).
+    #[arg(long, value_parser = parse_proof_system)]
+    proof_system: Option<vos::agent::sdk::Hash>,
+}
+
+impl AgentBuildOptions {
+    fn into_build_args(self) -> commands::build::Args {
+        commands::build::Args {
+            target: commands::build::BuildTarget::Agent,
+            program: self.program,
+            name: self.name,
+            out_dir: self.out_dir,
+            interfaces: None,
+            role_policies: None,
+            method_policy: self.method_policy,
+            schemas: self.metadata,
+            agent_schema: self.agent_schema,
+            agent_authorizations: self.agent_authorizations,
+            source_map: None,
+            tasks: self.tasks,
+            include_elf: false,
+            crdt: self.crdt,
+            scheduling: self.scheduling,
+            proof_system: self.proof_system,
+        }
+    }
+}
+
+fn parse_proof_system(value: &str) -> Result<vos::agent::sdk::Hash, String> {
+    if value.len() != 64
+        || value
+            .as_bytes()
+            .iter()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(byte))
+    {
+        return Err("proof system must be exactly 64 lowercase hexadecimal characters".into());
+    }
+    let bytes = hex::decode(value).map_err(|_| "proof system is not hexadecimal")?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "proof system must decode to exactly 32 bytes")?;
+    if bytes == [0; 32] {
+        return Err("proof system must be nonzero".into());
+    }
+    Ok(vos::agent::sdk::Hash(bytes))
 }
 
 #[derive(Subcommand)]
@@ -202,16 +282,11 @@ enum AgentCommand {
         #[arg(long)]
         crdt: bool,
     },
-    /// Build one standard-agent actor PVM and signed `VOSK` package. PROGRAM
-    /// may be a project, an ELF, or a canonical PVM accompanied by both
-    /// `--schemas` and `--agent-schema`.
+    /// Build one standard-agent actor PVM and signed clean-generation VOS3
+    /// package. PVM inputs require exact producer metadata artifacts.
     Build {
         #[command(flatten)]
-        options: BuildOptions,
-        /// Exact `.vos_agent` bytes when PROGRAM is an already-linked PVM.
-        /// Pass the matching `.vos_meta` bytes with `--schemas` as well.
-        #[arg(long)]
-        agent_schema: Option<PathBuf>,
+        options: Box<AgentBuildOptions>,
     },
 }
 
@@ -323,13 +398,8 @@ fn main() {
                     report_error(error);
                 }
             }
-            AgentCommand::Build {
-                options,
-                agent_schema,
-            } => {
-                if let Err(error) = commands::build::run(
-                    options.into_build_args(commands::build::BuildTarget::Agent, agent_schema),
-                ) {
+            AgentCommand::Build { options } => {
+                if let Err(error) = commands::build::run((*options).into_build_args()) {
                     report_error(error);
                 }
             }
@@ -540,10 +610,24 @@ fn exit_code_for(e: &anyhow::Error) -> i32 {
 
 #[cfg(test)]
 mod routing_tests {
-    use super::{is_top_level_help, should_dynamic_dispatch};
+    use super::{is_top_level_help, parse_proof_system, should_dynamic_dispatch};
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn proof_system_identity_is_exact_lowercase_hex_and_nonzero() {
+        assert_eq!(parse_proof_system(&"42".repeat(32)).unwrap().0, [0x42; 32]);
+        for invalid in [
+            "42".repeat(31),
+            "42".repeat(33),
+            "GG".repeat(32),
+            "AA".repeat(32),
+            "00".repeat(32),
+        ] {
+            assert!(parse_proof_system(&invalid).is_err());
+        }
     }
 
     #[test]

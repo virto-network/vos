@@ -74,7 +74,11 @@ impl Board {
         }
     }
 
-    #[msg(linear, role = BoardRole::Moderator)]
+    #[msg(
+        linear,
+        role = BoardRole::Moderator,
+        actor_role_id = "4242424242424242424242424242424242424242424242424242424242424242"
+    )]
     fn set_title(&mut self, title: String) {
         self.title = title;
     }

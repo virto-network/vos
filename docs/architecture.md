@@ -4,7 +4,8 @@ A space is an operator-controlled network. Its registry names packages,
 actors, nodes, and grants. The production service path creates one root service
 and actor tree per installed `VOSP` package. The agent foundation hosts many
 actors inside one runtime and stores each actor's Linear, Merge, and Local
-state separately; `VOSK` publication is the next node-integration boundary.
+state separately. The producer emits a signed, exact-closure `VOS3` package;
+node publication is a separate integration boundary.
 
 ```mermaid
 flowchart TB

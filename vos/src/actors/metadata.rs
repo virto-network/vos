@@ -431,6 +431,115 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
     (buf, pos)
 }
 
+// --- Clean Agent authorization metadata ----------------------------------
+
+/// Clean-generation metadata section emitted only by `#[messages(agent)]`.
+/// It carries the exact portable authorization identities needed to produce
+/// AMP2 without binding a package to a destination Space or reinterpreting a
+/// legacy role byte. It is producer input and is never part of the VOS3
+/// package closure.
+pub const AGENT_AUTHORIZATION_MAGIC: [u8; 4] = *b"AAM1";
+pub const AGENT_AUTHORIZATION_VERSION: u16 = 1;
+pub const MAX_AGENT_AUTHORIZATION_BYTES: usize = 16 * 1024;
+pub const MAX_AGENT_AUTHORIZATION_METHODS: usize = 256;
+pub const MAX_AGENT_AUTHORIZATION_NAME_BYTES: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentAuthorizationSelectorMeta {
+    Public,
+    SpaceRole([u8; 32]),
+    ActorRole([u8; 32]),
+    Capability(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentMethodAuthorizationMeta {
+    pub name: &'static str,
+    pub selector: AgentAuthorizationSelectorMeta,
+}
+
+/// Encode the declaration-ordered Agent authorization surface in a const
+/// context for the `.vos_agent_auth` ELF section.
+pub const fn encode_agent_authorizations<const N: usize>(
+    methods: &[AgentMethodAuthorizationMeta],
+) -> ([u8; N], usize) {
+    let mut buf = [0u8; N];
+    let mut pos = 0usize;
+    let mut magic = 0usize;
+    while magic < AGENT_AUTHORIZATION_MAGIC.len() {
+        buf[pos] = AGENT_AUTHORIZATION_MAGIC[magic];
+        pos += 1;
+        magic += 1;
+    }
+    let version = AGENT_AUTHORIZATION_VERSION.to_le_bytes();
+    buf[pos] = version[0];
+    buf[pos + 1] = version[1];
+    pos += 2;
+    let count = (methods.len() as u16).to_le_bytes();
+    buf[pos] = count[0];
+    buf[pos + 1] = count[1];
+    pos += 2;
+
+    let mut method_index = 0usize;
+    while method_index < methods.len() {
+        let method = &methods[method_index];
+        let name = method.name.as_bytes();
+        let name_len = (name.len() as u16).to_le_bytes();
+        buf[pos] = name_len[0];
+        buf[pos + 1] = name_len[1];
+        pos += 2;
+        let mut index = 0usize;
+        while index < name.len() {
+            buf[pos + index] = name[index];
+            index += 1;
+        }
+        pos += name.len();
+        match method.selector {
+            AgentAuthorizationSelectorMeta::Public => {
+                buf[pos] = 0;
+                pos += 1;
+            }
+            AgentAuthorizationSelectorMeta::SpaceRole(identity) => {
+                buf[pos] = 1;
+                pos += 1;
+                let mut index = 0usize;
+                while index < identity.len() {
+                    buf[pos + index] = identity[index];
+                    index += 1;
+                }
+                pos += identity.len();
+            }
+            AgentAuthorizationSelectorMeta::ActorRole(identity) => {
+                buf[pos] = 2;
+                pos += 1;
+                let mut index = 0usize;
+                while index < identity.len() {
+                    buf[pos + index] = identity[index];
+                    index += 1;
+                }
+                pos += identity.len();
+            }
+            AgentAuthorizationSelectorMeta::Capability(capability) => {
+                buf[pos] = 3;
+                pos += 1;
+                let value = capability.as_bytes();
+                let value_len = (value.len() as u16).to_le_bytes();
+                buf[pos] = value_len[0];
+                buf[pos + 1] = value_len[1];
+                pos += 2;
+                let mut index = 0usize;
+                while index < value.len() {
+                    buf[pos + index] = value[index];
+                    index += 1;
+                }
+                pos += value.len();
+            }
+        }
+        method_index += 1;
+    }
+    (buf, pos)
+}
+
 // --- Binary deserialization (alloc-only, re-exported unconditionally) ---
 
 pub use decode::*;
@@ -697,6 +806,63 @@ mod tests {
         assert_eq!(parsed.messages[0].returns, "u64");
         assert!(parsed.messages[0].exposed_to_cli);
     }
+
+    #[test]
+    fn clean_agent_authorization_metadata_is_strict_and_exact() {
+        const METHODS: &[AgentMethodAuthorizationMeta] = &[
+            AgentMethodAuthorizationMeta {
+                name: "open",
+                selector: AgentAuthorizationSelectorMeta::Public,
+            },
+            AgentMethodAuthorizationMeta {
+                name: "moderate",
+                selector: AgentAuthorizationSelectorMeta::ActorRole([0x42; 32]),
+            },
+            AgentMethodAuthorizationMeta {
+                name: "publish",
+                selector: AgentAuthorizationSelectorMeta::Capability("board.publish"),
+            },
+        ];
+        let (encoded, len) = encode_agent_authorizations::<512>(METHODS);
+        let encoded = &encoded[..len];
+        assert_eq!(encoded.get(..4), Some(AGENT_AUTHORIZATION_MAGIC.as_slice()));
+        let parsed = decode_agent_authorizations(encoded).unwrap();
+        assert_eq!(parsed.len(), METHODS.len());
+        assert_eq!(parsed[0].name, "open");
+        assert_eq!(
+            parsed[1].selector,
+            ParsedAgentAuthorizationSelector::ActorRole([0x42; 32])
+        );
+        assert_eq!(
+            parsed[2].selector,
+            ParsedAgentAuthorizationSelector::Capability("board.publish".into())
+        );
+
+        let mut old = encoded.to_vec();
+        old[..4].copy_from_slice(b"AAM0");
+        assert!(decode_agent_authorizations(&old).is_none());
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(decode_agent_authorizations(&trailing).is_none());
+
+        let (zero, zero_len) =
+            encode_agent_authorizations::<128>(&[AgentMethodAuthorizationMeta {
+                name: "zero",
+                selector: AgentAuthorizationSelectorMeta::SpaceRole([0; 32]),
+            }]);
+        assert!(decode_agent_authorizations(&zero[..zero_len]).is_none());
+        let (duplicate, duplicate_len) = encode_agent_authorizations::<128>(&[
+            AgentMethodAuthorizationMeta {
+                name: "same",
+                selector: AgentAuthorizationSelectorMeta::Public,
+            },
+            AgentMethodAuthorizationMeta {
+                name: "same",
+                selector: AgentAuthorizationSelectorMeta::Public,
+            },
+        ]);
+        assert!(decode_agent_authorizations(&duplicate[..duplicate_len]).is_none());
+    }
 }
 
 /// Parsed metadata + the `decode` / `from_elf` / `raw_section_from_elf`
@@ -759,6 +925,20 @@ mod decode {
         /// `#[actor(task, provable)]` publication mark — this Task is
         /// meant to be pinned and proved.
         pub provable: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ParsedAgentAuthorizationSelector {
+        Public,
+        SpaceRole([u8; 32]),
+        ActorRole([u8; 32]),
+        Capability(String),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ParsedAgentMethodAuthorization {
+        pub name: String,
+        pub selector: ParsedAgentAuthorizationSelector,
     }
 
     /// Decode binary metadata from a `.vos_meta` section.
@@ -920,6 +1100,90 @@ mod decode {
         })
     }
 
+    /// Strictly decode the clean agent-only `.vos_agent_auth` producer
+    /// metadata. Old/unknown versions, duplicate names, zero role identities,
+    /// malformed capability names, trailing bytes, and oversized inputs are
+    /// rejected rather than normalized.
+    pub fn decode_agent_authorizations(data: &[u8]) -> Option<Vec<ParsedAgentMethodAuthorization>> {
+        if data.len() > super::MAX_AGENT_AUTHORIZATION_BYTES {
+            return None;
+        }
+        let mut pos = 0usize;
+        let magic = data.get(..super::AGENT_AUTHORIZATION_MAGIC.len())?;
+        if magic != super::AGENT_AUTHORIZATION_MAGIC {
+            return None;
+        }
+        pos += super::AGENT_AUTHORIZATION_MAGIC.len();
+        if read_u16(data, &mut pos)? != super::AGENT_AUTHORIZATION_VERSION {
+            return None;
+        }
+        let count = read_u16(data, &mut pos)? as usize;
+        if count > super::MAX_AGENT_AUTHORIZATION_METHODS {
+            return None;
+        }
+        let mut methods = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name = read_str(data, &mut pos)?;
+            if name.is_empty()
+                || name.len() > super::MAX_AGENT_AUTHORIZATION_NAME_BYTES
+                || methods
+                    .iter()
+                    .any(|method: &ParsedAgentMethodAuthorization| method.name == name)
+            {
+                return None;
+            }
+            let selector = match *data.get(pos)? {
+                0 => {
+                    pos += 1;
+                    ParsedAgentAuthorizationSelector::Public
+                }
+                1 => {
+                    pos += 1;
+                    let identity = read_identity(data, &mut pos)?;
+                    ParsedAgentAuthorizationSelector::SpaceRole(identity)
+                }
+                2 => {
+                    pos += 1;
+                    let identity = read_identity(data, &mut pos)?;
+                    ParsedAgentAuthorizationSelector::ActorRole(identity)
+                }
+                3 => {
+                    pos += 1;
+                    let capability = read_str(data, &mut pos)?;
+                    if !valid_capability_name(&capability) {
+                        return None;
+                    }
+                    ParsedAgentAuthorizationSelector::Capability(capability)
+                }
+                _ => return None,
+            };
+            methods.push(ParsedAgentMethodAuthorization { name, selector });
+        }
+        (pos == data.len()).then_some(methods)
+    }
+
+    fn read_identity(data: &[u8], pos: &mut usize) -> Option<[u8; 32]> {
+        let end = pos.checked_add(32)?;
+        let identity: [u8; 32] = data.get(*pos..end)?.try_into().ok()?;
+        if identity == [0; 32] {
+            return None;
+        }
+        *pos = end;
+        Some(identity)
+    }
+
+    fn valid_capability_name(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= 128
+            && bytes[0].is_ascii_lowercase()
+            && bytes.iter().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(*byte, b'.' | b'_' | b'-')
+            })
+    }
+
     fn read_u16(data: &[u8], pos: &mut usize) -> Option<u16> {
         if *pos + 2 > data.len() {
             return None;
@@ -962,6 +1226,11 @@ mod decode {
     /// same bytes back to consumers, which decode them into [`ParsedMeta`].
     pub fn raw_section_from_elf(elf_data: &[u8]) -> Option<Vec<u8>> {
         find_elf_section(elf_data, b".vos_meta").map(|s| s.to_vec())
+    }
+
+    /// Exact clean Agent authorization producer metadata from an ELF.
+    pub fn raw_agent_authorizations_from_elf(elf_data: &[u8]) -> Option<Vec<u8>> {
+        find_elf_section(elf_data, b".vos_agent_auth").map(|section| section.to_vec())
     }
 
     /// Raw bytes of a named ELF section. Agent packaging uses this for the

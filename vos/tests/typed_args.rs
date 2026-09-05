@@ -346,9 +346,128 @@ mod installation_data_fixture {
         }
     }
 
-    use const_only_actor::ConstOnly;
-    use parameterized_actor::Parameterized;
-    use unconfigured_actor::Unconfigured;
+    mod raw_actor {
+        use vos::prelude::*;
+
+        #[actor(agent)]
+        pub struct RawConfigured {
+            pub(super) length: u64,
+        }
+
+        #[messages(agent)]
+        impl RawConfigured {
+            fn new(bytes: &[u8]) -> Self {
+                Self {
+                    length: bytes.len() as u64,
+                }
+            }
+
+            #[msg]
+            fn length(&self) -> u64 {
+                self.length
+            }
+        }
+    }
+
+    mod portable_role_actor {
+        use vos::prelude::*;
+
+        #[actor(agent)]
+        pub struct PortableRole;
+
+        #[messages(agent)]
+        impl PortableRole {
+            fn new() -> Self {
+                Self
+            }
+
+            #[msg(
+                query,
+                space_role = SpaceRole::Member,
+                space_role_id = "3131313131313131313131313131313131313131313131313131313131313131"
+            )]
+            fn guarded(&self) {}
+        }
+    }
+
+    use const_only_actor::{ConstOnly, ConstOnlyMsg};
+    use parameterized_actor::{Parameterized, ParameterizedMsg};
+    use portable_role_actor::PortableRoleMsg;
+    use raw_actor::{RawConfigured, RawConfiguredMsg};
+    use unconfigured_actor::{Unconfigured, UnconfiguredMsg};
+
+    fn encoded_constructor_schema(
+        constructor: vos::agent::sdk::schema::ConstructorMeta,
+    ) -> Vec<u8> {
+        let (encoded, len) =
+            vos::agent::sdk::schema::encode::<1024>(&vos::agent::sdk::schema::SchemaMeta {
+                constructor,
+                fields: &[],
+                methods: &[],
+            });
+        encoded[..len].to_vec()
+    }
+
+    #[test]
+    fn agent_macro_emits_exact_aas2_constructor_contracts() {
+        let forbidden = encoded_constructor_schema(UnconfiguredMsg::AGENT_CONSTRUCTOR);
+        assert_eq!(forbidden.get(..4), Some(b"AAS2".as_slice()));
+        assert!(matches!(
+            vos::agent::sdk::schema::decode(&forbidden)
+                .unwrap()
+                .constructor,
+            vos::agent::sdk::schema::ConstructorContract::Forbidden
+        ));
+
+        let raw = encoded_constructor_schema(RawConfiguredMsg::AGENT_CONSTRUCTOR);
+        let raw = vos::agent::sdk::schema::decode(&raw).unwrap();
+        let vos::agent::sdk::schema::ConstructorContract::RequiredRaw(argument) = raw.constructor
+        else {
+            panic!("one &[u8] constructor must be RequiredRaw")
+        };
+        assert_eq!(argument.name, "bytes");
+        assert_eq!(
+            argument.type_identity,
+            vos::agent::sdk::schema::RAW_CONSTRUCTOR_TYPE_IDENTITY
+        );
+
+        let named = encoded_constructor_schema(ParameterizedMsg::AGENT_CONSTRUCTOR);
+        let named = vos::agent::sdk::schema::decode(&named).unwrap();
+        let vos::agent::sdk::schema::ConstructorContract::RequiredNamed(arguments) =
+            named.constructor
+        else {
+            panic!("typed constructor must be RequiredNamed")
+        };
+        assert_eq!(arguments.len(), 1);
+        assert_eq!(arguments[0].name, "tenant");
+        assert!(arguments[0].type_identity.ends_with("::u64"));
+
+        let no_arg_const = encoded_constructor_schema(ConstOnlyMsg::AGENT_CONSTRUCTOR);
+        assert!(matches!(
+            vos::agent::sdk::schema::decode(&no_arg_const)
+                .unwrap()
+                .constructor,
+            vos::agent::sdk::schema::ConstructorContract::Forbidden
+        ));
+
+        let mut old_magic = forbidden;
+        old_magic[..4].copy_from_slice(b"AAS1");
+        assert!(vos::agent::sdk::schema::decode(&old_magic).is_err());
+    }
+
+    #[test]
+    fn agent_macro_preserves_exact_portable_role_identity() {
+        let (encoded, len) = vos::metadata::encode_agent_authorizations::<512>(
+            PortableRoleMsg::AGENT_AUTHORIZATIONS,
+        );
+        let parsed = vos::metadata::decode_agent_authorizations(&encoded[..len]).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "guarded");
+        assert_eq!(
+            parsed[0].selector,
+            vos::metadata::ParsedAgentAuthorizationSelector::SpaceRole([0x31; 32])
+        );
+    }
 
     #[test]
     fn generated_agent_construction_uses_exact_installation_args_on_every_hydration() {
@@ -388,6 +507,18 @@ mod installation_data_fixture {
             "unexpected present-empty data is distinct from absence"
         );
         assert!(<Unconfigured as vos::Actor>::__load_agent_state(None, None, None, None).is_some());
+
+        assert_eq!(
+            <RawConfigured as vos::Actor>::__load_agent_state(Some(&[]), None, None, None,)
+                .unwrap()
+                .length,
+            0,
+            "RequiredRaw preserves present-empty installation data"
+        );
+        assert!(
+            <RawConfigured as vos::Actor>::__load_agent_state(None, None, None, None).is_none(),
+            "RequiredRaw distinguishes absence from present-empty"
+        );
 
         assert_eq!(
             <ConstOnly as vos::Actor>::__load_agent_state(None, None, None, None,)

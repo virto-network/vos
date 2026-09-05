@@ -1,0 +1,5 @@
+error: #[messages(agent)] requires role = ... and actor_role_id = "<64 lowercase hex>" together
+ --> tests/ui/agent_policy_orphan_id.rs:9:5
+  |
+9 |     fn read(&self) {}
+  |     ^^^^^^^^^^^^^^

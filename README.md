@@ -24,10 +24,12 @@ during the agent cutover:
 - `#[actor]` defines an actor.
 - `vosx build` creates a service package (`VOSP`); `space publish` and
   `space install` create the production root service from it.
-- `vosx agent build` creates an agent package (`VOSK`) for a runtime that can
-  own multiple actors and keep Linear, Merge, and Local state in separate
-  lanes. Node-level publication of these packages is the next integration
-  boundary; `space publish` intentionally rejects them today.
+- `vosx agent build` creates the clean-generation signed `VOS3` package: one
+  standard actor PVM plus exact AAS2 state/constructor, AMP2 method-policy,
+  AAI1 introspection, and ATD1 Task-dependency artifacts. Agent scheduling and
+  any proof-system identity are explicit build inputs. Node-level publication
+  of `VOS3` is the next integration boundary; `space publish` intentionally
+  rejects it today.
 - Both targets use the same actor macros, typed messages, and signed method
   policy. Their host ABIs are authenticated and cannot be cross-packaged.
 

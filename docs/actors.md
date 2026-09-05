@@ -9,15 +9,17 @@ A `.vos` package always contains:
 
 - the actor PVM;
 - typed method schemas;
-- role policies;
+- authorization/method policies;
 - optional Task dependencies;
 - a deployment signature.
 
 A service package (`VOSP`) additionally binds the generic service program and
-is accepted by `space publish`. An agent package (`VOSK`) additionally signs
-its execution entry, state-lane schema, and runtime requirements; the agent
-driver installs it into an existing agent. The two envelopes cannot be
-cross-packaged.
+is accepted by `space publish`. A clean Agent package (`VOS3`) signs an exact
+closure containing the actor PVM, AAS2 state and constructor contract, AMP2
+method policy, AAI1 introspection, ATD1 Task set, and every referenced Task
+PVM. It uses a raw Ed25519 producer key/signature and derives its deployment
+identity from those signing bytes. The two envelopes cannot be cross-packaged;
+host publication of `VOS3` remains a separate cutover.
 
 The package is the installation unit. Raw ELFs and PVMs are build inputs, not
 deployable applications.
@@ -53,6 +55,23 @@ The generated method view exposes only the lanes permitted by its mode. The
 runtime independently projects the same lanes before execution and rejects a
 transition that changes any other lane. Service actors continue to use plain
 `#[actor]` and `#[messages]`.
+
+An Agent method that names an actor or Space role also supplies its portable,
+nonzero role identity; packages are not bound to the destination Space:
+
+```rust,ignore
+#[msg(
+    query,
+    space_role = SpaceRole::Member,
+    space_role_id = "3131313131313131313131313131313131313131313131313131313131313131"
+)]
+pub fn status(&self) -> Status { /* ... */ }
+```
+
+`vosx agent build --scheduling` explicitly signs scheduler requirements.
+Attested methods or provable Task dependencies require one exact nonzero
+`--proof-system <64-lowercase-hex>` identity; supplying it when unused is an
+error.
 
 ## Actor trees
 

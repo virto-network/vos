@@ -5,11 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, anyhow, bail};
-use vos::agent::contract::ActorPackageContract;
-use vos::agent::package::{
-    Package as AgentPackage, PackageManifest as AgentPackageManifest, actor_runtime_requirements,
-};
-use vos::agent::{LaneSet, PackageKind, StateLane};
+use vos::agent::sdk;
+use vos::agent::sdk::wire::CanonicalWire;
 use vos::service::{
     DeploymentSignature, PackageDiagnostics, PackageManifest as ServicePackageManifest,
     PackageRolePolicies, PackageTaskDependency, ProducerId, ProgramId, ServiceWire, TaskDependency,
@@ -55,12 +52,18 @@ pub struct Args {
     pub out_dir: PathBuf,
     pub interfaces: Option<PathBuf>,
     pub role_policies: Option<PathBuf>,
+    /// Optional prebuilt AMP2 bytes. Agent builds accept them only when they
+    /// byte-equal the artifact generated from authenticated macro metadata.
+    pub method_policy: Option<PathBuf>,
     pub schemas: Option<PathBuf>,
     pub agent_schema: Option<PathBuf>,
+    pub agent_authorizations: Option<PathBuf>,
     pub source_map: Option<PathBuf>,
     pub tasks: Vec<PathBuf>,
     pub include_elf: bool,
     pub crdt: bool,
+    pub scheduling: bool,
+    pub proof_system: Option<sdk::Hash>,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -69,24 +72,25 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 }
 
 fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::Result<()> {
+    if args.target == BuildTarget::Agent {
+        return run_agent_with_signer(args, keypair);
+    }
+    run_legacy_service_with_signer(args, keypair)
+}
+
+/// Frozen Service producer path. The separate clean Agent path never constructs
+/// or decodes its VOS1/VOSK policy/package types.
+fn run_legacy_service_with_signer(
+    args: Args,
+    keypair: &libp2p::identity::Keypair,
+) -> anyhow::Result<()> {
+    if args.target != BuildTarget::Service {
+        bail!("internal build dispatch attempted to route an Agent through the Service producer");
+    }
     let program = resolve_program_input(&args.program)?;
     let input = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
     let is_pvm = program.extension().and_then(|x| x.to_str()) == Some("pvm");
-    if is_pvm && args.target == BuildTarget::Agent {
-        if args.schemas.is_none() {
-            bail!(
-                "{} is an agent PVM without authenticated actor metadata; pass --schemas with exact .vos_meta bytes",
-                program.display()
-            );
-        }
-        if args.agent_schema.is_none() {
-            bail!(
-                "{} is an agent PVM without its execution schema; pass --agent-schema with exact .vos_agent bytes",
-                program.display()
-            );
-        }
-    }
-    if is_pvm && args.target == BuildTarget::Service && args.agent_schema.is_none() {
+    if is_pvm && args.agent_schema.is_none() {
         bail!(
             "{} is a PVM without its authenticated service-entry marker; pass the canonical service actor ELF or project directory",
             program.display()
@@ -95,23 +99,14 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     let actor_pvm = if is_pvm {
         input.clone()
     } else {
-        match args.target {
-            BuildTarget::Service => vos_pvm_compiler::link_elf(&input),
-            BuildTarget::Agent => vos_pvm_compiler::link_elf_spi(&input),
-        }
-        .map_err(|error| anyhow!("transpile {}: {error:?}", program.display()))?
+        vos_pvm_compiler::link_elf(&input)
+            .map_err(|error| anyhow!("transpile {}: {error:?}", program.display()))?
     };
     if actor_pvm.is_empty() {
         bail!("{} produced an empty PVM", program.display());
     }
-    match args.target {
-        BuildTarget::Service => vos::service::validate_actor_program_layout(&actor_pvm)
-            .map_err(|error| anyhow!("invalid canonical actor PVM capability layout: {error}"))?,
-        BuildTarget::Agent => {
-            vos_pvm::spi::parse_standard_program(&actor_pvm)
-                .ok_or_else(|| anyhow!("{} is not a canonical standard PVM", program.display()))?;
-        }
-    }
+    vos::service::validate_actor_program_layout(&actor_pvm)
+        .map_err(|error| anyhow!("invalid canonical actor PVM capability layout: {error}"))?;
 
     let schemas = match args.schemas.as_deref() {
         Some(path) => std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
@@ -126,76 +121,35 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     })?;
     let embedded_execution_schema =
         (!is_pvm).then(|| vos::agent::schema::raw_section_from_elf(&input).unwrap_or_default());
-    let (agent_schema, requirements, service_crdt) = match args.target {
-        BuildTarget::Service => {
-            if args.crdt && !actor_metadata.crdt {
+    if args.crdt && !actor_metadata.crdt {
+        bail!(
+            "{} is an ordinary actor; use #[actor(crdt)] instead of forcing --crdt",
+            program.display(),
+        );
+    }
+    let execution_schema = match args.agent_schema.as_deref() {
+        Some(path) => {
+            let supplied =
+                std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            if embedded_execution_schema
+                .as_ref()
+                .is_some_and(|embedded| *embedded != supplied)
+            {
                 bail!(
-                    "{} is an ordinary actor; use #[actor(crdt)] instead of forcing --crdt",
-                    program.display(),
+                    "{} does not match the actor ELF's embedded .vos_agent schema",
+                    path.display()
                 );
             }
-            let execution_schema = match args.agent_schema.as_deref() {
-                Some(path) => {
-                    let supplied =
-                        std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-                    if embedded_execution_schema
-                        .as_ref()
-                        .is_some_and(|embedded| *embedded != supplied)
-                    {
-                        bail!(
-                            "{} does not match the actor ELF's embedded .vos_agent schema",
-                            path.display()
-                        );
-                    }
-                    supplied
-                }
-                None => embedded_execution_schema.unwrap_or_default(),
-            };
-            require_execution_entry(
-                &execution_schema,
-                vos::agent::schema::ExecutionEntryKind::ServiceActor,
-                &program,
-            )?;
-            (Vec::new(), None, actor_metadata.crdt || args.crdt)
+            supplied
         }
-        BuildTarget::Agent => {
-            let agent_schema = match args.agent_schema.as_deref() {
-                Some(path) => {
-                    let supplied =
-                        std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-                    if embedded_execution_schema
-                        .as_ref()
-                        .is_some_and(|embedded| *embedded != supplied)
-                    {
-                        bail!(
-                            "{} does not match the actor ELF's embedded .vos_agent schema",
-                            path.display()
-                        );
-                    }
-                    supplied
-                }
-                None if !is_pvm => embedded_execution_schema.unwrap_or_default(),
-                None => Vec::new(),
-            };
-            let parsed_agent_schema = require_execution_entry(
-                &agent_schema,
-                vos::agent::schema::ExecutionEntryKind::AgentActor,
-                &program,
-            )?;
-            let requirements = actor_runtime_requirements(
-                &parsed_agent_schema,
-                &actor_metadata,
-                !args.tasks.is_empty(),
-            );
-            if args.crdt && requirements.lanes != LaneSet::of(StateLane::Merge) {
-                bail!(
-                    "{} is not a merge-only actor; field types now derive lanes and --crdt cannot override them",
-                    program.display(),
-                );
-            }
-            (agent_schema, Some(requirements), false)
-        }
+        None => embedded_execution_schema.unwrap_or_default(),
     };
+    require_execution_entry(
+        &execution_schema,
+        vos::agent::schema::ExecutionEntryKind::ServiceActor,
+        &program,
+    )?;
+    let service_crdt = actor_metadata.crdt || args.crdt;
     let name = args
         .name
         .unwrap_or_else(|| actor_metadata.actor_name.clone());
@@ -204,7 +158,7 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     let mut task_dependencies = args
         .tasks
         .iter()
-        .map(|input| build_task_dependency(input, args.target))
+        .map(|input| build_service_task_dependency(input))
         .collect::<anyhow::Result<Vec<_>>>()?;
     task_dependencies.sort_by_key(|dependency| dependency.binding.task);
     if task_dependencies
@@ -242,77 +196,37 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
         elf: (args.include_elf && !is_pvm).then_some(input),
         source_map: (!source_map.is_empty()).then_some(source_map),
     });
-    let (package_bytes, deployment_id) = match args.target {
-        BuildTarget::Service => {
-            let mut package = VosPackage {
-                manifest: ServicePackageManifest {
-                    name: name.clone(),
-                    platform: vos::service::PLATFORM_ID,
-                    execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
-                    service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-                    actor_program,
-                    crdt: service_crdt,
-                    interfaces_hash: artifact_hash(b"interfaces", &interfaces),
-                    role_policies_hash: artifact_hash(b"role-policies", &role_policies),
-                    schemas_hash: artifact_hash(b"schemas", &schemas),
-                    task_dependencies_hash: task_dependencies_hash(&task_dependencies),
-                },
-                actor_pvm: actor_pvm.clone(),
-                generated_interfaces: interfaces,
-                role_policies,
-                schemas,
-                task_dependencies: task_dependencies.clone(),
-                diagnostics,
-                deployment_signature: DeploymentSignature {
-                    producer,
-                    public_key,
-                    signature: vec![0],
-                },
-            };
-            package.deployment_signature.signature = keypair
-                .sign(&package.signing_message())
-                .map_err(|error| anyhow!("sign deployment: {error}"))?;
-            package.validate()?;
-            (package.encode(), package.deployment_id())
-        }
-        BuildTarget::Agent => {
-            let requirements = requirements.expect("agent requirements were derived");
-            let mut package = AgentPackage {
-                manifest: AgentPackageManifest {
-                    name: name.clone(),
-                    platform: vos::service::PLATFORM_ID,
-                    execution_semantics: vos::agent::EXECUTION_SEMANTICS_ID,
-                    kind: PackageKind::Actor {
-                        contract: ActorPackageContract::canonical(),
-                        requirements,
-                    },
-                    program: actor_program,
-                    interfaces_hash: artifact_hash(b"interfaces", &interfaces),
-                    role_policies_hash: artifact_hash(b"role-policies", &role_policies),
-                    schemas_hash: artifact_hash(b"schemas", &schemas),
-                    agent_schema_hash: artifact_hash(b"agent-schema", &agent_schema),
-                    dependencies_hash: task_dependencies_hash(&task_dependencies),
-                },
-                pvm: actor_pvm.clone(),
-                generated_interfaces: interfaces,
-                role_policies,
-                schemas,
-                agent_schema,
-                task_dependencies: task_dependencies.clone(),
-                diagnostics,
-                deployment_signature: DeploymentSignature {
-                    producer,
-                    public_key,
-                    signature: vec![0],
-                },
-            };
-            package.deployment_signature.signature = keypair
-                .sign(&package.signing_message())
-                .map_err(|error| anyhow!("sign deployment: {error}"))?;
-            package.validate()?;
-            (package.encode(), package.deployment_id())
-        }
+    let mut package = VosPackage {
+        manifest: ServicePackageManifest {
+            name: name.clone(),
+            platform: vos::service::PLATFORM_ID,
+            execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+            service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
+            actor_program,
+            crdt: service_crdt,
+            interfaces_hash: artifact_hash(b"interfaces", &interfaces),
+            role_policies_hash: artifact_hash(b"role-policies", &role_policies),
+            schemas_hash: artifact_hash(b"schemas", &schemas),
+            task_dependencies_hash: task_dependencies_hash(&task_dependencies),
+        },
+        actor_pvm: actor_pvm.clone(),
+        generated_interfaces: interfaces,
+        role_policies,
+        schemas,
+        task_dependencies: task_dependencies.clone(),
+        diagnostics,
+        deployment_signature: DeploymentSignature {
+            producer,
+            public_key,
+            signature: vec![0],
+        },
     };
+    package.deployment_signature.signature = keypair
+        .sign(&package.signing_message())
+        .map_err(|error| anyhow!("sign deployment: {error}"))?;
+    package.validate()?;
+    let package_bytes = package.encode();
+    let deployment_id = package.deployment_id();
 
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("create {}", args.out_dir.display()))?;
@@ -334,6 +248,550 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
         );
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct AgentTaskDependencyBuild {
+    dependency: sdk::task::TaskDependency,
+    pvm: Vec<u8>,
+    provable: bool,
+}
+
+fn run_agent_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::Result<()> {
+    if args.interfaces.is_some() {
+        bail!("agent build does not admit legacy --interfaces into a VOS3 closure");
+    }
+    if args.role_policies.is_some() {
+        bail!("agent build uses canonical AMP2 --method-policy, not --role-policies");
+    }
+    if args.source_map.is_some() || args.include_elf {
+        bail!("agent build does not admit legacy diagnostics into a VOS3 closure");
+    }
+    if args.tasks.len() > sdk::task::MAX_TASK_DEPENDENCIES {
+        bail!(
+            "agent package has {} Task dependencies; the canonical maximum is {}",
+            args.tasks.len(),
+            sdk::task::MAX_TASK_DEPENDENCIES,
+        );
+    }
+
+    let program = resolve_program_input(&args.program)?;
+    let input = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
+    let is_pvm = program.extension().and_then(|extension| extension.to_str()) == Some("pvm");
+    let actor_pvm = if is_pvm {
+        input.clone()
+    } else {
+        vos_pvm_compiler::link_elf_spi(&input)
+            .map_err(|error| anyhow!("transpile {}: {error:?}", program.display()))?
+    };
+    if actor_pvm.is_empty() || vos_pvm::spi::parse_standard_program(&actor_pvm).is_none() {
+        bail!("{} is not a canonical standard PVM", program.display());
+    }
+
+    let embedded_metadata =
+        (!is_pvm).then(|| vos::metadata::raw_section_from_elf(&input).unwrap_or_default());
+    let metadata_bytes = exact_producer_input(
+        args.schemas.as_deref(),
+        embedded_metadata,
+        ".vos_meta actor metadata",
+        "--metadata",
+        &program,
+    )?;
+    let actor_metadata = vos::metadata::decode(&metadata_bytes).ok_or_else(|| {
+        anyhow!(
+            "{} has no valid authenticated actor metadata",
+            program.display()
+        )
+    })?;
+
+    let embedded_schema = (!is_pvm).then(|| {
+        vos::metadata::raw_named_section_from_elf(&input, b".vos_agent").unwrap_or_default()
+    });
+    let actor_schema_bytes = exact_producer_input(
+        args.agent_schema.as_deref(),
+        embedded_schema,
+        ".vos_agent AAS2 schema",
+        "--agent-schema",
+        &program,
+    )?;
+    let actor_schema = sdk::schema::decode(&actor_schema_bytes).map_err(|error| {
+        anyhow!(
+            "{} has no canonical AAS2 AgentActor schema: {error}",
+            program.display()
+        )
+    })?;
+
+    let embedded_authorizations = (!is_pvm)
+        .then(|| vos::metadata::raw_agent_authorizations_from_elf(&input).unwrap_or_default());
+    let authorization_bytes = exact_producer_input(
+        args.agent_authorizations.as_deref(),
+        embedded_authorizations,
+        ".vos_agent_auth authorization metadata",
+        "--agent-authorizations",
+        &program,
+    )?;
+    let authorizations = vos::metadata::decode_agent_authorizations(&authorization_bytes)
+        .ok_or_else(|| {
+            anyhow!(
+                "{} has no canonical AAM1 Agent authorization metadata",
+                program.display()
+            )
+        })?;
+
+    validate_agent_metadata_surface(&actor_metadata, &actor_schema, &authorizations)?;
+    validate_constructor_metadata(&actor_metadata, &actor_schema)?;
+    if args.crdt && actor_schema.lanes() != sdk::LaneSet::of(sdk::StateLane::Merge) {
+        bail!(
+            "{} is not a merge-only actor; field types derive lanes and --crdt cannot override them",
+            program.display(),
+        );
+    }
+
+    let method_uses_proof = actor_metadata.messages.iter().any(|method| method.attested);
+    let mut task_dependencies = args
+        .tasks
+        .iter()
+        .map(|input| build_agent_task_dependency(input, args.proof_system))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    task_dependencies.sort_unstable_by_key(|dependency| dependency.dependency.task);
+    if task_dependencies
+        .windows(2)
+        .any(|pair| pair[0].dependency.task == pair[1].dependency.task)
+    {
+        bail!("duplicate canonical Task dependency");
+    }
+    let task_uses_proof = task_dependencies
+        .iter()
+        .any(|dependency| dependency.provable);
+    match (method_uses_proof || task_uses_proof, args.proof_system) {
+        (true, None) => {
+            bail!("attested methods and provable Task dependencies require an exact --proof-system")
+        }
+        (false, Some(_)) => {
+            bail!("--proof-system was supplied but no attested method or provable Task uses it")
+        }
+        _ => {}
+    }
+
+    let schema_reference = sdk::BlobRef::of_bytes(&actor_schema_bytes);
+    let mut methods = Vec::with_capacity(actor_metadata.messages.len());
+    let mut introspection_methods = Vec::with_capacity(actor_metadata.messages.len());
+    for ((metadata, schema_method), authorization) in actor_metadata
+        .messages
+        .iter()
+        .zip(&actor_schema.methods)
+        .zip(&authorizations)
+    {
+        let authorization_policy = match &authorization.selector {
+            vos::metadata::ParsedAgentAuthorizationSelector::Public => {
+                sdk::method_policy::AuthorizationPolicySelector::Public
+            }
+            vos::metadata::ParsedAgentAuthorizationSelector::SpaceRole(identity) => {
+                sdk::method_policy::AuthorizationPolicySelector::SpaceRole(sdk::RoleId(*identity))
+            }
+            vos::metadata::ParsedAgentAuthorizationSelector::ActorRole(identity) => {
+                sdk::method_policy::AuthorizationPolicySelector::ActorRole(sdk::RoleId(*identity))
+            }
+            vos::metadata::ParsedAgentAuthorizationSelector::Capability(name) => {
+                sdk::method_policy::AuthorizationPolicySelector::Capability(
+                    sdk::CapabilityId::named(name),
+                )
+            }
+        };
+        let attestation = if metadata.attested {
+            sdk::method_policy::AttestationRequirement::Required {
+                proof_system: args
+                    .proof_system
+                    .expect("proof-system presence was validated"),
+            }
+        } else {
+            sdk::method_policy::AttestationRequirement::None
+        };
+        methods.push(sdk::method_policy::ActorMethodPolicy {
+            name: metadata.name.clone(),
+            mode: schema_method.mode,
+            arguments: metadata
+                .fields
+                .iter()
+                .map(|field| sdk::method_policy::MethodArgument {
+                    name: field.name.clone(),
+                    type_identity: field.ty.clone(),
+                })
+                .collect(),
+            return_type_identity: metadata.returns.clone(),
+            authorization_policy,
+            idempotency: sdk::method_policy::IdempotencyRequirement::for_mode(schema_method.mode),
+            attestation,
+        });
+        introspection_methods.push(sdk::introspection::ActorMethodIntrospection {
+            name: metadata.name.clone(),
+            doc: metadata.doc.clone(),
+            cli_exposure: if metadata.exposed_to_cli {
+                sdk::introspection::CliExposure::Exposed
+            } else {
+                sdk::introspection::CliExposure::Hidden
+            },
+            timeout_ms: metadata.timeout_ms,
+            dispatch: match metadata.mode {
+                0 => sdk::introspection::MethodDispatch::Sync,
+                1 => sdk::introspection::MethodDispatch::Job,
+                value => bail!(
+                    "method '{}' has unknown dispatch mode {value}",
+                    metadata.name
+                ),
+            },
+        });
+    }
+    methods.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    introspection_methods.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+
+    let method_policy = sdk::method_policy::ActorMethodPolicyArtifact {
+        actor_schema: schema_reference.clone(),
+        methods,
+    };
+    method_policy
+        .validate_against_schema_bytes(&actor_schema_bytes)
+        .map_err(|error| anyhow!("generated AMP2 method policy is invalid: {error}"))?;
+    let method_policy_bytes = method_policy.encode()?;
+    if let Some(path) = args.method_policy.as_deref() {
+        let supplied = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        if supplied != method_policy_bytes {
+            bail!(
+                "{} does not byte-equal the canonical AMP2 generated from actor metadata",
+                path.display()
+            );
+        }
+    }
+    let method_policy_reference = sdk::BlobRef::of_bytes(&method_policy_bytes);
+    let introspection = sdk::introspection::ActorIntrospectionArtifact {
+        actor_schema: schema_reference.clone(),
+        method_policy: method_policy_reference.clone(),
+        actor_doc: actor_metadata.doc.clone(),
+        methods: introspection_methods,
+    };
+    introspection
+        .validate_against_artifact_bytes(&actor_schema_bytes, &method_policy_bytes)
+        .map_err(|error| anyhow!("generated AAI1 introspection is invalid: {error}"))?;
+    let introspection_bytes = introspection.encode()?;
+    let introspection_reference = sdk::BlobRef::of_bytes(&introspection_bytes);
+
+    let task_set = sdk::task::TaskDependencySetArtifact {
+        dependencies: task_dependencies
+            .iter()
+            .map(|dependency| dependency.dependency.clone())
+            .collect(),
+    };
+    task_set.validate()?;
+    let task_set_bytes = task_set.encode()?;
+    let task_set_reference = sdk::BlobRef::of_bytes(&task_set_bytes);
+    let proof_systems = method_policy
+        .proof_systems()?
+        .union(&task_set.proof_systems()?)?;
+    let requirements = sdk::RuntimeRequirements {
+        lanes: actor_schema.lanes(),
+        scheduling: args.scheduling,
+        proof_systems,
+    };
+
+    let public_key = raw_ed25519_public_key(keypair)?;
+    let producer = sdk::ProducerId::of_public_key(&public_key);
+    let actor_program = sdk::ProgramId::of_pvm(&actor_pvm);
+    let mut artifacts = vec![
+        package_artifact(actor_pvm.clone()),
+        package_artifact(actor_schema_bytes),
+        package_artifact(method_policy_bytes),
+        package_artifact(introspection_bytes),
+        package_artifact(task_set_bytes),
+    ];
+    artifacts.extend(
+        task_dependencies
+            .iter()
+            .map(|dependency| package_artifact(dependency.pvm.clone())),
+    );
+    artifacts.sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+
+    let name = args.name.unwrap_or(actor_metadata.actor_name);
+    let mut package = sdk::package::PackageEnvelope {
+        manifest: sdk::package::PackageManifest::Actor(sdk::package::ActorPackageManifest {
+            name: name.clone(),
+            program: sdk::BlobRef::of_bytes(&actor_pvm),
+            contract: sdk::contract::ActorPackageContract::canonical(),
+            state_lane_schema: schema_reference,
+            method_policy: method_policy_reference,
+            introspection: introspection_reference,
+            task_dependencies: task_set_reference,
+            scheduling: args.scheduling,
+            requirements,
+            signing: sdk::package::PackageSigning {
+                producer,
+                public_key,
+                signature: [0; sdk::package::PACKAGE_SIGNATURE_BYTES],
+            },
+        }),
+        artifacts,
+    };
+    let signature = sign_ed25519_exact(keypair, &package.signing_bytes()?)?;
+    package.manifest.signing_mut().signature = signature;
+    package.validate_shape()?;
+    let deployment_id = package.deployment_id()?;
+    let package_bytes = package.encode()?;
+
+    std::fs::create_dir_all(&args.out_dir)
+        .with_context(|| format!("create {}", args.out_dir.display()))?;
+    let pvm_path = args.out_dir.join(format!("{name}.pvm"));
+    let package_path = args.out_dir.join(format!("{name}.vos"));
+    std::fs::write(&pvm_path, actor_pvm)
+        .with_context(|| format!("write {}", pvm_path.display()))?;
+    std::fs::write(&package_path, package_bytes)
+        .with_context(|| format!("write {}", package_path.display()))?;
+
+    println!("built {}", package_path.display());
+    println!("  actor_pvm      = {}", pvm_path.display());
+    println!("  program_id     = {}", hex::encode(actor_program.0));
+    println!("  deployment_id  = {}", hex::encode(deployment_id.0));
+    for (index, dependency) in task_dependencies.iter().enumerate() {
+        println!(
+            "  task[{index}]        = {}",
+            hex::encode(dependency.dependency.task.0)
+        );
+    }
+    Ok(())
+}
+
+fn exact_producer_input(
+    supplied: Option<&Path>,
+    embedded: Option<Vec<u8>>,
+    description: &str,
+    option: &str,
+    program: &Path,
+) -> anyhow::Result<Vec<u8>> {
+    match supplied {
+        Some(path) => {
+            let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            if embedded.as_ref().is_some_and(|value| *value != bytes) {
+                bail!(
+                    "{} does not match {} embedded in {}",
+                    path.display(),
+                    description,
+                    program.display(),
+                );
+            }
+            Ok(bytes)
+        }
+        None => embedded.filter(|bytes| !bytes.is_empty()).ok_or_else(|| {
+            anyhow!(
+                "{} has no {description}; pass {option} with its exact bytes",
+                program.display()
+            )
+        }),
+    }
+}
+
+fn validate_agent_metadata_surface(
+    metadata: &vos::metadata::ParsedMeta,
+    schema: &sdk::schema::ParsedSchema,
+    authorizations: &[vos::metadata::ParsedAgentMethodAuthorization],
+) -> anyhow::Result<()> {
+    if metadata.messages.len() != schema.methods.len()
+        || metadata.messages.len() != authorizations.len()
+    {
+        bail!("actor metadata, AAS2, and authorization method counts differ");
+    }
+    for ((metadata, schema), authorization) in metadata
+        .messages
+        .iter()
+        .zip(&schema.methods)
+        .zip(authorizations)
+    {
+        if metadata.name != schema.name || metadata.name != authorization.name {
+            bail!(
+                "actor metadata surfaces differ at method '{}'",
+                metadata.name
+            );
+        }
+        if metadata.is_query != schema.mode.write_lane().is_none() {
+            bail!(
+                "method '{}' query/mutation metadata disagrees",
+                metadata.name
+            );
+        }
+        let selector_count = usize::from(metadata.space_role.is_some())
+            + usize::from(metadata.actor_role.is_some())
+            + usize::from(metadata.capability.is_some());
+        if selector_count > 1 {
+            bail!(
+                "method '{}' declares multiple authorization selectors",
+                metadata.name
+            );
+        }
+        let selector_matches = match (
+            metadata.space_role,
+            metadata.actor_role,
+            metadata.capability.as_deref(),
+            &authorization.selector,
+        ) {
+            (None, None, None, vos::metadata::ParsedAgentAuthorizationSelector::Public)
+            | (
+                Some(_),
+                None,
+                None,
+                vos::metadata::ParsedAgentAuthorizationSelector::SpaceRole(_),
+            )
+            | (
+                None,
+                Some(_),
+                None,
+                vos::metadata::ParsedAgentAuthorizationSelector::ActorRole(_),
+            ) => true,
+            (
+                None,
+                None,
+                Some(expected),
+                vos::metadata::ParsedAgentAuthorizationSelector::Capability(actual),
+            ) => expected == actual,
+            _ => false,
+        };
+        if !selector_matches {
+            bail!(
+                "method '{}' legacy selector kind disagrees with exact AAM1 authorization",
+                metadata.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_constructor_metadata(
+    metadata: &vos::metadata::ParsedMeta,
+    schema: &sdk::schema::ParsedSchema,
+) -> anyhow::Result<()> {
+    let matches = match &schema.constructor {
+        sdk::schema::ConstructorContract::Forbidden => metadata.constructor.is_empty(),
+        sdk::schema::ConstructorContract::RequiredRaw(argument) => {
+            metadata.constructor.len() == 1
+                && metadata.constructor[0].name == argument.name
+                && metadata.constructor[0].ty == sdk::schema::RAW_CONSTRUCTOR_TYPE_IDENTITY
+                && argument.type_identity == sdk::schema::RAW_CONSTRUCTOR_TYPE_IDENTITY
+        }
+        sdk::schema::ConstructorContract::RequiredNamed(arguments) => {
+            arguments.len() == metadata.constructor.len()
+                && arguments
+                    .iter()
+                    .zip(&metadata.constructor)
+                    .all(|(schema, metadata)| {
+                        schema.name == metadata.name
+                            && schema
+                                .type_identity
+                                .strip_suffix(&metadata.ty)
+                                .is_some_and(|prefix| prefix.ends_with("::"))
+                    })
+        }
+    };
+    if !matches {
+        bail!(".vos_meta constructor ABI does not match the exact AAS2 constructor contract");
+    }
+    Ok(())
+}
+
+fn package_artifact(bytes: Vec<u8>) -> sdk::package::PackageArtifact {
+    sdk::package::PackageArtifact {
+        identity: sdk::BlobRef::of_bytes(&bytes),
+        bytes,
+    }
+}
+
+fn raw_ed25519_public_key(keypair: &libp2p::identity::Keypair) -> anyhow::Result<[u8; 32]> {
+    if keypair.key_type() != libp2p::identity::KeyType::Ed25519 {
+        bail!("Agent VOS3 packages require an Ed25519 operator identity");
+    }
+    Ok(keypair
+        .public()
+        .try_into_ed25519()
+        .map_err(|_| anyhow!("operator identity did not yield a raw Ed25519 public key"))?
+        .to_bytes())
+}
+
+fn sign_ed25519_exact(
+    keypair: &libp2p::identity::Keypair,
+    message: &[u8],
+) -> anyhow::Result<[u8; 64]> {
+    if keypair.key_type() != libp2p::identity::KeyType::Ed25519 {
+        bail!("Agent VOS3 packages require an Ed25519 operator identity");
+    }
+    keypair
+        .sign(message)
+        .map_err(|error| anyhow!("sign Agent deployment: {error}"))?
+        .try_into()
+        .map_err(|signature: Vec<u8>| {
+            anyhow!(
+                "Ed25519 operator returned a {}-byte signature instead of 64 bytes",
+                signature.len()
+            )
+        })
+}
+
+fn build_agent_task_dependency(
+    input: &Path,
+    proof_system: Option<sdk::Hash>,
+) -> anyhow::Result<AgentTaskDependencyBuild> {
+    let program = resolve_task_input(input)?;
+    if program.extension().and_then(|extension| extension.to_str()) == Some("pvm") {
+        bail!(
+            "{} is a PVM without authenticated witness-layout metadata; pass the canonical Task ELF or project directory",
+            program.display()
+        );
+    }
+    let elf = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
+    let execution_schema = vos::agent::schema::raw_section_from_elf(&elf).unwrap_or_default();
+    require_execution_entry(
+        &execution_schema,
+        vos::agent::schema::ExecutionEntryKind::Task,
+        &program,
+    )?;
+    let metadata = vos::metadata::from_elf(&elf)
+        .ok_or_else(|| anyhow!("{} has no canonical Task metadata", program.display()))?;
+    let pvm = vos_pvm_compiler::link_elf_spi(&elf)
+        .map_err(|error| anyhow!("transpile Task {}: {error:?}", program.display()))?;
+    if pvm.is_empty() || vos_pvm::spi::parse_standard_program(&pvm).is_none() {
+        bail!(
+            "{} did not produce a canonical standard Task PVM",
+            program.display()
+        );
+    }
+    let (witness_address, witness_capacity) = vos::zk::witness_symbol(&elf).ok_or_else(|| {
+        anyhow!(
+            "{} does not export the required __VOS_WITNESS buffer",
+            program.display()
+        )
+    })?;
+    let witness_address = u32::try_from(witness_address)
+        .context("Task witness address does not fit the PVM address space")?;
+    let witness_capacity = u32::try_from(witness_capacity)
+        .context("Task witness capacity does not fit the package wire")?;
+    let proof = if metadata.provable {
+        sdk::task::TaskProofRequirement::Required {
+            proof_system: proof_system.ok_or_else(|| {
+                anyhow!(
+                    "provable Task {} requires an exact --proof-system",
+                    program.display()
+                )
+            })?,
+        }
+    } else {
+        sdk::task::TaskProofRequirement::None
+    };
+    let dependency = sdk::task::TaskDependency::new(
+        sdk::BlobRef::of_bytes(&pvm),
+        sdk::ProgramId::of_pvm(&pvm),
+        witness_address,
+        witness_capacity,
+        proof,
+    )?;
+    Ok(AgentTaskDependencyBuild {
+        dependency,
+        pvm,
+        provable: metadata.provable,
+    })
 }
 
 fn require_execution_entry(
@@ -358,10 +816,7 @@ fn require_execution_entry(
     Ok(parsed)
 }
 
-fn build_task_dependency(
-    input: &Path,
-    target: BuildTarget,
-) -> anyhow::Result<PackageTaskDependency> {
+fn build_service_task_dependency(input: &Path) -> anyhow::Result<PackageTaskDependency> {
     let program = resolve_task_input(input)?;
     if program.extension().and_then(|extension| extension.to_str()) == Some("pvm") {
         bail!(
@@ -376,11 +831,8 @@ fn build_task_dependency(
         vos::agent::schema::ExecutionEntryKind::Task,
         &program,
     )?;
-    let pvm = match target {
-        BuildTarget::Service => vos_pvm_compiler::link_elf(&elf),
-        BuildTarget::Agent => vos_pvm_compiler::link_elf_spi(&elf),
-    }
-    .map_err(|error| anyhow!("transpile Task {}: {error:?}", program.display()))?;
+    let pvm = vos_pvm_compiler::link_elf(&elf)
+        .map_err(|error| anyhow!("transpile Task {}: {error:?}", program.display()))?;
     if pvm.is_empty() {
         bail!("{} produced an empty Task PVM", program.display());
     }
@@ -1102,21 +1554,34 @@ mod tests {
         actor.trap();
         let actor_pvm = actor.build_standard();
         let (metadata, metadata_len) = vos::metadata::encode::<512>(&META);
-        const AGENT_SCHEMA: vos::agent::schema::SchemaMeta = vos::agent::schema::SchemaMeta {
-            uses_storage: false,
+        const AGENT_SCHEMA: sdk::schema::SchemaMeta = sdk::schema::SchemaMeta {
+            constructor: sdk::schema::ConstructorMeta::Forbidden,
             fields: &[],
-            methods: &[vos::agent::schema::MethodMeta {
+            methods: &[sdk::schema::MethodMeta {
+                source_index: 0,
                 name: "value",
-                mode: vos::agent::MethodMode::Query,
+                mode: sdk::MethodMode::Query,
                 explicit: false,
             }],
         };
-        let (agent_schema, agent_schema_len) = vos::agent::schema::encode::<512>(&AGENT_SCHEMA);
+        const AUTHORIZATIONS: &[vos::metadata::AgentMethodAuthorizationMeta] =
+            &[vos::metadata::AgentMethodAuthorizationMeta {
+                name: "value",
+                selector: vos::metadata::AgentAuthorizationSelectorMeta::Public,
+            }];
+        let (agent_schema, agent_schema_len) = sdk::schema::encode::<512>(&AGENT_SCHEMA);
+        let (authorizations, authorizations_len) =
+            vos::metadata::encode_agent_authorizations::<512>(AUTHORIZATIONS);
         std::fs::write(temp.0.join("actor.pvm"), &actor_pvm).unwrap();
         std::fs::write(temp.0.join("actor.meta"), &metadata[..metadata_len]).unwrap();
         std::fs::write(
             temp.0.join("actor.agent"),
             &agent_schema[..agent_schema_len],
+        )
+        .unwrap();
+        std::fs::write(
+            temp.0.join("actor.auth"),
+            &authorizations[..authorizations_len],
         )
         .unwrap();
         let build_args = |out_dir| Args {
@@ -1126,12 +1591,16 @@ mod tests {
             out_dir,
             interfaces: None,
             role_policies: None,
+            method_policy: None,
             schemas: Some(temp.0.join("actor.meta")),
             agent_schema: Some(temp.0.join("actor.agent")),
+            agent_authorizations: Some(temp.0.join("actor.auth")),
             source_map: None,
             tasks: vec![],
             include_elf: false,
             crdt: false,
+            scheduling: false,
+            proof_system: None,
         };
         let first = temp.0.join("first");
         let second = temp.0.join("second");
@@ -1145,18 +1614,22 @@ mod tests {
                 out_dir: temp.0.join("missing-metadata"),
                 interfaces: None,
                 role_policies: None,
+                method_policy: None,
                 schemas: None,
                 agent_schema: Some(temp.0.join("actor.agent")),
+                agent_authorizations: Some(temp.0.join("actor.auth")),
                 source_map: None,
                 tasks: vec![],
                 include_elf: false,
                 crdt: false,
+                scheduling: false,
+                proof_system: None,
             },
             &signer,
         )
         .unwrap_err()
         .to_string();
-        assert!(missing_metadata.contains("pass --schemas with exact .vos_meta bytes"));
+        assert!(missing_metadata.contains("pass --metadata with its exact bytes"));
         let missing_execution_schema = run_with_signer(
             Args {
                 target: BuildTarget::Agent,
@@ -1165,20 +1638,22 @@ mod tests {
                 out_dir: temp.0.join("missing-agent-schema"),
                 interfaces: None,
                 role_policies: None,
+                method_policy: None,
                 schemas: Some(temp.0.join("actor.meta")),
                 agent_schema: None,
+                agent_authorizations: Some(temp.0.join("actor.auth")),
                 source_map: None,
                 tasks: vec![],
                 include_elf: false,
                 crdt: false,
+                scheduling: false,
+                proof_system: None,
             },
             &signer,
         )
         .unwrap_err()
         .to_string();
-        assert!(
-            missing_execution_schema.contains("pass --agent-schema with exact .vos_agent bytes")
-        );
+        assert!(missing_execution_schema.contains("pass --agent-schema with its exact bytes"));
 
         run_with_signer(build_args(first.clone()), &signer).unwrap();
         run_with_signer(build_args(second.clone()), &signer).unwrap();
@@ -1195,19 +1670,28 @@ mod tests {
             std::fs::read(first.join("deterministic-counter.vos")).unwrap(),
             std::fs::read(second.join("deterministic-counter.vos")).unwrap(),
         );
-        let package =
-            AgentPackage::decode(&std::fs::read(first.join("deterministic-counter.vos")).unwrap())
-                .unwrap();
+        let package_bytes = std::fs::read(first.join("deterministic-counter.vos")).unwrap();
+        assert_eq!(package_bytes.get(..4), Some(b"VOS3".as_slice()));
+        let package = sdk::package::PackageEnvelope::decode(&package_bytes).unwrap();
+        package.validate_shape().unwrap();
+        let sdk::package::PackageManifest::Actor(manifest) = &package.manifest else {
+            panic!("Agent build must emit an Actor manifest")
+        };
+        assert_eq!(manifest.requirements.lanes, sdk::LaneSet::NONE);
+        assert!(!manifest.scheduling);
+        assert_eq!(package.actor_program_bytes().unwrap(), actor_pvm);
+        assert_eq!(manifest.program, sdk::BlobRef::of_bytes(&actor_pvm));
         assert!(matches!(
-            package.manifest.kind,
-            PackageKind::Actor { requirements, .. }
-                if requirements.lanes == LaneSet::NONE
+            package.actor_schema().unwrap().constructor,
+            sdk::schema::ConstructorContract::Forbidden
         ));
-        assert_eq!(
-            package.manifest.execution_semantics,
-            vos::agent::EXECUTION_SEMANTICS_ID,
+        assert!(
+            package
+                .task_dependency_set()
+                .unwrap()
+                .dependencies
+                .is_empty()
         );
-        assert_eq!(package.manifest.program, ProgramId::of_pvm(&actor_pvm));
         assert!(!first.join("deterministic-counter.attestation.pvm").exists());
         assert_eq!(std::fs::read_dir(first).unwrap().count(), 2);
     }
@@ -1270,12 +1754,16 @@ mod tests {
                 out_dir: output.clone(),
                 interfaces: None,
                 role_policies: None,
+                method_policy: None,
                 schemas: Some(temp.0.join("actor.meta")),
                 agent_schema: Some(temp.0.join("actor.agent")),
+                agent_authorizations: None,
                 source_map: None,
                 tasks: vec![],
                 include_elf: false,
                 crdt: false,
+                scheduling: false,
+                proof_system: None,
             },
             &signer,
         )

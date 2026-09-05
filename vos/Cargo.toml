@@ -241,3 +241,4 @@ sha2 = "0.10"
 hkdf = "0.12"
 aes-gcm = { version = "0.10", features = ["aes", "alloc"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+trybuild = "1"

@@ -547,6 +547,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             vos::agent::sdk::schema::encode::<16384>(
                 &vos::agent::sdk::schema::SchemaMeta {
+                    constructor: <#msg_enum>::AGENT_CONSTRUCTOR,
                     fields: &[ #( #clean_field_metas ),* ],
                     methods: <#msg_enum>::AGENT_METHODS,
                 },
@@ -570,6 +571,26 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             )
         }
     };
+    let agent_authorization_section = agent_actor.then(|| {
+        quote! {
+            #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+            const __VOS_AGENT_AUTHORIZATIONS_ENCODED: ([u8; 16384], usize) =
+                vos::metadata::encode_agent_authorizations::<16384>(
+                    <#msg_enum>::AGENT_AUTHORIZATIONS,
+                );
+
+            #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+            #[unsafe(link_section = ".vos_agent_auth")]
+            #[used]
+            static _VOS_AGENT_AUTHORIZATIONS: [u8; __VOS_AGENT_AUTHORIZATIONS_ENCODED.1] = {
+                let (src, len) = __VOS_AGENT_AUTHORIZATIONS_ENCODED;
+                let mut out = [0u8; __VOS_AGENT_AUTHORIZATIONS_ENCODED.1];
+                let mut i = 0;
+                while i < len { out[i] = src[i]; i += 1; }
+                out
+            };
+        }
+    });
     let pvm_entries = quote! {
         #entry
 
@@ -604,6 +625,8 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             while i < len { out[i] = src[i]; i += 1; }
             out
         };
+
+        #agent_authorization_section
     };
 
     // `#[storage]` fields: point each handle at its key prefix after
@@ -1216,6 +1239,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut required_space_role_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut required_capability_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut agent_method_metas: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut agent_authorization_metas: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut after_commit_merge_impls: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
     let mut constructor_params: Vec<(syn::Ident, syn::Type)> = Vec::new();
@@ -1253,6 +1277,8 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         let mut exposed_to_cli = false;
         let mut role_expr: Option<syn::Expr> = None;
         let mut space_role_expr: Option<syn::Expr> = None;
+        let mut actor_role_id: Option<[u8; 32]> = None;
+        let mut space_role_id: Option<[u8; 32]> = None;
         let mut capability: Option<syn::LitStr> = None;
         let mut is_attested = false;
         let mut execution_mode: Option<syn::Ident> = None;
@@ -1304,6 +1330,15 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
                     role_expr = Some(expr);
                     return Ok(());
                 }
+                if meta.path.is_ident("actor_role_id") {
+                    if actor_role_id.is_some() {
+                        return Err(meta.error("duplicate actor_role_id"));
+                    }
+                    let value = meta.value()?;
+                    let identity: syn::LitStr = value.parse()?;
+                    actor_role_id = Some(parse_portable_policy_id(&identity)?);
+                    return Ok(());
+                }
                 if meta.path.is_ident("timeout_ms") {
                     let value = meta.value()?;
                     let lit: syn::LitInt = value.parse()?;
@@ -1314,6 +1349,15 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let value = meta.value()?;
                     let expr: syn::Expr = value.parse()?;
                     space_role_expr = Some(expr);
+                    return Ok(());
+                }
+                if meta.path.is_ident("space_role_id") {
+                    if space_role_id.is_some() {
+                        return Err(meta.error("duplicate space_role_id"));
+                    }
+                    let value = meta.value()?;
+                    let identity: syn::LitStr = value.parse()?;
+                    space_role_id = Some(parse_portable_policy_id(&identity)?);
                     return Ok(());
                 }
                 if meta.path.is_ident("capability") {
@@ -1351,6 +1395,40 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             passthrough_items.push(item.clone());
             continue;
+        }
+
+        if agent_messages {
+            if role_expr.is_some() != actor_role_id.is_some() {
+                return syn::Error::new_spanned(
+                    &method.sig,
+                    "#[messages(agent)] requires role = ... and actor_role_id = \"<64 lowercase hex>\" together",
+                )
+                .to_compile_error()
+                .into();
+            }
+            if space_role_expr.is_some() != space_role_id.is_some() {
+                return syn::Error::new_spanned(
+                    &method.sig,
+                    "#[messages(agent)] requires space_role = ... and space_role_id = \"<64 lowercase hex>\" together",
+                )
+                .to_compile_error()
+                .into();
+            }
+            if role_expr.is_some() && space_role_expr.is_some() {
+                return syn::Error::new_spanned(
+                    &method.sig,
+                    "an Agent method selects exactly one authorization predicate; actor role and space role cannot be combined",
+                )
+                .to_compile_error()
+                .into();
+            }
+        } else if actor_role_id.is_some() || space_role_id.is_some() {
+            return syn::Error::new_spanned(
+                &method.sig,
+                "actor_role_id and space_role_id are valid only in #[messages(agent)]",
+            )
+            .to_compile_error()
+            .into();
         }
 
         if is_attested && is_job {
@@ -1913,6 +1991,35 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! { None }
         };
+        if agent_messages {
+            let selector = if let Some(name) = &capability {
+                quote! {
+                    vos::metadata::AgentAuthorizationSelectorMeta::Capability(#name)
+                }
+            } else if let Some(identity) = space_role_id {
+                let bytes = identity.iter();
+                quote! {
+                    vos::metadata::AgentAuthorizationSelectorMeta::SpaceRole(
+                        [ #( #bytes ),* ]
+                    )
+                }
+            } else if let Some(identity) = actor_role_id {
+                let bytes = identity.iter();
+                quote! {
+                    vos::metadata::AgentAuthorizationSelectorMeta::ActorRole(
+                        [ #( #bytes ),* ]
+                    )
+                }
+            } else {
+                quote! { vos::metadata::AgentAuthorizationSelectorMeta::Public }
+            };
+            agent_authorization_metas.push(quote! {
+                vos::metadata::AgentMethodAuthorizationMeta {
+                    name: #msg_name_str,
+                    selector: #selector,
+                }
+            });
+        }
         meta_messages.push(quote! {
             vos::metadata::MessageMeta {
                 name: #msg_name_str,
@@ -1993,6 +2100,48 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     // per-param `.expect()` extraction below.
     let raw_args_ctor = constructor_params.len() == 1 && is_byte_slice(&constructor_params[0].1);
     let requires_constructor_args = !constructor_params.is_empty();
+
+    // AAS2 owns the installation-data contract. Keep this projection next to
+    // the constructor parser so it cannot drift from the generated create
+    // path: no arguments forbid an object, one `&[u8]` argument requires the
+    // exact raw object (including present-empty), and every other parameter
+    // remains a declaration-ordered named ABI field.
+    let agent_constructor_meta = agent_messages.then(|| {
+        let constructor = if constructor_params.is_empty() {
+            quote! { vos::agent::sdk::schema::ConstructorMeta::Forbidden }
+        } else if raw_args_ctor {
+            let name = constructor_params[0].0.to_string();
+            quote! {
+                vos::agent::sdk::schema::ConstructorMeta::RequiredRaw(
+                    vos::agent::sdk::schema::ConstructorArgumentMeta {
+                        name: #name,
+                        type_identity:
+                            vos::agent::sdk::schema::RAW_CONSTRUCTOR_TYPE_IDENTITY,
+                    },
+                )
+            }
+        } else {
+            let arguments = constructor_params.iter().map(|(name, ty)| {
+                let name = name.to_string();
+                quote! {
+                    vos::agent::sdk::schema::ConstructorArgumentMeta {
+                        name: #name,
+                        type_identity: concat!(module_path!(), "::", stringify!(#ty)),
+                    }
+                }
+            });
+            quote! {
+                vos::agent::sdk::schema::ConstructorMeta::RequiredNamed(
+                    &[ #( #arguments ),* ],
+                )
+            }
+        };
+        quote! {
+            #[doc(hidden)]
+            pub const AGENT_CONSTRUCTOR: vos::agent::sdk::schema::ConstructorMeta =
+                #constructor;
+        }
+    });
 
     // Constructor field metadata
     let ctor_field_metas: Vec<_> = constructor_params
@@ -2161,6 +2310,13 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub const AGENT_METHODS: &'static [#agent_schema_method_type] =
                 &[ #( #agent_method_metas ),* ];
+
+            #agent_constructor_meta
+
+            #[doc(hidden)]
+            pub const AGENT_AUTHORIZATIONS: &'static [
+                vos::metadata::AgentMethodAuthorizationMeta
+            ] = &[ #( #agent_authorization_metas ),* ];
 
             pub const META: vos::metadata::ActorMeta = vos::metadata::ActorMeta {
                 actor_name: #actor_name_str,
@@ -2641,6 +2797,7 @@ fn is_context_type(ty: &syn::Type) -> bool {
 /// Useful for extensions whose init format is application-defined.
 fn is_byte_slice(ty: &syn::Type) -> bool {
     if let syn::Type::Reference(r) = ty
+        && r.mutability.is_none()
         && let syn::Type::Slice(s) = r.elem.as_ref()
         && let syn::Type::Path(p) = s.elem.as_ref()
     {
@@ -3975,6 +4132,42 @@ fn valid_capability_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(byte))
 }
 
+fn parse_portable_policy_id(literal: &syn::LitStr) -> syn::Result<[u8; 32]> {
+    let value = literal.value();
+    let bytes = value.as_bytes();
+    if bytes.len() != 64
+        || bytes
+            .iter()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(byte))
+    {
+        return Err(syn::Error::new_spanned(
+            literal,
+            "policy identity must be exactly 64 lowercase hexadecimal characters",
+        ));
+    }
+    let mut identity = [0u8; 32];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0]);
+        let low = hex_nibble(pair[1]);
+        identity[index] = (high << 4) | low;
+    }
+    if identity == [0; 32] {
+        return Err(syn::Error::new_spanned(
+            literal,
+            "policy identity must be nonzero",
+        ));
+    }
+    Ok(identity)
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!("portable policy identity was prevalidated"),
+    }
+}
+
 fn to_pascal_case(s: &str) -> String {
     s.split('_')
         .map(|word| {
@@ -3990,8 +4183,8 @@ fn to_pascal_case(s: &str) -> String {
 #[cfg(test)]
 mod doc_tests {
     use super::{
-        first_doc_paragraph, is_attestation_type, parse_actor_attrs, state_schema_fingerprint,
-        valid_capability_name,
+        first_doc_paragraph, is_attestation_type, parse_actor_attrs, parse_portable_policy_id,
+        state_schema_fingerprint, valid_capability_name,
     };
     use quote::quote;
 
@@ -4050,6 +4243,24 @@ mod doc_tests {
         )));
         assert!(!is_attestation_type(&ty("vos::Attestation<Claim>")));
         assert!(!is_attestation_type(&ty("vos::Attestation")));
+    }
+
+    #[test]
+    fn portable_policy_ids_are_exact_lowercase_hex_and_nonzero() {
+        let literal = |value: &str| syn::LitStr::new(value, proc_macro2::Span::call_site());
+        assert_eq!(
+            parse_portable_policy_id(&literal(&"42".repeat(32))).unwrap(),
+            [0x42; 32]
+        );
+        for invalid in [
+            "42".repeat(31),
+            "42".repeat(33),
+            "GG".repeat(32),
+            "AA".repeat(32),
+            "00".repeat(32),
+        ] {
+            assert!(parse_portable_policy_id(&literal(&invalid)).is_err());
+        }
     }
     #[test]
     fn capability_names_are_stable_lowercase_identifiers() {

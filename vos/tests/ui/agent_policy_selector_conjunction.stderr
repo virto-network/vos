@@ -1,0 +1,5 @@
+error: #[msg(capability = "...")] cannot be combined with role or space_role
+  --> tests/ui/agent_policy_selector_conjunction.rs:14:5
+   |
+14 |     fn read(&self) {}
+   |     ^^^^^^^^^^^^^^
