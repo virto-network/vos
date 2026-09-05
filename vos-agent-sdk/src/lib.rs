@@ -12,6 +12,7 @@ pub mod authority;
 pub mod contract;
 mod model;
 pub mod private;
+pub mod proof;
 mod runtime;
 pub mod scheduling;
 pub mod wire;
