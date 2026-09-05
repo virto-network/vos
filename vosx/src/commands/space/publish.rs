@@ -1,8 +1,8 @@
 //! `space publish` — add a program to the catalog.
 
 use serde::Serialize;
-use vos::agent::sdk::package::{
-    PackageEnvelope as AgentPackage, PackageManifest as AgentPackageManifest, PackageVerifier,
+use vos::agent::package_admission::{
+    AdmittedActorPackage, PackageAdmissionError, admit_actor_package,
 };
 use vos::registry::{ProgramKind, Status};
 use vos::service::{ServiceWire, VosPackage};
@@ -128,59 +128,21 @@ pub(crate) fn validate_package(name: &str, bytes: &[u8]) -> anyhow::Result<VosPa
     Ok(package)
 }
 
-fn validate_agent_actor_package(name: &str, bytes: &[u8]) -> anyhow::Result<AgentPackage> {
-    if bytes.get(..4) != Some(b"VOS3") {
-        anyhow::bail!(
+fn validate_agent_actor_package(name: &str, bytes: &[u8]) -> anyhow::Result<AdmittedActorPackage> {
+    let package = match admit_actor_package(bytes) {
+        Ok(package) => package,
+        Err(PackageAdmissionError::PreviousGeneration) => anyhow::bail!(
             "expected a signed VOS3 AgentActor package; previous Agent package generations are unsupported"
-        );
-    }
-    let package = AgentPackage::decode(bytes)
-        .map_err(|error| anyhow::anyhow!("decode VOS3 AgentActor package: {error}"))?;
-    let canonical = package
-        .encode()
-        .map_err(|error| anyhow::anyhow!("encode VOS3 AgentActor package: {error}"))?;
-    if canonical != bytes {
-        anyhow::bail!("signed VOS3 AgentActor package is not canonical");
-    }
-    package
-        .verify(&RawEd25519PackageVerifier)
-        .map_err(|error| anyhow::anyhow!("verify VOS3 AgentActor package: {error}"))?;
-    let AgentPackageManifest::Actor(manifest) = &package.manifest else {
-        anyhow::bail!("VOS3 AgentRuntime packages cannot be published as AgentActor programs");
-    };
-    if manifest.name != name {
-        anyhow::bail!("package is named {}, not {name}", manifest.name);
-    }
-
-    let actor_program = package
-        .actor_program_bytes()
-        .map_err(|error| anyhow::anyhow!("read VOS3 actor PVM: {error}"))?;
-    if vos_pvm::spi::parse_standard_program(actor_program).is_none() {
-        anyhow::bail!("VOS3 actor artifact is not a canonical standard PVM");
-    }
-    let task_set = package
-        .task_dependency_set()
-        .map_err(|error| anyhow::anyhow!("read VOS3 Task dependency set: {error}"))?;
-    for dependency in task_set.dependencies {
-        let program = package
-            .task_program_bytes(dependency.task)
-            .map_err(|error| anyhow::anyhow!("read VOS3 Task PVM: {error}"))?;
-        if vos_pvm::spi::parse_standard_program(program).is_none() {
-            anyhow::bail!("VOS3 Task artifact is not a canonical standard PVM");
+        ),
+        Err(PackageAdmissionError::WrongKind) => {
+            anyhow::bail!("VOS3 AgentRuntime packages cannot be published as AgentActor programs")
         }
+        Err(error) => return Err(anyhow::anyhow!("admit VOS3 AgentActor package: {error}")),
+    };
+    if package.manifest().name != name {
+        anyhow::bail!("package is named {}, not {name}", package.manifest().name);
     }
     Ok(package)
-}
-
-struct RawEd25519PackageVerifier;
-
-impl PackageVerifier for RawEd25519PackageVerifier {
-    fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
-        let Ok(key) = libp2p::identity::ed25519::PublicKey::try_from_bytes(public_key) else {
-            return false;
-        };
-        key.verify(message, signature)
-    }
 }
 
 fn verify_ed25519_signature(
@@ -246,15 +208,7 @@ pub(crate) fn canonical_program(
         }
         Some(b"VOS3") => {
             let package = validate_agent_actor_package(name, &bytes)?;
-            let AgentPackageManifest::Actor(manifest) = &package.manifest else {
-                unreachable!("AgentRuntime package rejected during validation")
-            };
-            let metadata = package
-                .artifacts
-                .iter()
-                .find(|artifact| artifact.identity == manifest.introspection)
-                .map(|artifact| artifact.bytes.clone())
-                .ok_or_else(|| anyhow::anyhow!("VOS3 package omitted its AAI1 introspection"))?;
+            let metadata = package.introspection_bytes().to_vec();
             // The Agent Host consumes the exact VOS3 envelope. Public
             // introspection is an authenticated closure member, never a
             // caller-selected metadata side channel.

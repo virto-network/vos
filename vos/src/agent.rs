@@ -38,6 +38,8 @@ pub(crate) mod local_journal_driver;
 #[cfg(feature = "pvm")]
 pub mod machine;
 pub mod package;
+#[cfg(feature = "std")]
+pub mod package_admission;
 #[cfg(feature = "private-agent-crypto")]
 pub mod private_crypto;
 #[cfg(feature = "private-agent-store")]
