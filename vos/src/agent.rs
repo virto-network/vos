@@ -24,6 +24,8 @@ pub mod catalog_finality;
 pub mod clean_authority_issuer;
 #[cfg(feature = "std")]
 pub mod clean_bootstrap;
+#[cfg(feature = "std")]
+pub mod clean_control;
 pub mod committee;
 pub mod contract;
 #[cfg(feature = "std")]
