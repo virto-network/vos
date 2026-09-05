@@ -1461,6 +1461,7 @@ mod tests {
     fn management_receipt(
         descriptor: &AgentDescriptor,
         request: &ManagementRequest,
+        decision_sequence: u64,
         valid_from: u64,
         expires_at: u64,
     ) -> AuthorityReceipt {
@@ -1487,6 +1488,8 @@ mod tests {
                 },
                 lane_roots: AuthorityLaneRoots::default(),
                 epoch: 1,
+                decision_sequence,
+                acknowledged_through: 0,
                 valid_from,
                 expires_at,
                 request: request.commitment(),
@@ -1502,6 +1505,7 @@ mod tests {
         management_receipt(
             descriptor,
             &ManagementRequest::Create(Box::new(descriptor.clone())),
+            1,
             1,
             expires_at,
         )
@@ -1723,6 +1727,8 @@ mod tests {
                 },
                 lane_roots: AuthorityLaneRoots::default(),
                 epoch: 1,
+                decision_sequence: 0,
+                acknowledged_through: 0,
                 valid_from,
                 expires_at,
                 request: invocation.commitment(),
@@ -2081,7 +2087,7 @@ mod tests {
             .unwrap();
         let actor_package = admitted_actor();
         let install = install_request(&descriptor, &actor_package);
-        let install_receipt = management_receipt(&descriptor, &install, 1, 2);
+        let install_receipt = management_receipt(&descriptor, &install, 2, 1, 2);
         slot.store(2, Ordering::SeqCst);
         let installed = host
             .manage(
@@ -2169,7 +2175,13 @@ mod tests {
             ),
         ] {
             slot.store(logical_slot, Ordering::SeqCst);
-            let receipt = management_receipt(&descriptor, &request, logical_slot, logical_slot);
+            let receipt = management_receipt(
+                &descriptor,
+                &request,
+                logical_slot,
+                logical_slot,
+                logical_slot,
+            );
             let outcome = host
                 .manage(agent, request, Some(receipt), SdkManagementArtifacts::None)
                 .unwrap();
@@ -2207,7 +2219,7 @@ mod tests {
         host.manage(
             agent,
             install.clone(),
-            Some(management_receipt(&descriptor, &install, 2, 2)),
+            Some(management_receipt(&descriptor, &install, 2, 2, 2)),
             SdkManagementArtifacts::Actor(&actor_package),
         )
         .unwrap();

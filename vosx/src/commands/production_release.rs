@@ -15,7 +15,8 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, bail};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
-use vos::service::{ProgramId, ServicePvm};
+use vos::agent::sdk::ProgramId as AgentProgramId;
+use vos::service::{ProgramId as ServiceProgramId, ServicePvm};
 
 use crate::bundled;
 
@@ -163,7 +164,7 @@ fn validate_manifest(
 }
 
 fn validate_service(bytes: &[u8]) -> anyhow::Result<()> {
-    let actual = ProgramId::of_pvm(bytes);
+    let actual = ServiceProgramId::of_pvm(bytes);
     if actual != vos::service::VOS_SERVICE_PROGRAM_ID {
         bail!(
             "service PVM has program {}, expected protocol pin {}",
@@ -190,12 +191,13 @@ fn validate_agent_runtime(bytes: &[u8]) -> anyhow::Result<()> {
     if bytes != canonical {
         bail!("agent runtime PVM does not match the canonical release bytes");
     }
-    let actual = ProgramId::of_pvm(bytes);
-    if actual != vos::agent::STANDARD_RUNTIME_PROGRAM_ID {
+    let actual = AgentProgramId::of_pvm(bytes);
+    let expected = AgentProgramId(vos::agent::STANDARD_RUNTIME_PROGRAM_ID.0);
+    if actual != expected {
         bail!(
             "agent runtime PVM has program {}, expected protocol pin {}",
             hex::encode(actual.0),
-            hex::encode(vos::agent::STANDARD_RUNTIME_PROGRAM_ID.0),
+            hex::encode(expected.0),
         );
     }
     Ok(())
@@ -207,18 +209,26 @@ fn manifest_for(service: &[u8], authority: &[u8], agent_runtime: &[u8]) -> Relea
         platform: hex::encode(vos::service::PLATFORM_ID.0),
         service_execution_semantics: hex::encode(vos::service::EXECUTION_SEMANTICS_ID.0),
         agent_execution_semantics: hex::encode(vos::agent::EXECUTION_SEMANTICS_ID.0),
-        service: artifact(SERVICE_FILE, service),
-        authority: artifact(AUTHORITY_FILE, authority),
-        agent_runtime: artifact(AGENT_RUNTIME_FILE, agent_runtime),
+        service: service_artifact(SERVICE_FILE, service),
+        authority: service_artifact(AUTHORITY_FILE, authority),
+        agent_runtime: agent_runtime_artifact(AGENT_RUNTIME_FILE, agent_runtime),
     }
 }
 
-fn artifact(file: &str, bytes: &[u8]) -> ReleaseArtifact {
+fn service_artifact(file: &str, bytes: &[u8]) -> ReleaseArtifact {
+    artifact(file, bytes, ServiceProgramId::of_pvm(bytes).0)
+}
+
+fn agent_runtime_artifact(file: &str, bytes: &[u8]) -> ReleaseArtifact {
+    artifact(file, bytes, AgentProgramId::of_pvm(bytes).0)
+}
+
+fn artifact(file: &str, bytes: &[u8], program_id: [u8; 32]) -> ReleaseArtifact {
     ReleaseArtifact {
         file: file.into(),
         bytes: bytes.len() as u64,
         blake2b_256: hex::encode(vos::crypto::blake2b_hash::<32>(&[], &[bytes])),
-        program_id: hex::encode(ProgramId::of_pvm(bytes).0),
+        program_id: hex::encode(program_id),
     }
 }
 
@@ -431,6 +441,21 @@ mod tests {
     }
 
     #[test]
+    fn release_manifest_uses_the_agent_program_identity_domain() {
+        let runtime = b"agent runtime";
+        let manifest = manifest_for(b"service", b"authority", runtime);
+        assert_eq!(
+            manifest.agent_runtime.program_id,
+            hex::encode(AgentProgramId::of_pvm(runtime).0),
+        );
+        assert_ne!(
+            manifest.agent_runtime.program_id,
+            hex::encode(ServiceProgramId::of_pvm(runtime).0),
+            "an AgentRuntime must never be identified in the retired service domain",
+        );
+    }
+
+    #[test]
     fn authority_pin_rejects_changed_bytes() {
         assert!(validate_authority(b"not the canonical authority").is_err());
     }
@@ -452,8 +477,8 @@ mod tests {
         validate_agent_runtime(runtime)
             .expect("build-time and protocol agent-runtime pins must agree");
         assert_eq!(
-            ProgramId::of_pvm(runtime),
-            vos::agent::STANDARD_RUNTIME_PROGRAM_ID
+            AgentProgramId::of_pvm(runtime),
+            AgentProgramId(vos::agent::STANDARD_RUNTIME_PROGRAM_ID.0),
         );
     }
 

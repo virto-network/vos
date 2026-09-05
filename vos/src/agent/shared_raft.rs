@@ -5827,6 +5827,8 @@ mod tests {
                     ..AuthorityLaneRoots::default()
                 },
                 epoch,
+                decision_sequence: valid_from.max(1),
+                acknowledged_through: 0,
                 valid_from,
                 expires_at,
                 request,

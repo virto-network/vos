@@ -3,9 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail, ensure};
-use vos::agent::wire::{RuntimeCall, RuntimeReturn, RuntimeState};
-use vos::agent::{LifecycleError, LifecycleRequest};
-use vos::service::{ProgramId, ServiceWire};
+use vos::agent::sdk::wire::CanonicalWire as _;
+use vos::agent::sdk::{
+    AgentId, DeploymentId, ManagementError, ManagementRequest, ProgramId, RuntimeOutcome,
+    RuntimeState, RuntimeTransition, RuntimeWork, SpaceId,
+};
 use vos_pvm::ExitReason;
 use vos_pvm::refine_host::RefineContext;
 
@@ -53,14 +55,20 @@ fn canonical_agent_runtime_pvm(elf: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 fn validate_agent_runtime_pvm(pvm: &[u8]) -> anyhow::Result<()> {
-    let probe = RuntimeCall::new(
-        RuntimeState::default(),
-        LifecycleRequest::Inspect {
+    let probe = RuntimeWork::Manage {
+        space: SpaceId([1; 32]),
+        agent: AgentId([2; 32]),
+        runtime_deployment: DeploymentId([3; 32]),
+        state: RuntimeState::default(),
+        request: Box::new(ManagementRequest::InspectActors {
             after: None,
             limit: 1,
-        },
-    )
-    .encode();
+        }),
+        authority: None,
+        observed_slot: 0,
+    }
+    .encode()
+    .map_err(|error| anyhow!("encode clean agent-runtime ABI probe: {error}"))?;
     let invocation = RefineContext::load(pvm, &probe, ABI_PROBE_GAS)
         .map_err(|error| anyhow!("load agent-runtime PVM: {error}"))?
         .run();
@@ -72,11 +80,12 @@ fn validate_agent_runtime_pvm(pvm: &[u8]) -> anyhow::Result<()> {
     let output = invocation
         .output()
         .ok_or_else(|| anyhow!("agent-runtime ABI probe returned an invalid output window"))?;
-    let output = RuntimeReturn::decode(&output)
-        .map_err(|error| anyhow!("decode agent-runtime ABI probe: {error:?}"))?;
+    let output = RuntimeTransition::decode(&output)
+        .map_err(|error| anyhow!("decode clean agent-runtime ABI probe: {error}"))?;
     ensure!(
-        output.result == Err(LifecycleError::NotCreated),
-        "agent-runtime ABI probe returned an unexpected lifecycle result"
+        output.state == RuntimeState::default()
+            && output.outcome == RuntimeOutcome::Management(Err(ManagementError::NotCreated)),
+        "agent-runtime clean ABI probe returned an unexpected transition"
     );
     Ok(())
 }
@@ -94,5 +103,10 @@ mod tests {
     #[test]
     fn rejects_non_program_bytes() {
         assert!(validate_agent_runtime_pvm(b"not a standard PVM").is_err());
+    }
+
+    #[test]
+    fn bundled_runtime_implements_the_clean_management_probe() {
+        validate_agent_runtime_pvm(crate::bundled::agent_runtime_pvm()).unwrap();
     }
 }
