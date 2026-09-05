@@ -2122,7 +2122,10 @@ mod tests {
         let path = directory.store();
         let mut store = create_store(&path, &fixture);
         assert_eq!(store.key_epoch(), &fixture.epoch.record);
-        assert_eq!(store.recovery_public_key(), fixture.recovery.verifying_key());
+        assert_eq!(
+            store.recovery_public_key(),
+            fixture.recovery.verifying_key()
+        );
         assert_eq!(
             store.put_object_inner(&object, CommitStop::AfterStage),
             Err(PrivateStoreError::Interrupted)
