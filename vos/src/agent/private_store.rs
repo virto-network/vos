@@ -1384,6 +1384,21 @@ impl PrivateStore {
         self.chain.nodes()
     }
 
+    /// Current authenticated ciphertext-only key epoch. This exposes sealed
+    /// envelopes and commitments, never an unwrapped owner/data key. A host
+    /// uses it to recover its own active keys through the exact authorized
+    /// [`PrivateNodeIdentity`] after restart.
+    pub fn key_epoch(&self) -> &PrivateKeyEpoch {
+        self.chain.epoch()
+    }
+
+    /// Offline recovery verification key pinned by immutable genesis
+    /// metadata. The corresponding signing key is deliberately never stored
+    /// by this type.
+    pub fn recovery_public_key(&self) -> [u8; 32] {
+        self.metadata.recovery_public_key
+    }
+
     pub fn object_count(&self) -> usize {
         self.index.objects.len()
     }
@@ -2106,6 +2121,8 @@ mod tests {
         .unwrap();
         let path = directory.store();
         let mut store = create_store(&path, &fixture);
+        assert_eq!(store.key_epoch(), &fixture.epoch.record);
+        assert_eq!(store.recovery_public_key(), fixture.recovery.verifying_key());
         assert_eq!(
             store.put_object_inner(&object, CommitStop::AfterStage),
             Err(PrivateStoreError::Interrupted)
