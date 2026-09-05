@@ -7,11 +7,11 @@
 //! Agent becomes discoverable.
 //!
 //! This module deliberately does not attach the existing service-oriented
-//! Raft worker or the singleton service CRDT router.  Those adapters carry a
+//! Raft worker or the singleton service CRDT router. Those adapters carry a
 //! service snapshot format which is not an authenticated Agent journal
-//! snapshot.  The status surface reports that transport is unattached and
-//! snapshot/compaction is unsupported; callers can drive only already
-//! committed physical slots and committee-authenticated Merge events.
+//! snapshot. Transport remains explicitly unattached. Agent-specific
+//! checkpoint candidates, authenticated installation, and bounded journal
+//! retirement are instead driven through this host boundary.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -34,6 +34,7 @@ use super::journal::{
 };
 use super::journal_store::{AgentJournalStore, FileAgentJournalStore, FileLocalAgentJournalSlot};
 use super::local_journal_driver::LocalJournalAgentDriver;
+use super::shared_commit::{SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim};
 use super::shared_journal_driver::{
     FileSharedArtifactStager, SharedArtifactStagerError, SharedJournalAgentDriver,
     SharedJournalDriverError, SharedPhysicalApplyOutcome, install_immutable_file,
@@ -84,7 +85,11 @@ pub enum SharedAgentHostError {
     AgentNotFound,
     CapacityExhausted,
     TransportNotAttached,
-    SnapshotUnsupported,
+    SnapshotBoundaryRequired,
+    SnapshotCertificateInvalid,
+    SnapshotStale,
+    SnapshotReplay,
+    SnapshotEvidenceLimit,
 }
 
 impl core::fmt::Display for SharedAgentHostError {
@@ -103,11 +108,87 @@ pub enum SharedAgentTransportState {
     NotAttached,
 }
 
-/// No generic service snapshot may be installed into an Agent generation.
+/// Durable Agent-specific snapshot state. This never describes the generic
+/// service snapshot format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SharedAgentSnapshotState {
-    Unsupported,
+    None,
+    Installed {
+        raft_index: u64,
+        raft_term: u64,
+        certificate: Hash,
+    },
+}
+
+/// Successful exact snapshot installation. Journal cleanup is intentionally
+/// reported separately by the bounded compaction API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedAgentSnapshotInstall {
+    pub raft_index: u64,
+    pub raft_term: u64,
+    pub certificate: Hash,
+    pub journal_heads: super::journal::JournalHeadsId,
+}
+
+/// Opaque result of exact physical snapshot-candidate reconstruction.
+///
+/// Only [`SharedAgentHost::request_snapshot_compaction`] can construct this
+/// token. It proves that this host compared the complete claim with its bound
+/// journal and Raft generation. A remote voter must still reconstruct and
+/// validate the authenticated evidence independently before signing; the
+/// composite-network evidence exchange is not attached by this host.
+#[derive(Clone, Debug)]
+pub struct VerifiedSharedAgentSnapshotCandidate {
+    claim: SharedAgentSnapshotClaim,
+    message: Hash,
+}
+
+impl VerifiedSharedAgentSnapshotCandidate {
+    fn from_reconstructed(claim: SharedAgentSnapshotClaim) -> Self {
+        let message = SharedAgentSnapshotCertificate::signing_message(
+            claim.active_committee().id(),
+            claim.commitment(),
+        );
+        Self { claim, message }
+    }
+
+    pub const fn claim(&self) -> &SharedAgentSnapshotClaim {
+        &self.claim
+    }
+
+    /// Domain-separated bytes an independently validating voter may sign.
+    pub const fn signing_message(&self) -> Hash {
+        self.message
+    }
+}
+
+/// Explicit bounds for one resumable post-snapshot journal cleanup pass.
+/// Shared-binding validation additionally scans at most the fixed,
+/// fail-closed Shared-binding namespace capacity; `max_binding_unlinks` caps
+/// mutations, while the remaining fields cap generic journal traversal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedAgentCompactionLimits {
+    /// Maximum authenticated Shared-binding files physically removed.
+    pub max_binding_unlinks: usize,
+    pub max_index_nodes: usize,
+    pub max_marked_objects: usize,
+    pub max_marked_blobs: usize,
+    pub max_scanned_files: usize,
+    pub max_scanned_bytes: u64,
+    pub max_unlinks: usize,
+}
+
+/// Exact physical work completed in one bounded pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedAgentCompaction {
+    pub bindings_removed: usize,
+    pub bindings_remaining: usize,
+    pub objects_removed: usize,
+    pub blobs_removed: usize,
+    pub aliases_removed: usize,
+    pub resumed: bool,
+    pub complete: bool,
 }
 
 /// Engines required by the currently admitted actor directory. Control is
@@ -586,16 +667,107 @@ impl SharedAgentHost {
         Err(SharedAgentHostError::TransportNotAttached)
     }
 
-    /// Explicit fail-closed gate for the missing authenticated Agent snapshot
-    /// and audit-retirement protocol.
+    /// Derive and locally verify an exact Agent checkpoint candidate without
+    /// mutation. Only the opaque result exposes the signing message; decoding
+    /// an unsigned claim is never signing authority. Remote voters must also
+    /// validate authenticated candidate evidence before signing. That
+    /// composite-network evidence exchange is not attached by this host.
     pub fn request_snapshot_compaction(
         &mut self,
         agent: AgentId,
-    ) -> Result<(), SharedAgentHostError> {
-        if !self.agents.contains_key(&agent) {
-            return Err(SharedAgentHostError::AgentNotFound);
+    ) -> Result<VerifiedSharedAgentSnapshotCandidate, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let claim = self
+            .agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .snapshot_candidate()
+            .map_err(map_driver_error)?;
+        Ok(VerifiedSharedAgentSnapshotCandidate::from_reconstructed(
+            claim,
+        ))
+    }
+
+    /// Verify, publish, and atomically install one exact Agent snapshot.
+    pub fn install_snapshot(
+        &mut self,
+        agent: AgentId,
+        certificate: &SharedAgentSnapshotCertificate,
+    ) -> Result<SharedAgentSnapshotInstall, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let installed = self
+            .agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .install_snapshot(certificate)
+            .map_err(map_driver_error)?;
+        Ok(SharedAgentSnapshotInstall {
+            raft_index: installed.claim.raft_index(),
+            raft_term: installed.claim.raft_term(),
+            certificate: installed.certificate_commitment,
+            journal_heads: installed.claim.journal_heads(),
+        })
+    }
+
+    pub fn install_snapshot_bytes(
+        &mut self,
+        agent: AgentId,
+        bytes: &[u8],
+    ) -> Result<SharedAgentSnapshotInstall, SharedAgentHostError> {
+        if bytes.len() > super::shared_commit::MAX_SHARED_AGENT_SNAPSHOT_CERTIFICATE_BYTES {
+            return Err(SharedAgentHostError::SnapshotCertificateInvalid);
         }
-        Err(SharedAgentHostError::SnapshotUnsupported)
+        let certificate = SharedAgentSnapshotCertificate::decode(bytes)
+            .map_err(|_| SharedAgentHostError::SnapshotCertificateInvalid)?;
+        if certificate.encode() != bytes {
+            return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+        }
+        self.install_snapshot(agent, &certificate)
+    }
+
+    /// Resume fail-closed retirement of Shared commit bindings and bounded
+    /// retirement of unreachable journal objects/blobs after a snapshot is
+    /// durably installed. Binding validation is limited by the fixed
+    /// namespace capacity, while `max_binding_unlinks` bounds mutations. A
+    /// false `complete` is backpressure, never a claim that cleanup finished.
+    pub fn compact_snapshot(
+        &mut self,
+        agent: AgentId,
+        limits: SharedAgentCompactionLimits,
+    ) -> Result<SharedAgentCompaction, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        if limits.max_binding_unlinks == 0 {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        let outcome = self
+            .agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .compact_snapshot(
+                limits.max_binding_unlinks,
+                super::journal_store::GcLimits {
+                    max_index_nodes: limits.max_index_nodes,
+                    max_marked_objects: limits.max_marked_objects,
+                    max_marked_blobs: limits.max_marked_blobs,
+                    max_scanned_files: limits.max_scanned_files,
+                    max_scanned_bytes: limits.max_scanned_bytes,
+                    max_unlinks_per_run: limits.max_unlinks,
+                },
+            )
+            .map_err(map_driver_error)?;
+        let journal = outcome.journal;
+        Ok(SharedAgentCompaction {
+            bindings_removed: outcome.bindings_removed,
+            bindings_remaining: outcome.bindings_remaining,
+            objects_removed: journal.map_or(0, |gc| gc.objects_removed),
+            blobs_removed: journal.map_or(0, |gc| gc.blobs_removed),
+            aliases_removed: journal.map_or(0, |gc| gc.aliases_removed),
+            resumed: journal.is_some_and(|gc| gc.resumed),
+            complete: outcome.bindings_remaining == 0 && journal.is_some_and(|gc| gc.complete),
+        })
     }
 
     fn verify_and_prepare(
@@ -803,6 +975,14 @@ fn status_for(hosted: &HostedSharedAgent) -> Result<SharedAgentStatus, SharedAge
     let lanes = hosted.driver.engine_lanes().map_err(map_driver_error)?;
     let (applied_slots, remaining_slots, reservation_pending) =
         hosted.driver.capacity().map_err(map_driver_error)?;
+    let snapshots = match hosted.driver.current_snapshot().map_err(map_driver_error)? {
+        Some(snapshot) => SharedAgentSnapshotState::Installed {
+            raft_index: snapshot.claim.raft_index(),
+            raft_term: snapshot.claim.raft_term(),
+            certificate: snapshot.certificate_commitment,
+        },
+        None => SharedAgentSnapshotState::None,
+    };
     let replicas = committee
         .members()
         .iter()
@@ -831,7 +1011,7 @@ fn status_for(hosted: &HostedSharedAgent) -> Result<SharedAgentStatus, SharedAge
         remaining_slots,
         reservation_pending,
         transport: SharedAgentTransportState::NotAttached,
-        snapshots: SharedAgentSnapshotState::Unsupported,
+        snapshots,
     })
 }
 
@@ -886,6 +1066,10 @@ fn map_driver_error(error: SharedJournalDriverError) -> SharedAgentHostError {
         SharedJournalDriverError::WrongReplica | SharedJournalDriverError::InvalidProfile => {
             SharedAgentHostError::ScopeMismatch
         }
+        SharedJournalDriverError::Snapshot(
+            super::shared_commit::SharedCommitError::WrongSnapshotClaim,
+        ) => SharedAgentHostError::SnapshotReplay,
+        SharedJournalDriverError::Snapshot(_) => SharedAgentHostError::SnapshotCertificateInvalid,
         SharedJournalDriverError::InvalidArtifactBatch
         | SharedJournalDriverError::CrossStoreMismatch
         | SharedJournalDriverError::Replay(_)
@@ -896,8 +1080,16 @@ fn map_driver_error(error: SharedJournalDriverError) -> SharedAgentHostError {
 fn map_ledger_error(error: AgentRaftApplicationErrorV2) -> SharedAgentHostError {
     match error {
         AgentRaftApplicationErrorV2::BacklogLimit => SharedAgentHostError::CapacityExhausted,
-        AgentRaftApplicationErrorV2::SnapshotUnsupported => {
-            SharedAgentHostError::SnapshotUnsupported
+        AgentRaftApplicationErrorV2::SnapshotBoundaryRequired => {
+            SharedAgentHostError::SnapshotBoundaryRequired
+        }
+        AgentRaftApplicationErrorV2::SnapshotCertificateInvalid => {
+            SharedAgentHostError::SnapshotCertificateInvalid
+        }
+        AgentRaftApplicationErrorV2::SnapshotStale => SharedAgentHostError::SnapshotStale,
+        AgentRaftApplicationErrorV2::SnapshotReplay => SharedAgentHostError::SnapshotReplay,
+        AgentRaftApplicationErrorV2::SnapshotEvidenceLimit => {
+            SharedAgentHostError::SnapshotEvidenceLimit
         }
         AgentRaftApplicationErrorV2::ConfigurationMismatch
         | AgentRaftApplicationErrorV2::WrongGeneration
@@ -1154,14 +1346,15 @@ mod tests {
     use vos_raft::EntryKind;
 
     use super::super::authority::{
-        AgentAuthorityBinding, AgentAuthorityClaim, AgentAuthorityReceipt, ED25519_SIGNATURE_BYTES,
-        ed25519_public_key_wire,
+        ActorInvocationClaim, ActorInvocationReceipt, AgentAuthorityBinding, AgentAuthorityClaim,
+        AgentAuthorityReceipt, ED25519_SIGNATURE_BYTES, ed25519_public_key_wire,
     };
     use super::super::committee::{
         AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
         AuthorityQuorumCertificate, AuthoritySignature,
     };
     use super::super::contract::RuntimePackageContract;
+    use super::super::execution::{ActorInvocation, ActorInvocationAuth};
     use super::super::genesis::{
         AgentGenesisAdmissionId, AgentGenesisClaim, AgentGenesisDecision, AgentGenesisEvidence,
         AgentGenesisExpectations, AgentGenesisLocator, AgentGenesisProposal, AgentReplicaCommittee,
@@ -1172,15 +1365,16 @@ mod tests {
         system_genesis_post_create_state_commitment,
     };
     use super::super::package::{Package, PackageManifest};
+    use super::super::shared_commit::ReplicaCommitSignature;
     use super::super::standard::StandardAgentRuntime;
     use super::super::wire::encode_standard_runtime_state;
     use super::super::{
         AgentConfig, AgentReplica, AgentRuntime, LifecycleAuthorityAdmission, LifecycleRequest,
-        PackageKind, RuntimeCapabilities,
+        MethodMode, PackageKind, RuntimeCapabilities,
     };
     use crate::service::{
-        ActorId, CapabilityId, CredentialId, DeploymentId, DeploymentSignature, PrincipalId,
-        ProducerId, ProgramId, SpaceId, artifact_hash, task_dependencies_hash,
+        ActorId, CapabilityId, CredentialId, DeploymentId, DeploymentSignature, InvocationId,
+        PrincipalId, ProducerId, ProgramId, SpaceId, artifact_hash, task_dependencies_hash,
     };
 
     const PEER_ID_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
@@ -1271,6 +1465,7 @@ mod tests {
         provision: AgentGenesisProvision,
         catalog: Vec<RuntimeBlob>,
         authority: AgentAuthorityBinding,
+        authority_key: SigningKey,
         committee_authority: CommitteeChangeAuthorityBinding,
         replica_keys: Vec<SigningKey>,
         agent: AgentId,
@@ -1519,6 +1714,7 @@ mod tests {
             provision,
             catalog,
             authority,
+            authority_key,
             committee_authority: committee_authority_binding(&key(0xe1)),
             replica_keys,
             agent,
@@ -1527,13 +1723,22 @@ mod tests {
     }
 
     fn open_host(directory: &TempDirectory, fixture: &Fixture) -> SharedAgentHost {
+        open_host_on_node(
+            directory,
+            fixture,
+            fixture.provision.replicas().members()[0].replica().node,
+        )
+    }
+
+    fn open_host_on_node(
+        directory: &TempDirectory,
+        fixture: &Fixture,
+        node: NodeId,
+    ) -> SharedAgentHost {
         let merge_key = fixture
             .replica_keys
             .iter()
-            .find(|key| {
-                NodeId::of_authenticated_peer(&peer_id(key))
-                    == fixture.provision.replicas().members()[0].replica().node
-            })
+            .find(|key| NodeId::of_authenticated_peer(&peer_id(key)) == node)
             .unwrap()
             .clone();
         SharedAgentHost::open(
@@ -1541,13 +1746,203 @@ mod tests {
             directory.lock(),
             AgentHostScope {
                 space: fixture.space,
-                node: NodeId::of_authenticated_peer(&peer_id(&merge_key)),
+                node,
             },
             Arc::new(StaticTrust(fixture.authority.clone())),
             Arc::new(SigningMerge(merge_key)),
             Arc::new(AcceptFinality),
         )
         .unwrap()
+    }
+
+    fn physical_bytes(directory: &TempDirectory) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, at: &Path, output: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let mut entries = fs::read_dir(at)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    visit(root, &path, output);
+                } else if kind.is_file() {
+                    output.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    );
+                } else {
+                    panic!("unexpected test namespace entry: {path:?}");
+                }
+            }
+        }
+
+        let mut output = BTreeMap::new();
+        visit(&directory.0, &directory.0, &mut output);
+        output
+    }
+
+    fn provision_apply_candidate(
+        host: &mut SharedAgentHost,
+        fixture: &Fixture,
+        term: u64,
+    ) -> VerifiedSharedAgentSnapshotCandidate {
+        host.provision(
+            fixture.provision.clone(),
+            fixture.catalog.clone(),
+            fixture.committee_authority,
+        )
+        .unwrap();
+        let index = host
+            .agents
+            .get_mut(&fixture.agent)
+            .unwrap()
+            .driver
+            .append_ordered_for_test(term, authorized_management(fixture, 2, 0xc1))
+            .unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(
+            host.apply_next(fixture.agent).unwrap(),
+            SharedAgentApplyOutcome::Applied { index: 1 }
+        );
+        host.request_snapshot_compaction(fixture.agent).unwrap()
+    }
+
+    fn append_local_invocation_and_acknowledgement(
+        host: &mut SharedAgentHost,
+        fixture: &Fixture,
+        discriminator: u8,
+    ) {
+        let invocation = ActorInvocation {
+            invocation: InvocationId([discriminator; 32]),
+            actor: ActorId([discriminator.wrapping_add(1); 32]),
+            incarnation: Hash([discriminator.wrapping_add(2); 32]),
+            deployment: DeploymentId([discriminator.wrapping_add(3); 32]),
+            program: ProgramId([discriminator.wrapping_add(4); 32]),
+            mode: MethodMode::Local,
+            auth: ActorInvocationAuth::anonymous(),
+            message: vec![discriminator],
+            availability: Vec::new(),
+            gas: 1_000,
+        };
+        let claim = ActorInvocationClaim {
+            authority: fixture.authority.clone(),
+            space: fixture.space,
+            agent: fixture.agent,
+            principal: None,
+            credential: None,
+            authorization: invocation.authorization_message(),
+            auth: invocation.auth.clone(),
+            valid_from: 10,
+            valid_until: 30,
+        };
+        let receipt = ActorInvocationReceipt {
+            signature: fixture
+                .authority_key
+                .sign(&claim.signing_message().0)
+                .to_bytes()
+                .to_vec(),
+            claim,
+        };
+        host.agents
+            .get_mut(&fixture.agent)
+            .unwrap()
+            .driver
+            .append_acknowledged_local_for_test(
+                ReplayOperation::Invoke {
+                    invocation: invocation.clone(),
+                    authority: receipt.clone(),
+                    observed_slot: 20,
+                },
+                ReplayOperation::Acknowledge {
+                    invocation,
+                    authority: receipt,
+                },
+            )
+            .unwrap();
+    }
+
+    fn snapshot_certificate(
+        candidate: &VerifiedSharedAgentSnapshotCandidate,
+        fixture: &Fixture,
+    ) -> SharedAgentSnapshotCertificate {
+        snapshot_certificate_with_message(candidate, fixture, candidate.signing_message())
+    }
+
+    fn authorized_management(
+        fixture: &Fixture,
+        sequence: u64,
+        discriminator: u8,
+    ) -> ReplayOperation {
+        let request = LifecycleRequest::Suspend {
+            actor: ActorId([discriminator; 32]),
+            expected_deployment: DeploymentId([discriminator.wrapping_add(1); 32]),
+        };
+        let claim = AgentAuthorityClaim {
+            authority: fixture.authority.clone(),
+            space: fixture.space,
+            agent: fixture.agent,
+            principal: PrincipalId([0x12; 32]),
+            credential: CredentialId([0x24; 32]),
+            capability: CapabilityId::named(request.required_capability().unwrap()),
+            operation: request.commitment(),
+            sequence,
+            valid_from: 10,
+            valid_until: 30,
+        };
+        let receipt = AgentAuthorityReceipt {
+            signature: fixture
+                .authority_key
+                .sign(&claim.signing_message().0)
+                .to_bytes()
+                .to_vec(),
+            claim,
+        };
+        ReplayOperation::Management {
+            request: LifecycleRequest::Authorized {
+                admission: LifecycleAuthorityAdmission {
+                    receipt,
+                    observed_slot: 20,
+                },
+                request: Box::new(request),
+            },
+        }
+    }
+
+    fn snapshot_certificate_with_message(
+        candidate: &VerifiedSharedAgentSnapshotCandidate,
+        fixture: &Fixture,
+        message: Hash,
+    ) -> SharedAgentSnapshotCertificate {
+        let committee = candidate.claim().active_committee();
+        let mut signatures = fixture
+            .replica_keys
+            .iter()
+            .filter_map(|key| {
+                let node = NodeId::of_authenticated_peer(&peer_id(key));
+                committee
+                    .member_by_node(node)
+                    .filter(|member| member.replica().role == ReplicaRole::Voter)
+                    .map(|_| {
+                        ReplicaCommitSignature::new(node, key.sign(&message.0).to_bytes()).unwrap()
+                    })
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(ReplicaCommitSignature::signer);
+        SharedAgentSnapshotCertificate::new(candidate.claim().clone(), signatures).unwrap()
+    }
+
+    fn compaction_limits(max_unlinks: usize) -> SharedAgentCompactionLimits {
+        SharedAgentCompactionLimits {
+            max_binding_unlinks: 1,
+            max_index_nodes: 10_000,
+            max_marked_objects: 10_000,
+            max_marked_blobs: 10_000,
+            max_scanned_files: 10_000,
+            max_scanned_bytes: 64 * 1024 * 1024,
+            max_unlinks,
+        }
     }
 
     #[test]
@@ -1570,10 +1965,10 @@ mod tests {
             host.require_transport(fixture.agent),
             Err(SharedAgentHostError::TransportNotAttached)
         );
-        assert_eq!(
+        assert!(matches!(
             host.request_snapshot_compaction(fixture.agent),
-            Err(SharedAgentHostError::SnapshotUnsupported)
-        );
+            Err(SharedAgentHostError::SnapshotBoundaryRequired)
+        ));
         let index = host.agents[&fixture.agent]
             .driver
             .ledger()
@@ -1603,6 +1998,251 @@ mod tests {
             reopened.apply_next(fixture.agent).unwrap(),
             SharedAgentApplyOutcome::Idle
         );
+    }
+
+    #[test]
+    fn filesystem_snapshot_is_authenticated_compacted_repeated_and_reopened_with_suffix() {
+        let directory = TempDirectory::new("snapshot_compact_restart");
+        let fixture = fixture(0x15);
+        let mut host = open_host(&directory, &fixture);
+        let provisioned = host
+            .provision(
+                fixture.provision.clone(),
+                fixture.catalog.clone(),
+                fixture.committee_authority,
+            )
+            .unwrap();
+
+        let first_index = host
+            .agents
+            .get_mut(&fixture.agent)
+            .unwrap()
+            .driver
+            .append_ordered_for_test(7, authorized_management(&fixture, 2, 0xb1))
+            .unwrap();
+        assert_eq!(first_index, 1);
+        assert_eq!(
+            host.apply_next(fixture.agent).unwrap(),
+            SharedAgentApplyOutcome::Applied { index: 1 }
+        );
+
+        // The signed checkpoint predecessor must remain distinct from the
+        // Ordered publication successor when Local work advanced the head.
+        // The rejected invocation plus acknowledgement leaves no live result
+        // which could independently block checkpoint creation.
+        append_local_invocation_and_acknowledgement(&mut host, &fixture, 0xb3);
+
+        let first_candidate = host.request_snapshot_compaction(fixture.agent).unwrap();
+        assert_eq!(first_candidate.claim().ordered().agent(), fixture.agent);
+        assert_eq!(first_candidate.claim().raft_index(), 1);
+        assert_eq!(first_candidate.claim().local_node(), host.scope().node);
+        assert_ne!(
+            first_candidate.claim().checkpoint_predecessor(),
+            first_candidate.claim().ordered_successor()
+        );
+        let forged = snapshot_certificate_with_message(
+            &first_candidate,
+            &fixture,
+            Hash::digest(b"vos/test/forged-snapshot-message", &[]),
+        );
+        assert_eq!(
+            host.install_snapshot(fixture.agent, &forged),
+            Err(SharedAgentHostError::SnapshotCertificateInvalid)
+        );
+        let after_forgery = host.show(fixture.agent).unwrap().unwrap();
+        assert_eq!(after_forgery.applied_slots, 1);
+        assert_eq!(after_forgery.snapshots, SharedAgentSnapshotState::None);
+        let unchanged = host.request_snapshot_compaction(fixture.agent).unwrap();
+        assert_eq!(unchanged.claim(), first_candidate.claim());
+
+        let first_certificate = snapshot_certificate(&first_candidate, &fixture);
+        let first_install = host
+            .install_snapshot(fixture.agent, &first_certificate)
+            .unwrap();
+        assert_eq!(first_install.raft_index, 1);
+        assert_eq!(
+            host.install_snapshot(fixture.agent, &first_certificate)
+                .unwrap(),
+            first_install
+        );
+        assert_eq!(
+            host.show(fixture.agent).unwrap().unwrap().snapshots,
+            SharedAgentSnapshotState::Installed {
+                raft_index: 1,
+                raft_term: 7,
+                certificate: first_certificate.commitment(),
+            }
+        );
+
+        // All budgets are rejected before either the authenticated binding
+        // namespace or the object/blob namespace is touched.
+        let status_before_exhaustion = host.show(fixture.agent).unwrap().unwrap();
+        let bytes_before_exhaustion = physical_bytes(&directory);
+        let mut exhausted = compaction_limits(1);
+        exhausted.max_marked_objects = 0;
+        assert_eq!(
+            host.compact_snapshot(fixture.agent, exhausted),
+            Err(SharedAgentHostError::CapacityExhausted)
+        );
+        assert_eq!(
+            host.show(fixture.agent).unwrap().unwrap(),
+            status_before_exhaustion
+        );
+        assert_eq!(physical_bytes(&directory), bytes_before_exhaustion);
+
+        let mut complete = false;
+        let mut removed = 0;
+        for _ in 0..256 {
+            let pass = host
+                .compact_snapshot(fixture.agent, compaction_limits(1))
+                .unwrap();
+            removed += pass.bindings_removed
+                + pass.objects_removed
+                + pass.blobs_removed
+                + pass.aliases_removed;
+            if pass.complete {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete, "bounded checkpoint cleanup did not converge");
+        assert!(removed > 0, "checkpoint cleanup retired no physical data");
+
+        // A committed suffix after the retained checkpoint must replay on
+        // reopen without the retired Ordered prefix or Raft audit/log rows.
+        let second_index = host
+            .agents
+            .get_mut(&fixture.agent)
+            .unwrap()
+            .driver
+            .append_ordered_for_test(8, authorized_management(&fixture, 3, 0xb2))
+            .unwrap();
+        assert_eq!(second_index, 2);
+        assert_eq!(
+            host.apply_next(fixture.agent).unwrap(),
+            SharedAgentApplyOutcome::Applied { index: 2 }
+        );
+        let second_candidate = host.request_snapshot_compaction(fixture.agent).unwrap();
+        assert_eq!(
+            second_candidate.claim().previous_snapshot(),
+            Some(first_certificate.commitment())
+        );
+        let second_certificate = snapshot_certificate(&second_candidate, &fixture);
+        let second_install = host
+            .install_snapshot(fixture.agent, &second_certificate)
+            .unwrap();
+        assert_eq!(second_install.raft_index, 2);
+        assert_eq!(
+            host.install_snapshot(fixture.agent, &first_certificate),
+            Err(SharedAgentHostError::SnapshotStale)
+        );
+        assert_eq!(
+            host.install_snapshot(fixture.agent, &second_certificate)
+                .unwrap(),
+            second_install
+        );
+        let route = host.physical_route(fixture.agent).unwrap();
+        drop(host);
+
+        let reopened = open_host(&directory, &fixture);
+        let status = reopened.show(fixture.agent).unwrap().unwrap();
+        assert_eq!(status.generation, provisioned.generation);
+        assert_eq!(status.replication_id, route.replication_id);
+        assert_eq!(status.applied_slots, 2);
+        assert_eq!(
+            status.snapshots,
+            SharedAgentSnapshotState::Installed {
+                raft_index: 2,
+                raft_term: 8,
+                certificate: second_certificate.commitment(),
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_certificate_replay_isolated_by_agent_store_node_and_generation() {
+        let fixture = fixture(0x16);
+        let directory_a = TempDirectory::new("snapshot_isolation_a");
+        let directory_b = TempDirectory::new("snapshot_isolation_b");
+        let mut host_a = open_host(&directory_a, &fixture);
+        let mut host_b = open_host(&directory_b, &fixture);
+        let candidate_a = provision_apply_candidate(&mut host_a, &fixture, 9);
+        let candidate_b = provision_apply_candidate(&mut host_b, &fixture, 9);
+        assert_eq!(
+            candidate_a.claim().raft_index(),
+            candidate_b.claim().raft_index()
+        );
+        assert_eq!(candidate_a.claim().ordered(), candidate_b.claim().ordered());
+        assert_ne!(
+            candidate_a.claim().journal_store(),
+            candidate_b.claim().journal_store()
+        );
+        let certificate_a = snapshot_certificate(&candidate_a, &fixture);
+        let certificate_b = snapshot_certificate(&candidate_b, &fixture);
+        assert!(
+            certificate_b
+                .verify(candidate_b.claim().active_committee(), candidate_b.claim(),)
+                .is_ok()
+        );
+
+        // A valid quorum certificate for the byte-identical generation in a
+        // different physical store cannot publish even a checkpoint blob.
+        let status_b = host_b.show(fixture.agent).unwrap().unwrap();
+        let bytes_b = physical_bytes(&directory_b);
+        assert_eq!(
+            host_b.install_snapshot(fixture.agent, &certificate_a),
+            Err(SharedAgentHostError::SnapshotReplay)
+        );
+        assert_eq!(host_b.show(fixture.agent).unwrap().unwrap(), status_b);
+        assert_eq!(physical_bytes(&directory_b), bytes_b);
+
+        // Install A, then present B's independently valid quorum certificate
+        // at the same Raft index. It is divergent, not a forged signature,
+        // and must be rejected before any journal or Raft mutation.
+        host_a
+            .install_snapshot(fixture.agent, &certificate_a)
+            .unwrap();
+        let status_a = host_a.show(fixture.agent).unwrap().unwrap();
+        let bytes_a = physical_bytes(&directory_a);
+        assert_eq!(
+            host_a.install_snapshot(fixture.agent, &certificate_b),
+            Err(SharedAgentHostError::SnapshotStale)
+        );
+        assert_eq!(host_a.show(fixture.agent).unwrap().unwrap(), status_a);
+        assert_eq!(physical_bytes(&directory_a), bytes_a);
+
+        // The complete local replica identity is signed too. A certificate
+        // from A cannot enter another admitted replica's independent store.
+        let directory_node = TempDirectory::new("snapshot_isolation_node");
+        let alternate_node = fixture.provision.replicas().members()[1].replica().node;
+        assert_ne!(alternate_node, candidate_a.claim().local_node());
+        let mut host_node = open_host_on_node(&directory_node, &fixture, alternate_node);
+        let candidate_node = provision_apply_candidate(&mut host_node, &fixture, 9);
+        assert_eq!(candidate_node.claim().local_node(), alternate_node);
+        let status_node = host_node.show(fixture.agent).unwrap().unwrap();
+        let bytes_node = physical_bytes(&directory_node);
+        assert_eq!(
+            host_node.install_snapshot(fixture.agent, &certificate_a),
+            Err(SharedAgentHostError::SnapshotReplay)
+        );
+        assert_eq!(host_node.show(fixture.agent).unwrap().unwrap(), status_node);
+        assert_eq!(physical_bytes(&directory_node), bytes_node);
+
+        // A distinct Agent necessarily has a distinct full generation route,
+        // even under the same space, node keys, and logical slot.
+        let other = self::fixture(0x17);
+        let directory_other = TempDirectory::new("snapshot_isolation_agent");
+        let mut host_other = open_host(&directory_other, &other);
+        let candidate_other = provision_apply_candidate(&mut host_other, &other, 9);
+        assert_ne!(candidate_other.claim().ordered().agent(), fixture.agent);
+        let status_other = host_other.show(other.agent).unwrap().unwrap();
+        let bytes_other = physical_bytes(&directory_other);
+        assert_eq!(
+            host_other.install_snapshot(other.agent, &certificate_a),
+            Err(SharedAgentHostError::SnapshotReplay)
+        );
+        assert_eq!(host_other.show(other.agent).unwrap().unwrap(), status_other);
+        assert_eq!(physical_bytes(&directory_other), bytes_other);
     }
 
     #[test]

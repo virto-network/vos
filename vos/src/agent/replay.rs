@@ -55,7 +55,10 @@ use super::journal_store::{
 };
 use super::shared_commit::OrderedCommitClaim;
 #[cfg(feature = "std")]
-use super::shared_commit::{SharedLaneProjection, SharedSealedMergeProjection};
+use super::shared_commit::{
+    SharedAgentSnapshotClaim, SharedLaneProjection, SharedSealedMergeProjection,
+    VerifiedSharedAgentSnapshot,
+};
 #[cfg(all(feature = "std", feature = "storage"))]
 use super::shared_journal_driver::ValidatedSharedArtifactBatch;
 use super::shared_raft::{
@@ -3454,6 +3457,114 @@ impl<'store, S: AgentJournalStore> ReplayPreparedPublication<'store, S> {
         }
         let publication = self.store.publish(&self.sealed)?;
         Ok((publication, self.successor, self.executions))
+    }
+}
+
+/// Owned, read-only-derived Shared checkpoint plan. Candidate construction
+/// writes nothing; only a quorum-verified snapshot capability can stage its
+/// content-addressed lane blobs and cross the journal-head CAS.
+#[cfg(feature = "std")]
+pub(crate) struct PreparedSharedCheckpoint {
+    sealed: ReplaySealedPublication,
+    successor: ReplayMaterialization,
+    lane_blobs: Vec<(BlobRef, Vec<u8>)>,
+}
+
+#[cfg(feature = "std")]
+impl PreparedSharedCheckpoint {
+    pub(crate) fn predecessor_heads(&self) -> JournalHeadsId {
+        self.sealed.expected
+    }
+
+    pub(crate) fn next_heads(&self) -> &JournalHeads {
+        self.sealed.next()
+    }
+
+    pub(crate) fn checkpoint(&self) -> &ReplaySealedCheckpoint {
+        self.sealed
+            .checkpoint_validation()
+            .expect("Shared checkpoint plans always carry validation")
+    }
+
+    pub(crate) fn lane_roots(
+        &self,
+    ) -> Option<(LaneStateId, LaneStateId, LaneStateId, LaneStateId)> {
+        let mut roots = [None; 4];
+        for (lane, state) in self.checkpoint().lanes() {
+            let index = match lane.lane {
+                PersistedLane::Control => 0,
+                PersistedLane::Linear => 1,
+                PersistedLane::Merge => 2,
+                PersistedLane::Local if lane.node == Some(self.successor.heads.node) => 3,
+                PersistedLane::Local => return None,
+            };
+            if roots[index].replace(state.id()).is_some() {
+                return None;
+            }
+        }
+        Some((roots[0]?, roots[1]?, roots[2]?, roots[3]?))
+    }
+
+    pub(crate) fn validate_claim(
+        &self,
+        claim: &SharedAgentSnapshotClaim,
+    ) -> Result<(), JournalStoreError> {
+        let checkpoint = self.checkpoint();
+        let manifest = checkpoint.manifest();
+        let mut control = None;
+        let mut linear = None;
+        let mut merge = None;
+        let mut local = None;
+        for (lane, state) in checkpoint.lanes() {
+            match lane.lane {
+                PersistedLane::Control if lane.node.is_none() => control = Some(state.id()),
+                PersistedLane::Linear if lane.node.is_none() => linear = Some(state.id()),
+                PersistedLane::Merge if lane.node.is_none() => merge = Some(state.id()),
+                PersistedLane::Local if lane.node == Some(self.successor.heads.node) => {
+                    local = Some(state.id())
+                }
+                _ => return Err(JournalStoreError::NonCanonical),
+            }
+        }
+        if claim.checkpoint_predecessor() != self.sealed.expected
+            || claim.journal_heads() != self.successor.heads_id
+            || claim.checkpoint() != manifest.id()
+            || claim.local_node() != self.successor.heads.node
+            || control != Some(claim.control())
+            || linear != Some(claim.linear())
+            || merge != Some(claim.merge())
+            || local != Some(claim.local())
+            || claim.ordered_invocations() != self.successor.heads.ordered_invocations
+            || claim.merge_invocations() != self.successor.heads.merge_invocations
+            || claim.local_invocations() != self.successor.heads.local_invocations
+            || claim.artifacts() != manifest.artifacts
+            || self.successor.artifacts.id() != manifest.artifacts
+            || manifest.ordered_index != claim.ordered().ordered().index
+            || manifest.ordered_head != claim.ordered().ordered().head
+            || manifest.runtime != *claim.ordered().runtime()
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_shared<S: AgentJournalStore>(
+        self,
+        store: &mut S,
+        verified: &VerifiedSharedAgentSnapshot,
+    ) -> Result<ReplayMaterialization, JournalStoreError> {
+        self.validate_claim(verified.claim())?;
+        if store.instance_id().as_bytes() != &verified.claim().journal_store().0 {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        for (reference, bytes) in &self.lane_blobs {
+            store.put_blob(JournalBlobClass::LaneState, reference, bytes)?;
+        }
+        let publication = store.publish(&self.sealed)?;
+        if !publication.heads_advanced && store.heads()?.as_ref() != Some(self.sealed.next()) {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(self.successor)
     }
 }
 
@@ -12843,6 +12954,343 @@ mod aggregate {
         Ok(compacted)
     }
 
+    /// Build a complete Shared checkpoint without writing any object, blob,
+    /// or head. The caller combines its exact roots with the V2 ledger
+    /// context, obtains voter signatures, and returns the verified capability
+    /// to `PreparedSharedCheckpoint::publish_shared`.
+    pub(crate) fn prepare_shared_checkpoint<S>(
+        store: &mut S,
+        materialization: &ReplayMaterialization,
+    ) -> Result<
+        PreparedSharedCheckpoint,
+        MaterializeError<core::convert::Infallible, core::convert::Infallible>,
+    >
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+    {
+        require_current_materialization(store, materialization)?;
+        let current = &materialization.heads;
+        let decoded = decode_standard_runtime_state(&materialization.state)
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        if decoded
+            .config
+            .as_ref()
+            .is_none_or(|config| config.identity.profile != AgentProfile::Shared)
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let indexes = InvocationIndexes::open(
+            store,
+            current.ordered_invocations,
+            current.merge_invocations,
+            current.local_invocations,
+        )
+        .map_err(|_| ReplayError::InvocationOwnership(InvocationOwnershipError::Unauthenticated))?;
+        for scope in [
+            InvocationOwnershipScope::Ordered,
+            InvocationOwnershipScope::Merge,
+            InvocationOwnershipScope::Local(current.node),
+        ] {
+            if InvocationOwnership::unfinalized(&indexes, scope)
+                .map_err(ReplayError::InvocationOwnership)?
+                != 0
+            {
+                return Err(ReplayError::InvocationOwnership(
+                    InvocationOwnershipError::Unauthenticated,
+                ));
+            }
+        }
+        drop(indexes);
+        let state = compact_standard_checkpoint(&materialization.state)?;
+        let artifacts = derive_standard_artifact_closure(current.genesis, &current.runtime, &state)
+            .map_err(lift_validation)?;
+        authenticate_artifacts(store, &artifacts)?;
+        let ordered = materialization.ordered_base();
+        let cursors = [
+            LaneCursor::Ordered { base: ordered },
+            LaneCursor::Ordered { base: ordered },
+            LaneCursor::Merge {
+                frontier: current.merge_frontier,
+            },
+            LaneCursor::Local {
+                node: current.node,
+                revision: current.local_revision,
+                head: current.local_head,
+            },
+        ];
+        let persisted = [
+            PersistedLane::Control,
+            PersistedLane::Linear,
+            PersistedLane::Merge,
+            PersistedLane::Local,
+        ];
+        let mut lanes = Vec::new();
+        let mut sealed_lanes = Vec::new();
+        let mut lane_blobs = Vec::new();
+        for (lane, cursor) in persisted.into_iter().zip(cursors) {
+            let bytes = state_component(&state, lane);
+            let reference = BlobRef::of_bytes(bytes);
+            lane_blobs.push((reference.clone(), bytes.to_vec()));
+            let manifest = derive_lane_state(
+                current.genesis,
+                current.runtime.clone(),
+                lane,
+                cursor,
+                bytes,
+            )
+            .map_err(lift_validation)?;
+            let checkpoint_lane = CheckpointLane {
+                lane,
+                node: (lane == PersistedLane::Local).then_some(current.node),
+                state: manifest.id(),
+                invocations: (lane == PersistedLane::Local).then_some(current.local_invocations),
+            };
+            lanes.push(checkpoint_lane.clone());
+            sealed_lanes.push((checkpoint_lane, manifest));
+        }
+        let manifest = derive_checkpoint(
+            current.genesis,
+            current.admission,
+            current.runtime.clone(),
+            current.publication_revision,
+            ordered,
+            current.merge_frontier,
+            current.merge_fence,
+            current.merge_seal,
+            current.ordered_invocations,
+            current.merge_invocations,
+            lanes,
+            artifacts.id(),
+        )
+        .map_err(lift_validation)?;
+        let id = manifest.id();
+        let mut next = successor_heads(current).map_err(lift_validation)?;
+        next.checkpoint = Some(id);
+        let expected_indexes = [
+            (
+                current.ordered_invocations,
+                InvocationOwnershipScope::Ordered,
+            ),
+            (current.merge_invocations, InvocationOwnershipScope::Merge),
+            (
+                current.local_invocations,
+                InvocationOwnershipScope::Local(current.node),
+            ),
+        ];
+        let mut invocation_indexes = Vec::new();
+        for (index_id, scope) in expected_indexes {
+            let index: InvocationIndexManifest = require_record(store, index_id)?;
+            if index.id() != index_id || index.genesis != current.genesis || index.scope != scope {
+                return Err(ReplayError::InvalidRecord);
+            }
+            invocation_indexes.push((index_id, index));
+        }
+        let fence_ancestry = successor_fence_ancestry(materialization, &next, true, None)
+            .map_err(lift_validation)?;
+        let checkpoint = ReplaySealedCheckpoint {
+            manifest: manifest.clone(),
+            lanes: sealed_lanes,
+            artifacts: artifacts.clone(),
+            invocation_indexes,
+            local_cursors: vec![(current.node, current.local_revision, current.local_head)],
+            fence_ancestry: fence_ancestry.clone(),
+        };
+        let sealed = ReplaySealedPublication {
+            expected: materialization.heads_id,
+            next: next.clone(),
+            anchor: ReplayPublicationAnchor::Checkpoint(manifest),
+            outcomes: Vec::new(),
+            history_plans: Vec::new(),
+            checkpoint: Some(checkpoint),
+            shared_merge_projection: None,
+            shared_ordered_commit: None,
+            system_authority_write: None,
+            fence_ancestry: fence_ancestry.clone(),
+            mode: ReplayPublicationMode::Canonical,
+        };
+        let snapshots = MaterializedOrderedSnapshots::singleton(
+            ordered,
+            MaterializedOrderedSnapshot {
+                runtime: current.runtime.clone(),
+                control: state.control.clone(),
+                linear: state.linear.clone(),
+            },
+        )
+        .map_err(lift_validation)?;
+        let checkpoint_roots = materialization
+            .merge_roots
+            .iter()
+            .map(|root| root.id)
+            .collect::<BTreeSet<_>>();
+        let mut checkpoint_fence = materialization.fence.clone();
+        if let Some(fence) = checkpoint_fence.as_mut() {
+            fence
+                .sealed_ancestry
+                .retain(|event| checkpoint_roots.contains(event));
+        }
+        let checkpoint_merge_state = state.merge.clone();
+        Ok(PreparedSharedCheckpoint {
+            sealed,
+            successor: ReplayMaterialization {
+                heads_id: next.id(),
+                heads: next,
+                replayed_root: materialization.replayed_root,
+                final_system_authority_write: None,
+                state,
+                ordered_snapshots: snapshots,
+                merge_roots: materialization.merge_roots.clone(),
+                merge_boundary_roots: checkpoint_roots.clone(),
+                merge_boundary_ancestry: checkpoint_roots.clone(),
+                merge_boundary_state: checkpoint_merge_state,
+                merge_boundary_invocations: current.merge_invocations,
+                merge_ancestry: checkpoint_roots,
+                fence: checkpoint_fence,
+                artifacts,
+                suffix_budget: ReplaySuffixBudget::default(),
+                replay_boundary: ordered,
+                fence_ancestry,
+            },
+            lane_blobs,
+        })
+    }
+
+    /// Revalidate a checkpoint already visible at the durable Shared head.
+    /// This is the crash-recovery half of journal-first snapshot publication:
+    /// a certificate retry may proceed to the atomic Raft install only when
+    /// every signed root resolves to the exact current materialization.
+    pub(crate) fn validate_published_shared_checkpoint<S>(
+        store: &S,
+        materialization: &ReplayMaterialization,
+        claim: &SharedAgentSnapshotClaim,
+    ) -> Result<(), MaterializeError<core::convert::Infallible, core::convert::Infallible>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+    {
+        let current = materialization.heads();
+        let checkpoint: CheckpointManifest = require_record(store, claim.checkpoint())?;
+        if checkpoint.id() != claim.checkpoint()
+            || checkpoint.genesis != claim.ordered().genesis()
+            || checkpoint.admission != claim.ordered().admission()
+            || checkpoint.runtime != *claim.ordered().runtime()
+            || checkpoint.ordered_index != claim.ordered().ordered().index
+            || checkpoint.ordered_head != claim.ordered().ordered().head
+            || checkpoint.ordered_invocations != claim.ordered_invocations()
+            || checkpoint.merge_invocations != claim.merge_invocations()
+            || checkpoint.artifacts != claim.artifacts()
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let mut roots = [None; 4];
+        let mut local_cursor = None;
+        for lane in &checkpoint.lanes {
+            let manifest: LaneStateManifest = require_record(store, lane.state)?;
+            let state = require_blob(store, JournalBlobClass::LaneState, &manifest.state)?;
+            let expected = match lane.lane {
+                PersistedLane::Control
+                    if lane.node.is_none()
+                        && manifest.cursor
+                            == (LaneCursor::Ordered {
+                                base: claim.ordered().ordered(),
+                            }) =>
+                {
+                    0
+                }
+                PersistedLane::Linear
+                    if lane.node.is_none()
+                        && manifest.cursor
+                            == (LaneCursor::Ordered {
+                                base: claim.ordered().ordered(),
+                            }) =>
+                {
+                    1
+                }
+                PersistedLane::Merge
+                    if lane.node.is_none()
+                        && manifest.cursor
+                            == (LaneCursor::Merge {
+                                frontier: checkpoint.merge_frontier,
+                            }) =>
+                {
+                    2
+                }
+                PersistedLane::Local if lane.node == Some(claim.local_node()) => {
+                    let LaneCursor::Local {
+                        node,
+                        revision,
+                        head,
+                    } = &manifest.cursor
+                    else {
+                        return Err(ReplayError::InvalidRecord);
+                    };
+                    if *node != claim.local_node()
+                        || lane.invocations != Some(claim.local_invocations())
+                        || local_cursor.replace((*revision, *head)).is_some()
+                    {
+                        return Err(ReplayError::InvalidRecord);
+                    }
+                    3
+                }
+                _ => return Err(ReplayError::InvalidRecord),
+            };
+            if manifest.genesis != checkpoint.genesis
+                || manifest.runtime != checkpoint.runtime
+                || manifest.id() != lane.state
+                || manifest.state != BlobRef::of_bytes(&state)
+                || roots[expected].replace(lane.state).is_some()
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
+        }
+        if roots
+            != [
+                Some(claim.control()),
+                Some(claim.linear()),
+                Some(claim.merge()),
+                Some(claim.local()),
+            ]
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let (local_revision, local_head) = local_cursor.ok_or(ReplayError::InvalidRecord)?;
+        let snapshot_heads = JournalHeads {
+            genesis: checkpoint.genesis,
+            admission: checkpoint.admission,
+            node: claim.local_node(),
+            runtime: checkpoint.runtime.clone(),
+            publication_revision: checkpoint
+                .publication_revision
+                .checked_add(1)
+                .ok_or(ReplayError::ReplayLimit)?,
+            previous: Some(claim.checkpoint_predecessor()),
+            ordered_head: checkpoint.ordered_head,
+            ordered_index: checkpoint.ordered_index,
+            merge_frontier: checkpoint.merge_frontier,
+            merge_fence: checkpoint.merge_fence,
+            merge_seal: checkpoint.merge_seal,
+            ordered_invocations: checkpoint.ordered_invocations,
+            merge_invocations: checkpoint.merge_invocations,
+            local_invocations: claim.local_invocations(),
+            local_head,
+            local_revision,
+            checkpoint: Some(claim.checkpoint()),
+        };
+        if snapshot_heads.validate().is_err()
+            || snapshot_heads.id() != claim.journal_heads()
+            || current.checkpoint != Some(claim.checkpoint())
+            || current.genesis != snapshot_heads.genesis
+            || current.admission != snapshot_heads.admission
+            || current.node != snapshot_heads.node
+            || current.publication_revision < snapshot_heads.publication_revision
+            || current.ordered_index < snapshot_heads.ordered_index
+            || (current.ordered_index == snapshot_heads.ordered_index
+                && (current.ordered_head != snapshot_heads.ordered_head
+                    || current.runtime != snapshot_heads.runtime))
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare_checkpoint<'store, S>(
         store: &'store mut S,
         materialization: &ReplayMaterialization,
@@ -13050,7 +13498,8 @@ mod aggregate {
 #[allow(unused_imports)]
 pub(crate) use aggregate::{
     MaterializeError, materialize_current, prepare_checkpoint, prepare_local, prepare_merge,
-    prepare_ordered, prepare_shared_ordered, recover_invocation,
+    prepare_ordered, prepare_shared_checkpoint, prepare_shared_ordered, recover_invocation,
+    validate_published_shared_checkpoint,
 };
 
 #[cfg(all(feature = "std", feature = "storage"))]

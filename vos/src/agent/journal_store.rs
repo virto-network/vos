@@ -108,9 +108,10 @@ const SHARED_ORDERED_COMMIT_DIRECTORY: &str = "shared-ordered-commits";
 /// Durable, immutable bridge from a published Agent-journal entry back to the
 /// exact Shared Raft authority which selected it.
 ///
-/// This binding deliberately remains outside checkpoint reachability for now:
-/// Shared checkpoint/GC must fail closed until it can retain the complete
-/// claim/QC audit closure (or a replacement checkpoint certificate).
+/// This binding deliberately remains outside generic checkpoint reachability.
+/// Only the Shared snapshot retirement path may unlink it, after validating a
+/// store-bound quorum certificate and retaining its replacement checkpoint,
+/// committee-transition evidence, and cumulative retired-audit root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SharedOrderedCommitBinding {
     journal_store: JournalStoreInstanceId,
@@ -251,6 +252,66 @@ pub(crate) trait SharedOrderedCommitStore: AgentJournalStore {
     /// the Shared host's cross-ledger restart audit; callers cannot install or
     /// reinterpret bindings through this enumeration seam.
     fn shared_ordered_commit_ids(&self) -> Result<Vec<OrderedEntryId>, JournalStoreError>;
+}
+
+/// One fail-closed retirement pass over obsolete Shared Ordered bindings.
+/// The complete namespace audit is bounded by
+/// [`MAX_SHARED_ORDERED_COMMIT_BINDINGS`]; `maximum` separately caps physical
+/// unlinks in the pass. The generic object collector intentionally does not
+/// interpret this authority namespace; only an installed, store-bound Agent
+/// snapshot can retire it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SharedOrderedCommitRetirement {
+    pub(crate) removed: usize,
+    pub(crate) remaining: usize,
+}
+
+pub(crate) trait SharedOrderedCommitRetirementStore: SharedOrderedCommitStore {
+    fn retire_shared_ordered_commits(
+        &mut self,
+        snapshot: &super::shared_raft::InstalledAgentRaftSnapshotV2,
+        maximum: usize,
+    ) -> Result<SharedOrderedCommitRetirement, JournalStoreError>;
+}
+
+fn validate_snapshot_retirement_scope<S: AgentJournalStore>(
+    store: &S,
+    snapshot: &super::shared_raft::InstalledAgentRaftSnapshotV2,
+) -> Result<JournalHeads, JournalStoreError> {
+    let heads = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+    let claim = &snapshot.claim;
+    if claim.journal_store().0 != *store.instance_id().as_bytes()
+        || heads.genesis != claim.ordered().genesis()
+        || heads.admission != claim.ordered().admission()
+        || heads.runtime.space != claim.ordered().space()
+        || heads.runtime.agent != claim.ordered().agent()
+        || heads.node != claim.local_node()
+        || heads.checkpoint != Some(claim.checkpoint())
+        || heads.ordered_index < claim.ordered().ordered().index
+    {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
+    Ok(heads)
+}
+
+fn binding_retired_by_snapshot(
+    binding: &SharedOrderedCommitBinding,
+    snapshot: &super::shared_raft::InstalledAgentRaftSnapshotV2,
+) -> Result<bool, JournalStoreError> {
+    let claim = binding.claim();
+    let boundary = snapshot.claim.ordered();
+    if binding.journal_store().as_bytes() != &snapshot.claim.journal_store().0
+        || claim.space() != boundary.space()
+        || claim.agent() != boundary.agent()
+        || claim.genesis() != boundary.genesis()
+        || claim.admission() != boundary.admission()
+        || claim.raft_index() == 0
+        || claim.ordered().index == 0
+    {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
+    Ok(claim.raft_index() <= snapshot.claim.raft_index()
+        && claim.ordered().index <= boundary.ordered().index)
 }
 
 /// Typed, content-addressed persistence for permanent live-system authority
@@ -2302,7 +2363,7 @@ fn validate_checkpoint_publication<S: AgentJournalStore>(
     Ok(())
 }
 
-fn validate_gc_limits(limits: GcLimits) -> Result<(), JournalStoreError> {
+pub(crate) fn validate_gc_limits(limits: GcLimits) -> Result<(), JournalStoreError> {
     if limits.max_marked_objects == 0
         || limits.max_marked_blobs == 0
         || limits.max_scanned_files == 0
@@ -4652,6 +4713,31 @@ impl SharedOrderedCommitStore for MemoryAgentJournalStore {
             ids.push(entry);
         }
         Ok(ids)
+    }
+}
+
+impl SharedOrderedCommitRetirementStore for MemoryAgentJournalStore {
+    fn retire_shared_ordered_commits(
+        &mut self,
+        snapshot: &super::shared_raft::InstalledAgentRaftSnapshotV2,
+        maximum: usize,
+    ) -> Result<SharedOrderedCommitRetirement, JournalStoreError> {
+        validate_snapshot_retirement_scope(self, snapshot)?;
+        let mut eligible = Vec::new();
+        for (&entry, bytes) in &self.shared_ordered_commits {
+            let binding = decode_shared_ordered_commit_binding(bytes, entry)?;
+            if binding_retired_by_snapshot(&binding, snapshot)? {
+                eligible.push(entry);
+            }
+        }
+        let removed = eligible.len().min(maximum);
+        for entry in eligible.iter().take(removed) {
+            self.shared_ordered_commits.remove(entry);
+        }
+        Ok(SharedOrderedCommitRetirement {
+            removed,
+            remaining: eligible.len().saturating_sub(removed),
+        })
     }
 }
 
@@ -10122,6 +10208,39 @@ impl SharedOrderedCommitStore for FileAgentJournalStore {
             return Err(JournalStoreError::LimitExceeded);
         }
         Ok(ids.into_iter().collect())
+    }
+}
+
+impl SharedOrderedCommitRetirementStore for FileAgentJournalStore {
+    fn retire_shared_ordered_commits(
+        &mut self,
+        snapshot: &super::shared_raft::InstalledAgentRaftSnapshotV2,
+        maximum: usize,
+    ) -> Result<SharedOrderedCommitRetirement, JournalStoreError> {
+        validate_snapshot_retirement_scope(self, snapshot)?;
+        let mut eligible = Vec::new();
+        for entry in self.shared_ordered_commit_ids()? {
+            let binding = self
+                .shared_ordered_commit(entry)?
+                .ok_or(JournalStoreError::Corrupt)?;
+            if binding_retired_by_snapshot(&binding, snapshot)? {
+                eligible.push(entry);
+            }
+        }
+        let removed = eligible.len().min(maximum);
+        let directory = self.directory(SHARED_ORDERED_COMMIT_DIRECTORY)?;
+        for entry in eligible.iter().take(removed) {
+            unlink_file_at(directory, &encode_hex(entry.as_bytes()))?;
+        }
+        if removed != 0 {
+            directory
+                .sync_all()
+                .map_err(|_| JournalStoreError::Unavailable)?;
+        }
+        Ok(SharedOrderedCommitRetirement {
+            removed,
+            remaining: eligible.len().saturating_sub(removed),
+        })
     }
 }
 

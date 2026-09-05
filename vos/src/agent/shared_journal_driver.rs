@@ -19,26 +19,33 @@ use super::driver::AgentTrustProvider;
 use super::execution::RuntimeBlob;
 use super::journal::{CanonicalJournalRecord, MergeEvent};
 use super::journal_store::{
-    AgentJournalStore, CatalogBlobResolverFactory, JournalBlobClass, JournalStoreError,
-    ReverifiedRootJournalStore, SharedOrderedCommitStore,
+    AgentJournalGarbageCollection, AgentJournalStore, CatalogBlobResolverFactory, GcLimits,
+    JournalBlobClass, JournalGc, JournalStoreError, ReverifiedRootJournalStore,
+    SharedOrderedCommitRetirementStore, SharedOrderedCommitStore, validate_gc_limits,
 };
 use super::local_journal_driver::{
     LocalMergeAuthenticator, LocalReplayExecutorError, StandardLocalReplayExecutor,
 };
+#[cfg(test)]
+use super::replay::prepare_local;
 use super::replay::{
     CommittedSharedOrdered, MaterializeError, NoPrunedOrderedBases, ReplayMaterialization,
     ReplayPreparation, ReplaySource, SharedReplayPreparation, materialize_current, prepare_merge,
-    prepare_shared_ordered,
+    prepare_shared_checkpoint, prepare_shared_ordered, validate_published_shared_checkpoint,
+};
+use super::shared_commit::{
+    OrderedCommitClaim, SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim, SharedCommitError,
 };
 use super::shared_raft::{
     AgentGenerationRouteKey, AgentRaftApplicationErrorV2, AgentRaftApplicationLedgerV2,
     AgentRaftAuditDisposition, AgentRaftCommand, AgentRaftFoundationApplyOutcomeV2,
     AgentRaftJournalAuditV2, AgentRaftOrderedJournalAnchorV2, AgentRaftPendingOrderedV2,
     ArtifactBatchId, ArtifactBatchManifest, ArtifactChunk, CommittedSharedRaftSlot,
+    InstalledAgentRaftSnapshotV2,
 };
 use super::{AgentProfile, ReplicaRole};
 use crate::service::wire::ServiceWire;
-use crate::service::{BlobRef, NodeId};
+use crate::service::{BlobRef, Hash, NodeId};
 
 type SharedReplayError = MaterializeError<core::convert::Infallible, LocalReplayExecutorError>;
 
@@ -573,6 +580,66 @@ pub(crate) enum SharedPhysicalApplyOutcome {
     Idle,
 }
 
+/// Deterministic test executor used only to create a fully authenticated
+/// Local-head suffix around the snapshot predecessor regression. Production
+/// Shared replay always uses `StandardLocalReplayExecutor` above.
+#[cfg(test)]
+struct RejectedInvocationTestExecutor;
+
+#[cfg(test)]
+impl super::replay::ReplayExecutor for RejectedInvocationTestExecutor {
+    type Error = core::convert::Infallible;
+
+    fn verify_merge_event(&mut self, _event: &MergeEvent) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    fn authenticate(
+        &mut self,
+        input: &super::journal::ReplayInput,
+        _before: &super::wire::RuntimeState,
+        _position: super::replay::ReplayPosition,
+    ) -> Result<(), Self::Error> {
+        assert!(input.validate().is_ok());
+        Ok(())
+    }
+
+    fn execute(
+        &mut self,
+        input: &super::journal::ReplayInput,
+        before: &super::wire::RuntimeState,
+        _position: super::replay::ReplayPosition,
+    ) -> Result<super::replay::ReplayTransition, Self::Error> {
+        let super::journal::ReplayOperation::Invoke {
+            invocation,
+            observed_slot,
+            ..
+        } = &input.operation
+        else {
+            panic!("the acknowledgement short-circuits before test execution")
+        };
+        let decoded = super::wire::decode_standard_runtime_state(before).unwrap();
+        let mut runtime = super::standard::StandardAgentRuntime::restore(decoded).unwrap();
+        runtime
+            .commit_exact_outcome_clock(invocation, *observed_slot)
+            .unwrap();
+        Ok(super::replay::ReplayTransition {
+            state: super::wire::encode_standard_runtime_state(&runtime.snapshot()),
+            disposition: super::replay::ReplayDisposition::Rejected,
+            result: Some(Err(super::execution::ActorExecutionError::NotFound)),
+            next_runtime: input.runtime.clone(),
+            products: super::replay::ReplayProducts::default(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SharedSnapshotCompactionOutcome {
+    pub(crate) bindings_removed: usize,
+    pub(crate) bindings_remaining: usize,
+    pub(crate) journal: Option<JournalGc>,
+}
+
 #[derive(Debug)]
 pub(crate) enum SharedJournalDriverError {
     Store(JournalStoreError),
@@ -583,6 +650,7 @@ pub(crate) enum SharedJournalDriverError {
     InvalidProfile,
     InvalidArtifactBatch,
     CrossStoreMismatch,
+    Snapshot(SharedCommitError),
 }
 
 impl From<JournalStoreError> for SharedJournalDriverError {
@@ -609,13 +677,21 @@ impl From<SharedArtifactStagerError> for SharedJournalDriverError {
     }
 }
 
+impl From<SharedCommitError> for SharedJournalDriverError {
+    fn from(error: SharedCommitError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
 /// One independently durable physical Shared replica.
 pub(crate) struct SharedJournalAgentDriver<S, A>
 where
     S: AgentJournalStore
         + ReplaySource<Error = JournalStoreError>
         + CatalogBlobResolverFactory
-        + SharedOrderedCommitStore,
+        + SharedOrderedCommitStore
+        + SharedOrderedCommitRetirementStore
+        + AgentJournalGarbageCollection,
     A: SharedArtifactStager,
 {
     store: S,
@@ -631,7 +707,9 @@ where
     S: AgentJournalStore
         + ReplaySource<Error = JournalStoreError>
         + CatalogBlobResolverFactory
-        + SharedOrderedCommitStore,
+        + SharedOrderedCommitStore
+        + SharedOrderedCommitRetirementStore
+        + AgentJournalGarbageCollection,
     A: SharedArtifactStager,
 {
     pub(crate) fn open(
@@ -673,6 +751,10 @@ where
             return Err(SharedJournalDriverError::WrongReplica);
         }
         let audit = ledger.journal_audit()?;
+        if let Some(snapshot) = &audit.snapshot {
+            validate_published_shared_checkpoint(&store, &materialization, &snapshot.claim)
+                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        }
         reconcile_journal_ledger(&store, &materialization, ledger.journal_store(), &audit)?;
         store.finish_reverified_open()?;
         Ok(Self {
@@ -782,6 +864,116 @@ where
         &self.ledger
     }
 
+    /// Build one real seal-only Ordered command from the currently
+    /// materialized filesystem journal, then append its canonical bytes to
+    /// the physical Raft log. Test-only because production log admission is
+    /// owned by the not-yet-attached Agent transport coordinator.
+    #[cfg(test)]
+    pub(crate) fn append_ordered_for_test(
+        &mut self,
+        term: u64,
+        operation: super::journal::ReplayOperation,
+    ) -> Result<u64, SharedJournalDriverError> {
+        let heads = self.materialization.heads().clone();
+        let merge_state = self.materialization.state().merge.clone();
+        let state = BlobRef::of_bytes(&merge_state);
+        self.store
+            .put_blob(JournalBlobClass::LaneState, &state, &merge_state)?;
+        let manifest = super::journal::LaneStateManifest {
+            genesis: heads.genesis,
+            runtime: heads.runtime.clone(),
+            lane: super::journal::PersistedLane::Merge,
+            cursor: super::journal::LaneCursor::Merge {
+                frontier: heads.merge_frontier,
+            },
+            state,
+        };
+        self.store.put(&manifest)?;
+        let seal = super::journal::MergeSeal {
+            genesis: heads.genesis,
+            frontier: heads.merge_frontier,
+            ordered_base: super::journal::OrderedBase {
+                index: heads.ordered_index,
+                head: heads.ordered_head,
+            },
+            merge_state: manifest.id(),
+        };
+        self.store.put(&seal)?;
+        let entry = super::journal::OrderedEntry {
+            genesis: heads.genesis,
+            index: heads
+                .ordered_index
+                .checked_add(1)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+            parent: heads.ordered_head,
+            merge_frontier: heads.merge_frontier,
+            merge_seal: Some(seal.id()),
+            input: super::journal::ReplayInput {
+                runtime: heads.runtime,
+                operation,
+            },
+        };
+        let command = AgentRaftCommand::Ordered {
+            route: self.active_route()?,
+            artifact_batch: None,
+            entry,
+        };
+        self.ledger
+            .append_committed_for_test(
+                term,
+                &vos_raft::EntryKind::Data {
+                    payload: command.encode(),
+                },
+            )
+            .map_err(SharedJournalDriverError::from)
+    }
+
+    /// Publish a rejected Local invocation and its acknowledgement through
+    /// the generic replay/store boundary. This is test-only scaffolding for
+    /// proving that snapshot recovery binds the actual post-Ordered head.
+    #[cfg(test)]
+    pub(crate) fn append_acknowledged_local_for_test(
+        &mut self,
+        invocation: super::journal::ReplayOperation,
+        acknowledgement: super::journal::ReplayOperation,
+    ) -> Result<(), SharedJournalDriverError> {
+        let mut executor = RejectedInvocationTestExecutor;
+        for operation in [invocation, acknowledgement] {
+            let heads = self.materialization.heads().clone();
+            let entry = super::journal::LocalEntry {
+                genesis: heads.genesis,
+                node: heads.node,
+                revision: heads
+                    .local_revision
+                    .checked_add(1)
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+                parent: heads.local_head,
+                ordered_base: super::journal::OrderedBase {
+                    index: heads.ordered_index,
+                    head: heads.ordered_head,
+                },
+                merge_frontier: heads.merge_frontier,
+                input: super::journal::ReplayInput {
+                    runtime: heads.runtime,
+                    operation,
+                },
+            };
+            let prepared = prepare_local(
+                &mut self.store,
+                &mut executor,
+                &self.materialization,
+                &entry,
+            )
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+            let ReplayPreparation::Ready(prepared) = prepared else {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            };
+            let (_, successor, _) = prepared.publish()?;
+            self.materialization = successor;
+        }
+        Ok(())
+    }
+
     pub(crate) fn capacity(&self) -> Result<(u64, u64, bool), SharedJournalDriverError> {
         let audit = self.ledger.journal_audit()?;
         Ok((
@@ -789,6 +981,196 @@ where
             audit.remaining_slots,
             audit.reservation_pending,
         ))
+    }
+
+    fn snapshot_boundary_claim(&self) -> Result<OrderedCommitClaim, SharedJournalDriverError> {
+        let heads = self.materialization.heads();
+        let entry = heads.ordered_head.ok_or(SharedJournalDriverError::Ledger(
+            AgentRaftApplicationErrorV2::SnapshotBoundaryRequired,
+        ))?;
+        let binding = self
+            .store
+            .shared_ordered_commit(entry)?
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        let claim = binding.claim();
+        if claim.ordered().head != Some(entry)
+            || claim.ordered().index != heads.ordered_index
+            || claim.genesis() != heads.genesis
+            || claim.admission() != heads.admission
+            || claim.runtime() != &heads.runtime
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        Ok(claim.clone())
+    }
+
+    fn prepare_snapshot_candidate(
+        &mut self,
+    ) -> Result<
+        (
+            super::replay::PreparedSharedCheckpoint,
+            SharedAgentSnapshotClaim,
+        ),
+        SharedJournalDriverError,
+    > {
+        let ordered = self.snapshot_boundary_claim()?;
+        let context = self.ledger.snapshot_context(&ordered)?;
+        let plan = prepare_shared_checkpoint(&mut self.store, &self.materialization)
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let (control, linear, merge, local) = plan
+            .lane_roots()
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        let next = plan.next_heads();
+        let claim = SharedAgentSnapshotClaim::new(
+            ordered,
+            context.active_committee,
+            context.authority_epoch,
+            Hash(*self.store.instance_id().as_bytes()),
+            context.boundary_payload_commitment,
+            context.ordered_successor,
+            plan.predecessor_heads(),
+            next.id(),
+            plan.checkpoint().manifest().id(),
+            next.node,
+            control,
+            linear,
+            merge,
+            local,
+            next.ordered_invocations,
+            next.merge_invocations,
+            next.local_invocations,
+            plan.checkpoint().manifest().artifacts,
+            context.retired_audit_root,
+            context.committee_evidence_root,
+            context.previous_snapshot,
+        )?;
+        plan.validate_claim(&claim)?;
+        Ok((plan, claim))
+    }
+
+    /// Return the exact unsigned checkpoint claim. This is a read-only
+    /// operation: no lane blob, journal head, audit row, or Raft scalar is
+    /// changed until a voter-majority certificate is returned.
+    pub(crate) fn snapshot_candidate(
+        &mut self,
+    ) -> Result<SharedAgentSnapshotClaim, SharedJournalDriverError> {
+        self.prepare_snapshot_candidate().map(|(_, claim)| claim)
+    }
+
+    /// Publish and install one exact Agent-specific snapshot. The journal CAS
+    /// precedes the atomic Raft/audit retirement; restart recognizes the
+    /// journal-first intermediate state and accepts only the same certificate.
+    pub(crate) fn install_snapshot(
+        &mut self,
+        certificate: &SharedAgentSnapshotCertificate,
+    ) -> Result<InstalledAgentRaftSnapshotV2, SharedJournalDriverError> {
+        if let Some(installed) = self.ledger.current_snapshot()? {
+            if installed.certificate_commitment == certificate.commitment() {
+                if installed.claim != *certificate.claim() {
+                    return Err(SharedJournalDriverError::CrossStoreMismatch);
+                }
+                validate_published_shared_checkpoint(
+                    &self.store,
+                    &self.materialization,
+                    certificate.claim(),
+                )
+                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+                return self
+                    .ledger
+                    .install_snapshot(certificate)
+                    .map_err(Into::into);
+            }
+            // Let the ledger's authenticated snapshot cursor reject lower or
+            // equal divergent certificates before preparing or publishing
+            // any journal checkpoint material.
+            if certificate.claim().raft_index() <= installed.claim.raft_index() {
+                return self
+                    .ledger
+                    .install_snapshot(certificate)
+                    .map_err(Into::into);
+            }
+        }
+
+        let verified = if self.materialization.heads_id() == certificate.claim().journal_heads() {
+            let ordered = self.snapshot_boundary_claim()?;
+            let context = self.ledger.snapshot_context(&ordered)?;
+            validate_published_shared_checkpoint(
+                &self.store,
+                &self.materialization,
+                certificate.claim(),
+            )
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+            let claim = certificate.claim();
+            if claim.ordered() != &ordered
+                || claim.active_committee() != &context.active_committee
+                || claim.authority_epoch() != context.authority_epoch
+                || claim.journal_store().0 != *self.store.instance_id().as_bytes()
+                || claim.boundary_payload_commitment() != context.boundary_payload_commitment
+                || claim.ordered_successor() != context.ordered_successor
+                || claim.retired_audit_root() != context.retired_audit_root
+                || claim.committee_evidence_root() != context.committee_evidence_root
+                || claim.previous_snapshot() != context.previous_snapshot
+            {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            certificate.verify(&context.active_committee, claim)?
+        } else {
+            let (plan, expected) = self.prepare_snapshot_candidate()?;
+            let active = expected.active_committee().clone();
+            let verified = certificate.verify(&active, &expected)?;
+            let successor = plan.publish_shared(&mut self.store, &verified)?;
+            self.materialization = successor;
+            verified
+        };
+        if verified.claim() != certificate.claim() {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        self.ledger
+            .install_snapshot(certificate)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn current_snapshot(
+        &self,
+    ) -> Result<Option<InstalledAgentRaftSnapshotV2>, SharedJournalDriverError> {
+        self.ledger.current_snapshot().map_err(Into::into)
+    }
+
+    pub(crate) fn compact_snapshot(
+        &mut self,
+        maximum_binding_unlinks: usize,
+        gc_limits: GcLimits,
+    ) -> Result<SharedSnapshotCompactionOutcome, SharedJournalDriverError> {
+        if maximum_binding_unlinks == 0 {
+            return Err(JournalStoreError::LimitExceeded.into());
+        }
+        // Validate every caller-selected budget before retiring authority
+        // bindings. A rejected pass must leave both namespaces untouched.
+        validate_gc_limits(gc_limits)?;
+        let snapshot = self
+            .ledger
+            .current_snapshot()?
+            .ok_or(SharedJournalDriverError::Ledger(
+                AgentRaftApplicationErrorV2::SnapshotBoundaryRequired,
+            ))?;
+        validate_published_shared_checkpoint(&self.store, &self.materialization, &snapshot.claim)
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let bindings = self
+            .store
+            .retire_shared_ordered_commits(&snapshot, maximum_binding_unlinks)?;
+        let journal = if bindings.remaining == 0 {
+            Some(
+                self.store
+                    .collect_garbage(self.materialization.heads_id(), gc_limits)?,
+            )
+        } else {
+            None
+        };
+        Ok(SharedSnapshotCompactionOutcome {
+            bindings_removed: bindings.removed,
+            bindings_remaining: bindings.remaining,
+            journal,
+        })
     }
 
     /// Apply one authenticated causal event without crossing Raft. Replay
@@ -1042,10 +1424,15 @@ fn reconcile_journal_ledger<S: AgentJournalStore + SharedOrderedCommitStore>(
     audit: &AgentRaftJournalAuditV2,
 ) -> Result<(), SharedJournalDriverError> {
     let heads = materialization.heads();
+    let snapshot_base = audit
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.claim.ordered().ordered());
     let mut chain = BTreeMap::new();
     let mut next = heads.ordered_head;
     let mut expected_index = heads.ordered_index;
-    while let Some(entry_id) = next {
+    while expected_index > snapshot_base.map_or(0, |base| base.index) {
+        let entry_id = next.ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
         if chain.len() == super::shared_raft::MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
@@ -1064,7 +1451,14 @@ fn reconcile_journal_ledger<S: AgentJournalStore + SharedOrderedCommitStore>(
             .checked_sub(1)
             .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
     }
-    if expected_index != 0 || chain.len() != heads.ordered_index as usize {
+    let expected_parent = snapshot_base.and_then(|base| base.head);
+    if expected_index != snapshot_base.map_or(0, |base| base.index)
+        || next != expected_parent
+        || chain.len()
+            != heads
+                .ordered_index
+                .saturating_sub(snapshot_base.map_or(0, |base| base.index)) as usize
+    {
         return Err(SharedJournalDriverError::CrossStoreMismatch);
     }
 
@@ -1090,10 +1484,33 @@ fn reconcile_journal_ledger<S: AgentJournalStore + SharedOrderedCommitStore>(
         }
     }
     let actual = store.shared_ordered_commit_ids()?;
-    if actual.len() != expected_bindings.len()
-        || actual
-            .iter()
-            .any(|entry| !expected_bindings.contains(entry))
+    for entry in &actual {
+        if expected_bindings.contains(entry) {
+            continue;
+        }
+        let snapshot = audit
+            .snapshot
+            .as_ref()
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        let binding = store
+            .shared_ordered_commit(*entry)?
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        let claim = binding.claim();
+        if binding.journal_store() != journal_store
+            || claim.space() != snapshot.claim.ordered().space()
+            || claim.agent() != snapshot.claim.ordered().agent()
+            || claim.genesis() != snapshot.claim.ordered().genesis()
+            || claim.admission() != snapshot.claim.ordered().admission()
+            || claim.raft_index() > snapshot.claim.raft_index()
+            || claim.ordered().index > snapshot.claim.ordered().ordered().index
+            || claim.ordered().head != Some(*entry)
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+    }
+    if expected_bindings
+        .iter()
+        .any(|entry| !actual.contains(entry))
         || chain.keys().any(|entry| !expected_bindings.contains(entry))
     {
         return Err(SharedJournalDriverError::CrossStoreMismatch);
