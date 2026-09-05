@@ -1533,7 +1533,7 @@ mod tests {
             fields: vec![ParsedField::Inline(ParsedInlineField {
                 source_index: 0,
                 name: "value".into(),
-                type_identity: "u8".into(),
+                type_identity: "core::primitive::u8".into(),
                 persistence: sdk::FieldPersistence::State(StateLane::Linear),
             })],
             methods: vec![ParsedMethod {
@@ -1550,7 +1550,7 @@ mod tests {
                 name: "write".into(),
                 mode: MethodMode::Linear,
                 arguments: Vec::new(),
-                return_type_identity: "u8".into(),
+                return_type_identity: "core::primitive::u8".into(),
                 authorization_policy: AuthorizationPolicySelector::Public,
                 idempotency: IdempotencyRequirement::Required,
                 attestation: AttestationRequirement::None,
@@ -1933,7 +1933,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the clean RuntimeWork::Manage PVM repin"]
     fn physical_sdk_create_two_agents_reopen_retry_and_profile_scope_refusals() {
         let directory = TestDirectory::new("physical-create");
         let root = directory.child("agents");
@@ -2022,7 +2021,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the clean RuntimeWork::Manage PVM repin"]
     fn physical_valid_staged_create_and_store_stages_reconcile_on_restart() {
         let directory = TestDirectory::new("physical-stage");
         let root = directory.child("agents");
@@ -2074,7 +2072,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the clean RuntimeWork::Manage PVM repin"]
     fn physical_manage_invoke_retry_lifecycle_and_catalog_reconciliation() {
         let directory = TestDirectory::new("physical-lifecycle");
         let root = directory.child("agents");
@@ -2135,6 +2132,12 @@ mod tests {
 
         let work = invocation(&descriptor, &record, &actor_package, 0xa1);
         let authority = invocation_receipt(&descriptor, &work, 50, 50);
+        let mut forged = authority.clone();
+        forged.signature[0] ^= 1;
+        assert_eq!(
+            host.invoke(agent, work.clone(), forged).unwrap(),
+            RuntimeOutcome::Completed(Err(sdk::InvocationError::InvalidAuthorization))
+        );
         let completed = host.invoke(agent, work.clone(), authority.clone()).unwrap();
         assert!(matches!(completed, RuntimeOutcome::Completed(Ok(_))));
         drop(host);
@@ -2202,7 +2205,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the clean RuntimeWork::Manage PVM repin"]
     fn physical_resume_boundary_replays_persisted_fifo_continuations() {
         let directory = TestDirectory::new("physical-resume");
         let root = directory.child("agents");
