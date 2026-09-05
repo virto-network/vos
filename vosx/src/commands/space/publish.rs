@@ -307,11 +307,11 @@ mod tests {
         PackageManifest as CleanPackageManifest, PackageSigning,
     };
     use vos::agent::sdk::schema::{ConstructorContract, ParsedSchema};
-    use vos::agent::sdk::task::TaskDependencySetArtifact;
+    use vos::agent::sdk::task::{TaskDependency, TaskDependencySetArtifact, TaskProofRequirement};
     use vos::agent::sdk::wire::CanonicalWire as _;
     use vos::agent::sdk::{
-        BlobRef as AgentBlobRef, LaneSet, ProducerId as AgentProducerId, ProofSystemSet,
-        RuntimeCapabilities, RuntimeRequirements,
+        BlobRef as AgentBlobRef, LaneSet, ProducerId as AgentProducerId,
+        ProgramId as AgentProgramId, ProofSystemSet, RuntimeCapabilities, RuntimeRequirements,
     };
     use vos::metadata::{ActorMeta, MessageMeta};
     use vos::service::{
@@ -411,6 +411,23 @@ mod tests {
         package
     }
 
+    fn replace_clean_artifact(
+        package: &mut PackageEnvelope,
+        previous: AgentBlobRef,
+        replacement: &[u8],
+    ) -> AgentBlobRef {
+        let artifact = package
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.identity == previous)
+            .unwrap();
+        *artifact = clean_artifact(replacement);
+        package
+            .artifacts
+            .sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+        AgentBlobRef::of_bytes(replacement)
+    }
+
     fn signed_agent_actor_package() -> PackageEnvelope {
         let program = standard_pvm();
         let schema = ParsedSchema {
@@ -490,6 +507,35 @@ mod tests {
             }),
             artifacts: vec![clean_artifact(&pvm)],
         })
+    }
+
+    fn signed_agent_actor_with_invalid_task_pvm() -> PackageEnvelope {
+        let mut package = signed_agent_actor_package();
+        let invalid_task = b"not a standard task pvm";
+        let dependency = TaskDependency::new(
+            AgentBlobRef::of_bytes(invalid_task),
+            AgentProgramId::of_pvm(invalid_task),
+            64,
+            128,
+            TaskProofRequirement::None,
+        )
+        .unwrap();
+        let tasks = TaskDependencySetArtifact {
+            dependencies: vec![dependency],
+        }
+        .encode()
+        .unwrap();
+        let CleanPackageManifest::Actor(manifest) = &mut package.manifest else {
+            unreachable!()
+        };
+        let previous = manifest.task_dependencies.clone();
+        manifest.task_dependencies = AgentBlobRef::of_bytes(&tasks);
+        replace_clean_artifact(&mut package, previous, &tasks);
+        package.artifacts.push(clean_artifact(invalid_task));
+        package
+            .artifacts
+            .sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+        sign_clean(package)
     }
 
     #[test]
@@ -643,6 +689,25 @@ mod tests {
         let bytes = signed_agent_runtime_package().encode().unwrap();
         let error = canonical_program("standard-runtime", BlobHash::of(&bytes), bytes).unwrap_err();
         assert!(error.to_string().contains("AgentRuntime"));
+    }
+
+    #[test]
+    fn publishing_rejects_nonstandard_actor_and_task_programs() {
+        let mut actor = signed_agent_actor_package();
+        let invalid_actor = b"not a standard actor pvm";
+        let CleanPackageManifest::Actor(manifest) = &mut actor.manifest else {
+            unreachable!()
+        };
+        let previous = manifest.program.clone();
+        manifest.program = AgentBlobRef::of_bytes(invalid_actor);
+        replace_clean_artifact(&mut actor, previous, invalid_actor);
+        let actor = sign_clean(actor).encode().unwrap();
+        let error = canonical_program("counter", BlobHash::of(&actor), actor).unwrap_err();
+        assert!(error.to_string().contains("actor artifact"));
+
+        let task = signed_agent_actor_with_invalid_task_pvm().encode().unwrap();
+        let error = canonical_program("counter", BlobHash::of(&task), task).unwrap_err();
+        assert!(error.to_string().contains("Task artifact"));
     }
 
     #[test]
