@@ -2907,14 +2907,17 @@ impl NodeService {
     /// learn the space before an operator grants it a role. `Private`
     /// (`msg-*`) deliberately does NOT accept enrollment here — a voter
     /// isn't automatically a channel reader; that stays grant-based.
-    #[cfg(feature = "network")]
+    #[cfg(all(feature = "network", feature = "storage"))]
     fn caller_is_enrolled_node(&self, peer: &libp2p::PeerId) -> bool {
-        self.lookup_node_role(crate::network::derive_node_prefix(peer)) > 0
+        let prefix = crate::network::derive_node_prefix(peer);
+        self.lookup_node_member(prefix)
+            .is_some_and(|member| node_member_authenticates_active_slot(&member, prefix, peer))
     }
 
-    /// No-network build: enrollment can't be probed, so fall back to the
-    /// grant-only membership test.
-    #[cfg(not(feature = "network"))]
+    /// Without both authenticated transport and durable roster state,
+    /// enrollment cannot be proven; fall back to the grant-only membership
+    /// test.
+    #[cfg(not(all(feature = "network", feature = "storage")))]
     fn caller_is_enrolled_node(&self, _peer: &libp2p::PeerId) -> bool {
         false
     }
@@ -19489,6 +19492,79 @@ mod tests {
         assert!(!check(Some(0)), "an unenrolled prefix is refused");
         assert!(!check(Some(2)), "an OBSERVER is refused");
         assert!(!check(None), "an unreachable registry fails closed");
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn enrolled_node_sync_gate_binds_the_full_authenticated_peer_id() {
+        use crate::actors::codec::Encode;
+        use crate::value::Value;
+
+        let mut peers_by_prefix = std::collections::BTreeMap::new();
+        let (enrolled_peer, colliding_peer, prefix) = (1u64..=4_096)
+            .find_map(|counter| {
+                let mut seed = [0u8; 32];
+                seed[..8].copy_from_slice(&counter.to_le_bytes());
+                seed[8..16].copy_from_slice(&counter.rotate_left(17).to_le_bytes());
+                seed[16..24].copy_from_slice(&counter.rotate_left(31).to_le_bytes());
+                seed[24..].copy_from_slice(&counter.rotate_left(47).to_le_bytes());
+                let keypair = libp2p::identity::Keypair::ed25519_from_bytes(seed)
+                    .expect("valid deterministic Ed25519 seed");
+                let peer = keypair.public().to_peer_id();
+                let prefix = crate::network::derive_node_prefix(&peer);
+                peers_by_prefix
+                    .insert(prefix, peer)
+                    .map(|previous| (previous, peer, prefix))
+            })
+            .expect("deterministic fixture range contains a compact-prefix collision");
+        assert_ne!(enrolled_peer, colliding_peer);
+        assert_eq!(crate::network::derive_node_prefix(&enrolled_peer), prefix);
+        assert_eq!(crate::network::derive_node_prefix(&colliding_peer), prefix);
+
+        let enrolled_row = crate::registry::MemberRow {
+            kind: crate::registry::MEMBER_KIND_NODE,
+            key: enrolled_peer.to_bytes(),
+            prefix,
+            role: crate::registry::NODE_ROLE_VOTER,
+            proof_kind: 0,
+            proof_data: Vec::new(),
+        };
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(ServiceId::REGISTRY.0, tx);
+        let registry = thread::spawn(move || {
+            while let Ok(request) = rx.recv() {
+                assert_eq!(
+                    intercepted_method_name(&request.msg).as_deref(),
+                    Some("members")
+                );
+                let page = crate::registry::MemberPage {
+                    members: vec![enrolled_row.clone()],
+                    next_kind: crate::registry::MEMBER_KIND_IDENTITY,
+                    next_key: Vec::new(),
+                    more: false,
+                };
+                let reply = encode_invoke_envelope(
+                    crate::actors::run::STATUS_DONE,
+                    &[],
+                    &Value::Bytes(page.encode()).encode(),
+                );
+                assert!(request.reply.send(reply));
+            }
+        });
+        let service = lifecycle_service(
+            routes,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+        );
+
+        assert!(service.caller_is_enrolled_node(&enrolled_peer));
+        assert!(
+            !service.caller_is_enrolled_node(&colliding_peer),
+            "a prefix collision must not inherit roster enrollment",
+        );
+        drop(service);
+        registry.join().unwrap();
     }
 
     #[test]
