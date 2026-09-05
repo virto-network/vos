@@ -549,11 +549,13 @@ impl AgentHostRootLease {
         }
     }
 
+    #[cfg(not(all(feature = "storage", target_os = "linux")))]
     fn arm_after_agent_open(&mut self) -> Result<(), AgentHostError> {
-        #[cfg(not(all(feature = "storage", target_os = "linux")))]
-        {
-            return Err(AgentHostError::Unavailable);
-        }
+        Err(AgentHostError::Unavailable)
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    fn arm_after_agent_open(&mut self) -> Result<(), AgentHostError> {
         self.validate_live()?;
         let fresh_binding =
             encode_agent_host_lease_binding(&self.root, self.scope, HOST_LEASE_BINDING_FRESH)?;
@@ -1859,12 +1861,25 @@ fn reject_queued_agent_host_jobs(receiver: &Receiver<AgentHostCommand>) {
 }
 
 impl AgentHost {
+    #[cfg(not(all(feature = "storage", target_os = "linux")))]
+    pub fn open(
+        lease: AgentHostRootLease,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        genesis: Arc<dyn SystemAgentGenesisProvider>,
+        root_pins: RootAnchorPins,
+    ) -> Result<Self, AgentHostError> {
+        let _ = (lease, trust, merge, genesis, root_pins);
+        Err(AgentHostError::Unavailable)
+    }
+
     /// Open the one independently pinned Local system Agent in `root`.
     ///
     /// Startup probes the configured provider locator even when no journal is
     /// present. An archived provider-first Create is therefore completed after
     /// a crash before the first destination write. Conversely, generation
     /// residue without its exact archive fails closed and is never re-minted.
+    #[cfg(all(feature = "storage", target_os = "linux"))]
     pub fn open(
         mut lease: AgentHostRootLease,
         trust: Arc<dyn AgentTrustProvider>,
@@ -2390,17 +2405,24 @@ impl AgentHost {
     }
 
     /// Create a durable empty agent with its explicitly selected runtime.
+    #[cfg(not(all(feature = "storage", target_os = "linux")))]
     pub fn create(
         &mut self,
         config: AgentConfig,
         runtime_package: Package,
         authority: &AgentAuthorityReceipt,
     ) -> Result<AgentIdentity, AgentHostError> {
-        #[cfg(not(all(feature = "storage", target_os = "linux")))]
-        {
-            let _ = (&config, &runtime_package, authority);
-            return Err(AgentHostError::Unavailable);
-        }
+        let _ = (config, runtime_package, authority);
+        Err(AgentHostError::Unavailable)
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    pub fn create(
+        &mut self,
+        config: AgentConfig,
+        runtime_package: Package,
+        authority: &AgentAuthorityReceipt,
+    ) -> Result<AgentIdentity, AgentHostError> {
         self._root_lease.validate_live()?;
         if !self.scope.admits(&config) {
             return Err(AgentHostError::ScopeMismatch);
