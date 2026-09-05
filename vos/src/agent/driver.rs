@@ -34,6 +34,510 @@ use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{ActorId, BlobRef, CapabilityId, DeploymentId, Hash, ProgramId};
 
 pub const DEFAULT_MANAGEMENT_GAS: Gas = 1_000_000_000;
+const MAX_STORED_PACKAGE_BYTES: usize = if super::package::MAX_ENCODED_PACKAGE_BYTES
+    > crate::agent_sdk::package::MAX_PACKAGE_ENCODED_BYTES
+{
+    super::package::MAX_ENCODED_PACKAGE_BYTES
+} else {
+    crate::agent_sdk::package::MAX_PACKAGE_ENCODED_BYTES
+};
+
+fn stored_blob_matches(reference: &BlobRef, bytes: &[u8]) -> bool {
+    reference.matches(bytes)
+        || (reference.len == bytes.len() as u64
+            && reference.hash.0 == crate::agent_sdk::BlobRef::of_bytes(bytes).hash.0)
+}
+
+fn sdk_blob_as_legacy(reference: &crate::agent_sdk::BlobRef) -> BlobRef {
+    BlobRef {
+        hash: Hash(reference.hash.0),
+        len: reference.len,
+    }
+}
+
+fn validate_sdk_process_local_profile(
+    profile: crate::agent_sdk::AgentProfile,
+) -> Result<(), AgentDriverError> {
+    if profile == crate::agent_sdk::AgentProfile::Local {
+        Ok(())
+    } else {
+        Err(AgentDriverError::UnsupportedProfile(match profile {
+            crate::agent_sdk::AgentProfile::Local => AgentProfile::Local,
+            crate::agent_sdk::AgentProfile::Shared => AgentProfile::Shared,
+            crate::agent_sdk::AgentProfile::Private => AgentProfile::Private,
+        }))
+    }
+}
+
+fn clean_descriptor_from_state(
+    state: &RuntimeState,
+) -> Result<crate::agent_sdk::AgentDescriptor, AgentDriverError> {
+    let decoded = super::wire::decode_standard_runtime_state(state)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    decoded
+        .clean_descriptor
+        .ok_or(AgentDriverError::InvalidRuntime)
+}
+
+fn clean_projected_config_from_state(
+    state: &RuntimeState,
+) -> Result<AgentConfig, AgentDriverError> {
+    let descriptor = clean_descriptor_from_state(state)?;
+    super::standard::clean_descriptor_to_legacy_config(&descriptor)
+        .map_err(AgentDriverError::Lifecycle)
+}
+
+fn image_config_is_valid(config: &AgentConfig, state: &RuntimeState) -> bool {
+    match clean_projected_config_from_state(state) {
+        Ok(projected) => projected == *config,
+        Err(_) => config.validate().is_ok(),
+    }
+}
+
+fn validate_clean_standard_descriptor(
+    state: &crate::agent_sdk::RuntimeState,
+    expected: &crate::agent_sdk::AgentDescriptor,
+) -> Result<(), AgentDriverError> {
+    let decoded = super::wire::decode_standard_runtime_state(&sdk_state_as_legacy(state))
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    if decoded.clean_creation_descriptor.as_ref() == Some(expected)
+        && decoded.clean_descriptor.as_ref() == Some(expected)
+    {
+        Ok(())
+    } else {
+        Err(AgentDriverError::InvalidRuntime)
+    }
+}
+
+fn verify_clean_runtime_package_binding(
+    descriptor: &crate::agent_sdk::AgentDescriptor,
+    package: &super::package_admission::AdmittedRuntimePackage,
+) -> Result<(), AgentDriverError> {
+    if descriptor.validate().is_err()
+        || descriptor.runtime_package != *package.package_ref()
+        || descriptor.identity.runtime_deployment != package.deployment()
+        || descriptor.identity.runtime_program != package.program()
+        || descriptor.identity.runtime_producer != package.producer()
+        || descriptor.runtime_contract != package.manifest().contract
+        || descriptor.capabilities != package.capabilities()
+    {
+        return Err(AgentDriverError::RuntimeProgramMismatch);
+    }
+    Ok(())
+}
+
+fn clean_management_operation(
+    request: &crate::agent_sdk::ManagementRequest,
+) -> Option<crate::agent_sdk::authority::AuthorityOperationKind> {
+    use crate::agent_sdk::ManagementRequest;
+    use crate::agent_sdk::authority::AuthorityOperationKind;
+    match request {
+        ManagementRequest::Create(_) => Some(AuthorityOperationKind::CreateAgent),
+        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => None,
+        ManagementRequest::Install(_) => Some(AuthorityOperationKind::InstallActor),
+        ManagementRequest::UpgradeActor(_) => Some(AuthorityOperationKind::UpgradeActor),
+        ManagementRequest::Suspend { .. } => Some(AuthorityOperationKind::SuspendActor),
+        ManagementRequest::Resume { .. } => Some(AuthorityOperationKind::ResumeActor),
+        ManagementRequest::RemoveLeaf { .. } => Some(AuthorityOperationKind::RemoveActor),
+        ManagementRequest::UpgradeRuntime(_) => Some(AuthorityOperationKind::UpgradeRuntime),
+        ManagementRequest::ChangeReplicas { .. } => Some(AuthorityOperationKind::ChangeReplicaSet),
+    }
+}
+
+fn clean_management_actor(
+    request: &crate::agent_sdk::ManagementRequest,
+) -> Option<(crate::agent_sdk::ActorId, crate::agent_sdk::DeploymentId)> {
+    use crate::agent_sdk::ManagementRequest;
+    match request {
+        ManagementRequest::Install(install) => {
+            Some((install.entry.actor, install.entry.deployment))
+        }
+        ManagementRequest::UpgradeActor(upgrade) => Some((upgrade.actor, upgrade.to_deployment)),
+        ManagementRequest::Suspend {
+            actor,
+            expected_deployment,
+        }
+        | ManagementRequest::Resume {
+            actor,
+            expected_deployment,
+        }
+        | ManagementRequest::RemoveLeaf {
+            actor,
+            expected_deployment,
+        } => Some((*actor, *expected_deployment)),
+        _ => None,
+    }
+}
+
+fn verify_clean_management_receipt(
+    descriptor: &crate::agent_sdk::AgentDescriptor,
+    request: &crate::agent_sdk::ManagementRequest,
+    receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+    _observed_slot: u64,
+) -> Result<(), AgentDriverError> {
+    let runtime_deployment = match request {
+        crate::agent_sdk::ManagementRequest::Create(descriptor) => {
+            descriptor.identity.runtime_deployment
+        }
+        crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade) => upgrade.from_deployment,
+        _ => descriptor.identity.runtime_deployment,
+    };
+    let selector = &receipt.selector;
+    if receipt.validate_shape().is_err()
+        || !descriptor.authority.accepts(receipt)
+        || selector.space != descriptor.identity.space
+        || selector.agent != descriptor.identity.agent
+        || selector.runtime_deployment != runtime_deployment
+        || Some(selector.operation) != clean_management_operation(request)
+        || selector.actor.zip(selector.actor_deployment) != clean_management_actor(request)
+        || selector.request != request.commitment()
+        || !super::authority::verify_raw_ed25519(
+            &receipt.public_key,
+            &receipt.signing_bytes(),
+            &receipt.signature,
+        )
+    {
+        return Err(AgentDriverError::SdkManagement(
+            crate::agent_sdk::ManagementError::InvalidRequest,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sdk_management_artifacts(
+    descriptor: &crate::agent_sdk::AgentDescriptor,
+    request: &crate::agent_sdk::ManagementRequest,
+    artifacts: SdkManagementArtifacts<'_>,
+) -> Result<(), AgentDriverError> {
+    use crate::agent_sdk::ManagementRequest;
+
+    match (request, artifacts) {
+        (ManagementRequest::Install(install), SdkManagementArtifacts::Actor(package)) => {
+            validate_sdk_actor_install(descriptor, install, package)
+        }
+        (ManagementRequest::UpgradeActor(upgrade), SdkManagementArtifacts::Actor(package)) => {
+            validate_sdk_actor_upgrade(descriptor, upgrade, package)
+        }
+        (ManagementRequest::UpgradeRuntime(upgrade), SdkManagementArtifacts::Runtime(package)) => {
+            if upgrade.to_deployment != package.deployment()
+                || upgrade.to_program != package.program()
+                || upgrade.producer != package.producer()
+                || upgrade.package != *package.package_ref()
+                || upgrade.contract != package.manifest().contract
+                || upgrade.capabilities != package.capabilities()
+            {
+                return Err(AgentDriverError::RuntimeProgramMismatch);
+            }
+            Ok(())
+        }
+        (
+            ManagementRequest::Create(_)
+            | ManagementRequest::InspectActors { .. }
+            | ManagementRequest::InspectResources
+            | ManagementRequest::Suspend { .. }
+            | ManagementRequest::Resume { .. }
+            | ManagementRequest::RemoveLeaf { .. }
+            | ManagementRequest::ChangeReplicas { .. },
+            SdkManagementArtifacts::None,
+        ) => Ok(()),
+        _ => Err(AgentDriverError::InvalidRuntime),
+    }
+}
+
+fn validate_sdk_actor_install(
+    descriptor: &crate::agent_sdk::AgentDescriptor,
+    install: &crate::agent_sdk::InstallActor,
+    package: &super::package_admission::AdmittedActorPackage,
+) -> Result<(), AgentDriverError> {
+    let schema = crate::agent_sdk::schema::decode(package.state_lane_schema_bytes())
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let expected_actor = match install.entry.parent {
+        Some(parent) => crate::agent_sdk::ActorId::owned_child(parent, &install.entry.name),
+        None => {
+            crate::agent_sdk::ActorId::top_level(descriptor.identity.agent, &install.entry.name)
+        }
+    };
+    let data_present = install.installation_data.is_some();
+    if install.entry.actor != expected_actor
+        || install.entry.deployment != package.deployment()
+        || install.entry.program != package.program()
+        || install.entry.package != *package.package_ref()
+        || install.entry.agent_schema != package.manifest().state_lane_schema
+        || install.entry.method_policy != package.manifest().method_policy
+        || install.producer != package.producer()
+        || install.package != *package.package_ref()
+        || install.agent_schema != package.manifest().state_lane_schema
+        || install.method_policy != package.manifest().method_policy
+        || install.contract != package.manifest().contract
+        || install.requirements != package.requirements()
+        || install.entry.lanes != package.requirements().lanes
+        || install.constructor_abi
+            != schema
+                .constructor_abi()
+                .map_err(|_| AgentDriverError::InvalidRuntime)?
+        || install.state_layout
+            != schema
+                .state_layout_hash()
+                .map_err(|_| AgentDriverError::InvalidRuntime)?
+        || data_present != schema.requires_installation_data()
+    {
+        return Err(AgentDriverError::InvalidRuntime);
+    }
+    package
+        .requirements()
+        .supported_by(descriptor.identity.profile)
+        .then_some(())
+        .ok_or(AgentDriverError::SdkManagement(
+            crate::agent_sdk::ManagementError::UnsupportedLane,
+        ))?;
+    if !descriptor
+        .runtime_contract
+        .supports(package.manifest().contract)
+        || !descriptor.capabilities.satisfies(package.requirements())
+    {
+        return Err(AgentDriverError::SdkManagement(
+            crate::agent_sdk::ManagementError::UnsupportedRuntime,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sdk_actor_upgrade(
+    descriptor: &crate::agent_sdk::AgentDescriptor,
+    upgrade: &crate::agent_sdk::UpgradeActor,
+    package: &super::package_admission::AdmittedActorPackage,
+) -> Result<(), AgentDriverError> {
+    let schema = crate::agent_sdk::schema::decode(package.state_lane_schema_bytes())
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    if upgrade.to_deployment != package.deployment()
+        || upgrade.to_program != package.program()
+        || upgrade.producer != package.producer()
+        || upgrade.package != *package.package_ref()
+        || upgrade.agent_schema != package.manifest().state_lane_schema
+        || upgrade.method_policy != package.manifest().method_policy
+        || upgrade.contract != package.manifest().contract
+        || upgrade.requirements != package.requirements()
+        || upgrade.constructor_abi
+            != schema
+                .constructor_abi()
+                .map_err(|_| AgentDriverError::InvalidRuntime)?
+        || upgrade.state_layout
+            != schema
+                .state_layout_hash()
+                .map_err(|_| AgentDriverError::InvalidRuntime)?
+    {
+        return Err(AgentDriverError::InvalidRuntime);
+    }
+    if !upgrade
+        .requirements
+        .supported_by(descriptor.identity.profile)
+    {
+        return Err(AgentDriverError::SdkManagement(
+            crate::agent_sdk::ManagementError::UnsupportedLane,
+        ));
+    }
+    if !descriptor.runtime_contract.supports(upgrade.contract)
+        || !descriptor.capabilities.satisfies(upgrade.requirements)
+    {
+        return Err(AgentDriverError::SdkManagement(
+            crate::agent_sdk::ManagementError::UnsupportedRuntime,
+        ));
+    }
+    Ok(())
+}
+
+fn stage_sdk_actor_artifacts<S: AgentImageStore>(
+    store: &mut S,
+    package: &super::package_admission::AdmittedActorPackage,
+    installation_data: Option<&crate::agent_sdk::InstallationData>,
+    staged: &mut StagedSdkArtifacts,
+) -> Result<(), AgentDriverError> {
+    let package_ref = sdk_blob_as_legacy(package.package_ref());
+    let program = ProgramId(package.program().0);
+    let deployment = DeploymentId(package.deployment().0);
+    staged.package = Some((
+        package_ref.clone(),
+        store.put_package(&package_ref, package.exact_bytes())?,
+    ));
+    staged.program = Some((
+        program,
+        store.put_program(program, package.program_bytes())?,
+    ));
+    let schema_ref = sdk_blob_as_legacy(&package.manifest().state_lane_schema);
+    staged.schema = Some((
+        deployment,
+        store.put_actor_schema(deployment, &schema_ref, package.state_lane_schema_bytes())?,
+    ));
+    let policy_ref = sdk_blob_as_legacy(&package.manifest().method_policy);
+    staged.policy = Some((
+        deployment,
+        store.put_actor_policies(deployment, &policy_ref, package.method_policy_bytes())?,
+    ));
+    if let Some(data) = installation_data {
+        let reference = sdk_blob_as_legacy(&data.reference);
+        staged.installation_data = Some((
+            reference.clone(),
+            store.put_installation_data(&reference, &data.bytes)?,
+        ));
+    }
+    Ok(())
+}
+
+fn stage_sdk_runtime_artifacts<S: AgentImageStore>(
+    store: &mut S,
+    package: &super::package_admission::AdmittedRuntimePackage,
+    staged: &mut StagedSdkArtifacts,
+) -> Result<(), AgentDriverError> {
+    let package_ref = sdk_blob_as_legacy(package.package_ref());
+    let program = ProgramId(package.program().0);
+    staged.package = Some((
+        package_ref.clone(),
+        store.put_package(&package_ref, package.exact_bytes())?,
+    ));
+    staged.program = Some((
+        program,
+        store.put_program(program, package.program_bytes())?,
+    ));
+    Ok(())
+}
+
+fn sdk_management_reply_matches(
+    current: &crate::agent_sdk::AgentDescriptor,
+    request: &crate::agent_sdk::ManagementRequest,
+    outcome: &crate::agent_sdk::RuntimeOutcome,
+) -> bool {
+    use crate::agent_sdk::{ManagementReply, ManagementRequest, RuntimeOutcome};
+    let RuntimeOutcome::Management(result) = outcome else {
+        return false;
+    };
+    let Ok(reply) = result else {
+        return true;
+    };
+    match (request, reply) {
+        (ManagementRequest::Create(descriptor), ManagementReply::Created(identity)) => {
+            *identity == descriptor.identity
+        }
+        (ManagementRequest::InspectActors { .. }, ManagementReply::Actors(page)) => {
+            page.validate().is_ok()
+        }
+        (ManagementRequest::InspectResources, ManagementReply::Resources(_)) => true,
+        (ManagementRequest::Install(install), ManagementReply::Installed(entry)) => {
+            *entry == install.entry
+        }
+        (ManagementRequest::UpgradeActor(upgrade), ManagementReply::Upgraded(entry)) => {
+            entry.actor == upgrade.actor
+                && entry.deployment == upgrade.to_deployment
+                && entry.program == upgrade.to_program
+                && entry.package == upgrade.package
+                && entry.agent_schema == upgrade.agent_schema
+                && entry.method_policy == upgrade.method_policy
+                && entry.constructor_abi == upgrade.constructor_abi
+                && entry.state_layout == upgrade.state_layout
+                && entry.lanes == upgrade.requirements.lanes
+        }
+        (
+            ManagementRequest::Suspend {
+                actor,
+                expected_deployment,
+            },
+            ManagementReply::Suspended(entry),
+        ) => entry.actor == *actor && entry.deployment == *expected_deployment && entry.suspended,
+        (
+            ManagementRequest::Resume {
+                actor,
+                expected_deployment,
+            },
+            ManagementReply::Resumed(entry),
+        ) => entry.actor == *actor && entry.deployment == *expected_deployment && !entry.suspended,
+        (ManagementRequest::RemoveLeaf { actor, .. }, ManagementReply::Removed(removed)) => {
+            actor == removed
+        }
+        (
+            ManagementRequest::UpgradeRuntime(upgrade),
+            ManagementReply::RuntimeUpgraded(identity),
+        ) => {
+            identity.space == current.identity.space
+                && identity.agent == current.identity.agent
+                && identity.owner == current.identity.owner
+                && identity.profile == current.identity.profile
+                && identity.runtime_deployment == upgrade.to_deployment
+                && identity.runtime_program == upgrade.to_program
+                && identity.runtime_producer == upgrade.producer
+        }
+        (
+            ManagementRequest::ChangeReplicas { replicas, .. },
+            ManagementReply::ReplicasChanged { generation },
+        ) => {
+            *generation
+                == crate::agent_sdk::replica_set_generation(
+                    &current.identity,
+                    current.creation_nonce,
+                    replicas,
+                )
+        }
+        _ => false,
+    }
+}
+
+fn expected_standard_sdk_management_transition(
+    work: &crate::agent_sdk::RuntimeWork,
+) -> Result<crate::agent_sdk::RuntimeTransition, AgentDriverError> {
+    let crate::agent_sdk::RuntimeWork::Manage {
+        space,
+        agent,
+        runtime_deployment,
+        state,
+        request,
+        authority,
+        observed_slot,
+    } = work
+    else {
+        return Err(AgentDriverError::InvalidRuntime);
+    };
+    let pristine_input = state.is_empty();
+    let read_only = matches!(
+        request.as_ref(),
+        crate::agent_sdk::ManagementRequest::InspectActors { .. }
+            | crate::agent_sdk::ManagementRequest::InspectResources
+    );
+    let decoded = super::wire::decode_standard_runtime_state(&sdk_state_as_legacy(state))
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let mut runtime = super::standard::StandardAgentRuntime::restore(decoded)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let result = runtime.apply_clean_management(
+        *space,
+        *agent,
+        *runtime_deployment,
+        request.as_ref().clone(),
+        authority.as_ref().map(|receipt| receipt.as_ref().clone()),
+        *observed_slot,
+        pristine_input,
+    );
+    Ok(crate::agent_sdk::RuntimeTransition {
+        state: if read_only {
+            state.clone()
+        } else {
+            legacy_state_as_sdk(&super::wire::encode_standard_runtime_state(
+                &runtime.snapshot(),
+            ))
+        },
+        outcome: crate::agent_sdk::RuntimeOutcome::Management(result),
+    })
+}
+
+fn stored_program_matches(program: ProgramId, bytes: &[u8]) -> bool {
+    ProgramId::of_pvm(bytes) == program || crate::agent_sdk::ProgramId::of_pvm(bytes).0 == program.0
+}
+
+fn valid_stored_schema(bytes: &[u8]) -> bool {
+    super::schema::decode(bytes).is_some() || crate::agent_sdk::schema::decode(bytes).is_ok()
+}
+
+fn valid_stored_policy(bytes: &[u8]) -> bool {
+    use crate::agent_sdk::wire::CanonicalWire as _;
+    crate::service::PackageRolePolicies::decode(bytes).is_ok()
+        || crate::agent_sdk::method_policy::ActorMethodPolicyArtifact::decode(bytes).is_ok()
+}
 
 /// Driver-owned source of logical time and signed-package trust. Lifecycle
 /// and invocation authority is carried as canonical signed receipts and
@@ -221,7 +725,6 @@ impl ServiceWire for AgentImage {
         if config_bytes.len() > MAX_AGENT_CONFIG_BYTES {
             return Err(DecodeError::LimitExceeded);
         }
-        let config = AgentConfig::decode(config_bytes)?;
         // Borrow every component first and check their aggregate before any
         // potentially large Vec is allocated.
         let control = decoder.bytes_ref()?;
@@ -237,16 +740,32 @@ impl ServiceWire for AgentImage {
         if runtime_bytes > MAX_RUNTIME_STATE_BYTES {
             return Err(DecodeError::LimitExceeded);
         }
+        let runtime_state = RuntimeState {
+            control: control.to_vec(),
+            linear: linear.to_vec(),
+            merge: merge.to_vec(),
+            local: local.to_vec(),
+        };
+        let config = match AgentConfig::decode(config_bytes) {
+            Ok(config) => config,
+            Err(_) => {
+                // Clean SDK identities and historical in-crate identities
+                // intentionally use different hash domains. Admit this
+                // internal projection only when the fully validated clean
+                // state reconstructs the exact persisted config bytes.
+                let projected = clean_projected_config_from_state(&runtime_state)
+                    .map_err(|_| DecodeError::NonCanonical)?;
+                if projected.encode().as_slice() != config_bytes {
+                    return Err(DecodeError::NonCanonical);
+                }
+                projected
+            }
+        };
         let image = Self {
             revision,
             runtime_program,
             config,
-            runtime_state: RuntimeState {
-                control: control.to_vec(),
-                linear: linear.to_vec(),
-                merge: merge.to_vec(),
-                local: local.to_vec(),
-            },
+            runtime_state,
         };
         if image.revision == 0
             || image.runtime_program == ProgramId::ZERO
@@ -259,7 +778,7 @@ impl ServiceWire for AgentImage {
                     .resources
                     .max_runtime_state_bytes as usize
             || image.config.replicas.len() > MAX_AGENT_IMAGE_REPLICAS
-            || image.config.validate().is_err()
+            || !image_config_is_valid(&image.config, &image.runtime_state)
             || image.config.identity.runtime_program != image.runtime_program
         {
             return Err(DecodeError::NonCanonical);
@@ -399,7 +918,7 @@ impl AgentImageStore for MemoryAgentStore {
     }
 
     fn put_package(&mut self, reference: &BlobRef, bytes: &[u8]) -> Result<bool, AgentStoreError> {
-        if bytes.len() > super::package::MAX_ENCODED_PACKAGE_BYTES || !reference.matches(bytes) {
+        if bytes.len() > MAX_STORED_PACKAGE_BYTES || !stored_blob_matches(reference, bytes) {
             return Err(AgentStoreError::Corrupt);
         }
         put_memory_artifact(&mut self.packages, reference.hash, bytes)
@@ -407,7 +926,7 @@ impl AgentImageStore for MemoryAgentStore {
 
     fn load_package(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, AgentStoreError> {
         match self.packages.get(&reference.hash) {
-            Some(bytes) if reference.matches(bytes) => Ok(Some(bytes.clone())),
+            Some(bytes) if stored_blob_matches(reference, bytes) => Ok(Some(bytes.clone())),
             Some(_) => Err(AgentStoreError::Corrupt),
             None => Ok(None),
         }
@@ -425,8 +944,8 @@ impl AgentImageStore for MemoryAgentStore {
         bytes: &[u8],
     ) -> Result<bool, AgentStoreError> {
         if deployment == DeploymentId::ZERO
-            || !reference.matches(bytes)
-            || super::schema::decode(bytes).is_none()
+            || !stored_blob_matches(reference, bytes)
+            || !valid_stored_schema(bytes)
         {
             return Err(AgentStoreError::Corrupt);
         }
@@ -467,8 +986,8 @@ impl AgentImageStore for MemoryAgentStore {
     ) -> Result<bool, AgentStoreError> {
         if deployment == DeploymentId::ZERO
             || bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES
-            || !reference.matches(bytes)
-            || crate::service::PackageRolePolicies::decode(bytes).is_err()
+            || !stored_blob_matches(reference, bytes)
+            || !valid_stored_policy(bytes)
         {
             return Err(AgentStoreError::Corrupt);
         }
@@ -506,7 +1025,9 @@ impl AgentImageStore for MemoryAgentStore {
         reference: &BlobRef,
         bytes: &[u8],
     ) -> Result<bool, AgentStoreError> {
-        if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES || !reference.matches(bytes) {
+        if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES
+            || !stored_blob_matches(reference, bytes)
+        {
             return Err(AgentStoreError::Corrupt);
         }
         put_memory_artifact(&mut self.installation_data, reference.hash, bytes)
@@ -519,7 +1040,7 @@ impl AgentImageStore for MemoryAgentStore {
         match self.installation_data.get(&reference.hash) {
             Some(bytes)
                 if bytes.len() <= super::MAX_INSTALLATION_DATA_BYTES
-                    && reference.matches(bytes) =>
+                    && stored_blob_matches(reference, bytes) =>
             {
                 Ok(Some(RuntimeBlob {
                     reference: reference.clone(),
@@ -538,7 +1059,7 @@ impl AgentImageStore for MemoryAgentStore {
 
     fn put_program(&mut self, program: ProgramId, bytes: &[u8]) -> Result<bool, AgentStoreError> {
         if bytes.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
-            || ProgramId::of_pvm(bytes) != program
+            || !stored_program_matches(program, bytes)
         {
             return Err(AgentStoreError::Corrupt);
         }
@@ -563,13 +1084,13 @@ impl AgentImageStore for MemoryAgentStore {
         // Authenticate every mandatory artifact before changing any map.
         for (hash, reference) in &keep.required_packages {
             let bytes = self.packages.get(hash).ok_or(AgentStoreError::Corrupt)?;
-            if !reference.matches(bytes) {
+            if !stored_blob_matches(reference, bytes) {
                 return Err(AgentStoreError::Corrupt);
             }
         }
         for program in &keep.required_programs {
             let bytes = self.programs.get(program).ok_or(AgentStoreError::Corrupt)?;
-            if ProgramId::of_pvm(bytes) != *program {
+            if !stored_program_matches(*program, bytes) {
                 return Err(AgentStoreError::Corrupt);
             }
         }
@@ -579,8 +1100,8 @@ impl AgentImageStore for MemoryAgentStore {
                 .get(deployment)
                 .ok_or(AgentStoreError::Corrupt)?;
             if blob.reference != *reference
-                || !reference.matches(&blob.bytes)
-                || super::schema::decode(&blob.bytes).is_none()
+                || !stored_blob_matches(reference, &blob.bytes)
+                || !valid_stored_schema(&blob.bytes)
             {
                 return Err(AgentStoreError::Corrupt);
             }
@@ -591,9 +1112,9 @@ impl AgentImageStore for MemoryAgentStore {
                 .get(deployment)
                 .ok_or(AgentStoreError::Corrupt)?;
             if blob.reference != *reference
-                || !reference.matches(&blob.bytes)
+                || !stored_blob_matches(reference, &blob.bytes)
                 || blob.bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES
-                || crate::service::PackageRolePolicies::decode(&blob.bytes).is_err()
+                || !valid_stored_policy(&blob.bytes)
             {
                 return Err(AgentStoreError::Corrupt);
             }
@@ -603,7 +1124,9 @@ impl AgentImageStore for MemoryAgentStore {
                 .installation_data
                 .get(hash)
                 .ok_or(AgentStoreError::Corrupt)?;
-            if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES || !reference.matches(bytes) {
+            if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES
+                || !stored_blob_matches(reference, bytes)
+            {
                 return Err(AgentStoreError::Corrupt);
             }
         }
@@ -734,7 +1257,7 @@ impl FileAgentStore {
     }
 
     fn read_regular_artifact(&self, path: &Path) -> Result<Option<Vec<u8>>, AgentStoreError> {
-        self.read_bounded_regular(path, super::package::MAX_ENCODED_PACKAGE_BYTES)
+        self.read_bounded_regular(path, MAX_STORED_PACKAGE_BYTES)
     }
 
     fn validate_catalog_shape(&self) -> Result<(), AgentStoreError> {
@@ -823,7 +1346,7 @@ impl FileAgentStore {
     }
 
     fn put_artifact(&self, path: &Path, bytes: &[u8]) -> Result<bool, AgentStoreError> {
-        if bytes.len() > super::package::MAX_ENCODED_PACKAGE_BYTES {
+        if bytes.len() > MAX_STORED_PACKAGE_BYTES {
             return Err(AgentStoreError::Corrupt);
         }
         if let Some(existing) = self.read_regular_artifact(path)? {
@@ -966,7 +1489,7 @@ impl AgentImageStore for FileAgentStore {
     }
 
     fn put_package(&mut self, reference: &BlobRef, bytes: &[u8]) -> Result<bool, AgentStoreError> {
-        if bytes.len() > super::package::MAX_ENCODED_PACKAGE_BYTES || !reference.matches(bytes) {
+        if bytes.len() > MAX_STORED_PACKAGE_BYTES || !stored_blob_matches(reference, bytes) {
             return Err(AgentStoreError::Corrupt);
         }
         self.put_artifact(
@@ -978,7 +1501,7 @@ impl AgentImageStore for FileAgentStore {
     fn load_package(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, AgentStoreError> {
         let path = self.catalog_path("packages", &reference.hash.0, "vos");
         match self.read_regular_artifact(&path)? {
-            Some(bytes) if reference.matches(&bytes) => Ok(Some(bytes)),
+            Some(bytes) if stored_blob_matches(reference, &bytes) => Ok(Some(bytes)),
             Some(_) => Err(AgentStoreError::Corrupt),
             None => Ok(None),
         }
@@ -995,8 +1518,8 @@ impl AgentImageStore for FileAgentStore {
         bytes: &[u8],
     ) -> Result<bool, AgentStoreError> {
         if deployment == DeploymentId::ZERO
-            || !reference.matches(bytes)
-            || super::schema::decode(bytes).is_none()
+            || !stored_blob_matches(reference, bytes)
+            || !valid_stored_schema(bytes)
         {
             return Err(AgentStoreError::Corrupt);
         }
@@ -1009,7 +1532,7 @@ impl AgentImageStore for FileAgentStore {
     ) -> Result<Option<RuntimeBlob>, AgentStoreError> {
         let path = self.catalog_path("schemas", &deployment.0, "agent");
         match self.read_bounded_regular(&path, super::schema::MAX_ENCODED_BYTES)? {
-            Some(bytes) if super::schema::decode(&bytes).is_some() => Ok(Some(RuntimeBlob {
+            Some(bytes) if valid_stored_schema(&bytes) => Ok(Some(RuntimeBlob {
                 reference: BlobRef::of_bytes(&bytes),
                 bytes,
             })),
@@ -1030,8 +1553,8 @@ impl AgentImageStore for FileAgentStore {
     ) -> Result<bool, AgentStoreError> {
         if deployment == DeploymentId::ZERO
             || bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES
-            || !reference.matches(bytes)
-            || crate::service::PackageRolePolicies::decode(bytes).is_err()
+            || !stored_blob_matches(reference, bytes)
+            || !valid_stored_policy(bytes)
         {
             return Err(AgentStoreError::Corrupt);
         }
@@ -1049,7 +1572,7 @@ impl AgentImageStore for FileAgentStore {
         match self.read_bounded_regular(&path, super::execution::MAX_EXECUTION_POLICY_BYTES)? {
             Some(bytes)
                 if bytes.len() <= super::execution::MAX_EXECUTION_POLICY_BYTES
-                    && crate::service::PackageRolePolicies::decode(&bytes).is_ok() =>
+                    && valid_stored_policy(&bytes) =>
             {
                 Ok(Some(RuntimeBlob {
                     reference: BlobRef::of_bytes(&bytes),
@@ -1070,7 +1593,9 @@ impl AgentImageStore for FileAgentStore {
         reference: &BlobRef,
         bytes: &[u8],
     ) -> Result<bool, AgentStoreError> {
-        if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES || !reference.matches(bytes) {
+        if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES
+            || !stored_blob_matches(reference, bytes)
+        {
             return Err(AgentStoreError::Corrupt);
         }
         self.put_artifact(
@@ -1085,7 +1610,7 @@ impl AgentImageStore for FileAgentStore {
     ) -> Result<Option<RuntimeBlob>, AgentStoreError> {
         let path = self.catalog_path("installation-data", &reference.hash.0, "args");
         match self.read_bounded_regular(&path, super::MAX_INSTALLATION_DATA_BYTES)? {
-            Some(bytes) if reference.matches(&bytes) => Ok(Some(RuntimeBlob {
+            Some(bytes) if stored_blob_matches(reference, &bytes) => Ok(Some(RuntimeBlob {
                 reference: reference.clone(),
                 bytes,
             })),
@@ -1100,7 +1625,7 @@ impl AgentImageStore for FileAgentStore {
 
     fn put_program(&mut self, program: ProgramId, bytes: &[u8]) -> Result<bool, AgentStoreError> {
         if bytes.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES
-            || ProgramId::of_pvm(bytes) != program
+            || !stored_program_matches(program, bytes)
         {
             return Err(AgentStoreError::Corrupt);
         }
@@ -1110,7 +1635,7 @@ impl AgentImageStore for FileAgentStore {
     fn load_program(&self, program: ProgramId) -> Result<Option<Vec<u8>>, AgentStoreError> {
         let path = self.catalog_path("programs", &program.0, "pvm");
         match self.read_bounded_regular(&path, super::execution::MAX_EXECUTION_PROGRAM_BYTES)? {
-            Some(bytes) if ProgramId::of_pvm(&bytes) == program => Ok(Some(bytes)),
+            Some(bytes) if stored_program_matches(program, &bytes) => Ok(Some(bytes)),
             Some(_) => Err(AgentStoreError::Corrupt),
             None => Ok(None),
         }
@@ -1143,7 +1668,7 @@ impl AgentImageStore for FileAgentStore {
             let bytes = self
                 .read_regular_artifact(&path)?
                 .ok_or(AgentStoreError::Corrupt)?;
-            if !reference.matches(&bytes) {
+            if !stored_blob_matches(reference, &bytes) {
                 return Err(AgentStoreError::Corrupt);
             }
         }
@@ -1152,7 +1677,7 @@ impl AgentImageStore for FileAgentStore {
             let bytes = self
                 .read_regular_artifact(&path)?
                 .ok_or(AgentStoreError::Corrupt)?;
-            if ProgramId::of_pvm(&bytes) != *program {
+            if !stored_program_matches(*program, &bytes) {
                 return Err(AgentStoreError::Corrupt);
             }
         }
@@ -1161,7 +1686,7 @@ impl AgentImageStore for FileAgentStore {
             let bytes = self
                 .read_regular_artifact(&path)?
                 .ok_or(AgentStoreError::Corrupt)?;
-            if !reference.matches(&bytes) || super::schema::decode(&bytes).is_none() {
+            if !stored_blob_matches(reference, &bytes) || !valid_stored_schema(&bytes) {
                 return Err(AgentStoreError::Corrupt);
             }
         }
@@ -1171,8 +1696,8 @@ impl AgentImageStore for FileAgentStore {
                 .read_regular_artifact(&path)?
                 .ok_or(AgentStoreError::Corrupt)?;
             if bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES
-                || !reference.matches(&bytes)
-                || crate::service::PackageRolePolicies::decode(&bytes).is_err()
+                || !stored_blob_matches(reference, &bytes)
+                || !valid_stored_policy(&bytes)
             {
                 return Err(AgentStoreError::Corrupt);
             }
@@ -1182,7 +1707,7 @@ impl AgentImageStore for FileAgentStore {
             let bytes = self
                 .read_bounded_regular(&path, super::MAX_INSTALLATION_DATA_BYTES)?
                 .ok_or(AgentStoreError::Corrupt)?;
-            if !reference.matches(&bytes) {
+            if !stored_blob_matches(reference, &bytes) {
                 return Err(AgentStoreError::Corrupt);
             }
         }
@@ -1257,6 +1782,8 @@ pub enum AgentDriverError {
     Lifecycle(LifecycleError),
     Execution(ActorExecutionError),
     Package(PackageError),
+    PackageAdmission(super::package_admission::PackageAdmissionError),
+    SdkManagement(crate::agent_sdk::ManagementError),
     Authority(AuthorityError),
     Store(AgentStoreError),
 }
@@ -1383,7 +1910,169 @@ pub struct AgentDriver<S> {
     trust: Arc<dyn AgentTrustProvider>,
 }
 
+/// Host-admitted artifact carried beside a clean management request.
+/// Requests which do not select a package must use `None`; this prevents an
+/// uncommitted sidecar from being mistaken for guest-owned catalog state.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum SdkManagementArtifacts<'a> {
+    #[default]
+    None,
+    Actor(&'a super::package_admission::AdmittedActorPackage),
+    Runtime(&'a super::package_admission::AdmittedRuntimePackage),
+}
+
+#[derive(Default)]
+struct StagedSdkArtifacts {
+    package: Option<(BlobRef, bool)>,
+    program: Option<(ProgramId, bool)>,
+    schema: Option<(DeploymentId, bool)>,
+    policy: Option<(DeploymentId, bool)>,
+    installation_data: Option<(BlobRef, bool)>,
+}
+
+impl StagedSdkArtifacts {
+    fn rollback<S: AgentImageStore>(&self, store: &mut S) {
+        if let Some((reference, true)) = &self.installation_data {
+            let _ = store.remove_installation_data(reference);
+        }
+        if let Some((deployment, true)) = self.policy {
+            let _ = store.remove_actor_policies(deployment);
+        }
+        if let Some((deployment, true)) = self.schema {
+            let _ = store.remove_actor_schema(deployment);
+        }
+        if let Some((program, true)) = self.program {
+            let _ = store.remove_program(program);
+        }
+        if let Some((reference, true)) = &self.package {
+            let _ = store.remove_package(reference);
+        }
+    }
+}
+
 impl<S: AgentImageStore> AgentDriver<S> {
+    /// Create one process-local Agent through the canonical AWRK management
+    /// entry using an already signature/PVM-admitted VOS3 runtime package.
+    pub fn create_sdk(
+        runtime_package: super::package_admission::AdmittedRuntimePackage,
+        descriptor: crate::agent_sdk::AgentDescriptor,
+        mut store: S,
+        trust: Arc<dyn AgentTrustProvider>,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<Self, AgentDriverError> {
+        validate_sdk_process_local_profile(descriptor.identity.profile)?;
+        verify_clean_runtime_package_binding(&descriptor, &runtime_package)?;
+        if store.load()?.is_some() {
+            return Err(AgentDriverError::Store(AgentStoreError::Conflict));
+        }
+        let observed_slot = trust
+            .current_logical_slot()
+            .ok_or(AgentDriverError::TrustUnavailable)?;
+        let request = crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+        verify_clean_management_receipt(&descriptor, &request, &authority, observed_slot)?;
+        let work = crate::agent_sdk::RuntimeWork::Manage {
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            runtime_deployment: descriptor.identity.runtime_deployment,
+            state: crate::agent_sdk::RuntimeState::default(),
+            request: Box::new(request),
+            authority: Some(Box::new(authority)),
+            observed_slot,
+        };
+        let encoded = work
+            .encode()
+            .map_err(|_| AgentDriverError::InvalidRuntime)?;
+        let expected = expected_standard_sdk_management_transition(&work)?;
+        let transition: crate::agent_sdk::RuntimeTransition = execute_runtime_canonical(
+            runtime_package.program_bytes(),
+            DEFAULT_MANAGEMENT_GAS,
+            &encoded,
+        )?;
+        if transition != expected
+            || transition.outcome
+                != crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                    crate::agent_sdk::ManagementReply::Created(descriptor.identity.clone()),
+                ))
+            || transition.state.is_empty()
+        {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        validate_clean_standard_descriptor(&transition.state, &descriptor)?;
+        let config = super::standard::clean_descriptor_to_legacy_config(&descriptor)
+            .map_err(AgentDriverError::Lifecycle)?;
+        let runtime_state = sdk_state_as_legacy(&transition.state);
+        validate_state_size(&runtime_state, &config.runtime_contract)?;
+        let runtime_program = ProgramId(runtime_package.program().0);
+        let image = AgentImage {
+            revision: 1,
+            runtime_program,
+            config,
+            runtime_state,
+        };
+        let package_reference = sdk_blob_as_legacy(runtime_package.package_ref());
+        let created_package =
+            store.put_package(&package_reference, runtime_package.exact_bytes())?;
+        if let Err(error) = store.put_program(runtime_program, runtime_package.program_bytes()) {
+            if created_package {
+                let _ = store.remove_package(&package_reference);
+            }
+            return Err(error.into());
+        }
+        store.commit(None, &image)?;
+        let mut driver = Self {
+            runtime_pvm: runtime_package.program_bytes().to_vec(),
+            image,
+            store,
+            management_gas: DEFAULT_MANAGEMENT_GAS,
+            catalog_cleanup_pending: false,
+            trust,
+        };
+        driver.reconcile_catalog_after_commit();
+        Ok(driver)
+    }
+
+    /// Open a clean-generation image. VOS3 admission is repeated from the
+    /// exact persisted package; no process-local default or VOSK decoder is
+    /// consulted.
+    pub fn open_sdk(
+        store: S,
+        trust: Arc<dyn AgentTrustProvider>,
+    ) -> Result<Self, AgentDriverError> {
+        let image = store.load()?.ok_or(AgentStoreError::Unavailable)?;
+        let descriptor = clean_descriptor_from_state(&image.runtime_state)?;
+        validate_sdk_process_local_profile(descriptor.identity.profile)?;
+        let projected = super::standard::clean_descriptor_to_legacy_config(&descriptor)
+            .map_err(AgentDriverError::Lifecycle)?;
+        if image.config != projected
+            || image.runtime_program.0 != descriptor.identity.runtime_program.0
+        {
+            return Err(AgentDriverError::RuntimeProgramMismatch);
+        }
+        let package_reference = sdk_blob_as_legacy(&descriptor.runtime_package);
+        let package_bytes = store
+            .load_package(&package_reference)?
+            .ok_or(AgentDriverError::PackageUnavailable(package_reference.hash))?;
+        let runtime_package = super::package_admission::admit_runtime_package(&package_bytes)
+            .map_err(AgentDriverError::PackageAdmission)?;
+        verify_clean_runtime_package_binding(&descriptor, &runtime_package)?;
+        let runtime_pvm = store
+            .load_program(image.runtime_program)?
+            .ok_or(AgentDriverError::ProgramUnavailable(image.runtime_program))?;
+        if runtime_pvm != runtime_package.program_bytes() {
+            return Err(AgentDriverError::RuntimeProgramMismatch);
+        }
+        let mut driver = Self {
+            runtime_pvm,
+            image,
+            store,
+            management_gas: DEFAULT_MANAGEMENT_GAS,
+            catalog_cleanup_pending: false,
+            trust,
+        };
+        driver.reconcile_catalog()?;
+        Ok(driver)
+    }
+
     /// Construct and validate the exact creation operation an authority must
     /// approve before any image or catalog artifact is written.
     pub(crate) fn create_request(
@@ -2242,6 +2931,199 @@ impl<S: AgentImageStore> AgentDriver<S> {
         self.invoke_raw(invocation, authority.clone(), observed_slot)
     }
 
+    /// Execute one clean-generation management request. Package-bearing
+    /// mutations accept only opaque values returned by VOS3 host admission;
+    /// all other requests reject ambient artifacts.
+    pub fn manage_sdk(
+        &mut self,
+        request: crate::agent_sdk::ManagementRequest,
+        authority: Option<crate::agent_sdk::authority::AuthorityReceipt>,
+        artifacts: SdkManagementArtifacts<'_>,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, AgentDriverError> {
+        let current = clean_descriptor_from_state(&self.image.runtime_state)?;
+        let read_only = matches!(
+            &request,
+            crate::agent_sdk::ManagementRequest::InspectActors { .. }
+                | crate::agent_sdk::ManagementRequest::InspectResources
+        );
+        let observed_slot = match self.trust.current_logical_slot() {
+            Some(slot) => slot,
+            None if read_only => 0,
+            None => return Err(AgentDriverError::TrustUnavailable),
+        };
+        match (&request, authority.as_ref()) {
+            (
+                crate::agent_sdk::ManagementRequest::InspectActors { .. }
+                | crate::agent_sdk::ManagementRequest::InspectResources,
+                None,
+            ) => {}
+            (_, Some(receipt)) => {
+                verify_clean_management_receipt(&current, &request, receipt, observed_slot)?;
+            }
+            _ => return Err(AgentDriverError::InvalidRuntime),
+        }
+        validate_sdk_management_artifacts(&current, &request, artifacts)?;
+        let staged = match self.stage_sdk_management_artifacts(&request, artifacts) {
+            Ok(staged) => staged,
+            Err(error) => return Err(error),
+        };
+        let runtime_deployment = match &request {
+            crate::agent_sdk::ManagementRequest::Create(descriptor) => {
+                descriptor.identity.runtime_deployment
+            }
+            crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade) => upgrade.from_deployment,
+            _ => current.identity.runtime_deployment,
+        };
+        let work = crate::agent_sdk::RuntimeWork::Manage {
+            space: current.identity.space,
+            agent: current.identity.agent,
+            runtime_deployment,
+            state: legacy_state_as_sdk(&self.image.runtime_state),
+            request: Box::new(request.clone()),
+            authority: authority.map(Box::new),
+            observed_slot,
+        };
+        let encoded = match work.encode() {
+            Ok(encoded) => encoded,
+            Err(_) => {
+                staged.rollback(&mut self.store);
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+        };
+        let expected = match expected_standard_sdk_management_transition(&work) {
+            Ok(expected) => expected,
+            Err(error) => {
+                staged.rollback(&mut self.store);
+                return Err(error);
+            }
+        };
+        let returned: crate::agent_sdk::RuntimeTransition =
+            match execute_runtime_canonical(&self.runtime_pvm, self.management_gas, &encoded) {
+                Ok(returned) => returned,
+                Err(error) => {
+                    staged.rollback(&mut self.store);
+                    return Err(error);
+                }
+            };
+        if returned != expected
+            || !matches!(
+                &returned.outcome,
+                crate::agent_sdk::RuntimeOutcome::Management(_)
+            )
+            || !sdk_management_reply_matches(&current, &request, &returned.outcome)
+            || (read_only && returned.state != legacy_state_as_sdk(&self.image.runtime_state))
+            || (!read_only
+                && (returned.state.linear != self.image.runtime_state.linear
+                    || returned.state.merge != self.image.runtime_state.merge
+                    || returned.state.local != self.image.runtime_state.local))
+        {
+            staged.rollback(&mut self.store);
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+
+        let next_state = sdk_state_as_legacy(&returned.state);
+        let next_descriptor = match clean_descriptor_from_state(&next_state) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                staged.rollback(&mut self.store);
+                return Err(error);
+            }
+        };
+        let success = matches!(
+            &returned.outcome,
+            crate::agent_sdk::RuntimeOutcome::Management(Ok(_))
+        );
+        let runtime_upgrade = match (&request, success, artifacts) {
+            (
+                crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade),
+                true,
+                SdkManagementArtifacts::Runtime(package),
+            ) => Some((upgrade.as_ref(), package)),
+            _ => None,
+        };
+        let next_config = match super::standard::clean_descriptor_to_legacy_config(&next_descriptor)
+            .map_err(AgentDriverError::Lifecycle)
+        {
+            Ok(config) => config,
+            Err(error) => {
+                staged.rollback(&mut self.store);
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_state_size(&next_state, &next_config.runtime_contract) {
+            staged.rollback(&mut self.store);
+            return Err(error);
+        }
+        let next_program = runtime_upgrade.map_or(self.image.runtime_program, |(upgrade, _)| {
+            ProgramId(upgrade.to_program.0)
+        });
+        if next_descriptor.identity.runtime_program.0 != next_program.0 {
+            staged.rollback(&mut self.store);
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        let changed = next_state != self.image.runtime_state
+            || next_config != self.image.config
+            || next_program != self.image.runtime_program;
+        if changed {
+            let revision = match self.image.revision.checked_add(1) {
+                Some(revision) => revision,
+                None => {
+                    staged.rollback(&mut self.store);
+                    return Err(AgentDriverError::InvalidRuntime);
+                }
+            };
+            let next = AgentImage {
+                revision,
+                runtime_program: next_program,
+                config: next_config,
+                runtime_state: next_state,
+            };
+            // A failed commit may have become durable before returning an I/O
+            // error; staged artifacts are therefore intentionally retained.
+            self.store.commit(Some(self.image.revision), &next)?;
+            self.image = next;
+            if let Some((_, package)) = runtime_upgrade {
+                self.runtime_pvm = package.program_bytes().to_vec();
+            }
+        }
+        self.reconcile_catalog_after_commit();
+        Ok(returned.outcome)
+    }
+
+    fn stage_sdk_management_artifacts(
+        &mut self,
+        request: &crate::agent_sdk::ManagementRequest,
+        artifacts: SdkManagementArtifacts<'_>,
+    ) -> Result<StagedSdkArtifacts, AgentDriverError> {
+        let mut staged = StagedSdkArtifacts::default();
+        let result = match (request, artifacts) {
+            (
+                crate::agent_sdk::ManagementRequest::Install(install),
+                SdkManagementArtifacts::Actor(package),
+            ) => stage_sdk_actor_artifacts(
+                &mut self.store,
+                package,
+                install.installation_data.as_ref(),
+                &mut staged,
+            ),
+            (
+                crate::agent_sdk::ManagementRequest::UpgradeActor(_),
+                SdkManagementArtifacts::Actor(package),
+            ) => stage_sdk_actor_artifacts(&mut self.store, package, None, &mut staged),
+            (
+                crate::agent_sdk::ManagementRequest::UpgradeRuntime(_),
+                SdkManagementArtifacts::Runtime(package),
+            ) => stage_sdk_runtime_artifacts(&mut self.store, package, &mut staged),
+            (_, SdkManagementArtifacts::None) => Ok(()),
+            _ => Err(AgentDriverError::InvalidRuntime),
+        };
+        if let Err(error) = result {
+            staged.rollback(&mut self.store);
+            return Err(error);
+        }
+        Ok(staged)
+    }
+
     /// Execute one clean-generation invocation. A Yielded outcome is an
     /// atomically persisted intermediate revision and is returned to the
     /// scheduler; it is never converted into a terminal actor result.
@@ -2726,6 +3608,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
             &self.image.runtime_state,
             &self.image.config.runtime_contract,
         )?;
+        if let Ok(descriptor) = clean_descriptor_from_state(&self.image.runtime_state) {
+            return self.clean_catalog_references(&descriptor);
+        }
         let mut actors = Vec::new();
         let mut after = None;
         loop {
@@ -2766,6 +3651,159 @@ impl<S: AgentImageStore> AgentDriver<S> {
             actors,
         })
     }
+
+    fn clean_catalog_references(
+        &self,
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+    ) -> Result<AgentCatalogReferences, AgentDriverError> {
+        let mut actors = Vec::new();
+        let mut after = None;
+        let page_limit = crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16;
+        let max_pages = usize::try_from(descriptor.capabilities.max_actors)
+            .map_err(|_| AgentDriverError::InvalidRuntime)?
+            .div_ceil(usize::from(page_limit))
+            .saturating_add(1);
+        for _ in 0..max_pages {
+            let request = crate::agent_sdk::ManagementRequest::InspectActors {
+                after,
+                limit: page_limit,
+            };
+            let work = crate::agent_sdk::RuntimeWork::Manage {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                state: legacy_state_as_sdk(&self.image.runtime_state),
+                request: Box::new(request),
+                authority: None,
+                observed_slot: self.trust.current_logical_slot().unwrap_or(0),
+            };
+            let encoded = work
+                .encode()
+                .map_err(|_| AgentDriverError::InvalidRuntime)?;
+            let returned: crate::agent_sdk::RuntimeTransition =
+                execute_runtime_canonical(&self.runtime_pvm, self.management_gas, &encoded)?;
+            if returned.state != legacy_state_as_sdk(&self.image.runtime_state) {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            let crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                crate::agent_sdk::ManagementReply::Actors(page),
+            )) = returned.outcome
+            else {
+                return Err(AgentDriverError::InvalidRuntime);
+            };
+            page.validate()
+                .map_err(|_| AgentDriverError::InvalidRuntime)?;
+            if after.is_some_and(|cursor| {
+                page.entries
+                    .first()
+                    .is_some_and(|record| record.entry.actor <= cursor)
+            }) {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            for record in page.entries {
+                validate_loaded_clean_actor(&self.store, descriptor, &record.entry)?;
+                actors.push(ActorEntry {
+                    actor: ActorId(record.entry.actor.0),
+                    name: record.entry.name,
+                    parent: record.entry.parent.map(|value| ActorId(value.0)),
+                    deployment: DeploymentId(record.entry.deployment.0),
+                    program: ProgramId(record.entry.program.0),
+                    package: sdk_blob_as_legacy(&record.entry.package),
+                    agent_schema: sdk_blob_as_legacy(&record.entry.agent_schema),
+                    role_policies: sdk_blob_as_legacy(&record.entry.method_policy),
+                    constructor_abi: Hash(record.entry.constructor_abi.0),
+                    installation_data: record
+                        .entry
+                        .installation_data
+                        .as_ref()
+                        .map(sdk_blob_as_legacy),
+                    state_layout: Hash(record.entry.state_layout.0),
+                    lanes: super::LaneSet::from_bits(record.entry.lanes.bits())
+                        .ok_or(AgentDriverError::InvalidRuntime)?,
+                    suspended: record.entry.suspended,
+                });
+            }
+            let Some(next) = page.next else {
+                return Ok(AgentCatalogReferences {
+                    runtime_package: sdk_blob_as_legacy(&descriptor.runtime_package),
+                    runtime_program: ProgramId(descriptor.identity.runtime_program.0),
+                    actors,
+                });
+            };
+            if after == Some(next) {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            after = Some(next);
+        }
+        Err(AgentDriverError::InvalidRuntime)
+    }
+}
+
+fn validate_loaded_clean_actor<S: AgentImageStore>(
+    store: &S,
+    descriptor: &crate::agent_sdk::AgentDescriptor,
+    actor: &crate::agent_sdk::ActorEntry,
+) -> Result<(), AgentDriverError> {
+    let package_reference = sdk_blob_as_legacy(&actor.package);
+    let package_bytes = store
+        .load_package(&package_reference)?
+        .ok_or(AgentDriverError::PackageUnavailable(package_reference.hash))?;
+    let package = super::package_admission::admit_actor_package(&package_bytes)
+        .map_err(AgentDriverError::PackageAdmission)?;
+    let program = ProgramId(actor.program.0);
+    let program_bytes = store
+        .load_program(program)?
+        .ok_or(AgentDriverError::ProgramUnavailable(program))?;
+    let deployment = DeploymentId(actor.deployment.0);
+    let schema = store
+        .load_actor_schema(deployment)?
+        .ok_or(AgentDriverError::SchemaUnavailable(deployment))?;
+    let policy = store
+        .load_actor_policies(deployment)?
+        .ok_or(AgentDriverError::PolicyUnavailable(deployment))?;
+    let parsed = crate::agent_sdk::schema::decode(&schema.bytes)
+        .map_err(|_| AgentDriverError::SchemaMismatch(deployment))?;
+    let installation_data = match actor.installation_data.as_ref() {
+        Some(reference) => Some(
+            store
+                .load_installation_data(&sdk_blob_as_legacy(reference))?
+                .ok_or(AgentDriverError::PackageUnavailable(Hash(reference.hash.0)))?,
+        ),
+        None => None,
+    };
+    if package.deployment() != actor.deployment
+        || package.program() != actor.program
+        || *package.package_ref() != actor.package
+        || package.manifest().state_lane_schema != actor.agent_schema
+        || package.manifest().method_policy != actor.method_policy
+        || package.program_bytes() != program_bytes
+        || package.state_lane_schema_bytes() != schema.bytes
+        || package.method_policy_bytes() != policy.bytes
+        || parsed
+            .constructor_abi()
+            .map_err(|_| AgentDriverError::SchemaMismatch(deployment))?
+            != actor.constructor_abi
+        || parsed
+            .state_layout_hash()
+            .map_err(|_| AgentDriverError::SchemaMismatch(deployment))?
+            != actor.state_layout
+        || parsed.lanes() != actor.lanes
+        || installation_data
+            .as_ref()
+            .map(|blob| crate::agent_sdk::BlobRef::of_bytes(&blob.bytes))
+            != actor.installation_data
+        || parsed.requires_installation_data() != actor.installation_data.is_some()
+        || !package
+            .requirements()
+            .supported_by(descriptor.identity.profile)
+        || !descriptor
+            .runtime_contract
+            .supports(package.manifest().contract)
+        || !descriptor.capabilities.satisfies(package.requirements())
+    {
+        return Err(AgentDriverError::InvalidRuntime);
+    }
+    Ok(())
 }
 
 fn validate_loaded_actor<S: AgentImageStore>(
@@ -2897,7 +3935,7 @@ fn encode_valid_image(image: &AgentImage) -> Result<Vec<u8>, AgentStoreError> {
     if image.revision == 0
         || image.runtime_program == ProgramId::ZERO
         || image.config.replicas.len() > MAX_AGENT_IMAGE_REPLICAS
-        || image.config.validate().is_err()
+        || !image_config_is_valid(&image.config, &image.runtime_state)
         || image.config.identity.runtime_program != image.runtime_program
         || image.runtime_state.is_empty()
         || image

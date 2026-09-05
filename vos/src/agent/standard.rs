@@ -15,8 +15,8 @@ use super::{
     LifecycleRequest, RuntimeRequirements, StateLane,
 };
 use crate::service::{
-    ActorId, AgentId, BlobRef, CredentialId, DeploymentId, Hash, InstallationId, InvocationId,
-    ProducerId, ProgramId,
+    ActorId, BlobRef, CredentialId, DeploymentId, Hash, InstallationId, InvocationId, ProducerId,
+    ProgramId,
 };
 
 pub const MAX_DIRECTORY_PAGE: u16 = 256;
@@ -137,6 +137,14 @@ struct ManagedActor {
 #[derive(Clone, Debug, Default)]
 pub struct StandardAgentRuntime {
     config: Option<AgentConfig>,
+    /// Exact portable descriptor supplied by the successful clean Create.
+    /// This is never reconstructed from transitional service identities.
+    clean_creation_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
+    /// Current portable runtime/replica view. Immutable creation identity and
+    /// authority fields must remain equal to `clean_creation_descriptor`.
+    clean_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
+    clean_authority_epoch_high_water: Option<u64>,
+    clean_management_dispositions: Vec<StandardCleanManagementDisposition>,
     system_authority: Option<super::system_authority::SystemAuthorityState>,
     actors: BTreeMap<ActorId, ManagedActor>,
     /// Installation identities remain consumed after their actor leaves the
@@ -161,6 +169,10 @@ pub struct StandardAgentRuntime {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StandardRuntimeState {
     pub config: Option<AgentConfig>,
+    pub clean_creation_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
+    pub clean_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
+    pub clean_authority_epoch_high_water: Option<u64>,
+    pub clean_management_dispositions: Vec<StandardCleanManagementDisposition>,
     pub system_authority: Option<super::system_authority::SystemAuthorityState>,
     pub actors: Vec<StandardActorState>,
     /// Strictly ordered grow-only tombstones for removed installations.
@@ -227,6 +239,17 @@ pub struct StandardAuthorityDisposition {
     pub claim: Hash,
     pub operation: Hash,
     pub result: Result<LifecycleReply, LifecycleError>,
+}
+
+/// Bounded exact-result record for the portable management ABI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandardCleanManagementDisposition {
+    /// Commitment of the complete signed receipt, including its signature.
+    pub authority: crate::agent_sdk::Hash,
+    pub request: crate::agent_sdk::Hash,
+    pub epoch: u64,
+    pub observed_slot: u64,
+    pub result: Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -457,6 +480,295 @@ fn continuation_order_key(continuation: &StandardMachineContinuation) -> (u8, u6
     )
 }
 
+fn clean_profile_to_legacy(profile: crate::agent_sdk::AgentProfile) -> super::AgentProfile {
+    match profile {
+        crate::agent_sdk::AgentProfile::Local => super::AgentProfile::Local,
+        crate::agent_sdk::AgentProfile::Shared => super::AgentProfile::Shared,
+        crate::agent_sdk::AgentProfile::Private => super::AgentProfile::Private,
+    }
+}
+
+fn clean_lanes_to_legacy(lanes: crate::agent_sdk::LaneSet) -> super::LaneSet {
+    super::LaneSet::from_bits(lanes.bits()).expect("portable lanes share the closed three-bit set")
+}
+
+fn clean_capabilities_to_legacy(
+    capabilities: crate::agent_sdk::RuntimeCapabilities,
+    profile: crate::agent_sdk::AgentProfile,
+) -> super::RuntimeCapabilities {
+    let mut lanes = capabilities.lanes.bits();
+    if profile == crate::agent_sdk::AgentProfile::Private {
+        lanes &= !super::LaneSet::of(super::StateLane::Linear).bits();
+    }
+    super::RuntimeCapabilities {
+        lanes: super::LaneSet::from_bits(lanes).expect("masked portable lanes remain canonical"),
+        scheduling: capabilities.scheduling,
+        proofs: !capabilities.proof_systems.is_empty(),
+        max_actors: capabilities.max_actors,
+    }
+}
+
+fn clean_runtime_contract_to_legacy(
+    contract: crate::agent_sdk::contract::RuntimePackageContract,
+) -> super::contract::RuntimePackageContract {
+    super::contract::RuntimePackageContract {
+        // The transitional state machinery is an implementation detail. Its
+        // own codec pins remain local and are never exposed as the portable
+        // package contract.
+        lifecycle_abi: super::RUNTIME_ABI_ID,
+        actor_abis: super::contract::ActorAbiRange {
+            minimum: contract.actor_abis.minimum,
+            maximum: contract.actor_abis.maximum,
+        },
+        control_schema: super::contract::CONTROL_SCHEMA_ID,
+        resources: super::contract::RuntimeResourceLimits {
+            max_runtime_state_bytes: contract.resources.max_runtime_state_bytes,
+            max_artifact_references: contract.resources.max_artifact_references,
+            max_artifact_referenced_bytes: contract.resources.max_artifact_referenced_bytes,
+        },
+        migration: super::contract::RuntimeMigrationPolicy::None,
+    }
+}
+
+pub(crate) fn clean_descriptor_to_legacy_config(
+    descriptor: &crate::agent_sdk::AgentDescriptor,
+) -> Result<AgentConfig, LifecycleError> {
+    descriptor
+        .validate()
+        .map_err(|_| LifecycleError::InvalidRequest)?;
+    let raw_key = descriptor.authority.public_key;
+    let public_key = super::authority::ed25519_public_key_wire(raw_key);
+    let profile = clean_profile_to_legacy(descriptor.identity.profile);
+    let config = AgentConfig {
+        identity: super::AgentIdentity {
+            space: crate::service::SpaceId(descriptor.identity.space.0),
+            agent: crate::service::AgentId(descriptor.identity.agent.0),
+            owner: crate::service::PrincipalId(descriptor.identity.owner.0),
+            profile,
+            runtime_deployment: crate::service::DeploymentId(
+                descriptor.identity.runtime_deployment.0,
+            ),
+            runtime_program: crate::service::ProgramId(descriptor.identity.runtime_program.0),
+            runtime_producer: crate::service::ProducerId(descriptor.identity.runtime_producer.0),
+        },
+        creation_nonce: Hash(descriptor.creation_nonce.0),
+        authority: super::authority::AgentAuthorityBinding {
+            agent: crate::service::AgentId(descriptor.identity.agent.0),
+            actor: crate::service::ActorId(descriptor.authority.issuer.actor.0),
+            deployment: crate::service::DeploymentId(descriptor.authority.issuer.deployment.0),
+            program: crate::service::ProgramId(descriptor.authority.issuer.program.0),
+            producer: crate::service::ProducerId::of_public_key(&public_key),
+            public_key,
+        },
+        system_authority_genesis: None,
+        runtime_package: crate::service::BlobRef {
+            hash: Hash(descriptor.runtime_package.hash.0),
+            len: descriptor.runtime_package.len,
+        },
+        runtime_contract: clean_runtime_contract_to_legacy(descriptor.runtime_contract),
+        capabilities: clean_capabilities_to_legacy(
+            descriptor.capabilities,
+            descriptor.identity.profile,
+        ),
+        replicas: descriptor
+            .replicas
+            .iter()
+            .map(|replica| super::AgentReplica {
+                node: crate::service::NodeId(replica.node.0),
+                principal: crate::service::PrincipalId(replica.principal.0),
+                role: match replica.role {
+                    crate::agent_sdk::ReplicaRole::Voter => super::ReplicaRole::Voter,
+                    crate::agent_sdk::ReplicaRole::Observer => super::ReplicaRole::Observer,
+                },
+            })
+            .collect(),
+    };
+    // `AgentConfig` is an internal compatibility projection. Its historical
+    // validator derives AgentId in the legacy domain, while the portable SDK
+    // descriptor deliberately derives the identity in the SDK domain. The
+    // descriptor above is the authoritative validation boundary for this
+    // path; do not reinterpret its identity through the legacy derivation.
+    Ok(config)
+}
+
+fn clean_descriptors_share_immutable_creation(
+    creation: &crate::agent_sdk::AgentDescriptor,
+    current: &crate::agent_sdk::AgentDescriptor,
+) -> bool {
+    creation.identity.space == current.identity.space
+        && creation.identity.agent == current.identity.agent
+        && creation.identity.owner == current.identity.owner
+        && creation.identity.profile == current.identity.profile
+        && creation.creation_nonce == current.creation_nonce
+        && creation.authority == current.authority
+}
+
+fn clean_requirements_to_legacy(
+    requirements: crate::agent_sdk::RuntimeRequirements,
+) -> super::RuntimeRequirements {
+    super::RuntimeRequirements {
+        lanes: clean_lanes_to_legacy(requirements.lanes),
+        scheduling: requirements.scheduling,
+        proofs: !requirements.proof_systems.is_empty(),
+    }
+}
+
+fn clean_actor_contract_to_legacy(
+    contract: crate::agent_sdk::contract::ActorPackageContract,
+) -> super::contract::ActorPackageContract {
+    super::contract::ActorPackageContract {
+        actor_abi: contract.actor_abi,
+    }
+}
+
+fn clean_blob_to_legacy(reference: &crate::agent_sdk::BlobRef) -> crate::service::BlobRef {
+    crate::service::BlobRef {
+        hash: Hash(reference.hash.0),
+        len: reference.len,
+    }
+}
+
+fn clean_entry_to_legacy(entry: &crate::agent_sdk::ActorEntry) -> super::ActorEntry {
+    super::ActorEntry {
+        actor: crate::service::ActorId(entry.actor.0),
+        name: entry.name.clone(),
+        parent: entry.parent.map(|value| crate::service::ActorId(value.0)),
+        deployment: crate::service::DeploymentId(entry.deployment.0),
+        program: crate::service::ProgramId(entry.program.0),
+        package: clean_blob_to_legacy(&entry.package),
+        agent_schema: clean_blob_to_legacy(&entry.agent_schema),
+        role_policies: clean_blob_to_legacy(&entry.method_policy),
+        constructor_abi: Hash(entry.constructor_abi.0),
+        installation_data: entry.installation_data.as_ref().map(clean_blob_to_legacy),
+        state_layout: Hash(entry.state_layout.0),
+        lanes: clean_lanes_to_legacy(entry.lanes),
+        suspended: entry.suspended,
+    }
+}
+
+fn legacy_entry_to_clean(entry: &super::ActorEntry) -> crate::agent_sdk::ActorEntry {
+    crate::agent_sdk::ActorEntry {
+        actor: crate::agent_sdk::ActorId(entry.actor.0),
+        name: entry.name.clone(),
+        parent: entry.parent.map(|value| crate::agent_sdk::ActorId(value.0)),
+        deployment: crate::agent_sdk::DeploymentId(entry.deployment.0),
+        program: crate::agent_sdk::ProgramId(entry.program.0),
+        package: crate::agent_sdk::BlobRef {
+            hash: crate::agent_sdk::Hash(entry.package.hash.0),
+            len: entry.package.len,
+        },
+        agent_schema: crate::agent_sdk::BlobRef {
+            hash: crate::agent_sdk::Hash(entry.agent_schema.hash.0),
+            len: entry.agent_schema.len,
+        },
+        method_policy: crate::agent_sdk::BlobRef {
+            hash: crate::agent_sdk::Hash(entry.role_policies.hash.0),
+            len: entry.role_policies.len,
+        },
+        constructor_abi: crate::agent_sdk::Hash(entry.constructor_abi.0),
+        installation_data: entry.installation_data.as_ref().map(|reference| {
+            crate::agent_sdk::BlobRef {
+                hash: crate::agent_sdk::Hash(reference.hash.0),
+                len: reference.len,
+            }
+        }),
+        state_layout: crate::agent_sdk::Hash(entry.state_layout.0),
+        lanes: crate::agent_sdk::LaneSet::from_bits(entry.lanes.bits())
+            .expect("transitional lanes share the closed three-bit set"),
+        suspended: entry.suspended,
+    }
+}
+
+fn clean_install_to_legacy(install: &crate::agent_sdk::InstallActor) -> super::InstallActor {
+    super::InstallActor {
+        installation_id: crate::service::InstallationId(install.installation_id.0),
+        registry_reservation: Hash(install.registry_reservation.0),
+        entry: clean_entry_to_legacy(&install.entry),
+        producer: crate::service::ProducerId(install.producer.0),
+        package: clean_blob_to_legacy(&install.package),
+        agent_schema: clean_blob_to_legacy(&install.agent_schema),
+        role_policies: clean_blob_to_legacy(&install.method_policy),
+        constructor_abi: Hash(install.constructor_abi.0),
+        installation_data: install
+            .installation_data
+            .as_ref()
+            .map(|data| super::InstallationData {
+                reference: clean_blob_to_legacy(&data.reference),
+                bytes: data.bytes.clone(),
+            }),
+        state_layout: Hash(install.state_layout.0),
+        contract: clean_actor_contract_to_legacy(install.contract),
+        requirements: clean_requirements_to_legacy(install.requirements),
+    }
+}
+
+fn clean_upgrade_to_legacy(upgrade: &crate::agent_sdk::UpgradeActor) -> super::UpgradeActor {
+    super::UpgradeActor {
+        actor: crate::service::ActorId(upgrade.actor.0),
+        from_deployment: crate::service::DeploymentId(upgrade.from_deployment.0),
+        to_deployment: crate::service::DeploymentId(upgrade.to_deployment.0),
+        to_program: crate::service::ProgramId(upgrade.to_program.0),
+        producer: crate::service::ProducerId(upgrade.producer.0),
+        package: clean_blob_to_legacy(&upgrade.package),
+        agent_schema: clean_blob_to_legacy(&upgrade.agent_schema),
+        role_policies: clean_blob_to_legacy(&upgrade.method_policy),
+        constructor_abi: Hash(upgrade.constructor_abi.0),
+        state_layout: Hash(upgrade.state_layout.0),
+        contract: clean_actor_contract_to_legacy(upgrade.contract),
+        requirements: clean_requirements_to_legacy(upgrade.requirements),
+    }
+}
+
+fn legacy_identity_to_clean(identity: &super::AgentIdentity) -> crate::agent_sdk::AgentIdentity {
+    crate::agent_sdk::AgentIdentity {
+        space: crate::agent_sdk::SpaceId(identity.space.0),
+        agent: crate::agent_sdk::AgentId(identity.agent.0),
+        owner: crate::agent_sdk::PrincipalId(identity.owner.0),
+        profile: match identity.profile {
+            super::AgentProfile::Local => crate::agent_sdk::AgentProfile::Local,
+            super::AgentProfile::Shared => crate::agent_sdk::AgentProfile::Shared,
+            super::AgentProfile::Private => crate::agent_sdk::AgentProfile::Private,
+        },
+        runtime_deployment: crate::agent_sdk::DeploymentId(identity.runtime_deployment.0),
+        runtime_program: crate::agent_sdk::ProgramId(identity.runtime_program.0),
+        runtime_producer: crate::agent_sdk::ProducerId(identity.runtime_producer.0),
+    }
+}
+
+fn legacy_debt_to_clean(debt: super::ActorLifecycleDebt) -> crate::agent_sdk::ActorLifecycleDebt {
+    crate::agent_sdk::ActorLifecycleDebt {
+        children: debt.children,
+        continuations: debt.continuations,
+        inbox: debt.inbox,
+        outbox: debt.outbox,
+        schedules: debt.schedules,
+        proof_artifacts: debt.proof_artifacts,
+        lifecycle_operations: debt.lifecycle_operations,
+    }
+}
+
+fn legacy_management_error(error: LifecycleError) -> crate::agent_sdk::ManagementError {
+    use crate::agent_sdk::ManagementError;
+    match error {
+        LifecycleError::NotCreated => ManagementError::NotCreated,
+        LifecycleError::AlreadyCreated => ManagementError::AlreadyCreated,
+        LifecycleError::NotFound => ManagementError::NotFound,
+        LifecycleError::AlreadyExists => ManagementError::AlreadyExists,
+        LifecycleError::StaleDeployment => ManagementError::StaleDeployment,
+        LifecycleError::UnsupportedRuntime => ManagementError::UnsupportedRuntime,
+        LifecycleError::UnsupportedLane => ManagementError::UnsupportedLane,
+        LifecycleError::Busy(debt) => ManagementError::Busy(legacy_debt_to_clean(debt)),
+        LifecycleError::DirectoryFull => ManagementError::DirectoryFull,
+        LifecycleError::InvalidRequest | LifecycleError::SystemAuthority(_) => {
+            ManagementError::InvalidRequest
+        }
+        LifecycleError::AuthoritySequenceRegressed => ManagementError::AuthoritySequenceRegressed,
+        LifecycleError::AuthoritySequenceConflict => ManagementError::AuthoritySequenceConflict,
+        LifecycleError::AuthoritySlotRegressed => ManagementError::AuthoritySlotRegressed,
+        LifecycleError::ResourceLimit => ManagementError::ResourceLimit,
+    }
+}
+
 const fn clean_method_mode(mode: crate::agent_sdk::MethodMode) -> super::MethodMode {
     match mode {
         crate::agent_sdk::MethodMode::Query => super::MethodMode::Query,
@@ -565,6 +877,10 @@ impl StandardAgentRuntime {
     pub const fn new() -> Self {
         Self {
             config: None,
+            clean_creation_descriptor: None,
+            clean_descriptor: None,
+            clean_authority_epoch_high_water: None,
+            clean_management_dispositions: Vec::new(),
             system_authority: None,
             actors: BTreeMap::new(),
             retired_installation_ids: BTreeSet::new(),
@@ -594,6 +910,10 @@ impl StandardAgentRuntime {
         self.config.as_ref()
     }
 
+    pub fn clean_descriptor(&self) -> Option<&crate::agent_sdk::AgentDescriptor> {
+        self.clean_descriptor.as_ref()
+    }
+
     pub(crate) fn system_authority(
         &self,
     ) -> Option<&super::system_authority::SystemAuthorityState> {
@@ -619,6 +939,10 @@ impl StandardAgentRuntime {
     pub fn snapshot(&self) -> StandardRuntimeState {
         StandardRuntimeState {
             config: self.config.clone(),
+            clean_creation_descriptor: self.clean_creation_descriptor.clone(),
+            clean_descriptor: self.clean_descriptor.clone(),
+            clean_authority_epoch_high_water: self.clean_authority_epoch_high_water,
+            clean_management_dispositions: self.clean_management_dispositions.clone(),
             system_authority: self.system_authority.clone(),
             actors: self
                 .actors
@@ -660,8 +984,16 @@ impl StandardAgentRuntime {
     }
 
     pub fn restore(state: StandardRuntimeState) -> Result<Self, LifecycleError> {
+        let clean_creation_descriptor = state.clean_creation_descriptor.clone();
+        let clean_descriptor = state.clean_descriptor.clone();
+        let clean_authority_epoch_high_water = state.clean_authority_epoch_high_water;
+        let clean_management_dispositions = state.clean_management_dispositions.clone();
         let Some(config) = state.config else {
             return if state.actors.is_empty()
+                && state.clean_creation_descriptor.is_none()
+                && state.clean_descriptor.is_none()
+                && state.clean_authority_epoch_high_water.is_none()
+                && state.clean_management_dispositions.is_empty()
                 && state.retired_installation_ids.is_empty()
                 && state.system_authority.is_none()
                 && state.lane_state == StandardLaneState::default()
@@ -736,8 +1068,53 @@ impl StandardAgentRuntime {
             return Err(LifecycleError::InvalidRequest);
         }
 
+        match (&clean_creation_descriptor, &clean_descriptor) {
+            (None, None)
+                if clean_authority_epoch_high_water.is_none()
+                    && clean_management_dispositions.is_empty() => {}
+            (Some(creation), Some(current))
+                if creation.validate().is_ok()
+                    && current.validate().is_ok()
+                    && clean_descriptors_share_immutable_creation(creation, current)
+                    && clean_descriptor_to_legacy_config(current)
+                        .is_ok_and(|projected| projected == config)
+                    && clean_authority_epoch_high_water.is_some_and(|high_water| {
+                        high_water >= creation.authority.initial_epoch
+                            && clean_management_dispositions
+                                .iter()
+                                .all(|item| item.epoch <= high_water)
+                    })
+                    && !clean_management_dispositions.is_empty()
+                    && clean_management_dispositions.len() <= MAX_AUTHORITY_DISPOSITIONS
+                    && clean_management_dispositions.iter().all(|item| {
+                        item.authority != crate::agent_sdk::Hash::ZERO
+                            && item.request != crate::agent_sdk::Hash::ZERO
+                            && item.epoch >= creation.authority.initial_epoch
+                    })
+                    && clean_management_dispositions
+                        .windows(2)
+                        .all(|pair| pair[0].observed_slot < pair[1].observed_slot)
+                    && clean_management_dispositions.last().is_some_and(|item| {
+                        state
+                            .authority_slot_high_water
+                            .is_some_and(|high_water| item.observed_slot <= high_water)
+                    }) => {}
+            _ => return Err(LifecycleError::InvalidRequest),
+        }
+
         let mut runtime = Self::new();
-        runtime.apply_mutation(LifecycleRequest::Create(config))?;
+        if clean_descriptor.is_some() {
+            // A clean state has already been validated against its exact SDK
+            // descriptor and compatibility projection above. Re-running the
+            // legacy Create validator would reject the SDK AgentId domain.
+            runtime.config = Some(config);
+        } else {
+            runtime.apply_mutation(LifecycleRequest::Create(config))?;
+        }
+        runtime.clean_creation_descriptor = clean_creation_descriptor;
+        runtime.clean_descriptor = clean_descriptor;
+        runtime.clean_authority_epoch_high_water = clean_authority_epoch_high_water;
+        runtime.clean_management_dispositions = clean_management_dispositions;
         match (
             runtime
                 .config
@@ -808,7 +1185,7 @@ impl StandardAgentRuntime {
                     &record.role_policies,
                 )
                 || record.state_layout == Hash::ZERO
-                || Self::expected_actor_id(config.identity.agent, &record.entry) != actor_id
+                || runtime.expected_actor_id(&record.entry) != actor_id
                 || runtime
                     .actors
                     .values()
@@ -930,9 +1307,15 @@ impl StandardAgentRuntime {
             }
             runtime.authority_dispositions.push(disposition);
         }
-        if runtime.authority_sequence_high_water.is_none()
+        if runtime.authority_dispositions.is_empty() {
+            if runtime.authority_sequence_high_water.is_some()
+                || (runtime.clean_descriptor.is_none()
+                    && runtime.authority_slot_high_water.is_none())
+            {
+                return Err(LifecycleError::InvalidRequest);
+            }
+        } else if runtime.authority_sequence_high_water.is_none()
             || runtime.authority_slot_high_water.is_none()
-            || runtime.authority_dispositions.is_empty()
             || runtime
                 .authority_dispositions
                 .last()
@@ -1087,10 +1470,31 @@ impl StandardAgentRuntime {
         }
     }
 
-    fn expected_actor_id(agent: AgentId, entry: &ActorEntry) -> ActorId {
+    fn expected_actor_id(&self, entry: &ActorEntry) -> ActorId {
+        if let Some(descriptor) = &self.clean_descriptor {
+            return match entry.parent {
+                Some(parent) => crate::service::ActorId(
+                    crate::agent_sdk::ActorId::owned_child(
+                        crate::agent_sdk::ActorId(parent.0),
+                        &entry.name,
+                    )
+                    .0,
+                ),
+                None => crate::service::ActorId(
+                    crate::agent_sdk::ActorId::top_level(descriptor.identity.agent, &entry.name).0,
+                ),
+            };
+        }
         match entry.parent {
             Some(parent) => ActorId::owned_child(parent, &entry.name),
-            None => ActorId::top_level(agent, &entry.name),
+            None => ActorId::top_level(
+                self.config
+                    .as_ref()
+                    .expect("created runtime has an identity")
+                    .identity
+                    .agent,
+                &entry.name,
+            ),
         }
     }
 
@@ -1187,10 +1591,17 @@ impl StandardAgentRuntime {
             || install.role_policies.len == 0
             || install.role_policies.len > super::execution::MAX_EXECUTION_POLICY_BYTES as u64
             || install.constructor_abi == Hash::ZERO
-            || install
-                .installation_data
-                .as_ref()
-                .is_some_and(|data| !data.is_valid())
+            || install.installation_data.as_ref().is_some_and(|data| {
+                if self.clean_descriptor.is_some() {
+                    !crate::agent_sdk::BlobRef {
+                        hash: crate::agent_sdk::Hash(data.reference.hash.0),
+                        len: data.reference.len,
+                    }
+                    .matches(&data.bytes)
+                } else {
+                    !data.is_valid()
+                }
+            })
             || installation_data_aliases_actor_artifact(
                 install
                     .installation_data
@@ -1202,7 +1613,7 @@ impl StandardAgentRuntime {
             )
             || install.state_layout == Hash::ZERO
             || state_generation == Hash::ZERO
-            || Self::expected_actor_id(config.identity.agent, &install.entry) != install.entry.actor
+            || self.expected_actor_id(&install.entry) != install.entry.actor
         {
             return Err(LifecycleError::InvalidRequest);
         }
@@ -1371,10 +1782,14 @@ impl StandardAgentRuntime {
         use crate::agent_sdk::InvocationError;
         use crate::agent_sdk::authority::AuthorityOperationKind;
 
-        let config = self.config.as_ref().ok_or(InvocationError::NotCreated)?;
+        let descriptor = self
+            .clean_descriptor
+            .as_ref()
+            .ok_or(InvocationError::NotCreated)?;
         let selector = &authority.selector;
         if !invocation.validate()
             || authority.validate_shape().is_err()
+            || !descriptor.authority.accepts(authority)
             || selector.operation != AuthorityOperationKind::InvokeActor
             || selector.space != invocation.space
             || selector.agent != invocation.agent
@@ -1382,14 +1797,9 @@ impl StandardAgentRuntime {
             || selector.actor != Some(invocation.actor)
             || selector.actor_deployment != Some(invocation.deployment)
             || selector.request != invocation.commitment()
-            || invocation.space.0 != config.identity.space.0
-            || invocation.agent.0 != config.identity.agent.0
-            || invocation.runtime_deployment.0 != config.identity.runtime_deployment.0
-            || selector.issuer.actor.0 != config.authority.actor.0
-            || selector.issuer.deployment.0 != config.authority.deployment.0
-            || selector.issuer.program.0 != config.authority.program.0
-            || config.authority.public_key
-                != super::authority::ed25519_public_key_wire(authority.public_key)
+            || invocation.space != descriptor.identity.space
+            || invocation.agent != descriptor.identity.agent
+            || invocation.runtime_deployment != descriptor.identity.runtime_deployment
             || !super::authority::verify_raw_ed25519(
                 &authority.public_key,
                 &authority.signing_bytes(),
@@ -1415,10 +1825,14 @@ impl StandardAgentRuntime {
         use crate::agent_sdk::InvocationError;
         use crate::agent_sdk::authority::AuthorityOperationKind;
 
-        let config = self.config.as_ref().ok_or(InvocationError::NotCreated)?;
+        let descriptor = self
+            .clean_descriptor
+            .as_ref()
+            .ok_or(InvocationError::NotCreated)?;
         let selector = &authority.selector;
         if !accepted.validate()
             || authority.validate_shape().is_err()
+            || !descriptor.authority.accepts(authority)
             || selector.operation != AuthorityOperationKind::InvokeActor
             || selector.space != accepted.space
             || selector.agent != accepted.agent
@@ -1426,14 +1840,9 @@ impl StandardAgentRuntime {
             || selector.actor != Some(accepted.actor)
             || selector.actor_deployment != Some(accepted.deployment)
             || selector.request.0 != expected_work.0
-            || accepted.space.0 != config.identity.space.0
-            || accepted.agent.0 != config.identity.agent.0
-            || accepted.runtime_deployment.0 != config.identity.runtime_deployment.0
-            || selector.issuer.actor.0 != config.authority.actor.0
-            || selector.issuer.deployment.0 != config.authority.deployment.0
-            || selector.issuer.program.0 != config.authority.program.0
-            || config.authority.public_key
-                != super::authority::ed25519_public_key_wire(authority.public_key)
+            || accepted.space != descriptor.identity.space
+            || accepted.agent != descriptor.identity.agent
+            || accepted.runtime_deployment != descriptor.identity.runtime_deployment
             || !super::authority::verify_raw_ed25519(
                 &authority.public_key,
                 &authority.signing_bytes(),
@@ -1455,6 +1864,12 @@ impl StandardAgentRuntime {
 
         if !authority.selector.is_live_at(observed_slot) {
             return Err(InvocationError::AuthorityExpired);
+        }
+        if self
+            .clean_authority_epoch_high_water
+            .is_some_and(|high_water| authority.selector.epoch < high_water)
+        {
+            return Err(InvocationError::InvalidAuthorization);
         }
         if self
             .logical_slot_high_water()
@@ -1501,19 +1916,23 @@ impl StandardAgentRuntime {
         let mut installation_data_index = None;
         for (index, blob) in work.availability.iter().enumerate() {
             if blob.bytes.len() <= super::execution::MAX_EXECUTION_PROGRAM_BYTES
-                && crate::service::ProgramId::of_pvm(&blob.bytes).0 == work.program.0
+                && crate::agent_sdk::ProgramId::of_pvm(&blob.bytes) == work.program
             {
                 if program_index.replace(index).is_some() {
                     return Err(InvocationError::InvalidAvailability);
                 }
             }
-            let legacy = crate::service::BlobRef::of_bytes(&blob.bytes);
-            if legacy == actor.record.agent_schema {
+            let portable = crate::agent_sdk::BlobRef::of_bytes(&blob.bytes);
+            if portable.hash.0 == actor.record.agent_schema.hash.0
+                && portable.len == actor.record.agent_schema.len
+            {
                 if schema_index.replace(index).is_some() {
                     return Err(InvocationError::InvalidAvailability);
                 }
             }
-            if legacy == actor.record.role_policies {
+            if portable.hash.0 == actor.record.role_policies.hash.0
+                && portable.len == actor.record.role_policies.len
+            {
                 if policy_index.replace(index).is_some() {
                     return Err(InvocationError::InvalidAvailability);
                 }
@@ -1522,7 +1941,9 @@ impl StandardAgentRuntime {
                 .record
                 .installation_data
                 .as_ref()
-                .is_some_and(|expected| legacy == *expected)
+                .is_some_and(|expected| {
+                    portable.hash.0 == expected.hash.0 && portable.len == expected.len
+                })
             {
                 if blob.bytes.len() > super::MAX_INSTALLATION_DATA_BYTES
                     || installation_data_index.replace(index).is_some()
@@ -2638,6 +3059,524 @@ impl StandardAgentRuntime {
         Ok(LifecycleReply::RuntimeUpgraded(identity))
     }
 
+    fn clean_resource_usage(
+        &self,
+    ) -> Result<crate::agent_sdk::RuntimeResourceUsage, crate::agent_sdk::ManagementError> {
+        use crate::agent_sdk::ManagementError;
+
+        self.created().map_err(legacy_management_error)?;
+        let mut usage = crate::agent_sdk::RuntimeResourceUsage {
+            actors: u32::try_from(self.actors.len()).map_err(|_| ManagementError::ResourceLimit)?,
+            // Management executes between scheduler slices; persisted
+            // continuations are dormant snapshots, not live PVM machines.
+            active_machines: 0,
+            continuations: u32::try_from(self.machine_continuations.len())
+                .map_err(|_| ManagementError::ResourceLimit)?,
+            ..crate::agent_sdk::RuntimeResourceUsage::default()
+        };
+        for actor in self.actors.keys().copied() {
+            let debt = self
+                .lifecycle_debt(actor)
+                .map_err(legacy_management_error)?;
+            usage.inbox = usage
+                .inbox
+                .checked_add(debt.inbox)
+                .ok_or(ManagementError::ResourceLimit)?;
+            usage.outbox = usage
+                .outbox
+                .checked_add(debt.outbox)
+                .ok_or(ManagementError::ResourceLimit)?;
+            usage.schedules = usage
+                .schedules
+                .checked_add(debt.schedules)
+                .ok_or(ManagementError::ResourceLimit)?;
+            usage.proof_artifacts = usage
+                .proof_artifacts
+                .checked_add(debt.proof_artifacts)
+                .ok_or(ManagementError::ResourceLimit)?;
+        }
+        usage.state_bytes = u32::try_from(
+            super::wire::encode_standard_runtime_state(&self.snapshot())
+                .encoded_len()
+                .ok_or(ManagementError::ResourceLimit)?,
+        )
+        .map_err(|_| ManagementError::ResourceLimit)?;
+        Ok(usage)
+    }
+
+    fn verify_clean_management_authority(
+        &self,
+        space: crate::agent_sdk::SpaceId,
+        agent: crate::agent_sdk::AgentId,
+        runtime_deployment: crate::agent_sdk::DeploymentId,
+        request: &crate::agent_sdk::ManagementRequest,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<(), crate::agent_sdk::ManagementError> {
+        use crate::agent_sdk::ManagementError;
+        use crate::agent_sdk::authority::AuthorityOperationKind;
+
+        let descriptor = match request {
+            crate::agent_sdk::ManagementRequest::Create(requested) => {
+                let selected = self
+                    .clean_creation_descriptor
+                    .as_ref()
+                    .unwrap_or(requested.as_ref());
+                if requested.as_ref() != selected {
+                    return Err(ManagementError::AuthoritySequenceConflict);
+                }
+                selected
+            }
+            _ => self
+                .clean_descriptor
+                .as_ref()
+                .ok_or(ManagementError::NotCreated)?,
+        };
+        let expected_runtime = match request {
+            crate::agent_sdk::ManagementRequest::Create(descriptor) => {
+                descriptor.identity.runtime_deployment
+            }
+            crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade) => upgrade.from_deployment,
+            _ => descriptor.identity.runtime_deployment,
+        };
+        let expected_operation = match request {
+            crate::agent_sdk::ManagementRequest::Create(_) => AuthorityOperationKind::CreateAgent,
+            crate::agent_sdk::ManagementRequest::Install(_) => AuthorityOperationKind::InstallActor,
+            crate::agent_sdk::ManagementRequest::UpgradeActor(_) => {
+                AuthorityOperationKind::UpgradeActor
+            }
+            crate::agent_sdk::ManagementRequest::Suspend { .. } => {
+                AuthorityOperationKind::SuspendActor
+            }
+            crate::agent_sdk::ManagementRequest::Resume { .. } => {
+                AuthorityOperationKind::ResumeActor
+            }
+            crate::agent_sdk::ManagementRequest::RemoveLeaf { .. } => {
+                AuthorityOperationKind::RemoveActor
+            }
+            crate::agent_sdk::ManagementRequest::UpgradeRuntime(_) => {
+                AuthorityOperationKind::UpgradeRuntime
+            }
+            crate::agent_sdk::ManagementRequest::ChangeReplicas { .. } => {
+                AuthorityOperationKind::ChangeReplicaSet
+            }
+            crate::agent_sdk::ManagementRequest::InspectActors { .. }
+            | crate::agent_sdk::ManagementRequest::InspectResources => {
+                return Err(ManagementError::InvalidRequest);
+            }
+        };
+        let expected_actor = match request {
+            crate::agent_sdk::ManagementRequest::Install(install) => {
+                Some((install.entry.actor, install.entry.deployment))
+            }
+            crate::agent_sdk::ManagementRequest::UpgradeActor(upgrade) => {
+                Some((upgrade.actor, upgrade.to_deployment))
+            }
+            crate::agent_sdk::ManagementRequest::Suspend {
+                actor,
+                expected_deployment,
+            }
+            | crate::agent_sdk::ManagementRequest::Resume {
+                actor,
+                expected_deployment,
+            }
+            | crate::agent_sdk::ManagementRequest::RemoveLeaf {
+                actor,
+                expected_deployment,
+            } => Some((*actor, *expected_deployment)),
+            _ => None,
+        };
+        let selector = &authority.selector;
+        let selector_actor = selector.actor.zip(selector.actor_deployment);
+        if descriptor.identity.space != space
+            || descriptor.identity.agent != agent
+            || expected_runtime != runtime_deployment
+            || !descriptor.authority.accepts(authority)
+            || authority.validate_shape().is_err()
+            || selector.space != space
+            || selector.agent != agent
+            || selector.runtime_deployment != runtime_deployment
+            || selector.operation != expected_operation
+            || selector_actor != expected_actor
+            || selector.request != request.commitment()
+            || !super::authority::verify_raw_ed25519(
+                &authority.public_key,
+                &authority.signing_bytes(),
+                &authority.signature,
+            )
+        {
+            return Err(ManagementError::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    fn clean_management_mutation(
+        &mut self,
+        request: &crate::agent_sdk::ManagementRequest,
+        authority: crate::agent_sdk::Hash,
+        observed_slot: u64,
+        pristine_input: bool,
+    ) -> Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError> {
+        use crate::agent_sdk::{ManagementError, ManagementReply, ManagementRequest};
+
+        match request {
+            ManagementRequest::Create(descriptor) => {
+                if self.config.is_some() {
+                    return Err(ManagementError::AlreadyCreated);
+                }
+                if !pristine_input {
+                    return Err(ManagementError::InvalidRequest);
+                }
+                let intrinsic = crate::agent_sdk::RuntimeCapabilities::standard();
+                if descriptor.validate().is_err()
+                    || descriptor.capabilities.max_actors > intrinsic.max_actors
+                    || descriptor.capabilities.lanes.bits() & !intrinsic.lanes.bits() != 0
+                    || (descriptor.capabilities.scheduling && !intrinsic.scheduling)
+                    || !descriptor.capabilities.proof_systems.is_empty()
+                {
+                    return Err(ManagementError::UnsupportedRuntime);
+                }
+                let config = clean_descriptor_to_legacy_config(descriptor)
+                    .map_err(legacy_management_error)?;
+                validate_artifact_resources(
+                    config.runtime_contract.resources,
+                    core::iter::once(&config.runtime_package),
+                )
+                .map_err(legacy_management_error)?;
+                // The exact SDK descriptor is the validation and identity
+                // authority here. `AgentConfig` remains private transitional
+                // state and uses a historical AgentId hash domain.
+                self.config = Some(config);
+                self.clean_creation_descriptor = Some((**descriptor).clone());
+                self.clean_descriptor = Some((**descriptor).clone());
+                Ok(ManagementReply::Created(descriptor.identity.clone()))
+            }
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
+                Err(ManagementError::InvalidRequest)
+            }
+            ManagementRequest::Install(install) => {
+                let descriptor = self
+                    .clean_descriptor
+                    .as_ref()
+                    .ok_or(ManagementError::NotCreated)?;
+                install
+                    .validate_for_profile(descriptor.identity.profile)
+                    .map_err(|error| match error {
+                        crate::agent_sdk::ModelError::InvalidProfile => {
+                            ManagementError::UnsupportedLane
+                        }
+                        _ => ManagementError::InvalidRequest,
+                    })?;
+                if !descriptor.runtime_contract.supports(install.contract)
+                    || !descriptor.capabilities.satisfies(install.requirements)
+                {
+                    return Err(ManagementError::UnsupportedRuntime);
+                }
+                let actor = crate::service::ActorId(install.entry.actor.0);
+                let generation = derive_state_generation(
+                    Hash(authority.0),
+                    observed_slot,
+                    Hash(request.commitment().0),
+                    actor,
+                );
+                match self.install(clean_install_to_legacy(install), generation) {
+                    Ok(LifecycleReply::Installed(entry)) => {
+                        Ok(ManagementReply::Installed(legacy_entry_to_clean(&entry)))
+                    }
+                    Ok(_) => Err(ManagementError::InvalidRequest),
+                    Err(error) => Err(legacy_management_error(error)),
+                }
+            }
+            ManagementRequest::UpgradeActor(upgrade) => {
+                let descriptor = self
+                    .clean_descriptor
+                    .as_ref()
+                    .ok_or(ManagementError::NotCreated)?;
+                if !upgrade
+                    .requirements
+                    .supported_by(descriptor.identity.profile)
+                {
+                    return Err(ManagementError::UnsupportedLane);
+                }
+                if !descriptor.runtime_contract.supports(upgrade.contract)
+                    || !descriptor.capabilities.satisfies(upgrade.requirements)
+                {
+                    return Err(ManagementError::UnsupportedRuntime);
+                }
+                match self.upgrade_actor(clean_upgrade_to_legacy(upgrade)) {
+                    Ok(LifecycleReply::Upgraded(entry)) => {
+                        Ok(ManagementReply::Upgraded(legacy_entry_to_clean(&entry)))
+                    }
+                    Ok(_) => Err(ManagementError::InvalidRequest),
+                    Err(error) => Err(legacy_management_error(error)),
+                }
+            }
+            ManagementRequest::Suspend {
+                actor,
+                expected_deployment,
+            } => match self.set_suspended(
+                crate::service::ActorId(actor.0),
+                crate::service::DeploymentId(expected_deployment.0),
+                true,
+            ) {
+                Ok(LifecycleReply::Suspended(entry)) => {
+                    Ok(ManagementReply::Suspended(legacy_entry_to_clean(&entry)))
+                }
+                Ok(_) => Err(ManagementError::InvalidRequest),
+                Err(error) => Err(legacy_management_error(error)),
+            },
+            ManagementRequest::Resume {
+                actor,
+                expected_deployment,
+            } => match self.set_suspended(
+                crate::service::ActorId(actor.0),
+                crate::service::DeploymentId(expected_deployment.0),
+                false,
+            ) {
+                Ok(LifecycleReply::Resumed(entry)) => {
+                    Ok(ManagementReply::Resumed(legacy_entry_to_clean(&entry)))
+                }
+                Ok(_) => Err(ManagementError::InvalidRequest),
+                Err(error) => Err(legacy_management_error(error)),
+            },
+            ManagementRequest::RemoveLeaf {
+                actor,
+                expected_deployment,
+            } => match self.remove_leaf(
+                crate::service::ActorId(actor.0),
+                crate::service::DeploymentId(expected_deployment.0),
+            ) {
+                Ok(LifecycleReply::Removed(actor)) => {
+                    Ok(ManagementReply::Removed(crate::agent_sdk::ActorId(actor.0)))
+                }
+                Ok(_) => Err(ManagementError::InvalidRequest),
+                Err(error) => Err(legacy_management_error(error)),
+            },
+            ManagementRequest::UpgradeRuntime(upgrade) => {
+                if upgrade.capabilities.proof_systems.len() != 0 {
+                    return Err(ManagementError::UnsupportedRuntime);
+                }
+                let legacy_capabilities = clean_capabilities_to_legacy(
+                    upgrade.capabilities,
+                    self.clean_descriptor
+                        .as_ref()
+                        .ok_or(ManagementError::NotCreated)?
+                        .identity
+                        .profile,
+                );
+                self.upgrade_runtime(
+                    crate::service::DeploymentId(upgrade.from_deployment.0),
+                    crate::service::DeploymentId(upgrade.to_deployment.0),
+                    crate::service::ProgramId(upgrade.to_program.0),
+                    crate::service::ProducerId(upgrade.producer.0),
+                    clean_blob_to_legacy(&upgrade.package),
+                    clean_runtime_contract_to_legacy(upgrade.contract),
+                    legacy_capabilities,
+                )
+                .map_err(legacy_management_error)?;
+                let current = self
+                    .clean_descriptor
+                    .as_mut()
+                    .ok_or(ManagementError::NotCreated)?;
+                current.identity.runtime_deployment = upgrade.to_deployment;
+                current.identity.runtime_program = upgrade.to_program;
+                current.identity.runtime_producer = upgrade.producer;
+                current.runtime_package = upgrade.package.clone();
+                current.runtime_contract = upgrade.contract;
+                current.capabilities = upgrade.capabilities;
+                Ok(ManagementReply::RuntimeUpgraded(current.identity.clone()))
+            }
+            ManagementRequest::ChangeReplicas {
+                expected_generation,
+                replicas,
+            } => {
+                let current = self
+                    .clean_descriptor
+                    .as_ref()
+                    .ok_or(ManagementError::NotCreated)?;
+                if current.replica_generation() != *expected_generation {
+                    return Err(ManagementError::StaleDeployment);
+                }
+                let mut next = current.clone();
+                next.replicas = replicas.clone();
+                next.validate()
+                    .map_err(|_| ManagementError::InvalidRequest)?;
+                let generation = next.replica_generation();
+                let projected =
+                    clean_descriptor_to_legacy_config(&next).map_err(legacy_management_error)?;
+                self.config = Some(projected);
+                self.clean_descriptor = Some(next);
+                Ok(ManagementReply::ReplicasChanged { generation })
+            }
+        }
+    }
+
+    /// Apply one clean-generation management operation. Authentication is
+    /// repeated inside the guest; host-side RuntimeWork validation is never a
+    /// trust decision.
+    pub(crate) fn apply_clean_management(
+        &mut self,
+        space: crate::agent_sdk::SpaceId,
+        agent: crate::agent_sdk::AgentId,
+        runtime_deployment: crate::agent_sdk::DeploymentId,
+        request: crate::agent_sdk::ManagementRequest,
+        authority: Option<crate::agent_sdk::authority::AuthorityReceipt>,
+        observed_slot: u64,
+        pristine_input: bool,
+    ) -> Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError> {
+        use crate::agent_sdk::{ManagementError, ManagementReply, ManagementRequest};
+
+        if matches!(
+            request,
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources
+        ) {
+            if authority.is_some() {
+                return Err(ManagementError::InvalidRequest);
+            }
+            let descriptor = self
+                .clean_descriptor
+                .as_ref()
+                .ok_or(ManagementError::NotCreated)?;
+            if descriptor.identity.space != space
+                || descriptor.identity.agent != agent
+                || descriptor.identity.runtime_deployment != runtime_deployment
+            {
+                return Err(ManagementError::InvalidRequest);
+            }
+            return match request {
+                ManagementRequest::InspectActors { after, limit } => {
+                    let reply = self
+                        .directory_page(after.map(|value| crate::service::ActorId(value.0)), limit)
+                        .map_err(legacy_management_error)?;
+                    let LifecycleReply::Directory(page) = reply else {
+                        return Err(ManagementError::InvalidRequest);
+                    };
+                    let page = crate::agent_sdk::ActorDirectoryPage {
+                        entries: page
+                            .entries
+                            .into_iter()
+                            .map(|record| crate::agent_sdk::ActorDirectoryRecord {
+                                entry: legacy_entry_to_clean(&record.entry),
+                                incarnation: crate::agent_sdk::Hash(record.incarnation.0),
+                                installation_id: crate::agent_sdk::InstallationId(
+                                    record.installation_id.0,
+                                ),
+                                registry_reservation: crate::agent_sdk::Hash(
+                                    record.registry_reservation.0,
+                                ),
+                            })
+                            .collect(),
+                        next: page.next.map(|value| crate::agent_sdk::ActorId(value.0)),
+                    };
+                    page.validate()
+                        .map_err(|_| ManagementError::InvalidRequest)?;
+                    Ok(ManagementReply::Actors(page))
+                }
+                ManagementRequest::InspectResources => {
+                    self.clean_resource_usage().map(ManagementReply::Resources)
+                }
+                _ => unreachable!("read-only branch selected above"),
+            };
+        }
+
+        let authority = authority.ok_or(ManagementError::InvalidRequest)?;
+        self.verify_clean_management_authority(
+            space,
+            agent,
+            runtime_deployment,
+            &request,
+            &authority,
+        )?;
+        let authority_id = authority.commitment();
+        let request_id = request.commitment();
+        if let Some(disposition) = self
+            .clean_management_dispositions
+            .iter()
+            .find(|item| item.authority == authority_id)
+        {
+            if disposition.request != request_id || disposition.epoch != authority.selector.epoch {
+                return Err(ManagementError::AuthoritySequenceConflict);
+            }
+            let result = disposition.result.clone();
+            self.clean_authority_epoch_high_water = Some(
+                self.clean_authority_epoch_high_water
+                    .map_or(authority.selector.epoch, |current| {
+                        current.max(authority.selector.epoch)
+                    }),
+            );
+            self.authority_slot_high_water = Some(
+                self.authority_slot_high_water
+                    .map_or(observed_slot, |current| current.max(observed_slot)),
+            );
+            return result;
+        }
+        if !authority.selector.is_live_at(observed_slot) {
+            return Err(ManagementError::InvalidRequest);
+        }
+        if self
+            .clean_authority_epoch_high_water
+            .is_some_and(|high_water| authority.selector.epoch < high_water)
+        {
+            return Err(ManagementError::AuthoritySequenceRegressed);
+        }
+        if let Some(high_water) = self.logical_slot_high_water() {
+            if observed_slot < high_water {
+                return Err(ManagementError::AuthoritySlotRegressed);
+            }
+            if observed_slot == high_water {
+                return Err(ManagementError::AuthoritySequenceConflict);
+            }
+        }
+
+        let before = self.clone();
+        let mut result =
+            self.clean_management_mutation(&request, authority_id, observed_slot, pristine_input);
+        if result.is_err() {
+            *self = before.clone();
+        }
+        if before.config.is_none() && result.is_err() {
+            return result;
+        }
+        self.clean_authority_epoch_high_water = Some(authority.selector.epoch);
+        self.authority_slot_high_water = Some(observed_slot);
+        if self.clean_management_dispositions.len() == MAX_AUTHORITY_DISPOSITIONS {
+            self.clean_management_dispositions.remove(0);
+        }
+        self.clean_management_dispositions
+            .push(StandardCleanManagementDisposition {
+                authority: authority_id,
+                request: request_id,
+                epoch: authority.selector.epoch,
+                observed_slot,
+                result: result.clone(),
+            });
+        if self.validate_signed_state_resource().is_ok() {
+            return result;
+        }
+
+        *self = before.clone();
+        result = Err(ManagementError::ResourceLimit);
+        if self.config.is_none() {
+            return result;
+        }
+        if self.clean_management_dispositions.len() == MAX_AUTHORITY_DISPOSITIONS {
+            self.clean_management_dispositions.remove(0);
+        }
+        self.clean_authority_epoch_high_water = Some(authority.selector.epoch);
+        self.authority_slot_high_water = Some(observed_slot);
+        self.clean_management_dispositions
+            .push(StandardCleanManagementDisposition {
+                authority: authority_id,
+                request: request_id,
+                epoch: authority.selector.epoch,
+                observed_slot,
+                result: result.clone(),
+            });
+        if self.validate_signed_state_resource().is_err() {
+            *self = before;
+        }
+        result
+    }
+
     fn apply_authorized(
         &mut self,
         admission: super::LifecycleAuthorityAdmission,
@@ -3368,6 +4307,7 @@ mod tests {
         AgentIdentity, AgentProfile, AgentReplica, InstallActor, LaneSet,
         LifecycleAuthorityAdmission, ReplicaRole, RuntimeCapabilities, StateLane, UpgradeActor,
     };
+    use crate::service::AgentId;
     use crate::service::wire::ServiceWire;
     use crate::service::{
         BlobRef, CapabilityId, CredentialId, Hash, NodeId, OperationId, PrincipalId, ProducerId,

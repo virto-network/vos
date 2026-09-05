@@ -8,8 +8,8 @@ use super::execution::{
 };
 use super::standard::{
     StandardActorState, StandardAgentRuntime, StandardAuthorityDisposition,
-    StandardInvocationResult, StandardLaneEntry, StandardLaneState, StandardMachineContinuation,
-    StandardRuntimeState,
+    StandardCleanManagementDisposition, StandardInvocationResult, StandardLaneEntry,
+    StandardLaneState, StandardMachineContinuation, StandardRuntimeState,
 };
 use super::{
     ActorDirectoryPage, ActorDirectoryRecord, ActorEntry, ActorLifecycleDebt, AgentConfig,
@@ -456,6 +456,36 @@ fn decode_bounded_list<T>(
     Ok(values)
 }
 
+const MAX_CLEAN_MANAGEMENT_RESULT_BYTES: usize = 8 * 1024;
+
+fn encode_clean_management_result(
+    result: &Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
+) -> Vec<u8> {
+    use crate::agent_sdk::wire::CanonicalWire as _;
+    crate::agent_sdk::RuntimeTransition {
+        state: crate::agent_sdk::RuntimeState::default(),
+        outcome: crate::agent_sdk::RuntimeOutcome::Management(result.clone()),
+    }
+    .encode()
+    .expect("persisted clean management result is canonical")
+}
+
+fn decode_clean_management_result(
+    bytes: &[u8],
+) -> Result<Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>, DecodeError>
+{
+    use crate::agent_sdk::wire::CanonicalWire as _;
+    let transition = crate::agent_sdk::RuntimeTransition::decode(bytes)
+        .map_err(|_| DecodeError::NonCanonical)?;
+    if !transition.state.is_empty() {
+        return Err(DecodeError::NonCanonical);
+    }
+    match transition.outcome {
+        crate::agent_sdk::RuntimeOutcome::Management(result) => Ok(result),
+        _ => Err(DecodeError::NonCanonical),
+    }
+}
+
 /// Encode the standard runtime's policy state and three actor-state lanes as
 /// independently durable opaque components.
 pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeState {
@@ -463,6 +493,32 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
     let mut encoder = Encoder(&mut control);
     encoder.fixed(&super::RUNTIME_ABI_ID.0);
     encoder.option(&state.config, encode_config);
+    encoder.option(&state.clean_creation_descriptor, |encoder, descriptor| {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        encoder.bytes(
+            &descriptor
+                .encode()
+                .expect("persisted clean creation descriptor is canonical"),
+        )
+    });
+    encoder.option(&state.clean_descriptor, |encoder, descriptor| {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        encoder.bytes(
+            &descriptor
+                .encode()
+                .expect("persisted clean current descriptor is canonical"),
+        )
+    });
+    encoder.option(&state.clean_authority_epoch_high_water, |encoder, epoch| {
+        encoder.u64(*epoch)
+    });
+    encoder.list(&state.clean_management_dispositions, |encoder, item| {
+        encoder.fixed(item.authority.as_bytes());
+        encoder.fixed(item.request.as_bytes());
+        encoder.u64(item.epoch);
+        encoder.u64(item.observed_slot);
+        encoder.bytes(&encode_clean_management_result(&item.result));
+    });
     encoder.option(&state.system_authority, |encoder, authority| {
         encoder.bytes(&authority.encode())
     });
@@ -571,7 +627,53 @@ pub fn decode_standard_runtime_state(
     if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID {
         return Err(DecodeError::InvalidPlatform);
     }
-    let config = decoder.option(decode_config)?;
+    // Clean SDK state carries an internal AgentConfig projection whose
+    // AgentId is derived in the SDK domain. Decode its shape first; restore
+    // below validates it against the exact persisted SDK descriptor. Legacy
+    // standalone AgentConfig and lifecycle decoders still use decode_config
+    // and therefore retain the historical identity-domain validation.
+    let config = decoder.option(decode_config_unvalidated)?;
+    let clean_creation_descriptor = decoder.option(|decoder| {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        let bytes = decoder.bytes_ref().and_then(|bytes| {
+            (bytes.len() <= crate::agent_sdk::wire::MAX_AGENT_DESCRIPTOR_WIRE_BYTES)
+                .then_some(bytes)
+                .ok_or(DecodeError::LimitExceeded)
+        })?;
+        crate::agent_sdk::AgentDescriptor::decode(bytes).map_err(|_| DecodeError::NonCanonical)
+    })?;
+    let clean_descriptor = decoder.option(|decoder| {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        let bytes = decoder.bytes_ref().and_then(|bytes| {
+            (bytes.len() <= crate::agent_sdk::wire::MAX_AGENT_DESCRIPTOR_WIRE_BYTES)
+                .then_some(bytes)
+                .ok_or(DecodeError::LimitExceeded)
+        })?;
+        crate::agent_sdk::AgentDescriptor::decode(bytes).map_err(|_| DecodeError::NonCanonical)
+    })?;
+    let clean_authority_epoch_high_water = decoder.option(Decoder::u64)?;
+    let clean_management_dispositions = decode_bounded_list(
+        &mut decoder,
+        super::standard::MAX_AUTHORITY_DISPOSITIONS,
+        |decoder| {
+            let authority = crate::agent_sdk::Hash(decoder.fixed()?);
+            let request = crate::agent_sdk::Hash(decoder.fixed()?);
+            let epoch = decoder.u64()?;
+            let observed_slot = decoder.u64()?;
+            let bytes = decoder.bytes_ref()?;
+            if bytes.len() > MAX_CLEAN_MANAGEMENT_RESULT_BYTES {
+                return Err(DecodeError::LimitExceeded);
+            }
+            let result = decode_clean_management_result(bytes)?;
+            Ok(StandardCleanManagementDisposition {
+                authority,
+                request,
+                epoch,
+                observed_slot,
+                result,
+            })
+        },
+    )?;
     let system_authority = decoder.option(|decoder| {
         let bytes = decoder.bytes_ref()?;
         if bytes.len() > super::system_authority::MAX_SYSTEM_AUTHORITY_STATE_BYTES {
@@ -756,6 +858,10 @@ pub fn decode_standard_runtime_state(
     }
     let state = StandardRuntimeState {
         config,
+        clean_creation_descriptor,
+        clean_descriptor,
+        clean_authority_epoch_high_water,
+        clean_management_dispositions,
         system_authority,
         actors,
         retired_installation_ids,
@@ -1449,9 +1555,9 @@ pub fn apply_standard_execution(
     Ok(RuntimeExecutionReturn { state, result })
 }
 
-/// Apply the clean portable AgentRuntime work ABI. Management remains on the
-/// established lifecycle seam during the cutover; Invoke and Resume are
-/// clean-generation messages and never fall back to a legacy decoder.
+/// Apply the clean portable AgentRuntime work ABI. Every branch consumes
+/// exactly one canonical AWRK generation; no transitional lifecycle message
+/// is decoded by this entry.
 #[cfg(feature = "pvm")]
 pub fn apply_standard_runtime_work(
     work: crate::agent_sdk::RuntimeWork,
@@ -1466,15 +1572,63 @@ pub fn apply_standard_runtime_work(
         crate::agent_sdk::RuntimeWork::Resume { state, resume } => {
             apply_clean_resume(state, *resume)
         }
-        crate::agent_sdk::RuntimeWork::Manage { state, .. } => {
-            Ok(crate::agent_sdk::RuntimeTransition {
-                state,
-                outcome: crate::agent_sdk::RuntimeOutcome::Management(Err(
-                    crate::agent_sdk::ManagementError::InvalidRequest,
-                )),
-            })
-        }
+        crate::agent_sdk::RuntimeWork::Manage {
+            space,
+            agent,
+            runtime_deployment,
+            state,
+            request,
+            authority,
+            observed_slot,
+        } => apply_clean_manage(
+            space,
+            agent,
+            runtime_deployment,
+            state,
+            *request,
+            authority.map(|value| *value),
+            observed_slot,
+        ),
     }
+}
+
+#[cfg(feature = "pvm")]
+fn apply_clean_manage(
+    space: crate::agent_sdk::SpaceId,
+    agent: crate::agent_sdk::AgentId,
+    runtime_deployment: crate::agent_sdk::DeploymentId,
+    state: crate::agent_sdk::RuntimeState,
+    request: crate::agent_sdk::ManagementRequest,
+    authority: Option<crate::agent_sdk::authority::AuthorityReceipt>,
+    observed_slot: u64,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    let pristine_input = state.is_empty();
+    let read_only = matches!(
+        &request,
+        crate::agent_sdk::ManagementRequest::InspectActors { .. }
+            | crate::agent_sdk::ManagementRequest::InspectResources
+    );
+    let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state))?;
+    let mut runtime =
+        StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
+    let result = runtime.apply_clean_management(
+        space,
+        agent,
+        runtime_deployment,
+        request,
+        authority,
+        observed_slot,
+        pristine_input,
+    );
+    let successor = if read_only {
+        state
+    } else {
+        legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot()))
+    };
+    Ok(crate::agent_sdk::RuntimeTransition {
+        state: successor,
+        outcome: crate::agent_sdk::RuntimeOutcome::Management(result),
+    })
 }
 
 #[cfg(feature = "pvm")]
@@ -3096,6 +3250,12 @@ fn encode_config(encoder: &mut Encoder<'_>, config: &AgentConfig) {
 }
 
 fn decode_config(decoder: &mut Decoder<'_>) -> Result<AgentConfig, DecodeError> {
+    let config = decode_config_unvalidated(decoder)?;
+    config.validate().map_err(|_| DecodeError::NonCanonical)?;
+    Ok(config)
+}
+
+fn decode_config_unvalidated(decoder: &mut Decoder<'_>) -> Result<AgentConfig, DecodeError> {
     let identity = decode_identity(decoder)?;
     let creation_nonce = Hash(decoder.fixed()?);
     let authority = super::authority::decode_binding(decoder)?;
@@ -3138,7 +3298,6 @@ fn decode_config(decoder: &mut Decoder<'_>) -> Result<AgentConfig, DecodeError> 
         capabilities,
         replicas,
     };
-    config.validate().map_err(|_| DecodeError::NonCanonical)?;
     Ok(config)
 }
 
@@ -3507,6 +3666,115 @@ mod tests {
     }
 
     #[cfg(feature = "pvm")]
+    fn clean_test_descriptor(
+        profile: crate::agent_sdk::AgentProfile,
+    ) -> crate::agent_sdk::AgentDescriptor {
+        use crate::agent_sdk::authority::{AgentAuthorityBinding, AuthorityIssuer};
+
+        let space = crate::agent_sdk::SpaceId([2; 32]);
+        let owner = crate::agent_sdk::PrincipalId([1; 32]);
+        let creation_nonce = crate::agent_sdk::Hash([0x15; 32]);
+        let agent = crate::agent_sdk::AgentId::derive(space, owner, creation_nonce.as_bytes());
+        let public_key = authority_key().verifying_key().to_bytes();
+        let replicas = match profile {
+            crate::agent_sdk::AgentProfile::Local => vec![crate::agent_sdk::AgentReplica {
+                node: crate::agent_sdk::NodeId([8; 32]),
+                principal: owner,
+                role: crate::agent_sdk::ReplicaRole::Voter,
+            }],
+            crate::agent_sdk::AgentProfile::Shared => vec![
+                crate::agent_sdk::AgentReplica {
+                    node: crate::agent_sdk::NodeId([8; 32]),
+                    principal: owner,
+                    role: crate::agent_sdk::ReplicaRole::Voter,
+                },
+                crate::agent_sdk::AgentReplica {
+                    node: crate::agent_sdk::NodeId([9; 32]),
+                    principal: crate::agent_sdk::PrincipalId([10; 32]),
+                    role: crate::agent_sdk::ReplicaRole::Observer,
+                },
+            ],
+            crate::agent_sdk::AgentProfile::Private => vec![
+                crate::agent_sdk::AgentReplica {
+                    node: crate::agent_sdk::NodeId([8; 32]),
+                    principal: owner,
+                    role: crate::agent_sdk::ReplicaRole::Observer,
+                },
+                crate::agent_sdk::AgentReplica {
+                    node: crate::agent_sdk::NodeId([9; 32]),
+                    principal: owner,
+                    role: crate::agent_sdk::ReplicaRole::Observer,
+                },
+            ],
+        };
+        let descriptor = crate::agent_sdk::AgentDescriptor {
+            identity: crate::agent_sdk::AgentIdentity {
+                space,
+                agent,
+                owner,
+                profile,
+                runtime_deployment: crate::agent_sdk::DeploymentId([4; 32]),
+                runtime_program: crate::agent_sdk::ProgramId([5; 32]),
+                runtime_producer: crate::agent_sdk::ProducerId([6; 32]),
+            },
+            creation_nonce,
+            authority: AgentAuthorityBinding {
+                policy: crate::agent_sdk::Hash([0x31; 32]),
+                issuer: AuthorityIssuer {
+                    principal: owner,
+                    actor: crate::agent_sdk::ActorId([12; 32]),
+                    deployment: crate::agent_sdk::DeploymentId([13; 32]),
+                    program: crate::agent_sdk::ProgramId([14; 32]),
+                    producer: crate::agent_sdk::ProducerId::of_public_key(&public_key),
+                },
+                public_key,
+                initial_epoch: 1,
+            },
+            runtime_package: crate::agent_sdk::BlobRef {
+                hash: crate::agent_sdk::Hash([7; 32]),
+                len: 100,
+            },
+            runtime_contract: crate::agent_sdk::contract::RuntimePackageContract::canonical(),
+            capabilities: crate::agent_sdk::RuntimeCapabilities::standard(),
+            replicas,
+        };
+        descriptor.validate().unwrap();
+        descriptor
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_sparse_standard_state() -> StandardRuntimeState {
+        let mut state = sparse_standard_state();
+        let descriptor = clean_test_descriptor(crate::agent_sdk::AgentProfile::Shared);
+        let config =
+            super::super::standard::clean_descriptor_to_legacy_config(&descriptor).unwrap();
+        let actor = crate::service::ActorId(
+            crate::agent_sdk::ActorId::top_level(descriptor.identity.agent, "sparse").0,
+        );
+        state.config = Some(config.clone());
+        state.actors[0].record.entry.actor = actor;
+        state.actors[0].record.contract = super::super::contract::ActorPackageContract {
+            actor_abi: crate::agent_sdk::contract::ACTOR_ABI,
+        };
+        state.lane_state.linear[0].actor = actor;
+        state.clean_creation_descriptor = Some(descriptor.clone());
+        state.clean_descriptor = Some(descriptor.clone());
+        state.clean_authority_epoch_high_water = Some(1);
+        state.clean_management_dispositions = vec![StandardCleanManagementDisposition {
+            authority: crate::agent_sdk::Hash([0x91; 32]),
+            request: crate::agent_sdk::Hash([0x92; 32]),
+            epoch: 1,
+            observed_slot: 1,
+            result: Ok(crate::agent_sdk::ManagementReply::Created(
+                descriptor.identity.clone(),
+            )),
+        }];
+        state.authority_dispositions[0].result = Ok(LifecycleReply::Created(config.identity));
+        StandardAgentRuntime::restore(state.clone()).unwrap();
+        state
+    }
+
+    #[cfg(feature = "pvm")]
     fn sparse_invocation(mode: MethodMode, id: u8) -> ActorInvocation {
         let state = sparse_standard_state();
         let actor = &state.actors[0].record;
@@ -3784,15 +4052,835 @@ mod tests {
     }
 
     #[cfg(feature = "pvm")]
+    fn clean_management_receipt(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        request: &crate::agent_sdk::ManagementRequest,
+        epoch: u64,
+        valid_from: u64,
+        expires_at: u64,
+    ) -> crate::agent_sdk::authority::AuthorityReceipt {
+        use crate::agent_sdk::ManagementRequest;
+        use crate::agent_sdk::authority::{
+            AuthorityEvidence, AuthorityLaneRoots, AuthorityOperationKind, AuthorityReceipt,
+            AuthorityReceiptSelector,
+        };
+
+        let (operation, actor, actor_deployment) = match request {
+            ManagementRequest::Create(_) => (AuthorityOperationKind::CreateAgent, None, None),
+            ManagementRequest::Install(install) => (
+                AuthorityOperationKind::InstallActor,
+                Some(install.entry.actor),
+                Some(install.entry.deployment),
+            ),
+            ManagementRequest::UpgradeActor(upgrade) => (
+                AuthorityOperationKind::UpgradeActor,
+                Some(upgrade.actor),
+                Some(upgrade.to_deployment),
+            ),
+            ManagementRequest::Suspend {
+                actor,
+                expected_deployment,
+            } => (
+                AuthorityOperationKind::SuspendActor,
+                Some(*actor),
+                Some(*expected_deployment),
+            ),
+            ManagementRequest::Resume {
+                actor,
+                expected_deployment,
+            } => (
+                AuthorityOperationKind::ResumeActor,
+                Some(*actor),
+                Some(*expected_deployment),
+            ),
+            ManagementRequest::RemoveLeaf {
+                actor,
+                expected_deployment,
+            } => (
+                AuthorityOperationKind::RemoveActor,
+                Some(*actor),
+                Some(*expected_deployment),
+            ),
+            ManagementRequest::UpgradeRuntime(_) => {
+                (AuthorityOperationKind::UpgradeRuntime, None, None)
+            }
+            ManagementRequest::ChangeReplicas { .. } => {
+                (AuthorityOperationKind::ChangeReplicaSet, None, None)
+            }
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
+                panic!("read-only management has no authority receipt")
+            }
+        };
+        let runtime_deployment = match request {
+            ManagementRequest::Create(requested) => requested.identity.runtime_deployment,
+            ManagementRequest::UpgradeRuntime(upgrade) => upgrade.from_deployment,
+            _ => descriptor.identity.runtime_deployment,
+        };
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: descriptor.authority.policy,
+                issuer: descriptor.authority.issuer,
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                operation,
+                runtime_deployment,
+                actor,
+                actor_deployment,
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: crate::agent_sdk::Hash([0x32; 32]),
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch,
+                valid_from,
+                expires_at,
+                request: request.commitment(),
+            },
+            public_key: descriptor.authority.public_key,
+            signature: [1; 64],
+        };
+        receipt.signature = authority_key().sign(&receipt.signing_bytes()).to_bytes();
+        receipt
+    }
+
+    #[cfg(feature = "pvm")]
+    fn apply_clean_management_test(
+        state: crate::agent_sdk::RuntimeState,
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        request: crate::agent_sdk::ManagementRequest,
+        authority: Option<crate::agent_sdk::authority::AuthorityReceipt>,
+        observed_slot: u64,
+    ) -> crate::agent_sdk::RuntimeTransition {
+        let runtime_deployment = match &request {
+            crate::agent_sdk::ManagementRequest::Create(requested) => {
+                requested.identity.runtime_deployment
+            }
+            crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade) => upgrade.from_deployment,
+            _ => descriptor.identity.runtime_deployment,
+        };
+        apply_standard_runtime_work(crate::agent_sdk::RuntimeWork::Manage {
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            runtime_deployment,
+            state,
+            request: Box::new(request),
+            authority: authority.map(Box::new),
+            observed_slot,
+        })
+        .unwrap()
+    }
+
+    #[cfg(feature = "pvm")]
+    fn create_clean_management_state(
+        profile: crate::agent_sdk::AgentProfile,
+    ) -> (
+        crate::agent_sdk::AgentDescriptor,
+        crate::agent_sdk::RuntimeState,
+        crate::agent_sdk::authority::AuthorityReceipt,
+    ) {
+        let descriptor = clean_test_descriptor(profile);
+        let request = crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+        let receipt = clean_management_receipt(&descriptor, &request, 1, 1, 10);
+        let transition = apply_clean_management_test(
+            crate::agent_sdk::RuntimeState::default(),
+            &descriptor,
+            request,
+            Some(receipt.clone()),
+            1,
+        );
+        assert_eq!(
+            transition.outcome,
+            crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                crate::agent_sdk::ManagementReply::Created(descriptor.identity.clone()),
+            ))
+        );
+        assert!(!transition.state.is_empty());
+        (descriptor, transition.state, receipt)
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_install_request(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        name: &str,
+        parent: Option<crate::agent_sdk::ActorId>,
+        marker: u8,
+        lanes: crate::agent_sdk::LaneSet,
+    ) -> crate::agent_sdk::InstallActor {
+        let package = crate::agent_sdk::BlobRef::of_bytes(&[marker, 1]);
+        let schema = crate::agent_sdk::BlobRef::of_bytes(&[marker, 2]);
+        let policy = crate::agent_sdk::BlobRef::of_bytes(&[marker, 3]);
+        let installation_bytes = vec![marker, 9];
+        let installation_data = crate::agent_sdk::InstallationData {
+            reference: crate::agent_sdk::BlobRef::of_bytes(&installation_bytes),
+            bytes: installation_bytes,
+        };
+        let actor = parent.map_or_else(
+            || crate::agent_sdk::ActorId::top_level(descriptor.identity.agent, name),
+            |parent| crate::agent_sdk::ActorId::owned_child(parent, name),
+        );
+        let entry = crate::agent_sdk::ActorEntry {
+            actor,
+            name: name.into(),
+            parent,
+            deployment: crate::agent_sdk::DeploymentId([marker; 32]),
+            program: crate::agent_sdk::ProgramId::of_pvm(&[marker, 4]),
+            package: package.clone(),
+            agent_schema: schema.clone(),
+            method_policy: policy.clone(),
+            constructor_abi: crate::agent_sdk::Hash([marker.wrapping_add(1); 32]),
+            installation_data: Some(installation_data.reference.clone()),
+            state_layout: crate::agent_sdk::Hash([marker.wrapping_add(2); 32]),
+            lanes,
+            suspended: false,
+        };
+        crate::agent_sdk::InstallActor {
+            installation_id: crate::agent_sdk::InstallationId([marker.wrapping_add(3); 32]),
+            registry_reservation: crate::agent_sdk::Hash([marker.wrapping_add(4); 32]),
+            entry,
+            producer: crate::agent_sdk::ProducerId([marker.wrapping_add(5); 32]),
+            package,
+            agent_schema: schema,
+            method_policy: policy,
+            constructor_abi: crate::agent_sdk::Hash([marker.wrapping_add(1); 32]),
+            installation_data: Some(installation_data),
+            state_layout: crate::agent_sdk::Hash([marker.wrapping_add(2); 32]),
+            contract: crate::agent_sdk::contract::ActorPackageContract::canonical(),
+            requirements: crate::agent_sdk::RuntimeRequirements {
+                lanes,
+                scheduling: false,
+                proof_systems: crate::agent_sdk::ProofSystemSet::EMPTY,
+            },
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_management_retries_expiry_restart_and_authority_checks_are_exact() {
+        use crate::agent_sdk::{
+            ManagementError, ManagementReply, ManagementRequest, RuntimeOutcome,
+        };
+
+        let (descriptor, created, create_receipt) =
+            create_clean_management_state(crate::agent_sdk::AgentProfile::Local);
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&created)).unwrap();
+        assert_eq!(
+            decoded.clean_creation_descriptor.as_ref(),
+            Some(&descriptor)
+        );
+        assert_eq!(decoded.clean_descriptor.as_ref(), Some(&descriptor));
+        assert_eq!(decoded.clean_management_dispositions.len(), 1);
+        let projected =
+            super::super::standard::clean_descriptor_to_legacy_config(&descriptor).unwrap();
+        let image = super::super::driver::AgentImage {
+            revision: 1,
+            runtime_program: crate::service::ProgramId(descriptor.identity.runtime_program.0),
+            config: projected,
+            runtime_state: clean_state_to_legacy(&created),
+        };
+        assert_eq!(
+            super::super::driver::AgentImage::decode(&image.encode()).unwrap(),
+            image,
+            "a clean image must survive the durable host envelope"
+        );
+        let mut mismatched_image = image.clone();
+        mismatched_image.config.identity.owner = crate::service::PrincipalId([0x7f; 32]);
+        assert!(
+            super::super::driver::AgentImage::decode(&mismatched_image.encode()).is_err(),
+            "the envelope cannot substitute a legacy projection for the clean descriptor"
+        );
+        assert_eq!(
+            legacy_state_to_clean(encode_standard_runtime_state(&decoded)),
+            created,
+            "restart must preserve the exact clean state bytes"
+        );
+
+        let create = ManagementRequest::Create(Box::new(descriptor.clone()));
+        let retried =
+            apply_clean_management_test(created, &descriptor, create, Some(create_receipt), 20);
+        assert_eq!(
+            retried.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Created(descriptor.identity.clone(),))),
+            "an already committed exact retry survives receipt expiry"
+        );
+
+        let inspected = apply_clean_management_test(
+            retried.state.clone(),
+            &descriptor,
+            ManagementRequest::InspectResources,
+            None,
+            u64::MAX,
+        );
+        assert_eq!(inspected.state, retried.state);
+        assert!(matches!(
+            inspected.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Resources(_)))
+        ));
+
+        let request = ManagementRequest::Suspend {
+            actor: crate::agent_sdk::ActorId([0x61; 32]),
+            expected_deployment: crate::agent_sdk::DeploymentId([0x62; 32]),
+        };
+        let expired = clean_management_receipt(&descriptor, &request, 1, 1, 10);
+        let rejected = apply_clean_management_test(
+            retried.state.clone(),
+            &descriptor,
+            request.clone(),
+            Some(expired),
+            21,
+        );
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::InvalidRequest)),
+            "an unseen receipt is rejected after expiry"
+        );
+        assert_eq!(rejected.state, retried.state);
+
+        let live = clean_management_receipt(&descriptor, &request, 1, 1, 100);
+        let assert_invalid = |receipt| {
+            let rejected = apply_clean_management_test(
+                retried.state.clone(),
+                &descriptor,
+                request.clone(),
+                Some(receipt),
+                21,
+            );
+            assert_eq!(
+                rejected.outcome,
+                RuntimeOutcome::Management(Err(ManagementError::InvalidRequest))
+            );
+            assert_eq!(rejected.state, retried.state);
+        };
+
+        let mut wrong_signature = live.clone();
+        wrong_signature.signature[0] ^= 1;
+        assert_invalid(wrong_signature);
+
+        let mut wrong_policy = live.clone();
+        wrong_policy.selector.policy = crate::agent_sdk::Hash([0x63; 32]);
+        wrong_policy.signature = authority_key()
+            .sign(&wrong_policy.signing_bytes())
+            .to_bytes();
+        assert_invalid(wrong_policy);
+
+        let mut wrong_issuer = live.clone();
+        wrong_issuer.selector.issuer.principal = crate::agent_sdk::PrincipalId([0x64; 32]);
+        wrong_issuer.signature = authority_key()
+            .sign(&wrong_issuer.signing_bytes())
+            .to_bytes();
+        assert_invalid(wrong_issuer);
+
+        let mut wrong_operation = live.clone();
+        wrong_operation.selector.operation =
+            crate::agent_sdk::authority::AuthorityOperationKind::ResumeActor;
+        wrong_operation.signature = authority_key()
+            .sign(&wrong_operation.signing_bytes())
+            .to_bytes();
+        assert_invalid(wrong_operation);
+
+        let mut wrong_request = live.clone();
+        wrong_request.selector.request = crate::agent_sdk::Hash([0x65; 32]);
+        wrong_request.signature = authority_key()
+            .sign(&wrong_request.signing_bytes())
+            .to_bytes();
+        assert_invalid(wrong_request);
+
+        let mut wrong_runtime = live.clone();
+        wrong_runtime.selector.runtime_deployment = crate::agent_sdk::DeploymentId([0x66; 32]);
+        wrong_runtime.signature = authority_key()
+            .sign(&wrong_runtime.signing_bytes())
+            .to_bytes();
+        assert_invalid(wrong_runtime);
+
+        let mut wrong_space = live.clone();
+        wrong_space.selector.space = crate::agent_sdk::SpaceId([0x68; 32]);
+        wrong_space.signature = authority_key()
+            .sign(&wrong_space.signing_bytes())
+            .to_bytes();
+        assert_invalid(wrong_space);
+
+        let mut wrong_agent = live.clone();
+        wrong_agent.selector.agent = crate::agent_sdk::AgentId([0x69; 32]);
+        wrong_agent.signature = authority_key()
+            .sign(&wrong_agent.signing_bytes())
+            .to_bytes();
+        assert_invalid(wrong_agent);
+
+        let mut wrong_actor = live.clone();
+        wrong_actor.selector.actor = Some(crate::agent_sdk::ActorId([0x67; 32]));
+        wrong_actor.signature = authority_key()
+            .sign(&wrong_actor.signing_bytes())
+            .to_bytes();
+        assert_invalid(wrong_actor);
+
+        let alternate = SigningKey::from_bytes(&[0x42; 32]);
+        let mut wrong_key = live.clone();
+        wrong_key.public_key = alternate.verifying_key().to_bytes();
+        wrong_key.selector.issuer.producer =
+            crate::agent_sdk::ProducerId::of_public_key(&wrong_key.public_key);
+        wrong_key.signature = alternate.sign(&wrong_key.signing_bytes()).to_bytes();
+        assert_invalid(wrong_key);
+
+        let divergent = apply_clean_management_test(
+            retried.state.clone(),
+            &descriptor,
+            request.clone(),
+            Some(live.clone()),
+            20,
+        );
+        assert_eq!(
+            divergent.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::AuthoritySequenceConflict))
+        );
+        assert_eq!(divergent.state, retried.state);
+
+        let regressed = apply_clean_management_test(
+            retried.state.clone(),
+            &descriptor,
+            request.clone(),
+            Some(live),
+            19,
+        );
+        assert_eq!(
+            regressed.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::AuthoritySlotRegressed))
+        );
+        assert_eq!(regressed.state, retried.state);
+
+        let replacement = vec![crate::agent_sdk::AgentReplica {
+            node: crate::agent_sdk::NodeId([0x70; 32]),
+            principal: descriptor.identity.owner,
+            role: crate::agent_sdk::ReplicaRole::Voter,
+        }];
+        let change = ManagementRequest::ChangeReplicas {
+            expected_generation: descriptor.replica_generation(),
+            replicas: replacement,
+        };
+        let changed = apply_clean_management_test(
+            retried.state,
+            &descriptor,
+            change.clone(),
+            Some(clean_management_receipt(&descriptor, &change, 2, 21, 30)),
+            21,
+        );
+        assert!(matches!(
+            changed.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::ReplicasChanged { .. }))
+        ));
+        let current = decode_standard_runtime_state(&clean_state_to_legacy(&changed.state))
+            .unwrap()
+            .clean_descriptor
+            .unwrap();
+        let old_epoch = clean_management_receipt(&current, &request, 1, 22, 30);
+        let rejected = apply_clean_management_test(
+            changed.state.clone(),
+            &current,
+            request,
+            Some(old_epoch),
+            22,
+        );
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::AuthoritySequenceRegressed))
+        );
+        assert_eq!(rejected.state, changed.state);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_management_runs_full_lifecycle_paging_runtime_and_replica_changes() {
+        use crate::agent_sdk::{
+            ManagementError, ManagementReply, ManagementRequest, RuntimeOutcome,
+        };
+
+        let (descriptor, mut state, _) =
+            create_clean_management_state(crate::agent_sdk::AgentProfile::Local);
+        let parent = clean_install_request(
+            &descriptor,
+            "parent",
+            None,
+            0x21,
+            crate::agent_sdk::LaneSet::NONE,
+        );
+        let parent_actor = parent.entry.actor;
+        let parent_deployment = parent.entry.deployment;
+        let install_parent = ManagementRequest::Install(Box::new(parent.clone()));
+        let transition = apply_clean_management_test(
+            state,
+            &descriptor,
+            install_parent.clone(),
+            Some(clean_management_receipt(
+                &descriptor,
+                &install_parent,
+                1,
+                2,
+                2,
+            )),
+            2,
+        );
+        assert_eq!(
+            transition.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Installed(parent.entry.clone())))
+        );
+        state = transition.state;
+
+        let child = clean_install_request(
+            &descriptor,
+            "child",
+            Some(parent_actor),
+            0x31,
+            crate::agent_sdk::LaneSet::NONE,
+        );
+        let child_actor = child.entry.actor;
+        let child_deployment = child.entry.deployment;
+        let install_child = ManagementRequest::Install(Box::new(child.clone()));
+        let transition = apply_clean_management_test(
+            state,
+            &descriptor,
+            install_child.clone(),
+            Some(clean_management_receipt(
+                &descriptor,
+                &install_child,
+                1,
+                3,
+                3,
+            )),
+            3,
+        );
+        assert_eq!(
+            transition.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Installed(child.entry.clone())))
+        );
+        state = transition.state;
+
+        let first = apply_clean_management_test(
+            state.clone(),
+            &descriptor,
+            ManagementRequest::InspectActors {
+                after: None,
+                limit: 1,
+            },
+            None,
+            0,
+        );
+        assert_eq!(first.state, state);
+        let RuntimeOutcome::Management(Ok(ManagementReply::Actors(first_page))) = first.outcome
+        else {
+            panic!("expected first actor page")
+        };
+        assert_eq!(first_page.entries.len(), 1);
+        let cursor = first_page.next.expect("two actors require a second page");
+        let second = apply_clean_management_test(
+            state.clone(),
+            &descriptor,
+            ManagementRequest::InspectActors {
+                after: Some(cursor),
+                limit: 1,
+            },
+            None,
+            0,
+        );
+        assert_eq!(second.state, state);
+        let RuntimeOutcome::Management(Ok(ManagementReply::Actors(second_page))) = second.outcome
+        else {
+            panic!("expected second actor page")
+        };
+        assert_eq!(second_page.entries.len(), 1);
+        assert_eq!(second_page.next, None);
+        assert_ne!(
+            first_page.entries[0].entry.actor,
+            second_page.entries[0].entry.actor
+        );
+
+        let upgraded_deployment = crate::agent_sdk::DeploymentId([0x41; 32]);
+        let upgraded_package = crate::agent_sdk::BlobRef::of_bytes(b"upgraded-package");
+        let upgraded_schema = crate::agent_sdk::BlobRef::of_bytes(b"upgraded-schema");
+        let upgraded_policy = crate::agent_sdk::BlobRef::of_bytes(b"upgraded-policy");
+        let upgrade = crate::agent_sdk::UpgradeActor {
+            actor: parent_actor,
+            from_deployment: parent_deployment,
+            to_deployment: upgraded_deployment,
+            to_program: crate::agent_sdk::ProgramId::of_pvm(b"upgraded-program"),
+            producer: crate::agent_sdk::ProducerId([0x42; 32]),
+            package: upgraded_package,
+            agent_schema: upgraded_schema,
+            method_policy: upgraded_policy,
+            constructor_abi: parent.constructor_abi,
+            state_layout: parent.state_layout,
+            contract: parent.contract,
+            requirements: parent.requirements,
+        };
+        let upgrade_request = ManagementRequest::UpgradeActor(Box::new(upgrade.clone()));
+        let transition = apply_clean_management_test(
+            state,
+            &descriptor,
+            upgrade_request.clone(),
+            Some(clean_management_receipt(
+                &descriptor,
+                &upgrade_request,
+                1,
+                4,
+                4,
+            )),
+            4,
+        );
+        assert!(matches!(
+            transition.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Upgraded(ref entry)))
+                if entry.actor == parent_actor && entry.deployment == upgraded_deployment
+        ));
+        state = transition.state;
+
+        let suspend = ManagementRequest::Suspend {
+            actor: parent_actor,
+            expected_deployment: upgraded_deployment,
+        };
+        let transition = apply_clean_management_test(
+            state,
+            &descriptor,
+            suspend.clone(),
+            Some(clean_management_receipt(&descriptor, &suspend, 1, 5, 5)),
+            5,
+        );
+        assert!(matches!(
+            transition.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Suspended(ref entry)))
+                if entry.suspended
+        ));
+        state = transition.state;
+
+        let resume = ManagementRequest::Resume {
+            actor: parent_actor,
+            expected_deployment: upgraded_deployment,
+        };
+        let transition = apply_clean_management_test(
+            state,
+            &descriptor,
+            resume.clone(),
+            Some(clean_management_receipt(&descriptor, &resume, 1, 6, 6)),
+            6,
+        );
+        assert!(matches!(
+            transition.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Resumed(ref entry)))
+                if !entry.suspended
+        ));
+        state = transition.state;
+
+        let remove_parent = ManagementRequest::RemoveLeaf {
+            actor: parent_actor,
+            expected_deployment: upgraded_deployment,
+        };
+        let remove_parent_receipt = clean_management_receipt(&descriptor, &remove_parent, 1, 7, 7);
+        let busy = apply_clean_management_test(
+            state,
+            &descriptor,
+            remove_parent.clone(),
+            Some(remove_parent_receipt.clone()),
+            7,
+        );
+        assert!(matches!(
+            busy.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::Busy(debt))) if debt.children == 1
+        ));
+        let busy_retry = apply_clean_management_test(
+            busy.state,
+            &descriptor,
+            remove_parent.clone(),
+            Some(remove_parent_receipt),
+            50,
+        );
+        assert!(matches!(
+            busy_retry.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::Busy(debt))) if debt.children == 1
+        ));
+        state = busy_retry.state;
+
+        let remove_child = ManagementRequest::RemoveLeaf {
+            actor: child_actor,
+            expected_deployment: child_deployment,
+        };
+        let transition = apply_clean_management_test(
+            state,
+            &descriptor,
+            remove_child.clone(),
+            Some(clean_management_receipt(
+                &descriptor,
+                &remove_child,
+                1,
+                51,
+                51,
+            )),
+            51,
+        );
+        assert_eq!(
+            transition.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Removed(child_actor)))
+        );
+        state = transition.state;
+
+        let transition = apply_clean_management_test(
+            state,
+            &descriptor,
+            remove_parent.clone(),
+            Some(clean_management_receipt(
+                &descriptor,
+                &remove_parent,
+                1,
+                52,
+                52,
+            )),
+            52,
+        );
+        assert_eq!(
+            transition.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Removed(parent_actor)))
+        );
+        state = transition.state;
+
+        let runtime_upgrade = crate::agent_sdk::RuntimeUpgrade {
+            from_deployment: descriptor.identity.runtime_deployment,
+            to_deployment: crate::agent_sdk::DeploymentId([0x81; 32]),
+            to_program: crate::agent_sdk::ProgramId([0x82; 32]),
+            producer: crate::agent_sdk::ProducerId([0x83; 32]),
+            package: crate::agent_sdk::BlobRef::of_bytes(b"new-runtime-package"),
+            contract: crate::agent_sdk::contract::RuntimePackageContract::canonical(),
+            capabilities: crate::agent_sdk::RuntimeCapabilities::standard(),
+        };
+        let upgrade_runtime = ManagementRequest::UpgradeRuntime(Box::new(runtime_upgrade.clone()));
+        let transition = apply_clean_management_test(
+            state,
+            &descriptor,
+            upgrade_runtime.clone(),
+            Some(clean_management_receipt(
+                &descriptor,
+                &upgrade_runtime,
+                1,
+                53,
+                53,
+            )),
+            53,
+        );
+        assert!(matches!(
+            transition.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::RuntimeUpgraded(ref identity)))
+                if identity.runtime_deployment == runtime_upgrade.to_deployment
+                    && identity.runtime_program == runtime_upgrade.to_program
+        ));
+        state = transition.state;
+        let current = decode_standard_runtime_state(&clean_state_to_legacy(&state))
+            .unwrap()
+            .clean_descriptor
+            .unwrap();
+
+        let replacements = vec![crate::agent_sdk::AgentReplica {
+            node: crate::agent_sdk::NodeId([0x84; 32]),
+            principal: current.identity.owner,
+            role: crate::agent_sdk::ReplicaRole::Voter,
+        }];
+        let change = ManagementRequest::ChangeReplicas {
+            expected_generation: current.replica_generation(),
+            replicas: replacements,
+        };
+        let transition = apply_clean_management_test(
+            state,
+            &current,
+            change.clone(),
+            Some(clean_management_receipt(&current, &change, 1, 54, 54)),
+            54,
+        );
+        assert!(matches!(
+            transition.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::ReplicasChanged { .. }))
+        ));
+        let inspected = apply_clean_management_test(
+            transition.state.clone(),
+            &current,
+            ManagementRequest::InspectResources,
+            None,
+            0,
+        );
+        assert_eq!(inspected.state, transition.state);
+        assert!(matches!(
+            inspected.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Resources(usage)))
+                if usage.actors == 0 && usage.continuations == 0
+        ));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_management_private_profile_refuses_linear_install_and_retains_error() {
+        use crate::agent_sdk::{ManagementError, ManagementRequest, RuntimeOutcome, StateLane};
+
+        let (descriptor, state, _) =
+            create_clean_management_state(crate::agent_sdk::AgentProfile::Private);
+        let install = clean_install_request(
+            &descriptor,
+            "linear",
+            None,
+            0x51,
+            crate::agent_sdk::LaneSet::of(StateLane::Linear),
+        );
+        let request = ManagementRequest::Install(Box::new(install));
+        let receipt = clean_management_receipt(&descriptor, &request, 1, 2, 2);
+        let rejected = apply_clean_management_test(
+            state,
+            &descriptor,
+            request.clone(),
+            Some(receipt.clone()),
+            2,
+        );
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::UnsupportedLane))
+        );
+        let retried =
+            apply_clean_management_test(rejected.state, &descriptor, request, Some(receipt), 100);
+        assert_eq!(
+            retried.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::UnsupportedLane))
+        );
+        let inspected = apply_clean_management_test(
+            retried.state.clone(),
+            &descriptor,
+            ManagementRequest::InspectActors {
+                after: None,
+                limit: 1,
+            },
+            None,
+            0,
+        );
+        assert_eq!(inspected.state, retried.state);
+        assert!(matches!(
+            inspected.outcome,
+            RuntimeOutcome::Management(Ok(crate::agent_sdk::ManagementReply::Actors(page)))
+                if page.entries.is_empty()
+        ));
+    }
+
+    #[cfg(feature = "pvm")]
     fn clean_pending_fixture() -> (
         crate::agent_sdk::RuntimeState,
         crate::agent_sdk::InvocationWork,
         crate::agent_sdk::authority::AuthorityReceipt,
         crate::agent_sdk::YieldedInvocation,
     ) {
-        let state = sparse_standard_state();
+        let state = clean_sparse_standard_state();
         let config = state.config.as_ref().unwrap().clone();
-        let invocation = sparse_invocation(MethodMode::Linear, 0xc1);
+        let actor = &state.actors[0].record;
+        let invocation = ActorInvocation {
+            invocation: crate::service::InvocationId([0xc1; 32]),
+            actor: actor.entry.actor,
+            incarnation: actor.state_generation,
+            deployment: actor.entry.deployment,
+            program: actor.entry.program,
+            mode: MethodMode::Linear,
+            auth: ActorInvocationAuth::anonymous(),
+            message: vec![1],
+            availability: Vec::new(),
+            gas: 100,
+        };
         let mut availability = [
             b"immutable-program".as_slice(),
             b"immutable-schema",
@@ -3880,7 +4968,7 @@ mod tests {
     fn clean_resolvable_fixture(
         alias_artifact_roles: bool,
     ) -> (StandardAgentRuntime, crate::agent_sdk::InvocationWork) {
-        let mut state = sparse_standard_state();
+        let mut state = clean_sparse_standard_state();
         let config = state.config.as_ref().unwrap().clone();
         let actor = &mut state.actors[0].record;
         let program_bytes = b"clean-program".to_vec();
@@ -3894,9 +4982,18 @@ mod tests {
         } else {
             b"clean-policy".to_vec()
         };
-        actor.entry.program = crate::service::ProgramId::of_pvm(&program_bytes);
-        actor.entry.agent_schema = crate::service::BlobRef::of_bytes(&schema_bytes);
-        actor.entry.role_policies = crate::service::BlobRef::of_bytes(&policy_bytes);
+        actor.entry.program =
+            crate::service::ProgramId(crate::agent_sdk::ProgramId::of_pvm(&program_bytes).0);
+        let schema = crate::agent_sdk::BlobRef::of_bytes(&schema_bytes);
+        actor.entry.agent_schema = crate::service::BlobRef {
+            hash: crate::service::Hash(schema.hash.0),
+            len: schema.len,
+        };
+        let policy = crate::agent_sdk::BlobRef::of_bytes(&policy_bytes);
+        actor.entry.role_policies = crate::service::BlobRef {
+            hash: crate::service::Hash(policy.hash.0),
+            len: policy.len,
+        };
         actor.agent_schema = actor.entry.agent_schema.clone();
         actor.role_policies = actor.entry.role_policies.clone();
         let mut availability = [program_bytes, schema_bytes, policy_bytes]
@@ -4040,8 +5137,10 @@ mod tests {
 
         let mut divergent = work.clone();
         divergent.message.push(0xff);
-        let divergent_authority =
-            clean_authority_receipt(sparse_standard_state().config.as_ref().unwrap(), &divergent);
+        let divergent_authority = clean_authority_receipt(
+            clean_sparse_standard_state().config.as_ref().unwrap(),
+            &divergent,
+        );
         let rejected = apply_standard_runtime_work(RuntimeWork::Invoke {
             state: state.clone(),
             invocation: Box::new(divergent),

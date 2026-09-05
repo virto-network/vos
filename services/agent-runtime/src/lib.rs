@@ -1,10 +1,9 @@
 //! Bundled VOS agent-runtime guest.
 //!
-//! `_start` is the stable lifecycle entry. The node supplies one
-//! [`RuntimeCall`](vos::agent::wire::RuntimeCall); the runtime returns the
-//! next opaque state and its lifecycle result as a
-//! [`RuntimeReturn`](vos::agent::wire::RuntimeReturn). The host persists the
-//! state bytes without interpreting them.
+//! `_start` is the stable clean-generation entry. The node supplies exactly
+//! one canonical [`RuntimeWork`](vos::agent_sdk::RuntimeWork) and receives a
+//! canonical [`RuntimeTransition`](vos::agent_sdk::RuntimeTransition). The
+//! host persists the returned lane components without interpreting them.
 
 #[cfg(target_arch = "riscv64")]
 mod guest {
@@ -13,12 +12,8 @@ mod guest {
     use alloc::vec::Vec;
     use core::arch::global_asm;
 
-    use vos::agent::execution::RuntimeExecutionCall;
-    use vos::agent::wire::{
-        RuntimeCall, apply_standard, apply_standard_execution, apply_standard_runtime_work,
-    };
+    use vos::agent::wire::apply_standard_runtime_work;
     use vos::agent_sdk::wire::CanonicalWire as _;
-    use vos::service::ServiceWire;
 
     #[repr(C)]
     struct OutputWindow {
@@ -41,25 +36,11 @@ mod guest {
         // SAFETY: the standard PVM loader maps the complete argument window
         // read-only and supplies its base/length in a0/a1.
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
-        let output = if input.starts_with(&vos::agent_sdk::RuntimeWork::MAGIC) {
-            let work = vos::agent_sdk::RuntimeWork::decode(input).unwrap_or_else(|_| fail_closed());
-            apply_standard_runtime_work(work)
-                .unwrap_or_else(|_| fail_closed())
-                .encode()
-                .unwrap_or_else(|_| fail_closed())
-        } else if input.starts_with(&RuntimeCall::MAGIC) {
-            let call = RuntimeCall::decode(input).unwrap_or_else(|_| fail_closed());
-            apply_standard(call)
-                .unwrap_or_else(|_| fail_closed())
-                .encode()
-        } else if input.starts_with(&RuntimeExecutionCall::MAGIC) {
-            let call = RuntimeExecutionCall::decode(input).unwrap_or_else(|_| fail_closed());
-            apply_standard_execution(call)
-                .unwrap_or_else(|_| fail_closed())
-                .encode()
-        } else {
-            fail_closed()
-        };
+        let work = vos::agent_sdk::RuntimeWork::decode(input).unwrap_or_else(|_| fail_closed());
+        let output = apply_standard_runtime_work(work)
+            .unwrap_or_else(|_| fail_closed())
+            .encode()
+            .unwrap_or_else(|_| fail_closed());
         return_owned(output)
     }
 

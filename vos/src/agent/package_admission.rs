@@ -139,6 +139,16 @@ impl AdmittedActorPackage {
             .expect("admitted package retained its exact closure")
     }
 
+    pub fn state_lane_schema_bytes(&self) -> &[u8] {
+        artifact_bytes(&self.envelope, &self.manifest().state_lane_schema)
+            .expect("admitted package retained its exact closure")
+    }
+
+    pub fn method_policy_bytes(&self) -> &[u8] {
+        artifact_bytes(&self.envelope, &self.manifest().method_policy)
+            .expect("admitted package retained its exact closure")
+    }
+
     pub fn program_bytes(&self) -> &[u8] {
         artifact_bytes(&self.envelope, &self.manifest().program)
             .expect("admitted package retained its exact closure")

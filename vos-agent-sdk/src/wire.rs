@@ -24,6 +24,7 @@ pub const MAX_ACTOR_ENTRY_WIRE_BYTES: usize = 1_024;
 pub const MAX_DIRECTORY_PAGE_WIRE_BYTES: usize =
     HEADER_BYTES + 4 + MAX_DIRECTORY_PAGE_ENTRIES * (MAX_ACTOR_ENTRY_WIRE_BYTES + 128) + 33;
 pub const MAX_AUTHORITY_RECEIPT_WIRE_BYTES: usize = 1_024;
+pub const MAX_AGENT_DESCRIPTOR_WIRE_BYTES: usize = 64 * 1024;
 pub const MAX_RUNTIME_WORK_WIRE_BYTES: usize =
     HEADER_BYTES + MAX_RUNTIME_STATE_BYTES + MAX_RUNTIME_AVAILABILITY_BYTES + 512 * 1024;
 pub const MAX_RUNTIME_TRANSITION_WIRE_BYTES: usize =
@@ -415,6 +416,23 @@ fn decode_agent_descriptor(decoder: &mut Decoder<'_>) -> Result<AgentDescriptor,
         .is_ok()
         .then_some(value)
         .ok_or(DecodeError::NonCanonical)
+}
+
+impl CanonicalWire for AgentDescriptor {
+    const MAGIC: [u8; 4] = *b"AADS";
+    const MAX_ENCODED_BYTES: usize = MAX_AGENT_DESCRIPTOR_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_agent_descriptor(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_agent_descriptor(decoder)
+    }
 }
 
 fn encode_actor_entry(encoder: &mut Encoder<'_>, value: &ActorEntry) {
@@ -1075,7 +1093,7 @@ fn authority_matches_management(
     agent: AgentId,
     runtime_deployment: DeploymentId,
     request: &ManagementRequest,
-    observed_slot: u64,
+    _observed_slot: u64,
 ) -> bool {
     receipt.validate_shape().is_ok()
         && receipt.selector.space == space
@@ -1083,7 +1101,6 @@ fn authority_matches_management(
         && receipt.selector.runtime_deployment == runtime_deployment
         && Some(receipt.selector.operation) == required_operation(request)
         && receipt.selector.request == management_request_commitment(request)
-        && receipt.selector.is_live_at(observed_slot)
         && match (
             management_actor(request),
             receipt.selector.actor,
@@ -1342,8 +1359,7 @@ fn runtime_work_valid(value: &RuntimeWork) -> bool {
                 return false;
             }
             if let ManagementRequest::Create(descriptor) = request.as_ref() {
-                if !state.is_empty()
-                    || descriptor.identity.space != *space
+                if descriptor.identity.space != *space
                     || descriptor.identity.agent != *agent
                     || descriptor.identity.runtime_deployment != *runtime_deployment
                     || authority
@@ -2592,7 +2608,7 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_predecessor_runtime_state() {
+    fn create_retry_may_carry_predecessor_state_but_cannot_self_select_trust() {
         let space = SpaceId([41; 32]);
         let owner = PrincipalId([42; 32]);
         let creation_nonce = Hash([43; 32]);
@@ -2631,6 +2647,11 @@ mod tests {
                 role: ReplicaRole::Voter,
             }],
         };
+        let descriptor_bytes = descriptor.encode().unwrap();
+        assert_eq!(
+            AgentDescriptor::decode(&descriptor_bytes),
+            Ok(descriptor.clone())
+        );
         let request = ManagementRequest::Create(alloc::boxed::Box::new(descriptor));
         authority.selector.request = request.commitment();
         let work = RuntimeWork::Manage {
@@ -2660,7 +2681,7 @@ mod tests {
             unreachable!()
         };
         state.control.push(1);
-        assert_eq!(with_predecessor.encode(), Err(WireError::InvalidValue));
+        assert!(with_predecessor.encode().is_ok());
     }
 
     #[test]

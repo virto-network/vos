@@ -464,6 +464,41 @@ impl AgentDescriptor {
         }
         Ok(())
     }
+
+    /// Generation of the complete replica set selected by this descriptor.
+    ///
+    /// Replica-set changes use this value as their compare-and-replace
+    /// predecessor.  It is deliberately scoped by the Agent identity so an
+    /// otherwise identical roster cannot be replayed across Agents.
+    pub fn replica_generation(&self) -> Hash {
+        replica_set_generation(&self.identity, self.creation_nonce, &self.replicas)
+    }
+}
+
+/// Domain-separated commitment of one canonical replica roster.
+///
+/// Callers must validate the surrounding descriptor (or the replacement
+/// roster) before treating this commitment as an admitted generation.
+pub fn replica_set_generation(
+    identity: &AgentIdentity,
+    creation_nonce: Hash,
+    replicas: &[AgentReplica],
+) -> Hash {
+    let mut bytes = Vec::with_capacity(4 * 32 + 1 + 4 + replicas.len() * 65);
+    bytes.extend_from_slice(identity.space.as_bytes());
+    bytes.extend_from_slice(identity.agent.as_bytes());
+    bytes.extend_from_slice(identity.owner.as_bytes());
+    bytes.push(identity.profile as u8);
+    bytes.extend_from_slice(creation_nonce.as_bytes());
+    bytes.extend_from_slice(&(replicas.len() as u32).to_le_bytes());
+    for replica in replicas {
+        bytes.extend_from_slice(replica.node.as_bytes());
+        bytes.extend_from_slice(replica.principal.as_bytes());
+        bytes.push(replica.role as u8);
+    }
+    let mut generation = Hash::digest(b"vos/agent/replica-set-generation/v1", &[&bytes]);
+    generation.0[0] |= 0x80;
+    generation
 }
 
 /// Durable actor descriptor. Top-level actors have `parent = None`; no actor
@@ -779,6 +814,40 @@ mod tests {
 
         assert!(descriptor.capabilities.lanes.contains(StateLane::Linear));
         assert_eq!(descriptor.validate(), Ok(()));
+        let generation = descriptor.replica_generation();
+        let mut changed = descriptor.clone();
+        changed.replicas[0].node = NodeId([15; 32]);
+        assert_ne!(changed.replica_generation(), generation);
+        let mut changed = descriptor.clone();
+        changed.replicas[0].principal = PrincipalId([16; 32]);
+        assert_ne!(changed.replica_generation(), generation);
+        let mut changed = descriptor.clone();
+        changed.replicas[0].role = ReplicaRole::Voter;
+        assert_ne!(changed.replica_generation(), generation);
+        let mut changed = descriptor.clone();
+        changed.identity.space = SpaceId([17; 32]);
+        assert_ne!(changed.replica_generation(), generation);
+        let mut changed = descriptor.clone();
+        changed.identity.agent = AgentId([18; 32]);
+        assert_ne!(changed.replica_generation(), generation);
+        let mut changed = descriptor.clone();
+        changed.identity.owner = PrincipalId([19; 32]);
+        assert_ne!(changed.replica_generation(), generation);
+        let mut changed = descriptor.clone();
+        changed.identity.profile = AgentProfile::Shared;
+        assert_ne!(changed.replica_generation(), generation);
+        let mut changed = descriptor.clone();
+        changed.creation_nonce = Hash([20; 32]);
+        assert_ne!(changed.replica_generation(), generation);
+        let mut runtime_changed = descriptor.clone();
+        runtime_changed.identity.runtime_deployment = DeploymentId([21; 32]);
+        runtime_changed.identity.runtime_program = ProgramId([22; 32]);
+        runtime_changed.identity.runtime_producer = ProducerId([23; 32]);
+        assert_eq!(
+            runtime_changed.replica_generation(),
+            generation,
+            "runtime upgrades must not silently advance the replica generation"
+        );
         let mut unanchored = descriptor.clone();
         unanchored.authority.policy = Hash::ZERO;
         assert_eq!(unanchored.validate(), Err(ModelError::InvalidRuntime));
