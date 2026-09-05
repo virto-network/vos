@@ -60,7 +60,7 @@ the live authority, so revocation and role changes take effect immediately.
 | `GET /__schema`, `GET /__schema/<actor>` | `space.discover` |
 | `GET /openapi.json` | `space.discover` |
 | `GET /__metrics` | `space.metrics.read` |
-| `/<actor>/<method>` | `agent.invoke`, then the actor's method capability |
+| `/<agent>/<actor>/<method>` | `agent.invoke`, then the actor's method capability |
 
 Queries use `GET` query parameters. Array query values use comma-separated
 OpenAPI form encoding; byte values use hexadecimal text. Mutating methods use

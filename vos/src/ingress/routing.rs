@@ -1,9 +1,9 @@
 //! Built-in HTTP request routing.
 //!
 //! The host parses HTTP/1.1, authenticates a bearer credential against the
-//! canonical space authority, and converts `/<actor>/<method>` into the same
-//! schema-bound actor invocation used by typed VOS clients. Socket and HTTP
-//! state never enter actor execution.
+//! canonical space authority, and converts `/<agent>/<actor>/<method>` into
+//! the same schema-bound actor invocation used by typed VOS clients. Socket
+//! and HTTP state never enter actor execution.
 //!
 //! ## Built-in routes (precedence + auth)
 //!
@@ -13,7 +13,7 @@
 //! | 2 | `/__metrics`                 | GET    | none     | Admin         |
 //! | 3 | `/__schema`, `/__schema/<a>` | GET    | registry | space.discover |
 //! | 4 | `/openapi.json`              | GET    | registry | space.discover |
-//! | 5 | `/<actor>/<method>`           | any    | actor    | agent.invoke + policy |
+//! | 5 | `/<agent>/<actor>/<method>`   | any    | actor    | agent.invoke + policy |
 //!
 //! Credential revocation and role changes take effect on the next request.
 
@@ -98,10 +98,10 @@ fn handle_metrics(req: &Request, inner: &Inner) -> Option<Response> {
 /// Reserved namespaces which can never be actor names.
 const PUBLIC_NAMESPACES: &[&str] = &["__schema", "__metrics", "openapi.json"];
 
-/// Resolve `/<agent>/<method>` (and the `/__schema*` / `/openapi.json`
+/// Resolve `/<agent>/<actor>/<method>` (and the `/__schema*` / `/openapi.json`
 /// registry-backed endpoints) through the host ingress handle.
 fn handle(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> Response {
-    // `/__schema*` and `/openapi.json` short-circuit the agent/method
+    // `/__schema*` and `/openapi.json` short-circuit the agent/actor/method
     // dispatcher. They `ask` the registry for schema, so they live here
     // (not in `dispatch`'s ask-free pre-auth shortcut).
     if let Some(resp) = handle_schema(req, inner, ctx) {
@@ -111,9 +111,15 @@ fn handle(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> Respons
         return resp;
     }
 
-    let Some((agent, method)) = split_path(req.uri().path()) else {
-        return text(400, "expected /<agent>/<method>");
+    let route = match InvocationRoute::parse(req.uri().path()) {
+        Ok(route) => route,
+        Err(_) => return text(400, "expected canonical /<agent>/<actor>/<method>"),
     };
+    let InvocationRoute {
+        agent,
+        actor,
+        method,
+    } = route;
 
     // Reserve the ingress namespaces. The exact built-in paths
     // (`/__metrics`, `/__status`, `/__schema*`, `/openapi.json`) were handled
@@ -137,8 +143,18 @@ fn handle(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> Respons
     let Some(meta) = ensure_meta_cached(ctx, inner, target, &agent) else {
         return text(502, format!("schema unavailable for agent '{agent}'"));
     };
+    // The current host bridge can resolve only the one schema-bearing actor
+    // attached to an agent route. Bind the explicit actor segment to that
+    // signed schema name. In particular, never ignore the segment and thereby
+    // make an arbitrary nested target appear to have been dispatched.
+    if meta.actor_name != actor {
+        return text(404, format!("unknown actor '{actor}' in agent '{agent}'"));
+    }
     let Some(method_meta) = meta.messages.iter().find(|msg| msg.name == method).cloned() else {
-        return text(404, format!("unknown method '{method}' on agent '{agent}'"));
+        return text(
+            404,
+            format!("unknown method '{method}' on actor '{agent}/{actor}'"),
+        );
     };
 
     let msg = match build_msg(method, &method_meta, req) {
@@ -396,8 +412,8 @@ fn meta_to_json(meta: &crate::metadata::ParsedMeta) -> String {
 /// OpenAPI 3.0 document at `GET /openapi.json`. Walks every agent
 /// the registry knows about, fetches each one's schema (using the
 /// same `ensure_meta_cached` warm path as the dispatcher), and
-/// renders one `paths./<agent>/<method>` entry per `#[msg]`. The caller applies
-/// the Member gate before entering this function.
+/// renders one `paths./<agent>/<actor>/<method>` entry per `#[msg]`. The caller
+/// applies the Member gate before entering this function.
 ///
 /// Type mapping for arg shapes mirrors what `coerce_to_type`
 /// accepts on the way in (so the documented surface and the
@@ -437,7 +453,14 @@ fn render_openapi(inner: &Inner, ctx: &mut HttpIngressContext) -> Response {
             continue;
         };
         for msg in &meta.messages {
-            let path_key = format!("/{}/{}", name, msg.name);
+            // Do not advertise a spelling the request parser cannot route.
+            // Hostile or stale metadata therefore fails closed instead of
+            // creating a second path grammar in generated OpenAPI.
+            let Ok(route) = InvocationRoute::from_segments(name, &meta.actor_name, &msg.name)
+            else {
+                continue;
+            };
+            let path_key = route.canonical_path();
             paths_obj.insert(path_key, openapi_operation_for(&meta.actor_name, msg));
         }
     }
@@ -593,10 +616,137 @@ fn vos_ty_to_openapi(ty: &str) -> serde_json::Value {
     }
 }
 
-fn split_path(path: &str) -> Option<(String, String)> {
-    let trimmed = path.trim_start_matches('/');
-    let (agent, method) = trimmed.split_once('/')?;
-    (!agent.is_empty() && !method.is_empty()).then(|| (agent.to_string(), method.to_string()))
+const MAX_HTTP_ROUTE_SEGMENT_BYTES: usize = vos_agent_sdk::MAX_ACTOR_NAME_BYTES;
+
+/// One canonical application route. Values are decoded exactly once and are
+/// safe to pass to name/schema lookup; alternate URL spellings never survive
+/// parsing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InvocationRoute {
+    agent: String,
+    actor: String,
+    method: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InvocationRouteError {
+    Shape,
+    InvalidPercentEncoding,
+    InvalidUtf8,
+    EncodedSeparator,
+    Traversal,
+    NonCanonicalSegment,
+}
+
+impl InvocationRoute {
+    fn parse(path: &str) -> Result<Self, InvocationRouteError> {
+        let path = path.strip_prefix('/').ok_or(InvocationRouteError::Shape)?;
+        let mut segments = path.split('/');
+        let agent = segments.next().ok_or(InvocationRouteError::Shape)?;
+        let actor = segments.next().ok_or(InvocationRouteError::Shape)?;
+        let method = segments.next().ok_or(InvocationRouteError::Shape)?;
+        if segments.next().is_some() {
+            return Err(InvocationRouteError::Shape);
+        }
+        Self::from_raw_segments(agent, actor, method)
+    }
+
+    fn from_raw_segments(
+        agent: &str,
+        actor: &str,
+        method: &str,
+    ) -> Result<Self, InvocationRouteError> {
+        Self::from_segments(
+            &decode_canonical_route_segment(agent)?,
+            &decode_canonical_route_segment(actor)?,
+            &decode_canonical_route_segment(method)?,
+        )
+    }
+
+    fn from_segments(agent: &str, actor: &str, method: &str) -> Result<Self, InvocationRouteError> {
+        if !is_canonical_http_route_segment(agent)
+            || !is_canonical_http_route_segment(actor)
+            || !is_canonical_http_route_segment(method)
+        {
+            return Err(InvocationRouteError::NonCanonicalSegment);
+        }
+        Ok(Self {
+            agent: agent.to_owned(),
+            actor: actor.to_owned(),
+            method: method.to_owned(),
+        })
+    }
+
+    fn canonical_path(&self) -> String {
+        format!("/{}/{}/{}", self.agent, self.actor, self.method)
+    }
+}
+
+/// Decode one path segment strictly, then require its decoded form to already
+/// be the exact wire spelling. Route names use only URL-unreserved ASCII, so a
+/// percent escape can only introduce an alias or hide a forbidden byte.
+fn decode_canonical_route_segment(raw: &str) -> Result<String, InvocationRouteError> {
+    if raw.is_empty() {
+        return Err(InvocationRouteError::Shape);
+    }
+    // A decoded segment is at most 128 bytes. Three bytes per escaped octet
+    // is the largest raw spelling worth examining; reject anything larger
+    // before allocating so the route boundary itself is resource-bounded.
+    if raw.len() > MAX_HTTP_ROUTE_SEGMENT_BYTES * 3 {
+        return Err(InvocationRouteError::NonCanonicalSegment);
+    }
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err(InvocationRouteError::InvalidPercentEncoding);
+        }
+        let high = decode_hex_nibble(bytes[index + 1])
+            .ok_or(InvocationRouteError::InvalidPercentEncoding)?;
+        let low = decode_hex_nibble(bytes[index + 2])
+            .ok_or(InvocationRouteError::InvalidPercentEncoding)?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+
+    let decoded = String::from_utf8(decoded).map_err(|_| InvocationRouteError::InvalidUtf8)?;
+    if decoded
+        .as_bytes()
+        .iter()
+        .any(|byte| *byte == b'/' || *byte == b'\\')
+    {
+        return Err(InvocationRouteError::EncodedSeparator);
+    }
+    if decoded == "." || decoded == ".." {
+        return Err(InvocationRouteError::Traversal);
+    }
+    if decoded != raw || !is_canonical_http_route_segment(&decoded) {
+        return Err(InvocationRouteError::NonCanonicalSegment);
+    }
+    Ok(decoded)
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn is_canonical_http_route_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    (1..=MAX_HTTP_ROUTE_SEGMENT_BYTES).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 #[allow(clippy::result_large_err)]
@@ -906,37 +1056,145 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_path_happy() {
+    fn invocation_route_requires_agent_actor_and_method() {
         assert_eq!(
-            split_path("/agent/method"),
-            Some(("agent".into(), "method".into()))
+            InvocationRoute::parse("/notes/Board/add_task"),
+            Ok(InvocationRoute {
+                agent: "notes".into(),
+                actor: "Board".into(),
+                method: "add_task".into(),
+            })
+        );
+        assert_eq!(
+            InvocationRoute::parse("/notes/private-notes/add-task")
+                .unwrap()
+                .canonical_path(),
+            "/notes/private-notes/add-task",
         );
     }
 
     #[test]
-    fn split_path_no_leading_slash() {
+    fn invocation_route_rejects_legacy_and_non_absolute_shapes() {
         assert_eq!(
-            split_path("agent/method"),
-            Some(("agent".into(), "method".into()))
+            InvocationRoute::parse("/agent/method"),
+            Err(InvocationRouteError::Shape),
+        );
+        assert_eq!(
+            InvocationRoute::parse("agent/actor/method"),
+            Err(InvocationRouteError::Shape),
         );
     }
 
     #[test]
-    fn split_path_extra_segments_kept_in_method() {
-        // `<method>` carries the rest of the path verbatim — no
-        // escaping or slash-handling beyond the first split.
+    fn invocation_route_rejects_extra_empty_and_aliased_segments() {
+        for path in [
+            "/",
+            "/agent",
+            "/agent/actor",
+            "/agent/actor/method/extra",
+            "/agent/actor/method/",
+            "//actor/method",
+            "/agent//method",
+            "/agent/actor/",
+            "///",
+        ] {
+            assert!(
+                InvocationRoute::parse(path).is_err(),
+                "accepted non-canonical path {path:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn invocation_route_percent_decoding_is_strict_and_alias_free() {
+        for path in [
+            "/%61gent/actor/method",
+            "/agent/%61ctor/method",
+            "/agent/actor/m%65thod",
+            "/agent/actor/%",
+            "/agent/actor/%0",
+            "/agent/actor/%gg",
+            "/agent/actor/%ff",
+            "/agent/actor/%25method",
+        ] {
+            assert!(
+                InvocationRoute::parse(path).is_err(),
+                "accepted percent alias {path:?}",
+            );
+        }
         assert_eq!(
-            split_path("/agent/method/extra"),
-            Some(("agent".into(), "method/extra".into()))
+            InvocationRoute::parse("/agent/actor/%"),
+            Err(InvocationRouteError::InvalidPercentEncoding),
+        );
+        assert_eq!(
+            InvocationRoute::parse("/agent/actor/%ff"),
+            Err(InvocationRouteError::InvalidUtf8),
         );
     }
 
     #[test]
-    fn split_path_rejects_empty_segments() {
-        assert!(split_path("/").is_none());
-        assert!(split_path("/agent").is_none());
-        assert!(split_path("/agent/").is_none());
-        assert!(split_path("//method").is_none());
+    fn invocation_route_rejects_encoded_separators_and_traversal() {
+        for path in [
+            "/agent/actor/%2fmethod",
+            "/agent/actor/method%2Fextra",
+            "/agent%5cother/actor/method",
+            "/agent/actor/%2e",
+            "/agent/actor/%2E%2E",
+            "/agent/./method",
+            "/agent/../method",
+            "/agent/actor\\alias/method",
+            "/agent/actor/%252e%252e",
+        ] {
+            assert!(
+                InvocationRoute::parse(path).is_err(),
+                "accepted separator/traversal spelling {path:?}",
+            );
+        }
+        assert_eq!(
+            InvocationRoute::parse("/agent/actor/method%2Fextra"),
+            Err(InvocationRouteError::EncodedSeparator),
+        );
+        assert_eq!(
+            InvocationRoute::parse("/agent/actor/%2e%2e"),
+            Err(InvocationRouteError::Traversal),
+        );
+    }
+
+    #[test]
+    fn query_is_not_a_route_segment_and_fragment_spellings_are_rejected() {
+        let uri: http::Uri = "/agent/Actor/get_value?after=other/path"
+            .parse()
+            .expect("valid URI");
+        assert_eq!(uri.path(), "/agent/Actor/get_value");
+        assert_eq!(
+            InvocationRoute::parse(uri.path()).unwrap().method,
+            "get_value",
+        );
+
+        for path in [
+            "/agent/Actor/method?other/path",
+            "/agent/Actor/method#other/path",
+            "/agent/Actor/method%3Fother",
+            "/agent/Actor/method%23other",
+        ] {
+            assert!(InvocationRoute::parse(path).is_err());
+        }
+    }
+
+    #[test]
+    fn invocation_route_segments_are_ascii_and_bounded() {
+        assert!(InvocationRoute::parse("/agent/Actor/method-name_2").is_ok());
+        for path in [
+            "/agent/a.b/method",
+            "/agent/actor/method~alias",
+            "/agent/actor/méthod",
+            "/agent/actor/method%20alias",
+        ] {
+            assert!(InvocationRoute::parse(path).is_err());
+        }
+
+        let too_long = "a".repeat(MAX_HTTP_ROUTE_SEGMENT_BYTES + 1);
+        assert!(InvocationRoute::parse(&format!("/agent/actor/{too_long}")).is_err());
     }
 
     #[test]
@@ -1020,7 +1278,7 @@ mod tests {
         let mut method = parsed_method(true);
         let post = http::Request::builder()
             .method(Method::POST)
-            .uri("/counter/value")
+            .uri("/scratch/Counter/value")
             .body(Vec::new())
             .unwrap();
         assert_eq!(
@@ -1033,7 +1291,7 @@ mod tests {
         method.is_query = false;
         let get = http::Request::builder()
             .method(Method::GET)
-            .uri("/counter/increment")
+            .uri("/scratch/Counter/increment")
             .body(Vec::new())
             .unwrap();
         assert_eq!(
@@ -1048,14 +1306,14 @@ mod tests {
     fn mutations_require_a_bounded_idempotency_key() {
         let query = http::Request::builder()
             .method(Method::GET)
-            .uri("/counter/value")
+            .uri("/scratch/Counter/value")
             .body(Vec::new())
             .unwrap();
         assert_eq!(mutation_idempotency_key(&query, true).unwrap(), None);
 
         let missing = http::Request::builder()
             .method(Method::POST)
-            .uri("/counter/increment")
+            .uri("/scratch/Counter/increment")
             .body(Vec::new())
             .unwrap();
         assert_eq!(
@@ -1067,7 +1325,7 @@ mod tests {
 
         let keyed = http::Request::builder()
             .method(Method::POST)
-            .uri("/counter/increment")
+            .uri("/scratch/Counter/increment")
             .header("Idempotency-Key", "transfer-42")
             .body(Vec::new())
             .unwrap();
@@ -1158,14 +1416,14 @@ mod tests {
         assert!(is_discovery_route("/__schema"));
         assert!(is_discovery_route("/__schema/counter"));
         assert!(is_discovery_route("/openapi.json"));
-        assert!(!is_discovery_route("/counter/value"));
-        assert!(!is_discovery_route("/counter/add"));
+        assert!(!is_discovery_route("/scratch/Counter/value"));
+        assert!(!is_discovery_route("/scratch/Counter/add"));
         assert_eq!(
             required_route_capability("/__schema/counter"),
             crate::capability::SPACE_DISCOVER,
         );
         assert_eq!(
-            required_route_capability("/counter/add"),
+            required_route_capability("/scratch/Counter/add"),
             crate::capability::AGENT_INVOKE,
         );
     }
