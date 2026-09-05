@@ -1,0 +1,1559 @@
+//! Hardened whole-image stores for clean system-Agent bootstrap state.
+//!
+//! The directory is a dedicated, single-writer namespace. Each logical image
+//! has a fixed file name and a fixed staging name; callers cannot supply either
+//! name. Files contain a role-bound integrity envelope, while the persistence
+//! traits continue to return the caller's exact image bytes. The envelope also
+//! binds a staged replacement to the exact canonical predecessor, allowing
+//! restart to finish only an unambiguous publication.
+
+#[cfg(unix)]
+use std::ffi::CString;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use fs2::FileExt as _;
+use vos::agent::clean_authority_issuer::{
+    CleanManagementIssuerStore, MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
+};
+use vos::agent::clean_bootstrap::{
+    CleanSystemAgentBootstrapStore, MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
+    MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES,
+};
+
+#[cfg(unix)]
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+
+const LOCK_FILE: &str = "lock";
+const PINS_FILE: &str = "system-agent.pins";
+const PINS_STAGE_FILE: &str = "system-agent.pins.next";
+const BOOTSTRAP_FILE: &str = "system-agent.bootstrap";
+const BOOTSTRAP_STAGE_FILE: &str = "system-agent.bootstrap.next";
+const ISSUER_FILE: &str = "system-agent.management-issuer";
+const ISSUER_STAGE_FILE: &str = "system-agent.management-issuer.next";
+
+const STORE_MAGIC: [u8; 4] = *b"CSF1";
+const STORE_VERSION: u8 = 1;
+const STORE_HEADER_BYTES: usize = 80;
+const NO_PREDECESSOR: [u8; 32] = [0; 32];
+const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"vos/clean-system-agent/file-payload/v1";
+const ENVELOPE_DIGEST_DOMAIN: &[u8] = b"vos/clean-system-agent/file-envelope/v1";
+
+const ALLOWED_ENTRIES: [&str; 7] = [
+    LOCK_FILE,
+    PINS_FILE,
+    PINS_STAGE_FILE,
+    BOOTSTRAP_FILE,
+    BOOTSTRAP_STAGE_FILE,
+    ISSUER_FILE,
+    ISSUER_STAGE_FILE,
+];
+
+/// Failure at the physical clean-system-Agent persistence boundary.
+///
+/// Structural failures are kept separate from I/O failures so startup can
+/// distinguish an unavailable filesystem from state that must never be
+/// selected automatically.
+#[derive(Debug)]
+pub(crate) enum CleanFileStoreError {
+    InvalidPath,
+    InsecureParent,
+    InsecureRoot,
+    InsecurePermissions,
+    Busy,
+    Alias,
+    HardLink,
+    NonRegular,
+    UnexpectedResidue,
+    WrongStoreRole,
+    Oversized,
+    Corrupt,
+    AmbiguousPublication,
+    StageCollision,
+    LockPoisoned,
+    Io(io::Error),
+}
+
+impl fmt::Display for CleanFileStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "clean store I/O failure: {error}"),
+            other => write!(formatter, "clean store rejected physical state: {other:?}"),
+        }
+    }
+}
+
+impl std::error::Error for CleanFileStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for CleanFileStoreError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum StoreRole {
+    Pins = 1,
+    Bootstrap = 2,
+    ManagementIssuer = 3,
+}
+
+impl StoreRole {
+    const fn file(self) -> &'static str {
+        match self {
+            Self::Pins => PINS_FILE,
+            Self::Bootstrap => BOOTSTRAP_FILE,
+            Self::ManagementIssuer => ISSUER_FILE,
+        }
+    }
+
+    const fn stage_file(self) -> &'static str {
+        match self {
+            Self::Pins => PINS_STAGE_FILE,
+            Self::Bootstrap => BOOTSTRAP_STAGE_FILE,
+            Self::ManagementIssuer => ISSUER_STAGE_FILE,
+        }
+    }
+
+    const fn maximum_bytes(self) -> usize {
+        match self {
+            Self::Pins => MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES,
+            Self::Bootstrap => MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
+            Self::ManagementIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Pins),
+            2 => Some(Self::Bootstrap),
+            3 => Some(Self::ManagementIssuer),
+            _ => None,
+        }
+    }
+}
+
+/// The three independently addressable files under one shared writer lease.
+pub(crate) struct CleanSystemAgentFileStores {
+    pins: CleanSystemAgentPinsFile,
+    bootstrap: CleanSystemAgentBootstrapFile,
+    issuer: CleanManagementIssuerFile,
+}
+
+impl CleanSystemAgentFileStores {
+    /// Open or create one dedicated clean store directory.
+    ///
+    /// The immediate parent must already be an absolute, canonical, private
+    /// directory. A missing final directory is created as `0700`; existing
+    /// directories and all existing entries are verified before any image is
+    /// read or changed.
+    pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
+        let root = Arc::new(StoreRoot::open_or_create(root.as_ref())?);
+        Ok(Self {
+            pins: CleanSystemAgentPinsFile(ExactFileStore::new(Arc::clone(&root), StoreRole::Pins)),
+            bootstrap: CleanSystemAgentBootstrapFile(ExactFileStore::new(
+                Arc::clone(&root),
+                StoreRole::Bootstrap,
+            )),
+            issuer: CleanManagementIssuerFile(ExactFileStore::new(
+                root,
+                StoreRole::ManagementIssuer,
+            )),
+        })
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CleanSystemAgentPinsFile,
+        CleanSystemAgentBootstrapFile,
+        CleanManagementIssuerFile,
+    ) {
+        (self.pins, self.bootstrap, self.issuer)
+    }
+}
+
+pub(crate) struct CleanSystemAgentPinsFile(ExactFileStore);
+pub(crate) struct CleanSystemAgentBootstrapFile(ExactFileStore);
+pub(crate) struct CleanManagementIssuerFile(ExactFileStore);
+
+impl CleanSystemAgentBootstrapStore for CleanSystemAgentPinsFile {
+    type Error = CleanFileStoreError;
+
+    fn load(&mut self, maximum_bytes: usize) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.load(maximum_bytes)
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        self.0.commit(image)
+    }
+}
+
+impl CleanSystemAgentBootstrapStore for CleanSystemAgentBootstrapFile {
+    type Error = CleanFileStoreError;
+
+    fn load(&mut self, maximum_bytes: usize) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.load(maximum_bytes)
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        self.0.commit(image)
+    }
+}
+
+impl CleanManagementIssuerStore for CleanManagementIssuerFile {
+    type Error = CleanFileStoreError;
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.load(MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES)
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        self.0.commit(image)
+    }
+}
+
+struct StoreRoot {
+    parent_path: PathBuf,
+    parent: File,
+    path: PathBuf,
+    directory: File,
+    lock: File,
+    writes: Mutex<()>,
+}
+
+impl StoreRoot {
+    fn open_or_create(path: &Path) -> Result<Self, CleanFileStoreError> {
+        validate_new_path(path)?;
+        let parent_path = path.parent().ok_or(CleanFileStoreError::InvalidPath)?;
+        let parent = open_private_directory(parent_path, true)?;
+        let (directory, created) = open_or_create_child_directory(&parent, path)?;
+        if created {
+            set_private_directory_permissions(&directory)?;
+        }
+        let opened = directory.metadata()?;
+        validate_private_directory_metadata(&opened, false)?;
+        let named = fs::symlink_metadata(path).map_err(CleanFileStoreError::Io)?;
+        validate_private_directory_metadata(&named, false)?;
+        same_file_identity(&opened, &named)?;
+        if created {
+            directory.sync_all()?;
+            parent.sync_all()?;
+        }
+        audit_named_entries(path)?;
+        let lock = open_lock(&directory, path)?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(CleanFileStoreError::Busy);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let root = Self {
+            parent_path: parent_path.to_path_buf(),
+            parent,
+            path: path.to_path_buf(),
+            directory,
+            lock,
+            writes: Mutex::new(()),
+        };
+        root.validate_path()?;
+        root.audit_entries()?;
+        Ok(root)
+    }
+
+    fn guard(&self) -> Result<MutexGuard<'_, ()>, CleanFileStoreError> {
+        self.writes
+            .lock()
+            .map_err(|_| CleanFileStoreError::LockPoisoned)
+    }
+
+    fn validate_path(&self) -> Result<(), CleanFileStoreError> {
+        self.validate_directory_path()?;
+        self.validate_lock()?;
+        self.validate_directory_path()
+    }
+
+    fn validate_directory_path(&self) -> Result<(), CleanFileStoreError> {
+        validate_opened_directory(&self.parent, &self.parent_path, true)?;
+        let named = fs::symlink_metadata(&self.path).map_err(CleanFileStoreError::Io)?;
+        validate_private_directory_metadata(&named, false)?;
+        let opened = self.directory.metadata()?;
+        same_file_identity(&opened, &named)?;
+        let entry = open_child_directory(&self.parent, &self.path)?;
+        same_file_identity(&entry.metadata()?, &opened)?;
+        let canonical = fs::canonicalize(&self.path).map_err(CleanFileStoreError::Io)?;
+        if canonical != self.path {
+            return Err(CleanFileStoreError::Alias);
+        }
+        Ok(())
+    }
+
+    fn validate_lock(&self) -> Result<(), CleanFileStoreError> {
+        let named = named_metadata(&self.path, LOCK_FILE)?;
+        validate_private_regular_metadata(&named)?;
+        validate_opened_file(&self.lock, &named)?;
+        if named.len() != 0 {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn audit_entries(&self) -> Result<(), CleanFileStoreError> {
+        self.validate_path()?;
+        audit_named_entries(&self.path)?;
+        self.validate_path()
+    }
+
+    fn sync(&self) -> Result<(), CleanFileStoreError> {
+        self.validate_path()?;
+        self.directory.sync_all()?;
+        self.validate_path()
+    }
+}
+
+struct ExactFileStore {
+    root: Arc<StoreRoot>,
+    role: StoreRole,
+}
+
+impl ExactFileStore {
+    fn new(root: Arc<StoreRoot>, role: StoreRole) -> Self {
+        Self { root, role }
+    }
+
+    fn load(&mut self, maximum_bytes: usize) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        let _guard = self.root.guard()?;
+        let maximum_bytes = maximum_bytes.min(self.role.maximum_bytes());
+        self.reconcile(maximum_bytes)
+            .map(|stored| stored.map(|stored| stored.payload))
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), CleanFileStoreError> {
+        if image.len() > self.role.maximum_bytes() {
+            return Err(CleanFileStoreError::Oversized);
+        }
+        let _guard = self.root.guard()?;
+        let current = self.reconcile(self.role.maximum_bytes())?;
+        if current
+            .as_ref()
+            .is_some_and(|current| current.payload == image)
+        {
+            self.sync_named(self.role.file())?;
+            return self.root.sync();
+        }
+        let predecessor = current.as_ref().map(StoredImage::commitment);
+        let encoded = encode_envelope(self.role, predecessor, image)?;
+        self.write_stage(&encoded)?;
+        self.publish_stage(
+            current.as_ref(),
+            &decode_envelope(self.role, &encoded, image.len())?,
+        )
+    }
+
+    fn reconcile(&self, maximum_bytes: usize) -> Result<Option<StoredImage>, CleanFileStoreError> {
+        self.root.audit_entries()?;
+        let canonical = self.read_optional(self.role.file(), maximum_bytes)?;
+        let staged = self.read_optional(self.role.stage_file(), maximum_bytes)?;
+        let resolved = match (canonical, staged) {
+            (None, None) => None,
+            (Some(canonical), None) => Some(canonical),
+            (None, Some(staged)) if staged.predecessor.is_none() => {
+                self.publish_stage(None, &staged)?;
+                Some(staged)
+            }
+            (Some(canonical), Some(staged)) if canonical == staged => {
+                self.unlink_stage()?;
+                Some(canonical)
+            }
+            (Some(canonical), Some(staged))
+                if staged.predecessor == Some(canonical.commitment()) =>
+            {
+                self.publish_stage(Some(&canonical), &staged)?;
+                Some(staged)
+            }
+            (None, Some(_)) | (Some(_), Some(_)) => {
+                return Err(CleanFileStoreError::AmbiguousPublication);
+            }
+        };
+        self.root.audit_entries()?;
+        Ok(resolved)
+    }
+
+    fn read_optional(
+        &self,
+        name: &str,
+        maximum_bytes: usize,
+    ) -> Result<Option<StoredImage>, CleanFileStoreError> {
+        let named = match named_metadata(&self.root.path, name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        validate_private_regular_metadata(&named)?;
+        let mut file = open_read_at(&self.root.directory, &self.root.path, name)?;
+        validate_opened_file(&file, &named)?;
+        let physical_maximum = STORE_HEADER_BYTES
+            .checked_add(maximum_bytes)
+            .ok_or(CleanFileStoreError::Oversized)?;
+        let length = usize::try_from(named.len()).map_err(|_| CleanFileStoreError::Oversized)?;
+        if length > physical_maximum {
+            return Err(CleanFileStoreError::Oversized);
+        }
+        if length < STORE_HEADER_BYTES {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let mut header = [0_u8; STORE_HEADER_BYTES];
+        file.read_exact(&mut header)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        let payload_length = decode_payload_length(self.role, &header, maximum_bytes)?;
+        if STORE_HEADER_BYTES
+            .checked_add(payload_length)
+            .ok_or(CleanFileStoreError::Oversized)?
+            != length
+        {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(payload_length)
+            .map_err(|_| CleanFileStoreError::Oversized)?;
+        payload.resize(payload_length, 0);
+        file.read_exact(&mut payload)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        let mut trailing = [0_u8; 1];
+        if file.read(&mut trailing).map_err(CleanFileStoreError::Io)? != 0 {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let after = file.metadata()?;
+        validate_opened_file(&file, &named)?;
+        if after.len() != named.len() {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        decode_envelope_parts(self.role, &header, payload).map(Some)
+    }
+
+    fn write_stage(&self, encoded: &[u8]) -> Result<(), CleanFileStoreError> {
+        let name = self.role.stage_file();
+        let mut file = match create_new_at(&self.root.directory, &self.root.path, name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(CleanFileStoreError::StageCollision);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let result = (|| -> Result<(), CleanFileStoreError> {
+            set_private_file_permissions(&file)?;
+            file.write_all(encoded)?;
+            file.sync_all()?;
+            let named = named_metadata(&self.root.path, name)?;
+            validate_private_regular_metadata(&named)?;
+            validate_opened_file(&file, &named)?;
+            if usize::try_from(named.len()).ok() != Some(encoded.len()) {
+                return Err(CleanFileStoreError::Corrupt);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.remove_owned_failed_stage(&file, name);
+        }
+        result
+    }
+
+    fn remove_owned_failed_stage(&self, file: &File, name: &str) {
+        let Ok(named) = named_metadata(&self.root.path, name) else {
+            return;
+        };
+        if validate_private_regular_metadata(&named).is_err()
+            || validate_opened_file(file, &named).is_err()
+        {
+            return;
+        }
+        if unlink_at(&self.root.directory, &self.root.path, name).is_ok() {
+            let _ = self.root.sync();
+        }
+    }
+
+    fn publish_stage(
+        &self,
+        expected: Option<&StoredImage>,
+        staged: &StoredImage,
+    ) -> Result<(), CleanFileStoreError> {
+        let observed_stage = self
+            .read_optional(self.role.stage_file(), self.role.maximum_bytes())?
+            .ok_or(CleanFileStoreError::AmbiguousPublication)?;
+        if &observed_stage != staged {
+            return Err(CleanFileStoreError::AmbiguousPublication);
+        }
+        let observed_canonical = self.read_optional(self.role.file(), self.role.maximum_bytes())?;
+        if observed_canonical.as_ref() != expected
+            || staged.predecessor != expected.map(StoredImage::commitment)
+        {
+            return Err(CleanFileStoreError::AmbiguousPublication);
+        }
+        self.sync_named(self.role.stage_file())?;
+        rename_at(
+            &self.root.directory,
+            &self.root.path,
+            self.role.stage_file(),
+            self.role.file(),
+        )?;
+        self.root.sync()?;
+        let published = self
+            .read_optional(self.role.file(), self.role.maximum_bytes())?
+            .ok_or(CleanFileStoreError::Corrupt)?;
+        if &published != staged {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        match named_metadata(&self.root.path, self.role.stage_file()) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(CleanFileStoreError::Corrupt),
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    fn unlink_stage(&self) -> Result<(), CleanFileStoreError> {
+        unlink_at(
+            &self.root.directory,
+            &self.root.path,
+            self.role.stage_file(),
+        )?;
+        self.root.sync()
+    }
+
+    fn sync_named(&self, name: &str) -> Result<(), CleanFileStoreError> {
+        let named = named_metadata(&self.root.path, name)?;
+        validate_private_regular_metadata(&named)?;
+        let file = open_read_at(&self.root.directory, &self.root.path, name)?;
+        validate_opened_file(&file, &named)?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredImage {
+    role: StoreRole,
+    predecessor: Option<[u8; 32]>,
+    payload: Vec<u8>,
+}
+
+impl StoredImage {
+    fn commitment(&self) -> [u8; 32] {
+        envelope_digest(self.role, self.predecessor, &self.payload)
+    }
+}
+
+fn encode_envelope(
+    role: StoreRole,
+    predecessor: Option<[u8; 32]>,
+    payload: &[u8],
+) -> Result<Vec<u8>, CleanFileStoreError> {
+    if payload.len() > role.maximum_bytes()
+        || predecessor.is_some_and(|predecessor| predecessor == NO_PREDECESSOR)
+    {
+        return Err(CleanFileStoreError::Corrupt);
+    }
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(
+            STORE_HEADER_BYTES
+                .checked_add(payload.len())
+                .ok_or(CleanFileStoreError::Oversized)?,
+        )
+        .map_err(|_| CleanFileStoreError::Oversized)?;
+    encoded.extend_from_slice(&STORE_MAGIC);
+    encoded.push(STORE_VERSION);
+    encoded.push(role as u8);
+    encoded.push(u8::from(predecessor.is_some()));
+    encoded.push(0);
+    encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    encoded.extend_from_slice(&predecessor.unwrap_or(NO_PREDECESSOR));
+    encoded.extend_from_slice(&payload_digest(role, payload));
+    encoded.extend_from_slice(payload);
+    debug_assert_eq!(encoded.len(), STORE_HEADER_BYTES + payload.len());
+    Ok(encoded)
+}
+
+fn decode_payload_length(
+    expected_role: StoreRole,
+    header: &[u8; STORE_HEADER_BYTES],
+    maximum_bytes: usize,
+) -> Result<usize, CleanFileStoreError> {
+    if header[..4] != STORE_MAGIC || header[4] != STORE_VERSION || header[7] != 0 {
+        return Err(CleanFileStoreError::Corrupt);
+    }
+    let role = StoreRole::from_byte(header[5]).ok_or(CleanFileStoreError::Corrupt)?;
+    if role != expected_role {
+        return Err(CleanFileStoreError::WrongStoreRole);
+    }
+    let length = u64::from_le_bytes(
+        header[8..16]
+            .try_into()
+            .map_err(|_| CleanFileStoreError::Corrupt)?,
+    );
+    let length = usize::try_from(length).map_err(|_| CleanFileStoreError::Oversized)?;
+    if length > maximum_bytes || length > expected_role.maximum_bytes() {
+        return Err(CleanFileStoreError::Oversized);
+    }
+    Ok(length)
+}
+
+fn decode_envelope(
+    role: StoreRole,
+    encoded: &[u8],
+    maximum_bytes: usize,
+) -> Result<StoredImage, CleanFileStoreError> {
+    if encoded.len() < STORE_HEADER_BYTES {
+        return Err(CleanFileStoreError::Corrupt);
+    }
+    let header: &[u8; STORE_HEADER_BYTES] = encoded[..STORE_HEADER_BYTES]
+        .try_into()
+        .map_err(|_| CleanFileStoreError::Corrupt)?;
+    let length = decode_payload_length(role, header, maximum_bytes)?;
+    if encoded.len() != STORE_HEADER_BYTES + length {
+        return Err(CleanFileStoreError::Corrupt);
+    }
+    decode_envelope_parts(role, header, encoded[STORE_HEADER_BYTES..].to_vec())
+}
+
+fn decode_envelope_parts(
+    role: StoreRole,
+    header: &[u8; STORE_HEADER_BYTES],
+    payload: Vec<u8>,
+) -> Result<StoredImage, CleanFileStoreError> {
+    let length = decode_payload_length(role, header, role.maximum_bytes())?;
+    if payload.len() != length || header[48..80] != payload_digest(role, &payload) {
+        return Err(CleanFileStoreError::Corrupt);
+    }
+    let predecessor_bytes: [u8; 32] = header[16..48]
+        .try_into()
+        .map_err(|_| CleanFileStoreError::Corrupt)?;
+    let predecessor = match header[6] {
+        0 if predecessor_bytes == NO_PREDECESSOR => None,
+        1 if predecessor_bytes != NO_PREDECESSOR => Some(predecessor_bytes),
+        _ => return Err(CleanFileStoreError::Corrupt),
+    };
+    let stored = StoredImage {
+        role,
+        predecessor,
+        payload,
+    };
+    if stored.commitment() == NO_PREDECESSOR {
+        return Err(CleanFileStoreError::Corrupt);
+    }
+    Ok(stored)
+}
+
+fn payload_digest(role: StoreRole, payload: &[u8]) -> [u8; 32] {
+    digest(PAYLOAD_DIGEST_DOMAIN, role, None, payload)
+}
+
+fn envelope_digest(role: StoreRole, predecessor: Option<[u8; 32]>, payload: &[u8]) -> [u8; 32] {
+    digest(ENVELOPE_DIGEST_DOMAIN, role, predecessor, payload)
+}
+
+fn digest(
+    domain: &[u8],
+    role: StoreRole,
+    predecessor: Option<[u8; 32]>,
+    payload: &[u8],
+) -> [u8; 32] {
+    let mut state = blake2b_simd::Params::new().hash_length(32).to_state();
+    state.update(domain);
+    state.update(&[role as u8]);
+    state.update(&[u8::from(predecessor.is_some())]);
+    state.update(&predecessor.unwrap_or(NO_PREDECESSOR));
+    state.update(&(payload.len() as u64).to_le_bytes());
+    state.update(payload);
+    let hash = state.finalize();
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(hash.as_bytes());
+    output
+}
+
+fn validate_new_path(path: &Path) -> Result<(), CleanFileStoreError> {
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(CleanFileStoreError::InvalidPath);
+    }
+    let parent = path.parent().ok_or(CleanFileStoreError::InvalidPath)?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|_| CleanFileStoreError::InvalidPath)?;
+    if canonical_parent != parent {
+        return Err(CleanFileStoreError::Alias);
+    }
+    let metadata = fs::symlink_metadata(parent).map_err(CleanFileStoreError::Io)?;
+    validate_private_directory_metadata(&metadata, true)
+}
+
+fn open_private_directory(path: &Path, parent: bool) -> Result<File, CleanFileStoreError> {
+    let named = fs::symlink_metadata(path).map_err(CleanFileStoreError::Io)?;
+    validate_private_directory_metadata(&named, parent)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    }
+    let file = options.open(path).map_err(CleanFileStoreError::Io)?;
+    same_file_identity(&file.metadata()?, &named)?;
+    Ok(file)
+}
+
+fn validate_opened_directory(
+    file: &File,
+    path: &Path,
+    parent: bool,
+) -> Result<(), CleanFileStoreError> {
+    let named = fs::symlink_metadata(path).map_err(CleanFileStoreError::Io)?;
+    validate_private_directory_metadata(&named, parent)?;
+    let opened = file.metadata()?;
+    validate_private_directory_metadata(&opened, parent)?;
+    same_file_identity(&opened, &named)?;
+    let canonical = fs::canonicalize(path).map_err(CleanFileStoreError::Io)?;
+    if canonical != path {
+        return Err(CleanFileStoreError::Alias);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn child_name(path: &Path) -> Result<CString, CleanFileStoreError> {
+    let name = path.file_name().ok_or(CleanFileStoreError::InvalidPath)?;
+    CString::new(name.as_bytes()).map_err(|_| CleanFileStoreError::InvalidPath)
+}
+
+#[cfg(unix)]
+fn open_child_directory(parent: &File, path: &Path) -> Result<File, CleanFileStoreError> {
+    let name = child_name(path)?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn open_or_create_child_directory(
+    parent: &File,
+    path: &Path,
+) -> Result<(File, bool), CleanFileStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            validate_private_directory_metadata(&metadata, false)?;
+            let directory = open_child_directory(parent, path)?;
+            same_file_identity(&directory.metadata()?, &metadata)?;
+            Ok((directory, false))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let name = child_name(path)?;
+            let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+            if result != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            let directory = open_child_directory(parent, path)?;
+            Ok((directory, true))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_private_directory_metadata(
+    metadata: &fs::Metadata,
+    parent: bool,
+) -> Result<(), CleanFileStoreError> {
+    if metadata.file_type().is_symlink() {
+        return Err(CleanFileStoreError::Alias);
+    }
+    if !metadata.is_dir() {
+        return Err(if parent {
+            CleanFileStoreError::InsecureParent
+        } else {
+            CleanFileStoreError::InsecureRoot
+        });
+    }
+    #[cfg(unix)]
+    {
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o700 {
+            return Err(if parent {
+                CleanFileStoreError::InsecureParent
+            } else {
+                CleanFileStoreError::InsecureRoot
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_regular_metadata(metadata: &fs::Metadata) -> Result<(), CleanFileStoreError> {
+    if metadata.file_type().is_symlink() {
+        return Err(CleanFileStoreError::Alias);
+    }
+    if !metadata.is_file() {
+        return Err(CleanFileStoreError::NonRegular);
+    }
+    #[cfg(unix)]
+    {
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o600 {
+            return Err(CleanFileStoreError::InsecurePermissions);
+        }
+        if metadata.nlink() == 0 {
+            return Err(CleanFileStoreError::Alias);
+        }
+        if metadata.nlink() > 1 {
+            return Err(CleanFileStoreError::HardLink);
+        }
+    }
+    Ok(())
+}
+
+fn audit_named_entries(root: &Path) -> Result<(), CleanFileStoreError> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
+        if !ALLOWED_ENTRIES.contains(&name.as_str()) {
+            return Err(CleanFileStoreError::UnexpectedResidue);
+        }
+        validate_private_regular_metadata(&fs::symlink_metadata(entry.path())?)?;
+    }
+    Ok(())
+}
+
+fn same_file_identity(
+    opened: &fs::Metadata,
+    named: &fs::Metadata,
+) -> Result<(), CleanFileStoreError> {
+    #[cfg(unix)]
+    if opened.dev() != named.dev() || opened.ino() != named.ino() {
+        return Err(CleanFileStoreError::Alias);
+    }
+    Ok(())
+}
+
+fn validate_opened_file(file: &File, named: &fs::Metadata) -> Result<(), CleanFileStoreError> {
+    let opened = file.metadata()?;
+    validate_private_regular_metadata(&opened)?;
+    same_file_identity(&opened, named)
+}
+
+fn named_metadata(root: &Path, name: &str) -> io::Result<fs::Metadata> {
+    fs::symlink_metadata(root.join(name))
+}
+
+fn open_lock(directory: &File, root: &Path) -> Result<File, CleanFileStoreError> {
+    let (file, created) = match create_new_at(directory, root, LOCK_FILE) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let named = named_metadata(root, LOCK_FILE)?;
+            validate_private_regular_metadata(&named)?;
+            let file = open_write_at(directory, root, LOCK_FILE)?;
+            validate_opened_file(&file, &named)?;
+            (file, false)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if created {
+        set_private_file_permissions(&file)?;
+        file.sync_all()?;
+        directory.sync_all()?;
+    }
+    let named = named_metadata(root, LOCK_FILE)?;
+    validate_private_regular_metadata(&named)?;
+    validate_opened_file(&file, &named)?;
+    if named.len() != 0 {
+        return Err(CleanFileStoreError::Corrupt);
+    }
+    Ok(file)
+}
+
+fn set_private_file_permissions(file: &File) -> Result<(), CleanFileStoreError> {
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+        if result != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+fn set_private_directory_permissions(directory: &File) -> Result<(), CleanFileStoreError> {
+    let result = unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) };
+    if result != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_at(directory: &File, name: &str, flags: i32, mode: u32) -> io::Result<File> {
+    let name = CString::new(name).map_err(|_| io::ErrorKind::InvalidInput)?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            mode as libc::mode_t,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn open_read_at(directory: &File, _root: &Path, name: &str) -> io::Result<File> {
+    open_at(
+        directory,
+        name,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    )
+}
+
+#[cfg(unix)]
+fn open_write_at(directory: &File, _root: &Path, name: &str) -> io::Result<File> {
+    open_at(
+        directory,
+        name,
+        libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    )
+}
+
+#[cfg(unix)]
+fn create_new_at(directory: &File, _root: &Path, name: &str) -> io::Result<File> {
+    open_at(
+        directory,
+        name,
+        libc::O_RDWR
+            | libc::O_CREAT
+            | libc::O_EXCL
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK,
+        0o600,
+    )
+}
+
+#[cfg(unix)]
+fn rename_at(
+    directory: &File,
+    _root: &Path,
+    from: &str,
+    to: &str,
+) -> Result<(), CleanFileStoreError> {
+    let from = CString::new(from).map_err(|_| CleanFileStoreError::InvalidPath)?;
+    let to = CString::new(to).map_err(|_| CleanFileStoreError::InvalidPath)?;
+    let result = unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            from.as_ptr(),
+            directory.as_raw_fd(),
+            to.as_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unlink_at(directory: &File, _root: &Path, name: &str) -> Result<(), CleanFileStoreError> {
+    let name = CString::new(name).map_err(|_| CleanFileStoreError::InvalidPath)?;
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    if result != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Seek as _, SeekFrom};
+    #[cfg(unix)]
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+    struct Fixture {
+        parent: PathBuf,
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let mut nonce = [0_u8; 8];
+            getrandom::getrandom(&mut nonce).expect("test entropy");
+            let parent = std::env::temp_dir().join(format!(
+                "vosx-clean-store-{label}-{}-{}",
+                std::process::id(),
+                hex::encode(nonce)
+            ));
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder.create(&parent).expect("create private test parent");
+            #[cfg(unix)]
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+                .expect("set private test parent mode");
+            let root = parent.join("state");
+            Self { parent, root }
+        }
+
+        fn stores(&self) -> CleanSystemAgentFileStores {
+            CleanSystemAgentFileStores::open_or_create(&self.root).expect("open clean stores")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                let _ = fs::set_permissions(&self.parent, fs::Permissions::from_mode(0o700));
+                if let Ok(metadata) = fs::symlink_metadata(&self.root)
+                    && metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                {
+                    let _ = fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700));
+                }
+            }
+            let _ = fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    fn write_private(path: &Path, bytes: &[u8]) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path).expect("create private test file");
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("set private test file mode");
+        file.write_all(bytes).expect("write private test file");
+        file.sync_all().expect("sync private test file");
+        File::open(path.parent().unwrap())
+            .and_then(|directory| directory.sync_all())
+            .expect("sync private test directory");
+    }
+
+    fn stage(store: &ExactFileStore, predecessor: Option<[u8; 32]>, payload: &[u8]) -> StoredImage {
+        let encoded = encode_envelope(store.role, predecessor, payload).expect("encode stage");
+        let staged = decode_envelope(store.role, &encoded, payload.len()).expect("decode stage");
+        store.write_stage(&encoded).expect("write stage");
+        staged
+    }
+
+    #[test]
+    fn missing_files_create_and_reopen_with_exact_bytes() {
+        let fixture = Fixture::new("roundtrip");
+        let stores = fixture.stores();
+        let (mut pins, mut bootstrap, mut issuer) = stores.into_parts();
+        assert_eq!(pins.load(1024).unwrap(), None);
+        assert_eq!(bootstrap.load(1024).unwrap(), None);
+        assert_eq!(issuer.load().unwrap(), None);
+
+        let pins_bytes = b"pins\0exact";
+        let bootstrap_bytes = b"bootstrap\xffexact";
+        let issuer_bytes = b"issuer\0\xffexact";
+        pins.commit(pins_bytes).unwrap();
+        bootstrap.commit(bootstrap_bytes).unwrap();
+        issuer.commit(issuer_bytes).unwrap();
+        assert_ne!(fs::read(fixture.root.join(PINS_FILE)).unwrap(), pins_bytes);
+        drop((pins, bootstrap, issuer));
+
+        let (mut pins, mut bootstrap, mut issuer) = fixture.stores().into_parts();
+        assert_eq!(
+            pins.load(1024).unwrap().as_deref(),
+            Some(pins_bytes.as_slice())
+        );
+        assert_eq!(
+            bootstrap.load(1024).unwrap().as_deref(),
+            Some(bootstrap_bytes.as_slice())
+        );
+        assert_eq!(
+            issuer.load().unwrap().as_deref(),
+            Some(issuer_bytes.as_slice())
+        );
+        assert!(!fixture.root.join(PINS_STAGE_FILE).exists());
+        assert!(!fixture.root.join(BOOTSTRAP_STAGE_FILE).exists());
+        assert!(!fixture.root.join(ISSUER_STAGE_FILE).exists());
+    }
+
+    #[test]
+    fn exact_retry_preserves_the_exact_payload() {
+        let fixture = Fixture::new("exact-retry");
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        pins.commit(b"same-image").unwrap();
+        let physical = fs::read(fixture.root.join(PINS_FILE)).unwrap();
+        pins.commit(b"same-image").unwrap();
+        assert_eq!(fs::read(fixture.root.join(PINS_FILE)).unwrap(), physical);
+        assert_eq!(
+            pins.load(64).unwrap().as_deref(),
+            Some(b"same-image".as_slice())
+        );
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn valid_initial_stage_is_the_only_safe_missing_target_recovery() {
+        let fixture = Fixture::new("initial-stage");
+        let (pins, bootstrap, issuer) = fixture.stores().into_parts();
+        stage(&pins.0, None, b"initial");
+        drop((pins, bootstrap, issuer));
+
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        assert_eq!(
+            pins.load(64).unwrap().as_deref(),
+            Some(b"initial".as_slice())
+        );
+        assert!(fixture.root.join(PINS_FILE).is_file());
+        assert!(!fixture.root.join(PINS_STAGE_FILE).exists());
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn predecessor_bound_stage_completes_replacement_on_reopen() {
+        let fixture = Fixture::new("replacement-stage");
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        pins.commit(b"old").unwrap();
+        let current = pins
+            .0
+            .reconcile(StoreRole::Pins.maximum_bytes())
+            .unwrap()
+            .unwrap();
+        stage(&pins.0, Some(current.commitment()), b"new");
+        drop((pins, bootstrap, issuer));
+
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        assert_eq!(pins.load(64).unwrap().as_deref(), Some(b"new".as_slice()));
+        assert!(!fixture.root.join(PINS_STAGE_FILE).exists());
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn exact_duplicate_stage_is_retired_without_republication() {
+        let fixture = Fixture::new("duplicate-stage");
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        pins.commit(b"published").unwrap();
+        fs::copy(
+            fixture.root.join(PINS_FILE),
+            fixture.root.join(PINS_STAGE_FILE),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(
+            fixture.root.join(PINS_STAGE_FILE),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        drop((pins, bootstrap, issuer));
+
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        assert_eq!(
+            pins.load(64).unwrap().as_deref(),
+            Some(b"published".as_slice())
+        );
+        assert!(!fixture.root.join(PINS_STAGE_FILE).exists());
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn unrelated_stage_and_target_fail_closed_without_cleanup() {
+        let fixture = Fixture::new("ambiguous-stage");
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        pins.commit(b"published").unwrap();
+        stage(&pins.0, Some([0x55; 32]), b"unrelated");
+        drop((pins, bootstrap, issuer));
+
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        assert!(matches!(
+            pins.load(64),
+            Err(CleanFileStoreError::AmbiguousPublication)
+        ));
+        assert!(fixture.root.join(PINS_FILE).is_file());
+        assert!(fixture.root.join(PINS_STAGE_FILE).is_file());
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn predecessor_without_a_target_is_ambiguous() {
+        let fixture = Fixture::new("missing-predecessor");
+        let (pins, bootstrap, issuer) = fixture.stores().into_parts();
+        stage(&pins.0, Some([0x33; 32]), b"orphan-successor");
+        drop((pins, bootstrap, issuer));
+
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        assert!(matches!(
+            pins.load(64),
+            Err(CleanFileStoreError::AmbiguousPublication)
+        ));
+        assert!(!fixture.root.join(PINS_FILE).exists());
+        assert!(fixture.root.join(PINS_STAGE_FILE).is_file());
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn corrupt_stage_fails_closed_and_is_not_removed() {
+        let fixture = Fixture::new("corrupt-stage");
+        let stores = fixture.stores();
+        drop(stores);
+        write_private(&fixture.root.join(PINS_STAGE_FILE), b"partial");
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        assert!(matches!(pins.load(64), Err(CleanFileStoreError::Corrupt)));
+        assert_eq!(
+            fs::read(fixture.root.join(PINS_STAGE_FILE)).unwrap(),
+            b"partial"
+        );
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn create_new_stage_never_overwrites_a_collision() {
+        let fixture = Fixture::new("stage-collision");
+        let (pins, bootstrap, issuer) = fixture.stores().into_parts();
+        write_private(&fixture.root.join(PINS_STAGE_FILE), b"occupied");
+        let encoded = encode_envelope(StoreRole::Pins, None, b"candidate").unwrap();
+        assert!(matches!(
+            pins.0.write_stage(&encoded),
+            Err(CleanFileStoreError::StageCollision)
+        ));
+        assert_eq!(
+            fs::read(fixture.root.join(PINS_STAGE_FILE)).unwrap(),
+            b"occupied"
+        );
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn one_lease_serializes_all_three_files() {
+        let fixture = Fixture::new("lease");
+        let stores = fixture.stores();
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(stores);
+        assert!(CleanSystemAgentFileStores::open_or_create(&fixture.root).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_or_unlinked_named_lock_invalidates_the_held_lease() {
+        let replacement_fixture = Fixture::new("lock-replacement");
+        let (mut pins, mut bootstrap, issuer) = replacement_fixture.stores().into_parts();
+        let lock_path = replacement_fixture.root.join(LOCK_FILE);
+        fs::remove_file(&lock_path).unwrap();
+        write_private(&lock_path, b"");
+        assert!(matches!(pins.load(64), Err(CleanFileStoreError::Alias)));
+        assert!(matches!(
+            bootstrap.load(64),
+            Err(CleanFileStoreError::Alias)
+        ));
+        drop((pins, bootstrap, issuer));
+
+        let unlink_fixture = Fixture::new("lock-unlink");
+        let (mut pins, bootstrap, issuer) = unlink_fixture.stores().into_parts();
+        fs::remove_file(unlink_fixture.root.join(LOCK_FILE)).unwrap();
+        assert!(matches!(
+            pins.load(64),
+            Err(CleanFileStoreError::Io(error))
+                if error.kind() == io::ErrorKind::NotFound
+        ));
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_mode_and_root_inode_are_revalidated_for_existing_handles() {
+        let parent_fixture = Fixture::new("live-parent-mode");
+        let (mut pins, bootstrap, issuer) = parent_fixture.stores().into_parts();
+        fs::set_permissions(&parent_fixture.parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            pins.load(64),
+            Err(CleanFileStoreError::InsecureParent)
+        ));
+        drop((pins, bootstrap, issuer));
+
+        let root_fixture = Fixture::new("live-root-replacement");
+        let (mut pins, bootstrap, issuer) = root_fixture.stores().into_parts();
+        let displaced = root_fixture.parent.join("displaced-state");
+        fs::rename(&root_fixture.root, &displaced).unwrap();
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(&root_fixture.root).unwrap();
+        fs::set_permissions(&root_fixture.root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(pins.load(64), Err(CleanFileStoreError::Alias)));
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn relative_dotdot_and_symlink_roots_are_rejected() {
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(Path::new("relative-clean-store")),
+            Err(CleanFileStoreError::InvalidPath)
+        ));
+
+        let fixture = Fixture::new("root-alias");
+        let stores = fixture.stores();
+        drop(stores);
+        let dotdot = fixture.root.join("..").join("state");
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(dotdot),
+            Err(CleanFileStoreError::InvalidPath)
+        ));
+
+        #[cfg(unix)]
+        {
+            let alias = fixture.parent.join("alias");
+            std::os::unix::fs::symlink(&fixture.root, &alias).unwrap();
+            assert!(matches!(
+                CleanSystemAgentFileStores::open_or_create(alias),
+                Err(CleanFileStoreError::Alias)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_and_root_must_be_exact_private_directories() {
+        let fixture = Fixture::new("directory-modes");
+        fs::set_permissions(&fixture.parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::InsecureParent)
+        ));
+        fs::set_permissions(&fixture.parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let stores = fixture.stores();
+        drop(stores);
+        fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::InsecureRoot)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_hardlink_and_nonregular_entries_are_rejected() {
+        let symlink_fixture = Fixture::new("symlink-entry");
+        drop(symlink_fixture.stores());
+        let outside = symlink_fixture.parent.join("outside");
+        write_private(&outside, b"outside");
+        std::os::unix::fs::symlink(&outside, symlink_fixture.root.join(PINS_FILE)).unwrap();
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(&symlink_fixture.root),
+            Err(CleanFileStoreError::Alias)
+        ));
+
+        let hardlink_fixture = Fixture::new("hardlink-entry");
+        drop(hardlink_fixture.stores());
+        let outside = hardlink_fixture.parent.join("outside");
+        write_private(&outside, b"outside");
+        fs::hard_link(&outside, hardlink_fixture.root.join(PINS_FILE)).unwrap();
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(&hardlink_fixture.root),
+            Err(CleanFileStoreError::HardLink)
+        ));
+
+        let directory_fixture = Fixture::new("directory-entry");
+        drop(directory_fixture.stores());
+        fs::create_dir(directory_fixture.root.join(PINS_FILE)).unwrap();
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(&directory_fixture.root),
+            Err(CleanFileStoreError::NonRegular)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_and_lock_permissions_are_revalidated_on_reopen() {
+        let image_fixture = Fixture::new("image-mode");
+        let (mut pins, bootstrap, issuer) = image_fixture.stores().into_parts();
+        pins.commit(b"pins").unwrap();
+        drop((pins, bootstrap, issuer));
+        fs::set_permissions(
+            image_fixture.root.join(PINS_FILE),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(&image_fixture.root),
+            Err(CleanFileStoreError::InsecurePermissions)
+        ));
+        assert_eq!(
+            fs::symlink_metadata(image_fixture.root.join(PINS_FILE))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o640
+        );
+
+        let lock_fixture = Fixture::new("lock-mode");
+        drop(lock_fixture.stores());
+        fs::set_permissions(
+            lock_fixture.root.join(LOCK_FILE),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(&lock_fixture.root),
+            Err(CleanFileStoreError::InsecurePermissions)
+        ));
+        assert_eq!(
+            fs::symlink_metadata(lock_fixture.root.join(LOCK_FILE))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn truncated_and_digest_corrupt_images_fail_closed() {
+        let truncated_fixture = Fixture::new("truncated");
+        let (mut pins, bootstrap, issuer) = truncated_fixture.stores().into_parts();
+        pins.commit(b"complete").unwrap();
+        drop((pins, bootstrap, issuer));
+        OpenOptions::new()
+            .write(true)
+            .open(truncated_fixture.root.join(PINS_FILE))
+            .unwrap()
+            .set_len((STORE_HEADER_BYTES - 1) as u64)
+            .unwrap();
+        let (mut pins, bootstrap, issuer) = truncated_fixture.stores().into_parts();
+        assert!(matches!(pins.load(64), Err(CleanFileStoreError::Corrupt)));
+        drop((pins, bootstrap, issuer));
+
+        let corrupt_fixture = Fixture::new("digest-corrupt");
+        let (mut pins, bootstrap, issuer) = corrupt_fixture.stores().into_parts();
+        pins.commit(b"complete").unwrap();
+        drop((pins, bootstrap, issuer));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(corrupt_fixture.root.join(PINS_FILE))
+            .unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(&[0x7f]).unwrap();
+        file.sync_all().unwrap();
+        let (mut pins, bootstrap, issuer) = corrupt_fixture.stores().into_parts();
+        assert!(matches!(pins.load(64), Err(CleanFileStoreError::Corrupt)));
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn oversized_state_is_rejected_before_body_allocation() {
+        let fixture = Fixture::new("oversized");
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        pins.commit(b"small").unwrap();
+        drop((pins, bootstrap, issuer));
+        OpenOptions::new()
+            .write(true)
+            .open(fixture.root.join(PINS_FILE))
+            .unwrap()
+            .set_len((STORE_HEADER_BYTES + MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES + 1) as u64)
+            .unwrap();
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        assert!(matches!(
+            pins.load(MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES),
+            Err(CleanFileStoreError::Oversized)
+        ));
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn caller_bound_and_store_bound_are_both_enforced() {
+        let fixture = Fixture::new("bounds");
+        let (mut pins, bootstrap, mut issuer) = fixture.stores().into_parts();
+        pins.commit(b"four").unwrap();
+        assert!(matches!(pins.load(3), Err(CleanFileStoreError::Oversized)));
+        assert!(matches!(
+            issuer.commit(&vec![0_u8; MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES + 1]),
+            Err(CleanFileStoreError::Oversized)
+        ));
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn role_bound_envelopes_reject_cross_store_file_swaps() {
+        let fixture = Fixture::new("role-swap");
+        let (mut pins, mut bootstrap, issuer) = fixture.stores().into_parts();
+        pins.commit(b"pins").unwrap();
+        bootstrap.commit(b"bootstrap").unwrap();
+        drop((pins, bootstrap, issuer));
+        let temporary = fixture.parent.join("swap");
+        fs::rename(fixture.root.join(PINS_FILE), &temporary).unwrap();
+        fs::rename(
+            fixture.root.join(BOOTSTRAP_FILE),
+            fixture.root.join(PINS_FILE),
+        )
+        .unwrap();
+        fs::rename(temporary, fixture.root.join(BOOTSTRAP_FILE)).unwrap();
+
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        assert!(matches!(
+            pins.load(64),
+            Err(CleanFileStoreError::WrongStoreRole)
+        ));
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn unknown_files_are_never_treated_as_store_residue() {
+        let fixture = Fixture::new("unknown-residue");
+        drop(fixture.stores());
+        write_private(&fixture.root.join("old-generation"), b"legacy");
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::UnexpectedResidue)
+        ));
+
+        let fresh_fixture = Fixture::new("fresh-unknown-residue");
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(&fresh_fixture.root).unwrap();
+        fs::set_permissions(&fresh_fixture.root, fs::Permissions::from_mode(0o700)).unwrap();
+        write_private(&fresh_fixture.root.join("foreign"), b"foreign");
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(&fresh_fixture.root),
+            Err(CleanFileStoreError::UnexpectedResidue)
+        ));
+        assert!(!fresh_fixture.root.join(LOCK_FILE).exists());
+    }
+}

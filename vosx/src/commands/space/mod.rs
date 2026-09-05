@@ -30,6 +30,12 @@ mod authority_socket;
 pub mod backup;
 pub mod call;
 pub mod caps;
+// The hardened store depends on Unix dirfd, no-follow, ownership, link-count,
+// and durable-directory semantics. It is intentionally unavailable where
+// those guarantees cannot be enforced.
+#[cfg(unix)]
+#[allow(dead_code)] // Deliberately unwired until the subsequent bootstrap cutover slice.
+pub(crate) mod clean_store;
 pub mod client;
 pub mod common;
 pub mod describe;
