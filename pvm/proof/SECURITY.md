@@ -40,6 +40,36 @@ The verifier accepts the proof iff:
 8. (v5, standalone) `component_mask` contains the three boundary-binding
    chips and its popcount equals `num_components`.
 
+### Nested Refine bundles (formats 18/19)
+
+`RefineProofBundle` is an ordered closure of single-program child STARKs.
+Its transcript binds the exact outer artifact hash and invocation
+arguments/gas, every inner `(slot, generation, program-hash)` identity, child
+proof format/shape/commitments, sparse state/page commitments, calls 9 through
+14 with their before/after registers and state hashes, and the final exit.
+
+`RefineProofBundle` derives Serde for in-memory interchange, but Serde is not a
+bounded hostile-input decoder. A network or artifact transport **must cap the
+aggregate serialized byte length before deserialization**. The 1024-slice and
+boundary/component limits are post-decode verifier preflights; they prevent
+unbounded transcript hashing, resolver callbacks, and proof verification, but
+cannot undo allocations made while deserializing an unbounded byte stream.
+
+`verify_refine_bundle_authenticated` also requires a trusted external mapping
+from every exact machine/program identity and proof shape to its
+preprocessed-trace commitment. This prevents a valid proof for arbitrary code
+from being relabelled with a signed program hash. The verifier checks those
+child STARKs and canonical slice/boundary coverage, but deliberately returns
+`ReplayRequired`; transcript authentication alone does not bind the separately
+recorded native machine-state hashes or exit reasons to the child STARK
+statements, nor does it prove the native state mutation performed by calls 9
+through 14. It must never be treated as end-to-end Refine validity. A
+prover-enabled host obtains that stronger result only from
+`verify_refine_bundle_replayed`, which reruns the standard `RefineContext` from
+the exact committed program, arguments, and gas, compares every machine
+identity/slice/boundary, and then verifies each child proof against the directly
+observed witness.
+
 ## What a verified proof guarantees
 
 A proof verified against `hash = H(P)` for program `P` proves that:

@@ -539,45 +539,70 @@ mod prover {
     /// and its final memory commitment (`prove`'s boundary state); the two
     /// MUST agree or `verify_chain`'s boundary-continuity check rejects.
     pub(crate) fn replay_writes(side_note: &SideNote, ts_upper: Option<u64>) -> Vec<u8> {
-        let keep = |ts: u64| ts_upper.is_none_or(|t| ts < t);
-        let mut writes: Vec<PendingWrite> = Vec::new();
-
-        for s in &side_note.steps {
-            if keep(s.timestamp) {
-                if let Some(w) = write_of_step(s) {
-                    writes.push(w);
-                }
-            }
-        }
-        for m in &side_note.blake2b_mem_ops {
-            if keep(m.ts) {
-                writes.push(write_of_bytes(m.ts, m.h_ptr, &m.out_bytes));
-            }
-        }
-        for m in &side_note.ristretto_mem_ops {
-            if keep(m.ts) {
-                writes.push(write_of_bytes(m.ts, m.output_ptr, &m.out_bytes));
-            }
-        }
-        for m in &side_note.ristretto_add_mem_ops {
-            if keep(m.ts) {
-                writes.push(write_of_bytes(m.ts, m.output_ptr, &m.out_bytes));
-            }
-        }
-        for m in &side_note.scalar_reduce_wide_mem_ops {
-            if keep(m.ts) {
-                writes.push(write_of_bytes(m.ts, m.output_ptr, &m.out_bytes));
-            }
-        }
-        for m in &side_note.scalar_binop_mem_ops {
-            if keep(m.ts) {
-                writes.push(write_of_bytes(m.ts, m.output_ptr, &m.out_bytes));
-            }
-        }
-
+        let writes = collect_writes(side_note, ts_upper);
         let mut mem = side_note.initial_memory.clone();
         apply_writes(&mut mem, writes);
         mem
+    }
+
+    /// Replay writes over a canonical sparse entering image. This is the
+    /// Refine proof path's equivalent of [`replay_writes`] and never grows a
+    /// dense vector to a high guest address.
+    pub(crate) fn replay_sparse_writes(
+        side_note: &SideNote,
+        ts_upper: Option<u64>,
+    ) -> crate::SparseMemoryImage {
+        let mut image = side_note
+            .sparse_initial_memory
+            .clone()
+            .expect("sparse replay requires a sparse entering image");
+        let mut writes = collect_writes(side_note, ts_upper);
+        writes.sort_by_key(|write| write.0);
+        for (_timestamp, address, bytes, len) in writes {
+            assert!(
+                image.write(address, &bytes[..len as usize]),
+                "proof trace write lies outside its sparse memory span"
+            );
+        }
+        image
+    }
+
+    fn collect_writes(side_note: &SideNote, ts_upper: Option<u64>) -> Vec<PendingWrite> {
+        let keep = |ts: u64| ts_upper.is_none_or(|t| ts < t);
+        let mut writes = Vec::new();
+        for step in &side_note.steps {
+            if keep(step.timestamp) {
+                if let Some(write) = write_of_step(step) {
+                    writes.push(write);
+                }
+            }
+        }
+        for op in &side_note.blake2b_mem_ops {
+            if keep(op.ts) {
+                writes.push(write_of_bytes(op.ts, op.h_ptr, &op.out_bytes));
+            }
+        }
+        for op in &side_note.ristretto_mem_ops {
+            if keep(op.ts) {
+                writes.push(write_of_bytes(op.ts, op.output_ptr, &op.out_bytes));
+            }
+        }
+        for op in &side_note.ristretto_add_mem_ops {
+            if keep(op.ts) {
+                writes.push(write_of_bytes(op.ts, op.output_ptr, &op.out_bytes));
+            }
+        }
+        for op in &side_note.scalar_reduce_wide_mem_ops {
+            if keep(op.ts) {
+                writes.push(write_of_bytes(op.ts, op.output_ptr, &op.out_bytes));
+            }
+        }
+        for op in &side_note.scalar_binop_mem_ops {
+            if keep(op.ts) {
+                writes.push(write_of_bytes(op.ts, op.output_ptr, &op.out_bytes));
+            }
+        }
+        writes
     }
 
     /// One memory write pending replay: `(ts, addr, 64-byte buffer, len)`.
@@ -1432,12 +1457,12 @@ mod prover {
 }
 
 #[cfg(feature = "prover")]
-pub(crate) use prover::replay_writes;
-#[cfg(feature = "prover")]
 pub use prover::{
     CompactSegmentCursor, SegmentCursor, StepArrival, StepSource, TraceStream, TracingSource,
     segment_bounds_budgeted, segment_bounds_budgeted_compact, segment_side_note,
 };
+#[cfg(feature = "prover")]
+pub(crate) use prover::{replay_sparse_writes, replay_writes};
 
 #[cfg(all(test, feature = "prover"))]
 mod tests {

@@ -32,6 +32,123 @@ use crate::PVM_PAGE_SIZE;
 
 const PAGE: usize = PVM_PAGE_SIZE as usize;
 
+/// One non-zero page in a canonical sparse memory image.
+///
+/// Images are ordered by `page_index` and never contain an all-zero page.
+/// Keeping this representation at the interpreter boundary lets proof
+/// tracers snapshot a 32-bit guest address space without materialising its
+/// mostly-zero, nearly 4 GiB logical byte image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonZeroPage {
+    pub page_index: u32,
+    pub bytes: [u8; PAGE],
+}
+
+/// Deterministic sparse value image of guest memory.
+///
+/// Permissions are intentionally not part of the value image. Callers that
+/// commit complete architectural state must bind [`Memory::page_perms`]
+/// separately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SparseMemoryImage {
+    span: u64,
+    pages: Vec<NonZeroPage>,
+}
+
+impl SparseMemoryImage {
+    /// Construct a canonical image. Returns `None` for an invalid span,
+    /// unordered/duplicate/out-of-range pages, or an all-zero listed page.
+    pub fn new(span: u64, pages: Vec<NonZeroPage>) -> Option<Self> {
+        if span > 1u64 << 32 || !span.is_multiple_of(PAGE as u64) {
+            return None;
+        }
+        let page_count = span / PAGE as u64;
+        let mut previous = None;
+        for page in &pages {
+            if u64::from(page.page_index) >= page_count
+                || previous.is_some_and(|p| p >= page.page_index)
+                || page.bytes.iter().all(|&byte| byte == 0)
+            {
+                return None;
+            }
+            previous = Some(page.page_index);
+        }
+        Some(Self { span, pages })
+    }
+
+    pub fn span(&self) -> u64 {
+        self.span
+    }
+
+    pub fn pages(&self) -> &[NonZeroPage] {
+        &self.pages
+    }
+
+    /// Return a page by index, or an all-zero page when it is absent.
+    pub fn page(&self, page_index: u32) -> [u8; PAGE] {
+        self.pages
+            .binary_search_by_key(&page_index, |page| page.page_index)
+            .ok()
+            .map_or([0; PAGE], |index| self.pages[index].bytes)
+    }
+
+    /// Read one logical byte. Out-of-span addresses read as zero, matching
+    /// [`Memory::read_bytes`].
+    pub fn byte(&self, address: u32) -> u8 {
+        if u64::from(address) >= self.span {
+            return 0;
+        }
+        let page_index = address / PVM_PAGE_SIZE;
+        let offset = (address % PVM_PAGE_SIZE) as usize;
+        self.pages
+            .binary_search_by_key(&page_index, |page| page.page_index)
+            .ok()
+            .map_or(0, |index| self.pages[index].bytes[offset])
+    }
+
+    /// Apply bytes to the logical image while preserving canonical ordering
+    /// and dropping pages that become all-zero.
+    pub fn write(&mut self, address: u32, mut bytes: &[u8]) -> bool {
+        if u64::from(address) + bytes.len() as u64 > self.span {
+            return false;
+        }
+        let mut cursor = u64::from(address);
+        while !bytes.is_empty() {
+            let page_index = (cursor / PAGE as u64) as u32;
+            let offset = (cursor % PAGE as u64) as usize;
+            let len = (PAGE - offset).min(bytes.len());
+            let search = self
+                .pages
+                .binary_search_by_key(&page_index, |page| page.page_index);
+            let index = match search {
+                Ok(index) => index,
+                Err(index) => {
+                    if bytes[..len].iter().all(|&byte| byte == 0) {
+                        cursor += len as u64;
+                        bytes = &bytes[len..];
+                        continue;
+                    }
+                    self.pages.insert(
+                        index,
+                        NonZeroPage {
+                            page_index,
+                            bytes: [0; PAGE],
+                        },
+                    );
+                    index
+                }
+            };
+            self.pages[index].bytes[offset..offset + len].copy_from_slice(&bytes[..len]);
+            if self.pages[index].bytes.iter().all(|&byte| byte == 0) {
+                self.pages.remove(index);
+            }
+            cursor += len as u64;
+            bytes = &bytes[len..];
+        }
+        true
+    }
+}
+
 /// Per-page access map shared by both memory representations.
 ///
 /// Mirrors the recompiler's hardware page protection (PROT_NONE /
@@ -250,6 +367,10 @@ pub struct SparseMem {
     table: Vec<u32>,
     /// Frame arena: frame `i` occupies `[i * 4096, (i + 1) * 4096)`.
     frames: Vec<u8>,
+    /// Frame index → guest page. This inverse index makes canonical sparse
+    /// snapshots proportional to allocated frames rather than the complete
+    /// million-entry 32-bit page table.
+    frame_pages: Vec<u32>,
     perms: PagePerms,
 }
 
@@ -262,6 +383,7 @@ impl SparseMem {
         Self {
             table: vec![NO_FRAME; pages],
             frames: Vec::new(),
+            frame_pages: Vec::new(),
             perms: PagePerms::new_rw(pages),
         }
     }
@@ -275,6 +397,7 @@ impl SparseMem {
         }
         let idx = self.frames.len() / PAGE;
         self.frames.resize(self.frames.len() + PAGE, 0);
+        self.frame_pages.push(page as u32);
         self.table[page] = idx as u32;
         idx * PAGE
     }
@@ -608,8 +731,56 @@ impl Memory {
             Memory::Sparse(m) => {
                 m.table.capacity() * core::mem::size_of::<u32>()
                     + m.frames.capacity()
+                    + m.frame_pages.capacity() * core::mem::size_of::<u32>()
                     + m.perms.allocated_bytes()
             }
+        }
+    }
+
+    /// Whether this memory uses the sparse representation.
+    pub fn is_sparse(&self) -> bool {
+        matches!(self, Self::Sparse(_))
+    }
+
+    /// Snapshot the logical value image as sorted non-zero pages.
+    ///
+    /// The result is representation-independent: equal flat and sparse
+    /// memories produce byte-identical page sequences. Runtime proof tracing
+    /// forces sparse execution, so this remains O(touched pages) rather than
+    /// scanning or allocating the full 32-bit address space.
+    pub fn nonzero_page_image(&self) -> SparseMemoryImage {
+        let mut pages = Vec::new();
+        match self {
+            Memory::Flat(memory) => {
+                for (page_index, chunk) in memory.bytes.chunks(PAGE).enumerate() {
+                    if chunk.iter().all(|&byte| byte == 0) {
+                        continue;
+                    }
+                    let mut bytes = [0; PAGE];
+                    bytes[..chunk.len()].copy_from_slice(chunk);
+                    pages.push(NonZeroPage {
+                        page_index: page_index as u32,
+                        bytes,
+                    });
+                }
+            }
+            Memory::Sparse(memory) => {
+                for (frame, &page_index) in memory.frame_pages.iter().enumerate() {
+                    let base = frame * PAGE;
+                    let frame = &memory.frames[base..base + PAGE];
+                    if frame.iter().all(|&byte| byte == 0) {
+                        continue;
+                    }
+                    let mut bytes = [0; PAGE];
+                    bytes.copy_from_slice(frame);
+                    pages.push(NonZeroPage { page_index, bytes });
+                }
+                pages.sort_unstable_by_key(|page| page.page_index);
+            }
+        }
+        SparseMemoryImage {
+            span: self.span(),
+            pages,
         }
     }
 }
@@ -648,6 +819,52 @@ mod tests {
             assert_eq!(flat.read_u64_le(addr), Ok(0), "flat @{addr:#x}");
             assert_eq!(sparse.read_u64_le(addr), Ok(0), "sparse @{addr:#x}");
         }
+    }
+
+    #[test]
+    fn nonzero_page_image_is_canonical_and_handles_high_addresses() {
+        let mut memory = Memory::sparse(1u64 << 32);
+        let address = u32::MAX - 31;
+        // Allocate out of guest-page order: snapshots must still canonicalize.
+        memory.init_copy(address, b"high-page");
+        memory.init_copy(2 * PVM_PAGE_SIZE, b"low-page");
+        let image = memory.nonzero_page_image();
+
+        assert_eq!(image.span(), 1u64 << 32);
+        assert_eq!(image.pages().len(), 2);
+        assert_eq!(image.pages()[0].page_index, 2);
+        assert_eq!(image.pages()[1].page_index, address / PVM_PAGE_SIZE);
+        assert_eq!(image.byte(address), b'h');
+        assert_eq!(image.byte(address + 8), b'e');
+        assert!(memory.allocated_bytes() < 16 << 20);
+
+        let cloned = memory.clone();
+        assert_eq!(cloned.nonzero_page_image(), image);
+        let Memory::Sparse(sparse) = &memory else {
+            unreachable!()
+        };
+        assert_eq!(sparse.frame_pages, [address / PVM_PAGE_SIZE, 2]);
+        assert_eq!(sparse.frames.len(), 2 * PAGE);
+        for (frame, &page) in sparse.frame_pages.iter().enumerate() {
+            assert_eq!(sparse.table[page as usize], frame as u32);
+        }
+        assert_eq!(
+            memory.allocated_bytes(),
+            sparse.table.capacity() * core::mem::size_of::<u32>()
+                + sparse.frames.capacity()
+                + sparse.frame_pages.capacity() * core::mem::size_of::<u32>()
+                + sparse.perms.allocated_bytes()
+        );
+        let empty = SparseMem::default();
+        assert!(empty.table.is_empty());
+        assert!(empty.frames.is_empty());
+        assert!(empty.frame_pages.is_empty());
+
+        let mut updated = image.clone();
+        assert!(updated.write(address, &[0; 9]));
+        assert_eq!(updated.pages().len(), 1, "zero pages are removed");
+        assert!(SparseMemoryImage::new(1u64 << 32, image.pages().to_vec()).is_some());
+        assert!(SparseMemoryImage::new(1u64 << 32, vec![image.pages()[0].clone(); 2]).is_none());
     }
 
     #[test]

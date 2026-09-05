@@ -525,18 +525,16 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
         }
     }
 
-    if !side_note.initial_memory.is_empty() {
+    if side_note.has_initial_memory() {
         let mut first_access: BTreeMap<u32, bool> = BTreeMap::new();
         for e in &entries {
             first_access.entry(e.address).or_insert(e.is_write);
         }
-        let flat_mem = &side_note.initial_memory;
         for (&addr, &first_is_write) in &first_access {
             if first_is_write {
                 continue;
             }
-            let a = addr as usize;
-            let value = if a < flat_mem.len() { flat_mem[a] } else { 0 };
+            let value = side_note.initial_memory_byte(addr);
             entries.push(MemEntry {
                 address: addr,
                 value,

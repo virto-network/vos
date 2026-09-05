@@ -151,14 +151,21 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///        low 64 KiB and does not wrap through 2^32. CPU/ProgramMemory columns
 ///        and the program-memory lookup tuple change, so older proofs reject.
 ///   17 — Poseidon2-M31 PCS variant of format 16.
+///   18 — Standard Refine proof-closure generation. Individual STARKs remain
+///        single-program machine-slice proofs; the new boundary bundle binds
+///        their exact outer/inner program identities, proof shapes, order,
+///        sparse memory states, and calls 9..=14 before/after transcript.
+///        Sparse entering images also replace the dense nearly-4-GiB Refine
+///        witness representation. Older proof/bundle combinations reject.
+///   19 — Poseidon2-M31 PCS variant of format 18.
 #[cfg(not(feature = "poseidon2-channel"))]
-pub const PROOF_FORMAT_VERSION: u32 = 16;
+pub const PROOF_FORMAT_VERSION: u32 = 18;
 /// Native recursion: the PCS commit hash + Fiat-Shamir
 /// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
 /// become `P2Hash` digests — a different wire format. A Blake2s verifier
-/// (v16) and a Poseidon2-M31 verifier (v17) therefore reject each other's proofs.
+/// (v18) and a Poseidon2-M31 verifier (v19) therefore reject each other's proofs.
 #[cfg(feature = "poseidon2-channel")]
-pub const PROOF_FORMAT_VERSION: u32 = 17;
+pub const PROOF_FORMAT_VERSION: u32 = 19;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.

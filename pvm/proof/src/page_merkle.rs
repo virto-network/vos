@@ -67,10 +67,12 @@ const PARAM_XOR_256: u64 = 0x0101_0020;
 /// Domain tag prepended as the full first 128-byte block of a leaf hash.
 ///
 /// This byte string was introduced in proof formats 10 and 11 and remains
-/// stable in formats 12 through 17. Its historical crate name is intentional:
-/// moving the prover must not change committed roots.
+/// stable in formats 12 through 19. Its historical crate name is intentional:
+/// moving the prover must not change committed roots. It remains unchanged in
+/// proof formats 18 and 19; those versions add the Refine closure envelope,
+/// not a page-hash permutation change.
 const TAG_LEAF: &[u8] = b"zkpvm/page-merkle/leaf/v1";
-/// Stable inner-node domain for proof formats 10 through 17; see `TAG_LEAF`.
+/// Stable inner-node domain for proof formats 10 through 19; see `TAG_LEAF`.
 const TAG_NODE: &[u8] = b"zkpvm/page-merkle/node/v1";
 
 const BLOCK: usize = 128;
@@ -96,7 +98,7 @@ fn block_words(block: &[u8]) -> [u64; 16] {
 
 /// Standard blake2b-256 of an arbitrary message, built on the in-circuit
 /// software compression core so host and circuit agree bit-for-bit.
-fn blake2b256(msg: &[u8]) -> [u8; 32] {
+pub(crate) fn blake2b256(msg: &[u8]) -> [u8; 32] {
     let mut h = iv_param_256();
     // At least one block, even for an empty message; the final block is
     // zero-padded and `t` counts real (non-padding) bytes processed so far.
@@ -183,6 +185,15 @@ fn nondefault_leaves(image: &[u8]) -> BTreeMap<u32, [u8; 32]> {
     leaves
 }
 
+#[cfg(feature = "prover")]
+fn sparse_image_leaves(image: &crate::SparseMemoryImage) -> BTreeMap<u32, [u8; 32]> {
+    image
+        .pages()
+        .iter()
+        .map(|page| (page.page_index, leaf_hash(&page.bytes)))
+        .collect()
+}
+
 /// Root of the subtree rooted at `(level, node_idx)` given the non-default
 /// leaf hashes of the whole tree.  Short-circuits all-default subtrees, so the
 /// cost is `O(non-default pages × DEPTH)`.
@@ -218,6 +229,12 @@ pub fn sparse_root(leaves: &BTreeMap<u32, [u8; 32]>) -> [u8; 32] {
 #[cfg(feature = "prover")]
 pub fn image_root(image: &[u8]) -> [u8; 32] {
     sparse_root(&nondefault_leaves(image))
+}
+
+/// Root of a canonical sparse non-zero-page image.
+#[cfg(feature = "prover")]
+pub fn sparse_image_root(image: &crate::SparseMemoryImage) -> [u8; 32] {
+    sparse_root(&sparse_image_leaves(image))
 }
 
 /// A child slot of a merge row in the boundary multiproof schedule.
@@ -281,6 +298,20 @@ pub fn build_multiproof(
     build_multiproof_from_leaves(
         &nondefault_leaves(entering),
         &nondefault_leaves(exiting),
+        touched,
+    )
+}
+
+/// Sparse-image counterpart to [`build_multiproof`].
+#[cfg(feature = "prover")]
+pub fn build_sparse_multiproof(
+    entering: &crate::SparseMemoryImage,
+    exiting: &crate::SparseMemoryImage,
+    touched: &BTreeSet<u32>,
+) -> MerkleMultiproof {
+    build_multiproof_from_leaves(
+        &sparse_image_leaves(entering),
+        &sparse_image_leaves(exiting),
         touched,
     )
 }
@@ -595,10 +626,32 @@ pub fn boundary_blake2b_calls(
     entering: &[u8],
     exiting: &[u8],
 ) -> (Vec<crate::chips::Blake2bCall>, Vec<u32>) {
+    boundary_blake2b_calls_with(
+        mp,
+        |page| page_bytes(entering, page),
+        |page| page_bytes(exiting, page),
+    )
+}
+
+/// Sparse-image counterpart to [`boundary_blake2b_calls`].
+#[cfg(feature = "prover")]
+pub fn sparse_boundary_blake2b_calls(
+    mp: &MerkleMultiproof,
+    entering: &crate::SparseMemoryImage,
+    exiting: &crate::SparseMemoryImage,
+) -> (Vec<crate::chips::Blake2bCall>, Vec<u32>) {
+    boundary_blake2b_calls_with(mp, |page| entering.page(page), |page| exiting.page(page))
+}
+
+fn boundary_blake2b_calls_with(
+    mp: &MerkleMultiproof,
+    mut entering_page: impl FnMut(u32) -> [u8; PAGE_SIZE],
+    mut exiting_page: impl FnMut(u32) -> [u8; PAGE_SIZE],
+) -> (Vec<crate::chips::Blake2bCall>, Vec<u32>) {
     let mut calls = Vec::new();
     for &(p, _, _) in &mp.leaves {
-        push_leaf_calls(&page_bytes(entering, p), &mut calls); // before pass
-        push_leaf_calls(&page_bytes(exiting, p), &mut calls); // after pass
+        push_leaf_calls(&entering_page(p), &mut calls); // before pass
+        push_leaf_calls(&exiting_page(p), &mut calls); // after pass
     }
     for node in &mp.merges {
         calls.push(node_call(&node.child_before[0], &node.child_before[1]));
@@ -678,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn page_domains_remain_stable_across_v10_through_v17() {
+    fn page_domains_remain_stable_across_v10_through_v19() {
         assert_eq!(
             leaf_hash(&[0u8; PAGE_SIZE]),
             hex_to_32("fd2c1ac593371c52c7fb0dc8fce568b2edea3cc192ca663a07fed4cd714f8fa3"),
@@ -713,6 +766,64 @@ mod tests {
             }
         }
         img
+    }
+
+    fn sparse_image_from_dense(image: &[u8]) -> crate::SparseMemoryImage {
+        let pages = image
+            .chunks(PAGE_SIZE)
+            .enumerate()
+            .filter_map(|(page_index, chunk)| {
+                if chunk.iter().all(|&byte| byte == 0) {
+                    return None;
+                }
+                let mut bytes = [0; PAGE_SIZE];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                Some(crate::SparseMemoryPage {
+                    page_index: page_index as u32,
+                    bytes,
+                })
+            })
+            .collect();
+        crate::SparseMemoryImage::new(image.len() as u64, pages).unwrap()
+    }
+
+    #[test]
+    fn dense_and_sparse_images_have_identical_roots_and_multiproofs() {
+        let entering = make_image(&[(1, 0x11), (2, 0x22), (19, 0x33)]);
+        let mut exiting = entering.clone();
+        exiting[2 * PAGE_SIZE + 7] ^= 0x5a;
+        exiting[8 * PAGE_SIZE + 3] = 0x44;
+        let sparse_entering = sparse_image_from_dense(&entering);
+        let sparse_exiting = sparse_image_from_dense(&exiting);
+        let touched: BTreeSet<u32> = [2, 8].into_iter().collect();
+
+        assert_eq!(image_root(&entering), sparse_image_root(&sparse_entering));
+        assert_eq!(image_root(&exiting), sparse_image_root(&sparse_exiting));
+        let dense = build_multiproof(&entering, &exiting, &touched);
+        let sparse = build_sparse_multiproof(&sparse_entering, &sparse_exiting, &touched);
+        assert_eq!(dense.leaves, sparse.leaves);
+        assert_eq!(dense.merges, sparse.merges);
+        assert_eq!(dense.root_before, sparse.root_before);
+        assert_eq!(dense.root_after, sparse.root_after);
+    }
+
+    #[test]
+    fn sparse_image_root_and_multiproof_handle_the_last_guest_page() {
+        let span = 1u64 << 32;
+        let page_index = (1u32 << DEPTH) - 1;
+        let entering = crate::SparseMemoryImage::new(span, Vec::new()).unwrap();
+        let mut page = crate::SparseMemoryPage {
+            page_index,
+            bytes: [0; PAGE_SIZE],
+        };
+        page.bytes[PAGE_SIZE - 1] = 0x7f;
+        let exiting = crate::SparseMemoryImage::new(span, vec![page]).unwrap();
+        let touched: BTreeSet<u32> = [page_index].into_iter().collect();
+        let proof = build_sparse_multiproof(&entering, &exiting, &touched);
+
+        assert_eq!(proof.root_before, sparse_image_root(&entering));
+        assert_eq!(proof.root_after, sparse_image_root(&exiting));
+        assert_ne!(proof.root_before, proof.root_after);
     }
 
     #[test]

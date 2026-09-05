@@ -16,7 +16,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, format, string::ToString, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, format, string::ToString, vec::Vec};
 use num_traits::Zero;
 use stwo::core::{
     air::Component,
@@ -35,6 +35,13 @@ use vos_pvm_proof::recursion_pcs::{ProverChannel, ProverMerkleChannel};
 // was compiled against.  Callers can compare against
 // `proof.format_version` themselves for early rejection at the network
 // boundary, or just rely on `verify_standalone`'s built-in check.
+pub use vos_pvm_proof::refine::{
+    MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, MAX_REFINE_PROOF_SLICES,
+    REFINE_BUNDLE_FORMAT_VERSION, REFINE_CHILD_COMMITMENT_COUNT, RefineBundleVerification,
+    RefineMachineId, RefineProgramId, RefineProofBundle, RefineSliceExit,
+    refine_arguments_commitment, refine_bundle_cardinality_is_valid, refine_bundle_commitment,
+    refine_program_id,
+};
 pub use vos_pvm_proof::{PROOF_FORMAT_VERSION, Proof};
 // PcsPolicy floor — see SECURITY.md "Proof shape". `check_min_security` /
 // `conjectured_security_bits` / `MIN_CONJECTURED_SECURITY_BITS` are the
@@ -67,6 +74,259 @@ pub use vos_pvm_proof::recursion_pcs::ProverMerkleHash as CommitmentHash;
 /// proving over very long executions) should call
 /// `verify_standalone_with_max_log_size` with an explicit bound.
 pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
+
+/// Trusted mapping from an exact Refine machine/program identity and proof
+/// shape to its preprocessed-trace commitment.
+///
+/// The mapping must come from an authenticated program catalog or equivalent
+/// admission record, never from the presented bundle itself. A PVM program's
+/// preprocessed commitment also depends on its selected component/log-size
+/// profile, so the complete shape is part of the lookup key.
+pub trait RefineProgramCommitmentResolver {
+    fn resolve_preprocessed_commitment(
+        &self,
+        identity: RefineMachineId,
+        proof_format_version: u32,
+        component_mask: u32,
+        log_sizes: &[u32],
+    ) -> Option<CommitmentHash>;
+}
+
+impl<F> RefineProgramCommitmentResolver for F
+where
+    F: Fn(RefineMachineId, u32, u32, &[u32]) -> Option<CommitmentHash>,
+{
+    fn resolve_preprocessed_commitment(
+        &self,
+        identity: RefineMachineId,
+        proof_format_version: u32,
+        component_mask: u32,
+        log_sizes: &[u32],
+    ) -> Option<CommitmentHash> {
+        self(identity, proof_format_version, component_mask, log_sizes)
+    }
+}
+
+/// Verify every child STARK and the canonical Refine boundary transcript.
+///
+/// This deliberately returns [`RefineBundleVerification::ReplayRequired`]
+/// rather than `()` or `true`: a proof-only verifier cannot bind the bundle's
+/// native machine-state hashes and exit reasons to the child proof statements,
+/// or establish the native semantics of host calls 9..=14. Prover-enabled
+/// hosts close those boundaries with
+/// `vos_pvm_proof::verify_refine_bundle_replayed`, using exact outer
+/// program/argument bytes and gas. `program_commitments` must be a trusted
+/// external mapping; requiring it prevents a valid proof for an arbitrary
+/// program from being relabelled with a different
+/// [`RefineMachineId::program`](RefineMachineId::program).
+pub fn verify_refine_bundle_authenticated<R: RefineProgramCommitmentResolver + ?Sized>(
+    bundle: &RefineProofBundle,
+    expected_outer_program: RefineProgramId,
+    expected_arguments_commitment: [u8; 32],
+    expected_gas_limit: u64,
+    program_commitments: &R,
+) -> Result<RefineBundleVerification, VerificationError> {
+    // Must precede transcript construction, resolver callbacks, proof clones,
+    // and cryptographic work. Every collection length encoded as u32 in the
+    // transcript is bounded here.
+    if !refine_bundle_cardinality_is_valid(bundle) {
+        return Err(VerificationError::InvalidStructure(
+            "Refine bundle cardinality is noncanonical".to_string(),
+        ));
+    }
+    if bundle.format_version != REFINE_BUNDLE_FORMAT_VERSION {
+        return Err(VerificationError::InvalidStructure(
+            "Refine bundle format version mismatch".to_string(),
+        ));
+    }
+    if bundle.outer_program != expected_outer_program
+        || bundle.arguments_commitment != expected_arguments_commitment
+        || bundle.gas_limit != expected_gas_limit
+    {
+        return Err(VerificationError::InvalidStructure(
+            "Refine invocation identity/arguments/gas mismatch".to_string(),
+        ));
+    }
+    if bundle.transcript_commitment != refine_bundle_commitment(bundle) {
+        return Err(VerificationError::InvalidStructure(
+            "Refine transcript commitment mismatch".to_string(),
+        ));
+    }
+    let mut identities = BTreeMap::<(u32, u64), RefineProgramId>::new();
+    for (index, slice) in bundle.slices.iter().enumerate() {
+        if slice.order != index as u32 {
+            return Err(VerificationError::InvalidStructure(
+                "Refine machine slices are reordered".to_string(),
+            ));
+        }
+        match slice.identity {
+            RefineMachineId::Outer { program } if program == bundle.outer_program => {}
+            RefineMachineId::Outer { .. } => {
+                return Err(VerificationError::InvalidStructure(
+                    "Refine outer slice has the wrong program identity".to_string(),
+                ));
+            }
+            RefineMachineId::Inner {
+                slot,
+                generation,
+                program,
+            } => {
+                if identities
+                    .insert((slot, generation), program)
+                    .is_some_and(|previous| previous != program)
+                {
+                    return Err(VerificationError::InvalidStructure(
+                        "Refine inner slot/generation aliases two programs".to_string(),
+                    ));
+                }
+            }
+        }
+        let Some(actual_program_commitment) = slice.proof.stark_proof.commitments.first().copied()
+        else {
+            return Err(VerificationError::InvalidStructure(
+                "Refine child proof has no preprocessed commitment".to_string(),
+            ));
+        };
+        let Some(expected_program_commitment) = program_commitments
+            .resolve_preprocessed_commitment(
+                slice.identity,
+                slice.proof.format_version,
+                slice.proof.component_mask,
+                &slice.proof.log_sizes,
+            )
+        else {
+            return Err(VerificationError::InvalidStructure(
+                "Refine machine/program proof shape has no trusted commitment".to_string(),
+            ));
+        };
+        if actual_program_commitment != expected_program_commitment {
+            return Err(VerificationError::InvalidStructure(
+                "Refine child proof does not match its trusted program commitment".to_string(),
+            ));
+        }
+    }
+
+    if !matches!(bundle.slices[0].identity, RefineMachineId::Outer { .. }) {
+        return Err(VerificationError::InvalidStructure(
+            "Refine closure must start in the outer runtime".to_string(),
+        ));
+    }
+    // Walk the closure in execution order. This proves structural coverage,
+    // not host semantics: every handled outer host exit has exactly one
+    // boundary, only INVOKE may enclose one inner slice, and every other
+    // slice is the next outer continuation. A final handled host call can
+    // end in Panic/OutOfGas during native dispatch without another machine
+    // slice; replay is what proves that terminal transition.
+    let mut slice_index = 0usize;
+    let mut boundary_index = 0usize;
+    while slice_index < bundle.slices.len() {
+        let outer = &bundle.slices[slice_index];
+        if !matches!(outer.identity, RefineMachineId::Outer { .. }) {
+            return Err(VerificationError::InvalidStructure(
+                "Refine inner slice is outside an INVOKE boundary".to_string(),
+            ));
+        }
+        let RefineSliceExit::HostCall(call) = outer.exit else {
+            if slice_index + 1 != bundle.slices.len()
+                || outer.exit != bundle.result
+                || boundary_index != bundle.host_boundaries.len()
+            {
+                return Err(VerificationError::InvalidStructure(
+                    "Refine terminal result or slice coverage is noncanonical".to_string(),
+                ));
+            }
+            slice_index += 1;
+            continue;
+        };
+        let Ok(call) = u8::try_from(call) else {
+            return Err(VerificationError::InvalidStructure(
+                "Refine outer host call is outside the standard call range".to_string(),
+            ));
+        };
+        if !(9..=14).contains(&call) {
+            return Err(VerificationError::InvalidStructure(
+                "Refine outer host call is outside the standard call range".to_string(),
+            ));
+        }
+        let Some(boundary) = bundle.host_boundaries.get(boundary_index) else {
+            return Err(VerificationError::InvalidStructure(
+                "Refine outer host call has no matching boundary".to_string(),
+            ));
+        };
+        let expected_before = slice_index + 1;
+        if boundary.call != call || boundary.slices_before as usize != expected_before {
+            return Err(VerificationError::InvalidStructure(
+                "Refine host boundary does not match its outer call".to_string(),
+            ));
+        }
+        if boundary.registers_before != outer.proof.final_state.registers {
+            return Err(VerificationError::InvalidStructure(
+                "Refine host boundary input registers differ from the child proof exit".to_string(),
+            ));
+        }
+        let expected_after = if call == 13 {
+            match bundle.slices.get(expected_before) {
+                Some(slice) if matches!(slice.identity, RefineMachineId::Inner { .. }) => {
+                    expected_before + 1
+                }
+                _ => expected_before,
+            }
+        } else {
+            expected_before
+        };
+        if boundary.slices_after as usize != expected_after {
+            return Err(VerificationError::InvalidStructure(
+                "Refine host boundary encloses a noncanonical slice range".to_string(),
+            ));
+        }
+        if let Some(next_outer) = bundle.slices.get(expected_after) {
+            if !matches!(next_outer.identity, RefineMachineId::Outer { .. })
+                || boundary.registers_after != next_outer.proof.initial_state.registers
+            {
+                return Err(VerificationError::InvalidStructure(
+                    "Refine host boundary output registers differ from the next outer proof entry"
+                        .to_string(),
+                ));
+            }
+        }
+        boundary_index += 1;
+        slice_index = expected_after;
+
+        if slice_index == bundle.slices.len()
+            && (expected_after != expected_before
+                || !matches!(
+                    bundle.result,
+                    RefineSliceExit::Panic | RefineSliceExit::OutOfGas
+                )
+                || boundary_index != bundle.host_boundaries.len())
+        {
+            return Err(VerificationError::InvalidStructure(
+                "Refine final host transition/result is noncanonical".to_string(),
+            ));
+        }
+    }
+    if boundary_index != bundle.host_boundaries.len() {
+        return Err(VerificationError::InvalidStructure(
+            "Refine bundle has an extra host boundary".to_string(),
+        ));
+    }
+
+    // Perform expensive cryptographic verification only after all bounded
+    // structural checks. The checked access above makes an empty commitment
+    // vector a normal hostile-input error rather than a panic.
+    for slice in &bundle.slices {
+        let Some(program_commitment) = slice.proof.stark_proof.commitments.first().copied() else {
+            return Err(VerificationError::InvalidStructure(
+                "Refine child proof has no preprocessed commitment".to_string(),
+            ));
+        };
+        verify_standalone(slice.proof.clone(), program_commitment)?;
+    }
+
+    Ok(RefineBundleVerification::ReplayRequired {
+        transcript_commitment: bundle.transcript_commitment,
+    })
+}
 
 /// Verify a PVM execution proof.
 ///

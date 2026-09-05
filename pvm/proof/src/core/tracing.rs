@@ -1177,7 +1177,7 @@ fn wrapping_effective_address(base: u64, offset: u64) -> u32 {
     (base as u32).wrapping_add(offset as u32)
 }
 
-fn decode_mem_access(
+pub(crate) fn decode_mem_access(
     opcode: Opcode,
     decoded_args: &args::Args,
     regs_before: &[u64; PVM_REGISTER_COUNT],

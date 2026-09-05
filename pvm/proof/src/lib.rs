@@ -133,7 +133,9 @@ mod framework;
 pub mod framework_access;
 mod lookups;
 pub mod proof;
+pub mod refine;
 pub mod segment;
+pub mod sparse_memory;
 pub mod trace;
 
 // Native-recursion Stage-0: the Poseidon2-M31 PCS primitives + the per-build
@@ -544,6 +546,19 @@ pub(crate) fn active_components_verifier(
 }
 
 pub use proof::{PROOF_FORMAT_VERSION, PcsPolicy, Proof, SegmentState};
+pub use refine::{
+    MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, MAX_REFINE_PROOF_SLICES,
+    REFINE_BUNDLE_FORMAT_VERSION, REFINE_CHILD_COMMITMENT_COUNT, RefineBundleVerification,
+    RefineHostBoundary, RefineMachineId, RefineProgramId, RefineProofBundle, RefineProofSlice,
+    RefineSliceExit, refine_arguments_commitment, refine_bundle_cardinality_is_valid,
+    refine_bundle_commitment, refine_program_id,
+};
+#[cfg(feature = "prover")]
+pub use refine::{
+    RefineTraceBundle, RefineTraceError, RefineTraceSlice, prove_refine, trace_refine,
+    verify_refine_bundle_replayed,
+};
+pub use sparse_memory::{SPARSE_MEMORY_PAGE_SIZE, SparseMemoryImage, SparseMemoryPage};
 // The per-policy FRI floor constants + the policy checker: used by callers
 // that assemble a custom `PcsPolicy`; hidden from the top-level page.
 #[doc(hidden)]

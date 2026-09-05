@@ -37,6 +37,11 @@ pub struct SideNote {
     /// The MemoryChip injects synthetic writes at timestamp 0 for addresses
     /// that are read without a prior write.
     pub initial_memory: Vec<u8>,
+    /// Canonical sorted non-zero pages for a sparse 32-bit memory image.
+    /// Mutually exclusive with `initial_memory`; Refine proof tracing uses
+    /// this form so the high stack/input pages never imply a dense 4 GiB
+    /// allocation.
+    pub sparse_initial_memory: Option<crate::SparseMemoryImage>,
     /// Number of initial memory entries injected (set by MemoryChip).
     pub num_initial_mem_entries: usize,
     /// Power-of-two lookup counts: shift_amount → multiplicity (set by CpuChip).
@@ -447,6 +452,7 @@ impl SideNote {
             bitwise_and_counts: HashMap::new(),
             bitwise_and_byte_counts: vec![0u32; 1 << 16],
             initial_memory: Vec::new(),
+            sparse_initial_memory: None,
             num_initial_mem_entries: 0,
             power_of_two_counts: vec![0u32; 64],
             popcount_counts: vec![0u32; 256],
@@ -502,22 +508,54 @@ impl SideNote {
         use crate::page_merkle;
         let mut touched = page_merkle::touched_pages(self);
         touched.insert(0); // never-empty page set (design §0)
-        let exiting = crate::segment::replay_writes(self, None);
-        let mp = page_merkle::build_multiproof(&self.initial_memory, &exiting, &touched);
+        let sparse_exiting = self
+            .sparse_initial_memory
+            .as_ref()
+            .map(|_| crate::segment::replay_sparse_writes(self, None));
+        let dense_exiting = sparse_exiting
+            .is_none()
+            .then(|| crate::segment::replay_writes(self, None));
+        let mp = match (&self.sparse_initial_memory, &sparse_exiting) {
+            (Some(entering), Some(exiting)) => {
+                page_merkle::build_sparse_multiproof(entering, exiting, &touched)
+            }
+            _ => page_merkle::build_multiproof(
+                &self.initial_memory,
+                dense_exiting.as_deref().unwrap_or_default(),
+                &touched,
+            ),
+        };
         // Unique compressions with per-consumption multiplicities: the
         // page/merge chips emit −1 per consumption, the boundary chip
         // produces +EmitMult per unique compression — same balance design
         // §4's one-block-per-consumption scheme held, at far fewer rows.
-        let (calls, mults) =
-            page_merkle::boundary_blake2b_calls(&mp, &self.initial_memory, &exiting);
+        let (calls, mults) = match (&self.sparse_initial_memory, &sparse_exiting) {
+            (Some(entering), Some(exiting)) => {
+                page_merkle::sparse_boundary_blake2b_calls(&mp, entering, exiting)
+            }
+            _ => page_merkle::boundary_blake2b_calls(
+                &mp,
+                &self.initial_memory,
+                dense_exiting.as_deref().unwrap_or_default(),
+            ),
+        };
         self.merkle_blake2b_calls = calls;
         self.merkle_blake2b_mults = mults;
         let pages = touched
             .iter()
-            .map(|&p| MemoryPageImage {
-                page_idx: p,
-                before: page_merkle::page_bytes(&self.initial_memory, p).to_vec(),
-                after: page_merkle::page_bytes(&exiting, p).to_vec(),
+            .map(|&p| {
+                let (before, after) = match (&self.sparse_initial_memory, &sparse_exiting) {
+                    (Some(entering), Some(exiting)) => (entering.page(p), exiting.page(p)),
+                    _ => (
+                        page_merkle::page_bytes(&self.initial_memory, p),
+                        page_merkle::page_bytes(dense_exiting.as_deref().unwrap_or_default(), p),
+                    ),
+                };
+                MemoryPageImage {
+                    page_idx: p,
+                    before: before.to_vec(),
+                    after: after.to_vec(),
+                }
             })
             .collect();
         self.memory_pages = Some(MemoryPagePayload {
@@ -538,7 +576,31 @@ impl SideNote {
 
     pub fn with_memory(mut self, flat_mem: Vec<u8>) -> Self {
         self.initial_memory = flat_mem;
+        self.sparse_initial_memory = None;
         self
+    }
+
+    /// Attach a canonical sparse entering-memory image.
+    pub fn with_sparse_memory(mut self, image: crate::SparseMemoryImage) -> Self {
+        self.initial_memory.clear();
+        self.sparse_initial_memory = Some(image);
+        self
+    }
+
+    pub(crate) fn has_initial_memory(&self) -> bool {
+        !self.initial_memory.is_empty() || self.sparse_initial_memory.is_some()
+    }
+
+    pub(crate) fn initial_memory_byte(&self, address: u32) -> u8 {
+        self.sparse_initial_memory.as_ref().map_or_else(
+            || {
+                self.initial_memory
+                    .get(address as usize)
+                    .copied()
+                    .unwrap_or(0)
+            },
+            |image| image.byte(address),
+        )
     }
 
     pub fn with_initial_regs(mut self, regs: [u64; NUM_REGS]) -> Self {

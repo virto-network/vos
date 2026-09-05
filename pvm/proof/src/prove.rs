@@ -472,8 +472,32 @@ fn compute_final_memory_commitment(side_note: &SideNote) -> [u8; 32] {
     // segment's initial-memory commitment (which DOES reflect those writes,
     // via `segment::replay_writes`) would mismatch and `verify_chain`'s
     // boundary-continuity check would reject. `ts_upper = None` ⇒ all writes.
-    let mem = crate::segment::replay_writes(side_note, None);
-    *blake3::hash(&mem).as_bytes()
+    if side_note.sparse_initial_memory.is_some() {
+        let image = crate::segment::replay_sparse_writes(side_note, None);
+        sparse_memory_commitment(&image)
+    } else {
+        let mem = crate::segment::replay_writes(side_note, None);
+        *blake3::hash(&mem).as_bytes()
+    }
+}
+
+fn initial_memory_commitment(side_note: &SideNote) -> [u8; 32] {
+    side_note.sparse_initial_memory.as_ref().map_or_else(
+        || *blake3::hash(&side_note.initial_memory).as_bytes(),
+        sparse_memory_commitment,
+    )
+}
+
+fn sparse_memory_commitment(image: &crate::SparseMemoryImage) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"vos/pvm/sparse-memory/v1\0");
+    hasher.update(&image.span().to_le_bytes());
+    hasher.update(&(image.pages().len() as u64).to_le_bytes());
+    for page in image.pages() {
+        hasher.update(&page.page_index.to_le_bytes());
+        hasher.update(&page.bytes);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 /// Normalize a `SideNote` the way the production prove path does before
@@ -1226,7 +1250,7 @@ fn prove_impl_with_components_overridden(
             pc: first.pc,
             timestamp: first.timestamp,
             registers: side_note.initial_regs,
-            memory_commitment: *blake3::hash(&side_note.initial_memory).as_bytes(),
+            memory_commitment: initial_memory_commitment(side_note),
             memory_root: root_before,
         }
     };

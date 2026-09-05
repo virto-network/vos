@@ -10,7 +10,7 @@ use alloc::{vec, vec::Vec};
 use crate::args::{self, Args};
 use crate::instruction::Opcode;
 use crate::{ExitReason, Gas, PVM_REGISTER_COUNT};
-pub use memory::Memory;
+pub use memory::{Memory, NonZeroPage, SparseMemoryImage};
 
 /// Pre-decoded instruction for the fast interpreter path.
 ///

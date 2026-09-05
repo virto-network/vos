@@ -137,6 +137,17 @@ pub struct InnerMachineIdentity {
     pub generation: u64,
 }
 
+/// Immutable dictionary view used by nested proof boundary tracers.
+/// `machine` is absent until the lazily-created inner interpreter is first
+/// needed; the canonical compact `program` and entry counter remain available
+/// in either state.
+pub struct InnerMachineView<'a> {
+    pub identity: InnerMachineIdentity,
+    pub program: &'a [u8],
+    pub initial_pc: u32,
+    pub machine: Option<&'a Interpreter>,
+}
+
 /// Read-only events emitted while an inner machine is invoked.
 pub enum InnerMachineObservation<'a> {
     Enter {
@@ -156,6 +167,7 @@ pub enum InnerMachineObservation<'a> {
 
 struct InnerMachine {
     generation: u64,
+    program_blob: Vec<u8>,
     program: Option<ParsedCodeBlob>,
     initial_pc: u32,
     vm: Option<Interpreter>,
@@ -212,6 +224,22 @@ impl InnerMachines {
         self.machines.contains_key(&id)
     }
 
+    /// Iterate the dictionary in slot order without initializing dormant
+    /// machines or mutating execution state.
+    pub fn views(&self) -> impl Iterator<Item = InnerMachineView<'_>> {
+        self.machines
+            .iter()
+            .map(|(&slot, machine)| InnerMachineView {
+                identity: InnerMachineIdentity {
+                    slot,
+                    generation: machine.generation,
+                },
+                program: &machine.program_blob,
+                initial_pc: machine.initial_pc,
+                machine: machine.vm.as_ref(),
+            })
+    }
+
     /// Create a machine from one canonical compact code blob.
     ///
     /// The lowest unused natural-number index is returned.
@@ -234,6 +262,7 @@ impl InnerMachines {
             id,
             InnerMachine {
                 generation,
+                program_blob: program_blob.to_vec(),
                 program: Some(program),
                 initial_pc,
                 vm: None,
