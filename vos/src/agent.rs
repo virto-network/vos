@@ -40,6 +40,10 @@ pub mod machine;
 pub mod package;
 #[cfg(feature = "private-agent-crypto")]
 pub mod private_crypto;
+#[cfg(feature = "private-agent-store")]
+pub mod private_store;
+#[cfg(feature = "private-agent-store")]
+pub mod private_sync;
 pub(crate) mod replay;
 pub mod schema;
 pub mod shared_commit;

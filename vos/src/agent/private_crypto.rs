@@ -927,6 +927,7 @@ pub fn verify_control_record_signature(
 /// chain. This type contains no secret material. Persistence and branch
 /// transport are caller-owned boundaries; every supplied record is checked
 /// synchronously against the current authenticated head.
+#[derive(Clone)]
 pub struct PrivateControlChainVerifier {
     space: SpaceId,
     agent: AgentId,
@@ -1104,6 +1105,59 @@ impl PrivateControlChainVerifier {
         Ok(())
     }
 
+    /// Adopt an offline-recovery record from a different authenticated
+    /// control fork. Unlike [`Self::apply`], this deliberately does not
+    /// require `previous` to equal the local head: the local head must instead
+    /// appear in the signed, strictly sorted `superseded_heads` set. Sequence
+    /// and epoch jumps are monotonic so a stale recovery cannot roll a fork
+    /// backwards.
+    pub fn apply_recovery_from_superseded_head<V: PrivateNodeAuthorityVerifier>(
+        &mut self,
+        record: &PrivateControlRecord,
+        authority: &V,
+    ) -> Result<(), PrivateCryptoError> {
+        if self.record_count >= MAX_PRIVATE_CONTROL_RECORDS {
+            return Err(PrivateCryptoError::LimitExceeded);
+        }
+        if !record.validate_shape() {
+            return Err(PrivateCryptoError::InvalidRecord);
+        }
+        if record.space != self.space || record.agent != self.agent {
+            return Err(PrivateCryptoError::InvalidScope);
+        }
+        if record.sequence < self.next_sequence {
+            return Err(PrivateCryptoError::WrongSequence);
+        }
+        let local_head = self.head.ok_or(PrivateCryptoError::WrongPrevious)?;
+        let PrivateControlOperation::Recover {
+            superseded_heads,
+            next_epoch,
+            replacement_nodes,
+        } = &record.operation
+        else {
+            return Err(PrivateCryptoError::WrongSigner);
+        };
+        let selected_head = record.previous.ok_or(PrivateCryptoError::WrongPrevious)?;
+        if superseded_heads.binary_search(&local_head).is_err()
+            || superseded_heads.binary_search(&selected_head).is_err()
+        {
+            return Err(PrivateCryptoError::WrongPrevious);
+        }
+        self.verify_current_signer(record)?;
+        verify_control_record_signature(record)?;
+        self.validate_recovery_epoch(next_epoch, replacement_nodes, authority)?;
+        let next_sequence = record
+            .sequence
+            .checked_add(1)
+            .ok_or(PrivateCryptoError::LimitExceeded)?;
+        self.epoch = next_epoch.clone();
+        self.nodes = replacement_nodes.clone();
+        self.head = Some(record.commitment());
+        self.next_sequence = next_sequence;
+        self.record_count += 1;
+        Ok(())
+    }
+
     fn verify_current_signer(
         &self,
         record: &PrivateControlRecord,
@@ -1134,6 +1188,28 @@ impl PrivateControlChainVerifier {
         if candidate.space != self.space
             || candidate.agent != self.agent
             || self.epoch.epoch.checked_add(1) != Some(candidate.epoch)
+            || candidate.owner_key_commitment == self.epoch.owner_key_commitment
+            || candidate.data_key_commitment == self.epoch.data_key_commitment
+            || candidate.recovery_key_commitment != self.epoch.recovery_key_commitment
+        {
+            return Err(PrivateCryptoError::InvalidEpoch);
+        }
+        validate_authorized_nodes(self.space, self.agent, self.owner, nodes, authority)?;
+        if !epoch_matches_nodes(candidate, nodes) {
+            return Err(PrivateCryptoError::InvalidEpoch);
+        }
+        Ok(())
+    }
+
+    fn validate_recovery_epoch<V: PrivateNodeAuthorityVerifier>(
+        &self,
+        candidate: &PrivateKeyEpoch,
+        nodes: &[PrivateNodeIdentity],
+        authority: &V,
+    ) -> Result<(), PrivateCryptoError> {
+        if candidate.space != self.space
+            || candidate.agent != self.agent
+            || candidate.epoch <= self.epoch.epoch
             || candidate.owner_key_commitment == self.epoch.owner_key_commitment
             || candidate.data_key_commitment == self.epoch.data_key_commitment
             || candidate.recovery_key_commitment != self.epoch.recovery_key_commitment
