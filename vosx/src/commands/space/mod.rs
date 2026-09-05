@@ -33,6 +33,8 @@ pub mod caps;
 // The hardened store depends on Unix dirfd, no-follow, ownership, link-count,
 // and durable-directory semantics. It is intentionally unavailable where
 // those guarantees cannot be enforced.
+#[allow(dead_code)] // Deliberately unwired until clean space genesis owns these capabilities.
+pub(crate) mod clean_identity;
 #[cfg(unix)]
 #[allow(dead_code)] // Deliberately unwired until the subsequent bootstrap cutover slice.
 pub(crate) mod clean_store;
