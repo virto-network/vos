@@ -14,7 +14,7 @@ pub mod wire;
 pub use identity::{
     ActorId, AgentId, CallId, CapabilityId, ChangeId, CredentialId, DeploymentId, Hash,
     InstallationId, InvocationId, NodeId, OperationId, PrincipalId, ProducerId, ProgramId, RoleId,
-    SpaceId,
+    ScheduleId, SpaceId,
 };
 
 /// A content-addressed byte string.

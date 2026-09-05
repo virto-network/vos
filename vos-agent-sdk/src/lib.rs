@@ -13,6 +13,7 @@ pub mod contract;
 mod model;
 pub mod private;
 mod runtime;
+pub mod scheduling;
 pub mod wire;
 
 pub use model::*;
@@ -21,7 +22,7 @@ pub use vos_protocol as protocol;
 pub use vos_protocol::{
     ActorId, AgentId, BlobRef, CallId, CapabilityId, ChangeId, CredentialId, DeploymentId, Hash,
     InstallationId, InvocationId, NodeId, OperationId, PrincipalId, ProducerId, ProgramId, RoleId,
-    SpaceId,
+    ScheduleId, SpaceId,
 };
 
 /// Stable clean-generation management/runtime ABI identity.

@@ -81,6 +81,7 @@ id_type!(DeploymentId, "DeploymentId");
 id_type!(InstallationId, "InstallationId");
 id_type!(InvocationId, "InvocationId");
 id_type!(CallId, "CallId");
+id_type!(ScheduleId, "ScheduleId");
 id_type!(ChangeId, "ChangeId");
 id_type!(OperationId, "OperationId");
 id_type!(CapabilityId, "CapabilityId");
@@ -230,6 +231,30 @@ impl InvocationId {
     pub fn for_call(call: CallId) -> Self {
         Self(digest::<32>(b"vos/call-invocation", &[&call.0]))
     }
+
+    /// One interval occurrence has one replay-stable invocation identity.
+    pub fn for_schedule(schedule: ScheduleId, due_slot: u64) -> Self {
+        Self(digest::<32>(
+            b"vos/schedule/invocation",
+            &[schedule.as_bytes(), &due_slot.to_le_bytes()],
+        ))
+    }
+}
+
+impl ScheduleId {
+    /// Derive a stable timer identity in one actor namespace. Length framing
+    /// keeps caller-selected nonces unambiguous and makes retries idempotent.
+    pub fn derive(agent: AgentId, actor: ActorId, nonce: &[u8]) -> Self {
+        Self(digest::<32>(
+            b"vos/schedule/id",
+            &[
+                agent.as_bytes(),
+                actor.as_bytes(),
+                &(nonce.len() as u64).to_le_bytes(),
+                nonce,
+            ],
+        ))
+    }
 }
 
 impl ChangeId {
@@ -290,6 +315,24 @@ mod tests {
         assert_eq!(invocation.call_id(3), invocation.call_id(3));
         assert_ne!(invocation.call_id(3), invocation.call_id(4));
         assert_eq!(invocation.root_reply_id().0, invocation.0);
+    }
+
+    #[test]
+    fn schedule_ids_are_actor_scoped_and_length_framed() {
+        let agent = AgentId([1; 32]);
+        let actor = ActorId([2; 32]);
+        assert_eq!(
+            ScheduleId::derive(agent, actor, b"daily"),
+            ScheduleId::derive(agent, actor, b"daily")
+        );
+        assert_ne!(
+            ScheduleId::derive(agent, actor, b"daily"),
+            ScheduleId::derive(agent, ActorId([3; 32]), b"daily")
+        );
+        assert_ne!(
+            ScheduleId::derive(agent, actor, b"ab"),
+            ScheduleId::derive(agent, actor, b"a\0b")
+        );
     }
 
     #[test]
