@@ -79,26 +79,54 @@ fn clean_descriptor_from_state(
         .ok_or(AgentDriverError::InvalidRuntime)
 }
 
-fn clean_management_retry_is_retained(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanManagementReceiptHistory {
+    Retained,
+    Consumed,
+    RejectedUnseen,
+    Unseen,
+}
+
+fn clean_management_receipt_history(
     state: &RuntimeState,
     request: &crate::agent_sdk::ManagementRequest,
     receipt: &crate::agent_sdk::authority::AuthorityReceipt,
-) -> Result<bool, AgentDriverError> {
+) -> Result<CleanManagementReceiptHistory, AgentDriverError> {
     let decoded = super::wire::decode_standard_runtime_state(state)
         .map_err(|_| AgentDriverError::InvalidRuntime)?;
-    let Some(disposition) = decoded
+    if let Some(disposition) = decoded
         .clean_management_dispositions
         .iter()
         .find(|item| item.authority == receipt.commitment())
-    else {
-        return Ok(false);
-    };
-    if disposition.request != request.commitment() || disposition.epoch != receipt.selector.epoch {
-        return Err(AgentDriverError::SdkManagement(
-            crate::agent_sdk::ManagementError::AuthoritySequenceConflict,
-        ));
+    {
+        return Ok(
+            if disposition.request != request.commitment()
+                || disposition.epoch != receipt.selector.epoch
+                || disposition.sequence != receipt.selector.decision_sequence
+            {
+                CleanManagementReceiptHistory::Consumed
+            } else {
+                CleanManagementReceiptHistory::Retained
+            },
+        );
     }
-    Ok(true)
+    if decoded
+        .clean_management_dispositions
+        .iter()
+        .any(|item| item.sequence == receipt.selector.decision_sequence)
+    {
+        return Ok(CleanManagementReceiptHistory::Consumed);
+    }
+    let prior_high_water = decoded.clean_decision_sequence_high_water.unwrap_or(0);
+    if receipt.selector.decision_sequence <= prior_high_water {
+        return Ok(CleanManagementReceiptHistory::Consumed);
+    }
+    if receipt.selector.acknowledged_through < decoded.clean_acknowledged_through
+        || receipt.selector.acknowledged_through > prior_high_water
+    {
+        return Ok(CleanManagementReceiptHistory::RejectedUnseen);
+    }
+    Ok(CleanManagementReceiptHistory::Unseen)
 }
 
 fn clean_projected_config_from_state(
@@ -3021,15 +3049,21 @@ impl<S: AgentImageStore> AgentDriver<S> {
             crate::agent_sdk::ManagementRequest::InspectActors { .. }
                 | crate::agent_sdk::ManagementRequest::InspectResources
         );
-        let exact_retry = match authority.as_ref() {
+        let receipt_history = match authority.as_ref() {
             Some(receipt) => {
-                clean_management_retry_is_retained(&self.image.runtime_state, &request, receipt)?
+                clean_management_receipt_history(&self.image.runtime_state, &request, receipt)?
             }
-            None => false,
+            None => CleanManagementReceiptHistory::Unseen,
         };
+        let exact_retry = receipt_history == CleanManagementReceiptHistory::Retained;
+        let allow_historical_runtime = matches!(
+            receipt_history,
+            CleanManagementReceiptHistory::Retained | CleanManagementReceiptHistory::Consumed
+        );
+        let skip_artifact_staging = receipt_history != CleanManagementReceiptHistory::Unseen;
         let observed_slot = match self.trust.current_logical_slot() {
             Some(slot) => slot,
-            None if read_only || exact_retry => 0,
+            None if read_only || skip_artifact_staging => 0,
             None => return Err(AgentDriverError::TrustUnavailable),
         };
         match (&request, authority.as_ref()) {
@@ -3044,12 +3078,12 @@ impl<S: AgentImageStore> AgentDriver<S> {
                     &request,
                     receipt,
                     observed_slot,
-                    exact_retry,
+                    allow_historical_runtime,
                 )?;
             }
             _ => return Err(AgentDriverError::InvalidRuntime),
         }
-        let staged = if exact_retry {
+        let staged = if skip_artifact_staging {
             validate_sdk_retry_artifact_shape(&request, artifacts)?;
             StagedSdkArtifacts::default()
         } else {
@@ -4803,6 +4837,8 @@ mod tests {
                 },
                 lane_roots: AuthorityLaneRoots::default(),
                 epoch: 1,
+                decision_sequence: 2,
+                acknowledged_through: 0,
                 valid_from: 1,
                 expires_at: 2,
                 request: request.commitment(),
@@ -4820,11 +4856,14 @@ mod tests {
                 clean_creation_descriptor: Some(descriptor.clone()),
                 clean_descriptor: Some(descriptor.clone()),
                 clean_authority_epoch_high_water: Some(1),
+                clean_decision_sequence_high_water: Some(2),
+                clean_acknowledged_through: 0,
                 clean_management_dispositions: vec![
                     super::super::standard::StandardCleanManagementDisposition {
                         authority: crate::agent_sdk::Hash([0x72; 32]),
                         request: crate::agent_sdk::Hash([0x73; 32]),
                         epoch: 1,
+                        sequence: 1,
                         observed_slot: 1,
                         result: Ok(crate::agent_sdk::ManagementReply::Created(
                             descriptor.identity.clone(),
@@ -4834,6 +4873,7 @@ mod tests {
                         authority: receipt.commitment(),
                         request: request.commitment(),
                         epoch: receipt.selector.epoch,
+                        sequence: receipt.selector.decision_sequence,
                         observed_slot: 2,
                         result: Err(crate::agent_sdk::ManagementError::NotFound),
                     },
@@ -4843,8 +4883,8 @@ mod tests {
             },
         );
         assert_eq!(
-            clean_management_retry_is_retained(&runtime_state, &request, &receipt),
-            Ok(true)
+            clean_management_receipt_history(&runtime_state, &request, &receipt),
+            Ok(CleanManagementReceiptHistory::Retained)
         );
         assert_eq!(
             verify_clean_management_receipt(&descriptor, &request, &receipt, 100, true),
@@ -4858,13 +4898,40 @@ mod tests {
             ))
         );
 
+        let mut consumed = receipt.clone();
+        consumed.selector.decision_sequence = 1;
+        consumed.signature = signing.sign(&consumed.signing_bytes()).to_bytes();
+        assert_eq!(
+            clean_management_receipt_history(&runtime_state, &request, &consumed),
+            Ok(CleanManagementReceiptHistory::Consumed),
+            "a pruned or otherwise consumed sequence reaches the guest without staging artifacts"
+        );
+        assert_eq!(
+            verify_clean_management_receipt(&descriptor, &request, &consumed, 100, true),
+            Ok(())
+        );
+        let mut forged_consumed = consumed;
+        forged_consumed.signature[0] ^= 1;
+        assert_eq!(
+            clean_management_receipt_history(&runtime_state, &request, &forged_consumed),
+            Ok(CleanManagementReceiptHistory::Consumed)
+        );
+        assert_eq!(
+            verify_clean_management_receipt(&descriptor, &request, &forged_consumed, 100, true,),
+            Err(AgentDriverError::SdkManagement(
+                crate::agent_sdk::ManagementError::InvalidRequest
+            )),
+            "history classification never bypasses immutable authentication"
+        );
+
         let mut unseen = receipt;
+        unseen.selector.decision_sequence = 3;
         unseen.selector.valid_from = 100;
         unseen.selector.expires_at = 110;
         unseen.signature = signing.sign(&unseen.signing_bytes()).to_bytes();
         assert_eq!(
-            clean_management_retry_is_retained(&runtime_state, &request, &unseen),
-            Ok(false)
+            clean_management_receipt_history(&runtime_state, &request, &unseen),
+            Ok(CleanManagementReceiptHistory::Unseen)
         );
         assert_eq!(
             verify_clean_management_receipt(&descriptor, &request, &unseen, 100, false),
@@ -4872,6 +4939,15 @@ mod tests {
                 crate::agent_sdk::ManagementError::InvalidRequest
             )),
             "an unseen receipt cannot select a retired runtime"
+        );
+
+        let mut impossible_ack = unseen;
+        impossible_ack.selector.decision_sequence = 4;
+        impossible_ack.selector.acknowledged_through = 3;
+        impossible_ack.signature = signing.sign(&impossible_ack.signing_bytes()).to_bytes();
+        assert_eq!(
+            clean_management_receipt_history(&runtime_state, &request, &impossible_ack),
+            Ok(CleanManagementReceiptHistory::RejectedUnseen)
         );
     }
 
@@ -5120,6 +5196,8 @@ mod tests {
                 },
                 lane_roots: AuthorityLaneRoots::default(),
                 epoch: 1,
+                decision_sequence: 0,
+                acknowledged_through: 0,
                 valid_from: 1,
                 expires_at: observed_slot,
                 request: clean.commitment(),

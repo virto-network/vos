@@ -512,10 +512,16 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
     encoder.option(&state.clean_authority_epoch_high_water, |encoder, epoch| {
         encoder.u64(*epoch)
     });
+    encoder.option(
+        &state.clean_decision_sequence_high_water,
+        |encoder, sequence| encoder.u64(*sequence),
+    );
+    encoder.u64(state.clean_acknowledged_through);
     encoder.list(&state.clean_management_dispositions, |encoder, item| {
         encoder.fixed(item.authority.as_bytes());
         encoder.fixed(item.request.as_bytes());
         encoder.u64(item.epoch);
+        encoder.u64(item.sequence);
         encoder.u64(item.observed_slot);
         encoder.bytes(&encode_clean_management_result(&item.result));
     });
@@ -652,6 +658,8 @@ pub fn decode_standard_runtime_state(
         crate::agent_sdk::AgentDescriptor::decode(bytes).map_err(|_| DecodeError::NonCanonical)
     })?;
     let clean_authority_epoch_high_water = decoder.option(Decoder::u64)?;
+    let clean_decision_sequence_high_water = decoder.option(Decoder::u64)?;
+    let clean_acknowledged_through = decoder.u64()?;
     let clean_management_dispositions = decode_bounded_list(
         &mut decoder,
         super::standard::MAX_AUTHORITY_DISPOSITIONS,
@@ -659,6 +667,7 @@ pub fn decode_standard_runtime_state(
             let authority = crate::agent_sdk::Hash(decoder.fixed()?);
             let request = crate::agent_sdk::Hash(decoder.fixed()?);
             let epoch = decoder.u64()?;
+            let sequence = decoder.u64()?;
             let observed_slot = decoder.u64()?;
             let bytes = decoder.bytes_ref()?;
             if bytes.len() > MAX_CLEAN_MANAGEMENT_RESULT_BYTES {
@@ -669,6 +678,7 @@ pub fn decode_standard_runtime_state(
                 authority,
                 request,
                 epoch,
+                sequence,
                 observed_slot,
                 result,
             })
@@ -861,6 +871,8 @@ pub fn decode_standard_runtime_state(
         clean_creation_descriptor,
         clean_descriptor,
         clean_authority_epoch_high_water,
+        clean_decision_sequence_high_water,
+        clean_acknowledged_through,
         clean_management_dispositions,
         system_authority,
         actors,
@@ -3760,10 +3772,12 @@ mod tests {
         state.clean_creation_descriptor = Some(descriptor.clone());
         state.clean_descriptor = Some(descriptor.clone());
         state.clean_authority_epoch_high_water = Some(1);
+        state.clean_decision_sequence_high_water = Some(1);
         state.clean_management_dispositions = vec![StandardCleanManagementDisposition {
             authority: crate::agent_sdk::Hash([0x91; 32]),
             request: crate::agent_sdk::Hash([0x92; 32]),
             epoch: 1,
+            sequence: 1,
             observed_slot: 1,
             result: Ok(crate::agent_sdk::ManagementReply::Created(
                 descriptor.identity.clone(),
@@ -4040,6 +4054,8 @@ mod tests {
                 },
                 lane_roots: AuthorityLaneRoots::default(),
                 epoch: 1,
+                decision_sequence: 0,
+                acknowledged_through: 0,
                 valid_from: 1,
                 expires_at: 2,
                 request: work.commitment(),
@@ -4052,10 +4068,12 @@ mod tests {
     }
 
     #[cfg(feature = "pvm")]
-    fn clean_management_receipt(
+    fn clean_management_receipt_with_sequence(
         descriptor: &crate::agent_sdk::AgentDescriptor,
         request: &crate::agent_sdk::ManagementRequest,
         epoch: u64,
+        decision_sequence: u64,
+        acknowledged_through: u64,
         valid_from: u64,
         expires_at: u64,
     ) -> crate::agent_sdk::authority::AuthorityReceipt {
@@ -4133,6 +4151,8 @@ mod tests {
                 },
                 lane_roots: AuthorityLaneRoots::default(),
                 epoch,
+                decision_sequence,
+                acknowledged_through,
                 valid_from,
                 expires_at,
                 request: request.commitment(),
@@ -4142,6 +4162,31 @@ mod tests {
         };
         receipt.signature = authority_key().sign(&receipt.signing_bytes()).to_bytes();
         receipt
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_management_receipt(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        request: &crate::agent_sdk::ManagementRequest,
+        epoch: u64,
+        valid_from: u64,
+        expires_at: u64,
+    ) -> crate::agent_sdk::authority::AuthorityReceipt {
+        let decision_sequence = if matches!(request, crate::agent_sdk::ManagementRequest::Create(_))
+        {
+            1
+        } else {
+            valid_from.max(2)
+        };
+        clean_management_receipt_with_sequence(
+            descriptor,
+            request,
+            epoch,
+            decision_sequence,
+            0,
+            valid_from,
+            expires_at,
+        )
     }
 
     #[cfg(feature = "pvm")]
@@ -4491,12 +4536,12 @@ mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
-    fn clean_management_capacity_never_evicts_unacknowledged_results() {
+    fn clean_management_full_journal_acknowledges_and_pruned_retries_fail_closed() {
         use crate::agent_sdk::{
             ManagementError, ManagementReply, ManagementRequest, RuntimeOutcome,
         };
 
-        let (descriptor, mut state, create_receipt) =
+        let (descriptor, mut state, _) =
             create_clean_management_state(crate::agent_sdk::AgentProfile::Local);
         let install = clean_install_request(
             &descriptor,
@@ -4513,8 +4558,15 @@ mod tests {
             actor,
             expected_deployment: deployment,
         };
-        let retained_receipt =
-            clean_management_receipt(&descriptor, &retained_request, 1, 2, capacity + 4);
+        let retained_receipt = clean_management_receipt_with_sequence(
+            &descriptor,
+            &retained_request,
+            1,
+            2,
+            0,
+            2,
+            1_000,
+        );
         let refused = apply_clean_management_test(
             state,
             &descriptor,
@@ -4533,12 +4585,14 @@ mod tests {
             state,
             &descriptor,
             install_request.clone(),
-            Some(clean_management_receipt(
+            Some(clean_management_receipt_with_sequence(
                 &descriptor,
                 &install_request,
                 1,
                 3,
-                capacity + 10,
+                0,
+                3,
+                1_000,
             )),
             3,
         );
@@ -4552,19 +4606,21 @@ mod tests {
             actor: crate::agent_sdk::ActorId([0x71; 32]),
             expected_deployment: crate::agent_sdk::DeploymentId([0x72; 32]),
         };
-        for slot in 4..=capacity {
+        for sequence in 4..=capacity {
             let transition = apply_clean_management_test(
                 state,
                 &descriptor,
                 absent_request.clone(),
-                Some(clean_management_receipt(
+                Some(clean_management_receipt_with_sequence(
                     &descriptor,
                     &absent_request,
                     1,
-                    slot,
-                    capacity + 10,
+                    sequence,
+                    0,
+                    sequence,
+                    1_000,
                 )),
-                slot,
+                sequence,
             );
             assert_eq!(
                 transition.outcome,
@@ -4578,55 +4634,95 @@ mod tests {
             saturated.clean_management_dispositions.len(),
             super::super::standard::MAX_AUTHORITY_DISPOSITIONS
         );
-        assert_eq!(
-            saturated.clean_management_dispositions[0].authority,
-            create_receipt.commitment(),
-            "Create remains recoverable for the lifetime of the Agent"
-        );
-        assert_eq!(
-            saturated.clean_management_dispositions[1].authority,
-            retained_receipt.commitment()
-        );
+        assert_eq!(saturated.clean_decision_sequence_high_water, Some(capacity));
+        assert_eq!(saturated.clean_acknowledged_through, 0);
 
         let restored = StandardAgentRuntime::restore(saturated).unwrap().snapshot();
         let restarted = legacy_state_to_clean(encode_standard_runtime_state(&restored));
         assert_eq!(restarted, state, "restart preserves the saturated journal");
         state = restarted;
 
-        // Two additional accepted receipts used to evict Create and then the
-        // retained refusal. Capacity admission must instead be byte-identical.
-        for slot in (capacity + 1)..=(capacity + 2) {
-            let overflow = apply_clean_management_test(
-                state.clone(),
+        let overflow = apply_clean_management_test(
+            state.clone(),
+            &descriptor,
+            absent_request.clone(),
+            Some(clean_management_receipt_with_sequence(
                 &descriptor,
-                absent_request.clone(),
-                Some(clean_management_receipt(
-                    &descriptor,
-                    &absent_request,
-                    1,
-                    slot,
-                    capacity + 10,
-                )),
-                slot,
-            );
-            assert_eq!(
-                overflow.outcome,
-                RuntimeOutcome::Management(Err(ManagementError::ResourceLimit))
-            );
-            assert_eq!(overflow.state, state);
-        }
+                &absent_request,
+                1,
+                capacity + 1,
+                0,
+                capacity + 1,
+                1_000,
+            )),
+            capacity + 1,
+        );
+        assert_eq!(
+            overflow.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::ResourceLimit))
+        );
+        assert_eq!(
+            overflow.state, state,
+            "a full journal with no advancing acknowledgement is unconsumed"
+        );
+
+        let acknowledged_through = capacity / 2;
+        let progressed = apply_clean_management_test(
+            state.clone(),
+            &descriptor,
+            absent_request.clone(),
+            Some(clean_management_receipt_with_sequence(
+                &descriptor,
+                &absent_request,
+                1,
+                capacity + 1,
+                acknowledged_through,
+                capacity + 1,
+                1_000,
+            )),
+            capacity + 1,
+        );
+        assert_eq!(
+            progressed.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::NotFound))
+        );
+        let compacted =
+            decode_standard_runtime_state(&clean_state_to_legacy(&progressed.state)).unwrap();
+        assert_eq!(compacted.clean_acknowledged_through, acknowledged_through);
+        assert_eq!(
+            compacted.clean_decision_sequence_high_water,
+            Some(capacity + 1)
+        );
+        assert_eq!(
+            compacted.clean_management_dispositions.len(),
+            (capacity - acknowledged_through + 1) as usize
+        );
+        assert_eq!(
+            compacted.clean_creation_descriptor.as_ref(),
+            Some(&descriptor),
+            "immutable creation survives acknowledgement of the Create result"
+        );
+        let mut invalid_watermark = compacted.clone();
+        invalid_watermark.clean_acknowledged_through = capacity + 1;
+        assert!(StandardAgentRuntime::restore(invalid_watermark).is_err());
+        let mut invalid_order = compacted.clone();
+        invalid_order.clean_management_dispositions.swap(0, 1);
+        assert!(StandardAgentRuntime::restore(invalid_order).is_err());
+        let restored = StandardAgentRuntime::restore(compacted).unwrap().snapshot();
+        state = legacy_state_to_clean(encode_standard_runtime_state(&restored));
+        assert_eq!(state, progressed.state);
 
         let live_retry = apply_clean_management_test(
             state.clone(),
             &descriptor,
             retained_request.clone(),
             Some(retained_receipt.clone()),
-            capacity + 3,
+            capacity + 2,
         );
         assert_eq!(
             live_retry.outcome,
-            RuntimeOutcome::Management(Err(ManagementError::NotFound)),
-            "a retained live refusal cannot be re-executed after saturation"
+            RuntimeOutcome::Management(Err(ManagementError::AuthoritySequenceRegressed)),
+            "an acknowledged live refusal is consumed and cannot execute again"
         );
         assert_eq!(live_retry.state, state, "live retry is byte-identical");
         state = live_retry.state;
@@ -4646,41 +4742,129 @@ mod tests {
         let expired_retry = apply_clean_management_test(
             state.clone(),
             &descriptor,
-            retained_request,
-            Some(retained_receipt),
-            capacity + 5,
+            retained_request.clone(),
+            Some(retained_receipt.clone()),
+            1_001,
         );
         assert_eq!(
             expired_retry.outcome,
-            RuntimeOutcome::Management(Err(ManagementError::NotFound)),
-            "the same committed result remains available after receipt expiry"
+            RuntimeOutcome::Management(Err(ManagementError::AuthoritySequenceRegressed)),
+            "expiry cannot turn an acknowledged receipt back into unseen work"
         );
         assert_eq!(
             expired_retry.state, state,
             "expired exact retry is byte-identical"
         );
-        assert_eq!(
-            decode_standard_runtime_state(&clean_state_to_legacy(&expired_retry.state))
-                .unwrap()
-                .clean_management_dispositions
-                .len(),
-            super::super::standard::MAX_AUTHORITY_DISPOSITIONS
-        );
-
-        let unseen_expired =
-            clean_management_receipt(&descriptor, &absent_request, 1, capacity + 1, capacity + 2);
-        let rejected = apply_clean_management_test(
-            expired_retry.state.clone(),
+        let ack_beyond_high_water = apply_clean_management_test(
+            state.clone(),
             &descriptor,
-            absent_request,
-            Some(unseen_expired),
-            capacity + 6,
+            absent_request.clone(),
+            Some(clean_management_receipt_with_sequence(
+                &descriptor,
+                &absent_request,
+                1,
+                capacity + 3,
+                capacity + 2,
+                capacity + 2,
+                2_000,
+            )),
+            capacity + 2,
         );
         assert_eq!(
-            rejected.outcome,
-            RuntimeOutcome::Management(Err(ManagementError::InvalidRequest))
+            ack_beyond_high_water.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::AuthoritySequenceConflict))
         );
-        assert_eq!(rejected.state, expired_retry.state);
+        assert_eq!(ack_beyond_high_water.state, state);
+
+        let decreasing_ack = apply_clean_management_test(
+            state.clone(),
+            &descriptor,
+            absent_request.clone(),
+            Some(clean_management_receipt_with_sequence(
+                &descriptor,
+                &absent_request,
+                1,
+                capacity + 2,
+                acknowledged_through - 1,
+                capacity + 2,
+                2_000,
+            )),
+            capacity + 2,
+        );
+        assert_eq!(
+            decreasing_ack.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::AuthoritySequenceRegressed))
+        );
+        assert_eq!(decreasing_ack.state, state);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_management_periodic_acknowledgements_cross_twice_capacity_and_restart() {
+        use crate::agent_sdk::{ManagementError, ManagementRequest, RuntimeOutcome};
+
+        let (descriptor, mut state, _) =
+            create_clean_management_state(crate::agent_sdk::AgentProfile::Local);
+        let request = ManagementRequest::Suspend {
+            actor: crate::agent_sdk::ActorId([0xd1; 32]),
+            expected_deployment: crate::agent_sdk::DeploymentId([0xd2; 32]),
+        };
+        let capacity = super::super::standard::MAX_AUTHORITY_DISPOSITIONS as u64;
+        let last_sequence = 2 * capacity + 37;
+        let mut acknowledged_through = 0;
+        for sequence in 2..=last_sequence {
+            if sequence % 64 == 0 {
+                acknowledged_through = sequence - 1;
+            }
+            let transition = apply_clean_management_test(
+                state,
+                &descriptor,
+                request.clone(),
+                Some(clean_management_receipt_with_sequence(
+                    &descriptor,
+                    &request,
+                    1,
+                    sequence,
+                    acknowledged_through,
+                    sequence,
+                    last_sequence + 10,
+                )),
+                sequence,
+            );
+            assert_eq!(
+                transition.outcome,
+                RuntimeOutcome::Management(Err(ManagementError::NotFound))
+            );
+            state = transition.state;
+            if sequence % 73 == 0 {
+                let decoded =
+                    decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+                state = legacy_state_to_clean(encode_standard_runtime_state(
+                    &StandardAgentRuntime::restore(decoded).unwrap().snapshot(),
+                ));
+            }
+        }
+
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+        assert_eq!(
+            decoded.clean_decision_sequence_high_water,
+            Some(last_sequence)
+        );
+        assert_eq!(decoded.clean_acknowledged_through, acknowledged_through);
+        assert!(
+            decoded.clean_management_dispositions.len()
+                < super::super::standard::MAX_AUTHORITY_DISPOSITIONS
+        );
+        assert!(
+            decoded
+                .clean_management_dispositions
+                .iter()
+                .all(|item| item.sequence > acknowledged_through)
+        );
+        assert_eq!(
+            decoded.clean_creation_descriptor.as_ref(),
+            Some(&descriptor)
+        );
     }
 
     #[cfg(feature = "pvm")]
@@ -4688,7 +4872,7 @@ mod tests {
     fn clean_management_state_ceiling_refuses_before_consuming_authority() {
         use crate::agent_sdk::{ManagementError, ManagementRequest, RuntimeOutcome};
 
-        let (descriptor, state, _) =
+        let (_descriptor, state, _) =
             create_clean_management_state(crate::agent_sdk::AgentProfile::Local);
         let mut constrained =
             decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
@@ -4850,7 +5034,7 @@ mod tests {
             old_retry.state.clone(),
             &after_second,
             first_request.clone(),
-            Some(first_receipt),
+            Some(first_receipt.clone()),
             101,
         );
         assert!(matches!(
@@ -4888,7 +5072,7 @@ mod tests {
         let rejected = apply_clean_management_test(
             first_upgrade_retry.state.clone(),
             &after_second,
-            first_request,
+            first_request.clone(),
             Some(stale_upgrade),
             103,
         );
@@ -4903,12 +5087,12 @@ mod tests {
             space: after_second.identity.space,
             agent: after_second.identity.agent,
             runtime_deployment: old_receipt.selector.runtime_deployment,
-            state: first_upgrade_retry.state,
+            state: first_upgrade_retry.state.clone(),
             request: Box::new(ManagementRequest::Resume {
                 actor: crate::agent_sdk::ActorId([0x91; 32]),
                 expected_deployment: crate::agent_sdk::DeploymentId([0x92; 32]),
             }),
-            authority: Some(Box::new(old_receipt)),
+            authority: Some(Box::new(old_receipt.clone())),
             observed_slot: 104,
         };
         assert_eq!(
@@ -4916,6 +5100,57 @@ mod tests {
             Err(crate::agent_sdk::wire::WireError::InvalidValue),
             "a retained receipt cannot be paired with a divergent typed request"
         );
+
+        let acknowledgement_request = ManagementRequest::Suspend {
+            actor: crate::agent_sdk::ActorId([0xc1; 32]),
+            expected_deployment: crate::agent_sdk::DeploymentId([0xc2; 32]),
+        };
+        let acknowledged = apply_clean_management_test(
+            first_upgrade_retry.state.clone(),
+            &after_second,
+            acknowledgement_request.clone(),
+            Some(clean_management_receipt_with_sequence(
+                &after_second,
+                &acknowledgement_request,
+                1,
+                5,
+                3,
+                5,
+                200,
+            )),
+            5,
+        );
+        assert_eq!(
+            acknowledged.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::NotFound))
+        );
+        let compacted =
+            decode_standard_runtime_state(&clean_state_to_legacy(&acknowledged.state)).unwrap();
+        assert_eq!(compacted.clean_acknowledged_through, 3);
+        assert!(
+            compacted
+                .clean_management_dispositions
+                .iter()
+                .all(|item| item.sequence > 3)
+        );
+
+        for (request, receipt) in [(old_request, old_receipt), (first_request, first_receipt)] {
+            let pruned_retry = apply_clean_management_test(
+                acknowledged.state.clone(),
+                &after_second,
+                request,
+                Some(receipt),
+                201,
+            );
+            assert_eq!(
+                pruned_retry.outcome,
+                RuntimeOutcome::Management(Err(ManagementError::AuthoritySequenceRegressed))
+            );
+            assert_eq!(
+                pruned_retry.state, acknowledged.state,
+                "acknowledged historical decisions cannot run again"
+            );
+        }
     }
 
     #[cfg(feature = "pvm")]

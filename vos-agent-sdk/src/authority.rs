@@ -41,6 +41,24 @@ impl AuthorityOperationKind {
                 | Self::InvokeActor
         )
     }
+
+    /// Whether this operation participates in the standard Agent management
+    /// decision journal. Invocation, Private-Agent, and catalog receipts use
+    /// their own replay domains and therefore carry zero in both management
+    /// replay fields.
+    pub const fn uses_management_decision_journal(self) -> bool {
+        matches!(
+            self,
+            Self::CreateAgent
+                | Self::InstallActor
+                | Self::UpgradeActor
+                | Self::SuspendActor
+                | Self::ResumeActor
+                | Self::RemoveActor
+                | Self::UpgradeRuntime
+                | Self::ChangeReplicaSet
+        )
+    }
 }
 
 /// Exact visible authority actor which issued the receipt.
@@ -181,6 +199,14 @@ pub struct AuthorityReceiptSelector {
     pub lane_roots: AuthorityLaneRoots,
     /// Monotonic policy/committee epoch.
     pub epoch: u64,
+    /// Binding-global sequence in the clean management decision journal.
+    /// This is nonzero only for operations selected by
+    /// [`AuthorityOperationKind::uses_management_decision_journal`].
+    pub decision_sequence: u64,
+    /// Inclusive clean-management sequence watermark whose older exact
+    /// results the authority has durably observed and permits the Agent to
+    /// discard. Unrelated operation domains carry zero here and above.
+    pub acknowledged_through: u64,
     /// First logical slot at which this decision may be consumed.
     pub valid_from: u64,
     /// Last logical slot at which this decision may be consumed, inclusive.
@@ -191,12 +217,18 @@ pub struct AuthorityReceiptSelector {
 
 impl AuthorityReceiptSelector {
     pub fn validate(&self) -> Result<(), AuthorityReceiptError> {
+        let valid_management_replay = if self.operation.uses_management_decision_journal() {
+            self.decision_sequence != 0 && self.acknowledged_through < self.decision_sequence
+        } else {
+            self.decision_sequence == 0 && self.acknowledged_through == 0
+        };
         if self.policy == Hash::ZERO
             || !self.issuer.is_valid()
             || self.space == SpaceId::ZERO
             || self.agent == AgentId::ZERO
             || self.runtime_deployment == DeploymentId::ZERO
             || self.request == Hash::ZERO
+            || !valid_management_replay
             || self.valid_from > self.expires_at
             || !self.evidence.is_valid()
             || !self.lane_roots.is_valid()
@@ -314,6 +346,8 @@ mod tests {
                 ..AuthorityLaneRoots::default()
             },
             epoch: 4,
+            decision_sequence: 0,
+            acknowledged_through: 0,
             valid_from: 20,
             expires_at: 30,
             request: Hash([13; 32]),
@@ -351,6 +385,39 @@ mod tests {
         assert!(value.is_live_at(20));
         assert!(value.is_live_at(30));
         assert!(!value.is_live_at(31));
+    }
+
+    #[test]
+    fn management_replay_fields_are_nonzero_and_scoped_away_from_invocations() {
+        let key = [14; 32];
+        let invocation = selector(ProducerId::of_public_key(&key));
+        assert_eq!(invocation.validate(), Ok(()));
+
+        let mut invalid_invocation = invocation.clone();
+        invalid_invocation.decision_sequence = 1;
+        assert_eq!(
+            invalid_invocation.validate(),
+            Err(AuthorityReceiptError::InvalidSelector)
+        );
+
+        let mut management = invocation;
+        management.operation = AuthorityOperationKind::SuspendActor;
+        management.decision_sequence = 9;
+        management.acknowledged_through = 8;
+        assert_eq!(management.validate(), Ok(()));
+
+        let mut zero_sequence = management.clone();
+        zero_sequence.decision_sequence = 0;
+        zero_sequence.acknowledged_through = 0;
+        assert_eq!(
+            zero_sequence.validate(),
+            Err(AuthorityReceiptError::InvalidSelector)
+        );
+        management.acknowledged_through = management.decision_sequence;
+        assert_eq!(
+            management.validate(),
+            Err(AuthorityReceiptError::InvalidSelector)
+        );
     }
 
     #[test]

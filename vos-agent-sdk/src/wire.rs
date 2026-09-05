@@ -681,6 +681,8 @@ fn encode_authority_selector(encoder: &mut Encoder<'_>, value: &AuthorityReceipt
     encoder.fixed(value.evidence.commitment.as_bytes());
     encode_lane_roots(encoder, value.lane_roots);
     encoder.u64(value.epoch);
+    encoder.u64(value.decision_sequence);
+    encoder.u64(value.acknowledged_through);
     encoder.u64(value.valid_from);
     encoder.u64(value.expires_at);
     encoder.fixed(value.request.as_bytes());
@@ -705,6 +707,8 @@ fn decode_authority_selector(
         },
         lane_roots: decode_lane_roots(decoder)?,
         epoch: decoder.u64()?,
+        decision_sequence: decoder.u64()?,
+        acknowledged_through: decoder.u64()?,
         valid_from: decoder.u64()?,
         expires_at: decoder.u64()?,
         request: Hash(decoder.fixed()?),
@@ -2531,6 +2535,8 @@ mod tests {
                     ..AuthorityLaneRoots::default()
                 },
                 epoch: 3,
+                decision_sequence: 0,
+                acknowledged_through: 0,
                 valid_from: 40,
                 expires_at: 50,
                 request: invocation.commitment(),
@@ -2618,6 +2624,7 @@ mod tests {
         authority.selector.space = space;
         authority.selector.agent = agent;
         authority.selector.operation = AuthorityOperationKind::CreateAgent;
+        authority.selector.decision_sequence = 1;
         authority.selector.runtime_deployment = runtime_deployment;
         authority.selector.actor = None;
         authority.selector.actor_deployment = None;

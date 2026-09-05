@@ -144,6 +144,8 @@ pub struct StandardAgentRuntime {
     /// authority fields must remain equal to `clean_creation_descriptor`.
     clean_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
     clean_authority_epoch_high_water: Option<u64>,
+    clean_decision_sequence_high_water: Option<u64>,
+    clean_acknowledged_through: u64,
     clean_management_dispositions: Vec<StandardCleanManagementDisposition>,
     system_authority: Option<super::system_authority::SystemAuthorityState>,
     actors: BTreeMap<ActorId, ManagedActor>,
@@ -172,6 +174,8 @@ pub struct StandardRuntimeState {
     pub clean_creation_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
     pub clean_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
     pub clean_authority_epoch_high_water: Option<u64>,
+    pub clean_decision_sequence_high_water: Option<u64>,
+    pub clean_acknowledged_through: u64,
     pub clean_management_dispositions: Vec<StandardCleanManagementDisposition>,
     pub system_authority: Option<super::system_authority::SystemAuthorityState>,
     pub actors: Vec<StandardActorState>,
@@ -248,6 +252,7 @@ pub struct StandardCleanManagementDisposition {
     pub authority: crate::agent_sdk::Hash,
     pub request: crate::agent_sdk::Hash,
     pub epoch: u64,
+    pub sequence: u64,
     pub observed_slot: u64,
     pub result: Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
 }
@@ -880,6 +885,8 @@ impl StandardAgentRuntime {
             clean_creation_descriptor: None,
             clean_descriptor: None,
             clean_authority_epoch_high_water: None,
+            clean_decision_sequence_high_water: None,
+            clean_acknowledged_through: 0,
             clean_management_dispositions: Vec::new(),
             system_authority: None,
             actors: BTreeMap::new(),
@@ -942,6 +949,8 @@ impl StandardAgentRuntime {
             clean_creation_descriptor: self.clean_creation_descriptor.clone(),
             clean_descriptor: self.clean_descriptor.clone(),
             clean_authority_epoch_high_water: self.clean_authority_epoch_high_water,
+            clean_decision_sequence_high_water: self.clean_decision_sequence_high_water,
+            clean_acknowledged_through: self.clean_acknowledged_through,
             clean_management_dispositions: self.clean_management_dispositions.clone(),
             system_authority: self.system_authority.clone(),
             actors: self
@@ -987,12 +996,16 @@ impl StandardAgentRuntime {
         let clean_creation_descriptor = state.clean_creation_descriptor.clone();
         let clean_descriptor = state.clean_descriptor.clone();
         let clean_authority_epoch_high_water = state.clean_authority_epoch_high_water;
+        let clean_decision_sequence_high_water = state.clean_decision_sequence_high_water;
+        let clean_acknowledged_through = state.clean_acknowledged_through;
         let clean_management_dispositions = state.clean_management_dispositions.clone();
         let Some(config) = state.config else {
             return if state.actors.is_empty()
                 && state.clean_creation_descriptor.is_none()
                 && state.clean_descriptor.is_none()
                 && state.clean_authority_epoch_high_water.is_none()
+                && state.clean_decision_sequence_high_water.is_none()
+                && state.clean_acknowledged_through == 0
                 && state.clean_management_dispositions.is_empty()
                 && state.retired_installation_ids.is_empty()
                 && state.system_authority.is_none()
@@ -1071,6 +1084,8 @@ impl StandardAgentRuntime {
         match (&clean_creation_descriptor, &clean_descriptor) {
             (None, None)
                 if clean_authority_epoch_high_water.is_none()
+                    && clean_decision_sequence_high_water.is_none()
+                    && clean_acknowledged_through == 0
                     && clean_management_dispositions.is_empty() => {}
             (Some(creation), Some(current))
                 if creation.validate().is_ok()
@@ -1083,24 +1098,37 @@ impl StandardAgentRuntime {
                             && clean_management_dispositions
                                 .iter()
                                 .all(|item| item.epoch <= high_water)
+                            && clean_management_dispositions
+                                .last()
+                                .is_some_and(|item| item.epoch == high_water)
+                    })
+                    && clean_decision_sequence_high_water.is_some_and(|high_water| {
+                        high_water > clean_acknowledged_through
+                            && clean_management_dispositions
+                                .last()
+                                .is_some_and(|item| item.sequence == high_water)
                     })
                     && !clean_management_dispositions.is_empty()
                     && clean_management_dispositions.len() <= MAX_AUTHORITY_DISPOSITIONS
-                    && clean_management_dispositions.first().is_some_and(|item| {
-                        matches!(
-                            &item.result,
-                            Ok(crate::agent_sdk::ManagementReply::Created(identity))
-                                if identity == &creation.identity
-                        )
-                    })
                     && clean_management_dispositions.iter().all(|item| {
                         item.authority != crate::agent_sdk::Hash::ZERO
                             && item.request != crate::agent_sdk::Hash::ZERO
                             && item.epoch >= creation.authority.initial_epoch
+                            && item.sequence > clean_acknowledged_through
                     })
                     && clean_management_dispositions
-                        .windows(2)
-                        .all(|pair| pair[0].observed_slot < pair[1].observed_slot)
+                        .iter()
+                        .enumerate()
+                        .all(|(index, item)| {
+                            clean_management_dispositions[index + 1..]
+                                .iter()
+                                .all(|other| item.authority != other.authority)
+                        })
+                    && clean_management_dispositions.windows(2).all(|pair| {
+                        pair[0].sequence < pair[1].sequence
+                            && pair[0].epoch <= pair[1].epoch
+                            && pair[0].observed_slot < pair[1].observed_slot
+                    })
                     && clean_management_dispositions.last().is_some_and(|item| {
                         state
                             .authority_slot_high_water
@@ -1121,6 +1149,8 @@ impl StandardAgentRuntime {
         runtime.clean_creation_descriptor = clean_creation_descriptor;
         runtime.clean_descriptor = clean_descriptor;
         runtime.clean_authority_epoch_high_water = clean_authority_epoch_high_water;
+        runtime.clean_decision_sequence_high_water = clean_decision_sequence_high_water;
+        runtime.clean_acknowledged_through = clean_acknowledged_through;
         runtime.clean_management_dispositions = clean_management_dispositions;
         match (
             runtime
@@ -3516,10 +3546,35 @@ impl StandardAgentRuntime {
             .iter()
             .find(|item| item.authority == authority_id)
         {
-            if disposition.request != request_id || disposition.epoch != authority.selector.epoch {
+            if disposition.request != request_id
+                || disposition.epoch != authority.selector.epoch
+                || disposition.sequence != authority.selector.decision_sequence
+            {
                 return Err(ManagementError::AuthoritySequenceConflict);
             }
             return disposition.result.clone();
+        }
+
+        // A second, differently signed decision cannot reuse a retained
+        // binding-global sequence. A decision at or below the durable high
+        // water but absent from the retained journal is either acknowledged
+        // or an already-skipped sequence; neither can become unseen work.
+        if self
+            .clean_management_dispositions
+            .iter()
+            .any(|item| item.sequence == authority.selector.decision_sequence)
+        {
+            return Err(ManagementError::AuthoritySequenceConflict);
+        }
+        let prior_decision_high_water = self.clean_decision_sequence_high_water.unwrap_or(0);
+        if authority.selector.decision_sequence <= prior_decision_high_water {
+            return Err(ManagementError::AuthoritySequenceRegressed);
+        }
+        if authority.selector.acknowledged_through < self.clean_acknowledged_through {
+            return Err(ManagementError::AuthoritySequenceRegressed);
+        }
+        if authority.selector.acknowledged_through > prior_decision_high_water {
+            return Err(ManagementError::AuthoritySequenceConflict);
         }
         self.verify_clean_management_authority(
             space,
@@ -3547,24 +3602,29 @@ impl StandardAgentRuntime {
             }
         }
 
-        // Exact management results have no acknowledgement operation in the
-        // r4 ABI. Evicting one would therefore make a later retry
-        // indistinguishable from unseen work: a still-live receipt could be
-        // applied twice, while an expired receipt would lose its committed
-        // result. Saturate instead. This bounds signed state without ever
-        // discarding an unacknowledged disposition.
-        if self.clean_management_dispositions.len() == MAX_AUTHORITY_DISPOSITIONS {
+        let before = self.clone();
+        let mut compacted = before.clone();
+        compacted
+            .clean_management_dispositions
+            .retain(|item| item.sequence > authority.selector.acknowledged_through);
+        compacted.clean_acknowledged_through = authority.selector.acknowledged_through;
+
+        // Refuse an unacknowledged full journal without consuming authority.
+        // An advancing acknowledgement only creates headroom when it actually
+        // retires at least one retained result.
+        if compacted.clean_management_dispositions.len() == MAX_AUTHORITY_DISPOSITIONS {
             return Err(ManagementError::ResourceLimit);
         }
 
-        let before = self.clone();
         // Reserve enough signed-state headroom for the smallest durable
         // disposition before applying any established-Agent mutation. If
         // even the fixed ResourceLimit record cannot fit, this receipt is an
         // unconsumed admission failure and state remains byte-identical.
         let reserved_limit = if before.config.is_some() {
-            let mut fallback = before.clone();
+            let mut fallback = compacted.clone();
             fallback.clean_authority_epoch_high_water = Some(authority.selector.epoch);
+            fallback.clean_decision_sequence_high_water =
+                Some(authority.selector.decision_sequence);
             fallback.authority_slot_high_water = Some(observed_slot);
             fallback
                 .clean_management_dispositions
@@ -3572,6 +3632,7 @@ impl StandardAgentRuntime {
                     authority: authority_id,
                     request: request_id,
                     epoch: authority.selector.epoch,
+                    sequence: authority.selector.decision_sequence,
                     observed_slot,
                     result: Err(ManagementError::ResourceLimit),
                 });
@@ -3583,21 +3644,25 @@ impl StandardAgentRuntime {
             None
         };
 
+        *self = compacted.clone();
         let result =
             self.clean_management_mutation(&request, authority_id, observed_slot, pristine_input);
         if result.is_err() {
-            *self = before.clone();
+            *self = compacted;
         }
         if before.config.is_none() && result.is_err() {
+            *self = before;
             return result;
         }
         self.clean_authority_epoch_high_water = Some(authority.selector.epoch);
+        self.clean_decision_sequence_high_water = Some(authority.selector.decision_sequence);
         self.authority_slot_high_water = Some(observed_slot);
         self.clean_management_dispositions
             .push(StandardCleanManagementDisposition {
                 authority: authority_id,
                 request: request_id,
                 epoch: authority.selector.epoch,
+                sequence: authority.selector.decision_sequence,
                 observed_slot,
                 result: result.clone(),
             });
