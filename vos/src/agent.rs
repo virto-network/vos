@@ -38,6 +38,8 @@ pub(crate) mod local_journal_driver;
 #[cfg(feature = "pvm")]
 pub mod machine;
 pub mod package;
+#[cfg(feature = "private-agent-crypto")]
+pub mod private_crypto;
 pub(crate) mod replay;
 pub mod schema;
 pub mod shared_commit;
