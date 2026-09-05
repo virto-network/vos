@@ -921,7 +921,7 @@ fn replica_set_valid(replicas: &[AgentReplica]) -> bool {
         && replicas.windows(2).all(|pair| pair[0].node < pair[1].node)
 }
 
-fn management_request_valid(value: &ManagementRequest) -> bool {
+pub(crate) fn management_request_valid(value: &ManagementRequest) -> bool {
     match value {
         ManagementRequest::Create(descriptor) => descriptor.validate().is_ok(),
         ManagementRequest::InspectActors { after, limit } => {
@@ -1057,7 +1057,9 @@ pub(crate) fn management_request_commitment(value: &ManagementRequest) -> Hash {
     Hash::digest(b"vos/agent/management-request", &[&bytes])
 }
 
-fn required_operation(value: &ManagementRequest) -> Option<AuthorityOperationKind> {
+pub(crate) fn required_management_operation(
+    value: &ManagementRequest,
+) -> Option<AuthorityOperationKind> {
     match value {
         ManagementRequest::Create(_) => Some(AuthorityOperationKind::CreateAgent),
         ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => None,
@@ -1071,7 +1073,7 @@ fn required_operation(value: &ManagementRequest) -> Option<AuthorityOperationKin
     }
 }
 
-fn management_actor(value: &ManagementRequest) -> Option<(ActorId, DeploymentId)> {
+pub(crate) fn management_actor(value: &ManagementRequest) -> Option<(ActorId, DeploymentId)> {
     match value {
         ManagementRequest::Install(value) => Some((value.entry.actor, value.entry.deployment)),
         ManagementRequest::UpgradeActor(value) => Some((value.actor, value.to_deployment)),
@@ -1103,7 +1105,7 @@ fn authority_matches_management(
         && receipt.selector.space == space
         && receipt.selector.agent == agent
         && receipt.selector.runtime_deployment == runtime_deployment
-        && Some(receipt.selector.operation) == required_operation(request)
+        && Some(receipt.selector.operation) == required_management_operation(request)
         && receipt.selector.request == management_request_commitment(request)
         && match (
             management_actor(request),
@@ -1373,7 +1375,7 @@ fn runtime_work_valid(value: &RuntimeWork) -> bool {
                     return false;
                 }
             }
-            match (required_operation(request), authority) {
+            match (required_management_operation(request), authority) {
                 (None, None) => true,
                 (None, Some(_)) => false,
                 (Some(_), Some(receipt)) => authority_matches_management(

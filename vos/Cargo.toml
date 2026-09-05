@@ -82,6 +82,7 @@ network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait"]
 
 [dependencies]
 vos-agent-sdk.workspace = true
+vos-protocol.workspace = true
 vos-macros = { path = "vos-macros", version = "0.1.0", optional = true }
 vos-raft = { path = "../support/vos-raft", version = "0.1.0", default-features = false, features = ["std"], optional = true }
 rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }

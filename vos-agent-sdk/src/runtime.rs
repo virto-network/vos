@@ -237,9 +237,25 @@ pub enum ManagementRequest {
 }
 
 impl ManagementRequest {
+    /// Whether this request is one canonical SDK management value.
+    pub fn is_valid(&self) -> bool {
+        crate::wire::management_request_valid(self)
+    }
+
     /// Commitment matched by a management authority selector.
     pub fn commitment(&self) -> Hash {
         crate::wire::management_request_commitment(self)
+    }
+
+    /// Signed authority operation required for a mutating management request.
+    /// Read-only inspection deliberately has no authority operation.
+    pub fn authority_operation(&self) -> Option<crate::authority::AuthorityOperationKind> {
+        crate::wire::required_management_operation(self)
+    }
+
+    /// Exact actor/deployment selector required by this request, when any.
+    pub fn authority_actor(&self) -> Option<(ActorId, DeploymentId)> {
+        crate::wire::management_actor(self)
     }
 }
 
@@ -595,6 +611,33 @@ pub trait AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn management_authority_metadata_is_derived_from_the_typed_request() {
+        let actor = ActorId([1; 32]);
+        let deployment = DeploymentId([2; 32]);
+        let mut request = ManagementRequest::Suspend {
+            actor,
+            expected_deployment: deployment,
+        };
+        assert!(request.is_valid());
+        assert_eq!(
+            request.authority_operation(),
+            Some(crate::authority::AuthorityOperationKind::SuspendActor)
+        );
+        assert_eq!(request.authority_actor(), Some((actor, deployment)));
+
+        request = ManagementRequest::InspectResources;
+        assert!(request.is_valid());
+        assert_eq!(request.authority_operation(), None);
+        assert_eq!(request.authority_actor(), None);
+
+        request = ManagementRequest::Suspend {
+            actor: ActorId::ZERO,
+            expected_deployment: deployment,
+        };
+        assert!(!request.is_valid());
+    }
 
     #[test]
     fn continuation_tuple_rejects_zero_or_oversized_references() {

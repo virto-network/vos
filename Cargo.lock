@@ -7688,6 +7688,7 @@ dependencies = [
  "ureq",
  "vos-agent-sdk",
  "vos-macros",
+ "vos-protocol",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-pvm-precompiles",

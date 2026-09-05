@@ -20,6 +20,8 @@ pub mod sdk {
 pub mod authority;
 pub mod bootstrap;
 pub mod catalog_finality;
+#[cfg(feature = "std")]
+pub mod clean_authority_issuer;
 pub mod committee;
 pub mod contract;
 #[cfg(feature = "std")]
