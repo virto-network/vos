@@ -1060,18 +1060,12 @@ fn translate_section_linked(
                     let jalr_rd = ((jalr >> 7) & 0x1f) as u8;
                     let ret_addr = rv_addr + 8;
 
-                    // A call is not a load_imm-fusing instruction. `translate_one`
-                    // clears a stale `pending_load_imm` for any opcode that can't
-                    // consume it, but this CALL_PLT path bypasses `translate_one`.
-                    // Clearing it here is essential: otherwise a `pending_load_imm`
-                    // left by a preceding PCREL (AUIPC+ADDI) survives across the
-                    // emitted call, and the next fusable instruction (branch, load,
-                    // store, ALU) "undoes" the fusion back to the load_imm's
-                    // position — truncating the call's bytes and desyncing every
-                    // address_map entry past it (a branch target then lands
-                    // mid-instruction → a PVM trap). The load_imm is already
-                    // emitted, so dropping the tracking simply forgoes fusion.
-                    ctx.pending_load_imm = None;
+                    // This relocation override bypasses `translate_one`, so flush
+                    // any LUI/AUIPC buffered by the linear predecessor before the
+                    // call can transfer control. This also clears load-immediate
+                    // fusion state: a later consumer must not fuse backwards across
+                    // the emitted call and truncate its bytes.
+                    ctx.flush_pending()?;
                     // Fused load_imm_jump: set return address and jump in one instruction
                     ctx.emit_call(jalr_rd, ret_addr, target_addr)?;
                     // Map the JALR address too
@@ -1200,4 +1194,124 @@ fn translate_section_linked(
     ctx.flush_pending()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vos_pvm::{ExitReason, refine};
+
+    const TEXT_VADDR: u64 = 0x40_0000;
+    const RA: u32 = 1;
+    const SP: u32 = 2;
+    const T0: u32 = 5;
+    const T2: u32 = 7;
+    const A0: u32 = 10;
+    const A1: u32 = 11;
+    const A2: u32 = 12;
+
+    fn lui(rd: u32, imm20: u32) -> u32 {
+        (imm20 << 12) | (rd << 7) | 0x37
+    }
+
+    fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (rd << 7) | 0x13
+    }
+
+    fn auipc(rd: u32) -> u32 {
+        (rd << 7) | 0x17
+    }
+
+    fn jalr(rd: u32, rs1: u32) -> u32 {
+        (rs1 << 15) | (rd << 7) | 0x67
+    }
+
+    fn sd(rs2: u32, rs1: u32, imm: i32) -> u32 {
+        let imm = imm as u32 & 0xfff;
+        ((imm >> 5) << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | ((imm & 0x1f) << 7) | 0x23
+    }
+
+    fn assemble(insts: &[u32]) -> Vec<u8> {
+        insts.iter().flat_map(|inst| inst.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn relocated_call_flushes_pending_lui_before_transfer() {
+        const LIMIT: u64 = 8192;
+        const CALL_SITE: u64 = TEXT_VADDR + 8;
+        const RETURN_ADDR: u64 = TEXT_VADDR + 16;
+        const CALLEE: u64 = TEXT_VADDR + 32;
+
+        // The LUI is deliberately adjacent to the relocated AUIPC+JALR pair.
+        // The callee snapshots A2 before the caller can execute another normal
+        // instruction. If CALL_PLT bypasses the buffered-LUI flush, it observes
+        // zero instead of LIMIT (the agent-runtime bytes_bounded failure mode).
+        let text = assemble(&[
+            addi(T2, RA, 0),  // preserve the host return address
+            lui(A2, 2),       // buffered A2 = 8192
+            auipc(T0),        // R_RISCV_CALL_PLT relocation lives here
+            jalr(RA, T0),     // relocation override consumes this instruction
+            addi(RA, T2, 0),  // restore the host return address
+            addi(A0, SP, -8), // designate the callee's snapshot as output
+            addi(A1, 0, 8),
+            jalr(0, RA), // return to the host
+            sd(A2, SP, -8),
+            jalr(0, RA), // callee return
+        ]);
+
+        let elf = LinkedElf {
+            is_64bit: true,
+            code_sections: vec![(0, TEXT_VADDR, text.clone())],
+            ro_data: Vec::new(),
+            ro_base: 0x1_0000,
+            rw_data: Vec::new(),
+            rw_base: 0x2_0000,
+            rw_min: 0x2_0000,
+            stack_size: 0x1_0000,
+            heap_pages: 0,
+            hi20_targets: HashMap::new(),
+            lo12_targets: HashMap::new(),
+            call_targets: HashMap::from([(CALL_SITE, CALLEE)]),
+            abs_code_ptrs: Vec::new(),
+            sub32_relocs: Vec::new(),
+            code_ranges: vec![(TEXT_VADDR, TEXT_VADDR + text.len() as u64)],
+            control_flow_targets: HashSet::from([TEXT_VADDR, RETURN_ADDR, CALLEE]),
+            entry_vaddr: TEXT_VADDR,
+            accumulate_vaddr: None,
+        };
+
+        let mut ctx = TranslationContext::with_opcode_encoding(true, OpcodeEncoding::Standard);
+        ctx.code_ranges = elf.code_ranges.clone();
+        ctx.emit_jump(elf.entry_vaddr);
+        ctx.emit_inst(0); // unused accumulate entry
+        translate_section_linked(&mut ctx, &text, TEXT_VADDR, &elf).expect("translates");
+        ctx.apply_fixups();
+
+        crate::peephole_fuse_load_imm_alu(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
+        crate::peephole_fuse_load_imm_memory(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
+        crate::peephole_eliminate_dead_load_imm(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
+        crate::ensure_branch_targets_are_block_starts(
+            &mut ctx.code,
+            &mut ctx.bitmask,
+            &mut ctx.jump_table,
+        );
+
+        let blob = crate::spi::build_spi_blob(
+            &[],
+            &[],
+            elf.heap_pages as u16,
+            elf.stack_size,
+            &ctx.code,
+            &ctx.bitmask,
+            &ctx.jump_table,
+        );
+        let invocation = refine::execute(&blob, &[], 10_000_000).expect("executes");
+
+        assert_eq!(invocation.exit, ExitReason::Halt);
+        assert_eq!(
+            invocation.output().as_deref(),
+            Some(&LIMIT.to_le_bytes()[..]),
+            "the callee must observe the LUI value before control transfers"
+        );
+    }
 }
