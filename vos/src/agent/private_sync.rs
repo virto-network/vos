@@ -1290,7 +1290,7 @@ mod tests {
     use crate::agent::private_crypto::{
         GeneratedPrivateEpoch, OwnerSigningKey, PrivateNodeDecryptionKey, RecoverySigningKey,
         encrypt_private_object, generate_fresh_private_epoch, sign_owner_control_record,
-        sign_recovery_control_record, unwrap_owner_key,
+        sign_recovery_control_record, unwrap_data_key, unwrap_owner_key,
     };
     use vos_agent_sdk::private::{EncryptedObjectKind, PrivateControlSigner};
     use vos_agent_sdk::{
@@ -2027,5 +2027,226 @@ mod tests {
             validate_private_runtime_work(&work),
             Err(PrivateSyncError::LinearUnsupported)
         );
+    }
+
+    #[test]
+    fn owner_bound_nodes_revoke_rotate_and_recover_onto_replacement_roots() {
+        let directory = TestDirectory::new("physical-offline-recovery");
+        let fixture = fixture();
+        let mut primary = create_store(&directory.child("primary"), &fixture);
+        let mut peer = create_store(&directory.child("peer"), &fixture);
+        let initial = encrypt_private_object(
+            &fixture.epoch.data_key,
+            fixture.space,
+            fixture.agent,
+            0,
+            EncryptedObjectKind::CrdtNode,
+            b"before-revocation",
+        )
+        .unwrap();
+        primary.put_object(&initial).unwrap();
+        converge(
+            &primary,
+            &mut peer,
+            &fixture.recipients[1].identity,
+            &fixture.recipients[0].identity,
+            b"plaintext-never-in-sync",
+        );
+        assert_eq!(primary.object_count(), peer.object_count());
+
+        let survivor = fixture.recipients[0].identity.clone();
+        let revoked = fixture.recipients[1].identity.clone();
+        let epoch_one = generate_fresh_private_epoch(
+            fixture.space,
+            fixture.agent,
+            1,
+            fixture.owner,
+            core::slice::from_ref(&survivor),
+            fixture.recovery.verifying_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let mut revoke = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: 0,
+            previous: None,
+            operation: PrivateControlOperation::Revoke {
+                node: revoked.node,
+                next_epoch: epoch_one.record.clone(),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_owner_control_record(&mut revoke, &fixture.owner_key).unwrap();
+        primary.append_control(&revoke, &TestAuthority).unwrap();
+
+        let epoch_two = generate_fresh_private_epoch(
+            fixture.space,
+            fixture.agent,
+            2,
+            fixture.owner,
+            core::slice::from_ref(&survivor),
+            fixture.recovery.verifying_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let mut rotate = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: 1,
+            previous: Some(revoke.commitment()),
+            operation: PrivateControlOperation::RotateKeys {
+                next_epoch: epoch_two.record.clone(),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_owner_control_record(&mut rotate, &epoch_one.owner_key).unwrap();
+        primary.append_control(&rotate, &TestAuthority).unwrap();
+
+        let stale_change = policy_record(&fixture, 2, Some(rotate.commitment()), 73);
+        assert!(matches!(
+            primary.append_control(&stale_change, &TestAuthority),
+            Err(PrivateStoreError::Crypto(PrivateCryptoError::WrongSigner))
+        ));
+        let before = primary.binding();
+        primary.reset_artifact_read_spy();
+        let stale_request = request_for(&peer, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32);
+        assert_eq!(
+            serve_private_sync_page(&primary, &revoked, &stale_request, &TestTransport),
+            Err(PrivateSyncError::Unauthorized)
+        );
+        assert_eq!(primary.artifact_read_spy(), 0);
+        assert_eq!(primary.binding(), before);
+
+        let later = encrypt_private_object(
+            &epoch_two.data_key,
+            fixture.space,
+            fixture.agent,
+            2,
+            EncryptedObjectKind::Snapshot,
+            b"after-revoke-and-rotation",
+        )
+        .unwrap();
+        primary.put_object(&later).unwrap();
+        let backup = primary
+            .export_encrypted_backup(crate::agent::private_store::MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        let prior_head = rotate.commitment();
+        drop(primary);
+        drop(peer);
+
+        let mut replacements = vec![
+            recipient(fixture.space, fixture.agent, fixture.owner, 81),
+            recipient(fixture.space, fixture.agent, fixture.owner, 82),
+        ];
+        replacements.sort_by_key(|recipient| recipient.identity.node);
+        let replacement_nodes: Vec<_> = replacements
+            .iter()
+            .map(|recipient| recipient.identity.clone())
+            .collect();
+        let epoch_three = generate_fresh_private_epoch(
+            fixture.space,
+            fixture.agent,
+            3,
+            fixture.owner,
+            &replacement_nodes,
+            fixture.recovery.verifying_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let mut recovery = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: 2,
+            previous: Some(prior_head),
+            operation: PrivateControlOperation::Recover {
+                superseded_heads: vec![prior_head],
+                next_epoch: epoch_three.record.clone(),
+                replacement_nodes: replacement_nodes.clone(),
+            },
+            signer: PrivateControlSigner::Recovery,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_recovery_control_record(&mut recovery, &fixture.recovery).unwrap();
+
+        let restore = |path: &Path| {
+            PrivateStore::restore_encrypted_backup(
+                path,
+                fixture.space,
+                fixture.agent,
+                fixture.owner,
+                fixture.recovery.verifying_key(),
+                &backup,
+                &TestAuthority,
+            )
+            .unwrap()
+            .0
+        };
+        let mut recovered_primary = restore(&directory.child("replacement-primary"));
+        let mut recovered_peer = restore(&directory.child("replacement-peer"));
+        assert_eq!(recovered_primary.binding().owner, fixture.owner);
+        let recovery_count = recovered_primary.control_count();
+        assert_eq!(
+            recovered_primary.apply_offline_recovery(Hash([99; 32]), &recovery, &TestAuthority),
+            Err(PrivateStoreError::Diverged)
+        );
+        assert_eq!(recovered_primary.control_count(), recovery_count);
+        let mut tampered_recovery = recovery.clone();
+        tampered_recovery.signature[0] ^= 1;
+        assert!(
+            recovered_primary
+                .apply_offline_recovery(prior_head, &tampered_recovery, &TestAuthority)
+                .is_err()
+        );
+        assert_eq!(recovered_primary.control_count(), recovery_count);
+        recovered_primary
+            .apply_offline_recovery(prior_head, &recovery, &TestAuthority)
+            .unwrap();
+        recovered_peer
+            .apply_offline_recovery(prior_head, &recovery, &TestAuthority)
+            .unwrap();
+        assert_eq!(recovered_primary.authorized_nodes(), replacement_nodes);
+        assert_eq!(recovered_peer.binding(), recovered_primary.binding());
+
+        for old in &fixture.recipients {
+            assert!(unwrap_data_key(&epoch_three.record, &old.identity, &old.key).is_err());
+        }
+        let request = request_for(&recovered_peer, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32);
+        recovered_primary.reset_artifact_read_spy();
+        for old in [&survivor, &revoked] {
+            assert_eq!(
+                serve_private_sync_page(&recovered_primary, old, &request, &TestTransport),
+                Err(PrivateSyncError::Unauthorized)
+            );
+        }
+        assert_eq!(recovered_primary.artifact_read_spy(), 0);
+
+        let replacement_change = encrypt_private_object(
+            &epoch_three.data_key,
+            fixture.space,
+            fixture.agent,
+            3,
+            EncryptedObjectKind::Index,
+            b"replacement-nodes-converge",
+        )
+        .unwrap();
+        recovered_primary.put_object(&replacement_change).unwrap();
+        converge(
+            &recovered_primary,
+            &mut recovered_peer,
+            &replacements[1].identity,
+            &replacements[0].identity,
+            b"replacement-nodes-converge",
+        );
+        assert_eq!(
+            recovered_peer.object_count(),
+            recovered_primary.object_count()
+        );
+        assert_eq!(recovered_peer.binding(), recovered_primary.binding());
     }
 }

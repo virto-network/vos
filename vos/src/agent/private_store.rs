@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 use vos_agent_sdk::private::{
     EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_NODES, PrivateControlOperation,
-    PrivateControlRecord, PrivateKeyEpoch, PrivateNodeIdentity,
+    PrivateControlRecord, PrivateControlSigner, PrivateKeyEpoch, PrivateNodeIdentity,
 };
 use vos_agent_sdk::wire::{
     CanonicalWire, MAX_PRIVATE_CONTROL_WIRE_BYTES, MAX_PRIVATE_KEY_EPOCH_WIRE_BYTES,
@@ -65,8 +65,11 @@ pub enum PrivateStoreError {
     Corrupt,
     InvalidScope,
     InvalidRecord,
+    InvalidBinding,
     LimitExceeded,
     Alias,
+    Rollback,
+    Diverged,
     Interrupted,
     Crypto(PrivateCryptoError),
 }
@@ -88,6 +91,12 @@ impl From<PrivateCryptoError> for PrivateStoreError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PutDisposition {
     Inserted,
+    AlreadyPresent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreDisposition {
+    Restored,
     AlreadyPresent,
 }
 
@@ -181,6 +190,13 @@ struct PendingTransaction {
     artifact_len: u32,
     index_hash: Hash,
     index_len: u32,
+}
+
+struct VerifiedEncryptedBackup {
+    metadata: RecoveryMetadata,
+    index: StoreIndex,
+    controls: Vec<PrivateControlRecord>,
+    objects: Vec<EncryptedPrivateObject>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -676,6 +692,139 @@ fn decode_pending(bytes: &[u8]) -> Result<PendingTransaction, PrivateStoreError>
     Ok(pending)
 }
 
+/// Fully decode and authenticate an encrypted archive without touching the
+/// destination filesystem. The caller-supplied binding is the external trust
+/// anchor; archive metadata is never allowed to select its own owner or
+/// recovery key.
+fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
+    bytes: &[u8],
+    expected_space: SpaceId,
+    expected_agent: AgentId,
+    expected_owner: PrincipalId,
+    expected_recovery_public_key: [u8; 32],
+    authority: &V,
+) -> Result<VerifiedEncryptedBackup, PrivateStoreError> {
+    let mut decoder = Decoder::new(bytes, BACKUP_MAGIC, MAX_PRIVATE_BACKUP_BYTES)?;
+    let recovery_wire = decoder.bytes(MAX_PRIVATE_RECOVERY_METADATA_BYTES)?;
+    let metadata = decode_recovery(&recovery_wire)?;
+    if encode_recovery(&metadata)? != recovery_wire {
+        return Err(PrivateStoreError::Corrupt);
+    }
+    if metadata.space != expected_space || metadata.agent != expected_agent {
+        return Err(PrivateStoreError::InvalidScope);
+    }
+    if metadata.owner != expected_owner
+        || metadata.recovery_public_key != expected_recovery_public_key
+    {
+        return Err(PrivateStoreError::InvalidBinding);
+    }
+
+    let index_wire = decoder.bytes(MAX_PRIVATE_STORE_INDEX_BYTES)?;
+    let index = decode_index(&index_wire)?;
+    if encode_index(&index)? != index_wire {
+        return Err(PrivateStoreError::Corrupt);
+    }
+    if index.space != expected_space || index.agent != expected_agent {
+        return Err(PrivateStoreError::InvalidScope);
+    }
+
+    let mut chain = PrivateControlChainVerifier::new_genesis(
+        metadata.space,
+        metadata.agent,
+        metadata.owner,
+        metadata.recovery_public_key,
+        metadata.genesis_epoch.clone(),
+        metadata.genesis_nodes.clone(),
+        authority,
+    )?;
+    let control_count =
+        usize::try_from(decoder.u32()?).map_err(|_| PrivateStoreError::LimitExceeded)?;
+    if control_count != index.controls.len() || control_count > MAX_PRIVATE_STORE_CONTROLS {
+        return Err(PrivateStoreError::Corrupt);
+    }
+    let mut controls = Vec::new();
+    controls
+        .try_reserve(control_count)
+        .map_err(|_| PrivateStoreError::LimitExceeded)?;
+    for entry in &index.controls {
+        let commitment = Hash(decoder.fixed()?);
+        let wire = decoder.bytes(MAX_PRIVATE_CONTROL_WIRE_BYTES)?;
+        if commitment != entry.commitment
+            || wire.len() != entry.wire_len as usize
+            || raw_wire_hash(&wire) != entry.wire_hash
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        let record =
+            PrivateControlRecord::decode(&wire).map_err(|_| PrivateStoreError::InvalidRecord)?;
+        if record
+            .encode()
+            .map_err(|_| PrivateStoreError::InvalidRecord)?
+            != wire
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        validate_control_index_entry(entry, &record)?;
+        apply_control_transition(&mut chain, &record, authority)?;
+        if chain.epoch().epoch != entry.resulting_epoch
+            || chain.head() != Some(entry.commitment)
+            || chain.next_sequence()
+                != entry
+                    .sequence
+                    .checked_add(1)
+                    .ok_or(PrivateStoreError::Corrupt)?
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        controls.push(record);
+    }
+
+    let object_count =
+        usize::try_from(decoder.u32()?).map_err(|_| PrivateStoreError::LimitExceeded)?;
+    if object_count != index.objects.len() || object_count > MAX_PRIVATE_STORE_OBJECTS {
+        return Err(PrivateStoreError::Corrupt);
+    }
+    let mut objects = Vec::new();
+    objects
+        .try_reserve(object_count)
+        .map_err(|_| PrivateStoreError::LimitExceeded)?;
+    for entry in &index.objects {
+        let key = decode_object_key(&mut decoder)?;
+        let wire = decoder.bytes(MAX_PRIVATE_OBJECT_WIRE_BYTES)?;
+        if key != entry.key
+            || wire.len() != entry.wire_len as usize
+            || raw_wire_hash(&wire) != entry.wire_hash
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        let object =
+            EncryptedPrivateObject::decode(&wire).map_err(|_| PrivateStoreError::InvalidRecord)?;
+        if object
+            .encode()
+            .map_err(|_| PrivateStoreError::InvalidRecord)?
+            != wire
+            || object.epoch > index.epoch
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        validate_object_index_entry(entry, &object, expected_space, expected_agent)?;
+        objects.push(object);
+    }
+    decoder.finish()?;
+    if chain.epoch().epoch != index.epoch
+        || chain.head() != index.control_head
+        || chain.next_sequence() != index.next_sequence
+    {
+        return Err(PrivateStoreError::Corrupt);
+    }
+    Ok(VerifiedEncryptedBackup {
+        metadata,
+        index,
+        controls,
+        objects,
+    })
+}
+
 fn map_io(_: std::io::Error) -> PrivateStoreError {
     PrivateStoreError::Io
 }
@@ -1086,6 +1235,9 @@ impl PrivateStore {
             )?;
             let object = EncryptedPrivateObject::decode(&bytes)
                 .map_err(|_| PrivateStoreError::InvalidRecord)?;
+            if object.epoch > index.epoch {
+                return Err(PrivateStoreError::Corrupt);
+            }
             validate_object_index_entry(entry, &object, metadata.space, metadata.agent)?;
         }
         Ok(Self {
@@ -1097,6 +1249,124 @@ impl PrivateStore {
             #[cfg(test)]
             artifact_reads: core::cell::Cell::new(0),
         })
+    }
+
+    /// Restore a fully authenticated ciphertext archive. Archive validation
+    /// and complete control-chain replay happen before the destination path is
+    /// opened or created. A pre-existing destination must be an exact prefix
+    /// of the archive, making retries safe while rejecting rollback. After
+    /// archive authentication, opening an existing store may first reconcile
+    /// one of its own previously staged transactions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
+        root: impl AsRef<Path>,
+        expected_space: SpaceId,
+        expected_agent: AgentId,
+        expected_owner: PrincipalId,
+        expected_recovery_public_key: [u8; 32],
+        backup_bytes: &[u8],
+        authority: &V,
+    ) -> Result<(Self, RestoreDisposition), PrivateStoreError> {
+        let backup = verify_encrypted_backup(
+            backup_bytes,
+            expected_space,
+            expected_agent,
+            expected_owner,
+            expected_recovery_public_key,
+            authority,
+        )?;
+        let root = root.as_ref();
+        let (mut store, created) = match fs::symlink_metadata(root) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(PrivateStoreError::Corrupt);
+                }
+                (
+                    Self::open(root, expected_space, expected_agent, authority)?,
+                    false,
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+                Self::create(
+                    root,
+                    expected_space,
+                    expected_agent,
+                    expected_owner,
+                    expected_recovery_public_key,
+                    backup.metadata.genesis_epoch.clone(),
+                    backup.metadata.genesis_nodes.clone(),
+                    authority,
+                )?,
+                true,
+            ),
+            Err(_) => return Err(PrivateStoreError::Io),
+        };
+        if store.metadata != backup.metadata {
+            return Err(PrivateStoreError::Diverged);
+        }
+        validate_restore_prefix(&store.index, &backup.index)?;
+        let changed = created || store.index != backup.index;
+        for record in backup.controls.iter().skip(store.index.controls.len()) {
+            store.append_control(record, authority)?;
+        }
+        for object in &backup.objects {
+            store.put_object(object)?;
+        }
+        if store.index != backup.index {
+            return Err(PrivateStoreError::Diverged);
+        }
+        Ok((
+            store,
+            if changed {
+                RestoreDisposition::Restored
+            } else {
+                RestoreDisposition::AlreadyPresent
+            },
+        ))
+    }
+
+    /// Durably apply an offline recovery transition after checking the exact
+    /// authenticated local head supplied by the recovery ceremony. Only the
+    /// signed SDK `Recover` operation is accepted; no secret or caller-owned
+    /// authorization assertion crosses this API.
+    pub fn apply_offline_recovery<V: PrivateNodeAuthorityVerifier>(
+        &mut self,
+        expected_prior_head: Hash,
+        record: &PrivateControlRecord,
+        authority: &V,
+    ) -> Result<PutDisposition, PrivateStoreError> {
+        if expected_prior_head == Hash::ZERO
+            || record.signer != PrivateControlSigner::Recovery
+            || !matches!(record.operation, PrivateControlOperation::Recover { .. })
+        {
+            return Err(PrivateStoreError::InvalidRecord);
+        }
+        let PrivateControlOperation::Recover {
+            superseded_heads, ..
+        } = &record.operation
+        else {
+            return Err(PrivateStoreError::InvalidRecord);
+        };
+        let commitment = record.commitment();
+        if self.chain.head() == Some(commitment) {
+            if superseded_heads
+                .binary_search(&expected_prior_head)
+                .is_err()
+            {
+                return Err(PrivateStoreError::InvalidRecord);
+            }
+            return self.append_control(record, authority);
+        }
+        if self.chain.head() != Some(expected_prior_head) {
+            return Err(PrivateStoreError::Diverged);
+        }
+        if superseded_heads
+            .binary_search(&expected_prior_head)
+            .is_err()
+        {
+            return Err(PrivateStoreError::InvalidRecord);
+        }
+        self.append_control(record, authority)
     }
 
     pub fn binding(&self) -> PrivateStoreBinding {
@@ -1514,6 +1784,54 @@ impl PrivateStore {
     }
 }
 
+fn validate_restore_prefix(
+    local: &StoreIndex,
+    archive: &StoreIndex,
+) -> Result<(), PrivateStoreError> {
+    if local.space != archive.space || local.agent != archive.agent {
+        return Err(PrivateStoreError::InvalidScope);
+    }
+    if local.controls.len() > archive.controls.len() {
+        return Err(PrivateStoreError::Rollback);
+    }
+    for (local_entry, archive_entry) in local.controls.iter().zip(&archive.controls) {
+        if local_entry.sequence != archive_entry.sequence
+            || local_entry.commitment != archive_entry.commitment
+        {
+            return Err(PrivateStoreError::Diverged);
+        }
+        if local_entry != archive_entry {
+            return Err(PrivateStoreError::Alias);
+        }
+    }
+    match local.controls.last() {
+        Some(last)
+            if local.control_head != Some(last.commitment)
+                || local.epoch != last.resulting_epoch
+                || last.sequence.checked_add(1) != Some(local.next_sequence) =>
+        {
+            return Err(PrivateStoreError::Diverged);
+        }
+        None if local.control_head.is_some() || local.epoch != 0 || local.next_sequence != 0 => {
+            return Err(PrivateStoreError::Diverged);
+        }
+        _ => {}
+    }
+
+    if local.objects.len() > archive.objects.len() {
+        return Err(PrivateStoreError::Rollback);
+    }
+    for (local_entry, archive_entry) in local.objects.iter().zip(&archive.objects) {
+        if archive_entry.key != local_entry.key {
+            return Err(PrivateStoreError::Diverged);
+        }
+        if archive_entry != local_entry {
+            return Err(PrivateStoreError::Alias);
+        }
+    }
+    Ok(())
+}
+
 fn validate_object_index_entry(
     entry: &StoredObjectIndex,
     object: &EncryptedPrivateObject,
@@ -1743,6 +2061,35 @@ mod tests {
         }
     }
 
+    fn backup_with_orders(
+        store: &PrivateStore,
+        control_order: &[usize],
+        object_order: &[usize],
+    ) -> Vec<u8> {
+        let mut encoder = Encoder::new(BACKUP_MAGIC);
+        encoder
+            .bytes(&encode_recovery(&store.metadata).unwrap())
+            .unwrap();
+        encoder.bytes(&encode_index(&store.index).unwrap()).unwrap();
+        encoder.u32(u32::try_from(control_order.len()).unwrap());
+        for position in control_order {
+            let entry = &store.index.controls[*position];
+            encoder.fixed(entry.commitment.as_bytes());
+            encoder
+                .bytes(&store.read_control_wire(entry).unwrap())
+                .unwrap();
+        }
+        encoder.u32(u32::try_from(object_order.len()).unwrap());
+        for position in object_order {
+            let entry = &store.index.objects[*position];
+            encode_object_key(&mut encoder, entry.key);
+            encoder
+                .bytes(&store.read_object_wire(entry).unwrap())
+                .unwrap();
+        }
+        encoder.finish(MAX_PRIVATE_BACKUP_BYTES).unwrap()
+    }
+
     #[test]
     fn interrupted_stage_artifact_index_and_head_reconcile_without_plaintext() {
         let directory = TestDirectory::new("reconcile");
@@ -1917,5 +2264,284 @@ mod tests {
                 Some(PrivateStoreError::Corrupt)
             );
         }
+    }
+
+    #[test]
+    fn backup_restore_is_side_effect_free_until_full_authentication() {
+        let fixture = fixture();
+        let directory = TestDirectory::new("restore-hostile");
+        let source_path = directory.0.join("source");
+        let mut source = create_store(&source_path, &fixture);
+        let control = control(&fixture, 0, None);
+        source.append_control(&control, &TestAuthority).unwrap();
+        for plaintext in [b"ordered-a".as_slice(), b"ordered-b".as_slice()] {
+            let object = encrypt_private_object(
+                &fixture.epoch.data_key,
+                fixture.space,
+                fixture.agent,
+                0,
+                EncryptedObjectKind::Blob,
+                plaintext,
+            )
+            .unwrap();
+            source.put_object(&object).unwrap();
+        }
+        let backup = source
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        let target = directory.0.join("target");
+
+        let mut tampered = backup.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(
+            PrivateStore::restore_encrypted_backup(
+                &target,
+                fixture.space,
+                fixture.agent,
+                fixture.owner,
+                fixture.recovery.verifying_key(),
+                &tampered,
+                &TestAuthority,
+            )
+            .is_err()
+        );
+        assert!(!target.exists());
+
+        let mut truncated = backup.clone();
+        truncated.pop();
+        assert!(
+            PrivateStore::restore_encrypted_backup(
+                &target,
+                fixture.space,
+                fixture.agent,
+                fixture.owner,
+                fixture.recovery.verifying_key(),
+                &truncated,
+                &TestAuthority,
+            )
+            .is_err()
+        );
+        assert!(!target.exists());
+
+        for (space, agent, owner, recovery, expected) in [
+            (
+                SpaceId([91; 32]),
+                fixture.agent,
+                fixture.owner,
+                fixture.recovery.verifying_key(),
+                PrivateStoreError::InvalidScope,
+            ),
+            (
+                fixture.space,
+                AgentId([92; 32]),
+                fixture.owner,
+                fixture.recovery.verifying_key(),
+                PrivateStoreError::InvalidScope,
+            ),
+            (
+                fixture.space,
+                fixture.agent,
+                PrincipalId([93; 32]),
+                fixture.recovery.verifying_key(),
+                PrivateStoreError::InvalidBinding,
+            ),
+            (
+                fixture.space,
+                fixture.agent,
+                fixture.owner,
+                [94; 32],
+                PrivateStoreError::InvalidBinding,
+            ),
+        ] {
+            assert_eq!(
+                PrivateStore::restore_encrypted_backup(
+                    &target,
+                    space,
+                    agent,
+                    owner,
+                    recovery,
+                    &backup,
+                    &TestAuthority,
+                )
+                .err(),
+                Some(expected)
+            );
+            assert!(!target.exists());
+        }
+
+        let duplicate = backup_with_orders(&source, &[0], &[0, 0]);
+        assert!(
+            PrivateStore::restore_encrypted_backup(
+                &target,
+                fixture.space,
+                fixture.agent,
+                fixture.owner,
+                fixture.recovery.verifying_key(),
+                &duplicate,
+                &TestAuthority,
+            )
+            .is_err()
+        );
+        assert!(!target.exists());
+        let reversed = backup_with_orders(&source, &[0], &[1, 0]);
+        assert!(
+            PrivateStore::restore_encrypted_backup(
+                &target,
+                fixture.space,
+                fixture.agent,
+                fixture.owner,
+                fixture.recovery.verifying_key(),
+                &reversed,
+                &TestAuthority,
+            )
+            .is_err()
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn restore_resumes_an_interrupted_prefix_and_rejects_rollback() {
+        let fixture = fixture();
+        let directory = TestDirectory::new("restore-resume-rollback");
+        let mut source = create_store(&directory.0.join("source"), &fixture);
+        let first_control = control(&fixture, 0, None);
+        source
+            .append_control(&first_control, &TestAuthority)
+            .unwrap();
+        let first_object = encrypt_private_object(
+            &fixture.epoch.data_key,
+            fixture.space,
+            fixture.agent,
+            0,
+            EncryptedObjectKind::Snapshot,
+            b"resumable-ciphertext-only-restore",
+        )
+        .unwrap();
+        let second_object = encrypt_private_object(
+            &fixture.epoch.data_key,
+            fixture.space,
+            fixture.agent,
+            0,
+            EncryptedObjectKind::Blob,
+            b"exact-object-prefix-only",
+        )
+        .unwrap();
+        source.put_object(&first_object).unwrap();
+        source.put_object(&second_object).unwrap();
+        let prefix_object = source
+            .get_object(source.index.objects[0].key)
+            .expect("source has a first object");
+        let old_backup = source
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        let second_control = control(&fixture, 1, Some(first_control.commitment()));
+        source
+            .append_control(&second_control, &TestAuthority)
+            .unwrap();
+        let current_backup = source
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+
+        let target = directory.0.join("target");
+        let mut interrupted = create_store(&target, &fixture);
+        assert_eq!(
+            interrupted.put_object_inner(&prefix_object, CommitStop::AfterArtifact),
+            Err(PrivateStoreError::Interrupted)
+        );
+        drop(interrupted);
+        let (restored, disposition) = PrivateStore::restore_encrypted_backup(
+            &target,
+            fixture.space,
+            fixture.agent,
+            fixture.owner,
+            fixture.recovery.verifying_key(),
+            &current_backup,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(disposition, RestoreDisposition::Restored);
+        assert_eq!(restored.index, source.index);
+        drop(restored);
+
+        let before = fs::read(target.join(INDEX_FILE)).unwrap();
+        assert_eq!(
+            PrivateStore::restore_encrypted_backup(
+                &target,
+                fixture.space,
+                fixture.agent,
+                fixture.owner,
+                fixture.recovery.verifying_key(),
+                &old_backup,
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateStoreError::Rollback)
+        );
+        assert_eq!(fs::read(target.join(INDEX_FILE)).unwrap(), before);
+
+        let fork_target = directory.0.join("fork-target");
+        let mut fork = create_store(&fork_target, &fixture);
+        let mut divergent = first_control.clone();
+        divergent.operation = PrivateControlOperation::SetResourcePolicy {
+            policy: BlobRef::of_bytes(b"authenticated-but-divergent-policy"),
+        };
+        sign_owner_control_record(&mut divergent, &fixture.owner_key).unwrap();
+        fork.append_control(&divergent, &TestAuthority).unwrap();
+        drop(fork);
+        let fork_before = fs::read(fork_target.join(INDEX_FILE)).unwrap();
+        assert_eq!(
+            PrivateStore::restore_encrypted_backup(
+                &fork_target,
+                fixture.space,
+                fixture.agent,
+                fixture.owner,
+                fixture.recovery.verifying_key(),
+                &current_backup,
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateStoreError::Diverged)
+        );
+        assert_eq!(fs::read(fork_target.join(INDEX_FILE)).unwrap(), fork_before);
+
+        let subsequence_target = directory.0.join("object-subsequence-target");
+        let mut subsequence = create_store(&subsequence_target, &fixture);
+        let second_object = source
+            .get_object(source.index.objects[1].key)
+            .expect("source has a second object");
+        subsequence.put_object(&second_object).unwrap();
+        drop(subsequence);
+        let subsequence_before = fs::read(subsequence_target.join(INDEX_FILE)).unwrap();
+        assert_eq!(
+            PrivateStore::restore_encrypted_backup(
+                &subsequence_target,
+                fixture.space,
+                fixture.agent,
+                fixture.owner,
+                fixture.recovery.verifying_key(),
+                &current_backup,
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateStoreError::Diverged)
+        );
+        assert_eq!(
+            fs::read(subsequence_target.join(INDEX_FILE)).unwrap(),
+            subsequence_before
+        );
+
+        let (restored, disposition) = PrivateStore::restore_encrypted_backup(
+            &target,
+            fixture.space,
+            fixture.agent,
+            fixture.owner,
+            fixture.recovery.verifying_key(),
+            &current_backup,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(disposition, RestoreDisposition::AlreadyPresent);
+        assert_eq!(restored.index, source.index);
     }
 }
