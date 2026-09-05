@@ -3,9 +3,10 @@
 use alloc::vec::Vec;
 
 use crate::inner::{
-    InnerError, InnerExit, InnerMachines, InvokeState, MAX_INNER_MACHINES, PageMode, gas, host_call,
+    InnerError, InnerExit, InnerMachineIdentity, InnerMachineObservation, InnerMachines,
+    InvokeState, MAX_INNER_MACHINES, PageMode, gas, host_call,
 };
-use crate::refine::{Invocation, Machine, MemoryModel, RefineError};
+use crate::refine::{Invocation, Machine, MachineObservation, MemoryModel, RefineError};
 use crate::{ExitReason, Gas, PVM_REGISTER_COUNT};
 
 /// Standard host result constants used by the inner-machine calls.
@@ -20,6 +21,48 @@ pub mod result {
 enum Dispatch {
     Continue,
     Exit(ExitReason),
+}
+
+/// Stable identity of a machine participating in one nested Refine run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RefineMachineIdentity {
+    Outer,
+    Inner(InnerMachineIdentity),
+}
+
+/// Phase of an outer-runtime host-call dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefineHostPhase {
+    Before,
+    After,
+}
+
+/// Read-only nested execution events used by proof and diagnostic tracers.
+///
+/// `MachineEnter` exposes the exact code and sparse memory image before the
+/// first instruction of that slice. `Instruction` is emitted by the sole
+/// interpreter execution path. Host boundaries surround all state changes
+/// made by calls 9 through 14, including an intervening inner invocation.
+pub enum RefineObservation<'a> {
+    MachineEnter {
+        identity: RefineMachineIdentity,
+        machine: &'a crate::interpreter::Interpreter,
+    },
+    Instruction {
+        identity: RefineMachineIdentity,
+        instruction: crate::interpreter::InstructionObservation<'a>,
+    },
+    MachineExit {
+        identity: RefineMachineIdentity,
+        exit: ExitReason,
+        machine: &'a crate::interpreter::Interpreter,
+    },
+    HostCall {
+        phase: RefineHostPhase,
+        id: u64,
+        outer: &'a Machine,
+        inner: &'a InnerMachines,
+    },
 }
 
 /// A standard outer PVM plus its per-invocation inner-machine dictionary.
@@ -60,6 +103,62 @@ impl RefineContext {
         }
     }
 
+    /// Run the same nested Refine state machine as [`Self::run`] while
+    /// reporting immutable machine and host-dispatch boundaries.
+    pub fn run_observed(
+        self,
+        mut observer: impl for<'a> FnMut(RefineObservation<'a>),
+    ) -> Invocation {
+        self.run_with_observer(&mut observer)
+    }
+
+    fn run_with_observer(
+        mut self,
+        observer: &mut dyn for<'a> FnMut(RefineObservation<'a>),
+    ) -> Invocation {
+        loop {
+            let exit = self.outer.resume_observed(|event| match event {
+                MachineObservation::Enter(machine) => {
+                    observer(RefineObservation::MachineEnter {
+                        identity: RefineMachineIdentity::Outer,
+                        machine,
+                    });
+                }
+                MachineObservation::Instruction(instruction) => {
+                    observer(RefineObservation::Instruction {
+                        identity: RefineMachineIdentity::Outer,
+                        instruction,
+                    });
+                }
+            });
+            observer(RefineObservation::MachineExit {
+                identity: RefineMachineIdentity::Outer,
+                exit: exit.clone(),
+                machine: self.outer.interpreter(),
+            });
+            let ExitReason::HostCall(id) = exit else {
+                return self.outer.finish(exit);
+            };
+            observer(RefineObservation::HostCall {
+                phase: RefineHostPhase::Before,
+                id,
+                outer: &self.outer,
+                inner: &self.inner,
+            });
+            let dispatch = self.dispatch_observed(id, observer);
+            observer(RefineObservation::HostCall {
+                phase: RefineHostPhase::After,
+                id,
+                outer: &self.outer,
+                inner: &self.inner,
+            });
+            match dispatch {
+                Dispatch::Continue => {}
+                Dispatch::Exit(exit) => return self.outer.finish(exit),
+            }
+        }
+    }
+
     pub fn inner(&self) -> &InnerMachines {
         &self.inner
     }
@@ -70,7 +169,23 @@ impl RefineContext {
             value if value == u64::from(host_call::PEEK) => self.peek(),
             value if value == u64::from(host_call::POKE) => self.poke(),
             value if value == u64::from(host_call::PAGES) => self.pages(),
-            value if value == u64::from(host_call::INVOKE) => self.invoke(),
+            value if value == u64::from(host_call::INVOKE) => self.invoke(None),
+            value if value == u64::from(host_call::EXPUNGE) => self.expunge(),
+            _ => Dispatch::Exit(ExitReason::HostCall(id)),
+        }
+    }
+
+    fn dispatch_observed(
+        &mut self,
+        id: u64,
+        observer: &mut dyn for<'a> FnMut(RefineObservation<'a>),
+    ) -> Dispatch {
+        match id {
+            value if value == u64::from(host_call::MACHINE) => self.machine(),
+            value if value == u64::from(host_call::PEEK) => self.peek(),
+            value if value == u64::from(host_call::POKE) => self.poke(),
+            value if value == u64::from(host_call::PAGES) => self.pages(),
+            value if value == u64::from(host_call::INVOKE) => self.invoke(Some(observer)),
             value if value == u64::from(host_call::EXPUNGE) => self.expunge(),
             _ => Dispatch::Exit(ExitReason::HostCall(id)),
         }
@@ -221,7 +336,10 @@ impl RefineContext {
         Dispatch::Continue
     }
 
-    fn invoke(&mut self) -> Dispatch {
+    fn invoke(
+        &mut self,
+        observer: Option<&mut dyn for<'a> FnMut(RefineObservation<'a>)>,
+    ) -> Dispatch {
         let registers = *self.outer.registers();
         let (id, frame_address) = (registers[7], registers[8]);
         let Some((frame_address, _)) = self.outer_range(frame_address, 112, true) else {
@@ -256,13 +374,42 @@ impl RefineContext {
             self.outer.registers_mut()[7] = result::WHO;
             return Dispatch::Continue;
         };
-        let outcome = match self.inner.invoke(
-            id,
-            InvokeState {
-                gas: requested_gas,
-                registers: inner_registers,
-            },
-        ) {
+        let state = InvokeState {
+            gas: requested_gas,
+            registers: inner_registers,
+        };
+        let outcome = match observer {
+            Some(observer) => self.inner.invoke_observed(id, state, |event| match event {
+                InnerMachineObservation::Enter { identity, machine } => {
+                    observer(RefineObservation::MachineEnter {
+                        identity: RefineMachineIdentity::Inner(identity),
+                        machine,
+                    });
+                }
+                InnerMachineObservation::Instruction {
+                    identity,
+                    instruction,
+                } => {
+                    observer(RefineObservation::Instruction {
+                        identity: RefineMachineIdentity::Inner(identity),
+                        instruction,
+                    });
+                }
+                InnerMachineObservation::Exit {
+                    identity,
+                    exit,
+                    machine,
+                } => {
+                    observer(RefineObservation::MachineExit {
+                        identity: RefineMachineIdentity::Inner(identity),
+                        exit: inner_exit_reason(exit),
+                        machine,
+                    });
+                }
+            }),
+            None => self.inner.invoke(id, state),
+        };
+        let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(InnerError::Unknown) => {
                 self.outer.registers_mut()[7] = result::WHO;
@@ -339,12 +486,26 @@ impl RefineContext {
     }
 }
 
+fn inner_exit_reason(exit: InnerExit) -> ExitReason {
+    match exit {
+        InnerExit::Halt => ExitReason::Halt,
+        InnerExit::Panic => ExitReason::Panic,
+        InnerExit::Fault(address) => ExitReason::PageFault(address),
+        InnerExit::Host(id) => ExitReason::HostCall(id),
+        InnerExit::OutOfGas => ExitReason::OutOfGas,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use vos_pvm_program::{CodeBlob, build_compact_code_blob};
 
     fn standard_program(args_code: &[u8], starts: &[usize]) -> Vec<u8> {
+        standard_program_with_rw(args_code, starts, &[])
+    }
+
+    fn standard_program_with_rw(args_code: &[u8], starts: &[usize], rw_data: &[u8]) -> Vec<u8> {
         let mut packed = alloc::vec![0u8; args_code.len().div_ceil(8)];
         for &i in starts {
             packed[i / 8] |= 1 << (i % 8);
@@ -355,9 +516,10 @@ mod tests {
 
         let mut blob = Vec::new();
         blob.extend_from_slice(&[0; 3]);
-        blob.extend_from_slice(&[0; 3]);
+        blob.extend_from_slice(&(rw_data.len() as u32).to_le_bytes()[..3]);
         blob.extend_from_slice(&0u16.to_le_bytes());
         blob.extend_from_slice(&4096u32.to_le_bytes()[..3]);
+        blob.extend_from_slice(rw_data);
         blob.extend_from_slice(&(code_blob.len() as u32).to_le_bytes());
         blob.extend_from_slice(&code_blob);
         blob
@@ -366,6 +528,91 @@ mod tests {
     fn inner_program() -> Vec<u8> {
         // host(42), then trap.
         vec![0, 1, 3, 10, 42, 0, 0b0000_0101]
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum ObservedEvent {
+        Enter(RefineMachineIdentity, u32),
+        Instruction(RefineMachineIdentity, u32),
+        Exit(RefineMachineIdentity, ExitReason),
+        Host(RefineHostPhase, u64),
+    }
+
+    #[test]
+    fn observed_nested_run_preserves_semantics_and_machine_identity() {
+        const RW_BASE: u32 = 2 * crate::PVM_ZONE_SIZE;
+        let mut frame = [0u8; 112];
+        frame[..8].copy_from_slice(&100_000u64.to_le_bytes());
+        let [b0, b1, b2, _] = RW_BASE.to_le_bytes();
+        // machine(args), r8 <- RW_BASE, invoke(machine 0, frame), halt.
+        let code = [10, 9, 51, 8, b0, b1, b2, 10, 13, 50, 0];
+        let outer = standard_program_with_rw(&code, &[0, 2, 7, 9], &frame);
+        let args = inner_program();
+        let expected = RefineContext::load_with(&outer, &args, 1_000_000, MemoryModel::Sparse)
+            .unwrap()
+            .run();
+
+        let mut events = Vec::new();
+        let observed = RefineContext::load_with(&outer, &args, 1_000_000, MemoryModel::Sparse)
+            .unwrap()
+            .run_observed(|event| match event {
+                RefineObservation::MachineEnter { identity, machine } => {
+                    assert!(
+                        machine.memory().allocated_bytes() < 16 << 20,
+                        "observation must retain the sparse 4 GiB image"
+                    );
+                    events.push(ObservedEvent::Enter(identity, machine.pc));
+                }
+                RefineObservation::Instruction {
+                    identity,
+                    instruction,
+                } => events.push(ObservedEvent::Instruction(identity, instruction.pc_before)),
+                RefineObservation::MachineExit { identity, exit, .. } => {
+                    events.push(ObservedEvent::Exit(identity, exit));
+                }
+                RefineObservation::HostCall { phase, id, .. } => {
+                    events.push(ObservedEvent::Host(phase, id));
+                }
+            });
+
+        assert_eq!(observed.exit, expected.exit);
+        assert_eq!(observed.pc, expected.pc);
+        assert_eq!(observed.registers, expected.registers);
+        assert_eq!(observed.gas_used, expected.gas_used);
+        assert_eq!(observed.output(), expected.output());
+        let inner = RefineMachineIdentity::Inner(InnerMachineIdentity {
+            slot: 0,
+            generation: 0,
+        });
+        assert!(events.contains(&ObservedEvent::Enter(inner, 0)));
+        assert!(events.contains(&ObservedEvent::Instruction(inner, 0)));
+        assert!(events.contains(&ObservedEvent::Exit(inner, ExitReason::HostCall(42))));
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    ObservedEvent::Enter(RefineMachineIdentity::Outer, pc) => Some(*pc),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [0, 2, 9],
+            "each outer trace slice starts after the prior handled call"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    ObservedEvent::Host(phase, id) => Some((*phase, *id)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [
+                (RefineHostPhase::Before, 9),
+                (RefineHostPhase::After, 9),
+                (RefineHostPhase::Before, 13),
+                (RefineHostPhase::After, 13),
+            ]
+        );
     }
 
     #[test]

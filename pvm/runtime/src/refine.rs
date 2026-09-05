@@ -130,6 +130,12 @@ pub struct Machine {
     terminal_exit: Option<ExitReason>,
 }
 
+/// Read-only entry and instruction events for one standard machine slice.
+pub enum MachineObservation<'a> {
+    Enter(&'a Interpreter),
+    Instruction(crate::interpreter::InstructionObservation<'a>),
+}
+
 impl Machine {
     /// Construct the full Gray Paper Ψ boundary from a canonical compact PVM
     /// blob and an explicit architectural state.
@@ -279,6 +285,39 @@ impl Machine {
         // surfaced ecalli. The first call is a no-op here.
         self.interp.resume_after_host_call();
         self.interp.run().0
+    }
+
+    /// Run until the next PVM exit while observing every instruction.
+    ///
+    /// This is the proof/diagnostic twin of [`Self::resume`]. It performs
+    /// the same pending-host-call acknowledgement before entering the
+    /// interpreter and delegates execution to
+    /// [`Interpreter::run_observed`], whose callback receives immutable
+    /// post-step state. Installing an observer therefore cannot perturb the
+    /// standard machine's semantics.
+    pub fn resume_observed(
+        &mut self,
+        mut observer: impl for<'a> FnMut(MachineObservation<'a>),
+    ) -> ExitReason {
+        self.interp.resume_after_host_call();
+        observer(MachineObservation::Enter(&self.interp));
+        if let Some(exit) = &self.terminal_exit {
+            return exit.clone();
+        }
+        self.interp
+            .run_observed(|instruction| {
+                observer(MachineObservation::Instruction(instruction));
+            })
+            .0
+    }
+
+    /// Exact interpreter image owned by this standard machine.
+    ///
+    /// The returned reference is read-only so trace assemblers can capture
+    /// the code, register, and sparse-memory boundary without acquiring a
+    /// second execution implementation.
+    pub fn interpreter(&self) -> &Interpreter {
+        &self.interp
     }
 
     pub fn gas_remaining(&self) -> Gas {

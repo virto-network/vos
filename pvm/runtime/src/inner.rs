@@ -126,7 +126,36 @@ pub struct InvokeOutcome {
     pub state: InvokeState,
 }
 
+/// Invocation-unique identity of one inner machine.
+///
+/// Slots are deliberately reusable after `expunge`; `generation` is not.
+/// Proof traces use the pair so two different programs that occupied the
+/// same dictionary slot can never be spliced together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InnerMachineIdentity {
+    pub slot: u32,
+    pub generation: u64,
+}
+
+/// Read-only events emitted while an inner machine is invoked.
+pub enum InnerMachineObservation<'a> {
+    Enter {
+        identity: InnerMachineIdentity,
+        machine: &'a Interpreter,
+    },
+    Instruction {
+        identity: InnerMachineIdentity,
+        instruction: crate::interpreter::InstructionObservation<'a>,
+    },
+    Exit {
+        identity: InnerMachineIdentity,
+        exit: InnerExit,
+        machine: &'a Interpreter,
+    },
+}
+
 struct InnerMachine {
+    generation: u64,
     program: Option<ParsedCodeBlob>,
     initial_pc: u32,
     vm: Option<Interpreter>,
@@ -163,6 +192,7 @@ impl InnerMachine {
 #[derive(Default)]
 pub struct InnerMachines {
     machines: BTreeMap<u32, InnerMachine>,
+    next_generation: u64,
 }
 
 impl InnerMachines {
@@ -195,9 +225,15 @@ impl InnerMachines {
         let id = (0..MAX_INNER_MACHINES as u32)
             .find(|id| !self.machines.contains_key(id))
             .expect("a free ID exists below the machine limit");
+        let generation = self.next_generation;
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("an invocation cannot create 2^64 inner machines");
         self.machines.insert(
             id,
             InnerMachine {
+                generation,
                 program: Some(program),
                 initial_pc,
                 vm: None,
@@ -270,11 +306,52 @@ impl InnerMachines {
 
     /// Resume a machine with the supplied gas counter and register file.
     pub fn invoke(&mut self, id: u32, state: InvokeState) -> Result<InvokeOutcome, InnerError> {
+        self.invoke_with_observer(id, state, None)
+    }
+
+    /// Resume a machine while exposing immutable entry, instruction, and
+    /// exit observations. This follows [`Self::invoke`] exactly while keeping
+    /// the ordinary path on the interpreter's non-observing run loop.
+    pub fn invoke_observed(
+        &mut self,
+        id: u32,
+        state: InvokeState,
+        mut observer: impl for<'a> FnMut(InnerMachineObservation<'a>),
+    ) -> Result<InvokeOutcome, InnerError> {
+        self.invoke_with_observer(id, state, Some(&mut observer))
+    }
+
+    fn invoke_with_observer(
+        &mut self,
+        id: u32,
+        state: InvokeState,
+        observer: Option<&mut dyn for<'a> FnMut(InnerMachineObservation<'a>)>,
+    ) -> Result<InvokeOutcome, InnerError> {
         let machine = self.machines.get_mut(&id).ok_or(InnerError::Unknown)?;
+        let identity = InnerMachineIdentity {
+            slot: id,
+            generation: machine.generation,
+        };
         let vm = machine.vm();
         vm.gas = state.gas;
         vm.registers = state.registers;
-        let (exit, _) = vm.run();
+        let mut observer = observer;
+        let exit = match observer.as_deref_mut() {
+            Some(observer) => {
+                observer(InnerMachineObservation::Enter {
+                    identity,
+                    machine: vm,
+                });
+                vm.run_observed(|instruction| {
+                    observer(InnerMachineObservation::Instruction {
+                        identity,
+                        instruction,
+                    });
+                })
+                .0
+            }
+            None => vm.run().0,
+        };
         let exit = match exit {
             ExitReason::Halt => {
                 vm.pc = 0;
@@ -293,6 +370,13 @@ impl InnerMachines {
                 InnerExit::Host(id)
             }
         };
+        if let Some(observer) = observer {
+            observer(InnerMachineObservation::Exit {
+                identity,
+                exit,
+                machine: vm,
+            });
+        }
         Ok(InvokeOutcome {
             exit,
             state: InvokeState {
@@ -415,6 +499,41 @@ mod tests {
         let second = machines.invoke(id, first.state).unwrap();
         assert_eq!(second.exit, InnerExit::Panic);
         assert_eq!(machines.expunge(id), Ok(0));
+    }
+
+    #[test]
+    fn observed_identity_does_not_alias_a_reused_slot() {
+        let mut machines = InnerMachines::new();
+        let state = InvokeState {
+            gas: 100_000,
+            registers: [0; PVM_REGISTER_COUNT],
+        };
+        let first_slot = machines.create(&host_then_trap(), 0).unwrap();
+        let mut first_identity = None;
+        machines
+            .invoke_observed(first_slot, state.clone(), |event| {
+                if let InnerMachineObservation::Enter { identity, .. } = event {
+                    first_identity = Some(identity);
+                }
+            })
+            .unwrap();
+        machines.expunge(first_slot).unwrap();
+
+        let second_slot = machines.create(&host_then_trap(), 0).unwrap();
+        let mut second_identity = None;
+        machines
+            .invoke_observed(second_slot, state, |event| {
+                if let InnerMachineObservation::Enter { identity, .. } = event {
+                    second_identity = Some(identity);
+                }
+            })
+            .unwrap();
+
+        assert_eq!(first_slot, second_slot);
+        assert_eq!(first_identity.unwrap().slot, second_identity.unwrap().slot);
+        assert_ne!(first_identity, second_identity);
+        assert_eq!(first_identity.unwrap().generation, 0);
+        assert_eq!(second_identity.unwrap().generation, 1);
     }
 
     #[test]
