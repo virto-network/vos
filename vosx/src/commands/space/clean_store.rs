@@ -43,7 +43,6 @@ const STORE_MAGIC: [u8; 4] = *b"CSF1";
 const STORE_VERSION: u8 = 1;
 const STORE_HEADER_BYTES: usize = 80;
 const NO_PREDECESSOR: [u8; 32] = [0; 32];
-const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"vos/clean-system-agent/file-payload/v1";
 const ENVELOPE_DIGEST_DOMAIN: &[u8] = b"vos/clean-system-agent/file-envelope/v1";
 
 const ALLOWED_ENTRIES: [&str; 7] = [
@@ -585,7 +584,7 @@ fn encode_envelope(
     encoded.push(0);
     encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     encoded.extend_from_slice(&predecessor.unwrap_or(NO_PREDECESSOR));
-    encoded.extend_from_slice(&payload_digest(role, payload));
+    encoded.extend_from_slice(&envelope_digest(role, predecessor, payload));
     encoded.extend_from_slice(payload);
     debug_assert_eq!(encoded.len(), STORE_HEADER_BYTES + payload.len());
     Ok(encoded)
@@ -639,9 +638,6 @@ fn decode_envelope_parts(
     payload: Vec<u8>,
 ) -> Result<StoredImage, CleanFileStoreError> {
     let length = decode_payload_length(role, header, role.maximum_bytes())?;
-    if payload.len() != length || header[48..80] != payload_digest(role, &payload) {
-        return Err(CleanFileStoreError::Corrupt);
-    }
     let predecessor_bytes: [u8; 32] = header[16..48]
         .try_into()
         .map_err(|_| CleanFileStoreError::Corrupt)?;
@@ -650,6 +646,9 @@ fn decode_envelope_parts(
         1 if predecessor_bytes != NO_PREDECESSOR => Some(predecessor_bytes),
         _ => return Err(CleanFileStoreError::Corrupt),
     };
+    if payload.len() != length || header[48..80] != envelope_digest(role, predecessor, &payload) {
+        return Err(CleanFileStoreError::Corrupt);
+    }
     let stored = StoredImage {
         role,
         predecessor,
@@ -659,10 +658,6 @@ fn decode_envelope_parts(
         return Err(CleanFileStoreError::Corrupt);
     }
     Ok(stored)
-}
-
-fn payload_digest(role: StoreRole, payload: &[u8]) -> [u8; 32] {
-    digest(PAYLOAD_DIGEST_DOMAIN, role, None, payload)
 }
 
 fn envelope_digest(role: StoreRole, predecessor: Option<[u8; 32]>, payload: &[u8]) -> [u8; 32] {
@@ -1081,6 +1076,22 @@ mod tests {
         staged
     }
 
+    fn flip_first_predecessor_byte(path: &Path) {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open envelope for predecessor tamper");
+        file.seek(SeekFrom::Start(16)).expect("seek to predecessor");
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).expect("read predecessor byte");
+        byte[0] ^= 1;
+        file.seek(SeekFrom::Start(16))
+            .expect("rewind to predecessor");
+        file.write_all(&byte).expect("tamper predecessor byte");
+        file.sync_all().expect("sync predecessor tamper");
+    }
+
     #[test]
     fn missing_files_create_and_reopen_with_exact_bytes() {
         let fixture = Fixture::new("roundtrip");
@@ -1165,6 +1176,42 @@ mod tests {
         let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
         assert_eq!(pins.load(64).unwrap().as_deref(), Some(b"new".as_slice()));
         assert!(!fixture.root.join(PINS_STAGE_FILE).exists());
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn canonical_predecessor_tamper_is_detected() {
+        let fixture = Fixture::new("canonical-predecessor-tamper");
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        pins.commit(b"predecessor").unwrap();
+        pins.commit(b"successor").unwrap();
+        drop((pins, bootstrap, issuer));
+
+        flip_first_predecessor_byte(&fixture.root.join(PINS_FILE));
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        assert!(matches!(pins.load(64), Err(CleanFileStoreError::Corrupt)));
+        assert!(fixture.root.join(PINS_FILE).is_file());
+        drop((pins, bootstrap, issuer));
+    }
+
+    #[test]
+    fn staged_predecessor_tamper_is_detected() {
+        let fixture = Fixture::new("staged-predecessor-tamper");
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        pins.commit(b"predecessor").unwrap();
+        let current = pins
+            .0
+            .reconcile(StoreRole::Pins.maximum_bytes())
+            .unwrap()
+            .unwrap();
+        stage(&pins.0, Some(current.commitment()), b"successor");
+        flip_first_predecessor_byte(&fixture.root.join(PINS_STAGE_FILE));
+        drop((pins, bootstrap, issuer));
+
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        assert!(matches!(pins.load(64), Err(CleanFileStoreError::Corrupt)));
+        assert!(fixture.root.join(PINS_FILE).is_file());
+        assert!(fixture.root.join(PINS_STAGE_FILE).is_file());
         drop((pins, bootstrap, issuer));
     }
 
