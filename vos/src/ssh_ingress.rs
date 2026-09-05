@@ -210,7 +210,6 @@ fn server_limits(config: &SshIngressConfig) -> ServerLimits {
 #[derive(Clone)]
 enum Message {
     Loaded(EffectOutput),
-    Method(String),
     IdempotencyKey(String),
     Invoke,
     Invoked(EffectOutput),
@@ -227,10 +226,97 @@ enum Message {
     Managed(EffectOutput),
 }
 
+/// Canonical nested RUI navigation below `/agents`.
+///
+/// The literals between identifiers make every level explicit: an Agent is
+/// not an Actor, and an Actor overview is never itself an invocation target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentShellRoute<'a> {
+    Agent {
+        agent: &'a str,
+    },
+    Actors {
+        agent: &'a str,
+    },
+    Actor {
+        agent: &'a str,
+        actor: &'a str,
+    },
+    Methods {
+        agent: &'a str,
+        actor: &'a str,
+    },
+    Method {
+        agent: &'a str,
+        actor: &'a str,
+        method: &'a str,
+    },
+}
+
+fn parse_agent_shell_route(route: &str) -> Option<AgentShellRoute<'_>> {
+    let rest = route.strip_prefix("/agents/")?;
+    let mut segments = rest.split('/');
+    let agent = segments.next()?;
+    if !is_canonical_agent_name(agent) {
+        return None;
+    }
+    let Some(level) = segments.next() else {
+        return Some(AgentShellRoute::Agent { agent });
+    };
+    if level != "actors" {
+        return None;
+    }
+    let Some(actor) = segments.next() else {
+        return Some(AgentShellRoute::Actors { agent });
+    };
+    if !is_canonical_schema_name(actor) {
+        return None;
+    }
+    let Some(level) = segments.next() else {
+        return Some(AgentShellRoute::Actor { agent, actor });
+    };
+    if level != "methods" {
+        return None;
+    }
+    let Some(method) = segments.next() else {
+        return Some(AgentShellRoute::Methods { agent, actor });
+    };
+    if !is_canonical_schema_name(method) || segments.next().is_some() {
+        return None;
+    }
+    Some(AgentShellRoute::Method {
+        agent,
+        actor,
+        method,
+    })
+}
+
+fn is_canonical_agent_name(name: &str) -> bool {
+    crate::registry::is_canonical_registry_slug(name)
+}
+
+fn is_canonical_schema_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=vos_agent_sdk::MAX_ACTOR_NAME_BYTES).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn shell_metadata_is_canonical(meta: &crate::metadata::ParsedMeta) -> bool {
+    is_canonical_schema_name(&meta.actor_name)
+        && meta.messages.iter().enumerate().all(|(index, method)| {
+            is_canonical_schema_name(&method.name)
+                && method.mode <= 1
+                && meta.messages[index + 1..]
+                    .iter()
+                    .all(|other| other.name != method.name)
+        })
+}
+
 struct SpaceApp {
     route: String,
     content: String,
-    method: String,
     idempotency_key: String,
     role_name: String,
     role_power: String,
@@ -245,7 +331,6 @@ impl SpaceApp {
         Self {
             route: context.route().as_str().to_owned(),
             content: "Loading space…".into(),
-            method: String::new(),
             idempotency_key: String::new(),
             role_name: String::new(),
             role_power: String::new(),
@@ -278,10 +363,12 @@ impl App for SpaceApp {
                     .link("Agents", "s4:/agents")
             })
             .text(self.content.clone());
-        if self.route.starts_with("/agents/") {
+        if matches!(
+            parse_agent_shell_route(&self.route),
+            Some(AgentShellRoute::Method { .. })
+        ) {
             page = page
-                .text("Invoke a no-argument method")
-                .field(self.method.clone(), Message::Method)
+                .text("Invoke this no-argument method")
                 .field(self.idempotency_key.clone(), Message::IdempotencyKey)
                 .button("Invoke", Message::Invoke);
         }
@@ -314,7 +401,6 @@ impl App for SpaceApp {
             Message::Loaded(output) | Message::Invoked(output) | Message::Managed(output) => {
                 self.content = effect_text(output);
             }
-            Message::Method(method) => self.method = method,
             Message::IdempotencyKey(key) => self.idempotency_key = key,
             Message::RoleName(value) => self.role_name = value,
             Message::RolePower(value) => self.role_power = value,
@@ -323,7 +409,12 @@ impl App for SpaceApp {
             Message::MemberRoles(value) => self.member_roles = value,
             Message::OperationKey(value) => self.operation_key = value,
             Message::Invoke => {
-                let Some(agent) = self.route.strip_prefix("/agents/") else {
+                let Some(AgentShellRoute::Method {
+                    agent,
+                    actor,
+                    method,
+                }) = parse_agent_shell_route(&self.route)
+                else {
                     return;
                 };
                 self.content = "Invoking…".into();
@@ -333,7 +424,8 @@ impl App for SpaceApp {
                     Self::identifier("invoke"),
                     Value::object([
                         ("agent".into(), Value::Text(agent.into())),
-                        ("method".into(), Value::Text(self.method.clone())),
+                        ("actor".into(), Value::Text(actor.into())),
+                        ("method".into(), Value::Text(method.into())),
                         (
                             "idempotency_key".into(),
                             Value::Text(self.idempotency_key.clone()),
@@ -752,7 +844,25 @@ fn describe(
         }
         path if path.starts_with("/agents/") => {
             require(access, crate::capability::AGENT_DISCOVER)?;
-            describe_agent(handle, &path[8..])
+            match parse_agent_shell_route(path) {
+                Some(AgentShellRoute::Agent { agent }) => describe_agent(handle, agent),
+                Some(AgentShellRoute::Actors { agent }) => describe_actors(handle, agent),
+                Some(AgentShellRoute::Actor { agent, actor }) => {
+                    describe_actor(handle, agent, actor)
+                }
+                Some(AgentShellRoute::Methods { agent, actor }) => {
+                    describe_methods(handle, agent, actor)
+                }
+                Some(AgentShellRoute::Method {
+                    agent,
+                    actor,
+                    method,
+                }) => describe_method(handle, agent, actor, method),
+                None => Err(service_error(
+                    "vos.not-found",
+                    "unknown or non-canonical Agent → Actor → Method route",
+                )),
+            }
         }
         _ => Err(service_error("vos.not-found", "unknown space route")),
     }
@@ -1003,22 +1113,131 @@ fn describe_roles(
 fn describe_agent(handle: &IngressHandle, name: &str) -> Result<String, HostServiceError> {
     let meta = agent_metadata(handle, name)?;
     Ok(format!(
-        "{}\n{}\n\nMethods:\n{}",
+        "Agent {name}\n\nActors:\n{}\n  s4:/agents/{name}/actors",
         meta.actor_name,
-        meta.doc,
-        meta.messages
-            .into_iter()
-            .map(|message| {
-                format!(
-                    "{}{} -> {}",
-                    message.name,
-                    if message.is_query { " [query]" } else { "" },
-                    message.returns
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     ))
+}
+
+fn describe_actors(handle: &IngressHandle, agent: &str) -> Result<String, HostServiceError> {
+    let meta = agent_metadata(handle, agent)?;
+    Ok(format!(
+        "Actors in {agent}:\n{}\n  s4:/agents/{agent}/actors/{}",
+        meta.actor_name, meta.actor_name,
+    ))
+}
+
+fn require_signed_actor<'a>(
+    meta: &'a crate::metadata::ParsedMeta,
+    actor: &str,
+) -> Result<&'a crate::metadata::ParsedMeta, HostServiceError> {
+    if !is_canonical_schema_name(actor) || meta.actor_name != actor {
+        return Err(service_error(
+            "vos.not-found",
+            "actor is not present in the Agent's signed directory schema",
+        ));
+    }
+    Ok(meta)
+}
+
+fn describe_actor(
+    handle: &IngressHandle,
+    agent: &str,
+    actor: &str,
+) -> Result<String, HostServiceError> {
+    let meta = agent_metadata(handle, agent)?;
+    require_signed_actor(&meta, actor)?;
+    Ok(format!(
+        "Actor {agent}/{actor}\n{}\n\nMethods: {}\n  s4:/agents/{agent}/actors/{actor}/methods",
+        meta.doc,
+        meta.messages.len(),
+    ))
+}
+
+fn describe_methods(
+    handle: &IngressHandle,
+    agent: &str,
+    actor: &str,
+) -> Result<String, HostServiceError> {
+    let meta = agent_metadata(handle, agent)?;
+    require_signed_actor(&meta, actor)?;
+    if meta.messages.is_empty() {
+        return Ok(format!("Actor {agent}/{actor} exposes no methods"));
+    }
+    Ok(meta
+        .messages
+        .iter()
+        .map(|message| {
+            format!(
+                "{}{} -> {}\n  s4:/agents/{agent}/actors/{actor}/methods/{}",
+                message.name,
+                if message.is_query {
+                    " [query]"
+                } else {
+                    " [mutation]"
+                },
+                message.returns,
+                message.name,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn describe_method(
+    handle: &IngressHandle,
+    agent: &str,
+    actor: &str,
+    method: &str,
+) -> Result<String, HostServiceError> {
+    let meta = agent_metadata(handle, agent)?;
+    require_signed_actor(&meta, actor)?;
+    let method = meta
+        .messages
+        .iter()
+        .find(|candidate| candidate.name == method && is_canonical_schema_name(&candidate.name))
+        .ok_or_else(|| {
+            service_error(
+                "vos.not-found",
+                "method is not present in the Actor's signed schema",
+            )
+        })?;
+    Ok(render_method_description(agent, actor, method))
+}
+
+fn render_method_description(
+    agent: &str,
+    actor: &str,
+    method: &crate::metadata::ParsedMessage,
+) -> String {
+    let invocation_kind = if method.is_query { "query" } else { "mutation" };
+    let dispatch = match method.mode {
+        0 => "synchronous",
+        1 => "durable job",
+        _ => "unknown (refused by dispatch)",
+    };
+    let attestation = if method.attested {
+        "required"
+    } else {
+        "not requested"
+    };
+    let idempotency = if method.is_query {
+        "optional"
+    } else {
+        "required"
+    };
+    let authorization = if let Some(capability) = &method.capability {
+        format!("capability {capability}")
+    } else if let Some(role) = method.actor_role {
+        format!("actor role {role}")
+    } else if let Some(role) = method.space_role {
+        format!("space role {role}")
+    } else {
+        "signed package policy".into()
+    };
+    format!(
+        "Method {agent}/{actor}/{}\n{}\n\nkind: {invocation_kind}\ndispatch: {dispatch}\nreturns: {}\ntimeout_ms: {}\nauthorization: {authorization}\nattestation: {attestation}\nidempotency key: {idempotency}",
+        method.name, method.doc, method.returns, method.timeout_ms,
+    )
 }
 
 fn agent_metadata(
@@ -1040,8 +1259,15 @@ fn agent_metadata(
     let crate::value::Value::Bytes(bytes) = value else {
         return Err(service_error("vos.invalid-reply", "invalid agent schema"));
     };
-    crate::metadata::decode(&bytes)
-        .ok_or_else(|| service_error("vos.not-found", "agent has no canonical schema"))
+    let meta = crate::metadata::decode(&bytes)
+        .ok_or_else(|| service_error("vos.not-found", "agent has no canonical schema"))?;
+    if !shell_metadata_is_canonical(&meta) {
+        return Err(service_error(
+            "vos.invalid-reply",
+            "agent schema contains non-canonical or ambiguous names",
+        ));
+    }
+    Ok(meta)
 }
 
 fn dynamic_payload(message: crate::value::Msg) -> Vec<u8> {
@@ -1071,14 +1297,18 @@ fn invoke(
     let agent =
         text("agent").ok_or_else(|| service_error("vos.invalid-request", "missing agent"))?;
     require_canonical_agent_name(agent)?;
+    let actor = text("actor")
+        .filter(|value| is_canonical_schema_name(value))
+        .ok_or_else(|| service_error("vos.invalid-request", "missing or invalid actor"))?;
     let method = text("method")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| service_error("vos.invalid-request", "method must not be empty"))?;
+        .filter(|value| is_canonical_schema_name(value))
+        .ok_or_else(|| service_error("vos.invalid-request", "missing or invalid method"))?;
     let key = text("idempotency_key").unwrap_or_default();
     let target = handle
         .resolve_actor(agent)
         .ok_or_else(|| service_error("vos.not-found", "agent is not attached to this node"))?;
     let meta = agent_metadata(handle, agent)?;
+    require_signed_actor(&meta, actor)?;
     let method_meta = meta
         .messages
         .iter()
@@ -1110,7 +1340,7 @@ fn invoke(
 }
 
 fn require_canonical_agent_name(name: &str) -> Result<(), HostServiceError> {
-    if crate::registry::is_canonical_registry_slug(name) {
+    if is_canonical_agent_name(name) {
         Ok(())
     } else {
         Err(service_error(
@@ -1177,6 +1407,62 @@ mod tests {
             host_key: "/tmp/vos-ssh-test-key".into(),
             max_connections: 8,
             max_sessions_per_member: 2,
+        }
+    }
+
+    #[test]
+    fn agent_shell_routes_are_exactly_nested() {
+        assert_eq!(
+            parse_agent_shell_route("/agents/notes"),
+            Some(AgentShellRoute::Agent { agent: "notes" }),
+        );
+        assert_eq!(
+            parse_agent_shell_route("/agents/notes/actors"),
+            Some(AgentShellRoute::Actors { agent: "notes" }),
+        );
+        assert_eq!(
+            parse_agent_shell_route("/agents/notes/actors/Board"),
+            Some(AgentShellRoute::Actor {
+                agent: "notes",
+                actor: "Board",
+            }),
+        );
+        assert_eq!(
+            parse_agent_shell_route("/agents/notes/actors/Board/methods"),
+            Some(AgentShellRoute::Methods {
+                agent: "notes",
+                actor: "Board",
+            }),
+        );
+        assert_eq!(
+            parse_agent_shell_route("/agents/notes/actors/Board/methods/add_task"),
+            Some(AgentShellRoute::Method {
+                agent: "notes",
+                actor: "Board",
+                method: "add_task",
+            }),
+        );
+    }
+
+    #[test]
+    fn agent_shell_routes_reject_legacy_alias_and_traversal_shapes() {
+        for route in [
+            "/agents/notes/add_task",
+            "/agents/notes/actors/Board/add_task",
+            "/agents/notes/actors/Board/methods/add_task/extra",
+            "/agents//actors/Board",
+            "/agents/notes/actors//methods/add_task",
+            "/agents/notes/actors/Board/methods/",
+            "/agents/notes/actors/../methods/add_task",
+            "/agents/notes/actors/Board%2fOther/methods/add_task",
+            "/agents/notes/actors/Board/methods/%61dd_task",
+            "/agents/Bad_Name/actors/Board",
+            "/agents/notes\\alias/actors/Board",
+        ] {
+            assert!(
+                parse_agent_shell_route(route).is_none(),
+                "accepted non-canonical shell route {route:?}",
+            );
         }
     }
 
@@ -1261,6 +1547,77 @@ mod tests {
         );
         assert!(ssh_invocation_key(&method(false, false), &"x".repeat(129)).is_err());
         assert!(method(false, true).attested);
+    }
+
+    #[test]
+    fn method_screen_displays_signed_invocation_requirements() {
+        let method = crate::metadata::ParsedMessage {
+            name: "add_task".into(),
+            is_query: false,
+            fields: Vec::new(),
+            exposed_to_cli: false,
+            returns: "TaskId".into(),
+            doc: "Create one task".into(),
+            timeout_ms: 5_000,
+            mode: 1,
+            attested: true,
+            space_role: None,
+            actor_role: None,
+            capability: Some("board.write".into()),
+        };
+        let rendered = render_method_description("notes", "Board", &method);
+        for expected in [
+            "Method notes/Board/add_task",
+            "kind: mutation",
+            "dispatch: durable job",
+            "authorization: capability board.write",
+            "attestation: required",
+            "idempotency key: required",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_metadata_rejects_name_aliases_duplicate_methods_and_unknown_dispatch() {
+        let method = crate::metadata::ParsedMessage {
+            name: "get_value".into(),
+            is_query: true,
+            fields: Vec::new(),
+            exposed_to_cli: false,
+            returns: "u64".into(),
+            doc: String::new(),
+            timeout_ms: 1_000,
+            mode: 0,
+            attested: false,
+            space_role: None,
+            actor_role: None,
+            capability: None,
+        };
+        let mut meta = crate::metadata::ParsedMeta {
+            actor_name: "Counter".into(),
+            messages: vec![method.clone()],
+            constructor: Vec::new(),
+            doc: String::new(),
+            crdt: false,
+            provable: false,
+        };
+        assert!(shell_metadata_is_canonical(&meta));
+
+        meta.messages.push(method.clone());
+        assert!(!shell_metadata_is_canonical(&meta));
+        meta.messages.pop();
+        meta.messages[0].name = "../get".into();
+        assert!(!shell_metadata_is_canonical(&meta));
+        meta.messages[0] = method;
+        meta.messages[0].mode = 2;
+        assert!(!shell_metadata_is_canonical(&meta));
+        meta.messages[0].mode = 0;
+        meta.actor_name = "Counter%2fOther".into();
+        assert!(!shell_metadata_is_canonical(&meta));
     }
 
     #[test]

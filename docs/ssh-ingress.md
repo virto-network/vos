@@ -72,7 +72,11 @@ The current built-in routes are:
 | `/roles` | list/edit roles and assignments | discover; management actions require the matching management capability |
 | `/catalog` | published packages | `agent.discover` |
 | `/agents` | installed agents | `agent.discover` |
-| `/agents/<name>` | schema and no-argument invocation | `agent.discover`; invocation requires `agent.invoke` and package policy |
+| `/agents/<name>` | agent overview | `agent.discover` |
+| `/agents/<name>/actors` | signed actor directory | `agent.discover` |
+| `/agents/<name>/actors/<actor>` | actor overview | `agent.discover` |
+| `/agents/<name>/actors/<actor>/methods` | signed method directory | `agent.discover` |
+| `/agents/<name>/actors/<actor>/methods/<method>` | method metadata and no-argument invocation | `agent.discover`; invocation requires `agent.invoke` and package policy |
 
 The UI session may resume on the same running node. It is intentionally not
 durable or replicated; reconnecting after restart or to another node creates a
