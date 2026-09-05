@@ -752,6 +752,17 @@ mod tests {
         methods: ACTOR_SCHEMA.methods,
     };
 
+    const STORAGE_FIELDS: &[super::super::schema::StorageFieldMeta] =
+        &[super::super::schema::StorageFieldMeta {
+            name: "rows",
+            type_identity: "counter::StorageMap<u64,u64>",
+            lane: super::super::StateLane::Linear,
+            prefix: b"rows/",
+            committed: false,
+            leaf_domain: None,
+            node_domain: None,
+        }];
+
     fn signature() -> DeploymentSignature {
         DeploymentSignature {
             producer: ProducerId::of_public_key(b"producer"),
@@ -807,6 +818,15 @@ mod tests {
         schema: &'static super::super::schema::SchemaMeta,
         entry: super::super::schema::ExecutionEntryKind,
     ) -> Package {
+        actor_package_with_storage(metadata, schema, &[], entry)
+    }
+
+    fn actor_package_with_storage(
+        metadata: &'static crate::metadata::ActorMeta,
+        schema: &'static super::super::schema::SchemaMeta,
+        storage: &'static [super::super::schema::StorageFieldMeta],
+        entry: super::super::schema::ExecutionEntryKind,
+    ) -> Package {
         let pvm = vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
             ro_data: Vec::new(),
             rw_data: Vec::new(),
@@ -826,7 +846,7 @@ mod tests {
             .unwrap()
             .encode();
         let (agent_bytes, agent_len) =
-            super::super::schema::encode_with_entry::<1024>(schema, entry);
+            super::super::schema::encode_with_storage::<1024>(schema, storage, entry);
         let agent_schema = agent_bytes[..agent_len].to_vec();
         let requirements = actor_runtime_requirements(
             &super::super::schema::decode(&agent_schema).unwrap(),
@@ -1188,9 +1208,10 @@ mod tests {
 
     #[test]
     fn actor_packages_reject_signed_storage_use_before_install() {
-        let storage = actor_package(
+        let storage = actor_package_with_storage(
             &ACTOR_META,
             &STORAGE_SCHEMA,
+            STORAGE_FIELDS,
             super::super::schema::ExecutionEntryKind::AgentActor,
         );
         assert_eq!(

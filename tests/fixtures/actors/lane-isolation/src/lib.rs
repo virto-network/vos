@@ -50,7 +50,13 @@ pub struct LaneSurface {
     private: u64,
     #[state(skip)]
     derived: u64,
-    #[storage(linear, committed, prefix = "rows/linear/")]
+    #[storage(
+        linear,
+        committed,
+        prefix = "rows/linear/",
+        leaf_domain = "lane-isolation/smt/leaf/v1",
+        node_domain = "lane-isolation/smt/node/v1"
+    )]
     committed: vos::storage::CommittedMap<u64, u64>,
     #[storage(merge, prefix = "rows/merge/")]
     merge_rows: vos::storage::StorageMap<u64, u64>,

@@ -12,6 +12,7 @@ use syn::{FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType, parse_macro_in
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 const MAX_STORAGE_PREFIX_BYTES: usize = 128;
+const MAX_STORAGE_DOMAIN_BYTES: usize = 128;
 
 fn fingerprint_bytes(hash: &mut u64, bytes: &[u8]) {
     for byte in bytes {
@@ -23,16 +24,6 @@ fn fingerprint_bytes(hash: &mut u64, bytes: &[u8]) {
 fn fingerprint_frame(hash: &mut u64, bytes: &[u8]) {
     fingerprint_bytes(hash, &(bytes.len() as u64).to_le_bytes());
     fingerprint_bytes(hash, bytes);
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    encoded
 }
 
 fn fingerprint_literal(hash: &mut u64, literal: proc_macro2::Literal) {
@@ -447,19 +438,17 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         },
     };
-    // Keep inline and row-backed fields in declaration order. Storage handles
-    // do not enter an inline lane codec, but their exact handle type, prefix,
-    // lane, commitment mode, and optional SMT domains are still part of the
-    // signed state-layout identity. The `vos/storage/v1` codec namespace is a
-    // clean discriminator for runtimes which materialize row-backed lanes.
-    let mut agent_field_metas = state_fields
+    // Storage handles do not enter an inline lane codec. Emit them through the
+    // schema's explicit storage surface so the signed bytes carry typed,
+    // independently bounded keyspace and commitment policy.
+    let agent_field_metas = state_fields
         .fields
         .iter()
         .map(|field| {
             let name = field.ident.to_string();
             let ty = &field.ty;
             let persistence = field.persistence.tokens();
-            let tokens = quote! {
+            quote! {
                 vos::agent::schema::FieldMeta {
                     name: #name,
                     // Source spelling alone lets two modules reuse an alias
@@ -468,41 +457,34 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
                     codec: concat!(module_path!(), "::", stringify!(#ty)),
                     persistence: #persistence,
                 }
-            };
-            (field.order, tokens)
+            }
         })
-        .chain(storage_fields.iter().map(|field| {
+        .collect::<Vec<_>>();
+    let agent_storage_metas = storage_fields
+        .iter()
+        .map(|field| {
             let name = field.ident.to_string();
             let ty = &field.ty;
-            let persistence = field.persistence.tokens();
-            let prefix = hex_bytes(&field.prefix);
-            let lane = field.persistence.name();
-            let committed = if field.committed {
-                "committed"
-            } else {
-                "ordinary"
+            let lane = field.persistence.lane_tokens();
+            let prefix = syn::LitByteStr::new(&field.prefix, proc_macro2::Span::call_site());
+            let committed = field.committed;
+            let (leaf_domain, node_domain) = match &field.domains {
+                Some((leaf, node)) => (quote! { Some(#leaf) }, quote! { Some(#node) }),
+                None => (quote! { None }, quote! { None }),
             };
-            let (leaf_domain, node_domain) = field.domains.as_ref().map_or_else(
-                || (String::new(), String::new()),
-                |(leaf, node)| (hex_bytes(leaf.as_bytes()), hex_bytes(node.as_bytes())),
-            );
-            let tokens = quote! {
-                vos::agent::schema::FieldMeta {
+            quote! {
+                vos::agent::schema::StorageFieldMeta {
                     name: #name,
-                    codec: concat!(
-                        "vos/storage/v1\0",
-                        module_path!(), "::", stringify!(#ty), "\0",
-                        #prefix, "\0", #lane, "\0", #committed, "\0",
-                        #leaf_domain, "\0", #node_domain,
-                    ),
-                    persistence: #persistence,
+                    type_identity: concat!(module_path!(), "::", stringify!(#ty)),
+                    lane: #lane,
+                    prefix: #prefix,
+                    committed: #committed,
+                    leaf_domain: #leaf_domain,
+                    node_domain: #node_domain,
                 }
-            };
-            (field.order, tokens)
-        }))
+            }
+        })
         .collect::<Vec<_>>();
-    agent_field_metas.sort_by_key(|(order, _)| *order);
-    let agent_field_metas = agent_field_metas.into_iter().map(|(_, tokens)| tokens);
     let agent_entry_kind = if parsed.task_buf.is_some() {
         quote! { vos::agent::schema::ExecutionEntryKind::Task }
     } else if agent_actor {
@@ -533,12 +515,13 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[cfg(all(target_arch = "riscv64", feature = "bin"))]
         const __VOS_AGENT_SCHEMA_ENCODED: ([u8; 16384], usize) =
-            vos::agent::schema::encode_with_entry::<16384>(
+            vos::agent::schema::encode_with_storage::<16384>(
                 &vos::agent::schema::SchemaMeta {
                     uses_storage: #agent_uses_storage,
                     fields: &[ #( #agent_field_metas ),* ],
                     methods: <#msg_enum>::AGENT_METHODS,
                 },
+                &[ #( #agent_storage_metas ),* ],
                 #agent_entry_kind,
             );
 
@@ -2708,7 +2691,7 @@ fn extract_storage_fields(input: &mut ItemStruct) -> syn::Result<Vec<StorageFiel
 
         let ident = field.ident.clone().expect("named field");
         let prefix = custom.unwrap_or_else(|| format!("s/{ident}/"));
-        if prefix.is_empty() || prefix.starts_with("__vos_") {
+        if prefix.is_empty() || prefix.as_bytes()[0] == 0 || prefix.starts_with("__vos_") {
             return Err(syn::Error::new_spanned(
                 &attr,
                 format!("#[storage] prefix {prefix:?} collides with the framework keyspace"),
@@ -2747,6 +2730,31 @@ fn extract_storage_fields(input: &mut ItemStruct) -> syn::Result<Vec<StorageFiel
                 &attr,
                 "#[storage]: custom SMT domains only apply to `committed` fields",
             ));
+        }
+        if let Some((leaf, node)) = &domains {
+            if leaf == node {
+                return Err(syn::Error::new_spanned(
+                    &attr,
+                    "#[storage]: leaf and node domains must be distinct",
+                ));
+            }
+            for (name, domain) in [("leaf_domain", leaf), ("node_domain", node)] {
+                if domain.is_empty() {
+                    return Err(syn::Error::new_spanned(
+                        &attr,
+                        format!("#[storage]: `{name}` must not be empty"),
+                    ));
+                }
+                if domain.len() > MAX_STORAGE_DOMAIN_BYTES {
+                    return Err(syn::Error::new_spanned(
+                        &attr,
+                        format!(
+                            "#[storage]: `{name}` is {} bytes; the maximum is {MAX_STORAGE_DOMAIN_BYTES}",
+                            domain.len(),
+                        ),
+                    ));
+                }
+            }
         }
         out.push(StorageField {
             ident,
@@ -2921,13 +2929,14 @@ impl PersistencePlan {
         }
     }
 
-    const fn name(self) -> &'static str {
+    fn lane_tokens(self) -> proc_macro2::TokenStream {
         match self {
-            Self::Linear => "linear",
-            Self::Merge => "merge",
-            Self::Local => "local",
-            Self::Constant => "const",
-            Self::Skipped => "skip",
+            Self::Linear => quote! { vos::agent::StateLane::Linear },
+            Self::Merge => quote! { vos::agent::StateLane::Merge },
+            Self::Local => quote! { vos::agent::StateLane::Local },
+            Self::Constant | Self::Skipped => {
+                unreachable!("storage persistence is always a durability lane")
+            }
         }
     }
 }
@@ -3295,6 +3304,37 @@ mod agent_schema_tests {
         ))
         .unwrap();
         assert!(error(oversized).contains("maximum is 128"));
+
+        let nul_prefix: ItemStruct = syn::parse_quote! {
+            struct Stored {
+                #[storage(prefix = "\0private/")]
+                rows: vos::StorageMap<String, String>,
+            }
+        };
+        assert!(error(nul_prefix).contains("framework keyspace"));
+
+        let empty_domain: ItemStruct = syn::parse_quote! {
+            struct Stored {
+                #[storage(committed, leaf_domain = "", node_domain = "tree/node/v1")]
+                rows: vos::StorageMap<String, String>,
+            }
+        };
+        assert!(error(empty_domain).contains("must not be empty"));
+
+        let colliding_domains: ItemStruct = syn::parse_quote! {
+            struct Stored {
+                #[storage(committed, leaf_domain = "tree/v1", node_domain = "tree/v1")]
+                rows: vos::StorageMap<String, String>,
+            }
+        };
+        assert!(error(colliding_domains).contains("must be distinct"));
+
+        let oversized_domain = "x".repeat(MAX_STORAGE_DOMAIN_BYTES + 1);
+        let oversized_domain: ItemStruct = syn::parse_str(&format!(
+            "struct Stored {{ #[storage(committed, leaf_domain = {oversized_domain:?}, node_domain = \"tree/node/v1\")] rows: StorageMap<u8, u8> }}"
+        ))
+        .unwrap();
+        assert!(error(oversized_domain).contains("maximum is 128"));
     }
 
     #[test]
