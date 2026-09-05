@@ -20414,7 +20414,12 @@ pub(crate) mod tests {
             store.instance_id(),
         );
         assert!(matches!(
-            CommittedSharedOrdered::from_reserved_raft_application(reserved, &committee, None),
+            CommittedSharedOrdered::from_reserved_raft_application(
+                reserved,
+                &committee,
+                #[cfg(feature = "storage")]
+                None,
+            ),
             Err(ReplayError::InvalidRecord)
         ));
         assert_eq!(store.heads().unwrap().unwrap(), heads);
