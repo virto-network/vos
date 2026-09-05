@@ -19,6 +19,13 @@ extern crate alloc;
 
 pub use rkyv;
 
+/// Clean-generation portable AgentRuntime SDK. Existing runtime internals are
+/// adapted incrementally, while new actors and custom runtimes can depend on
+/// `vos-agent-sdk` directly without linking the host crate.
+pub use vos_agent_sdk as agent_sdk;
+/// Canonical agent protocol primitives re-exported for host adapters.
+pub use vos_agent_sdk::protocol;
+
 /// Re-export of the [`log`](https://docs.rs/log/0.4) facade. The
 /// per-target `Log` impl is auto-installed by the entry point for
 /// each build flavor (PVM `_start`, `vos_extension_create`,

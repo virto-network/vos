@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
+    "vos-protocol",
+    "vos-agent-sdk",
     "vos",
     "vos/vos-macros",
     "vosx",
@@ -108,6 +110,8 @@ opt-level = 3
 
 [workspace.dependencies]
 # Internal crates
+vos-protocol = { path = "vos-protocol" }
+vos-agent-sdk = { path = "vos-agent-sdk" }
 vos-pvm-proof = { path = "pvm/proof" }
 vos-pvm-proof-derive = { path = "pvm/proof/derive" }
 vos-pvm-proof-verifier = { path = "pvm/proof/verifier" }

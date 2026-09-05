@@ -11,6 +11,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
+/// Portable clean-generation ABI. This namespace is deliberately separate
+/// from the transitional in-crate runtime implementation below, so no legacy
+/// service wire can be decoded as an SDK message.
+pub mod sdk {
+    pub use vos_agent_sdk::*;
+}
 pub mod authority;
 pub mod bootstrap;
 pub mod catalog_finality;

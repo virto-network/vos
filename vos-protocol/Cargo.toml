@@ -1,0 +1,14 @@
+[package]
+name = "vos-protocol"
+description = "Canonical no_std protocol primitives shared by VOS hosts and agent runtimes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+
+[dependencies]
+blake2b_simd = { version = "1", default-features = false }
+rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }

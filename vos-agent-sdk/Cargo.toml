@@ -1,0 +1,13 @@
+[package]
+name = "vos-agent-sdk"
+description = "Portable no_std SDK contract for VOS agent runtimes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+
+[dependencies]
+vos-protocol.workspace = true
