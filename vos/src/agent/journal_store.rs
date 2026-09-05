@@ -261,11 +261,13 @@ pub(crate) trait SharedOrderedCommitStore: AgentJournalStore {
 /// interpret this authority namespace; only an installed, store-bound Agent
 /// snapshot can retire it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "storage")]
 pub(crate) struct SharedOrderedCommitRetirement {
     pub(crate) removed: usize,
     pub(crate) remaining: usize,
 }
 
+#[cfg(feature = "storage")]
 pub(crate) trait SharedOrderedCommitRetirementStore: SharedOrderedCommitStore {
     fn retire_shared_ordered_commits(
         &mut self,
@@ -274,6 +276,7 @@ pub(crate) trait SharedOrderedCommitRetirementStore: SharedOrderedCommitStore {
     ) -> Result<SharedOrderedCommitRetirement, JournalStoreError>;
 }
 
+#[cfg(feature = "storage")]
 fn validate_snapshot_retirement_scope<S: AgentJournalStore>(
     store: &S,
     snapshot: &super::shared_raft::InstalledAgentRaftSnapshotV2,
@@ -294,6 +297,7 @@ fn validate_snapshot_retirement_scope<S: AgentJournalStore>(
     Ok(heads)
 }
 
+#[cfg(feature = "storage")]
 fn binding_retired_by_snapshot(
     binding: &SharedOrderedCommitBinding,
     snapshot: &super::shared_raft::InstalledAgentRaftSnapshotV2,
@@ -4716,6 +4720,7 @@ impl SharedOrderedCommitStore for MemoryAgentJournalStore {
     }
 }
 
+#[cfg(feature = "storage")]
 impl SharedOrderedCommitRetirementStore for MemoryAgentJournalStore {
     fn retire_shared_ordered_commits(
         &mut self,
@@ -10211,6 +10216,7 @@ impl SharedOrderedCommitStore for FileAgentJournalStore {
     }
 }
 
+#[cfg(feature = "storage")]
 impl SharedOrderedCommitRetirementStore for FileAgentJournalStore {
     fn retire_shared_ordered_commits(
         &mut self,
