@@ -14,7 +14,21 @@ pub const MAX_INVOCATION_MESSAGE_BYTES: usize = 8 * 1024;
 pub const MAX_INVOCATION_REPLY_BYTES: usize = 8 * 1024;
 pub const MAX_RESUME_INPUT_BYTES: usize = 8 * 1024;
 pub const MAX_RUNTIME_AVAILABILITY_ITEMS: usize = 16;
-pub const MAX_RUNTIME_AVAILABILITY_BYTES: usize = 64 * 1024;
+/// Caller-selected actor inputs retained across one invocation. This matches
+/// the standard execution ABI's aggregate availability window.
+pub const MAX_RUNTIME_CALLER_AVAILABILITY_BYTES: usize = 48 * 1024;
+/// Largest standard actor PVM staged into one runtime work item.
+pub const MAX_RUNTIME_PROGRAM_BYTES: usize = 1_280 * 1024;
+/// Largest signed actor schema staged alongside the actor PVM.
+pub const MAX_RUNTIME_SCHEMA_BYTES: usize = 16 * 1024;
+/// Largest signed method-policy preimage staged alongside the actor PVM.
+pub const MAX_RUNTIME_EXECUTION_ARTIFACT_BYTES: usize = 64 * 1024;
+/// Complete outer-input availability ceiling: one actor PVM, schema and
+/// policy artifacts, plus the bounded caller-selected availability map.
+pub const MAX_RUNTIME_AVAILABILITY_BYTES: usize = MAX_RUNTIME_PROGRAM_BYTES
+    + MAX_RUNTIME_SCHEMA_BYTES
+    + MAX_RUNTIME_EXECUTION_ARTIFACT_BYTES
+    + MAX_RUNTIME_CALLER_AVAILABILITY_BYTES;
 pub const MAX_AFTER_COMMIT_MERGE_MESSAGES: usize = 256;
 
 /// Runtime-owned durable state split only at replication boundaries. Hosts
@@ -67,6 +81,32 @@ impl RuntimeBlob {
     pub fn validate(&self) -> bool {
         self.bytes.len() <= MAX_RUNTIME_AVAILABILITY_BYTES && self.reference.matches(&self.bytes)
     }
+}
+
+fn availability_valid(values: &[RuntimeBlob]) -> bool {
+    values.len() <= MAX_RUNTIME_AVAILABILITY_ITEMS
+        && values.iter().all(RuntimeBlob::validate)
+        && values
+            .windows(2)
+            .all(|pair| pair[0].reference < pair[1].reference)
+        && values
+            .iter()
+            .try_fold(0usize, |total, blob| total.checked_add(blob.bytes.len()))
+            .is_some_and(|total| total <= MAX_RUNTIME_AVAILABILITY_BYTES)
+}
+
+fn required_refs_valid(values: &[BlobRef]) -> bool {
+    values.len() <= MAX_RUNTIME_AVAILABILITY_ITEMS
+        && values.iter().all(|reference| {
+            reference.hash != Hash::ZERO
+                && reference.len != 0
+                && reference.len <= MAX_RUNTIME_AVAILABILITY_BYTES as u64
+        })
+        && values.windows(2).all(|pair| pair[0] < pair[1])
+        && values
+            .iter()
+            .try_fold(0u64, |total, reference| total.checked_add(reference.len))
+            .is_some_and(|total| total <= MAX_RUNTIME_AVAILABILITY_BYTES as u64)
 }
 
 /// Explicit authenticated caller identities. Principals, transport nodes, and
@@ -139,17 +179,7 @@ impl InvocationWork {
             && self.program != ProgramId::ZERO
             && self.origin.validate()
             && self.message.len() <= MAX_INVOCATION_MESSAGE_BYTES
-            && self.availability.len() <= MAX_RUNTIME_AVAILABILITY_ITEMS
-            && self.availability.iter().all(RuntimeBlob::validate)
-            && self
-                .availability
-                .windows(2)
-                .all(|pair| pair[0].reference < pair[1].reference)
-            && self
-                .availability
-                .iter()
-                .try_fold(0usize, |total, blob| total.checked_add(blob.bytes.len()))
-                .is_some_and(|total| total <= MAX_RUNTIME_AVAILABILITY_BYTES)
+            && availability_valid(&self.availability)
             && self.gas != 0
     }
 
@@ -307,6 +337,9 @@ pub struct ResumeWork {
     pub mode: MethodMode,
     pub continuation: BlobRef,
     pub ready_sequence: u64,
+    /// Exact preimages named by the yielded continuation. This map must cover
+    /// the yielded `required` set with no missing, extra, or aliased entry.
+    pub availability: Vec<RuntimeBlob>,
     pub input: Option<ResumeInput>,
 }
 
@@ -319,7 +352,9 @@ impl ResumeWork {
             self.deployment,
             self.program,
             &self.continuation,
-        ) && self.input.as_ref().is_none_or(ResumeInput::validate)
+        ) && self.ready_sequence != 0
+            && availability_valid(&self.availability)
+            && self.input.as_ref().is_none_or(ResumeInput::validate)
     }
 }
 
@@ -377,6 +412,27 @@ pub enum InvocationError {
     NotReady,
 }
 
+impl InvocationError {
+    /// Whether a structurally admitted invocation retains this deterministic
+    /// rejection by advancing its owning exact-result clock.
+    ///
+    /// Malformed work is rejected before this classification is consulted.
+    pub const fn is_durable_exact_outcome(self) -> bool {
+        matches!(
+            self,
+            Self::NotFound
+                | Self::StaleIncarnation
+                | Self::Suspended
+                | Self::StaleDeployment
+                | Self::WrongProgram
+                | Self::UnsupportedMethod
+                | Self::InvalidInput
+                | Self::InvalidActorOutput
+                | Self::UnsupportedHostCall(_)
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct YieldedInvocation {
     pub invocation: InvocationId,
@@ -387,6 +443,9 @@ pub struct YieldedInvocation {
     pub mode: MethodMode,
     pub continuation: BlobRef,
     pub ready_sequence: u64,
+    /// Strictly sorted immutable preimages which the host must re-supply on
+    /// resume. The continuation retains references, never catalog bytes.
+    pub required: Vec<BlobRef>,
     pub reason: YieldReason,
 }
 
@@ -399,10 +458,12 @@ impl YieldedInvocation {
             self.deployment,
             self.program,
             &self.continuation,
-        ) && match self.reason {
-            YieldReason::Cooperative => true,
-            YieldReason::Await { call } => call != CallId::ZERO,
-        }
+        ) && self.ready_sequence != 0
+            && required_refs_valid(&self.required)
+            && match self.reason {
+                YieldReason::Cooperative => true,
+                YieldReason::Await { call } => call != CallId::ZERO,
+            }
     }
 }
 
@@ -482,11 +543,64 @@ mod tests {
                 len: 128,
             },
             ready_sequence: 7,
+            availability: alloc::vec![],
             input: None,
         };
         assert!(resume.validate());
+        resume.ready_sequence = 0;
+        assert!(!resume.validate());
+        resume.ready_sequence = 7;
         resume.continuation.len = crate::MAX_RUNTIME_STATE_BYTES as u64 + 1;
         assert!(!resume.validate());
+    }
+
+    #[test]
+    fn resume_preimages_and_yielded_requirements_are_canonical_maps() {
+        let runtime_blob = |bytes: &[u8]| RuntimeBlob {
+            reference: BlobRef::of_bytes(bytes),
+            bytes: bytes.to_vec(),
+        };
+        let mut availability = alloc::vec![runtime_blob(b"first"), runtime_blob(b"second")];
+        availability.sort_unstable_by_key(|blob| blob.reference.clone());
+        let mut resume = ResumeWork {
+            invocation: InvocationId([1; 32]),
+            actor: ActorId([2; 32]),
+            incarnation: Hash([3; 32]),
+            deployment: DeploymentId([4; 32]),
+            program: ProgramId([5; 32]),
+            mode: MethodMode::Linear,
+            continuation: BlobRef::of_bytes(b"continuation"),
+            ready_sequence: 1,
+            availability: availability.clone(),
+            input: None,
+        };
+        assert!(resume.validate());
+        resume.availability[0].bytes[0] ^= 1;
+        assert!(
+            !resume.validate(),
+            "aliases with mismatched bytes fail closed"
+        );
+
+        let mut required = availability
+            .iter()
+            .map(|blob| blob.reference.clone())
+            .collect::<Vec<_>>();
+        let mut yielded = YieldedInvocation {
+            invocation: resume.invocation,
+            actor: resume.actor,
+            incarnation: resume.incarnation,
+            deployment: resume.deployment,
+            program: resume.program,
+            mode: resume.mode,
+            continuation: resume.continuation,
+            ready_sequence: 1,
+            required: required.clone(),
+            reason: YieldReason::Cooperative,
+        };
+        assert!(yielded.validate());
+        required.swap(0, 1);
+        yielded.required = required;
+        assert!(!yielded.validate());
     }
 
     #[test]

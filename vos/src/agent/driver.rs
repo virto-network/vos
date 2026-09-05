@@ -15,6 +15,8 @@ use std::sync::Arc;
 use vos_pvm::refine_host::RefineContext;
 use vos_pvm::{ExitReason, Gas};
 
+use crate::agent_sdk::wire::CanonicalWire as AgentCanonicalWire;
+
 use super::authority::{ActorInvocationReceipt, AgentAuthorityReceipt, AuthorityError};
 pub use super::execution::MAX_RUNTIME_STATE_BYTES;
 use super::execution::{
@@ -2019,6 +2021,159 @@ impl<S: AgentImageStore> AgentDriver<S> {
         self.invoke_raw(invocation, authority.clone(), observed_slot)
     }
 
+    /// Execute one clean-generation invocation. A Yielded outcome is an
+    /// atomically persisted intermediate revision and is returned to the
+    /// scheduler; it is never converted into a terminal actor result.
+    pub fn invoke_sdk(
+        &mut self,
+        invocation: crate::agent_sdk::InvocationWork,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, AgentDriverError> {
+        if !invocation.validate() {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        if self.image.runtime_program == super::STANDARD_RUNTIME_PROGRAM_ID {
+            validate_standard_sdk_invoke_preflight(&self.image.runtime_state, &invocation)?;
+        }
+        let observed_slot = self
+            .trust
+            .current_logical_slot()
+            .ok_or(AgentDriverError::TrustUnavailable)?;
+        let gas = self
+            .management_gas
+            .checked_add(invocation.gas)
+            .ok_or(AgentDriverError::InvalidRuntime)?;
+        self.apply_sdk_work(
+            crate::agent_sdk::RuntimeWork::Invoke {
+                state: legacy_state_as_sdk(&self.image.runtime_state),
+                invocation: Box::new(invocation),
+                authority: Box::new(authority),
+                observed_slot,
+            },
+            gas,
+        )
+    }
+
+    /// Resume one previously persisted clean continuation. Immutable
+    /// availability is supplied again by exact reference; the guest checks
+    /// the FIFO sequence and continuation commitment before restoring it.
+    pub fn resume_sdk(
+        &mut self,
+        resume: crate::agent_sdk::ResumeWork,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, AgentDriverError> {
+        if !resume.validate() {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        if resume.input.is_some() {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        if self.image.runtime_program == super::STANDARD_RUNTIME_PROGRAM_ID {
+            validate_standard_sdk_resume_preflight(&self.image.runtime_state, &resume)?;
+        }
+        self.apply_sdk_work(
+            crate::agent_sdk::RuntimeWork::Resume {
+                state: legacy_state_as_sdk(&self.image.runtime_state),
+                resume: Box::new(resume),
+            },
+            self.management_gas
+                .saturating_add(super::execution::MAX_EXECUTION_GAS),
+        )
+    }
+
+    fn apply_sdk_work(
+        &mut self,
+        work: crate::agent_sdk::RuntimeWork,
+        gas: Gas,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, AgentDriverError> {
+        let (expected, mode) = match &work {
+            crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } => (
+                (
+                    invocation.invocation,
+                    invocation.actor,
+                    invocation.incarnation,
+                    invocation.deployment,
+                    invocation.program,
+                ),
+                invocation.mode,
+            ),
+            crate::agent_sdk::RuntimeWork::Resume { resume, .. } => (
+                (
+                    resume.invocation,
+                    resume.actor,
+                    resume.incarnation,
+                    resume.deployment,
+                    resume.program,
+                ),
+                resume.mode,
+            ),
+            crate::agent_sdk::RuntimeWork::Manage { .. } => {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+        };
+        let encoded = work
+            .encode()
+            .map_err(|_| AgentDriverError::InvalidRuntime)?;
+        let returned: crate::agent_sdk::RuntimeTransition =
+            execute_runtime_canonical(&self.runtime_pvm, gas, &encoded)?;
+        let next = sdk_state_as_legacy(&returned.state);
+        validate_state_size(&next, &self.image.config.runtime_contract)?;
+        match &returned.outcome {
+            crate::agent_sdk::RuntimeOutcome::Yielded(yielded) => {
+                if (
+                    yielded.invocation,
+                    yielded.actor,
+                    yielded.incarnation,
+                    yielded.deployment,
+                    yielded.program,
+                ) != expected
+                    || yielded.mode != mode
+                {
+                    return Err(AgentDriverError::InvalidRuntime);
+                }
+                if self.image.runtime_program == super::STANDARD_RUNTIME_PROGRAM_ID {
+                    validate_standard_sdk_yielded_transition(&next, &work, yielded)?;
+                }
+            }
+            crate::agent_sdk::RuntimeOutcome::Completed(Ok(reply)) => {
+                if (
+                    reply.invocation,
+                    reply.actor,
+                    reply.incarnation,
+                    reply.deployment,
+                ) != (expected.0, expected.1, expected.2, expected.3)
+                    || reply.mode != mode
+                {
+                    return Err(AgentDriverError::InvalidRuntime);
+                }
+                if reply.status != crate::agent_sdk::InvocationStatus::Done {
+                    validate_sdk_exact_execution_transition(
+                        self.image.runtime_program,
+                        &self.image.runtime_state,
+                        &next,
+                        &work,
+                    )?;
+                }
+            }
+            crate::agent_sdk::RuntimeOutcome::Completed(Err(error)) => {
+                validate_sdk_error_transition(
+                    self.image.runtime_program,
+                    &self.image.runtime_state,
+                    &next,
+                    &work,
+                    *error,
+                )?;
+            }
+            crate::agent_sdk::RuntimeOutcome::Management(_) => {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+        }
+        validate_execution_transition(&self.image.runtime_state, &next, sdk_mode_as_legacy(mode))?;
+        if next != self.image.runtime_state {
+            self.commit_runtime_state(next)?;
+        }
+        Ok(returned.outcome)
+    }
+
     /// Execute the raw runtime invocation after the public verification seam
     /// has sealed it. Replicated host adapters in this crate may reuse this
     /// deterministic path only after independently verifying their ordered
@@ -2553,6 +2708,95 @@ fn validate_execution_transition(
     Ok(())
 }
 
+fn validate_standard_sdk_invoke_preflight(
+    prior: &RuntimeState,
+    invocation: &crate::agent_sdk::InvocationWork,
+) -> Result<(), AgentDriverError> {
+    // Unsupported clean identities are a host admission failure, not a
+    // fabricated terminal guest outcome: no exact-result clock has advanced.
+    if !super::standard::clean_origin_supported_by_actor_abi(&invocation.origin) {
+        return Err(AgentDriverError::InvalidRuntime);
+    }
+    let state = super::wire::decode_standard_runtime_state(prior)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let runtime = super::standard::StandardAgentRuntime::restore(state)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    match runtime.resolve_clean_invocation(invocation) {
+        Ok(_) => Ok(()),
+        Err(
+            crate::agent_sdk::InvocationError::InvalidAvailability
+            | crate::agent_sdk::InvocationError::InvalidInput,
+        ) => Err(AgentDriverError::InvalidRuntime),
+        // Authenticated target errors are exact guest outcomes; they must
+        // still cross the runtime so its owning clock advances.
+        Err(_) => Ok(()),
+    }
+}
+
+fn validate_standard_sdk_resume_preflight(
+    prior: &RuntimeState,
+    resume: &crate::agent_sdk::ResumeWork,
+) -> Result<(), AgentDriverError> {
+    let state = super::wire::decode_standard_runtime_state(prior)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let runtime = super::standard::StandardAgentRuntime::restore(state)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let (_, accepted) = runtime
+        .resolve_clean_resume(resume)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    runtime
+        .resolve_clean_invocation(&accepted)
+        .map(|_| ())
+        .map_err(|_| AgentDriverError::InvalidRuntime)
+}
+
+fn validate_standard_sdk_yielded_transition(
+    next: &RuntimeState,
+    work: &crate::agent_sdk::RuntimeWork,
+    yielded: &crate::agent_sdk::YieldedInvocation,
+) -> Result<(), AgentDriverError> {
+    let availability = match work {
+        crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } => &invocation.availability,
+        crate::agent_sdk::RuntimeWork::Resume { resume, .. } => &resume.availability,
+        crate::agent_sdk::RuntimeWork::Manage { .. } => {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+    };
+    let state = super::wire::decode_standard_runtime_state(next)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let runtime = super::standard::StandardAgentRuntime::restore(state)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let resume = crate::agent_sdk::ResumeWork {
+        invocation: yielded.invocation,
+        actor: yielded.actor,
+        incarnation: yielded.incarnation,
+        deployment: yielded.deployment,
+        program: yielded.program,
+        mode: yielded.mode,
+        continuation: yielded.continuation.clone(),
+        ready_sequence: yielded.ready_sequence,
+        availability: availability.clone(),
+        input: None,
+    };
+    let (record, accepted) = runtime
+        .resolve_clean_resume(&resume)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    if let crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } = work
+        && accepted != **invocation
+    {
+        return Err(AgentDriverError::InvalidRuntime);
+    }
+    if record
+        .yielded()
+        .map_err(|_| AgentDriverError::InvalidRuntime)?
+        == *yielded
+    {
+        Ok(())
+    } else {
+        Err(AgentDriverError::InvalidRuntime)
+    }
+}
+
 fn validate_exact_execution_transition(
     runtime_program: ProgramId,
     prior: &RuntimeState,
@@ -2572,6 +2816,85 @@ fn validate_exact_execution_transition(
         .map_err(|_| AgentDriverError::InvalidRuntime)?;
     let expected = super::wire::encode_standard_runtime_state(&runtime.snapshot());
     if next == &expected {
+        Ok(())
+    } else {
+        Err(AgentDriverError::InvalidRuntime)
+    }
+}
+
+fn validate_sdk_exact_execution_transition(
+    runtime_program: ProgramId,
+    prior: &RuntimeState,
+    next: &RuntimeState,
+    work: &crate::agent_sdk::RuntimeWork,
+) -> Result<(), AgentDriverError> {
+    let mode = match work {
+        crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } => invocation.mode,
+        crate::agent_sdk::RuntimeWork::Resume { resume, .. } => resume.mode,
+        crate::agent_sdk::RuntimeWork::Manage { .. } => {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+    };
+    if runtime_program != super::STANDARD_RUNTIME_PROGRAM_ID {
+        return validate_execution_transition(prior, next, sdk_mode_as_legacy(mode));
+    }
+
+    let state = super::wire::decode_standard_runtime_state(prior)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    let mut runtime = super::standard::StandardAgentRuntime::restore(state)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    match work {
+        crate::agent_sdk::RuntimeWork::Invoke {
+            invocation,
+            observed_slot,
+            ..
+        } => runtime
+            .commit_clean_exact_outcome_clock(invocation.mode, *observed_slot)
+            .map_err(|_| AgentDriverError::InvalidRuntime)?,
+        crate::agent_sdk::RuntimeWork::Resume { resume, .. } => {
+            let (record, accepted) = runtime
+                .resolve_clean_resume(resume)
+                .map_err(|_| AgentDriverError::InvalidRuntime)?;
+            let (invocation, _, _, _) = runtime
+                .resolve_clean_invocation(&accepted)
+                .map_err(|_| AgentDriverError::InvalidRuntime)?;
+            runtime
+                .consume_machine_continuation(&invocation, record.ready_sequence)
+                .map_err(|_| AgentDriverError::InvalidRuntime)?;
+            runtime
+                .commit_clean_exact_outcome_clock(resume.mode, record.observed_slot)
+                .map_err(|_| AgentDriverError::InvalidRuntime)?;
+        }
+        crate::agent_sdk::RuntimeWork::Manage { .. } => unreachable!("rejected above"),
+    }
+    let expected = super::wire::encode_standard_runtime_state(&runtime.snapshot());
+    if next == &expected {
+        Ok(())
+    } else {
+        Err(AgentDriverError::InvalidRuntime)
+    }
+}
+
+fn validate_sdk_error_transition(
+    runtime_program: ProgramId,
+    prior: &RuntimeState,
+    next: &RuntimeState,
+    work: &crate::agent_sdk::RuntimeWork,
+    error: crate::agent_sdk::InvocationError,
+) -> Result<(), AgentDriverError> {
+    if runtime_program != super::STANDARD_RUNTIME_PROGRAM_ID {
+        let mode = match work {
+            crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } => invocation.mode,
+            crate::agent_sdk::RuntimeWork::Resume { resume, .. } => resume.mode,
+            crate::agent_sdk::RuntimeWork::Manage { .. } => {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+        };
+        return validate_execution_transition(prior, next, sdk_mode_as_legacy(mode));
+    }
+    if error.is_durable_exact_outcome() {
+        validate_sdk_exact_execution_transition(runtime_program, prior, next, work)
+    } else if next == prior {
         Ok(())
     } else {
         Err(AgentDriverError::InvalidRuntime)
@@ -2670,6 +2993,53 @@ fn execute_runtime_wire<T: ServiceWire>(
     }
     let output = invocation.output().ok_or(AgentDriverError::RuntimeOutput)?;
     T::decode(&output).map_err(|_| AgentDriverError::RuntimeOutput)
+}
+
+fn execute_runtime_canonical<T: AgentCanonicalWire>(
+    runtime_pvm: &[u8],
+    gas: Gas,
+    input: &[u8],
+) -> Result<T, AgentDriverError> {
+    let invocation = RefineContext::load(runtime_pvm, input, gas)
+        .map_err(|_| AgentDriverError::InvalidRuntime)?
+        .run();
+    if invocation.exit != ExitReason::Halt {
+        return Err(AgentDriverError::RuntimeExit {
+            reason: invocation.exit,
+            pc: invocation.pc,
+        });
+    }
+    let output = invocation.output().ok_or(AgentDriverError::RuntimeOutput)?;
+    T::decode(&output).map_err(|_| AgentDriverError::RuntimeOutput)
+}
+
+fn legacy_state_as_sdk(state: &RuntimeState) -> crate::agent_sdk::RuntimeState {
+    crate::agent_sdk::RuntimeState {
+        control: state.control.clone(),
+        linear: state.linear.clone(),
+        merge: state.merge.clone(),
+        local: state.local.clone(),
+    }
+}
+
+fn sdk_state_as_legacy(state: &crate::agent_sdk::RuntimeState) -> RuntimeState {
+    RuntimeState {
+        control: state.control.clone(),
+        linear: state.linear.clone(),
+        merge: state.merge.clone(),
+        local: state.local.clone(),
+    }
+}
+
+const fn sdk_mode_as_legacy(mode: crate::agent_sdk::MethodMode) -> super::MethodMode {
+    match mode {
+        crate::agent_sdk::MethodMode::Query => super::MethodMode::Query,
+        crate::agent_sdk::MethodMode::LinearizableQuery => super::MethodMode::LinearizableQuery,
+        crate::agent_sdk::MethodMode::LocalQuery => super::MethodMode::LocalQuery,
+        crate::agent_sdk::MethodMode::Linear => super::MethodMode::Linear,
+        crate::agent_sdk::MethodMode::Merge => super::MethodMode::Merge,
+        crate::agent_sdk::MethodMode::Local => super::MethodMode::Local,
+    }
 }
 
 #[cfg(test)]
@@ -3150,6 +3520,186 @@ mod tests {
                 &wrong_component,
                 &invocation,
                 9,
+            ),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+    }
+
+    fn sdk_exact_invoke_work(
+        prior: &RuntimeState,
+        invocation: &ActorInvocation,
+        observed_slot: u64,
+    ) -> crate::agent_sdk::RuntimeWork {
+        use crate::agent_sdk::authority::{
+            AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots, AuthorityOperationKind,
+            AuthorityReceipt, AuthorityReceiptSelector,
+        };
+
+        let decoded = super::super::wire::decode_standard_runtime_state(prior).unwrap();
+        let config = decoded.config.unwrap();
+        let clean = crate::agent_sdk::InvocationWork {
+            space: crate::agent_sdk::SpaceId(config.identity.space.0),
+            agent: crate::agent_sdk::AgentId(config.identity.agent.0),
+            runtime_deployment: crate::agent_sdk::DeploymentId(
+                config.identity.runtime_deployment.0,
+            ),
+            invocation: crate::agent_sdk::InvocationId(invocation.invocation.0),
+            actor: crate::agent_sdk::ActorId(invocation.actor.0),
+            incarnation: crate::agent_sdk::Hash(invocation.incarnation.0),
+            deployment: crate::agent_sdk::DeploymentId(invocation.deployment.0),
+            program: crate::agent_sdk::ProgramId(invocation.program.0),
+            mode: crate::agent_sdk::MethodMode::Linear,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            message: invocation.message.clone(),
+            availability: Vec::new(),
+            gas: invocation.gas,
+            recovery_only: false,
+        };
+        let public_key = [0x31; 32];
+        let authority = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: crate::agent_sdk::Hash([0x32; 32]),
+                issuer: AuthorityIssuer {
+                    principal: crate::agent_sdk::PrincipalId(config.identity.owner.0),
+                    actor: crate::agent_sdk::ActorId(config.authority.actor.0),
+                    deployment: crate::agent_sdk::DeploymentId(config.authority.deployment.0),
+                    program: crate::agent_sdk::ProgramId(config.authority.program.0),
+                    producer: crate::agent_sdk::ProducerId::of_public_key(&public_key),
+                },
+                space: clean.space,
+                agent: clean.agent,
+                operation: AuthorityOperationKind::InvokeActor,
+                runtime_deployment: clean.runtime_deployment,
+                actor: Some(clean.actor),
+                actor_deployment: Some(clean.deployment),
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: crate::agent_sdk::Hash([0x33; 32]),
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch: 1,
+                valid_from: 1,
+                expires_at: observed_slot,
+                request: clean.commitment(),
+            },
+            public_key,
+            signature: [0x34; 64],
+        };
+        crate::agent_sdk::RuntimeWork::Invoke {
+            state: crate::agent_sdk::RuntimeState {
+                control: prior.control.clone(),
+                linear: prior.linear.clone(),
+                merge: prior.merge.clone(),
+                local: prior.local.clone(),
+            },
+            invocation: Box::new(clean),
+            authority: Box::new(authority),
+            observed_slot,
+        }
+    }
+
+    #[test]
+    fn sdk_error_transitions_reject_hostile_standard_and_custom_state() {
+        use crate::agent_sdk::InvocationError;
+
+        let observed_slot = 9;
+        let (prior, exact, invocation) = standard_exact_transition_fixture(observed_slot);
+        let work = sdk_exact_invoke_work(&prior, &invocation, observed_slot);
+        let crate::agent_sdk::RuntimeWork::Invoke {
+            invocation: clean, ..
+        } = &work
+        else {
+            unreachable!()
+        };
+        let mut unsupported_origin = (**clean).clone();
+        unsupported_origin.origin.actor = Some(crate::agent_sdk::ActorId([0x38; 32]));
+        let unchanged = prior.clone();
+        assert_eq!(
+            validate_standard_sdk_invoke_preflight(&prior, &unsupported_origin),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        assert_eq!(
+            validate_standard_sdk_invoke_preflight(&prior, &unsupported_origin),
+            Err(AgentDriverError::InvalidRuntime),
+            "an exact retry is the same nonterminal host rejection"
+        );
+        assert_eq!(prior, unchanged);
+        assert_eq!(
+            validate_sdk_error_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                &exact,
+                &work,
+                InvocationError::InvalidActorOutput,
+            ),
+            Ok(())
+        );
+        let mut forged_exact = exact.clone();
+        forged_exact.linear.push(0xff);
+        assert_eq!(
+            validate_sdk_error_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                &forged_exact,
+                &work,
+                InvocationError::InvalidActorOutput,
+            ),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        assert_eq!(
+            validate_sdk_error_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                &prior,
+                &work,
+                InvocationError::InvalidInput,
+            ),
+            Err(AgentDriverError::InvalidRuntime),
+            "a runtime cannot turn a host-admission failure into an unclocked terminal result"
+        );
+        assert_eq!(
+            validate_sdk_error_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                &prior,
+                &work,
+                InvocationError::InvalidAvailability,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_sdk_error_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                &exact,
+                &work,
+                InvocationError::InvalidAvailability,
+            ),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let custom = ProgramId([0x35; 32]);
+        let mut owned = prior.clone();
+        owned.linear.push(0x36);
+        assert_eq!(
+            validate_sdk_error_transition(
+                custom,
+                &prior,
+                &owned,
+                &work,
+                InvocationError::InvalidAvailability,
+            ),
+            Ok(())
+        );
+        owned.merge.push(0x37);
+        assert_eq!(
+            validate_sdk_error_transition(
+                custom,
+                &prior,
+                &owned,
+                &work,
+                InvocationError::InvalidAvailability,
             ),
             Err(AgentDriverError::InvalidRuntime)
         );

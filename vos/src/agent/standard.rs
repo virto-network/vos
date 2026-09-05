@@ -236,14 +236,184 @@ pub(crate) struct StandardMachineContinuation {
     pub deployment: DeploymentId,
     pub program: ProgramId,
     pub mode: super::MethodMode,
+    /// Internal execution request commitment used by exact-result recovery.
     pub request: Hash,
+    /// Clean SDK InvocationWork commitment. Legacy execution records set this
+    /// equal to `request` and have no accepted clean work metadata.
+    pub work: Hash,
     pub ready_sequence: u64,
+    /// Clean work and authority accepted on the first slice. Immutable
+    /// availability bytes are deliberately absent; only their sorted refs are
+    /// retained and every resume must supply the exact preimages again.
+    pub accepted: Option<StandardAcceptedInvocation>,
+    pub authority: Option<crate::agent_sdk::authority::AuthorityReceipt>,
+    pub observed_slot: u64,
     pub continuation: super::execution::ActorMachineContinuation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StandardAcceptedInvocation {
+    pub space: crate::agent_sdk::SpaceId,
+    pub agent: crate::agent_sdk::AgentId,
+    pub runtime_deployment: crate::agent_sdk::DeploymentId,
+    pub invocation: crate::agent_sdk::InvocationId,
+    pub actor: crate::agent_sdk::ActorId,
+    pub incarnation: crate::agent_sdk::Hash,
+    pub deployment: crate::agent_sdk::DeploymentId,
+    pub program: crate::agent_sdk::ProgramId,
+    pub mode: crate::agent_sdk::MethodMode,
+    pub origin: crate::agent_sdk::InvocationOrigin,
+    pub message: Vec<u8>,
+    pub required: Vec<crate::agent_sdk::BlobRef>,
+    pub gas: u64,
+    pub recovery_only: bool,
+}
+
+impl StandardAcceptedInvocation {
+    pub(crate) fn from_work(work: &crate::agent_sdk::InvocationWork) -> Self {
+        Self {
+            space: work.space,
+            agent: work.agent,
+            runtime_deployment: work.runtime_deployment,
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            program: work.program,
+            mode: work.mode,
+            origin: work.origin,
+            message: work.message.clone(),
+            required: work
+                .availability
+                .iter()
+                .map(|blob| blob.reference.clone())
+                .collect(),
+            gas: work.gas,
+            recovery_only: work.recovery_only,
+        }
+    }
+
+    pub(crate) fn with_availability(
+        &self,
+        availability: Vec<crate::agent_sdk::RuntimeBlob>,
+    ) -> crate::agent_sdk::InvocationWork {
+        crate::agent_sdk::InvocationWork {
+            space: self.space,
+            agent: self.agent,
+            runtime_deployment: self.runtime_deployment,
+            invocation: self.invocation,
+            actor: self.actor,
+            incarnation: self.incarnation,
+            deployment: self.deployment,
+            program: self.program,
+            mode: self.mode,
+            origin: self.origin,
+            message: self.message.clone(),
+            availability,
+            gas: self.gas,
+            recovery_only: self.recovery_only,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> bool {
+        self.space != crate::agent_sdk::SpaceId::ZERO
+            && self.agent != crate::agent_sdk::AgentId::ZERO
+            && self.runtime_deployment != crate::agent_sdk::DeploymentId::ZERO
+            && self.invocation != crate::agent_sdk::InvocationId::ZERO
+            && self.actor != crate::agent_sdk::ActorId::ZERO
+            && self.incarnation != crate::agent_sdk::Hash::ZERO
+            && self.deployment != crate::agent_sdk::DeploymentId::ZERO
+            && self.program != crate::agent_sdk::ProgramId::ZERO
+            && self.origin.validate()
+            && self.message.len() <= crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES
+            && self.gas != 0
+            && !self.recovery_only
+            && self.required.len() <= crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_ITEMS
+            && self.required.windows(2).all(|pair| pair[0] < pair[1])
+            && self.required.iter().all(|reference| {
+                reference.hash != crate::agent_sdk::Hash::ZERO
+                    && reference.len != 0
+                    && reference.len <= crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_BYTES as u64
+            })
+            && self
+                .required
+                .iter()
+                .try_fold(0u64, |total, reference| total.checked_add(reference.len))
+                .is_some_and(|total| {
+                    total <= crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_BYTES as u64
+                })
+    }
 }
 
 impl StandardMachineContinuation {
     fn storage(&self) -> InvocationResultStorage {
         self.mode.result_storage()
+    }
+
+    pub(crate) fn validate_record(&self) -> bool {
+        let clean_pair = match (&self.accepted, &self.authority) {
+            (Some(accepted), Some(authority)) => {
+                accepted.validate()
+                    && clean_origin_supported_by_actor_abi(&accepted.origin)
+                    && accepted.invocation.0 == self.invocation.0
+                    && accepted.actor.0 == self.actor.0
+                    && accepted.incarnation.0 == self.incarnation.0
+                    && accepted.deployment.0 == self.deployment.0
+                    && accepted.program.0 == self.program.0
+                    && accepted.mode as u8 == self.mode as u8
+                    && authority.validate_shape().is_ok()
+                    && authority.selector.space == accepted.space
+                    && authority.selector.agent == accepted.agent
+                    && authority.selector.runtime_deployment == accepted.runtime_deployment
+                    && authority.selector.actor == Some(accepted.actor)
+                    && authority.selector.actor_deployment == Some(accepted.deployment)
+                    && authority.selector.request.0 == self.work.0
+            }
+            (None, None) => self.work == self.request,
+            _ => false,
+        };
+        self.invocation != InvocationId::ZERO
+            && self.actor != ActorId::ZERO
+            && self.incarnation != Hash::ZERO
+            && self.deployment != DeploymentId::ZERO
+            && self.program != ProgramId::ZERO
+            && self.request != Hash::ZERO
+            && self.work != Hash::ZERO
+            && self.ready_sequence != 0
+            && self.continuation.validate()
+            && clean_pair
+    }
+
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, crate::service::wire::DecodeError> {
+        super::wire::encode_standard_machine_continuation(self)
+    }
+
+    pub(crate) fn clean_reference(
+        &self,
+    ) -> Result<crate::agent_sdk::BlobRef, crate::service::wire::DecodeError> {
+        self.canonical_bytes()
+            .map(|bytes| crate::agent_sdk::BlobRef::of_bytes(&bytes))
+    }
+
+    pub(crate) fn yielded(
+        &self,
+    ) -> Result<crate::agent_sdk::YieldedInvocation, crate::service::wire::DecodeError> {
+        let accepted = self
+            .accepted
+            .as_ref()
+            .ok_or(crate::service::wire::DecodeError::NonCanonical)?;
+        Ok(crate::agent_sdk::YieldedInvocation {
+            invocation: accepted.invocation,
+            actor: accepted.actor,
+            incarnation: accepted.incarnation,
+            deployment: accepted.deployment,
+            program: accepted.program,
+            mode: accepted.mode,
+            continuation: self.clean_reference()?,
+            ready_sequence: self.ready_sequence,
+            required: accepted.required.clone(),
+            reason: crate::agent_sdk::YieldReason::Cooperative,
+        })
     }
 }
 
@@ -261,6 +431,23 @@ fn continuation_order_key(continuation: &StandardMachineContinuation) -> (u8, u6
         continuation_storage_tag(continuation.storage()),
         continuation.ready_sequence,
     )
+}
+
+const fn clean_method_mode(mode: crate::agent_sdk::MethodMode) -> super::MethodMode {
+    match mode {
+        crate::agent_sdk::MethodMode::Query => super::MethodMode::Query,
+        crate::agent_sdk::MethodMode::LinearizableQuery => super::MethodMode::LinearizableQuery,
+        crate::agent_sdk::MethodMode::LocalQuery => super::MethodMode::LocalQuery,
+        crate::agent_sdk::MethodMode::Linear => super::MethodMode::Linear,
+        crate::agent_sdk::MethodMode::Merge => super::MethodMode::Merge,
+        crate::agent_sdk::MethodMode::Local => super::MethodMode::Local,
+    }
+}
+
+pub(crate) const fn clean_origin_supported_by_actor_abi(
+    origin: &crate::agent_sdk::InvocationOrigin,
+) -> bool {
+    origin.transport_node.is_none() && origin.credential.is_none() && origin.actor.is_none()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -495,16 +682,10 @@ impl StandardAgentRuntime {
                 (pair[0].scope, pair[0].invocation) >= (pair[1].scope, pair[1].invocation)
             })
             || state.machine_continuations.len() > MAX_MACHINE_CONTINUATIONS
-            || state.machine_continuations.iter().any(|continuation| {
-                continuation.invocation == InvocationId::ZERO
-                    || continuation.actor == ActorId::ZERO
-                    || continuation.incarnation == Hash::ZERO
-                    || continuation.deployment == DeploymentId::ZERO
-                    || continuation.program == ProgramId::ZERO
-                    || continuation.request == Hash::ZERO
-                    || continuation.ready_sequence == 0
-                    || !continuation.continuation.validate()
-            })
+            || state
+                .machine_continuations
+                .iter()
+                .any(|continuation| !continuation.validate_record())
             || state
                 .machine_continuations
                 .windows(2)
@@ -600,6 +781,7 @@ impl StandardAgentRuntime {
         }
         runtime.lane_state = state.lane_state;
         runtime.lane_revisions = state.lane_revisions;
+        runtime.control_authority_slot = state.control_authority_slot;
         runtime.validate_restored_lane_state()?;
         for result in state.invocation_results {
             let actor = runtime.actors.get(&result.reply.actor);
@@ -625,6 +807,23 @@ impl StandardAgentRuntime {
         }
         for continuation in state.machine_continuations {
             let actor = runtime.actors.get(&continuation.actor);
+            let clean_target_valid = match (&continuation.accepted, &continuation.authority) {
+                (Some(accepted), Some(authority)) => {
+                    runtime
+                        .verify_clean_accepted_authority(accepted, authority, continuation.work)
+                        .is_ok()
+                        // The immutable acceptance slot is checked against
+                        // the signed window once on every hostile-state
+                        // restore. Current-time expiry is deliberately not
+                        // reapplied when Resume later executes.
+                        && authority.selector.is_live_at(continuation.observed_slot)
+                        && runtime
+                            .result_authority_slot(continuation.storage())
+                            .is_some_and(|high_water| high_water >= continuation.observed_slot)
+                }
+                (None, None) => true,
+                _ => false,
+            };
             if actor.is_none_or(|actor| {
                 actor.record.state_generation != continuation.incarnation
                     || actor.record.entry.deployment != continuation.deployment
@@ -634,7 +833,8 @@ impl StandardAgentRuntime {
                         .mode
                         .write_lane()
                         .is_some_and(|lane| !actor.record.entry.lanes.contains(lane))
-            }) || !runtime.result_storage_supported(continuation.storage())
+            }) || !clean_target_valid
+                || !runtime.result_storage_supported(continuation.storage())
                 || runtime.invocation_results.contains_key(&(
                     continuation.mode.invocation_scope(),
                     continuation.invocation,
@@ -644,7 +844,6 @@ impl StandardAgentRuntime {
             }
             runtime.machine_continuations.push(continuation);
         }
-        runtime.control_authority_slot = state.control_authority_slot;
         for storage in [
             InvocationResultStorage::Control,
             InvocationResultStorage::Lane(StateLane::Linear),
@@ -778,6 +977,13 @@ impl StandardAgentRuntime {
         }
     }
 
+    fn result_authority_slot(&self, storage: InvocationResultStorage) -> Option<u64> {
+        match storage {
+            InvocationResultStorage::Control => self.control_authority_slot,
+            InvocationResultStorage::Lane(lane) => self.lane_revisions.authority_slot(lane),
+        }
+    }
+
     /// Commit only the monotone authority clock for one externally retained
     /// exact outcome. Terminal replies and deterministic execution errors do
     /// not enter the guest result table and cannot mutate actor state.
@@ -791,6 +997,20 @@ impl StandardAgentRuntime {
         let storage = invocation.mode.result_storage();
         if !self.result_storage_supported(storage) {
             return Err(ActorExecutionError::UnsupportedResultStorage);
+        }
+        self.advance_result_authority_slot(storage, observed_slot);
+        Ok(())
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn commit_clean_exact_outcome_clock(
+        &mut self,
+        mode: crate::agent_sdk::MethodMode,
+        observed_slot: u64,
+    ) -> Result<(), crate::agent_sdk::InvocationError> {
+        let storage = clean_method_mode(mode).result_storage();
+        if !self.result_storage_supported(storage) {
+            return Err(crate::agent_sdk::InvocationError::UnsupportedResultStorage);
         }
         self.advance_result_authority_slot(storage, observed_slot);
         Ok(())
@@ -1057,6 +1277,249 @@ impl StandardAgentRuntime {
     }
 
     #[cfg(feature = "pvm")]
+    pub(crate) fn verify_clean_invocation_authority(
+        &self,
+        invocation: &crate::agent_sdk::InvocationWork,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<(), crate::agent_sdk::InvocationError> {
+        use crate::agent_sdk::InvocationError;
+        use crate::agent_sdk::authority::AuthorityOperationKind;
+
+        let config = self.config.as_ref().ok_or(InvocationError::NotCreated)?;
+        let selector = &authority.selector;
+        if !invocation.validate()
+            || authority.validate_shape().is_err()
+            || selector.operation != AuthorityOperationKind::InvokeActor
+            || selector.space != invocation.space
+            || selector.agent != invocation.agent
+            || selector.runtime_deployment != invocation.runtime_deployment
+            || selector.actor != Some(invocation.actor)
+            || selector.actor_deployment != Some(invocation.deployment)
+            || selector.request != invocation.commitment()
+            || invocation.space.0 != config.identity.space.0
+            || invocation.agent.0 != config.identity.agent.0
+            || invocation.runtime_deployment.0 != config.identity.runtime_deployment.0
+            || selector.issuer.actor.0 != config.authority.actor.0
+            || selector.issuer.deployment.0 != config.authority.deployment.0
+            || selector.issuer.program.0 != config.authority.program.0
+            || config.authority.public_key
+                != super::authority::ed25519_public_key_wire(authority.public_key)
+            || !super::authority::verify_raw_ed25519(
+                &authority.public_key,
+                &authority.signing_bytes(),
+                &authority.signature,
+            )
+        {
+            return Err(InvocationError::InvalidAuthorization);
+        }
+        Ok(())
+    }
+
+    /// Revalidate the immutable authorization proof embedded in a portable
+    /// continuation without applying its logical-slot window again. Restore
+    /// treats runtime state as hostile input, so accepting a merely
+    /// well-shaped receipt here would turn state corruption into an
+    /// authorization bypass on Resume.
+    #[cfg(feature = "pvm")]
+    fn verify_clean_accepted_authority(
+        &self,
+        accepted: &StandardAcceptedInvocation,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        expected_work: Hash,
+    ) -> Result<(), crate::agent_sdk::InvocationError> {
+        use crate::agent_sdk::InvocationError;
+        use crate::agent_sdk::authority::AuthorityOperationKind;
+
+        let config = self.config.as_ref().ok_or(InvocationError::NotCreated)?;
+        let selector = &authority.selector;
+        if !accepted.validate()
+            || authority.validate_shape().is_err()
+            || selector.operation != AuthorityOperationKind::InvokeActor
+            || selector.space != accepted.space
+            || selector.agent != accepted.agent
+            || selector.runtime_deployment != accepted.runtime_deployment
+            || selector.actor != Some(accepted.actor)
+            || selector.actor_deployment != Some(accepted.deployment)
+            || selector.request.0 != expected_work.0
+            || accepted.space.0 != config.identity.space.0
+            || accepted.agent.0 != config.identity.agent.0
+            || accepted.runtime_deployment.0 != config.identity.runtime_deployment.0
+            || selector.issuer.actor.0 != config.authority.actor.0
+            || selector.issuer.deployment.0 != config.authority.deployment.0
+            || selector.issuer.program.0 != config.authority.program.0
+            || config.authority.public_key
+                != super::authority::ed25519_public_key_wire(authority.public_key)
+            || !super::authority::verify_raw_ed25519(
+                &authority.public_key,
+                &authority.signing_bytes(),
+                &authority.signature,
+            )
+        {
+            return Err(InvocationError::InvalidAuthorization);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn validate_clean_unseen_invocation_slot(
+        &self,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        observed_slot: u64,
+    ) -> Result<(), crate::agent_sdk::InvocationError> {
+        use crate::agent_sdk::InvocationError;
+
+        if !authority.selector.is_live_at(observed_slot) {
+            return Err(InvocationError::AuthorityExpired);
+        }
+        if self
+            .logical_slot_high_water()
+            .is_some_and(|high_water| observed_slot < high_water)
+        {
+            return Err(InvocationError::AuthoritySlotRegressed);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn resolve_clean_invocation(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+    ) -> Result<
+        (
+            super::execution::ActorInvocation,
+            Vec<u8>,
+            super::execution::RuntimeBlob,
+            super::execution::RuntimeBlob,
+        ),
+        crate::agent_sdk::InvocationError,
+    > {
+        use crate::agent_sdk::InvocationError;
+        use crate::service::{Origin, SubjectId};
+
+        let actor_id = ActorId(work.actor.0);
+        let actor = self
+            .actors
+            .get(&actor_id)
+            .ok_or(InvocationError::NotFound)?;
+        if actor.record.state_generation.0 != work.incarnation.0 {
+            return Err(InvocationError::StaleIncarnation);
+        }
+        if actor.record.entry.deployment.0 != work.deployment.0 {
+            return Err(InvocationError::StaleDeployment);
+        }
+        if actor.record.entry.program.0 != work.program.0 {
+            return Err(InvocationError::WrongProgram);
+        }
+
+        let mut program_index = None;
+        let mut schema_index = None;
+        let mut policy_index = None;
+        for (index, blob) in work.availability.iter().enumerate() {
+            if blob.bytes.len() <= super::execution::MAX_EXECUTION_PROGRAM_BYTES
+                && crate::service::ProgramId::of_pvm(&blob.bytes).0 == work.program.0
+            {
+                if program_index.replace(index).is_some() {
+                    return Err(InvocationError::InvalidAvailability);
+                }
+            }
+            let legacy = crate::service::BlobRef::of_bytes(&blob.bytes);
+            if legacy == actor.record.agent_schema {
+                if schema_index.replace(index).is_some() {
+                    return Err(InvocationError::InvalidAvailability);
+                }
+            }
+            if legacy == actor.record.role_policies {
+                if policy_index.replace(index).is_some() {
+                    return Err(InvocationError::InvalidAvailability);
+                }
+            }
+        }
+        let program_index = program_index.ok_or(InvocationError::InvalidAvailability)?;
+        let schema_index = schema_index.ok_or(InvocationError::InvalidAvailability)?;
+        let policy_index = policy_index.ok_or(InvocationError::InvalidAvailability)?;
+        if program_index == schema_index
+            || program_index == policy_index
+            || schema_index == policy_index
+        {
+            // Artifact roles are independently authenticated. Even when two
+            // catalog hashes happen to alias, one availability entry cannot
+            // stand in for more than one role.
+            return Err(InvocationError::InvalidAvailability);
+        }
+
+        // The legacy actor dispatch frame has no authenticated transport-node
+        // or credential slots, and its actor origin additionally requires a
+        // complete ServiceIdentity which the clean envelope intentionally
+        // does not pretend to provide. Fail closed until the actor dispatch
+        // ABI can preserve these identities without projection.
+        if !clean_origin_supported_by_actor_abi(&work.origin) {
+            return Err(InvocationError::InvalidInput);
+        }
+
+        let auth = match (work.origin.principal, work.origin.capability) {
+            (Some(principal), capability) => super::execution::ActorInvocationAuth {
+                origin: Origin::Member(SubjectId(principal.0)),
+                principal: Some(crate::service::PrincipalId(principal.0)),
+                origin_service: None,
+                space_role: None,
+                actor_role: None,
+                capability: capability.map(|value| crate::service::CapabilityId(value.0)),
+            },
+            (None, Some(capability)) => super::execution::ActorInvocationAuth {
+                origin: Origin::System,
+                principal: None,
+                origin_service: None,
+                space_role: None,
+                actor_role: None,
+                capability: Some(crate::service::CapabilityId(capability.0)),
+            },
+            (None, None) => super::execution::ActorInvocationAuth::anonymous(),
+        };
+        let mut application_availability = work
+            .availability
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                *index != program_index && *index != schema_index && *index != policy_index
+            })
+            .map(|(_, blob)| super::execution::RuntimeBlob {
+                reference: crate::service::BlobRef::of_bytes(&blob.bytes),
+                bytes: blob.bytes.clone(),
+            })
+            .collect::<Vec<_>>();
+        application_availability.sort_unstable_by_key(|blob| blob.reference.hash);
+        let invocation = super::execution::ActorInvocation {
+            invocation: InvocationId(work.invocation.0),
+            actor: actor_id,
+            incarnation: Hash(work.incarnation.0),
+            deployment: DeploymentId(work.deployment.0),
+            program: ProgramId(work.program.0),
+            mode: clean_method_mode(work.mode),
+            auth,
+            message: work.message.clone(),
+            availability: application_availability,
+            gas: work.gas,
+        };
+        invocation
+            .validate()
+            .map_err(|_| InvocationError::InvalidInput)?;
+        let actor_schema = super::execution::RuntimeBlob {
+            reference: actor.record.agent_schema.clone(),
+            bytes: work.availability[schema_index].bytes.clone(),
+        };
+        let actor_policies = super::execution::RuntimeBlob {
+            reference: actor.record.role_policies.clone(),
+            bytes: work.availability[policy_index].bytes.clone(),
+        };
+        Ok((
+            invocation,
+            work.availability[program_index].bytes.clone(),
+            actor_schema,
+            actor_policies,
+        ))
+    }
+
+    #[cfg(feature = "pvm")]
     pub(crate) fn validate_unseen_invocation_slot(
         &self,
         _invocation: &super::execution::ActorInvocation,
@@ -1178,6 +1641,104 @@ impl StandardAgentRuntime {
     }
 
     #[cfg(feature = "pvm")]
+    pub(crate) fn recover_clean_yield(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<Option<crate::agent_sdk::YieldedInvocation>, crate::agent_sdk::InvocationError>
+    {
+        use crate::agent_sdk::InvocationError;
+
+        let scope = clean_method_mode(work.mode).invocation_scope();
+        let Some(record) = self.machine_continuations.iter().find(|record| {
+            record.mode.invocation_scope() == scope && record.invocation.0 == work.invocation.0
+        }) else {
+            return Ok(None);
+        };
+        let expected = StandardAcceptedInvocation::from_work(work);
+        if record.accepted.as_ref() != Some(&expected)
+            || record.work.0 != work.commitment().0
+            || record
+                .authority
+                .as_ref()
+                .is_none_or(|accepted| accepted.commitment() != authority.commitment())
+        {
+            return Err(InvocationError::DivergentInvocation);
+        }
+        record
+            .yielded()
+            .map(Some)
+            .map_err(|_| InvocationError::StaleContinuation)
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn resolve_clean_resume(
+        &self,
+        resume: &crate::agent_sdk::ResumeWork,
+    ) -> Result<
+        (
+            StandardMachineContinuation,
+            crate::agent_sdk::InvocationWork,
+        ),
+        crate::agent_sdk::InvocationError,
+    > {
+        use crate::agent_sdk::InvocationError;
+
+        let mode = clean_method_mode(resume.mode);
+        let Some(record) = self.machine_continuations.iter().find(|record| {
+            record.mode.invocation_scope() == mode.invocation_scope()
+                && record.invocation.0 == resume.invocation.0
+        }) else {
+            return Err(InvocationError::StaleContinuation);
+        };
+        if record.actor.0 != resume.actor.0
+            || record.incarnation.0 != resume.incarnation.0
+            || record.deployment.0 != resume.deployment.0
+            || record.program.0 != resume.program.0
+            || record.mode != mode
+            || record.clean_reference().ok().as_ref() != Some(&resume.continuation)
+        {
+            return Err(InvocationError::StaleContinuation);
+        }
+        if record.ready_sequence != resume.ready_sequence {
+            return Err(InvocationError::NotReady);
+        }
+        let head = self
+            .machine_continuations
+            .iter()
+            .find(|candidate| candidate.storage() == record.storage())
+            .ok_or(InvocationError::StaleContinuation)?;
+        if head.invocation != record.invocation || head.ready_sequence != record.ready_sequence {
+            return Err(InvocationError::NotReady);
+        }
+        let accepted = record
+            .accepted
+            .as_ref()
+            .ok_or(InvocationError::StaleContinuation)?;
+        let supplied = resume
+            .availability
+            .iter()
+            .map(|blob| blob.reference.clone())
+            .collect::<Vec<_>>();
+        if supplied != accepted.required {
+            return Err(InvocationError::InvalidAvailability);
+        }
+        let work = accepted.with_availability(resume.availability.clone());
+        if !work.validate() {
+            return Err(InvocationError::InvalidAvailability);
+        }
+        if work.commitment().0 != record.work.0
+            || record
+                .authority
+                .as_ref()
+                .is_none_or(|authority| authority.selector.request.0 != record.work.0)
+        {
+            return Err(InvocationError::StaleContinuation);
+        }
+        Ok((record.clone(), work))
+    }
+
+    #[cfg(feature = "pvm")]
     pub(crate) fn consume_machine_continuation(
         &mut self,
         invocation: &super::execution::ActorInvocation,
@@ -1215,10 +1776,46 @@ impl StandardAgentRuntime {
         invocation: &super::execution::ActorInvocation,
         reply: &super::execution::ActorExecutionReply,
         before: &super::execution::ActorStateLanes,
+        after: super::execution::ActorStateLanes,
+        observed_slot: u64,
+        expected_sequence: Option<u64>,
+        continuation: super::execution::ActorMachineContinuation,
+        accepted: Option<(
+            StandardAcceptedInvocation,
+            crate::agent_sdk::authority::AuthorityReceipt,
+        )>,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        // Yield is one atomic runtime transition even when this method is
+        // reused outside the current top-level pristine-clone wrapper.
+        let mut candidate = self.clone();
+        candidate.commit_yielded_execution_inner(
+            invocation,
+            reply,
+            before,
+            after,
+            observed_slot,
+            expected_sequence,
+            continuation,
+            accepted,
+        )?;
+        *self = candidate;
+        Ok(())
+    }
+
+    #[cfg(feature = "pvm")]
+    fn commit_yielded_execution_inner(
+        &mut self,
+        invocation: &super::execution::ActorInvocation,
+        reply: &super::execution::ActorExecutionReply,
+        before: &super::execution::ActorStateLanes,
         mut after: super::execution::ActorStateLanes,
         observed_slot: u64,
         expected_sequence: Option<u64>,
         continuation: super::execution::ActorMachineContinuation,
+        accepted: Option<(
+            StandardAcceptedInvocation,
+            crate::agent_sdk::authority::AuthorityReceipt,
+        )>,
     ) -> Result<(), super::execution::ActorExecutionError> {
         use super::execution::{ActorExecutionError, ActorExecutionStatus};
 
@@ -1292,8 +1889,17 @@ impl StandardAgentRuntime {
             .map(|record| record.ready_sequence)
             .max()
             .unwrap_or(0)
+            .max(expected_sequence.unwrap_or(0))
             .checked_add(1)
             .ok_or(ActorExecutionError::ResultCapacity)?;
+        let (work, accepted, authority) = match accepted {
+            Some((accepted, authority)) => (
+                Hash(authority.selector.request.0),
+                Some(accepted),
+                Some(authority),
+            ),
+            None => (invocation.commitment(), None, None),
+        };
         let record = StandardMachineContinuation {
             invocation: invocation.invocation,
             actor: invocation.actor,
@@ -1302,9 +1908,16 @@ impl StandardAgentRuntime {
             program: invocation.program,
             mode: invocation.mode,
             request: invocation.commitment(),
+            work,
             ready_sequence,
+            accepted,
+            authority,
+            observed_slot,
             continuation,
         };
+        if !record.validate_record() {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
         let key = continuation_order_key(&record);
         let index = self
             .machine_continuations

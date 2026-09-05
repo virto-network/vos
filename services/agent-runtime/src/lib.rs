@@ -14,7 +14,10 @@ mod guest {
     use core::arch::global_asm;
 
     use vos::agent::execution::RuntimeExecutionCall;
-    use vos::agent::wire::{RuntimeCall, apply_standard, apply_standard_execution};
+    use vos::agent::wire::{
+        RuntimeCall, apply_standard, apply_standard_execution, apply_standard_runtime_work,
+    };
+    use vos::agent_sdk::wire::CanonicalWire as _;
     use vos::service::ServiceWire;
 
     #[repr(C)]
@@ -38,7 +41,13 @@ mod guest {
         // SAFETY: the standard PVM loader maps the complete argument window
         // read-only and supplies its base/length in a0/a1.
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
-        let output = if input.starts_with(&RuntimeCall::MAGIC) {
+        let output = if input.starts_with(&vos::agent_sdk::RuntimeWork::MAGIC) {
+            let work = vos::agent_sdk::RuntimeWork::decode(input).unwrap_or_else(|_| fail_closed());
+            apply_standard_runtime_work(work)
+                .unwrap_or_else(|_| fail_closed())
+                .encode()
+                .unwrap_or_else(|_| fail_closed())
+        } else if input.starts_with(&RuntimeCall::MAGIC) {
             let call = RuntimeCall::decode(input).unwrap_or_else(|_| fail_closed());
             apply_standard(call)
                 .unwrap_or_else(|_| fail_closed())

@@ -668,6 +668,12 @@ pub fn decode_standard_runtime_state(
         super::standard::MAX_MACHINE_CONTINUATIONS,
         |decoder| decode_machine_continuation(decoder, super::InvocationResultStorage::Control),
     )?;
+    if machine_continuations
+        .windows(2)
+        .any(|pair| pair[0].ready_sequence >= pair[1].ready_sequence)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
     if !decoder.exhausted() {
         return Err(DecodeError::TrailingBytes);
     }
@@ -678,7 +684,10 @@ pub fn decode_standard_runtime_state(
         (StateLane::Merge, state.merge.as_slice()),
         (StateLane::Local, state.local.as_slice()),
     ] {
-        let decoded = decode_standard_lane(bytes, lane)?;
+        let remaining_continuations = super::standard::MAX_MACHINE_CONTINUATIONS
+            .checked_sub(machine_continuations.len())
+            .ok_or(DecodeError::LimitExceeded)?;
+        let decoded = decode_standard_lane(bytes, lane, remaining_continuations)?;
         match lane {
             StateLane::Linear => {
                 lane_revisions.linear = decoded.revision;
@@ -708,12 +717,6 @@ pub fn decode_standard_runtime_state(
     {
         return Err(DecodeError::NonCanonical);
     }
-    machine_continuations.sort_unstable_by_key(|continuation| {
-        (
-            invocation_result_storage_tag(continuation.mode.result_storage()),
-            continuation.ready_sequence,
-        )
-    });
     if machine_continuations.windows(2).any(|pair| {
         (
             invocation_result_storage_tag(pair[0].mode.result_storage()),
@@ -806,7 +809,67 @@ struct DecodedStandardLane {
     machine_continuations: Vec<StandardMachineContinuation>,
 }
 
+pub(crate) const STANDARD_MACHINE_CONTINUATION_MAGIC: [u8; 4] = *b"SMCN";
+pub(crate) const STANDARD_MACHINE_CONTINUATION_VERSION: u16 = 1;
+pub(crate) const MAX_STANDARD_MACHINE_CONTINUATION_BYTES: usize =
+    super::execution::MAX_RUNTIME_STATE_BYTES;
+
+/// Encode one self-contained portable continuation record. Its clean SDK
+/// BlobRef is computed over these exact bytes; embedded runtime state uses the
+/// same envelope rather than a second, subtly different representation.
+pub(crate) fn encode_standard_machine_continuation(
+    value: &StandardMachineContinuation,
+) -> Result<Vec<u8>, DecodeError> {
+    if !value.validate_record() {
+        return Err(DecodeError::NonCanonical);
+    }
+    let mut output = Vec::new();
+    output.extend_from_slice(&STANDARD_MACHINE_CONTINUATION_MAGIC);
+    output.extend_from_slice(crate::agent_sdk::RUNTIME_ABI_ID.as_bytes());
+    let mut encoder = Encoder(&mut output);
+    encoder.u16(STANDARD_MACHINE_CONTINUATION_VERSION);
+    encode_machine_continuation_body(&mut encoder, value)?;
+    if output.len() > MAX_STANDARD_MACHINE_CONTINUATION_BYTES {
+        return Err(DecodeError::LimitExceeded);
+    }
+    Ok(output)
+}
+
+pub(crate) fn decode_standard_machine_continuation(
+    bytes: &[u8],
+) -> Result<StandardMachineContinuation, DecodeError> {
+    if bytes.len() > MAX_STANDARD_MACHINE_CONTINUATION_BYTES {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let mut decoder = Decoder::new(bytes);
+    if decoder.take(4)? != STANDARD_MACHINE_CONTINUATION_MAGIC {
+        return Err(DecodeError::InvalidTag);
+    }
+    if decoder.fixed()? != crate::agent_sdk::RUNTIME_ABI_ID.0
+        || decoder.u16()? != STANDARD_MACHINE_CONTINUATION_VERSION
+    {
+        return Err(DecodeError::InvalidPlatform);
+    }
+    let value = decode_machine_continuation_body(&mut decoder)?;
+    if !decoder.exhausted() {
+        return Err(DecodeError::TrailingBytes);
+    }
+    value
+        .validate_record()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
 fn encode_machine_continuation(encoder: &mut Encoder<'_>, value: &StandardMachineContinuation) {
+    let bytes = encode_standard_machine_continuation(value)
+        .expect("restored standard continuation is canonically encodable");
+    encoder.bytes(&bytes);
+}
+
+fn encode_machine_continuation_body(
+    encoder: &mut Encoder<'_>,
+    value: &StandardMachineContinuation,
+) -> Result<(), DecodeError> {
     encoder.fixed(&value.invocation.0);
     encoder.fixed(&value.actor.0);
     encoder.fixed(&value.incarnation.0);
@@ -814,7 +877,19 @@ fn encode_machine_continuation(encoder: &mut Encoder<'_>, value: &StandardMachin
     encoder.fixed(&value.program.0);
     encoder.u8(encode_method_mode(value.mode));
     encoder.fixed(&value.request.0);
+    encoder.fixed(&value.work.0);
     encoder.u64(value.ready_sequence);
+    encoder.u64(value.observed_slot);
+    encoder.option(&value.accepted, |encoder, accepted| {
+        encode_accepted_invocation(encoder, accepted)
+    });
+    encoder.option(&value.authority, |encoder, authority| {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        let bytes = authority
+            .encode()
+            .expect("validated clean authority receipt is encodable");
+        encoder.bytes(&bytes);
+    });
     encoder.u8(value.continuation.fetch_index);
     encoder.u32(value.continuation.host_budget.calls);
     encoder.u32(value.continuation.host_budget.fetch_calls);
@@ -830,11 +905,26 @@ fn encode_machine_continuation(encoder: &mut Encoder<'_>, value: &StandardMachin
         encoder.u32(region.base);
         encoder.bytes(&region.bytes);
     });
+    Ok(())
 }
 
 fn decode_machine_continuation(
     decoder: &mut Decoder<'_>,
     expected_storage: super::InvocationResultStorage,
+) -> Result<StandardMachineContinuation, DecodeError> {
+    let bytes = decoder.bytes_ref()?;
+    if bytes.len() > MAX_STANDARD_MACHINE_CONTINUATION_BYTES {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let value = decode_standard_machine_continuation(bytes)?;
+    if value.mode.result_storage() != expected_storage {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
+}
+
+fn decode_machine_continuation_body(
+    decoder: &mut Decoder<'_>,
 ) -> Result<StandardMachineContinuation, DecodeError> {
     let invocation = crate::service::InvocationId(decoder.fixed()?);
     let actor = ActorId(decoder.fixed()?);
@@ -843,7 +933,19 @@ fn decode_machine_continuation(
     let program = ProgramId(decoder.fixed()?);
     let mode = decode_method_mode(decoder.u8()?)?;
     let request = Hash(decoder.fixed()?);
+    let work = Hash(decoder.fixed()?);
     let ready_sequence = decoder.u64()?;
+    let observed_slot = decoder.u64()?;
+    let accepted = decoder.option(decode_accepted_invocation)?;
+    let authority = decoder.option(|decoder| {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        let bytes = decoder.bytes_ref()?;
+        if bytes.len() > crate::agent_sdk::wire::MAX_AUTHORITY_RECEIPT_WIRE_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        crate::agent_sdk::authority::AuthorityReceipt::decode(bytes)
+            .map_err(|_| DecodeError::NonCanonical)
+    })?;
     let fetch_index = decoder.u8()?;
     let host_budget = super::execution::ActorHostBudget {
         calls: decoder.u32()?,
@@ -891,7 +993,11 @@ fn decode_machine_continuation(
         program,
         mode,
         request,
+        work,
         ready_sequence,
+        accepted,
+        authority,
+        observed_slot,
         continuation,
     };
     if invocation == crate::service::InvocationId::ZERO
@@ -900,18 +1006,134 @@ fn decode_machine_continuation(
         || deployment == DeploymentId::ZERO
         || program == ProgramId::ZERO
         || request == Hash::ZERO
+        || work == Hash::ZERO
         || ready_sequence == 0
-        || mode.result_storage() != expected_storage
-        || !value.continuation.validate()
+        || !value.validate_record()
     {
         return Err(DecodeError::NonCanonical);
     }
     Ok(value)
 }
 
+fn encode_sdk_blob(encoder: &mut Encoder<'_>, value: &crate::agent_sdk::BlobRef) {
+    encoder.fixed(value.hash.as_bytes());
+    encoder.u64(value.len);
+}
+
+fn decode_sdk_blob(decoder: &mut Decoder<'_>) -> Result<crate::agent_sdk::BlobRef, DecodeError> {
+    Ok(crate::agent_sdk::BlobRef {
+        hash: crate::agent_sdk::Hash(decoder.fixed()?),
+        len: decoder.u64()?,
+    })
+}
+
+fn encode_sdk_origin(encoder: &mut Encoder<'_>, value: crate::agent_sdk::InvocationOrigin) {
+    encoder.option(&value.principal, |encoder, value| {
+        encoder.fixed(value.as_bytes())
+    });
+    encoder.option(&value.transport_node, |encoder, value| {
+        encoder.fixed(value.as_bytes())
+    });
+    encoder.option(&value.credential, |encoder, value| {
+        encoder.fixed(value.as_bytes())
+    });
+    encoder.option(&value.actor, |encoder, value| {
+        encoder.fixed(value.as_bytes())
+    });
+    encoder.option(&value.capability, |encoder, value| {
+        encoder.fixed(value.as_bytes())
+    });
+}
+
+fn decode_sdk_origin(
+    decoder: &mut Decoder<'_>,
+) -> Result<crate::agent_sdk::InvocationOrigin, DecodeError> {
+    let value = crate::agent_sdk::InvocationOrigin {
+        principal: decoder.option(|decoder| Ok(crate::agent_sdk::PrincipalId(decoder.fixed()?)))?,
+        transport_node: decoder.option(|decoder| Ok(crate::agent_sdk::NodeId(decoder.fixed()?)))?,
+        credential: decoder
+            .option(|decoder| Ok(crate::agent_sdk::CredentialId(decoder.fixed()?)))?,
+        actor: decoder.option(|decoder| Ok(crate::agent_sdk::ActorId(decoder.fixed()?)))?,
+        capability: decoder
+            .option(|decoder| Ok(crate::agent_sdk::CapabilityId(decoder.fixed()?)))?,
+    };
+    value
+        .validate()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn decode_sdk_method_mode(value: u8) -> Result<crate::agent_sdk::MethodMode, DecodeError> {
+    match value {
+        0 => Ok(crate::agent_sdk::MethodMode::Query),
+        1 => Ok(crate::agent_sdk::MethodMode::LinearizableQuery),
+        2 => Ok(crate::agent_sdk::MethodMode::LocalQuery),
+        3 => Ok(crate::agent_sdk::MethodMode::Linear),
+        4 => Ok(crate::agent_sdk::MethodMode::Merge),
+        5 => Ok(crate::agent_sdk::MethodMode::Local),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn encode_accepted_invocation(
+    encoder: &mut Encoder<'_>,
+    value: &super::standard::StandardAcceptedInvocation,
+) {
+    encoder.fixed(value.space.as_bytes());
+    encoder.fixed(value.agent.as_bytes());
+    encoder.fixed(value.runtime_deployment.as_bytes());
+    encoder.fixed(value.invocation.as_bytes());
+    encoder.fixed(value.actor.as_bytes());
+    encoder.fixed(value.incarnation.as_bytes());
+    encoder.fixed(value.deployment.as_bytes());
+    encoder.fixed(value.program.as_bytes());
+    encoder.u8(value.mode as u8);
+    encode_sdk_origin(encoder, value.origin);
+    encoder.bytes(&value.message);
+    encoder.list(&value.required, encode_sdk_blob);
+    encoder.u64(value.gas);
+    encoder.bool(value.recovery_only);
+}
+
+fn decode_accepted_invocation(
+    decoder: &mut Decoder<'_>,
+) -> Result<super::standard::StandardAcceptedInvocation, DecodeError> {
+    let value = super::standard::StandardAcceptedInvocation {
+        space: crate::agent_sdk::SpaceId(decoder.fixed()?),
+        agent: crate::agent_sdk::AgentId(decoder.fixed()?),
+        runtime_deployment: crate::agent_sdk::DeploymentId(decoder.fixed()?),
+        invocation: crate::agent_sdk::InvocationId(decoder.fixed()?),
+        actor: crate::agent_sdk::ActorId(decoder.fixed()?),
+        incarnation: crate::agent_sdk::Hash(decoder.fixed()?),
+        deployment: crate::agent_sdk::DeploymentId(decoder.fixed()?),
+        program: crate::agent_sdk::ProgramId(decoder.fixed()?),
+        mode: decode_sdk_method_mode(decoder.u8()?)?,
+        origin: decode_sdk_origin(decoder)?,
+        message: {
+            let bytes = decoder.bytes_ref()?;
+            if bytes.len() > crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES {
+                return Err(DecodeError::LimitExceeded);
+            }
+            bytes.to_vec()
+        },
+        required: decode_bounded_list(
+            decoder,
+            crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_ITEMS,
+            decode_sdk_blob,
+        )?,
+        gas: decoder.u64()?,
+        recovery_only: decoder.bool()?,
+    };
+    value
+        .validate()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
 fn decode_standard_lane(
     bytes: &[u8],
     expected_lane: StateLane,
+    remaining_continuations: usize,
 ) -> Result<DecodedStandardLane, DecodeError> {
     let mut decoder = Decoder::new(bytes);
     if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID
@@ -984,16 +1206,19 @@ fn decode_standard_lane(
     {
         return Err(DecodeError::NonCanonical);
     }
-    let machine_continuations = decode_bounded_list(
-        &mut decoder,
-        super::standard::MAX_MACHINE_CONTINUATIONS,
-        |decoder| {
+    let machine_continuations =
+        decode_bounded_list(&mut decoder, remaining_continuations, |decoder| {
             decode_machine_continuation(
                 decoder,
                 super::InvocationResultStorage::Lane(expected_lane),
             )
-        },
-    )?;
+        })?;
+    if machine_continuations
+        .windows(2)
+        .any(|pair| pair[0].ready_sequence >= pair[1].ready_sequence)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
     if !decoder.exhausted() {
         return Err(DecodeError::NonCanonical);
     }
@@ -1149,6 +1374,7 @@ pub fn apply_standard_execution(
                                                                 call.observed_slot,
                                                                 expected_sequence,
                                                                 continuation,
+                                                                None,
                                                             )?;
                                                             Ok(reply)
                                                         }
@@ -1181,6 +1407,456 @@ pub fn apply_standard_execution(
         &mut result,
     );
     Ok(RuntimeExecutionReturn { state, result })
+}
+
+/// Apply the clean portable AgentRuntime work ABI. Management remains on the
+/// established lifecycle seam during the cutover; Invoke and Resume are
+/// clean-generation messages and never fall back to a legacy decoder.
+#[cfg(feature = "pvm")]
+pub fn apply_standard_runtime_work(
+    work: crate::agent_sdk::RuntimeWork,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    match work {
+        crate::agent_sdk::RuntimeWork::Invoke {
+            state,
+            invocation,
+            authority,
+            observed_slot,
+        } => apply_clean_invoke(state, *invocation, *authority, observed_slot),
+        crate::agent_sdk::RuntimeWork::Resume { state, resume } => {
+            apply_clean_resume(state, *resume)
+        }
+        crate::agent_sdk::RuntimeWork::Manage { state, .. } => {
+            Ok(crate::agent_sdk::RuntimeTransition {
+                state,
+                outcome: crate::agent_sdk::RuntimeOutcome::Management(Err(
+                    crate::agent_sdk::ManagementError::InvalidRequest,
+                )),
+            })
+        }
+    }
+}
+
+#[cfg(feature = "pvm")]
+fn apply_clean_invoke(
+    state: crate::agent_sdk::RuntimeState,
+    work: crate::agent_sdk::InvocationWork,
+    authority: crate::agent_sdk::authority::AuthorityReceipt,
+    observed_slot: u64,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
+
+    let original_state = clean_state_to_legacy(&state);
+    let decoded = decode_standard_runtime_state(&original_state)?;
+    let state_limit = standard_state_limit(&decoded);
+    let mut runtime =
+        StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
+    if let Err(error) = runtime.verify_clean_invocation_authority(&work, &authority) {
+        return Ok(clean_completed(state, Err(error)));
+    }
+    match runtime.recover_clean_yield(&work, &authority) {
+        Ok(Some(yielded)) => {
+            return Ok(RuntimeTransition {
+                state,
+                outcome: RuntimeOutcome::Yielded(yielded),
+            });
+        }
+        Err(error) => return Ok(clean_completed(state, Err(error))),
+        Ok(None) => {}
+    }
+    let (invocation, actor_pvm, actor_schema, actor_policies) =
+        match runtime.resolve_clean_invocation(&work) {
+            Ok(resolved) => resolved,
+            Err(error) if error.is_durable_exact_outcome() => {
+                if let Err(slot_error) =
+                    runtime.validate_clean_unseen_invocation_slot(&authority, observed_slot)
+                {
+                    return Ok(clean_completed(state, Err(slot_error)));
+                }
+                if let Err(clock_error) =
+                    runtime.commit_clean_exact_outcome_clock(work.mode, observed_slot)
+                {
+                    return Ok(clean_completed(state, Err(clock_error)));
+                }
+                let candidate = encode_standard_runtime_state(&runtime.snapshot());
+                if candidate.encoded_len().is_none_or(|len| len > state_limit) {
+                    return Ok(clean_completed(state, Err(InvocationError::ResultCapacity)));
+                }
+                return Ok(clean_completed(
+                    legacy_state_to_clean(candidate),
+                    Err(error),
+                ));
+            }
+            Err(error) => return Ok(clean_completed(state, Err(error))),
+        };
+    let (mut result, commit_candidate) = match runtime.recover_execution(&invocation, observed_slot)
+    {
+        Ok(Some(reply)) => (Ok(reply), true),
+        Err(ActorExecutionError::DivergentInvocation) => {
+            return Ok(clean_completed(
+                state,
+                Err(InvocationError::DivergentInvocation),
+            ));
+        }
+        unseen => match runtime.validate_clean_unseen_invocation_slot(&authority, observed_slot) {
+            Err(error) => return Ok(clean_completed(state, Err(error))),
+            Ok(()) => {
+                let pristine = runtime.clone();
+                let mut result = match unseen {
+                    Err(error) => Err(error),
+                    Ok(None) if work.recovery_only => Err(ActorExecutionError::InvalidAvailability),
+                    Ok(None) => match runtime
+                        .validate_execution_schema(&invocation, &actor_schema)
+                        .and_then(|()| runtime.authorize_execution(&invocation, &actor_policies))
+                    {
+                        Err(error) => Err(error),
+                        Ok(false) => Ok(ActorExecutionReply {
+                            invocation: invocation.invocation,
+                            actor: invocation.actor,
+                            incarnation: invocation.incarnation,
+                            deployment: invocation.deployment,
+                            mode: invocation.mode,
+                            lane: invocation.mode.write_lane(),
+                            status: ActorExecutionStatus::Forbidden,
+                            reply: Vec::new(),
+                            gas_remaining: invocation.gas,
+                            observation: super::execution::ActorObservation::default(),
+                        }),
+                        Ok(true) => {
+                            runtime
+                                .prepare_execution_state(&invocation)
+                                .and_then(|before| {
+                                    let visible = before.visible_for(invocation.mode);
+                                    super::execution::run_inner_actor(
+                                        &invocation,
+                                        &actor_pvm,
+                                        &visible,
+                                        None,
+                                    )
+                                    .and_then(|outcome| {
+                                        match outcome {
+                                            super::execution::ActorRunOutcome::Completed {
+                                                mut reply,
+                                                state: next_state,
+                                            } => {
+                                                if reply.status == ActorExecutionStatus::Done {
+                                                    runtime.commit_execution(
+                                                        &invocation,
+                                                        &mut reply,
+                                                        &before,
+                                                        next_state,
+                                                        observed_slot,
+                                                    )?;
+                                                }
+                                                Ok(reply)
+                                            }
+                                            super::execution::ActorRunOutcome::Yielded {
+                                                reply,
+                                                state: next_state,
+                                                continuation,
+                                            } => {
+                                                runtime.commit_yielded_execution(
+                                        &invocation,
+                                        &reply,
+                                        &before,
+                                        next_state,
+                                        observed_slot,
+                                        None,
+                                        continuation,
+                                        Some((
+                                            super::standard::StandardAcceptedInvocation::from_work(
+                                                &work,
+                                            ),
+                                            authority.clone(),
+                                        )),
+                                    )?;
+                                                Ok(reply)
+                                            }
+                                        }
+                                    })
+                                })
+                        }
+                    },
+                    Ok(Some(_)) => unreachable!("exact recovery returned above"),
+                };
+                let committed = finalize_unseen_standard_outcome(
+                    &mut runtime,
+                    pristine,
+                    &invocation,
+                    observed_slot,
+                    None,
+                    &mut result,
+                );
+                (result, committed)
+            }
+        },
+    };
+    let successor = finish_standard_execution_candidate(
+        original_state,
+        &runtime,
+        commit_candidate,
+        state_limit,
+        &mut result,
+    );
+    let state = legacy_state_to_clean(successor);
+    if matches!(&result, Ok(reply) if reply.status == ActorExecutionStatus::Yielded) {
+        let yielded = runtime
+            .recover_clean_yield(&work, &authority)
+            .map_err(|_| DecodeError::NonCanonical)?
+            .ok_or(DecodeError::NonCanonical)?;
+        Ok(RuntimeTransition {
+            state,
+            outcome: RuntimeOutcome::Yielded(yielded),
+        })
+    } else {
+        Ok(clean_completed(
+            state,
+            result.map(clean_reply).map_err(clean_error),
+        ))
+    }
+}
+
+#[cfg(feature = "pvm")]
+fn apply_clean_resume(
+    state: crate::agent_sdk::RuntimeState,
+    resume: crate::agent_sdk::ResumeWork,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
+
+    if resume.input.is_some() {
+        return Ok(clean_completed(state, Err(InvocationError::InvalidInput)));
+    }
+    let original_state = clean_state_to_legacy(&state);
+    let decoded = decode_standard_runtime_state(&original_state)?;
+    let state_limit = standard_state_limit(&decoded);
+    let mut runtime =
+        StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
+    let (record, work) = match runtime.resolve_clean_resume(&resume) {
+        Ok(value) => value,
+        Err(error) => return Ok(clean_completed(state, Err(error))),
+    };
+    let (invocation, actor_pvm, actor_schema, actor_policies) =
+        match runtime.resolve_clean_invocation(&work) {
+            Ok(value) => value,
+            Err(error) => return Ok(clean_completed(state, Err(error))),
+        };
+    if invocation.commitment() != record.request {
+        return Ok(clean_completed(
+            state,
+            Err(InvocationError::StaleContinuation),
+        ));
+    }
+    let authority = record.authority.clone().ok_or(DecodeError::NonCanonical)?;
+    let accepted = record.accepted.clone().ok_or(DecodeError::NonCanonical)?;
+    let observed_slot = record.observed_slot;
+    let pristine = runtime.clone();
+    let mut terminal_sequence = None;
+    let mut result = runtime
+        .validate_execution_schema(&invocation, &actor_schema)
+        .and_then(|()| runtime.authorize_execution(&invocation, &actor_policies))
+        .and_then(|authorized| {
+            if !authorized {
+                return Err(ActorExecutionError::InvalidAuthorization);
+            }
+            runtime.prepare_execution_state(&invocation)
+        })
+        .and_then(|before| {
+            let visible = before.visible_for(invocation.mode);
+            super::execution::run_inner_actor(
+                &invocation,
+                &actor_pvm,
+                &visible,
+                Some(record.continuation.clone()),
+            )
+            .and_then(|outcome| match outcome {
+                super::execution::ActorRunOutcome::Completed {
+                    mut reply,
+                    state: next_state,
+                } => {
+                    if reply.status == ActorExecutionStatus::Done {
+                        runtime.consume_machine_continuation(&invocation, record.ready_sequence)?;
+                        runtime.commit_execution(
+                            &invocation,
+                            &mut reply,
+                            &before,
+                            next_state,
+                            observed_slot,
+                        )?;
+                    } else {
+                        terminal_sequence = Some(record.ready_sequence);
+                    }
+                    Ok(reply)
+                }
+                super::execution::ActorRunOutcome::Yielded {
+                    reply,
+                    state: next_state,
+                    continuation,
+                } => {
+                    runtime.commit_yielded_execution(
+                        &invocation,
+                        &reply,
+                        &before,
+                        next_state,
+                        observed_slot,
+                        Some(record.ready_sequence),
+                        continuation,
+                        Some((accepted.clone(), authority.clone())),
+                    )?;
+                    Ok(reply)
+                }
+            })
+        });
+    if matches!(&result, Err(error) if error.is_durable_exact_outcome()) {
+        terminal_sequence = Some(record.ready_sequence);
+    }
+    let commit_candidate = finalize_unseen_standard_outcome(
+        &mut runtime,
+        pristine,
+        &invocation,
+        observed_slot,
+        terminal_sequence,
+        &mut result,
+    );
+    let successor = finish_standard_execution_candidate(
+        original_state,
+        &runtime,
+        commit_candidate,
+        state_limit,
+        &mut result,
+    );
+    let state = legacy_state_to_clean(successor);
+    if matches!(&result, Ok(reply) if reply.status == ActorExecutionStatus::Yielded) {
+        let yielded = runtime
+            .recover_clean_yield(&work, &authority)
+            .map_err(|_| DecodeError::NonCanonical)?
+            .ok_or(DecodeError::NonCanonical)?;
+        Ok(RuntimeTransition {
+            state,
+            outcome: RuntimeOutcome::Yielded(yielded),
+        })
+    } else {
+        Ok(clean_completed(
+            state,
+            result.map(clean_reply).map_err(clean_error),
+        ))
+    }
+}
+
+#[cfg(feature = "pvm")]
+fn clean_completed(
+    state: crate::agent_sdk::RuntimeState,
+    result: Result<crate::agent_sdk::InvocationReply, crate::agent_sdk::InvocationError>,
+) -> crate::agent_sdk::RuntimeTransition {
+    crate::agent_sdk::RuntimeTransition {
+        state,
+        outcome: crate::agent_sdk::RuntimeOutcome::Completed(result),
+    }
+}
+
+#[cfg(feature = "pvm")]
+fn clean_state_to_legacy(state: &crate::agent_sdk::RuntimeState) -> RuntimeState {
+    RuntimeState {
+        control: state.control.clone(),
+        linear: state.linear.clone(),
+        merge: state.merge.clone(),
+        local: state.local.clone(),
+    }
+}
+
+#[cfg(feature = "pvm")]
+fn legacy_state_to_clean(state: RuntimeState) -> crate::agent_sdk::RuntimeState {
+    crate::agent_sdk::RuntimeState {
+        control: state.control,
+        linear: state.linear,
+        merge: state.merge,
+        local: state.local,
+    }
+}
+
+#[cfg(feature = "pvm")]
+fn standard_state_limit(state: &StandardRuntimeState) -> usize {
+    let hard = super::execution::MAX_RUNTIME_STATE_BYTES;
+    state.config.as_ref().map_or(hard, |config| {
+        hard.min(config.runtime_contract.resources.max_runtime_state_bytes as usize)
+    })
+}
+
+#[cfg(feature = "pvm")]
+fn clean_reply(reply: ActorExecutionReply) -> crate::agent_sdk::InvocationReply {
+    crate::agent_sdk::InvocationReply {
+        invocation: crate::agent_sdk::InvocationId(reply.invocation.0),
+        actor: crate::agent_sdk::ActorId(reply.actor.0),
+        incarnation: crate::agent_sdk::Hash(reply.incarnation.0),
+        deployment: crate::agent_sdk::DeploymentId(reply.deployment.0),
+        mode: clean_mode(reply.mode),
+        lane: reply.lane.map(clean_lane),
+        status: match reply.status {
+            ActorExecutionStatus::Done => crate::agent_sdk::InvocationStatus::Done,
+            ActorExecutionStatus::Forbidden => crate::agent_sdk::InvocationStatus::Forbidden,
+            ActorExecutionStatus::Panicked => crate::agent_sdk::InvocationStatus::Panicked,
+            ActorExecutionStatus::OutOfGas => crate::agent_sdk::InvocationStatus::OutOfGas,
+            ActorExecutionStatus::Yielded => unreachable!("yield is a distinct clean outcome"),
+        },
+        reply: reply.reply,
+        gas_remaining: reply.gas_remaining,
+        observation: crate::agent_sdk::InvocationObservation {
+            linear_revision: reply.observation.linear_revision,
+            merge_frontier: reply
+                .observation
+                .merge_frontier
+                .map(|value| crate::agent_sdk::Hash(value.0)),
+            local_revision: reply.observation.local_revision,
+        },
+    }
+}
+
+#[cfg(feature = "pvm")]
+const fn clean_lane(lane: StateLane) -> crate::agent_sdk::StateLane {
+    match lane {
+        StateLane::Linear => crate::agent_sdk::StateLane::Linear,
+        StateLane::Merge => crate::agent_sdk::StateLane::Merge,
+        StateLane::Local => crate::agent_sdk::StateLane::Local,
+    }
+}
+
+#[cfg(feature = "pvm")]
+const fn clean_mode(mode: super::MethodMode) -> crate::agent_sdk::MethodMode {
+    match mode {
+        super::MethodMode::Query => crate::agent_sdk::MethodMode::Query,
+        super::MethodMode::LinearizableQuery => crate::agent_sdk::MethodMode::LinearizableQuery,
+        super::MethodMode::LocalQuery => crate::agent_sdk::MethodMode::LocalQuery,
+        super::MethodMode::Linear => crate::agent_sdk::MethodMode::Linear,
+        super::MethodMode::Merge => crate::agent_sdk::MethodMode::Merge,
+        super::MethodMode::Local => crate::agent_sdk::MethodMode::Local,
+    }
+}
+
+#[cfg(feature = "pvm")]
+const fn clean_error(error: ActorExecutionError) -> crate::agent_sdk::InvocationError {
+    use crate::agent_sdk::InvocationError;
+    match error {
+        ActorExecutionError::NotCreated => InvocationError::NotCreated,
+        ActorExecutionError::NotFound => InvocationError::NotFound,
+        ActorExecutionError::StaleIncarnation => InvocationError::StaleIncarnation,
+        ActorExecutionError::Suspended => InvocationError::Suspended,
+        ActorExecutionError::StaleDeployment => InvocationError::StaleDeployment,
+        ActorExecutionError::WrongProgram => InvocationError::WrongProgram,
+        ActorExecutionError::UnsupportedMethod => InvocationError::UnsupportedMethod,
+        ActorExecutionError::UnsupportedResultStorage => InvocationError::UnsupportedResultStorage,
+        ActorExecutionError::MissingState => InvocationError::MissingState,
+        ActorExecutionError::InvalidAvailability => InvocationError::InvalidAvailability,
+        ActorExecutionError::InvalidInput => InvocationError::InvalidInput,
+        ActorExecutionError::InvalidActorOutput => InvocationError::InvalidActorOutput,
+        ActorExecutionError::DivergentInvocation => InvocationError::DivergentInvocation,
+        ActorExecutionError::ResultCapacity => InvocationError::ResultCapacity,
+        ActorExecutionError::InvalidAuthorization => InvocationError::InvalidAuthorization,
+        ActorExecutionError::AuthorityExpired => InvocationError::AuthorityExpired,
+        ActorExecutionError::AuthoritySlotRegressed => InvocationError::AuthoritySlotRegressed,
+        ActorExecutionError::ContinuationNotReady => InvocationError::NotReady,
+        ActorExecutionError::UnsupportedHostCall(call) => {
+            InvocationError::UnsupportedHostCall(call)
+        }
+    }
 }
 
 #[cfg(feature = "pvm")]
@@ -2790,7 +3466,11 @@ mod tests {
             program: invocation.program,
             mode: invocation.mode,
             request: invocation.commitment(),
+            work: invocation.commitment(),
             ready_sequence,
+            accepted: None,
+            authority: None,
+            observed_slot: 1,
             continuation: super::super::execution::ActorMachineContinuation {
                 machine: super::super::execution::PortableMachineSnapshot {
                     pc: u32::from(marker) * 2,
@@ -2820,6 +3500,512 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn minimal_portable_continuation(
+        mode: MethodMode,
+        ordinal: u32,
+        ready_sequence: u64,
+    ) -> StandardMachineContinuation {
+        let mut invocation = sparse_invocation(mode, 0x41);
+        let mut id = [0u8; 32];
+        id[..4].copy_from_slice(&ordinal.to_le_bytes());
+        id[31] = 1;
+        invocation.invocation = crate::service::InvocationId(id);
+        let mut record = portable_continuation(&invocation, ready_sequence, 1);
+        record.continuation.machine.memory.clear();
+        record
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn standalone_continuation_wire_is_exact_bounded_and_strict() {
+        let invocation = sparse_invocation(MethodMode::Linear, 0xd0);
+        let record = portable_continuation(&invocation, 7, 3);
+        let encoded = encode_standard_machine_continuation(&record).unwrap();
+
+        assert_eq!(&encoded[..4], &STANDARD_MACHINE_CONTINUATION_MAGIC);
+        assert_eq!(
+            decode_standard_machine_continuation(&encoded).unwrap(),
+            record
+        );
+        assert_eq!(
+            encode_standard_machine_continuation(
+                &decode_standard_machine_continuation(&encoded).unwrap()
+            )
+            .unwrap(),
+            encoded
+        );
+        assert_eq!(
+            record.clean_reference().unwrap(),
+            crate::agent_sdk::BlobRef::of_bytes(&encoded),
+            "the SDK continuation reference commits the standalone bytes"
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_standard_machine_continuation(&trailing),
+            Err(DecodeError::TrailingBytes)
+        );
+        assert!(decode_standard_machine_continuation(&encoded[..encoded.len() - 1]).is_err());
+        assert!(decode_standard_machine_continuation(&encoded[..5]).is_err());
+
+        let mut unknown_version = encoded.clone();
+        let version_offset = STANDARD_MACHINE_CONTINUATION_MAGIC.len()
+            + crate::agent_sdk::RUNTIME_ABI_ID.as_bytes().len();
+        unknown_version[version_offset..version_offset + 2].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            decode_standard_machine_continuation(&unknown_version),
+            Err(DecodeError::InvalidPlatform)
+        );
+
+        let oversized = vec![0u8; MAX_STANDARD_MACHINE_CONTINUATION_BYTES + 1];
+        assert_eq!(
+            decode_standard_machine_continuation(&oversized),
+            Err(DecodeError::LimitExceeded)
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn continuation_decoder_rejects_hostile_order_and_aggregate_count() {
+        let mut swapped = sparse_standard_state();
+        swapped.machine_continuations = vec![
+            minimal_portable_continuation(MethodMode::Query, 2, 2),
+            minimal_portable_continuation(MethodMode::Query, 1, 1),
+        ];
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&swapped)),
+            Err(DecodeError::NonCanonical),
+            "hostile component order must not be sorted into validity"
+        );
+
+        let mut aggregate = sparse_standard_state();
+        aggregate.machine_continuations = (0..super::super::standard::MAX_MACHINE_CONTINUATIONS)
+            .map(|index| {
+                minimal_portable_continuation(
+                    MethodMode::Query,
+                    u32::try_from(index + 1).unwrap(),
+                    u64::try_from(index + 1).unwrap(),
+                )
+            })
+            .chain(core::iter::once(minimal_portable_continuation(
+                MethodMode::Linear,
+                u32::MAX,
+                1,
+            )))
+            .collect();
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&aggregate)),
+            Err(DecodeError::LimitExceeded),
+            "the continuation ceiling is aggregate across control and lane components"
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn yielded_commit_rolls_back_mutations_when_capacity_is_full() {
+        let mut state = sparse_standard_state();
+        state.machine_continuations = (0..super::super::standard::MAX_MACHINE_CONTINUATIONS)
+            .map(|index| {
+                minimal_portable_continuation(
+                    MethodMode::Query,
+                    u32::try_from(index + 1).unwrap(),
+                    u64::try_from(index + 1).unwrap(),
+                )
+            })
+            .collect();
+        let mut runtime = StandardAgentRuntime::restore(state).unwrap();
+        let invocation = sparse_invocation(MethodMode::Linear, 0xf0);
+        let before_lanes = runtime.prepare_execution_state(&invocation).unwrap();
+        let mut after_lanes = before_lanes.clone();
+        after_lanes.linear = Some(vec![0xde, 0xad]);
+        let before = runtime.snapshot();
+
+        assert_eq!(
+            runtime.commit_yielded_execution(
+                &invocation,
+                &exact_reply(&invocation, ActorExecutionStatus::Yielded),
+                &before_lanes,
+                after_lanes,
+                10,
+                None,
+                minimal_portable_continuation(MethodMode::Linear, u32::MAX - 1, 1).continuation,
+                None,
+            ),
+            Err(ActorExecutionError::ResultCapacity)
+        );
+        assert_eq!(runtime.snapshot(), before);
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_authority_receipt(
+        config: &AgentConfig,
+        work: &crate::agent_sdk::InvocationWork,
+    ) -> crate::agent_sdk::authority::AuthorityReceipt {
+        use crate::agent_sdk::authority::{
+            AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots, AuthorityOperationKind,
+            AuthorityReceipt, AuthorityReceiptSelector,
+        };
+
+        let public_key = authority_key().verifying_key().to_bytes();
+        let binding = &config.authority;
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: crate::agent_sdk::Hash([0x31; 32]),
+                issuer: AuthorityIssuer {
+                    principal: crate::agent_sdk::PrincipalId(config.identity.owner.0),
+                    actor: crate::agent_sdk::ActorId(binding.actor.0),
+                    deployment: crate::agent_sdk::DeploymentId(binding.deployment.0),
+                    program: crate::agent_sdk::ProgramId(binding.program.0),
+                    producer: crate::agent_sdk::ProducerId::of_public_key(&public_key),
+                },
+                space: crate::agent_sdk::SpaceId(config.identity.space.0),
+                agent: crate::agent_sdk::AgentId(config.identity.agent.0),
+                operation: AuthorityOperationKind::InvokeActor,
+                runtime_deployment: crate::agent_sdk::DeploymentId(
+                    config.identity.runtime_deployment.0,
+                ),
+                actor: Some(work.actor),
+                actor_deployment: Some(work.deployment),
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: crate::agent_sdk::Hash([0x32; 32]),
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch: 1,
+                valid_from: 1,
+                expires_at: 2,
+                request: work.commitment(),
+            },
+            public_key,
+            signature: [1; 64],
+        };
+        receipt.signature = authority_key().sign(&receipt.signing_bytes()).to_bytes();
+        receipt
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_pending_fixture() -> (
+        crate::agent_sdk::RuntimeState,
+        crate::agent_sdk::InvocationWork,
+        crate::agent_sdk::authority::AuthorityReceipt,
+        crate::agent_sdk::YieldedInvocation,
+    ) {
+        let state = sparse_standard_state();
+        let config = state.config.as_ref().unwrap().clone();
+        let invocation = sparse_invocation(MethodMode::Linear, 0xc1);
+        let mut availability = [
+            b"immutable-program".as_slice(),
+            b"immutable-schema",
+            b"immutable-policy",
+        ]
+        .into_iter()
+        .map(|bytes| crate::agent_sdk::RuntimeBlob {
+            reference: crate::agent_sdk::BlobRef::of_bytes(bytes),
+            bytes: bytes.to_vec(),
+        })
+        .collect::<Vec<_>>();
+        availability.sort_unstable_by_key(|blob| blob.reference.clone());
+        let work = crate::agent_sdk::InvocationWork {
+            space: crate::agent_sdk::SpaceId(config.identity.space.0),
+            agent: crate::agent_sdk::AgentId(config.identity.agent.0),
+            runtime_deployment: crate::agent_sdk::DeploymentId(
+                config.identity.runtime_deployment.0,
+            ),
+            invocation: crate::agent_sdk::InvocationId(invocation.invocation.0),
+            actor: crate::agent_sdk::ActorId(invocation.actor.0),
+            incarnation: crate::agent_sdk::Hash(invocation.incarnation.0),
+            deployment: crate::agent_sdk::DeploymentId(invocation.deployment.0),
+            program: crate::agent_sdk::ProgramId(invocation.program.0),
+            mode: crate::agent_sdk::MethodMode::Linear,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            message: invocation.message.clone(),
+            availability,
+            gas: invocation.gas,
+            recovery_only: false,
+        };
+        let authority = clean_authority_receipt(&config, &work);
+        let mut runtime = StandardAgentRuntime::restore(state).unwrap();
+        let before = runtime.prepare_execution_state(&invocation).unwrap();
+        let mut after = before.clone();
+        after.linear = Some(vec![0xa1]);
+        runtime
+            .commit_yielded_execution(
+                &invocation,
+                &exact_reply(&invocation, ActorExecutionStatus::Yielded),
+                &before,
+                after,
+                1,
+                None,
+                portable_continuation(&invocation, 1, 3).continuation,
+                Some((
+                    super::super::standard::StandardAcceptedInvocation::from_work(&work),
+                    authority.clone(),
+                )),
+            )
+            .unwrap();
+        let yielded = runtime
+            .recover_clean_yield(&work, &authority)
+            .unwrap()
+            .unwrap();
+        (
+            legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot())),
+            work,
+            authority,
+            yielded,
+        )
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_resume(
+        yielded: &crate::agent_sdk::YieldedInvocation,
+        availability: Vec<crate::agent_sdk::RuntimeBlob>,
+    ) -> crate::agent_sdk::ResumeWork {
+        crate::agent_sdk::ResumeWork {
+            invocation: yielded.invocation,
+            actor: yielded.actor,
+            incarnation: yielded.incarnation,
+            deployment: yielded.deployment,
+            program: yielded.program,
+            mode: yielded.mode,
+            continuation: yielded.continuation.clone(),
+            ready_sequence: yielded.ready_sequence,
+            availability,
+            input: None,
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_resolvable_fixture(
+        alias_artifact_roles: bool,
+    ) -> (StandardAgentRuntime, crate::agent_sdk::InvocationWork) {
+        let mut state = sparse_standard_state();
+        let config = state.config.as_ref().unwrap().clone();
+        let actor = &mut state.actors[0].record;
+        let program_bytes = b"clean-program".to_vec();
+        let schema_bytes = if alias_artifact_roles {
+            program_bytes.clone()
+        } else {
+            b"clean-schema".to_vec()
+        };
+        let policy_bytes = if alias_artifact_roles {
+            program_bytes.clone()
+        } else {
+            b"clean-policy".to_vec()
+        };
+        actor.entry.program = crate::service::ProgramId::of_pvm(&program_bytes);
+        actor.entry.agent_schema = crate::service::BlobRef::of_bytes(&schema_bytes);
+        actor.entry.role_policies = crate::service::BlobRef::of_bytes(&policy_bytes);
+        actor.agent_schema = actor.entry.agent_schema.clone();
+        actor.role_policies = actor.entry.role_policies.clone();
+        let mut availability = [program_bytes, schema_bytes, policy_bytes]
+            .into_iter()
+            .map(|bytes| crate::agent_sdk::RuntimeBlob {
+                reference: crate::agent_sdk::BlobRef::of_bytes(&bytes),
+                bytes,
+            })
+            .collect::<Vec<_>>();
+        availability.sort_unstable_by_key(|blob| blob.reference.clone());
+        availability.dedup_by(|left, right| left.reference == right.reference);
+        let work = crate::agent_sdk::InvocationWork {
+            space: crate::agent_sdk::SpaceId(config.identity.space.0),
+            agent: crate::agent_sdk::AgentId(config.identity.agent.0),
+            runtime_deployment: crate::agent_sdk::DeploymentId(
+                config.identity.runtime_deployment.0,
+            ),
+            invocation: crate::agent_sdk::InvocationId([0xd4; 32]),
+            actor: crate::agent_sdk::ActorId(actor.entry.actor.0),
+            incarnation: crate::agent_sdk::Hash(actor.state_generation.0),
+            deployment: crate::agent_sdk::DeploymentId(actor.entry.deployment.0),
+            program: crate::agent_sdk::ProgramId(actor.entry.program.0),
+            mode: crate::agent_sdk::MethodMode::Linear,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            message: vec![1],
+            availability,
+            gas: 100,
+            recovery_only: false,
+        };
+        (StandardAgentRuntime::restore(state).unwrap(), work)
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_resolution_rejects_origin_projection_and_artifact_role_aliases() {
+        use crate::agent_sdk::InvocationError;
+
+        let (runtime, work) = clean_resolvable_fixture(false);
+        assert!(runtime.resolve_clean_invocation(&work).is_ok());
+
+        let mut actor_origin = work.clone();
+        actor_origin.origin.actor = Some(crate::agent_sdk::ActorId([0xd5; 32]));
+        assert_eq!(
+            runtime.resolve_clean_invocation(&actor_origin),
+            Err(InvocationError::InvalidInput)
+        );
+        let mut transport_origin = work.clone();
+        transport_origin.origin.transport_node = Some(crate::agent_sdk::NodeId([0xd6; 32]));
+        assert_eq!(
+            runtime.resolve_clean_invocation(&transport_origin),
+            Err(InvocationError::InvalidInput)
+        );
+        let mut credential_origin = work;
+        credential_origin.origin.principal = Some(crate::agent_sdk::PrincipalId([0xd7; 32]));
+        credential_origin.origin.credential = Some(crate::agent_sdk::CredentialId([0xd8; 32]));
+        assert_eq!(
+            runtime.resolve_clean_invocation(&credential_origin),
+            Err(InvocationError::InvalidInput)
+        );
+
+        let (runtime, aliased) = clean_resolvable_fixture(true);
+        assert_eq!(
+            runtime.resolve_clean_invocation(&aliased),
+            Err(InvocationError::InvalidAvailability)
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_pending_retry_and_resume_validation_are_exact_and_state_preserving() {
+        use crate::agent_sdk::{InvocationError, ResumeInput, RuntimeOutcome, RuntimeWork};
+
+        let (state, work, authority, yielded) = clean_pending_fixture();
+        let retried = apply_standard_runtime_work(RuntimeWork::Invoke {
+            state: state.clone(),
+            invocation: Box::new(work.clone()),
+            authority: Box::new(authority.clone()),
+            observed_slot: 99,
+        })
+        .unwrap();
+        assert_eq!(retried.state, state);
+        assert_eq!(retried.outcome, RuntimeOutcome::Yielded(yielded.clone()));
+
+        let assert_rejected = |resume: crate::agent_sdk::ResumeWork, expected| {
+            let transition = apply_standard_runtime_work(RuntimeWork::Resume {
+                state: state.clone(),
+                resume: Box::new(resume),
+            })
+            .unwrap();
+            assert_eq!(transition.state, state);
+            assert_eq!(transition.outcome, RuntimeOutcome::Completed(Err(expected)));
+        };
+
+        let mut wrong_actor = clean_resume(&yielded, work.availability.clone());
+        wrong_actor.actor = crate::agent_sdk::ActorId([0xe1; 32]);
+        assert_rejected(wrong_actor, InvocationError::StaleContinuation);
+        let mut wrong_incarnation = clean_resume(&yielded, work.availability.clone());
+        wrong_incarnation.incarnation = crate::agent_sdk::Hash([0xe2; 32]);
+        assert_rejected(wrong_incarnation, InvocationError::StaleContinuation);
+        let mut wrong_deployment = clean_resume(&yielded, work.availability.clone());
+        wrong_deployment.deployment = crate::agent_sdk::DeploymentId([0xe3; 32]);
+        assert_rejected(wrong_deployment, InvocationError::StaleContinuation);
+        let mut wrong_program = clean_resume(&yielded, work.availability.clone());
+        wrong_program.program = crate::agent_sdk::ProgramId([0xe4; 32]);
+        assert_rejected(wrong_program, InvocationError::StaleContinuation);
+        let mut wrong_mode = clean_resume(&yielded, work.availability.clone());
+        wrong_mode.mode = crate::agent_sdk::MethodMode::Merge;
+        assert_rejected(wrong_mode, InvocationError::StaleContinuation);
+
+        let mut wrong_reference = clean_resume(&yielded, work.availability.clone());
+        wrong_reference.continuation.hash.0[0] ^= 1;
+        assert_rejected(wrong_reference, InvocationError::StaleContinuation);
+
+        let mut wrong_sequence = clean_resume(&yielded, work.availability.clone());
+        wrong_sequence.ready_sequence += 1;
+        assert_rejected(wrong_sequence, InvocationError::NotReady);
+
+        let mut missing = clean_resume(&yielded, work.availability.clone());
+        missing.availability.pop();
+        assert_rejected(missing, InvocationError::InvalidAvailability);
+        let mut extra = clean_resume(&yielded, work.availability.clone());
+        extra.availability.push(crate::agent_sdk::RuntimeBlob {
+            reference: crate::agent_sdk::BlobRef::of_bytes(b"extra"),
+            bytes: b"extra".to_vec(),
+        });
+        extra
+            .availability
+            .sort_unstable_by_key(|blob| blob.reference.clone());
+        assert_rejected(extra, InvocationError::InvalidAvailability);
+        let mut aliased = clean_resume(&yielded, work.availability.clone());
+        aliased.availability[0].bytes[0] ^= 1;
+        assert_rejected(aliased, InvocationError::InvalidAvailability);
+
+        let mut ready = clean_resume(&yielded, work.availability.clone());
+        ready.input = Some(ResumeInput::Ready(vec![1]));
+        assert_rejected(ready, InvocationError::InvalidInput);
+        let mut failed = clean_resume(&yielded, work.availability.clone());
+        failed.input = Some(ResumeInput::Failed(7));
+        assert_rejected(failed, InvocationError::InvalidInput);
+
+        let mut divergent = work.clone();
+        divergent.message.push(0xff);
+        let divergent_authority =
+            clean_authority_receipt(sparse_standard_state().config.as_ref().unwrap(), &divergent);
+        let rejected = apply_standard_runtime_work(RuntimeWork::Invoke {
+            state: state.clone(),
+            invocation: Box::new(divergent),
+            authority: Box::new(divergent_authority),
+            observed_slot: 1,
+        })
+        .unwrap();
+        assert_eq!(rejected.state, state);
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::DivergentInvocation))
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn restored_clean_continuation_rejects_a_forged_accepted_receipt() {
+        let (state, _, _, _) = clean_pending_fixture();
+        let mut decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+        decoded.machine_continuations[0]
+            .accepted
+            .as_mut()
+            .unwrap()
+            .origin
+            .actor = Some(crate::agent_sdk::ActorId([0xf1; 32]));
+        assert!(
+            matches!(
+                StandardAgentRuntime::restore(decoded),
+                Err(super::super::LifecycleError::InvalidRequest)
+            ),
+            "unsupported clean provenance cannot be smuggled through persisted state"
+        );
+
+        let mut decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+        decoded.machine_continuations[0]
+            .authority
+            .as_mut()
+            .unwrap()
+            .signature[0] ^= 1;
+        let encoded = encode_standard_runtime_state(&decoded);
+        assert_eq!(
+            decode_standard_runtime_state(&encoded),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+        decoded.machine_continuations[0].observed_slot = 3;
+        let encoded = encode_standard_runtime_state(&decoded);
+        assert_eq!(
+            decode_standard_runtime_state(&encoded),
+            Err(DecodeError::NonCanonical),
+            "the immutable acceptance slot must remain inside its signed window"
+        );
+
+        let mut decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+        decoded.lane_revisions.linear_authority_slot = None;
+        let encoded = encode_standard_runtime_state(&decoded);
+        assert_eq!(
+            decode_standard_runtime_state(&encoded),
+            Err(DecodeError::NonCanonical),
+            "a clean continuation cannot outrun its owning authority high-water"
+        );
     }
 
     #[cfg(feature = "pvm")]
@@ -2891,6 +4077,7 @@ mod tests {
                 20,
                 Some(sequence),
                 portable_continuation(&first, 1, 5).continuation,
+                None,
             )
             .unwrap();
         assert_eq!(

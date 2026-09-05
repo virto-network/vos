@@ -66,6 +66,28 @@ fn verify_ed25519(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
     public_key.verify_strict(message, &signature).is_ok()
 }
 
+#[cfg(any(feature = "std", feature = "agent-runtime"))]
+pub(crate) fn verify_raw_ed25519(
+    public_key: &[u8; 32],
+    message: &[u8],
+    signature: &[u8; 64],
+) -> bool {
+    let Ok(public_key) = ed25519_dalek::VerifyingKey::from_bytes(public_key) else {
+        return false;
+    };
+    let signature = ed25519_dalek::Signature::from_bytes(signature);
+    public_key.verify_strict(message, &signature).is_ok()
+}
+
+#[cfg(not(any(feature = "std", feature = "agent-runtime")))]
+pub(crate) fn verify_raw_ed25519(
+    _public_key: &[u8; 32],
+    _message: &[u8],
+    _signature: &[u8; 64],
+) -> bool {
+    false
+}
+
 // Receipt wire types remain available to ordinary no-std actors, but only a
 // host or the standard agent runtime carries the cryptographic implementation.
 // Any accidental verification attempt in another feature set must fail

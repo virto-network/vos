@@ -1098,15 +1098,36 @@ fn encode_runtime_blob(encoder: &mut Encoder<'_>, value: &RuntimeBlob) {
     encoder.bytes(&value.bytes);
 }
 
-fn decode_runtime_blob(decoder: &mut Decoder<'_>) -> Result<RuntimeBlob, DecodeError> {
-    let value = RuntimeBlob {
-        reference: decode_blob(decoder)?,
-        bytes: decoder.bytes_bounded(MAX_RUNTIME_AVAILABILITY_BYTES)?,
-    };
-    value
-        .validate()
-        .then_some(value)
-        .ok_or(DecodeError::NonCanonical)
+fn decode_runtime_availability(decoder: &mut Decoder<'_>) -> Result<Vec<RuntimeBlob>, DecodeError> {
+    let mut remaining = MAX_RUNTIME_AVAILABILITY_BYTES;
+    decoder.list_bounded(MAX_RUNTIME_AVAILABILITY_ITEMS, |decoder| {
+        let reference = decode_blob(decoder)?;
+        let bytes = decoder.bytes_bounded(remaining)?;
+        remaining -= bytes.len();
+        let value = RuntimeBlob { reference, bytes };
+        value
+            .validate()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    })
+}
+
+fn encode_required_refs(encoder: &mut Encoder<'_>, values: &[BlobRef]) {
+    encoder.list(values, encode_blob);
+}
+
+fn decode_required_refs(decoder: &mut Decoder<'_>) -> Result<Vec<BlobRef>, DecodeError> {
+    let values = decoder.list_bounded(MAX_RUNTIME_AVAILABILITY_ITEMS, decode_blob)?;
+    let valid = values.iter().all(|reference| {
+        reference.hash != Hash::ZERO
+            && reference.len != 0
+            && reference.len <= MAX_RUNTIME_AVAILABILITY_BYTES as u64
+    }) && values.windows(2).all(|pair| pair[0] < pair[1])
+        && values
+            .iter()
+            .try_fold(0u64, |total, reference| total.checked_add(reference.len))
+            .is_some_and(|total| total <= MAX_RUNTIME_AVAILABILITY_BYTES as u64);
+    valid.then_some(values).ok_or(DecodeError::NonCanonical)
 }
 
 fn encode_invocation_work(encoder: &mut Encoder<'_>, value: &InvocationWork) {
@@ -1139,7 +1160,7 @@ fn decode_invocation_work(decoder: &mut Decoder<'_>) -> Result<InvocationWork, D
         mode: decode_method_mode(decoder)?,
         origin: decode_origin(decoder)?,
         message: decoder.bytes_bounded(MAX_INVOCATION_MESSAGE_BYTES)?,
-        availability: decoder.list_bounded(MAX_RUNTIME_AVAILABILITY_ITEMS, decode_runtime_blob)?,
+        availability: decode_runtime_availability(decoder)?,
         gas: decoder.u64()?,
         recovery_only: decoder.bool()?,
     };
@@ -1160,7 +1181,7 @@ pub(crate) fn invocation_work_commitment(value: &InvocationWork) -> Hash {
 fn authority_matches_invocation(
     receipt: &AuthorityReceipt,
     invocation: &InvocationWork,
-    observed_slot: u64,
+    _observed_slot: u64,
 ) -> bool {
     receipt.validate_shape().is_ok()
         && receipt.selector.operation == AuthorityOperationKind::InvokeActor
@@ -1170,7 +1191,6 @@ fn authority_matches_invocation(
         && receipt.selector.actor == Some(invocation.actor)
         && receipt.selector.actor_deployment == Some(invocation.deployment)
         && receipt.selector.request == invocation_work_commitment(invocation)
-        && receipt.selector.is_live_at(observed_slot)
 }
 
 fn encode_resume_input(encoder: &mut Encoder<'_>, value: &ResumeInput) {
@@ -1207,6 +1227,7 @@ fn encode_resume_work(encoder: &mut Encoder<'_>, value: &ResumeWork) {
     encoder.u8(value.mode as u8);
     encode_blob(encoder, &value.continuation);
     encoder.u64(value.ready_sequence);
+    encoder.list(&value.availability, encode_runtime_blob);
     encoder.option(&value.input, encode_resume_input);
 }
 
@@ -1220,6 +1241,7 @@ fn decode_resume_work(decoder: &mut Decoder<'_>) -> Result<ResumeWork, DecodeErr
         mode: decode_method_mode(decoder)?,
         continuation: decode_blob(decoder)?,
         ready_sequence: decoder.u64()?,
+        availability: decode_runtime_availability(decoder)?,
         input: decoder.option(decode_resume_input)?,
     };
     value
@@ -1709,6 +1731,7 @@ fn encode_yielded(encoder: &mut Encoder<'_>, value: &YieldedInvocation) {
     encoder.u8(value.mode as u8);
     encode_blob(encoder, &value.continuation);
     encoder.u64(value.ready_sequence);
+    encode_required_refs(encoder, &value.required);
     encode_yield_reason(encoder, value.reason);
 }
 
@@ -1722,6 +1745,7 @@ fn decode_yielded(decoder: &mut Decoder<'_>) -> Result<YieldedInvocation, Decode
         mode: decode_method_mode(decoder)?,
         continuation: decode_blob(decoder)?,
         ready_sequence: decoder.u64()?,
+        required: decode_required_refs(decoder)?,
         reason: decode_yield_reason(decoder)?,
     };
     value
@@ -2330,6 +2354,15 @@ mod tests {
         };
         let encoded = work.encode().unwrap();
         assert_eq!(RuntimeWork::decode(&encoded), Ok(work.clone()));
+        let mut later_retry = work.clone();
+        let RuntimeWork::Invoke { observed_slot, .. } = &mut later_retry else {
+            unreachable!()
+        };
+        *observed_slot = 51;
+        assert!(
+            later_retry.encode().is_ok(),
+            "the guest must distinguish an exact retry from unseen expired work before applying the signed slot window"
+        );
 
         let RuntimeWork::Invoke {
             mut authority,
@@ -2448,6 +2481,7 @@ mod tests {
                     len: 512,
                 },
                 ready_sequence: 7,
+                required: alloc::vec![BlobRef::of_bytes(b"actor program")],
                 reason: YieldReason::Await {
                     call: CallId([8; 32]),
                 },

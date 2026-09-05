@@ -69,6 +69,14 @@ impl ActorMachine {
         snapshot: Option<&PortableMachineSnapshot>,
     ) -> Result<Self, LoadError> {
         let program = parse_standard_program(blob).ok_or(LoadError::InvalidProgram)?;
+        if snapshot.is_some()
+            && (usize::try_from(initial_pc)
+                .ok()
+                .and_then(|pc| program.code.bitmask.get(pc))
+                != Some(&1))
+        {
+            return Err(LoadError::InvalidSnapshot);
+        }
         let compact = program.compact_code().ok_or(LoadError::InvalidProgram)?;
         let layout = program.layout(args).ok_or(LoadError::InvalidLayout)?;
         let writable_regions: Vec<_> = [layout.rw, layout.stack]
@@ -342,6 +350,43 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_a_pc_which_is_not_an_instruction_boundary() {
+        let program = StandardProgram {
+            ro_data: vec![1],
+            rw_data: vec![2],
+            heap_pages: 0,
+            stack_size: PAGE_SIZE,
+            code: CodeBlob {
+                jump_table: Vec::new(),
+                code: vec![10, 42, 0],
+                bitmask: vec![1, 0, 1],
+            },
+        };
+        let blob = vos_pvm_program::build_standard_program(&program).unwrap();
+        let layout = program.layout(&[]).unwrap();
+        let memory = [layout.rw, layout.stack]
+            .into_iter()
+            .filter(|region| region.size != 0)
+            .map(|region| PortableMemoryRegion {
+                base: u32::try_from(region.base).unwrap(),
+                bytes: vec![0; usize::try_from(region.size).unwrap()],
+            })
+            .collect();
+        let snapshot = PortableMachineSnapshot {
+            pc: 1,
+            gas_remaining: 1,
+            registers: [0; vos_pvm_program::REGISTER_COUNT],
+            memory,
+        };
+
+        assert!(snapshot.is_valid());
+        assert!(matches!(
+            ActorMachine::restore(&blob, &[], &snapshot),
+            Err(LoadError::InvalidSnapshot)
+        ));
+    }
+
+    #[test]
     fn expunge_result_sentinels_never_become_continuation_pcs() {
         assert_eq!(
             decode_expunge_pc(inner::RESULT_WHO),
@@ -410,6 +455,252 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    #[cfg(feature = "std")]
+    fn repeated_yield_program() -> StandardProgram {
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+        let yielded = [
+            crate::actors::STATUS_YIELDED,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+        ];
+        let done = [
+            crate::actors::STATUS_DONE,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            2,
+        ];
+        let mut rw = Vec::new();
+        rw.extend_from_slice(&yielded);
+        rw.extend_from_slice(&yielded);
+        rw.extend_from_slice(&done);
+        let base = 2 * u64::from(vos_pvm_program::ZONE_SIZE);
+
+        // Instruction offsets are fixed by the assembler encodings:
+        // ECALLI=5, branch-imm=10, and each return block=26 bytes.
+        const FIRST_BRANCH: u32 = 5;
+        const SECOND_BRANCH: u32 = 20;
+        const FIRST_YIELD: u32 = 56;
+        const SECOND_YIELD: u32 = 82;
+        let mut actor = Assembler::new();
+        actor
+            .set_rw_data(rw)
+            .ecalli(crate::abi::hostcall::SUSPEND)
+            .branch_eq_imm(Reg::A0, 0, FIRST_YIELD - FIRST_BRANCH)
+            .ecalli(crate::abi::hostcall::SUSPEND)
+            .branch_eq_imm(Reg::A0, 0, SECOND_YIELD - SECOND_BRANCH)
+            .load_imm_64(Reg::A0, base + (yielded.len() * 2) as u64)
+            .load_imm_64(Reg::A1, done.len() as u64)
+            .jump_ind(Reg::RA, 0);
+        assert_eq!(actor.current_offset(), FIRST_YIELD);
+        actor
+            .load_imm_64(Reg::A0, base)
+            .load_imm_64(Reg::A1, yielded.len() as u64)
+            .jump_ind(Reg::RA, 0);
+        assert_eq!(actor.current_offset(), SECOND_YIELD);
+        actor
+            .load_imm_64(Reg::A0, base + yielded.len() as u64)
+            .load_imm_64(Reg::A1, yielded.len() as u64)
+            .jump_ind(Reg::RA, 0);
+        let blob = actor.build_standard();
+        parse_standard_program(&blob).unwrap()
+    }
+
+    #[cfg(feature = "std")]
+    fn physical_snapshot(
+        machines: &mut vos_pvm::inner::InnerMachines,
+        id: u32,
+        program: &StandardProgram,
+        state: vos_pvm::inner::InvokeState,
+    ) -> PortableMachineSnapshot {
+        let layout = program.layout(&[]).unwrap();
+        let memory = [layout.rw, layout.stack]
+            .into_iter()
+            .filter(|region| region.size != 0)
+            .map(|region| PortableMemoryRegion {
+                base: u32::try_from(region.base).unwrap(),
+                bytes: machines
+                    .peek(
+                        id,
+                        u32::try_from(region.base).unwrap(),
+                        usize::try_from(region.size).unwrap(),
+                    )
+                    .unwrap(),
+            })
+            .collect();
+        PortableMachineSnapshot {
+            pc: machines.expunge(id).unwrap(),
+            gas_remaining: state.gas,
+            registers: state.registers,
+            memory,
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn restore_physical_snapshot(
+        machines: &mut vos_pvm::inner::InnerMachines,
+        compact: &[u8],
+        program: &StandardProgram,
+        snapshot: &PortableMachineSnapshot,
+    ) -> u32 {
+        let id = machines.create(compact, snapshot.pc).unwrap();
+        initialize_physical_machine(machines, id, program, &[]);
+        for region in &snapshot.memory {
+            machines.poke(id, region.base, &region.bytes).unwrap();
+        }
+        id
+    }
+
+    #[cfg(feature = "std")]
+    fn invoke_snapshot_branch(
+        machines: &mut vos_pvm::inner::InnerMachines,
+        id: u32,
+        snapshot: &PortableMachineSnapshot,
+        resumed: bool,
+    ) -> vos_pvm::inner::InvokeOutcome {
+        let mut registers = snapshot.registers;
+        registers[7] = u64::from(resumed);
+        registers[8] = 0;
+        machines
+            .invoke(
+                id,
+                vos_pvm::inner::InvokeState {
+                    gas: snapshot.gas_remaining,
+                    registers,
+                },
+            )
+            .unwrap()
+    }
+
+    #[cfg(feature = "std")]
+    fn physical_output(
+        machines: &mut vos_pvm::inner::InnerMachines,
+        id: u32,
+        state: &vos_pvm::inner::InvokeState,
+    ) -> Vec<u8> {
+        machines
+            .peek(
+                id,
+                u32::try_from(state.registers[7]).unwrap(),
+                usize::try_from(state.registers[8]).unwrap(),
+            )
+            .unwrap()
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn physical_repeated_yield_persists_restarts_and_completes_exactly() {
+        use vos_pvm::inner::{InnerExit as PhysicalExit, InnerMachines, InvokeState};
+
+        let program = repeated_yield_program();
+        let starts = vos_pvm::interpreter::compute_basic_block_starts(
+            &program.code.code,
+            &program.code.bitmask,
+        );
+        assert!(starts[15]);
+        assert!(starts[56]);
+        assert!(starts[82]);
+        // Static branch operands are signed deltas from their instruction
+        // counters, not absolute PCs.
+        assert_eq!(&program.code.code[11..15], &51_u32.to_le_bytes());
+        let compact = program.compact_code().unwrap();
+        let mut machines = InnerMachines::new();
+        let id = machines.create(&compact, 0).unwrap();
+        initialize_physical_machine(&mut machines, id, &program, &[]);
+        let first = machines
+            .invoke(
+                id,
+                InvokeState {
+                    gas: 1_000_000,
+                    registers: program.layout(&[]).unwrap().registers,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            first.exit,
+            PhysicalExit::Host(u64::from(crate::abi::hostcall::SUSPEND))
+        );
+        let mut first_snapshot = physical_snapshot(&mut machines, id, &program, first.state);
+        assert!(first_snapshot.is_valid());
+
+        let finalizer =
+            restore_physical_snapshot(&mut machines, &compact, &program, &first_snapshot);
+        let first_yield = invoke_snapshot_branch(&mut machines, finalizer, &first_snapshot, false);
+        assert_eq!(
+            first_yield.state.registers[7],
+            2 * u64::from(vos_pvm_program::ZONE_SIZE),
+            "the finalized branch must publish the first yielded reply"
+        );
+        assert_eq!(
+            first_yield.state.registers[0],
+            vos_pvm_program::HALT_ADDRESS,
+            "the persisted return address must survive restoration"
+        );
+        assert_eq!(first_yield.state.registers[8], 14);
+        assert_eq!(first_yield.exit, PhysicalExit::Halt);
+        assert_eq!(
+            physical_output(&mut machines, finalizer, &first_yield.state)[0],
+            crate::actors::STATUS_YIELDED
+        );
+        assert!(first_yield.state.gas < first_snapshot.gas_remaining);
+        first_snapshot.gas_remaining = first_yield.state.gas;
+        machines.expunge(finalizer).unwrap();
+
+        // Recreate the complete machine from the persisted first image. It
+        // reaches a second physical SUSPEND rather than replaying slice one.
+        let resumed = restore_physical_snapshot(&mut machines, &compact, &program, &first_snapshot);
+        let second = invoke_snapshot_branch(&mut machines, resumed, &first_snapshot, true);
+        assert_eq!(
+            second.exit,
+            PhysicalExit::Host(u64::from(crate::abi::hostcall::SUSPEND))
+        );
+        let mut second_snapshot = physical_snapshot(&mut machines, resumed, &program, second.state);
+        assert_ne!(second_snapshot.pc, first_snapshot.pc);
+        assert!(second_snapshot.gas_remaining < first_snapshot.gas_remaining);
+
+        let finalizer =
+            restore_physical_snapshot(&mut machines, &compact, &program, &second_snapshot);
+        let second_yield =
+            invoke_snapshot_branch(&mut machines, finalizer, &second_snapshot, false);
+        assert_eq!(second_yield.exit, PhysicalExit::Halt);
+        assert_eq!(
+            physical_output(&mut machines, finalizer, &second_yield.state)[0],
+            crate::actors::STATUS_YIELDED
+        );
+        assert!(second_yield.state.gas < second_snapshot.gas_remaining);
+        second_snapshot.gas_remaining = second_yield.state.gas;
+        machines.expunge(finalizer).unwrap();
+
+        let resumed =
+            restore_physical_snapshot(&mut machines, &compact, &program, &second_snapshot);
+        let completed = invoke_snapshot_branch(&mut machines, resumed, &second_snapshot, true);
+        assert_eq!(completed.exit, PhysicalExit::Halt);
+        let output = physical_output(&mut machines, resumed, &completed.state);
+        assert_eq!(output[0], crate::actors::STATUS_DONE);
+        assert_eq!(output.last(), Some(&2));
     }
 
     #[cfg(feature = "std")]
