@@ -9,8 +9,9 @@ use core::fmt;
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
 use crate::authority::{
-    AUTHORITY_PUBLIC_KEY_BYTES, AUTHORITY_SIGNATURE_BYTES, AuthorityEvidence, AuthorityIssuer,
-    AuthorityLaneRoots, AuthorityOperationKind, AuthorityReceipt, AuthorityReceiptSelector,
+    AUTHORITY_PUBLIC_KEY_BYTES, AUTHORITY_SIGNATURE_BYTES, AgentAuthorityBinding,
+    AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots, AuthorityOperationKind,
+    AuthorityReceipt, AuthorityReceiptSelector,
 };
 use crate::contract::{
     ActorAbiRange, ActorPackageContract, RuntimeMigrationPolicy, RuntimePackageContract,
@@ -367,9 +368,32 @@ fn decode_replica(decoder: &mut Decoder<'_>) -> Result<AgentReplica, DecodeError
     })
 }
 
+fn encode_agent_authority_binding(encoder: &mut Encoder<'_>, value: AgentAuthorityBinding) {
+    encoder.fixed(value.policy.as_bytes());
+    encode_authority_issuer(encoder, value.issuer);
+    encoder.fixed(&value.public_key);
+    encoder.u64(value.initial_epoch);
+}
+
+fn decode_agent_authority_binding(
+    decoder: &mut Decoder<'_>,
+) -> Result<AgentAuthorityBinding, DecodeError> {
+    let value = AgentAuthorityBinding {
+        policy: Hash(decoder.fixed()?),
+        issuer: decode_authority_issuer(decoder)?,
+        public_key: decoder.fixed()?,
+        initial_epoch: decoder.u64()?,
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
 fn encode_agent_descriptor(encoder: &mut Encoder<'_>, value: &AgentDescriptor) {
     encode_agent_identity(encoder, &value.identity);
     encoder.fixed(value.creation_nonce.as_bytes());
+    encode_agent_authority_binding(encoder, value.authority);
     encode_blob(encoder, &value.runtime_package);
     encode_runtime_contract(encoder, value.runtime_contract);
     encode_capabilities(encoder, value.capabilities);
@@ -380,6 +404,7 @@ fn decode_agent_descriptor(decoder: &mut Decoder<'_>) -> Result<AgentDescriptor,
     let value = AgentDescriptor {
         identity: decode_agent_identity(decoder)?,
         creation_nonce: Hash(decoder.fixed()?),
+        authority: decode_agent_authority_binding(decoder)?,
         runtime_package: decode_blob(decoder)?,
         runtime_contract: decode_runtime_contract(decoder)?,
         capabilities: decode_capabilities(decoder)?,
@@ -1321,6 +1346,9 @@ fn runtime_work_valid(value: &RuntimeWork) -> bool {
                     || descriptor.identity.space != *space
                     || descriptor.identity.agent != *agent
                     || descriptor.identity.runtime_deployment != *runtime_deployment
+                    || authority
+                        .as_deref()
+                        .is_none_or(|receipt| !descriptor.authority.accepts(receipt))
                 {
                     return false;
                 }
@@ -2570,6 +2598,13 @@ mod tests {
         let creation_nonce = Hash([43; 32]);
         let agent = AgentId::derive(space, owner, creation_nonce.as_bytes());
         let runtime_deployment = DeploymentId([44; 32]);
+        let mut authority = receipt_for(&invocation());
+        authority.selector.space = space;
+        authority.selector.agent = agent;
+        authority.selector.operation = AuthorityOperationKind::CreateAgent;
+        authority.selector.runtime_deployment = runtime_deployment;
+        authority.selector.actor = None;
+        authority.selector.actor_deployment = None;
         let descriptor = AgentDescriptor {
             identity: AgentIdentity {
                 space,
@@ -2581,6 +2616,12 @@ mod tests {
                 runtime_producer: ProducerId([46; 32]),
             },
             creation_nonce,
+            authority: AgentAuthorityBinding {
+                policy: authority.selector.policy,
+                issuer: authority.selector.issuer,
+                public_key: authority.public_key,
+                initial_epoch: authority.selector.epoch,
+            },
             runtime_package: blob(47),
             runtime_contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities::standard(),
@@ -2591,13 +2632,6 @@ mod tests {
             }],
         };
         let request = ManagementRequest::Create(alloc::boxed::Box::new(descriptor));
-        let mut authority = receipt_for(&invocation());
-        authority.selector.space = space;
-        authority.selector.agent = agent;
-        authority.selector.operation = AuthorityOperationKind::CreateAgent;
-        authority.selector.runtime_deployment = runtime_deployment;
-        authority.selector.actor = None;
-        authority.selector.actor_deployment = None;
         authority.selector.request = request.commitment();
         let work = RuntimeWork::Manage {
             space,
@@ -2609,6 +2643,17 @@ mod tests {
             observed_slot: 45,
         };
         assert!(work.encode().is_ok());
+
+        let mut self_selected = work.clone();
+        let RuntimeWork::Manage {
+            authority: Some(receipt),
+            ..
+        } = &mut self_selected
+        else {
+            unreachable!()
+        };
+        receipt.selector.policy = Hash([49; 32]);
+        assert_eq!(self_selected.encode(), Err(WireError::InvalidValue));
 
         let mut with_predecessor = work;
         let RuntimeWork::Manage { state, .. } = &mut with_predecessor else {

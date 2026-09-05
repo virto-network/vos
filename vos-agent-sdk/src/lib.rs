@@ -35,7 +35,7 @@ pub use vos_protocol::{
 };
 
 /// Stable clean-generation management/runtime ABI identity.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260906r3");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-20260906r4");
 
 /// Maximum bytes named by one content-addressed artifact reference.
 pub const MAX_CATALOG_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;

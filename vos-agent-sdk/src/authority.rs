@@ -63,6 +63,60 @@ impl AuthorityIssuer {
     }
 }
 
+/// Immutable trust anchor selected when an Agent is created.
+///
+/// A receipt is self-describing so a runtime can verify its signature, but
+/// those self-described fields are not themselves a trust decision. Every
+/// Agent therefore persists this independently supplied binding and requires
+/// exact policy, issuer, and key equality before consuming a receipt. The
+/// epoch is a floor for later authority rotations and prevents a newly
+/// created Agent from accepting evidence from an already-retired epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentAuthorityBinding {
+    pub policy: Hash,
+    pub issuer: AuthorityIssuer,
+    pub public_key: [u8; AUTHORITY_PUBLIC_KEY_BYTES],
+    pub initial_epoch: u64,
+}
+
+impl AgentAuthorityBinding {
+    pub fn is_valid(self) -> bool {
+        self.policy != Hash::ZERO
+            && self.issuer.is_valid()
+            && self.public_key != [0; AUTHORITY_PUBLIC_KEY_BYTES]
+            && ProducerId::of_public_key(&self.public_key) == self.issuer.producer
+            && self.initial_epoch != 0
+    }
+
+    /// Whether this immutable anchor selects the signer and policy carried by
+    /// `receipt`. Request, target, operation, liveness, and signature checks
+    /// remain separate so callers cannot accidentally treat a trust match as
+    /// complete authorization.
+    pub fn accepts(self, receipt: &AuthorityReceipt) -> bool {
+        self.is_valid()
+            && receipt.selector.policy == self.policy
+            && receipt.selector.issuer == self.issuer
+            && receipt.public_key == self.public_key
+            && receipt.selector.epoch >= self.initial_epoch
+    }
+
+    pub fn commitment(self) -> Hash {
+        Hash::digest(
+            b"vos/agent/authority-binding/v1",
+            &[
+                self.policy.as_bytes(),
+                self.issuer.principal.as_bytes(),
+                self.issuer.actor.as_bytes(),
+                self.issuer.deployment.as_bytes(),
+                self.issuer.program.as_bytes(),
+                self.issuer.producer.as_bytes(),
+                &self.public_key,
+                &self.initial_epoch.to_le_bytes(),
+            ],
+        )
+    }
+}
+
 /// Relevant lane commitments selected at authorization time. Missing lanes
 /// are explicit and cannot be confused with a zero root.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -266,6 +320,16 @@ mod tests {
         }
     }
 
+    fn binding(public_key: [u8; 32]) -> AgentAuthorityBinding {
+        let selector = selector(ProducerId::of_public_key(&public_key));
+        AgentAuthorityBinding {
+            policy: selector.policy,
+            issuer: selector.issuer,
+            public_key,
+            initial_epoch: selector.epoch,
+        }
+    }
+
     #[test]
     fn selector_binds_actor_and_runtime_deployments() {
         let key = [14; 32];
@@ -287,5 +351,29 @@ mod tests {
         assert!(value.is_live_at(20));
         assert!(value.is_live_at(30));
         assert!(!value.is_live_at(31));
+    }
+
+    #[test]
+    fn authority_binding_is_independent_of_self_described_receipt_fields() {
+        let public_key = [14; 32];
+        let anchor = binding(public_key);
+        let receipt = AuthorityReceipt {
+            selector: selector(ProducerId::of_public_key(&public_key)),
+            public_key,
+            signature: [15; 64],
+        };
+        assert!(anchor.is_valid());
+        assert!(anchor.accepts(&receipt));
+        assert_ne!(anchor.commitment(), Hash::ZERO);
+
+        let mut attacker = receipt.clone();
+        attacker.selector.policy = Hash([16; 32]);
+        assert!(!anchor.accepts(&attacker));
+        attacker = receipt.clone();
+        attacker.selector.epoch = anchor.initial_epoch - 1;
+        assert!(!anchor.accepts(&attacker));
+        attacker = receipt;
+        attacker.public_key = [17; 32];
+        assert!(!anchor.accepts(&attacker));
     }
 }

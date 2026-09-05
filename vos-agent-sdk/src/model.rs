@@ -1,6 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::authority::AgentAuthorityBinding;
 use crate::contract::{ActorPackageContract, RuntimePackageContract};
 use crate::proof_system::ProofSystemSet;
 use crate::{
@@ -376,6 +377,10 @@ pub struct AgentIdentity {
 pub struct AgentDescriptor {
     pub identity: AgentIdentity,
     pub creation_nonce: Hash,
+    /// Independently selected system-authority trust anchor. The signed
+    /// creation receipt must match this binding; it cannot select its own
+    /// policy, issuer, or verification key.
+    pub authority: AgentAuthorityBinding,
     pub runtime_package: BlobRef,
     pub runtime_contract: RuntimePackageContract,
     pub capabilities: RuntimeCapabilities,
@@ -415,6 +420,7 @@ impl AgentDescriptor {
             || !self.runtime_contract.is_valid()
             || self.capabilities.max_actors == 0
             || self.capabilities.max_actors > STANDARD_MAX_ACTORS
+            || !self.authority.is_valid()
         {
             return Err(ModelError::InvalidRuntime);
         }
@@ -746,6 +752,18 @@ mod tests {
                 runtime_producer: ProducerId([6; 32]),
             },
             creation_nonce,
+            authority: crate::authority::AgentAuthorityBinding {
+                policy: Hash([9; 32]),
+                issuer: crate::authority::AuthorityIssuer {
+                    principal: PrincipalId([10; 32]),
+                    actor: ActorId([11; 32]),
+                    deployment: DeploymentId([12; 32]),
+                    program: ProgramId([13; 32]),
+                    producer: ProducerId::of_public_key(&[14; 32]),
+                },
+                public_key: [14; 32],
+                initial_epoch: 1,
+            },
             runtime_package: BlobRef {
                 hash: Hash([7; 32]),
                 len: 1,
@@ -761,6 +779,9 @@ mod tests {
 
         assert!(descriptor.capabilities.lanes.contains(StateLane::Linear));
         assert_eq!(descriptor.validate(), Ok(()));
+        let mut unanchored = descriptor.clone();
+        unanchored.authority.policy = Hash::ZERO;
+        assert_eq!(unanchored.validate(), Err(ModelError::InvalidRuntime));
         assert!(
             !RuntimeRequirements {
                 lanes: LaneSet::of(StateLane::Linear),
