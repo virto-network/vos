@@ -19,7 +19,10 @@ use super::committee::{
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, MAX_RUNTIME_STATE_BYTES,
 };
-use super::genesis::{AgentGenesisAdmissionId, AgentGenesisAdmissionRecord, AgentReplicaCommittee};
+use super::genesis::{
+    AgentGenesisAdmissionId, AgentGenesisAdmissionRecord, AgentGenesisExpectations,
+    AgentReplicaCommittee, VerifiedAgentGenesisProvision,
+};
 use super::invocation_history::InvocationHistoryWritePlan;
 #[cfg(feature = "std")]
 use super::invocation_index::InvocationIndexes;
@@ -53,6 +56,8 @@ use super::journal_store::{
 use super::shared_commit::OrderedCommitClaim;
 #[cfg(feature = "std")]
 use super::shared_commit::{SharedLaneProjection, SharedSealedMergeProjection};
+#[cfg(all(feature = "std", feature = "storage"))]
+use super::shared_journal_driver::ValidatedSharedArtifactBatch;
 use super::shared_raft::{
     AgentRaftCommand, AgentRouteKey, JournalStoreInstanceId, ReservedAgentRaftApplication,
 };
@@ -1460,10 +1465,10 @@ impl ReplayPreparedGenesis {
         let LifecycleRequest::Create(config) = request.as_ref() else {
             return Err(ReplayError::InvalidRecord);
         };
-        if config.identity.profile != super::AgentProfile::Local
-            || config.replicas.as_slice() != [replica]
-        {
-            return Err(ReplayError::ScopeMismatch);
+        match config.identity.profile {
+            super::AgentProfile::Local if config.replicas.as_slice() == [replica] => {}
+            super::AgentProfile::Shared if config.replicas.contains(&replica) => {}
+            _ => return Err(ReplayError::ScopeMismatch),
         }
 
         let before = RuntimeState::default();
@@ -1500,10 +1505,14 @@ impl ReplayPreparedGenesis {
         let decoded =
             decode_standard_runtime_state(&post_create).map_err(|_| ReplayError::InvalidRecord)?;
         if decoded.config.as_ref() != Some(config)
-            || !decoded.config.as_ref().is_some_and(|created| {
-                created.identity.profile == super::AgentProfile::Local
-                    && created.replicas.as_slice() == [replica]
-            })
+            || !decoded
+                .config
+                .as_ref()
+                .is_some_and(|created| match created.identity.profile {
+                    super::AgentProfile::Local => created.replicas.as_slice() == [replica],
+                    super::AgentProfile::Shared => created.replicas.contains(&replica),
+                    super::AgentProfile::Private => false,
+                })
         {
             return Err(ReplayError::InvalidManagementTransition);
         }
@@ -1830,6 +1839,406 @@ impl ReplaySealedLocalGenesis {
     pub(crate) fn validate(&self) -> Result<(), ReplayValidationError> {
         self.admission
             .validate_against(&self.genesis, &self.post_create, &self.artifacts)
+    }
+}
+
+/// Opaque, system-finality-verified clean-generation seal for one physical
+/// replica of an ordinary Shared Agent.
+///
+/// The selected replica is local storage identity only. The complete
+/// authority-certified committee remains attached to the seal so journal,
+/// Raft, and transport routing cannot independently reconstruct membership
+/// from a caller-supplied `AgentConfig`.
+pub(crate) struct ReplaySealedSharedGenesis {
+    genesis: AgentJournalGenesis,
+    post_create: RuntimeState,
+    empty_frontier: MergeFrontier,
+    ordered_invocations: InvocationIndexManifest,
+    merge_invocations: InvocationIndexManifest,
+    local_invocations: InvocationIndexManifest,
+    artifacts: ArtifactClosure,
+    admission_record: AgentGenesisAdmissionRecord,
+    committee: AgentReplicaCommittee,
+    replica: AgentReplica,
+}
+
+impl ReplaySealedSharedGenesis {
+    pub(crate) fn from_prepared_verified(
+        verified: &VerifiedAgentGenesisProvision,
+        prepared: ReplayPreparedGenesis,
+    ) -> Result<Self, ReplayValidationError> {
+        let provision = verified.provision();
+        provision
+            .validate()
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        let proposal = provision.proposal();
+        let config = proposal.config().map_err(|_| ReplayError::InvalidRecord)?;
+        let expected = AgentGenesisExpectations::new(
+            prepared.expectations.runtime_binding(),
+            prepared.expectations.inner_create_request(),
+            prepared.expectations.post_create_state(),
+            prepared.expectations.artifact_closure(),
+            prepared.expectations.sequence(),
+        )
+        .map_err(|_| ReplayError::InvalidRecord)?;
+        let committee = provision.replicas();
+        if proposal.create() != &prepared.create
+            || proposal.expectations() != expected
+            || proposal.catalog() != prepared.artifacts.as_slice()
+            || config.identity.profile != AgentProfile::Shared
+            || config.system_authority_genesis.is_some()
+            || committee.profile() != AgentProfile::Shared
+            || committee.space() != prepared.create.runtime.space
+            || committee.agent() != prepared.create.runtime.agent
+            || committee
+                .member_by_node(prepared.replica.node)
+                .map(|member| member.replica())
+                != Some(prepared.replica)
+        {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        committee
+            .validate_for(config)
+            .map_err(|_| ReplayError::ScopeMismatch)?;
+        let admission_record = provision
+            .admission_record()
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        if !matches!(
+            &admission_record,
+            AgentGenesisAdmissionRecord::SystemAuthorized { .. }
+        ) || admission_record.id() == AgentGenesisAdmissionId::ZERO
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+
+        let genesis = AgentJournalGenesis {
+            admission: admission_record.id(),
+            create: prepared.create,
+        };
+        genesis.validate().map_err(|_| ReplayError::InvalidRecord)?;
+        let genesis_id = genesis.id();
+        if genesis_id == AgentJournalGenesisId::ZERO {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let artifacts = ArtifactClosure {
+            genesis: genesis_id,
+            artifacts: prepared.artifacts,
+        };
+        artifacts
+            .validate()
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        if artifacts
+            .system_genesis_commitment()
+            .map_err(|_| ReplayError::InvalidRecord)?
+            != expected.artifact_closure()
+            || system_genesis_post_create_state_commitment(&prepared.post_create)
+                .map_err(|_| ReplayError::InvalidRecord)?
+                != expected.post_create_state()
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let replica = prepared.replica;
+        let empty_frontier = MergeFrontier {
+            genesis: genesis_id,
+            events: Vec::new(),
+        };
+        let sealed = Self {
+            genesis,
+            post_create: prepared.post_create,
+            empty_frontier,
+            ordered_invocations: InvocationIndexManifest::empty(
+                genesis_id,
+                InvocationOwnershipScope::Ordered,
+            ),
+            merge_invocations: InvocationIndexManifest::empty(
+                genesis_id,
+                InvocationOwnershipScope::Merge,
+            ),
+            local_invocations: InvocationIndexManifest::empty(
+                genesis_id,
+                InvocationOwnershipScope::Local(replica.node),
+            ),
+            artifacts,
+            admission_record,
+            committee: committee.clone(),
+            replica,
+        };
+        sealed.validate()?;
+        Ok(sealed)
+    }
+
+    pub(crate) const fn genesis(&self) -> &AgentJournalGenesis {
+        &self.genesis
+    }
+
+    pub(crate) const fn post_create(&self) -> &RuntimeState {
+        &self.post_create
+    }
+
+    pub(crate) const fn empty_frontier(&self) -> &MergeFrontier {
+        &self.empty_frontier
+    }
+
+    pub(crate) const fn ordered_invocations(&self) -> &InvocationIndexManifest {
+        &self.ordered_invocations
+    }
+
+    pub(crate) const fn merge_invocations(&self) -> &InvocationIndexManifest {
+        &self.merge_invocations
+    }
+
+    pub(crate) const fn local_invocations(&self) -> &InvocationIndexManifest {
+        &self.local_invocations
+    }
+
+    pub(crate) const fn artifacts(&self) -> &ArtifactClosure {
+        &self.artifacts
+    }
+
+    pub(crate) const fn admission_record(&self) -> &AgentGenesisAdmissionRecord {
+        &self.admission_record
+    }
+
+    pub(crate) const fn committee(&self) -> &AgentReplicaCommittee {
+        &self.committee
+    }
+
+    pub(crate) const fn replica(&self) -> AgentReplica {
+        self.replica
+    }
+
+    pub(crate) fn admission_commitment(&self) -> Hash {
+        self.genesis.admission.as_hash()
+    }
+
+    pub(crate) fn lane_manifest(&self, lane: PersistedLane) -> LaneStateManifest {
+        let cursor = match lane {
+            PersistedLane::Control | PersistedLane::Linear => LaneCursor::Ordered {
+                base: OrderedBase::post_genesis(),
+            },
+            PersistedLane::Merge => LaneCursor::Merge {
+                frontier: self.empty_frontier.id(),
+            },
+            PersistedLane::Local => LaneCursor::Local {
+                node: self.replica.node,
+                revision: 0,
+                head: None,
+            },
+        };
+        LaneStateManifest {
+            genesis: self.genesis.id(),
+            runtime: self.genesis.runtime().clone(),
+            lane,
+            cursor,
+            state: BlobRef::of_bytes(state_component(&self.post_create, lane)),
+        }
+    }
+
+    pub(crate) fn initial_heads(&self) -> JournalHeads {
+        JournalHeads::initial(
+            self.genesis.id(),
+            self.genesis.admission,
+            self.replica.node,
+            self.empty_frontier.id(),
+            self.genesis.runtime().clone(),
+        )
+    }
+
+    pub(crate) fn route(&self) -> Result<AgentRouteKey, ReplayValidationError> {
+        AgentRouteKey::new(
+            self.genesis.runtime().space,
+            self.genesis.runtime().agent,
+            self.genesis.id(),
+            self.genesis.admission,
+            self.committee.id(),
+        )
+        .map_err(|_| ReplayError::ScopeMismatch)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), ReplayValidationError> {
+        self.genesis
+            .validate()
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        self.admission_record
+            .validate()
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        let ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { request, .. },
+        } = &self.genesis.create.operation
+        else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        let LifecycleRequest::Create(config) = request.as_ref() else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        if self.genesis.admission != self.admission_record.id()
+            || !matches!(
+                &self.admission_record,
+                AgentGenesisAdmissionRecord::SystemAuthorized { .. }
+            )
+            || config.identity.profile != AgentProfile::Shared
+            || config.system_authority_genesis.is_some()
+            || self.committee.validate_for(config).is_err()
+            || self
+                .committee
+                .member_by_node(self.replica.node)
+                .map(|member| member.replica())
+                != Some(self.replica)
+            || self.artifacts.genesis != self.genesis.id()
+            || self.empty_frontier.genesis != self.genesis.id()
+            || !self.empty_frontier.events.is_empty()
+        {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        self.route()?;
+        Ok(())
+    }
+}
+
+/// Storage-only view shared by the independently sealed Local and Shared
+/// ordinary-genesis capabilities. Keeping this trait crate-private lets the
+/// filesystem slot reuse one crash protocol without accepting raw genesis
+/// data or erasing either admission authority.
+pub(crate) trait ReplaySealedOrdinaryGenesis {
+    fn genesis(&self) -> &AgentJournalGenesis;
+    fn post_create(&self) -> &RuntimeState;
+    fn empty_frontier(&self) -> &MergeFrontier;
+    fn ordered_invocations(&self) -> &InvocationIndexManifest;
+    fn merge_invocations(&self) -> &InvocationIndexManifest;
+    fn local_invocations(&self) -> &InvocationIndexManifest;
+    fn artifacts(&self) -> &ArtifactClosure;
+    fn replica(&self) -> AgentReplica;
+    fn admission_commitment(&self) -> Hash;
+    fn lane_manifest(&self, lane: PersistedLane) -> LaneStateManifest;
+    fn initial_heads(&self) -> JournalHeads;
+    fn validates_config(&self, config: &super::AgentConfig) -> bool;
+    fn admission_record(&self) -> Option<&AgentGenesisAdmissionRecord>;
+    fn validate_seal(&self) -> Result<(), ReplayValidationError>;
+}
+
+impl ReplaySealedOrdinaryGenesis for ReplaySealedLocalGenesis {
+    fn genesis(&self) -> &AgentJournalGenesis {
+        self.genesis()
+    }
+
+    fn post_create(&self) -> &RuntimeState {
+        self.post_create()
+    }
+
+    fn empty_frontier(&self) -> &MergeFrontier {
+        self.empty_frontier()
+    }
+
+    fn ordered_invocations(&self) -> &InvocationIndexManifest {
+        self.ordered_invocations()
+    }
+
+    fn merge_invocations(&self) -> &InvocationIndexManifest {
+        self.merge_invocations()
+    }
+
+    fn local_invocations(&self) -> &InvocationIndexManifest {
+        self.local_invocations()
+    }
+
+    fn artifacts(&self) -> &ArtifactClosure {
+        self.artifacts()
+    }
+
+    fn replica(&self) -> AgentReplica {
+        self.replica()
+    }
+
+    fn admission_commitment(&self) -> Hash {
+        self.admission_commitment()
+    }
+
+    fn lane_manifest(&self, lane: PersistedLane) -> LaneStateManifest {
+        self.lane_manifest(lane)
+    }
+
+    fn initial_heads(&self) -> JournalHeads {
+        self.initial_heads()
+    }
+
+    fn validates_config(&self, config: &super::AgentConfig) -> bool {
+        config.identity.profile == AgentProfile::Local
+            && config.system_authority_genesis.is_none()
+            && config.replicas.as_slice() == [self.replica]
+            && self.admission.node() == self.replica.node
+    }
+
+    fn admission_record(&self) -> Option<&AgentGenesisAdmissionRecord> {
+        None
+    }
+
+    fn validate_seal(&self) -> Result<(), ReplayValidationError> {
+        self.validate()
+    }
+}
+
+impl ReplaySealedOrdinaryGenesis for ReplaySealedSharedGenesis {
+    fn genesis(&self) -> &AgentJournalGenesis {
+        self.genesis()
+    }
+
+    fn post_create(&self) -> &RuntimeState {
+        self.post_create()
+    }
+
+    fn empty_frontier(&self) -> &MergeFrontier {
+        self.empty_frontier()
+    }
+
+    fn ordered_invocations(&self) -> &InvocationIndexManifest {
+        self.ordered_invocations()
+    }
+
+    fn merge_invocations(&self) -> &InvocationIndexManifest {
+        self.merge_invocations()
+    }
+
+    fn local_invocations(&self) -> &InvocationIndexManifest {
+        self.local_invocations()
+    }
+
+    fn artifacts(&self) -> &ArtifactClosure {
+        self.artifacts()
+    }
+
+    fn replica(&self) -> AgentReplica {
+        self.replica()
+    }
+
+    fn admission_commitment(&self) -> Hash {
+        self.admission_commitment()
+    }
+
+    fn lane_manifest(&self, lane: PersistedLane) -> LaneStateManifest {
+        self.lane_manifest(lane)
+    }
+
+    fn initial_heads(&self) -> JournalHeads {
+        self.initial_heads()
+    }
+
+    fn validates_config(&self, config: &super::AgentConfig) -> bool {
+        config.identity.profile == AgentProfile::Shared
+            && config.system_authority_genesis.is_none()
+            && self.committee.validate_for(config).is_ok()
+            && self
+                .committee
+                .member_by_node(self.replica.node)
+                .map(|member| member.replica())
+                == Some(self.replica)
+    }
+
+    fn admission_record(&self) -> Option<&AgentGenesisAdmissionRecord> {
+        Some(&self.admission_record)
+    }
+
+    fn validate_seal(&self) -> Result<(), ReplayValidationError> {
+        self.validate()
     }
 }
 
@@ -2377,6 +2786,7 @@ impl CommittedSharedOrdered {
     pub(crate) fn from_reserved_raft_application(
         reserved: ReservedAgentRaftApplication,
         trusted_committee: &AgentReplicaCommittee,
+        #[cfg(feature = "storage")] validated_batch: Option<ValidatedSharedArtifactBatch>,
     ) -> Result<Self, ReplayValidationError> {
         let committed = reserved.committed();
         let AgentRaftCommand::Ordered {
@@ -2387,7 +2797,18 @@ impl CommittedSharedOrdered {
         else {
             return Err(ReplayError::InvalidRecord);
         };
-        if artifact_batch.is_some()
+        #[cfg(feature = "storage")]
+        let staged_batch_matches = match (artifact_batch, validated_batch.as_ref()) {
+            (None, None) => true,
+            (Some(expected), Some(validated)) => {
+                *expected == validated.batch() && *route == validated.route()
+            }
+            _ => false,
+        };
+        #[cfg(not(feature = "storage"))]
+        let staged_batch_matches = artifact_batch.is_none();
+        if !staged_batch_matches
+            || *artifact_batch != reserved.artifact_batch()
             || entry.validate().is_err()
             || route.validate().is_err()
             || route.genesis() != entry.genesis
@@ -2436,7 +2857,7 @@ impl CommittedSharedOrdered {
         else {
             return Err(ReplayError::InvalidRecord);
         };
-        if artifact_batch.is_some()
+        if *artifact_batch != self.reservation.artifact_batch()
             || route != &self.route
             || entry != &self.entry
             || self.entry.validate().is_err()
@@ -11261,17 +11682,10 @@ mod aggregate {
         let decoded = decode_standard_runtime_state(&materialization.state)
             .map_err(|_| ReplayError::InvalidRecord)?;
         let config = decoded.config.as_ref().ok_or(ReplayError::InvalidRecord)?;
-        let admitted_replicas = committed
-            .committee
-            .members()
-            .iter()
-            .map(|member| member.replica())
-            .collect::<Vec<_>>();
         if committed.committee.profile() != AgentProfile::Shared
             || config.identity.profile != AgentProfile::Shared
             || config.identity.space != committed.committee.space()
             || config.identity.agent != committed.committee.agent()
-            || config.replicas != admitted_replicas
             || store.instance_id() != committed.journal_store
             || current.node != committed.local_node
             || current.genesis != committed.route.genesis()
@@ -15099,7 +15513,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let reserved = ledger.reserve_ordered_application(&committed).unwrap();
-        let token = CommittedSharedOrdered::from_reserved_raft_application(reserved, &committee);
+        let token =
+            CommittedSharedOrdered::from_reserved_raft_application(reserved, &committee, None);
         drop(ledger);
         let _ = std::fs::remove_dir_all(directory);
         token
@@ -15235,6 +15650,7 @@ pub(crate) mod tests {
                 InvocationOwnershipScope::Merge => {
                     let event = MergeEvent {
                         genesis: materialized.heads.genesis,
+                        committee: None,
                         author: materialized.heads.node,
                         ordered_base: materialized.ordered_base(),
                         causal_height: 1,
@@ -15661,6 +16077,7 @@ pub(crate) mod tests {
         for height in 1..=2_000 {
             let event = MergeEvent {
                 genesis,
+                committee: None,
                 author: NodeId([0x65; 32]),
                 ordered_base: OrderedBase::post_genesis(),
                 causal_height: height,
@@ -18483,6 +18900,7 @@ pub(crate) mod tests {
 
         let source = MergeEvent {
             genesis: materialized.heads().genesis,
+            committee: None,
             author: materialized.heads().node,
             ordered_base: materialized.ordered_base(),
             causal_height: 1,
@@ -18518,6 +18936,7 @@ pub(crate) mod tests {
 
         let next_merge = MergeEvent {
             genesis: after_source.heads().genesis,
+            committee: None,
             author: after_source.heads().node,
             ordered_base: after_source.ordered_base(),
             causal_height: 2,
@@ -18694,6 +19113,7 @@ pub(crate) mod tests {
                 MethodMode::Merge => {
                     let event = MergeEvent {
                         genesis: materialized.heads().genesis,
+                        committee: None,
                         author: materialized.heads().node,
                         ordered_base: materialized.ordered_base(),
                         causal_height: 1,
@@ -18815,6 +19235,7 @@ pub(crate) mod tests {
                 MethodMode::Merge => {
                     let event = MergeEvent {
                         genesis: full_heads.genesis,
+                        committee: None,
                         author: full_heads.node,
                         ordered_base: materialized.ordered_base(),
                         causal_height: 1,
@@ -19419,6 +19840,7 @@ pub(crate) mod tests {
 
         let merge = MergeEvent {
             genesis: materialized.heads().genesis,
+            committee: None,
             author: materialized.heads().node,
             ordered_base: materialized.ordered_base(),
             causal_height: 1,
@@ -19599,6 +20021,7 @@ pub(crate) mod tests {
         let base = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
         let event = |discriminator| MergeEvent {
             genesis: base.heads().genesis,
+            committee: None,
             author: base.heads().node,
             ordered_base: base.ordered_base(),
             causal_height: 1,
@@ -19749,6 +20172,7 @@ pub(crate) mod tests {
         parents.sort_unstable();
         let acknowledgement = MergeEvent {
             genesis: reopened.heads().genesis,
+            committee: None,
             author: reopened.heads().node,
             ordered_base: reopened.ordered_base(),
             causal_height: 2,
@@ -19989,7 +20413,7 @@ pub(crate) mod tests {
             store.instance_id(),
         );
         assert!(matches!(
-            CommittedSharedOrdered::from_reserved_raft_application(reserved, &committee),
+            CommittedSharedOrdered::from_reserved_raft_application(reserved, &committee, None),
             Err(ReplayError::InvalidRecord)
         ));
         assert_eq!(store.heads().unwrap().unwrap(), heads);
@@ -20022,6 +20446,7 @@ pub(crate) mod tests {
 
         let event = |discriminator| MergeEvent {
             genesis: left_base.heads().genesis,
+            committee: None,
             author: left_base.heads().node,
             ordered_base: left_base.ordered_base(),
             causal_height: 1,
@@ -20282,6 +20707,7 @@ pub(crate) mod tests {
 
         let causal_parent = MergeEvent {
             genesis: base.heads().genesis,
+            committee: None,
             author: base.heads().node,
             ordered_base: base.ordered_base(),
             causal_height: 1,
@@ -20291,6 +20717,7 @@ pub(crate) mod tests {
         };
         let noncausal = MergeEvent {
             genesis: base.heads().genesis,
+            committee: None,
             author: base.heads().node,
             ordered_base: base.ordered_base(),
             causal_height: 3,
@@ -20336,6 +20763,7 @@ pub(crate) mod tests {
         let base = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
         let event = |discriminator| MergeEvent {
             genesis: base.heads().genesis,
+            committee: None,
             author: base.heads().node,
             ordered_base: base.ordered_base(),
             causal_height: 1,
@@ -20545,6 +20973,7 @@ pub(crate) mod tests {
 
         let root = |discriminator| MergeEvent {
             genesis: checkpointed.heads().genesis,
+            committee: None,
             author: checkpointed.heads().node,
             ordered_base: checkpointed.ordered_base(),
             causal_height: 1,

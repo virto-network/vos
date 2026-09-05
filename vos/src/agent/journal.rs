@@ -1814,6 +1814,11 @@ impl CanonicalJournalRecord for LocalEntry {
 pub struct MergeEvent {
     pub genesis: AgentJournalGenesisId,
     pub author: NodeId,
+    /// Shared events bind the exact authority-certified replica committee
+    /// active when the host admitted them. Local events leave this absent.
+    /// The field is signed and content-addressed, so a removed replica cannot
+    /// relabel a newly produced event as current after a stable transition.
+    pub committee: Option<super::genesis::AgentReplicaCommitteeId>,
     /// Exact lifecycle/directory snapshot used to admit this event.
     pub ordered_base: OrderedBase,
     /// One plus the maximum verified parent height. Importers independently
@@ -1834,6 +1839,9 @@ impl MergeEvent {
         let mut encoder = Encoder(&mut bytes);
         encoder.fixed(&self.genesis.0);
         encoder.fixed(&self.author.0);
+        encoder.option(&self.committee, |encoder, committee| {
+            encoder.fixed(committee.as_bytes())
+        });
         encode_ordered_base(&mut encoder, self.ordered_base);
         encoder.u64(self.causal_height);
         encoder.list(&self.parents, |encoder, parent| encoder.fixed(&parent.0));
@@ -1846,6 +1854,7 @@ impl MergeEvent {
         self.ordered_base.validate()?;
         if self.genesis == AgentJournalGenesisId::ZERO
             || self.author == NodeId::ZERO
+            || self.committee == Some(super::genesis::AgentReplicaCommitteeId::ZERO)
             || self.causal_height == 0
             || self.parents.len() > MAX_MERGE_FRONTIER_ENTRIES
             || (self.parents.is_empty() != (self.causal_height == 1))
@@ -1861,12 +1870,15 @@ impl MergeEvent {
 }
 
 impl ServiceWire for MergeEvent {
-    const MAGIC: [u8; 4] = *b"AGJE";
+    const MAGIC: [u8; 4] = *b"AGJ2";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
         encoder.fixed(&self.genesis.0);
         encoder.fixed(&self.author.0);
+        encoder.option(&self.committee, |encoder, committee| {
+            encoder.fixed(committee.as_bytes())
+        });
         encode_ordered_base(&mut encoder, self.ordered_base);
         encoder.u64(self.causal_height);
         encoder.list(&self.parents, |encoder, parent| encoder.fixed(&parent.0));
@@ -1878,6 +1890,11 @@ impl ServiceWire for MergeEvent {
         enforce_complete_bound(decoder, MAX_JOURNAL_RECORD_BYTES)?;
         let genesis = AgentJournalGenesisId(decoder.fixed()?);
         let author = NodeId(decoder.fixed()?);
+        let committee = decoder.option(|decoder| {
+            Ok(super::genesis::AgentReplicaCommitteeId::from_bytes(
+                decoder.fixed()?,
+            ))
+        })?;
         let ordered_base = decode_ordered_base(decoder)?;
         let causal_height = decoder.u64()?;
         let parents = decode_fixed_id_list::<MergeEventId>(decoder, MAX_MERGE_FRONTIER_ENTRIES)?;
@@ -1886,6 +1903,7 @@ impl ServiceWire for MergeEvent {
         let event = Self {
             genesis,
             author,
+            committee,
             ordered_base,
             causal_height,
             parents,
@@ -4688,6 +4706,7 @@ mod tests {
         .id();
         let event = MergeEvent {
             genesis,
+            committee: None,
             author: NodeId([7; 32]),
             ordered_base: OrderedBase::post_genesis(),
             causal_height: 1,

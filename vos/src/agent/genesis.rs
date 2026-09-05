@@ -1277,6 +1277,78 @@ pub trait AgentGenesisProvider: Send + Sync {
     ) -> Result<Option<Vec<u8>>, AgentGenesisProviderError>;
 }
 
+/// State-dependent trust boundary which proves that an ordinary-Agent
+/// decision is a permanent fact of the already trusted live system Agent.
+///
+/// [`AgentGenesisProvider`] deliberately cannot implement this proof merely
+/// by returning a self-consistent provision. A host must configure an
+/// independent verifier backed by authenticated system-Agent replay (or an
+/// equally strong pinned proof source), and must invoke it again when a
+/// generation is reopened.
+pub trait AgentGenesisFinalityVerifier: Send + Sync {
+    fn verify_finalized(
+        &self,
+        provision: &AgentGenesisProvision,
+    ) -> Result<(), AgentGenesisFinalityError>;
+}
+
+/// Bounded failures from the host-configured live system-Agent verifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentGenesisFinalityError {
+    Unavailable,
+    NotFinalized,
+    WrongSystemAgent,
+    Conflict,
+    Corrupt,
+}
+
+impl fmt::Display for AgentGenesisFinalityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Agent genesis finality verifier: {self:?}")
+    }
+}
+
+impl core::error::Error for AgentGenesisFinalityError {}
+
+/// Opaque proof that one exact canonical provision crossed the configured
+/// state-dependent finality boundary. It is intentionally not wire encodable
+/// and has no raw constructor.
+#[derive(Debug)]
+pub(crate) struct VerifiedAgentGenesisProvision {
+    provision: AgentGenesisProvision,
+}
+
+impl VerifiedAgentGenesisProvision {
+    pub(crate) fn verify<V: AgentGenesisFinalityVerifier + ?Sized>(
+        provision: AgentGenesisProvision,
+        verifier: &V,
+    ) -> Result<Self, AgentGenesisProvisionVerificationError> {
+        provision
+            .validate()
+            .map_err(AgentGenesisProvisionVerificationError::InvalidProvision)?;
+        verifier
+            .verify_finalized(&provision)
+            .map_err(AgentGenesisProvisionVerificationError::Finality)?;
+        // Revalidate after the external trust call. Implementations receive
+        // only a shared reference, but this also keeps the promotion boundary
+        // explicit if interior-backed provision fields are ever introduced.
+        provision
+            .validate()
+            .map_err(AgentGenesisProvisionVerificationError::InvalidProvision)?;
+        Ok(Self { provision })
+    }
+
+    pub(crate) const fn provision(&self) -> &AgentGenesisProvision {
+        &self.provision
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentGenesisProvisionVerificationError {
+    InvalidProvision(AgentGenesisError),
+    Finality(AgentGenesisFinalityError),
+}
+
 /// Validate exact catalog preimages supplied to or loaded from a provider.
 pub fn validate_agent_genesis_catalog(
     proposal: &AgentGenesisProposal,

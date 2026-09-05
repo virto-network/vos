@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use ed25519_dalek::{Signature, VerifyingKey};
 use vos_pvm::refine_host::RefineContext;
 use vos_pvm::{ExitReason, Gas};
 
@@ -17,6 +18,9 @@ use super::driver::{AgentTrustProvider, DEFAULT_MANAGEMENT_GAS};
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation, RuntimeBlob,
     RuntimeExecutionCall, RuntimeExecutionReturn,
+};
+use super::genesis::{
+    AgentReplicaCommittee, AgentReplicaCommitteeId, VerifiedAgentGenesisProvision,
 };
 use super::invocation_index::{InvocationIndexLookup, InvocationIndexes};
 use super::journal::{
@@ -40,8 +44,9 @@ use super::replay::{
     ReplayError, ReplayExecutionResult, ReplayExecutor, ReplayInvocationRecovery,
     ReplayMaterialization, ReplayMaterializationSourceError, ReplayPosition, ReplayPreparation,
     ReplayPreparedGenesis, ReplayProducts, ReplaySealedGenesis, ReplaySealedLocalGenesis,
-    ReplayStepOutcome, ReplayTransition, derive_lane_state, materialize_current,
-    prepare_checkpoint, prepare_local, prepare_merge, prepare_ordered, recover_invocation,
+    ReplaySealedSharedGenesis, ReplayStepOutcome, ReplayTransition, derive_lane_state,
+    materialize_current, prepare_checkpoint, prepare_local, prepare_merge, prepare_ordered,
+    recover_invocation,
 };
 #[cfg(all(feature = "storage", target_os = "linux"))]
 use super::replay::{
@@ -53,6 +58,8 @@ use super::replay::{
 use super::standard::{StandardAgentRuntime, StandardRuntimeState};
 #[cfg(all(feature = "storage", target_os = "linux"))]
 use super::system_authority_ledger::SystemAuthorityLedgerError;
+#[cfg(test)]
+use super::wire::encode_standard_runtime_state;
 use super::wire::{
     RuntimeCall, RuntimeJournalContext, RuntimeReturn, RuntimeState, decode_standard_runtime_state,
 };
@@ -597,10 +604,12 @@ pub(crate) enum LocalSettledAcknowledgementResult {
 
 /// Exact Standard-runtime replay executor backed by an immutable catalog
 /// resolver snapshot.
-struct StandardLocalReplayExecutor<R> {
+pub(crate) struct StandardLocalReplayExecutor<R> {
     resolver: R,
     trust: Arc<dyn AgentTrustProvider>,
     merge: Arc<dyn LocalMergeAuthenticator>,
+    profile: AgentProfile,
+    shared_committees: BTreeMap<AgentReplicaCommitteeId, AgentReplicaCommittee>,
     management_gas: Gas,
     last_management_result: Option<(ReplayInputId, Result<LifecycleReply, LifecycleError>)>,
     authenticated_execution: Option<AuthenticatedLocalExecution>,
@@ -641,14 +650,46 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             resolver,
             trust,
             merge,
+            profile: AgentProfile::Local,
+            shared_committees: BTreeMap::new(),
             management_gas: DEFAULT_MANAGEMENT_GAS,
             last_management_result: None,
             authenticated_execution: None,
         }
     }
 
-    fn replace_resolver(&mut self, resolver: R) {
+    pub(crate) fn new_shared(
+        resolver: R,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        committees: Vec<AgentReplicaCommittee>,
+    ) -> Self {
+        let shared_committees = committees
+            .into_iter()
+            .map(|committee| (committee.id(), committee))
+            .collect();
+        Self {
+            resolver,
+            trust,
+            merge,
+            profile: AgentProfile::Shared,
+            shared_committees,
+            management_gas: DEFAULT_MANAGEMENT_GAS,
+            last_management_result: None,
+            authenticated_execution: None,
+        }
+    }
+
+    pub(crate) fn replace_resolver(&mut self, resolver: R) {
         self.resolver = resolver;
+        self.authenticated_execution = None;
+    }
+
+    pub(crate) fn replace_shared_committees(&mut self, committees: Vec<AgentReplicaCommittee>) {
+        self.shared_committees = committees
+            .into_iter()
+            .map(|committee| (committee.id(), committee))
+            .collect();
         self.authenticated_execution = None;
     }
 
@@ -691,13 +732,24 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         binding: &RuntimeBinding,
         node: NodeId,
     ) -> Result<(), LocalReplayExecutorError> {
+        Self::validate_config_shape(config, binding, node, AgentProfile::Local)
+    }
+
+    fn validate_config_shape(
+        config: &AgentConfig,
+        binding: &RuntimeBinding,
+        node: NodeId,
+        profile: AgentProfile,
+    ) -> Result<(), LocalReplayExecutorError> {
         config
             .validate()
             .map_err(|_| LocalReplayExecutorError::InvalidState)?;
-        if config.identity.profile != AgentProfile::Local || config.replicas.len() != 1 {
+        if config.identity.profile != profile
+            || (profile == AgentProfile::Local && config.replicas.len() != 1)
+        {
             return Err(LocalReplayExecutorError::InvalidProfile);
         }
-        if config.replicas[0].node != node {
+        if !config.replicas.iter().any(|replica| replica.node == node) {
             return Err(LocalReplayExecutorError::WrongReplica);
         }
         if binding.space != config.identity.space
@@ -719,7 +771,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         config: &AgentConfig,
         binding: &RuntimeBinding,
     ) -> Result<Package, LocalReplayExecutorError> {
-        Self::validate_local_config_shape(config, binding, self.merge.node())?;
+        Self::validate_config_shape(config, binding, self.merge.node(), self.profile)?;
         let anchored = self
             .trust
             .authority_for_space(config.identity.space)
@@ -1380,7 +1432,29 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
     type Error = LocalReplayExecutorError;
 
     fn verify_merge_event(&mut self, event: &MergeEvent) -> Result<bool, Self::Error> {
-        Ok(event.author == self.merge.node() && self.merge.verify_event(event))
+        if self.profile == AgentProfile::Local {
+            return Ok(event.committee.is_none()
+                && event.author == self.merge.node()
+                && self.merge.verify_event(event));
+        }
+        let Some(committee_id) = event.committee else {
+            return Ok(false);
+        };
+        let Some(committee) = self.shared_committees.get(&committee_id) else {
+            return Ok(false);
+        };
+        let Some(member) = committee.member_by_node(event.author) else {
+            return Ok(false);
+        };
+        let Ok(key) = VerifyingKey::from_bytes(member.ed25519_public_key()) else {
+            return Ok(false);
+        };
+        let Ok(signature) = Signature::from_slice(&event.signature) else {
+            return Ok(false);
+        };
+        Ok(key
+            .verify_strict(&event.signing_message().0, &signature)
+            .is_ok())
     }
 
     fn authenticate(
@@ -1491,6 +1565,16 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                     }
                     None => RuntimeCall::new(before.clone(), request.clone()),
                 };
+                #[cfg(test)]
+                let returned: RuntimeReturn = if self.trust.use_native_standard_runtime_for_test() {
+                    RuntimeReturn {
+                        state: encode_standard_runtime_state(&expected.snapshot()),
+                        result: expected_result.clone(),
+                    }
+                } else {
+                    self.execute_wire(&runtime.pvm, self.management_gas, &call.encode())?
+                };
+                #[cfg(not(test))]
                 let returned: RuntimeReturn =
                     self.execute_wire(&runtime.pvm, self.management_gas, &call.encode())?;
                 if returned.result != expected_result {
@@ -2168,6 +2252,54 @@ where
     ) -> Result<ReplaySealedLocalGenesis, LocalJournalDriverError> {
         let prepared = Self::prepare_system_genesis(create, replica, catalog, trust, merge)?;
         ReplaySealedLocalGenesis::from_prepared(prepared).map_err(|error| {
+            LocalJournalDriverError::Replay(
+                error
+                    .map_source(|never| match never {})
+                    .map_executor(|never| match never {}),
+            )
+        })
+    }
+
+    /// Re-execute one independently finalized Shared provision for the exact
+    /// selected local replica and mint the only seal accepted by Shared
+    /// journal initialization. Provider bytes and finality remain separate:
+    /// the caller must first obtain `verified` from the configured live
+    /// system-Agent verifier.
+    pub(crate) fn prepare_shared_genesis(
+        verified: &VerifiedAgentGenesisProvision,
+        replica: AgentReplica,
+        catalog: &[RuntimeBlob],
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<ReplaySealedSharedGenesis, LocalJournalDriverError> {
+        if replica.node != merge.node() {
+            return Err(LocalReplayExecutorError::WrongReplica.into());
+        }
+        let provision = verified.provision();
+        let supplied = SuppliedCatalogBlobResolver::from_catalog(catalog)?;
+        let expected_catalog = supplied.blobs.clone();
+        let mut executor = StandardLocalReplayExecutor::new_shared(
+            supplied,
+            trust,
+            merge,
+            vec![provision.replicas().clone()],
+        );
+        let prepared = ReplayPreparedGenesis::prepare(
+            provision.proposal().create().clone(),
+            replica,
+            &mut executor,
+        )
+        .map_err(lift_prepared_genesis_error)?;
+        if expected_catalog.len() != prepared.artifacts().len()
+            || prepared.artifacts().iter().any(|reference| {
+                expected_catalog
+                    .get(&(reference.hash, reference.len))
+                    .is_none_or(|bytes| !reference.matches(bytes))
+            })
+        {
+            return Err(LocalJournalDriverError::InvalidResult);
+        }
+        ReplaySealedSharedGenesis::from_prepared_verified(verified, prepared).map_err(|error| {
             LocalJournalDriverError::Replay(
                 error
                     .map_source(|never| match never {})
@@ -3013,6 +3145,7 @@ where
         let mut event = MergeEvent {
             genesis: heads.genesis,
             author: heads.node,
+            committee: None,
             ordered_base: self.core.materialization.ordered_base(),
             causal_height,
             parents: frontier.events,
@@ -5156,6 +5289,7 @@ mod tests {
             .unwrap();
         let mut event = MergeEvent {
             genesis: core.materialization.heads().genesis,
+            committee: None,
             author: expected_node,
             ordered_base: core.materialization.ordered_base(),
             causal_height: 1,
@@ -5587,6 +5721,7 @@ mod tests {
                         + 1;
                     Self::Merge(MergeEvent {
                         genesis: heads.genesis,
+                        committee: None,
                         author: heads.node,
                         ordered_base: core.materialization.ordered_base(),
                         causal_height,
@@ -6698,6 +6833,7 @@ mod tests {
         let input = invocation_input(&core.materialization, MethodMode::Merge, 0x51);
         let event = MergeEvent {
             genesis: core.materialization.heads().genesis,
+            committee: None,
             author: core.materialization.heads().node,
             ordered_base: core.materialization.ordered_base(),
             causal_height: 1,

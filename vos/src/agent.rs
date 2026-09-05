@@ -53,6 +53,10 @@ pub mod private_sync;
 pub(crate) mod replay;
 pub mod schema;
 pub mod shared_commit;
+#[cfg(all(feature = "std", feature = "storage", target_os = "linux"))]
+pub mod shared_host;
+#[cfg(all(feature = "std", feature = "storage"))]
+pub(crate) mod shared_journal_driver;
 pub mod shared_raft;
 pub mod standard;
 pub mod system_authority;

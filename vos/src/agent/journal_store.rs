@@ -65,7 +65,8 @@ use super::journal::{
 };
 use super::replay::{
     ReplayPublicationAnchor, ReplayPublicationMode, ReplaySealedGenesis, ReplaySealedLocalGenesis,
-    ReplaySealedPublication, ReplaySealedSharedMergeProjection, ReplaySystemAuthorityStoragePlan,
+    ReplaySealedOrdinaryGenesis, ReplaySealedPublication, ReplaySealedSharedGenesis,
+    ReplaySealedSharedMergeProjection, ReplaySystemAuthorityStoragePlan,
     ReplayedRootJournalIdentity,
 };
 use super::shared_commit::{MAX_ORDERED_COMMIT_CLAIM_BYTES, OrderedCommitClaim};
@@ -116,6 +117,7 @@ pub(crate) struct SharedOrderedCommitBinding {
     entry: OrderedEntryId,
     claim: OrderedCommitClaim,
     raft_payload_commitment: Hash,
+    successor: JournalHeadsId,
 }
 
 impl SharedOrderedCommitBinding {
@@ -124,12 +126,14 @@ impl SharedOrderedCommitBinding {
         entry: OrderedEntryId,
         claim: OrderedCommitClaim,
         raft_payload_commitment: Hash,
+        successor: JournalHeadsId,
     ) -> Result<Self, JournalStoreError> {
         let binding = Self {
             journal_store,
             entry,
             claim,
             raft_payload_commitment,
+            successor,
         };
         binding.validate()?;
         Ok(binding)
@@ -140,6 +144,7 @@ impl SharedOrderedCommitBinding {
             || self.claim.validate().is_err()
             || self.claim.ordered().head != Some(self.entry)
             || self.raft_payload_commitment == Hash::ZERO
+            || self.successor == JournalHeadsId::ZERO
         {
             Err(JournalStoreError::Corrupt)
         } else {
@@ -162,10 +167,14 @@ impl SharedOrderedCommitBinding {
     pub(crate) const fn raft_payload_commitment(&self) -> Hash {
         self.raft_payload_commitment
     }
+
+    pub(crate) const fn successor(&self) -> JournalHeadsId {
+        self.successor
+    }
 }
 
 impl ServiceWire for SharedOrderedCommitBinding {
-    const MAGIC: [u8; 4] = *b"AGCB";
+    const MAGIC: [u8; 4] = *b"AGC2";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -173,6 +182,7 @@ impl ServiceWire for SharedOrderedCommitBinding {
         encoder.fixed(self.entry.as_bytes());
         encoder.bytes(&self.claim.encode());
         encoder.fixed(&self.raft_payload_commitment.0);
+        encoder.fixed(self.successor.as_bytes());
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -182,6 +192,7 @@ impl ServiceWire for SharedOrderedCommitBinding {
             entry: OrderedEntryId(decoder.fixed()?),
             claim: OrderedCommitClaim::decode(&decoder.bytes()?)?,
             raft_payload_commitment: Hash(decoder.fixed()?),
+            successor: JournalHeadsId(decoder.fixed()?),
         };
         binding.validate().map_err(|_| DecodeError::NonCanonical)?;
         Ok(binding)
@@ -235,6 +246,11 @@ pub(crate) trait SharedOrderedCommitStore: AgentJournalStore {
         &mut self,
         binding: &SharedOrderedCommitBinding,
     ) -> Result<bool, JournalStoreError>;
+
+    /// Canonical committed binding keys in strict order. This is used only by
+    /// the Shared host's cross-ledger restart audit; callers cannot install or
+    /// reinterpret bindings through this enumeration seam.
+    fn shared_ordered_commit_ids(&self) -> Result<Vec<OrderedEntryId>, JournalStoreError>;
 }
 
 /// Typed, content-addressed persistence for permanent live-system authority
@@ -1926,24 +1942,22 @@ fn validate_sealed_genesis_shape(
     })
 }
 
-/// Validate the storage-visible closure of an opaque ordinary-Local genesis
-/// seal.  Authority is deliberately different from root bootstrap: the seal
-/// has already crossed the live receipt/package trust boundary, and storage
-/// proves its exact derived admission rather than looking for a system
-/// authority ledger owner.
-fn validate_sealed_local_genesis_shape(
-    sealed: &ReplaySealedLocalGenesis,
+/// Validate the storage-visible closure of an opaque ordinary-Agent genesis
+/// seal. Local receipt admission and Shared system-finality admission remain
+/// distinct opaque constructors; this helper only shares their physical
+/// crash protocol after that trust boundary has been crossed.
+fn validate_sealed_ordinary_genesis_shape<T: ReplaySealedOrdinaryGenesis>(
+    sealed: &T,
     agent: AgentId,
     node: NodeId,
 ) -> Result<SealedGenesisShape, JournalStoreError> {
     sealed
-        .validate()
+        .validate_seal()
         .map_err(|_| JournalStoreError::NonCanonical)?;
     let genesis = sealed.genesis();
     encode_object(genesis)?;
     if genesis.runtime().agent != agent
         || sealed.replica().node != node
-        || sealed.admission().node() != node
         || sealed.admission_commitment() == Hash::ZERO
     {
         return Err(JournalStoreError::ScopeMismatch);
@@ -1959,12 +1973,13 @@ fn validate_sealed_local_genesis_shape(
     let decoded =
         decode_standard_runtime_state(post_create).map_err(|_| JournalStoreError::NonCanonical)?;
     let config = decoded.config.ok_or(JournalStoreError::NonCanonical)?;
-    if config.validate().is_err()
-        || config.identity.profile != super::AgentProfile::Local
-        || config.system_authority_genesis.is_some()
-        || config.replicas.as_slice() != [sealed.replica()]
-    {
+    if config.validate().is_err() || !sealed.validates_config(&config) {
         return Err(JournalStoreError::ScopeMismatch);
+    }
+    if let Some(admission) = sealed.admission_record()
+        && (admission.id() != genesis.admission || admission.validate().is_err())
+    {
+        return Err(JournalStoreError::NonCanonical);
     }
 
     let expected_frontier = MergeFrontier {
@@ -3369,6 +3384,7 @@ fn validate_shared_ordered_commit(
                 entry.id(),
                 claim.clone(),
                 sealed.raft_payload_commitment(),
+                publication.next().id(),
             )
             .map(Some)
             .map_err(|_| JournalStoreError::NonCanonical)
@@ -4622,6 +4638,20 @@ impl SharedOrderedCommitStore for MemoryAgentJournalStore {
                 Ok(true)
             }
         }
+    }
+
+    fn shared_ordered_commit_ids(&self) -> Result<Vec<OrderedEntryId>, JournalStoreError> {
+        if self.shared_ordered_commits.len() > MAX_SHARED_ORDERED_COMMIT_BINDINGS {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        let mut ids = Vec::new();
+        ids.try_reserve(self.shared_ordered_commits.len())
+            .map_err(|_| JournalStoreError::LimitExceeded)?;
+        for (&entry, bytes) in self.shared_ordered_commits.iter() {
+            decode_shared_ordered_commit_binding(bytes, entry)?;
+            ids.push(entry);
+        }
+        Ok(ids)
     }
 }
 
@@ -6457,9 +6487,9 @@ impl FileLocalAgentJournalSlot {
     /// admission. `exposed` is the separately durable Host marker; an
     /// exposed store must already be complete, while an unexposed store may
     /// resume only a monotonic prefix of this seal.
-    pub(crate) fn open(
+    pub(crate) fn open<T: ReplaySealedOrdinaryGenesis>(
         self,
-        sealed: &ReplaySealedLocalGenesis,
+        sealed: &T,
         externally_exposed: bool,
     ) -> Result<FileAgentJournalStore, JournalStoreError> {
         self.verify_lock()?;
@@ -6557,9 +6587,9 @@ impl FileLocalAgentJournalSlot {
         Ok(store)
     }
 
-    fn preflight_unexposed_generation_prefix(
+    fn preflight_unexposed_generation_prefix<T: ReplaySealedOrdinaryGenesis>(
         &self,
-        sealed: &ReplaySealedLocalGenesis,
+        sealed: &T,
     ) -> Result<bool, JournalStoreError> {
         if !self.generation_exists {
             return Ok(false);
@@ -6649,9 +6679,9 @@ impl FileLocalAgentJournalSlot {
             && staged_heads.is_none())
     }
 
-    fn preflight_exposed_generation(
+    fn preflight_exposed_generation<T: ReplaySealedOrdinaryGenesis>(
         &self,
-        sealed: &ReplaySealedLocalGenesis,
+        sealed: &T,
     ) -> Result<(), JournalStoreError> {
         if !self.generation_exists {
             return Err(JournalStoreError::Corrupt);
@@ -7204,8 +7234,25 @@ impl FileAgentJournalStore {
         &mut self,
         sealed: &ReplaySealedLocalGenesis,
     ) -> Result<bool, JournalStoreError> {
+        self.initialize_ordinary(sealed)
+    }
+
+    /// Install one system-finality-verified Shared genesis using the same
+    /// descriptor-pinned crash protocol as Local genesis while additionally
+    /// retaining its typed SystemAuthorized admission record.
+    pub(crate) fn initialize_shared(
+        &mut self,
+        sealed: &ReplaySealedSharedGenesis,
+    ) -> Result<bool, JournalStoreError> {
+        self.initialize_ordinary(sealed)
+    }
+
+    fn initialize_ordinary<T: ReplaySealedOrdinaryGenesis>(
+        &mut self,
+        sealed: &T,
+    ) -> Result<bool, JournalStoreError> {
         self.ensure_no_gc_pending()?;
-        let shape = validate_sealed_local_genesis_shape(sealed, self.agent, self.node)?;
+        let shape = validate_sealed_ordinary_genesis_shape(sealed, self.agent, self.node)?;
         if self.replayed_root.is_some() {
             return Err(JournalStoreError::ScopeMismatch);
         }
@@ -7246,6 +7293,9 @@ impl FileAgentJournalStore {
             if existing != shape.initial {
                 return Err(JournalStoreError::Conflict);
             }
+        }
+        if let Some(admission) = sealed.admission_record() {
+            self.persist_authority(admission)?;
         }
         self.persist_admission(sealed.admission_commitment())?;
         self.persist_object(sealed.empty_frontier())?;
@@ -7288,13 +7338,33 @@ impl FileAgentJournalStore {
         sealed: &ReplaySealedLocalGenesis,
         intent: Hash,
     ) -> Result<(), JournalStoreError> {
+        self.commit_ordinary_exposure(sealed, intent)
+    }
+
+    /// Irreversibly bind a Shared generation to the exact externally durable
+    /// provision intent after journal and Raft initialization have completed.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn commit_shared_exposure(
+        &mut self,
+        sealed: &ReplaySealedSharedGenesis,
+        intent: Hash,
+    ) -> Result<(), JournalStoreError> {
+        self.commit_ordinary_exposure(sealed, intent)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn commit_ordinary_exposure<T: ReplaySealedOrdinaryGenesis>(
+        &mut self,
+        sealed: &T,
+        intent: Hash,
+    ) -> Result<(), JournalStoreError> {
         if intent == Hash::ZERO
             || self.local_exposure != Some(intent)
             || self.replayed_root.is_some()
         {
             return Err(JournalStoreError::ScopeMismatch);
         }
-        validate_sealed_local_genesis_shape(sealed, self.agent, self.node)?;
+        validate_sealed_ordinary_genesis_shape(sealed, self.agent, self.node)?;
 
         // Cleanup for a read-only reopen is permitted only after the driver
         // has authenticated and replayed its current head closure.
@@ -7315,6 +7385,11 @@ impl FileAgentJournalStore {
             return Err(JournalStoreError::ScopeMismatch);
         }
         validate_head_targets(self, &heads)?;
+        // Re-read the typed authority record at the last irreversible
+        // boundary. In particular, a Shared SystemAuthorized admission may
+        // not be deleted or replaced between slot open/initialization and
+        // stable-lock exposure.
+        self.validate_local_authority_recovery(sealed)?;
         self.sync_unexposed_generation()?;
         commit_local_stable_lock_exposure(
             &self._stable_lock,
@@ -8733,11 +8808,11 @@ impl FileAgentJournalStore {
         Ok(())
     }
 
-    fn validate_local_authority_recovery(
+    fn validate_local_authority_recovery<T: ReplaySealedOrdinaryGenesis>(
         &self,
-        sealed: &ReplaySealedLocalGenesis,
+        sealed: &T,
     ) -> Result<(), JournalStoreError> {
-        validate_sealed_local_genesis_shape(sealed, self.agent, self.node)?;
+        validate_sealed_ordinary_genesis_shape(sealed, self.agent, self.node)?;
         let Some(genesis) = self.genesis()? else {
             return Ok(());
         };
@@ -8745,6 +8820,14 @@ impl FileAgentJournalStore {
             || self.read_admission("genesis-admission")? != Some(sealed.admission_commitment())
         {
             return Err(JournalStoreError::ScopeMismatch);
+        }
+        if let Some(expected) = sealed.admission_record() {
+            let stored = self
+                .read_authority::<AgentGenesisAdmissionRecord>(*expected.id().as_bytes())?
+                .ok_or(JournalStoreError::MissingObject)?;
+            if &stored != expected {
+                return Err(JournalStoreError::ScopeMismatch);
+            }
         }
         Ok(())
     }
@@ -10016,6 +10099,30 @@ impl SharedOrderedCommitStore for FileAgentJournalStore {
     ) -> Result<bool, JournalStoreError> {
         self.persist_shared_ordered_commit_binding(binding)
     }
+
+    fn shared_ordered_commit_ids(&self) -> Result<Vec<OrderedEntryId>, JournalStoreError> {
+        let directory = self.directory(SHARED_ORDERED_COMMIT_DIRECTORY)?;
+        let names = bounded_directory_names(directory, MAX_SHARED_ORDERED_COMMIT_FILES)?;
+        let mut ids = BTreeSet::new();
+        for name in names {
+            if name.ends_with(".next") {
+                return Err(JournalStoreError::Corrupt);
+            }
+            let raw = decode_hex_32(name.as_bytes()).ok_or(JournalStoreError::Corrupt)?;
+            let entry = OrderedEntryId(raw);
+            if entry == OrderedEntryId::ZERO
+                || encode_hex(entry.as_bytes()) != name
+                || !ids.insert(entry)
+                || self.shared_ordered_commit(entry)?.is_none()
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+        if ids.len() > MAX_SHARED_ORDERED_COMMIT_BINDINGS {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        Ok(ids.into_iter().collect())
+    }
 }
 
 impl SystemAuthorityHistoryStore for FileAgentJournalStore {
@@ -10794,7 +10901,14 @@ mod tests {
             Hash([0xd6; 32]),
         )
         .unwrap();
-        SharedOrderedCommitBinding::new(journal_store, entry.id(), claim, Hash([0xd7; 32])).unwrap()
+        SharedOrderedCommitBinding::new(
+            journal_store,
+            entry.id(),
+            claim,
+            Hash([0xd7; 32]),
+            heads.id(),
+        )
+        .unwrap()
     }
 
     #[derive(Clone)]
@@ -12163,6 +12277,7 @@ mod tests {
             entry.id(),
             binding.claim().clone(),
             Hash([0xd8; 32]),
+            binding.successor(),
         )
         .unwrap();
         assert_eq!(
@@ -12199,6 +12314,7 @@ mod tests {
             entry.id(),
             binding.claim().clone(),
             Hash([0xd9; 32]),
+            binding.successor(),
         )
         .unwrap();
         assert_eq!(
@@ -13254,6 +13370,7 @@ mod tests {
     ) -> MergeEvent {
         MergeEvent {
             genesis: genesis.id(),
+            committee: None,
             author: NodeId([discriminator; 32]),
             ordered_base: OrderedBase::post_genesis(),
             causal_height: height,

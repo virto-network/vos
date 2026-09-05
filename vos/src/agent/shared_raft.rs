@@ -4,8 +4,9 @@
 //! Raft slot as a leader no-op, canonical [`AgentRaftCommand`], or bounded
 //! membership change. It advances its V2 audit cursor and Raft `last_applied`
 //! atomically for leader no-ops and the application-authorized two-slot
-//! committee-transition barrier. Ordinary command execution and live-worker
-//! attachment remain later integration slices.
+//! committee-transition barrier. Ordinary commands cross a generation/store/
+//! replica-bound reservation before the Shared journal driver executes them;
+//! live transport-worker attachment remains a later integration slice.
 //! Applying an ordered command and publishing its exact [`OrderedCommitClaim`]
 //! are separate from signing: the evidence ledger first anchors that applied
 //! claim, then commits an immutable pledge, and only then invokes a replica
@@ -43,6 +44,7 @@ const SERVICE_WIRE_HEADER_BYTES: usize = 4 + 32;
 const ARTIFACT_BATCH_ID_DOMAIN: &[u8] = b"vos/agent/shared/artifact-batch/v1";
 const ARTIFACT_CHUNK_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/artifact-batch-chunk/v1";
 const AGENT_RAFT_COMMAND_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/raft-command/v1";
+const AGENT_RAFT_REPLICATION_ID_DOMAIN: &[u8] = b"vos/agent/shared/raft-replication/v1";
 const AGENT_RAFT_APPLY_RESERVATION_DOMAIN: &[u8] = b"vos/agent/shared/raft-apply-reservation/v1";
 const COMMITTEE_CHANGE_REQUEST_DOMAIN: &[u8] = b"vos/agent/shared/committee-change-request/v1";
 const COMMITTEE_TRANSITION_ID_DOMAIN: &[u8] = b"vos/agent/shared/committee-transition/v1";
@@ -189,6 +191,14 @@ impl AgentGenerationRouteKey {
             return Err(AgentRaftWireError::InvalidRoute);
         }
         enforce_wire_bound(&self, MAX_AGENT_GENERATION_ROUTE_KEY_BYTES)
+    }
+
+    /// Network replication group shared by every committee epoch of this
+    /// exact journal generation. Full Agent identity and admission remain in
+    /// the preimage; committee transitions therefore never create a second
+    /// overlapping Raft group for the same Agent.
+    pub fn replication_id(self) -> [u8; 32] {
+        Hash::digest(AGENT_RAFT_REPLICATION_ID_DOMAIN, &[&self.encode()]).0
     }
 }
 
@@ -1883,7 +1893,7 @@ const MAX_COMMITTEE_APPLICATION_STATE_BYTES: usize = 256 * 1024;
 /// it by one.
 #[cfg(feature = "storage")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CommitteeChangeAuthorityBinding {
+pub struct CommitteeChangeAuthorityBinding {
     policy: crate::agent_sdk::Hash,
     issuer: crate::agent_sdk::authority::AuthorityIssuer,
     runtime_deployment: crate::agent_sdk::DeploymentId,
@@ -1893,7 +1903,7 @@ pub(crate) struct CommitteeChangeAuthorityBinding {
 
 #[cfg(feature = "storage")]
 impl CommitteeChangeAuthorityBinding {
-    pub(crate) fn new(
+    pub fn new(
         policy: crate::agent_sdk::Hash,
         issuer: crate::agent_sdk::authority::AuthorityIssuer,
         runtime_deployment: crate::agent_sdk::DeploymentId,
@@ -2179,6 +2189,7 @@ pub(crate) struct ReservedAgentRaftApplication {
     committed: CommittedAgentRaftEntry,
     local_node: NodeId,
     journal_store: JournalStoreInstanceId,
+    artifact_batch: Option<ArtifactBatchId>,
 }
 
 /// Read-only recovery evidence for an exact application already anchored
@@ -2237,10 +2248,15 @@ impl ReservedAgentRaftApplication {
         local_node: NodeId,
         journal_store: JournalStoreInstanceId,
     ) -> Self {
+        let artifact_batch = match committed.command() {
+            AgentRaftCommand::Ordered { artifact_batch, .. } => *artifact_batch,
+            _ => None,
+        };
         Self {
             committed,
             local_node,
             journal_store,
+            artifact_batch,
         }
     }
 
@@ -2270,6 +2286,10 @@ impl ReservedAgentRaftApplication {
 
     pub(crate) const fn journal_store(&self) -> JournalStoreInstanceId {
         self.journal_store
+    }
+
+    pub(crate) const fn artifact_batch(&self) -> Option<ArtifactBatchId> {
+        self.artifact_batch
     }
 }
 
@@ -2916,6 +2936,7 @@ mod evidence_ledger {
                         committed: committed.clone(),
                         local_node: self.local_node,
                         journal_store: self.journal_store,
+                        artifact_batch: None,
                     });
                 }
                 let fail_stop = FailStopRecord {
@@ -2962,6 +2983,7 @@ mod evidence_ledger {
                 committed: committed.clone(),
                 local_node: self.local_node,
                 journal_store: self.journal_store,
+                artifact_batch: None,
             })
         }
 
@@ -4092,6 +4114,23 @@ mod evidence_ledger {
         committed: &CommittedAgentRaftEntry,
         claim: &OrderedCommitClaim,
     ) -> Result<(), AgentRaftLedgerError> {
+        validate_claim_link_inner(route, committed, claim, false)
+    }
+
+    pub(super) fn validate_claim_link_with_artifact_batch(
+        route: AgentRouteKey,
+        committed: &CommittedAgentRaftEntry,
+        claim: &OrderedCommitClaim,
+    ) -> Result<(), AgentRaftLedgerError> {
+        validate_claim_link_inner(route, committed, claim, true)
+    }
+
+    fn validate_claim_link_inner(
+        route: AgentRouteKey,
+        committed: &CommittedAgentRaftEntry,
+        claim: &OrderedCommitClaim,
+        artifact_batch_receipted: bool,
+    ) -> Result<(), AgentRaftLedgerError> {
         claim.validate()?;
         if AgentRouteKey::from_claim(claim)? != route
             || committed.route() != route
@@ -4106,6 +4145,11 @@ mod evidence_ledger {
                 entry,
                 ..
             } => entry,
+            AgentRaftCommand::Ordered {
+                artifact_batch: Some(_),
+                entry,
+                ..
+            } if artifact_batch_receipted => entry,
             AgentRaftCommand::Ordered {
                 artifact_batch: Some(_),
                 ..
@@ -4249,6 +4293,7 @@ pub(crate) use evidence_ledger::{
 
 #[cfg(all(feature = "std", feature = "storage"))]
 mod application_ledger_v2 {
+    use alloc::collections::BTreeMap;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
@@ -4259,6 +4304,7 @@ mod application_ledger_v2 {
     const APPLICATION_SCHEMA_VERSION: u32 = 2;
     const CONFIG_RECORD_MAX_BYTES: usize =
         MAX_AGENT_REPLICA_COMMITTEE_BYTES + MAX_COMMITTEE_AUTHORITY_BINDING_BYTES + 1024;
+    const COMMAND_RESERVATION_RECORD_MAX_BYTES: usize = 1024;
     const GENERATION_STORAGE_KEY_BYTES: usize = 32 * 4;
     const AUDIT_STORAGE_KEY_BYTES: usize = GENERATION_STORAGE_KEY_BYTES + 8;
 
@@ -4270,6 +4316,18 @@ mod application_ledger_v2 {
         TableDefinition::new("agent_shared_raft_apply_audit_v2");
     const COMMITTEE_STATE_TABLE_V2: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("agent_shared_raft_committee_state_v2");
+    const COMMAND_RESERVATION_TABLE_V2: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("agent_shared_raft_command_reservation_v2");
+
+    const V2_TABLE_NAMES: &[&str] = &[
+        "raft_log",
+        "raft_meta",
+        "agent_shared_raft_application_config_v2",
+        "agent_shared_raft_apply_meta_v2",
+        "agent_shared_raft_apply_audit_v2",
+        "agent_shared_raft_committee_state_v2",
+        "agent_shared_raft_command_reservation_v2",
+    ];
 
     // Any table from the previous committee-keyed evidence generation makes
     // this database ineligible for V2 initialization. There is deliberately
@@ -4290,6 +4348,7 @@ mod application_ledger_v2 {
         version: u32,
         generation: AgentGenerationRouteKey,
         journal_store: JournalStoreInstanceId,
+        local_node: NodeId,
         initial_committee: AgentReplicaCommittee,
         authority: CommitteeChangeAuthorityBinding,
     }
@@ -4303,9 +4362,14 @@ mod application_ledger_v2 {
             self.authority.validate()?;
             if self.version != APPLICATION_SCHEMA_VERSION
                 || self.journal_store.as_bytes() == &[0; 32]
+                || self.local_node == NodeId::ZERO
                 || self.initial_committee.profile() != AgentProfile::Shared
                 || self.initial_committee.space() != self.generation.space
                 || self.initial_committee.agent() != self.generation.agent
+                || self
+                    .initial_committee
+                    .member_by_node(self.local_node)
+                    .is_none()
             {
                 return Err(AgentRaftWireError::InvalidApplyMeta);
             }
@@ -4321,6 +4385,7 @@ mod application_ledger_v2 {
             encoder.u32(self.version);
             encode_generation_route(&mut encoder, self.generation);
             encoder.fixed(self.journal_store.as_bytes());
+            encoder.fixed(&self.local_node.0);
             encoder.bytes(&self.initial_committee.encode());
             encoder.bytes(&self.authority.encode());
         }
@@ -4332,6 +4397,7 @@ mod application_ledger_v2 {
                 generation: decode_generation_route(decoder)?,
                 journal_store: JournalStoreInstanceId::from_bytes(decoder.fixed()?)
                     .ok_or(DecodeError::NonCanonical)?,
+                local_node: NodeId(decoder.fixed()?),
                 initial_committee: decode_nested::<AgentReplicaCommittee>(
                     decoder,
                     MAX_AGENT_REPLICA_COMMITTEE_BYTES,
@@ -4346,11 +4412,163 @@ mod application_ledger_v2 {
         }
     }
 
+    /// One exact ordinary command which may have crossed its external
+    /// journal/artifact publication boundary but has not yet advanced the
+    /// atomic Raft/application cursor. There is at most one such row for the
+    /// generation because physical slots are applied strictly in order.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CommandReservationRecordV2 {
+        generation: AgentGenerationRouteKey,
+        route: AgentRouteKey,
+        journal_store: JournalStoreInstanceId,
+        local_node: NodeId,
+        index: u64,
+        term: u64,
+        raw_payload_commitment: Hash,
+        command_commitment: Hash,
+        artifact_batch: Option<ArtifactBatchId>,
+    }
+
+    impl CommandReservationRecordV2 {
+        fn from_slot(
+            generation: AgentGenerationRouteKey,
+            journal_store: JournalStoreInstanceId,
+            local_node: NodeId,
+            slot: &CommittedSharedRaftCommand,
+        ) -> Result<Self, AgentRaftApplicationErrorV2> {
+            let artifact_batch = match slot.entry().command() {
+                AgentRaftCommand::Ordered { artifact_batch, .. } => *artifact_batch,
+                _ => None,
+            };
+            let record = Self {
+                generation,
+                route: slot.entry().route(),
+                journal_store,
+                local_node,
+                index: slot.entry().index(),
+                term: slot.entry().term(),
+                raw_payload_commitment: slot.raw_payload_commitment(),
+                command_commitment: slot.entry().payload_commitment(),
+                artifact_batch,
+            };
+            record
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            Ok(record)
+        }
+
+        fn validate(&self) -> Result<(), AgentRaftWireError> {
+            self.generation.validate()?;
+            self.route.validate()?;
+            if self.route.generation() != self.generation
+                || self.journal_store.as_bytes() == &[0; 32]
+                || self.local_node == NodeId::ZERO
+                || self.index == 0
+                || self.term == 0
+                || self.raw_payload_commitment == Hash::ZERO
+                || self.command_commitment == Hash::ZERO
+                || self.artifact_batch == Some(ArtifactBatchId::ZERO)
+            {
+                return Err(AgentRaftWireError::InvalidApplyMeta);
+            }
+            enforce_wire_bound(self, COMMAND_RESERVATION_RECORD_MAX_BYTES)
+        }
+
+        fn matches_reserved(&self, reserved: &ReservedAgentRaftApplication) -> bool {
+            self.route == reserved.route()
+                && self.journal_store == reserved.journal_store()
+                && self.local_node == reserved.local_node()
+                && self.index == reserved.index()
+                && self.term == reserved.term()
+                && self.command_commitment == reserved.payload_commitment()
+                && self.artifact_batch == reserved.artifact_batch()
+        }
+    }
+
+    impl ServiceWire for CommandReservationRecordV2 {
+        const MAGIC: [u8; 4] = *b"AGR2";
+
+        fn encode_body(&self, output: &mut Vec<u8>) {
+            let mut encoder = Encoder(output);
+            encode_generation_route(&mut encoder, self.generation);
+            encode_route(&mut encoder, self.route);
+            encoder.fixed(self.journal_store.as_bytes());
+            encoder.fixed(&self.local_node.0);
+            encoder.u64(self.index);
+            encoder.u64(self.term);
+            encoder.fixed(&self.raw_payload_commitment.0);
+            encoder.fixed(&self.command_commitment.0);
+            encoder.option(&self.artifact_batch, |encoder, batch| {
+                encoder.fixed(batch.as_bytes())
+            });
+        }
+
+        fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+            enforce_complete_bound(decoder, COMMAND_RESERVATION_RECORD_MAX_BYTES)?;
+            let record = Self {
+                generation: decode_generation_route(decoder)?,
+                route: decode_route(decoder)?,
+                journal_store: JournalStoreInstanceId::from_bytes(decoder.fixed()?)
+                    .ok_or(DecodeError::NonCanonical)?,
+                local_node: NodeId(decoder.fixed()?),
+                index: decoder.u64()?,
+                term: decoder.u64()?,
+                raw_payload_commitment: Hash(decoder.fixed()?),
+                command_commitment: Hash(decoder.fixed()?),
+                artifact_batch: decoder
+                    .option(|decoder| Ok(ArtifactBatchId::from_bytes(decoder.fixed()?)))?,
+            };
+            record.validate().map_err(map_wire_decode_error)?;
+            Ok(record)
+        }
+    }
+
     /// Result of an atomic V2 foundation application.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum AgentRaftFoundationApplyOutcomeV2 {
         Applied(AgentRaftApplyMetaV2),
         Duplicate(AgentRaftApplyMetaV2),
+    }
+
+    /// Result of completing a replay/artifact operation under the exact
+    /// durable command reservation.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum AgentRaftCommandApplyOutcomeV2 {
+        Applied(AgentRaftApplyMetaV2),
+        Duplicate(AgentRaftApplyMetaV2),
+    }
+
+    /// One Ordered audit row projected with the exact physical command.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct AgentRaftOrderedJournalAnchorV2 {
+        pub(crate) route: AgentRouteKey,
+        pub(crate) index: u64,
+        pub(crate) term: u64,
+        pub(crate) command_commitment: Hash,
+        pub(crate) entry: OrderedEntryId,
+        pub(crate) claim: Hash,
+        pub(crate) successor: JournalHeadsId,
+    }
+
+    /// The sole reserved Ordered command which may be on either side of its
+    /// journal CAS when a process restarts.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct AgentRaftPendingOrderedV2 {
+        pub(crate) route: AgentRouteKey,
+        pub(crate) index: u64,
+        pub(crate) term: u64,
+        pub(crate) command_commitment: Hash,
+        pub(crate) entry: OrderedEntryId,
+    }
+
+    /// Cross-store restart projection and explicit bounded capacity.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct AgentRaftJournalAuditV2 {
+        pub(crate) applied_slots: u64,
+        pub(crate) remaining_slots: u64,
+        pub(crate) reservation_pending: bool,
+        pub(crate) ordered: Vec<AgentRaftOrderedJournalAnchorV2>,
+        pub(crate) pending_ordered: Option<AgentRaftPendingOrderedV2>,
     }
 
     /// Fail-closed V2 application error.
@@ -4368,6 +4586,11 @@ mod application_ledger_v2 {
         RaftCursorMismatch { raft: u64, application: u64 },
         SnapshotUnsupported,
         CommandExecutionRequired,
+        CommandReservationRequired,
+        DivergentCommandReservation,
+        WrongLocalReplica,
+        WrongJournalStore,
+        InvalidCommandDisposition,
         UnsolicitedConfiguration,
         WrongGeneration,
         StaleCommittee,
@@ -4403,13 +4626,14 @@ mod application_ledger_v2 {
     /// Durable clean-generation application ledger for one Shared-Agent Raft
     /// database.
     ///
-    /// Leader no-ops and the exact authorized committee barrier are the only
-    /// work handled here. Ordinary commands remain a typed later-slice
-    /// refusal, as do snapshots and live-worker attachment.
+    /// Leader no-ops, ordinary-command reservations/completions, and the exact
+    /// authorized committee barrier share one contiguous physical cursor.
+    /// Snapshots and live-worker attachment remain explicit refusals.
     pub(crate) struct AgentRaftApplicationLedgerV2 {
         database: Arc<Database>,
         generation: AgentGenerationRouteKey,
         journal_store: JournalStoreInstanceId,
+        local_node: NodeId,
         initial_committee: AgentReplicaCommittee,
         authority: CommitteeChangeAuthorityBinding,
         writes: std::sync::Mutex<()>,
@@ -4420,13 +4644,14 @@ mod application_ledger_v2 {
             database: Arc<Database>,
             generation: AgentGenerationRouteKey,
             journal_store: JournalStoreInstanceId,
+            local_node: NodeId,
             initial_committee: AgentReplicaCommittee,
             authority: CommitteeChangeAuthorityBinding,
         ) -> Result<Self, AgentRaftApplicationErrorV2> {
             generation
                 .validate()
                 .map_err(|_| AgentRaftApplicationErrorV2::ConfigurationMismatch)?;
-            if journal_store.as_bytes() == &[0; 32] {
+            if journal_store.as_bytes() == &[0; 32] || local_node == NodeId::ZERO {
                 return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
             }
             initial_committee
@@ -4438,6 +4663,7 @@ mod application_ledger_v2 {
             if initial_committee.profile() != AgentProfile::Shared
                 || initial_committee.space() != generation.space
                 || initial_committee.agent() != generation.agent
+                || initial_committee.member_by_node(local_node).is_none()
             {
                 return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
             }
@@ -4445,25 +4671,26 @@ mod application_ledger_v2 {
                 version: APPLICATION_SCHEMA_VERSION,
                 generation,
                 journal_store,
+                local_node,
                 initial_committee: initial_committee.clone(),
                 authority,
             };
             let key = generation_storage_key(generation);
             let transaction = database.begin_write()?;
 
-            for table in transaction.list_tables()? {
-                if LEGACY_V1_TABLE_NAMES.contains(&table.name()) {
-                    return Err(AgentRaftApplicationErrorV2::LegacyGeneration);
-                }
-            }
+            validate_v2_table_namespace_write(&transaction, false)?;
 
             // Pin the complete V2 schema before inspecting any rows.
             {
+                drop(transaction.open_table(crate::raft::RAFT_LOG)?);
+                drop(transaction.open_table(crate::raft::RAFT_META)?);
                 drop(transaction.open_table(CONFIG_TABLE_V2)?);
                 drop(transaction.open_table(APPLY_META_TABLE_V2)?);
                 drop(transaction.open_table(APPLY_AUDIT_TABLE_V2)?);
                 drop(transaction.open_table(COMMITTEE_STATE_TABLE_V2)?);
+                drop(transaction.open_table(COMMAND_RESERVATION_TABLE_V2)?);
             }
+            validate_v2_table_namespace_write(&transaction, true)?;
             ensure_single_generation_in_write(&transaction, &key, true)?;
 
             let existing_config = {
@@ -4489,6 +4716,8 @@ mod application_ledger_v2 {
                 None => {
                     if read_meta_in_write(&transaction, key.as_slice())?.is_some()
                         || read_committee_state_in_write(&transaction, key.as_slice())?.is_some()
+                        || read_command_reservation_in_write(&transaction, key.as_slice())?
+                            .is_some()
                         || audit_prefix_has_row_in_write(&transaction, &key)?
                     {
                         return Err(AgentRaftApplicationErrorV2::CorruptLedger);
@@ -4527,6 +4756,7 @@ mod application_ledger_v2 {
                 database,
                 generation,
                 journal_store,
+                local_node,
                 initial_committee,
                 authority,
                 writes: std::sync::Mutex::new(()),
@@ -4537,6 +4767,51 @@ mod application_ledger_v2 {
 
         pub(crate) const fn generation(&self) -> AgentGenerationRouteKey {
             self.generation
+        }
+
+        pub(crate) const fn journal_store(&self) -> JournalStoreInstanceId {
+            self.journal_store
+        }
+
+        pub(crate) const fn local_node(&self) -> NodeId {
+            self.local_node
+        }
+
+        /// Test-only physical consensus harness. Production callers cannot
+        /// manufacture commitment: they can only drain slots written by the
+        /// Agent-specific transport into the ordinary Raft tables.
+        #[cfg(test)]
+        pub(crate) fn append_committed_for_test(
+            &self,
+            term: u64,
+            kind: &vos_raft::EntryKind<u16>,
+        ) -> Result<u64, AgentRaftApplicationErrorV2> {
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let mut log = crate::raft::RaftLog::open(Arc::clone(&self.database))?;
+            let transaction = self.database.begin_write()?;
+            ensure_v2_config_in_write(
+                &transaction,
+                generation_storage_key(self.generation).as_slice(),
+                self.generation,
+                self.journal_store,
+                self.local_node,
+                &self.initial_committee,
+                self.authority,
+            )?;
+            let index = log.append_in_txn(
+                &transaction,
+                term,
+                &crate::raft::redb_storage::encode_entry_kind(kind),
+            )?;
+            let mut meta = crate::raft::RaftMeta::load_from_write_transaction(&transaction)?;
+            meta.current_term = meta.current_term.max(term);
+            meta.commit_index = index;
+            meta.write_worker_fields_in_txn(&transaction)?;
+            transaction.commit()?;
+            Ok(index)
         }
 
         pub(crate) fn cursor(&self) -> Result<AgentRaftApplyMetaV2, AgentRaftApplicationErrorV2> {
@@ -4578,6 +4853,55 @@ mod application_ledger_v2 {
             Ok(self.committee_state()?.authority_epoch)
         }
 
+        /// Every authority-certified committee ever activated or prepared in
+        /// this generation. Shared Merge replay uses this bounded history to
+        /// verify already-durable events, while live import separately
+        /// requires the currently active committee ID.
+        pub(crate) fn committee_history(
+            &self,
+        ) -> Result<Vec<AgentReplicaCommittee>, AgentRaftApplicationErrorV2> {
+            self.audit_recovery()?;
+            let key = generation_storage_key(self.generation);
+            let transaction = self.database.begin_read()?;
+            let raft = crate::raft::RaftMeta::load_from_read_transaction(&transaction)?;
+            let mut committees = BTreeMap::new();
+            committees.insert(self.initial_committee.id(), self.initial_committee.clone());
+            let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+            for row in table.range(key.as_slice()..)? {
+                let (stored_key, value) = row?;
+                if !stored_key.value().starts_with(key.as_slice()) {
+                    break;
+                }
+                let record = AgentRaftApplyAuditRecordV2::decode(value.value())
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                if !matches!(
+                    record.disposition,
+                    AgentRaftApplyDispositionV2::CommitteeChangePrepared { .. }
+                ) {
+                    continue;
+                }
+                let physical = verify_audited_physical_row_in_read(&transaction, &raft, &record)?;
+                let vos_raft::EntryKind::Data { payload } = physical else {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                };
+                let AgentRaftCommand::PrepareCommitteeChange(change) =
+                    AgentRaftCommand::decode(&payload)
+                        .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?
+                else {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                };
+                if let Some(existing) = committees.insert(change.next().id(), change.next().clone())
+                    && existing != *change.next()
+                {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                if committees.len() > MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES {
+                    return Err(AgentRaftApplicationErrorV2::BacklogLimit);
+                }
+            }
+            Ok(committees.into_values().collect())
+        }
+
         fn committee_state(
             &self,
         ) -> Result<CommitteeApplicationStateV2, AgentRaftApplicationErrorV2> {
@@ -4616,6 +4940,332 @@ mod application_ledger_v2 {
             }
         }
 
+        /// Reserve the exact next ordinary command before any external
+        /// journal or artifact publication is attempted. An exact retry by
+        /// the same local replica returns equivalent opaque authority; any
+        /// different command, replica, generation, committee, or store is a
+        /// fail-closed divergence.
+        pub(crate) fn reserve_command_application(
+            &self,
+            slot: &CommittedSharedRaftCommand,
+        ) -> Result<ReservedAgentRaftApplication, AgentRaftApplicationErrorV2> {
+            if matches!(
+                slot.entry().command(),
+                AgentRaftCommand::PrepareCommitteeChange(_)
+            ) {
+                return Err(AgentRaftApplicationErrorV2::CommandExecutionRequired);
+            }
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let key = generation_storage_key(self.generation);
+            let transaction = self.database.begin_write()?;
+            ensure_v2_config_in_write(
+                &transaction,
+                key.as_slice(),
+                self.generation,
+                self.journal_store,
+                self.local_node,
+                &self.initial_committee,
+                self.authority,
+            )?;
+            let current = read_meta_in_write(&transaction, key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            validate_bound_meta(&current, self.generation, self.journal_store)?;
+            let state = read_committee_state_in_write(&transaction, key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            validate_bound_committee_state(&state, self.generation, self.authority)?;
+            if state.pending.is_some() {
+                return Err(AgentRaftApplicationErrorV2::TransitionBarrier);
+            }
+            let route = slot.entry().route();
+            if route.generation() != self.generation {
+                return Err(AgentRaftApplicationErrorV2::WrongGeneration);
+            }
+            if route.committee() != state.active.id() {
+                return Err(AgentRaftApplicationErrorV2::StaleCommittee);
+            }
+            if state.active.member_by_node(self.local_node).is_none() {
+                return Err(AgentRaftApplicationErrorV2::WrongLocalReplica);
+            }
+
+            let raft = crate::raft::RaftMeta::load_from_write_transaction(&transaction)?;
+            if raft.snap_last_index != 0 {
+                return Err(AgentRaftApplicationErrorV2::SnapshotUnsupported);
+            }
+            if raft.last_applied != current.applied_index {
+                return Err(AgentRaftApplicationErrorV2::RaftCursorMismatch {
+                    raft: raft.last_applied,
+                    application: current.applied_index,
+                });
+            }
+            if slot.entry().index() <= current.applied_index {
+                return Err(AgentRaftApplicationErrorV2::ConflictingDuplicate(
+                    slot.entry().index(),
+                ));
+            }
+            let next = current.applied_index.saturating_add(1);
+            if slot.entry().index() != next {
+                return Err(AgentRaftApplicationErrorV2::ApplyGap {
+                    expected: next,
+                    actual: slot.entry().index(),
+                });
+            }
+            if current.applied_index != 0 && slot.entry().term() < current.applied_term {
+                return Err(AgentRaftApplicationErrorV2::TermRegression {
+                    previous: current.applied_term,
+                    actual: slot.entry().term(),
+                });
+            }
+            if current.applied_index as usize == MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES {
+                return Err(AgentRaftApplicationErrorV2::BacklogLimit);
+            }
+            verify_committed_command_physical_row_in_write(&transaction, &raft, slot)?;
+
+            let expected = CommandReservationRecordV2::from_slot(
+                self.generation,
+                self.journal_store,
+                self.local_node,
+                slot,
+            )?;
+            let existing = read_command_reservation_in_write(&transaction, key.as_slice())?;
+            if let Some(existing) = existing {
+                if existing != expected {
+                    return Err(AgentRaftApplicationErrorV2::DivergentCommandReservation);
+                }
+            } else {
+                let audit_key = audit_storage_key(self.generation, slot.entry().index());
+                if read_audit_in_write(&transaction, audit_key.as_slice())?.is_some() {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                let mut table = transaction.open_table(COMMAND_RESERVATION_TABLE_V2)?;
+                table.insert(key.as_slice(), expected.encode().as_slice())?;
+                drop(table);
+                transaction.commit()?;
+            }
+            Ok(ReservedAgentRaftApplication {
+                committed: slot.entry().clone(),
+                local_node: self.local_node,
+                journal_store: self.journal_store,
+                artifact_batch: expected.artifact_batch,
+            })
+        }
+
+        /// Complete a successfully persisted artifact operation. Ordered
+        /// publication cannot use this method; it must cross the opaque replay
+        /// receipt boundary below.
+        pub(crate) fn complete_artifact_command(
+            &self,
+            reserved: &ReservedAgentRaftApplication,
+            disposition: AgentRaftAuditDisposition,
+        ) -> Result<AgentRaftCommandApplyOutcomeV2, AgentRaftApplicationErrorV2> {
+            if matches!(
+                disposition,
+                AgentRaftAuditDisposition::OrderedApplied { .. }
+            ) {
+                return Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition);
+            }
+            self.complete_reserved_command(reserved, disposition)
+        }
+
+        /// Advance the physical Raft cursor only for replay's exact successful
+        /// Shared Ordered publication receipt.
+        pub(crate) fn anchor_applied_ordered(
+            &self,
+            published: PublishedSharedOrdered,
+        ) -> Result<AgentRaftCommandApplyOutcomeV2, AgentRaftApplicationErrorV2> {
+            let reserved = published.reservation();
+            if published.journal_store() != self.journal_store
+                || reserved.journal_store() != self.journal_store
+                || published.journal_store() != reserved.journal_store()
+            {
+                return Err(AgentRaftApplicationErrorV2::WrongJournalStore);
+            }
+            let committed = reserved.committed();
+            let claim = published.claim();
+            super::evidence_ledger::validate_claim_link_with_artifact_batch(
+                committed.route(),
+                committed,
+                claim,
+            )
+            .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
+            let entry = match committed.command() {
+                AgentRaftCommand::Ordered { entry, .. } => entry,
+                _ => return Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition),
+            };
+            if published.entry() != entry.id()
+                || published.raft_index() != committed.index()
+                || published.raft_term() != committed.term()
+                || published.raft_payload_commitment() != committed.payload_commitment()
+            {
+                return Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition);
+            }
+            self.complete_reserved_command(
+                reserved,
+                AgentRaftAuditDisposition::OrderedApplied {
+                    entry: entry.id(),
+                    claim: claim.commitment(),
+                    successor: published.successor(),
+                },
+            )
+        }
+
+        fn complete_reserved_command(
+            &self,
+            reserved: &ReservedAgentRaftApplication,
+            disposition: AgentRaftAuditDisposition,
+        ) -> Result<AgentRaftCommandApplyOutcomeV2, AgentRaftApplicationErrorV2> {
+            disposition
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
+            validate_command_disposition(reserved.committed().command(), disposition)?;
+            if reserved.journal_store() != self.journal_store {
+                return Err(AgentRaftApplicationErrorV2::WrongJournalStore);
+            }
+            if reserved.route().generation() != self.generation {
+                return Err(AgentRaftApplicationErrorV2::WrongGeneration);
+            }
+
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let key = generation_storage_key(self.generation);
+            let transaction = self.database.begin_write()?;
+            ensure_v2_config_in_write(
+                &transaction,
+                key.as_slice(),
+                self.generation,
+                self.journal_store,
+                self.local_node,
+                &self.initial_committee,
+                self.authority,
+            )?;
+            let current = read_meta_in_write(&transaction, key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            validate_bound_meta(&current, self.generation, self.journal_store)?;
+            let state = read_committee_state_in_write(&transaction, key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            validate_bound_committee_state(&state, self.generation, self.authority)?;
+            let mut raft = crate::raft::RaftMeta::load_from_write_transaction(&transaction)?;
+            if raft.snap_last_index != 0 {
+                return Err(AgentRaftApplicationErrorV2::SnapshotUnsupported);
+            }
+            if raft.last_applied != current.applied_index {
+                return Err(AgentRaftApplicationErrorV2::RaftCursorMismatch {
+                    raft: raft.last_applied,
+                    application: current.applied_index,
+                });
+            }
+
+            if reserved.index() <= current.applied_index {
+                if read_command_reservation_in_write(&transaction, key.as_slice())?.is_some() {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                let audit_key = audit_storage_key(self.generation, reserved.index());
+                let stored = read_audit_in_write(&transaction, audit_key.as_slice())?.ok_or(
+                    AgentRaftApplicationErrorV2::MissingAuditRecord(reserved.index()),
+                )?;
+                let expected = AgentRaftApplyDispositionV2::Command(disposition);
+                if stored.generation != self.generation
+                    || stored.index != reserved.index()
+                    || stored.term != reserved.term()
+                    || stored.disposition != expected
+                {
+                    return Err(AgentRaftApplicationErrorV2::ConflictingDuplicate(
+                        reserved.index(),
+                    ));
+                }
+                verify_reserved_command_physical_row_in_write(
+                    &transaction,
+                    &raft,
+                    reserved,
+                    stored.raw_payload_commitment,
+                )?;
+                return Ok(AgentRaftCommandApplyOutcomeV2::Duplicate(current));
+            }
+
+            let next = current.applied_index.saturating_add(1);
+            if reserved.index() != next {
+                return Err(AgentRaftApplicationErrorV2::ApplyGap {
+                    expected: next,
+                    actual: reserved.index(),
+                });
+            }
+            if current.applied_index != 0 && reserved.term() < current.applied_term {
+                return Err(AgentRaftApplicationErrorV2::TermRegression {
+                    previous: current.applied_term,
+                    actual: reserved.term(),
+                });
+            }
+            if state.pending.is_some() {
+                return Err(AgentRaftApplicationErrorV2::TransitionBarrier);
+            }
+            if reserved.route().committee() != state.active.id() {
+                return Err(AgentRaftApplicationErrorV2::StaleCommittee);
+            }
+            if state.active.member_by_node(reserved.local_node()).is_none() {
+                return Err(AgentRaftApplicationErrorV2::WrongLocalReplica);
+            }
+            let stored = read_command_reservation_in_write(&transaction, key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CommandReservationRequired)?;
+            if stored.generation != self.generation || !stored.matches_reserved(reserved) {
+                return Err(AgentRaftApplicationErrorV2::DivergentCommandReservation);
+            }
+            verify_reserved_command_physical_row_in_write(
+                &transaction,
+                &raft,
+                reserved,
+                stored.raw_payload_commitment,
+            )?;
+
+            let wrapped = AgentRaftApplyDispositionV2::Command(disposition);
+            let audit = AgentRaftApplyAuditRecordV2 {
+                generation: self.generation,
+                index: reserved.index(),
+                term: reserved.term(),
+                raw_payload_commitment: stored.raw_payload_commitment,
+                disposition: wrapped,
+            };
+            audit
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let audit_key = audit_storage_key(self.generation, reserved.index());
+            if read_audit_in_write(&transaction, audit_key.as_slice())?.is_some() {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            let next_meta = AgentRaftApplyMetaV2 {
+                generation: self.generation,
+                journal_store: self.journal_store,
+                applied_index: reserved.index(),
+                applied_term: reserved.term(),
+                raw_payload_commitment: stored.raw_payload_commitment,
+                disposition: Some(wrapped),
+            };
+            next_meta
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            {
+                let mut table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+                table.insert(audit_key.as_slice(), audit.encode().as_slice())?;
+            }
+            {
+                let mut table = transaction.open_table(APPLY_META_TABLE_V2)?;
+                table.insert(key.as_slice(), next_meta.encode().as_slice())?;
+            }
+            {
+                let mut table = transaction.open_table(COMMAND_RESERVATION_TABLE_V2)?;
+                if table.remove(key.as_slice())?.is_none() {
+                    return Err(AgentRaftApplicationErrorV2::CommandReservationRequired);
+                }
+            }
+            raft.last_applied = reserved.index();
+            raft.write_host_fields_in_txn(&transaction)?;
+            transaction.commit()?;
+            Ok(AgentRaftCommandApplyOutcomeV2::Applied(next_meta))
+        }
+
         /// Apply one exact physical slot. While a committee transition is
         /// pending, the next slot must be its exact joint/stable barrier leg;
         /// even leader no-ops are refused without cursor advancement.
@@ -4634,6 +5284,7 @@ mod application_ledger_v2 {
                 key.as_slice(),
                 self.generation,
                 self.journal_store,
+                self.local_node,
                 &self.initial_committee,
                 self.authority,
             )?;
@@ -4873,6 +5524,7 @@ mod application_ledger_v2 {
                 key.as_slice(),
                 self.generation,
                 self.journal_store,
+                self.local_node,
                 &self.initial_committee,
                 self.authority,
             )?;
@@ -4978,7 +5630,166 @@ mod application_ledger_v2 {
             if replayed_committee_state != stored_committee_state {
                 return Err(AgentRaftApplicationErrorV2::CorruptLedger);
             }
+            let reservation = {
+                let table = transaction.open_table(COMMAND_RESERVATION_TABLE_V2)?;
+                table
+                    .get(key.as_slice())?
+                    .map(|value| value.value().to_vec())
+            }
+            .map(|bytes| {
+                let record = CommandReservationRecordV2::decode(&bytes)
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                if record.encode() != bytes {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                Ok(record)
+            })
+            .transpose()?;
+            if let Some(reservation) = reservation {
+                if reservation.generation != self.generation
+                    || reservation.journal_store != self.journal_store
+                    || reservation.local_node != self.local_node
+                    || reservation.index != meta.applied_index.saturating_add(1)
+                    || (meta.applied_index != 0 && reservation.term < meta.applied_term)
+                    || stored_committee_state.pending.is_some()
+                    || reservation.route.committee() != stored_committee_state.active.id()
+                    || stored_committee_state
+                        .active
+                        .member_by_node(reservation.local_node)
+                        .is_none()
+                {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                verify_reservation_physical_row_in_read(&transaction, &raft, &reservation)?;
+            }
             Ok(())
+        }
+
+        /// Project the exact Ordered subset of the physically audited log so
+        /// the host can reconcile it with the independently durable journal
+        /// binding namespace. Snapshotting is deliberately unsupported; the
+        /// returned remaining count is therefore a hard application limit.
+        pub(crate) fn journal_audit(
+            &self,
+        ) -> Result<AgentRaftJournalAuditV2, AgentRaftApplicationErrorV2> {
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            self.audit_recovery()?;
+            let key = generation_storage_key(self.generation);
+            let transaction = self.database.begin_read()?;
+            let raft = crate::raft::RaftMeta::load_from_read_transaction(&transaction)?;
+            let meta_bytes = transaction
+                .open_table(APPLY_META_TABLE_V2)?
+                .get(key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?
+                .value()
+                .to_vec();
+            let meta = AgentRaftApplyMetaV2::decode(&meta_bytes)
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            if meta.encode() != meta_bytes {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            validate_bound_meta(&meta, self.generation, self.journal_store)?;
+
+            let mut ordered = Vec::new();
+            let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+            for row in table.range(key.as_slice()..)? {
+                let (stored_key, value) = row?;
+                if !stored_key.value().starts_with(key.as_slice()) {
+                    break;
+                }
+                let record = AgentRaftApplyAuditRecordV2::decode(value.value())
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                let AgentRaftApplyDispositionV2::Command(
+                    AgentRaftAuditDisposition::OrderedApplied {
+                        entry,
+                        claim,
+                        successor,
+                    },
+                ) = record.disposition
+                else {
+                    continue;
+                };
+                if ordered.len() == MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES {
+                    return Err(AgentRaftApplicationErrorV2::BacklogLimit);
+                }
+                let physical = verify_audited_physical_row_in_read(&transaction, &raft, &record)?;
+                let vos_raft::EntryKind::Data { payload } = physical else {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                };
+                let command = AgentRaftCommand::decode(&payload)
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                let AgentRaftCommand::Ordered {
+                    route,
+                    entry: physical_entry,
+                    ..
+                } = &command
+                else {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                };
+                if physical_entry.id() != entry {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                ordered.push(AgentRaftOrderedJournalAnchorV2 {
+                    route: *route,
+                    index: record.index,
+                    term: record.term,
+                    command_commitment: command.commitment(),
+                    entry,
+                    claim,
+                    successor,
+                });
+            }
+
+            let reservation = transaction
+                .open_table(COMMAND_RESERVATION_TABLE_V2)?
+                .get(key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .map(|bytes| {
+                    let record = CommandReservationRecordV2::decode(&bytes)
+                        .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                    if record.encode() != bytes {
+                        return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                    }
+                    Ok(record)
+                })
+                .transpose()?;
+            let pending_ordered = if let Some(reservation) = &reservation {
+                let (_, _, _, raw) =
+                    crate::raft::RaftLog::committed_payload_at(&self.database, reservation.index)?
+                        .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+                let physical = crate::raft::redb_storage::decode_entry_kind(&raw)
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                let vos_raft::EntryKind::Data { payload } = physical else {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                };
+                let command = AgentRaftCommand::decode(&payload)
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                match &command {
+                    AgentRaftCommand::Ordered { route, entry, .. } => {
+                        Some(AgentRaftPendingOrderedV2 {
+                            route: *route,
+                            index: reservation.index,
+                            term: reservation.term,
+                            command_commitment: command.commitment(),
+                            entry: entry.id(),
+                        })
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            Ok(AgentRaftJournalAuditV2 {
+                applied_slots: meta.applied_index,
+                remaining_slots: (MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64)
+                    .saturating_sub(meta.applied_index),
+                reservation_pending: reservation.is_some(),
+                ordered,
+                pending_ordered,
+            })
         }
     }
 
@@ -4991,6 +5802,21 @@ mod application_ledger_v2 {
         match (record.disposition, physical) {
             (AgentRaftApplyDispositionV2::LeaderNoop, vos_raft::EntryKind::Data { payload })
                 if payload.is_empty() && state.pending.is_none() => {}
+            (
+                AgentRaftApplyDispositionV2::Command(disposition),
+                vos_raft::EntryKind::Data { payload },
+            ) if state.pending.is_none() => {
+                let command = AgentRaftCommand::decode(&payload)
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                if command.encode() != payload
+                    || command.route().generation() != state.generation
+                    || command.route().committee() != state.active.id()
+                {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                validate_command_disposition(&command, disposition)
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            }
             (
                 AgentRaftApplyDispositionV2::CommitteeChangePrepared {
                     transition,
@@ -5117,6 +5943,46 @@ mod application_ledger_v2 {
         Ok(())
     }
 
+    fn validate_command_disposition(
+        command: &AgentRaftCommand,
+        disposition: AgentRaftAuditDisposition,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        let matches = match (command, disposition) {
+            (
+                AgentRaftCommand::ArtifactChunk(chunk),
+                AgentRaftAuditDisposition::ArtifactChunkStored {
+                    batch,
+                    artifact,
+                    offset,
+                    chunk: chunk_commitment,
+                },
+            ) => {
+                batch == chunk.batch()
+                    && artifact == chunk.artifact().hash
+                    && offset == chunk.offset()
+                    && chunk_commitment == chunk.commitment()
+            }
+            (
+                AgentRaftCommand::ArtifactAbort { batch, .. },
+                AgentRaftAuditDisposition::ArtifactBatchAborted {
+                    batch: applied_batch,
+                },
+            ) => *batch == applied_batch,
+            (
+                AgentRaftCommand::Ordered { entry, .. },
+                AgentRaftAuditDisposition::OrderedApplied {
+                    entry: applied_entry,
+                    ..
+                },
+            ) => entry.id() == applied_entry,
+            _ => false,
+        };
+        if !matches {
+            return Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition);
+        }
+        Ok(())
+    }
+
     fn validate_bound_committee_state(
         state: &CommitteeApplicationStateV2,
         generation: AgentGenerationRouteKey,
@@ -5139,14 +6005,11 @@ mod application_ledger_v2 {
         key: &[u8],
         generation: AgentGenerationRouteKey,
         journal_store: JournalStoreInstanceId,
+        local_node: NodeId,
         initial_committee: &AgentReplicaCommittee,
         authority: CommitteeChangeAuthorityBinding,
     ) -> Result<(), AgentRaftApplicationErrorV2> {
-        for table in transaction.list_tables()? {
-            if LEGACY_V1_TABLE_NAMES.contains(&table.name()) {
-                return Err(AgentRaftApplicationErrorV2::LegacyGeneration);
-            }
-        }
+        validate_v2_table_namespace_read(transaction)?;
         ensure_single_generation_in_read(transaction, key, false)?;
         let table = transaction.open_table(CONFIG_TABLE_V2)?;
         let bytes = table
@@ -5162,6 +6025,7 @@ mod application_ledger_v2 {
                     version: APPLICATION_SCHEMA_VERSION,
                     generation,
                     journal_store,
+                    local_node,
                     initial_committee: initial_committee.clone(),
                     authority,
                 })
@@ -5176,14 +6040,11 @@ mod application_ledger_v2 {
         key: &[u8],
         generation: AgentGenerationRouteKey,
         journal_store: JournalStoreInstanceId,
+        local_node: NodeId,
         initial_committee: &AgentReplicaCommittee,
         authority: CommitteeChangeAuthorityBinding,
     ) -> Result<(), AgentRaftApplicationErrorV2> {
-        for table in transaction.list_tables()? {
-            if LEGACY_V1_TABLE_NAMES.contains(&table.name()) {
-                return Err(AgentRaftApplicationErrorV2::LegacyGeneration);
-            }
-        }
+        validate_v2_table_namespace_write(transaction, true)?;
         let key: &[u8; GENERATION_STORAGE_KEY_BYTES] = key
             .try_into()
             .map_err(|_| AgentRaftApplicationErrorV2::ConfigurationMismatch)?;
@@ -5202,11 +6063,55 @@ mod application_ledger_v2 {
                     version: APPLICATION_SCHEMA_VERSION,
                     generation,
                     journal_store,
+                    local_node,
                     initial_committee: initial_committee.clone(),
                     authority,
                 })
         {
             return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_v2_table_namespace_read(
+        transaction: &redb::ReadTransaction,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        let mut count = 0_usize;
+        for table in transaction.list_tables()? {
+            let name = table.name();
+            if LEGACY_V1_TABLE_NAMES.contains(&name) {
+                return Err(AgentRaftApplicationErrorV2::LegacyGeneration);
+            }
+            if !V2_TABLE_NAMES.contains(&name) {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            count = count.saturating_add(1);
+        }
+        if count != V2_TABLE_NAMES.len() || transaction.list_multimap_tables()?.next().is_some() {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        Ok(())
+    }
+
+    fn validate_v2_table_namespace_write(
+        transaction: &redb::WriteTransaction,
+        require_complete: bool,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        let mut count = 0_usize;
+        for table in transaction.list_tables()? {
+            let name = table.name();
+            if LEGACY_V1_TABLE_NAMES.contains(&name) {
+                return Err(AgentRaftApplicationErrorV2::LegacyGeneration);
+            }
+            if !V2_TABLE_NAMES.contains(&name) {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            count = count.saturating_add(1);
+        }
+        if (require_complete && count != V2_TABLE_NAMES.len())
+            || transaction.list_multimap_tables()?.next().is_some()
+        {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
         }
         Ok(())
     }
@@ -5232,11 +6137,16 @@ mod application_ledger_v2 {
             let table = transaction.open_table(COMMITTEE_STATE_TABLE_V2)?;
             exact_generation_row_count(&table, expected_key)?
         };
+        let reservation_rows = {
+            let table = transaction.open_table(COMMAND_RESERVATION_TABLE_V2)?;
+            exact_generation_row_count(&table, expected_key)?
+        };
         validate_single_generation_counts(
             config_rows,
             meta_rows,
             committee_rows,
             audit_rows,
+            reservation_rows,
             allow_empty,
         )
     }
@@ -5262,11 +6172,16 @@ mod application_ledger_v2 {
             let table = transaction.open_table(COMMITTEE_STATE_TABLE_V2)?;
             exact_generation_row_count(&table, expected_key.as_slice())?
         };
+        let reservation_rows = {
+            let table = transaction.open_table(COMMAND_RESERVATION_TABLE_V2)?;
+            exact_generation_row_count(&table, expected_key.as_slice())?
+        };
         validate_single_generation_counts(
             config_rows,
             meta_rows,
             committee_rows,
             audit_rows,
+            reservation_rows,
             allow_empty,
         )
     }
@@ -5315,11 +6230,18 @@ mod application_ledger_v2 {
         meta_rows: usize,
         committee_rows: usize,
         audit_rows: usize,
+        reservation_rows: usize,
         allow_empty: bool,
     ) -> Result<(), AgentRaftApplicationErrorV2> {
-        match (config_rows, meta_rows, committee_rows, audit_rows) {
-            (0, 0, 0, 0) if allow_empty => Ok(()),
-            (1, 1, 1, _) => Ok(()),
+        match (
+            config_rows,
+            meta_rows,
+            committee_rows,
+            audit_rows,
+            reservation_rows,
+        ) {
+            (0, 0, 0, 0, 0) if allow_empty => Ok(()),
+            (1, 1, 1, _, 0 | 1) => Ok(()),
             _ => Err(AgentRaftApplicationErrorV2::CorruptLedger),
         }
     }
@@ -5375,6 +6297,23 @@ mod application_ledger_v2 {
         Ok(Some(record))
     }
 
+    fn read_command_reservation_in_write(
+        transaction: &redb::WriteTransaction,
+        key: &[u8],
+    ) -> Result<Option<CommandReservationRecordV2>, AgentRaftApplicationErrorV2> {
+        let table = transaction.open_table(COMMAND_RESERVATION_TABLE_V2)?;
+        let Some(value) = table.get(key)? else {
+            return Ok(None);
+        };
+        let bytes = value.value();
+        let record = CommandReservationRecordV2::decode(bytes)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        if record.encode() != bytes {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        Ok(Some(record))
+    }
+
     fn audit_prefix_has_row_in_write(
         transaction: &redb::WriteTransaction,
         prefix: &[u8; GENERATION_STORAGE_KEY_BYTES],
@@ -5408,6 +6347,155 @@ mod application_ledger_v2 {
             bytes.value(),
         )
         .map(|_| ())
+    }
+
+    fn verify_committed_command_physical_row_in_write(
+        transaction: &redb::WriteTransaction,
+        raft: &crate::raft::RaftMeta,
+        slot: &CommittedSharedRaftCommand,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        verify_command_physical_row_in_write(
+            transaction,
+            raft,
+            slot.entry().index(),
+            slot.entry().term(),
+            slot.raw_payload_commitment(),
+            slot.entry().route(),
+            slot.entry().payload_commitment(),
+            Some(slot.entry().command()),
+        )
+    }
+
+    fn verify_reserved_command_physical_row_in_write(
+        transaction: &redb::WriteTransaction,
+        raft: &crate::raft::RaftMeta,
+        reserved: &ReservedAgentRaftApplication,
+        raw_payload_commitment: Hash,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        verify_command_physical_row_in_write(
+            transaction,
+            raft,
+            reserved.index(),
+            reserved.term(),
+            raw_payload_commitment,
+            reserved.route(),
+            reserved.payload_commitment(),
+            Some(reserved.committed().command()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_command_physical_row_in_write(
+        transaction: &redb::WriteTransaction,
+        raft: &crate::raft::RaftMeta,
+        index: u64,
+        expected_term: u64,
+        expected_raw_commitment: Hash,
+        expected_route: AgentRouteKey,
+        expected_command_commitment: Hash,
+        expected_command: Option<&AgentRaftCommand>,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        if raft.commit_index < index {
+            return Err(AgentRaftApplicationErrorV2::MissingCommittedSlot);
+        }
+        let table = transaction.open_table(crate::raft::RAFT_LOG)?;
+        let bytes = table
+            .get(index)?
+            .ok_or(AgentRaftApplicationErrorV2::MissingCommittedSlot)?;
+        verify_command_physical_bytes(
+            index,
+            expected_term,
+            expected_raw_commitment,
+            expected_route,
+            expected_command_commitment,
+            expected_command,
+            bytes.value(),
+        )
+    }
+
+    fn verify_reservation_physical_row_in_read(
+        transaction: &redb::ReadTransaction,
+        raft: &crate::raft::RaftMeta,
+        reservation: &CommandReservationRecordV2,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        if raft.commit_index < reservation.index {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        let table = transaction.open_table(crate::raft::RAFT_LOG)?;
+        let bytes = table
+            .get(reservation.index)?
+            .ok_or(AgentRaftApplicationErrorV2::MissingCommittedSlot)?;
+        verify_command_physical_bytes(
+            reservation.index,
+            reservation.term,
+            reservation.raw_payload_commitment,
+            reservation.route,
+            reservation.command_commitment,
+            None,
+            bytes.value(),
+        )?;
+        let raw = bytes
+            .value()
+            .get(8..)
+            .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+        let vos_raft::EntryKind::Data { payload } =
+            crate::raft::redb_storage::decode_entry_kind(raw)
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?
+        else {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        };
+        let command = AgentRaftCommand::decode(&payload)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        let artifact_batch = match command {
+            AgentRaftCommand::Ordered { artifact_batch, .. } => artifact_batch,
+            _ => None,
+        };
+        if artifact_batch != reservation.artifact_batch {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_command_physical_bytes(
+        index: u64,
+        expected_term: u64,
+        expected_raw_commitment: Hash,
+        expected_route: AgentRouteKey,
+        expected_command_commitment: Hash,
+        expected_command: Option<&AgentRaftCommand>,
+        stored: &[u8],
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        let (term, raw) = stored
+            .split_at_checked(8)
+            .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+        let term = u64::from_le_bytes(
+            term.try_into()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?,
+        );
+        let raw_commitment = Hash::digest(AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN, &[raw]);
+        if term != expected_term || raw_commitment != expected_raw_commitment {
+            return Err(AgentRaftApplicationErrorV2::SlotDatabaseMismatch(index));
+        }
+        let kind = crate::raft::redb_storage::decode_entry_kind(raw)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        if crate::raft::redb_storage::encode_entry_kind(&kind) != raw {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        let vos_raft::EntryKind::Data { payload } = kind else {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        };
+        let command = AgentRaftCommand::decode(&payload)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        if command.encode() != payload
+            || matches!(command, AgentRaftCommand::PrepareCommitteeChange(_))
+            || command.route() != expected_route
+            || command.commitment() != expected_command_commitment
+            || expected_command.is_some_and(|expected| expected != &command)
+        {
+            return Err(AgentRaftApplicationErrorV2::SlotDatabaseMismatch(index));
+        }
+        Ok(())
     }
 
     fn verify_audited_physical_row_in_read(
@@ -5549,7 +6637,9 @@ mod application_ledger_v2 {
 #[cfg(all(feature = "std", feature = "storage"))]
 #[allow(unused_imports)]
 pub(crate) use application_ledger_v2::{
-    AgentRaftApplicationErrorV2, AgentRaftApplicationLedgerV2, AgentRaftFoundationApplyOutcomeV2,
+    AgentRaftApplicationErrorV2, AgentRaftApplicationLedgerV2, AgentRaftCommandApplyOutcomeV2,
+    AgentRaftFoundationApplyOutcomeV2, AgentRaftJournalAuditV2, AgentRaftOrderedJournalAnchorV2,
+    AgentRaftPendingOrderedV2,
 };
 
 #[cfg(test)]
@@ -5771,11 +6861,14 @@ mod tests {
         generation: AgentGenerationRouteKey,
         store: JournalStoreInstanceId,
     ) -> Result<AgentRaftApplicationLedgerV2, AgentRaftApplicationErrorV2> {
+        let initial = committee(&[key(1)], &[]);
+        let local_node = initial.members()[0].replica().node;
         AgentRaftApplicationLedgerV2::open(
             database,
             generation,
             store,
-            committee(&[key(1)], &[]),
+            local_node,
+            initial,
             committee_authority_binding(),
         )
     }
@@ -5870,10 +6963,12 @@ mod tests {
         initial: AgentReplicaCommittee,
         store: JournalStoreInstanceId,
     ) -> Result<AgentRaftApplicationLedgerV2, AgentRaftApplicationErrorV2> {
+        let local_node = initial.members()[0].replica().node;
         AgentRaftApplicationLedgerV2::open(
             database,
             route(&initial).generation(),
             store,
+            local_node,
             initial,
             committee_authority_binding(),
         )
@@ -6620,6 +7715,192 @@ mod tests {
         assert_eq!(ledger.cursor().unwrap().applied(), (1, 11));
         ledger.audit_recovery().unwrap();
         assert!(ledger.next_committed_slot().unwrap().is_none());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_command_reservation_is_replica_bound_restartable_and_atomically_completed() {
+        let directory = TempDirectory::new("v2_command_reservation_restart");
+        let path = directory.database();
+        let initial = committee(&[key(1)], &[key(2)]);
+        let generation = route(&initial).generation();
+        let store = journal_store(0xb1);
+        let local_node = member(&key(1), ReplicaRole::Voter).replica().node;
+        let batch = ArtifactBatchId::from_bytes([0xb2; 32]);
+        let disposition = AgentRaftAuditDisposition::ArtifactBatchAborted { batch };
+
+        {
+            let database = Arc::new(Database::create(&path).unwrap());
+            append_committed_kind(
+                &database,
+                12,
+                &EntryKind::Data {
+                    payload: AgentRaftCommand::ArtifactAbort {
+                        route: route(&initial),
+                        batch,
+                    }
+                    .encode(),
+                },
+            );
+            let ledger = AgentRaftApplicationLedgerV2::open(
+                Arc::clone(&database),
+                generation,
+                store,
+                local_node,
+                initial.clone(),
+                committee_authority_binding(),
+            )
+            .unwrap();
+            let slot = ledger.next_committed_slot().unwrap().unwrap();
+            let CommittedSharedRaftSlot::Command(command) = &slot else {
+                panic!("ordinary command decoded as the wrong physical kind");
+            };
+            assert_eq!(ledger.local_node(), local_node);
+            let first = ledger.reserve_command_application(command).unwrap();
+            let retry = ledger.reserve_command_application(command).unwrap();
+            assert_eq!(first.index(), 1);
+            assert_eq!(retry.payload_commitment(), first.payload_commitment());
+            assert_eq!(ledger.cursor().unwrap().applied(), (0, 0));
+            assert_eq!(
+                crate::raft::RaftMeta::load(&database).unwrap().last_applied,
+                0
+            );
+            ledger.audit_recovery().unwrap();
+        }
+
+        {
+            let database = Arc::new(Database::create(&path).unwrap());
+            let ledger = AgentRaftApplicationLedgerV2::open(
+                Arc::clone(&database),
+                generation,
+                store,
+                local_node,
+                initial.clone(),
+                committee_authority_binding(),
+            )
+            .unwrap();
+            let slot = ledger.next_committed_slot().unwrap().unwrap();
+            let CommittedSharedRaftSlot::Command(command) = &slot else {
+                panic!("ordinary command decoded as the wrong physical kind");
+            };
+            let recovered = ledger.reserve_command_application(command).unwrap();
+            match ledger
+                .complete_artifact_command(&recovered, disposition)
+                .unwrap()
+            {
+                AgentRaftCommandApplyOutcomeV2::Applied(meta) => {
+                    assert_eq!(meta.applied(), (1, 12));
+                    assert_eq!(
+                        meta.disposition(),
+                        Some(AgentRaftApplyDispositionV2::Command(disposition))
+                    );
+                }
+                _ => panic!("recovered command was not newly applied"),
+            }
+            assert!(matches!(
+                ledger
+                    .complete_artifact_command(&recovered, disposition)
+                    .unwrap(),
+                AgentRaftCommandApplyOutcomeV2::Duplicate(_)
+            ));
+            assert_eq!(
+                crate::raft::RaftMeta::load(&database).unwrap().last_applied,
+                1
+            );
+            ledger.audit_recovery().unwrap();
+        }
+
+        let database = Arc::new(Database::create(&path).unwrap());
+        let ledger = AgentRaftApplicationLedgerV2::open(
+            Arc::clone(&database),
+            generation,
+            store,
+            local_node,
+            initial,
+            committee_authority_binding(),
+        )
+        .unwrap();
+        assert_eq!(ledger.cursor().unwrap().applied(), (1, 12));
+        assert!(ledger.next_committed_slot().unwrap().is_none());
+        assert!(matches!(
+            AgentRaftApplicationLedgerV2::open(
+                database,
+                generation,
+                journal_store(0xb3),
+                local_node,
+                committee(&[key(1)], &[key(2)]),
+                committee_authority_binding(),
+            ),
+            Err(AgentRaftApplicationErrorV2::ConfigurationMismatch)
+        ));
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_restart_rejects_corrupt_or_ambiguous_command_residue() {
+        const RESERVATION_TABLE: TableDefinition<&[u8], &[u8]> =
+            TableDefinition::new("agent_shared_raft_command_reservation_v2");
+
+        let directory = TempDirectory::new("v2_corrupt_command_residue");
+        let path = directory.database();
+        let initial = committee(&[key(1)], &[]);
+        let generation = route(&initial).generation();
+        let store = journal_store(0xb4);
+        let local_node = member(&key(1), ReplicaRole::Voter).replica().node;
+        {
+            let database = Arc::new(Database::create(&path).unwrap());
+            append_committed_kind(
+                &database,
+                13,
+                &EntryKind::Data {
+                    payload: AgentRaftCommand::ArtifactAbort {
+                        route: route(&initial),
+                        batch: ArtifactBatchId::from_bytes([0xb5; 32]),
+                    }
+                    .encode(),
+                },
+            );
+            let ledger = AgentRaftApplicationLedgerV2::open(
+                Arc::clone(&database),
+                generation,
+                store,
+                local_node,
+                initial.clone(),
+                committee_authority_binding(),
+            )
+            .unwrap();
+            let slot = ledger.next_committed_slot().unwrap().unwrap();
+            let CommittedSharedRaftSlot::Command(command) = &slot else {
+                panic!("ordinary command decoded as the wrong physical kind");
+            };
+            ledger.reserve_command_application(command).unwrap();
+        }
+        {
+            let database = Database::create(&path).unwrap();
+            let transaction = database.begin_write().unwrap();
+            {
+                let mut table = transaction.open_table(RESERVATION_TABLE).unwrap();
+                table
+                    .insert(
+                        application_ledger_v2::generation_storage_key(generation).as_slice(),
+                        b"non-canonical-residue".as_slice(),
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        let database = Arc::new(Database::create(&path).unwrap());
+        assert!(matches!(
+            AgentRaftApplicationLedgerV2::open(
+                database,
+                generation,
+                store,
+                local_node,
+                initial,
+                committee_authority_binding(),
+            ),
+            Err(AgentRaftApplicationErrorV2::CorruptLedger)
+        ));
     }
 
     #[cfg(feature = "storage")]
@@ -7385,6 +8666,7 @@ mod tests {
             Arc::clone(&database),
             generation_a,
             store_a,
+            initial.members()[0].replica().node,
             initial.clone(),
             committee_authority_binding(),
         )
@@ -7406,6 +8688,7 @@ mod tests {
                 Arc::clone(&database),
                 generation_a,
                 store_a,
+                different_initial.members()[0].replica().node,
                 different_initial,
                 committee_authority_binding(),
             ),
@@ -7433,6 +8716,7 @@ mod tests {
                 database,
                 generation_a,
                 store_a,
+                initial.members()[0].replica().node,
                 initial,
                 alternate_authority,
             ),

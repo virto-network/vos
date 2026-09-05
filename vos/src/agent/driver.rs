@@ -649,6 +649,14 @@ pub trait AgentTrustProvider: Send + Sync {
     /// Durable APIs accept raw packages and always cross this driver-owned
     /// trust boundary themselves.
     fn verify_package(&self, agent: &AgentConfig, package: &Package) -> bool;
+
+    /// Unit-test-only native Standard-runtime oracle. This keeps physical
+    /// host/store tests independent of the separately pinned guest artifact;
+    /// production builds do not expose or compile this bypass.
+    #[cfg(test)]
+    fn use_native_standard_runtime_for_test(&self) -> bool {
+        false
+    }
 }
 
 /// Maximum canonical configuration embedded in one image. Replica and

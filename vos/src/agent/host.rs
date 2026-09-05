@@ -496,7 +496,7 @@ impl AgentHostRootLease {
     /// Pinned secure namespace that owns the durable per-Agent authority
     /// lock and ledger.  This deliberately differs from the replaceable
     /// journal root.
-    fn authority_root(&self) -> Result<&Path, AgentHostError> {
+    pub(crate) fn authority_root(&self) -> Result<&Path, AgentHostError> {
         Ok(&self.authority_root)
     }
 
@@ -504,7 +504,7 @@ impl AgentHostRootLease {
         matches!(self.state, AgentHostRootLeaseState::FreshBound) && !self.arm_write_uncertain
     }
 
-    const fn is_armed(&self) -> bool {
+    pub(crate) const fn is_armed(&self) -> bool {
         matches!(self.state, AgentHostRootLeaseState::FreshArmed)
     }
 
@@ -516,7 +516,7 @@ impl AgentHostRootLease {
             )
     }
 
-    fn clone_generation_parents(&mut self) -> Result<(File, File), AgentHostError> {
+    pub(crate) fn clone_generation_parents(&mut self) -> Result<(File, File), AgentHostError> {
         self.validate_live()?;
         let journal_parent = self
             .root_directory
@@ -550,12 +550,12 @@ impl AgentHostRootLease {
     }
 
     #[cfg(not(all(feature = "storage", target_os = "linux")))]
-    fn arm_after_agent_open(&mut self) -> Result<(), AgentHostError> {
+    pub(crate) fn arm_after_agent_open(&mut self) -> Result<(), AgentHostError> {
         Err(AgentHostError::Unavailable)
     }
 
     #[cfg(all(feature = "storage", target_os = "linux"))]
-    fn arm_after_agent_open(&mut self) -> Result<(), AgentHostError> {
+    pub(crate) fn arm_after_agent_open(&mut self) -> Result<(), AgentHostError> {
         self.validate_live()?;
         let fresh_binding =
             encode_agent_host_lease_binding(&self.root, self.scope, HOST_LEASE_BINDING_FRESH)?;
@@ -641,7 +641,7 @@ impl AgentHostRootLease {
         self.validate_live()
     }
 
-    fn validate_live(&mut self) -> Result<(), AgentHostError> {
+    pub(crate) fn validate_live(&mut self) -> Result<(), AgentHostError> {
         validate_agent_host_lock_identity(&self.stable_lock, &self.stable_lock_path)?;
         validate_agent_host_lock_parent_identity(&self.stable_lock_parent, &self.stable_lock_path)?;
         validate_agent_host_lock_parent_identity(&self.root_parent, &self.root)?;
