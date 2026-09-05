@@ -765,7 +765,9 @@ fn envelope_encoded_len(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::method_policy::{ActorMethodPolicy, AttestationRequirement, IdempotencyRequirement};
+    use crate::method_policy::{
+        ActorMethodPolicy, AttestationRequirement, IdempotencyRequirement, MethodArgument,
+    };
     use crate::schema::{ParsedMethod, ParsedSchema};
 
     struct TestVerifier;
@@ -832,8 +834,11 @@ mod tests {
             methods: alloc::vec![ActorMethodPolicy {
                 name: "increment".into(),
                 mode: crate::MethodMode::Merge,
-                argument_schema: Hash([0x31; 32]),
-                return_schema: Hash([0x32; 32]),
+                arguments: alloc::vec![MethodArgument {
+                    name: "amount".into(),
+                    type_identity: "example::IncrementAmount".into(),
+                }],
+                return_type_identity: "example::IncrementResult".into(),
                 authorization_policy: Hash([0x33; 32]),
                 idempotency: IdempotencyRequirement::Required,
                 attestation: AttestationRequirement::Required {

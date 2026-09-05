@@ -20,8 +20,16 @@ use crate::{BlobRef, Hash, MethodMode};
 pub const METHOD_POLICY_MAGIC: [u8; 4] = *b"AMP1";
 pub const MAX_METHOD_POLICIES: usize = schema::MAX_METHODS;
 pub const MAX_METHOD_POLICY_NAME_BYTES: usize = schema::MAX_NAME_BYTES;
+pub const MAX_METHOD_ARGUMENTS: usize = schema::MAX_FIELDS;
+pub const MAX_METHOD_ARGUMENT_NAME_BYTES: usize = schema::MAX_NAME_BYTES;
+pub const MAX_METHOD_TYPE_IDENTITY_BYTES: usize = schema::MAX_TYPE_IDENTITY_BYTES;
 /// Matches the runtime's separately bounded deployment-artifact window.
 pub const MAX_METHOD_POLICY_ENCODED_BYTES: usize = crate::MAX_RUNTIME_EXECUTION_ARTIFACT_BYTES;
+
+/// Domain for a method's declaration-ordered argument-schema identity.
+pub const ARGUMENT_SCHEMA_ID_DOMAIN: &[u8] = b"vos/agent/method-arguments-schema/v1";
+/// Domain for a method's return-schema identity.
+pub const RETURN_SCHEMA_ID_DOMAIN: &[u8] = b"vos/agent/method-return-schema/v1";
 
 /// Whether ingress must provide a stable idempotency identity for this
 /// method. There is deliberately no optional state without executor meaning.
@@ -72,15 +80,68 @@ impl AttestationRequirement {
     }
 }
 
+/// One named argument in exact source declaration order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodArgument {
+    pub name: String,
+    /// Exact producer-supplied type identity exposed to call encoders.
+    pub type_identity: String,
+}
+
+impl MethodArgument {
+    pub fn validate(&self) -> bool {
+        valid_argument_name(&self.name) && valid_type_identity(&self.type_identity)
+    }
+}
+
+/// Derive the stable identity of a declaration-ordered argument schema.
+///
+/// The preimage is a canonical list of length-framed argument names and type
+/// identities. Argument order is significant; names must be unique.
+pub fn argument_schema_id(arguments: &[MethodArgument]) -> Result<Hash, MethodPolicyError> {
+    validate_arguments(arguments)?;
+    let mut preimage = Vec::new();
+    let capacity = arguments_encoded_len(arguments).ok_or(MethodPolicyError::LimitExceeded)?;
+    preimage
+        .try_reserve_exact(capacity)
+        .map_err(|_| MethodPolicyError::LimitExceeded)?;
+    Encoder(&mut preimage).list(arguments, encode_argument);
+    debug_assert_eq!(preimage.len(), capacity);
+    Ok(Hash::digest(
+        ARGUMENT_SCHEMA_ID_DOMAIN,
+        &[crate::RUNTIME_ABI_ID.as_bytes(), &preimage],
+    ))
+}
+
+/// Derive the stable identity of one exact return type.
+pub fn return_schema_id(return_type_identity: &str) -> Result<Hash, MethodPolicyError> {
+    if !valid_type_identity(return_type_identity) {
+        return Err(MethodPolicyError::InvalidMethodAbi);
+    }
+    let capacity = 4usize
+        .checked_add(return_type_identity.len())
+        .ok_or(MethodPolicyError::LimitExceeded)?;
+    let mut preimage = Vec::new();
+    preimage
+        .try_reserve_exact(capacity)
+        .map_err(|_| MethodPolicyError::LimitExceeded)?;
+    Encoder(&mut preimage).string(return_type_identity);
+    debug_assert_eq!(preimage.len(), capacity);
+    Ok(Hash::digest(
+        RETURN_SCHEMA_ID_DOMAIN,
+        &[crate::RUNTIME_ABI_ID.as_bytes(), &preimage],
+    ))
+}
+
 /// Complete signed contract for one actor method.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActorMethodPolicy {
     pub name: String,
     pub mode: MethodMode,
-    /// Identity of the canonical complete argument schema.
-    pub argument_schema: Hash,
-    /// Identity of the canonical return schema.
-    pub return_schema: Hash,
+    /// Canonical complete argument-schema preimage, in declaration order.
+    pub arguments: Vec<MethodArgument>,
+    /// Canonical return-schema preimage.
+    pub return_type_identity: String,
     /// Exact policy expected in an invocation authority selector.
     pub authorization_policy: Hash,
     pub idempotency: IdempotencyRequirement,
@@ -88,14 +149,28 @@ pub struct ActorMethodPolicy {
 }
 
 impl ActorMethodPolicy {
-    pub fn validate(&self) -> bool {
-        !self.name.is_empty()
-            && self.name.len() <= MAX_METHOD_POLICY_NAME_BYTES
-            && self.argument_schema != Hash::ZERO
-            && self.return_schema != Hash::ZERO
-            && self.authorization_policy != Hash::ZERO
-            && self.idempotency.is_valid_for(self.mode)
-            && self.attestation.is_valid()
+    pub fn validate(&self) -> Result<(), MethodPolicyError> {
+        if self.name.is_empty()
+            || self.name.len() > MAX_METHOD_POLICY_NAME_BYTES
+            || self.authorization_policy == Hash::ZERO
+            || !self.idempotency.is_valid_for(self.mode)
+            || !self.attestation.is_valid()
+        {
+            return Err(MethodPolicyError::InvalidMethod);
+        }
+        validate_arguments(&self.arguments)?;
+        if !valid_type_identity(&self.return_type_identity) {
+            return Err(MethodPolicyError::InvalidMethodAbi);
+        }
+        Ok(())
+    }
+
+    pub fn argument_schema_id(&self) -> Result<Hash, MethodPolicyError> {
+        argument_schema_id(&self.arguments)
+    }
+
+    pub fn return_schema_id(&self) -> Result<Hash, MethodPolicyError> {
+        return_schema_id(&self.return_type_identity)
     }
 }
 
@@ -120,8 +195,8 @@ impl ActorMethodPolicyArtifact {
         if self.methods.len() > MAX_METHOD_POLICIES {
             return Err(MethodPolicyError::LimitExceeded);
         }
-        if self.methods.iter().any(|method| !method.validate()) {
-            return Err(MethodPolicyError::InvalidMethod);
+        for method in &self.methods {
+            method.validate()?;
         }
         if self
             .methods
@@ -144,10 +219,15 @@ impl ActorMethodPolicyArtifact {
             .checked_add(crate::RUNTIME_ABI_ID.0.len())?
             .checked_add(32 + 8 + 4)?;
         for method in &self.methods {
-            // name framing, mode, three identities, idempotency and
-            // attestation tag; a required attestation adds its proof system.
-            let fixed = 4usize + 1 + 3 * 32 + 1 + 1;
-            length = length.checked_add(fixed)?.checked_add(method.name.len())?;
+            // Method name framing, mode, argument-list framing, return-type
+            // framing, authorization identity, idempotency, and attestation
+            // tag. A required attestation adds its proof-system identity.
+            let fixed = 4usize + 1 + 4 + 4 + 32 + 1 + 1;
+            length = length
+                .checked_add(fixed)?
+                .checked_add(method.name.len())?
+                .checked_add(method.return_type_identity.len())?
+                .checked_add(arguments_encoded_len(&method.arguments)?.checked_sub(4)?)?;
             if method.attestation.is_required() {
                 length = length.checked_add(32)?;
             }
@@ -243,6 +323,8 @@ impl CanonicalWire for ActorMethodPolicyArtifact {
 pub enum MethodPolicyError {
     InvalidArtifact,
     InvalidMethod,
+    InvalidMethodAbi,
+    DuplicateArgument,
     MethodOrder,
     InvalidSchema,
     SchemaMismatch,
@@ -254,6 +336,8 @@ impl fmt::Display for MethodPolicyError {
         match self {
             Self::InvalidArtifact => formatter.write_str("invalid actor method-policy artifact"),
             Self::InvalidMethod => formatter.write_str("invalid actor method policy"),
+            Self::InvalidMethodAbi => formatter.write_str("invalid actor method ABI metadata"),
+            Self::DuplicateArgument => formatter.write_str("duplicate actor method argument name"),
             Self::MethodOrder => formatter.write_str("noncanonical actor method-policy order"),
             Self::InvalidSchema => formatter.write_str("invalid referenced AgentActor schema"),
             Self::SchemaMismatch => {
@@ -289,11 +373,61 @@ fn decode_blob(decoder: &mut Decoder<'_>) -> Result<BlobRef, DecodeError> {
     })
 }
 
+fn valid_argument_name(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_METHOD_ARGUMENT_NAME_BYTES
+}
+
+fn valid_type_identity(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_METHOD_TYPE_IDENTITY_BYTES
+}
+
+fn validate_arguments(arguments: &[MethodArgument]) -> Result<(), MethodPolicyError> {
+    if arguments.len() > MAX_METHOD_ARGUMENTS {
+        return Err(MethodPolicyError::LimitExceeded);
+    }
+    for (index, argument) in arguments.iter().enumerate() {
+        if !argument.validate() {
+            return Err(MethodPolicyError::InvalidMethodAbi);
+        }
+        if arguments[..index]
+            .iter()
+            .any(|previous| previous.name == argument.name)
+        {
+            return Err(MethodPolicyError::DuplicateArgument);
+        }
+    }
+    Ok(())
+}
+
+fn arguments_encoded_len(arguments: &[MethodArgument]) -> Option<usize> {
+    let mut length = 4usize;
+    for argument in arguments {
+        length = length
+            .checked_add(4)?
+            .checked_add(argument.name.len())?
+            .checked_add(4)?
+            .checked_add(argument.type_identity.len())?;
+    }
+    Some(length)
+}
+
+fn encode_argument(encoder: &mut Encoder<'_>, argument: &MethodArgument) {
+    encoder.string(&argument.name);
+    encoder.string(&argument.type_identity);
+}
+
+fn decode_argument(decoder: &mut Decoder<'_>) -> Result<MethodArgument, DecodeError> {
+    Ok(MethodArgument {
+        name: decoder.string_bounded(MAX_METHOD_ARGUMENT_NAME_BYTES)?,
+        type_identity: decoder.string_bounded(MAX_METHOD_TYPE_IDENTITY_BYTES)?,
+    })
+}
+
 fn encode_method(encoder: &mut Encoder<'_>, method: &ActorMethodPolicy) {
     encoder.string(&method.name);
     encoder.u8(method.mode as u8);
-    encoder.fixed(method.argument_schema.as_bytes());
-    encoder.fixed(method.return_schema.as_bytes());
+    encoder.list(&method.arguments, encode_argument);
+    encoder.string(&method.return_type_identity);
     encoder.fixed(method.authorization_policy.as_bytes());
     encoder.u8(method.idempotency as u8);
     match method.attestation {
@@ -309,8 +443,8 @@ fn decode_method(decoder: &mut Decoder<'_>) -> Result<ActorMethodPolicy, DecodeE
     Ok(ActorMethodPolicy {
         name: decoder.string_bounded(MAX_METHOD_POLICY_NAME_BYTES)?,
         mode: decode_mode(decoder.u8()?)?,
-        argument_schema: Hash(decoder.fixed()?),
-        return_schema: Hash(decoder.fixed()?),
+        arguments: decoder.list_bounded(MAX_METHOD_ARGUMENTS, decode_argument)?,
+        return_type_identity: decoder.string_bounded(MAX_METHOD_TYPE_IDENTITY_BYTES)?,
         authorization_policy: Hash(decoder.fixed()?),
         idempotency: match decoder.u8()? {
             0 => IdempotencyRequirement::NotRequired,
@@ -370,8 +504,11 @@ mod tests {
         ActorMethodPolicy {
             name: name.into(),
             mode,
-            argument_schema: Hash([seed; 32]),
-            return_schema: Hash([seed.wrapping_add(1); 32]),
+            arguments: alloc::vec![MethodArgument {
+                name: "request".into(),
+                type_identity: alloc::format!("example::Request{seed}"),
+            }],
+            return_type_identity: alloc::format!("example::Response{seed}"),
             authorization_policy: Hash([seed.wrapping_add(2); 32]),
             idempotency: IdempotencyRequirement::for_mode(mode),
             attestation: AttestationRequirement::None,
@@ -401,6 +538,41 @@ mod tests {
         bytes
     }
 
+    struct FirstMethodOffsets {
+        method_name_length: usize,
+        mode: usize,
+        argument_count: usize,
+        argument_name_length: usize,
+        argument_type_length: usize,
+        return_type_length: usize,
+        idempotency: usize,
+        attestation: usize,
+    }
+
+    fn first_method_offsets(artifact: &ActorMethodPolicyArtifact) -> FirstMethodOffsets {
+        let method = &artifact.methods[0];
+        assert_eq!(method.arguments.len(), 1);
+        let argument = &method.arguments[0];
+        let method_name_length = 4 + crate::RUNTIME_ABI_ID.0.len() + 32 + 8 + 4;
+        let mode = method_name_length + 4 + method.name.len();
+        let argument_count = mode + 1;
+        let argument_name_length = argument_count + 4;
+        let argument_type_length = argument_name_length + 4 + argument.name.len();
+        let return_type_length = argument_type_length + 4 + argument.type_identity.len();
+        let authorization_policy = return_type_length + 4 + method.return_type_identity.len();
+        let idempotency = authorization_policy + 32;
+        FirstMethodOffsets {
+            method_name_length,
+            mode,
+            argument_count,
+            argument_name_length,
+            argument_type_length,
+            return_type_length,
+            idempotency,
+            attestation: idempotency + 1,
+        }
+    }
+
     #[test]
     fn canonical_round_trip_lookup_and_schema_cross_binding() {
         let (artifact, schema_bytes) = policy_artifact();
@@ -420,6 +592,116 @@ mod tests {
         assert_eq!(artifact.method("read").unwrap().mode, MethodMode::Query);
         assert!(artifact.method("missing").is_none());
         assert!(!artifact.requires_attestation());
+    }
+
+    #[test]
+    fn argument_and_return_schema_ids_commit_exact_canonical_preimages() {
+        let mut arguments = alloc::vec![
+            MethodArgument {
+                name: "left".into(),
+                type_identity: "example::Left".into(),
+            },
+            MethodArgument {
+                name: "right".into(),
+                type_identity: "example::Right".into(),
+            },
+        ];
+        let original = argument_schema_id(&arguments).unwrap();
+        let mut preimage = Vec::new();
+        Encoder(&mut preimage).list(&arguments, encode_argument);
+        assert_eq!(
+            original,
+            Hash::digest(
+                ARGUMENT_SCHEMA_ID_DOMAIN,
+                &[crate::RUNTIME_ABI_ID.as_bytes(), &preimage],
+            )
+        );
+
+        arguments[0].name.push('2');
+        assert_ne!(argument_schema_id(&arguments).unwrap(), original);
+        arguments[0].name.pop();
+        arguments[0].type_identity.push('2');
+        assert_ne!(argument_schema_id(&arguments).unwrap(), original);
+        arguments[0].type_identity.pop();
+        arguments.swap(0, 1);
+        assert_ne!(argument_schema_id(&arguments).unwrap(), original);
+
+        let return_id = return_schema_id("example::Output").unwrap();
+        assert_eq!(
+            return_id,
+            Hash::digest(
+                RETURN_SCHEMA_ID_DOMAIN,
+                &[
+                    crate::RUNTIME_ABI_ID.as_bytes(),
+                    &("example::Output".len() as u32).to_le_bytes(),
+                    b"example::Output",
+                ],
+            )
+        );
+        assert_ne!(return_schema_id("example::Output2").unwrap(), return_id);
+
+        let (artifact, _) = policy_artifact();
+        assert_eq!(
+            artifact.methods[0].argument_schema_id().unwrap(),
+            argument_schema_id(&artifact.methods[0].arguments).unwrap()
+        );
+        assert_eq!(
+            artifact.methods[0].return_schema_id().unwrap(),
+            return_schema_id(&artifact.methods[0].return_type_identity).unwrap()
+        );
+    }
+
+    #[test]
+    fn method_abi_requires_unique_bounded_names_and_types() {
+        let (mut artifact, _) = policy_artifact();
+        let duplicate = artifact.methods[0].arguments[0].clone();
+        artifact.methods[0].arguments.push(duplicate);
+        assert_eq!(
+            artifact.methods[0].argument_schema_id(),
+            Err(MethodPolicyError::DuplicateArgument)
+        );
+        assert_eq!(
+            artifact.validate(),
+            Err(MethodPolicyError::DuplicateArgument)
+        );
+        assert!(matches!(
+            ActorMethodPolicyArtifact::decode(&encode_unchecked(&artifact)),
+            Err(WireError::Decode(DecodeError::NonCanonical))
+        ));
+
+        let (mut artifact, _) = policy_artifact();
+        artifact.methods[0].arguments[0].name.clear();
+        assert_eq!(
+            artifact.validate(),
+            Err(MethodPolicyError::InvalidMethodAbi)
+        );
+
+        let (mut artifact, _) = policy_artifact();
+        artifact.methods[0].arguments[0].type_identity.clear();
+        assert_eq!(
+            artifact.validate(),
+            Err(MethodPolicyError::InvalidMethodAbi)
+        );
+
+        let (mut artifact, _) = policy_artifact();
+        artifact.methods[0].return_type_identity.clear();
+        assert_eq!(
+            artifact.validate(),
+            Err(MethodPolicyError::InvalidMethodAbi)
+        );
+
+        let (mut artifact, _) = policy_artifact();
+        artifact.methods[0].arguments = (0..=MAX_METHOD_ARGUMENTS)
+            .map(|index| MethodArgument {
+                name: alloc::format!("arg{index}"),
+                type_identity: "example::Argument".into(),
+            })
+            .collect();
+        assert_eq!(artifact.validate(), Err(MethodPolicyError::LimitExceeded));
+        assert!(matches!(
+            ActorMethodPolicyArtifact::decode(&encode_unchecked(&artifact)),
+            Err(WireError::Decode(DecodeError::LimitExceeded))
+        ));
     }
 
     #[test]
@@ -501,6 +783,7 @@ mod tests {
     fn decoder_rejects_unknown_tags_trailing_and_hostile_bounds() {
         let (artifact, _) = policy_artifact();
         let encoded = artifact.encode().unwrap();
+        let offsets = first_method_offsets(&artifact);
 
         let mut trailing = encoded.clone();
         trailing.push(0);
@@ -509,11 +792,7 @@ mod tests {
             Err(WireError::Decode(DecodeError::TrailingBytes))
         ));
 
-        let name_position = 4 + crate::RUNTIME_ABI_ID.0.len() + 32 + 8 + 4;
-        let mode_position = name_position + 4 + artifact.methods[0].name.len();
-        let idempotency_position = mode_position + 1 + 32 * 3;
-        let attestation_position = idempotency_position + 1;
-        for position in [mode_position, idempotency_position, attestation_position] {
+        for position in [offsets.mode, offsets.idempotency, offsets.attestation] {
             let mut unknown = encoded.clone();
             unknown[position] = 0xff;
             assert!(matches!(
@@ -530,13 +809,39 @@ mod tests {
             Err(WireError::Decode(DecodeError::LimitExceeded))
         ));
 
-        let mut hostile_name = encoded;
-        hostile_name[name_position..name_position + 4]
+        let mut hostile_argument_count = encoded.clone();
+        hostile_argument_count[offsets.argument_count..offsets.argument_count + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            ActorMethodPolicyArtifact::decode(&hostile_argument_count),
+            Err(WireError::Decode(DecodeError::LimitExceeded))
+        ));
+
+        let mut hostile_name = encoded.clone();
+        hostile_name[offsets.method_name_length..offsets.method_name_length + 4]
             .copy_from_slice(&((MAX_METHOD_POLICY_NAME_BYTES + 1) as u32).to_le_bytes());
         assert!(matches!(
             ActorMethodPolicyArtifact::decode(&hostile_name),
             Err(WireError::Decode(DecodeError::LimitExceeded))
         ));
+
+        let mut hostile_argument_name = encoded.clone();
+        hostile_argument_name[offsets.argument_name_length..offsets.argument_name_length + 4]
+            .copy_from_slice(&((MAX_METHOD_ARGUMENT_NAME_BYTES + 1) as u32).to_le_bytes());
+        assert!(matches!(
+            ActorMethodPolicyArtifact::decode(&hostile_argument_name),
+            Err(WireError::Decode(DecodeError::LimitExceeded))
+        ));
+
+        for position in [offsets.argument_type_length, offsets.return_type_length] {
+            let mut hostile_type = encoded.clone();
+            hostile_type[position..position + 4]
+                .copy_from_slice(&((MAX_METHOD_TYPE_IDENTITY_BYTES + 1) as u32).to_le_bytes());
+            assert!(matches!(
+                ActorMethodPolicyArtifact::decode(&hostile_type),
+                Err(WireError::Decode(DecodeError::LimitExceeded))
+            ));
+        }
 
         let oversized = alloc::vec![0; MAX_METHOD_POLICY_ENCODED_BYTES + 1];
         assert_eq!(
@@ -551,6 +856,9 @@ mod tests {
                 .map(|index| {
                     let name = alloc::format!("{index:03}-{}", "x".repeat(124));
                     let mut method = method(&name, MethodMode::Query, 21);
+                    method.arguments[0].type_identity =
+                        alloc::format!("example::{}", "A".repeat(488));
+                    method.return_type_identity = alloc::format!("example::{}", "R".repeat(488));
                     method.attestation = AttestationRequirement::Required {
                         proof_system: Hash([22; 32]),
                     };
