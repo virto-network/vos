@@ -854,6 +854,7 @@ mod tests {
 
     const ACTOR_SCHEMA: super::super::sdk::schema::SchemaMeta =
         super::super::sdk::schema::SchemaMeta {
+            constructor: super::super::sdk::schema::ConstructorMeta::Forbidden,
             fields: &[super::super::sdk::schema::FieldMeta::Inline(
                 super::super::sdk::schema::InlineFieldMeta {
                     source_index: 0,
@@ -869,6 +870,7 @@ mod tests {
 
     const CONSTANT_SCHEMA: super::super::sdk::schema::SchemaMeta =
         super::super::sdk::schema::SchemaMeta {
+            constructor: super::super::sdk::schema::ConstructorMeta::Forbidden,
             fields: &[super::super::sdk::schema::FieldMeta::Inline(
                 super::super::sdk::schema::InlineFieldMeta {
                     source_index: 0,
@@ -882,6 +884,7 @@ mod tests {
 
     const STORAGE_SCHEMA: super::super::sdk::schema::SchemaMeta =
         super::super::sdk::schema::SchemaMeta {
+            constructor: super::super::sdk::schema::ConstructorMeta::Forbidden,
             fields: &[
                 super::super::sdk::schema::FieldMeta::Inline(
                     super::super::sdk::schema::InlineFieldMeta {
@@ -911,6 +914,7 @@ mod tests {
 
     const ALL_LANES_SCHEMA: super::super::sdk::schema::SchemaMeta =
         super::super::sdk::schema::SchemaMeta {
+            constructor: super::super::sdk::schema::ConstructorMeta::Forbidden,
             fields: &[
                 super::super::sdk::schema::FieldMeta::Inline(
                     super::super::sdk::schema::InlineFieldMeta {

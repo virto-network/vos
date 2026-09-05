@@ -4074,6 +4074,7 @@ mod tests {
         }];
     const FRESH_UPGRADE_SCHEMA: crate::agent_sdk::schema::SchemaMeta =
         crate::agent_sdk::schema::SchemaMeta {
+            constructor: crate::agent_sdk::schema::ConstructorMeta::Forbidden,
             fields: &[],
             methods: FRESH_UPGRADE_METHODS,
         };
