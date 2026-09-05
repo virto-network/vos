@@ -871,6 +871,39 @@ mod tests {
         })
     }
 
+    fn empty_actor_package() -> PackageEnvelope {
+        let program = b"canonical zero-handler actor pvm".as_slice();
+        let schema = ParsedSchema {
+            fields: Vec::new(),
+            methods: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        let policy = ActorMethodPolicyArtifact {
+            actor_schema: BlobRef::of_bytes(&schema),
+            methods: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        sign(PackageEnvelope {
+            manifest: PackageManifest::Actor(ActorPackageManifest {
+                name: "passive".into(),
+                program: BlobRef::of_bytes(program),
+                contract: ActorPackageContract::canonical(),
+                state_lane_schema: BlobRef::of_bytes(&schema),
+                method_policy: BlobRef::of_bytes(&policy),
+                task_dependencies: Vec::new(),
+                requirements: RuntimeRequirements {
+                    lanes: LaneSet::NONE,
+                    scheduling: false,
+                    proofs: false,
+                },
+                signing: unsigned_signing(),
+            }),
+            artifacts: sorted_artifacts(&[program, &schema, &policy]),
+        })
+    }
+
     fn replace_artifact(
         package: &mut PackageEnvelope,
         old_identity: &BlobRef,
@@ -958,6 +991,43 @@ mod tests {
         assert_eq!(decoded.encode().unwrap(), encoded);
         assert_eq!(package.package_ref().unwrap(), BlobRef::of_bytes(&encoded));
         assert!(matches!(package.manifest.kind(), PackageKind::Actor { .. }));
+    }
+
+    #[test]
+    fn zero_handler_actor_package_round_trips_but_cannot_name_a_nonempty_schema() {
+        let package = empty_actor_package();
+        package.verify(&TestVerifier).unwrap();
+        let encoded = package.encode().unwrap();
+        assert_eq!(PackageEnvelope::decode(&encoded).unwrap(), package);
+
+        let mut mismatch = actor_package();
+        let schema = match &mismatch.manifest {
+            PackageManifest::Actor(manifest) => manifest.state_lane_schema.clone(),
+            PackageManifest::AgentRuntime(_) => unreachable!(),
+        };
+        let old_policy = match &mismatch.manifest {
+            PackageManifest::Actor(manifest) => manifest.method_policy.clone(),
+            PackageManifest::AgentRuntime(_) => unreachable!(),
+        };
+        let empty_policy = ActorMethodPolicyArtifact {
+            actor_schema: schema,
+            methods: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        let replacement = replace_artifact(&mut mismatch, &old_policy, empty_policy);
+        let PackageManifest::Actor(manifest) = &mut mismatch.manifest else {
+            unreachable!();
+        };
+        manifest.method_policy = replacement;
+        assert_eq!(
+            mismatch.validate_shape(),
+            Err(PackageError::ActorArtifactMismatch)
+        );
+        assert_eq!(
+            PackageEnvelope::decode(&encode_unchecked(&mismatch)),
+            Err(PackageError::ActorArtifactMismatch)
+        );
     }
 
     #[test]

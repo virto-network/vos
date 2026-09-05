@@ -237,9 +237,6 @@ impl ParsedSchema {
         if self.fields.len() > MAX_FIELDS || self.methods.len() > MAX_METHODS {
             return Err(SchemaError::LimitExceeded);
         }
-        if self.methods.is_empty() {
-            return Err(SchemaError::InvalidMethod);
-        }
         for (index, field) in self.fields.iter().enumerate() {
             if field.source_index() as usize != index {
                 return Err(SchemaError::SourceOrder);
@@ -409,9 +406,6 @@ pub fn decode(input: &[u8]) -> Result<ParsedSchema, SchemaError> {
     let method_count = decoder.u16()? as usize;
     if method_count > MAX_METHODS {
         return Err(SchemaError::LimitExceeded);
-    }
-    if method_count == 0 {
-        return Err(SchemaError::InvalidMethod);
     }
     let mut methods = Vec::new();
     methods
@@ -602,7 +596,6 @@ fn encode_parsed_method(encoder: &mut Encoder<'_>, method: &ParsedMethod) {
 
 const fn assert_valid_meta(schema: &SchemaMeta) {
     assert!(schema.fields.len() <= MAX_FIELDS);
-    assert!(!schema.methods.is_empty());
     assert!(schema.methods.len() <= MAX_METHODS);
     let mut lanes = 0u8;
     let mut field_index = 0usize;
@@ -1259,11 +1252,18 @@ mod tests {
     fn decoder_and_encoder_enforce_cardinality_and_wire_bounds() {
         let mut methodless = parsed();
         methodless.methods.clear();
-        assert_eq!(methodless.validate(), Err(SchemaError::InvalidMethod));
-        assert_eq!(
-            decode(&encode_unchecked(&methodless)),
-            Err(SchemaError::InvalidMethod)
-        );
+        assert!(methodless.validate().is_ok());
+        let encoded = methodless.encode().unwrap();
+        assert_eq!(decode(&encoded).unwrap(), methodless);
+
+        const EMPTY_META: SchemaMeta = SchemaMeta {
+            fields: &[],
+            methods: &[],
+        };
+        const EMPTY_ENCODED: ([u8; 64], usize) = encode::<64>(&EMPTY_META);
+        let empty = decode(&EMPTY_ENCODED.0[..EMPTY_ENCODED.1]).unwrap();
+        assert!(empty.fields.is_empty());
+        assert!(empty.methods.is_empty());
 
         let mut hostile_count = Vec::new();
         hostile_count.extend_from_slice(&MAGIC);

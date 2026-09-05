@@ -188,7 +188,6 @@ impl ActorMethodPolicyArtifact {
         if self.actor_schema.hash == Hash::ZERO
             || self.actor_schema.len == 0
             || self.actor_schema.len > schema::MAX_ENCODED_BYTES as u64
-            || self.methods.is_empty()
         {
             return Err(MethodPolicyError::InvalidArtifact);
         }
@@ -592,6 +591,40 @@ mod tests {
         assert_eq!(artifact.method("read").unwrap().mode, MethodMode::Query);
         assert!(artifact.method("missing").is_none());
         assert!(!artifact.requires_attestation());
+    }
+
+    #[test]
+    fn empty_policy_is_canonical_only_for_an_empty_referenced_schema() {
+        let empty_schema = ParsedSchema {
+            fields: Vec::new(),
+            methods: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        let artifact = ActorMethodPolicyArtifact {
+            actor_schema: BlobRef::of_bytes(&empty_schema),
+            methods: Vec::new(),
+        };
+        artifact
+            .validate_against_schema_bytes(&empty_schema)
+            .unwrap();
+        let encoded = artifact.encode().unwrap();
+        assert_eq!(artifact.encoded_len(), Some(encoded.len()));
+        assert_eq!(
+            ActorMethodPolicyArtifact::decode(&encoded).unwrap(),
+            artifact
+        );
+
+        let (_, nonempty_schema) = schema();
+        let mismatched = ActorMethodPolicyArtifact {
+            actor_schema: BlobRef::of_bytes(&nonempty_schema),
+            methods: Vec::new(),
+        };
+        assert!(mismatched.validate().is_ok());
+        assert_eq!(
+            mismatched.validate_against_schema_bytes(&nonempty_schema),
+            Err(MethodPolicyError::SchemaMismatch)
+        );
     }
 
     #[test]
