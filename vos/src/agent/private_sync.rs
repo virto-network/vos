@@ -1996,7 +1996,8 @@ mod tests {
             program: ProgramId([10; 32]),
             mode: MethodMode::Merge,
             continuation: BlobRef::of_bytes(b"continuation"),
-            ready_sequence: 0,
+            ready_sequence: 1,
+            availability: Vec::new(),
             input: None,
         };
         let mut work = RuntimeWork::Resume {

@@ -1002,7 +1002,6 @@ impl StandardAgentRuntime {
         Ok(())
     }
 
-    #[cfg(feature = "pvm")]
     pub(crate) fn commit_clean_exact_outcome_clock(
         &mut self,
         mode: crate::agent_sdk::MethodMode,
@@ -1320,7 +1319,6 @@ impl StandardAgentRuntime {
     /// treats runtime state as hostile input, so accepting a merely
     /// well-shaped receipt here would turn state corruption into an
     /// authorization bypass on Resume.
-    #[cfg(feature = "pvm")]
     fn verify_clean_accepted_authority(
         &self,
         accepted: &StandardAcceptedInvocation,
@@ -1380,7 +1378,6 @@ impl StandardAgentRuntime {
         Ok(())
     }
 
-    #[cfg(feature = "pvm")]
     pub(crate) fn resolve_clean_invocation(
         &self,
         work: &crate::agent_sdk::InvocationWork,
@@ -1671,7 +1668,6 @@ impl StandardAgentRuntime {
             .map_err(|_| InvocationError::StaleContinuation)
     }
 
-    #[cfg(feature = "pvm")]
     pub(crate) fn resolve_clean_resume(
         &self,
         resume: &crate::agent_sdk::ResumeWork,
@@ -1738,7 +1734,6 @@ impl StandardAgentRuntime {
         Ok((record.clone(), work))
     }
 
-    #[cfg(feature = "pvm")]
     pub(crate) fn consume_machine_continuation(
         &mut self,
         invocation: &super::execution::ActorInvocation,
