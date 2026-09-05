@@ -1182,6 +1182,8 @@ mod tests {
     use vos_pvm_compiler::assembler::{Assembler, Reg};
 
     use super::*;
+    use crate::actors::codec::Encode as _;
+    use crate::actors::value::{Msg, TAG_DYNAMIC};
     use crate::agent::authority::AgentAuthorityBinding as LegacyAuthorityBinding;
     use crate::agent::driver::AgentTrustProvider;
     use crate::agent::package::Package as LegacyPackage;
@@ -1765,6 +1767,8 @@ mod tests {
         package: &AdmittedActorPackage,
         id: u8,
     ) -> InvocationWork {
+        let mut message = vec![TAG_DYNAMIC];
+        message.extend_from_slice(&Msg::new("write").encode());
         InvocationWork {
             space: descriptor.identity.space,
             agent: descriptor.identity.agent,
@@ -1776,7 +1780,7 @@ mod tests {
             program: record.entry.program,
             mode: MethodMode::Linear,
             origin: sdk::InvocationOrigin::anonymous(),
-            message: vec![0x51],
+            message,
             installation_data: None,
             availability: availability(package),
             gas: 10_000_000,
@@ -2139,7 +2143,25 @@ mod tests {
             RuntimeOutcome::Completed(Err(sdk::InvocationError::InvalidAuthorization))
         );
         let completed = host.invoke(agent, work.clone(), authority.clone()).unwrap();
-        assert!(matches!(completed, RuntimeOutcome::Completed(Ok(_))));
+        let RuntimeOutcome::Completed(Ok(reply)) = &completed else {
+            panic!("physical invoke did not complete successfully: {completed:?}")
+        };
+        assert_eq!(reply.status, sdk::InvocationStatus::Done);
+        assert_eq!(reply.reply, [0x63]);
+        let persisted = crate::agent::wire::decode_standard_runtime_state(
+            &host.agents[&agent].driver.image().runtime_state,
+        )
+        .unwrap();
+        let linear = persisted
+            .lane_state
+            .linear
+            .iter()
+            .find(|entry| {
+                entry.actor.0 == record.entry.actor.0
+                    && entry.state_generation.0 == record.incarnation.0
+            })
+            .expect("the completed write commits its Linear lane");
+        assert_eq!(linear.value, [0x2a]);
         drop(host);
         slot.store(100, Ordering::SeqCst);
         let mut host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
@@ -2241,37 +2263,63 @@ mod tests {
         };
         let work = invocation(&descriptor, &page.entries[0], &actor_package, 0xb1);
         slot.store(3, Ordering::SeqCst);
-        let mut outcome = host
+        let outcome = host
             .invoke(
                 agent,
                 work.clone(),
                 invocation_receipt(&descriptor, &work, 3, 3),
             )
             .unwrap();
-        for _ in 0..3 {
-            let RuntimeOutcome::Yielded(yielded) = outcome else {
-                assert!(matches!(outcome, RuntimeOutcome::Completed(Ok(_))));
-                return;
-            };
-            outcome = host
-                .resume(
-                    agent,
-                    ResumeWork {
-                        invocation: yielded.invocation,
-                        actor: yielded.actor,
-                        incarnation: yielded.incarnation,
-                        deployment: yielded.deployment,
-                        program: yielded.program,
-                        mode: yielded.mode,
-                        continuation: yielded.continuation,
-                        ready_sequence: yielded.ready_sequence,
-                        installation_data: yielded.installation_data,
-                        availability: work.availability.clone(),
-                        input: None,
-                    },
-                )
-                .unwrap();
-        }
-        panic!("the bounded fixture did not reach a terminal reply")
+        let RuntimeOutcome::Yielded(first) = outcome else {
+            panic!("initial execution did not yield: {outcome:?}")
+        };
+        assert_eq!(first.reason, sdk::YieldReason::Cooperative);
+        assert_eq!(first.ready_sequence, 1);
+        let outcome = host
+            .resume(
+                agent,
+                ResumeWork {
+                    invocation: first.invocation,
+                    actor: first.actor,
+                    incarnation: first.incarnation,
+                    deployment: first.deployment,
+                    program: first.program,
+                    mode: first.mode,
+                    continuation: first.continuation,
+                    ready_sequence: first.ready_sequence,
+                    installation_data: first.installation_data,
+                    availability: work.availability.clone(),
+                    input: None,
+                },
+            )
+            .unwrap();
+        let RuntimeOutcome::Yielded(second) = outcome else {
+            panic!("first resume did not yield: {outcome:?}")
+        };
+        assert_eq!(second.reason, sdk::YieldReason::Cooperative);
+        assert_eq!(second.ready_sequence, 2);
+        let outcome = host
+            .resume(
+                agent,
+                ResumeWork {
+                    invocation: second.invocation,
+                    actor: second.actor,
+                    incarnation: second.incarnation,
+                    deployment: second.deployment,
+                    program: second.program,
+                    mode: second.mode,
+                    continuation: second.continuation,
+                    ready_sequence: second.ready_sequence,
+                    installation_data: second.installation_data,
+                    availability: work.availability,
+                    input: None,
+                },
+            )
+            .unwrap();
+        let RuntimeOutcome::Completed(Ok(reply)) = outcome else {
+            panic!("second resume did not complete: {outcome:?}")
+        };
+        assert_eq!(reply.status, sdk::InvocationStatus::Done);
+        assert_eq!(reply.reply, [2]);
     }
 }

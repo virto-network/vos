@@ -1712,15 +1712,16 @@ fn apply_clean_invoke(
                     Err(error) => Err(error),
                     Ok(None) if work.recovery_only => Err(ActorExecutionError::InvalidAvailability),
                     Ok(None) => match runtime
-                        .validate_execution_installation_data(
-                            &invocation,
+                        .validate_clean_execution_installation_data(
+                            &work,
                             installation_data.as_ref(),
                         )
                         .and_then(|()| {
-                            runtime.validate_execution_schema(&invocation, &actor_schema)
+                            runtime.validate_clean_execution_schema(&work, &actor_schema)
                         })
-                        .and_then(|()| runtime.authorize_execution(&invocation, &actor_policies))
-                    {
+                        .and_then(|()| {
+                            runtime.authorize_clean_execution(&work, &actor_schema, &actor_policies)
+                        }) {
                         Err(error) => Err(error),
                         Ok(false) => Ok(ActorExecutionReply {
                             invocation: invocation.invocation,
@@ -1867,9 +1868,9 @@ fn apply_clean_resume(
     let pristine = runtime.clone();
     let mut terminal_sequence = None;
     let mut result = runtime
-        .validate_execution_installation_data(&invocation, installation_data.as_ref())
-        .and_then(|()| runtime.validate_execution_schema(&invocation, &actor_schema))
-        .and_then(|()| runtime.authorize_execution(&invocation, &actor_policies))
+        .validate_clean_execution_installation_data(&work, installation_data.as_ref())
+        .and_then(|()| runtime.validate_clean_execution_schema(&work, &actor_schema))
+        .and_then(|()| runtime.authorize_clean_execution(&work, &actor_schema, &actor_policies))
         .and_then(|authorized| {
             if !authorized {
                 return Err(ActorExecutionError::InvalidAuthorization);
@@ -5827,17 +5828,17 @@ mod tests {
     fn present_empty_installation_data_yields_persists_and_resumes_exactly() {
         let (runtime, mut work) = clean_resolvable_fixture(false);
         let mut snapshot = runtime.snapshot();
-        let empty = crate::service::BlobRef::of_bytes(&[]);
-        snapshot.actors[0].record.entry.installation_data = Some(empty.clone());
-        snapshot.actors[0].record.installation_data = Some(empty.clone());
-        let mut runtime = StandardAgentRuntime::restore(snapshot).unwrap();
         let empty = crate::agent_sdk::RuntimeBlob {
-            // Clean availability has its own canonical BlobRef domain; the
-            // Standard bridge authenticates the same bytes again against the
-            // installed service-domain reference before dispatch.
             reference: crate::agent_sdk::BlobRef::of_bytes(&[]),
             bytes: Vec::new(),
         };
+        let stored_empty = crate::service::BlobRef {
+            hash: crate::service::Hash(empty.reference.hash.0),
+            len: empty.reference.len,
+        };
+        snapshot.actors[0].record.entry.installation_data = Some(stored_empty.clone());
+        snapshot.actors[0].record.installation_data = Some(stored_empty);
+        let mut runtime = StandardAgentRuntime::restore(snapshot).unwrap();
         work.installation_data = Some(empty.reference.clone());
         work.availability.push(empty);
         work.availability
@@ -5845,7 +5846,11 @@ mod tests {
         assert!(work.validate());
         let config = runtime.config().unwrap().clone();
         let authority = clean_authority_receipt(&config, &work);
-        let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+        let (invocation, _, _, _, installation_data) =
+            runtime.resolve_clean_invocation(&work).unwrap();
+        runtime
+            .validate_clean_execution_installation_data(&work, installation_data.as_ref())
+            .unwrap();
         let before = runtime.prepare_execution_state(&invocation).unwrap();
         runtime
             .commit_yielded_execution(

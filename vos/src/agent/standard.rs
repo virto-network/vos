@@ -633,6 +633,14 @@ fn clean_blob_to_legacy(reference: &crate::agent_sdk::BlobRef) -> crate::service
     }
 }
 
+#[cfg(feature = "pvm")]
+fn clean_reference_matches_record(
+    reference: &crate::agent_sdk::BlobRef,
+    expected: &crate::service::BlobRef,
+) -> bool {
+    reference.hash.0 == expected.hash.0 && reference.len == expected.len
+}
+
 fn clean_entry_to_legacy(entry: &crate::agent_sdk::ActorEntry) -> super::ActorEntry {
     super::ActorEntry {
         actor: crate::service::ActorId(entry.actor.0),
@@ -1924,9 +1932,9 @@ impl StandardAgentRuntime {
         (
             super::execution::ActorInvocation,
             Vec<u8>,
-            super::execution::RuntimeBlob,
-            super::execution::RuntimeBlob,
-            Option<super::execution::RuntimeBlob>,
+            crate::agent_sdk::RuntimeBlob,
+            crate::agent_sdk::RuntimeBlob,
+            Option<crate::agent_sdk::RuntimeBlob>,
         ),
         crate::agent_sdk::InvocationError,
     > {
@@ -2072,23 +2080,10 @@ impl StandardAgentRuntime {
         invocation
             .validate()
             .map_err(|_| InvocationError::InvalidInput)?;
-        let actor_schema = super::execution::RuntimeBlob {
-            reference: actor.record.agent_schema.clone(),
-            bytes: work.availability[schema_index].bytes.clone(),
-        };
-        let actor_policies = super::execution::RuntimeBlob {
-            reference: actor.record.role_policies.clone(),
-            bytes: work.availability[policy_index].bytes.clone(),
-        };
+        let actor_schema = work.availability[schema_index].clone();
+        let actor_policies = work.availability[policy_index].clone();
         let installation_data =
-            installation_data_index.map(|index| super::execution::RuntimeBlob {
-                reference: actor
-                    .record
-                    .installation_data
-                    .clone()
-                    .expect("the selected index has an installed reference"),
-                bytes: work.availability[index].bytes.clone(),
-            });
+            installation_data_index.map(|index| work.availability[index].clone());
         Ok((
             invocation,
             work.availability[program_index].bytes.clone(),
@@ -2508,6 +2503,138 @@ impl StandardAgentRuntime {
         self.machine_continuations.insert(index, record);
         self.advance_result_authority_slot(storage, observed_slot);
         Ok(())
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn validate_clean_execution_schema(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        schema_blob: &crate::agent_sdk::RuntimeBlob,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+        use crate::actors::codec::Decode as _;
+        use crate::actors::value::{Msg, TAG_DYNAMIC};
+
+        let actor = self
+            .actors
+            .get(&ActorId(work.actor.0))
+            .ok_or(ActorExecutionError::NotFound)?;
+        if !clean_reference_matches_record(&schema_blob.reference, &actor.record.agent_schema)
+            || !schema_blob.validate()
+        {
+            return Err(ActorExecutionError::InvalidAvailability);
+        }
+        let schema = crate::agent_sdk::schema::decode(&schema_blob.bytes)
+            .map_err(|_| ActorExecutionError::InvalidAvailability)?;
+        let state_layout = schema
+            .state_layout_hash()
+            .map_err(|_| ActorExecutionError::InvalidAvailability)?;
+        if state_layout.0 != actor.record.state_layout.0
+            || schema.lanes().bits() != actor.record.requirements.lanes.bits()
+        {
+            return Err(ActorExecutionError::InvalidAvailability);
+        }
+        let message = work
+            .message
+            .strip_prefix(&[TAG_DYNAMIC])
+            .and_then(Msg::try_decode)
+            .ok_or(ActorExecutionError::UnsupportedMethod)?;
+        let method = schema
+            .methods
+            .iter()
+            .find(|method| method.name == message.name)
+            .ok_or(ActorExecutionError::UnsupportedMethod)?;
+        if method.mode != work.mode {
+            return Err(ActorExecutionError::UnsupportedMethod);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn validate_clean_execution_installation_data(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        data: Option<&crate::agent_sdk::RuntimeBlob>,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+
+        let actor = self
+            .actors
+            .get(&ActorId(work.actor.0))
+            .ok_or(ActorExecutionError::NotFound)?;
+        match (
+            actor.record.installation_data.as_ref(),
+            work.installation_data.as_ref(),
+            data,
+        ) {
+            (None, None, None) => Ok(()),
+            (Some(expected), Some(selected), Some(data))
+                if data.bytes.len() <= super::MAX_INSTALLATION_DATA_BYTES
+                    && clean_reference_matches_record(selected, expected)
+                    && data.reference == *selected
+                    && data.validate() =>
+            {
+                Ok(())
+            }
+            _ => Err(ActorExecutionError::InvalidAvailability),
+        }
+    }
+
+    /// Resolve the exact AMP2 method policy and enforce it against the clean
+    /// authenticated invocation envelope. The policy is closed over the exact
+    /// AAS2 preimage before its selected method can authorize execution.
+    #[cfg(feature = "pvm")]
+    pub(crate) fn authorize_clean_execution(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        schema_blob: &crate::agent_sdk::RuntimeBlob,
+        policy_blob: &crate::agent_sdk::RuntimeBlob,
+    ) -> Result<bool, super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+        use crate::actors::codec::Decode as _;
+        use crate::actors::value::{Msg, TAG_DYNAMIC};
+        use crate::agent_sdk::method_policy::{
+            ActorMethodPolicyArtifact, AttestationRequirement, AuthorizationPolicySelector,
+        };
+        use crate::agent_sdk::wire::CanonicalWire as _;
+
+        let actor = self
+            .actors
+            .get(&ActorId(work.actor.0))
+            .ok_or(ActorExecutionError::NotFound)?;
+        if !clean_reference_matches_record(&schema_blob.reference, &actor.record.agent_schema)
+            || !schema_blob.validate()
+            || !clean_reference_matches_record(&policy_blob.reference, &actor.record.role_policies)
+            || !policy_blob.validate()
+        {
+            return Err(ActorExecutionError::InvalidAvailability);
+        }
+        let policies = ActorMethodPolicyArtifact::decode(&policy_blob.bytes)
+            .map_err(|_| ActorExecutionError::InvalidAvailability)?;
+        policies
+            .validate_against_schema_bytes(&schema_blob.bytes)
+            .map_err(|_| ActorExecutionError::InvalidAvailability)?;
+        let message = work
+            .message
+            .strip_prefix(&[TAG_DYNAMIC])
+            .and_then(Msg::try_decode)
+            .ok_or(ActorExecutionError::UnsupportedMethod)?;
+        let policy = policies
+            .method(&message.name)
+            .ok_or(ActorExecutionError::UnsupportedMethod)?;
+        if policy.mode != work.mode || policy.attestation != AttestationRequirement::None {
+            return Err(ActorExecutionError::UnsupportedMethod);
+        }
+        Ok(match policy.authorization_policy {
+            AuthorizationPolicySelector::Public => true,
+            AuthorizationPolicySelector::Capability(required) => {
+                work.origin.capability == Some(required)
+            }
+            // InvocationOrigin carries no authenticated RoleId. Do not
+            // project principals or any transport identity into a role.
+            AuthorizationPolicySelector::SpaceRole(_)
+            | AuthorizationPolicySelector::ActorRole(_) => false,
+        })
     }
 
     #[cfg(feature = "pvm")]
@@ -7567,6 +7694,170 @@ mod tests {
             runtime.authorize_execution(&invocation, &corrupt_blob),
             Err(super::super::execution::ActorExecutionError::InvalidAvailability)
         );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_execution_artifacts_use_sdk_wires_and_hash_domains() {
+        use crate::actors::codec::Encode as _;
+        use crate::actors::value::{Msg, TAG_DYNAMIC};
+        use crate::agent_sdk::method_policy::{
+            ActorMethodPolicy, ActorMethodPolicyArtifact, AttestationRequirement,
+            AuthorizationPolicySelector, IdempotencyRequirement,
+        };
+        use crate::agent_sdk::schema::{
+            ConstructorContract, ParsedField, ParsedInlineField, ParsedMethod, ParsedSchema,
+        };
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{
+            BlobRef as CleanBlobRef, FieldPersistence, MethodMode as CleanMethodMode,
+            RoleId as CleanRoleId, StateLane as CleanStateLane,
+        };
+
+        let schema = ParsedSchema {
+            constructor: ConstructorContract::Forbidden,
+            fields: vec![ParsedField::Inline(ParsedInlineField {
+                source_index: 0,
+                name: "value".into(),
+                type_identity: "core::primitive::u8".into(),
+                persistence: FieldPersistence::State(CleanStateLane::Linear),
+            })],
+            methods: vec![ParsedMethod {
+                source_index: 0,
+                name: "write".into(),
+                mode: CleanMethodMode::Linear,
+                explicit: true,
+            }],
+        };
+        let schema_bytes = schema.encode().unwrap();
+        let clean_schema_ref = CleanBlobRef::of_bytes(&schema_bytes);
+        let schema_blob = crate::agent_sdk::RuntimeBlob {
+            reference: clean_schema_ref.clone(),
+            bytes: schema_bytes,
+        };
+        let policy_blob = |actor_schema: &CleanBlobRef, authorization_policy| {
+            let bytes = ActorMethodPolicyArtifact {
+                actor_schema: actor_schema.clone(),
+                methods: vec![ActorMethodPolicy {
+                    name: "write".into(),
+                    mode: CleanMethodMode::Linear,
+                    arguments: Vec::new(),
+                    return_type_identity: "core::primitive::u8".into(),
+                    authorization_policy,
+                    idempotency: IdempotencyRequirement::Required,
+                    attestation: AttestationRequirement::None,
+                }],
+            }
+            .encode()
+            .unwrap();
+            let reference = CleanBlobRef::of_bytes(&bytes);
+            crate::agent_sdk::RuntimeBlob { reference, bytes }
+        };
+        let public_policy = policy_blob(&clean_schema_ref, AuthorizationPolicySelector::Public);
+
+        let config = config(4);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let mut installed = install(config.identity.agent, None, "counter");
+        installed.entry.agent_schema = clean_blob_to_legacy(&schema_blob.reference);
+        installed.agent_schema = clean_blob_to_legacy(&schema_blob.reference);
+        installed.entry.role_policies = clean_blob_to_legacy(&public_policy.reference);
+        installed.role_policies = clean_blob_to_legacy(&public_policy.reference);
+        let state_layout = Hash(schema.state_layout_hash().unwrap().0);
+        installed.entry.state_layout = state_layout;
+        installed.state_layout = state_layout;
+        let actor = installed.entry.actor;
+        let deployment = installed.entry.deployment;
+        let program = installed.entry.program;
+        apply_authorized(&mut runtime, &config, LifecycleRequest::Install(installed)).unwrap();
+
+        let mut message = vec![TAG_DYNAMIC];
+        message.extend_from_slice(&Msg::new("write").encode());
+        let mut work = crate::agent_sdk::InvocationWork {
+            space: crate::agent_sdk::SpaceId(config.identity.space.0),
+            agent: crate::agent_sdk::AgentId(config.identity.agent.0),
+            runtime_deployment: crate::agent_sdk::DeploymentId(
+                config.identity.runtime_deployment.0,
+            ),
+            invocation: crate::agent_sdk::InvocationId([0x62; 32]),
+            actor: crate::agent_sdk::ActorId(actor.0),
+            incarnation: crate::agent_sdk::Hash(runtime.actors[&actor].record.state_generation.0),
+            deployment: crate::agent_sdk::DeploymentId(deployment.0),
+            program: crate::agent_sdk::ProgramId(program.0),
+            mode: CleanMethodMode::Linear,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            message,
+            availability: Vec::new(),
+            gas: 1,
+            installation_data: None,
+            recovery_only: false,
+        };
+        assert_eq!(
+            runtime.validate_clean_execution_schema(&work, &schema_blob),
+            Ok(())
+        );
+        assert_eq!(
+            runtime.validate_clean_execution_installation_data(&work, None),
+            Ok(())
+        );
+        assert_eq!(
+            runtime.authorize_clean_execution(&work, &schema_blob, &public_policy),
+            Ok(true)
+        );
+
+        let mut tampered_schema = schema_blob.clone();
+        *tampered_schema.bytes.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            runtime.validate_clean_execution_schema(&work, &tampered_schema),
+            Err(super::super::execution::ActorExecutionError::InvalidAvailability)
+        );
+
+        let mut other_schema = schema.clone();
+        let ParsedField::Inline(field) = &mut other_schema.fields[0] else {
+            unreachable!()
+        };
+        field.name = "other_value".into();
+        let other_schema_ref = CleanBlobRef::of_bytes(&other_schema.encode().unwrap());
+        let mismatched_policy = policy_blob(&other_schema_ref, AuthorizationPolicySelector::Public);
+        runtime.actors.get_mut(&actor).unwrap().record.role_policies =
+            clean_blob_to_legacy(&mismatched_policy.reference);
+        assert_eq!(
+            runtime.authorize_clean_execution(&work, &schema_blob, &mismatched_policy),
+            Err(super::super::execution::ActorExecutionError::InvalidAvailability),
+            "AMP2 must close over the exact supplied AAS2 preimage"
+        );
+
+        let capability = crate::agent_sdk::CapabilityId([0x63; 32]);
+        let capability_policy = policy_blob(
+            &clean_schema_ref,
+            AuthorizationPolicySelector::Capability(capability),
+        );
+        runtime.actors.get_mut(&actor).unwrap().record.role_policies =
+            clean_blob_to_legacy(&capability_policy.reference);
+        work.origin.capability = Some(capability);
+        assert_eq!(
+            runtime.authorize_clean_execution(&work, &schema_blob, &capability_policy),
+            Ok(true)
+        );
+        work.origin.capability = Some(crate::agent_sdk::CapabilityId([0x64; 32]));
+        assert_eq!(
+            runtime.authorize_clean_execution(&work, &schema_blob, &capability_policy),
+            Ok(false)
+        );
+
+        for selector in [
+            AuthorizationPolicySelector::SpaceRole(CleanRoleId([0x65; 32])),
+            AuthorizationPolicySelector::ActorRole(CleanRoleId([0x66; 32])),
+        ] {
+            let role_policy = policy_blob(&clean_schema_ref, selector);
+            runtime.actors.get_mut(&actor).unwrap().record.role_policies =
+                clean_blob_to_legacy(&role_policy.reference);
+            assert_eq!(
+                runtime.authorize_clean_execution(&work, &schema_blob, &role_policy),
+                Ok(false),
+                "clean InvocationOrigin has no RoleId to authorize a role selector"
+            );
+        }
     }
 
     #[test]
