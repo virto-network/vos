@@ -2374,14 +2374,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         let extractions: Vec<_> = constructor_params
             .iter()
-            .map(|(name, ty)| {
-                let name_str = name.to_string();
-                let accessor = type_to_accessor(ty);
-                quote! {
-                    let #name: #ty = args.#accessor(#name_str)
-                        .expect(concat!("missing init arg '", #name_str, "'"));
-                }
-            })
+            .map(|(name, ty)| constructor_arg_extraction(name, ty))
             .collect();
         let names: Vec<_> = constructor_params.iter().map(|(n, _)| n).collect();
         // PVM service path reads init args from storage. Worker/WASM
@@ -2427,14 +2420,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         let extractions: Vec<_> = constructor_params
             .iter()
-            .map(|(name, ty)| {
-                let name_str = name.to_string();
-                let accessor = type_to_accessor(ty);
-                quote! {
-                    let #name: #ty = args.#accessor(#name_str)
-                        .expect(concat!("missing init arg '", #name_str, "'"));
-                }
-            })
+            .map(|(name, ty)| constructor_arg_extraction(name, ty))
             .collect();
         let names: Vec<_> = constructor_params.iter().map(|(n, _)| n).collect();
         quote! {
@@ -4100,25 +4086,34 @@ fn is_attestation_type(ty: &syn::Type) -> bool {
             .all(|argument| matches!(argument, syn::GenericArgument::Type(_)))
 }
 
-/// Map a Rust type to the corresponding `InitArgs` accessor method.
-fn type_to_accessor(ty: &syn::Type) -> proc_macro2::TokenStream {
-    let ty_str = quote!(#ty).to_string().replace(' ', "");
-    match ty_str.as_str() {
-        "u8" => quote! { get_u8 },
-        "u16" => quote! { get_u16 },
-        "u32" => quote! { get_u32 },
-        "u64" => quote! { get_u64 },
-        "i32" => quote! { get_i32 },
-        "i64" => quote! { get_i64 },
-        "bool" => quote! { get_bool },
-        "String" => quote! { get_str },
-        "Vec<u8>" => quote! { get_bytes },
-        "Vec<u32>" => quote! { get_list_u32 },
-        "Vec<String>" => quote! { get_list_str },
-        _ => {
-            let msg = format!("unsupported constructor param type for init args: {ty_str}");
-            quote! { compile_error!(#msg) }
-        }
+/// Decode one named constructor argument using the same canonical `Value`
+/// representation as message arguments. In particular, fixed-size byte
+/// arrays are raw `Value::Bytes` and their exact length is checked before the
+/// actor constructor runs.
+fn constructor_arg_extraction(name: &syn::Ident, ty: &syn::Type) -> proc_macro2::TokenStream {
+    let name_str = name.to_string();
+    if let Some(accessor) = whitelist_accessor(ty) {
+        return quote! {
+            let #name: #ty = args.#accessor(#name_str)
+                .expect(concat!("missing or invalid init arg '", #name_str, "'"));
+        };
+    }
+    if is_byte_array(ty) {
+        return quote! {
+            let #name: #ty = <#ty>::try_from(
+                args.get(#name_str)
+                    .and_then(|value| value.as_bytes())
+                    .expect(concat!("missing or invalid byte init arg '", #name_str, "'")),
+            )
+            .expect(concat!("wrong byte length for init arg '", #name_str, "'"));
+        };
+    }
+
+    let ty_str = ty_string(ty);
+    let message = format!("unsupported constructor param type for init args: {ty_str}");
+    quote! {
+        compile_error!(#message);
+        let #name: #ty = unreachable!();
     }
 }
 

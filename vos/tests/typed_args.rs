@@ -303,6 +303,28 @@ mod installation_data_fixture {
         }
     }
 
+    mod fixed_array_actor {
+        use vos::prelude::*;
+
+        #[actor(agent)]
+        pub struct FixedArrayConfigured {
+            #[state(const)]
+            pub(super) seed: [u8; 32],
+        }
+
+        #[messages(agent)]
+        impl FixedArrayConfigured {
+            fn new(seed: [u8; 32]) -> Self {
+                Self { seed }
+            }
+
+            #[msg(query)]
+            fn seed(&self) -> [u8; 32] {
+                self.seed
+            }
+        }
+    }
+
     mod unconfigured_actor {
         use vos::prelude::*;
 
@@ -391,6 +413,7 @@ mod installation_data_fixture {
     }
 
     use const_only_actor::{ConstOnly, ConstOnlyMsg};
+    use fixed_array_actor::FixedArrayConfigured;
     use parameterized_actor::{Parameterized, ParameterizedMsg};
     use portable_role_actor::PortableRoleMsg;
     use raw_actor::{RawConfigured, RawConfiguredMsg};
@@ -534,6 +557,32 @@ mod installation_data_fixture {
         assert!(
             <ConstOnly as vos::Actor>::__load_agent_state(Some(&[1]), None, None, None,).is_none(),
             "const-only zero-argument construction cannot ignore non-empty bytes"
+        );
+    }
+
+    #[test]
+    fn fixed_byte_array_installation_args_are_exact_and_fail_closed() {
+        let seed = [0x5a; 32];
+        let args = vos::value::Args::new().with("seed", seed.to_vec()).encode();
+        let actor =
+            <FixedArrayConfigured as vos::Actor>::__load_agent_state(Some(&args), None, None, None)
+                .unwrap();
+        assert_eq!(actor.seed, seed);
+
+        let short = vos::value::Args::new()
+            .with("seed", vec![0x5a_u8; 31])
+            .encode();
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _ = <FixedArrayConfigured as vos::Actor>::__load_agent_state(
+                    Some(&short),
+                    None,
+                    None,
+                    None,
+                );
+            })
+            .is_err(),
+            "a fixed-size constructor argument must never truncate or pad"
         );
     }
 
