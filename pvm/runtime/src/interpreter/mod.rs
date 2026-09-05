@@ -859,6 +859,11 @@ impl Interpreter {
                 }
                 // Advance PC to next instruction before returning
                 self.pc = next_pc;
+                // Runtime Ecall is a JAR gas-block terminator.  The early
+                // return must carry the same unfunded-successor boundary that
+                // ordinary terminators install below.
+                self.gas_charged = false;
+                self.need_gas_charge = true;
                 // Exit with special ecall marker. Kernel reads φ[11]=op, φ[12]=subject|object.
                 return Some(ExitReason::Ecall);
             }
@@ -2106,6 +2111,11 @@ impl Interpreter {
                         return (ExitReason::Panic, initial_gas - self.gas);
                     }
                     self.pc = next_pc;
+                    // Runtime Ecall is a JAR gas-block terminator.  This arm
+                    // returns before the shared terminator bookkeeping below,
+                    // so install the successor boundary explicitly.
+                    self.gas_charged = false;
+                    self.need_gas_charge = true;
                     return (ExitReason::Ecall, initial_gas - self.gas);
                 }
 
@@ -3587,6 +3597,45 @@ mod tests {
         let mut standard = simple_vm(vec![Opcode::Ecall as u8], 100);
         standard.set_isa_mode(crate::IsaMode::Conformance);
         assert_eq!(standard.run().0, ExitReason::Panic);
+    }
+
+    #[test]
+    fn private_ecall_resume_opens_a_fresh_jar_gas_block() {
+        // Ecall is a private JAR terminator.  Its successor therefore starts
+        // a separately funded block even though execution first returns to
+        // the capability kernel at the Ecall boundary.
+        let code = vec![
+            Opcode::Ecall as u8,
+            Opcode::Unlikely as u8,
+            Opcode::Trap as u8,
+        ];
+        let bitmask = vec![1, 1, 1];
+
+        // Exercise both the predecoded fast loop and the step-driven tracing
+        // loop: both have an early Ecall return before common terminator
+        // bookkeeping.
+        for tracing in [false, true] {
+            let mut vm = Interpreter::new(
+                code.clone(),
+                bitmask.clone(),
+                vec![],
+                [0; 13],
+                vec![],
+                1_000,
+                crate::gas_cost::DEFAULT_MEM_CYCLES,
+            );
+            vm.tracing_enabled = tracing;
+            let first_cost = u64::from(vm.block_gas_costs[0]);
+            let successor_cost = u64::from(vm.block_gas_costs[1]);
+
+            assert_eq!(vm.run(), (ExitReason::Ecall, first_cost));
+            assert_eq!(vm.pc, 1);
+            assert!(!vm.gas_charged, "tracing={tracing}");
+            assert!(vm.need_gas_charge, "tracing={tracing}");
+
+            assert_eq!(vm.run(), (ExitReason::Trap, successor_cost));
+            assert_eq!(vm.gas, 1_000 - first_cost - successor_cost);
+        }
     }
 
     #[test]

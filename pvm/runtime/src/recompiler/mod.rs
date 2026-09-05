@@ -1505,6 +1505,54 @@ mod tests {
     }
 
     #[test]
+    fn jar_ecall_resume_gas_matches_interpreter() {
+        use crate::interpreter::Interpreter;
+
+        // The successor of private opcode 3 is a fresh JAR gas block.  This
+        // catches either backend preserving the funded marker across the
+        // capability-kernel exit and consequently skipping or duplicating the
+        // successor charge.
+        let code = vec![
+            crate::instruction::Opcode::Ecall as u8,
+            crate::instruction::Opcode::Unlikely as u8,
+            crate::instruction::Opcode::Trap as u8,
+        ];
+        let bitmask = vec![1, 1, 1];
+        let mut interpreter = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            [0; 13],
+            vec![],
+            1_000,
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+        );
+        let mut recompiler = RecompiledPvm::new_with_mode(
+            &code,
+            bitmask,
+            vec![],
+            [0; 13],
+            1_000,
+            Some(test_layout()),
+            crate::gas_cost::DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Jar,
+        )
+        .expect("compilation should succeed");
+
+        assert_eq!(interpreter.run().0, ExitReason::Ecall);
+        assert_eq!(recompiler.run(), ExitReason::Ecall);
+        assert_eq!(interpreter.gas, recompiler.gas());
+
+        // The capability kernel rebuilds its execution context from the
+        // advanced architectural PC after handling Ecall.  Mirror that
+        // external re-entry in the standalone recompiler harness.
+        recompiler.set_pc(recompiler.pc());
+        assert_eq!(interpreter.run().0, ExitReason::Trap);
+        assert_eq!(recompiler.run(), ExitReason::Trap);
+        assert_eq!(interpreter.gas, recompiler.gas());
+    }
+
+    #[test]
     fn test_recompile_ecalli() {
         let code = vec![10, 42]; // ecalli 42
         let bitmask = vec![1, 0];
