@@ -11,6 +11,7 @@ use syn::{FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType, parse_macro_in
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
+const MAX_STORAGE_PREFIX_BYTES: usize = 128;
 
 fn fingerprint_bytes(hash: &mut u64, bytes: &[u8]) {
     for byte in bytes {
@@ -22,6 +23,16 @@ fn fingerprint_bytes(hash: &mut u64, bytes: &[u8]) {
 fn fingerprint_frame(hash: &mut u64, bytes: &[u8]) {
     fingerprint_bytes(hash, &(bytes.len() as u64).to_le_bytes());
     fingerprint_bytes(hash, bytes);
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 fn fingerprint_literal(hash: &mut u64, literal: proc_macro2::Literal) {
@@ -320,7 +331,10 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(fields) => fields,
         Err(error) => return error.to_compile_error().into(),
     };
-    let storage_fields = extract_storage_fields(&mut input);
+    let storage_fields = match extract_storage_fields(&mut input) {
+        Ok(fields) => fields,
+        Err(error) => return error.to_compile_error().into(),
+    };
     let name = &input.ident;
     let msg_enum = format_ident!("{}Msg", name);
 
@@ -433,22 +447,62 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         },
     };
-    let agent_field_metas = state_fields.fields.iter().map(|field| {
-        let name = field.ident.to_string();
-        let ty = &field.ty;
-        let persistence = field.persistence.tokens();
-        quote! {
-            vos::agent::schema::FieldMeta {
-                name: #name,
-                // Source spelling alone lets two modules reuse an alias name
-                // for different codecs. Include its declaration context in
-                // the signed layout identity. Explicit state migration is
-                // still required when the meaning of that named codec changes.
-                codec: concat!(module_path!(), "::", stringify!(#ty)),
-                persistence: #persistence,
-            }
-        }
-    });
+    // Keep inline and row-backed fields in declaration order. Storage handles
+    // do not enter an inline lane codec, but their exact handle type, prefix,
+    // lane, commitment mode, and optional SMT domains are still part of the
+    // signed state-layout identity. The `vos/storage/v1` codec namespace is a
+    // clean discriminator for runtimes which materialize row-backed lanes.
+    let mut agent_field_metas = state_fields
+        .fields
+        .iter()
+        .map(|field| {
+            let name = field.ident.to_string();
+            let ty = &field.ty;
+            let persistence = field.persistence.tokens();
+            let tokens = quote! {
+                vos::agent::schema::FieldMeta {
+                    name: #name,
+                    // Source spelling alone lets two modules reuse an alias
+                    // name for different codecs. Include its declaration
+                    // context in the signed layout identity.
+                    codec: concat!(module_path!(), "::", stringify!(#ty)),
+                    persistence: #persistence,
+                }
+            };
+            (field.order, tokens)
+        })
+        .chain(storage_fields.iter().map(|field| {
+            let name = field.ident.to_string();
+            let ty = &field.ty;
+            let persistence = field.persistence.tokens();
+            let prefix = hex_bytes(&field.prefix);
+            let lane = field.persistence.name();
+            let committed = if field.committed {
+                "committed"
+            } else {
+                "ordinary"
+            };
+            let (leaf_domain, node_domain) = field.domains.as_ref().map_or_else(
+                || (String::new(), String::new()),
+                |(leaf, node)| (hex_bytes(leaf.as_bytes()), hex_bytes(node.as_bytes())),
+            );
+            let tokens = quote! {
+                vos::agent::schema::FieldMeta {
+                    name: #name,
+                    codec: concat!(
+                        "vos/storage/v1\0",
+                        module_path!(), "::", stringify!(#ty), "\0",
+                        #prefix, "\0", #lane, "\0", #committed, "\0",
+                        #leaf_domain, "\0", #node_domain,
+                    ),
+                    persistence: #persistence,
+                }
+            };
+            (field.order, tokens)
+        }))
+        .collect::<Vec<_>>();
+    agent_field_metas.sort_by_key(|(order, _)| *order);
+    let agent_field_metas = agent_field_metas.into_iter().map(|(_, tokens)| tokens);
     let agent_entry_kind = if parsed.task_buf.is_some() {
         quote! { vos::agent::schema::ExecutionEntryKind::Task }
     } else if agent_actor {
@@ -587,6 +641,42 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let linear_fields = lane_fields(PersistencePlan::Linear);
     let merge_fields = lane_fields(PersistencePlan::Merge);
     let local_fields = lane_fields(PersistencePlan::Local);
+    let has_lane = |lane: PersistencePlan| {
+        state_fields
+            .fields
+            .iter()
+            .any(|field| field.persistence == lane)
+            || storage_fields.iter().any(|field| field.persistence == lane)
+    };
+    let has_linear = has_lane(PersistencePlan::Linear);
+    let has_merge = has_lane(PersistencePlan::Merge);
+    let has_local = has_lane(PersistencePlan::Local);
+    let declared_lane_count =
+        usize::from(has_linear) + usize::from(has_merge) + usize::from(has_local);
+    let default_mutation_mode = if has_merge && !has_linear && !has_local {
+        MethodModePlan::Merge
+    } else if has_local && !has_linear && !has_merge {
+        MethodModePlan::Local
+    } else {
+        MethodModePlan::Linear
+    };
+    let mut view_fields = state_fields
+        .fields
+        .iter()
+        .map(|field| LaneViewField {
+            ident: field.ident.clone(),
+            ty: field.ty.clone(),
+            persistence: field.persistence,
+            order: field.order,
+        })
+        .chain(storage_fields.iter().map(|field| LaneViewField {
+            ident: field.ident.clone(),
+            ty: field.ty.clone(),
+            persistence: field.persistence,
+            order: field.order,
+        }))
+        .collect::<Vec<_>>();
+    view_fields.sort_by_key(|field| field.order);
     let mut view_generics = input.generics.clone();
     view_generics.params.insert(
         0,
@@ -598,17 +688,20 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
                      immutable: &[PersistencePlan],
                      shared_receiver: bool| {
         let view_name = format_ident!("__Vos{}{}View", name, suffix);
-        let selected = state_fields
-            .fields
+        let selected = view_fields
             .iter()
             .filter(|field| {
-                mutable.contains(&field.persistence) || immutable.contains(&field.persistence)
+                mutable.contains(&field.persistence)
+                    || immutable.contains(&field.persistence)
+                    || field.persistence == PersistencePlan::Skipped
             })
             .collect::<Vec<_>>();
         let declarations = selected.iter().map(|field| {
             let ident = &field.ident;
             let ty = &field.ty;
-            if mutable.contains(&field.persistence) {
+            if mutable.contains(&field.persistence)
+                || (!shared_receiver && field.persistence == PersistencePlan::Skipped)
+            {
                 quote! { #ident: &'__vos_agent_view mut #ty }
             } else {
                 quote! { #ident: &'__vos_agent_view #ty }
@@ -616,7 +709,9 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         });
         let initializers = selected.iter().map(|field| {
             let ident = &field.ident;
-            if mutable.contains(&field.persistence) {
+            if mutable.contains(&field.persistence)
+                || (!shared_receiver && field.persistence == PersistencePlan::Skipped)
+            {
                 quote! { #ident: &mut actor.#ident }
             } else {
                 quote! { #ident: &actor.#ident }
@@ -650,56 +745,79 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     };
-    let agent_lane_views = agent_actor
-        .then(|| {
-            [
-                lane_view(
-                    "SharedQuery",
-                    &[],
-                    &[
-                        PersistencePlan::Linear,
-                        PersistencePlan::Merge,
-                        PersistencePlan::Constant,
-                    ],
-                    true,
-                ),
-                lane_view(
-                    "LocalQuery",
-                    &[],
-                    &[
-                        PersistencePlan::Linear,
-                        PersistencePlan::Merge,
-                        PersistencePlan::Local,
-                        PersistencePlan::Constant,
-                    ],
-                    true,
-                ),
-                lane_view(
-                    "Linear",
-                    &[PersistencePlan::Linear],
-                    &[PersistencePlan::Merge, PersistencePlan::Constant],
-                    false,
-                ),
-                lane_view(
-                    "Merge",
-                    &[PersistencePlan::Merge],
-                    &[PersistencePlan::Constant],
-                    false,
-                ),
-                lane_view(
-                    "Local",
-                    &[PersistencePlan::Local],
-                    &[
-                        PersistencePlan::Linear,
-                        PersistencePlan::Merge,
-                        PersistencePlan::Constant,
-                    ],
-                    false,
-                ),
-            ]
-        })
-        .into_iter()
-        .flatten();
+    let (default_mutable, default_immutable) = match default_mutation_mode {
+        MethodModePlan::Linear => (
+            vec![PersistencePlan::Linear],
+            vec![PersistencePlan::Merge, PersistencePlan::Constant],
+        ),
+        MethodModePlan::Merge => (
+            vec![PersistencePlan::Merge],
+            vec![PersistencePlan::Constant],
+        ),
+        MethodModePlan::Local => (
+            vec![PersistencePlan::Local],
+            vec![
+                PersistencePlan::Linear,
+                PersistencePlan::Merge,
+                PersistencePlan::Constant,
+            ],
+        ),
+    };
+    let agent_lane_views = if agent_actor {
+        vec![
+            lane_view(
+                "SharedQuery",
+                &[],
+                &[
+                    PersistencePlan::Linear,
+                    PersistencePlan::Merge,
+                    PersistencePlan::Constant,
+                ],
+                true,
+            ),
+            lane_view(
+                "LocalQuery",
+                &[],
+                &[
+                    PersistencePlan::Linear,
+                    PersistencePlan::Merge,
+                    PersistencePlan::Local,
+                    PersistencePlan::Constant,
+                ],
+                true,
+            ),
+            lane_view(
+                "Linear",
+                &[PersistencePlan::Linear],
+                &[PersistencePlan::Merge, PersistencePlan::Constant],
+                false,
+            ),
+            lane_view(
+                "Merge",
+                &[PersistencePlan::Merge],
+                &[PersistencePlan::Constant],
+                false,
+            ),
+            lane_view(
+                "Local",
+                &[PersistencePlan::Local],
+                &[
+                    PersistencePlan::Linear,
+                    PersistencePlan::Merge,
+                    PersistencePlan::Constant,
+                ],
+                false,
+            ),
+            lane_view(
+                "DefaultMutation",
+                &default_mutable,
+                &default_immutable,
+                false,
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
     let load_lane = |argument: &syn::Ident, fields: &[syn::Ident]| {
         let count = fields.len() as u16;
         quote! {
@@ -783,12 +901,18 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     };
-    let default_mutation_mode = state_fields.default_mutation_mode.tokens();
+    let default_mutation_mode = default_mutation_mode.tokens();
+    let require_explicit_mutations = declared_lane_count > 1;
     let agent_message_assert = agent_actor.then(|| {
         quote! {
             const _: () = {
                 fn __vos_require_agent_messages<T: vos::agent::schema::AgentMessageSet>() {}
                 let _ = __vos_require_agent_messages::<#msg_enum> as fn();
+                assert!(
+                    !#require_explicit_mutations
+                        || <#msg_enum as vos::agent::schema::AgentMessageSet>::ALL_MUTATIONS_EXPLICIT,
+                    "mixed-lane #[actor(agent)] requires every &mut self handler to select #[msg(linear)], #[msg(merge)], or #[msg(local)]",
+                );
             };
         }
     });
@@ -908,9 +1032,31 @@ fn tokens_contain_self(tokens: proc_macro2::TokenStream) -> bool {
 /// written against an explicit view API rather than regaining the full actor.
 struct AgentLaneBodyRewriter {
     error: Option<syn::Error>,
+    context_names: Vec<syn::Ident>,
+    after_commit_merge_allowed: bool,
 }
 
 impl VisitMut for AgentLaneBodyRewriter {
+    fn visit_expr_method_call_mut(&mut self, expression: &mut syn::ExprMethodCall) {
+        let context_receiver = matches!(expression.receiver.as_ref(), syn::Expr::Path(path)
+            if path.qself.is_none()
+                && path.path.leading_colon.is_none()
+                && path.path.segments.len() == 1
+                && self.context_names.iter().any(|name| path.path.is_ident(name)));
+        if expression.method == "after_commit_merge"
+            && context_receiver
+            && !self.after_commit_merge_allowed
+        {
+            self.error.get_or_insert_with(|| {
+                syn::Error::new_spanned(
+                    &*expression,
+                    "after_commit_merge is only available from an explicit #[msg(linear)] handler",
+                )
+            });
+        }
+        syn::visit_mut::visit_expr_method_call_mut(self, expression);
+    }
+
     fn visit_expr_mut(&mut self, expression: &mut syn::Expr) {
         match expression {
             syn::Expr::Field(field) if path_is_self(&field.base) => {
@@ -931,7 +1077,7 @@ impl VisitMut for AgentLaneBodyRewriter {
                     self.error.get_or_insert_with(|| {
                         syn::Error::new_spanned(
                             expression_macro,
-                            "explicit agent handlers cannot hide `self` lane access inside a macro; move the field access outside the macro",
+                            "agent handlers cannot hide `self` lane access inside a macro; move the field access outside the macro",
                         )
                     });
                 }
@@ -1011,6 +1157,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut required_space_role_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut required_capability_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut agent_method_metas: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut after_commit_merge_impls: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
     let mut constructor_params: Vec<(syn::Ident, syn::Type)> = Vec::new();
     // One entry per `#[msg]`: the data the host-Client emission
@@ -1020,6 +1167,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut client_methods: Vec<ClientMethodInfo> = Vec::new();
     let mut has_start_handler = false;
     let mut start_returns_result = false;
+    let mut all_agent_mutations_explicit = true;
     for item in &input.items {
         let ImplItem::Fn(method) = item else {
             passthrough_items.push(item.clone());
@@ -1178,12 +1326,21 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
             _ => false,
         };
         let explicit_execution_mode = execution_mode.is_some();
+        if agent_messages && !is_query && !explicit_execution_mode {
+            all_agent_mutations_explicit = false;
+        }
         let effective_lane_view_mode = agent_messages
             .then(|| {
                 execution_mode
                     .as_ref()
                     .map(ToString::to_string)
-                    .or_else(|| is_query.then(|| "query".to_owned()))
+                    .or_else(|| {
+                        Some(if is_query {
+                            "query".to_owned()
+                        } else {
+                            "default_mutation".to_owned()
+                        })
+                    })
             })
             .flatten();
         let agent_lane_view = effective_lane_view_mode.as_deref().map(|mode| {
@@ -1193,6 +1350,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
                 "linear" => "Linear",
                 "merge" => "Merge",
                 "local" => "Local",
+                "default_mutation" => "DefaultMutation",
                 _ => unreachable!("execution modes were validated while parsing"),
             };
             format_ident!("__Vos{}{}View", actor_name, suffix)
@@ -1231,9 +1389,13 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Collect parameters (skip self, skip Context)
         let mut field_names = Vec::new();
         let mut field_types = Vec::new();
+        let mut context_names = Vec::new();
         for arg in method.sig.inputs.iter().skip(1) {
             if let FnArg::Typed(pat_type) = arg {
                 if is_context_type(pat_type.ty.as_ref()) {
+                    if let Pat::Ident(pat) = pat_type.pat.as_ref() {
+                        context_names.push(pat.ident.clone());
+                    }
                     continue;
                 }
                 if let Pat::Ident(pat) = pat_type.pat.as_ref() {
@@ -1273,10 +1435,45 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         msg_structs.push(msg_struct);
 
+        // Only an explicitly signed Merge handler can be queued as a
+        // post-Linear-commit message. The future Context/runtime effect API
+        // can accept this sealed marker rather than trusting a caller-supplied
+        // method string or reinterpreting an inferred default.
+        if agent_messages && execution_mode.as_ref().is_some_and(|mode| mode == "merge") {
+            let wire_name = method_name.to_string();
+            let with_calls = field_names
+                .iter()
+                .zip(field_types.iter())
+                .map(|(name, ty)| ref_arg_with(name, ty))
+                .collect::<Vec<_>>();
+            let destructure = if field_names.is_empty() {
+                quote! { let _ = self; }
+            } else {
+                quote! { let #struct_name { #( #field_names ),* } = self; }
+            };
+            after_commit_merge_impls.push(quote! {
+                impl vos::agent::schema::AfterCommitMergeMessage<#actor_name> for #struct_name {
+                    const METHOD: &'static str = #wire_name;
+
+                    fn into_dynamic(self) -> vos::value::Msg {
+                        #destructure
+                        vos::value::Msg::new(#wire_name)
+                            #( #with_calls )*
+                    }
+                }
+            });
+        }
+
         // Generate Message impl
         let mut body = method.block.clone();
         if agent_lane_view.is_some() {
-            let mut rewriter = AgentLaneBodyRewriter { error: None };
+            let mut rewriter = AgentLaneBodyRewriter {
+                error: None,
+                context_names,
+                after_commit_merge_allowed: execution_mode
+                    .as_ref()
+                    .is_some_and(|mode| mode == "linear"),
+            };
             rewriter.visit_block_mut(&mut body);
             if let Some(error) = rewriter.error {
                 return error.to_compile_error().into();
@@ -1763,7 +1960,9 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let agent_message_marker = agent_messages.then(|| {
         quote! {
-            impl vos::agent::schema::AgentMessageSet for #enum_name {}
+            impl vos::agent::schema::AgentMessageSet for #enum_name {
+                const ALL_MUTATIONS_EXPLICIT: bool = #all_agent_mutations_explicit;
+            }
             const _: () = assert!(
                 <#actor_ty as vos::Actor>::AGENT_ACTOR_SOURCE,
                 "#[messages(agent)] requires #[actor(agent)] on the actor type",
@@ -1899,6 +2098,20 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             fn __vos_create() -> Self {
                 Self::new()
+            }
+        }
+    } else if agent_messages {
+        // The standard-agent invocation ABI currently supplies only the three
+        // state lanes, invocation control, and the message. Never substitute
+        // empty/default constructor values: package admission rejects this
+        // surface until signed installation data is plumbed into the guest.
+        // Keeping the fail-closed seam here lets that follow-up replace one
+        // branch without changing constructor codecs or actor source.
+        quote! {
+            fn __vos_create() -> Self {
+                panic!(
+                    "parameterized #[actor(agent)] construction requires signed installation data; this runtime must reject the package until that input is available"
+                )
             }
         }
     } else if raw_args_ctor {
@@ -2299,6 +2512,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         #( #msg_structs )*
         #aggregated_enum
         #( #msg_impls )*
+        #( #after_commit_merge_impls )*
         #( #attested_method_impls )*
         #passthrough_impl
         #preamble
@@ -2381,11 +2595,10 @@ struct ActorAttrs {
     state_version: u64,
 }
 
-/// Pull `#[storage]` / `#[storage(prefix = "…")]` off the state
-/// struct's named fields, returning `(field, key-prefix-bytes)` per
-/// storage field. The attribute must be stripped here — nothing else
-/// declares it, so leaving it in the re-emitted struct is a compile
-/// error by design (it only means something on an `#[actor]` struct).
+/// Pull `#[storage]` off the state struct's named fields. Ordinary storage is
+/// Linear. `#[storage(merge)]` and `#[storage(local)]` select the other two
+/// durability lanes explicitly. The attribute must be stripped here — nothing
+/// else declares it, so leaving it in the re-emitted struct is a compile error.
 ///
 /// The default prefix is `s/<field>/`; pass an explicit
 /// `prefix = "…"` to pin it across a field rename (the prefix names
@@ -2396,91 +2609,156 @@ struct ActorAttrs {
 /// roots are pinned outside vos — clerk-ledger ↔ cipher-clerk).
 struct StorageField {
     ident: syn::Ident,
+    ty: syn::Type,
     prefix: Vec<u8>,
+    persistence: PersistencePlan,
     committed: bool,
     domains: Option<(String, String)>,
+    order: usize,
 }
 
-fn extract_storage_fields(input: &mut ItemStruct) -> Vec<StorageField> {
+fn extract_storage_fields(input: &mut ItemStruct) -> syn::Result<Vec<StorageField>> {
     let mut out: Vec<StorageField> = Vec::new();
     let syn::Fields::Named(named) = &mut input.fields else {
-        return out;
+        return Ok(out);
     };
-    for field in named.named.iter_mut() {
-        type StorageAttribute = (Option<String>, bool, Option<String>, Option<String>);
-        let mut storage: Option<StorageAttribute> = None;
-        field.attrs.retain(|attr| {
-            if !attr.path().is_ident("storage") {
-                return true;
-            }
-            let mut custom = None;
-            let mut committed = false;
-            let mut leaf_domain = None;
-            let mut node_domain = None;
-            if matches!(attr.meta, syn::Meta::List(_)) {
-                let parsed = attr.parse_nested_meta(|meta| {
-                    if meta.path.is_ident("prefix") {
-                        let lit: syn::LitStr = meta.value()?.parse()?;
-                        custom = Some(lit.value());
-                        Ok(())
-                    } else if meta.path.is_ident("committed") {
-                        committed = true;
-                        Ok(())
-                    } else if meta.path.is_ident("leaf_domain") {
-                        let lit: syn::LitStr = meta.value()?.parse()?;
-                        leaf_domain = Some(lit.value());
-                        Ok(())
-                    } else if meta.path.is_ident("node_domain") {
-                        let lit: syn::LitStr = meta.value()?.parse()?;
-                        node_domain = Some(lit.value());
-                        Ok(())
-                    } else {
-                        Err(meta.error(
-                            "expected `prefix = \"…\"`, `committed`, \
-                             `leaf_domain = \"…\"`, or `node_domain = \"…\"`",
-                        ))
-                    }
-                });
-                if let Err(e) = parsed {
-                    panic!("#[storage]: {e}");
-                }
-            }
-            storage = Some((custom, committed, leaf_domain, node_domain));
-            false
-        });
-        if let Some((custom, committed, leaf_domain, node_domain)) = storage {
-            let ident = field.ident.clone().expect("named field");
-            let prefix = custom.unwrap_or_else(|| format!("s/{ident}/"));
-            assert!(
-                !prefix.is_empty() && !prefix.starts_with("__vos_"),
-                "#[storage] prefix {prefix:?} collides with the framework keyspace",
-            );
-            assert!(
-                out.iter().all(|f| f.prefix != prefix.as_bytes()),
-                "#[storage] prefix {prefix:?} is used by two fields",
-            );
-            let domains = match (leaf_domain, node_domain) {
-                (Some(l), Some(n)) => Some((l, n)),
-                (None, None) => None,
-                _ => panic!(
-                    "#[storage]: leaf_domain and node_domain must be given together \
-                     (field `{ident}`)"
-                ),
-            };
-            assert!(
-                domains.is_none() || committed,
-                "#[storage]: custom SMT domains only apply to `committed` fields \
-                 (field `{ident}`)"
-            );
-            out.push(StorageField {
-                ident,
-                prefix: prefix.into_bytes(),
-                committed,
-                domains,
-            });
+    for (order, field) in named.named.iter_mut().enumerate() {
+        let storage_count = field
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("storage"))
+            .count();
+        if storage_count > 1 {
+            return Err(syn::Error::new_spanned(
+                field,
+                "declare exactly one #[storage(...)] attribute per field",
+            ));
         }
+        let Some(storage_index) = field
+            .attrs
+            .iter()
+            .position(|attr| attr.path().is_ident("storage"))
+        else {
+            continue;
+        };
+        let attr = field.attrs.remove(storage_index);
+        if matches!(attr.meta, syn::Meta::NameValue(_)) {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected #[storage] or #[storage(linear|merge|local, ...)]",
+            ));
+        }
+
+        let mut custom = None;
+        let mut committed = false;
+        let mut saw_committed = false;
+        let mut leaf_domain = None;
+        let mut node_domain = None;
+        let mut persistence = None;
+        if matches!(attr.meta, syn::Meta::List(_)) {
+            attr.parse_nested_meta(|meta| {
+                for (name, plan) in [
+                    ("linear", PersistencePlan::Linear),
+                    ("merge", PersistencePlan::Merge),
+                    ("local", PersistencePlan::Local),
+                ] {
+                    if meta.path.is_ident(name) {
+                        if persistence.replace(plan).is_some() {
+                            return Err(meta.error("select exactly one storage lane"));
+                        }
+                        return Ok(());
+                    }
+                }
+                if meta.path.is_ident("prefix") {
+                    if custom.is_some() {
+                        return Err(meta.error("declare `prefix` once"));
+                    }
+                    let lit: syn::LitStr = meta.value()?.parse()?;
+                    custom = Some(lit.value());
+                    Ok(())
+                } else if meta.path.is_ident("committed") {
+                    if saw_committed {
+                        return Err(meta.error("declare `committed` once"));
+                    }
+                    saw_committed = true;
+                    committed = true;
+                    Ok(())
+                } else if meta.path.is_ident("leaf_domain") {
+                    if leaf_domain.is_some() {
+                        return Err(meta.error("declare `leaf_domain` once"));
+                    }
+                    let lit: syn::LitStr = meta.value()?.parse()?;
+                    leaf_domain = Some(lit.value());
+                    Ok(())
+                } else if meta.path.is_ident("node_domain") {
+                    if node_domain.is_some() {
+                        return Err(meta.error("declare `node_domain` once"));
+                    }
+                    let lit: syn::LitStr = meta.value()?.parse()?;
+                    node_domain = Some(lit.value());
+                    Ok(())
+                } else {
+                    Err(meta.error(
+                        "expected `linear`, `merge`, `local`, `prefix = \"…\"`, \
+                         `committed`, `leaf_domain = \"…\"`, or `node_domain = \"…\"`",
+                    ))
+                }
+            })?;
+        }
+
+        let ident = field.ident.clone().expect("named field");
+        let prefix = custom.unwrap_or_else(|| format!("s/{ident}/"));
+        if prefix.is_empty() || prefix.starts_with("__vos_") {
+            return Err(syn::Error::new_spanned(
+                &attr,
+                format!("#[storage] prefix {prefix:?} collides with the framework keyspace"),
+            ));
+        }
+        if prefix.len() > MAX_STORAGE_PREFIX_BYTES {
+            return Err(syn::Error::new_spanned(
+                &attr,
+                format!(
+                    "#[storage] prefix is {} bytes; the maximum is {MAX_STORAGE_PREFIX_BYTES}",
+                    prefix.len(),
+                ),
+            ));
+        }
+        if out.iter().any(|field| {
+            field.prefix.starts_with(prefix.as_bytes())
+                || prefix.as_bytes().starts_with(&field.prefix)
+        }) {
+            return Err(syn::Error::new_spanned(
+                &attr,
+                format!("#[storage] prefix {prefix:?} overlaps another field's keyspace"),
+            ));
+        }
+        let domains = match (leaf_domain, node_domain) {
+            (Some(leaf), Some(node)) => Some((leaf, node)),
+            (None, None) => None,
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    &attr,
+                    "#[storage]: leaf_domain and node_domain must be given together",
+                ));
+            }
+        };
+        if domains.is_some() && !committed {
+            return Err(syn::Error::new_spanned(
+                &attr,
+                "#[storage]: custom SMT domains only apply to `committed` fields",
+            ));
+        }
+        out.push(StorageField {
+            ident,
+            ty: field.ty.clone(),
+            prefix: prefix.into_bytes(),
+            persistence: persistence.unwrap_or(PersistencePlan::Linear),
+            committed,
+            domains,
+            order,
+        });
     }
-    out
+    Ok(out)
 }
 
 /// Parse `#[actor(...)]` attributes.
@@ -2601,13 +2879,20 @@ struct StateFieldPlan {
     fields: Vec<StateField>,
     merge: Vec<syn::Ident>,
     constants: Vec<syn::Ident>,
-    default_mutation_mode: MethodModePlan,
 }
 
 struct StateField {
     ident: syn::Ident,
     ty: syn::Type,
     persistence: PersistencePlan,
+    order: usize,
+}
+
+struct LaneViewField {
+    ident: syn::Ident,
+    ty: syn::Type,
+    persistence: PersistencePlan,
+    order: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2633,6 +2918,16 @@ impl PersistencePlan {
             },
             Self::Constant => quote! { vos::agent::FieldPersistence::Constant },
             Self::Skipped => quote! { vos::agent::FieldPersistence::Skipped },
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::Merge => "merge",
+            Self::Local => "local",
+            Self::Constant => "const",
+            Self::Skipped => "skip",
         }
     }
 }
@@ -2704,10 +2999,7 @@ fn prepare_state_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<St
     };
 
     let mut plan = StateFieldPlan::default();
-    let mut has_linear = false;
-    let mut has_merge = false;
-    let mut has_local = false;
-    for field in &mut named.named {
+    for (order, field) in named.named.iter_mut().enumerate() {
         let is_storage = field
             .attrs
             .iter()
@@ -2847,30 +3139,20 @@ fn prepare_state_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<St
             plan.constants.push(ident.clone());
             PersistencePlan::Constant
         } else if is_local {
-            has_local = true;
             PersistencePlan::Local
         } else if is_merge || (!is_linear && is_crdt_field_type(&field.ty)) {
-            has_merge = true;
             plan.merge.push(ident.clone());
             PersistencePlan::Merge
         } else {
-            has_linear = true;
             PersistencePlan::Linear
         };
         plan.fields.push(StateField {
             ident,
             ty: field.ty.clone(),
             persistence,
+            order,
         });
     }
-
-    plan.default_mutation_mode = if has_merge && !has_linear && !has_local {
-        MethodModePlan::Merge
-    } else if has_local && !has_linear && !has_merge {
-        MethodModePlan::Local
-    } else {
-        MethodModePlan::Linear
-    };
     Ok(plan)
 }
 
@@ -2944,6 +3226,107 @@ mod agent_schema_tests {
                 .iter()
                 .any(|attr| attr.path().is_ident("storage"))
         );
+    }
+
+    #[test]
+    fn storage_handles_keep_their_lane_and_declaration_order() {
+        let mut actor: ItemStruct = syn::parse_quote! {
+            struct Stored {
+                #[storage(merge, prefix = "items/")]
+                items: vos::StorageMap<String, String>,
+                count: u64,
+                #[storage(local)]
+                cache: vos::StorageValue<Vec<u8>>,
+            }
+        };
+        let state = prepare_state_fields(&mut actor, false).unwrap();
+        let storage = extract_storage_fields(&mut actor).unwrap();
+
+        assert_eq!(state.fields.len(), 1);
+        assert_eq!(state.fields[0].ident, "count");
+        assert_eq!(state.fields[0].order, 1);
+        assert_eq!(storage.len(), 2);
+        assert_eq!(storage[0].ident, "items");
+        assert_eq!(storage[0].persistence, PersistencePlan::Merge);
+        assert_eq!(storage[0].prefix, b"items/");
+        assert_eq!(storage[0].order, 0);
+        assert_eq!(storage[1].ident, "cache");
+        assert_eq!(storage[1].persistence, PersistencePlan::Local);
+        assert_eq!(storage[1].prefix, b"s/cache/");
+        assert_eq!(storage[1].order, 2);
+        assert!(actor.fields.iter().all(|field| {
+            field
+                .attrs
+                .iter()
+                .all(|attr| !attr.path().is_ident("storage"))
+        }));
+    }
+
+    #[test]
+    fn storage_lane_and_keyspace_options_fail_closed() {
+        fn error(mut actor: ItemStruct) -> String {
+            match extract_storage_fields(&mut actor) {
+                Ok(_) => panic!("invalid storage declaration was accepted"),
+                Err(error) => error.to_string(),
+            }
+        }
+
+        let two_lanes: ItemStruct = syn::parse_quote! {
+            struct Stored {
+                #[storage(linear, merge)]
+                items: vos::StorageMap<String, String>,
+            }
+        };
+        assert!(error(two_lanes).contains("exactly one storage lane"));
+
+        let overlapping: ItemStruct = syn::parse_quote! {
+            struct Stored {
+                #[storage(prefix = "rows/")]
+                rows: vos::StorageMap<String, String>,
+                #[storage(prefix = "rows/private/")]
+                private: vos::StorageMap<String, String>,
+            }
+        };
+        assert!(error(overlapping).contains("overlaps"));
+
+        let oversized = "x".repeat(MAX_STORAGE_PREFIX_BYTES + 1);
+        let oversized: ItemStruct = syn::parse_str(&format!(
+            "struct Stored {{ #[storage(prefix = {oversized:?})] rows: StorageMap<u8, u8> }}"
+        ))
+        .unwrap();
+        assert!(error(oversized).contains("maximum is 128"));
+    }
+
+    #[test]
+    fn after_commit_merge_requires_an_explicit_linear_handler() {
+        let body = || -> syn::Block {
+            syn::parse_quote!({
+                ctx.after_commit_merge(queued);
+            })
+        };
+        let mut rejected = body();
+        let mut rewriter = AgentLaneBodyRewriter {
+            error: None,
+            context_names: vec![syn::parse_quote!(ctx)],
+            after_commit_merge_allowed: false,
+        };
+        rewriter.visit_block_mut(&mut rejected);
+        assert!(
+            rewriter
+                .error
+                .unwrap()
+                .to_string()
+                .contains("explicit #[msg(linear)]")
+        );
+
+        let mut accepted = body();
+        let mut rewriter = AgentLaneBodyRewriter {
+            error: None,
+            context_names: vec![syn::parse_quote!(ctx)],
+            after_commit_merge_allowed: true,
+        };
+        rewriter.visit_block_mut(&mut accepted);
+        assert!(rewriter.error.is_none());
     }
 
     #[test]

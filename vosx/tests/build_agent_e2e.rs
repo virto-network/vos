@@ -516,6 +516,27 @@ fn mixed_actor_enforces_signed_modes_and_commits_only_the_owned_lane() {
     let temp = TempDir::new("mixed");
     let out = temp.0.join("dist");
     let config_home = temp.0.join("config");
+    let lane_surface = Command::new("cargo")
+        .args([
+            "test",
+            "--locked",
+            "--manifest-path",
+            "../tests/fixtures/actors/lane-isolation/Cargo.toml",
+            "--no-default-features",
+            "--features",
+            "valid",
+        ])
+        .env("CARGO_TARGET_DIR", temp.0.join("lane-surface-target"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("compile the valid lane macro surface");
+    assert!(
+        lane_surface.status.success(),
+        "valid lane macro surface must compile and its generated merge-message codec must run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&lane_surface.stdout),
+        String::from_utf8_lossy(&lane_surface.stderr),
+    );
+
     let status = Command::new(env!("CARGO_BIN_EXE_vosx"))
         .args([
             "agent",

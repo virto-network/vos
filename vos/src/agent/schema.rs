@@ -62,7 +62,23 @@ pub struct MethodMeta {
 /// this trait so the signed AgentActor entry cannot be built with unrestricted
 /// service-style handler bodies.
 #[doc(hidden)]
-pub trait AgentMessageSet {}
+pub trait AgentMessageSet {
+    /// True only when every mutating handler selected its lane explicitly.
+    /// Mixed-lane actors use this to fail at compile time rather than waiting
+    /// for package admission to reject an inferred mutation mode.
+    const ALL_MUTATIONS_EXPLICIT: bool;
+}
+
+/// Typed message which may be emitted by a Linear handler after its Linear
+/// state transition commits. The macro implements this only for handlers with
+/// an explicit `#[msg(merge)]` contract, so a future runtime effect API can be
+/// generic over a generated typed codec instead of accepting an unchecked
+/// method name. Runtime admission must still validate the signed method mode.
+pub trait AfterCommitMergeMessage<A> {
+    const METHOD: &'static str;
+
+    fn into_dynamic(self) -> crate::value::Msg;
+}
 
 /// Complete compile-time schema encoded into `.vos_agent`.
 pub struct SchemaMeta {

@@ -9,6 +9,7 @@ publish = false
 [features]
 default = ["bin"]
 bin = []
+valid = []
 
 [lib]
 crate-type = ["rlib", "cdylib"]
