@@ -1957,7 +1957,8 @@ mod tests {
             program: ProgramId([3; 32]),
             package: blob(),
             agent_schema: blob(),
-            role_policies: blob(),
+            method_policy: blob(),
+            constructor_abi: Hash([0x0b; 32]),
             installation_data: None,
             state_layout: Hash([4; 32]),
             lanes: LaneSet::of(StateLane::Merge),
@@ -1997,6 +1998,7 @@ mod tests {
             mode: MethodMode::Merge,
             continuation: BlobRef::of_bytes(b"continuation"),
             ready_sequence: 1,
+            installation_data: None,
             availability: Vec::new(),
             input: None,
         };
