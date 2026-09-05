@@ -27,7 +27,7 @@ pub const MAX_CLEAN_MANAGEMENT_ISSUER_DECISIONS: usize =
     super::standard::MAX_AUTHORITY_DISPOSITIONS;
 /// Maximum complete canonical issuer image accepted from durable storage.
 pub const MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES: usize = 512 * 1024;
-const MAX_AUTHORIZED_DECISION_BYTES: usize = 1_024;
+pub(crate) const MAX_AUTHORIZED_DECISION_BYTES: usize = 1_024;
 const CLEAN_MANAGEMENT_ISSUER_MAGIC: [u8; 4] = *b"CMI1";
 
 /// Minimal durable whole-image boundary owned by the clean Agent issuer.
@@ -160,6 +160,40 @@ impl AuthorizedCleanManagementDecision {
 
     pub const fn request(&self) -> Hash {
         self.request
+    }
+
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
+        encode_authorized_decision(self)
+    }
+
+    pub(crate) fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        decode_authorized_decision(bytes)
+    }
+
+    pub(crate) fn matches_creation(&self, descriptor: &crate::agent::sdk::AgentDescriptor) -> bool {
+        self.is_valid()
+            && self.operation == AuthorityOperationKind::CreateAgent
+            && self.space == descriptor.identity.space
+            && self.agent == descriptor.identity.agent
+            && self.runtime_deployment == descriptor.identity.runtime_deployment
+            && self.actor.is_none()
+            && self.actor_deployment.is_none()
+            && self.creation_authority == Some(descriptor.authority)
+            && self.request == ManagementRequest::Create(Box::new(descriptor.clone())).commitment()
+    }
+
+    pub(crate) fn matches_receipt(
+        &self,
+        binding: AgentAuthorityBinding,
+        receipt: &AuthorityReceipt,
+    ) -> bool {
+        receipt.selector
+            == selector_for(
+                &binding,
+                self,
+                receipt.selector.decision_sequence,
+                receipt.selector.acknowledged_through,
+            )
     }
 
     fn is_valid(&self) -> bool {
@@ -647,6 +681,10 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         self.poisoned
     }
 
+    pub const fn has_pending_decision(&self) -> bool {
+        self.image.pending.is_some()
+    }
+
     pub fn into_store(self) -> B {
         self.store
     }
@@ -813,12 +851,16 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         Ok(receipt)
     }
 
-    /// Persist an explicit caller assertion that the exact latest issued
-    /// receipt was observed in durable Agent state, then retire the complete
-    /// acknowledged prefix. Restricting observation to the latest receipt
-    /// prevents an acknowledgement from invalidating later outstanding
+    /// Persist an Agent-owned proof boundary that the exact latest issued
+    /// receipt and its resulting state are durably recoverable, then retire
+    /// the complete acknowledged prefix. This method is crate-private on
+    /// purpose: an authority client must not advance the watermark merely
+    /// because it observed a successful in-memory result. The owning Agent
+    /// coordinator may call it only after reopening or committing the exact
+    /// resulting Agent image. Restricting observation to the latest receipt
+    /// also prevents an acknowledgement from invalidating later outstanding
     /// receipts whose signed watermark is older.
-    pub fn observe_durable(
+    pub(crate) fn observe_durable(
         &mut self,
         receipt: &AuthorityReceipt,
     ) -> Result<bool, CleanManagementIssuerError<B::Error>> {

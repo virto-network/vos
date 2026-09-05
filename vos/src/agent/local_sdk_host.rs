@@ -29,6 +29,45 @@ use super::driver::{
 };
 use super::package_admission::AdmittedRuntimePackage;
 
+/// Clean-generation logical time required by SDK receipt verification.
+///
+/// The adapter below deliberately supplies no legacy authority or package
+/// trust. Clean lifecycle trust is the immutable descriptor binding plus the
+/// canonical signed SDK receipt, while VOS3 package admission is performed
+/// before this host boundary.
+pub trait CleanAgentLogicalClock: Send + Sync {
+    fn current_logical_slot(&self) -> Option<u64>;
+}
+
+struct CleanAgentTrustAdapter {
+    clock: Arc<dyn CleanAgentLogicalClock>,
+}
+
+impl AgentTrustProvider for CleanAgentTrustAdapter {
+    fn current_logical_slot(&self) -> Option<u64> {
+        self.clock.current_logical_slot()
+    }
+
+    fn authority_for_space(
+        &self,
+        _space: crate::service::SpaceId,
+    ) -> Option<super::authority::AgentAuthorityBinding> {
+        None
+    }
+
+    fn verify_package(
+        &self,
+        _agent: &super::AgentConfig,
+        _package: &super::package::Package,
+    ) -> bool {
+        false
+    }
+}
+
+fn clean_clock_trust(clock: Arc<dyn CleanAgentLogicalClock>) -> Arc<dyn AgentTrustProvider> {
+    Arc::new(CleanAgentTrustAdapter { clock })
+}
+
 /// Hard bound on directories and loaded drivers owned by one Local host.
 pub const MAX_LOCAL_HOST_AGENTS: usize = 4_096;
 
@@ -110,6 +149,29 @@ pub struct LocalAgentHost {
 }
 
 impl LocalAgentHost {
+    pub(crate) fn create_with_clean_clock(
+        root: impl AsRef<Path>,
+        space: SpaceId,
+        node: NodeId,
+        clock: Arc<dyn CleanAgentLogicalClock>,
+    ) -> Result<Self, LocalAgentHostError> {
+        Self::create(root, space, node, clean_clock_trust(clock))
+    }
+
+    pub(crate) fn open_with_clean_clock(
+        root: impl AsRef<Path>,
+        expected_space: SpaceId,
+        expected_node: NodeId,
+        clock: Arc<dyn CleanAgentLogicalClock>,
+    ) -> Result<Self, LocalAgentHostError> {
+        Self::open(
+            root,
+            expected_space,
+            expected_node,
+            clean_clock_trust(clock),
+        )
+    }
+
     /// Create a new empty root. The supplied path and its parent must already
     /// be canonical; relative, symlinked, `.` and `..` aliases are rejected.
     pub fn create(
