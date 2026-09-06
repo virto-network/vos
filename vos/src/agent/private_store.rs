@@ -18,6 +18,7 @@ use fs2::FileExt;
 use vos_agent_sdk::private::{
     EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_NODES, PrivateControlOperation,
     PrivateControlRecord, PrivateControlSigner, PrivateKeyEpoch, PrivateNodeIdentity,
+    PrivateRecoveryKeyringGrant,
 };
 use vos_agent_sdk::wire::{
     CanonicalWire, MAX_PRIVATE_CONTROL_WIRE_BYTES, MAX_PRIVATE_KEY_EPOCH_WIRE_BYTES,
@@ -162,6 +163,7 @@ struct RecoveryMetadata {
     agent: AgentId,
     owner: PrincipalId,
     recovery_public_key: [u8; 32],
+    recovery_encryption_public_key: [u8; 32],
     genesis_epoch: PrivateKeyEpoch,
     genesis_nodes: Vec<PrivateNodeIdentity>,
 }
@@ -192,11 +194,16 @@ struct PendingTransaction {
     index_len: u32,
 }
 
-struct VerifiedEncryptedBackup {
+/// Fully authenticated, bounded ciphertext archive held only while an
+/// offline recovery ceremony prepares its exact successor. It deliberately
+/// exposes sealed epoch metadata but no API for plaintext or unwrapped keys.
+pub(crate) struct VerifiedEncryptedBackup {
     metadata: RecoveryMetadata,
     index: StoreIndex,
     controls: Vec<PrivateControlRecord>,
     objects: Vec<EncryptedPrivateObject>,
+    key_epochs: Vec<PrivateKeyEpoch>,
+    chain: PrivateControlChainVerifier,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -409,6 +416,9 @@ fn encode_recovery(metadata: &RecoveryMetadata) -> Result<Vec<u8>, PrivateStoreE
     encoder.fixed(metadata.agent.as_bytes());
     encoder.fixed(metadata.owner.as_bytes());
     encoder.0.extend_from_slice(&metadata.recovery_public_key);
+    encoder
+        .0
+        .extend_from_slice(&metadata.recovery_encryption_public_key);
     encoder.bytes(&epoch)?;
     encoder.u16(
         u16::try_from(metadata.genesis_nodes.len())
@@ -429,6 +439,7 @@ fn decode_recovery(bytes: &[u8]) -> Result<RecoveryMetadata, PrivateStoreError> 
     let agent = AgentId(decoder.fixed()?);
     let owner = PrincipalId(decoder.fixed()?);
     let recovery_public_key = decoder.fixed()?;
+    let recovery_encryption_public_key = decoder.fixed()?;
     let epoch_bytes = decoder.bytes(MAX_PRIVATE_KEY_EPOCH_WIRE_BYTES)?;
     let genesis_epoch =
         PrivateKeyEpoch::decode(&epoch_bytes).map_err(|_| PrivateStoreError::InvalidRecord)?;
@@ -452,9 +463,11 @@ fn decode_recovery(bytes: &[u8]) -> Result<RecoveryMetadata, PrivateStoreError> 
         || agent == AgentId::ZERO
         || owner == PrincipalId::ZERO
         || recovery_public_key == [0; 32]
+        || recovery_encryption_public_key == [0; 32]
         || genesis_epoch.space != space
         || genesis_epoch.agent != agent
         || genesis_epoch.epoch != 0
+        || genesis_epoch.recovery_encryption_public_key != recovery_encryption_public_key
         || genesis_nodes
             .windows(2)
             .any(|pair| pair[0].node >= pair[1].node)
@@ -466,6 +479,7 @@ fn decode_recovery(bytes: &[u8]) -> Result<RecoveryMetadata, PrivateStoreError> 
         agent,
         owner,
         recovery_public_key,
+        recovery_encryption_public_key,
         genesis_epoch,
         genesis_nodes,
     })
@@ -696,12 +710,13 @@ fn decode_pending(bytes: &[u8]) -> Result<PendingTransaction, PrivateStoreError>
 /// destination filesystem. The caller-supplied binding is the external trust
 /// anchor; archive metadata is never allowed to select its own owner or
 /// recovery key.
-fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
+pub(crate) fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
     bytes: &[u8],
     expected_space: SpaceId,
     expected_agent: AgentId,
     expected_owner: PrincipalId,
     expected_recovery_public_key: [u8; 32],
+    expected_recovery_encryption_public_key: [u8; 32],
     authority: &V,
 ) -> Result<VerifiedEncryptedBackup, PrivateStoreError> {
     let mut decoder = Decoder::new(bytes, BACKUP_MAGIC, MAX_PRIVATE_BACKUP_BYTES)?;
@@ -715,6 +730,7 @@ fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
     }
     if metadata.owner != expected_owner
         || metadata.recovery_public_key != expected_recovery_public_key
+        || metadata.recovery_encryption_public_key != expected_recovery_encryption_public_key
     {
         return Err(PrivateStoreError::InvalidBinding);
     }
@@ -733,10 +749,12 @@ fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
         metadata.agent,
         metadata.owner,
         metadata.recovery_public_key,
+        metadata.recovery_encryption_public_key,
         metadata.genesis_epoch.clone(),
         metadata.genesis_nodes.clone(),
         authority,
     )?;
+    let mut key_epochs = vec![metadata.genesis_epoch.clone()];
     let control_count =
         usize::try_from(decoder.u32()?).map_err(|_| PrivateStoreError::LimitExceeded)?;
     if control_count != index.controls.len() || control_count > MAX_PRIVATE_STORE_CONTROLS {
@@ -766,6 +784,7 @@ fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
         }
         validate_control_index_entry(entry, &record)?;
         apply_control_transition(&mut chain, &record, authority)?;
+        advance_key_epochs(&mut key_epochs, &record)?;
         if chain.epoch().epoch != entry.resulting_epoch
             || chain.head() != Some(entry.commitment)
             || chain.next_sequence()
@@ -814,6 +833,7 @@ fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
     if chain.epoch().epoch != index.epoch
         || chain.head() != index.control_head
         || chain.next_sequence() != index.next_sequence
+        || key_epochs.last() != Some(chain.epoch())
     {
         return Err(PrivateStoreError::Corrupt);
     }
@@ -822,7 +842,148 @@ fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
         index,
         controls,
         objects,
+        key_epochs,
+        chain,
     })
+}
+
+impl VerifiedEncryptedBackup {
+    pub(crate) fn binding(&self) -> PrivateStoreBinding {
+        PrivateStoreBinding {
+            space: self.metadata.space,
+            agent: self.metadata.agent,
+            owner: self.metadata.owner,
+            epoch: self.chain.epoch().epoch,
+            control_head: self.chain.head(),
+            next_sequence: self.chain.next_sequence(),
+        }
+    }
+
+    pub(crate) fn key_epochs(&self) -> &[PrivateKeyEpoch] {
+        &self.key_epochs
+    }
+
+    /// Append the exact already-signed recovery successor in memory. The
+    /// original backup is left untouched; the resulting bytes are still a
+    /// ciphertext-only canonical backup and can be durably restored through
+    /// the ordinary transactional store path.
+    pub(crate) fn append_offline_recovery<V: PrivateNodeAuthorityVerifier>(
+        &mut self,
+        record: &PrivateControlRecord,
+        authority: &V,
+    ) -> Result<(), PrivateStoreError> {
+        if self.index.controls.len() >= MAX_PRIVATE_STORE_CONTROLS
+            || record.signer != PrivateControlSigner::Recovery
+            || record.sequence != self.index.next_sequence
+            || record.previous != self.index.control_head
+            || !matches!(record.operation, PrivateControlOperation::Recover { .. })
+        {
+            return Err(PrivateStoreError::InvalidRecord);
+        }
+        let PrivateControlOperation::Recover {
+            superseded_heads, ..
+        } = &record.operation
+        else {
+            return Err(PrivateStoreError::InvalidRecord);
+        };
+        match self.index.control_head {
+            Some(head) if superseded_heads.as_slice() == [head] => {}
+            None if superseded_heads.is_empty() => {}
+            _ => return Err(PrivateStoreError::InvalidRecord),
+        }
+
+        let wire = record
+            .encode()
+            .map_err(|_| PrivateStoreError::InvalidRecord)?;
+        if wire.len() > MAX_PRIVATE_CONTROL_WIRE_BYTES {
+            return Err(PrivateStoreError::LimitExceeded);
+        }
+        let commitment = record.commitment();
+        if self
+            .index
+            .controls
+            .iter()
+            .any(|entry| entry.commitment == commitment || entry.sequence == record.sequence)
+        {
+            return Err(PrivateStoreError::Alias);
+        }
+        let mut next_chain = self.chain.clone();
+        apply_control_transition(&mut next_chain, record, authority)?;
+        let mut next_key_epochs = self.key_epochs.clone();
+        advance_key_epochs(&mut next_key_epochs, record)?;
+        if next_key_epochs.last() != Some(next_chain.epoch()) {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        let entry = StoredControlIndex {
+            sequence: record.sequence,
+            commitment,
+            previous: record.previous,
+            resulting_epoch: next_chain.epoch().epoch,
+            superseded_heads: superseded_heads.clone(),
+            wire_hash: raw_wire_hash(&wire),
+            wire_len: u32::try_from(wire.len()).map_err(|_| PrivateStoreError::LimitExceeded)?,
+        };
+        self.index.controls.push(entry);
+        self.index.epoch = next_chain.epoch().epoch;
+        self.index.control_head = next_chain.head();
+        self.index.next_sequence = next_chain.next_sequence();
+        validate_index_shape(&self.index)?;
+        self.controls.push(record.clone());
+        self.key_epochs = next_key_epochs;
+        self.chain = next_chain;
+        Ok(())
+    }
+
+    pub(crate) fn encode_backup(&self, max_bytes: usize) -> Result<Vec<u8>, PrivateStoreError> {
+        let maximum = max_bytes.min(MAX_PRIVATE_BACKUP_BYTES);
+        if self.controls.len() != self.index.controls.len()
+            || self.objects.len() != self.index.objects.len()
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        let recovery = encode_recovery(&self.metadata)?;
+        let index = encode_index(&self.index)?;
+        let mut encoder = Encoder::new(BACKUP_MAGIC);
+        encoder.bytes(&recovery)?;
+        encoder.bytes(&index)?;
+        encoder
+            .u32(u32::try_from(self.controls.len()).map_err(|_| PrivateStoreError::LimitExceeded)?);
+        for (entry, record) in self.index.controls.iter().zip(&self.controls) {
+            let wire = record
+                .encode()
+                .map_err(|_| PrivateStoreError::InvalidRecord)?;
+            if record.commitment() != entry.commitment
+                || raw_wire_hash(&wire) != entry.wire_hash
+                || wire.len() != entry.wire_len as usize
+            {
+                return Err(PrivateStoreError::Corrupt);
+            }
+            encoder.fixed(entry.commitment.as_bytes());
+            encoder.bytes(&wire)?;
+            if encoder.0.len() > maximum {
+                return Err(PrivateStoreError::LimitExceeded);
+            }
+        }
+        encoder
+            .u32(u32::try_from(self.objects.len()).map_err(|_| PrivateStoreError::LimitExceeded)?);
+        for (entry, object) in self.index.objects.iter().zip(&self.objects) {
+            let wire = object
+                .encode()
+                .map_err(|_| PrivateStoreError::InvalidRecord)?;
+            if PrivateObjectKey::from_object(object) != entry.key
+                || raw_wire_hash(&wire) != entry.wire_hash
+                || wire.len() != entry.wire_len as usize
+            {
+                return Err(PrivateStoreError::Corrupt);
+            }
+            encode_object_key(&mut encoder, entry.key);
+            encoder.bytes(&wire)?;
+            if encoder.0.len() > maximum {
+                return Err(PrivateStoreError::LimitExceeded);
+            }
+        }
+        encoder.finish(maximum)
+    }
 }
 
 fn map_io(_: std::io::Error) -> PrivateStoreError {
@@ -1075,6 +1236,9 @@ pub struct PrivateStore {
     /// the verified control chain. These contain recipient ciphertext only;
     /// unwrapped keys remain a host concern.
     key_epochs: Vec<PrivateKeyEpoch>,
+    /// Latest recovery-signed ciphertext grant. Every Recover grant is a full
+    /// history snapshot, so retaining older large ciphertexts is unnecessary.
+    latest_recovery_keyring: Option<PrivateRecoveryKeyringGrant>,
     #[cfg(test)]
     artifact_reads: core::cell::Cell<u64>,
 }
@@ -1087,6 +1251,7 @@ impl PrivateStore {
         agent: AgentId,
         owner: PrincipalId,
         recovery_public_key: [u8; 32],
+        recovery_encryption_public_key: [u8; 32],
         genesis_epoch: PrivateKeyEpoch,
         genesis_nodes: Vec<PrivateNodeIdentity>,
         authority: &V,
@@ -1119,6 +1284,7 @@ impl PrivateStore {
             agent,
             owner,
             recovery_public_key,
+            recovery_encryption_public_key,
             genesis_epoch.clone(),
             genesis_nodes.clone(),
             authority,
@@ -1129,6 +1295,7 @@ impl PrivateStore {
             agent,
             owner,
             recovery_public_key,
+            recovery_encryption_public_key,
             genesis_epoch,
             genesis_nodes,
         };
@@ -1155,6 +1322,7 @@ impl PrivateStore {
             index,
             chain,
             key_epochs,
+            latest_recovery_keyring: None,
             #[cfg(test)]
             artifact_reads: core::cell::Cell::new(0),
         })
@@ -1197,11 +1365,13 @@ impl PrivateStore {
             metadata.agent,
             metadata.owner,
             metadata.recovery_public_key,
+            metadata.recovery_encryption_public_key,
             metadata.genesis_epoch.clone(),
             metadata.genesis_nodes.clone(),
             authority,
         )?;
         let mut key_epochs = vec![metadata.genesis_epoch.clone()];
+        let mut latest_recovery_keyring = None;
         for entry in &index.controls {
             let bytes = verify_file_identity(
                 &root
@@ -1216,6 +1386,12 @@ impl PrivateStore {
             validate_control_index_entry(entry, &record)?;
             apply_control_transition(&mut chain, &record, authority)?;
             advance_key_epochs(&mut key_epochs, &record)?;
+            if let PrivateControlOperation::Recover {
+                historical_keyring, ..
+            } = &record.operation
+            {
+                latest_recovery_keyring = Some(historical_keyring.clone());
+            }
             if chain.epoch().epoch != entry.resulting_epoch
                 || chain.head() != Some(entry.commitment)
                 || chain.next_sequence()
@@ -1256,6 +1432,7 @@ impl PrivateStore {
             index,
             chain,
             key_epochs,
+            latest_recovery_keyring,
             #[cfg(test)]
             artifact_reads: core::cell::Cell::new(0),
         })
@@ -1274,6 +1451,7 @@ impl PrivateStore {
         expected_agent: AgentId,
         expected_owner: PrincipalId,
         expected_recovery_public_key: [u8; 32],
+        expected_recovery_encryption_public_key: [u8; 32],
         backup_bytes: &[u8],
         authority: &V,
     ) -> Result<(Self, RestoreDisposition), PrivateStoreError> {
@@ -1283,6 +1461,7 @@ impl PrivateStore {
             expected_agent,
             expected_owner,
             expected_recovery_public_key,
+            expected_recovery_encryption_public_key,
             authority,
         )?;
         let root = root.as_ref();
@@ -1303,6 +1482,7 @@ impl PrivateStore {
                     expected_agent,
                     expected_owner,
                     expected_recovery_public_key,
+                    expected_recovery_encryption_public_key,
                     backup.metadata.genesis_epoch.clone(),
                     backup.metadata.genesis_nodes.clone(),
                     authority,
@@ -1341,11 +1521,11 @@ impl PrivateStore {
     /// authorization assertion crosses this API.
     pub fn apply_offline_recovery<V: PrivateNodeAuthorityVerifier>(
         &mut self,
-        expected_prior_head: Hash,
+        expected_prior_head: Option<Hash>,
         record: &PrivateControlRecord,
         authority: &V,
     ) -> Result<PutDisposition, PrivateStoreError> {
-        if expected_prior_head == Hash::ZERO
+        if expected_prior_head == Some(Hash::ZERO)
             || record.signer != PrivateControlSigner::Recovery
             || !matches!(record.operation, PrivateControlOperation::Recover { .. })
         {
@@ -1357,24 +1537,19 @@ impl PrivateStore {
         else {
             return Err(PrivateStoreError::InvalidRecord);
         };
+        let supersedes_expected = match expected_prior_head {
+            Some(head) => superseded_heads.binary_search(&head).is_ok(),
+            None => superseded_heads.is_empty() && record.previous.is_none(),
+        };
+        if !supersedes_expected {
+            return Err(PrivateStoreError::InvalidRecord);
+        }
         let commitment = record.commitment();
         if self.chain.head() == Some(commitment) {
-            if superseded_heads
-                .binary_search(&expected_prior_head)
-                .is_err()
-            {
-                return Err(PrivateStoreError::InvalidRecord);
-            }
             return self.append_control(record, authority);
         }
-        if self.chain.head() != Some(expected_prior_head) {
+        if self.chain.head() != expected_prior_head {
             return Err(PrivateStoreError::Diverged);
-        }
-        if superseded_heads
-            .binary_search(&expected_prior_head)
-            .is_err()
-        {
-            return Err(PrivateStoreError::InvalidRecord);
         }
         self.append_control(record, authority)
     }
@@ -1409,11 +1584,19 @@ impl PrivateStore {
         &self.key_epochs
     }
 
+    pub(crate) fn latest_recovery_keyring(&self) -> Option<&PrivateRecoveryKeyringGrant> {
+        self.latest_recovery_keyring.as_ref()
+    }
+
     /// Offline recovery verification key pinned by immutable genesis
     /// metadata. The corresponding signing key is deliberately never stored
     /// by this type.
     pub fn recovery_public_key(&self) -> [u8; 32] {
         self.metadata.recovery_public_key
+    }
+
+    pub fn recovery_encryption_public_key(&self) -> [u8; 32] {
+        self.metadata.recovery_encryption_public_key
     }
 
     pub fn object_count(&self) -> usize {
@@ -1551,6 +1734,13 @@ impl PrivateStore {
         apply_control_transition(&mut next_chain, record, authority)?;
         let mut next_key_epochs = self.key_epochs.clone();
         advance_key_epochs(&mut next_key_epochs, record)?;
+        let mut next_recovery_keyring = self.latest_recovery_keyring.clone();
+        if let PrivateControlOperation::Recover {
+            historical_keyring, ..
+        } = &record.operation
+        {
+            next_recovery_keyring = Some(historical_keyring.clone());
+        }
         if next_key_epochs.last() != Some(next_chain.epoch()) {
             return Err(PrivateStoreError::Corrupt);
         }
@@ -1584,6 +1774,7 @@ impl PrivateStore {
         )?;
         self.chain = next_chain;
         self.key_epochs = next_key_epochs;
+        self.latest_recovery_keyring = next_recovery_keyring;
         self.index = next;
         Ok(PutDisposition::Inserted)
     }
@@ -1992,8 +2183,10 @@ mod tests {
     use vos_agent_sdk::private::EncryptedObjectKind;
 
     use crate::agent::private_crypto::{
-        GeneratedPrivateEpoch, OwnerSigningKey, PrivateNodeDecryptionKey, RecoverySigningKey,
+        GeneratedPrivateEpoch, OfflineRecoveryDecryptionKey, OwnerSigningKey,
+        PrivateNodeDecryptionKey, RecoverySigningKey, build_recovery_keyring_grant,
         encrypt_private_object, generate_fresh_private_epoch, sign_owner_control_record,
+        sign_recovery_control_record, unwrap_recovery_data_key,
     };
     use vos_agent_sdk::{BlobRef, NodeId};
 
@@ -2068,6 +2261,7 @@ mod tests {
         owner: PrincipalId,
         owner_key: OwnerSigningKey,
         recovery: RecoverySigningKey,
+        recovery_encryption: OfflineRecoveryDecryptionKey,
         nodes: Vec<PrivateNodeIdentity>,
         epoch: GeneratedPrivateEpoch,
     }
@@ -2077,6 +2271,7 @@ mod tests {
         let agent = AgentId([2; 32]);
         let owner = PrincipalId([3; 32]);
         let recovery = RecoverySigningKey::from_seed([4; 32]).unwrap();
+        let recovery_encryption = OfflineRecoveryDecryptionKey::from_bytes([8; 32]).unwrap();
         let node_key = PrivateNodeDecryptionKey::from_bytes([5; 32]).unwrap();
         let transport_identity = vec![6; 48];
         let mut node = PrivateNodeIdentity {
@@ -2096,6 +2291,7 @@ mod tests {
             owner,
             &nodes,
             recovery.verifying_key(),
+            recovery_encryption.public_key(),
             &TestAuthority,
         )
         .unwrap();
@@ -2109,6 +2305,7 @@ mod tests {
             owner,
             owner_key: unwrapped_owner,
             recovery,
+            recovery_encryption,
             nodes,
             epoch,
         }
@@ -2121,6 +2318,7 @@ mod tests {
             fixture.agent,
             fixture.owner,
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             fixture.epoch.record.clone(),
             fixture.nodes.clone(),
             &TestAuthority,
@@ -2260,6 +2458,64 @@ mod tests {
     }
 
     #[test]
+    fn genesis_head_offline_recovery_is_exact_and_retryable() {
+        let directory = TestDirectory::new("genesis-recovery");
+        let fixture = fixture();
+        let mut store = create_store(&directory.store(), &fixture);
+        let successor = generate_fresh_private_epoch(
+            fixture.space,
+            fixture.agent,
+            1,
+            fixture.owner,
+            &fixture.nodes,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let historical = alloc::collections::BTreeMap::from([(
+            0,
+            unwrap_recovery_data_key(&fixture.epoch.record, &fixture.recovery_encryption).unwrap(),
+        )]);
+        let historical_keyring = build_recovery_keyring_grant(
+            core::slice::from_ref(&fixture.epoch.record),
+            &historical,
+            &successor.record,
+            &fixture.nodes,
+        )
+        .unwrap();
+        let mut record = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: 0,
+            previous: None,
+            operation: PrivateControlOperation::Recover {
+                superseded_heads: Vec::new(),
+                next_epoch: successor.record,
+                replacement_nodes: fixture.nodes.clone(),
+                historical_keyring,
+            },
+            signer: PrivateControlSigner::Recovery,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_recovery_control_record(&mut record, &fixture.recovery).unwrap();
+        assert_eq!(
+            store
+                .apply_offline_recovery(None, &record, &TestAuthority)
+                .unwrap(),
+            PutDisposition::Inserted
+        );
+        assert_eq!(
+            store
+                .apply_offline_recovery(None, &record, &TestAuthority)
+                .unwrap(),
+            PutDisposition::AlreadyPresent
+        );
+        assert_eq!(store.binding().epoch, 1);
+    }
+
+    #[test]
     fn semantic_object_aliases_are_rejected_and_exact_retries_are_idempotent() {
         let directory = TestDirectory::new("alias");
         let fixture = fixture();
@@ -2357,6 +2613,7 @@ mod tests {
                     fixture.agent,
                     fixture.owner,
                     fixture.recovery.verifying_key(),
+                    fixture.recovery_encryption.public_key(),
                     fixture.epoch.record.clone(),
                     fixture.nodes.clone(),
                     &TestAuthority,
@@ -2402,6 +2659,7 @@ mod tests {
                 fixture.agent,
                 fixture.owner,
                 fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
                 &tampered,
                 &TestAuthority,
             )
@@ -2418,6 +2676,7 @@ mod tests {
                 fixture.agent,
                 fixture.owner,
                 fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
                 &truncated,
                 &TestAuthority,
             )
@@ -2462,6 +2721,7 @@ mod tests {
                     agent,
                     owner,
                     recovery,
+                    fixture.recovery_encryption.public_key(),
                     &backup,
                     &TestAuthority,
                 )
@@ -2479,6 +2739,7 @@ mod tests {
                 fixture.agent,
                 fixture.owner,
                 fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
                 &duplicate,
                 &TestAuthority,
             )
@@ -2493,6 +2754,7 @@ mod tests {
                 fixture.agent,
                 fixture.owner,
                 fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
                 &reversed,
                 &TestAuthority,
             )
@@ -2557,6 +2819,7 @@ mod tests {
             fixture.agent,
             fixture.owner,
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             &current_backup,
             &TestAuthority,
         )
@@ -2573,6 +2836,7 @@ mod tests {
                 fixture.agent,
                 fixture.owner,
                 fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
                 &old_backup,
                 &TestAuthority,
             )
@@ -2598,6 +2862,7 @@ mod tests {
                 fixture.agent,
                 fixture.owner,
                 fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
                 &current_backup,
                 &TestAuthority,
             )
@@ -2621,6 +2886,7 @@ mod tests {
                 fixture.agent,
                 fixture.owner,
                 fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
                 &current_backup,
                 &TestAuthority,
             )
@@ -2638,6 +2904,7 @@ mod tests {
             fixture.agent,
             fixture.owner,
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             &current_backup,
             &TestAuthority,
         )

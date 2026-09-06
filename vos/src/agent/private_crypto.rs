@@ -5,6 +5,7 @@
 //! owner, data, recovery, and node-decryption keys remain in zeroizing wrappers
 //! and are never included in a record.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -19,8 +20,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 use vos_agent_sdk::private::{
     EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_CIPHERTEXT_BYTES, MAX_PRIVATE_NODES,
+    MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES, MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS,
     PRIVATE_NONCE_BYTES, PrivateControlOperation, PrivateControlRecord, PrivateControlSigner,
-    PrivateKeyEpoch, PrivateNodeIdentity, SealedPrivateKey,
+    PrivateKeyEpoch, PrivateNodeIdentity, PrivateRecoveryKeyringGrant, SealedPrivateKey,
+    SealedRecoveryKey,
 };
 use vos_agent_sdk::{AgentId, Hash, NodeId, PrincipalId, SpaceId};
 
@@ -32,6 +35,7 @@ const SEALED_NONCE_BYTES: usize = PRIVATE_NONCE_BYTES;
 const SEALED_CIPHERTEXT_BYTES: usize = SECRET_BYTES + AEAD_TAG_BYTES;
 const SEALED_BYTES: usize =
     SEALED_MAGIC.len() + SEALED_EPHEMERAL_BYTES + SEALED_NONCE_BYTES + SEALED_CIPHERTEXT_BYTES;
+const RECOVERY_SEALED_MAGIC: &[u8; 4] = b"VRK1";
 
 /// Hard ceiling for records replayed into one in-memory verifier instance.
 /// A caller needing a later checkpoint must persist a separately authenticated
@@ -46,8 +50,17 @@ const PLAINTEXT_DOMAIN: &[u8] = b"vos/private/plaintext/v1";
 const SEAL_KDF_DOMAIN: &[u8] = b"vos/private/key-seal/kdf/v1";
 const SEAL_AAD_DOMAIN: &[u8] = b"vos/private/key-seal/aad/v1";
 const SEAL_SALT: &[u8] = b"vos/private/key-seal/salt/v1";
+const RECOVERY_SEAL_KDF_DOMAIN: &[u8] = b"vos/private/recovery-data-seal/kdf/v1";
+const RECOVERY_SEAL_AAD_DOMAIN: &[u8] = b"vos/private/recovery-data-seal/aad/v1";
+const RECOVERY_SEAL_SALT: &[u8] = b"vos/private/recovery-data-seal/salt/v1";
 const OBJECT_KDF_DOMAIN: &[u8] = b"vos/private/object-key/kdf/v1";
 const OBJECT_SALT: &[u8] = b"vos/private/object-key/salt/v1";
+const RECOVERY_KEYRING_MAGIC: &[u8; 4] = b"PVKG";
+const RECOVERY_KEYRING_VERSION: u16 = 1;
+const RECOVERY_KEYRING_FIXED_BYTES: usize = 4 + 2 + 32 + 32 + 32 + 8 + 4;
+const RECOVERY_KEYRING_ENTRY_BYTES: usize = 8 + 32 + SECRET_BYTES;
+const RECOVERY_PLAN_KDF_SALT: &[u8] = b"vos/private/recovery-plan-auth/salt/v1";
+const RECOVERY_PLAN_KDF_DOMAIN: &[u8] = b"vos/private/recovery-plan-auth/v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateCryptoError {
@@ -172,6 +185,69 @@ impl RecoverySigningKey {
     }
 }
 
+/// X25519 secret held with the offline recovery kit. It is independent of the
+/// Ed25519 recovery-signing seed and is never admitted as a Node identity.
+pub struct OfflineRecoveryDecryptionKey(Secret32);
+
+impl OfflineRecoveryDecryptionKey {
+    pub fn from_bytes(bytes: [u8; SECRET_BYTES]) -> Result<Self, PrivateCryptoError> {
+        Secret32::from_bytes(bytes).map(Self)
+    }
+
+    pub fn generate() -> Result<Self, PrivateCryptoError> {
+        Secret32::generate(&mut OsRng).map(Self)
+    }
+
+    fn generate_with<R: RngCore + CryptoRng>(rng: &mut R) -> Result<Self, PrivateCryptoError> {
+        Secret32::generate(rng).map(Self)
+    }
+
+    pub fn public_key(&self) -> [u8; SECRET_BYTES] {
+        let secret = StaticSecret::from(*self.0.bytes());
+        X25519PublicKey::from(&secret).to_bytes()
+    }
+}
+
+/// Both independent secret halves required by one offline recovery ceremony.
+/// The kit is non-cloneable, non-formattable, and zeroizes both halves.
+pub struct OfflineRecoveryKit {
+    signing: RecoverySigningKey,
+    decryption: OfflineRecoveryDecryptionKey,
+}
+
+impl OfflineRecoveryKit {
+    pub fn new(
+        signing: RecoverySigningKey,
+        decryption: OfflineRecoveryDecryptionKey,
+    ) -> Result<Self, PrivateCryptoError> {
+        if signing.0.bytes() == decryption.0.bytes()
+            || signing.verifying_key() == decryption.public_key()
+        {
+            return Err(PrivateCryptoError::InvalidKey);
+        }
+        Ok(Self {
+            signing,
+            decryption,
+        })
+    }
+
+    pub fn signing_public_key(&self) -> [u8; SECRET_BYTES] {
+        self.signing.verifying_key()
+    }
+
+    pub fn encryption_public_key(&self) -> [u8; SECRET_BYTES] {
+        self.decryption.public_key()
+    }
+
+    pub(crate) fn signing_key(&self) -> &RecoverySigningKey {
+        &self.signing
+    }
+
+    pub(crate) fn decryption_key(&self) -> &OfflineRecoveryDecryptionKey {
+        &self.decryption
+    }
+}
+
 /// Symmetric key for Private objects. Bytes are zeroized on drop and cannot
 /// be cloned or formatted.
 pub struct PrivateDataKey(Secret32);
@@ -193,6 +269,12 @@ impl PrivateDataKey {
 
     pub fn commitment(&self) -> Hash {
         data_key_commitment(self.0.bytes())
+    }
+
+    /// Copy into a zeroizing buffer solely for canonical encrypted keyring
+    /// construction. Callers must never persist the returned plaintext.
+    pub(crate) fn recovery_bytes(&self) -> Zeroizing<[u8; SECRET_BYTES]> {
+        Zeroizing::new(*self.0.bytes())
     }
 }
 
@@ -219,6 +301,23 @@ impl PrivateNodeDecryptionKey {
         let secret = StaticSecret::from(*self.0.bytes());
         X25519PublicKey::from(&secret).to_bytes()
     }
+
+    /// Authenticate a bounded ciphertext-only recovery plan to this exact
+    /// host recipient. This is used only to resume already-prepared random
+    /// recovery bytes after a crash; it never authenticates network input.
+    pub(crate) fn recovery_plan_authenticator(
+        &self,
+        plan_hash: Hash,
+    ) -> Result<Hash, PrivateCryptoError> {
+        let hkdf = Hkdf::<Sha256>::new(Some(RECOVERY_PLAN_KDF_SALT), self.0.bytes());
+        let mut info = Vec::with_capacity(RECOVERY_PLAN_KDF_DOMAIN.len() + 32);
+        info.extend_from_slice(RECOVERY_PLAN_KDF_DOMAIN);
+        info.extend_from_slice(plan_hash.as_bytes());
+        let mut output = Zeroizing::new([0; SECRET_BYTES]);
+        hkdf.expand(&info, &mut *output)
+            .map_err(|_| PrivateCryptoError::KeyDerivation)?;
+        Ok(Hash(*output))
+    }
 }
 
 fn owner_public_key_commitment(public_key: &[u8; SECRET_BYTES]) -> Hash {
@@ -243,7 +342,7 @@ fn strict_ed25519_public_key(
     Ok(key)
 }
 
-fn valid_x25519_public_key(public_key: &[u8; SECRET_BYTES]) -> bool {
+pub(crate) fn valid_x25519_public_key(public_key: &[u8; SECRET_BYTES]) -> bool {
     if *public_key == [0; SECRET_BYTES] {
         return false;
     }
@@ -266,6 +365,7 @@ pub fn private_content_identity(plaintext: &[u8]) -> Hash {
 enum EpochKeyKind {
     Owner = 0,
     Data = 1,
+    History = 2,
 }
 
 #[derive(Clone, Copy)]
@@ -297,10 +397,11 @@ fn seal_context(domain: &[u8], input: SealContext<'_>) -> Vec<u8> {
 }
 
 fn derive_seal_key(
+    salt: &[u8],
     shared_secret: &[u8; SECRET_BYTES],
     context: &[u8],
 ) -> Result<Zeroizing<[u8; SECRET_BYTES]>, PrivateCryptoError> {
-    let hkdf = Hkdf::<Sha256>::new(Some(SEAL_SALT), shared_secret);
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), shared_secret);
     let mut key = Zeroizing::new([0; SECRET_BYTES]);
     hkdf.expand(context, &mut *key)
         .map_err(|_| PrivateCryptoError::KeyDerivation)?;
@@ -367,7 +468,7 @@ fn seal_epoch_secret<R: RngCore + CryptoRng>(
         ephemeral_key: &ephemeral_public,
     };
     let kdf_context = seal_context(SEAL_KDF_DOMAIN, input);
-    let wrapping_key = derive_seal_key(shared.as_bytes(), &kdf_context)?;
+    let wrapping_key = derive_seal_key(SEAL_SALT, shared.as_bytes(), &kdf_context)?;
     let aad = seal_context(SEAL_AAD_DOMAIN, input);
     let mut nonce = [0; SEALED_NONCE_BYTES];
     rng.try_fill_bytes(&mut nonce)
@@ -452,7 +553,7 @@ fn unseal_epoch_secret(
         ephemeral_key: &ephemeral_public,
     };
     let kdf_context = seal_context(SEAL_KDF_DOMAIN, input);
-    let wrapping_key = derive_seal_key(shared.as_bytes(), &kdf_context)?;
+    let wrapping_key = derive_seal_key(SEAL_SALT, shared.as_bytes(), &kdf_context)?;
     let aad = seal_context(SEAL_AAD_DOMAIN, input);
     let cipher = XChaCha20Poly1305::new_from_slice(&*wrapping_key)
         .map_err(|_| PrivateCryptoError::InvalidKey)?;
@@ -475,6 +576,190 @@ fn unseal_epoch_secret(
     Ok(Secret32(bytes))
 }
 
+#[derive(Clone, Copy)]
+struct RecoverySealContext<'a> {
+    space: SpaceId,
+    agent: AgentId,
+    epoch: u64,
+    recipient_key: &'a [u8; SECRET_BYTES],
+    data_key_commitment: Hash,
+    ephemeral_key: &'a [u8; SECRET_BYTES],
+}
+
+fn recovery_seal_context(domain: &[u8], input: RecoverySealContext<'_>) -> Vec<u8> {
+    let mut context = Vec::with_capacity(domain.len() + 32 + 32 + 8 + 32 + 32 + 32);
+    context.extend_from_slice(domain);
+    context.extend_from_slice(input.space.as_bytes());
+    context.extend_from_slice(input.agent.as_bytes());
+    context.extend_from_slice(&input.epoch.to_le_bytes());
+    context.extend_from_slice(input.recipient_key);
+    context.extend_from_slice(input.data_key_commitment.as_bytes());
+    context.extend_from_slice(input.ephemeral_key);
+    context
+}
+
+fn recovery_sealed_envelope_has_strict_shape(sealed: &SealedRecoveryKey) -> bool {
+    if !sealed.validate()
+        || sealed.sealed.len() != SEALED_BYTES
+        || sealed.sealed.get(..RECOVERY_SEALED_MAGIC.len()) != Some(RECOVERY_SEALED_MAGIC)
+        || !valid_x25519_public_key(&sealed.recipient_key)
+    {
+        return false;
+    }
+    let ephemeral_offset = RECOVERY_SEALED_MAGIC.len();
+    let nonce_offset = ephemeral_offset + SEALED_EPHEMERAL_BYTES;
+    let ciphertext_offset = nonce_offset + SEALED_NONCE_BYTES;
+    let Ok(ephemeral_public) = sealed.sealed[ephemeral_offset..nonce_offset]
+        .try_into()
+        .map(|value: [u8; SEALED_EPHEMERAL_BYTES]| value)
+    else {
+        return false;
+    };
+    valid_x25519_public_key(&ephemeral_public)
+        && sealed.sealed[nonce_offset..ciphertext_offset]
+            .iter()
+            .any(|byte| *byte != 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seal_recovery_data_key_with<R: RngCore + CryptoRng>(
+    rng: &mut R,
+    space: SpaceId,
+    agent: AgentId,
+    epoch: u64,
+    data_key: &PrivateDataKey,
+    recipient_key: [u8; SECRET_BYTES],
+) -> Result<SealedRecoveryKey, PrivateCryptoError> {
+    if space == SpaceId::ZERO || agent == AgentId::ZERO || !valid_x25519_public_key(&recipient_key)
+    {
+        return Err(PrivateCryptoError::InvalidRecord);
+    }
+    let ephemeral = Secret32::generate(rng)?;
+    let ephemeral_secret = StaticSecret::from(*ephemeral.bytes());
+    let ephemeral_public = X25519PublicKey::from(&ephemeral_secret).to_bytes();
+    let shared = ephemeral_secret.diffie_hellman(&X25519PublicKey::from(recipient_key));
+    if !shared.was_contributory() {
+        return Err(PrivateCryptoError::KeyAgreement);
+    }
+    let input = RecoverySealContext {
+        space,
+        agent,
+        epoch,
+        recipient_key: &recipient_key,
+        data_key_commitment: data_key.commitment(),
+        ephemeral_key: &ephemeral_public,
+    };
+    let kdf_context = recovery_seal_context(RECOVERY_SEAL_KDF_DOMAIN, input);
+    let wrapping_key = derive_seal_key(RECOVERY_SEAL_SALT, shared.as_bytes(), &kdf_context)?;
+    let aad = recovery_seal_context(RECOVERY_SEAL_AAD_DOMAIN, input);
+    let mut nonce = [0; SEALED_NONCE_BYTES];
+    rng.try_fill_bytes(&mut nonce)
+        .map_err(|_| PrivateCryptoError::Randomness)?;
+    if nonce == [0; SEALED_NONCE_BYTES] {
+        return Err(PrivateCryptoError::Randomness);
+    }
+    let cipher = XChaCha20Poly1305::new_from_slice(&*wrapping_key)
+        .map_err(|_| PrivateCryptoError::InvalidKey)?;
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: data_key.0.bytes(),
+                aad: &aad,
+            },
+        )
+        .map_err(|_| PrivateCryptoError::Encryption)?;
+    if ciphertext.len() != SEALED_CIPHERTEXT_BYTES {
+        return Err(PrivateCryptoError::Encryption);
+    }
+    let mut bytes = Vec::with_capacity(SEALED_BYTES);
+    bytes.extend_from_slice(RECOVERY_SEALED_MAGIC);
+    bytes.extend_from_slice(&ephemeral_public);
+    bytes.extend_from_slice(&nonce);
+    bytes.extend_from_slice(&ciphertext);
+    Ok(SealedRecoveryKey {
+        recipient_key,
+        sealed: bytes,
+    })
+}
+
+pub fn seal_recovery_data_key(
+    space: SpaceId,
+    agent: AgentId,
+    epoch: u64,
+    data_key: &PrivateDataKey,
+    recipient_key: [u8; SECRET_BYTES],
+) -> Result<SealedRecoveryKey, PrivateCryptoError> {
+    seal_recovery_data_key_with(&mut OsRng, space, agent, epoch, data_key, recipient_key)
+}
+
+pub fn unwrap_recovery_data_key(
+    epoch: &PrivateKeyEpoch,
+    decryption_key: &OfflineRecoveryDecryptionKey,
+) -> Result<PrivateDataKey, PrivateCryptoError> {
+    let sealed = &epoch.sealed_recovery_data_key;
+    let recipient_key = decryption_key.public_key();
+    if !epoch.validate()
+        || epoch.recovery_encryption_public_key != recipient_key
+        || sealed.recipient_key != recipient_key
+        || !recovery_sealed_envelope_has_strict_shape(sealed)
+    {
+        return Err(PrivateCryptoError::WrongRecipient);
+    }
+    let ephemeral_offset = RECOVERY_SEALED_MAGIC.len();
+    let nonce_offset = ephemeral_offset + SEALED_EPHEMERAL_BYTES;
+    let ciphertext_offset = nonce_offset + SEALED_NONCE_BYTES;
+    let ephemeral_public: [u8; SEALED_EPHEMERAL_BYTES] = sealed.sealed
+        [ephemeral_offset..nonce_offset]
+        .try_into()
+        .map_err(|_| PrivateCryptoError::Decryption)?;
+    let nonce: [u8; SEALED_NONCE_BYTES] = sealed.sealed[nonce_offset..ciphertext_offset]
+        .try_into()
+        .map_err(|_| PrivateCryptoError::Decryption)?;
+    if nonce == [0; SEALED_NONCE_BYTES] {
+        return Err(PrivateCryptoError::Decryption);
+    }
+    let secret = StaticSecret::from(*decryption_key.0.bytes());
+    let shared = secret.diffie_hellman(&X25519PublicKey::from(ephemeral_public));
+    if !shared.was_contributory() {
+        return Err(PrivateCryptoError::KeyAgreement);
+    }
+    let input = RecoverySealContext {
+        space: epoch.space,
+        agent: epoch.agent,
+        epoch: epoch.epoch,
+        recipient_key: &recipient_key,
+        data_key_commitment: epoch.data_key_commitment,
+        ephemeral_key: &ephemeral_public,
+    };
+    let kdf_context = recovery_seal_context(RECOVERY_SEAL_KDF_DOMAIN, input);
+    let wrapping_key = derive_seal_key(RECOVERY_SEAL_SALT, shared.as_bytes(), &kdf_context)?;
+    let aad = recovery_seal_context(RECOVERY_SEAL_AAD_DOMAIN, input);
+    let cipher = XChaCha20Poly1305::new_from_slice(&*wrapping_key)
+        .map_err(|_| PrivateCryptoError::InvalidKey)?;
+    let mut plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &sealed.sealed[ciphertext_offset..],
+                aad: &aad,
+            },
+        )
+        .map_err(|_| PrivateCryptoError::Decryption)?;
+    if plaintext.len() != SECRET_BYTES {
+        plaintext.zeroize();
+        return Err(PrivateCryptoError::Decryption);
+    }
+    let mut bytes = Zeroizing::new([0; SECRET_BYTES]);
+    bytes.copy_from_slice(&plaintext);
+    plaintext.zeroize();
+    let key = PrivateDataKey(Secret32(bytes));
+    if key.commitment() != epoch.data_key_commitment {
+        return Err(PrivateCryptoError::KeyCommitment);
+    }
+    Ok(key)
+}
+
 fn verify_unsealed_commitment(
     secret: &Secret32,
     kind: EpochKeyKind,
@@ -487,7 +772,7 @@ fn verify_unsealed_commitment(
                 .to_bytes();
             owner_public_key_commitment(&public)
         }
-        EpochKeyKind::Data => data_key_commitment(secret.bytes()),
+        EpochKeyKind::Data | EpochKeyKind::History => data_key_commitment(secret.bytes()),
     };
     if actual != expected {
         return Err(PrivateCryptoError::KeyCommitment);
@@ -542,6 +827,280 @@ pub fn seal_data_key_for_node(
         key.commitment(),
         recipient,
     )
+}
+
+pub fn seal_recovery_keyring_key_for_node(
+    space: SpaceId,
+    agent: AgentId,
+    epoch: u64,
+    key: &PrivateDataKey,
+    recipient: &PrivateNodeIdentity,
+) -> Result<SealedPrivateKey, PrivateCryptoError> {
+    seal_epoch_secret(
+        &mut OsRng,
+        space,
+        agent,
+        epoch,
+        EpochKeyKind::History,
+        key.0.bytes(),
+        key.commitment(),
+        recipient,
+    )
+}
+
+pub fn unwrap_recovery_keyring_key(
+    grant: &PrivateRecoveryKeyringGrant,
+    recipient: &PrivateNodeIdentity,
+    decryption_key: &PrivateNodeDecryptionKey,
+) -> Result<PrivateDataKey, PrivateCryptoError> {
+    if !grant.validate() || !recipient.validate() {
+        return Err(PrivateCryptoError::InvalidRecord);
+    }
+    let sealed = find_seal(&grant.sealed_keys, recipient.node)?;
+    let secret = unseal_epoch_secret(
+        grant.ciphertext.space,
+        grant.ciphertext.agent,
+        grant.ciphertext.epoch,
+        EpochKeyKind::History,
+        grant.key_commitment,
+        recipient.node,
+        &recipient.encryption_public_key,
+        sealed,
+        decryption_key,
+    )?;
+    verify_unsealed_commitment(&secret, EpochKeyKind::History, grant.key_commitment)?;
+    Ok(PrivateDataKey(secret))
+}
+
+/// Build the one canonical, complete encrypted history grant carried by a
+/// recovery control. `authenticated_epochs` and `data_keys` must describe
+/// exactly the full pre-recovery epoch history; omission and substitution are
+/// rejected before any grant is sealed.
+pub fn build_recovery_keyring_grant(
+    authenticated_epochs: &[PrivateKeyEpoch],
+    data_keys: &BTreeMap<u64, PrivateDataKey>,
+    successor_epoch: &PrivateKeyEpoch,
+    replacement_nodes: &[PrivateNodeIdentity],
+) -> Result<PrivateRecoveryKeyringGrant, PrivateCryptoError> {
+    if authenticated_epochs.len() > MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS {
+        return Err(PrivateCryptoError::LimitExceeded);
+    }
+    if authenticated_epochs.is_empty()
+        || authenticated_epochs.len() != data_keys.len()
+        || !successor_epoch.validate()
+        || successor_epoch.epoch
+            <= authenticated_epochs
+                .last()
+                .ok_or(PrivateCryptoError::InvalidEpoch)?
+                .epoch
+        || replacement_nodes.is_empty()
+        || replacement_nodes.len() > MAX_PRIVATE_NODES
+        || replacement_nodes
+            .windows(2)
+            .any(|pair| pair[0].node >= pair[1].node)
+        || !epoch_matches_nodes(successor_epoch, replacement_nodes)
+    {
+        return Err(PrivateCryptoError::InvalidRecord);
+    }
+
+    let plaintext_len = RECOVERY_KEYRING_FIXED_BYTES
+        .checked_add(
+            authenticated_epochs
+                .len()
+                .checked_mul(RECOVERY_KEYRING_ENTRY_BYTES)
+                .ok_or(PrivateCryptoError::LimitExceeded)?,
+        )
+        .ok_or(PrivateCryptoError::LimitExceeded)?;
+    if plaintext_len > MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES.saturating_sub(AEAD_TAG_BYTES)
+    {
+        return Err(PrivateCryptoError::LimitExceeded);
+    }
+    let mut plaintext = Zeroizing::new(Vec::new());
+    plaintext
+        .try_reserve_exact(plaintext_len)
+        .map_err(|_| PrivateCryptoError::LimitExceeded)?;
+    plaintext.extend_from_slice(RECOVERY_KEYRING_MAGIC);
+    plaintext.extend_from_slice(&RECOVERY_KEYRING_VERSION.to_le_bytes());
+    plaintext.extend_from_slice(vos_agent_sdk::RUNTIME_ABI_ID.as_bytes());
+    plaintext.extend_from_slice(successor_epoch.space.as_bytes());
+    plaintext.extend_from_slice(successor_epoch.agent.as_bytes());
+    plaintext.extend_from_slice(&successor_epoch.epoch.to_le_bytes());
+    plaintext.extend_from_slice(
+        &u32::try_from(authenticated_epochs.len())
+            .map_err(|_| PrivateCryptoError::LimitExceeded)?
+            .to_le_bytes(),
+    );
+    let mut previous_epoch = None;
+    for epoch in authenticated_epochs {
+        if !epoch.validate()
+            || epoch.space != successor_epoch.space
+            || epoch.agent != successor_epoch.agent
+            || previous_epoch.is_some_and(|previous| previous >= epoch.epoch)
+            || epoch.epoch >= successor_epoch.epoch
+        {
+            return Err(PrivateCryptoError::InvalidEpoch);
+        }
+        let data_key = data_keys
+            .get(&epoch.epoch)
+            .ok_or(PrivateCryptoError::MissingRecipient)?;
+        if data_key.commitment() != epoch.data_key_commitment {
+            return Err(PrivateCryptoError::KeyCommitment);
+        }
+        let raw_key = data_key.recovery_bytes();
+        plaintext.extend_from_slice(&epoch.epoch.to_le_bytes());
+        plaintext.extend_from_slice(epoch.data_key_commitment.as_bytes());
+        plaintext.extend_from_slice(&*raw_key);
+        previous_epoch = Some(epoch.epoch);
+    }
+    if plaintext.len() != plaintext_len {
+        return Err(PrivateCryptoError::InvalidRecord);
+    }
+
+    let wrapping_key = PrivateDataKey::generate()?;
+    if wrapping_key.commitment() == successor_epoch.data_key_commitment {
+        return Err(PrivateCryptoError::Randomness);
+    }
+    let ciphertext = encrypt_private_object(
+        &wrapping_key,
+        successor_epoch.space,
+        successor_epoch.agent,
+        successor_epoch.epoch,
+        EncryptedObjectKind::Control,
+        &plaintext,
+    )?;
+    if ciphertext.ciphertext.len() > MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES {
+        return Err(PrivateCryptoError::LimitExceeded);
+    }
+    let mut sealed_keys = Vec::new();
+    sealed_keys
+        .try_reserve_exact(replacement_nodes.len())
+        .map_err(|_| PrivateCryptoError::LimitExceeded)?;
+    for node in replacement_nodes {
+        sealed_keys.push(seal_recovery_keyring_key_for_node(
+            successor_epoch.space,
+            successor_epoch.agent,
+            successor_epoch.epoch,
+            &wrapping_key,
+            node,
+        )?);
+    }
+    let grant = PrivateRecoveryKeyringGrant {
+        key_commitment: wrapping_key.commitment(),
+        sealed_keys,
+        ciphertext,
+    };
+    if !grant.validate() {
+        return Err(PrivateCryptoError::InvalidRecord);
+    }
+    Ok(grant)
+}
+
+/// Open and completely revalidate a recovery keyring for one exact
+/// replacement node. No key is returned unless every authenticated prior
+/// epoch appears once, in order, with its exact data-key commitment.
+pub fn unwrap_recovery_keyring(
+    grant: &PrivateRecoveryKeyringGrant,
+    authenticated_epochs: &[PrivateKeyEpoch],
+    recipient: &PrivateNodeIdentity,
+    decryption_key: &PrivateNodeDecryptionKey,
+) -> Result<BTreeMap<u64, PrivateDataKey>, PrivateCryptoError> {
+    if authenticated_epochs.len() > MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS {
+        return Err(PrivateCryptoError::LimitExceeded);
+    }
+    if authenticated_epochs.is_empty()
+        || !grant.validate()
+        || grant.ciphertext.kind != EncryptedObjectKind::Control
+    {
+        return Err(PrivateCryptoError::InvalidRecord);
+    }
+    let wrapping_key = unwrap_recovery_keyring_key(grant, recipient, decryption_key)?;
+    let plaintext = Zeroizing::new(decrypt_private_object(&wrapping_key, &grant.ciphertext)?);
+    let expected_len = RECOVERY_KEYRING_FIXED_BYTES
+        .checked_add(
+            authenticated_epochs
+                .len()
+                .checked_mul(RECOVERY_KEYRING_ENTRY_BYTES)
+                .ok_or(PrivateCryptoError::LimitExceeded)?,
+        )
+        .ok_or(PrivateCryptoError::LimitExceeded)?;
+    if plaintext.len() != expected_len
+        || plaintext.get(..4) != Some(RECOVERY_KEYRING_MAGIC)
+        || u16::from_le_bytes(
+            plaintext
+                .get(4..6)
+                .ok_or(PrivateCryptoError::InvalidRecord)?
+                .try_into()
+                .map_err(|_| PrivateCryptoError::InvalidRecord)?,
+        ) != RECOVERY_KEYRING_VERSION
+        || plaintext.get(6..38) != Some(vos_agent_sdk::RUNTIME_ABI_ID.as_bytes())
+        || plaintext.get(38..70) != Some(grant.ciphertext.space.as_bytes())
+        || plaintext.get(70..102) != Some(grant.ciphertext.agent.as_bytes())
+        || u64::from_le_bytes(
+            plaintext
+                .get(102..110)
+                .ok_or(PrivateCryptoError::InvalidRecord)?
+                .try_into()
+                .map_err(|_| PrivateCryptoError::InvalidRecord)?,
+        ) != grant.ciphertext.epoch
+        || usize::try_from(u32::from_le_bytes(
+            plaintext
+                .get(110..114)
+                .ok_or(PrivateCryptoError::InvalidRecord)?
+                .try_into()
+                .map_err(|_| PrivateCryptoError::InvalidRecord)?,
+        ))
+        .map_err(|_| PrivateCryptoError::LimitExceeded)?
+            != authenticated_epochs.len()
+    {
+        return Err(PrivateCryptoError::InvalidRecord);
+    }
+
+    let mut keys = BTreeMap::new();
+    let mut offset = RECOVERY_KEYRING_FIXED_BYTES;
+    for epoch in authenticated_epochs {
+        if !epoch.validate()
+            || epoch.space != grant.ciphertext.space
+            || epoch.agent != grant.ciphertext.agent
+            || epoch.epoch >= grant.ciphertext.epoch
+        {
+            return Err(PrivateCryptoError::InvalidEpoch);
+        }
+        let encoded_epoch = u64::from_le_bytes(
+            plaintext
+                .get(offset..offset + 8)
+                .ok_or(PrivateCryptoError::InvalidRecord)?
+                .try_into()
+                .map_err(|_| PrivateCryptoError::InvalidRecord)?,
+        );
+        offset += 8;
+        let commitment = Hash(
+            plaintext
+                .get(offset..offset + 32)
+                .ok_or(PrivateCryptoError::InvalidRecord)?
+                .try_into()
+                .map_err(|_| PrivateCryptoError::InvalidRecord)?,
+        );
+        offset += 32;
+        let mut raw_key: [u8; SECRET_BYTES] = plaintext
+            .get(offset..offset + SECRET_BYTES)
+            .ok_or(PrivateCryptoError::InvalidRecord)?
+            .try_into()
+            .map_err(|_| PrivateCryptoError::InvalidRecord)?;
+        offset += SECRET_BYTES;
+        if encoded_epoch != epoch.epoch || commitment != epoch.data_key_commitment {
+            raw_key.zeroize();
+            return Err(PrivateCryptoError::KeyCommitment);
+        }
+        let data_key = PrivateDataKey::from_bytes(raw_key)?;
+        raw_key.zeroize();
+        if data_key.commitment() != commitment || keys.insert(encoded_epoch, data_key).is_some() {
+            return Err(PrivateCryptoError::KeyCommitment);
+        }
+    }
+    if offset != plaintext.len() || keys.len() != authenticated_epochs.len() {
+        return Err(PrivateCryptoError::InvalidRecord);
+    }
+    Ok(keys)
 }
 
 pub fn unwrap_owner_key(
@@ -672,6 +1231,7 @@ pub fn generate_fresh_private_epoch<V: PrivateNodeAuthorityVerifier>(
     owner: PrincipalId,
     nodes: &[PrivateNodeIdentity],
     recovery_public_key: [u8; SECRET_BYTES],
+    recovery_encryption_public_key: [u8; SECRET_BYTES],
     authority: &V,
 ) -> Result<GeneratedPrivateEpoch, PrivateCryptoError> {
     generate_fresh_private_epoch_with(
@@ -682,6 +1242,7 @@ pub fn generate_fresh_private_epoch<V: PrivateNodeAuthorityVerifier>(
         owner,
         nodes,
         recovery_public_key,
+        recovery_encryption_public_key,
         authority,
     )
 }
@@ -695,6 +1256,7 @@ fn generate_fresh_private_epoch_with<R, V>(
     owner: PrincipalId,
     nodes: &[PrivateNodeIdentity],
     recovery_public_key: [u8; SECRET_BYTES],
+    recovery_encryption_public_key: [u8; SECRET_BYTES],
     authority: &V,
 ) -> Result<GeneratedPrivateEpoch, PrivateCryptoError>
 where
@@ -703,6 +1265,11 @@ where
 {
     validate_authorized_nodes(space, agent, owner, nodes, authority)?;
     strict_ed25519_public_key(&recovery_public_key)?;
+    if !valid_x25519_public_key(&recovery_encryption_public_key)
+        || recovery_encryption_public_key == recovery_public_key
+    {
+        return Err(PrivateCryptoError::InvalidKey);
+    }
     let owner_key = OwnerSigningKey::generate_with(rng)?;
     let data_key = PrivateDataKey::generate_with(rng)?;
     let mut sealed_owner_keys = Vec::new();
@@ -735,6 +1302,14 @@ where
             node,
         )?);
     }
+    let sealed_recovery_data_key = seal_recovery_data_key_with(
+        rng,
+        space,
+        agent,
+        epoch,
+        &data_key,
+        recovery_encryption_public_key,
+    )?;
     let record = PrivateKeyEpoch {
         space,
         agent,
@@ -742,10 +1317,14 @@ where
         owner_key_commitment: owner_key.commitment(),
         data_key_commitment: data_key.commitment(),
         recovery_key_commitment: recovery_public_key_commitment(&recovery_public_key),
+        recovery_encryption_public_key,
+        sealed_recovery_data_key,
         sealed_owner_keys,
         sealed_data_keys,
     };
-    if !epoch_matches_nodes(&record, nodes) {
+    if !epoch_matches_nodes(&record, nodes)
+        || !recovery_sealed_envelope_has_strict_shape(&record.sealed_recovery_data_key)
+    {
         return Err(PrivateCryptoError::InvalidRecord);
     }
     Ok(GeneratedPrivateEpoch {
@@ -933,6 +1512,7 @@ pub struct PrivateControlChainVerifier {
     agent: AgentId,
     owner: PrincipalId,
     recovery_public_key: [u8; SECRET_BYTES],
+    recovery_encryption_public_key: [u8; SECRET_BYTES],
     epoch: PrivateKeyEpoch,
     nodes: Vec<PrivateNodeIdentity>,
     head: Option<Hash>,
@@ -946,16 +1526,24 @@ impl PrivateControlChainVerifier {
         agent: AgentId,
         owner: PrincipalId,
         recovery_public_key: [u8; SECRET_BYTES],
+        recovery_encryption_public_key: [u8; SECRET_BYTES],
         epoch: PrivateKeyEpoch,
         nodes: Vec<PrivateNodeIdentity>,
         authority: &V,
     ) -> Result<Self, PrivateCryptoError> {
         validate_authorized_nodes(space, agent, owner, &nodes, authority)?;
         strict_ed25519_public_key(&recovery_public_key)?;
+        if !valid_x25519_public_key(&recovery_encryption_public_key)
+            || recovery_encryption_public_key == recovery_public_key
+        {
+            return Err(PrivateCryptoError::InvalidKey);
+        }
         if epoch.space != space
             || epoch.agent != agent
             || epoch.epoch != 0
             || epoch.recovery_key_commitment != recovery_public_key_commitment(&recovery_public_key)
+            || epoch.recovery_encryption_public_key != recovery_encryption_public_key
+            || !recovery_sealed_envelope_has_strict_shape(&epoch.sealed_recovery_data_key)
             || !epoch_matches_nodes(&epoch, &nodes)
         {
             return Err(PrivateCryptoError::InvalidEpoch);
@@ -965,6 +1553,7 @@ impl PrivateControlChainVerifier {
             agent,
             owner,
             recovery_public_key,
+            recovery_encryption_public_key,
             epoch,
             nodes,
             head: None,
@@ -1080,12 +1669,15 @@ impl PrivateControlChainVerifier {
                 superseded_heads,
                 next_epoch: candidate,
                 replacement_nodes,
+                historical_keyring,
             } => {
-                let head = self.head.ok_or(PrivateCryptoError::WrongPrevious)?;
-                if superseded_heads.binary_search(&head).is_err() {
-                    return Err(PrivateCryptoError::WrongPrevious);
+                match self.head {
+                    Some(head) if superseded_heads.binary_search(&head).is_ok() => {}
+                    None if superseded_heads.is_empty() => {}
+                    _ => return Err(PrivateCryptoError::WrongPrevious),
                 }
                 self.validate_successor_epoch(candidate, replacement_nodes, authority)?;
+                self.validate_recovery_keyring(historical_keyring, candidate, replacement_nodes)?;
                 next_nodes = replacement_nodes.clone();
                 next_epoch = candidate.clone();
             }
@@ -1128,24 +1720,26 @@ impl PrivateControlChainVerifier {
         if record.sequence < self.next_sequence {
             return Err(PrivateCryptoError::WrongSequence);
         }
-        let local_head = self.head.ok_or(PrivateCryptoError::WrongPrevious)?;
         let PrivateControlOperation::Recover {
             superseded_heads,
             next_epoch,
             replacement_nodes,
+            historical_keyring,
         } = &record.operation
         else {
             return Err(PrivateCryptoError::WrongSigner);
         };
-        let selected_head = record.previous.ok_or(PrivateCryptoError::WrongPrevious)?;
-        if superseded_heads.binary_search(&local_head).is_err()
-            || superseded_heads.binary_search(&selected_head).is_err()
-        {
-            return Err(PrivateCryptoError::WrongPrevious);
+        match (self.head, record.previous) {
+            (Some(local_head), Some(selected_head))
+                if superseded_heads.binary_search(&local_head).is_ok()
+                    && superseded_heads.binary_search(&selected_head).is_ok() => {}
+            (None, None) if superseded_heads.is_empty() => {}
+            _ => return Err(PrivateCryptoError::WrongPrevious),
         }
         self.verify_current_signer(record)?;
         verify_control_record_signature(record)?;
         self.validate_recovery_epoch(next_epoch, replacement_nodes, authority)?;
+        self.validate_recovery_keyring(historical_keyring, next_epoch, replacement_nodes)?;
         let next_sequence = record
             .sequence
             .checked_add(1)
@@ -1191,6 +1785,8 @@ impl PrivateControlChainVerifier {
             || candidate.owner_key_commitment == self.epoch.owner_key_commitment
             || candidate.data_key_commitment == self.epoch.data_key_commitment
             || candidate.recovery_key_commitment != self.epoch.recovery_key_commitment
+            || candidate.recovery_encryption_public_key != self.recovery_encryption_public_key
+            || !recovery_sealed_envelope_has_strict_shape(&candidate.sealed_recovery_data_key)
         {
             return Err(PrivateCryptoError::InvalidEpoch);
         }
@@ -1213,12 +1809,41 @@ impl PrivateControlChainVerifier {
             || candidate.owner_key_commitment == self.epoch.owner_key_commitment
             || candidate.data_key_commitment == self.epoch.data_key_commitment
             || candidate.recovery_key_commitment != self.epoch.recovery_key_commitment
+            || candidate.recovery_encryption_public_key != self.recovery_encryption_public_key
+            || !recovery_sealed_envelope_has_strict_shape(&candidate.sealed_recovery_data_key)
         {
             return Err(PrivateCryptoError::InvalidEpoch);
         }
         validate_authorized_nodes(self.space, self.agent, self.owner, nodes, authority)?;
         if !epoch_matches_nodes(candidate, nodes) {
             return Err(PrivateCryptoError::InvalidEpoch);
+        }
+        Ok(())
+    }
+
+    fn validate_recovery_keyring(
+        &self,
+        grant: &PrivateRecoveryKeyringGrant,
+        next_epoch: &PrivateKeyEpoch,
+        replacement_nodes: &[PrivateNodeIdentity],
+    ) -> Result<(), PrivateCryptoError> {
+        if !grant.validate()
+            || grant.ciphertext.space != self.space
+            || grant.ciphertext.agent != self.agent
+            || grant.ciphertext.epoch != next_epoch.epoch
+            || grant.key_commitment == next_epoch.data_key_commitment
+            || grant.sealed_keys.len() != replacement_nodes.len()
+            || grant
+                .sealed_keys
+                .iter()
+                .zip(replacement_nodes)
+                .any(|(sealed, node)| {
+                    !sealed_envelope_has_strict_shape(sealed)
+                        || sealed.node != node.node
+                        || sealed.recipient_key != node.encryption_public_key
+                })
+        {
+            return Err(PrivateCryptoError::InvalidRecord);
         }
         Ok(())
     }
@@ -1307,6 +1932,7 @@ mod tests {
         agent: AgentId,
         owner: PrincipalId,
         recovery: RecoverySigningKey,
+        recovery_encryption: OfflineRecoveryDecryptionKey,
         recipients: Vec<Recipient>,
         generated: GeneratedPrivateEpoch,
     }
@@ -1317,6 +1943,7 @@ mod tests {
         let agent = AgentId([2; 32]);
         let owner = PrincipalId([3; 32]);
         let recovery = RecoverySigningKey::generate_with(&mut rng).unwrap();
+        let recovery_encryption = OfflineRecoveryDecryptionKey::generate_with(&mut rng).unwrap();
         let mut recipients: Vec<_> = (0..count)
             .map(|index| {
                 make_recipient(
@@ -1341,6 +1968,7 @@ mod tests {
             owner,
             &nodes,
             recovery.verifying_key(),
+            recovery_encryption.public_key(),
             &TestAuthority,
         )
         .unwrap();
@@ -1350,6 +1978,7 @@ mod tests {
             agent,
             owner,
             recovery,
+            recovery_encryption,
             recipients,
             generated,
         }
@@ -1369,6 +1998,7 @@ mod tests {
             fixture.agent,
             fixture.owner,
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             fixture.generated.record.clone(),
             nodes(fixture),
             &TestAuthority,
@@ -1798,6 +2428,7 @@ mod tests {
             fixture.owner,
             &members,
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             &TestAuthority,
         )
         .unwrap();
@@ -1836,6 +2467,7 @@ mod tests {
             fixture.owner,
             core::slice::from_ref(&survivor),
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             &TestAuthority,
         )
         .unwrap();
@@ -1905,6 +2537,7 @@ mod tests {
             fixture.owner,
             core::slice::from_ref(&replacement.identity),
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             &TestAuthority,
         )
         .unwrap();
@@ -1912,6 +2545,23 @@ mod tests {
         heads.sort();
         heads.dedup();
         assert_eq!(heads.len(), 2);
+        let mut historical_keys = BTreeMap::new();
+        historical_keys.insert(
+            fixture.generated.record.epoch,
+            unwrap_data_key(
+                &fixture.generated.record,
+                &fixture.recipients[0].identity,
+                &fixture.recipients[0].key,
+            )
+            .unwrap(),
+        );
+        let historical_keyring = build_recovery_keyring_grant(
+            core::slice::from_ref(&fixture.generated.record),
+            &historical_keys,
+            &successor.record,
+            core::slice::from_ref(&replacement.identity),
+        )
+        .unwrap();
         let mut recovery = unsigned_record(
             &fixture,
             1,
@@ -1920,6 +2570,7 @@ mod tests {
                 superseded_heads: heads.clone(),
                 next_epoch: successor.record.clone(),
                 replacement_nodes: vec![replacement.identity.clone()],
+                historical_keyring,
             },
         );
         let mut unsorted = recovery.clone();
@@ -1979,6 +2630,126 @@ mod tests {
     }
 
     #[test]
+    fn offline_recovery_seals_and_complete_keyring_fail_closed() {
+        assert!(matches!(
+            OfflineRecoveryKit::new(
+                RecoverySigningKey::from_seed([93; 32]).unwrap(),
+                OfflineRecoveryDecryptionKey::from_bytes([93; 32]).unwrap(),
+            ),
+            Err(PrivateCryptoError::InvalidKey)
+        ));
+        let mut fixture = fixture(2);
+        let recovered =
+            unwrap_recovery_data_key(&fixture.generated.record, &fixture.recovery_encryption)
+                .unwrap();
+        assert_eq!(
+            recovered.commitment(),
+            fixture.generated.record.data_key_commitment
+        );
+        let wrong_recovery_encryption = OfflineRecoveryDecryptionKey::from_bytes([91; 32]).unwrap();
+        assert!(matches!(
+            unwrap_recovery_data_key(&fixture.generated.record, &wrong_recovery_encryption),
+            Err(PrivateCryptoError::WrongRecipient)
+        ));
+
+        let replacement_nodes = nodes(&fixture);
+        let successor = generate_fresh_private_epoch_with(
+            &mut fixture.rng,
+            fixture.space,
+            fixture.agent,
+            1,
+            fixture.owner,
+            &replacement_nodes,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let historical = BTreeMap::from([(
+            fixture.generated.record.epoch,
+            unwrap_data_key(
+                &fixture.generated.record,
+                &fixture.recipients[0].identity,
+                &fixture.recipients[0].key,
+            )
+            .unwrap(),
+        )]);
+        let grant = build_recovery_keyring_grant(
+            core::slice::from_ref(&fixture.generated.record),
+            &historical,
+            &successor.record,
+            &replacement_nodes,
+        )
+        .unwrap();
+        let opened = unwrap_recovery_keyring(
+            &grant,
+            core::slice::from_ref(&fixture.generated.record),
+            &fixture.recipients[0].identity,
+            &fixture.recipients[0].key,
+        )
+        .unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(
+            opened[&0].commitment(),
+            fixture.generated.record.data_key_commitment
+        );
+        assert!(
+            unwrap_recovery_keyring(
+                &grant,
+                core::slice::from_ref(&fixture.generated.record),
+                &fixture.recipients[0].identity,
+                &fixture.recipients[1].key,
+            )
+            .is_err()
+        );
+
+        let mut tampered = grant.clone();
+        tampered.ciphertext.ciphertext[0] ^= 1;
+        assert!(
+            unwrap_recovery_keyring(
+                &tampered,
+                core::slice::from_ref(&fixture.generated.record),
+                &fixture.recipients[0].identity,
+                &fixture.recipients[0].key,
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            build_recovery_keyring_grant(
+                core::slice::from_ref(&fixture.generated.record),
+                &BTreeMap::new(),
+                &successor.record,
+                &replacement_nodes,
+            ),
+            Err(PrivateCryptoError::InvalidRecord)
+        ));
+        let substituted = BTreeMap::from([(
+            fixture.generated.record.epoch,
+            PrivateDataKey::from_bytes([92; 32]).unwrap(),
+        )]);
+        assert!(matches!(
+            build_recovery_keyring_grant(
+                core::slice::from_ref(&fixture.generated.record),
+                &substituted,
+                &successor.record,
+                &replacement_nodes,
+            ),
+            Err(PrivateCryptoError::KeyCommitment)
+        ));
+        let too_many =
+            vec![fixture.generated.record.clone(); MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS + 1];
+        assert!(matches!(
+            build_recovery_keyring_grant(
+                &too_many,
+                &BTreeMap::new(),
+                &successor.record,
+                &replacement_nodes,
+            ),
+            Err(PrivateCryptoError::LimitExceeded)
+        ));
+    }
+
+    #[test]
     fn membership_and_envelope_bounds_fail_before_acceptance() {
         let mut fixture = fixture(2);
         let mut unsorted = nodes(&fixture);
@@ -1992,6 +2763,7 @@ mod tests {
                 fixture.owner,
                 &unsorted,
                 fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
                 &TestAuthority,
             )
             .err(),
@@ -2007,6 +2779,7 @@ mod tests {
                 fixture.owner,
                 &too_many,
                 fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
                 &TestAuthority,
             )
             .err(),
@@ -2025,6 +2798,7 @@ mod tests {
                 fixture.owner,
                 &duplicate,
                 fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
                 &TestAuthority,
             )
             .err(),

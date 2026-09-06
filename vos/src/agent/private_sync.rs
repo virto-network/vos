@@ -1293,13 +1293,15 @@ fn map_private_model_error(error: ModelError) -> PrivateSyncError {
 mod tests {
     use super::*;
     use alloc::boxed::Box;
+    use alloc::collections::BTreeMap;
     use alloc::vec;
     use core::sync::atomic::{AtomicU64, Ordering};
     use std::fs;
     use std::path::{Path, PathBuf};
 
     use crate::agent::private_crypto::{
-        GeneratedPrivateEpoch, OwnerSigningKey, PrivateNodeDecryptionKey, RecoverySigningKey,
+        GeneratedPrivateEpoch, OfflineRecoveryDecryptionKey, OwnerSigningKey,
+        PrivateNodeDecryptionKey, RecoverySigningKey, build_recovery_keyring_grant,
         encrypt_private_object, generate_fresh_private_epoch, sign_owner_control_record,
         sign_recovery_control_record, unwrap_data_key, unwrap_owner_key,
     };
@@ -1412,6 +1414,7 @@ mod tests {
         agent: AgentId,
         owner: PrincipalId,
         recovery: RecoverySigningKey,
+        recovery_encryption: OfflineRecoveryDecryptionKey,
         recipients: Vec<Recipient>,
         nodes: Vec<PrivateNodeIdentity>,
         epoch: GeneratedPrivateEpoch,
@@ -1438,6 +1441,7 @@ mod tests {
         let agent = AgentId([12; 32]);
         let owner = PrincipalId([13; 32]);
         let recovery = RecoverySigningKey::from_seed([14; 32]).unwrap();
+        let recovery_encryption = OfflineRecoveryDecryptionKey::from_bytes([19; 32]).unwrap();
         let mut recipients = vec![
             recipient(space, agent, owner, 15),
             recipient(space, agent, owner, 16),
@@ -1454,6 +1458,7 @@ mod tests {
             owner,
             &nodes,
             recovery.verifying_key(),
+            recovery_encryption.public_key(),
             &TestAuthority,
         )
         .unwrap();
@@ -1463,6 +1468,7 @@ mod tests {
             agent,
             owner,
             recovery,
+            recovery_encryption,
             recipients,
             nodes,
             epoch,
@@ -1477,6 +1483,7 @@ mod tests {
             fixture.agent,
             fixture.owner,
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             fixture.epoch.record.clone(),
             fixture.nodes.clone(),
             &TestAuthority,
@@ -1620,6 +1627,7 @@ mod tests {
             fixture.owner,
             core::slice::from_ref(&survivor),
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             &TestAuthority,
         )
         .unwrap();
@@ -1763,11 +1771,28 @@ mod tests {
             fixture.owner,
             &fixture.nodes,
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             &TestAuthority,
         )
         .unwrap();
         let mut heads = vec![fork_a.commitment(), fork_b.commitment()];
         heads.sort();
+        let historical_keys = BTreeMap::from([(
+            fixture.epoch.record.epoch,
+            unwrap_data_key(
+                &fixture.epoch.record,
+                &fixture.recipients[0].identity,
+                &fixture.recipients[0].key,
+            )
+            .unwrap(),
+        )]);
+        let historical_keyring = build_recovery_keyring_grant(
+            core::slice::from_ref(&fixture.epoch.record),
+            &historical_keys,
+            &successor.record,
+            &fixture.nodes,
+        )
+        .unwrap();
         let mut recovery = PrivateControlRecord {
             space: fixture.space,
             agent: fixture.agent,
@@ -1777,6 +1802,7 @@ mod tests {
                 superseded_heads: heads,
                 next_epoch: successor.record,
                 replacement_nodes: fixture.nodes.clone(),
+                historical_keyring,
             },
             signer: PrivateControlSigner::Recovery,
             signer_public_key: [0; 32],
@@ -2076,6 +2102,7 @@ mod tests {
             fixture.owner,
             core::slice::from_ref(&survivor),
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             &TestAuthority,
         )
         .unwrap();
@@ -2102,6 +2129,7 @@ mod tests {
             fixture.owner,
             core::slice::from_ref(&survivor),
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             &TestAuthority,
         )
         .unwrap();
@@ -2168,7 +2196,27 @@ mod tests {
             fixture.owner,
             &replacement_nodes,
             fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
             &TestAuthority,
+        )
+        .unwrap();
+        let historical_epochs = vec![
+            fixture.epoch.record.clone(),
+            epoch_one.record.clone(),
+            epoch_two.record.clone(),
+        ];
+        let mut historical_keys = BTreeMap::new();
+        for epoch in &historical_epochs {
+            historical_keys.insert(
+                epoch.epoch,
+                unwrap_data_key(epoch, &survivor, &fixture.recipients[0].key).unwrap(),
+            );
+        }
+        let historical_keyring = build_recovery_keyring_grant(
+            &historical_epochs,
+            &historical_keys,
+            &epoch_three.record,
+            &replacement_nodes,
         )
         .unwrap();
         let mut recovery = PrivateControlRecord {
@@ -2180,6 +2228,7 @@ mod tests {
                 superseded_heads: vec![prior_head],
                 next_epoch: epoch_three.record.clone(),
                 replacement_nodes: replacement_nodes.clone(),
+                historical_keyring,
             },
             signer: PrivateControlSigner::Recovery,
             signer_public_key: [0; 32],
@@ -2194,6 +2243,7 @@ mod tests {
                 fixture.agent,
                 fixture.owner,
                 fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
                 &backup,
                 &TestAuthority,
             )
@@ -2205,23 +2255,27 @@ mod tests {
         assert_eq!(recovered_primary.binding().owner, fixture.owner);
         let recovery_count = recovered_primary.control_count();
         assert_eq!(
-            recovered_primary.apply_offline_recovery(Hash([99; 32]), &recovery, &TestAuthority),
-            Err(PrivateStoreError::Diverged)
+            recovered_primary.apply_offline_recovery(
+                Some(Hash([99; 32])),
+                &recovery,
+                &TestAuthority
+            ),
+            Err(PrivateStoreError::InvalidRecord)
         );
         assert_eq!(recovered_primary.control_count(), recovery_count);
         let mut tampered_recovery = recovery.clone();
         tampered_recovery.signature[0] ^= 1;
         assert!(
             recovered_primary
-                .apply_offline_recovery(prior_head, &tampered_recovery, &TestAuthority)
+                .apply_offline_recovery(Some(prior_head), &tampered_recovery, &TestAuthority)
                 .is_err()
         );
         assert_eq!(recovered_primary.control_count(), recovery_count);
         recovered_primary
-            .apply_offline_recovery(prior_head, &recovery, &TestAuthority)
+            .apply_offline_recovery(Some(prior_head), &recovery, &TestAuthority)
             .unwrap();
         recovered_peer
-            .apply_offline_recovery(prior_head, &recovery, &TestAuthority)
+            .apply_offline_recovery(Some(prior_head), &recovery, &TestAuthority)
             .unwrap();
         assert_eq!(recovered_primary.authorized_nodes(), replacement_nodes);
         assert_eq!(recovered_peer.binding(), recovered_primary.binding());
