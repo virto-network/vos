@@ -25,7 +25,7 @@ use vos_agent_sdk::private::{
     NodeEncryptionEnrollmentVerifier, PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES, PRIVATE_NONCE_BYTES,
     PrivateControlOperation, PrivateControlRecord, PrivateControlSigner, PrivateInviteHistoryGrant,
     PrivateKeyEpoch, PrivateNodeIdentity, PrivateRecoveryKeyringGrant, SealedPrivateKey,
-    SealedRecoveryKey,
+    SealedRecoveryKey, valid_x25519_public_key as sdk_valid_x25519_public_key,
 };
 use vos_agent_sdk::{AgentId, Hash, NodeId, PrincipalId, SpaceId};
 
@@ -349,12 +349,12 @@ fn strict_ed25519_public_key(
 }
 
 pub(crate) fn valid_x25519_public_key(public_key: &[u8; SECRET_BYTES]) -> bool {
-    if *public_key == [0; SECRET_BYTES] {
+    if !sdk_valid_x25519_public_key(public_key) {
         return false;
     }
-    // X25519 public keys are Montgomery u-coordinates rather than encoded
-    // group points. A contributory DH with a fixed non-secret probe rejects
-    // the low-order inputs which a byte-shape check cannot distinguish.
+    // Keep an independent contributory-DH check at the cryptographic use
+    // boundary. The SDK predicate above is also required because RFC 7748
+    // masks bit 255 and would otherwise accept high-bit aliases.
     let probe = StaticSecret::from([0xA5; SECRET_BYTES]);
     probe
         .diffie_hellman(&X25519PublicKey::from(*public_key))
@@ -2422,6 +2422,24 @@ mod tests {
         let mut wrong_signature = enrollment;
         wrong_signature.transport_signature[0] ^= 1;
         assert!(!wrong_signature.verify_with(&StrictNodeEncryptionEnrollmentVerifier));
+    }
+
+    #[test]
+    fn x25519_keys_reject_low_order_values_and_high_bit_aliases() {
+        for low_order in vos_agent_sdk::private::X25519_LOW_ORDER_PUBLIC_KEYS {
+            assert!(!valid_x25519_public_key(&low_order));
+
+            let mut high_bit_alias = low_order;
+            high_bit_alias[31] |= 0x80;
+            assert!(!valid_x25519_public_key(&high_bit_alias));
+        }
+
+        let ordinary_secret = StaticSecret::from([0x37; SECRET_BYTES]);
+        let ordinary = X25519PublicKey::from(&ordinary_secret).to_bytes();
+        assert!(valid_x25519_public_key(&ordinary));
+        let mut high_bit_alias = ordinary;
+        high_bit_alias[31] |= 0x80;
+        assert!(!valid_x25519_public_key(&high_bit_alias));
     }
 
     struct Recipient {
