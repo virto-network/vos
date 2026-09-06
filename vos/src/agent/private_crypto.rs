@@ -19,11 +19,12 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
 use vos_agent_sdk::private::{
-    EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_CIPHERTEXT_BYTES, MAX_PRIVATE_NODES,
+    EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_CIPHERTEXT_BYTES,
+    MAX_PRIVATE_INVITE_HISTORY_EPOCHS, MAX_PRIVATE_NODES,
     MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES, MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS,
-    PRIVATE_NONCE_BYTES, PrivateControlOperation, PrivateControlRecord, PrivateControlSigner,
-    PrivateKeyEpoch, PrivateNodeIdentity, PrivateRecoveryKeyringGrant, SealedPrivateKey,
-    SealedRecoveryKey,
+    PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES, PRIVATE_NONCE_BYTES, PrivateControlOperation,
+    PrivateControlRecord, PrivateControlSigner, PrivateInviteHistoryGrant, PrivateKeyEpoch,
+    PrivateNodeIdentity, PrivateRecoveryKeyringGrant, SealedPrivateKey, SealedRecoveryKey,
 };
 use vos_agent_sdk::{AgentId, Hash, NodeId, PrincipalId, SpaceId};
 
@@ -36,6 +37,7 @@ const SEALED_CIPHERTEXT_BYTES: usize = SECRET_BYTES + AEAD_TAG_BYTES;
 const SEALED_BYTES: usize =
     SEALED_MAGIC.len() + SEALED_EPHEMERAL_BYTES + SEALED_NONCE_BYTES + SEALED_CIPHERTEXT_BYTES;
 const RECOVERY_SEALED_MAGIC: &[u8; 4] = b"VRK1";
+const INVITE_HISTORY_SEALED_MAGIC: &[u8; 4] = b"VIH1";
 
 /// Hard ceiling for records replayed into one in-memory verifier instance.
 /// A caller needing a later checkpoint must persist a separately authenticated
@@ -53,6 +55,9 @@ const SEAL_SALT: &[u8] = b"vos/private/key-seal/salt/v1";
 const RECOVERY_SEAL_KDF_DOMAIN: &[u8] = b"vos/private/recovery-data-seal/kdf/v1";
 const RECOVERY_SEAL_AAD_DOMAIN: &[u8] = b"vos/private/recovery-data-seal/aad/v1";
 const RECOVERY_SEAL_SALT: &[u8] = b"vos/private/recovery-data-seal/salt/v1";
+const INVITE_HISTORY_SEAL_KDF_DOMAIN: &[u8] = b"vos/private/invite-history-seal/kdf/v1";
+const INVITE_HISTORY_SEAL_AAD_DOMAIN: &[u8] = b"vos/private/invite-history-seal/aad/v1";
+const INVITE_HISTORY_SEAL_SALT: &[u8] = b"vos/private/invite-history-seal/salt/v1";
 const OBJECT_KDF_DOMAIN: &[u8] = b"vos/private/object-key/kdf/v1";
 const OBJECT_SALT: &[u8] = b"vos/private/object-key/salt/v1";
 const RECOVERY_KEYRING_MAGIC: &[u8; 4] = b"PVKG";
@@ -602,6 +607,221 @@ fn unseal_epoch_secret(
 }
 
 #[derive(Clone, Copy)]
+struct InviteHistorySealContext<'a> {
+    space: SpaceId,
+    agent: AgentId,
+    owner: PrincipalId,
+    transition: Hash,
+    epoch: u64,
+    recipient_node: NodeId,
+    recipient_key: &'a [u8; SECRET_BYTES],
+    data_key_commitment: Hash,
+    ephemeral_key: &'a [u8; SECRET_BYTES],
+}
+
+fn invite_history_seal_context(domain: &[u8], input: InviteHistorySealContext<'_>) -> Vec<u8> {
+    let mut context = Vec::with_capacity(domain.len() + 8 * 32 + 8);
+    context.extend_from_slice(domain);
+    context.extend_from_slice(input.space.as_bytes());
+    context.extend_from_slice(input.agent.as_bytes());
+    context.extend_from_slice(input.owner.as_bytes());
+    context.extend_from_slice(input.transition.as_bytes());
+    context.extend_from_slice(&input.epoch.to_le_bytes());
+    context.extend_from_slice(input.recipient_node.as_bytes());
+    context.extend_from_slice(input.recipient_key);
+    context.extend_from_slice(input.data_key_commitment.as_bytes());
+    context.extend_from_slice(input.ephemeral_key);
+    context
+}
+
+fn invite_history_sealed_envelope_has_strict_shape(grant: &PrivateInviteHistoryGrant) -> bool {
+    if !grant.validate()
+        || grant.sealed_data_key.sealed.len() != SEALED_BYTES
+        || SEALED_BYTES != PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES
+        || grant
+            .sealed_data_key
+            .sealed
+            .get(..INVITE_HISTORY_SEALED_MAGIC.len())
+            != Some(INVITE_HISTORY_SEALED_MAGIC)
+        || !valid_x25519_public_key(&grant.recipient_key)
+    {
+        return false;
+    }
+    let ephemeral_offset = INVITE_HISTORY_SEALED_MAGIC.len();
+    let nonce_offset = ephemeral_offset + SEALED_EPHEMERAL_BYTES;
+    let ciphertext_offset = nonce_offset + SEALED_NONCE_BYTES;
+    let Ok(ephemeral_public) = grant.sealed_data_key.sealed[ephemeral_offset..nonce_offset]
+        .try_into()
+        .map(|value: [u8; SEALED_EPHEMERAL_BYTES]| value)
+    else {
+        return false;
+    };
+    valid_x25519_public_key(&ephemeral_public)
+        && grant.sealed_data_key.sealed[nonce_offset..ciphertext_offset]
+            .iter()
+            .any(|byte| *byte != 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seal_invite_history_data_key_with<R: RngCore + CryptoRng>(
+    rng: &mut R,
+    space: SpaceId,
+    agent: AgentId,
+    owner: PrincipalId,
+    transition: Hash,
+    epoch: u64,
+    data_key: &PrivateDataKey,
+    recipient: &PrivateNodeIdentity,
+) -> Result<PrivateInviteHistoryGrant, PrivateCryptoError> {
+    if space == SpaceId::ZERO
+        || agent == AgentId::ZERO
+        || owner == PrincipalId::ZERO
+        || transition == Hash::ZERO
+        || !recipient.validate()
+        || recipient.principal != owner
+    {
+        return Err(PrivateCryptoError::InvalidRecord);
+    }
+    let ephemeral = Secret32::generate(rng)?;
+    let ephemeral_secret = StaticSecret::from(*ephemeral.bytes());
+    let ephemeral_public = X25519PublicKey::from(&ephemeral_secret).to_bytes();
+    let shared =
+        ephemeral_secret.diffie_hellman(&X25519PublicKey::from(recipient.encryption_public_key));
+    if !shared.was_contributory() {
+        return Err(PrivateCryptoError::KeyAgreement);
+    }
+    let input = InviteHistorySealContext {
+        space,
+        agent,
+        owner,
+        transition,
+        epoch,
+        recipient_node: recipient.node,
+        recipient_key: &recipient.encryption_public_key,
+        data_key_commitment: data_key.commitment(),
+        ephemeral_key: &ephemeral_public,
+    };
+    let kdf_context = invite_history_seal_context(INVITE_HISTORY_SEAL_KDF_DOMAIN, input);
+    let wrapping_key = derive_seal_key(INVITE_HISTORY_SEAL_SALT, shared.as_bytes(), &kdf_context)?;
+    let aad = invite_history_seal_context(INVITE_HISTORY_SEAL_AAD_DOMAIN, input);
+    let mut nonce = [0; SEALED_NONCE_BYTES];
+    rng.try_fill_bytes(&mut nonce)
+        .map_err(|_| PrivateCryptoError::Randomness)?;
+    if nonce == [0; SEALED_NONCE_BYTES] {
+        return Err(PrivateCryptoError::Randomness);
+    }
+    let cipher = XChaCha20Poly1305::new_from_slice(&*wrapping_key)
+        .map_err(|_| PrivateCryptoError::InvalidKey)?;
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: data_key.0.bytes(),
+                aad: &aad,
+            },
+        )
+        .map_err(|_| PrivateCryptoError::Encryption)?;
+    if ciphertext.len() != SEALED_CIPHERTEXT_BYTES {
+        return Err(PrivateCryptoError::Encryption);
+    }
+    let mut sealed = Vec::with_capacity(SEALED_BYTES);
+    sealed.extend_from_slice(INVITE_HISTORY_SEALED_MAGIC);
+    sealed.extend_from_slice(&ephemeral_public);
+    sealed.extend_from_slice(&nonce);
+    sealed.extend_from_slice(&ciphertext);
+    let grant = PrivateInviteHistoryGrant {
+        space,
+        agent,
+        owner,
+        transition,
+        recipient: recipient.node,
+        recipient_key: recipient.encryption_public_key,
+        epoch,
+        data_key_commitment: data_key.commitment(),
+        sealed_data_key: SealedPrivateKey {
+            node: recipient.node,
+            recipient_key: recipient.encryption_public_key,
+            sealed,
+        },
+    };
+    invite_history_sealed_envelope_has_strict_shape(&grant)
+        .then_some(grant)
+        .ok_or(PrivateCryptoError::Encryption)
+}
+
+fn unwrap_invite_history_data_key(
+    grant: &PrivateInviteHistoryGrant,
+    recipient: &PrivateNodeIdentity,
+    decryption_key: &PrivateNodeDecryptionKey,
+) -> Result<PrivateDataKey, PrivateCryptoError> {
+    if !invite_history_sealed_envelope_has_strict_shape(grant)
+        || !recipient.validate()
+        || grant.owner != recipient.principal
+        || grant.recipient != recipient.node
+        || grant.recipient_key != recipient.encryption_public_key
+        || decryption_key.public_key() != recipient.encryption_public_key
+    {
+        return Err(PrivateCryptoError::WrongRecipient);
+    }
+    let ephemeral_offset = INVITE_HISTORY_SEALED_MAGIC.len();
+    let nonce_offset = ephemeral_offset + SEALED_EPHEMERAL_BYTES;
+    let ciphertext_offset = nonce_offset + SEALED_NONCE_BYTES;
+    let ephemeral_public: [u8; SEALED_EPHEMERAL_BYTES] = grant.sealed_data_key.sealed
+        [ephemeral_offset..nonce_offset]
+        .try_into()
+        .map_err(|_| PrivateCryptoError::Decryption)?;
+    let nonce: [u8; SEALED_NONCE_BYTES] = grant.sealed_data_key.sealed
+        [nonce_offset..ciphertext_offset]
+        .try_into()
+        .map_err(|_| PrivateCryptoError::Decryption)?;
+    if nonce == [0; SEALED_NONCE_BYTES] {
+        return Err(PrivateCryptoError::Decryption);
+    }
+    let node_secret = StaticSecret::from(*decryption_key.0.bytes());
+    let shared = node_secret.diffie_hellman(&X25519PublicKey::from(ephemeral_public));
+    if !shared.was_contributory() {
+        return Err(PrivateCryptoError::KeyAgreement);
+    }
+    let input = InviteHistorySealContext {
+        space: grant.space,
+        agent: grant.agent,
+        owner: grant.owner,
+        transition: grant.transition,
+        epoch: grant.epoch,
+        recipient_node: grant.recipient,
+        recipient_key: &grant.recipient_key,
+        data_key_commitment: grant.data_key_commitment,
+        ephemeral_key: &ephemeral_public,
+    };
+    let kdf_context = invite_history_seal_context(INVITE_HISTORY_SEAL_KDF_DOMAIN, input);
+    let wrapping_key = derive_seal_key(INVITE_HISTORY_SEAL_SALT, shared.as_bytes(), &kdf_context)?;
+    let aad = invite_history_seal_context(INVITE_HISTORY_SEAL_AAD_DOMAIN, input);
+    let cipher = XChaCha20Poly1305::new_from_slice(&*wrapping_key)
+        .map_err(|_| PrivateCryptoError::InvalidKey)?;
+    let mut plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &grant.sealed_data_key.sealed[ciphertext_offset..],
+                aad: &aad,
+            },
+        )
+        .map_err(|_| PrivateCryptoError::Decryption)?;
+    if plaintext.len() != SECRET_BYTES {
+        plaintext.zeroize();
+        return Err(PrivateCryptoError::Decryption);
+    }
+    let mut raw = Zeroizing::new([0; SECRET_BYTES]);
+    raw.copy_from_slice(&plaintext);
+    plaintext.zeroize();
+    let key = PrivateDataKey(Secret32(raw));
+    if key.commitment() != grant.data_key_commitment {
+        return Err(PrivateCryptoError::KeyCommitment);
+    }
+    Ok(key)
+}
+
+#[derive(Clone, Copy)]
 struct RecoverySealContext<'a> {
     space: SpaceId,
     agent: AgentId,
@@ -895,6 +1115,163 @@ pub fn unwrap_recovery_keyring_key(
     )?;
     verify_unsealed_commitment(&secret, EpochKeyKind::History, grant.key_commitment)?;
     Ok(PrivateDataKey(secret))
+}
+
+/// Build the complete canonical set of historical data-key grants for one
+/// exact Invite transition. The current epoch remains independently sealed in
+/// the Invite's ordinary `sealed_data_key` field and is never duplicated here.
+pub fn build_invite_history_grants(
+    invite: &PrivateControlRecord,
+    authenticated_epochs: &[PrivateKeyEpoch],
+    data_keys: &BTreeMap<u64, PrivateDataKey>,
+) -> Result<Vec<PrivateInviteHistoryGrant>, PrivateCryptoError> {
+    let PrivateControlOperation::Invite {
+        node,
+        epoch: current_epoch,
+        sealed_owner_key,
+        sealed_data_key,
+        historical_grants,
+    } = &invite.operation
+    else {
+        return Err(PrivateCryptoError::InvalidRecord);
+    };
+    let historical_count = authenticated_epochs
+        .len()
+        .checked_sub(1)
+        .ok_or(PrivateCryptoError::InvalidEpoch)?;
+    let transition = invite
+        .invite_transition_binding()
+        .ok_or(PrivateCryptoError::InvalidRecord)?;
+    if invite.space == SpaceId::ZERO
+        || invite.agent == AgentId::ZERO
+        || !node.validate()
+        || node.principal == PrincipalId::ZERO
+        || !historical_grants.is_empty()
+        || historical_count > MAX_PRIVATE_INVITE_HISTORY_EPOCHS
+        || authenticated_epochs.len() != data_keys.len()
+        || authenticated_epochs.last().is_none_or(|epoch| {
+            epoch.space != invite.space
+                || epoch.agent != invite.agent
+                || epoch.epoch != *current_epoch
+        })
+        || sealed_owner_key.node != node.node
+        || sealed_data_key.node != node.node
+        || sealed_owner_key.recipient_key != node.encryption_public_key
+        || sealed_data_key.recipient_key != node.encryption_public_key
+        || !sealed_envelope_has_strict_shape(sealed_owner_key)
+        || !sealed_envelope_has_strict_shape(sealed_data_key)
+    {
+        return Err(PrivateCryptoError::InvalidRecord);
+    }
+    let mut grants = Vec::new();
+    grants
+        .try_reserve_exact(historical_count)
+        .map_err(|_| PrivateCryptoError::LimitExceeded)?;
+    let mut previous_epoch = None;
+    for authenticated in authenticated_epochs {
+        if !authenticated.validate()
+            || authenticated.space != invite.space
+            || authenticated.agent != invite.agent
+            || previous_epoch.is_some_and(|previous| previous >= authenticated.epoch)
+            || authenticated.epoch > *current_epoch
+        {
+            return Err(PrivateCryptoError::InvalidEpoch);
+        }
+        let key = data_keys
+            .get(&authenticated.epoch)
+            .ok_or(PrivateCryptoError::MissingRecipient)?;
+        if key.commitment() != authenticated.data_key_commitment {
+            return Err(PrivateCryptoError::KeyCommitment);
+        }
+        previous_epoch = Some(authenticated.epoch);
+    }
+    for authenticated in &authenticated_epochs[..historical_count] {
+        grants.push(seal_invite_history_data_key_with(
+            &mut OsRng,
+            invite.space,
+            invite.agent,
+            node.principal,
+            transition,
+            authenticated.epoch,
+            data_keys
+                .get(&authenticated.epoch)
+                .ok_or(PrivateCryptoError::MissingRecipient)?,
+            node,
+        )?);
+    }
+    Ok(grants)
+}
+
+/// Open a complete Invite history for one exact newly authorized Node. No key
+/// is returned unless the owner-signed record grants every authenticated data
+/// epoch preceding the current epoch exactly once and in canonical order.
+pub fn unwrap_invite_history_grants(
+    invite: &PrivateControlRecord,
+    authenticated_epochs: &[PrivateKeyEpoch],
+    owner: PrincipalId,
+    recipient: &PrivateNodeIdentity,
+    decryption_key: &PrivateNodeDecryptionKey,
+) -> Result<BTreeMap<u64, PrivateDataKey>, PrivateCryptoError> {
+    let PrivateControlOperation::Invite {
+        node,
+        epoch: current_epoch,
+        historical_grants,
+        ..
+    } = &invite.operation
+    else {
+        return Err(PrivateCryptoError::InvalidRecord);
+    };
+    let historical_count = authenticated_epochs
+        .len()
+        .checked_sub(1)
+        .ok_or(PrivateCryptoError::InvalidEpoch)?;
+    let transition = invite
+        .invite_transition_binding()
+        .ok_or(PrivateCryptoError::InvalidRecord)?;
+    if !invite.validate_shape()
+        || owner == PrincipalId::ZERO
+        || node != recipient
+        || node.principal != owner
+        || historical_count > MAX_PRIVATE_INVITE_HISTORY_EPOCHS
+        || historical_grants.len() != historical_count
+        || authenticated_epochs.last().is_none_or(|epoch| {
+            epoch.space != invite.space
+                || epoch.agent != invite.agent
+                || epoch.epoch != *current_epoch
+        })
+    {
+        return Err(PrivateCryptoError::InvalidRecord);
+    }
+    verify_control_record_signature(invite)?;
+    let mut keys = BTreeMap::new();
+    for (grant, authenticated) in historical_grants
+        .iter()
+        .zip(&authenticated_epochs[..historical_count])
+    {
+        if !authenticated.validate()
+            || grant.space != invite.space
+            || grant.agent != invite.agent
+            || grant.owner != owner
+            || grant.transition != transition
+            || grant.recipient != recipient.node
+            || grant.recipient_key != recipient.encryption_public_key
+            || grant.epoch != authenticated.epoch
+            || grant.data_key_commitment != authenticated.data_key_commitment
+            || grant.epoch >= *current_epoch
+        {
+            return Err(PrivateCryptoError::InvalidRecord);
+        }
+        let key = unwrap_invite_history_data_key(grant, recipient, decryption_key)?;
+        if key.commitment() != authenticated.data_key_commitment
+            || keys.insert(grant.epoch, key).is_some()
+        {
+            return Err(PrivateCryptoError::KeyCommitment);
+        }
+    }
+    if keys.len() != historical_count {
+        return Err(PrivateCryptoError::InvalidRecord);
+    }
+    Ok(keys)
 }
 
 /// Build the one canonical, complete encrypted history grant carried by a
@@ -1547,6 +1924,7 @@ pub struct PrivateControlChainVerifier {
     recovery_public_key: [u8; SECRET_BYTES],
     recovery_encryption_public_key: [u8; SECRET_BYTES],
     epoch: PrivateKeyEpoch,
+    data_epoch_commitments: Vec<(u64, Hash)>,
     nodes: Vec<PrivateNodeIdentity>,
     head: Option<Hash>,
     next_sequence: u64,
@@ -1581,6 +1959,7 @@ impl PrivateControlChainVerifier {
         {
             return Err(PrivateCryptoError::InvalidEpoch);
         }
+        let data_epoch_commitments = alloc::vec![(epoch.epoch, epoch.data_key_commitment)];
         Ok(Self {
             space,
             agent,
@@ -1588,6 +1967,7 @@ impl PrivateControlChainVerifier {
             recovery_public_key,
             recovery_encryption_public_key,
             epoch,
+            data_epoch_commitments,
             nodes,
             head: None,
             next_sequence: 0,
@@ -1635,6 +2015,7 @@ impl PrivateControlChainVerifier {
         verify_control_record_signature(record)?;
 
         let mut next_epoch = self.epoch.clone();
+        let mut next_data_epoch_commitments = self.data_epoch_commitments.clone();
         let mut next_nodes = self.nodes.clone();
         match &record.operation {
             PrivateControlOperation::Invite {
@@ -1642,6 +2023,7 @@ impl PrivateControlChainVerifier {
                 epoch,
                 sealed_owner_key,
                 sealed_data_key,
+                historical_grants,
             } => {
                 if *epoch != self.epoch.epoch {
                     return Err(PrivateCryptoError::InvalidEpoch);
@@ -1670,6 +2052,7 @@ impl PrivateControlChainVerifier {
                 {
                     return Err(PrivateCryptoError::WrongRecipient);
                 }
+                self.validate_invite_history(record, node, *epoch, historical_grants)?;
                 next_nodes.insert(position, node.clone());
                 next_epoch
                     .sealed_owner_keys
@@ -1718,11 +2101,19 @@ impl PrivateControlChainVerifier {
             | PrivateControlOperation::ActorLifecycle { .. } => {}
         }
 
+        if next_epoch.epoch != self.epoch.epoch {
+            if next_data_epoch_commitments.len() > MAX_PRIVATE_INVITE_HISTORY_EPOCHS {
+                return Err(PrivateCryptoError::LimitExceeded);
+            }
+            next_data_epoch_commitments.push((next_epoch.epoch, next_epoch.data_key_commitment));
+        }
+
         let next_sequence = self
             .next_sequence
             .checked_add(1)
             .ok_or(PrivateCryptoError::LimitExceeded)?;
         self.epoch = next_epoch;
+        self.data_epoch_commitments = next_data_epoch_commitments;
         self.nodes = next_nodes;
         self.head = Some(record.commitment());
         self.next_sequence = next_sequence;
@@ -1773,11 +2164,16 @@ impl PrivateControlChainVerifier {
         verify_control_record_signature(record)?;
         self.validate_recovery_epoch(next_epoch, replacement_nodes, authority)?;
         self.validate_recovery_keyring(historical_keyring, next_epoch, replacement_nodes)?;
+        if self.data_epoch_commitments.len() > MAX_PRIVATE_INVITE_HISTORY_EPOCHS {
+            return Err(PrivateCryptoError::LimitExceeded);
+        }
         let next_sequence = record
             .sequence
             .checked_add(1)
             .ok_or(PrivateCryptoError::LimitExceeded)?;
         self.epoch = next_epoch.clone();
+        self.data_epoch_commitments
+            .push((next_epoch.epoch, next_epoch.data_key_commitment));
         self.nodes = replacement_nodes.clone();
         self.head = Some(record.commitment());
         self.next_sequence = next_sequence;
@@ -1802,6 +2198,51 @@ impl PrivateControlChainVerifier {
         };
         if !matches {
             return Err(PrivateCryptoError::WrongSigner);
+        }
+        Ok(())
+    }
+
+    fn validate_invite_history(
+        &self,
+        record: &PrivateControlRecord,
+        node: &PrivateNodeIdentity,
+        current_epoch: u64,
+        grants: &[PrivateInviteHistoryGrant],
+    ) -> Result<(), PrivateCryptoError> {
+        let history_count = self
+            .data_epoch_commitments
+            .len()
+            .checked_sub(1)
+            .ok_or(PrivateCryptoError::InvalidEpoch)?;
+        let transition = record
+            .invite_transition_binding()
+            .ok_or(PrivateCryptoError::InvalidRecord)?;
+        if current_epoch != self.epoch.epoch
+            || node.principal != self.owner
+            || history_count > MAX_PRIVATE_INVITE_HISTORY_EPOCHS
+            || grants.len() != history_count
+            || self.data_epoch_commitments.last()
+                != Some(&(self.epoch.epoch, self.epoch.data_key_commitment))
+        {
+            return Err(PrivateCryptoError::InvalidRecord);
+        }
+        for (grant, (epoch, commitment)) in grants
+            .iter()
+            .zip(&self.data_epoch_commitments[..history_count])
+        {
+            if !invite_history_sealed_envelope_has_strict_shape(grant)
+                || grant.space != self.space
+                || grant.agent != self.agent
+                || grant.owner != self.owner
+                || grant.transition != transition
+                || grant.recipient != node.node
+                || grant.recipient_key != node.encryption_public_key
+                || grant.epoch != *epoch
+                || grant.data_key_commitment != *commitment
+                || grant.epoch >= current_epoch
+            {
+                return Err(PrivateCryptoError::InvalidRecord);
+            }
         }
         Ok(())
     }
@@ -2407,6 +2848,7 @@ mod tests {
                 epoch: 0,
                 sealed_owner_key: owner_seal,
                 sealed_data_key: data_seal,
+                historical_grants: Vec::new(),
             },
         );
         sign_owner_control_record(&mut invite, &fixture.generated.owner_key).unwrap();
@@ -2448,6 +2890,7 @@ mod tests {
                 epoch: 0,
                 sealed_owner_key: owner_seal,
                 sealed_data_key: data_seal,
+                historical_grants: Vec::new(),
             },
         );
         sign_owner_control_record(&mut invite, &fixture.generated.owner_key).unwrap();
@@ -2498,6 +2941,7 @@ mod tests {
                 epoch: 0,
                 sealed_owner_key,
                 sealed_data_key,
+                historical_grants: Vec::new(),
             },
         );
         sign_owner_control_record(&mut invite, &fixture.generated.owner_key).unwrap();
@@ -2556,6 +3000,280 @@ mod tests {
             chain.epoch().owner_key_commitment,
             successor.owner_key.commitment()
         );
+    }
+
+    #[test]
+    fn late_invite_history_is_complete_transition_bound_and_hostile_to_substitution() {
+        let mut fixture = fixture(1);
+        let invited = make_recipient(
+            &mut fixture.rng,
+            fixture.space,
+            fixture.agent,
+            fixture.owner,
+            60,
+        );
+        let mut chain = new_chain(&fixture);
+        let mut epochs = vec![fixture.generated.record.clone()];
+        let mut data_keys = BTreeMap::new();
+        data_keys.insert(
+            0,
+            PrivateDataKey::from_bytes(*fixture.generated.data_key.0.bytes()).unwrap(),
+        );
+        let mut owner = OwnerSigningKey::from_seed(*fixture.generated.owner_key.0.bytes()).unwrap();
+        for next_epoch in 1..=2 {
+            let generated = generate_fresh_private_epoch_with(
+                &mut fixture.rng,
+                fixture.space,
+                fixture.agent,
+                next_epoch,
+                fixture.owner,
+                chain.nodes(),
+                fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
+                &TestAuthority,
+            )
+            .unwrap();
+            let mut rotate = unsigned_record(
+                &fixture,
+                next_epoch - 1,
+                chain.head(),
+                PrivateControlOperation::RotateKeys {
+                    next_epoch: generated.record.clone(),
+                },
+            );
+            sign_owner_control_record(&mut rotate, &owner).unwrap();
+            chain.apply(&rotate, &TestAuthority).unwrap();
+            epochs.push(generated.record);
+            data_keys.insert(next_epoch, generated.data_key);
+            owner = generated.owner_key;
+        }
+
+        let sealed_owner_key =
+            seal_owner_key_for_node(fixture.space, fixture.agent, 2, &owner, &invited.identity)
+                .unwrap();
+        let sealed_data_key = seal_data_key_for_node(
+            fixture.space,
+            fixture.agent,
+            2,
+            data_keys.get(&2).unwrap(),
+            &invited.identity,
+        )
+        .unwrap();
+        let mut invite = unsigned_record(
+            &fixture,
+            2,
+            chain.head(),
+            PrivateControlOperation::Invite {
+                node: invited.identity.clone(),
+                epoch: 2,
+                sealed_owner_key,
+                sealed_data_key,
+                historical_grants: Vec::new(),
+            },
+        );
+        let grants = build_invite_history_grants(&invite, &epochs, &data_keys).unwrap();
+        assert_eq!(
+            grants.iter().map(|grant| grant.epoch).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let PrivateControlOperation::Invite {
+            historical_grants, ..
+        } = &mut invite.operation
+        else {
+            unreachable!()
+        };
+        *historical_grants = grants;
+        sign_owner_control_record(&mut invite, &owner).unwrap();
+        let opened = unwrap_invite_history_grants(
+            &invite,
+            &epochs,
+            fixture.owner,
+            &invited.identity,
+            &invited.key,
+        )
+        .unwrap();
+        assert_eq!(opened.len(), 2);
+        for epoch in 0..2 {
+            assert_eq!(opened[&epoch].commitment(), data_keys[&epoch].commitment());
+        }
+
+        let mut omitted = invite.clone();
+        let PrivateControlOperation::Invite {
+            historical_grants, ..
+        } = &mut omitted.operation
+        else {
+            unreachable!()
+        };
+        historical_grants.pop();
+        sign_owner_control_record(&mut omitted, &owner).unwrap();
+        assert_eq!(
+            chain.clone().apply(&omitted, &TestAuthority),
+            Err(PrivateCryptoError::InvalidRecord)
+        );
+
+        let mut duplicate = invite.clone();
+        let PrivateControlOperation::Invite {
+            historical_grants, ..
+        } = &mut duplicate.operation
+        else {
+            unreachable!()
+        };
+        historical_grants.push(historical_grants[1].clone());
+        assert_eq!(
+            sign_owner_control_record(&mut duplicate, &owner),
+            Err(PrivateCryptoError::InvalidRecord)
+        );
+
+        let mut reordered = invite.clone();
+        let PrivateControlOperation::Invite {
+            historical_grants, ..
+        } = &mut reordered.operation
+        else {
+            unreachable!()
+        };
+        historical_grants.swap(0, 1);
+        assert_eq!(
+            sign_owner_control_record(&mut reordered, &owner),
+            Err(PrivateCryptoError::InvalidRecord)
+        );
+
+        let mutations: [fn(&mut PrivateInviteHistoryGrant); 4] = [
+            |grant: &mut PrivateInviteHistoryGrant| grant.agent = AgentId([0x91; 32]),
+            |grant: &mut PrivateInviteHistoryGrant| grant.recipient = NodeId([0x92; 32]),
+            |grant: &mut PrivateInviteHistoryGrant| grant.owner = PrincipalId([0x93; 32]),
+            |grant: &mut PrivateInviteHistoryGrant| grant.transition = Hash([0x94; 32]),
+        ];
+        for mutate in mutations {
+            let mut changed = invite.clone();
+            let PrivateControlOperation::Invite {
+                historical_grants, ..
+            } = &mut changed.operation
+            else {
+                unreachable!()
+            };
+            mutate(&mut historical_grants[0]);
+            assert_eq!(
+                sign_owner_control_record(&mut changed, &owner),
+                Err(PrivateCryptoError::InvalidRecord)
+            );
+        }
+
+        let mut forged = invite.clone();
+        let PrivateControlOperation::Invite {
+            historical_grants, ..
+        } = &mut forged.operation
+        else {
+            unreachable!()
+        };
+        *historical_grants[0]
+            .sealed_data_key
+            .sealed
+            .last_mut()
+            .unwrap() ^= 1;
+        sign_owner_control_record(&mut forged, &owner).unwrap();
+        assert!(matches!(
+            unwrap_invite_history_grants(
+                &forged,
+                &epochs,
+                fixture.owner,
+                &invited.identity,
+                &invited.key,
+            ),
+            Err(PrivateCryptoError::Decryption)
+        ));
+
+        chain.apply(&invite, &TestAuthority).unwrap();
+    }
+
+    #[test]
+    fn invite_history_accepts_exact_4096_boundary_and_rejects_one_more() {
+        let mut fixture = fixture(1);
+        let invited = make_recipient(
+            &mut fixture.rng,
+            fixture.space,
+            fixture.agent,
+            fixture.owner,
+            61,
+        );
+        let mut chain = new_chain(&fixture);
+        let commitment = fixture.generated.data_key.commitment();
+        chain.epoch.epoch = MAX_PRIVATE_INVITE_HISTORY_EPOCHS as u64;
+        chain.data_epoch_commitments = (0..=MAX_PRIVATE_INVITE_HISTORY_EPOCHS as u64)
+            .map(|epoch| (epoch, commitment))
+            .collect();
+        let sealed_owner_key = seal_owner_key_for_node(
+            fixture.space,
+            fixture.agent,
+            chain.epoch.epoch,
+            &fixture.generated.owner_key,
+            &invited.identity,
+        )
+        .unwrap();
+        let sealed_data_key = seal_data_key_for_node(
+            fixture.space,
+            fixture.agent,
+            chain.epoch.epoch,
+            &fixture.generated.data_key,
+            &invited.identity,
+        )
+        .unwrap();
+        let mut invite = unsigned_record(
+            &fixture,
+            0,
+            None,
+            PrivateControlOperation::Invite {
+                node: invited.identity.clone(),
+                epoch: chain.epoch.epoch,
+                sealed_owner_key,
+                sealed_data_key,
+                historical_grants: Vec::new(),
+            },
+        );
+        let transition = invite.invite_transition_binding().unwrap();
+        let prototype = seal_invite_history_data_key_with(
+            &mut fixture.rng,
+            fixture.space,
+            fixture.agent,
+            fixture.owner,
+            transition,
+            0,
+            &fixture.generated.data_key,
+            &invited.identity,
+        )
+        .unwrap();
+        let grants: Vec<_> = (0..MAX_PRIVATE_INVITE_HISTORY_EPOCHS as u64)
+            .map(|epoch| {
+                let mut grant = prototype.clone();
+                grant.epoch = epoch;
+                grant
+            })
+            .collect();
+        let PrivateControlOperation::Invite {
+            historical_grants, ..
+        } = &mut invite.operation
+        else {
+            unreachable!()
+        };
+        *historical_grants = grants;
+        sign_owner_control_record(&mut invite, &fixture.generated.owner_key).unwrap();
+        assert!(invite.validate_shape());
+        let wire = invite.encode().unwrap();
+        assert_eq!(PrivateControlRecord::decode(&wire), Ok(invite.clone()));
+        chain.apply(&invite, &TestAuthority).unwrap();
+
+        let mut excess = invite;
+        let PrivateControlOperation::Invite {
+            historical_grants, ..
+        } = &mut excess.operation
+        else {
+            unreachable!()
+        };
+        historical_grants.push(historical_grants.last().unwrap().clone());
+        assert_eq!(
+            historical_grants.len(),
+            MAX_PRIVATE_INVITE_HISTORY_EPOCHS + 1
+        );
+        assert!(!excess.validate_shape());
     }
 
     #[test]

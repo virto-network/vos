@@ -2845,12 +2845,13 @@ impl CanonicalWire for RuntimeTransition {
 }
 
 use crate::private::{
-    EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_CIPHERTEXT_BYTES, MAX_PRIVATE_NODES,
+    EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_CIPHERTEXT_BYTES,
+    MAX_PRIVATE_INVITE_HISTORY_EPOCHS, MAX_PRIVATE_NODES,
     MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES, MAX_SEALED_KEY_BYTES,
-    MAX_TRANSPORT_IDENTITY_BYTES, PRIVATE_NONCE_BYTES, PRIVATE_SIGNATURE_BYTES,
-    PrivateActorLifecycleKind, PrivateControlOperation, PrivateControlRecord, PrivateControlSigner,
-    PrivateKeyEpoch, PrivateNodeIdentity, PrivateRecoveryKeyringGrant, SealedPrivateKey,
-    SealedRecoveryKey,
+    MAX_TRANSPORT_IDENTITY_BYTES, PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES, PRIVATE_NONCE_BYTES,
+    PRIVATE_SIGNATURE_BYTES, PrivateActorLifecycleKind, PrivateControlOperation,
+    PrivateControlRecord, PrivateControlSigner, PrivateInviteHistoryGrant, PrivateKeyEpoch,
+    PrivateNodeIdentity, PrivateRecoveryKeyringGrant, SealedPrivateKey, SealedRecoveryKey,
 };
 
 pub const MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES: usize = 1_024;
@@ -2862,9 +2863,12 @@ pub const MAX_PRIVATE_RECOVERY_KEYRING_GRANT_WIRE_BYTES: usize = HEADER_BYTES
     + 256
     + MAX_PRIVATE_NODES * (32 + 32 + 4 + MAX_SEALED_KEY_BYTES)
     + MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES;
+pub const MAX_PRIVATE_INVITE_HISTORY_GRANT_WIRE_BYTES: usize =
+    7 * 32 + 8 + 32 + 32 + 4 + PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES;
 pub const MAX_PRIVATE_CONTROL_WIRE_BYTES: usize = HEADER_BYTES
     + MAX_PRIVATE_KEY_EPOCH_WIRE_BYTES
     + MAX_PRIVATE_RECOVERY_KEYRING_GRANT_WIRE_BYTES
+    + MAX_PRIVATE_INVITE_HISTORY_EPOCHS * MAX_PRIVATE_INVITE_HISTORY_GRANT_WIRE_BYTES
     + MAX_PRIVATE_NODES * (MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES + 32)
     + 512;
 pub const MAX_PRIVATE_OBJECT_WIRE_BYTES: usize =
@@ -2931,6 +2935,44 @@ fn decode_sealed_key(decoder: &mut Decoder<'_>) -> Result<SealedPrivateKey, Deco
             .try_into()
             .map_err(|_| DecodeError::Truncated)?,
         sealed: decoder.bytes_bounded(MAX_SEALED_KEY_BYTES)?,
+    };
+    value
+        .validate()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_private_invite_history_grant(
+    encoder: &mut Encoder<'_>,
+    value: &PrivateInviteHistoryGrant,
+) {
+    encoder.fixed(value.space.as_bytes());
+    encoder.fixed(value.agent.as_bytes());
+    encoder.fixed(value.owner.as_bytes());
+    encoder.fixed(value.transition.as_bytes());
+    encoder.fixed(value.recipient.as_bytes());
+    encoder.0.extend_from_slice(&value.recipient_key);
+    encoder.u64(value.epoch);
+    encoder.fixed(value.data_key_commitment.as_bytes());
+    encode_sealed_key(encoder, &value.sealed_data_key);
+}
+
+fn decode_private_invite_history_grant(
+    decoder: &mut Decoder<'_>,
+) -> Result<PrivateInviteHistoryGrant, DecodeError> {
+    let value = PrivateInviteHistoryGrant {
+        space: SpaceId(decoder.fixed()?),
+        agent: AgentId(decoder.fixed()?),
+        owner: PrincipalId(decoder.fixed()?),
+        transition: Hash(decoder.fixed()?),
+        recipient: NodeId(decoder.fixed()?),
+        recipient_key: decoder
+            .take(32)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?,
+        epoch: decoder.u64()?,
+        data_key_commitment: Hash(decoder.fixed()?),
+        sealed_data_key: decode_sealed_key(decoder)?,
     };
     value
         .validate()
@@ -3126,12 +3168,14 @@ fn encode_private_operation(encoder: &mut Encoder<'_>, value: &PrivateControlOpe
             epoch,
             sealed_owner_key,
             sealed_data_key,
+            historical_grants,
         } => {
             encoder.u8(0);
             encode_private_node(encoder, node);
             encoder.u64(*epoch);
             encode_sealed_key(encoder, sealed_owner_key);
             encode_sealed_key(encoder, sealed_data_key);
+            encoder.list(historical_grants, encode_private_invite_history_grant);
         }
         PrivateControlOperation::Revoke { node, next_epoch } => {
             encoder.u8(1);
@@ -3182,6 +3226,10 @@ fn decode_private_operation(
             epoch: decoder.u64()?,
             sealed_owner_key: decode_sealed_key(decoder)?,
             sealed_data_key: decode_sealed_key(decoder)?,
+            historical_grants: decoder.list_bounded(
+                MAX_PRIVATE_INVITE_HISTORY_EPOCHS,
+                decode_private_invite_history_grant,
+            )?,
         }),
         1 => Ok(PrivateControlOperation::Revoke {
             node: NodeId(decoder.fixed()?),
@@ -3225,6 +3273,32 @@ pub(crate) fn private_control_signing_bytes(value: &PrivateControlRecord) -> Vec
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_private_control_unsigned(&mut Encoder(&mut bytes), value);
     bytes
+}
+
+pub(crate) fn private_invite_transition_binding(value: &PrivateControlRecord) -> Option<Hash> {
+    let PrivateControlOperation::Invite {
+        node,
+        epoch,
+        sealed_owner_key,
+        sealed_data_key,
+        ..
+    } = &value.operation
+    else {
+        return None;
+    };
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    let mut encoder = Encoder(&mut bytes);
+    encoder.fixed(value.space.as_bytes());
+    encoder.fixed(value.agent.as_bytes());
+    encoder.fixed(node.principal.as_bytes());
+    encoder.u64(value.sequence);
+    encode_optional_hash(&mut encoder, &value.previous);
+    encode_private_node(&mut encoder, node);
+    encoder.u64(*epoch);
+    encode_sealed_key(&mut encoder, sealed_owner_key);
+    encode_sealed_key(&mut encoder, sealed_data_key);
+    Some(Hash::digest(b"vos/private/invite-transition/v1", &[&bytes]))
 }
 
 impl CanonicalWire for PrivateControlRecord {
@@ -3429,8 +3503,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/acc1-golden", &[&call_bytes]).0,
             [
-                110, 95, 57, 199, 51, 237, 53, 146, 30, 31, 186, 212, 47, 2, 205, 79, 197, 64, 24,
-                252, 109, 113, 29, 29, 213, 175, 96, 246, 100, 187, 186, 51,
+                90, 250, 220, 139, 155, 107, 6, 220, 252, 38, 59, 251, 76, 158, 220, 80, 203, 246,
+                97, 246, 32, 123, 56, 7, 79, 98, 181, 126, 36, 145, 45, 152,
             ]
         );
 
@@ -3442,8 +3516,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/map1-golden", &[&approval_bytes]).0,
             [
-                234, 62, 135, 87, 53, 142, 215, 187, 93, 83, 43, 136, 132, 4, 130, 227, 207, 129,
-                150, 249, 24, 127, 0, 132, 178, 33, 207, 59, 116, 150, 168, 65,
+                42, 217, 27, 175, 118, 72, 31, 252, 62, 206, 196, 11, 253, 242, 233, 214, 190, 46,
+                46, 157, 120, 163, 203, 32, 128, 42, 28, 199, 120, 47, 217, 227,
             ]
         );
 
@@ -3458,8 +3532,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/maa1-golden", &[&acknowledgement_bytes]).0,
             [
-                171, 140, 167, 24, 112, 250, 196, 172, 142, 143, 4, 26, 76, 120, 101, 197, 45, 37,
-                194, 248, 96, 150, 92, 43, 176, 150, 206, 92, 239, 100, 37, 224,
+                42, 18, 158, 201, 157, 107, 247, 163, 84, 203, 82, 151, 184, 235, 99, 147, 117, 14,
+                170, 116, 121, 102, 187, 49, 19, 64, 206, 177, 56, 30, 179, 165,
             ]
         );
     }
@@ -3937,8 +4011,8 @@ mod tests {
         assert_eq!(
             golden.0,
             [
-                42, 247, 148, 121, 88, 221, 84, 30, 19, 182, 28, 62, 218, 202, 71, 75, 156, 54, 16,
-                38, 36, 209, 238, 158, 54, 10, 67, 199, 227, 173, 50, 145,
+                7, 130, 211, 96, 229, 170, 74, 208, 253, 92, 151, 185, 47, 149, 229, 152, 248, 75,
+                111, 54, 242, 191, 231, 133, 6, 68, 70, 126, 35, 175, 103, 202,
             ]
         );
 
@@ -4354,6 +4428,7 @@ mod tests {
                 epoch: 0,
                 sealed_owner_key: sealed(9),
                 sealed_data_key: sealed(10),
+                historical_grants: Vec::new(),
             },
             signer: PrivateControlSigner::Owner,
             signer_public_key: [11; 32],

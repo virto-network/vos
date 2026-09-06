@@ -41,10 +41,11 @@ use zeroize::Zeroizing;
 use super::package_admission::{AdmittedRuntimePackage, admit_runtime_package};
 use super::private_crypto::{
     GeneratedPrivateEpoch, OfflineRecoveryKit, OwnerSigningKey, PrivateCryptoError, PrivateDataKey,
-    PrivateNodeAuthorityVerifier, PrivateNodeDecryptionKey, build_recovery_keyring_grant,
-    decrypt_private_object, encrypt_private_object, generate_fresh_private_epoch,
-    seal_data_key_for_node, seal_owner_key_for_node, sign_owner_control_record,
-    sign_recovery_control_record, unwrap_data_key, unwrap_owner_key, unwrap_recovery_data_key,
+    PrivateNodeAuthorityVerifier, PrivateNodeDecryptionKey, build_invite_history_grants,
+    build_recovery_keyring_grant, decrypt_private_object, encrypt_private_object,
+    generate_fresh_private_epoch, seal_data_key_for_node, seal_owner_key_for_node,
+    sign_owner_control_record, sign_recovery_control_record, unwrap_data_key,
+    unwrap_invite_history_grants, unwrap_owner_key, unwrap_recovery_data_key,
     unwrap_recovery_keyring, valid_x25519_public_key,
 };
 use super::private_store::{
@@ -610,13 +611,27 @@ impl PrivateAgentHost {
                 .ok_or(PrivateAgentHostError::Corrupt)?,
             &node,
         )?;
-        let operation = PrivateControlOperation::Invite {
-            node,
-            epoch: binding.epoch,
-            sealed_owner_key,
-            sealed_data_key,
+        let mut record = unsigned_owner_record(
+            hosted,
+            PrivateControlOperation::Invite {
+                node,
+                epoch: binding.epoch,
+                sealed_owner_key,
+                sealed_data_key,
+                historical_grants: Vec::new(),
+            },
+        );
+        let grants =
+            build_invite_history_grants(&record, hosted.store.key_epochs(), &hosted.data_keys)?;
+        let PrivateControlOperation::Invite {
+            historical_grants, ..
+        } = &mut record.operation
+        else {
+            return Err(PrivateAgentHostError::Corrupt);
         };
-        append_owner_record(hosted, operation, authority)
+        *historical_grants = grants;
+        sign_owner_control_record(&mut record, &hosted.owner_key)?;
+        Ok(hosted.store.append_control(&record, authority)?)
     }
 
     /// Revoke one exact Node and commit a fresh owner/data epoch before this
@@ -2405,10 +2420,9 @@ fn unwrap_local_data_keyring(
     local_node: &PrivateNodeIdentity,
     node_key: &PrivateNodeDecryptionKey,
 ) -> Result<BTreeMap<u64, PrivateDataKey>, PrivateAgentHostError> {
-    // History is available only where the authenticated epoch actually
-    // contains a seal for this exact node recipient. A later Invite or
-    // replacement Recovery deliberately does not synthesize access to epochs
-    // that predate that identity's authorization.
+    // Current and directly authorized epochs remain independently sealed in
+    // their epoch records. Complete Invite and Recovery grants add only the
+    // exact authenticated history explicitly authorized for this recipient.
     let mut data_keys = BTreeMap::new();
     for epoch in store.key_epochs() {
         let Some(sealed) = epoch
@@ -2427,6 +2441,31 @@ fn unwrap_local_data_keyring(
         let data_key = unwrap_data_key(epoch, local_node, node_key)?;
         if data_keys.insert(epoch.epoch, data_key).is_some() {
             return Err(PrivateAgentHostError::Corrupt);
+        }
+    }
+    for invite in store.invite_history_records(local_node)? {
+        let PrivateControlOperation::Invite { epoch, .. } = &invite.operation else {
+            return Err(PrivateAgentHostError::Corrupt);
+        };
+        let current_position = store
+            .key_epochs()
+            .binary_search_by_key(epoch, |candidate| candidate.epoch)
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        let history = unwrap_invite_history_grants(
+            &invite,
+            &store.key_epochs()[..=current_position],
+            store.binding().owner,
+            local_node,
+            node_key,
+        )?;
+        for (epoch, key) in history {
+            if let Some(existing) = data_keys.get(&epoch) {
+                if existing.commitment() != key.commitment() {
+                    return Err(PrivateAgentHostError::Corrupt);
+                }
+            } else {
+                data_keys.insert(epoch, key);
+            }
         }
     }
     if let Some(grant) = store.latest_recovery_keyring() {
@@ -3884,21 +3923,55 @@ mod tests {
     }
 
     #[test]
-    fn post_history_invite_gets_current_epoch_but_not_retroactive_history() {
+    fn post_history_invite_gets_every_prior_epoch_and_reopens() {
         let fixture = fixture(1);
         let invited = node(fixture.space, fixture.owner, 99);
         let mut primary = create_host(&fixture, 0, "late-invite-primary");
         let agent = create_agent(&mut primary, &fixture);
-        let historical = primary
-            .encrypt_and_put(agent, EncryptedObjectKind::CrdtNode, b"before-invite")
+        let epoch_zero = primary
+            .encrypt_and_put(agent, EncryptedObjectKind::CrdtNode, b"epoch-zero")
+            .unwrap();
+        primary.rotate_keys(agent, &TestAuthority).unwrap();
+        let epoch_one = primary
+            .encrypt_and_put(agent, EncryptedObjectKind::Blob, b"epoch-one")
             .unwrap();
         primary.rotate_keys(agent, &TestAuthority).unwrap();
         let current = primary
-            .encrypt_and_put(agent, EncryptedObjectKind::Snapshot, b"current-at-invite")
+            .encrypt_and_put(agent, EncryptedObjectKind::Snapshot, b"epoch-two")
             .unwrap();
+        drop(primary);
+        let mut primary = PrivateAgentHost::open(
+            fixture.directory.child("late-invite-primary"),
+            fixture.space,
+            fixture.owner,
+            fixture.nodes[0].identity.clone(),
+            fixture.nodes[0].key(),
+            &TestAuthority,
+        )
+        .unwrap();
         primary
             .invite_node(agent, invited.identity.clone(), &TestAuthority)
             .unwrap();
+        let invites = primary.agents[&agent]
+            .store
+            .invite_history_records(&invited.identity)
+            .unwrap();
+        let PrivateControlOperation::Invite {
+            historical_grants,
+            epoch,
+            ..
+        } = &invites[0].operation
+        else {
+            panic!("expected Invite");
+        };
+        assert_eq!(*epoch, 2);
+        assert_eq!(
+            historical_grants
+                .iter()
+                .map(|grant| grant.epoch)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
         let backup = primary
             .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
             .unwrap();
@@ -3924,17 +3997,63 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
-        assert_eq!(invited_host.agents[&agent].data_keys.len(), 1);
+        assert_eq!(invited_host.agents[&agent].data_keys.len(), 3);
+        for (key, expected) in [
+            (epoch_zero, b"epoch-zero".as_slice()),
+            (epoch_one, b"epoch-one".as_slice()),
+            (current, b"epoch-two".as_slice()),
+        ] {
+            assert_eq!(
+                invited_host.get_and_decrypt(agent, key).unwrap().as_slice(),
+                expected
+            );
+        }
+        let post_invite = primary
+            .encrypt_and_put(agent, EncryptedObjectKind::Package, b"post-invite-sync")
+            .unwrap();
+        let binding = invited_host.binding(agent).unwrap();
+        let mut cursor = PrivateSyncCursor::start(
+            binding.space,
+            binding.agent,
+            binding.epoch,
+            binding.control_head,
+        )
+        .unwrap();
+        loop {
+            let request = PrivateSyncRequest {
+                cursor,
+                max_items: MAX_PRIVATE_SYNC_ITEMS as u16,
+                max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+            };
+            let page_bytes = primary
+                .serve_sync_page(
+                    agent,
+                    PrivatePeerIdentity::Node(&invited.identity),
+                    &request.encode().unwrap(),
+                    &TestTransport,
+                )
+                .unwrap();
+            let page = PrivateSyncPage::decode(&page_bytes).unwrap();
+            invited_host
+                .apply_sync_page(
+                    agent,
+                    PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                    &page_bytes,
+                    &TestAuthority,
+                    &TestTransport,
+                )
+                .unwrap();
+            let Some(next) = page.next else {
+                break;
+            };
+            cursor = next;
+        }
         assert_eq!(
             invited_host
-                .get_and_decrypt(agent, current)
+                .get_and_decrypt(agent, post_invite)
                 .unwrap()
                 .as_slice(),
-            b"current-at-invite"
-        );
-        assert_eq!(
-            invited_host.get_and_decrypt(agent, historical),
-            Err(PrivateAgentHostError::Unauthorized)
+            b"post-invite-sync"
         );
 
         drop(invited_host);
@@ -3947,11 +4066,31 @@ mod tests {
             &TestAuthority,
         )
         .unwrap();
-        assert_eq!(invited_host.agents[&agent].data_keys.len(), 1);
+        assert_eq!(invited_host.agents[&agent].data_keys.len(), 3);
         assert_eq!(
-            invited_host.get_and_decrypt(agent, historical),
-            Err(PrivateAgentHostError::Unauthorized)
+            invited_host
+                .get_and_decrypt(agent, epoch_zero)
+                .unwrap()
+                .as_slice(),
+            b"epoch-zero"
         );
+
+        let invited_epoch_key = &invited_host.agents[&agent].data_keys[&2];
+        primary
+            .revoke_node(agent, invited.identity.node, &TestAuthority)
+            .unwrap();
+        let future = primary
+            .encrypt_and_put(agent, EncryptedObjectKind::CrdtNode, b"after-revocation")
+            .unwrap();
+        assert_eq!(future.epoch, 3);
+        assert!(
+            decrypt_private_object(
+                invited_epoch_key,
+                &primary.get_encrypted_object(agent, future).unwrap(),
+            )
+            .is_err()
+        );
+        assert!(!invited_host.agents[&agent].data_keys.contains_key(&3));
     }
 
     #[test]
@@ -4958,6 +5097,104 @@ mod tests {
             collect_files(&root, &mut disk);
             assert!(!contains(&disk, SENTINEL));
         }
+    }
+
+    #[test]
+    fn recovery_successor_can_late_invite_complete_prior_history() {
+        let fixture = fixture(1);
+        let mut source = create_host(&fixture, 0, "recovery-invite-source");
+        let agent = create_agent(&mut source, &fixture);
+        let epoch_zero = source
+            .encrypt_and_put(
+                agent,
+                EncryptedObjectKind::CrdtNode,
+                b"before-recovery-zero",
+            )
+            .unwrap();
+        source.rotate_keys(agent, &TestAuthority).unwrap();
+        let epoch_one = source
+            .encrypt_and_put(agent, EncryptedObjectKind::Blob, b"before-recovery-one")
+            .unwrap();
+        let source_backup = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        drop(source);
+
+        let replacement = node(fixture.space, fixture.owner, 121);
+        let mut recovered = PrivateAgentHost::create(
+            fixture.directory.child("recovery-invite-owner"),
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+        )
+        .unwrap();
+        recovered
+            .recover_from_encrypted_backup(
+                agent,
+                &recovery_kit(),
+                core::slice::from_ref(&replacement.identity),
+                &source_backup,
+                &TestAuthority,
+            )
+            .unwrap();
+        assert_eq!(recovered.binding(agent).unwrap().epoch, 2);
+
+        let invited = node(fixture.space, fixture.owner, 122);
+        recovered
+            .invite_node(agent, invited.identity.clone(), &TestAuthority)
+            .unwrap();
+        let backup = recovered
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let invited_root = fixture.directory.child("recovery-invite-peer");
+        let mut invited_host = PrivateAgentHost::create(
+            &invited_root,
+            fixture.space,
+            fixture.owner,
+            invited.identity.clone(),
+            invited.key(),
+        )
+        .unwrap();
+        invited_host
+            .restore_encrypted_backup(
+                agent,
+                DurableRecoveryRecipient::from_durable_keystore(
+                    fixture.recovery.verifying_key(),
+                    fixture.recovery_encryption.public_key(),
+                )
+                .unwrap(),
+                &backup,
+                &TestAuthority,
+            )
+            .unwrap();
+        for (key, expected) in [
+            (epoch_zero, b"before-recovery-zero".as_slice()),
+            (epoch_one, b"before-recovery-one".as_slice()),
+        ] {
+            assert_eq!(
+                invited_host.get_and_decrypt(agent, key).unwrap().as_slice(),
+                expected
+            );
+        }
+        drop(invited_host);
+        let invited_host = PrivateAgentHost::open(
+            &invited_root,
+            fixture.space,
+            fixture.owner,
+            invited.identity.clone(),
+            invited.key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(invited_host.agents[&agent].data_keys.len(), 3);
+        assert_eq!(
+            invited_host
+                .get_and_decrypt(agent, epoch_zero)
+                .unwrap()
+                .as_slice(),
+            b"before-recovery-zero"
+        );
     }
 
     #[test]

@@ -1783,6 +1783,32 @@ impl PrivateStore {
         self.latest_recovery_keyring.as_ref()
     }
 
+    /// Re-read the exact authenticated Invite records for one recipient. The
+    /// immutable control files are hash/length checked again so late history
+    /// grants cannot be swapped after the store was opened.
+    pub(crate) fn invite_history_records(
+        &self,
+        recipient: &PrivateNodeIdentity,
+    ) -> Result<Vec<PrivateControlRecord>, PrivateStoreError> {
+        let mut records = Vec::new();
+        records
+            .try_reserve(self.index.controls.len().min(MAX_PRIVATE_STORE_CONTROLS))
+            .map_err(|_| PrivateStoreError::LimitExceeded)?;
+        for entry in &self.index.controls {
+            let wire = self.read_control_wire(entry)?;
+            let record = PrivateControlRecord::decode(&wire)
+                .map_err(|_| PrivateStoreError::InvalidRecord)?;
+            validate_control_index_entry(entry, &record)?;
+            if matches!(
+                &record.operation,
+                PrivateControlOperation::Invite { node, .. } if node == recipient
+            ) {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     /// Offline recovery verification key pinned by immutable genesis
     /// metadata. The corresponding signing key is deliberately never stored
     /// by this type.
@@ -2316,6 +2342,7 @@ fn advance_key_epochs(
             epoch,
             sealed_owner_key,
             sealed_data_key,
+            ..
         } => {
             if current.epoch != *epoch {
                 return Err(PrivateStoreError::Corrupt);

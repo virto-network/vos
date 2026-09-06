@@ -12,6 +12,13 @@ pub const MAX_PRIVATE_CIPHERTEXT_BYTES: usize = 8 * 1024 * 1024;
 /// epoch which can precede a valid recovery control.
 pub const MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS: usize = 4_096;
 pub const MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES: usize = 512 * 1024;
+/// An Invite carries at most one independently sealed historical data key for
+/// every authenticated data epoch which precedes the current epoch.
+pub const MAX_PRIVATE_INVITE_HISTORY_EPOCHS: usize = 4_096;
+/// Exact host seal size used by an Invite history grant. Keeping this bound
+/// distinct from the extensible generic sealed-key ceiling prevents a bounded
+/// Invite control from expanding to tens of megabytes.
+pub const PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES: usize = 4 + 32 + 24 + 48;
 pub const PRIVATE_SIGNATURE_BYTES: usize = 64;
 pub const PRIVATE_NONCE_BYTES: usize = 24;
 
@@ -55,6 +62,38 @@ impl SealedPrivateKey {
             && self.recipient_key != [0; 32]
             && !self.sealed.is_empty()
             && self.sealed.len() <= MAX_SEALED_KEY_BYTES
+    }
+}
+
+/// One historical data-epoch key independently sealed to the exact Node
+/// admitted by an owner-signed Invite transition. All binding fields are
+/// repeated in canonical wire so substitution is rejected before decryption.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateInviteHistoryGrant {
+    pub space: SpaceId,
+    pub agent: AgentId,
+    pub owner: PrincipalId,
+    pub transition: Hash,
+    pub recipient: NodeId,
+    pub recipient_key: [u8; 32],
+    pub epoch: u64,
+    pub data_key_commitment: Hash,
+    pub sealed_data_key: SealedPrivateKey,
+}
+
+impl PrivateInviteHistoryGrant {
+    pub fn validate(&self) -> bool {
+        self.space != SpaceId::ZERO
+            && self.agent != AgentId::ZERO
+            && self.owner != PrincipalId::ZERO
+            && self.transition != Hash::ZERO
+            && self.recipient != NodeId::ZERO
+            && self.recipient_key != [0; 32]
+            && self.data_key_commitment != Hash::ZERO
+            && self.sealed_data_key.validate()
+            && self.sealed_data_key.node == self.recipient
+            && self.sealed_data_key.recipient_key == self.recipient_key
+            && self.sealed_data_key.sealed.len() == PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES
     }
 }
 
@@ -208,6 +247,7 @@ pub enum PrivateControlOperation {
         epoch: u64,
         sealed_owner_key: SealedPrivateKey,
         sealed_data_key: SealedPrivateKey,
+        historical_grants: Vec<PrivateInviteHistoryGrant>,
     },
     Revoke {
         node: NodeId,
@@ -278,6 +318,14 @@ impl PrivateControlRecord {
         )
     }
 
+    /// Commitment to the exact Invite transition fields which precede its
+    /// historical grants. Each grant binds this value in its seal AAD, while
+    /// the final owner signature authenticates both the transition and the
+    /// complete canonical grant list.
+    pub fn invite_transition_binding(&self) -> Option<Hash> {
+        crate::wire::private_invite_transition_binding(self)
+    }
+
     pub fn validate_shape(&self) -> bool {
         self.space != SpaceId::ZERO
             && self.agent != AgentId::ZERO
@@ -292,10 +340,12 @@ impl PrivateControlRecord {
             && match &self.operation {
                 PrivateControlOperation::Invite {
                     node,
+                    epoch,
                     sealed_owner_key,
                     sealed_data_key,
-                    ..
+                    historical_grants,
                 } => {
+                    let transition = self.invite_transition_binding();
                     node.validate()
                         && sealed_owner_key.validate()
                         && sealed_data_key.validate()
@@ -303,6 +353,20 @@ impl PrivateControlRecord {
                         && sealed_data_key.node == node.node
                         && sealed_owner_key.recipient_key == node.encryption_public_key
                         && sealed_data_key.recipient_key == node.encryption_public_key
+                        && historical_grants.len() <= MAX_PRIVATE_INVITE_HISTORY_EPOCHS
+                        && historical_grants
+                            .windows(2)
+                            .all(|pair| pair[0].epoch < pair[1].epoch)
+                        && historical_grants.iter().all(|grant| {
+                            grant.validate()
+                                && grant.space == self.space
+                                && grant.agent == self.agent
+                                && grant.owner == node.principal
+                                && Some(grant.transition) == transition
+                                && grant.recipient == node.node
+                                && grant.recipient_key == node.encryption_public_key
+                                && grant.epoch < *epoch
+                        })
                 }
                 PrivateControlOperation::Revoke { node, next_epoch } => {
                     *node != NodeId::ZERO
