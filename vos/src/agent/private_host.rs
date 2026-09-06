@@ -1000,14 +1000,44 @@ impl PrivateAgentHost {
             return Err(PrivateAgentHostError::LimitExceeded);
         }
         let mut historical_keys = BTreeMap::new();
+        let mut historical_commitments = BTreeMap::new();
         for epoch in verified.key_epochs() {
             let key = unwrap_recovery_data_key(epoch, recovery_kit.decryption_key())?;
             if historical_keys.insert(epoch.epoch, key).is_some() {
                 return Err(PrivateAgentHostError::Corrupt);
             }
+            if historical_commitments
+                .insert(epoch.epoch, epoch.data_key_commitment)
+                .is_some()
+            {
+                return Err(PrivateAgentHostError::Corrupt);
+            }
         }
-        if historical_keys.len() != verified.key_epochs().len() {
+        if historical_keys.len() != verified.key_epochs().len()
+            || historical_commitments.len() != verified.key_epochs().len()
+        {
             return Err(PrivateAgentHostError::Corrupt);
+        }
+        // The archive index authenticates the canonical ciphertext records,
+        // but only the exact historical epoch keys can authenticate their
+        // contents. Audit every object before creating or publishing any
+        // recovery plan; successful plaintext exists only in this bounded
+        // zeroizing buffer.
+        for object in verified.objects() {
+            if !object.validate() || object.space != self.scope.space || object.agent != agent {
+                return Err(PrivateAgentHostError::Corrupt);
+            }
+            let key = historical_keys
+                .get(&object.epoch)
+                .ok_or(PrivateAgentHostError::Corrupt)?;
+            let commitment = historical_commitments
+                .get(&object.epoch)
+                .ok_or(PrivateAgentHostError::Corrupt)?;
+            if key.commitment() != *commitment {
+                return Err(PrivateAgentHostError::Corrupt);
+            }
+            let plaintext = Zeroizing::new(decrypt_private_object(key, object)?);
+            drop(plaintext);
         }
         let current_key = historical_keys
             .get(&prior_binding.epoch)
@@ -4214,6 +4244,58 @@ mod tests {
         );
         assert!(!forged_host.creating_path(agent).exists());
         drop(forged_host);
+
+        // Re-indexing a corrupted historical ciphertext makes the outer
+        // archive structurally canonical. Recovery must still authenticate
+        // every object with its exact epoch key before it stages a plan.
+        let mut forged_object_archive = decode_host_archive(&backup, true).unwrap();
+        let audit_kit = recovery_kit();
+        let mut forged_objects = verify_encrypted_backup(
+            &forged_object_archive.store,
+            fixture.space,
+            agent,
+            fixture.owner,
+            audit_kit.signing_public_key(),
+            audit_kit.encryption_public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        forged_objects
+            .corrupt_epoch_object_and_reindex_for_test(0)
+            .unwrap();
+        forged_object_archive.store = forged_objects
+            .encode_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        let forged_object_backup =
+            encode_host_archive(&forged_object_archive, true, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+                .unwrap();
+        let forged_object_root = fixture.directory.child("forged-object-backup");
+        let mut forged_object_host = PrivateAgentHost::create(
+            &forged_object_root,
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+        )
+        .unwrap();
+        assert_eq!(
+            forged_object_host.recover_from_encrypted_backup(
+                agent,
+                &audit_kit,
+                &replacements,
+                &forged_object_backup,
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::Crypto(
+                PrivateCryptoError::Decryption
+            ))
+        );
+        assert!(!forged_object_host.creating_path(agent).exists());
+        assert_eq!(
+            forged_object_host.binding(agent),
+            Err(PrivateAgentHostError::NotFound)
+        );
+        drop(forged_object_host);
 
         let forged_plan_root = fixture.directory.child("forged-recovery-plan");
         let mut forged_plan_host = PrivateAgentHost::create(

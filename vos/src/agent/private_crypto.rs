@@ -46,7 +46,7 @@ pub const MAX_PRIVATE_CONTROL_RECORDS: u64 = 4_096;
 const OWNER_PUBLIC_DOMAIN: &[u8] = b"vos/private/owner-signing-public/v1";
 const DATA_KEY_DOMAIN: &[u8] = b"vos/private/data-key/v1";
 const RECOVERY_PUBLIC_DOMAIN: &[u8] = b"vos/private/recovery-signing-public/v1";
-const PLAINTEXT_DOMAIN: &[u8] = b"vos/private/plaintext/v1";
+const CONTENT_IDENTITY_DOMAIN: &[u8] = b"vos/private/content-identity/v2";
 const SEAL_KDF_DOMAIN: &[u8] = b"vos/private/key-seal/kdf/v1";
 const SEAL_AAD_DOMAIN: &[u8] = b"vos/private/key-seal/aad/v1";
 const SEAL_SALT: &[u8] = b"vos/private/key-seal/salt/v1";
@@ -355,9 +355,34 @@ pub(crate) fn valid_x25519_public_key(public_key: &[u8; SECRET_BYTES]) -> bool {
         .was_contributory()
 }
 
-/// Content identity authenticated by [`EncryptedPrivateObject`].
-pub fn private_content_identity(plaintext: &[u8]) -> Hash {
-    Hash::digest(PLAINTEXT_DOMAIN, &[plaintext])
+/// Epoch-confidential content identity authenticated by
+/// [`EncryptedPrivateObject`].
+///
+/// The identity is a keyed, domain-separated digest. Its exact private data
+/// epoch key and complete object scope prevent equal plaintext from becoming
+/// linkable across spaces, agents, epochs, or object kinds.
+pub fn private_content_identity(
+    data_key: &PrivateDataKey,
+    space: SpaceId,
+    agent: AgentId,
+    epoch: u64,
+    kind: EncryptedObjectKind,
+    plaintext: &[u8],
+) -> Hash {
+    let mut parameters = blake2b_simd::Params::new();
+    parameters.hash_length(32).key(data_key.0.bytes());
+    let mut state = parameters.to_state();
+    state.update(CONTENT_IDENTITY_DOMAIN);
+    state.update(space.as_bytes());
+    state.update(agent.as_bytes());
+    state.update(&epoch.to_le_bytes());
+    state.update(&[kind as u8]);
+    state.update(&(plaintext.len() as u64).to_le_bytes());
+    state.update(plaintext);
+    let digest = state.finalize();
+    let mut identity = [0; 32];
+    identity.copy_from_slice(digest.as_bytes());
+    Hash(identity)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1385,7 +1410,7 @@ fn encrypt_private_object_with<R: RngCore + CryptoRng>(
         agent,
         epoch,
         kind,
-        content: private_content_identity(plaintext),
+        content: private_content_identity(data_key, space, agent, epoch, kind, plaintext),
         nonce,
         ciphertext: Vec::new(),
     };
@@ -1428,7 +1453,15 @@ pub fn decrypt_private_object(
             },
         )
         .map_err(|_| PrivateCryptoError::Decryption)?;
-    if private_content_identity(&plaintext) != object.content {
+    if private_content_identity(
+        data_key,
+        object.space,
+        object.agent,
+        object.epoch,
+        object.kind,
+        &plaintext,
+    ) != object.content
+    {
         plaintext.zeroize();
         return Err(PrivateCryptoError::KeyCommitment);
     }
@@ -2193,7 +2226,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             object.content,
-            private_content_identity(b"authenticated private value")
+            private_content_identity(
+                &fixture.generated.data_key,
+                fixture.space,
+                fixture.agent,
+                0,
+                EncryptedObjectKind::Blob,
+                b"authenticated private value",
+            )
         );
 
         let mut variants = Vec::new();
@@ -2224,6 +2264,70 @@ mod tests {
 
         let wrong_key = PrivateDataKey::generate_with(&mut fixture.rng).unwrap();
         assert!(decrypt_private_object(&wrong_key, &object).is_err());
+    }
+
+    #[test]
+    fn equal_plaintext_identities_are_unlinkable_across_keys_scopes_epochs_and_kinds() {
+        let mut fixture = fixture(1);
+        let plaintext = b"same private plaintext";
+        let other_key = PrivateDataKey::generate_with(&mut fixture.rng).unwrap();
+        let identities = [
+            private_content_identity(
+                &fixture.generated.data_key,
+                fixture.space,
+                fixture.agent,
+                0,
+                EncryptedObjectKind::Blob,
+                plaintext,
+            ),
+            private_content_identity(
+                &fixture.generated.data_key,
+                fixture.space,
+                fixture.agent,
+                1,
+                EncryptedObjectKind::Blob,
+                plaintext,
+            ),
+            private_content_identity(
+                &fixture.generated.data_key,
+                fixture.space,
+                fixture.agent,
+                0,
+                EncryptedObjectKind::Snapshot,
+                plaintext,
+            ),
+            private_content_identity(
+                &fixture.generated.data_key,
+                fixture.space,
+                AgentId([0xA7; 32]),
+                0,
+                EncryptedObjectKind::Blob,
+                plaintext,
+            ),
+            private_content_identity(
+                &fixture.generated.data_key,
+                SpaceId([0xB8; 32]),
+                fixture.agent,
+                0,
+                EncryptedObjectKind::Blob,
+                plaintext,
+            ),
+            private_content_identity(
+                &other_key,
+                fixture.space,
+                fixture.agent,
+                0,
+                EncryptedObjectKind::Blob,
+                plaintext,
+            ),
+        ];
+        for (position, identity) in identities.iter().enumerate() {
+            assert_ne!(*identity, Hash::ZERO);
+            assert!(
+                identities[..position].iter().all(|prior| prior != identity),
+                "private content identity collision at case {position}"
+            );
+        }
     }
 
     #[test]

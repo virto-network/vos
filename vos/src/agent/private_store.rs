@@ -102,7 +102,7 @@ pub enum RestoreDisposition {
 }
 
 /// Canonical semantic address of one encrypted object. A second ciphertext at
-/// the same `(epoch, kind, plaintext-content commitment)` is an alias and is
+/// the same `(epoch, kind, epoch-keyed content identity)` is an alias and is
 /// rejected rather than silently replacing the first representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PrivateObjectKey {
@@ -861,6 +861,48 @@ impl VerifiedEncryptedBackup {
 
     pub(crate) fn key_epochs(&self) -> &[PrivateKeyEpoch] {
         &self.key_epochs
+    }
+
+    /// Canonical encrypted objects authenticated by the archive index. The
+    /// recovery host must additionally authenticate their AEAD tags with the
+    /// exact archived epoch keys before it can publish a successor.
+    pub(crate) fn objects(&self) -> &[EncryptedPrivateObject] {
+        &self.objects
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_epoch_object_and_reindex_for_test(
+        &mut self,
+        epoch: u64,
+    ) -> Result<(), PrivateStoreError> {
+        let position = self
+            .objects
+            .iter()
+            .position(|object| object.epoch == epoch)
+            .ok_or(PrivateStoreError::NotFound)?;
+        let object = self
+            .objects
+            .get_mut(position)
+            .ok_or(PrivateStoreError::Corrupt)?;
+        let byte = object
+            .ciphertext
+            .first_mut()
+            .ok_or(PrivateStoreError::Corrupt)?;
+        *byte ^= 1;
+        let wire = object
+            .encode()
+            .map_err(|_| PrivateStoreError::InvalidRecord)?;
+        let entry = self
+            .index
+            .objects
+            .get_mut(position)
+            .ok_or(PrivateStoreError::Corrupt)?;
+        if entry.key != PrivateObjectKey::from_object(object) {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        entry.wire_hash = raw_wire_hash(&wire);
+        entry.wire_len = u32::try_from(wire.len()).map_err(|_| PrivateStoreError::LimitExceeded)?;
+        Ok(())
     }
 
     /// Append the exact already-signed recovery successor in memory. The
