@@ -847,6 +847,112 @@ pub(crate) fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
     })
 }
 
+/// Deterministically select one authenticated control path and union every
+/// compatible ciphertext object from the contributing backups. Divergent
+/// control heads are resolved only by the later recovery record; this step
+/// never attempts to replay two records at the same sequence.
+pub(crate) fn reconcile_encrypted_backups(
+    mut backups: Vec<VerifiedEncryptedBackup>,
+) -> Result<(VerifiedEncryptedBackup, Vec<Hash>, u64), PrivateStoreError> {
+    if backups.is_empty() || backups.len() > MAX_PRIVATE_NODES {
+        return Err(PrivateStoreError::LimitExceeded);
+    }
+    let metadata = &backups[0].metadata;
+    if backups
+        .iter()
+        .skip(1)
+        .any(|backup| backup.metadata != *metadata)
+    {
+        return Err(PrivateStoreError::Diverged);
+    }
+
+    // A sound recovered store must be able to reconstruct every historical
+    // epoch from its retained control path after restart. Select only a path
+    // whose authenticated epoch history covers all contributors, then break
+    // ties solely from authenticated control state rather than caller order.
+    let selected_position = backups
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            backups
+                .iter()
+                .all(|source| recovery_epoch_history_covers(candidate, source))
+        })
+        .max_by(|(_, left), (_, right)| compare_recovery_base(left, right))
+        .map(|(position, _)| position)
+        .ok_or(PrivateStoreError::Diverged)?;
+
+    let mut superseded_heads: Vec<_> = backups
+        .iter()
+        .filter_map(|backup| backup.chain.head())
+        .collect();
+    superseded_heads.sort_unstable();
+    superseded_heads.dedup();
+    if superseded_heads.len() > MAX_PRIVATE_NODES {
+        return Err(PrivateStoreError::LimitExceeded);
+    }
+    let maximum_next_sequence = backups
+        .iter()
+        .map(|backup| backup.chain.next_sequence())
+        .max()
+        .ok_or(PrivateStoreError::Corrupt)?;
+
+    let mut selected = backups.swap_remove(selected_position);
+    for source in &backups {
+        selected.merge_compatible_objects(source)?;
+    }
+    if (selected.chain.head().is_none()) != superseded_heads.is_empty() {
+        return Err(PrivateStoreError::Diverged);
+    }
+    Ok((selected, superseded_heads, maximum_next_sequence))
+}
+
+fn recovery_epoch_history_covers(
+    candidate: &VerifiedEncryptedBackup,
+    source: &VerifiedEncryptedBackup,
+) -> bool {
+    source.key_epochs.iter().all(|source_epoch| {
+        candidate
+            .key_epochs
+            .binary_search_by_key(&source_epoch.epoch, |epoch| epoch.epoch)
+            .ok()
+            .and_then(|position| candidate.key_epochs.get(position))
+            .is_some_and(|candidate_epoch| {
+                recovery_epoch_material_matches(candidate_epoch, source_epoch)
+            })
+    })
+}
+
+fn recovery_epoch_material_matches(left: &PrivateKeyEpoch, right: &PrivateKeyEpoch) -> bool {
+    left.space == right.space
+        && left.agent == right.agent
+        && left.epoch == right.epoch
+        && left.owner_key_commitment == right.owner_key_commitment
+        && left.data_key_commitment == right.data_key_commitment
+        && left.recovery_key_commitment == right.recovery_key_commitment
+        && left.recovery_encryption_public_key == right.recovery_encryption_public_key
+        && left.sealed_recovery_data_key == right.sealed_recovery_data_key
+}
+
+fn compare_recovery_base(
+    left: &VerifiedEncryptedBackup,
+    right: &VerifiedEncryptedBackup,
+) -> core::cmp::Ordering {
+    left.chain
+        .epoch()
+        .epoch
+        .cmp(&right.chain.epoch().epoch)
+        .then_with(|| left.chain.next_sequence().cmp(&right.chain.next_sequence()))
+        .then_with(|| left.index.controls.len().cmp(&right.index.controls.len()))
+        .then_with(|| {
+            left.index
+                .controls
+                .iter()
+                .map(|entry| entry.commitment)
+                .cmp(right.index.controls.iter().map(|entry| entry.commitment))
+        })
+}
+
 impl VerifiedEncryptedBackup {
     pub(crate) fn binding(&self) -> PrivateStoreBinding {
         PrivateStoreBinding {
@@ -868,6 +974,52 @@ impl VerifiedEncryptedBackup {
     /// exact archived epoch keys before it can publish a successor.
     pub(crate) fn objects(&self) -> &[EncryptedPrivateObject] {
         &self.objects
+    }
+
+    fn merge_compatible_objects(
+        &mut self,
+        source: &VerifiedEncryptedBackup,
+    ) -> Result<(), PrivateStoreError> {
+        if self.metadata != source.metadata
+            || !recovery_epoch_history_covers(self, source)
+            || self.objects.len() != self.index.objects.len()
+            || source.objects.len() != source.index.objects.len()
+        {
+            return Err(PrivateStoreError::Diverged);
+        }
+        for object in &source.objects {
+            let key = PrivateObjectKey::from_object(object);
+            match self
+                .index
+                .objects
+                .binary_search_by_key(&key, |entry| entry.key)
+            {
+                Ok(position) => {
+                    if self.objects.get(position) != Some(object) {
+                        return Err(PrivateStoreError::Alias);
+                    }
+                }
+                Err(position) => {
+                    if self.objects.len() >= MAX_PRIVATE_STORE_OBJECTS {
+                        return Err(PrivateStoreError::LimitExceeded);
+                    }
+                    let wire = object
+                        .encode()
+                        .map_err(|_| PrivateStoreError::InvalidRecord)?;
+                    self.index.objects.insert(
+                        position,
+                        StoredObjectIndex {
+                            key,
+                            wire_hash: raw_wire_hash(&wire),
+                            wire_len: u32::try_from(wire.len())
+                                .map_err(|_| PrivateStoreError::LimitExceeded)?,
+                        },
+                    );
+                    self.objects.insert(position, object.clone());
+                }
+            }
+        }
+        validate_index_shape(&self.index)
     }
 
     #[cfg(test)]
@@ -916,8 +1068,7 @@ impl VerifiedEncryptedBackup {
     ) -> Result<(), PrivateStoreError> {
         if self.index.controls.len() >= MAX_PRIVATE_STORE_CONTROLS
             || record.signer != PrivateControlSigner::Recovery
-            || record.sequence != self.index.next_sequence
-            || record.previous != self.index.control_head
+            || record.sequence < self.index.next_sequence
             || !matches!(record.operation, PrivateControlOperation::Recover { .. })
         {
             return Err(PrivateStoreError::InvalidRecord);
@@ -928,9 +1079,11 @@ impl VerifiedEncryptedBackup {
         else {
             return Err(PrivateStoreError::InvalidRecord);
         };
-        match self.index.control_head {
-            Some(head) if superseded_heads.as_slice() == [head] => {}
-            None if superseded_heads.is_empty() => {}
+        match (self.index.control_head, record.previous) {
+            (Some(local_head), Some(selected_head))
+                if superseded_heads.binary_search(&local_head).is_ok()
+                    && superseded_heads.binary_search(&selected_head).is_ok() => {}
+            (None, None) if superseded_heads.is_empty() => {}
             _ => return Err(PrivateStoreError::InvalidRecord),
         }
 

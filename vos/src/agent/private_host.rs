@@ -49,7 +49,7 @@ use super::private_crypto::{
 };
 use super::private_store::{
     MAX_PRIVATE_BACKUP_BYTES, PrivateObjectKey, PrivateStore, PrivateStoreError, PutDisposition,
-    RestoreDisposition, verify_encrypted_backup,
+    RestoreDisposition, reconcile_encrypted_backups, verify_encrypted_backup,
 };
 use super::private_sync::{
     PrivateSyncApplyDisposition, PrivateSyncError, PrivateSyncPage, PrivateSyncPhase,
@@ -69,8 +69,10 @@ const BOOTSTRAP_MAGIC: &[u8; 4] = b"PVHM";
 const BACKUP_MAGIC: &[u8; 4] = b"PVHB";
 const SNAPSHOT_MAGIC: &[u8; 4] = b"PVHS";
 const RECOVERY_PLAN_MAGIC: &[u8; 4] = b"PVRP";
-const RECOVERY_PLAN_HASH_DOMAIN: &[u8] = b"vos/private/recovery-plan-bytes/v1";
-const RECOVERY_SOURCE_HASH_DOMAIN: &[u8] = b"vos/private/recovery-source-archive/v1";
+const RECOVERY_PLAN_VERSION: u16 = 2;
+const RECOVERY_PLAN_HASH_DOMAIN: &[u8] = b"vos/private/recovery-plan-bytes/v2";
+const RECOVERY_SOURCE_ARCHIVE_HASH_DOMAIN: &[u8] = b"vos/private/recovery-source-archive/v2";
+const RECOVERY_SOURCE_SET_HASH_DOMAIN: &[u8] = b"vos/private/recovery-source-set/v2";
 const RECOVERY_REPLACEMENTS_DOMAIN: &[u8] = b"vos/private/recovery-replacements/v1";
 
 const ROOT_SCOPE_FILE: &str = "scope";
@@ -86,6 +88,8 @@ const RECOVERY_PLAN_FILE: &str = "recovery.plan";
 const RECOVERY_PLAN_WRITE_FILE: &str = "recovery.plan.write";
 const SIDECAR_FILES: [&str; 3] = [DESCRIPTOR_FILE, RUNTIME_FILE, BOOTSTRAP_FILE];
 const MAX_PRIVATE_RECOVERY_PLAN_BYTES: usize = MAX_PRIVATE_HOST_ARCHIVE_BYTES + 512;
+const MAX_PRIVATE_RECOVERY_SOURCE_BYTES: usize =
+    MAX_PRIVATE_HOST_ARCHIVE_BYTES.saturating_mul(MAX_PRIVATE_NODES);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateAgentHostError {
@@ -894,11 +898,32 @@ impl PrivateAgentHost {
         bytes: &[u8],
         authority: &V,
     ) -> Result<RestoreDisposition, PrivateAgentHostError> {
-        self.recover_from_encrypted_backup_inner(
+        self.recover_from_encrypted_backups_inner(
             agent,
             recovery_kit,
             replacement_nodes,
-            bytes,
+            &[bytes],
+            authority,
+            RecoveryInstallStop::Never,
+        )
+    }
+
+    /// Recover from the deterministic union of complete independently held
+    /// ciphertext archives. Every archive, control head, epoch, sidecar, and
+    /// object is authenticated before a recovery plan is made durable.
+    pub fn recover_from_encrypted_backups<V: PrivateNodeAuthorityVerifier>(
+        &mut self,
+        agent: AgentId,
+        recovery_kit: &OfflineRecoveryKit,
+        replacement_nodes: &[PrivateNodeIdentity],
+        backups: &[&[u8]],
+        authority: &V,
+    ) -> Result<RestoreDisposition, PrivateAgentHostError> {
+        self.recover_from_encrypted_backups_inner(
+            agent,
+            recovery_kit,
+            replacement_nodes,
+            backups,
             authority,
             RecoveryInstallStop::Never,
         )
@@ -914,29 +939,49 @@ impl PrivateAgentHost {
         authority: &V,
         stop: RecoveryInstallStop,
     ) -> Result<RestoreDisposition, PrivateAgentHostError> {
-        self.recover_from_encrypted_backup_inner(
+        self.recover_from_encrypted_backups_inner(
             agent,
             recovery_kit,
             replacement_nodes,
-            bytes,
+            &[bytes],
+            authority,
+            stop,
+        )
+    }
+
+    #[cfg(test)]
+    fn recover_from_encrypted_backups_with_stop<V: PrivateNodeAuthorityVerifier>(
+        &mut self,
+        agent: AgentId,
+        recovery_kit: &OfflineRecoveryKit,
+        replacement_nodes: &[PrivateNodeIdentity],
+        backups: &[&[u8]],
+        authority: &V,
+        stop: RecoveryInstallStop,
+    ) -> Result<RestoreDisposition, PrivateAgentHostError> {
+        self.recover_from_encrypted_backups_inner(
+            agent,
+            recovery_kit,
+            replacement_nodes,
+            backups,
             authority,
             stop,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn recover_from_encrypted_backup_inner<V: PrivateNodeAuthorityVerifier>(
+    fn recover_from_encrypted_backups_inner<V: PrivateNodeAuthorityVerifier>(
         &mut self,
         agent: AgentId,
         recovery_kit: &OfflineRecoveryKit,
         replacement_nodes: &[PrivateNodeIdentity],
-        bytes: &[u8],
+        backups: &[&[u8]],
         authority: &V,
         stop: RecoveryInstallStop,
     ) -> Result<RestoreDisposition, PrivateAgentHostError> {
         self.verify_root_scope()?;
         require_exact_local_member(replacement_nodes, &self.scope.local_node)?;
-        let source_hash = Hash::digest(RECOVERY_SOURCE_HASH_DOMAIN, &[bytes]);
+        let source_hash = recovery_sources_hash(backups)?;
         let replacements_hash = recovery_replacements_hash(
             self.scope.space,
             agent,
@@ -979,71 +1024,105 @@ impl PrivateAgentHost {
             return Ok(disposition);
         }
 
-        let archive = decode_host_archive(bytes, true)?;
-        if archive.space != self.scope.space || archive.agent != agent {
-            return Err(PrivateAgentHostError::InvalidScope);
+        let mut sources = Vec::new();
+        sources
+            .try_reserve_exact(backups.len())
+            .map_err(|_| PrivateAgentHostError::LimitExceeded)?;
+        for bytes in backups {
+            let archive = decode_host_archive(bytes, true)?;
+            if archive.space != self.scope.space || archive.agent != agent {
+                return Err(PrivateAgentHostError::InvalidScope);
+            }
+            let verified = verify_encrypted_backup(
+                &archive.store,
+                self.scope.space,
+                agent,
+                self.scope.owner,
+                recovery_kit.signing_public_key(),
+                recovery_kit.encryption_public_key(),
+                authority,
+            )?;
+            if verified.key_epochs().is_empty()
+                || verified.key_epochs().len() > MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS
+            {
+                return Err(PrivateAgentHostError::LimitExceeded);
+            }
+            sources.push((archive, verified));
         }
-        let mut verified = verify_encrypted_backup(
-            &archive.store,
-            self.scope.space,
-            agent,
-            self.scope.owner,
-            recovery_kit.signing_public_key(),
-            recovery_kit.encryption_public_key(),
-            authority,
-        )?;
-        let prior_binding = verified.binding();
-        if verified.key_epochs().is_empty()
-            || verified.key_epochs().len() > MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS
-            || prior_binding.next_sequence >= super::private_crypto::MAX_PRIVATE_CONTROL_RECORDS
-        {
-            return Err(PrivateAgentHostError::LimitExceeded);
-        }
+
         let mut historical_keys = BTreeMap::new();
         let mut historical_commitments = BTreeMap::new();
-        for epoch in verified.key_epochs() {
-            let key = unwrap_recovery_data_key(epoch, recovery_kit.decryption_key())?;
-            if historical_keys.insert(epoch.epoch, key).is_some() {
-                return Err(PrivateAgentHostError::Corrupt);
+        let mut plaintext = None;
+        for (archive, verified) in &sources {
+            for epoch in verified.key_epochs() {
+                let key = unwrap_recovery_data_key(epoch, recovery_kit.decryption_key())?;
+                match historical_commitments.get(&epoch.epoch) {
+                    Some(commitment)
+                        if *commitment != epoch.data_key_commitment
+                            || historical_keys.get(&epoch.epoch).is_none_or(
+                                |existing: &PrivateDataKey| {
+                                    existing.commitment() != key.commitment()
+                                },
+                            ) =>
+                    {
+                        return Err(PrivateStoreError::Diverged.into());
+                    }
+                    Some(_) => {}
+                    None => {
+                        historical_commitments.insert(epoch.epoch, epoch.data_key_commitment);
+                        historical_keys.insert(epoch.epoch, key);
+                    }
+                }
             }
-            if historical_commitments
-                .insert(epoch.epoch, epoch.data_key_commitment)
-                .is_some()
-            {
-                return Err(PrivateAgentHostError::Corrupt);
+            // The archive index authenticates the canonical ciphertext
+            // records, but only the exact historical epoch keys authenticate
+            // their contents. Audit every object from every contributor
+            // before reconciling or publishing a recovery plan.
+            for object in verified.objects() {
+                if !object.validate() || object.space != self.scope.space || object.agent != agent {
+                    return Err(PrivateAgentHostError::Corrupt);
+                }
+                let key = historical_keys
+                    .get(&object.epoch)
+                    .ok_or(PrivateAgentHostError::Corrupt)?;
+                let commitment = historical_commitments
+                    .get(&object.epoch)
+                    .ok_or(PrivateAgentHostError::Corrupt)?;
+                if key.commitment() != *commitment {
+                    return Err(PrivateAgentHostError::Corrupt);
+                }
+                let object_plaintext = Zeroizing::new(decrypt_private_object(key, object)?);
+                drop(object_plaintext);
             }
+
+            let binding = verified.binding();
+            let current_key = historical_keys
+                .get(&binding.epoch)
+                .ok_or(PrivateAgentHostError::Corrupt)?;
+            let candidate = decrypt_archive_plaintext(archive, binding.epoch, current_key)?;
+            validate_archive_plaintext(&candidate, self.scope.space, agent, self.scope.owner)?;
+            if let Some(reference) = &plaintext {
+                if !recovery_plaintext_is_compatible(reference, &candidate) {
+                    return Err(PrivateStoreError::Diverged.into());
+                }
+            } else {
+                plaintext = Some(candidate);
+            }
+        }
+
+        let verified_backups = sources.into_iter().map(|(_, verified)| verified).collect();
+        let (mut verified, superseded_heads, recovery_sequence) =
+            reconcile_encrypted_backups(verified_backups)?;
+        let prior_binding = verified.binding();
+        if recovery_sequence >= super::private_crypto::MAX_PRIVATE_CONTROL_RECORDS {
+            return Err(PrivateAgentHostError::LimitExceeded);
         }
         if historical_keys.len() != verified.key_epochs().len()
             || historical_commitments.len() != verified.key_epochs().len()
         {
             return Err(PrivateAgentHostError::Corrupt);
         }
-        // The archive index authenticates the canonical ciphertext records,
-        // but only the exact historical epoch keys can authenticate their
-        // contents. Audit every object before creating or publishing any
-        // recovery plan; successful plaintext exists only in this bounded
-        // zeroizing buffer.
-        for object in verified.objects() {
-            if !object.validate() || object.space != self.scope.space || object.agent != agent {
-                return Err(PrivateAgentHostError::Corrupt);
-            }
-            let key = historical_keys
-                .get(&object.epoch)
-                .ok_or(PrivateAgentHostError::Corrupt)?;
-            let commitment = historical_commitments
-                .get(&object.epoch)
-                .ok_or(PrivateAgentHostError::Corrupt)?;
-            if key.commitment() != *commitment {
-                return Err(PrivateAgentHostError::Corrupt);
-            }
-            let plaintext = Zeroizing::new(decrypt_private_object(key, object)?);
-            drop(plaintext);
-        }
-        let current_key = historical_keys
-            .get(&prior_binding.epoch)
-            .ok_or(PrivateAgentHostError::Corrupt)?;
-        let mut plaintext = decrypt_archive_plaintext(&archive, prior_binding.epoch, current_key)?;
-        validate_archive_plaintext(&plaintext, self.scope.space, agent, self.scope.owner)?;
+        let mut plaintext = plaintext.ok_or(PrivateAgentHostError::Corrupt)?;
         plaintext.descriptor.replicas = replacement_nodes
             .iter()
             .map(|node| AgentReplica {
@@ -1080,10 +1159,10 @@ impl PrivateAgentHost {
         let mut recovery_record = PrivateControlRecord {
             space: self.scope.space,
             agent,
-            sequence: prior_binding.next_sequence,
+            sequence: recovery_sequence,
             previous: prior_binding.control_head,
             operation: PrivateControlOperation::Recover {
-                superseded_heads: prior_binding.control_head.into_iter().collect(),
+                superseded_heads,
                 next_epoch: generated.record.clone(),
                 replacement_nodes: replacement_nodes.to_vec(),
                 historical_keyring,
@@ -2784,6 +2863,45 @@ struct RecoveryPlan {
     recovered_archive: Vec<u8>,
 }
 
+fn recovery_sources_hash(backups: &[&[u8]]) -> Result<Hash, PrivateAgentHostError> {
+    if backups.is_empty() || backups.len() > MAX_PRIVATE_NODES {
+        return Err(PrivateAgentHostError::LimitExceeded);
+    }
+    let total_bytes = backups
+        .iter()
+        .try_fold(0usize, |total, backup| total.checked_add(backup.len()));
+    if total_bytes.is_none_or(|total| total > MAX_PRIVATE_RECOVERY_SOURCE_BYTES) {
+        return Err(PrivateAgentHostError::LimitExceeded);
+    }
+    let mut hashes = Vec::new();
+    hashes
+        .try_reserve_exact(backups.len())
+        .map_err(|_| PrivateAgentHostError::LimitExceeded)?;
+    for backup in backups {
+        if backup.len() > MAX_PRIVATE_HOST_ARCHIVE_BYTES {
+            return Err(PrivateAgentHostError::LimitExceeded);
+        }
+        hashes.push(Hash::digest(RECOVERY_SOURCE_ARCHIVE_HASH_DOMAIN, &[backup]));
+    }
+    hashes.sort_unstable();
+    if hashes.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(PrivateAgentHostError::Alias);
+    }
+    let mut canonical = Vec::new();
+    canonical
+        .try_reserve_exact(2 + hashes.len() * 32)
+        .map_err(|_| PrivateAgentHostError::LimitExceeded)?;
+    canonical.extend_from_slice(
+        &u16::try_from(hashes.len())
+            .map_err(|_| PrivateAgentHostError::LimitExceeded)?
+            .to_le_bytes(),
+    );
+    for hash in hashes {
+        canonical.extend_from_slice(hash.as_bytes());
+    }
+    Ok(Hash::digest(RECOVERY_SOURCE_SET_HASH_DOMAIN, &[&canonical]))
+}
+
 fn recovery_replacements_hash(
     space: SpaceId,
     agent: AgentId,
@@ -2844,7 +2962,7 @@ fn encode_recovery_plan(
     }
     let mut bytes = Vec::new();
     bytes.extend_from_slice(RECOVERY_PLAN_MAGIC);
-    bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&RECOVERY_PLAN_VERSION.to_le_bytes());
     bytes.extend_from_slice(vos_agent_sdk::RUNTIME_ABI_ID.as_bytes());
     let mut encoder = Encoder(&mut bytes);
     encoder.fixed(plan.space.as_bytes());
@@ -2877,7 +2995,7 @@ fn decode_recovery_plan(
         .ok_or(PrivateAgentHostError::Corrupt)?;
     let mut decoder = Decoder::new(bytes);
     if decoder.take(4).map_err(map_decode)? != RECOVERY_PLAN_MAGIC
-        || decoder.u16().map_err(map_decode)? != FORMAT_VERSION
+        || decoder.u16().map_err(map_decode)? != RECOVERY_PLAN_VERSION
         || Hash(decoder.fixed().map_err(map_decode)?) != vos_agent_sdk::RUNTIME_ABI_ID
     {
         return Err(PrivateAgentHostError::Corrupt);
@@ -3101,6 +3219,19 @@ fn validate_archive_plaintext(
         return Err(PrivateAgentHostError::Corrupt);
     }
     Ok(())
+}
+
+fn recovery_plaintext_is_compatible(left: &AgentPlaintext, right: &AgentPlaintext) -> bool {
+    let mut left_descriptor = left.descriptor.clone();
+    let mut right_descriptor = right.descriptor.clone();
+    // Replica membership belongs to each authenticated control head and is
+    // replaced by the recovery ceremony. Every other descriptor field and
+    // both opaque plaintext sidecars must agree across contributing backups.
+    left_descriptor.replicas.clear();
+    right_descriptor.replicas.clear();
+    left_descriptor == right_descriptor
+        && left.runtime_package.as_slice() == right.runtime_package.as_slice()
+        && left.bootstrap_metadata.as_slice() == right.bootstrap_metadata.as_slice()
 }
 
 fn read_sidecar_wire(slot: &Path, name: &str) -> Result<Vec<u8>, PrivateAgentHostError> {
@@ -4135,6 +4266,375 @@ mod tests {
     }
 
     #[test]
+    fn divergent_backups_union_deterministically_and_resume_across_publish_phases() {
+        let fixture = fixture(2);
+        let mut left = create_host(&fixture, 0, "union-left");
+        let agent = create_agent(&mut left, &fixture);
+        let base = left
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let mut right = create_host(&fixture, 1, "union-right");
+        right
+            .restore_encrypted_backup(
+                agent,
+                DurableRecoveryRecipient::from_durable_keystore(
+                    fixture.recovery.verifying_key(),
+                    fixture.recovery_encryption.public_key(),
+                )
+                .unwrap(),
+                &base,
+                &TestAuthority,
+            )
+            .unwrap();
+
+        left.record_actor_lifecycle(
+            agent,
+            ActorId([0x41; 32]),
+            PrivateActorLifecycleKind::Install,
+            Hash([0x42; 32]),
+            &TestAuthority,
+        )
+        .unwrap();
+        right
+            .record_actor_lifecycle(
+                agent,
+                ActorId([0x43; 32]),
+                PrivateActorLifecycleKind::Install,
+                Hash([0x44; 32]),
+                &TestAuthority,
+            )
+            .unwrap();
+        let left_head = left.binding(agent).unwrap().control_head.unwrap();
+        let right_head = right.binding(agent).unwrap().control_head.unwrap();
+        assert_ne!(left_head, right_head);
+        let selected_head = left_head.max(right_head);
+        let mut expected_heads = vec![left_head, right_head];
+        expected_heads.sort_unstable();
+
+        let left_object = left
+            .encrypt_and_put(agent, EncryptedObjectKind::CrdtNode, b"left-fork-object")
+            .unwrap();
+        let right_object = right
+            .encrypt_and_put(agent, EncryptedObjectKind::Snapshot, b"right-fork-object")
+            .unwrap();
+        let left_backup = left
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let right_backup = right
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        drop(left);
+        drop(right);
+
+        let replacement = node(fixture.space, fixture.owner, 111);
+        let replacements = vec![replacement.identity.clone()];
+        let ordered = [left_backup.as_slice(), right_backup.as_slice()];
+        let reversed = [right_backup.as_slice(), left_backup.as_slice()];
+
+        // The canonical source-set commitment is order independent, so an
+        // exact retry can resume the same random recovery plan with the input
+        // archives presented in the opposite order.
+        let retry_root = fixture.directory.child("union-retry");
+        let mut retry_host = PrivateAgentHost::create(
+            &retry_root,
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+        )
+        .unwrap();
+        assert_eq!(
+            retry_host.recover_from_encrypted_backups_with_stop(
+                agent,
+                &recovery_kit(),
+                &replacements,
+                &ordered,
+                &TestAuthority,
+                RecoveryInstallStop::AfterPlan,
+            ),
+            Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted))
+        );
+        let plan_path = retry_host.creating_path(agent).join(RECOVERY_PLAN_FILE);
+        let exact_plan = fs::read(&plan_path).unwrap();
+        assert_eq!(
+            retry_host.recover_from_encrypted_backups_with_stop(
+                agent,
+                &recovery_kit(),
+                &replacements,
+                &reversed,
+                &TestAuthority,
+                RecoveryInstallStop::AfterStore,
+            ),
+            Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted))
+        );
+        assert_eq!(fs::read(&plan_path).unwrap(), exact_plan);
+        drop(retry_host);
+
+        let mut roots = vec![retry_root];
+        for (position, stop) in [
+            RecoveryInstallStop::AfterDescriptor,
+            RecoveryInstallStop::AfterVerification,
+            RecoveryInstallStop::AfterPublish,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = fixture.directory.child(&format!("union-stop-{position}"));
+            let mut host = PrivateAgentHost::create(
+                &root,
+                fixture.space,
+                fixture.owner,
+                replacement.identity.clone(),
+                replacement.key(),
+            )
+            .unwrap();
+            let sources = if position % 2 == 0 {
+                &ordered[..]
+            } else {
+                &reversed[..]
+            };
+            assert_eq!(
+                host.recover_from_encrypted_backups_with_stop(
+                    agent,
+                    &recovery_kit(),
+                    &replacements,
+                    sources,
+                    &TestAuthority,
+                    stop,
+                ),
+                Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted))
+            );
+            drop(host);
+            roots.push(root);
+        }
+
+        for root in roots {
+            let reopened = PrivateAgentHost::open(
+                &root,
+                fixture.space,
+                fixture.owner,
+                replacement.identity.clone(),
+                replacement.key(),
+                &TestAuthority,
+            )
+            .unwrap();
+            let binding = reopened.binding(agent).unwrap();
+            assert_eq!(binding.epoch, 1);
+            assert_eq!(binding.next_sequence, 2);
+            assert_eq!(
+                reopened
+                    .get_and_decrypt(agent, left_object)
+                    .unwrap()
+                    .as_slice(),
+                b"left-fork-object"
+            );
+            assert_eq!(
+                reopened
+                    .get_and_decrypt(agent, right_object)
+                    .unwrap()
+                    .as_slice(),
+                b"right-fork-object"
+            );
+            let controls = reopened.agents[&agent].store.indexed_controls();
+            assert_eq!(controls.len(), 2);
+            assert_eq!(controls[0].commitment, selected_head);
+            let recovery = PrivateControlRecord::decode(
+                &reopened.agents[&agent]
+                    .store
+                    .read_control_wire(controls.last().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            let PrivateControlOperation::Recover {
+                superseded_heads, ..
+            } = recovery.operation
+            else {
+                panic!("union did not finish with an offline recovery record")
+            };
+            assert_eq!(superseded_heads, expected_heads);
+        }
+    }
+
+    #[test]
+    fn backup_union_rejects_aliases_incompatible_epochs_cross_scope_and_bounds() {
+        let fixture = fixture(2);
+        let mut left = create_host(&fixture, 0, "hostile-union-left");
+        let agent = create_agent(&mut left, &fixture);
+        let base = left
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let mut right = create_host(&fixture, 1, "hostile-union-right");
+        right
+            .restore_encrypted_backup(
+                agent,
+                DurableRecoveryRecipient::from_durable_keystore(
+                    fixture.recovery.verifying_key(),
+                    fixture.recovery_encryption.public_key(),
+                )
+                .unwrap(),
+                &base,
+                &TestAuthority,
+            )
+            .unwrap();
+
+        // Equal semantic object identities with distinct canonical
+        // ciphertexts are equivocation, not a caller-order tie break.
+        let left_alias = left
+            .encrypt_and_put(agent, EncryptedObjectKind::Blob, b"same-semantic-object")
+            .unwrap();
+        let right_alias = right
+            .encrypt_and_put(agent, EncryptedObjectKind::Blob, b"same-semantic-object")
+            .unwrap();
+        assert_eq!(left_alias, right_alias);
+        let left_alias_backup = left
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let right_alias_backup = right
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+
+        let replacement = node(fixture.space, fixture.owner, 112);
+        let replacements = vec![replacement.identity.clone()];
+        let hostile_root = fixture.directory.child("hostile-union-target");
+        let mut hostile = PrivateAgentHost::create(
+            &hostile_root,
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+        )
+        .unwrap();
+        assert_eq!(
+            hostile.recover_from_encrypted_backups(
+                agent,
+                &recovery_kit(),
+                &replacements,
+                &[left_alias_backup.as_slice(), right_alias_backup.as_slice()],
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::Alias)
+        );
+        assert!(!hostile.creating_path(agent).exists());
+        assert_eq!(
+            hostile.recover_from_encrypted_backups(
+                agent,
+                &recovery_kit(),
+                &replacements,
+                &[left_alias_backup.as_slice(), left_alias_backup.as_slice()],
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::Alias)
+        );
+
+        let mut cross_scope = decode_host_archive(&left_alias_backup, true).unwrap();
+        cross_scope.space = SpaceId([0xE1; 32]);
+        let cross_scope =
+            encode_host_archive(&cross_scope, true, MAX_PRIVATE_HOST_ARCHIVE_BYTES).unwrap();
+        assert_eq!(
+            hostile.recover_from_encrypted_backups(
+                agent,
+                &recovery_kit(),
+                &replacements,
+                &[left_alias_backup.as_slice(), cross_scope.as_slice()],
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::InvalidScope)
+        );
+        let too_many = vec![base.as_slice(); MAX_PRIVATE_NODES + 1];
+        assert_eq!(
+            hostile.recover_from_encrypted_backups(
+                agent,
+                &recovery_kit(),
+                &replacements,
+                &too_many,
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::LimitExceeded)
+        );
+        assert!(!hostile.creating_path(agent).exists());
+        drop(hostile);
+
+        // Independent rotations from the same head assign different exact
+        // key material to epoch one. No retained control path can represent
+        // both histories, so the ceremony must reject the fork.
+        left.rotate_keys(agent, &TestAuthority).unwrap();
+        right.rotate_keys(agent, &TestAuthority).unwrap();
+        assert_ne!(
+            left.agents[&agent].store.key_epoch().data_key_commitment,
+            right.agents[&agent].store.key_epoch().data_key_commitment
+        );
+        let left_rotated = left
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let right_rotated = right
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let incompatible_root = fixture.directory.child("incompatible-union-target");
+        let mut incompatible = PrivateAgentHost::create(
+            &incompatible_root,
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+        )
+        .unwrap();
+        assert_eq!(
+            incompatible.recover_from_encrypted_backups(
+                agent,
+                &recovery_kit(),
+                &replacements,
+                &[left_rotated.as_slice(), right_rotated.as_slice()],
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::Store(PrivateStoreError::Diverged))
+        );
+        assert!(!incompatible.creating_path(agent).exists());
+        drop(incompatible);
+
+        // A stale prefix may contribute to the authenticated set, but it
+        // cannot lower either the successor epoch or control sequence.
+        let rollback_root = fixture.directory.child("rollback-union-target");
+        let mut rollback = PrivateAgentHost::create(
+            &rollback_root,
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+        )
+        .unwrap();
+        rollback
+            .recover_from_encrypted_backups(
+                agent,
+                &recovery_kit(),
+                &replacements,
+                &[base.as_slice(), left_rotated.as_slice()],
+                &TestAuthority,
+            )
+            .unwrap();
+        let binding = rollback.binding(agent).unwrap();
+        assert_eq!(binding.epoch, 2);
+        assert_eq!(binding.next_sequence, 2);
+        assert_eq!(
+            rollback
+                .get_and_decrypt(agent, left_alias)
+                .unwrap()
+                .as_slice(),
+            b"same-semantic-object"
+        );
+        drop(rollback);
+        let reopened = PrivateAgentHost::open(
+            &rollback_root,
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(reopened.binding(agent).unwrap().epoch, 2);
+    }
+
+    #[test]
     fn encrypted_backup_recovers_all_epochs_after_total_node_loss_at_every_boundary() {
         let fixture = fixture(2);
         let mut primary = create_host(&fixture, 0, "offline-source");
@@ -4279,11 +4779,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            forged_object_host.recover_from_encrypted_backup(
+            forged_object_host.recover_from_encrypted_backups(
                 agent,
                 &audit_kit,
                 &replacements,
-                &forged_object_backup,
+                &[backup.as_slice(), forged_object_backup.as_slice()],
                 &TestAuthority,
             ),
             Err(PrivateAgentHostError::Crypto(
