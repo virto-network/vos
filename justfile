@@ -33,6 +33,7 @@ build-examples:
     cd examples/actors; cargo +nightly actor -p workflow
     cd examples/actors; cargo +nightly actor -p private-age
     cd examples/actors; cargo +nightly actor -p shared-board
+    cd examples/agent-runtimes/custom-linear; cargo actor
 
 # Build only programs consumed by package/registry integration tests.
 build-registry-fixtures:
@@ -177,6 +178,9 @@ test-examples:
     cd examples/actors; cargo +nightly actor -p workflow
     cd examples/actors; cargo +nightly actor -p private-age
     cd examples/actors; cargo +nightly actor -p shared-board
+    cd services/agent-runtime-guest; cargo test
+    cd examples/agent-runtimes/custom-linear; cargo test
+    cd examples/agent-runtimes/custom-linear; cargo actor
 
 # Run extension tests.
 test-extensions: build-extensions build-workflow-fixture
