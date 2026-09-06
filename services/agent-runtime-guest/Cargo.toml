@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "vos-agent-runtime-guest"
+description = "Portable fail-closed guest entry and conformance boundary for VOS AgentRuntime implementations"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/virto-network/vos"
+
+[dependencies]
+vos-agent-sdk = { path = "../../vos-agent-sdk" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

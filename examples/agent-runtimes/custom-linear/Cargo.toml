@@ -1,0 +1,27 @@
+[workspace]
+
+[package]
+name = "custom-linear-agent-runtime"
+description = "Maintained portable custom VOS AgentRuntime example"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/virto-network/vos"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false }
+vos-agent-runtime-guest = { path = "../../../services/agent-runtime-guest" }
+vos-agent-sdk = { path = "../../../vos-agent-sdk" }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", default-features = false }
+vos = { path = "../../../vos", default-features = false, features = ["std", "pvm"] }
+vos-pvm-compiler = { path = "../../../pvm/compiler" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
