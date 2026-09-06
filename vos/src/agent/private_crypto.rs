@@ -11,7 +11,7 @@ use core::fmt;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use rand_core::{CryptoRng, OsRng, RngCore};
 use sha2::Sha256;
@@ -22,9 +22,10 @@ use vos_agent_sdk::private::{
     EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_CIPHERTEXT_BYTES,
     MAX_PRIVATE_INVITE_HISTORY_EPOCHS, MAX_PRIVATE_NODES,
     MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES, MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS,
-    PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES, PRIVATE_NONCE_BYTES, PrivateControlOperation,
-    PrivateControlRecord, PrivateControlSigner, PrivateInviteHistoryGrant, PrivateKeyEpoch,
-    PrivateNodeIdentity, PrivateRecoveryKeyringGrant, SealedPrivateKey, SealedRecoveryKey,
+    NodeEncryptionEnrollmentVerifier, PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES, PRIVATE_NONCE_BYTES,
+    PrivateControlOperation, PrivateControlRecord, PrivateControlSigner, PrivateInviteHistoryGrant,
+    PrivateKeyEpoch, PrivateNodeIdentity, PrivateRecoveryKeyringGrant, SealedPrivateKey,
+    SealedRecoveryKey,
 };
 use vos_agent_sdk::{AgentId, Hash, NodeId, PrincipalId, SpaceId};
 
@@ -1569,6 +1570,24 @@ pub trait PrivateNodeAuthorityVerifier {
     ) -> bool;
 }
 
+/// Strict host verifier for the transport-key possession half of a system
+/// authority node enrollment. Authority authorization remains a separate
+/// state-machine decision; this verifier proves only that the exact Ed25519
+/// transport key signed the canonical Space/Principal/Node/X25519 tuple.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StrictNodeEncryptionEnrollmentVerifier;
+
+impl NodeEncryptionEnrollmentVerifier for StrictNodeEncryptionEnrollmentVerifier {
+    fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+        VerifyingKey::from_bytes(public_key).is_ok_and(|key| {
+            !key.is_weak()
+                && key
+                    .verify_strict(message, &Signature::from_bytes(signature))
+                    .is_ok()
+        })
+    }
+}
+
 fn validate_authorized_nodes<V: PrivateNodeAuthorityVerifier>(
     space: SpaceId,
     agent: AgentId,
@@ -2330,7 +2349,9 @@ mod tests {
 
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
-    use vos_agent_sdk::private::{MAX_SEALED_KEY_BYTES, PrivateActorLifecycleKind};
+    use vos_agent_sdk::private::{
+        MAX_SEALED_KEY_BYTES, NodeEncryptionEnrollment, PrivateActorLifecycleKind,
+    };
     use vos_agent_sdk::wire::CanonicalWire;
     use vos_agent_sdk::{ActorId, BlobRef};
 
@@ -2371,6 +2392,36 @@ mod tests {
             node.principal == expected_principal
                 && node.authority_binding == Self::binding(space, agent, expected_principal, node)
         }
+    }
+
+    #[test]
+    fn strict_node_enrollment_verifier_rejects_every_signed_field_substitution() {
+        let signing = SigningKey::from_bytes(&[0x41; 32]);
+        let mut enrollment = NodeEncryptionEnrollment::from_keys(
+            SpaceId([0x42; 32]),
+            PrincipalId([0x43; 32]),
+            signing.verifying_key().to_bytes(),
+            [0x44; 32],
+            [0; 64],
+        );
+        enrollment.transport_signature = signing.sign(&enrollment.signing_bytes()).to_bytes();
+        assert!(enrollment.verify_with(&StrictNodeEncryptionEnrollmentVerifier));
+
+        let mut wrong_space = enrollment;
+        wrong_space.space.0[0] ^= 1;
+        assert!(!wrong_space.verify_with(&StrictNodeEncryptionEnrollmentVerifier));
+
+        let mut wrong_principal = enrollment;
+        wrong_principal.principal.0[0] ^= 1;
+        assert!(!wrong_principal.verify_with(&StrictNodeEncryptionEnrollmentVerifier));
+
+        let mut wrong_recipient = enrollment;
+        wrong_recipient.encryption_public_key[0] ^= 1;
+        assert!(!wrong_recipient.verify_with(&StrictNodeEncryptionEnrollmentVerifier));
+
+        let mut wrong_signature = enrollment;
+        wrong_signature.transport_signature[0] ^= 1;
+        assert!(!wrong_signature.verify_with(&StrictNodeEncryptionEnrollmentVerifier));
     }
 
     struct Recipient {
