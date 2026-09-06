@@ -9,6 +9,7 @@
 extern crate alloc;
 
 pub mod authority;
+pub mod authority_operation;
 pub mod catalog;
 pub mod contract;
 pub mod introspection;

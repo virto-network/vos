@@ -686,7 +686,10 @@ fn decode_lane_roots(decoder: &mut Decoder<'_>) -> Result<AuthorityLaneRoots, De
     })
 }
 
-fn encode_authority_selector(encoder: &mut Encoder<'_>, value: &AuthorityReceiptSelector) {
+pub(crate) fn encode_authority_selector(
+    encoder: &mut Encoder<'_>,
+    value: &AuthorityReceiptSelector,
+) {
     encoder.fixed(value.policy.as_bytes());
     encode_authority_issuer(encoder, value.issuer);
     encoder.fixed(value.space.as_bytes());
@@ -711,7 +714,7 @@ fn encode_authority_selector(encoder: &mut Encoder<'_>, value: &AuthorityReceipt
     encoder.fixed(value.request.as_bytes());
 }
 
-fn decode_authority_selector(
+pub(crate) fn decode_authority_selector(
     decoder: &mut Decoder<'_>,
 ) -> Result<AuthorityReceiptSelector, DecodeError> {
     let value = AuthorityReceiptSelector {
@@ -797,14 +800,17 @@ impl CanonicalWire for AuthorityReceipt {
     }
 }
 
-fn encode_authority_actor_target(encoder: &mut Encoder<'_>, value: AuthorityActorTarget) {
+pub(crate) fn encode_authority_actor_target(
+    encoder: &mut Encoder<'_>,
+    value: AuthorityActorTarget,
+) {
     encoder.fixed(value.space.as_bytes());
     encoder.fixed(value.system_agent.as_bytes());
     encoder.fixed(value.system_runtime_deployment.as_bytes());
     encode_agent_authority_binding(encoder, value.binding);
 }
 
-fn decode_authority_actor_target(
+pub(crate) fn decode_authority_actor_target(
     decoder: &mut Decoder<'_>,
 ) -> Result<AuthorityActorTarget, DecodeError> {
     let value = AuthorityActorTarget {
@@ -839,7 +845,7 @@ fn decode_managed_agent_target(
         .ok_or(DecodeError::NonCanonical)
 }
 
-fn encode_credential_caller(
+pub(crate) fn encode_credential_caller(
     encoder: &mut Encoder<'_>,
     principal: PrincipalId,
     credential: CredentialId,
@@ -854,7 +860,7 @@ fn encode_credential_caller(
     });
 }
 
-fn decode_credential_caller(
+pub(crate) fn decode_credential_caller(
     decoder: &mut Decoder<'_>,
 ) -> Result<
     (
@@ -1427,7 +1433,7 @@ impl CanonicalWire for ManagementApplicationAck {
     }
 }
 
-fn encode_catalog_actor_target(encoder: &mut Encoder<'_>, value: CatalogActorTarget) {
+pub(crate) fn encode_catalog_actor_target(encoder: &mut Encoder<'_>, value: CatalogActorTarget) {
     encoder.fixed(value.space.as_bytes());
     encoder.fixed(value.system_agent.as_bytes());
     encoder.fixed(value.system_runtime_deployment.as_bytes());
@@ -1437,7 +1443,7 @@ fn encode_catalog_actor_target(encoder: &mut Encoder<'_>, value: CatalogActorTar
     encode_agent_authority_binding(encoder, value.authority);
 }
 
-fn decode_catalog_actor_target(
+pub(crate) fn decode_catalog_actor_target(
     decoder: &mut Decoder<'_>,
 ) -> Result<CatalogActorTarget, DecodeError> {
     let value = CatalogActorTarget {
@@ -1455,12 +1461,12 @@ fn decode_catalog_actor_target(
         .ok_or(DecodeError::NonCanonical)
 }
 
-fn encode_catalog_alias(encoder: &mut Encoder<'_>, value: &CatalogAlias) {
+pub(crate) fn encode_catalog_alias(encoder: &mut Encoder<'_>, value: &CatalogAlias) {
     encoder.string(&value.namespace);
     encoder.string(&value.name);
 }
 
-fn decode_catalog_alias(decoder: &mut Decoder<'_>) -> Result<CatalogAlias, DecodeError> {
+pub(crate) fn decode_catalog_alias(decoder: &mut Decoder<'_>) -> Result<CatalogAlias, DecodeError> {
     let value = CatalogAlias {
         namespace: decoder.string_bounded(MAX_CATALOG_NAMESPACE_BYTES)?,
         name: decoder.string_bounded(MAX_CATALOG_ALIAS_BYTES)?,
@@ -1471,7 +1477,7 @@ fn decode_catalog_alias(decoder: &mut Decoder<'_>) -> Result<CatalogAlias, Decod
         .ok_or(DecodeError::NonCanonical)
 }
 
-fn encode_catalog_publication(encoder: &mut Encoder<'_>, value: &CatalogPublication) {
+pub(crate) fn encode_catalog_publication(encoder: &mut Encoder<'_>, value: &CatalogPublication) {
     encode_agent_identity(encoder, &value.identity);
     encoder.fixed(value.actor.as_bytes());
     encoder.fixed(value.actor_deployment.as_bytes());
@@ -1480,7 +1486,7 @@ fn encode_catalog_publication(encoder: &mut Encoder<'_>, value: &CatalogPublicat
     encode_blob(encoder, &value.content);
 }
 
-fn decode_catalog_publication(
+pub(crate) fn decode_catalog_publication(
     decoder: &mut Decoder<'_>,
 ) -> Result<CatalogPublication, DecodeError> {
     let value = CatalogPublication {
@@ -1497,11 +1503,11 @@ fn decode_catalog_publication(
         .ok_or(DecodeError::NonCanonical)
 }
 
-fn encode_catalog_mutation_kind(encoder: &mut Encoder<'_>, value: CatalogMutationKind) {
+pub(crate) fn encode_catalog_mutation_kind(encoder: &mut Encoder<'_>, value: CatalogMutationKind) {
     encoder.u8(value as u8);
 }
 
-fn decode_catalog_mutation_kind(
+pub(crate) fn decode_catalog_mutation_kind(
     decoder: &mut Decoder<'_>,
 ) -> Result<CatalogMutationKind, DecodeError> {
     match decoder.u8()? {
@@ -2157,7 +2163,7 @@ fn decode_runtime_state(decoder: &mut Decoder<'_>) -> Result<RuntimeState, Decod
         .ok_or(DecodeError::LimitExceeded)
 }
 
-fn encode_origin(encoder: &mut Encoder<'_>, value: InvocationOrigin) {
+pub(crate) fn encode_origin(encoder: &mut Encoder<'_>, value: InvocationOrigin) {
     encoder.option(&value.principal, |encoder, value| {
         encoder.fixed(value.as_bytes())
     });
@@ -2175,7 +2181,7 @@ fn encode_origin(encoder: &mut Encoder<'_>, value: InvocationOrigin) {
     });
 }
 
-fn decode_origin(decoder: &mut Decoder<'_>) -> Result<InvocationOrigin, DecodeError> {
+pub(crate) fn decode_origin(decoder: &mut Decoder<'_>) -> Result<InvocationOrigin, DecodeError> {
     let value = InvocationOrigin {
         principal: decoder.option(|decoder| Ok(PrincipalId(decoder.fixed()?)))?,
         transport_node: decoder.option(|decoder| Ok(NodeId(decoder.fixed()?)))?,
@@ -2189,7 +2195,7 @@ fn decode_origin(decoder: &mut Decoder<'_>) -> Result<InvocationOrigin, DecodeEr
         .ok_or(DecodeError::NonCanonical)
 }
 
-fn encode_invocation_roles(encoder: &mut Encoder<'_>, value: InvocationRoleClaims) {
+pub(crate) fn encode_invocation_roles(encoder: &mut Encoder<'_>, value: InvocationRoleClaims) {
     encoder.option(&value.space, |encoder, value| {
         encoder.fixed(value.as_bytes())
     });
@@ -2198,7 +2204,7 @@ fn encode_invocation_roles(encoder: &mut Encoder<'_>, value: InvocationRoleClaim
     });
 }
 
-fn decode_invocation_roles(
+pub(crate) fn decode_invocation_roles(
     decoder: &mut Decoder<'_>,
     origin: InvocationOrigin,
 ) -> Result<InvocationRoleClaims, DecodeError> {
@@ -3167,7 +3173,7 @@ pub const MAX_PRIVATE_CONTROL_WIRE_BYTES: usize = HEADER_BYTES
 pub const MAX_PRIVATE_OBJECT_WIRE_BYTES: usize =
     HEADER_BYTES + 32 + 32 + 8 + 1 + 32 + PRIVATE_NONCE_BYTES + 4 + MAX_PRIVATE_CIPHERTEXT_BYTES;
 
-fn encode_private_node(encoder: &mut Encoder<'_>, value: &PrivateNodeIdentity) {
+pub(crate) fn encode_private_node(encoder: &mut Encoder<'_>, value: &PrivateNodeIdentity) {
     encoder.fixed(value.node.as_bytes());
     encoder.fixed(value.principal.as_bytes());
     encoder.bytes(&value.transport_identity);
@@ -3292,7 +3298,7 @@ fn decode_sealed_recovery_key(decoder: &mut Decoder<'_>) -> Result<SealedRecover
         .ok_or(DecodeError::NonCanonical)
 }
 
-fn encode_private_epoch(encoder: &mut Encoder<'_>, value: &PrivateKeyEpoch) {
+pub(crate) fn encode_private_epoch(encoder: &mut Encoder<'_>, value: &PrivateKeyEpoch) {
     encoder.fixed(value.space.as_bytes());
     encoder.fixed(value.agent.as_bytes());
     encoder.u64(value.epoch);
@@ -3411,7 +3417,7 @@ impl CanonicalWire for EncryptedPrivateObject {
     }
 }
 
-fn encode_private_recovery_keyring_grant(
+pub(crate) fn encode_private_recovery_keyring_grant(
     encoder: &mut Encoder<'_>,
     value: &PrivateRecoveryKeyringGrant,
 ) {
