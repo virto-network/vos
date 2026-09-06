@@ -69,6 +69,25 @@ pub struct IssuedAuthorityOperation {
     pub issuance_ack: AuthorityOperationIssuanceAck,
 }
 
+/// Exact durable issuer material reopened by the trusted actor coordinator.
+///
+/// This stays crate-private: an AOP1 is unsigned actor output and must never
+/// become a public capability for reaching the authority signer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetainedAuthorityOperation {
+    pub(crate) call: AuthorityOperationCall,
+    pub(crate) approval: AuthorityOperationApproval,
+    pub(crate) issued_at: u64,
+    pub(crate) receipt: Option<AuthorityReceipt>,
+    pub(crate) issuance_ack: Option<AuthorityOperationIssuanceAck>,
+}
+
+impl RetainedAuthorityOperation {
+    pub(crate) const fn is_complete(&self) -> bool {
+        self.issuance_ack.is_some()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthorityOperationIssuerRejection {
     Poisoned,
@@ -379,6 +398,45 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
 
     pub fn into_store(self) -> B {
         self.store
+    }
+
+    /// Reopen exact retained preimages before a coordinator considers calling
+    /// the authority actor again. In particular, a completed record must
+    /// drive an AOI1 retry directly because the actor intentionally cannot
+    /// reconstruct AOP1 after consuming that acknowledgement.
+    pub(crate) fn recover_retained(
+        &self,
+        authorization_invocation: InvocationId,
+    ) -> Result<Option<RetainedAuthorityOperation>, AuthorityOperationIssuerError<B::Error>> {
+        let Some(record) = self.image.records.iter().find(|record| {
+            AuthorityOperationCall::decode(&record.call)
+                .is_ok_and(|call| call.invocation == authorization_invocation)
+        }) else {
+            return Ok(None);
+        };
+        let call = AuthorityOperationCall::decode(&record.call)
+            .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
+        let approval = AuthorityOperationApproval::decode(&record.approval)
+            .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
+        let receipt = record
+            .receipt
+            .as_ref()
+            .map(|bytes| AuthorityReceipt::decode(bytes))
+            .transpose()
+            .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
+        let issuance_ack = record
+            .issuance_ack
+            .as_ref()
+            .map(|bytes| AuthorityOperationIssuanceAck::decode(bytes))
+            .transpose()
+            .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
+        Ok(Some(RetainedAuthorityOperation {
+            call,
+            approval,
+            issued_at: record.issued_at,
+            receipt,
+            issuance_ack,
+        }))
     }
 
     /// Issue and retain exact receipt evidence for one actor-approved call.

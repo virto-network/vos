@@ -19,6 +19,8 @@ pub mod sdk {
 }
 pub mod authority;
 #[cfg(feature = "std")]
+pub mod authority_operation_coordinator;
+#[cfg(feature = "std")]
 pub mod authority_operation_issuer;
 pub mod bootstrap;
 pub mod catalog_finality;
