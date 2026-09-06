@@ -5,6 +5,8 @@
 //! accepting those older wire generations. A call authenticates the complete
 //! requested intent with a credential signature; an approval materializes the
 //! exact selector which an authority signer may turn into an [`AuthorityReceipt`].
+//! AOI1 proves only durable receipt issuance; the separate PCA1 protocol proves
+//! that a Private runtime later applied and reopened an exact PCTL control.
 
 use alloc::vec::Vec;
 use core::num::NonZeroU64;
@@ -41,6 +43,10 @@ pub const MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES: usize = 4 * 1024;
 /// AOI1 contains one complete receipt and fixed-size retained-preimage
 /// commitments; it never embeds the AOC1 or AOP1 bytes themselves.
 pub const MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES: usize = 4 * 1024;
+/// PCA1 is a fixed-size acknowledgement of one durably reopened Private
+/// control application. It carries commitments and the resulting projection,
+/// never the variable-size PCTL ciphertext or Node list.
+pub const MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES: usize = 4 * 1024;
 
 /// Typed non-management authority intent.
 ///
@@ -471,7 +477,9 @@ fn private_node_identity_commitment(node: &PrivateNodeIdentity) -> Hash {
     Hash::digest(b"vos/agent/authority-private-node/v1", &[&bytes])
 }
 
-fn private_member_set_commitment(nodes: impl Iterator<Item = NodeId>) -> Option<Hash> {
+/// Commit one canonically sorted, unique, nonempty post-application Private
+/// Node set without embedding that list in AOC1 or PCA1.
+pub fn private_member_set_commitment(nodes: impl Iterator<Item = NodeId>) -> Option<Hash> {
     let nodes: Vec<NodeId> = nodes.collect();
     if nodes.is_empty()
         || nodes.len() > MAX_PRIVATE_NODES
@@ -979,6 +987,387 @@ impl AuthorityOperationIssuanceAck {
     }
 }
 
+/// Fixed-size observation produced only after a Private runtime has durably
+/// reopened one applied PCTL control.
+///
+/// The complete Node list, transport identities, and sealed grants remain in
+/// the Private control protocol. This projection carries only the exact
+/// resulting policy commitments needed by the authority actor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateControlApplicationFact {
+    pub managed: ManagedAgentTarget,
+    pub operation: AuthorityOperationKind,
+    pub control: Hash,
+    pub control_sequence: u64,
+    pub control_previous: Option<Hash>,
+    pub epoch: u64,
+    pub post_member_set: Hash,
+    /// Commitment of the complete durably reopened Private control state.
+    pub reopened_control_state: Hash,
+    /// Exact reopened control head. A valid application makes the authorized
+    /// PCTL control the new head, so this must equal `control`.
+    pub reopened_control_head: Hash,
+    pub applied_at: u64,
+}
+
+impl PrivateControlApplicationFact {
+    pub fn validate_shape(&self) -> Result<(), AuthorityOperationProtocolError> {
+        let valid_position = match self.operation {
+            AuthorityOperationKind::InvitePrivateNode
+            | AuthorityOperationKind::RevokePrivateNode => {
+                valid_owner_control_position(self.control_sequence, self.control_previous)
+            }
+            AuthorityOperationKind::RecoverPrivateAgent => {
+                valid_recovery_control_position(self.control_sequence, self.control_previous)
+            }
+            _ => false,
+        };
+        if !self.managed.is_valid()
+            || self.control == Hash::ZERO
+            || self.post_member_set == Hash::ZERO
+            || self.reopened_control_state == Hash::ZERO
+            || self.reopened_control_head != self.control
+            || !valid_position
+        {
+            return Err(AuthorityOperationProtocolError::InvalidApplication);
+        }
+        Ok(())
+    }
+
+    pub fn commitment(&self) -> Hash {
+        private_control_application_fact_commitment(self)
+    }
+
+    fn matches_intent(&self, intent: &AuthorityOperationIntent) -> bool {
+        if self.validate_shape().is_err() {
+            return false;
+        }
+        match intent {
+            AuthorityOperationIntent::InvitePrivateNode {
+                managed,
+                control,
+                control_sequence,
+                control_previous,
+                epoch,
+                ..
+            } => {
+                self.managed == *managed
+                    && self.operation == AuthorityOperationKind::InvitePrivateNode
+                    && self.control == *control
+                    && self.control_sequence == *control_sequence
+                    && self.control_previous == *control_previous
+                    && self.epoch == *epoch
+            }
+            AuthorityOperationIntent::RevokePrivateNode {
+                managed,
+                control,
+                control_sequence,
+                control_previous,
+                epoch,
+                member_set,
+                ..
+            } => {
+                self.managed == *managed
+                    && self.operation == AuthorityOperationKind::RevokePrivateNode
+                    && self.control == *control
+                    && self.control_sequence == *control_sequence
+                    && self.control_previous == *control_previous
+                    && self.epoch == *epoch
+                    && self.post_member_set == *member_set
+            }
+            AuthorityOperationIntent::RecoverPrivateAgent {
+                managed,
+                control,
+                control_sequence,
+                control_previous,
+                epoch,
+                member_set,
+                ..
+            } => {
+                self.managed == *managed
+                    && self.operation == AuthorityOperationKind::RecoverPrivateAgent
+                    && self.control == *control
+                    && self.control_sequence == *control_sequence
+                    && self.control_previous == *control_previous
+                    && self.epoch == *epoch
+                    && self.post_member_set == *member_set
+            }
+            AuthorityOperationIntent::InvokeActor { .. }
+            | AuthorityOperationIntent::Catalog { .. } => false,
+        }
+    }
+}
+
+/// Authority-signed proof that one exact Private control was durably applied
+/// and reopened after its non-management receipt had been issued.
+///
+/// PCA1 is distinct from AOI1: issuance alone never proves application. Its
+/// three invocation IDs reserve independent exact-retry domains for AOC1,
+/// AOI1, and PCA1. The AOC1/AOP1 commitments are repeated for auditability;
+/// the invocation pair, authorization sequence, and AOI1 commitment are also
+/// sufficient to match an issuance tombstone after those preimages retire.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateControlApplicationAck {
+    pub authorization_invocation: InvocationId,
+    pub issuance_invocation: InvocationId,
+    pub application_invocation: InvocationId,
+    pub authority: AuthorityActorTarget,
+    pub operation_call: Hash,
+    pub approval: Hash,
+    pub issuance_ack: Hash,
+    pub authorization_sequence: NonZeroU64,
+    pub receipt: AuthorityReceipt,
+    /// Exact AOI1 issuance slot, repeated under the PCA1 signature so a PCA1
+    /// reopened after AOI1 compaction still proves application ordering.
+    pub issued_at: u64,
+    pub application: PrivateControlApplicationFact,
+    pub signature: [u8; crate::authority::AUTHORITY_SIGNATURE_BYTES],
+}
+
+impl PrivateControlApplicationAck {
+    /// Derive PCA1's third invocation from the exact verified AOI1.
+    pub fn derive_application_invocation(issuance: &AuthorityOperationIssuanceAck) -> InvocationId {
+        Self::derive_application_invocation_from_issuance(
+            issuance.authority,
+            issuance.authorization_invocation,
+            issuance.acknowledgement_invocation,
+            issuance.authorization_sequence,
+            issuance.commitment(),
+        )
+    }
+
+    /// Derive the PCA1 invocation from the fixed-size AOI1 tombstone tuple.
+    /// Callers must authenticate that tuple from durable authority state; this
+    /// deterministic helper does not make ambient values trustworthy.
+    pub fn derive_application_invocation_from_issuance(
+        authority: AuthorityActorTarget,
+        authorization_invocation: InvocationId,
+        issuance_invocation: InvocationId,
+        authorization_sequence: NonZeroU64,
+        issuance_ack: Hash,
+    ) -> InvocationId {
+        private_control_application_invocation(
+            authority,
+            authorization_invocation,
+            issuance_invocation,
+            authorization_sequence,
+            issuance_ack,
+        )
+    }
+
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        private_control_application_ack_signing_bytes(self)
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            b"vos/agent/private-control-application-ack/v1",
+            &[&self.signing_bytes(), &self.signature],
+        )
+    }
+
+    pub fn validate_shape(&self) -> Result<(), AuthorityOperationProtocolError> {
+        if self.authorization_invocation == InvocationId::ZERO
+            || self.issuance_invocation == InvocationId::ZERO
+            || self.application_invocation == InvocationId::ZERO
+            || self.authorization_invocation == self.issuance_invocation
+            || self.authorization_invocation == self.application_invocation
+            || self.issuance_invocation == self.application_invocation
+            || !self.authority.is_valid()
+            || self.authority.space != self.application.managed.space
+        {
+            return Err(AuthorityOperationProtocolError::InvalidTarget);
+        }
+        if self.operation_call == Hash::ZERO
+            || self.approval == Hash::ZERO
+            || self.issuance_ack == Hash::ZERO
+            || self.signature == [0; crate::authority::AUTHORITY_SIGNATURE_BYTES]
+            || self.issued_at > self.application.applied_at
+            || self.application.validate_shape().is_err()
+        {
+            return Err(AuthorityOperationProtocolError::InvalidApplication);
+        }
+        if self.application_invocation
+            != Self::derive_application_invocation_from_issuance(
+                self.authority,
+                self.authorization_invocation,
+                self.issuance_invocation,
+                self.authorization_sequence,
+                self.issuance_ack,
+            )
+        {
+            return Err(AuthorityOperationProtocolError::InvalidTarget);
+        }
+        let selector = &self.receipt.selector;
+        if self.receipt.validate_shape().is_err()
+            || !self.authority.binding.accepts(&self.receipt)
+            || selector.space != self.application.managed.space
+            || selector.agent != self.application.managed.agent
+            || selector.runtime_deployment != self.application.managed.runtime_deployment
+            || selector.operation != self.application.operation
+            || selector.operation.uses_management_decision_journal()
+            || selector.decision_sequence != 0
+            || selector.acknowledged_through != 0
+            || selector.request != self.application.control
+            || !selector.is_live_at(self.issued_at)
+            || !selector.is_live_at(self.application.applied_at)
+        {
+            return Err(AuthorityOperationProtocolError::InvalidApplication);
+        }
+        if private_control_application_ack_encoded_len(self)
+            > MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES
+        {
+            return Err(AuthorityOperationProtocolError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    /// Verify the receipt and PCA1 signature with an independently selected
+    /// authority binding. The encoded target is never its own trust anchor.
+    pub fn verify_with<V: AuthorityVerifier>(
+        &self,
+        authority: crate::authority::AgentAuthorityBinding,
+        verifier: &V,
+    ) -> Result<(), AuthorityOperationProtocolError> {
+        self.validate_shape()?;
+        if authority != self.authority.binding || !authority.accepts(&self.receipt) {
+            return Err(AuthorityOperationProtocolError::InvalidApplication);
+        }
+        self.receipt
+            .verify_at(self.issued_at, verifier)
+            .map_err(|_| AuthorityOperationProtocolError::InvalidSignature)?;
+        self.receipt
+            .verify_at(self.application.applied_at, verifier)
+            .map_err(|_| AuthorityOperationProtocolError::InvalidSignature)?;
+        if !verifier.verify(
+            &authority.public_key,
+            &self.signing_bytes(),
+            &self.signature,
+        ) {
+            return Err(AuthorityOperationProtocolError::InvalidSignature);
+        }
+        Ok(())
+    }
+
+    /// Match all retained AOC1/AOP1/AOI1 preimages and the exact runtime
+    /// application observation. Verification remains a separate explicit step.
+    pub fn matches_pending(
+        &self,
+        call: &AuthorityOperationCall,
+        approval: &AuthorityOperationApproval,
+        issuance: &AuthorityOperationIssuanceAck,
+        application: &PrivateControlApplicationFact,
+    ) -> bool {
+        self.validate_shape().is_ok()
+            && issuance.matches_pending(call, approval)
+            && application.matches_intent(&call.intent)
+            && self.application == *application
+            && self.authorization_invocation == call.invocation
+            && self.authorization_invocation == approval.invocation
+            && self.authorization_invocation == issuance.authorization_invocation
+            && self.issuance_invocation == approval.acknowledgement_invocation
+            && self.issuance_invocation == issuance.acknowledgement_invocation
+            && self.application_invocation == Self::derive_application_invocation(issuance)
+            && self.authority == call.authority
+            && self.authority == approval.authority
+            && self.authority == issuance.authority
+            && self.operation_call == call.commitment()
+            && self.operation_call == approval.operation_call
+            && self.operation_call == issuance.operation_call
+            && self.approval == approval.commitment()
+            && self.approval == issuance.approval
+            && self.issuance_ack == issuance.commitment()
+            && self.authorization_sequence == approval.authorization_sequence
+            && self.authorization_sequence == issuance.authorization_sequence
+            && self.receipt == issuance.receipt
+            && self.issued_at == issuance.issued_at
+            && self.application.applied_at >= issuance.issued_at
+    }
+
+    /// Verify the complete pending chain, including both authority signatures
+    /// and the receipt at issuance and application time.
+    pub fn verify_pending_with<V: AuthorityVerifier>(
+        &self,
+        call: &AuthorityOperationCall,
+        approval: &AuthorityOperationApproval,
+        issuance: &AuthorityOperationIssuanceAck,
+        application: &PrivateControlApplicationFact,
+        authority: crate::authority::AgentAuthorityBinding,
+        verifier: &V,
+    ) -> Result<(), AuthorityOperationProtocolError> {
+        if !self.matches_pending(call, approval, issuance, application) {
+            return Err(AuthorityOperationProtocolError::MismatchedApplication);
+        }
+        issuance.verify_with(authority, verifier)?;
+        self.verify_with(authority, verifier)
+    }
+
+    /// Match the compact issuance tuple retained after AOC1/AOP1/AOI1
+    /// preimages have retired. The PCA1 signature still must be independently
+    /// verified; this method deliberately does not reconstruct discarded data.
+    pub fn matches_issuance_tombstone(
+        &self,
+        authority: AuthorityActorTarget,
+        authorization_invocation: InvocationId,
+        issuance_invocation: InvocationId,
+        authorization_sequence: NonZeroU64,
+        issuance_ack: Hash,
+    ) -> bool {
+        self.validate_shape().is_ok()
+            && self.authority == authority
+            && self.authorization_invocation == authorization_invocation
+            && self.issuance_invocation == issuance_invocation
+            && self.authorization_sequence == authorization_sequence
+            && self.issuance_ack == issuance_ack
+            && self.application_invocation
+                == Self::derive_application_invocation_from_issuance(
+                    authority,
+                    authorization_invocation,
+                    issuance_invocation,
+                    authorization_sequence,
+                    issuance_ack,
+                )
+    }
+
+    /// Verify a PCA1 after issuance preimages have compacted, using the exact
+    /// authenticated tombstone tuple and an independently selected binding.
+    pub fn verify_issuance_tombstone_with<V: AuthorityVerifier>(
+        &self,
+        authority: AuthorityActorTarget,
+        authorization_invocation: InvocationId,
+        issuance_invocation: InvocationId,
+        authorization_sequence: NonZeroU64,
+        issuance_ack: Hash,
+        verifier: &V,
+    ) -> Result<(), AuthorityOperationProtocolError> {
+        if !self.matches_issuance_tombstone(
+            authority,
+            authorization_invocation,
+            issuance_invocation,
+            authorization_sequence,
+            issuance_ack,
+        ) {
+            return Err(AuthorityOperationProtocolError::MismatchedApplication);
+        }
+        self.verify_with(authority.binding, verifier)
+    }
+
+    /// Bind PCA1 to its third exact Linear authority-actor invocation. As with
+    /// AOI1, relay identity is not authority; the signature authenticates the
+    /// message and the observed slot must equal the signed application slot.
+    pub fn matches_invocation_context(&self, context: &InvocationContext) -> bool {
+        self.validate_shape().is_ok()
+            && context.validate()
+            && context.invocation == self.application_invocation
+            && context.actor == self.authority.binding.issuer.actor
+            && context.mode == MethodMode::Linear
+            && context.observed_slot == self.application.applied_at
+            && context.origin.actor.is_none()
+            && context.origin.capability.is_none()
+            && context.roles == InvocationRoleClaims::none()
+    }
+}
+
 /// Verified issuance evidence for exactly one authorization sequence.
 /// Fields are private so callers cannot manufacture a retirement capability
 /// without reopening the retained AOC1/AOP1 and verifying AOI1.
@@ -1082,9 +1471,11 @@ pub enum AuthorityOperationProtocolError {
     InvalidSignature,
     InvalidApproval,
     InvalidAcknowledgement,
+    InvalidApplication,
     LimitExceeded,
     MismatchedCall,
     MismatchedAcknowledgement,
+    MismatchedApplication,
     NonContiguousRetirement,
 }
 
@@ -1541,6 +1932,172 @@ impl CanonicalWire for AuthorityOperationIssuanceAck {
     }
 }
 
+fn encode_private_control_operation(encoder: &mut Encoder<'_>, operation: AuthorityOperationKind) {
+    encoder.u8(operation as u8);
+}
+
+fn decode_private_control_operation(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityOperationKind, DecodeError> {
+    match decoder.u8()? {
+        value if value == AuthorityOperationKind::InvitePrivateNode as u8 => {
+            Ok(AuthorityOperationKind::InvitePrivateNode)
+        }
+        value if value == AuthorityOperationKind::RevokePrivateNode as u8 => {
+            Ok(AuthorityOperationKind::RevokePrivateNode)
+        }
+        value if value == AuthorityOperationKind::RecoverPrivateAgent as u8 => {
+            Ok(AuthorityOperationKind::RecoverPrivateAgent)
+        }
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn encode_private_control_application_fact(
+    encoder: &mut Encoder<'_>,
+    value: &PrivateControlApplicationFact,
+) {
+    encode_managed(encoder, value.managed);
+    encode_private_control_operation(encoder, value.operation);
+    encoder.fixed(value.control.as_bytes());
+    encoder.u64(value.control_sequence);
+    encoder.option(&value.control_previous, |encoder, previous| {
+        encoder.fixed(previous.as_bytes());
+    });
+    encoder.u64(value.epoch);
+    encoder.fixed(value.post_member_set.as_bytes());
+    encoder.fixed(value.reopened_control_state.as_bytes());
+    encoder.fixed(value.reopened_control_head.as_bytes());
+    encoder.u64(value.applied_at);
+}
+
+fn decode_private_control_application_fact(
+    decoder: &mut Decoder<'_>,
+) -> Result<PrivateControlApplicationFact, DecodeError> {
+    let value = PrivateControlApplicationFact {
+        managed: decode_managed(decoder)?,
+        operation: decode_private_control_operation(decoder)?,
+        control: Hash(decoder.fixed()?),
+        control_sequence: decoder.u64()?,
+        control_previous: decoder.option(|decoder| Ok(Hash(decoder.fixed()?)))?,
+        epoch: decoder.u64()?,
+        post_member_set: Hash(decoder.fixed()?),
+        reopened_control_state: Hash(decoder.fixed()?),
+        reopened_control_head: Hash(decoder.fixed()?),
+        applied_at: decoder.u64()?,
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn private_control_application_fact_commitment(value: &PrivateControlApplicationFact) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"PCAF");
+    bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
+    encode_private_control_application_fact(&mut Encoder(&mut bytes), value);
+    Hash::digest(b"vos/agent/private-control-application-fact/v1", &[&bytes])
+}
+
+fn private_control_application_invocation(
+    authority: AuthorityActorTarget,
+    authorization_invocation: InvocationId,
+    issuance_invocation: InvocationId,
+    authorization_sequence: NonZeroU64,
+    issuance_ack: Hash,
+) -> InvocationId {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"PCAI");
+    bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
+    crate::wire::encode_authority_actor_target(&mut Encoder(&mut bytes), authority);
+    bytes.extend_from_slice(authorization_invocation.as_bytes());
+    bytes.extend_from_slice(issuance_invocation.as_bytes());
+    bytes.extend_from_slice(&authorization_sequence.get().to_le_bytes());
+    bytes.extend_from_slice(issuance_ack.as_bytes());
+    InvocationId(
+        Hash::digest(
+            b"vos/agent/private-control-application-invocation/v1",
+            &[&bytes],
+        )
+        .0,
+    )
+}
+
+fn encode_private_control_application_ack_unsigned(
+    encoder: &mut Encoder<'_>,
+    value: &PrivateControlApplicationAck,
+) {
+    encoder.fixed(value.authorization_invocation.as_bytes());
+    encoder.fixed(value.issuance_invocation.as_bytes());
+    encoder.fixed(value.application_invocation.as_bytes());
+    crate::wire::encode_authority_actor_target(encoder, value.authority);
+    encoder.fixed(value.operation_call.as_bytes());
+    encoder.fixed(value.approval.as_bytes());
+    encoder.fixed(value.issuance_ack.as_bytes());
+    encoder.u64(value.authorization_sequence.get());
+    crate::wire::encode_authority_receipt_body(encoder, &value.receipt);
+    encoder.u64(value.issued_at);
+    encode_private_control_application_fact(encoder, &value.application);
+}
+
+fn private_control_application_ack_signing_bytes(value: &PrivateControlApplicationAck) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"PCAS");
+    bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
+    encode_private_control_application_ack_unsigned(&mut Encoder(&mut bytes), value);
+    bytes
+}
+
+fn private_control_application_ack_encoded_len(value: &PrivateControlApplicationAck) -> usize {
+    let mut body = Vec::new();
+    encode_private_control_application_ack_unsigned(&mut Encoder(&mut body), value);
+    HEADER_BYTES
+        .saturating_add(body.len())
+        .saturating_add(crate::authority::AUTHORITY_SIGNATURE_BYTES)
+}
+
+impl CanonicalWire for PrivateControlApplicationAck {
+    const MAGIC: [u8; 4] = *b"PCA1";
+    const MAX_ENCODED_BYTES: usize = MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_private_control_application_ack_unsigned(encoder, self);
+        encoder.0.extend_from_slice(&self.signature);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            authorization_invocation: InvocationId(decoder.fixed()?),
+            issuance_invocation: InvocationId(decoder.fixed()?),
+            application_invocation: InvocationId(decoder.fixed()?),
+            authority: crate::wire::decode_authority_actor_target(decoder)?,
+            operation_call: Hash(decoder.fixed()?),
+            approval: Hash(decoder.fixed()?),
+            issuance_ack: Hash(decoder.fixed()?),
+            authorization_sequence: NonZeroU64::new(decoder.u64()?)
+                .ok_or(DecodeError::NonCanonical)?,
+            receipt: crate::wire::decode_authority_receipt_body(decoder)?,
+            issued_at: decoder.u64()?,
+            application: decode_private_control_application_fact(decoder)?,
+            signature: decoder
+                .take(crate::authority::AUTHORITY_SIGNATURE_BYTES)?
+                .try_into()
+                .map_err(|_| DecodeError::Truncated)?,
+        };
+        value
+            .validate_shape()
+            .is_ok()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::string::ToString;
@@ -1914,6 +2471,106 @@ mod tests {
         [invite, revoke, recover]
     }
 
+    fn private_call(control: &PrivateControlRecord, discriminator: u8) -> AuthorityOperationCall {
+        call_with_intent(
+            AuthorityOperationIntent::private_control(DeploymentId([0x79; 32]), control).unwrap(),
+            discriminator,
+        )
+    }
+
+    fn private_application_fact(call: &AuthorityOperationCall) -> PrivateControlApplicationFact {
+        let (control, control_sequence, control_previous, epoch, post_member_set) =
+            match &call.intent {
+                AuthorityOperationIntent::InvitePrivateNode {
+                    control,
+                    control_sequence,
+                    control_previous,
+                    epoch,
+                    node,
+                    ..
+                } => (
+                    *control,
+                    *control_sequence,
+                    *control_previous,
+                    *epoch,
+                    private_member_set_commitment(core::iter::once(*node)).unwrap(),
+                ),
+                AuthorityOperationIntent::RevokePrivateNode {
+                    control,
+                    control_sequence,
+                    control_previous,
+                    epoch,
+                    member_set,
+                    ..
+                }
+                | AuthorityOperationIntent::RecoverPrivateAgent {
+                    control,
+                    control_sequence,
+                    control_previous,
+                    epoch,
+                    member_set,
+                    ..
+                } => (
+                    *control,
+                    *control_sequence,
+                    *control_previous,
+                    *epoch,
+                    *member_set,
+                ),
+                AuthorityOperationIntent::InvokeActor { .. }
+                | AuthorityOperationIntent::Catalog { .. } => unreachable!(),
+            };
+        let value = PrivateControlApplicationFact {
+            managed: call.intent.managed(),
+            operation: call.intent.operation(),
+            control,
+            control_sequence,
+            control_previous,
+            epoch,
+            post_member_set,
+            reopened_control_state: Hash([0x7b; 32]),
+            reopened_control_head: control,
+            applied_at: 24,
+        };
+        value.validate_shape().unwrap();
+        assert!(value.matches_intent(&call.intent));
+        value
+    }
+
+    fn private_application_ack(
+        call: &AuthorityOperationCall,
+        approved: &AuthorityOperationApproval,
+        issuance: &AuthorityOperationIssuanceAck,
+        application: PrivateControlApplicationFact,
+    ) -> PrivateControlApplicationAck {
+        let mut acknowledgement = PrivateControlApplicationAck {
+            authorization_invocation: call.invocation,
+            issuance_invocation: issuance.acknowledgement_invocation,
+            application_invocation: PrivateControlApplicationAck::derive_application_invocation(
+                issuance,
+            ),
+            authority: call.authority,
+            operation_call: call.commitment(),
+            approval: approved.commitment(),
+            issuance_ack: issuance.commitment(),
+            authorization_sequence: approved.authorization_sequence,
+            receipt: issuance.receipt.clone(),
+            issued_at: issuance.issued_at,
+            application,
+            signature: [0; AUTHORITY_SIGNATURE_BYTES],
+        };
+        resign_private_application_ack(&mut acknowledgement);
+        acknowledgement.validate_shape().unwrap();
+        acknowledgement
+    }
+
+    fn resign_private_application_ack(acknowledgement: &mut PrivateControlApplicationAck) {
+        acknowledgement.signature = test_signature(
+            &acknowledgement.authority.binding.public_key,
+            &acknowledgement.signing_bytes(),
+        );
+    }
+
     #[test]
     fn aoc1_aop1_and_aoi1_are_distinct_bounded_canonical_golden_wires() {
         let call = invoke_call();
@@ -1964,6 +2621,333 @@ mod tests {
                 166, 118, 110, 208, 66, 167, 129, 42, 163, 111, 141, 240, 34, 51,
             ]
         );
+    }
+
+    #[test]
+    fn pca1_is_a_distinct_canonical_tombstone_checkable_application_proof() {
+        let controls = private_controls();
+        let call = private_call(&controls[0], 0x7c);
+        let approved = approval_with_sequence(&call, 8);
+        let issuance = issuance_ack(&call, &approved);
+        let application = private_application_fact(&call);
+        let acknowledgement = private_application_ack(&call, &approved, &issuance, application);
+
+        let encoded = acknowledgement.encode().unwrap();
+        assert_eq!(encoded.get(..4), Some(b"PCA1".as_slice()));
+        assert!(encoded.len() <= MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES);
+        assert_eq!(
+            PrivateControlApplicationAck::decode(&encoded),
+            Ok(acknowledgement.clone())
+        );
+        assert_eq!(
+            Hash::digest(b"vos/test/pca1-golden", &[&encoded]).0,
+            [
+                67, 129, 104, 146, 125, 202, 138, 18, 242, 53, 99, 44, 150, 149, 120, 140, 161,
+                185, 56, 160, 145, 90, 93, 148, 100, 0, 92, 210, 223, 180, 132, 152,
+            ]
+        );
+        assert_ne!(application.commitment(), Hash::ZERO);
+        assert_ne!(acknowledgement.commitment(), issuance.commitment());
+        assert_ne!(
+            acknowledgement.authorization_invocation,
+            acknowledgement.issuance_invocation
+        );
+        assert_ne!(
+            acknowledgement.authorization_invocation,
+            acknowledgement.application_invocation
+        );
+        assert_ne!(
+            acknowledgement.issuance_invocation,
+            acknowledgement.application_invocation
+        );
+        assert_eq!(
+            acknowledgement.application_invocation,
+            PrivateControlApplicationAck::derive_application_invocation_from_issuance(
+                issuance.authority,
+                issuance.authorization_invocation,
+                issuance.acknowledgement_invocation,
+                issuance.authorization_sequence,
+                issuance.commitment(),
+            )
+        );
+        assert!(acknowledgement.matches_pending(&call, &approved, &issuance, &application,));
+        assert_eq!(
+            acknowledgement.verify_pending_with(
+                &call,
+                &approved,
+                &issuance,
+                &application,
+                call.authority.binding,
+                &TestVerifier,
+            ),
+            Ok(())
+        );
+        assert!(acknowledgement.matches_issuance_tombstone(
+            issuance.authority,
+            issuance.authorization_invocation,
+            issuance.acknowledgement_invocation,
+            issuance.authorization_sequence,
+            issuance.commitment(),
+        ));
+        assert_eq!(
+            acknowledgement.verify_issuance_tombstone_with(
+                issuance.authority,
+                issuance.authorization_invocation,
+                issuance.acknowledgement_invocation,
+                issuance.authorization_sequence,
+                issuance.commitment(),
+                &TestVerifier,
+            ),
+            Ok(())
+        );
+
+        let context = InvocationContext {
+            invocation: acknowledgement.application_invocation,
+            actor: acknowledgement.authority.binding.issuer.actor,
+            mode: MethodMode::Linear,
+            origin: InvocationOrigin::anonymous(),
+            roles: InvocationRoleClaims::none(),
+            observed_slot: application.applied_at,
+        };
+        assert!(acknowledgement.matches_invocation_context(&context));
+        let mut relayed = context;
+        relayed.origin.principal = Some(call.principal);
+        relayed.origin.credential = Some(call.credential);
+        relayed.origin.transport_node = call.authenticated_node;
+        assert!(acknowledgement.matches_invocation_context(&relayed));
+
+        let mut wrong_context = context;
+        wrong_context.invocation = issuance.acknowledgement_invocation;
+        assert!(!acknowledgement.matches_invocation_context(&wrong_context));
+        wrong_context = context;
+        wrong_context.observed_slot += 1;
+        assert!(!acknowledgement.matches_invocation_context(&wrong_context));
+        wrong_context = context;
+        wrong_context.actor = ActorId([0x7d; 32]);
+        assert!(!acknowledgement.matches_invocation_context(&wrong_context));
+        wrong_context = context;
+        wrong_context.mode = MethodMode::Merge;
+        assert!(!acknowledgement.matches_invocation_context(&wrong_context));
+        wrong_context = context;
+        wrong_context.origin.capability = Some(CapabilityId([0x7e; 32]));
+        assert!(!acknowledgement.matches_invocation_context(&wrong_context));
+
+        for (index, control) in controls[1..].iter().enumerate() {
+            let call = private_call(control, 0x7f + index as u8);
+            let approved = approval(&call);
+            let issuance = issuance_ack(&call, &approved);
+            let application = private_application_fact(&call);
+            let acknowledgement = private_application_ack(&call, &approved, &issuance, application);
+            assert!(acknowledgement.matches_pending(&call, &approved, &issuance, &application,));
+            assert_eq!(
+                acknowledgement.verify_pending_with(
+                    &call,
+                    &approved,
+                    &issuance,
+                    &application,
+                    call.authority.binding,
+                    &TestVerifier,
+                ),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn pca1_rejects_substitution_bad_ordering_and_unverified_signatures() {
+        let controls = private_controls();
+        let call = private_call(&controls[0], 0x7e);
+        let approved = approval(&call);
+        let issuance = issuance_ack(&call, &approved);
+        let application = private_application_fact(&call);
+        let acknowledgement = private_application_ack(&call, &approved, &issuance, application);
+
+        let mut before_issuance = acknowledgement.clone();
+        before_issuance.application.applied_at = issuance.issued_at - 1;
+        resign_private_application_ack(&mut before_issuance);
+        assert_eq!(
+            before_issuance.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidApplication)
+        );
+
+        let mut issuance_before_validity = acknowledgement.clone();
+        issuance_before_validity.issued_at = approved.selector.valid_from - 1;
+        resign_private_application_ack(&mut issuance_before_validity);
+        assert_eq!(
+            issuance_before_validity.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidApplication)
+        );
+
+        let mut after_expiry = acknowledgement.clone();
+        after_expiry.application.applied_at = approved.selector.expires_at + 1;
+        resign_private_application_ack(&mut after_expiry);
+        assert_eq!(
+            after_expiry.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidApplication)
+        );
+
+        let mut wrong_head = acknowledgement.clone();
+        wrong_head.application.reopened_control_head = Hash([0x7f; 32]);
+        resign_private_application_ack(&mut wrong_head);
+        assert_eq!(
+            wrong_head.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidApplication)
+        );
+        let mut missing_state = acknowledgement.clone();
+        missing_state.application.reopened_control_state = Hash::ZERO;
+        resign_private_application_ack(&mut missing_state);
+        assert_eq!(
+            missing_state.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidApplication)
+        );
+        let mut missing_members = acknowledgement.clone();
+        missing_members.application.post_member_set = Hash::ZERO;
+        resign_private_application_ack(&mut missing_members);
+        assert_eq!(
+            missing_members.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidApplication)
+        );
+
+        let mut substituted = acknowledgement.clone();
+        substituted.operation_call = Hash([0x80; 32]);
+        resign_private_application_ack(&mut substituted);
+        assert_eq!(
+            substituted.verify_with(call.authority.binding, &TestVerifier),
+            Ok(())
+        );
+        assert!(!substituted.matches_pending(&call, &approved, &issuance, &application,));
+        assert_eq!(
+            substituted.verify_pending_with(
+                &call,
+                &approved,
+                &issuance,
+                &application,
+                call.authority.binding,
+                &TestVerifier,
+            ),
+            Err(AuthorityOperationProtocolError::MismatchedApplication)
+        );
+
+        let mut wrong_issued_at = acknowledgement.clone();
+        wrong_issued_at.issued_at -= 1;
+        resign_private_application_ack(&mut wrong_issued_at);
+        assert_eq!(wrong_issued_at.validate_shape(), Ok(()));
+        assert!(!wrong_issued_at.matches_pending(&call, &approved, &issuance, &application,));
+
+        let mut wrong_application_invocation = acknowledgement.clone();
+        wrong_application_invocation.application_invocation = InvocationId([0x81; 32]);
+        resign_private_application_ack(&mut wrong_application_invocation);
+        assert_eq!(
+            wrong_application_invocation.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidTarget)
+        );
+        let mut reused_issuance_invocation = acknowledgement.clone();
+        reused_issuance_invocation.application_invocation =
+            reused_issuance_invocation.issuance_invocation;
+        resign_private_application_ack(&mut reused_issuance_invocation);
+        assert_eq!(
+            reused_issuance_invocation.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidTarget)
+        );
+
+        let mut bad_signature = acknowledgement.clone();
+        bad_signature.signature[0] ^= 1;
+        assert_eq!(bad_signature.validate_shape(), Ok(()));
+        assert_eq!(
+            bad_signature.verify_with(call.authority.binding, &TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidSignature)
+        );
+        let mut bad_receipt = acknowledgement.clone();
+        bad_receipt.receipt.signature[0] ^= 1;
+        resign_private_application_ack(&mut bad_receipt);
+        assert_eq!(bad_receipt.validate_shape(), Ok(()));
+        assert_eq!(
+            bad_receipt.verify_with(call.authority.binding, &TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidSignature)
+        );
+        let mut unrelated_binding = call.authority.binding;
+        unrelated_binding.policy = Hash([0x82; 32]);
+        assert_eq!(
+            acknowledgement.verify_with(unrelated_binding, &TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidApplication)
+        );
+
+        assert!(!acknowledgement.matches_issuance_tombstone(
+            issuance.authority,
+            issuance.authorization_invocation,
+            issuance.acknowledgement_invocation,
+            NonZeroU64::new(issuance.authorization_sequence.get() + 1).unwrap(),
+            issuance.commitment(),
+        ));
+        assert!(!acknowledgement.matches_issuance_tombstone(
+            issuance.authority,
+            issuance.authorization_invocation,
+            InvocationId([0x83; 32]),
+            issuance.authorization_sequence,
+            issuance.commitment(),
+        ));
+        assert!(!acknowledgement.matches_issuance_tombstone(
+            issuance.authority,
+            issuance.authorization_invocation,
+            issuance.acknowledgement_invocation,
+            issuance.authorization_sequence,
+            Hash([0x84; 32]),
+        ));
+
+        let revoke_call = private_call(&controls[1], 0x85);
+        let revoke_approval = approval(&revoke_call);
+        let revoke_issuance = issuance_ack(&revoke_call, &revoke_approval);
+        let mut wrong_revoke_application = private_application_fact(&revoke_call);
+        wrong_revoke_application.post_member_set = Hash([0x86; 32]);
+        assert_eq!(wrong_revoke_application.validate_shape(), Ok(()));
+        let wrong_revoke_ack = private_application_ack(
+            &revoke_call,
+            &revoke_approval,
+            &revoke_issuance,
+            wrong_revoke_application,
+        );
+        assert!(!wrong_revoke_ack.matches_pending(
+            &revoke_call,
+            &revoke_approval,
+            &revoke_issuance,
+            &wrong_revoke_application,
+        ));
+    }
+
+    #[test]
+    fn pca1_old_truncated_trailing_and_oversize_wires_fail_closed() {
+        let controls = private_controls();
+        let call = private_call(&controls[2], 0x85);
+        let approved = approval(&call);
+        let issuance = issuance_ack(&call, &approved);
+        let application = private_application_fact(&call);
+        let acknowledgement = private_application_ack(&call, &approved, &issuance, application);
+        let encoded = acknowledgement.encode().unwrap();
+
+        let mut old = encoded.clone();
+        old[..4].copy_from_slice(b"AOI1");
+        assert!(PrivateControlApplicationAck::decode(&old).is_err());
+        let mut old_abi = encoded.clone();
+        old_abi[4] ^= 1;
+        assert!(PrivateControlApplicationAck::decode(&old_abi).is_err());
+        let mut truncated = encoded.clone();
+        truncated.pop();
+        assert!(PrivateControlApplicationAck::decode(&truncated).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(PrivateControlApplicationAck::decode(&trailing).is_err());
+        assert_eq!(
+            PrivateControlApplicationAck::decode(&vec![
+                0;
+                MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES
+                    + 1
+            ]),
+            Err(WireError::LimitExceeded)
+        );
+
+        let mut unsigned = acknowledgement;
+        unsigned.signature = [0; AUTHORITY_SIGNATURE_BYTES];
+        assert_eq!(unsigned.encode(), Err(WireError::InvalidValue));
     }
 
     #[test]
