@@ -472,6 +472,10 @@ mod tests {
     };
 
     const OBSERVED_SLOT: u64 = 100;
+    // This actor is compiled against the no_std CRDT implementation even in
+    // native tests, so its deterministic change allocator is process-global.
+    // Keep independently parallel test cases from overlapping guest slices.
+    static CHANGE_SCOPE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn signing() -> SigningKey {
         SigningKey::from_bytes(&[0x71; 32])
@@ -632,6 +636,9 @@ mod tests {
         bytes: Vec<u8>,
         invocation_context: InvocationContext,
     ) -> Vec<u8> {
+        let _scope = CHANGE_SCOPE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut ctx = Context::new(ServiceId(0));
         ctx.__set_agent_invocation_context(invocation_context);
         crdt::with_change(crdt::ChangeId(invocation_context.invocation.0), || {
