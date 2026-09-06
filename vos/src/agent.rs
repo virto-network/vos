@@ -18,6 +18,8 @@ pub mod sdk {
     pub use vos_agent_sdk::*;
 }
 pub mod authority;
+#[cfg(feature = "std")]
+pub mod authority_operation_issuer;
 pub mod bootstrap;
 pub mod catalog_finality;
 #[cfg(feature = "std")]
