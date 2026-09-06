@@ -6,6 +6,12 @@ use crate::{ActorId, AgentId, BlobRef, Hash, NodeId, PrincipalId, SpaceId};
 
 pub const MAX_PRIVATE_NODES: usize = 256;
 pub const MAX_TRANSPORT_IDENTITY_BYTES: usize = 512;
+/// Exact multihash length of an inline libp2p Ed25519 public key.
+///
+/// VOS clean-generation transport identities are Ed25519 only. The libp2p
+/// public-key protobuf is 36 bytes (`08 01 12 20 || key`) and therefore uses
+/// the identity multihash (`00 24 || protobuf`) rather than a hashed PeerId.
+pub const ED25519_TRANSPORT_PEER_ID_BYTES: usize = 38;
 pub const MAX_SEALED_KEY_BYTES: usize = 4 * 1024;
 pub const MAX_PRIVATE_CIPHERTEXT_BYTES: usize = 8 * 1024 * 1024;
 /// A recovery grant contains at most one fixed-size data-key entry for every
@@ -21,6 +27,122 @@ pub const MAX_PRIVATE_INVITE_HISTORY_EPOCHS: usize = 4_096;
 pub const PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES: usize = 4 + 32 + 24 + 48;
 pub const PRIVATE_SIGNATURE_BYTES: usize = 64;
 pub const PRIVATE_NONCE_BYTES: usize = 24;
+
+const ED25519_TRANSPORT_PEER_ID_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
+
+/// Construct the one canonical libp2p PeerId representation accepted for a
+/// clean-generation Ed25519 transport public key.
+pub fn canonical_ed25519_peer_id(public_key: &[u8; 32]) -> [u8; ED25519_TRANSPORT_PEER_ID_BYTES] {
+    let mut peer_id = [0; ED25519_TRANSPORT_PEER_ID_BYTES];
+    peer_id[..ED25519_TRANSPORT_PEER_ID_PREFIX.len()]
+        .copy_from_slice(&ED25519_TRANSPORT_PEER_ID_PREFIX);
+    peer_id[ED25519_TRANSPORT_PEER_ID_PREFIX.len()..].copy_from_slice(public_key);
+    peer_id
+}
+
+/// Crypto seam for verifying a node's transport-key possession proof.
+///
+/// Implementations must perform strict Ed25519 verification. Keeping the
+/// provider outside this `no_std` model lets both the authority actor and a
+/// host-side policy client verify exactly the same canonical enrollment.
+pub trait NodeEncryptionEnrollmentVerifier {
+    fn verify(
+        &self,
+        public_key: &[u8; 32],
+        message: &[u8],
+        signature: &[u8; PRIVATE_SIGNATURE_BYTES],
+    ) -> bool;
+}
+
+/// One node-owned X25519 recipient enrolled into a Space authority.
+///
+/// The administrator's separately authenticated authority mutation proves
+/// authorization to bind `principal`; this transport signature independently
+/// proves possession of the exact full Ed25519 PeerId being bound. Repeating
+/// the public key, PeerId, and derived NodeId is deliberate and prevents any
+/// compact routing hint or alternate libp2p key encoding from entering policy
+/// state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeEncryptionEnrollment {
+    pub space: SpaceId,
+    pub principal: PrincipalId,
+    pub node: NodeId,
+    pub transport_public_key: [u8; 32],
+    pub transport_peer_id: [u8; ED25519_TRANSPORT_PEER_ID_BYTES],
+    pub encryption_public_key: [u8; 32],
+    pub transport_signature: [u8; PRIVATE_SIGNATURE_BYTES],
+}
+
+impl NodeEncryptionEnrollment {
+    /// Derive all redundant transport identity fields from the exact Ed25519
+    /// public key. `transport_signature` signs [`Self::signing_bytes`].
+    pub fn from_keys(
+        space: SpaceId,
+        principal: PrincipalId,
+        transport_public_key: [u8; 32],
+        encryption_public_key: [u8; 32],
+        transport_signature: [u8; PRIVATE_SIGNATURE_BYTES],
+    ) -> Self {
+        let transport_peer_id = canonical_ed25519_peer_id(&transport_public_key);
+        Self {
+            space,
+            principal,
+            node: NodeId::of_authenticated_peer(&transport_peer_id),
+            transport_public_key,
+            transport_peer_id,
+            encryption_public_key,
+            transport_signature,
+        }
+    }
+
+    pub fn validate_shape(&self) -> bool {
+        self.space != SpaceId::ZERO
+            && self.principal != PrincipalId::ZERO
+            && self.transport_public_key != [0; 32]
+            && self.transport_peer_id == canonical_ed25519_peer_id(&self.transport_public_key)
+            && self.node == NodeId::of_authenticated_peer(&self.transport_peer_id)
+            && self.node != NodeId::ZERO
+            && self.encryption_public_key != [0; 32]
+            && self.transport_signature != [0; PRIVATE_SIGNATURE_BYTES]
+    }
+
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        crate::wire::node_encryption_enrollment_signing_bytes(self)
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            b"vos/private/node-encryption-enrollment/v1",
+            &[&self.signing_bytes(), &self.transport_signature],
+        )
+    }
+
+    pub fn verify_with<V: NodeEncryptionEnrollmentVerifier>(&self, verifier: &V) -> bool {
+        self.validate_shape()
+            && verifier.verify(
+                &self.transport_public_key,
+                &self.signing_bytes(),
+                &self.transport_signature,
+            )
+    }
+
+    /// Verify possession before materializing the exact Private control
+    /// identity whose commitment can be compared with an enrolled
+    /// system-authority row.
+    pub fn verified_private_identity<V: NodeEncryptionEnrollmentVerifier>(
+        &self,
+        verifier: &V,
+    ) -> Option<PrivateNodeIdentity> {
+        self.verify_with(verifier).then(|| PrivateNodeIdentity {
+            node: self.node,
+            principal: self.principal,
+            transport_identity: self.transport_peer_id.to_vec(),
+            encryption_public_key: self.encryption_public_key,
+            authority_binding: self.commitment(),
+            transport_signature: self.transport_signature,
+        })
+    }
+}
 
 /// X25519 encryption identity authenticated by the node's full transport
 /// identity and bound to its owning Principal.
@@ -46,6 +168,20 @@ impl PrivateNodeIdentity {
             && self.encryption_public_key != [0; 32]
             && self.authority_binding != Hash::ZERO
             && self.transport_signature != [0; PRIVATE_SIGNATURE_BYTES]
+    }
+
+    /// Require byte-for-byte equality with the authority-enrolled transport
+    /// and encryption identity. A Private identity is Agent-scoped and has no
+    /// Space field, so its caller must select the enrollment from the expected
+    /// Space's authenticated authority state before calling this helper.
+    pub fn matches_enrollment(&self, enrollment: &NodeEncryptionEnrollment) -> bool {
+        enrollment.validate_shape()
+            && self.node == enrollment.node
+            && self.principal == enrollment.principal
+            && self.transport_identity.as_slice() == enrollment.transport_peer_id
+            && self.encryption_public_key == enrollment.encryption_public_key
+            && self.authority_binding == enrollment.commitment()
+            && self.transport_signature == enrollment.transport_signature
     }
 }
 
@@ -442,6 +578,93 @@ impl PrivateControlRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::CanonicalWire;
+
+    struct ExactEnrollmentVerifier {
+        public_key: [u8; 32],
+        message: Vec<u8>,
+        signature: [u8; PRIVATE_SIGNATURE_BYTES],
+    }
+
+    impl NodeEncryptionEnrollmentVerifier for ExactEnrollmentVerifier {
+        fn verify(
+            &self,
+            public_key: &[u8; 32],
+            message: &[u8],
+            signature: &[u8; PRIVATE_SIGNATURE_BYTES],
+        ) -> bool {
+            *public_key == self.public_key
+                && message == self.message
+                && *signature == self.signature
+        }
+    }
+
+    fn enrollment() -> NodeEncryptionEnrollment {
+        NodeEncryptionEnrollment::from_keys(
+            SpaceId([1; 32]),
+            PrincipalId([2; 32]),
+            [3; 32],
+            [4; 32],
+            [5; PRIVATE_SIGNATURE_BYTES],
+        )
+    }
+
+    #[test]
+    fn ed25519_enrollment_binds_exact_full_peer_node_and_x25519_key() {
+        let enrollment = enrollment();
+        assert_eq!(
+            enrollment.transport_peer_id[..6],
+            [0x00, 0x24, 0x08, 0x01, 0x12, 0x20]
+        );
+        assert_eq!(enrollment.transport_peer_id[6..], [3; 32]);
+        assert_eq!(
+            enrollment.node,
+            NodeId::of_authenticated_peer(&enrollment.transport_peer_id)
+        );
+        assert!(enrollment.validate_shape());
+
+        let verifier = ExactEnrollmentVerifier {
+            public_key: enrollment.transport_public_key,
+            message: enrollment.signing_bytes(),
+            signature: enrollment.transport_signature,
+        };
+        assert!(enrollment.verify_with(&verifier));
+
+        let identity = enrollment.verified_private_identity(&verifier).unwrap();
+        assert!(identity.matches_enrollment(&enrollment));
+        assert_eq!(identity.authority_binding, enrollment.commitment());
+
+        let encoded = enrollment.encode().unwrap();
+        assert_eq!(NodeEncryptionEnrollment::decode(&encoded), Ok(enrollment));
+    }
+
+    #[test]
+    fn enrollment_rejects_compact_or_substituted_transport_evidence() {
+        let enrollment = enrollment();
+        let verifier = ExactEnrollmentVerifier {
+            public_key: enrollment.transport_public_key,
+            message: enrollment.signing_bytes(),
+            signature: enrollment.transport_signature,
+        };
+
+        let mut compact = enrollment;
+        compact.transport_peer_id[0] = 0x12;
+        assert!(!compact.validate_shape());
+        assert!(!compact.verify_with(&verifier));
+
+        let mut substituted_node = enrollment;
+        substituted_node.node = NodeId([7; 32]);
+        assert!(!substituted_node.validate_shape());
+
+        let mut substituted_recipient = enrollment;
+        substituted_recipient.encryption_public_key = [8; 32];
+        assert!(substituted_recipient.validate_shape());
+        assert!(!substituted_recipient.verify_with(&verifier));
+
+        let mut old_abi = enrollment.encode().unwrap();
+        old_abi[4] ^= 0xff;
+        assert!(NodeEncryptionEnrollment::decode(&old_abi).is_err());
+    }
 
     #[test]
     fn encrypted_object_associated_data_binds_identity_epoch_kind_and_content() {

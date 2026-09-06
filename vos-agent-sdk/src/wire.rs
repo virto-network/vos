@@ -3144,15 +3144,17 @@ impl CanonicalWire for RuntimeTransition {
 }
 
 use crate::private::{
-    EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_CIPHERTEXT_BYTES,
-    MAX_PRIVATE_INVITE_HISTORY_EPOCHS, MAX_PRIVATE_NODES,
+    ED25519_TRANSPORT_PEER_ID_BYTES, EncryptedObjectKind, EncryptedPrivateObject,
+    MAX_PRIVATE_CIPHERTEXT_BYTES, MAX_PRIVATE_INVITE_HISTORY_EPOCHS, MAX_PRIVATE_NODES,
     MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES, MAX_SEALED_KEY_BYTES,
-    MAX_TRANSPORT_IDENTITY_BYTES, PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES, PRIVATE_NONCE_BYTES,
-    PRIVATE_SIGNATURE_BYTES, PrivateActorLifecycleKind, PrivateControlOperation,
-    PrivateControlRecord, PrivateControlSigner, PrivateInviteHistoryGrant, PrivateKeyEpoch,
-    PrivateNodeIdentity, PrivateRecoveryKeyringGrant, SealedPrivateKey, SealedRecoveryKey,
+    MAX_TRANSPORT_IDENTITY_BYTES, NodeEncryptionEnrollment,
+    PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES, PRIVATE_NONCE_BYTES, PRIVATE_SIGNATURE_BYTES,
+    PrivateActorLifecycleKind, PrivateControlOperation, PrivateControlRecord, PrivateControlSigner,
+    PrivateInviteHistoryGrant, PrivateKeyEpoch, PrivateNodeIdentity, PrivateRecoveryKeyringGrant,
+    SealedPrivateKey, SealedRecoveryKey,
 };
 
+pub const MAX_NODE_ENCRYPTION_ENROLLMENT_WIRE_BYTES: usize = 512;
 pub const MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES: usize = 1_024;
 pub const MAX_PRIVATE_KEY_EPOCH_WIRE_BYTES: usize = HEADER_BYTES
     + 192
@@ -3172,6 +3174,74 @@ pub const MAX_PRIVATE_CONTROL_WIRE_BYTES: usize = HEADER_BYTES
     + 512;
 pub const MAX_PRIVATE_OBJECT_WIRE_BYTES: usize =
     HEADER_BYTES + 32 + 32 + 8 + 1 + 32 + PRIVATE_NONCE_BYTES + 4 + MAX_PRIVATE_CIPHERTEXT_BYTES;
+
+fn encode_node_encryption_enrollment_fields(
+    encoder: &mut Encoder<'_>,
+    value: &NodeEncryptionEnrollment,
+) {
+    encoder.fixed(value.space.as_bytes());
+    encoder.fixed(value.principal.as_bytes());
+    encoder.fixed(value.node.as_bytes());
+    encoder.0.extend_from_slice(&value.transport_public_key);
+    encoder.0.extend_from_slice(&value.transport_peer_id);
+    encoder.0.extend_from_slice(&value.encryption_public_key);
+}
+
+/// Exact Ed25519 possession-proof preimage. This is deliberately a sibling
+/// domain of the full `NEN1` wire so a signature cannot be replayed as any
+/// other canonical message or over a representation which already contains
+/// the signature.
+pub(crate) fn node_encryption_enrollment_signing_bytes(
+    value: &NodeEncryptionEnrollment,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(MAX_NODE_ENCRYPTION_ENROLLMENT_WIRE_BYTES);
+    bytes.extend_from_slice(b"NES1");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_node_encryption_enrollment_fields(&mut Encoder(&mut bytes), value);
+    bytes
+}
+
+impl CanonicalWire for NodeEncryptionEnrollment {
+    const MAGIC: [u8; 4] = *b"NEN1";
+    const MAX_ENCODED_BYTES: usize = MAX_NODE_ENCRYPTION_ENROLLMENT_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_node_encryption_enrollment_fields(encoder, self);
+        encoder.0.extend_from_slice(&self.transport_signature);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            space: SpaceId(decoder.fixed()?),
+            principal: PrincipalId(decoder.fixed()?),
+            node: NodeId(decoder.fixed()?),
+            transport_public_key: decoder
+                .take(32)?
+                .try_into()
+                .map_err(|_| DecodeError::Truncated)?,
+            transport_peer_id: decoder
+                .take(ED25519_TRANSPORT_PEER_ID_BYTES)?
+                .try_into()
+                .map_err(|_| DecodeError::Truncated)?,
+            encryption_public_key: decoder
+                .take(32)?
+                .try_into()
+                .map_err(|_| DecodeError::Truncated)?,
+            transport_signature: decoder
+                .take(PRIVATE_SIGNATURE_BYTES)?
+                .try_into()
+                .map_err(|_| DecodeError::Truncated)?,
+        };
+        value
+            .validate_shape()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
 
 pub(crate) fn encode_private_node(encoder: &mut Encoder<'_>, value: &PrivateNodeIdentity) {
     encoder.fixed(value.node.as_bytes());
