@@ -10,8 +10,10 @@ use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
 use crate::authority::{
     AUTHORITY_PUBLIC_KEY_BYTES, AUTHORITY_SIGNATURE_BYTES, AgentAuthorityBinding,
-    AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots, AuthorityOperationKind,
-    AuthorityReceipt, AuthorityReceiptSelector,
+    AuthorityActorTarget, AuthorityCredentialCall, AuthorityEvidence, AuthorityIssuer,
+    AuthorityLaneRoots, AuthorityOperationKind, AuthorityReceipt, AuthorityReceiptSelector,
+    CREDENTIAL_PUBLIC_KEY_BYTES, CREDENTIAL_SIGNATURE_BYTES, ManagedAgentTarget,
+    ManagementApproval,
 };
 use crate::contract::{
     ActorAbiRange, ActorPackageContract, RuntimeMigrationPolicy, RuntimePackageContract,
@@ -24,6 +26,8 @@ pub const MAX_ACTOR_ENTRY_WIRE_BYTES: usize = 1_024;
 pub const MAX_DIRECTORY_PAGE_WIRE_BYTES: usize =
     HEADER_BYTES + 4 + MAX_DIRECTORY_PAGE_ENTRIES * (MAX_ACTOR_ENTRY_WIRE_BYTES + 128) + 33;
 pub const MAX_AUTHORITY_RECEIPT_WIRE_BYTES: usize = 1_024;
+pub const MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
+pub const MAX_MANAGEMENT_APPROVAL_WIRE_BYTES: usize = MAX_INVOCATION_REPLY_BYTES;
 pub const MAX_AGENT_DESCRIPTOR_WIRE_BYTES: usize = 64 * 1024;
 pub const MAX_INVOCATION_CONTEXT_WIRE_BYTES: usize = 512;
 pub const MAX_RUNTIME_WORK_WIRE_BYTES: usize =
@@ -765,6 +769,299 @@ impl CanonicalWire for AuthorityReceipt {
     }
 }
 
+fn encode_authority_actor_target(encoder: &mut Encoder<'_>, value: AuthorityActorTarget) {
+    encoder.fixed(value.space.as_bytes());
+    encoder.fixed(value.system_agent.as_bytes());
+    encoder.fixed(value.system_runtime_deployment.as_bytes());
+    encode_authority_issuer(encoder, value.issuer);
+}
+
+fn decode_authority_actor_target(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityActorTarget, DecodeError> {
+    let value = AuthorityActorTarget {
+        space: SpaceId(decoder.fixed()?),
+        system_agent: AgentId(decoder.fixed()?),
+        system_runtime_deployment: DeploymentId(decoder.fixed()?),
+        issuer: decode_authority_issuer(decoder)?,
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_managed_agent_target(encoder: &mut Encoder<'_>, value: ManagedAgentTarget) {
+    encoder.fixed(value.space.as_bytes());
+    encoder.fixed(value.agent.as_bytes());
+    encoder.fixed(value.runtime_deployment.as_bytes());
+}
+
+fn decode_managed_agent_target(
+    decoder: &mut Decoder<'_>,
+) -> Result<ManagedAgentTarget, DecodeError> {
+    let value = ManagedAgentTarget {
+        space: SpaceId(decoder.fixed()?),
+        agent: AgentId(decoder.fixed()?),
+        runtime_deployment: DeploymentId(decoder.fixed()?),
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_credential_caller(
+    encoder: &mut Encoder<'_>,
+    principal: PrincipalId,
+    credential: CredentialId,
+    public_key: &[u8; CREDENTIAL_PUBLIC_KEY_BYTES],
+    authenticated_node: Option<NodeId>,
+) {
+    encoder.fixed(principal.as_bytes());
+    encoder.fixed(credential.as_bytes());
+    encoder.0.extend_from_slice(public_key);
+    encoder.option(&authenticated_node, |encoder, node| {
+        encoder.fixed(node.as_bytes())
+    });
+}
+
+fn decode_credential_caller(
+    decoder: &mut Decoder<'_>,
+) -> Result<
+    (
+        PrincipalId,
+        CredentialId,
+        [u8; CREDENTIAL_PUBLIC_KEY_BYTES],
+        Option<NodeId>,
+    ),
+    DecodeError,
+> {
+    Ok((
+        PrincipalId(decoder.fixed()?),
+        CredentialId(decoder.fixed()?),
+        decoder
+            .take(CREDENTIAL_PUBLIC_KEY_BYTES)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?,
+        decoder.option(|decoder| Ok(NodeId(decoder.fixed()?)))?,
+    ))
+}
+
+fn encode_canonical_management_request(value: &ManagementRequest) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"AMRQ");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_management_request(&mut Encoder(&mut bytes), value);
+    bytes
+}
+
+fn decode_canonical_management_request(bytes: &[u8]) -> Result<ManagementRequest, DecodeError> {
+    let mut decoder = Decoder::new(bytes);
+    if decoder.take(4)? != b"AMRQ" {
+        return Err(DecodeError::InvalidTag);
+    }
+    if Hash(decoder.fixed()?) != RUNTIME_ABI_ID {
+        return Err(DecodeError::InvalidPlatform);
+    }
+    let value = decode_management_request(&mut decoder)?;
+    if !decoder.exhausted() {
+        return Err(DecodeError::TrailingBytes);
+    }
+    Ok(value)
+}
+
+fn encode_authority_credential_call_unsigned(
+    encoder: &mut Encoder<'_>,
+    value: &AuthorityCredentialCall,
+) {
+    encoder.fixed(value.invocation.as_bytes());
+    encode_authority_actor_target(encoder, value.authority);
+    encode_managed_agent_target(encoder, value.managed);
+    encode_credential_caller(
+        encoder,
+        value.principal,
+        value.credential,
+        &value.credential_public_key,
+        value.authenticated_node,
+    );
+    encoder.u64(value.requested_valid_from);
+    encoder.u64(value.requested_expires_at);
+    encoder.bytes(&encode_canonical_management_request(&value.request));
+}
+
+pub(crate) fn authority_credential_call_signing_bytes(value: &AuthorityCredentialCall) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"ACS1");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_authority_credential_call_unsigned(&mut Encoder(&mut bytes), value);
+    bytes
+}
+
+pub(crate) fn authority_credential_call_encoded_len(value: &AuthorityCredentialCall) -> usize {
+    let mut body = Vec::new();
+    encode_authority_credential_call_unsigned(&mut Encoder(&mut body), value);
+    HEADER_BYTES
+        .saturating_add(body.len())
+        .saturating_add(CREDENTIAL_SIGNATURE_BYTES)
+}
+
+impl CanonicalWire for AuthorityCredentialCall {
+    const MAGIC: [u8; 4] = *b"ACC1";
+    const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_authority_credential_call_unsigned(encoder, self);
+        encoder.0.extend_from_slice(&self.signature);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let invocation = InvocationId(decoder.fixed()?);
+        let authority = decode_authority_actor_target(decoder)?;
+        let managed = decode_managed_agent_target(decoder)?;
+        let (principal, credential, credential_public_key, authenticated_node) =
+            decode_credential_caller(decoder)?;
+        let requested_valid_from = decoder.u64()?;
+        let requested_expires_at = decoder.u64()?;
+        let request = decode_canonical_management_request(
+            decoder.bytes_ref_bounded(MAX_INVOCATION_MESSAGE_BYTES)?,
+        )?;
+        let signature = decoder
+            .take(CREDENTIAL_SIGNATURE_BYTES)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?;
+        let value = Self {
+            invocation,
+            authority,
+            managed,
+            principal,
+            credential,
+            credential_public_key,
+            authenticated_node,
+            requested_valid_from,
+            requested_expires_at,
+            request,
+            signature,
+        };
+        value
+            .validate_shape()
+            .is_ok()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
+fn encode_authority_evidence(encoder: &mut Encoder<'_>, value: &AuthorityEvidence) {
+    encode_optional_blob(encoder, &value.package);
+    encode_optional_blob(encoder, &value.proof);
+    encoder.fixed(value.commitment.as_bytes());
+}
+
+fn decode_authority_evidence(decoder: &mut Decoder<'_>) -> Result<AuthorityEvidence, DecodeError> {
+    let value = AuthorityEvidence {
+        package: decode_optional_blob(decoder)?,
+        proof: decode_optional_blob(decoder)?,
+        commitment: Hash(decoder.fixed()?),
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_management_approval_body(encoder: &mut Encoder<'_>, value: &ManagementApproval) {
+    encoder.fixed(value.credential_call.as_bytes());
+    encoder.u64(value.authorization_sequence.get());
+    encode_authority_actor_target(encoder, value.authority);
+    encode_managed_agent_target(encoder, value.managed);
+    encode_credential_caller(
+        encoder,
+        value.principal,
+        value.credential,
+        &value.credential_public_key,
+        value.authenticated_node,
+    );
+    encode_authority_evidence(encoder, &value.evidence);
+    encode_lane_roots(encoder, value.lane_roots);
+    encoder.u64(value.epoch);
+    encoder.u64(value.valid_from);
+    encoder.u64(value.expires_at);
+    encoder.bytes(&encode_canonical_management_request(&value.request));
+    encoder.fixed(value.request_commitment.as_bytes());
+}
+
+pub(crate) fn management_approval_encoded_len(value: &ManagementApproval) -> usize {
+    let mut body = Vec::new();
+    encode_management_approval_body(&mut Encoder(&mut body), value);
+    HEADER_BYTES.saturating_add(body.len())
+}
+
+pub(crate) fn management_approval_commitment(value: &ManagementApproval) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"MAPC");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_management_approval_body(&mut Encoder(&mut bytes), value);
+    Hash::digest(b"vos/agent/management-approval/v1", &[&bytes])
+}
+
+impl CanonicalWire for ManagementApproval {
+    const MAGIC: [u8; 4] = *b"MAP1";
+    const MAX_ENCODED_BYTES: usize = MAX_MANAGEMENT_APPROVAL_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_management_approval_body(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let credential_call = Hash(decoder.fixed()?);
+        let authorization_sequence =
+            core::num::NonZeroU64::new(decoder.u64()?).ok_or(DecodeError::NonCanonical)?;
+        let authority = decode_authority_actor_target(decoder)?;
+        let managed = decode_managed_agent_target(decoder)?;
+        let (principal, credential, credential_public_key, authenticated_node) =
+            decode_credential_caller(decoder)?;
+        let evidence = decode_authority_evidence(decoder)?;
+        let lane_roots = decode_lane_roots(decoder)?;
+        let epoch = decoder.u64()?;
+        let valid_from = decoder.u64()?;
+        let expires_at = decoder.u64()?;
+        let request = decode_canonical_management_request(
+            decoder.bytes_ref_bounded(MAX_INVOCATION_REPLY_BYTES)?,
+        )?;
+        let request_commitment = Hash(decoder.fixed()?);
+        let value = Self {
+            credential_call,
+            authorization_sequence,
+            authority,
+            managed,
+            principal,
+            credential,
+            credential_public_key,
+            authenticated_node,
+            evidence,
+            lane_roots,
+            epoch,
+            valid_from,
+            expires_at,
+            request,
+            request_commitment,
+        };
+        value
+            .validate_shape()
+            .is_ok()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
 fn install_valid(value: &InstallActor) -> bool {
     value.installation_id != InstallationId::ZERO
         && value.registry_reservation != Hash::ZERO
@@ -1051,11 +1348,10 @@ fn decode_management_request(decoder: &mut Decoder<'_>) -> Result<ManagementRequ
 }
 
 pub(crate) fn management_request_commitment(value: &ManagementRequest) -> Hash {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AMRQ");
-    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
-    encode_management_request(&mut Encoder(&mut bytes), value);
-    Hash::digest(b"vos/agent/management-request", &[&bytes])
+    Hash::digest(
+        b"vos/agent/management-request",
+        &[&encode_canonical_management_request(value)],
+    )
 }
 
 pub(crate) fn required_management_operation(
@@ -2470,6 +2766,314 @@ mod tests {
             lanes: LaneSet::of(StateLane::Linear),
             suspended: false,
         }
+    }
+
+    fn authority_actor_target() -> AuthorityActorTarget {
+        AuthorityActorTarget {
+            space: SpaceId([0x21; 32]),
+            system_agent: AgentId([0x22; 32]),
+            system_runtime_deployment: DeploymentId([0x23; 32]),
+            issuer: AuthorityIssuer {
+                principal: PrincipalId([0x24; 32]),
+                actor: ActorId([0x25; 32]),
+                deployment: DeploymentId([0x26; 32]),
+                program: ProgramId([0x27; 32]),
+                producer: ProducerId([0x28; 32]),
+            },
+        }
+    }
+
+    fn managed_agent_target() -> ManagedAgentTarget {
+        ManagedAgentTarget {
+            space: authority_actor_target().space,
+            agent: AgentId([0x29; 32]),
+            runtime_deployment: DeploymentId([0x2a; 32]),
+        }
+    }
+
+    fn authority_credential_call() -> AuthorityCredentialCall {
+        let credential_public_key = [0x2b; CREDENTIAL_PUBLIC_KEY_BYTES];
+        AuthorityCredentialCall {
+            invocation: InvocationId([0x2c; 32]),
+            authority: authority_actor_target(),
+            managed: managed_agent_target(),
+            principal: PrincipalId([0x2d; 32]),
+            credential: CredentialId::of_public_key(&credential_public_key),
+            credential_public_key,
+            authenticated_node: Some(NodeId([0x2e; 32])),
+            requested_valid_from: 47,
+            requested_expires_at: 59,
+            request: ManagementRequest::Suspend {
+                actor: ActorId([0x30; 32]),
+                expected_deployment: DeploymentId([0x31; 32]),
+            },
+            signature: [0x32; CREDENTIAL_SIGNATURE_BYTES],
+        }
+    }
+
+    fn management_approval() -> ManagementApproval {
+        let call = authority_credential_call();
+        ManagementApproval::from_call(
+            &call,
+            core::num::NonZeroU64::new(61).unwrap(),
+            AuthorityEvidence {
+                package: Some(blob(0x33)),
+                proof: Some(blob(0x34)),
+                commitment: Hash([0x35; 32]),
+            },
+            AuthorityLaneRoots {
+                control: Some(Hash([0x36; 32])),
+                linear: Some(Hash([0x37; 32])),
+                merge: Some(Hash([0x38; 32])),
+                local: None,
+            },
+            62,
+            48,
+            58,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn authority_actor_protocol_has_bounded_distinct_golden_wires() {
+        let call = authority_credential_call();
+        let call_bytes = call.encode().unwrap();
+        assert_eq!(call_bytes.get(..4), Some(b"ACC1".as_slice()));
+        assert!(call_bytes.len() <= MAX_INVOCATION_MESSAGE_BYTES);
+        assert_eq!(AuthorityCredentialCall::decode(&call_bytes), Ok(call));
+        assert_eq!(
+            Hash::digest(b"vos/test/acc1-golden", &[&call_bytes]).0,
+            [
+                205, 62, 117, 57, 76, 88, 188, 162, 22, 88, 57, 167, 215, 209, 185, 199, 76, 211,
+                144, 215, 110, 93, 170, 98, 152, 75, 97, 107, 72, 48, 210, 23,
+            ]
+        );
+
+        let approval = management_approval();
+        let approval_bytes = approval.encode().unwrap();
+        assert_eq!(approval_bytes.get(..4), Some(b"MAP1".as_slice()));
+        assert!(approval_bytes.len() <= MAX_INVOCATION_REPLY_BYTES);
+        assert_eq!(ManagementApproval::decode(&approval_bytes), Ok(approval));
+        assert_eq!(
+            Hash::digest(b"vos/test/map1-golden", &[&approval_bytes]).0,
+            [
+                172, 136, 101, 85, 233, 28, 48, 97, 87, 116, 151, 23, 86, 88, 93, 33, 9, 61, 132,
+                80, 187, 229, 16, 195, 135, 207, 31, 220, 39, 166, 134, 164,
+            ]
+        );
+    }
+
+    #[test]
+    fn credential_call_signature_and_commitment_bind_every_identity_target_and_request() {
+        let call = authority_credential_call();
+        let signing = call.signing_bytes();
+        let commitment = call.commitment();
+        assert_eq!(signing.get(..4), Some(b"ACS1".as_slice()));
+
+        let mut variants = Vec::new();
+        let mut value = call.clone();
+        value.invocation = InvocationId([0x40; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.authority.space = SpaceId([0x41; 32]);
+        value.managed.space = value.authority.space;
+        variants.push(value);
+        let mut value = call.clone();
+        value.authority.system_agent = AgentId([0x42; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.authority.system_runtime_deployment = DeploymentId([0x43; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.authority.issuer.principal = PrincipalId([0x44; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.authority.issuer.actor = ActorId([0x45; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.authority.issuer.deployment = DeploymentId([0x46; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.authority.issuer.program = ProgramId([0x47; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.authority.issuer.producer = ProducerId([0x48; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.managed.agent = AgentId([0x49; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.managed.runtime_deployment = DeploymentId([0x4a; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.principal = PrincipalId([0x4b; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.credential_public_key = [0x4c; 32];
+        value.credential = CredentialId::of_public_key(&value.credential_public_key);
+        variants.push(value);
+        let mut value = call.clone();
+        value.authenticated_node = Some(NodeId([0x4d; 32]));
+        variants.push(value);
+        let mut value = call.clone();
+        value.requested_valid_from += 1;
+        variants.push(value);
+        let mut value = call.clone();
+        value.requested_expires_at += 1;
+        variants.push(value);
+        let mut value = call.clone();
+        value.request = ManagementRequest::Resume {
+            actor: ActorId([0x30; 32]),
+            expected_deployment: DeploymentId([0x31; 32]),
+        };
+        variants.push(value);
+
+        for variant in variants {
+            assert_eq!(variant.validate_shape(), Ok(()));
+            assert_ne!(variant.signing_bytes(), signing);
+            assert_ne!(variant.commitment(), commitment);
+        }
+
+        let mut signature_only = call;
+        signature_only.signature[0] ^= 1;
+        assert_eq!(signature_only.signing_bytes(), signing);
+        assert_ne!(signature_only.commitment(), commitment);
+    }
+
+    #[test]
+    fn management_approval_commitment_binds_policy_output_and_exact_request() {
+        let approval = management_approval();
+        let commitment = approval.commitment();
+        let mut variants = Vec::new();
+
+        let mut value = approval.clone();
+        value.authorization_sequence = core::num::NonZeroU64::new(62).unwrap();
+        variants.push(value);
+        let mut value = approval.clone();
+        value.evidence.commitment = Hash([0x51; 32]);
+        variants.push(value);
+        let mut value = approval.clone();
+        value.lane_roots.local = Some(Hash([0x52; 32]));
+        variants.push(value);
+        let mut value = approval.clone();
+        value.epoch += 1;
+        variants.push(value);
+        let mut value = approval.clone();
+        value.valid_from += 1;
+        variants.push(value);
+        let mut value = approval;
+        value.request = ManagementRequest::Resume {
+            actor: ActorId([0x30; 32]),
+            expected_deployment: DeploymentId([0x31; 32]),
+        };
+        value.request_commitment = value.request.commitment();
+        variants.push(value);
+
+        for variant in variants {
+            assert_eq!(variant.validate_shape(), Ok(()));
+            assert_ne!(variant.commitment(), commitment);
+        }
+    }
+
+    #[test]
+    fn authority_actor_protocol_rejects_old_corrupt_and_ambiguous_wires() {
+        let call = authority_credential_call();
+        let encoded = call.encode().unwrap();
+        let mut old = encoded.clone();
+        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r6");
+        assert_eq!(
+            AuthorityCredentialCall::decode(&old),
+            Err(WireError::Decode(DecodeError::InvalidPlatform))
+        );
+        let request_at = encoded
+            .windows(4)
+            .position(|window| window == b"AMRQ")
+            .expect("nested canonical management request");
+        let mut old_nested_request = encoded.clone();
+        old_nested_request[request_at + 4..request_at + HEADER_BYTES]
+            .copy_from_slice(b"vos-agent-runtime-abi-20260906r6");
+        assert_eq!(
+            AuthorityCredentialCall::decode(&old_nested_request),
+            Err(WireError::Decode(DecodeError::InvalidPlatform))
+        );
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            AuthorityCredentialCall::decode(&trailing),
+            Err(WireError::Decode(DecodeError::TrailingBytes))
+        );
+        assert!(matches!(
+            AuthorityCredentialCall::decode(&encoded[..encoded.len() - 1]),
+            Err(WireError::Decode(DecodeError::Truncated))
+        ));
+        let mut zero_invocation = encoded;
+        zero_invocation[HEADER_BYTES..HEADER_BYTES + 32].fill(0);
+        assert_eq!(
+            AuthorityCredentialCall::decode(&zero_invocation),
+            Err(WireError::Decode(DecodeError::NonCanonical))
+        );
+
+        let approval = management_approval();
+        let encoded = approval.encode().unwrap();
+        let mut old = encoded.clone();
+        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r6");
+        assert_eq!(
+            ManagementApproval::decode(&old),
+            Err(WireError::Decode(DecodeError::InvalidPlatform))
+        );
+        let mut zero_sequence = encoded.clone();
+        zero_sequence[HEADER_BYTES + 32..HEADER_BYTES + 40].fill(0);
+        assert_eq!(
+            ManagementApproval::decode(&zero_sequence),
+            Err(WireError::Decode(DecodeError::NonCanonical))
+        );
+        let mut zero_request_commitment = encoded;
+        let end = zero_request_commitment.len();
+        zero_request_commitment[end - 32..].fill(0);
+        assert_eq!(
+            ManagementApproval::decode(&zero_request_commitment),
+            Err(WireError::Decode(DecodeError::NonCanonical))
+        );
+    }
+
+    #[test]
+    fn authority_credential_call_rejects_valid_management_larger_than_actor_message() {
+        let replicas = (1..=MAX_AGENT_REPLICAS)
+            .map(|index| {
+                let mut node = [0; 32];
+                node[..2].copy_from_slice(&(index as u16).to_be_bytes());
+                AgentReplica {
+                    node: NodeId(node),
+                    principal: PrincipalId([0x61; 32]),
+                    role: ReplicaRole::Voter,
+                }
+            })
+            .collect();
+        let request = ManagementRequest::ChangeReplicas {
+            expected_generation: Hash([0x62; 32]),
+            replicas,
+        };
+        assert!(request.is_valid());
+        let call = AuthorityCredentialCall {
+            request,
+            ..authority_credential_call()
+        };
+        assert!(authority_credential_call_encoded_len(&call) > MAX_INVOCATION_MESSAGE_BYTES);
+        assert_eq!(
+            call.validate_shape(),
+            Err(crate::authority::AuthorityActorProtocolError::LimitExceeded)
+        );
+        assert_eq!(call.encode(), Err(WireError::InvalidValue));
+
+        let mut approval = management_approval();
+        approval.request = call.request;
+        approval.request_commitment = approval.request.commitment();
+        assert!(management_approval_encoded_len(&approval) > MAX_INVOCATION_REPLY_BYTES);
+        assert_eq!(
+            approval.validate_shape(),
+            Err(crate::authority::AuthorityActorProtocolError::LimitExceeded)
+        );
+        assert_eq!(approval.encode(), Err(WireError::InvalidValue));
     }
 
     #[test]
