@@ -332,6 +332,8 @@ pub enum PendingManagementEffect {
 #[rkyv(crate = vos::rkyv)]
 pub struct ExactRetryRecord {
     pub invocation: [u8; 32],
+    /// Deterministic MAA1 invocation reserved atomically with this ACC1.
+    pub acknowledgement_invocation: [u8; 32],
     pub credential_call: [u8; 32],
     pub credential_call_bytes: Vec<u8>,
     pub approval_commitment: [u8; 32],
@@ -339,7 +341,6 @@ pub struct ExactRetryRecord {
     pub approval: Vec<u8>,
     pub effect: PendingManagementEffect,
     pub finalized: bool,
-    pub acknowledgement_invocation: Option<[u8; 32]>,
     pub acknowledgement: Option<[u8; 32]>,
     pub acknowledgement_bytes: Option<Vec<u8>>,
     pub reopened_state: Option<[u8; 32]>,
@@ -408,7 +409,7 @@ impl AuthorityLinearState {
 }
 
 /// Linear policy state for one Space's built-in system Agent.
-#[actor(agent, state_version = 1)]
+#[actor(agent, state_version = 2)]
 pub struct SystemAuthority {
     #[state(const)]
     configuration: SystemAuthorityConfiguration,
@@ -493,18 +494,13 @@ fn authorize_call(
     }
 
     let call_commitment = call.commitment();
-    if state
-        .retries
-        .iter()
-        .any(|record| record.acknowledgement_invocation == Some(call.invocation.0))
-    {
-        return Vec::new();
-    }
+    let acknowledgement_invocation = ManagementApproval::derive_acknowledgement_invocation(&call);
     match retry_record(state, call.invocation) {
         Ok(index) => {
             let record = &state.retries[index];
             if record.credential_call != call_commitment.0
                 || record.credential_call_bytes != encoded_call
+                || record.acknowledgement_invocation != acknowledgement_invocation.0
             {
                 return Vec::new();
             }
@@ -514,6 +510,7 @@ fn authorize_call(
             if approval.matches_call(&call)
                 && approval.commitment().0 == record.approval_commitment
                 && approval.authorization_sequence.get() == record.authorization_sequence
+                && approval.acknowledgement_invocation.0 == record.acknowledgement_invocation
                 && authority_target_matches(configuration, &approval.authority)
             {
                 return record.approval.clone();
@@ -522,6 +519,9 @@ fn authorize_call(
         }
         Err(index) => {
             if state.retries.len() >= MAX_EXACT_RETRY_RECORDS {
+                return Vec::new();
+            }
+            if !invocation_pair_is_available(state, call.invocation, acknowledgement_invocation) {
                 return Vec::new();
             }
 
@@ -571,6 +571,9 @@ fn authorize_call(
             ) else {
                 return Vec::new();
             };
+            if approval.acknowledgement_invocation != acknowledgement_invocation {
+                return Vec::new();
+            }
             let Ok(approval_bytes) = approval.encode() else {
                 return Vec::new();
             };
@@ -580,6 +583,7 @@ fn authorize_call(
 
             let record = ExactRetryRecord {
                 invocation: call.invocation.0,
+                acknowledgement_invocation: acknowledgement_invocation.0,
                 credential_call: call_commitment.0,
                 credential_call_bytes: encoded_call.to_vec(),
                 approval_commitment: approval.commitment().0,
@@ -587,7 +591,6 @@ fn authorize_call(
                 approval: approval_bytes.clone(),
                 effect,
                 finalized: false,
-                acknowledgement_invocation: None,
                 acknowledgement: None,
                 acknowledgement_bytes: None,
                 reopened_state: None,
@@ -624,34 +627,25 @@ fn finalize_application(
     }
     let ack_commitment = ack.commitment();
 
-    // Runtime invocation IDs are global exact-retry keys. An MAA1 must not
-    // reuse any ACC1 ID, including one belonging to another pending record.
-    if state
+    let Some(record_index) = state
         .retries
         .iter()
-        .any(|record| record.invocation == ack.acknowledgement_invocation.0)
-    {
+        .position(|record| record.acknowledgement_invocation == ack.acknowledgement_invocation.0)
+    else {
+        return false;
+    };
+    let record = &state.retries[record_index];
+    if record.invocation != ack.authorization_invocation.0 {
         return false;
     }
-    if let Some(record) = state
-        .retries
-        .iter()
-        .find(|record| record.acknowledgement_invocation == Some(ack.acknowledgement_invocation.0))
-    {
+    if record.finalized {
         return record.invocation == ack.authorization_invocation.0
-            && record.finalized
             && record.acknowledgement == Some(ack_commitment.0)
             && record.acknowledgement_bytes.as_deref() == Some(encoded_ack)
             && record.reopened_state == Some(ack.reopened_state.0)
             && record.applied_at == Some(ack.applied_at);
     }
-
-    let Ok(record_index) = retry_record(state, ack.authorization_invocation) else {
-        return false;
-    };
-    let record = &state.retries[record_index];
-    if record.finalized
-        || record.credential_call != ack.credential_call.0
+    if record.credential_call != ack.credential_call.0
         || record.approval_commitment != ack.approval.0
         || record.authorization_sequence != ack.authorization_sequence.get()
     {
@@ -673,7 +667,6 @@ fn finalize_application(
     apply_application_plan(state, plan);
     let record = &mut state.retries[record_index];
     record.finalized = true;
-    record.acknowledgement_invocation = Some(ack.acknowledgement_invocation.0);
     record.acknowledgement = Some(ack_commitment.0);
     record.acknowledgement_bytes = Some(encoded_ack.to_vec());
     record.reopened_state = Some(ack.reopened_state.0);
@@ -772,6 +765,22 @@ fn retry_record(
     state
         .retries
         .binary_search_by(|record| record.invocation.cmp(&invocation.0))
+}
+
+fn invocation_pair_is_available(
+    state: &AuthorityLinearState,
+    authorization: InvocationId,
+    acknowledgement: InvocationId,
+) -> bool {
+    authorization != InvocationId::ZERO
+        && acknowledgement != InvocationId::ZERO
+        && authorization != acknowledgement
+        && state.retries.iter().all(|record| {
+            record.invocation != authorization.0
+                && record.invocation != acknowledgement.0
+                && record.acknowledgement_invocation != authorization.0
+                && record.acknowledgement_invocation != acknowledgement.0
+        })
 }
 
 fn authenticated_role(
@@ -969,6 +978,8 @@ fn authority_state_is_valid(
         })
         && state.retries.iter().all(|row| {
             row.invocation != [0; 32]
+                && row.acknowledgement_invocation != [0; 32]
+                && row.acknowledgement_invocation != row.invocation
                 && row.credential_call != [0; 32]
                 && !row.credential_call_bytes.is_empty()
                 && row.credential_call_bytes.len() <= MAX_INVOCATION_MESSAGE_BYTES
@@ -985,27 +996,23 @@ fn authority_state_is_valid(
 fn retry_finalization_shape_is_valid(record: &ExactRetryRecord) -> bool {
     match (
         record.finalized,
-        record.acknowledgement_invocation,
         record.acknowledgement,
         record.acknowledgement_bytes.as_deref(),
         record.reopened_state,
         record.applied_at,
     ) {
-        (false, None, None, None, None, None) => true,
+        (false, None, None, None, None) => true,
         (
             true,
-            Some(invocation),
             Some(acknowledgement),
             Some(acknowledgement_bytes),
             Some(reopened_state),
             Some(_),
         ) => {
-            invocation != [0; 32]
-                && acknowledgement != [0; 32]
+            acknowledgement != [0; 32]
                 && !acknowledgement_bytes.is_empty()
                 && acknowledgement_bytes.len() <= MAX_INVOCATION_MESSAGE_BYTES
                 && reopened_state != [0; 32]
-                && invocation != record.invocation
         }
         _ => false,
     }
@@ -1016,10 +1023,9 @@ fn retry_identifiers_are_unique(records: &[ExactRetryRecord]) -> bool {
         records.iter().enumerate().all(|(other_index, other)| {
             index == other_index
                 || (record.authorization_sequence != other.authorization_sequence
-                    && record.acknowledgement_invocation != Some(other.invocation)
-                    && other.acknowledgement_invocation != Some(record.invocation)
-                    && (record.acknowledgement_invocation.is_none()
-                        || record.acknowledgement_invocation != other.acknowledgement_invocation))
+                    && record.acknowledgement_invocation != other.invocation
+                    && other.acknowledgement_invocation != record.invocation
+                    && record.acknowledgement_invocation != other.acknowledgement_invocation)
         })
     })
 }
@@ -1277,11 +1283,10 @@ mod tests {
         config: SystemAuthorityConfiguration,
         call: &AuthorityCredentialCall,
         approval: &ManagementApproval,
-        acknowledgement_invocation: InvocationId,
     ) -> ManagementApplicationAck {
         let mut ack = ManagementApplicationAck {
             authorization_invocation: call.invocation,
-            acknowledgement_invocation,
+            acknowledgement_invocation: approval.acknowledgement_invocation,
             authority: call.authority,
             managed: call.managed,
             credential_call: call.commitment(),
@@ -1860,8 +1865,11 @@ mod tests {
         actor.state.retries.clear();
         for ordinal in 1..=MAX_EXACT_RETRY_RECORDS {
             let byte = ordinal as u8;
+            let mut acknowledgement_invocation = [byte; 32];
+            acknowledgement_invocation[31] ^= 0x80;
             actor.state.retries.push(ExactRetryRecord {
                 invocation: [byte; 32],
+                acknowledgement_invocation,
                 credential_call: [byte; 32],
                 credential_call_bytes: b"bounded retained call".to_vec(),
                 approval_commitment: [byte.wrapping_add(1); 32],
@@ -1869,7 +1877,6 @@ mod tests {
                 approval: b"bounded retained approval".to_vec(),
                 effect: PendingManagementEffect::None,
                 finalized: false,
-                acknowledgement_invocation: None,
                 acknowledgement: None,
                 acknowledgement_bytes: None,
                 reopened_state: None,
@@ -1908,6 +1915,13 @@ mod tests {
         let mut actor = actor();
         let approval = dispatch(&mut actor, &call);
         assert!(!approval.is_empty());
+        let decoded_approval = ManagementApproval::decode(&approval).unwrap();
+        let reserved = ManagementApproval::derive_acknowledgement_invocation(&call);
+        assert_eq!(decoded_approval.acknowledgement_invocation, reserved);
+        assert_eq!(
+            actor.state.retries[0].acknowledgement_invocation,
+            reserved.0
+        );
         assert!(actor.state.managed_agents.is_empty());
 
         let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
@@ -1921,6 +1935,10 @@ mod tests {
         .expect("valid durable Linear restart");
         assert_eq!(restarted.configuration, config);
         assert!(restarted.state.managed_agents.is_empty());
+        assert_eq!(
+            restarted.state.retries[0].acknowledgement_invocation,
+            reserved.0
+        );
         assert_eq!(dispatch(&mut restarted, &call), approval);
         assert!(restarted.state.managed_agents.is_empty());
     }
@@ -1946,7 +1964,7 @@ mod tests {
         );
         assert!(actor.state.managed_agents.is_empty());
 
-        let ack = application_ack(config, &call, &approval, InvocationId([0xe5; 32]));
+        let ack = application_ack(config, &call, &approval);
         let ack_bytes = ack.encode().unwrap();
         assert_eq!(ack_bytes.get(..4), Some(b"MAA1".as_slice()));
         assert!(dispatch_ack(&mut actor, &ack));
@@ -1987,7 +2005,7 @@ mod tests {
         );
         let mut pending = actor();
         let approval = ManagementApproval::decode(&dispatch(&mut pending, &call)).unwrap();
-        let valid = application_ack(config, &call, &approval, InvocationId([0x69; 32]));
+        let valid = application_ack(config, &call, &approval);
 
         let mut variants = Vec::new();
         let mut bad_ack_signature = valid.clone();
@@ -2010,6 +2028,11 @@ mod tests {
         wrong_authorization.authorization_invocation = InvocationId([0x6b; 32]);
         resign_ack(&mut wrong_authorization);
         variants.push(wrong_authorization);
+
+        let mut unreserved_acknowledgement = valid.clone();
+        unreserved_acknowledgement.acknowledgement_invocation = InvocationId([0x6d; 32]);
+        resign_ack(&mut unreserved_acknowledgement);
+        variants.push(unreserved_acknowledgement);
 
         let mut reused_authorization_id = valid.clone();
         reused_authorization_id.acknowledgement_invocation = call.invocation;
@@ -2063,6 +2086,61 @@ mod tests {
     }
 
     #[test]
+    fn acknowledgement_invocation_is_reserved_before_approval_mutation() {
+        let config = configuration();
+        let key = signing(0x21);
+        let candidate = create_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x75,
+            AgentProfile::Local,
+            0x76,
+        );
+        let candidate_ack = ManagementApproval::derive_acknowledgement_invocation(&candidate);
+
+        // First reserve the candidate's prospective MAA1 ID as another ACC1
+        // ID. The candidate must be denied before consuming a sequence or
+        // adding its pending Create effect.
+        let mut blocker = create_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x77,
+            AgentProfile::Local,
+            0x78,
+        );
+        blocker.invocation = candidate_ack;
+        resign(&mut blocker, &key);
+        let mut actor = actor();
+        let blocker_approval = ManagementApproval::decode(&dispatch(&mut actor, &blocker)).unwrap();
+        assert_eq!(actor.state.retries.len(), 1);
+
+        let before = actor.state.clone();
+        assert!(dispatch(&mut actor, &candidate).is_empty());
+        assert_eq!(actor.state, before);
+
+        // The reciprocal collision is also reserved immediately: a later
+        // ACC1 cannot claim the blocker's prospective MAA1 ID while the
+        // blocker is still pending finalization.
+        let mut authorization_collision = create_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x79,
+            AgentProfile::Local,
+            0x7a,
+        );
+        authorization_collision.invocation = blocker_approval.acknowledgement_invocation;
+        resign(&mut authorization_collision, &key);
+        assert!(dispatch(&mut actor, &authorization_collision).is_empty());
+        assert_eq!(actor.state, before);
+    }
+
+    #[test]
     fn acknowledgement_invocation_conflict_is_not_an_exact_retry() {
         let config = configuration();
         let call = create_call(
@@ -2076,7 +2154,7 @@ mod tests {
         );
         let mut actor = actor();
         let approval = ManagementApproval::decode(&dispatch(&mut actor, &call)).unwrap();
-        let ack = application_ack(config, &call, &approval, InvocationId([0x6f; 32]));
+        let ack = application_ack(config, &call, &approval);
         assert!(dispatch_ack(&mut actor, &ack));
 
         let mut conflict = ack.clone();
