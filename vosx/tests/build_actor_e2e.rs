@@ -1,5 +1,5 @@
-//! Producer-only clean Agent package gates. These tests authenticate the exact
-//! VOS3 closure emitted by `vosx agent build`; host admission is covered by its
+//! Producer-only portable actor package gates. These tests authenticate the exact
+//! VOS3 closure emitted by `vosx actor build`; host admission is covered by its
 //! own focused integration suite.
 
 use std::path::{Path, PathBuf};
@@ -44,7 +44,7 @@ impl PackageVerifier for DalekVerifier {
 
 fn actor_manifest(package: &PackageEnvelope) -> &sdk::package::ActorPackageManifest {
     let PackageManifest::Actor(manifest) = &package.manifest else {
-        panic!("agent build emitted a runtime package")
+        panic!("actor build emitted a runtime package")
     };
     manifest
 }
@@ -55,7 +55,7 @@ fn project_build_emits_verified_exact_vos3_closure_and_portable_role_id() {
     let out = temp.0.join("dist");
     let output = Command::new(env!("CARGO_BIN_EXE_vosx"))
         .args([
-            "agent",
+            "actor",
             "build",
             "../examples/actors/shared-board",
             "--out-dir",
@@ -64,10 +64,10 @@ fn project_build_emits_verified_exact_vos3_closure_and_portable_role_id() {
         .env("XDG_CONFIG_HOME", temp.0.join("config"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
-        .expect("run vosx agent build");
+        .expect("run vosx actor build");
     assert!(
         output.status.success(),
-        "agent build failed: {}",
+        "actor build failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -168,7 +168,7 @@ fn build_pvm(
 ) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_vosx"));
     command
-        .args(["agent", "build"])
+        .args(["actor", "build"])
         .arg(&inputs.pvm)
         .arg("--metadata")
         .arg(&inputs.metadata)

@@ -67,30 +67,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a minimal service actor project.
-    New {
-        path: PathBuf,
-        /// Scaffold an explicitly convergent service actor.
-        #[arg(long)]
-        crdt: bool,
-    },
-    /// Build one canonical service actor PVM and signed `.vos` package.
-    Build {
-        #[command(flatten)]
-        options: BuildOptions,
-    },
-    /// Build and scaffold packages for the standard agent runtime.
-    Agent {
+    /// Build and scaffold portable actors hosted by an Agent.
+    Actor {
         #[command(subcommand)]
-        command: AgentCommand,
-    },
-    /// Transpile and validate the protocol-pinned generic service PVM.
-    ServicePvm {
-        /// `vos-service.elf` built with the pinned VOS/PVM revisions.
-        elf: PathBuf,
-        /// Output path; defaults to the input path with a `.pvm` extension.
-        #[arg(long)]
-        out: Option<PathBuf>,
+        command: ActorCommand,
     },
     /// Transpile and validate a standard agent-runtime PVM.
     AgentRuntimePvm {
@@ -141,63 +121,7 @@ enum Command {
 }
 
 #[derive(ClapArgs)]
-struct BuildOptions {
-    /// Actor project directory or ELF.
-    program: PathBuf,
-    #[arg(long)]
-    name: Option<String>,
-    #[arg(long, default_value = "dist")]
-    out_dir: PathBuf,
-    #[arg(long)]
-    interfaces: Option<PathBuf>,
-    #[arg(long)]
-    role_policies: Option<PathBuf>,
-    /// Exact `.vos_meta` bytes for a pre-linked Service PVM.
-    #[arg(long)]
-    schemas: Option<PathBuf>,
-    #[arg(long)]
-    source_map: Option<PathBuf>,
-    /// Canonical Task project directory or ELF dependency. May be repeated;
-    /// each dependency must export `__VOS_WITNESS`.
-    #[arg(long = "task")]
-    tasks: Vec<PathBuf>,
-    /// Retain the input ELF as non-authoritative diagnostics.
-    #[arg(long)]
-    include_elf: bool,
-    /// Require the target's convergent-only actor form.
-    #[arg(long)]
-    crdt: bool,
-}
-
-impl BuildOptions {
-    fn into_build_args(
-        self,
-        target: commands::build::BuildTarget,
-        agent_schema: Option<PathBuf>,
-    ) -> commands::build::Args {
-        commands::build::Args {
-            target,
-            program: self.program,
-            name: self.name,
-            out_dir: self.out_dir,
-            interfaces: self.interfaces,
-            role_policies: self.role_policies,
-            method_policy: None,
-            schemas: self.schemas,
-            agent_schema,
-            agent_authorizations: None,
-            source_map: self.source_map,
-            tasks: self.tasks,
-            include_elf: self.include_elf,
-            crdt: self.crdt,
-            scheduling: false,
-            proof_system: None,
-        }
-    }
-}
-
-#[derive(ClapArgs)]
-struct AgentBuildOptions {
+struct ActorBuildOptions {
     /// AgentActor project directory, ELF, or canonical standard PVM.
     program: PathBuf,
     #[arg(long)]
@@ -231,22 +155,17 @@ struct AgentBuildOptions {
     proof_system: Option<vos::agent::sdk::Hash>,
 }
 
-impl AgentBuildOptions {
+impl ActorBuildOptions {
     fn into_build_args(self) -> commands::build::Args {
         commands::build::Args {
-            target: commands::build::BuildTarget::Agent,
             program: self.program,
             name: self.name,
             out_dir: self.out_dir,
-            interfaces: None,
-            role_policies: None,
             method_policy: self.method_policy,
             schemas: self.metadata,
             agent_schema: self.agent_schema,
             agent_authorizations: self.agent_authorizations,
-            source_map: None,
             tasks: self.tasks,
-            include_elf: false,
             crdt: self.crdt,
             scheduling: self.scheduling,
             proof_system: self.proof_system,
@@ -274,19 +193,19 @@ fn parse_proof_system(value: &str) -> Result<vos::agent::sdk::Hash, String> {
 }
 
 #[derive(Subcommand)]
-enum AgentCommand {
-    /// Create a minimal actor project for the standard agent runtime.
+enum ActorCommand {
+    /// Create a minimal portable AgentActor project.
     New {
         path: PathBuf,
         /// Scaffold an actor whose state uses only the merge lane.
         #[arg(long)]
         crdt: bool,
     },
-    /// Build one standard-agent actor PVM and signed clean-generation VOS3
+    /// Build one portable AgentActor PVM and signed clean-generation VOS3
     /// package. PVM inputs require exact producer metadata artifacts.
     Build {
         #[command(flatten)]
-        options: Box<AgentBuildOptions>,
+        options: Box<ActorBuildOptions>,
     },
 }
 
@@ -372,43 +291,18 @@ fn main() {
     output::set(cli.format);
 
     match cli.command {
-        Some(Command::New { path, crdt }) => {
-            if let Err(error) = commands::new_project::run(
-                path,
-                crdt,
-                commands::new_project::ProjectTarget::Service,
-            ) {
-                report_error(error);
-            }
-        }
-        Some(Command::Build { options }) => {
-            if let Err(error) = commands::build::run(
-                options.into_build_args(commands::build::BuildTarget::Service, None),
-            ) {
-                report_error(error);
-            }
-        }
-        Some(Command::Agent { command }) => match command {
-            AgentCommand::New { path, crdt } => {
-                if let Err(error) = commands::new_project::run(
-                    path,
-                    crdt,
-                    commands::new_project::ProjectTarget::Agent,
-                ) {
+        Some(Command::Actor { command }) => match command {
+            ActorCommand::New { path, crdt } => {
+                if let Err(error) = commands::new_project::run(path, crdt) {
                     report_error(error);
                 }
             }
-            AgentCommand::Build { options } => {
+            ActorCommand::Build { options } => {
                 if let Err(error) = commands::build::run((*options).into_build_args()) {
                     report_error(error);
                 }
             }
         },
-        Some(Command::ServicePvm { elf, out }) => {
-            if let Err(error) = commands::service_pvm::run(&elf, out) {
-                report_error(error);
-            }
-        }
         Some(Command::AgentRuntimePvm { elf, out }) => {
             if let Err(error) = commands::agent_runtime_pvm::run(elf.as_deref(), out) {
                 report_error(error);
@@ -501,24 +395,30 @@ fn is_top_level_help(argv: &[String]) -> bool {
     saw_help
 }
 
-/// Decide whether argv should bypass clap into the dynamic
-/// dispatcher. The first non-flag token is the candidate verb;
-/// any of the built-in subcommand names — including clap's
-/// auto-generated `help` — falls back to clap.
+/// Names that must reach clap instead of dynamic actor dispatch.
+///
+/// `agent` is reserved for the operational Agent surface. The retired
+/// authoring spellings stay here solely so clap rejects them as unknown
+/// subcommands instead of treating them as remotely dispatchable actors.
+const CLAP_ROUTED_VERBS: &[&str] = &[
+    "actor",
+    "agent",
+    "agent-runtime-pvm",
+    "release",
+    "space",
+    "zk",
+    "help-schema",
+    "help",
+    "whoami",
+    "new",
+    "build",
+    "service-pvm",
+];
+
+/// Decide whether argv should bypass clap into the dynamic dispatcher. The
+/// first non-flag token is the candidate verb; active, reserved, and retired
+/// clap-routed names fall back to clap.
 fn should_dynamic_dispatch(argv: &[String]) -> bool {
-    const BUILTIN_VERBS: &[&str] = &[
-        "new",
-        "build",
-        "agent",
-        "service-pvm",
-        "agent-runtime-pvm",
-        "release",
-        "space",
-        "zk",
-        "help-schema",
-        "help",
-        "whoami",
-    ];
     // Skip global flags; `--format` / `--out` take a value, the
     // rest are boolean-shaped. `--out` is a dynamic-only flag but
     // we skip its value here (rather than `return true`) so its path
@@ -544,7 +444,7 @@ fn should_dynamic_dispatch(argv: &[String]) -> bool {
                     // Unknown flag — let clap surface the error.
                     return false;
                 }
-                if BUILTIN_VERBS.contains(&a.as_str()) {
+                if CLAP_ROUTED_VERBS.contains(&a.as_str()) {
                     return false;
                 }
                 return true;
@@ -610,7 +510,10 @@ fn exit_code_for(e: &anyhow::Error) -> i32 {
 
 #[cfg(test)]
 mod routing_tests {
-    use super::{is_top_level_help, parse_proof_system, should_dynamic_dispatch};
+    use super::{
+        ActorCommand, Cli, Command, is_top_level_help, parse_proof_system, should_dynamic_dispatch,
+    };
+    use clap::{CommandFactory, Parser, error::ErrorKind};
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -637,8 +540,9 @@ mod routing_tests {
     }
 
     #[test]
-    fn builtin_verbs_use_clap_path() {
+    fn active_reserved_and_retired_verbs_use_clap_path() {
         for v in [
+            "actor",
             "new",
             "build",
             "agent",
@@ -653,6 +557,46 @@ mod routing_tests {
         ] {
             assert!(!should_dynamic_dispatch(&s(&[v])), "verb={v}");
         }
+    }
+
+    #[test]
+    fn actor_owns_authoring_and_retired_spellings_have_no_aliases() {
+        let parsed = Cli::try_parse_from(["vosx", "actor", "new", "counter"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Actor {
+                command: ActorCommand::New { .. }
+            })
+        ));
+        assert!(Cli::try_parse_from(["vosx", "actor", "build", "counter"]).is_ok());
+
+        for argv in [
+            ["vosx", "new", "counter"],
+            ["vosx", "build", "counter"],
+            ["vosx", "agent", "new"],
+            ["vosx", "service-pvm", "service.elf"],
+        ] {
+            let error = Cli::try_parse_from(argv)
+                .err()
+                .expect("retired spelling must be rejected");
+            assert_eq!(error.kind(), ErrorKind::InvalidSubcommand, "argv={argv:?}");
+        }
+    }
+
+    #[test]
+    fn clap_help_exposes_only_the_actor_authoring_namespace() {
+        let names = Cli::command()
+            .get_subcommands()
+            .map(|command| command.get_name().to_owned())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "actor"));
+        for retired in ["new", "build", "agent", "service-pvm"] {
+            assert!(
+                !names.iter().any(|name| name == retired),
+                "retired command={retired}"
+            );
+        }
+        assert!(names.iter().any(|name| name == "agent-runtime-pvm"));
     }
 
     #[test]

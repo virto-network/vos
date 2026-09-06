@@ -102,7 +102,7 @@ fn build_accepts_the_canonical_binary_task_project() {
     let proof_system = "73".repeat(32);
 
     let built = Command::new(vosx)
-        .args(["agent", "build"])
+        .args(["actor", "build"])
         .arg(&actor_path)
         .args(["--name", "task-project-e2e", "--task"])
         .arg(&task)
@@ -120,10 +120,10 @@ fn build_accepts_the_canonical_binary_task_project() {
         .env("CARGO_TARGET_DIR", task_target.path())
         .env("NO_COLOR", "1")
         .output()
-        .expect("run vosx build");
+        .expect("run vosx actor build");
     assert!(
         built.status.success(),
-        "vosx build failed:\nstdout={}\nstderr={}",
+        "vosx actor build failed:\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&built.stdout),
         String::from_utf8_lossy(&built.stderr)
     );

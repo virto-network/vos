@@ -25,8 +25,8 @@
 //! ## Routing precedence
 //!
 //! `main` decides whether to enter this module by peeking argv
-//! before clap. The verb must be neither a built-in subcommand
-//! (`space`, `help-schema`, `help`).
+//! before clap. Active CLI namespaces, the reserved future `agent`
+//! namespace, and retired authoring spellings are routed to clap instead.
 
 use anyhow::{Context, anyhow, bail};
 use vos::metadata::{ParsedMessage, ParsedMeta};

@@ -1,16 +1,10 @@
-//! Actor scaffolding for the service and standard-agent runtimes.
+//! Portable AgentActor project scaffolding for `vosx actor new`.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProjectTarget {
-    Service,
-    Agent,
-}
-
-pub fn run(path: PathBuf, crdt: bool, target: ProjectTarget) -> anyhow::Result<()> {
+pub fn run(path: PathBuf, crdt: bool) -> anyhow::Result<()> {
     if path.exists() {
         bail!("{} already exists", path.display());
     }
@@ -23,26 +17,17 @@ pub fn run(path: PathBuf, crdt: bool, target: ProjectTarget) -> anyhow::Result<(
     std::fs::create_dir_all(path.join("src"))
         .with_context(|| format!("create {}", path.display()))?;
     std::fs::create_dir_all(path.join(".cargo"))?;
-    std::fs::write(path.join("Cargo.toml"), cargo_toml(name, target))?;
-    std::fs::write(
-        path.join(".cargo/config.toml"),
-        match target {
-            ProjectTarget::Service => SERVICE_CONFIG,
-            ProjectTarget::Agent => AGENT_CONFIG,
-        },
-    )?;
-    if target == ProjectTarget::Agent {
-        std::fs::write(path.join("pvm.ld"), PVM_LINKER_SCRIPT)?;
-    }
+    std::fs::write(path.join("Cargo.toml"), cargo_toml(name))?;
+    std::fs::write(path.join(".cargo/config.toml"), ACTOR_CONFIG)?;
+    std::fs::write(path.join("pvm.ld"), PVM_LINKER_SCRIPT)?;
     std::fs::write(path.join("rust-toolchain.toml"), TOOLCHAIN)?;
     std::fs::write(path.join("riscv64em-vos.json"), TARGET)?;
     std::fs::write(
         path.join("src/lib.rs"),
-        match (target, crdt) {
-            (ProjectTarget::Service, true) => service_crdt_source(&crate_name),
-            (ProjectTarget::Agent, true) => agent_crdt_source(&crate_name),
-            (ProjectTarget::Service, false) => counter_source(&crate_name, false),
-            (ProjectTarget::Agent, false) => counter_source(&crate_name, true),
+        if crdt {
+            merge_actor_source(&crate_name)
+        } else {
+            counter_source(&crate_name)
         },
     )?;
     println!("created {}", path.display());
@@ -50,11 +35,7 @@ pub fn run(path: PathBuf, crdt: bool, target: ProjectTarget) -> anyhow::Result<(
     Ok(())
 }
 
-fn cargo_toml(name: &str, target: ProjectTarget) -> String {
-    let guest_feature = match target {
-        ProjectTarget::Service => "service",
-        ProjectTarget::Agent => "pvm",
-    };
+fn cargo_toml(name: &str) -> String {
     format!(
         r#"[workspace]
 
@@ -71,7 +52,7 @@ bin = []
 crate-type = ["rlib", "cdylib"]
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-vos = {{ version = "{}", default-features = false, features = ["macros", "{guest_feature}"] }}
+vos = {{ version = "{}", default-features = false, features = ["macros", "pvm"] }}
 
 [target.'cfg(not(target_arch = "riscv64"))'.dependencies]
 vos = {{ version = "{}", default-features = false, features = ["macros", "extension"] }}
@@ -86,24 +67,18 @@ panic = "abort"
     )
 }
 
-fn counter_source(name: &str, agent: bool) -> String {
-    let actor_attribute = if agent { "#[actor(agent)]" } else { "#[actor]" };
-    let messages_attribute = if agent {
-        "#[messages(agent)]"
-    } else {
-        "#[messages]"
-    };
+fn counter_source(name: &str) -> String {
     format!(
         r#"//! {name}: an actor with linear state.
 
 use vos::prelude::*;
 
-{actor_attribute}
+#[actor(agent)]
 pub struct Counter {{
     count: u64,
 }}
 
-{messages_attribute}
+#[messages(agent)]
 impl Counter {{
     fn new() -> Self {{
         Self {{ count: 0 }}
@@ -124,58 +99,7 @@ impl Counter {{
     )
 }
 
-fn service_crdt_source(name: &str) -> String {
-    format!(
-        r#"//! {name}: an explicitly convergent shared actor.
-
-use vos::prelude::*;
-
-#[actor(crdt)]
-pub struct SharedBoard {{
-    title: crdt::Value<String>,
-    tasks: crdt::Map<u64, String>,
-    order: crdt::List<u64>,
-    notes: crdt::Text,
-    edits: crdt::Counter,
-
-    #[crdt(const)]
-    space: [u8; 32],
-
-    #[crdt(skip)]
-    cache: Option<String>,
-}}
-
-#[messages]
-impl SharedBoard {{
-    fn new() -> Self {{
-        Self {{
-            title: crdt::Value::default(),
-            tasks: crdt::Map::default(),
-            order: crdt::List::default(),
-            notes: crdt::Text::default(),
-            edits: crdt::Counter::default(),
-            space: [0; 32],
-            cache: None,
-        }}
-    }}
-
-    #[msg]
-    fn set_title(&mut self, title: String) {{
-        self.title
-            .set(title)
-            .expect("CRDT mutations in actor methods have stable operation identities");
-    }}
-
-    #[msg]
-    fn edit_count(&self) -> i64 {{
-        self.edits.value()
-    }}
-}}
-"#,
-    )
-}
-
-fn agent_crdt_source(name: &str) -> String {
+fn merge_actor_source(name: &str) -> String {
     format!(
         r#"//! {name}: an actor whose state can merge across replicas.
 
@@ -231,24 +155,7 @@ channel = "nightly"
 components = ["rust-src"]
 "#;
 
-const SERVICE_CONFIG: &str = r#"[target.riscv64em-vos]
-rustflags = [
-    "-Zunstable-options",
-    "-Zcrate-attr=no_std",
-    "-Zcrate-attr=no_main",
-    "-Zremap-cwd-prefix=.",
-    "-Aduplicate-macro-attributes",
-    "-Aunused-attributes",
-]
-
-[alias]
-actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-vos.json"
-
-[unstable]
-json-target-spec = true
-"#;
-
-const AGENT_CONFIG: &str = r#"[target.riscv64em-vos]
+const ACTOR_CONFIG: &str = r#"[target.riscv64em-vos]
 rustflags = [
     "-Zunstable-options",
     "-Zcrate-attr=no_std",
@@ -266,7 +173,7 @@ actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -
 json-target-spec = true
 "#;
 
-const PVM_LINKER_SCRIPT: &str = r#"/* Canonical standard-agent actor layout.
+const PVM_LINKER_SCRIPT: &str = r#"/* Canonical portable AgentActor layout.
  *
  * Read-only and read-write data occupy distinct GP zones. The read-write
  * base follows the complete read-only image instead of assuming a fixed
@@ -316,37 +223,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn service_template_preserves_the_service_build_surface() {
-        assert!(SERVICE_CONFIG.contains("-Zcrate-attr=no_std"));
-        assert!(SERVICE_CONFIG.contains("-Zcrate-attr=no_main"));
-        assert!(SERVICE_CONFIG.contains("-Zremap-cwd-prefix=."));
-        assert!(!SERVICE_CONFIG.contains("-Clink-arg=-Tpvm.ld"));
-        assert!(
-            cargo_toml("x", ProjectTarget::Service).contains(r#"features = ["macros", "service"]"#)
-        );
-        assert!(
-            !cargo_toml("x", ProjectTarget::Service).contains(r#"features = ["macros", "pvm"]"#)
-        );
-        assert!(!counter_source("x", false).contains("#![no_std]"));
-        assert!(service_crdt_source("x").contains("#[actor(crdt)]"));
-    }
-
-    #[test]
-    fn agent_template_uses_the_standard_program_layout() {
-        assert!(AGENT_CONFIG.contains("-Zcrate-attr=no_std"));
-        assert!(AGENT_CONFIG.contains("-Zcrate-attr=no_main"));
-        assert!(AGENT_CONFIG.contains("-Zremap-cwd-prefix=."));
-        assert!(AGENT_CONFIG.contains("-Clink-arg=-Tpvm.ld"));
-        assert!(cargo_toml("x", ProjectTarget::Agent).contains(r#"features = ["macros", "pvm"]"#));
+    fn actor_template_uses_the_standard_program_layout() {
+        assert!(ACTOR_CONFIG.contains("-Zcrate-attr=no_std"));
+        assert!(ACTOR_CONFIG.contains("-Zcrate-attr=no_main"));
+        assert!(ACTOR_CONFIG.contains("-Zremap-cwd-prefix=."));
+        assert!(ACTOR_CONFIG.contains("-Clink-arg=-Tpvm.ld"));
+        assert!(cargo_toml("x").contains(r#"features = ["macros", "pvm"]"#));
+        assert!(!cargo_toml("x").contains(r#"features = ["macros", "service"]"#));
         assert!(PVM_LINKER_SCRIPT.contains("SIZEOF(.rodata)"));
-        let source = counter_source("x", true);
+        let source = counter_source("x");
         assert!(source.contains("#[actor(agent)]"));
         assert!(source.contains("#[messages(agent)]"));
     }
 
     #[test]
     fn merge_template_uses_the_signed_agent_lane_surface() {
-        let source = agent_crdt_source("x");
+        let source = merge_actor_source("x");
         assert!(source.contains("#[actor(agent)]"));
         assert!(source.contains("#[messages(agent)]"));
         assert!(source.contains("#[msg(merge)]"));

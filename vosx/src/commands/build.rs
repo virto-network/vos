@@ -7,16 +7,11 @@ use std::process::Command;
 use anyhow::{Context, anyhow, bail};
 use vos::agent::sdk;
 use vos::agent::sdk::wire::CanonicalWire;
-use vos::service::{
-    DeploymentSignature, PackageDiagnostics, PackageManifest as ServicePackageManifest,
-    PackageRolePolicies, PackageTaskDependency, ProducerId, ProgramId, ServiceWire, TaskDependency,
-    VosPackage, artifact_hash, task_dependencies_hash,
-};
 
 const RUSTC_WRAPPER_MODE: &str = "VOSX_CANONICAL_RUSTC_WRAPPER";
 const RUSTC_WRAPPER_SOURCE_ROOT: &str = "VOSX_CANONICAL_SOURCE_ROOT";
 const RUSTC_WRAPPER_TARGET_ROOT: &str = "VOSX_CANONICAL_TARGET_ROOT";
-const RUSTC_UNIT_METADATA_DOMAIN: &[u8] = b"vos/rustc-unit-metadata/service";
+const RUSTC_UNIT_METADATA_DOMAIN: &[u8] = b"vos/rustc-unit-metadata/actor";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct RustcUnitIdentity {
@@ -37,30 +32,17 @@ impl RustcUnitIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BuildTarget {
-    /// The established service package consumed by `vosx space publish`.
-    Service,
-    /// A standard-agent actor package consumed by the agent driver.
-    Agent,
-}
-
 pub struct Args {
-    pub target: BuildTarget,
     pub program: PathBuf,
     pub name: Option<String>,
     pub out_dir: PathBuf,
-    pub interfaces: Option<PathBuf>,
-    pub role_policies: Option<PathBuf>,
-    /// Optional prebuilt AMP2 bytes. Agent builds accept them only when they
+    /// Optional prebuilt AMP2 bytes. Actor builds accept them only when they
     /// byte-equal the artifact generated from authenticated macro metadata.
     pub method_policy: Option<PathBuf>,
     pub schemas: Option<PathBuf>,
     pub agent_schema: Option<PathBuf>,
     pub agent_authorizations: Option<PathBuf>,
-    pub source_map: Option<PathBuf>,
     pub tasks: Vec<PathBuf>,
-    pub include_elf: bool,
     pub crdt: bool,
     pub scheduling: bool,
     pub proof_system: Option<sdk::Hash>,
@@ -72,204 +54,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 }
 
 fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::Result<()> {
-    if args.target == BuildTarget::Agent {
-        return run_agent_with_signer(args, keypair);
-    }
-    run_legacy_service_with_signer(args, keypair)
-}
-
-/// Frozen Service producer path. The separate clean Agent path never constructs
-/// or decodes its VOS1/VOSK policy/package types.
-fn run_legacy_service_with_signer(
-    args: Args,
-    keypair: &libp2p::identity::Keypair,
-) -> anyhow::Result<()> {
-    if args.target != BuildTarget::Service {
-        bail!("internal build dispatch attempted to route an Agent through the Service producer");
-    }
-    let program = resolve_program_input(&args.program)?;
-    let input = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
-    let is_pvm = program.extension().and_then(|x| x.to_str()) == Some("pvm");
-    if is_pvm && args.agent_schema.is_none() {
-        bail!(
-            "{} is a PVM without its authenticated service-entry marker; pass the canonical service actor ELF or project directory",
-            program.display()
-        );
-    }
-    let actor_pvm = if is_pvm {
-        input.clone()
-    } else {
-        vos_pvm_compiler::link_elf(&input)
-            .map_err(|error| anyhow!("transpile {}: {error:?}", program.display()))?
-    };
-    if actor_pvm.is_empty() {
-        bail!("{} produced an empty PVM", program.display());
-    }
-    vos::service::validate_actor_program_layout(&actor_pvm)
-        .map_err(|error| anyhow!("invalid canonical actor PVM capability layout: {error}"))?;
-
-    let schemas = match args.schemas.as_deref() {
-        Some(path) => std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
-        None if !is_pvm => vos::metadata::raw_section_from_elf(&input).unwrap_or_default(),
-        None => Vec::new(),
-    };
-    let actor_metadata = vos::metadata::decode(&schemas).ok_or_else(|| {
-        anyhow!(
-            "{} has no valid actor metadata; build from its ELF or pass --schemas with exact .vos_meta bytes",
-            program.display()
-        )
-    })?;
-    let embedded_execution_schema =
-        (!is_pvm).then(|| vos::agent::schema::raw_section_from_elf(&input).unwrap_or_default());
-    if args.crdt && !actor_metadata.crdt {
-        bail!(
-            "{} is an ordinary actor; use #[actor(crdt)] instead of forcing --crdt",
-            program.display(),
-        );
-    }
-    let execution_schema = match args.agent_schema.as_deref() {
-        Some(path) => {
-            let supplied =
-                std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-            if embedded_execution_schema
-                .as_ref()
-                .is_some_and(|embedded| *embedded != supplied)
-            {
-                bail!(
-                    "{} does not match the actor ELF's embedded .vos_agent schema",
-                    path.display()
-                );
-            }
-            supplied
-        }
-        None => embedded_execution_schema.unwrap_or_default(),
-    };
-    require_execution_entry(
-        &execution_schema,
-        vos::agent::schema::ExecutionEntryKind::ServiceActor,
-        &program,
-    )?;
-    let service_crdt = actor_metadata.crdt || args.crdt;
-    let name = args
-        .name
-        .unwrap_or_else(|| actor_metadata.actor_name.clone());
-
-    let interfaces = read_optional(args.interfaces.as_deref())?;
-    let mut task_dependencies = args
-        .tasks
-        .iter()
-        .map(|input| build_service_task_dependency(input))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    task_dependencies.sort_by_key(|dependency| dependency.binding.task);
-    if task_dependencies
-        .windows(2)
-        .any(|pair| pair[0].binding.task == pair[1].binding.task)
-    {
-        bail!("duplicate canonical Task dependency");
-    }
-    let mut generated_policies = PackageRolePolicies::from_metadata(&actor_metadata)?;
-    generated_policies.task_dependencies = task_dependencies
-        .iter()
-        .map(|dependency| dependency.binding.clone())
-        .collect();
-    let generated_role_policies = generated_policies.encode();
-    let role_policies = match args.role_policies.as_deref() {
-        Some(path) => {
-            let supplied =
-                std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-            if supplied != generated_role_policies {
-                bail!(
-                    "{} does not match the policies generated from the actor's .vos_meta annotations",
-                    path.display()
-                );
-            }
-            supplied
-        }
-        None => generated_role_policies,
-    };
-    let source_map = read_optional(args.source_map.as_deref())?;
-    let actor_program = ProgramId::of_pvm(&actor_pvm);
-
-    let public_key = keypair.public().encode_protobuf();
-    let producer = ProducerId::of_public_key(&public_key);
-    let diagnostics = (args.include_elf || !source_map.is_empty()).then_some(PackageDiagnostics {
-        elf: (args.include_elf && !is_pvm).then_some(input),
-        source_map: (!source_map.is_empty()).then_some(source_map),
-    });
-    let mut package = VosPackage {
-        manifest: ServicePackageManifest {
-            name: name.clone(),
-            platform: vos::service::PLATFORM_ID,
-            execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
-            service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            actor_program,
-            crdt: service_crdt,
-            interfaces_hash: artifact_hash(b"interfaces", &interfaces),
-            role_policies_hash: artifact_hash(b"role-policies", &role_policies),
-            schemas_hash: artifact_hash(b"schemas", &schemas),
-            task_dependencies_hash: task_dependencies_hash(&task_dependencies),
-        },
-        actor_pvm: actor_pvm.clone(),
-        generated_interfaces: interfaces,
-        role_policies,
-        schemas,
-        task_dependencies: task_dependencies.clone(),
-        diagnostics,
-        deployment_signature: DeploymentSignature {
-            producer,
-            public_key,
-            signature: vec![0],
-        },
-    };
-    package.deployment_signature.signature = keypair
-        .sign(&package.signing_message())
-        .map_err(|error| anyhow!("sign deployment: {error}"))?;
-    package.validate()?;
-    let package_bytes = package.encode();
-    let deployment_id = package.deployment_id();
-
-    std::fs::create_dir_all(&args.out_dir)
-        .with_context(|| format!("create {}", args.out_dir.display()))?;
-    let pvm_path = args.out_dir.join(format!("{name}.pvm"));
-    let package_path = args.out_dir.join(format!("{name}.vos"));
-    std::fs::write(&pvm_path, actor_pvm)
-        .with_context(|| format!("write {}", pvm_path.display()))?;
-    std::fs::write(&package_path, package_bytes)
-        .with_context(|| format!("write {}", package_path.display()))?;
-
-    println!("built {}", package_path.display());
-    println!("  actor_pvm    = {}", pvm_path.display());
-    println!("  program_id   = {}", hex::encode(actor_program.0));
-    println!("  deployment_id = {}", hex::encode(deployment_id.0));
-    for (index, dependency) in task_dependencies.iter().enumerate() {
-        println!(
-            "  task[{index}]      = {}",
-            hex::encode(dependency.binding.task.0)
-        );
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-struct AgentTaskDependencyBuild {
-    dependency: sdk::task::TaskDependency,
-    pvm: Vec<u8>,
-    provable: bool,
-}
-
-fn run_agent_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::Result<()> {
-    if args.interfaces.is_some() {
-        bail!("agent build does not admit legacy --interfaces into a VOS3 closure");
-    }
-    if args.role_policies.is_some() {
-        bail!("agent build uses canonical AMP2 --method-policy, not --role-policies");
-    }
-    if args.source_map.is_some() || args.include_elf {
-        bail!("agent build does not admit legacy diagnostics into a VOS3 closure");
-    }
     if args.tasks.len() > sdk::task::MAX_TASK_DEPENDENCIES {
         bail!(
-            "agent package has {} Task dependencies; the canonical maximum is {}",
+            "actor package has {} Task dependencies; the canonical maximum is {}",
             args.tasks.len(),
             sdk::task::MAX_TASK_DEPENDENCIES,
         );
@@ -351,7 +138,7 @@ fn run_agent_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> any
     let mut task_dependencies = args
         .tasks
         .iter()
-        .map(|input| build_agent_task_dependency(input, args.proof_system))
+        .map(|input| build_actor_task_dependency(input, args.proof_system))
         .collect::<anyhow::Result<Vec<_>>>()?;
     task_dependencies.sort_unstable_by_key(|dependency| dependency.dependency.task);
     if task_dependencies
@@ -558,6 +345,13 @@ fn run_agent_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> any
     Ok(())
 }
 
+#[derive(Debug)]
+struct ActorTaskDependencyBuild {
+    dependency: sdk::task::TaskDependency,
+    pvm: Vec<u8>,
+    provable: bool,
+}
+
 fn exact_producer_input(
     supplied: Option<&Path>,
     embedded: Option<Vec<u8>>,
@@ -702,7 +496,7 @@ fn package_artifact(bytes: Vec<u8>) -> sdk::package::PackageArtifact {
 
 fn raw_ed25519_public_key(keypair: &libp2p::identity::Keypair) -> anyhow::Result<[u8; 32]> {
     if keypair.key_type() != libp2p::identity::KeyType::Ed25519 {
-        bail!("Agent VOS3 packages require an Ed25519 operator identity");
+        bail!("Actor VOS3 packages require an Ed25519 operator identity");
     }
     Ok(keypair
         .public()
@@ -716,11 +510,11 @@ fn sign_ed25519_exact(
     message: &[u8],
 ) -> anyhow::Result<[u8; 64]> {
     if keypair.key_type() != libp2p::identity::KeyType::Ed25519 {
-        bail!("Agent VOS3 packages require an Ed25519 operator identity");
+        bail!("Actor VOS3 packages require an Ed25519 operator identity");
     }
     keypair
         .sign(message)
-        .map_err(|error| anyhow!("sign Agent deployment: {error}"))?
+        .map_err(|error| anyhow!("sign Actor deployment: {error}"))?
         .try_into()
         .map_err(|signature: Vec<u8>| {
             anyhow!(
@@ -730,10 +524,10 @@ fn sign_ed25519_exact(
         })
 }
 
-fn build_agent_task_dependency(
+fn build_actor_task_dependency(
     input: &Path,
     proof_system: Option<sdk::Hash>,
-) -> anyhow::Result<AgentTaskDependencyBuild> {
+) -> anyhow::Result<ActorTaskDependencyBuild> {
     let program = resolve_task_input(input)?;
     if program.extension().and_then(|extension| extension.to_str()) == Some("pvm") {
         bail!(
@@ -787,7 +581,7 @@ fn build_agent_task_dependency(
         witness_capacity,
         proof,
     )?;
-    Ok(AgentTaskDependencyBuild {
+    Ok(ActorTaskDependencyBuild {
         dependency,
         pvm,
         provable: metadata.provable,
@@ -814,53 +608,6 @@ fn require_execution_entry(
         );
     }
     Ok(parsed)
-}
-
-fn build_service_task_dependency(input: &Path) -> anyhow::Result<PackageTaskDependency> {
-    let program = resolve_task_input(input)?;
-    if program.extension().and_then(|extension| extension.to_str()) == Some("pvm") {
-        bail!(
-            "{} is a PVM without authenticated witness-layout metadata; pass the canonical Task ELF or project directory",
-            program.display()
-        );
-    }
-    let elf = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
-    let execution_schema = vos::agent::schema::raw_section_from_elf(&elf).unwrap_or_default();
-    require_execution_entry(
-        &execution_schema,
-        vos::agent::schema::ExecutionEntryKind::Task,
-        &program,
-    )?;
-    let pvm = vos_pvm_compiler::link_elf(&elf)
-        .map_err(|error| anyhow!("transpile Task {}: {error:?}", program.display()))?;
-    if pvm.is_empty() {
-        bail!("{} produced an empty Task PVM", program.display());
-    }
-    let (witness_address, witness_capacity) = vos::zk::witness_symbol(&elf).ok_or_else(|| {
-        anyhow!(
-            "{} does not export the required __VOS_WITNESS buffer",
-            program.display()
-        )
-    })?;
-    let witness_address = u32::try_from(witness_address)
-        .context("Task witness address does not fit the PVM address space")?;
-    let witness_capacity = u32::try_from(witness_capacity)
-        .context("Task witness capacity does not fit the package wire")?;
-    if witness_capacity == 0 {
-        bail!(
-            "{} exports an empty __VOS_WITNESS buffer",
-            program.display()
-        );
-    }
-    Ok(PackageTaskDependency {
-        binding: TaskDependency {
-            task: vos::service::Hash(vos::provable::task_blob_hash(&pvm)),
-            program: ProgramId::of_pvm(&pvm),
-            witness_address,
-            witness_capacity,
-        },
-        pvm,
-    })
 }
 
 /// Resolve a Task input without routing it through the actor-only
@@ -1336,13 +1083,6 @@ fn actor_names_from_manifest(manifest: &str) -> anyhow::Result<(String, String)>
     Ok((package_name, target_name))
 }
 
-fn read_optional(path: Option<&Path>) -> anyhow::Result<Vec<u8>> {
-    path.map(std::fs::read)
-        .transpose()
-        .map(|bytes| bytes.unwrap_or_default())
-        .map_err(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1524,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_agent_builds_emit_one_identical_actor_pvm_and_package() {
+    fn repeated_actor_builds_emit_one_identical_pvm_and_package() {
         use vos::metadata::{ActorMeta, MessageMeta};
 
         const META: ActorMeta = ActorMeta {
@@ -1585,19 +1325,14 @@ mod tests {
         )
         .unwrap();
         let build_args = |out_dir| Args {
-            target: BuildTarget::Agent,
             program: temp.0.join("actor.pvm"),
             name: None,
             out_dir,
-            interfaces: None,
-            role_policies: None,
             method_policy: None,
             schemas: Some(temp.0.join("actor.meta")),
             agent_schema: Some(temp.0.join("actor.agent")),
             agent_authorizations: Some(temp.0.join("actor.auth")),
-            source_map: None,
             tasks: vec![],
-            include_elf: false,
             crdt: false,
             scheduling: false,
             proof_system: None,
@@ -1608,19 +1343,14 @@ mod tests {
 
         let missing_metadata = run_with_signer(
             Args {
-                target: BuildTarget::Agent,
                 program: temp.0.join("actor.pvm"),
                 name: None,
                 out_dir: temp.0.join("missing-metadata"),
-                interfaces: None,
-                role_policies: None,
                 method_policy: None,
                 schemas: None,
                 agent_schema: Some(temp.0.join("actor.agent")),
                 agent_authorizations: Some(temp.0.join("actor.auth")),
-                source_map: None,
                 tasks: vec![],
-                include_elf: false,
                 crdt: false,
                 scheduling: false,
                 proof_system: None,
@@ -1632,19 +1362,14 @@ mod tests {
         assert!(missing_metadata.contains("pass --metadata with its exact bytes"));
         let missing_execution_schema = run_with_signer(
             Args {
-                target: BuildTarget::Agent,
                 program: temp.0.join("actor.pvm"),
                 name: None,
                 out_dir: temp.0.join("missing-agent-schema"),
-                interfaces: None,
-                role_policies: None,
                 method_policy: None,
                 schemas: Some(temp.0.join("actor.meta")),
                 agent_schema: None,
                 agent_authorizations: Some(temp.0.join("actor.auth")),
-                source_map: None,
                 tasks: vec![],
-                include_elf: false,
                 crdt: false,
                 scheduling: false,
                 proof_system: None,
@@ -1675,7 +1400,7 @@ mod tests {
         let package = sdk::package::PackageEnvelope::decode(&package_bytes).unwrap();
         package.validate_shape().unwrap();
         let sdk::package::PackageManifest::Actor(manifest) = &package.manifest else {
-            panic!("Agent build must emit an Actor manifest")
+            panic!("actor build must emit an Actor manifest")
         };
         assert_eq!(manifest.requirements.lanes, sdk::LaneSet::NONE);
         assert!(!manifest.scheduling);
@@ -1694,96 +1419,6 @@ mod tests {
         );
         assert!(!first.join("deterministic-counter.attestation.pvm").exists());
         assert_eq!(std::fs::read_dir(first).unwrap().count(), 2);
-    }
-
-    #[test]
-    fn top_level_service_build_emits_the_publishable_package_format() {
-        use vos::metadata::{ActorMeta, MessageMeta};
-
-        const META: ActorMeta = ActorMeta {
-            actor_name: "service-counter",
-            messages: &[MessageMeta {
-                name: "value",
-                is_query: true,
-                fields: &[],
-                returns: "u64",
-                doc: "",
-                timeout_ms: 0,
-                mode: 0,
-                attested: false,
-                capability: None,
-                space_role: None,
-                actor_role: None,
-            }],
-            constructor: &[],
-            cli_methods: &[],
-            doc: "",
-            crdt: false,
-            provable: false,
-        };
-        const SCHEMA: vos::agent::schema::SchemaMeta = vos::agent::schema::SchemaMeta {
-            uses_storage: false,
-            fields: &[],
-            methods: &[vos::agent::schema::MethodMeta {
-                name: "value",
-                mode: vos::agent::MethodMode::Query,
-                explicit: false,
-            }],
-        };
-
-        let temp = TempDir::new("service-format");
-        let output = temp.0.join("dist");
-        let signer = libp2p::identity::Keypair::generate_ed25519();
-        let mut actor = vos_pvm_compiler::assembler::Assembler::new();
-        actor.trap();
-        let actor_pvm = actor.build();
-        let (metadata, metadata_len) = vos::metadata::encode::<512>(&META);
-        let (schema, schema_len) = vos::agent::schema::encode_with_entry::<512>(
-            &SCHEMA,
-            vos::agent::schema::ExecutionEntryKind::ServiceActor,
-        );
-        std::fs::write(temp.0.join("actor.pvm"), &actor_pvm).unwrap();
-        std::fs::write(temp.0.join("actor.meta"), &metadata[..metadata_len]).unwrap();
-        std::fs::write(temp.0.join("actor.agent"), &schema[..schema_len]).unwrap();
-
-        run_with_signer(
-            Args {
-                target: BuildTarget::Service,
-                program: temp.0.join("actor.pvm"),
-                name: None,
-                out_dir: output.clone(),
-                interfaces: None,
-                role_policies: None,
-                method_policy: None,
-                schemas: Some(temp.0.join("actor.meta")),
-                agent_schema: Some(temp.0.join("actor.agent")),
-                agent_authorizations: None,
-                source_map: None,
-                tasks: vec![],
-                include_elf: false,
-                crdt: false,
-                scheduling: false,
-                proof_system: None,
-            },
-            &signer,
-        )
-        .unwrap();
-
-        let bytes = std::fs::read(output.join("service-counter.vos")).unwrap();
-        assert_eq!(bytes.get(..4), Some(b"VOSP".as_slice()));
-        let package = VosPackage::decode(&bytes).unwrap();
-        assert_eq!(
-            package.manifest.execution_semantics,
-            vos::service::EXECUTION_SEMANTICS_ID,
-        );
-        assert_eq!(
-            package.manifest.actor_program,
-            ProgramId::of_pvm(&actor_pvm)
-        );
-        assert_eq!(
-            package.manifest.service_program,
-            vos::service::VOS_SERVICE_PROGRAM_ID
-        );
     }
 
     #[test]

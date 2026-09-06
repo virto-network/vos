@@ -1,7 +1,7 @@
 //! Per-subcommand implementations.
 //!
+//! - `build` / `new_project` — author portable AgentActor packages.
 //! - `agent_runtime_pvm` — build and validate an agent-runtime PVM.
-//! - `service_pvm` — build and validate the predecessor service PVM.
 //! - `production_release` — package and independently verify the pinned
 //!   production service/authority artifacts.
 //! - `space::*` — everything space-related: lifecycle (new,
@@ -18,6 +18,5 @@ pub mod build;
 pub mod dynamic;
 pub mod new_project;
 pub mod production_release;
-pub mod service_pvm;
 pub mod space;
 pub mod zk;
