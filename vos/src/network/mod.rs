@@ -9,7 +9,9 @@
 //! Inbound Tells are pushed into the caller-supplied
 //! [`NetworkConfig::inbox`].
 
+pub(crate) mod agent_network;
 pub(crate) mod agent_protocol;
+pub(crate) mod agent_raft_transport;
 mod codec;
 mod ops;
 mod wire;
@@ -32,7 +34,15 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, Swarm, identify, identity, mdns, noise, ping, tcp, yamux};
 use tokio::sync::mpsc as async_mpsc;
 use tracing::{debug, error, info, warn};
+use vos_agent_sdk::NodeId as AgentNodeId;
 
+use agent_network::{
+    AgentOutboundReplies, AgentPeerDirectory, AgentResponseChannel, AgentRouteDirectory,
+    fail_all_agent_requests, handle_agent_event, new_agent_peer_directory, send_agent_request,
+};
+#[cfg(test)]
+use agent_protocol::AgentFrame;
+use agent_protocol::{AgentCodec, PROTOCOL as AGENT_PROTOCOL};
 use codec::{PROTOCOL, VosCodec};
 
 /// Combined libp2p behaviour.
@@ -42,6 +52,9 @@ struct VosBehaviour {
     ping: ping::Behaviour,
     identify: identify::Behaviour,
     req_resp: request_response::Behaviour<VosCodec>,
+    /// Clean full-identity Agent traffic.  This behaviour has a distinct
+    /// protocol, codec, pending map, and response path from `req_resp`.
+    agent_req_resp: request_response::Behaviour<AgentCodec>,
     /// Push-based head announcements per replication group.
     /// Each replica subscribes to `vos/sync/{rep_id_hex}` and
     /// publishes the encoded `Frame::Heads` after every commit.
@@ -798,6 +811,8 @@ type ListenAddrs = Arc<Mutex<Vec<Multiaddr>>>;
 pub struct Network {
     peer_id: PeerId,
     local_prefix: u16,
+    /// Full clean Agent identity derived from every authenticated PeerId byte.
+    agent_node_id: AgentNodeId,
     pub(in crate::network) cmd_tx: async_mpsc::UnboundedSender<NetworkCmd>,
     prefix_map: PrefixMap,
     listen_addrs: ListenAddrs,
@@ -819,6 +834,11 @@ pub struct Network {
     /// Frames carrying a `replication_id` with no entry surface to
     /// the peer as the default empty / current-term answer.
     raft_handlers: RaftHandlerMap,
+    /// Exact clean Agent generation routes.  Never consulted by the legacy
+    /// service protocol.
+    agent_routes: AgentRouteDirectory,
+    /// Bijective clean NodeId <-> Noise PeerId outbound bindings.
+    agent_peers: AgentPeerDirectory,
     join: Option<JoinHandle<()>>,
 }
 
@@ -864,6 +884,12 @@ impl Default for NetworkConfig {
 
 pub(in crate::network) enum NetworkCmd {
     Connect(Multiaddr),
+    SendAgent(agent_network::AgentOutboundRequest),
+    #[cfg(test)]
+    SendAgentUntracked {
+        peer: PeerId,
+        frame: AgentFrame,
+    },
     SendTell {
         target_peer: PeerId,
         from: u32,
@@ -1069,6 +1095,7 @@ impl Network {
     /// Spin up the libp2p swarm on a dedicated thread.
     pub fn start(config: NetworkConfig) -> Self {
         let peer_id = PeerId::from(config.keypair.public());
+        let agent_node_id = AgentNodeId::of_authenticated_peer(&peer_id.to_bytes());
         let local_prefix = derive_node_prefix(&peer_id);
         assert_eq!(
             config.local_prefix, local_prefix,
@@ -1078,6 +1105,8 @@ impl Network {
         let listen_addrs: ListenAddrs = Arc::new(Mutex::new(Vec::new()));
         let service: Arc<OnceLock<Arc<dyn NetworkService>>> = Arc::new(OnceLock::new());
         let raft_handlers: RaftHandlerMap = Arc::new(Mutex::new(BTreeMap::new()));
+        let agent_routes: AgentRouteDirectory = Arc::new(Mutex::new(BTreeMap::new()));
+        let agent_peers = new_agent_peer_directory(peer_id);
         let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel();
         let (inbox_tx, inbox_rx) = std_mpsc::channel();
 
@@ -1085,6 +1114,7 @@ impl Network {
         let listen_addrs_for_thread = listen_addrs.clone();
         let service_for_thread = service.clone();
         let raft_handlers_for_thread = raft_handlers.clone();
+        let agent_routes_for_thread = agent_routes.clone();
         let join = thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1104,18 +1134,22 @@ impl Network {
                 inbox_tx,
                 service_for_thread,
                 raft_handlers_for_thread,
+                agent_routes_for_thread,
             ));
         });
 
         Self {
             peer_id,
             local_prefix,
+            agent_node_id,
             cmd_tx,
             prefix_map,
             listen_addrs,
             inbox_rx: Mutex::new(Some(inbox_rx)),
             service,
             raft_handlers,
+            agent_routes,
+            agent_peers,
             join: Some(join),
         }
     }
@@ -1768,8 +1802,10 @@ async fn network_main(
     inbox_tx: std_mpsc::Sender<InboundTell>,
     service: Arc<OnceLock<Arc<dyn NetworkService>>>,
     raft_handlers: RaftHandlerMap,
+    agent_routes: AgentRouteDirectory,
 ) {
     let local_peer_id = PeerId::from(config.keypair.public());
+    let local_agent_node = AgentNodeId::of_authenticated_peer(&local_peer_id.to_bytes());
     let local_prefix = config.local_prefix;
     let auto_dial_mdns = config.auto_dial_mdns;
     info!(peer_id = %local_peer_id, prefix = format!("{local_prefix:#06x}"), "network: starting");
@@ -1805,6 +1841,9 @@ async fn network_main(
     // behaviour.
     let mut outbound_replies: HashMap<request_response::OutboundRequestId, OutboundReply> =
         HashMap::new();
+    // Clean Agent traffic intentionally uses a separate pending table even
+    // though libp2p gives both behaviours the same request-id type.
+    let mut agent_outbound_replies = AgentOutboundReplies::new();
 
     // Inbound dispatch path: blocking tasks complete asynchronously
     // and need to push (response_channel, frame) back to the swarm
@@ -1812,6 +1851,8 @@ async fn network_main(
     // from this channel.
     let (response_tx, mut response_rx) =
         async_mpsc::unbounded_channel::<(request_response::ResponseChannel<Frame>, Frame)>();
+    let (agent_response_tx, mut agent_response_rx) =
+        async_mpsc::unbounded_channel::<AgentResponseChannel>();
 
     // Per-replication-group hint senders. The agent's sync_loop
     // registers itself once on startup; gossipsub head announcements
@@ -1844,6 +1885,10 @@ async fn network_main(
                     &service,
                     &raft_handlers,
                     &response_tx,
+                    local_agent_node,
+                    &agent_routes,
+                    &mut agent_outbound_replies,
+                    &agent_response_tx,
                     &hint_senders,
                     auto_dial_mdns,
                 );
@@ -1855,6 +1900,20 @@ async fn network_main(
                             Ok(_) => info!(%addr, "network: dialing peer"),
                             Err(e) => warn!(%addr, error = %e, "network: dial failed"),
                         }
+                    }
+                    Some(NetworkCmd::SendAgent(request)) => {
+                        send_agent_request(
+                            &mut swarm,
+                            request,
+                            &mut agent_outbound_replies,
+                        );
+                    }
+                    #[cfg(test)]
+                    Some(NetworkCmd::SendAgentUntracked { peer, frame }) => {
+                        let _ = swarm
+                            .behaviour_mut()
+                            .agent_req_resp
+                            .send_request(&peer, frame);
                     }
                     Some(NetworkCmd::SendTell { target_peer, from, to, payload }) => {
                         let frame = Frame::Tell { from, to, payload };
@@ -2201,6 +2260,10 @@ async fn network_main(
                         debug!(%target_peer, "network: sent RaftStatusReq");
                     }
                     Some(NetworkCmd::Shutdown) | None => {
+                        fail_all_agent_requests(
+                            &mut agent_outbound_replies,
+                            agent_network::AgentNetworkError::Disconnected,
+                        );
                         info!("network: shutting down");
                         break;
                     }
@@ -2214,6 +2277,16 @@ async fn network_main(
                     .is_err()
                 {
                     warn!("network: deferred response failed (channel closed)");
+                }
+            }
+            Some((channel, frame)) = agent_response_rx.recv() => {
+                if swarm
+                    .behaviour_mut()
+                    .agent_req_resp
+                    .send_response(channel, frame)
+                    .is_err()
+                {
+                    warn!("network: deferred clean Agent response failed (channel closed)");
                 }
             }
         }
@@ -2254,6 +2327,12 @@ fn build_swarm(
                 std::iter::once((PROTOCOL, ProtocolSupport::Full)),
                 request_response::Config::default().with_request_timeout(Duration::from_secs(300)),
             );
+            let agent_req_resp = request_response::Behaviour::with_codec(
+                AgentCodec,
+                std::iter::once((AGENT_PROTOCOL, ProtocolSupport::Full)),
+                request_response::Config::default()
+                    .with_request_timeout(agent_network::AGENT_REQUEST_TIMEOUT),
+            );
             // Gossipsub: one mesh per replication group. We sign
             // messages with the local keypair so peers can attest
             // who published a head announcement; that lets
@@ -2278,6 +2357,7 @@ fn build_swarm(
                 ping,
                 identify,
                 req_resp,
+                agent_req_resp,
                 gossip,
             })
         })?
@@ -2300,6 +2380,10 @@ fn handle_swarm_event(
     service: &Arc<OnceLock<Arc<dyn NetworkService>>>,
     raft_handlers: &RaftHandlerMap,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
+    local_agent_node: AgentNodeId,
+    agent_routes: &AgentRouteDirectory,
+    agent_outbound_replies: &mut AgentOutboundReplies,
+    agent_response_tx: &async_mpsc::UnboundedSender<AgentResponseChannel>,
     hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
     auto_dial_mdns: bool,
 ) {
@@ -2390,6 +2474,15 @@ fn handle_swarm_event(
                 service,
                 raft_handlers,
                 response_tx,
+            );
+        }
+        SwarmEvent::Behaviour(VosBehaviourEvent::AgentReqResp(agent_event)) => {
+            handle_agent_event(
+                agent_event,
+                local_agent_node,
+                agent_routes,
+                agent_outbound_replies,
+                agent_response_tx,
             );
         }
         SwarmEvent::Behaviour(VosBehaviourEvent::Gossip(g_event)) => {

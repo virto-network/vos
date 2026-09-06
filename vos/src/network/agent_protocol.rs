@@ -1,16 +1,15 @@
 //! Clean-generation Agent network protocol boundary.
 //!
-//! This module is deliberately not registered with the libp2p swarm yet.  It
-//! defines the one Agent-only request/response protocol that later transport
-//! work can attach without teaching the legacy `/vos/0.1.0` service codec how
-//! to decode clean Agent traffic.
+//! This module defines the Agent-only request/response protocol registered by
+//! the clean network path.  It never teaches the legacy `/vos/0.1.0` service
+//! codec how to decode Agent traffic.
 //!
 //! Every route and consensus identity is a full clean SDK identifier.  The
 //! `sender` field is only accepted after it is compared with the [`NodeId`]
 //! derived from the complete Noise-authenticated [`PeerId`].  No compact node
 //! prefix is part of this schema.
 
-#![allow(dead_code)] // Staged boundary: swarm/dispatcher wiring lands separately.
+#![allow(dead_code)] // Live SharedAgentHost attachment lands separately.
 
 use std::fmt;
 use std::io;
@@ -37,12 +36,12 @@ const MAGIC: [u8; 4] = *b"VAN1";
 const VERSION: u16 = 1;
 
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
-const MAX_RAFT_COMMAND_BYTES: usize = 64 * 1024;
-const MAX_RAFT_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_RAFT_COMMAND_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_RAFT_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MERGE_NODE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_RAFT_ENTRIES: usize = 256;
-const MAX_RAFT_MEMBERS: usize = 64;
-const MAX_MERGE_HEADS: usize = 256;
+pub(crate) const MAX_RAFT_ENTRIES: usize = 256;
+pub(crate) const MAX_RAFT_MEMBERS: usize = 64;
+pub(crate) const MAX_MERGE_HEADS: usize = 256;
 
 const TAG_INVOKE_REQUEST: u8 = 0x10;
 const TAG_INVOKE_REPLY: u8 = 0x11;
@@ -136,7 +135,7 @@ impl From<WireError> for AgentProtocolError {
 }
 
 /// Exact route for one admitted Agent replica-set generation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct AgentGenerationRoute {
     pub(crate) space: SpaceId,
     pub(crate) agent: AgentId,
@@ -145,7 +144,7 @@ pub(crate) struct AgentGenerationRoute {
 }
 
 impl AgentGenerationRoute {
-    fn is_valid(self) -> bool {
+    pub(crate) fn is_valid(self) -> bool {
         self.space != SpaceId::ZERO && self.agent != AgentId::ZERO && self.generation != Hash::ZERO
     }
 }
@@ -304,9 +303,11 @@ pub(crate) enum RaftMessage {
         leader: NodeId,
         last_included_index: u64,
         last_included_term: u64,
+        offset: u64,
+        done: bool,
         members: Vec<NodeId>,
         joint_old: Option<Vec<NodeId>>,
-        active_config_index: u64,
+        active_config_index: Option<u64>,
         snapshot: Vec<u8>,
     },
     InstallSnapshotReply {
@@ -520,15 +521,30 @@ fn raft_message_is_valid(message: &RaftMessage, sender: NodeId) -> bool {
             joint_old,
             last_included_index,
             active_config_index,
+            offset,
+            done,
             snapshot,
             ..
         } => {
             *leader == sender
-                && valid_members(members)
-                && joint_old
-                    .as_ref()
-                    .is_none_or(|members| valid_members(members))
-                && active_config_index <= last_included_index
+                && u64::try_from(snapshot.len())
+                    .ok()
+                    .and_then(|length| offset.checked_add(length))
+                    .is_some()
+                && if *done {
+                    if members.is_empty() {
+                        joint_old.is_none() && active_config_index.is_none()
+                    } else {
+                        valid_members(members)
+                            && joint_old
+                                .as_ref()
+                                .is_none_or(|members| valid_members(members))
+                            && active_config_index
+                                .is_some_and(|index| index <= *last_included_index)
+                    }
+                } else {
+                    members.is_empty() && joint_old.is_none() && active_config_index.is_none()
+                }
                 && snapshot.len() <= MAX_RAFT_SNAPSHOT_BYTES
         }
         RaftMessage::StatusReply(status) => status
@@ -746,6 +762,8 @@ fn encode_raft_message(encoder: &mut Encoder<'_>, message: &RaftMessage) {
             leader,
             last_included_index,
             last_included_term,
+            offset,
+            done,
             members,
             joint_old,
             active_config_index,
@@ -756,11 +774,13 @@ fn encode_raft_message(encoder: &mut Encoder<'_>, message: &RaftMessage) {
             encoder.fixed(leader.as_bytes());
             encoder.u64(*last_included_index);
             encoder.u64(*last_included_term);
+            encoder.u64(*offset);
+            encoder.bool(*done);
             encode_members(encoder, members);
             encoder.option(joint_old, |encoder, members| {
                 encode_members(encoder, members)
             });
-            encoder.u64(*active_config_index);
+            encoder.option(active_config_index, |encoder, index| encoder.u64(*index));
             encoder.bytes(snapshot);
         }
         RaftMessage::InstallSnapshotReply {
@@ -1042,19 +1062,23 @@ fn decode_raft_message(
             let leader = NodeId(decoder.fixed()?);
             let last_included_index = decoder.u64()?;
             let last_included_term = decoder.u64()?;
+            let offset = decoder.u64()?;
+            let done = decoder.bool()?;
             let members = decode_members(decoder)?;
             let joint_old = if decoder.bool()? {
                 Some(decode_members(decoder)?)
             } else {
                 None
             };
-            let active_config_index = decoder.u64()?;
+            let active_config_index = decoder.option(Decoder::u64)?;
             let snapshot = decoder.bytes_bounded(MAX_RAFT_SNAPSHOT_BYTES)?;
             Ok(RaftMessage::InstallSnapshotRequest {
                 term,
                 leader,
                 last_included_index,
                 last_included_term,
+                offset,
+                done,
                 members,
                 joint_old,
                 active_config_index,
@@ -1171,8 +1195,8 @@ fn decode_heads(decoder: &mut Decoder<'_>) -> Result<Vec<Hash>, AgentProtocolErr
     Ok(decoder.list_bounded(MAX_MERGE_HEADS, |decoder| decoder.fixed().map(Hash))?)
 }
 
-/// `request_response` codec for the clean protocol.  It remains unregistered
-/// until the full-ID Agent dispatcher and transport are attached.
+/// `request_response` codec for the clean protocol.  It is registered only on
+/// the dedicated Agent behaviour and is never offered as a legacy fallback.
 #[derive(Clone, Default)]
 pub(crate) struct AgentCodec;
 
@@ -1476,9 +1500,11 @@ mod tests {
                 leader: sender,
                 last_included_index: 12,
                 last_included_term: 7,
+                offset: 0,
+                done: true,
                 members: members.clone(),
                 joint_old: None,
-                active_config_index: 12,
+                active_config_index: Some(12),
                 snapshot: b"snapshot".to_vec(),
             }),
         });
@@ -1848,9 +1874,11 @@ mod tests {
                 leader: sender,
                 last_included_index: 8,
                 last_included_term: 3,
+                offset: 0,
+                done: true,
                 members: members.clone(),
                 joint_old: None,
-                active_config_index: 9,
+                active_config_index: Some(9),
                 snapshot: vec![],
             }),
         };
