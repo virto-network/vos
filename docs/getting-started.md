@@ -8,23 +8,23 @@ just build-test-artifacts
 cargo build -p vosx
 ```
 
-## Create an actor
+## Create a portable AgentActor
 
 ```bash
-cargo run -p vosx -- new counter
+cargo run -p vosx -- actor new counter
 ```
 
-The generated actor has ordinary Rust state and typed handlers:
+The generated AgentActor has ordinary Rust state and typed handlers:
 
 ```rust,ignore
 use vos::prelude::*;
 
-#[actor]
+#[actor(agent)]
 pub struct Counter {
     value: u64,
 }
 
-#[messages]
+#[messages(agent)]
 impl Counter {
     fn new() -> Self {
         Self { value: 0 }
@@ -45,13 +45,14 @@ impl Counter {
 Build a signed package:
 
 ```bash
-cargo run -p vosx -- build counter --name counter
+cargo run -p vosx -- actor build counter --name counter
 ```
 
 The output package commits to the actor program, method schemas, policies,
-Task dependencies, and signer.
+Task dependencies, and signer. It is a portable `VOS3` package hosted by an
+Agent; `agent` is reserved for operations and is not an authoring alias.
 
-## Run it in a space
+## Start the current production space runtime
 
 Start a local space:
 
@@ -62,20 +63,13 @@ cargo run -p vosx -- space up demo \
   --allow-conformance
 ```
 
-Publish, install, and call the actor:
+The current production `space publish` path accepts legacy `VOSP` service
+packages and rejects the `VOS3` produced above. Publishing portable
+AgentActors is the next Agent-integration boundary.
 
-```bash
-cargo run -p vosx -- space publish demo counter dist/counter.vos
-cargo run -p vosx -- space install demo counter --consistency local
-cargo run -p vosx -- counter add amount=4 --space demo
-cargo run -p vosx -- counter value --space demo
-```
-
-Use `--consistency raft` for one ordered replicated state machine, or
-`--consistency crdt` for convergent operation history.
-
-Assign package capabilities through editable space roles. A member can use
-the same stable identity through several HTTP tokens and SSH keys:
+For installed production services, assign package capabilities through
+editable space roles. A member can use the same stable identity through
+several HTTP tokens and SSH keys:
 
 ```bash
 vosx space role demo define operator --power 150 \

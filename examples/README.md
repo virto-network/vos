@@ -1,13 +1,14 @@
 # Examples
 
-The examples cover both the standard agent runtime and the established service
-runtime. Agent actors build as signed `VOSK` packages; service actors build as
-signed `VOSP` packages accepted by the current `space publish` path.
+The examples cover both portable AgentActors hosted by the standard Agent and
+the established service runtime. `vosx actor build` packages a portable
+AgentActor as signed `VOS3`; the legacy service examples remain runtime and
+integration fixtures during the production cutover.
 
 | Example | Runtime | Demonstrates |
 | --- | --- | --- |
-| `counter` | standard agent | minimal state and query handlers |
-| `shared-board` | standard agent | linear and convergent state in one actor |
+| `counter` | Agent-hosted | minimal state and query handlers |
+| `shared-board` | Agent-hosted | linear and convergent state in one actor |
 | `workflow` | service | durable actor calls and suspension |
 | `private-age` | service | private input and attested claims |
 | `age-gate` | native verifier | verification of the attested age claim |
@@ -21,11 +22,8 @@ just build-examples
 Package one example:
 
 ```bash
-cargo run -p vosx -- agent build examples/actors/counter --name counter
+cargo run -p vosx -- actor build examples/actors/counter --name counter
 ```
 
-Package a service actor:
-
-```bash
-cargo run -p vosx -- build examples/actors/workflow --name workflow
-```
+`actor` is the portable authoring namespace. `agent` remains reserved for
+operations and does not expose `new` or `build` authoring aliases.

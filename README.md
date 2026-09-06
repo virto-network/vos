@@ -18,39 +18,36 @@ flowchart LR
     R --> Q[Proof producer]
 ```
 
-The repository contains one actor programming model and two package targets
-during the agent cutover:
+The CLI exposes one clean-generation authoring surface for portable
+AgentActors hosted by an Agent:
 
-- `#[actor]` defines an actor.
-- `vosx build` creates a service package (`VOSP`); `space publish` and
-  `space install` create the production root service from it.
-- `vosx agent build` creates the clean-generation signed `VOS3` package: one
-  standard actor PVM plus exact AAS2 state/constructor, AMP2 method-policy,
-  AAI1 introspection, and ATD1 Task-dependency artifacts. Agent scheduling and
-  any proof-system identity are explicit build inputs. Node-level publication
-  of `VOS3` is the next integration boundary; `space publish` intentionally
-  rejects it today.
-- Both targets use the same actor macros, typed messages, and signed method
-  policy. Their host ABIs are authenticated and cannot be cross-packaged.
+- `#[actor(agent)]` and `#[messages(agent)]` define a portable AgentActor.
+- `vosx actor new` scaffolds an AgentActor project.
+- `vosx actor build` creates its signed `VOS3` package: one actor PVM plus
+  exact AAS2 state/constructor, AMP2 method-policy, AAI1 introspection, and
+  ATD1 Task-dependency artifacts. Scheduling and any proof-system identity are
+  explicit build inputs.
+- `agent` is reserved for Agent operations; it is not an authoring alias.
+
+Legacy service packages (`VOSP`) remain part of the production runtime during
+the cutover, but no longer have a top-level authoring command. Node-level
+publication of `VOS3` is the next integration boundary; `space publish`
+intentionally rejects it today.
 
 ## Start here
 
 ```bash
-cargo run -p vosx -- new hello
-cargo run -p vosx -- build hello --name hello
+cargo run -p vosx -- actor new hello
+cargo run -p vosx -- actor build hello --name hello
 cargo run -p vosx -- space new demo
 cargo run -p vosx -- space up demo \
   --service-pvm services/vos-service/vos-service.pvm \
   --allow-conformance
 ```
 
-In another terminal:
-
-```bash
-cargo run -p vosx -- space publish demo hello dist/hello.vos
-cargo run -p vosx -- space install demo hello --consistency local
-cargo run -p vosx -- hello value --space demo
-```
+The build writes `dist/hello.vos`. It is a portable AgentActor package, not a
+legacy service package; installation follows the Agent publication cutover
+described above.
 
 See [Getting started](docs/getting-started.md),
 [Architecture](docs/architecture.md), and

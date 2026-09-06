@@ -38,7 +38,7 @@ impl LaneEscape {
 
 /// Compile-pass coverage for the complete macro-side lane surface. Package
 /// admission remains a separate runtime gate, so this fixture is checked with
-/// Cargo directly rather than packaged with `vosx agent build`.
+/// Cargo directly rather than packaged with `vosx actor build`.
 #[cfg(feature = "valid")]
 #[actor(agent)]
 pub struct LaneSurface {

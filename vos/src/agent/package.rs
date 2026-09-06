@@ -484,9 +484,9 @@ pub trait PackageSignatureVerifier {
     fn verify(&self, public_key: &[u8], message: &[u8], signature: &[u8]) -> bool;
 }
 
-/// Default host verifier for the protobuf-encoded Ed25519 public keys emitted
-/// by `vosx build`. Bare hosts may provide another implementation without
-/// enabling networking.
+/// Default host verifier for protobuf-encoded Ed25519 public keys in
+/// transitional service packages. Bare hosts may provide another
+/// implementation without enabling networking.
 #[cfg(feature = "network")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Ed25519PackageVerifier;
