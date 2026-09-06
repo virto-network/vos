@@ -2385,17 +2385,25 @@ impl CanonicalWire for RuntimeTransition {
 
 use crate::private::{
     EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_CIPHERTEXT_BYTES, MAX_PRIVATE_NODES,
-    MAX_SEALED_KEY_BYTES, MAX_TRANSPORT_IDENTITY_BYTES, PRIVATE_NONCE_BYTES,
-    PRIVATE_SIGNATURE_BYTES, PrivateActorLifecycleKind, PrivateControlOperation,
-    PrivateControlRecord, PrivateControlSigner, PrivateKeyEpoch, PrivateNodeIdentity,
-    SealedPrivateKey,
+    MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES, MAX_SEALED_KEY_BYTES,
+    MAX_TRANSPORT_IDENTITY_BYTES, PRIVATE_NONCE_BYTES, PRIVATE_SIGNATURE_BYTES,
+    PrivateActorLifecycleKind, PrivateControlOperation, PrivateControlRecord, PrivateControlSigner,
+    PrivateKeyEpoch, PrivateNodeIdentity, PrivateRecoveryKeyringGrant, SealedPrivateKey,
+    SealedRecoveryKey,
 };
 
 pub const MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES: usize = 1_024;
-pub const MAX_PRIVATE_KEY_EPOCH_WIRE_BYTES: usize =
-    HEADER_BYTES + 160 + 2 * MAX_PRIVATE_NODES * (32 + 32 + 4 + MAX_SEALED_KEY_BYTES);
+pub const MAX_PRIVATE_KEY_EPOCH_WIRE_BYTES: usize = HEADER_BYTES
+    + 192
+    + (32 + 4 + MAX_SEALED_KEY_BYTES)
+    + 2 * MAX_PRIVATE_NODES * (32 + 32 + 4 + MAX_SEALED_KEY_BYTES);
+pub const MAX_PRIVATE_RECOVERY_KEYRING_GRANT_WIRE_BYTES: usize = HEADER_BYTES
+    + 256
+    + MAX_PRIVATE_NODES * (32 + 32 + 4 + MAX_SEALED_KEY_BYTES)
+    + MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES;
 pub const MAX_PRIVATE_CONTROL_WIRE_BYTES: usize = HEADER_BYTES
     + MAX_PRIVATE_KEY_EPOCH_WIRE_BYTES
+    + MAX_PRIVATE_RECOVERY_KEYRING_GRANT_WIRE_BYTES
     + MAX_PRIVATE_NODES * (MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES + 32)
     + 512;
 pub const MAX_PRIVATE_OBJECT_WIRE_BYTES: usize =
@@ -2469,6 +2477,25 @@ fn decode_sealed_key(decoder: &mut Decoder<'_>) -> Result<SealedPrivateKey, Deco
         .ok_or(DecodeError::NonCanonical)
 }
 
+fn encode_sealed_recovery_key(encoder: &mut Encoder<'_>, value: &SealedRecoveryKey) {
+    encoder.0.extend_from_slice(&value.recipient_key);
+    encoder.bytes(&value.sealed);
+}
+
+fn decode_sealed_recovery_key(decoder: &mut Decoder<'_>) -> Result<SealedRecoveryKey, DecodeError> {
+    let value = SealedRecoveryKey {
+        recipient_key: decoder
+            .take(32)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?,
+        sealed: decoder.bytes_bounded(MAX_SEALED_KEY_BYTES)?,
+    };
+    value
+        .validate()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
 fn encode_private_epoch(encoder: &mut Encoder<'_>, value: &PrivateKeyEpoch) {
     encoder.fixed(value.space.as_bytes());
     encoder.fixed(value.agent.as_bytes());
@@ -2476,6 +2503,10 @@ fn encode_private_epoch(encoder: &mut Encoder<'_>, value: &PrivateKeyEpoch) {
     encoder.fixed(value.owner_key_commitment.as_bytes());
     encoder.fixed(value.data_key_commitment.as_bytes());
     encoder.fixed(value.recovery_key_commitment.as_bytes());
+    encoder
+        .0
+        .extend_from_slice(&value.recovery_encryption_public_key);
+    encode_sealed_recovery_key(encoder, &value.sealed_recovery_data_key);
     encoder.list(&value.sealed_owner_keys, encode_sealed_key);
     encoder.list(&value.sealed_data_keys, encode_sealed_key);
 }
@@ -2488,6 +2519,11 @@ fn decode_private_epoch(decoder: &mut Decoder<'_>) -> Result<PrivateKeyEpoch, De
         owner_key_commitment: Hash(decoder.fixed()?),
         data_key_commitment: Hash(decoder.fixed()?),
         recovery_key_commitment: Hash(decoder.fixed()?),
+        recovery_encryption_public_key: decoder
+            .take(32)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?,
+        sealed_recovery_data_key: decode_sealed_recovery_key(decoder)?,
         sealed_owner_keys: decoder.list_bounded(MAX_PRIVATE_NODES, decode_sealed_key)?,
         sealed_data_keys: decoder.list_bounded(MAX_PRIVATE_NODES, decode_sealed_key)?,
     };
@@ -2518,6 +2554,38 @@ fn encode_encrypted_kind(encoder: &mut Encoder<'_>, value: EncryptedObjectKind) 
     encoder.u8(value as u8);
 }
 
+fn encode_encrypted_private_object_body(encoder: &mut Encoder<'_>, value: &EncryptedPrivateObject) {
+    encoder.fixed(value.space.as_bytes());
+    encoder.fixed(value.agent.as_bytes());
+    encoder.u64(value.epoch);
+    encode_encrypted_kind(encoder, value.kind);
+    encoder.fixed(value.content.as_bytes());
+    encoder.0.extend_from_slice(&value.nonce);
+    encoder.bytes(&value.ciphertext);
+}
+
+fn decode_encrypted_private_object_body(
+    decoder: &mut Decoder<'_>,
+    maximum_ciphertext_bytes: usize,
+) -> Result<EncryptedPrivateObject, DecodeError> {
+    let value = EncryptedPrivateObject {
+        space: SpaceId(decoder.fixed()?),
+        agent: AgentId(decoder.fixed()?),
+        epoch: decoder.u64()?,
+        kind: decode_encrypted_kind(decoder)?,
+        content: Hash(decoder.fixed()?),
+        nonce: decoder
+            .take(PRIVATE_NONCE_BYTES)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?,
+        ciphertext: decoder.bytes_bounded(maximum_ciphertext_bytes)?,
+    };
+    value
+        .validate()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
 fn decode_encrypted_kind(decoder: &mut Decoder<'_>) -> Result<EncryptedObjectKind, DecodeError> {
     match decoder.u8()? {
         0 => Ok(EncryptedObjectKind::CrdtNode),
@@ -2539,33 +2607,38 @@ impl CanonicalWire for EncryptedPrivateObject {
     }
 
     fn encode_body(&self, encoder: &mut Encoder<'_>) {
-        encoder.fixed(self.space.as_bytes());
-        encoder.fixed(self.agent.as_bytes());
-        encoder.u64(self.epoch);
-        encode_encrypted_kind(encoder, self.kind);
-        encoder.fixed(self.content.as_bytes());
-        encoder.0.extend_from_slice(&self.nonce);
-        encoder.bytes(&self.ciphertext);
+        encode_encrypted_private_object_body(encoder, self);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        let value = Self {
-            space: SpaceId(decoder.fixed()?),
-            agent: AgentId(decoder.fixed()?),
-            epoch: decoder.u64()?,
-            kind: decode_encrypted_kind(decoder)?,
-            content: Hash(decoder.fixed()?),
-            nonce: decoder
-                .take(PRIVATE_NONCE_BYTES)?
-                .try_into()
-                .map_err(|_| DecodeError::Truncated)?,
-            ciphertext: decoder.bytes_bounded(MAX_PRIVATE_CIPHERTEXT_BYTES)?,
-        };
-        value
-            .validate()
-            .then_some(value)
-            .ok_or(DecodeError::NonCanonical)
+        decode_encrypted_private_object_body(decoder, MAX_PRIVATE_CIPHERTEXT_BYTES)
     }
+}
+
+fn encode_private_recovery_keyring_grant(
+    encoder: &mut Encoder<'_>,
+    value: &PrivateRecoveryKeyringGrant,
+) {
+    encoder.fixed(value.key_commitment.as_bytes());
+    encoder.list(&value.sealed_keys, encode_sealed_key);
+    encode_encrypted_private_object_body(encoder, &value.ciphertext);
+}
+
+fn decode_private_recovery_keyring_grant(
+    decoder: &mut Decoder<'_>,
+) -> Result<PrivateRecoveryKeyringGrant, DecodeError> {
+    let value = PrivateRecoveryKeyringGrant {
+        key_commitment: Hash(decoder.fixed()?),
+        sealed_keys: decoder.list_bounded(MAX_PRIVATE_NODES, decode_sealed_key)?,
+        ciphertext: decode_encrypted_private_object_body(
+            decoder,
+            MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES,
+        )?,
+    };
+    value
+        .validate()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
 }
 
 fn encode_private_lifecycle_kind(encoder: &mut Encoder<'_>, value: PrivateActorLifecycleKind) {
@@ -2626,6 +2699,7 @@ fn encode_private_operation(encoder: &mut Encoder<'_>, value: &PrivateControlOpe
             superseded_heads,
             next_epoch,
             replacement_nodes,
+            historical_keyring,
         } => {
             encoder.u8(5);
             encoder.list(superseded_heads, |encoder, value| {
@@ -2633,6 +2707,7 @@ fn encode_private_operation(encoder: &mut Encoder<'_>, value: &PrivateControlOpe
             });
             encode_private_epoch(encoder, next_epoch);
             encoder.list(replacement_nodes, encode_private_node);
+            encode_private_recovery_keyring_grant(encoder, historical_keyring);
         }
     }
 }
@@ -2667,6 +2742,7 @@ fn decode_private_operation(
                 .list_bounded(MAX_PRIVATE_NODES, |decoder| Ok(Hash(decoder.fixed()?)))?,
             next_epoch: decode_private_epoch(decoder)?,
             replacement_nodes: decoder.list_bounded(MAX_PRIVATE_NODES, decode_private_node)?,
+            historical_keyring: decode_private_recovery_keyring_grant(decoder)?,
         }),
         _ => Err(DecodeError::InvalidTag),
     }

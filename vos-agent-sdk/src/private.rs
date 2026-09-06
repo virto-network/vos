@@ -8,6 +8,10 @@ pub const MAX_PRIVATE_NODES: usize = 256;
 pub const MAX_TRANSPORT_IDENTITY_BYTES: usize = 512;
 pub const MAX_SEALED_KEY_BYTES: usize = 4 * 1024;
 pub const MAX_PRIVATE_CIPHERTEXT_BYTES: usize = 8 * 1024 * 1024;
+/// A recovery grant contains at most one fixed-size data-key entry for every
+/// epoch which can precede a valid recovery control.
+pub const MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS: usize = 4_096;
+pub const MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES: usize = 512 * 1024;
 pub const PRIVATE_SIGNATURE_BYTES: usize = 64;
 pub const PRIVATE_NONCE_BYTES: usize = 24;
 
@@ -54,8 +58,26 @@ impl SealedPrivateKey {
     }
 }
 
+/// One data key sealed to a dedicated offline X25519 recovery recipient.
+/// This recipient is deliberately not a Node identity and is independent of
+/// the Ed25519 key which signs recovery controls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedRecoveryKey {
+    pub recipient_key: [u8; 32],
+    pub sealed: Vec<u8>,
+}
+
+impl SealedRecoveryKey {
+    pub fn validate(&self) -> bool {
+        self.recipient_key != [0; 32]
+            && !self.sealed.is_empty()
+            && self.sealed.len() <= MAX_SEALED_KEY_BYTES
+    }
+}
+
 /// Separately sealed owner-signing and data-encryption keys for one epoch.
-/// The offline recovery key is represented only by its public commitment.
+/// Offline recovery signing remains a public commitment; the independent
+/// recovery-encryption recipient receives only this epoch's sealed data key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateKeyEpoch {
     pub space: SpaceId,
@@ -64,6 +86,8 @@ pub struct PrivateKeyEpoch {
     pub owner_key_commitment: Hash,
     pub data_key_commitment: Hash,
     pub recovery_key_commitment: Hash,
+    pub recovery_encryption_public_key: [u8; 32],
+    pub sealed_recovery_data_key: SealedRecoveryKey,
     pub sealed_owner_keys: Vec<SealedPrivateKey>,
     pub sealed_data_keys: Vec<SealedPrivateKey>,
 }
@@ -75,6 +99,9 @@ impl PrivateKeyEpoch {
             || self.owner_key_commitment == Hash::ZERO
             || self.data_key_commitment == Hash::ZERO
             || self.recovery_key_commitment == Hash::ZERO
+            || self.recovery_encryption_public_key == [0; 32]
+            || !self.sealed_recovery_data_key.validate()
+            || self.sealed_recovery_data_key.recipient_key != self.recovery_encryption_public_key
             || self.sealed_owner_keys.is_empty()
             || self.sealed_owner_keys.len() > MAX_PRIVATE_NODES
             || self.sealed_data_keys.len() != self.sealed_owner_keys.len()
@@ -99,6 +126,32 @@ impl PrivateKeyEpoch {
                 .sealed_owner_keys
                 .windows(2)
                 .all(|pair| pair[0].node < pair[1].node)
+    }
+}
+
+/// Recovery-signed, ciphertext-only transfer of historical data keys to the
+/// exact replacement Node set. The wrapping key is separately sealed to each
+/// replacement and never appears in canonical wire.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateRecoveryKeyringGrant {
+    pub key_commitment: Hash,
+    pub sealed_keys: Vec<SealedPrivateKey>,
+    pub ciphertext: EncryptedPrivateObject,
+}
+
+impl PrivateRecoveryKeyringGrant {
+    pub fn validate(&self) -> bool {
+        self.key_commitment != Hash::ZERO
+            && !self.sealed_keys.is_empty()
+            && self.sealed_keys.len() <= MAX_PRIVATE_NODES
+            && self.sealed_keys.iter().all(SealedPrivateKey::validate)
+            && self
+                .sealed_keys
+                .windows(2)
+                .all(|pair| pair[0].node < pair[1].node)
+            && self.ciphertext.validate()
+            && self.ciphertext.kind == EncryptedObjectKind::Control
+            && self.ciphertext.ciphertext.len() <= MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES
     }
 }
 
@@ -177,6 +230,7 @@ pub enum PrivateControlOperation {
         superseded_heads: Vec<Hash>,
         next_epoch: PrivateKeyEpoch,
         replacement_nodes: Vec<PrivateNodeIdentity>,
+        historical_keyring: PrivateRecoveryKeyringGrant,
     },
 }
 
@@ -273,11 +327,12 @@ impl PrivateControlRecord {
                     superseded_heads,
                     next_epoch,
                     replacement_nodes,
+                    historical_keyring,
                 } => {
-                    !superseded_heads.is_empty()
-                        && superseded_heads.len() <= MAX_PRIVATE_NODES
+                    superseded_heads.len() <= MAX_PRIVATE_NODES
                         && superseded_heads.iter().all(|head| *head != Hash::ZERO)
                         && superseded_heads.windows(2).all(|pair| pair[0] < pair[1])
+                        && (superseded_heads.is_empty() == self.previous.is_none())
                         && next_epoch.validate()
                         && next_epoch.space == self.space
                         && next_epoch.agent == self.agent
@@ -287,6 +342,20 @@ impl PrivateControlRecord {
                         && replacement_nodes
                             .windows(2)
                             .all(|pair| pair[0].node < pair[1].node)
+                        && historical_keyring.validate()
+                        && historical_keyring.key_commitment != next_epoch.data_key_commitment
+                        && historical_keyring.ciphertext.space == self.space
+                        && historical_keyring.ciphertext.agent == self.agent
+                        && historical_keyring.ciphertext.epoch == next_epoch.epoch
+                        && historical_keyring.sealed_keys.len() == replacement_nodes.len()
+                        && historical_keyring
+                            .sealed_keys
+                            .iter()
+                            .zip(replacement_nodes)
+                            .all(|(sealed, node)| {
+                                sealed.node == node.node
+                                    && sealed.recipient_key == node.encryption_public_key
+                            })
                 }
             }
             && matches!(
@@ -344,6 +413,11 @@ mod tests {
             owner_key_commitment: Hash([2; 32]),
             data_key_commitment: Hash([3; 32]),
             recovery_key_commitment: Hash([4; 32]),
+            recovery_encryption_public_key: [8; 32],
+            sealed_recovery_data_key: SealedRecoveryKey {
+                recipient_key: [8; 32],
+                sealed: alloc::vec![9; 48],
+            },
             sealed_owner_keys: alloc::vec![sealed(5), sealed(7)],
             sealed_data_keys: alloc::vec![sealed(5), sealed(7)],
         };
