@@ -134,6 +134,7 @@ impl SystemCatalogConfiguration {
 
     pub fn is_valid(self) -> bool {
         self.sdk().is_valid()
+            && VerifyingKey::from_bytes(&self.authority.public_key).is_ok_and(|key| !key.is_weak())
     }
 
     pub fn encode(self) -> Vec<u8> {
@@ -262,6 +263,9 @@ impl AuthorityVerifier for Ed25519AuthorityVerifier {
         let Ok(verifying_key) = VerifyingKey::from_bytes(public_key) else {
             return false;
         };
+        if verifying_key.is_weak() {
+            return false;
+        }
         verifying_key
             .verify_strict(message, &Signature::from_bytes(signature))
             .is_ok()
@@ -695,6 +699,19 @@ mod tests {
         let mut trailing = bytes;
         trailing.push(0);
         assert!(SystemCatalogConfiguration::decode(&trailing).is_none());
+
+        // A small-order Ed25519 point is structurally decodable and can be
+        // made to satisfy the producer-id relation, but must never become an
+        // authority trust anchor.
+        let mut weak_key = [0; 32];
+        weak_key[0] = 1;
+        assert!(VerifyingKey::from_bytes(&weak_key).is_ok_and(|key| key.is_weak()));
+        let mut weak = config;
+        weak.authority.public_key = weak_key;
+        weak.authority.issuer.producer = ProducerId::of_public_key(&weak_key).0;
+        assert!(weak.sdk().is_valid());
+        assert!(!weak.is_valid());
+        assert!(SystemCatalogConfiguration::decode(&weak.encode()).is_none());
     }
 
     #[test]
