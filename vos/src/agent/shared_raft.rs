@@ -45,6 +45,7 @@ use super::{
     AgentProfile, MAX_AGENT_REPLICAS, MAX_CATALOG_ARTIFACT_BYTES,
     MAX_CATALOG_ARTIFACT_REFERENCED_BYTES, MAX_CATALOG_ARTIFACT_REFERENCES, ReplicaRole,
 };
+use crate::agent_sdk::NodeId as AgentNodeId;
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{AgentId, BlobRef, Hash, NodeId, SpaceId};
 
@@ -55,10 +56,18 @@ const ARTIFACT_CHUNK_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/artifact-batc
 const AGENT_RAFT_COMMAND_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/raft-command/v1";
 const AGENT_RAFT_REPLICATION_ID_DOMAIN: &[u8] = b"vos/agent/shared/raft-replication/v1";
 const AGENT_RAFT_APPLY_RESERVATION_DOMAIN: &[u8] = b"vos/agent/shared/raft-apply-reservation/v1";
-const COMMITTEE_CHANGE_REQUEST_DOMAIN: &[u8] = b"vos/agent/shared/committee-change-request/v1";
-const COMMITTEE_TRANSITION_ID_DOMAIN: &[u8] = b"vos/agent/shared/committee-transition/v1";
+const COMMITTEE_CHANGE_REQUEST_DOMAIN: &[u8] = b"vos/agent/shared/committee-change-request/v2";
+const COMMITTEE_TRANSITION_ID_DOMAIN: &[u8] = b"vos/agent/shared/committee-transition/v2";
 #[cfg(feature = "storage")]
-const AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/raft-physical-slot/v2";
+const AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/raft-physical-slot/v3";
+#[cfg(feature = "storage")]
+const AGENT_RAFT_PHYSICAL_MAGIC: [u8; 4] = *b"ASR1";
+#[cfg(feature = "storage")]
+const AGENT_RAFT_PHYSICAL_DATA: u8 = 0;
+#[cfg(feature = "storage")]
+const AGENT_RAFT_PHYSICAL_CONFIGURATION: u8 = 1;
+#[cfg(feature = "storage")]
+const AGENT_RAFT_PHYSICAL_HEADER_BYTES: usize = AGENT_RAFT_PHYSICAL_MAGIC.len() + 1;
 
 /// Maximum complete stable generation route key.
 pub const MAX_AGENT_GENERATION_ROUTE_KEY_BYTES: usize = 224;
@@ -75,9 +84,10 @@ pub const MAX_AGENT_RAFT_COMMAND_BYTES: usize = 192 * 1024;
 /// Maximum complete authorized committee-change preparation.
 pub const MAX_PREPARE_COMMITTEE_CHANGE_BYTES: usize = 160 * 1024;
 /// Maximum complete encoded physical `vos-raft` slot admitted by the Shared
-/// adapter. The one-byte entry-kind tag is included.
+/// adapter. The versioned magic and one-byte entry-kind tag are included.
 #[cfg(feature = "storage")]
-pub const MAX_AGENT_RAFT_PHYSICAL_SLOT_BYTES: usize = MAX_AGENT_RAFT_COMMAND_BYTES + 1;
+pub const MAX_AGENT_RAFT_PHYSICAL_SLOT_BYTES: usize =
+    MAX_AGENT_RAFT_COMMAND_BYTES + AGENT_RAFT_PHYSICAL_HEADER_BYTES;
 /// Maximum complete apply-audit disposition.
 pub const MAX_AGENT_RAFT_AUDIT_DISPOSITION_BYTES: usize = 256;
 /// Maximum complete durable apply metadata record.
@@ -557,7 +567,7 @@ impl ServiceWire for ArtifactChunk {
 ///
 /// The authority receipt is the clean SDK receipt: its typed operation must
 /// be `ChangeReplicaSet` and its request hash must cover the stable generation,
-/// both complete committees, and both exact voter-prefix vectors. The
+/// both complete committees, and both exact full voter-Node vectors. The
 /// transition ID additionally covers the complete signed receipt, so two
 /// authority decisions for the same membership intent remain distinct.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -566,8 +576,8 @@ pub struct PrepareCommitteeChange {
     generation: AgentGenerationRouteKey,
     previous: AgentReplicaCommittee,
     next: AgentReplicaCommittee,
-    previous_prefixes: Vec<u16>,
-    next_prefixes: Vec<u16>,
+    previous_voters: Vec<AgentNodeId>,
+    next_voters: Vec<AgentNodeId>,
     authority: crate::agent_sdk::authority::AuthorityReceipt,
 }
 
@@ -580,14 +590,14 @@ impl PrepareCommitteeChange {
         next: &AgentReplicaCommittee,
     ) -> Result<crate::agent_sdk::Hash, AgentRaftWireError> {
         validate_committee_change_scope(generation, previous, next)?;
-        let previous_prefixes = committee_voter_prefixes(previous)?;
-        let next_prefixes = committee_voter_prefixes(next)?;
+        let previous_voters = committee_voter_nodes(previous)?;
+        let next_voters = committee_voter_nodes(next)?;
         Ok(committee_change_request_commitment(
             generation,
             previous,
             next,
-            &previous_prefixes,
-            &next_prefixes,
+            &previous_voters,
+            &next_voters,
         ))
     }
 
@@ -598,14 +608,14 @@ impl PrepareCommitteeChange {
         authority: crate::agent_sdk::authority::AuthorityReceipt,
     ) -> Result<Self, AgentRaftWireError> {
         validate_committee_change_scope(generation, &previous, &next)?;
-        let previous_prefixes = committee_voter_prefixes(&previous)?;
-        let next_prefixes = committee_voter_prefixes(&next)?;
+        let previous_voters = committee_voter_nodes(&previous)?;
+        let next_voters = committee_voter_nodes(&next)?;
         let request = committee_change_request_commitment(
             generation,
             &previous,
             &next,
-            &previous_prefixes,
-            &next_prefixes,
+            &previous_voters,
+            &next_voters,
         );
         let transition = committee_transition_id(request, &authority)?;
         let change = Self {
@@ -613,8 +623,8 @@ impl PrepareCommitteeChange {
             generation,
             previous,
             next,
-            previous_prefixes,
-            next_prefixes,
+            previous_voters,
+            next_voters,
             authority,
         };
         change.validate()?;
@@ -637,12 +647,12 @@ impl PrepareCommitteeChange {
         &self.next
     }
 
-    pub fn previous_prefixes(&self) -> &[u16] {
-        &self.previous_prefixes
+    pub fn previous_voters(&self) -> &[AgentNodeId] {
+        &self.previous_voters
     }
 
-    pub fn next_prefixes(&self) -> &[u16] {
-        &self.next_prefixes
+    pub fn next_voters(&self) -> &[AgentNodeId] {
+        &self.next_voters
     }
 
     pub const fn authority(&self) -> &crate::agent_sdk::authority::AuthorityReceipt {
@@ -668,8 +678,8 @@ impl PrepareCommitteeChange {
         use crate::agent_sdk::wire::CanonicalWire as _;
 
         validate_committee_change_scope(self.generation, &self.previous, &self.next)?;
-        if committee_voter_prefixes(&self.previous)? != self.previous_prefixes
-            || committee_voter_prefixes(&self.next)? != self.next_prefixes
+        if committee_voter_nodes(&self.previous)? != self.previous_voters
+            || committee_voter_nodes(&self.next)? != self.next_voters
         {
             return Err(AgentRaftWireError::InvalidCommitteeTransition);
         }
@@ -691,8 +701,8 @@ impl PrepareCommitteeChange {
             self.generation,
             &self.previous,
             &self.next,
-            &self.previous_prefixes,
-            &self.next_prefixes,
+            &self.previous_voters,
+            &self.next_voters,
         );
         let selector = &self.authority.selector;
         if selector.operation != AuthorityOperationKind::ChangeReplicaSet
@@ -710,7 +720,7 @@ impl PrepareCommitteeChange {
 }
 
 impl ServiceWire for PrepareCommitteeChange {
-    const MAGIC: [u8; 4] = *b"APC2";
+    const MAGIC: [u8; 4] = *b"APC3";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         use crate::agent_sdk::wire::CanonicalWire as _;
@@ -720,8 +730,8 @@ impl ServiceWire for PrepareCommitteeChange {
         encode_generation_route(&mut encoder, self.generation);
         encoder.bytes(&self.previous.encode());
         encoder.bytes(&self.next.encode());
-        encode_raft_prefixes(&mut encoder, &self.previous_prefixes);
-        encode_raft_prefixes(&mut encoder, &self.next_prefixes);
+        encode_raft_nodes(&mut encoder, &self.previous_voters);
+        encode_raft_nodes(&mut encoder, &self.next_voters);
         // Validation precedes every public construction and decode. A value
         // which somehow becomes invalid still encodes an impossible empty
         // nested receipt and is rejected by the outer command validator.
@@ -743,8 +753,8 @@ impl ServiceWire for PrepareCommitteeChange {
                 decoder,
                 MAX_AGENT_REPLICA_COMMITTEE_BYTES,
             )?,
-            previous_prefixes: decode_raft_prefixes(decoder)?,
-            next_prefixes: decode_raft_prefixes(decoder)?,
+            previous_voters: decode_raft_nodes(decoder)?,
+            next_voters: decode_raft_nodes(decoder)?,
             authority: {
                 let bytes = bounded_bytes(
                     decoder,
@@ -783,69 +793,73 @@ fn validate_committee_change_scope(
     Ok(())
 }
 
-fn committee_voter_prefixes(
+fn committee_voter_nodes(
     committee: &AgentReplicaCommittee,
-) -> Result<Vec<u16>, AgentRaftWireError> {
-    let mut prefixes = committee
+) -> Result<Vec<AgentNodeId>, AgentRaftWireError> {
+    let mut voters = committee
         .members()
         .iter()
         .filter_map(|member| match member.replica().role {
-            ReplicaRole::Voter => member.raft_slot(),
+            ReplicaRole::Voter => Some(AgentNodeId(member.replica().node.0)),
             ReplicaRole::Observer => None,
         })
         .collect::<Vec<_>>();
-    prefixes.sort_unstable();
-    validate_raft_prefixes(&prefixes)?;
-    Ok(prefixes)
+    voters.sort_unstable();
+    validate_raft_nodes(&voters)?;
+    Ok(voters)
 }
 
-fn validate_raft_prefixes(prefixes: &[u16]) -> Result<(), AgentRaftWireError> {
-    if prefixes.is_empty()
-        || prefixes.len() > MAX_AGENT_REPLICAS
-        || prefixes.windows(2).any(|pair| pair[0] >= pair[1])
+fn validate_raft_nodes(nodes: &[AgentNodeId]) -> Result<(), AgentRaftWireError> {
+    if nodes.is_empty()
+        || nodes.len() > MAX_AGENT_REPLICAS
+        || nodes.iter().any(|node| *node == AgentNodeId::ZERO)
+        || nodes.windows(2).any(|pair| pair[0] >= pair[1])
     {
         return Err(AgentRaftWireError::InvalidConfiguration);
     }
     Ok(())
 }
 
-fn encode_raft_prefixes(encoder: &mut Encoder<'_>, prefixes: &[u16]) {
-    encoder.u16(prefixes.len() as u16);
-    for prefix in prefixes {
-        encoder.u16(*prefix);
+fn encode_raft_nodes(encoder: &mut Encoder<'_>, nodes: &[AgentNodeId]) {
+    encoder.u16(nodes.len() as u16);
+    for node in nodes {
+        encoder.fixed(node.as_bytes());
     }
 }
 
-fn decode_raft_prefixes(decoder: &mut Decoder<'_>) -> Result<Vec<u16>, DecodeError> {
+fn decode_raft_nodes(decoder: &mut Decoder<'_>) -> Result<Vec<AgentNodeId>, DecodeError> {
     let count = decoder.u16()? as usize;
     if count == 0 || count > MAX_AGENT_REPLICAS {
         return Err(DecodeError::LimitExceeded);
     }
-    let mut prefixes = Vec::new();
-    prefixes
+    if count > decoder.remaining() / 32 {
+        return Err(DecodeError::Truncated);
+    }
+    let mut nodes = Vec::new();
+    nodes
         .try_reserve_exact(count)
         .map_err(|_| DecodeError::LimitExceeded)?;
     for _ in 0..count {
-        prefixes.push(decoder.u16()?);
+        nodes.push(AgentNodeId(decoder.fixed()?));
     }
-    validate_raft_prefixes(&prefixes).map_err(map_wire_decode_error)?;
-    Ok(prefixes)
+    validate_raft_nodes(&nodes).map_err(map_wire_decode_error)?;
+    Ok(nodes)
 }
 
 fn committee_change_request_commitment(
     generation: AgentGenerationRouteKey,
     previous: &AgentReplicaCommittee,
     next: &AgentReplicaCommittee,
-    previous_prefixes: &[u16],
-    next_prefixes: &[u16],
+    previous_voters: &[AgentNodeId],
+    next_voters: &[AgentNodeId],
 ) -> crate::agent_sdk::Hash {
     let mut bytes = Vec::new();
     let mut encoder = Encoder(&mut bytes);
     encode_generation_route(&mut encoder, generation);
     encoder.bytes(&previous.encode());
     encoder.bytes(&next.encode());
-    encode_raft_prefixes(&mut encoder, previous_prefixes);
-    encode_raft_prefixes(&mut encoder, next_prefixes);
+    encode_raft_nodes(&mut encoder, previous_voters);
+    encode_raft_nodes(&mut encoder, next_voters);
     crate::agent_sdk::Hash::digest(COMMITTEE_CHANGE_REQUEST_DOMAIN, &[&bytes])
 }
 
@@ -1370,8 +1384,8 @@ pub struct CommittedRaftConfiguration {
     index: u64,
     term: u64,
     committed_index: u64,
-    joint_old: Option<Vec<u16>>,
-    members: Vec<u16>,
+    joint_old: Option<Vec<AgentNodeId>>,
+    members: Vec<AgentNodeId>,
     raw_payload_commitment: Hash,
 }
 
@@ -1389,11 +1403,11 @@ impl CommittedRaftConfiguration {
         self.committed_index
     }
 
-    pub fn joint_old(&self) -> Option<&[u16]> {
+    pub fn joint_old(&self) -> Option<&[AgentNodeId]> {
         self.joint_old.as_deref()
     }
 
-    pub fn members(&self) -> &[u16] {
+    pub fn members(&self) -> &[AgentNodeId] {
         &self.members
     }
 
@@ -1406,7 +1420,7 @@ impl CommittedRaftConfiguration {
 ///
 /// Every committed index is decoded: empty `Data` is a leader no-op,
 /// non-empty `Data` must be an exact canonical [`AgentRaftCommand`], and a
-/// `ConfigChange` must carry bounded, non-empty, sorted-unique prefix lists.
+/// `ConfigChange` must carry bounded, non-empty, sorted-unique full Node lists.
 /// There is intentionally no public or raw constructor.
 #[cfg(feature = "storage")]
 #[derive(Clone, Debug)]
@@ -1475,11 +1489,11 @@ impl CommittedSharedRaftSlot {
                 AgentRaftWireError::InvalidPhysicalSlot,
             ));
         }
-        preflight_raft_configuration_bytes(&raw).map_err(CommittedSharedRaftSlotError::Invalid)?;
-        let kind = crate::raft::redb_storage::decode_entry_kind(&raw).map_err(|_| {
-            CommittedSharedRaftSlotError::Invalid(AgentRaftWireError::InvalidPhysicalSlot)
-        })?;
-        if crate::raft::redb_storage::encode_entry_kind(&kind) != raw {
+        let kind =
+            decode_agent_raft_entry_kind(&raw).map_err(CommittedSharedRaftSlotError::Invalid)?;
+        let canonical =
+            encode_agent_raft_entry_kind(&kind).map_err(CommittedSharedRaftSlotError::Invalid)?;
+        if canonical != raw {
             return Err(CommittedSharedRaftSlotError::Invalid(
                 AgentRaftWireError::NonCanonical,
             ));
@@ -1543,69 +1557,97 @@ impl CommittedSharedRaftSlot {
 }
 
 #[cfg(feature = "storage")]
-fn preflight_raft_configuration_bytes(raw: &[u8]) -> Result<(), AgentRaftWireError> {
-    if raw.first().copied() != Some(crate::raft::redb_storage::ENTRY_KIND_CONFIG_CHANGE) {
-        return Ok(());
-    }
-    let body = raw
-        .get(1..)
-        .ok_or(AgentRaftWireError::InvalidConfiguration)?;
-    let mut position = 0_usize;
-    let joint = *body
-        .get(position)
-        .ok_or(AgentRaftWireError::InvalidConfiguration)?;
-    position += 1;
-    match joint {
-        0 => {}
-        1 => preflight_raft_prefix_list(body, &mut position)?,
-        _ => return Err(AgentRaftWireError::InvalidConfiguration),
-    }
-    preflight_raft_prefix_list(body, &mut position)?;
-    if position != body.len() {
-        return Err(AgentRaftWireError::InvalidConfiguration);
-    }
-    Ok(())
-}
-
-#[cfg(feature = "storage")]
-fn preflight_raft_prefix_list(
-    bytes: &[u8],
-    position: &mut usize,
-) -> Result<(), AgentRaftWireError> {
-    let length = bytes
-        .get(*position..position.saturating_add(2))
-        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
-        .map(u16::from_le_bytes)
-        .ok_or(AgentRaftWireError::InvalidConfiguration)? as usize;
-    *position = position.saturating_add(2);
-    if length == 0 || length > MAX_AGENT_REPLICAS {
-        return Err(AgentRaftWireError::InvalidConfiguration);
-    }
-    let width = length
-        .checked_mul(core::mem::size_of::<u16>())
-        .ok_or(AgentRaftWireError::InvalidConfiguration)?;
-    *position = position
-        .checked_add(width)
-        .filter(|end| *end <= bytes.len())
-        .ok_or(AgentRaftWireError::InvalidConfiguration)?;
-    Ok(())
-}
-
-#[cfg(feature = "storage")]
 fn validate_raft_configuration(
-    joint_old: Option<&[u16]>,
-    members: &[u16],
+    joint_old: Option<&[AgentNodeId]>,
+    members: &[AgentNodeId],
 ) -> Result<(), AgentRaftWireError> {
-    fn validate_list(list: &[u16]) -> bool {
-        !list.is_empty()
-            && list.len() <= MAX_AGENT_REPLICAS
-            && list.windows(2).all(|pair| pair[0] < pair[1])
-    }
-
-    if !validate_list(members) || joint_old.is_some_and(|members| !validate_list(members)) {
-        return Err(AgentRaftWireError::InvalidConfiguration);
+    validate_raft_nodes(members)?;
+    if let Some(joint_old) = joint_old {
+        validate_raft_nodes(joint_old)?;
     }
     Ok(())
+}
+
+/// Canonical clean-generation encoding for Shared-Agent physical Raft slots.
+///
+/// This is intentionally distinct from the generic Service Raft adapter's
+/// legacy `EntryKind<u16>` bytes. The magic/version prevents a compact row
+/// from being reinterpreted as a full authenticated Node configuration.
+#[cfg(feature = "storage")]
+fn encode_agent_raft_entry_kind(
+    kind: &vos_raft::EntryKind<AgentNodeId>,
+) -> Result<Vec<u8>, AgentRaftWireError> {
+    use vos_raft::EntryKind;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&AGENT_RAFT_PHYSICAL_MAGIC);
+    let mut encoder = Encoder(&mut bytes);
+    match kind {
+        EntryKind::Data { payload } => {
+            if payload.len() > MAX_AGENT_RAFT_COMMAND_BYTES {
+                return Err(AgentRaftWireError::LimitExceeded);
+            }
+            encoder.u8(AGENT_RAFT_PHYSICAL_DATA);
+            encoder.0.extend_from_slice(payload);
+        }
+        EntryKind::ConfigChange { joint_old, members } => {
+            validate_raft_configuration(joint_old.as_deref(), members)?;
+            encoder.u8(AGENT_RAFT_PHYSICAL_CONFIGURATION);
+            encoder.option(joint_old, |encoder, nodes| {
+                encode_raft_nodes(encoder, nodes)
+            });
+            encode_raft_nodes(&mut encoder, members);
+        }
+        _ => return Err(AgentRaftWireError::InvalidPhysicalSlot),
+    }
+    if bytes.len() > MAX_AGENT_RAFT_PHYSICAL_SLOT_BYTES {
+        return Err(AgentRaftWireError::LimitExceeded);
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "storage")]
+fn decode_agent_raft_entry_kind(
+    bytes: &[u8],
+) -> Result<vos_raft::EntryKind<AgentNodeId>, AgentRaftWireError> {
+    use vos_raft::EntryKind;
+
+    if bytes.is_empty() || bytes.len() > MAX_AGENT_RAFT_PHYSICAL_SLOT_BYTES {
+        return Err(AgentRaftWireError::InvalidPhysicalSlot);
+    }
+    let mut decoder = Decoder::new(bytes);
+    if decoder
+        .take(AGENT_RAFT_PHYSICAL_MAGIC.len())
+        .map_err(|_| AgentRaftWireError::InvalidPhysicalSlot)?
+        != AGENT_RAFT_PHYSICAL_MAGIC
+    {
+        return Err(AgentRaftWireError::InvalidPhysicalSlot);
+    }
+    let tag = decoder
+        .u8()
+        .map_err(|_| AgentRaftWireError::InvalidPhysicalSlot)?;
+    let kind = match tag {
+        AGENT_RAFT_PHYSICAL_DATA => EntryKind::Data {
+            payload: decoder
+                .take(decoder.remaining())
+                .map_err(|_| AgentRaftWireError::InvalidPhysicalSlot)?
+                .to_vec(),
+        },
+        AGENT_RAFT_PHYSICAL_CONFIGURATION => {
+            let joint_old = decoder
+                .option(decode_raft_nodes)
+                .map_err(|_| AgentRaftWireError::InvalidConfiguration)?;
+            let members = decode_raft_nodes(&mut decoder)
+                .map_err(|_| AgentRaftWireError::InvalidConfiguration)?;
+            if !decoder.exhausted() {
+                return Err(AgentRaftWireError::InvalidConfiguration);
+            }
+            validate_raft_configuration(joint_old.as_deref(), &members)?;
+            EntryKind::ConfigChange { joint_old, members }
+        }
+        _ => return Err(AgentRaftWireError::InvalidPhysicalSlot),
+    };
+    Ok(kind)
 }
 
 /// Read-only production boundary for exact committed physical slots.
@@ -1967,8 +2009,8 @@ impl CommitteeChangeAuthorityBinding {
                     change.generation(),
                     change.previous(),
                     change.next(),
-                    change.previous_prefixes(),
-                    change.next_prefixes(),
+                    change.previous_voters(),
+                    change.next_voters(),
                 )
         {
             return Err(AgentRaftApplicationErrorV2::WrongAuthority);
@@ -4568,9 +4610,12 @@ mod application_ledger_v2 {
             {
                 return Err(AgentRaftApplicationErrorV2::CorruptLedger);
             }
-            let kind = crate::raft::redb_storage::decode_entry_kind(&self.physical)
+            let kind = decode_agent_raft_entry_kind(&self.physical)
                 .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
-            if crate::raft::redb_storage::encode_entry_kind(&kind) != self.physical {
+            if encode_agent_raft_entry_kind(&kind)
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?
+                != self.physical
+            {
                 return Err(AgentRaftApplicationErrorV2::CorruptLedger);
             }
             Ok(())
@@ -4809,7 +4854,7 @@ mod application_ledger_v2 {
         StaleCommittee,
         OverlappingCommitteeChange,
         ReorderedConfiguration,
-        WrongConfigurationPrefixes,
+        WrongConfigurationNodes,
         TransitionBarrier,
         WrongAuthority,
         StaleAuthority,
@@ -5007,7 +5052,7 @@ mod application_ledger_v2 {
         pub(crate) fn append_committed_for_test(
             &self,
             term: u64,
-            kind: &vos_raft::EntryKind<u16>,
+            kind: &vos_raft::EntryKind<AgentNodeId>,
         ) -> Result<u64, AgentRaftApplicationErrorV2> {
             let _guard = self
                 .writes
@@ -5027,7 +5072,8 @@ mod application_ledger_v2 {
             let index = log.append_in_txn(
                 &transaction,
                 term,
-                &crate::raft::redb_storage::encode_entry_kind(kind),
+                &encode_agent_raft_entry_kind(kind)
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?,
             )?;
             let mut meta = crate::raft::RaftMeta::load_from_write_transaction(&transaction)?;
             meta.current_term = meta.current_term.max(term);
@@ -5413,7 +5459,7 @@ mod application_ledger_v2 {
                         continue;
                     }
                     let vos_raft::EntryKind::Data { payload } =
-                        crate::raft::redb_storage::decode_entry_kind(&evidence.physical)
+                        decode_agent_raft_entry_kind(&evidence.physical)
                             .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?
                     else {
                         return Err(AgentRaftApplicationErrorV2::CorruptLedger);
@@ -6046,12 +6092,10 @@ mod application_ledger_v2 {
                             let Some(previous) = configuration.joint_old() else {
                                 return Err(AgentRaftApplicationErrorV2::ReorderedConfiguration);
                             };
-                            if previous != change.previous_prefixes()
-                                || configuration.members() != change.next_prefixes()
+                            if previous != change.previous_voters()
+                                || configuration.members() != change.next_voters()
                             {
-                                return Err(
-                                    AgentRaftApplicationErrorV2::WrongConfigurationPrefixes,
-                                );
+                                return Err(AgentRaftApplicationErrorV2::WrongConfigurationNodes);
                             }
                             let mut next_state = state.clone();
                             let Some(next_pending) = next_state.pending.as_mut() else {
@@ -6075,10 +6119,8 @@ mod application_ledger_v2 {
                             if configuration.joint_old().is_some() {
                                 return Err(AgentRaftApplicationErrorV2::ReorderedConfiguration);
                             }
-                            if configuration.members() != change.next_prefixes() {
-                                return Err(
-                                    AgentRaftApplicationErrorV2::WrongConfigurationPrefixes,
-                                );
+                            if configuration.members() != change.next_voters() {
+                                return Err(AgentRaftApplicationErrorV2::WrongConfigurationNodes);
                             }
                             let mut next_state = state.clone();
                             next_state.active = change.next().clone();
@@ -6399,7 +6441,7 @@ mod application_ledger_v2 {
                 let (_, _, _, raw) =
                     crate::raft::RaftLog::committed_payload_at(&self.database, reservation.index)?
                         .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
-                let physical = crate::raft::redb_storage::decode_entry_kind(&raw)
+                let physical = decode_agent_raft_entry_kind(&raw)
                     .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
                 let vos_raft::EntryKind::Data { payload } = physical else {
                     return Err(AgentRaftApplicationErrorV2::CorruptLedger);
@@ -6527,7 +6569,7 @@ mod application_ledger_v2 {
         );
         for item in evidence {
             item.validate()?;
-            let physical = crate::raft::redb_storage::decode_entry_kind(&item.physical)
+            let physical = decode_agent_raft_entry_kind(&item.physical)
                 .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
             replay_committee_disposition(&mut state, authority, &item.record, physical)?;
         }
@@ -6541,7 +6583,7 @@ mod application_ledger_v2 {
         state: &mut CommitteeApplicationStateV2,
         authority: CommitteeChangeAuthorityBinding,
         record: &AgentRaftApplyAuditRecordV2,
-        physical: vos_raft::EntryKind<u16>,
+        physical: vos_raft::EntryKind<AgentNodeId>,
     ) -> Result<(), AgentRaftApplicationErrorV2> {
         match (record.disposition, physical) {
             (AgentRaftApplyDispositionV2::LeaderNoop, vos_raft::EntryKind::Data { payload })
@@ -6620,8 +6662,8 @@ mod application_ledger_v2 {
                 if !matches!(pending.phase, PendingCommitteePhaseV2::Prepared)
                     || record.index != pending.prepare_index.saturating_add(1)
                     || record.term < pending.prepare_term
-                    || joint_old.as_deref() != Some(pending.change.previous_prefixes())
-                    || members != pending.change.next_prefixes()
+                    || joint_old.as_deref() != Some(pending.change.previous_voters())
+                    || members != pending.change.next_voters()
                     || transition != pending.change.transition()
                     || previous != pending.change.previous().id()
                     || next != pending.change.next().id()
@@ -6651,7 +6693,7 @@ mod application_ledger_v2 {
                 if record.index != index.saturating_add(1)
                     || record.term < term
                     || joint_old.is_some()
-                    || members != pending.change.next_prefixes()
+                    || members != pending.change.next_voters()
                     || transition != pending.change.transition()
                     || committee != pending.change.next().id()
                 {
@@ -7225,9 +7267,8 @@ mod application_ledger_v2 {
             .value()
             .get(8..)
             .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
-        let vos_raft::EntryKind::Data { payload } =
-            crate::raft::redb_storage::decode_entry_kind(raw)
-                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?
+        let vos_raft::EntryKind::Data { payload } = decode_agent_raft_entry_kind(raw)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?
         else {
             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
         };
@@ -7264,9 +7305,12 @@ mod application_ledger_v2 {
         if term != expected_term || raw_commitment != expected_raw_commitment {
             return Err(AgentRaftApplicationErrorV2::SlotDatabaseMismatch(index));
         }
-        let kind = crate::raft::redb_storage::decode_entry_kind(raw)
+        let kind = decode_agent_raft_entry_kind(raw)
             .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
-        if crate::raft::redb_storage::encode_entry_kind(&kind) != raw {
+        if encode_agent_raft_entry_kind(&kind)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?
+            != raw
+        {
             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
         }
         let vos_raft::EntryKind::Data { payload } = kind else {
@@ -7289,7 +7333,7 @@ mod application_ledger_v2 {
         transaction: &redb::ReadTransaction,
         raft: &crate::raft::RaftMeta,
         record: &AgentRaftApplyAuditRecordV2,
-    ) -> Result<vos_raft::EntryKind<u16>, AgentRaftApplicationErrorV2> {
+    ) -> Result<vos_raft::EntryKind<AgentNodeId>, AgentRaftApplicationErrorV2> {
         if raft.commit_index < record.index {
             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
         }
@@ -7312,7 +7356,7 @@ mod application_ledger_v2 {
         expected_commitment: Hash,
         disposition: AgentRaftApplyDispositionV2,
         stored: &[u8],
-    ) -> Result<vos_raft::EntryKind<u16>, AgentRaftApplicationErrorV2> {
+    ) -> Result<vos_raft::EntryKind<AgentNodeId>, AgentRaftApplicationErrorV2> {
         let (term, raw) = stored
             .split_at_checked(8)
             .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
@@ -7324,9 +7368,12 @@ mod application_ledger_v2 {
         if term != expected_term || commitment != expected_commitment {
             return Err(AgentRaftApplicationErrorV2::SlotDatabaseMismatch(index));
         }
-        let kind = crate::raft::redb_storage::decode_entry_kind(raw)
+        let kind = decode_agent_raft_entry_kind(raw)
             .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
-        if crate::raft::redb_storage::encode_entry_kind(&kind) != raw {
+        if encode_agent_raft_entry_kind(&kind)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?
+            != raw
+        {
             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
         }
         let compatible = match (&kind, disposition) {
@@ -7473,6 +7520,11 @@ mod tests {
         let mut peer = PEER_ID_PREFIX.to_vec();
         peer.extend_from_slice(&key.verifying_key().to_bytes());
         peer
+    }
+
+    #[cfg(feature = "storage")]
+    fn raft_node(byte: u8) -> AgentNodeId {
+        AgentNodeId([byte; 32])
     }
 
     fn member(key: &SigningKey, role: ReplicaRole) -> AgentReplicaMember {
@@ -7771,14 +7823,15 @@ mod tests {
     ) {
         let directory = TempDirectory::new(label);
         let database = Arc::new(Database::create(directory.database()).unwrap());
-        append_committed_kind(
-            &database,
-            7,
-            &EntryKind::Data {
-                payload: AgentRaftCommand::PrepareCommitteeChange(change).encode(),
-            },
-        );
         let ledger = open_transition_ledger(Arc::clone(&database), initial, store).unwrap();
+        ledger
+            .append_committed_for_test(
+                7,
+                &EntryKind::Data {
+                    payload: AgentRaftCommand::PrepareCommitteeChange(change).encode(),
+                },
+            )
+            .unwrap();
         let slot = ledger.next_committed_slot().unwrap().unwrap();
         let error = ledger.apply_foundation_slot(&slot).unwrap_err();
         assert!(expected(&error), "unexpected prepare error: {error:?}");
@@ -7912,14 +7965,18 @@ mod tests {
     }
 
     #[cfg(feature = "storage")]
-    fn physical_slot(kind: EntryKind<u16>, index: u64, term: u64) -> CommittedSharedRaftSlot {
+    fn physical_slot(
+        kind: EntryKind<AgentNodeId>,
+        index: u64,
+        term: u64,
+    ) -> CommittedSharedRaftSlot {
         CommittedSharedRaftSlot::from_durable_log(
             &PhysicalTestWitness {
                 row: Some((
                     index,
                     term,
                     index,
-                    crate::raft::redb_storage::encode_entry_kind(&kind),
+                    encode_agent_raft_entry_kind(&kind).unwrap(),
                 )),
             },
             index,
@@ -7928,14 +7985,18 @@ mod tests {
     }
 
     #[cfg(feature = "storage")]
-    fn append_committed_kind(database: &Arc<Database>, term: u64, kind: &EntryKind<u16>) -> u64 {
+    fn append_committed_kind(
+        database: &Arc<Database>,
+        term: u64,
+        kind: &EntryKind<AgentNodeId>,
+    ) -> u64 {
         let mut log = crate::raft::RaftLog::open(Arc::clone(database)).unwrap();
         let transaction = database.begin_write().unwrap();
         let index = log
             .append_in_txn(
                 &transaction,
                 term,
-                &crate::raft::redb_storage::encode_entry_kind(kind),
+                &encode_agent_raft_entry_kind(kind).unwrap(),
             )
             .unwrap();
         let mut meta = crate::raft::RaftMeta::load_from_write_transaction(&transaction).unwrap();
@@ -8057,7 +8118,7 @@ mod tests {
 
     #[cfg(feature = "storage")]
     #[test]
-    fn committee_prepare_wire_binds_complete_committees_prefixes_and_signed_evidence() {
+    fn committee_prepare_wire_binds_complete_committees_nodes_and_signed_evidence() {
         use crate::agent_sdk::authority::AuthorityOperationKind;
 
         let initial = committee(&[key(1), key(2)], &[key(9)]);
@@ -8083,13 +8144,10 @@ mod tests {
         );
         assert_eq!(command.route().committee(), initial.id());
         assert_eq!(
-            change.previous_prefixes(),
-            committee_voter_prefixes(&initial).unwrap()
+            change.previous_voters(),
+            committee_voter_nodes(&initial).unwrap()
         );
-        assert_eq!(
-            change.next_prefixes(),
-            committee_voter_prefixes(&next).unwrap()
-        );
+        assert_eq!(change.next_voters(), committee_voter_nodes(&next).unwrap());
 
         let mut different_evidence = change.authority().clone();
         different_evidence.selector.evidence.commitment = crate::agent_sdk::Hash([0xee; 32]);
@@ -8105,14 +8163,14 @@ mod tests {
         .unwrap();
         assert_ne!(different_evidence.transition(), change.transition());
 
-        let mut wrong_prefixes = change.clone();
-        wrong_prefixes.previous_prefixes = wrong_prefixes.next_prefixes.clone();
+        let mut wrong_nodes = change.clone();
+        wrong_nodes.previous_voters = wrong_nodes.next_voters.clone();
         assert_eq!(
-            wrong_prefixes.validate(),
+            wrong_nodes.validate(),
             Err(AgentRaftWireError::InvalidCommitteeTransition)
         );
         assert_eq!(
-            PrepareCommitteeChange::decode(&wrong_prefixes.encode()),
+            PrepareCommitteeChange::decode(&wrong_nodes.encode()),
             Err(DecodeError::NonCanonical)
         );
 
@@ -8207,9 +8265,7 @@ mod tests {
                             3,
                             4,
                             3,
-                            crate::raft::redb_storage::encode_entry_kind(&EntryKind::Data {
-                                payload,
-                            }),
+                            encode_agent_raft_entry_kind(&EntryKind::Data { payload }).unwrap(),
                         )),
                     },
                     3,
@@ -8235,16 +8291,19 @@ mod tests {
     fn physical_configuration_is_bounded_sorted_unique_and_unsolicited_is_refused() {
         let config = physical_slot(
             EntryKind::ConfigChange {
-                joint_old: Some(vec![1, 3]),
-                members: vec![2, 4],
+                joint_old: Some(vec![raft_node(1), raft_node(3)]),
+                members: vec![raft_node(2), raft_node(4)],
             },
             1,
             9,
         );
         match &config {
             CommittedSharedRaftSlot::Configuration(config) => {
-                assert_eq!(config.joint_old(), Some([1, 3].as_slice()));
-                assert_eq!(config.members(), &[2, 4]);
+                assert_eq!(
+                    config.joint_old(),
+                    Some([raft_node(1), raft_node(3)].as_slice())
+                );
+                assert_eq!(config.members(), &[raft_node(2), raft_node(4)]);
             }
             _ => panic!("configuration slot decoded as the wrong physical kind"),
         }
@@ -8256,48 +8315,43 @@ mod tests {
             },
             EntryKind::ConfigChange {
                 joint_old: None,
-                members: vec![2, 1],
+                members: vec![raft_node(2), raft_node(1)],
             },
             EntryKind::ConfigChange {
-                joint_old: Some(vec![1, 1]),
-                members: vec![1, 2],
+                joint_old: Some(vec![raft_node(1), raft_node(1)]),
+                members: vec![raft_node(1), raft_node(2)],
             },
             EntryKind::ConfigChange {
                 joint_old: None,
-                members: (0..=MAX_AGENT_REPLICAS as u16).collect(),
+                members: (1..=MAX_AGENT_REPLICAS + 1)
+                    .map(|index| raft_node(index as u8))
+                    .collect(),
             },
         ];
         for kind in invalid {
-            let raw = crate::raft::redb_storage::encode_entry_kind(&kind);
-            assert!(matches!(
-                CommittedSharedRaftSlot::from_durable_log(
-                    &PhysicalTestWitness {
-                        row: Some((1, 9, 1, raw)),
-                    },
-                    1,
-                ),
-                Err(CommittedSharedRaftSlotError::Invalid(
-                    AgentRaftWireError::InvalidConfiguration
-                ))
-            ));
+            assert_eq!(
+                encode_agent_raft_entry_kind(&kind),
+                Err(AgentRaftWireError::InvalidConfiguration)
+            );
         }
 
         let directory = TempDirectory::new("v2_config_refusal");
         let database = Arc::new(Database::create(directory.database()).unwrap());
-        append_committed_kind(
-            &database,
-            9,
-            &EntryKind::ConfigChange {
-                joint_old: Some(vec![1, 3]),
-                members: vec![2, 4],
-            },
-        );
         let ledger = open_foundation_ledger(
             Arc::clone(&database),
             route(&committee(&[key(1)], &[])).generation(),
             journal_store(0xa1),
         )
         .unwrap();
+        ledger
+            .append_committed_for_test(
+                9,
+                &EntryKind::ConfigChange {
+                    joint_old: Some(vec![raft_node(1), raft_node(3)]),
+                    members: vec![raft_node(2), raft_node(4)],
+                },
+            )
+            .unwrap();
         let config = ledger.next_committed_slot().unwrap().unwrap();
         assert!(matches!(
             ledger.apply_foundation_slot(&config),
@@ -8307,6 +8361,90 @@ mod tests {
         assert_eq!(
             crate::raft::RaftMeta::load(&database).unwrap().last_applied,
             0
+        );
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn full_node_configuration_preserves_low_byte_collisions_and_rejects_legacy_rows() {
+        let mut first = [0x11; 32];
+        first[30..].copy_from_slice(&[0xa5, 0x5a]);
+        let mut second = [0x22; 32];
+        second[30..].copy_from_slice(&[0xa5, 0x5a]);
+        let first = AgentNodeId(first);
+        let second = AgentNodeId(second);
+        assert_ne!(first, second);
+        assert_eq!(&first.as_bytes()[30..], &second.as_bytes()[30..]);
+
+        let mut members = vec![second, first];
+        members.sort_unstable();
+        let kind = EntryKind::ConfigChange {
+            joint_old: Some(members.clone()),
+            members: members.clone(),
+        };
+        let raw = encode_agent_raft_entry_kind(&kind).unwrap();
+        assert_eq!(decode_agent_raft_entry_kind(&raw).unwrap(), kind);
+        let slot = CommittedSharedRaftSlot::from_durable_log(
+            &PhysicalTestWitness {
+                row: Some((1, 9, 1, raw.clone())),
+            },
+            1,
+        )
+        .unwrap();
+        let CommittedSharedRaftSlot::Configuration(configuration) = slot else {
+            panic!("full-Node configuration decoded as a different physical kind")
+        };
+        assert_eq!(configuration.joint_old(), Some(members.as_slice()));
+        assert_eq!(configuration.members(), members);
+
+        let legacy = crate::raft::redb_storage::encode_entry_kind(
+            &vos_raft::EntryKind::<u16>::ConfigChange {
+                joint_old: Some(vec![0x5aa5]),
+                members: vec![0x5aa5],
+            },
+        );
+        assert_eq!(
+            decode_agent_raft_entry_kind(&legacy),
+            Err(AgentRaftWireError::InvalidPhysicalSlot)
+        );
+
+        let mut zero = AGENT_RAFT_PHYSICAL_MAGIC.to_vec();
+        {
+            let mut encoder = Encoder(&mut zero);
+            encoder.u8(AGENT_RAFT_PHYSICAL_CONFIGURATION);
+            encoder.bool(false);
+            encode_raft_nodes(&mut encoder, &[AgentNodeId::ZERO]);
+        }
+        assert_eq!(
+            decode_agent_raft_entry_kind(&zero),
+            Err(AgentRaftWireError::InvalidConfiguration)
+        );
+
+        let mut trailing = raw;
+        trailing.push(0);
+        assert_eq!(
+            decode_agent_raft_entry_kind(&trailing),
+            Err(AgentRaftWireError::InvalidConfiguration)
+        );
+
+        let mut oversized_count = AGENT_RAFT_PHYSICAL_MAGIC.to_vec();
+        {
+            let mut encoder = Encoder(&mut oversized_count);
+            encoder.u8(AGENT_RAFT_PHYSICAL_CONFIGURATION);
+            encoder.bool(false);
+            encoder.u16((MAX_AGENT_REPLICAS as u16) + 1);
+        }
+        assert_eq!(
+            decode_agent_raft_entry_kind(&oversized_count),
+            Err(AgentRaftWireError::InvalidConfiguration)
+        );
+
+        let mut oversized_slot = vec![0; MAX_AGENT_RAFT_PHYSICAL_SLOT_BYTES + 1];
+        oversized_slot[..AGENT_RAFT_PHYSICAL_MAGIC.len()]
+            .copy_from_slice(&AGENT_RAFT_PHYSICAL_MAGIC);
+        assert_eq!(
+            decode_agent_raft_entry_kind(&oversized_slot),
+            Err(AgentRaftWireError::InvalidPhysicalSlot)
         );
     }
 
@@ -8359,23 +8497,25 @@ mod tests {
 
         let gap_directory = TempDirectory::new("v2_gap");
         let gap_database = Arc::new(Database::create(gap_directory.database()).unwrap());
-        append_committed_kind(
-            &gap_database,
-            4,
-            &EntryKind::Data {
-                payload: Vec::new(),
-            },
-        );
-        append_committed_kind(
-            &gap_database,
-            4,
-            &EntryKind::Data {
-                payload: Vec::new(),
-            },
-        );
         let gap_ledger =
             open_foundation_ledger(Arc::clone(&gap_database), generation, journal_store(0xa2))
                 .unwrap();
+        gap_ledger
+            .append_committed_for_test(
+                4,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
+        gap_ledger
+            .append_committed_for_test(
+                4,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
         let gap_slot = CommittedSharedRaftSlot::from_durable_log(
             &RedbSharedRaftLogWitness::new(Arc::clone(&gap_database)),
             2,
@@ -8392,25 +8532,27 @@ mod tests {
 
         let term_directory = TempDirectory::new("v2_term_regression");
         let term_database = Arc::new(Database::create(term_directory.database()).unwrap());
-        append_committed_kind(
-            &term_database,
-            7,
-            &EntryKind::Data {
-                payload: Vec::new(),
-            },
-        );
         let term_ledger =
             open_foundation_ledger(Arc::clone(&term_database), generation, journal_store(0xa3))
                 .unwrap();
+        term_ledger
+            .append_committed_for_test(
+                7,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
         let first = term_ledger.next_committed_slot().unwrap().unwrap();
         term_ledger.apply_foundation_slot(&first).unwrap();
-        append_committed_kind(
-            &term_database,
-            6,
-            &EntryKind::Data {
-                payload: Vec::new(),
-            },
-        );
+        term_ledger
+            .append_committed_for_test(
+                6,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
         let second = term_ledger.next_committed_slot().unwrap().unwrap();
         assert!(matches!(
             term_ledger.apply_foundation_slot(&second),
@@ -8433,19 +8575,20 @@ mod tests {
         };
         let command_directory = TempDirectory::new("v2_command_refusal");
         let command_database = Arc::new(Database::create(command_directory.database()).unwrap());
-        append_committed_kind(
-            &command_database,
-            8,
-            &EntryKind::Data {
-                payload: command.encode(),
-            },
-        );
         let command_ledger = open_foundation_ledger(
             Arc::clone(&command_database),
             generation,
             journal_store(0xa4),
         )
         .unwrap();
+        command_ledger
+            .append_committed_for_test(
+                8,
+                &EntryKind::Data {
+                    payload: command.encode(),
+                },
+            )
+            .unwrap();
         let command_slot = command_ledger.next_committed_slot().unwrap().unwrap();
         assert!(matches!(
             command_ledger.apply_foundation_slot(&command_slot),
@@ -8463,14 +8606,15 @@ mod tests {
         let store = journal_store(0xa5);
         {
             let database = Arc::new(Database::create(&path).unwrap());
-            append_committed_kind(
-                &database,
-                11,
-                &EntryKind::Data {
-                    payload: Vec::new(),
-                },
-            );
             let ledger = open_foundation_ledger(Arc::clone(&database), generation, store).unwrap();
+            ledger
+                .append_committed_for_test(
+                    11,
+                    &EntryKind::Data {
+                        payload: Vec::new(),
+                    },
+                )
+                .unwrap();
             let slot = ledger.next_committed_slot().unwrap().unwrap();
             let commitment = slot.raw_payload_commitment();
             match ledger.apply_foundation_slot(&slot).unwrap() {
@@ -8518,17 +8662,6 @@ mod tests {
 
         {
             let database = Arc::new(Database::create(&path).unwrap());
-            append_committed_kind(
-                &database,
-                12,
-                &EntryKind::Data {
-                    payload: AgentRaftCommand::ArtifactAbort {
-                        route: route(&initial),
-                        batch,
-                    }
-                    .encode(),
-                },
-            );
             let ledger = AgentRaftApplicationLedgerV2::open(
                 Arc::clone(&database),
                 generation,
@@ -8538,6 +8671,18 @@ mod tests {
                 committee_authority_binding(),
             )
             .unwrap();
+            ledger
+                .append_committed_for_test(
+                    12,
+                    &EntryKind::Data {
+                        payload: AgentRaftCommand::ArtifactAbort {
+                            route: route(&initial),
+                            batch,
+                        }
+                        .encode(),
+                    },
+                )
+                .unwrap();
             let slot = ledger.next_committed_slot().unwrap().unwrap();
             let CommittedSharedRaftSlot::Command(command) = &slot else {
                 panic!("ordinary command decoded as the wrong physical kind");
@@ -8636,17 +8781,6 @@ mod tests {
         let local_node = member(&key(1), ReplicaRole::Voter).replica().node;
         {
             let database = Arc::new(Database::create(&path).unwrap());
-            append_committed_kind(
-                &database,
-                13,
-                &EntryKind::Data {
-                    payload: AgentRaftCommand::ArtifactAbort {
-                        route: route(&initial),
-                        batch: ArtifactBatchId::from_bytes([0xb5; 32]),
-                    }
-                    .encode(),
-                },
-            );
             let ledger = AgentRaftApplicationLedgerV2::open(
                 Arc::clone(&database),
                 generation,
@@ -8656,6 +8790,18 @@ mod tests {
                 committee_authority_binding(),
             )
             .unwrap();
+            ledger
+                .append_committed_for_test(
+                    13,
+                    &EntryKind::Data {
+                        payload: AgentRaftCommand::ArtifactAbort {
+                            route: route(&initial),
+                            batch: ArtifactBatchId::from_bytes([0xb5; 32]),
+                        }
+                        .encode(),
+                    },
+                )
+                .unwrap();
             let slot = ledger.next_committed_slot().unwrap().unwrap();
             let CommittedSharedRaftSlot::Command(command) = &slot else {
                 panic!("ordinary command decoded as the wrong physical kind");
@@ -8708,20 +8854,21 @@ mod tests {
             10,
         );
         let transition = change.transition();
-        let previous_prefixes = change.previous_prefixes().to_vec();
-        let next_prefixes = change.next_prefixes().to_vec();
+        let previous_voters = change.previous_voters().to_vec();
+        let next_voters = change.next_voters().to_vec();
 
         {
             let database = Arc::new(Database::create(&path).unwrap());
-            append_committed_kind(
-                &database,
-                7,
-                &EntryKind::Data {
-                    payload: AgentRaftCommand::PrepareCommitteeChange(change.clone()).encode(),
-                },
-            );
             let ledger =
                 open_transition_ledger(Arc::clone(&database), initial.clone(), store).unwrap();
+            ledger
+                .append_committed_for_test(
+                    7,
+                    &EntryKind::Data {
+                        payload: AgentRaftCommand::PrepareCommitteeChange(change.clone()).encode(),
+                    },
+                )
+                .unwrap();
             let prepare = ledger.next_committed_slot().unwrap().unwrap();
             match ledger.apply_foundation_slot(&prepare).unwrap() {
                 AgentRaftFoundationApplyOutcomeV2::Applied(meta) => assert_eq!(
@@ -8762,8 +8909,8 @@ mod tests {
                 &database,
                 8,
                 &EntryKind::ConfigChange {
-                    joint_old: Some(previous_prefixes.clone()),
-                    members: next_prefixes.clone(),
+                    joint_old: Some(previous_voters.clone()),
+                    members: next_voters.clone(),
                 },
             );
             let joint = ledger.next_committed_slot().unwrap().unwrap();
@@ -8802,7 +8949,7 @@ mod tests {
                 8,
                 &EntryKind::ConfigChange {
                     joint_old: None,
-                    members: next_prefixes,
+                    members: next_voters,
                 },
             );
             let stable = ledger.next_committed_slot().unwrap().unwrap();
@@ -8859,8 +9006,8 @@ mod tests {
             1,
             10,
         );
-        let previous_prefixes = change.previous_prefixes().to_vec();
-        let next_prefixes = change.next_prefixes().to_vec();
+        let previous_voters = change.previous_voters().to_vec();
+        let next_voters = change.next_voters().to_vec();
         let local_node = initial.members()[0].replica().node;
         assert!(next.member_by_node(local_node).is_some());
         let certificate;
@@ -8892,8 +9039,8 @@ mod tests {
                 &database,
                 8,
                 &EntryKind::ConfigChange {
-                    joint_old: Some(previous_prefixes),
-                    members: next_prefixes.clone(),
+                    joint_old: Some(previous_voters),
+                    members: next_voters.clone(),
                 },
             );
             let joint = ledger.next_committed_slot().unwrap().unwrap();
@@ -8906,7 +9053,7 @@ mod tests {
                 8,
                 &EntryKind::ConfigChange {
                     joint_old: None,
-                    members: next_prefixes,
+                    members: next_voters,
                 },
             );
             let stable = ledger.next_committed_slot().unwrap().unwrap();
@@ -9196,7 +9343,7 @@ mod tests {
 
     #[cfg(feature = "storage")]
     #[test]
-    fn v2_pending_barrier_rejects_overlap_reorder_wrong_role_and_partial_prefixes() {
+    fn v2_pending_barrier_rejects_overlap_reorder_wrong_role_and_partial_nodes() {
         let directory = TempDirectory::new("v2_committee_hostile_barrier");
         let database = Arc::new(Database::create(directory.database()).unwrap());
         let initial = committee(&[key(1), key(2)], &[key(9)]);
@@ -9210,18 +9357,19 @@ mod tests {
             1,
             10,
         );
-        let previous_prefixes = change.previous_prefixes().to_vec();
-        let next_prefixes = change.next_prefixes().to_vec();
-        append_committed_kind(
-            &database,
-            7,
-            &EntryKind::Data {
-                payload: AgentRaftCommand::PrepareCommitteeChange(change.clone()).encode(),
-            },
-        );
+        let previous_voters = change.previous_voters().to_vec();
+        let next_voters = change.next_voters().to_vec();
         let ledger =
             open_transition_ledger(Arc::clone(&database), initial.clone(), journal_store(0xc9))
                 .unwrap();
+        ledger
+            .append_committed_for_test(
+                7,
+                &EntryKind::Data {
+                    payload: AgentRaftCommand::PrepareCommitteeChange(change.clone()).encode(),
+                },
+            )
+            .unwrap();
         let prepare = ledger.next_committed_slot().unwrap().unwrap();
         ledger.apply_foundation_slot(&prepare).unwrap();
 
@@ -9248,7 +9396,7 @@ mod tests {
             physical_slot(
                 EntryKind::ConfigChange {
                     joint_old: None,
-                    members: next_prefixes.clone(),
+                    members: next_voters.clone(),
                 },
                 2,
                 8,
@@ -9258,41 +9406,41 @@ mod tests {
         rejects_at_prepare_barrier!(
             physical_slot(
                 EntryKind::ConfigChange {
-                    joint_old: Some(previous_prefixes[..1].to_vec()),
-                    members: next_prefixes.clone(),
+                    joint_old: Some(previous_voters[..1].to_vec()),
+                    members: next_voters.clone(),
                 },
                 2,
                 8,
             ),
-            AgentRaftApplicationErrorV2::WrongConfigurationPrefixes
+            AgentRaftApplicationErrorV2::WrongConfigurationNodes
         );
         rejects_at_prepare_barrier!(
             physical_slot(
                 EntryKind::ConfigChange {
-                    joint_old: Some(previous_prefixes.clone()),
-                    members: next_prefixes[..1].to_vec(),
+                    joint_old: Some(previous_voters.clone()),
+                    members: next_voters[..1].to_vec(),
                 },
                 2,
                 8,
             ),
-            AgentRaftApplicationErrorV2::WrongConfigurationPrefixes
+            AgentRaftApplicationErrorV2::WrongConfigurationNodes
         );
 
-        let observer_prefix = derive_replica_raft_slot(&peer_id(&key(8)));
-        assert!(!next_prefixes.contains(&observer_prefix));
-        let mut role_confused_prefixes = next_prefixes.clone();
-        role_confused_prefixes.push(observer_prefix);
-        role_confused_prefixes.sort_unstable();
+        let observer_node = AgentNodeId(member(&key(8), ReplicaRole::Observer).replica().node.0);
+        assert!(!next_voters.contains(&observer_node));
+        let mut role_confused_nodes = next_voters.clone();
+        role_confused_nodes.push(observer_node);
+        role_confused_nodes.sort_unstable();
         rejects_at_prepare_barrier!(
             physical_slot(
                 EntryKind::ConfigChange {
-                    joint_old: Some(previous_prefixes.clone()),
-                    members: role_confused_prefixes.clone(),
+                    joint_old: Some(previous_voters.clone()),
+                    members: role_confused_nodes.clone(),
                 },
                 2,
                 8,
             ),
-            AgentRaftApplicationErrorV2::WrongConfigurationPrefixes
+            AgentRaftApplicationErrorV2::WrongConfigurationNodes
         );
         rejects_at_prepare_barrier!(
             physical_slot(
@@ -9342,8 +9490,8 @@ mod tests {
             &database,
             8,
             &EntryKind::ConfigChange {
-                joint_old: Some(previous_prefixes),
-                members: next_prefixes.clone(),
+                joint_old: Some(previous_voters),
+                members: next_voters.clone(),
             },
         );
         let joint = ledger.next_committed_slot().unwrap().unwrap();
@@ -9375,8 +9523,8 @@ mod tests {
         rejects_at_joint_barrier!(
             physical_slot(
                 EntryKind::ConfigChange {
-                    joint_old: Some(change.previous_prefixes().to_vec()),
-                    members: next_prefixes.clone(),
+                    joint_old: Some(change.previous_voters().to_vec()),
+                    members: next_voters.clone(),
                 },
                 3,
                 8,
@@ -9387,23 +9535,23 @@ mod tests {
             physical_slot(
                 EntryKind::ConfigChange {
                     joint_old: None,
-                    members: next_prefixes[..1].to_vec(),
+                    members: next_voters[..1].to_vec(),
                 },
                 3,
                 8,
             ),
-            AgentRaftApplicationErrorV2::WrongConfigurationPrefixes
+            AgentRaftApplicationErrorV2::WrongConfigurationNodes
         );
         rejects_at_joint_barrier!(
             physical_slot(
                 EntryKind::ConfigChange {
                     joint_old: None,
-                    members: role_confused_prefixes,
+                    members: role_confused_nodes,
                 },
                 3,
                 8,
             ),
-            AgentRaftApplicationErrorV2::WrongConfigurationPrefixes
+            AgentRaftApplicationErrorV2::WrongConfigurationNodes
         );
 
         append_committed_kind(
@@ -9411,7 +9559,7 @@ mod tests {
             8,
             &EntryKind::ConfigChange {
                 joint_old: None,
-                members: next_prefixes,
+                members: next_voters,
             },
         );
         let stable = ledger.next_committed_slot().unwrap().unwrap();
@@ -9441,14 +9589,15 @@ mod tests {
             1,
             10,
         );
-        append_committed_kind(
-            &database,
-            7,
-            &EntryKind::Data {
-                payload: AgentRaftCommand::PrepareCommitteeChange(change).encode(),
-            },
-        );
         let ledger = open_transition_ledger(Arc::clone(&database), initial.clone(), store).unwrap();
+        ledger
+            .append_committed_for_test(
+                7,
+                &EntryKind::Data {
+                    payload: AgentRaftCommand::PrepareCommitteeChange(change).encode(),
+                },
+            )
+            .unwrap();
         let prepare = ledger.next_committed_slot().unwrap().unwrap();
         ledger.apply_foundation_slot(&prepare).unwrap();
         drop(ledger);
@@ -9485,19 +9634,20 @@ mod tests {
 
         let conflict_directory = TempDirectory::new("v2_duplicate_conflict");
         let conflict_database = Arc::new(Database::create(conflict_directory.database()).unwrap());
-        append_committed_kind(
-            &conflict_database,
-            12,
-            &EntryKind::Data {
-                payload: Vec::new(),
-            },
-        );
         let conflict_ledger = open_foundation_ledger(
             Arc::clone(&conflict_database),
             generation,
             journal_store(0xa6),
         )
         .unwrap();
+        conflict_ledger
+            .append_committed_for_test(
+                12,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
         let exact = conflict_ledger.next_committed_slot().unwrap().unwrap();
         conflict_ledger.apply_foundation_slot(&exact).unwrap();
         let conflicting = physical_slot(
@@ -9514,19 +9664,20 @@ mod tests {
 
         let missing_directory = TempDirectory::new("v2_missing_log");
         let missing_database = Arc::new(Database::create(missing_directory.database()).unwrap());
-        append_committed_kind(
-            &missing_database,
-            14,
-            &EntryKind::Data {
-                payload: Vec::new(),
-            },
-        );
         let missing_ledger = open_foundation_ledger(
             Arc::clone(&missing_database),
             generation,
             journal_store(0xa7),
         )
         .unwrap();
+        missing_ledger
+            .append_committed_for_test(
+                14,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
         let slot = missing_ledger.next_committed_slot().unwrap().unwrap();
         missing_ledger.apply_foundation_slot(&slot).unwrap();
         {
@@ -9545,19 +9696,20 @@ mod tests {
 
         let corrupt_directory = TempDirectory::new("v2_corrupt_audit");
         let corrupt_database = Arc::new(Database::create(corrupt_directory.database()).unwrap());
-        append_committed_kind(
-            &corrupt_database,
-            15,
-            &EntryKind::Data {
-                payload: Vec::new(),
-            },
-        );
         let corrupt_ledger = open_foundation_ledger(
             Arc::clone(&corrupt_database),
             generation,
             journal_store(0xa8),
         )
         .unwrap();
+        corrupt_ledger
+            .append_committed_for_test(
+                15,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
         let slot = corrupt_ledger.next_committed_slot().unwrap().unwrap();
         corrupt_ledger.apply_foundation_slot(&slot).unwrap();
         {
