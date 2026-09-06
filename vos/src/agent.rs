@@ -52,6 +52,8 @@ pub mod machine;
 pub mod package;
 #[cfg(feature = "std")]
 pub mod package_admission;
+#[cfg(feature = "std")]
+pub(crate) mod private_control_application_coordinator;
 #[cfg(feature = "private-agent-crypto")]
 pub mod private_crypto;
 #[cfg(feature = "private-agent-store")]
