@@ -29,7 +29,11 @@ use vos::agent_sdk::{
 use vos::prelude::*;
 
 /// Fixed installation-data wire for [`SystemAuthorityConfiguration`].
-pub const SYSTEM_AUTHORITY_CONFIGURATION_MAGIC: [u8; 4] = *b"SAC1";
+pub const SYSTEM_AUTHORITY_CONFIGURATION_MAGIC: [u8; 4] = *b"SAC2";
+
+/// The root admission consumes exactly one Create decision and one authority
+/// actor Install decision before this portable issuer can run.
+pub const ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER: u64 = 2;
 
 /// Maximum durable rows in each caller table.
 pub const MAX_AUTHORITY_CREDENTIALS: usize = 64;
@@ -50,9 +54,13 @@ pub const MAX_RETAINED_EXACT_WIRE_BYTES: usize = MAX_EXACT_RETRY_RECORDS
 /// slot at which unseen work was accepted.
 pub const MAX_APPROVAL_VALIDITY_SLOTS: u64 = 4_096;
 
-const CONFIG_FIXED_FIELDS: usize = 13;
-const CONFIG_ENCODED_BYTES: usize =
-    SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len() + 32 + CONFIG_FIXED_FIELDS * 32 + 8 + 1;
+const CONFIG_FIXED_FIELDS: usize = 15;
+const CONFIG_U64_FIELDS: usize = 2;
+const CONFIG_ENCODED_BYTES: usize = SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len()
+    + 32
+    + CONFIG_FIXED_FIELDS * 32
+    + CONFIG_U64_FIELDS * 8
+    + 1;
 const EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/policy-evidence/v1";
 
 const _: () = assert!(MAX_RETAINED_EXACT_WIRE_BYTES < MAX_RUNTIME_STATE_BYTES);
@@ -137,7 +145,11 @@ pub struct SystemAuthorityConfiguration {
     pub space: [u8; 32],
     pub system_agent: [u8; 32],
     pub system_runtime_deployment: [u8; 32],
+    pub system_runtime_program: [u8; 32],
+    pub system_runtime_producer: [u8; 32],
     pub binding: AuthorityBindingState,
+    /// Exact durable issuer sequence already consumed by root admission.
+    pub bootstrap_authorization_high_water: u64,
     pub bootstrap_principal: [u8; 32],
     pub bootstrap_credential_public_key: [u8; 32],
     /// Canonical [`vos::agent_sdk::authority::AuthorityCredentialKind`] tag.
@@ -150,6 +162,9 @@ impl SystemAuthorityConfiguration {
         self.space != [0; 32]
             && self.system_agent != [0; 32]
             && self.system_runtime_deployment != [0; 32]
+            && self.system_runtime_program != [0; 32]
+            && self.system_runtime_producer != [0; 32]
+            && self.bootstrap_authorization_high_water == ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER
             && self.bootstrap_principal != [0; 32]
             && canonical_credential_public_key(&self.bootstrap_credential_public_key)
             && CredentialId::of_public_key(&self.bootstrap_credential_public_key)
@@ -167,6 +182,8 @@ impl SystemAuthorityConfiguration {
         bytes.extend_from_slice(&self.space);
         bytes.extend_from_slice(&self.system_agent);
         bytes.extend_from_slice(&self.system_runtime_deployment);
+        bytes.extend_from_slice(&self.system_runtime_program);
+        bytes.extend_from_slice(&self.system_runtime_producer);
         bytes.extend_from_slice(&self.binding.policy);
         bytes.extend_from_slice(&self.binding.issuer.principal);
         bytes.extend_from_slice(&self.binding.issuer.actor);
@@ -175,6 +192,7 @@ impl SystemAuthorityConfiguration {
         bytes.extend_from_slice(&self.binding.issuer.producer);
         bytes.extend_from_slice(&self.binding.public_key);
         bytes.extend_from_slice(&self.binding.initial_epoch.to_le_bytes());
+        bytes.extend_from_slice(&self.bootstrap_authorization_high_water.to_le_bytes());
         bytes.extend_from_slice(&self.bootstrap_principal);
         bytes.extend_from_slice(&self.bootstrap_credential_public_key);
         bytes.push(self.bootstrap_credential_kind);
@@ -182,7 +200,7 @@ impl SystemAuthorityConfiguration {
         bytes
     }
 
-    /// Decode SAC1 exactly. Prior clean generations, truncation, and trailing
+    /// Decode SAC2 exactly. Prior clean generations, truncation, and trailing
     /// data are all rejected; there is no legacy constructor fallback.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != CONFIG_ENCODED_BYTES
@@ -195,6 +213,8 @@ impl SystemAuthorityConfiguration {
         let space = take_fixed(bytes, &mut cursor)?;
         let system_agent = take_fixed(bytes, &mut cursor)?;
         let system_runtime_deployment = take_fixed(bytes, &mut cursor)?;
+        let system_runtime_program = take_fixed(bytes, &mut cursor)?;
+        let system_runtime_producer = take_fixed(bytes, &mut cursor)?;
         let policy = take_fixed(bytes, &mut cursor)?;
         let issuer = AuthorityIssuerState {
             principal: take_fixed(bytes, &mut cursor)?,
@@ -205,6 +225,9 @@ impl SystemAuthorityConfiguration {
         };
         let public_key = take_fixed(bytes, &mut cursor)?;
         let initial_epoch = u64::from_le_bytes(bytes.get(cursor..cursor + 8)?.try_into().ok()?);
+        cursor += 8;
+        let bootstrap_authorization_high_water =
+            u64::from_le_bytes(bytes.get(cursor..cursor + 8)?.try_into().ok()?);
         cursor += 8;
         let bootstrap_principal = take_fixed(bytes, &mut cursor)?;
         let bootstrap_credential_public_key = take_fixed(bytes, &mut cursor)?;
@@ -218,12 +241,15 @@ impl SystemAuthorityConfiguration {
             space,
             system_agent,
             system_runtime_deployment,
+            system_runtime_program,
+            system_runtime_producer,
             binding: AuthorityBindingState {
                 policy,
                 issuer,
                 public_key,
                 initial_epoch,
             },
+            bootstrap_authorization_high_water,
             bootstrap_principal,
             bootstrap_credential_public_key,
             bootstrap_credential_kind,
@@ -320,6 +346,18 @@ pub struct ManagedAgentRow {
     pub runtime_program: [u8; 32],
     pub runtime_producer: [u8; 32],
     pub authority: AuthorityBindingState,
+}
+
+fn root_managed_agent(config: SystemAuthorityConfiguration) -> ManagedAgentRow {
+    ManagedAgentRow {
+        agent: config.system_agent,
+        owner: config.bootstrap_principal,
+        profile: AgentProfile::Shared as u8,
+        runtime_deployment: config.system_runtime_deployment,
+        runtime_program: config.system_runtime_program,
+        runtime_producer: config.system_runtime_producer,
+        authority: config.binding,
+    }
 }
 
 #[derive(
@@ -425,15 +463,17 @@ impl AuthorityLinearState {
             principal: config.bootstrap_principal,
             role: BuiltinPrincipalRole::Admin,
         });
+        let mut managed_agents = Vec::with_capacity(1);
+        managed_agents.push(root_managed_agent(config));
         Self {
             initialized: true,
             epoch: config.binding.initial_epoch,
-            authorization_sequence: 0,
+            authorization_sequence: config.bootstrap_authorization_high_water,
             administration_generation: 1,
             credentials,
             nodes,
             roles,
-            managed_agents: Vec::new(),
+            managed_agents,
             retries: Vec::new(),
             admin_retries: Vec::new(),
         }
@@ -441,7 +481,7 @@ impl AuthorityLinearState {
 }
 
 /// Linear policy state for one Space's built-in system Agent.
-#[actor(agent, state_version = 3)]
+#[actor(agent, state_version = 4)]
 pub struct SystemAuthority {
     #[state(const)]
     configuration: SystemAuthorityConfiguration,
@@ -1392,6 +1432,125 @@ fn authority_state_is_valid(
         && admin_generations_are_unique(&state.admin_retries)
         && retry_families_are_disjoint(&state.retries, &state.admin_retries)
         && admin_history_reconstructs_identity(configuration, state)
+        && management_history_reconstructs_policy(configuration, state)
+}
+
+fn management_history_reconstructs_policy(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+) -> bool {
+    let mut replay = AuthorityLinearState::bootstrap(*configuration);
+    // Create effects require their owner to remain enrolled. Identity history
+    // is reconstructed independently; use its already-validated final role
+    // table while replaying the orthogonal management sequence.
+    replay.roles.clone_from(&state.roles);
+    let mut history = state.retries.iter().collect::<Vec<_>>();
+    history.sort_unstable_by_key(|record| record.authorization_sequence);
+    for record in history {
+        let Some(expected_sequence) = replay.authorization_sequence.checked_add(1) else {
+            return false;
+        };
+        if record.authorization_sequence != expected_sequence {
+            return false;
+        }
+        let Ok(call) = AuthorityCredentialCall::decode(&record.credential_call_bytes) else {
+            return false;
+        };
+        let Ok(approval) = ManagementApproval::decode(&record.approval) else {
+            return false;
+        };
+        if call.invocation.0 != record.invocation
+            || call.commitment().0 != record.credential_call
+            || call.encode().ok().as_deref() != Some(record.credential_call_bytes.as_slice())
+            || call.verify_with(&Ed25519CredentialVerifier).is_err()
+            || !authority_target_matches(configuration, &call.authority)
+            || approval.commitment().0 != record.approval_commitment
+            || approval.encode().ok().as_deref() != Some(record.approval.as_slice())
+            || approval.authorization_sequence.get() != record.authorization_sequence
+            || approval.acknowledgement_invocation.0 != record.acknowledgement_invocation
+            || !approval.matches_call(&call)
+            || reconstruction_effect(configuration, &replay, &call).as_ref() != Some(&record.effect)
+        {
+            return false;
+        }
+        replay.authorization_sequence = expected_sequence;
+        if record.finalized {
+            let Some(encoded_ack) = record.acknowledgement_bytes.as_deref() else {
+                return false;
+            };
+            let Ok(ack) = ManagementApplicationAck::decode(encoded_ack) else {
+                return false;
+            };
+            if ack.commitment().0 != record.acknowledgement.unwrap_or([0; 32])
+                || ack.encode().ok().as_deref() != Some(encoded_ack)
+                || ack.verify_with(&Ed25519CredentialVerifier).is_err()
+                || !authority_target_matches(configuration, &ack.authority)
+                || !ack.matches_pending(&call, &approval)
+            {
+                return false;
+            }
+            let Some(plan) = application_plan(configuration, &replay, &record.effect) else {
+                return false;
+            };
+            apply_application_plan(&mut replay, plan);
+        }
+    }
+    replay.authorization_sequence == state.authorization_sequence
+        && replay.managed_agents == state.managed_agents
+}
+
+fn reconstruction_effect(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    call: &AuthorityCredentialCall,
+) -> Option<PendingManagementEffect> {
+    match &call.request {
+        ManagementRequest::Create(descriptor) => {
+            if descriptor.authority != configuration.binding.sdk() {
+                return None;
+            }
+            Some(PendingManagementEffect::Create(ManagedAgentRow {
+                agent: descriptor.identity.agent.0,
+                owner: descriptor.identity.owner.0,
+                profile: descriptor.identity.profile as u8,
+                runtime_deployment: descriptor.identity.runtime_deployment.0,
+                runtime_program: descriptor.identity.runtime_program.0,
+                runtime_producer: descriptor.identity.runtime_producer.0,
+                authority: configuration.binding,
+            }))
+        }
+        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => None,
+        ManagementRequest::Install(_)
+        | ManagementRequest::UpgradeActor(_)
+        | ManagementRequest::Suspend { .. }
+        | ManagementRequest::Resume { .. }
+        | ManagementRequest::RemoveLeaf { .. }
+        | ManagementRequest::ChangeReplicas { .. } => {
+            reconstruction_lifecycle_row(configuration, state, call)?;
+            Some(PendingManagementEffect::None)
+        }
+        ManagementRequest::UpgradeRuntime(upgrade) => {
+            let row = reconstruction_lifecycle_row(configuration, state, call)?;
+            Some(PendingManagementEffect::UpgradeRuntime {
+                agent: row.agent,
+                from_deployment: row.runtime_deployment,
+                to_deployment: upgrade.to_deployment.0,
+                to_program: upgrade.to_program.0,
+                producer: upgrade.producer.0,
+            })
+        }
+    }
+}
+
+fn reconstruction_lifecycle_row<'a>(
+    configuration: &SystemAuthorityConfiguration,
+    state: &'a AuthorityLinearState,
+    call: &AuthorityCredentialCall,
+) -> Option<&'a ManagedAgentRow> {
+    let row = &state.managed_agents[managed_agent(state, call.managed.agent).ok()?];
+    (row.runtime_deployment == call.managed.runtime_deployment.0
+        && row.authority == configuration.binding)
+        .then_some(row)
 }
 
 fn accessible_admin_exists(state: &AuthorityLinearState) -> bool {
@@ -1554,10 +1713,11 @@ mod tests {
         AuthorityCredentialKind, AuthorityOperationKind, AuthorityReceipt,
         AuthorityReceiptSelector, ManagementApplicationAck, ManagementApproval,
     };
-    use vos::agent_sdk::contract::RuntimePackageContract;
+    use vos::agent_sdk::contract::{ActorPackageContract, RuntimePackageContract};
     use vos::agent_sdk::{
-        AgentDescriptor, AgentIdentity, AgentReplica, BlobRef, InvocationOrigin,
-        InvocationRoleClaims, MethodMode, NodeId, ReplicaRole, RoleId, RuntimeCapabilities,
+        ActorEntry, AgentDescriptor, AgentIdentity, AgentReplica, BlobRef, InstallActor,
+        InstallationId, InvocationOrigin, InvocationRoleClaims, LaneSet, MethodMode, NodeId,
+        ProofSystemSet, ReplicaRole, RoleId, RuntimeCapabilities, RuntimeRequirements,
     };
 
     const ADMIN_PRINCIPAL: PrincipalId = PrincipalId([0x31; 32]);
@@ -1574,6 +1734,8 @@ mod tests {
             space: [0x11; 32],
             system_agent: [0x12; 32],
             system_runtime_deployment: [0x13; 32],
+            system_runtime_program: [0x19; 32],
+            system_runtime_producer: [0x1a; 32],
             binding: AuthorityBindingState {
                 policy: [0x14; 32],
                 issuer: AuthorityIssuerState {
@@ -1586,6 +1748,7 @@ mod tests {
                 public_key: authority_key,
                 initial_epoch: 7,
             },
+            bootstrap_authorization_high_water: ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER,
             bootstrap_principal: ADMIN_PRINCIPAL.0,
             bootstrap_credential_public_key: signing(0x21).verifying_key().to_bytes(),
             bootstrap_credential_kind: 0,
@@ -1647,6 +1810,56 @@ mod tests {
             space: descriptor.identity.space,
             agent: descriptor.identity.agent,
             runtime_deployment: descriptor.identity.runtime_deployment,
+        }
+    }
+
+    fn system_target(
+        config: SystemAuthorityConfiguration,
+    ) -> vos::agent_sdk::authority::ManagedAgentTarget {
+        vos::agent_sdk::authority::ManagedAgentTarget {
+            space: SpaceId(config.space),
+            agent: AgentId(config.system_agent),
+            runtime_deployment: DeploymentId(config.system_runtime_deployment),
+        }
+    }
+
+    fn catalog_install(config: SystemAuthorityConfiguration) -> InstallActor {
+        let package = BlobRef::of_bytes(b"system-catalog-package");
+        let agent_schema = BlobRef::of_bytes(b"system-catalog-schema");
+        let method_policy = BlobRef::of_bytes(b"system-catalog-policy");
+        let lanes = LaneSet::of(vos::agent_sdk::StateLane::Merge);
+        let entry = ActorEntry {
+            actor: ActorId::top_level(AgentId(config.system_agent), "system-catalog"),
+            name: "system-catalog".into(),
+            parent: None,
+            deployment: DeploymentId([0x24; 32]),
+            program: ProgramId([0x25; 32]),
+            package: package.clone(),
+            agent_schema: agent_schema.clone(),
+            method_policy: method_policy.clone(),
+            constructor_abi: Hash([0x26; 32]),
+            installation_data: None,
+            state_layout: Hash([0x27; 32]),
+            lanes,
+            suspended: false,
+        };
+        InstallActor {
+            installation_id: InstallationId([0x28; 32]),
+            registry_reservation: Hash([0x29; 32]),
+            producer: ProducerId([0x2a; 32]),
+            package,
+            agent_schema,
+            method_policy,
+            constructor_abi: entry.constructor_abi,
+            installation_data: None,
+            state_layout: entry.state_layout,
+            contract: ActorPackageContract::canonical(),
+            requirements: RuntimeRequirements {
+                lanes,
+                scheduling: false,
+                proof_systems: ProofSystemSet::EMPTY,
+            },
+            entry,
         }
     }
 
@@ -1795,7 +2008,7 @@ mod tests {
             approval: approval.commitment(),
             authorization_sequence: approval.authorization_sequence,
             request: approval.request_commitment,
-            receipt: receipt_for(config, approval, 1),
+            receipt: receipt_for(config, approval, approval.authorization_sequence.get()),
             reopened_state: Hash([0x73; 32]),
             applied_at: approval.valid_from,
             signature: [1; 64],
@@ -2006,34 +2219,66 @@ mod tests {
     }
 
     fn insert_live(actor: &mut SystemAuthority, descriptor: &AgentDescriptor) {
-        let row = ManagedAgentRow {
-            agent: descriptor.identity.agent.0,
-            owner: descriptor.identity.owner.0,
-            profile: descriptor.identity.profile as u8,
-            runtime_deployment: descriptor.identity.runtime_deployment.0,
-            runtime_program: descriptor.identity.runtime_program.0,
-            runtime_producer: descriptor.identity.runtime_producer.0,
-            authority: actor.configuration.binding,
-        };
-        let index = actor
-            .state
-            .managed_agents
-            .binary_search_by(|existing| existing.agent.cmp(&row.agent))
-            .unwrap_err();
-        actor.state.managed_agents.insert(index, row);
+        let config = actor.configuration;
+        let call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x90,
+            target_for(descriptor),
+            ManagementRequest::Create(Box::new(descriptor.clone())),
+        );
+        let approval = ManagementApproval::decode(&dispatch(actor, &call))
+            .expect("fixture Create must be authorized");
+        assert!(dispatch_ack(
+            actor,
+            &application_ack(config, &call, &approval)
+        ));
+    }
+
+    fn fill_pending_management_retries(actor: &mut SystemAuthority, count: usize) {
+        let config = actor.configuration;
+        for ordinal in 1..=count {
+            let byte = u8::try_from(ordinal).expect("bounded retry fixture");
+            let call = credential_call(
+                config,
+                &signing(0x21),
+                ADMIN_PRINCIPAL,
+                Some(ADMIN_NODE),
+                byte,
+                system_target(config),
+                ManagementRequest::Suspend {
+                    actor: ActorId([byte; 32]),
+                    expected_deployment: DeploymentId([byte.wrapping_add(1); 32]),
+                },
+            );
+            assert!(!dispatch(actor, &call).is_empty());
+        }
     }
 
     #[test]
-    fn sac1_configuration_is_exact_and_clean_generation_bound() {
+    fn sac2_configuration_is_exact_and_clean_generation_bound() {
         let config = configuration();
         let encoded = config.encode();
         assert_eq!(encoded.len(), CONFIG_ENCODED_BYTES);
-        assert_eq!(encoded.get(..4), Some(b"SAC1".as_slice()));
+        assert_eq!(encoded.get(..4), Some(b"SAC2".as_slice()));
         assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
+        assert_eq!(
+            <SystemAuthority as vos::Actor>::STATE_SCHEMA_VERSION,
+            4,
+            "the seeded Linear state is a clean state generation",
+        );
 
         let mut old_generation = encoded.clone();
-        old_generation[4] ^= 1;
+        old_generation[..4].copy_from_slice(b"SAC1");
         assert_eq!(SystemAuthorityConfiguration::decode(&old_generation), None);
+        let mut old_sac1_shape = vec![0; CONFIG_ENCODED_BYTES - 72];
+        old_sac1_shape[..4].copy_from_slice(b"SAC1");
+        assert_eq!(SystemAuthorityConfiguration::decode(&old_sac1_shape), None);
+        let mut wrong_abi = encoded.clone();
+        wrong_abi[4] ^= 1;
+        assert_eq!(SystemAuthorityConfiguration::decode(&wrong_abi), None);
         let mut trailing = encoded.clone();
         trailing.push(0);
         assert_eq!(SystemAuthorityConfiguration::decode(&trailing), None);
@@ -2054,10 +2299,143 @@ mod tests {
             SystemAuthorityConfiguration::decode(&inaccessible.encode()),
             None
         );
+        let mut missing_program = config;
+        missing_program.system_runtime_program = [0; 32];
+        assert_eq!(
+            SystemAuthorityConfiguration::decode(&missing_program.encode()),
+            None
+        );
+        let mut missing_producer = config;
+        missing_producer.system_runtime_producer = [0; 32];
+        assert_eq!(
+            SystemAuthorityConfiguration::decode(&missing_producer.encode()),
+            None
+        );
+        for altered_high_water in [0, 1, 3, u64::MAX] {
+            let mut altered = config;
+            altered.bootstrap_authorization_high_water = altered_high_water;
+            assert!(!altered.is_valid());
+            assert_eq!(
+                SystemAuthorityConfiguration::decode(&altered.encode()),
+                None
+            );
+        }
 
         let inert = SystemAuthority::new(&old_generation);
         assert!(!inert.state.initialized);
         assert!(inert.state.credentials.is_empty());
+    }
+
+    #[test]
+    fn root_seed_starts_at_sequence_two_authorizes_catalog_install_as_three_and_restarts() {
+        let config = configuration();
+        let expected_seed = root_managed_agent(config);
+        let mut actor = actor();
+        assert_eq!(
+            actor.state.authorization_sequence,
+            ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER
+        );
+        assert_eq!(actor.state.managed_agents, vec![expected_seed.clone()]);
+        assert!(authority_state_is_valid(&config, &actor.state));
+
+        let request = ManagementRequest::Install(Box::new(catalog_install(config)));
+        let call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x2b,
+            system_target(config),
+            request,
+        );
+        let approval_bytes = dispatch(&mut actor, &call);
+        let approval =
+            ManagementApproval::decode(&approval_bytes).expect("catalog Install approved");
+        assert_eq!(approval.authorization_sequence.get(), 3);
+        assert_eq!(actor.state.authorization_sequence, 3);
+        assert_eq!(actor.state.managed_agents, vec![expected_seed.clone()]);
+        assert!(matches!(
+            actor.state.retries[0].effect,
+            PendingManagementEffect::None
+        ));
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("seeded SAC2 authority state restarts");
+        assert_eq!(restarted.state.authorization_sequence, 3);
+        assert_eq!(restarted.state.managed_agents, vec![expected_seed]);
+        assert!(authority_state_is_valid(&config, &restarted.state));
+        assert_eq!(dispatch(&mut restarted, &call), approval_bytes);
+    }
+
+    #[test]
+    fn root_seed_and_authorization_high_water_cannot_drift() {
+        let config = configuration();
+        let actor = actor();
+
+        let mut missing_seed = actor.state.clone();
+        missing_seed.managed_agents.clear();
+        assert!(!authority_state_is_valid(&config, &missing_seed));
+
+        let mut altered_seed = actor.state.clone();
+        altered_seed.managed_agents[0].runtime_program[0] ^= 1;
+        assert!(!authority_state_is_valid(&config, &altered_seed));
+
+        let mut altered_profile = actor.state.clone();
+        altered_profile.managed_agents[0].profile = AgentProfile::Local as u8;
+        assert!(!authority_state_is_valid(&config, &altered_profile));
+
+        for altered_high_water in [0, 1, 3, u64::MAX] {
+            let mut altered = actor.state.clone();
+            altered.authorization_sequence = altered_high_water;
+            assert!(!authority_state_is_valid(&config, &altered));
+        }
+    }
+
+    #[test]
+    fn acknowledged_system_runtime_upgrade_is_the_only_seed_runtime_evolution() {
+        let config = configuration();
+        let mut actor = actor();
+        let request = ManagementRequest::UpgradeRuntime(Box::new(vos::agent_sdk::RuntimeUpgrade {
+            from_deployment: DeploymentId(config.system_runtime_deployment),
+            to_deployment: DeploymentId([0x2c; 32]),
+            to_program: ProgramId([0x2d; 32]),
+            producer: ProducerId([0x2e; 32]),
+            package: BlobRef::of_bytes(b"compatible-system-runtime"),
+            contract: RuntimePackageContract::canonical(),
+            capabilities: RuntimeCapabilities::standard(),
+        }));
+        let call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x2f,
+            system_target(config),
+            request,
+        );
+        let approval = ManagementApproval::decode(&dispatch(&mut actor, &call)).unwrap();
+        assert_eq!(approval.authorization_sequence.get(), 3);
+        assert!(dispatch_ack(
+            &mut actor,
+            &application_ack(config, &call, &approval)
+        ));
+        let system = &actor.state.managed_agents
+            [managed_agent(&actor.state, AgentId(config.system_agent)).unwrap()];
+        assert_eq!(system.runtime_deployment, [0x2c; 32]);
+        assert_eq!(system.runtime_program, [0x2d; 32]);
+        assert_eq!(system.runtime_producer, [0x2e; 32]);
+        assert!(authority_state_is_valid(&config, &actor.state));
+
+        let mut unbacked_drift = actor.state.clone();
+        let index = managed_agent(&unbacked_drift, AgentId(config.system_agent)).unwrap();
+        unbacked_drift.managed_agents[index].runtime_program[0] ^= 1;
+        assert!(!authority_state_is_valid(&config, &unbacked_drift));
     }
 
     #[test]
@@ -2189,7 +2567,7 @@ mod tests {
                     approval.expires_at,
                     OBSERVED_SLOT + MAX_APPROVAL_VALIDITY_SLOTS
                 );
-                assert!(actor.state.managed_agents.is_empty());
+                assert_eq!(actor.state.managed_agents, vec![root_managed_agent(config)]);
                 assert!(matches!(
                     actor.state.retries.last().map(|record| &record.effect),
                     Some(PendingManagementEffect::Create(_))
@@ -2503,28 +2881,7 @@ mod tests {
     fn retry_capacity_saturates_without_partial_sequence_mutation() {
         let config = configuration();
         let mut actor = actor();
-        actor.state.retries.clear();
-        for ordinal in 1..=MAX_EXACT_RETRY_RECORDS {
-            let byte = ordinal as u8;
-            let mut acknowledgement_invocation = [byte; 32];
-            acknowledgement_invocation[31] ^= 0x80;
-            actor.state.retries.push(ExactRetryRecord {
-                invocation: [byte; 32],
-                acknowledgement_invocation,
-                credential_call: [byte; 32],
-                credential_call_bytes: b"bounded retained call".to_vec(),
-                approval_commitment: [byte.wrapping_add(1); 32],
-                authorization_sequence: ordinal as u64,
-                approval: b"bounded retained approval".to_vec(),
-                effect: PendingManagementEffect::None,
-                finalized: false,
-                acknowledgement: None,
-                acknowledgement_bytes: None,
-                reopened_state: None,
-                applied_at: None,
-            });
-        }
-        actor.state.authorization_sequence = MAX_EXACT_RETRY_RECORDS as u64;
+        fill_pending_management_retries(&mut actor, MAX_EXACT_RETRY_RECORDS);
         assert!(authority_state_is_valid(&config, &actor.state));
 
         let call = create_call(
@@ -2561,27 +2918,7 @@ mod tests {
         let result = dispatch_admin(&mut actor, &call);
         assert!(!result.is_empty());
 
-        for ordinal in 1..MAX_EXACT_RETRY_RECORDS {
-            let byte = ordinal as u8;
-            let mut acknowledgement_invocation = [byte; 32];
-            acknowledgement_invocation[31] ^= 0x80;
-            actor.state.retries.push(ExactRetryRecord {
-                invocation: [byte; 32],
-                acknowledgement_invocation,
-                credential_call: [byte; 32],
-                credential_call_bytes: b"bounded retained call".to_vec(),
-                approval_commitment: [byte.wrapping_add(1); 32],
-                authorization_sequence: ordinal as u64,
-                approval: b"bounded retained approval".to_vec(),
-                effect: PendingManagementEffect::None,
-                finalized: false,
-                acknowledgement: None,
-                acknowledgement_bytes: None,
-                reopened_state: None,
-                applied_at: None,
-            });
-        }
-        actor.state.authorization_sequence = (MAX_EXACT_RETRY_RECORDS - 1) as u64;
+        fill_pending_management_retries(&mut actor, MAX_EXACT_RETRY_RECORDS - 1);
         assert!(authority_state_is_valid(&config, &actor.state));
 
         let saturated = actor.state.clone();
@@ -2625,7 +2962,7 @@ mod tests {
             actor.state.retries[0].acknowledgement_invocation,
             reserved.0
         );
-        assert!(actor.state.managed_agents.is_empty());
+        assert_eq!(actor.state.managed_agents, vec![root_managed_agent(config)]);
 
         let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
         let installation_data = config.encode();
@@ -2637,13 +2974,19 @@ mod tests {
         )
         .expect("valid durable Linear restart");
         assert_eq!(restarted.configuration, config);
-        assert!(restarted.state.managed_agents.is_empty());
+        assert_eq!(
+            restarted.state.managed_agents,
+            vec![root_managed_agent(config)]
+        );
         assert_eq!(
             restarted.state.retries[0].acknowledgement_invocation,
             reserved.0
         );
         assert_eq!(dispatch(&mut restarted, &call), approval);
-        assert!(restarted.state.managed_agents.is_empty());
+        assert_eq!(
+            restarted.state.managed_agents,
+            vec![root_managed_agent(config)]
+        );
     }
 
     #[test]
@@ -2665,13 +3008,14 @@ mod tests {
             approval.request.authority_operation(),
             Some(AuthorityOperationKind::CreateAgent)
         );
-        assert!(actor.state.managed_agents.is_empty());
+        assert_eq!(actor.state.managed_agents, vec![root_managed_agent(config)]);
 
         let ack = application_ack(config, &call, &approval);
         let ack_bytes = ack.encode().unwrap();
         assert_eq!(ack_bytes.get(..4), Some(b"MAA1".as_slice()));
         assert!(dispatch_ack(&mut actor, &ack));
-        let live = &actor.state.managed_agents[0];
+        let live = &actor.state.managed_agents
+            [managed_agent(&actor.state, call.managed.agent).expect("acknowledged Agent is live")];
         assert_eq!(live.agent, call.managed.agent.0);
         assert_eq!(live.authority, config.binding);
         assert!(actor.state.retries[0].finalized);
@@ -2754,7 +3098,7 @@ mod tests {
             let before = actor.state.clone();
             assert!(!dispatch_ack(&mut actor, &ack));
             assert_eq!(actor.state, before);
-            assert!(actor.state.managed_agents.is_empty());
+            assert_eq!(actor.state.managed_agents, vec![root_managed_agent(config)]);
         }
 
         let mut actor = SystemAuthority {
