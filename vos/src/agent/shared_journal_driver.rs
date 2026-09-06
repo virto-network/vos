@@ -946,7 +946,7 @@ where
     fn clean_invocation_input(
         &self,
         work: crate::agent_sdk::InvocationWork,
-        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<ReplayInput, SharedJournalDriverError> {
         let heads = self.materialization.heads();
         let observed_slot = self.executor.current_logical_slot()?;
@@ -954,7 +954,7 @@ where
             runtime: heads.runtime.clone(),
             operation: ReplayOperation::CleanInvoke {
                 work,
-                authority,
+                authorization,
                 observed_slot,
             },
         };
@@ -962,14 +962,17 @@ where
             .validate()
             .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
         let ReplayOperation::CleanInvoke {
-            work, authority, ..
+            work,
+            authorization,
+            observed_slot,
         } = &input.operation
         else {
             unreachable!()
         };
         self.executor.verify_clean_invocation_input(
             work,
-            authority,
+            authorization,
+            *observed_slot,
             self.materialization.state(),
             &input.runtime,
         )?;
@@ -982,9 +985,9 @@ where
     pub(crate) fn prepare_clean_ordered(
         &self,
         work: crate::agent_sdk::InvocationWork,
-        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
-        let input = self.clean_invocation_input(work, authority)?;
+        let input = self.clean_invocation_input(work, authorization)?;
         if !matches!(
             input.persisted_lane(),
             PersistedLane::Control | PersistedLane::Linear
@@ -1024,9 +1027,9 @@ where
     pub(crate) fn apply_clean_local(
         &mut self,
         work: crate::agent_sdk::InvocationWork,
-        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
-        let input = self.clean_invocation_input(work, authority)?;
+        let input = self.clean_invocation_input(work, authorization)?;
         if input.persisted_lane() != PersistedLane::Local {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
@@ -1072,9 +1075,9 @@ where
     pub(crate) fn apply_clean_merge(
         &mut self,
         work: crate::agent_sdk::InvocationWork,
-        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
-        let input = self.clean_invocation_input(work, authority)?;
+        let input = self.clean_invocation_input(work, authorization)?;
         if input.persisted_lane() != PersistedLane::Merge {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }

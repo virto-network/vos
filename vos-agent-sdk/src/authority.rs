@@ -227,6 +227,252 @@ impl AuthorityCredentialCall {
     }
 }
 
+/// Credential ingress family retained by the system authority. Both kinds
+/// use canonical Ed25519 public keys; the distinct tag prevents an API key
+/// from being silently reclassified as an SSH enrollment (or vice versa).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuthorityCredentialKind {
+    Ssh = 0,
+    Api = 1,
+}
+
+/// Built-in Space role assigned to one enrolled Principal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuthorityBuiltinRole {
+    Member = 0,
+    Developer = 1,
+    Admin = 2,
+}
+
+/// One typed credential enrollment. [`CredentialId`] remains derived from
+/// the exact public key and is never interchangeable with a Principal or Node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthorityCredentialEnrollment {
+    pub credential: CredentialId,
+    pub kind: AuthorityCredentialKind,
+    pub public_key: [u8; CREDENTIAL_PUBLIC_KEY_BYTES],
+}
+
+impl AuthorityCredentialEnrollment {
+    pub fn from_public_key(
+        kind: AuthorityCredentialKind,
+        public_key: [u8; CREDENTIAL_PUBLIC_KEY_BYTES],
+    ) -> Self {
+        Self {
+            credential: CredentialId::of_public_key(&public_key),
+            kind,
+            public_key,
+        }
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.credential != CredentialId::ZERO
+            && self.public_key != [0; CREDENTIAL_PUBLIC_KEY_BYTES]
+            && CredentialId::of_public_key(&self.public_key) == self.credential
+    }
+}
+
+/// One Admin-only mutation of the built-in identity authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthorityAdminOperation {
+    /// Enroll a Principal with Member role and its first active credential.
+    EnrollPrincipal {
+        principal: PrincipalId,
+        credential: AuthorityCredentialEnrollment,
+    },
+    AddCredential {
+        principal: PrincipalId,
+        credential: AuthorityCredentialEnrollment,
+    },
+    RevokeCredential {
+        principal: PrincipalId,
+        credential: CredentialId,
+    },
+    /// Assign the full authenticated NodeId as an authority act. Possession
+    /// of the new Node identity is proved later by transport enrollment; this
+    /// operation never derives or accepts a compact/short Node identifier.
+    BindNodeOwner {
+        node: NodeId,
+        owner: PrincipalId,
+    },
+    UnbindNodeOwner {
+        node: NodeId,
+        owner: PrincipalId,
+    },
+    SetBuiltinRole {
+        principal: PrincipalId,
+        role: AuthorityBuiltinRole,
+    },
+}
+
+impl AuthorityAdminOperation {
+    pub fn validate_shape(&self) -> bool {
+        match self {
+            Self::EnrollPrincipal {
+                principal,
+                credential,
+            }
+            | Self::AddCredential {
+                principal,
+                credential,
+            } => *principal != PrincipalId::ZERO && credential.is_valid(),
+            Self::RevokeCredential {
+                principal,
+                credential,
+            } => *principal != PrincipalId::ZERO && *credential != CredentialId::ZERO,
+            Self::BindNodeOwner { node, owner } | Self::UnbindNodeOwner { node, owner } => {
+                *node != NodeId::ZERO && *owner != PrincipalId::ZERO
+            }
+            Self::SetBuiltinRole { principal, .. } => *principal != PrincipalId::ZERO,
+        }
+    }
+
+    pub fn commitment(&self) -> Hash {
+        crate::wire::authority_admin_operation_commitment(self)
+    }
+}
+
+/// Self-authenticating Admin mutation admitted through an unsigned Public
+/// preflight. The credential signature covers the complete target, exact
+/// Principal/Credential/transport Node tuple, logical slot, CAS generation,
+/// and operation. Runtime Public admission does not authenticate these fields;
+/// the authority actor verifies them against its durable state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityAdminCall {
+    pub invocation: InvocationId,
+    pub authority: AuthorityActorTarget,
+    pub administrator: PrincipalId,
+    pub credential: CredentialId,
+    pub credential_public_key: [u8; CREDENTIAL_PUBLIC_KEY_BYTES],
+    pub authenticated_node: NodeId,
+    pub observed_slot: u64,
+    pub expected_generation: NonZeroU64,
+    pub operation: AuthorityAdminOperation,
+    pub signature: [u8; CREDENTIAL_SIGNATURE_BYTES],
+}
+
+impl AuthorityAdminCall {
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        crate::wire::authority_admin_call_signing_bytes(self)
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            b"vos/agent/authority-admin-call/v1",
+            &[&self.signing_bytes(), &self.signature],
+        )
+    }
+
+    pub fn next_generation(&self) -> Option<NonZeroU64> {
+        self.expected_generation
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+    }
+
+    pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        if self.invocation == InvocationId::ZERO || !self.authority.is_valid() {
+            return Err(AuthorityActorProtocolError::InvalidTarget);
+        }
+        if self.administrator == PrincipalId::ZERO
+            || self.credential == CredentialId::ZERO
+            || self.credential_public_key == [0; CREDENTIAL_PUBLIC_KEY_BYTES]
+            || CredentialId::of_public_key(&self.credential_public_key) != self.credential
+            || self.authenticated_node == NodeId::ZERO
+        {
+            return Err(AuthorityActorProtocolError::InvalidCaller);
+        }
+        if !self.operation.validate_shape() || self.next_generation().is_none() {
+            return Err(AuthorityActorProtocolError::InvalidRequest);
+        }
+        if self.signature == [0; CREDENTIAL_SIGNATURE_BYTES] {
+            return Err(AuthorityActorProtocolError::InvalidSignature);
+        }
+        if crate::wire::authority_admin_call_encoded_len(self) > crate::MAX_INVOCATION_MESSAGE_BYTES
+        {
+            return Err(AuthorityActorProtocolError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    pub fn verify_with<V: AuthorityCredentialVerifier>(
+        &self,
+        verifier: &V,
+    ) -> Result<(), AuthorityActorProtocolError> {
+        self.validate_shape()?;
+        if !verifier.verify(
+            &self.credential_public_key,
+            &self.signing_bytes(),
+            &self.signature,
+        ) {
+            return Err(AuthorityActorProtocolError::InvalidSignature);
+        }
+        Ok(())
+    }
+
+    pub fn matches_invocation_context(&self, context: &InvocationContext) -> bool {
+        self.validate_shape().is_ok()
+            && context.validate()
+            && context.invocation == self.invocation
+            && context.actor == self.authority.binding.issuer.actor
+            && context.mode == MethodMode::Linear
+            && context.observed_slot == self.observed_slot
+            && context.origin.principal == Some(self.administrator)
+            && context.origin.credential == Some(self.credential)
+            && context.origin.transport_node == Some(self.authenticated_node)
+            && context.origin.actor.is_none()
+            && context.origin.capability.is_none()
+            && context.roles == InvocationRoleClaims::none()
+    }
+}
+
+/// Canonical applied Admin result. Embedding the complete signed call makes
+/// the deterministic `expected + 1` generation part of that signature's
+/// closure without storing an authority signing secret in actor state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityAdminResult {
+    pub call: AuthorityAdminCall,
+    pub generation: NonZeroU64,
+}
+
+impl AuthorityAdminResult {
+    pub fn from_call(call: AuthorityAdminCall) -> Result<Self, AuthorityActorProtocolError> {
+        call.validate_shape()?;
+        let generation = call
+            .next_generation()
+            .ok_or(AuthorityActorProtocolError::InvalidRequest)?;
+        let result = Self { call, generation };
+        result.validate_shape()?;
+        Ok(result)
+    }
+
+    pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        self.call.validate_shape()?;
+        if self.call.next_generation() != Some(self.generation) {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        if crate::wire::authority_admin_result_encoded_len(self) > crate::MAX_INVOCATION_REPLY_BYTES
+        {
+            return Err(AuthorityActorProtocolError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    pub fn verify_with<V: AuthorityCredentialVerifier>(
+        &self,
+        verifier: &V,
+    ) -> Result<(), AuthorityActorProtocolError> {
+        self.validate_shape()?;
+        self.call.verify_with(verifier)
+    }
+
+    pub fn commitment(&self) -> Hash {
+        crate::wire::authority_admin_result_commitment(self)
+    }
+}
+
 /// Ed25519 verification is injected by the host or guest actor. The portable
 /// SDK intentionally provides no key store, host call, or crypto provider.
 pub trait AuthorityCredentialVerifier {
@@ -903,6 +1149,30 @@ mod tests {
         call.signature = test_signature(&call.credential_public_key, &call.signing_bytes());
     }
 
+    fn admin_call() -> AuthorityAdminCall {
+        let public_key = [45; CREDENTIAL_PUBLIC_KEY_BYTES];
+        let mut call = AuthorityAdminCall {
+            invocation: InvocationId([46; 32]),
+            authority: authority_target(),
+            administrator: PrincipalId([47; 32]),
+            credential: CredentialId::of_public_key(&public_key),
+            credential_public_key: public_key,
+            authenticated_node: NodeId([48; 32]),
+            observed_slot: 101,
+            expected_generation: NonZeroU64::new(3).unwrap(),
+            operation: AuthorityAdminOperation::EnrollPrincipal {
+                principal: PrincipalId([49; 32]),
+                credential: AuthorityCredentialEnrollment::from_public_key(
+                    AuthorityCredentialKind::Ssh,
+                    [50; CREDENTIAL_PUBLIC_KEY_BYTES],
+                ),
+            },
+            signature: [1; CREDENTIAL_SIGNATURE_BYTES],
+        };
+        call.signature = test_signature(&public_key, &call.signing_bytes());
+        call
+    }
+
     fn approval(call: &AuthorityCredentialCall) -> ManagementApproval {
         ManagementApproval::from_call(
             call,
@@ -1174,6 +1444,46 @@ mod tests {
                 Err(AuthorityActorProtocolError::InvalidRequest)
             );
         }
+    }
+
+    #[test]
+    fn admin_call_and_result_bind_exact_caller_context_operation_and_generation() {
+        let call = admin_call();
+        assert_eq!(call.validate_shape(), Ok(()));
+        assert_eq!(call.verify_with(&TestCredentialVerifier), Ok(()));
+        let context = InvocationContext {
+            invocation: call.invocation,
+            actor: call.authority.binding.issuer.actor,
+            mode: MethodMode::Linear,
+            origin: crate::InvocationOrigin {
+                principal: Some(call.administrator),
+                transport_node: Some(call.authenticated_node),
+                credential: Some(call.credential),
+                actor: None,
+                capability: None,
+            },
+            roles: InvocationRoleClaims::none(),
+            observed_slot: call.observed_slot,
+        };
+        assert!(call.matches_invocation_context(&context));
+
+        let result = AuthorityAdminResult::from_call(call.clone()).unwrap();
+        assert_eq!(result.generation.get(), call.expected_generation.get() + 1);
+        assert_eq!(result.verify_with(&TestCredentialVerifier), Ok(()));
+
+        let mut cross_node = call.clone();
+        cross_node.authenticated_node = NodeId([51; 32]);
+        assert_ne!(cross_node.signing_bytes(), call.signing_bytes());
+        assert!(!cross_node.matches_invocation_context(&context));
+        let mut stale = call.clone();
+        stale.expected_generation = NonZeroU64::new(2).unwrap();
+        assert_ne!(stale.signing_bytes(), call.signing_bytes());
+        let mut forged = call;
+        forged.signature[0] ^= 1;
+        assert_eq!(
+            forged.verify_with(&TestCredentialVerifier),
+            Err(AuthorityActorProtocolError::InvalidSignature),
+        );
     }
 
     #[test]

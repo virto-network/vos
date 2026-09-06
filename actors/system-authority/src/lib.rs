@@ -1,10 +1,11 @@
 //! Clean, portable policy actor for standard Agent management.
 //!
-//! The actor accepts only canonical `ACC1` credential calls delivered with an
-//! exact clean `AIC1` invocation context.  It performs policy and credential
-//! verification inside the guest, emits deterministic `MAP1` approvals, and
-//! retains exact results for replay.  A Create approval remains pending until
-//! a separately signed durable-application acknowledgement is observed.
+//! The actor accepts canonical `ACC1` management calls and self-authenticating
+//! `AAD1` identity-admin calls delivered with an exact clean `AIC1` invocation
+//! context. It performs policy, credential, and Admin-accessibility checks
+//! inside the guest and retains exact results for replay. A Create approval
+//! remains pending until a separately signed durable-application
+//! acknowledgement is observed.
 
 #![cfg_attr(target_arch = "riscv64", no_std)]
 
@@ -13,9 +14,10 @@ use core::num::NonZeroU64;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use vos::agent_sdk::authority::{
-    AgentAuthorityBinding, AuthorityActorTarget, AuthorityCredentialCall,
-    AuthorityCredentialVerifier, AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots,
-    AuthorityVerifier, ManagementApplicationAck, ManagementApproval,
+    AgentAuthorityBinding, AuthorityActorTarget, AuthorityAdminCall, AuthorityAdminOperation,
+    AuthorityAdminResult, AuthorityBuiltinRole, AuthorityCredentialCall,
+    AuthorityCredentialEnrollment, AuthorityCredentialVerifier, AuthorityEvidence, AuthorityIssuer,
+    AuthorityLaneRoots, AuthorityVerifier, ManagementApplicationAck, ManagementApproval,
 };
 use vos::agent_sdk::wire::CanonicalWire as _;
 use vos::agent_sdk::{
@@ -38,9 +40,10 @@ pub const MAX_MANAGED_AGENTS: usize = 256;
 /// Exact approvals are deliberately bounded. Saturation fails closed; records
 /// may only be retired by a future, explicitly ordered acknowledgement floor.
 pub const MAX_EXACT_RETRY_RECORDS: usize = 128;
-/// Worst-case canonical ACC1 + MAP1 + MAA1 preimages retained by the bounded
-/// exact-retry table. This leaves over one MiB of the standard state ceiling
-/// for row metadata and actor framing.
+/// Worst-case canonical ACC1/AAD1 calls plus MAP1/AAR1 results and MAA1
+/// acknowledgements retained by the bounded exact-retry tables. This leaves
+/// over one MiB of the standard state ceiling for row metadata and actor
+/// framing.
 pub const MAX_RETAINED_EXACT_WIRE_BYTES: usize = MAX_EXACT_RETRY_RECORDS
     * (MAX_INVOCATION_MESSAGE_BYTES + MAX_INVOCATION_REPLY_BYTES + MAX_INVOCATION_MESSAGE_BYTES);
 /// Policy will never authorize farther than this many logical slots after the
@@ -49,7 +52,7 @@ pub const MAX_APPROVAL_VALIDITY_SLOTS: u64 = 4_096;
 
 const CONFIG_FIXED_FIELDS: usize = 13;
 const CONFIG_ENCODED_BYTES: usize =
-    SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len() + 32 + CONFIG_FIXED_FIELDS * 32 + 8;
+    SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len() + 32 + CONFIG_FIXED_FIELDS * 32 + 8 + 1;
 const EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/policy-evidence/v1";
 
 const _: () = assert!(MAX_RETAINED_EXACT_WIRE_BYTES < MAX_RUNTIME_STATE_BYTES);
@@ -137,6 +140,8 @@ pub struct SystemAuthorityConfiguration {
     pub binding: AuthorityBindingState,
     pub bootstrap_principal: [u8; 32],
     pub bootstrap_credential_public_key: [u8; 32],
+    /// Canonical [`vos::agent_sdk::authority::AuthorityCredentialKind`] tag.
+    pub bootstrap_credential_kind: u8,
     pub bootstrap_node: [u8; 32],
 }
 
@@ -146,9 +151,10 @@ impl SystemAuthorityConfiguration {
             && self.system_agent != [0; 32]
             && self.system_runtime_deployment != [0; 32]
             && self.bootstrap_principal != [0; 32]
-            && self.bootstrap_credential_public_key != [0; 32]
+            && canonical_credential_public_key(&self.bootstrap_credential_public_key)
             && CredentialId::of_public_key(&self.bootstrap_credential_public_key)
                 != CredentialId::ZERO
+            && matches!(self.bootstrap_credential_kind, 0 | 1)
             && self.bootstrap_node != [0; 32]
             && self.binding.sdk().is_valid()
     }
@@ -171,6 +177,7 @@ impl SystemAuthorityConfiguration {
         bytes.extend_from_slice(&self.binding.initial_epoch.to_le_bytes());
         bytes.extend_from_slice(&self.bootstrap_principal);
         bytes.extend_from_slice(&self.bootstrap_credential_public_key);
+        bytes.push(self.bootstrap_credential_kind);
         bytes.extend_from_slice(&self.bootstrap_node);
         bytes
     }
@@ -201,6 +208,8 @@ impl SystemAuthorityConfiguration {
         cursor += 8;
         let bootstrap_principal = take_fixed(bytes, &mut cursor)?;
         let bootstrap_credential_public_key = take_fixed(bytes, &mut cursor)?;
+        let bootstrap_credential_kind = *bytes.get(cursor)?;
+        cursor += 1;
         let bootstrap_node = take_fixed(bytes, &mut cursor)?;
         if cursor != bytes.len() {
             return None;
@@ -217,6 +226,7 @@ impl SystemAuthorityConfiguration {
             },
             bootstrap_principal,
             bootstrap_credential_public_key,
+            bootstrap_credential_kind,
             bootstrap_node,
         };
         value.is_valid().then_some(value)
@@ -274,6 +284,8 @@ pub enum CredentialStatus {
 pub struct CredentialRow {
     pub credential: [u8; 32],
     pub principal: [u8; 32],
+    /// Canonical AuthorityCredentialKind tag.
+    pub kind: u8,
     pub public_key: [u8; 32],
     pub status: CredentialStatus,
 }
@@ -351,15 +363,30 @@ pub struct ExactRetryRecord {
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
 )]
 #[rkyv(crate = vos::rkyv)]
+pub struct AdminRetryRecord {
+    pub invocation: [u8; 32],
+    pub call_commitment: [u8; 32],
+    pub call_bytes: Vec<u8>,
+    pub result_commitment: [u8; 32],
+    pub result_bytes: Vec<u8>,
+    pub generation: u64,
+}
+
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
 pub struct AuthorityLinearState {
     initialized: bool,
     epoch: u64,
     authorization_sequence: u64,
+    administration_generation: u64,
     credentials: Vec<CredentialRow>,
     nodes: Vec<NodeOwnerRow>,
     roles: Vec<PrincipalRoleRow>,
     managed_agents: Vec<ManagedAgentRow>,
     retries: Vec<ExactRetryRecord>,
+    admin_retries: Vec<AdminRetryRecord>,
 }
 
 impl AuthorityLinearState {
@@ -368,11 +395,13 @@ impl AuthorityLinearState {
             initialized: false,
             epoch: 0,
             authorization_sequence: 0,
+            administration_generation: 0,
             credentials: Vec::new(),
             nodes: Vec::new(),
             roles: Vec::new(),
             managed_agents: Vec::new(),
             retries: Vec::new(),
+            admin_retries: Vec::new(),
         }
     }
 
@@ -382,6 +411,7 @@ impl AuthorityLinearState {
         credentials.push(CredentialRow {
             credential: credential.0,
             principal: config.bootstrap_principal,
+            kind: config.bootstrap_credential_kind,
             public_key: config.bootstrap_credential_public_key,
             status: CredentialStatus::Active,
         });
@@ -399,17 +429,19 @@ impl AuthorityLinearState {
             initialized: true,
             epoch: config.binding.initial_epoch,
             authorization_sequence: 0,
+            administration_generation: 1,
             credentials,
             nodes,
             roles,
             managed_agents: Vec::new(),
             retries: Vec::new(),
+            admin_retries: Vec::new(),
         }
     }
 }
 
 /// Linear policy state for one Space's built-in system Agent.
-#[actor(agent, state_version = 2)]
+#[actor(agent, state_version = 3)]
 pub struct SystemAuthority {
     #[state(const)]
     configuration: SystemAuthorityConfiguration,
@@ -451,18 +483,34 @@ impl SystemAuthority {
         };
         finalize_application(&self.configuration, &mut self.state, &ack, &context)
     }
+
+    /// Apply one self-authenticating Admin identity mutation. The enclosing
+    /// invocation uses unsigned PublicPreflight admission; this handler binds
+    /// the exact context and verifies the active Admin credential itself.
+    #[msg(linear)]
+    fn administer(&mut self, call: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
+        let Some(context) = ctx.agent_invocation_context().copied() else {
+            return Vec::new();
+        };
+        administer_call(&self.configuration, &mut self.state, &call, &context)
+    }
 }
 
 struct Ed25519CredentialVerifier;
+
+fn canonical_credential_public_key(public_key: &[u8; 32]) -> bool {
+    VerifyingKey::from_bytes(public_key).is_ok_and(|key| !key.is_weak())
+}
 
 impl AuthorityCredentialVerifier for Ed25519CredentialVerifier {
     fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
         let Ok(verifying_key) = VerifyingKey::from_bytes(public_key) else {
             return false;
         };
-        verifying_key
-            .verify_strict(message, &Signature::from_bytes(signature))
-            .is_ok()
+        !verifying_key.is_weak()
+            && verifying_key
+                .verify_strict(message, &Signature::from_bytes(signature))
+                .is_ok()
     }
 }
 
@@ -518,7 +566,12 @@ fn authorize_call(
             return Vec::new();
         }
         Err(index) => {
-            if state.retries.len() >= MAX_EXACT_RETRY_RECORDS {
+            if state
+                .retries
+                .len()
+                .saturating_add(state.admin_retries.len())
+                >= MAX_EXACT_RETRY_RECORDS
+            {
                 return Vec::new();
             }
             if !invocation_pair_is_available(state, call.invocation, acknowledgement_invocation) {
@@ -603,6 +656,305 @@ fn authorize_call(
             approval_bytes
         }
     }
+}
+
+fn administer_call(
+    configuration: &SystemAuthorityConfiguration,
+    state: &mut AuthorityLinearState,
+    encoded_call: &[u8],
+    context: &InvocationContext,
+) -> Vec<u8> {
+    if encoded_call.len() > MAX_INVOCATION_MESSAGE_BYTES
+        || !authority_state_is_valid(configuration, state)
+    {
+        return Vec::new();
+    }
+    let Ok(call) = AuthorityAdminCall::decode(encoded_call) else {
+        return Vec::new();
+    };
+    if !call.matches_invocation_context(context)
+        || !authority_target_matches(configuration, &call.authority)
+        || call.verify_with(&Ed25519CredentialVerifier).is_err()
+    {
+        return Vec::new();
+    }
+
+    let call_commitment = call.commitment();
+    match admin_retry_record(state, call.invocation) {
+        Ok(index) => {
+            let record = &state.admin_retries[index];
+            if record.call_commitment != call_commitment.0
+                || record.call_bytes != encoded_call
+                || record.invocation != call.invocation.0
+            {
+                return Vec::new();
+            }
+            let Ok(result) = AuthorityAdminResult::decode(&record.result_bytes) else {
+                return Vec::new();
+            };
+            if result.call == call
+                && result.generation.get() == record.generation
+                && result.commitment().0 == record.result_commitment
+                && result.verify_with(&Ed25519CredentialVerifier).is_ok()
+                && authority_target_matches(configuration, &result.call.authority)
+            {
+                return record.result_bytes.clone();
+            }
+            Vec::new()
+        }
+        Err(index) => {
+            if state
+                .retries
+                .len()
+                .saturating_add(state.admin_retries.len())
+                >= MAX_EXACT_RETRY_RECORDS
+                || !admin_invocation_is_available(state, call.invocation)
+                || call.expected_generation.get() != state.administration_generation
+                || !authenticated_admin(state, &call)
+            {
+                return Vec::new();
+            }
+            let Some(generation) = call.next_generation() else {
+                return Vec::new();
+            };
+            let mut candidate = state.clone();
+            if !apply_admin_operation(&mut candidate, &call.operation) {
+                return Vec::new();
+            }
+            candidate.administration_generation = generation.get();
+            let Ok(result) = AuthorityAdminResult::from_call(call.clone()) else {
+                return Vec::new();
+            };
+            let Ok(result_bytes) = result.encode() else {
+                return Vec::new();
+            };
+            if result_bytes.len() > MAX_INVOCATION_REPLY_BYTES {
+                return Vec::new();
+            }
+            candidate.admin_retries.insert(
+                index,
+                AdminRetryRecord {
+                    invocation: call.invocation.0,
+                    call_commitment: call_commitment.0,
+                    call_bytes: encoded_call.to_vec(),
+                    result_commitment: result.commitment().0,
+                    result_bytes: result_bytes.clone(),
+                    generation: generation.get(),
+                },
+            );
+            if !authority_state_is_valid(configuration, &candidate) {
+                return Vec::new();
+            }
+            *state = candidate;
+            result_bytes
+        }
+    }
+}
+
+fn authenticated_admin(state: &AuthorityLinearState, call: &AuthorityAdminCall) -> bool {
+    let Ok(credential_index) = state
+        .credentials
+        .binary_search_by(|row| row.credential.cmp(&call.credential.0))
+    else {
+        return false;
+    };
+    let credential = &state.credentials[credential_index];
+    if credential.principal != call.administrator.0
+        || credential.public_key != call.credential_public_key
+        || credential.status != CredentialStatus::Active
+    {
+        return false;
+    }
+    let Ok(node_index) = state
+        .nodes
+        .binary_search_by(|row| row.node.cmp(&call.authenticated_node.0))
+    else {
+        return false;
+    };
+    if state.nodes[node_index].owner != call.administrator.0 {
+        return false;
+    }
+    state
+        .roles
+        .binary_search_by(|row| row.principal.cmp(&call.administrator.0))
+        .ok()
+        .is_some_and(|index| state.roles[index].role == BuiltinPrincipalRole::Admin)
+}
+
+fn apply_admin_operation(
+    state: &mut AuthorityLinearState,
+    operation: &AuthorityAdminOperation,
+) -> bool {
+    match operation {
+        AuthorityAdminOperation::EnrollPrincipal {
+            principal,
+            credential,
+        } => {
+            if state.roles.len() >= MAX_AUTHORITY_PRINCIPALS
+                || state.credentials.len() >= MAX_AUTHORITY_CREDENTIALS
+                || state
+                    .roles
+                    .binary_search_by(|row| row.principal.cmp(&principal.0))
+                    .is_ok()
+            {
+                return false;
+            }
+            let Err(role_index) = state
+                .roles
+                .binary_search_by(|row| row.principal.cmp(&principal.0))
+            else {
+                return false;
+            };
+            let Err(credential_index) = state
+                .credentials
+                .binary_search_by(|row| row.credential.cmp(&credential.credential.0))
+            else {
+                return false;
+            };
+            state.roles.insert(
+                role_index,
+                PrincipalRoleRow {
+                    principal: principal.0,
+                    role: BuiltinPrincipalRole::Member,
+                },
+            );
+            state
+                .credentials
+                .insert(credential_index, credential_row(*principal, *credential));
+        }
+        AuthorityAdminOperation::AddCredential {
+            principal,
+            credential,
+        } => {
+            if state.credentials.len() >= MAX_AUTHORITY_CREDENTIALS
+                || state
+                    .roles
+                    .binary_search_by(|row| row.principal.cmp(&principal.0))
+                    .is_err()
+            {
+                return false;
+            }
+            let Err(index) = state
+                .credentials
+                .binary_search_by(|row| row.credential.cmp(&credential.credential.0))
+            else {
+                return false;
+            };
+            state
+                .credentials
+                .insert(index, credential_row(*principal, *credential));
+        }
+        AuthorityAdminOperation::RevokeCredential {
+            principal,
+            credential,
+        } => {
+            let Ok(index) = state
+                .credentials
+                .binary_search_by(|row| row.credential.cmp(&credential.0))
+            else {
+                return false;
+            };
+            if state.credentials[index].principal != principal.0
+                || state.credentials[index].status != CredentialStatus::Active
+                || active_credential_count(state, *principal) <= 1
+            {
+                return false;
+            }
+            state.credentials[index].status = CredentialStatus::Revoked;
+        }
+        AuthorityAdminOperation::BindNodeOwner { node, owner } => {
+            if state.nodes.len() >= MAX_AUTHORITY_NODES
+                || state
+                    .roles
+                    .binary_search_by(|row| row.principal.cmp(&owner.0))
+                    .is_err()
+            {
+                return false;
+            }
+            let Err(index) = state.nodes.binary_search_by(|row| row.node.cmp(&node.0)) else {
+                return false;
+            };
+            state.nodes.insert(
+                index,
+                NodeOwnerRow {
+                    node: node.0,
+                    owner: owner.0,
+                },
+            );
+        }
+        AuthorityAdminOperation::UnbindNodeOwner { node, owner } => {
+            let Ok(index) = state.nodes.binary_search_by(|row| row.node.cmp(&node.0)) else {
+                return false;
+            };
+            if state.nodes[index].owner != owner.0 {
+                return false;
+            }
+            state.nodes.remove(index);
+        }
+        AuthorityAdminOperation::SetBuiltinRole { principal, role } => {
+            let Ok(index) = state
+                .roles
+                .binary_search_by(|row| row.principal.cmp(&principal.0))
+            else {
+                return false;
+            };
+            let role = builtin_role(*role);
+            if state.roles[index].role == role {
+                return false;
+            }
+            state.roles[index].role = role;
+        }
+    }
+    true
+}
+
+fn credential_row(
+    principal: PrincipalId,
+    credential: AuthorityCredentialEnrollment,
+) -> CredentialRow {
+    CredentialRow {
+        credential: credential.credential.0,
+        principal: principal.0,
+        kind: credential.kind as u8,
+        public_key: credential.public_key,
+        status: CredentialStatus::Active,
+    }
+}
+
+fn builtin_role(role: AuthorityBuiltinRole) -> BuiltinPrincipalRole {
+    match role {
+        AuthorityBuiltinRole::Member => BuiltinPrincipalRole::Member,
+        AuthorityBuiltinRole::Developer => BuiltinPrincipalRole::Developer,
+        AuthorityBuiltinRole::Admin => BuiltinPrincipalRole::Admin,
+    }
+}
+
+fn active_credential_count(state: &AuthorityLinearState, principal: PrincipalId) -> usize {
+    state
+        .credentials
+        .iter()
+        .filter(|row| row.principal == principal.0 && row.status == CredentialStatus::Active)
+        .count()
+}
+
+fn admin_retry_record(
+    state: &AuthorityLinearState,
+    invocation: InvocationId,
+) -> core::result::Result<usize, usize> {
+    state
+        .admin_retries
+        .binary_search_by(|record| record.invocation.cmp(&invocation.0))
+}
+
+fn admin_invocation_is_available(state: &AuthorityLinearState, invocation: InvocationId) -> bool {
+    invocation != InvocationId::ZERO
+        && state
+            .admin_retries
+            .iter()
+            .all(|record| record.invocation != invocation.0)
+        && state.retries.iter().all(|record| {
+            record.invocation != invocation.0 && record.acknowledgement_invocation != invocation.0
+        })
 }
 
 fn finalize_application(
@@ -698,6 +1050,10 @@ fn application_plan(
         PendingManagementEffect::Create(row) => {
             if state.managed_agents.len() >= MAX_MANAGED_AGENTS
                 || row.authority != configuration.binding
+                || state
+                    .roles
+                    .binary_search_by(|role| role.principal.cmp(&row.owner))
+                    .is_err()
             {
                 return None;
             }
@@ -781,6 +1137,9 @@ fn invocation_pair_is_available(
                 && record.acknowledgement_invocation != authorization.0
                 && record.acknowledgement_invocation != acknowledgement.0
         })
+        && state.admin_retries.iter().all(|record| {
+            record.invocation != authorization.0 && record.invocation != acknowledgement.0
+        })
 }
 
 fn authenticated_role(
@@ -826,6 +1185,10 @@ fn policy_effect(
                 || !profile_allowed(role, descriptor.identity.profile)
                 || (role != BuiltinPrincipalRole::Admin
                     && descriptor.identity.owner != call.principal)
+                || state
+                    .roles
+                    .binary_search_by(|row| row.principal.cmp(&descriptor.identity.owner.0))
+                    .is_err()
                 || managed_agent(state, call.managed.agent).is_ok()
                 || pending_create_exists(state, call.managed.agent)
                 || live_and_pending_agent_count(state) >= MAX_MANAGED_AGENTS
@@ -946,27 +1309,49 @@ fn authority_state_is_valid(
         && configuration.is_valid()
         && state.epoch >= configuration.binding.initial_epoch
         && state.epoch != 0
+        && state.administration_generation != 0
         && state.credentials.len() <= MAX_AUTHORITY_CREDENTIALS
         && state.nodes.len() <= MAX_AUTHORITY_NODES
         && state.roles.len() <= MAX_AUTHORITY_PRINCIPALS
         && state.managed_agents.len() <= MAX_MANAGED_AGENTS
-        && state.retries.len() <= MAX_EXACT_RETRY_RECORDS
+        && state
+            .retries
+            .len()
+            .saturating_add(state.admin_retries.len())
+            <= MAX_EXACT_RETRY_RECORDS
         && sorted_unique_by(&state.credentials, |row| row.credential)
         && sorted_unique_by(&state.nodes, |row| row.node)
         && sorted_unique_by(&state.roles, |row| row.principal)
         && sorted_unique_by(&state.managed_agents, |row| row.agent)
         && sorted_unique_by(&state.retries, |row| row.invocation)
+        && sorted_unique_by(&state.admin_retries, |row| row.invocation)
         && state.credentials.iter().all(|row| {
             row.credential != [0; 32]
                 && row.principal != [0; 32]
-                && row.public_key != [0; 32]
+                && matches!(row.kind, 0 | 1)
+                && canonical_credential_public_key(&row.public_key)
                 && CredentialId::of_public_key(&row.public_key).0 == row.credential
+                && state
+                    .roles
+                    .binary_search_by(|role| role.principal.cmp(&row.principal))
+                    .is_ok()
         })
-        && state
-            .nodes
-            .iter()
-            .all(|row| row.node != [0; 32] && row.owner != [0; 32])
-        && state.roles.iter().all(|row| row.principal != [0; 32])
+        && state.nodes.iter().all(|row| {
+            row.node != [0; 32]
+                && row.owner != [0; 32]
+                && state
+                    .roles
+                    .binary_search_by(|role| role.principal.cmp(&row.owner))
+                    .is_ok()
+        })
+        && state.roles.iter().all(|row| {
+            row.principal != [0; 32]
+                && state.credentials.iter().any(|credential| {
+                    credential.principal == row.principal
+                        && credential.status == CredentialStatus::Active
+                })
+        })
+        && accessible_admin_exists(state)
         && state.managed_agents.iter().all(|row| {
             row.agent != [0; 32]
                 && row.owner != [0; 32]
@@ -975,6 +1360,10 @@ fn authority_state_is_valid(
                 && row.runtime_program != [0; 32]
                 && row.runtime_producer != [0; 32]
                 && row.authority == configuration.binding
+                && state
+                    .roles
+                    .binary_search_by(|role| role.principal.cmp(&row.owner))
+                    .is_ok()
         })
         && state.retries.iter().all(|row| {
             row.invocation != [0; 32]
@@ -990,7 +1379,119 @@ fn authority_state_is_valid(
                 && row.approval.len() <= MAX_INVOCATION_REPLY_BYTES
                 && retry_finalization_shape_is_valid(row)
         })
+        && state
+            .admin_retries
+            .iter()
+            .all(|row| admin_retry_shape_is_valid(configuration, state, row))
+        && state.administration_generation
+            == u64::try_from(state.admin_retries.len())
+                .ok()
+                .and_then(|count| count.checked_add(1))
+                .unwrap_or(0)
         && retry_identifiers_are_unique(&state.retries)
+        && admin_generations_are_unique(&state.admin_retries)
+        && retry_families_are_disjoint(&state.retries, &state.admin_retries)
+        && admin_history_reconstructs_identity(configuration, state)
+}
+
+fn accessible_admin_exists(state: &AuthorityLinearState) -> bool {
+    state.roles.iter().any(|role| {
+        role.role == BuiltinPrincipalRole::Admin
+            && state.credentials.iter().any(|credential| {
+                credential.principal == role.principal
+                    && credential.status == CredentialStatus::Active
+            })
+            && state.nodes.iter().any(|node| node.owner == role.principal)
+    })
+}
+
+fn admin_retry_shape_is_valid(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    record: &AdminRetryRecord,
+) -> bool {
+    if record.invocation == [0; 32]
+        || record.call_commitment == [0; 32]
+        || record.call_bytes.is_empty()
+        || record.call_bytes.len() > MAX_INVOCATION_MESSAGE_BYTES
+        || record.result_commitment == [0; 32]
+        || record.result_bytes.is_empty()
+        || record.result_bytes.len() > MAX_INVOCATION_REPLY_BYTES
+        || record.generation <= 1
+        || record.generation > state.administration_generation
+    {
+        return false;
+    }
+    let Ok(call) = AuthorityAdminCall::decode(&record.call_bytes) else {
+        return false;
+    };
+    let Ok(result) = AuthorityAdminResult::decode(&record.result_bytes) else {
+        return false;
+    };
+    call.invocation.0 == record.invocation
+        && call.commitment().0 == record.call_commitment
+        && call.encode().ok().as_deref() == Some(record.call_bytes.as_slice())
+        && call
+            .next_generation()
+            .is_some_and(|generation| generation.get() == record.generation)
+        && call.verify_with(&Ed25519CredentialVerifier).is_ok()
+        && authority_target_matches(configuration, &call.authority)
+        && result.call == call
+        && result.generation.get() == record.generation
+        && result.commitment().0 == record.result_commitment
+        && result.encode().ok().as_deref() == Some(record.result_bytes.as_slice())
+        && result.verify_with(&Ed25519CredentialVerifier).is_ok()
+}
+
+fn admin_generations_are_unique(records: &[AdminRetryRecord]) -> bool {
+    records.iter().enumerate().all(|(index, record)| {
+        records.iter().enumerate().all(|(other_index, other)| {
+            index == other_index || record.generation != other.generation
+        })
+    })
+}
+
+fn retry_families_are_disjoint(
+    retries: &[ExactRetryRecord],
+    admin_retries: &[AdminRetryRecord],
+) -> bool {
+    retries.iter().all(|retry| {
+        admin_retries.iter().all(|admin| {
+            retry.invocation != admin.invocation
+                && retry.acknowledgement_invocation != admin.invocation
+        })
+    })
+}
+
+fn admin_history_reconstructs_identity(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+) -> bool {
+    let mut replay = AuthorityLinearState::bootstrap(*configuration);
+    let mut history = state.admin_retries.iter().collect::<Vec<_>>();
+    history.sort_unstable_by_key(|record| record.generation);
+    for record in history {
+        let Ok(call) = AuthorityAdminCall::decode(&record.call_bytes) else {
+            return false;
+        };
+        if call.expected_generation.get() != replay.administration_generation
+            || call
+                .next_generation()
+                .is_none_or(|generation| generation.get() != record.generation)
+            || !authenticated_admin(&replay, &call)
+            || !apply_admin_operation(&mut replay, &call.operation)
+        {
+            return false;
+        }
+        replay.administration_generation = record.generation;
+        if !accessible_admin_exists(&replay) {
+            return false;
+        }
+    }
+    replay.administration_generation == state.administration_generation
+        && replay.credentials == state.credentials
+        && replay.nodes == state.nodes
+        && replay.roles == state.roles
 }
 
 fn retry_finalization_shape_is_valid(record: &ExactRetryRecord) -> bool {
@@ -1050,8 +1551,8 @@ mod tests {
     use vos::abi::service::ServiceId;
     use vos::agent::StateLane;
     use vos::agent_sdk::authority::{
-        AuthorityOperationKind, AuthorityReceipt, AuthorityReceiptSelector,
-        ManagementApplicationAck, ManagementApproval,
+        AuthorityCredentialKind, AuthorityOperationKind, AuthorityReceipt,
+        AuthorityReceiptSelector, ManagementApplicationAck, ManagementApproval,
     };
     use vos::agent_sdk::contract::RuntimePackageContract;
     use vos::agent_sdk::{
@@ -1087,6 +1588,7 @@ mod tests {
             },
             bootstrap_principal: ADMIN_PRINCIPAL.0,
             bootstrap_credential_public_key: signing(0x21).verifying_key().to_bytes(),
+            bootstrap_credential_kind: 0,
             bootstrap_node: ADMIN_NODE.0,
         }
     }
@@ -1339,6 +1841,106 @@ mod tests {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn admin_call(
+        config: SystemAuthorityConfiguration,
+        key: &SigningKey,
+        administrator: PrincipalId,
+        authenticated_node: NodeId,
+        invocation_byte: u8,
+        expected_generation: u64,
+        operation: AuthorityAdminOperation,
+    ) -> AuthorityAdminCall {
+        let public_key = key.verifying_key().to_bytes();
+        let mut call = AuthorityAdminCall {
+            invocation: InvocationId([invocation_byte; 32]),
+            authority: authority_target(config),
+            administrator,
+            credential: CredentialId::of_public_key(&public_key),
+            credential_public_key: public_key,
+            authenticated_node,
+            observed_slot: OBSERVED_SLOT,
+            expected_generation: NonZeroU64::new(expected_generation).unwrap(),
+            operation,
+            signature: [1; 64],
+        };
+        resign_admin(&mut call, key);
+        call
+    }
+
+    fn resign_admin(call: &mut AuthorityAdminCall, key: &SigningKey) {
+        call.signature = [1; 64];
+        call.signature = key.sign(&call.signing_bytes()).to_bytes();
+    }
+
+    fn admin_context(call: &AuthorityAdminCall) -> InvocationContext {
+        InvocationContext {
+            invocation: call.invocation,
+            actor: call.authority.binding.issuer.actor,
+            mode: MethodMode::Linear,
+            origin: InvocationOrigin {
+                principal: Some(call.administrator),
+                transport_node: Some(call.authenticated_node),
+                credential: Some(call.credential),
+                actor: None,
+                capability: None,
+            },
+            roles: InvocationRoleClaims::none(),
+            observed_slot: call.observed_slot,
+        }
+    }
+
+    fn dispatch_admin_bytes(
+        actor: &mut SystemAuthority,
+        bytes: Vec<u8>,
+        invocation_context: Option<InvocationContext>,
+    ) -> Vec<u8> {
+        let mut ctx = Context::new(ServiceId(0));
+        if let Some(invocation_context) = invocation_context {
+            ctx.__set_agent_invocation_context(invocation_context);
+        }
+        block_on(<SystemAuthority as Message<Administer>>::handle(
+            actor,
+            Administer { call: bytes },
+            &mut ctx,
+        ))
+    }
+
+    fn dispatch_admin(actor: &mut SystemAuthority, call: &AuthorityAdminCall) -> Vec<u8> {
+        dispatch_admin_bytes(
+            actor,
+            call.encode().expect("valid AAD1 fixture"),
+            Some(admin_context(call)),
+        )
+    }
+
+    fn dispatch_fixture_admin(
+        actor: &mut SystemAuthority,
+        invocation: InvocationId,
+        operation: AuthorityAdminOperation,
+    ) {
+        let key = signing(0x21);
+        let mut call = admin_call(
+            actor.configuration,
+            &key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            1,
+            actor.state.administration_generation,
+            operation,
+        );
+        call.invocation = invocation;
+        resign_admin(&mut call, &key);
+        assert!(!dispatch_admin(actor, &call).is_empty());
+    }
+
+    fn enrollment(
+        key: &SigningKey,
+        kind: AuthorityCredentialKind,
+    ) -> AuthorityCredentialEnrollment {
+        AuthorityCredentialEnrollment::from_public_key(kind, key.verifying_key().to_bytes())
+    }
+
     fn block_on<F: core::future::Future>(future: F) -> F::Output {
         let waker = std::task::Waker::noop();
         let mut context = core::task::Context::from_waker(waker);
@@ -1365,45 +1967,41 @@ mod tests {
         node: NodeId,
         role: BuiltinPrincipalRole,
     ) {
-        let public_key = key.verifying_key().to_bytes();
-        let credential = CredentialId::of_public_key(&public_key).0;
-        let credential_index = actor
-            .state
-            .credentials
-            .binary_search_by(|row| row.credential.cmp(&credential))
-            .unwrap_err();
-        actor.state.credentials.insert(
-            credential_index,
-            CredentialRow {
+        let credential = enrollment(key, AuthorityCredentialKind::Ssh);
+        let invocation = |step: u8| {
+            InvocationId(
+                Hash::digest(
+                    b"vos/test/system-authority/admin-fixture/v1",
+                    &[&principal.0, &node.0, &credential.credential.0, &[step]],
+                )
+                .0,
+            )
+        };
+        dispatch_fixture_admin(
+            actor,
+            invocation(0),
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal,
                 credential,
-                principal: principal.0,
-                public_key,
-                status: CredentialStatus::Active,
             },
         );
-        let node_index = actor
-            .state
-            .nodes
-            .binary_search_by(|row| row.node.cmp(&node.0))
-            .unwrap_err();
-        actor.state.nodes.insert(
-            node_index,
-            NodeOwnerRow {
-                node: node.0,
-                owner: principal.0,
+        dispatch_fixture_admin(
+            actor,
+            invocation(1),
+            AuthorityAdminOperation::BindNodeOwner {
+                node,
+                owner: principal,
             },
         );
-        let role_index = actor
-            .state
-            .roles
-            .binary_search_by(|row| row.principal.cmp(&principal.0))
-            .unwrap_err();
-        actor.state.roles.insert(
-            role_index,
-            PrincipalRoleRow {
-                principal: principal.0,
-                role,
-            },
+        let role = match role {
+            BuiltinPrincipalRole::Member => return,
+            BuiltinPrincipalRole::Developer => AuthorityBuiltinRole::Developer,
+            BuiltinPrincipalRole::Admin => AuthorityBuiltinRole::Admin,
+        };
+        dispatch_fixture_admin(
+            actor,
+            invocation(2),
+            AuthorityAdminOperation::SetBuiltinRole { principal, role },
         );
     }
 
@@ -1439,7 +2037,23 @@ mod tests {
         let mut trailing = encoded.clone();
         trailing.push(0);
         assert_eq!(SystemAuthorityConfiguration::decode(&trailing), None);
-        assert_eq!(SystemAuthorityConfiguration::decode(&encoded[..459]), None);
+        assert_eq!(
+            SystemAuthorityConfiguration::decode(&encoded[..encoded.len() - 1]),
+            None
+        );
+        let mut invalid_kind = encoded.clone();
+        invalid_kind[encoded.len() - 33] = 2;
+        assert_eq!(SystemAuthorityConfiguration::decode(&invalid_kind), None);
+        let mut weak_key = [0; 32];
+        weak_key[0] = 1;
+        assert!(!canonical_credential_public_key(&weak_key));
+        let mut inaccessible = config;
+        inaccessible.bootstrap_credential_public_key = weak_key;
+        assert!(!inaccessible.is_valid());
+        assert_eq!(
+            SystemAuthorityConfiguration::decode(&inaccessible.encode()),
+            None
+        );
 
         let inert = SystemAuthority::new(&old_generation);
         assert!(!inert.state.initialized);
@@ -1599,6 +2213,13 @@ mod tests {
         let mut actor = actor();
         enroll(
             &mut actor,
+            &signing(0x80),
+            beneficiary,
+            NodeId([0x80; 32]),
+            BuiltinPrincipalRole::Member,
+        );
+        enroll(
+            &mut actor,
             &member_key,
             member,
             member_node,
@@ -1627,6 +2248,26 @@ mod tests {
             ManagementRequest::Create(Box::new(descriptor)),
         );
         assert!(!dispatch(&mut actor, &admin_call).is_empty());
+    }
+
+    #[test]
+    fn admin_cannot_create_an_agent_owned_by_an_unenrolled_principal() {
+        let config = configuration();
+        let owner = PrincipalId([0x88; 32]);
+        let descriptor = descriptor(config, owner, AgentProfile::Private, 0x89);
+        let call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x8a,
+            target_for(&descriptor),
+            ManagementRequest::Create(Box::new(descriptor)),
+        );
+        let mut actor = actor();
+        let before = actor.state.clone();
+        assert!(dispatch(&mut actor, &call).is_empty());
+        assert_eq!(actor.state, before);
     }
 
     #[test]
@@ -1898,6 +2539,68 @@ mod tests {
         let before = actor.state.clone();
         assert!(dispatch(&mut actor, &call).is_empty());
         assert_eq!(actor.state, before);
+    }
+
+    #[test]
+    fn admin_exact_retry_survives_combined_retry_capacity() {
+        let config = configuration();
+        let key = signing(0x21);
+        let call = admin_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xf0,
+            1,
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal: PrincipalId([0xf1; 32]),
+                credential: enrollment(&signing(0xf2), AuthorityCredentialKind::Api),
+            },
+        );
+        let mut actor = actor();
+        let result = dispatch_admin(&mut actor, &call);
+        assert!(!result.is_empty());
+
+        for ordinal in 1..MAX_EXACT_RETRY_RECORDS {
+            let byte = ordinal as u8;
+            let mut acknowledgement_invocation = [byte; 32];
+            acknowledgement_invocation[31] ^= 0x80;
+            actor.state.retries.push(ExactRetryRecord {
+                invocation: [byte; 32],
+                acknowledgement_invocation,
+                credential_call: [byte; 32],
+                credential_call_bytes: b"bounded retained call".to_vec(),
+                approval_commitment: [byte.wrapping_add(1); 32],
+                authorization_sequence: ordinal as u64,
+                approval: b"bounded retained approval".to_vec(),
+                effect: PendingManagementEffect::None,
+                finalized: false,
+                acknowledgement: None,
+                acknowledgement_bytes: None,
+                reopened_state: None,
+                applied_at: None,
+            });
+        }
+        actor.state.authorization_sequence = (MAX_EXACT_RETRY_RECORDS - 1) as u64;
+        assert!(authority_state_is_valid(&config, &actor.state));
+
+        let saturated = actor.state.clone();
+        assert_eq!(dispatch_admin(&mut actor, &call), result);
+        assert_eq!(actor.state, saturated);
+        let fresh = admin_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xf3,
+            2,
+            AuthorityAdminOperation::BindNodeOwner {
+                node: NodeId([0xf4; 32]),
+                owner: PrincipalId([0xf1; 32]),
+            },
+        );
+        assert!(dispatch_admin(&mut actor, &fresh).is_empty());
+        assert_eq!(actor.state, saturated);
     }
 
     #[test]
@@ -2183,6 +2886,623 @@ mod tests {
     }
 
     #[test]
+    fn admin_operations_are_canonical_exact_and_survive_restart() {
+        let config = configuration();
+        let admin_key = signing(0x21);
+        let principal = PrincipalId([0x81; 32]);
+        let first_key = signing(0x82);
+        let second_key = signing(0x83);
+        let first_node = NodeId([0x84; 32]);
+        let second_node = NodeId([0x85; 32]);
+        let mut actor = actor();
+
+        let enroll_call = admin_call(
+            config,
+            &admin_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0x81,
+            1,
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal,
+                credential: enrollment(&first_key, AuthorityCredentialKind::Api),
+            },
+        );
+        let enrolled = dispatch_admin(&mut actor, &enroll_call);
+        let result = AuthorityAdminResult::decode(&enrolled).unwrap();
+        assert_eq!(result.call, enroll_call);
+        assert_eq!(result.generation.get(), 2);
+        assert!(actor.state.nodes.iter().all(|row| row.owner != principal.0));
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut actor = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("canonical Admin state restarts");
+        let after_restart = actor.state.clone();
+        assert_eq!(dispatch_admin(&mut actor, &enroll_call), enrolled);
+        assert_eq!(actor.state, after_restart);
+
+        let operations = [
+            (
+                0x82,
+                AuthorityAdminOperation::AddCredential {
+                    principal,
+                    credential: enrollment(&second_key, AuthorityCredentialKind::Ssh),
+                },
+            ),
+            (
+                0x83,
+                AuthorityAdminOperation::BindNodeOwner {
+                    node: first_node,
+                    owner: principal,
+                },
+            ),
+            (
+                0x84,
+                AuthorityAdminOperation::BindNodeOwner {
+                    node: second_node,
+                    owner: principal,
+                },
+            ),
+            (
+                0x85,
+                AuthorityAdminOperation::SetBuiltinRole {
+                    principal,
+                    role: AuthorityBuiltinRole::Developer,
+                },
+            ),
+            (
+                0x86,
+                AuthorityAdminOperation::RevokeCredential {
+                    principal,
+                    credential: enrollment(&first_key, AuthorityCredentialKind::Api).credential,
+                },
+            ),
+            (
+                0x87,
+                AuthorityAdminOperation::UnbindNodeOwner {
+                    node: first_node,
+                    owner: principal,
+                },
+            ),
+        ];
+        for (offset, (invocation, operation)) in operations.into_iter().enumerate() {
+            let expected_generation = u64::try_from(offset).unwrap() + 2;
+            let call = admin_call(
+                config,
+                &admin_key,
+                ADMIN_PRINCIPAL,
+                ADMIN_NODE,
+                invocation,
+                expected_generation,
+                operation,
+            );
+            let result = AuthorityAdminResult::decode(&dispatch_admin(&mut actor, &call)).unwrap();
+            assert_eq!(result.generation.get(), expected_generation + 1);
+        }
+        assert_eq!(actor.state.administration_generation, 8);
+        assert_eq!(
+            actor
+                .state
+                .nodes
+                .iter()
+                .filter(|row| row.owner == principal.0)
+                .count(),
+            1
+        );
+        let first = actor
+            .state
+            .credentials
+            .iter()
+            .find(|row| {
+                row.credential
+                    == enrollment(&first_key, AuthorityCredentialKind::Api)
+                        .credential
+                        .0
+            })
+            .unwrap();
+        assert_eq!(first.status, CredentialStatus::Revoked);
+        assert!(authority_state_is_valid(&config, &actor.state));
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut reopened = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("complete canonical Admin history restarts");
+        let before_retry = reopened.state.clone();
+        assert_eq!(dispatch_admin(&mut reopened, &enroll_call), enrolled);
+        assert_eq!(reopened.state, before_retry);
+    }
+
+    #[test]
+    fn admin_call_rejects_forged_cross_bound_and_ambient_contexts() {
+        let config = configuration();
+        let key = signing(0x21);
+        let operation = AuthorityAdminOperation::EnrollPrincipal {
+            principal: PrincipalId([0x91; 32]),
+            credential: enrollment(&signing(0x92), AuthorityCredentialKind::Ssh),
+        };
+        let call = admin_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0x91,
+            1,
+            operation,
+        );
+        let mut actor = actor();
+        let pristine = actor.state.clone();
+
+        let mut forged = call.clone();
+        forged.signature[0] ^= 1;
+        assert!(
+            dispatch_admin_bytes(
+                &mut actor,
+                forged.encode().unwrap(),
+                Some(admin_context(&forged)),
+            )
+            .is_empty()
+        );
+
+        let mut cross_space = call.clone();
+        cross_space.authority.space = SpaceId([0xa1; 32]);
+        resign_admin(&mut cross_space, &key);
+        assert!(dispatch_admin(&mut actor, &cross_space).is_empty());
+
+        let mut cross_target = call.clone();
+        cross_target.authority.system_agent = AgentId([0xa2; 32]);
+        resign_admin(&mut cross_target, &key);
+        assert!(dispatch_admin(&mut actor, &cross_target).is_empty());
+
+        let mut cross_node = call.clone();
+        cross_node.authenticated_node = NodeId([0xa3; 32]);
+        resign_admin(&mut cross_node, &key);
+        assert!(dispatch_admin(&mut actor, &cross_node).is_empty());
+
+        let mut cross_principal = call.clone();
+        cross_principal.administrator = PrincipalId([0xa4; 32]);
+        resign_admin(&mut cross_principal, &key);
+        assert!(dispatch_admin(&mut actor, &cross_principal).is_empty());
+
+        let mut weak_enrollment = call.clone();
+        let mut weak_key = [0; 32];
+        weak_key[0] = 1;
+        weak_enrollment.operation = AuthorityAdminOperation::EnrollPrincipal {
+            principal: PrincipalId([0xa5; 32]),
+            credential: AuthorityCredentialEnrollment::from_public_key(
+                AuthorityCredentialKind::Api,
+                weak_key,
+            ),
+        };
+        resign_admin(&mut weak_enrollment, &key);
+        assert!(dispatch_admin(&mut actor, &weak_enrollment).is_empty());
+
+        let mut wrong_context = admin_context(&call);
+        wrong_context.origin.transport_node = Some(NodeId([0xa6; 32]));
+        assert!(
+            dispatch_admin_bytes(&mut actor, call.encode().unwrap(), Some(wrong_context),)
+                .is_empty()
+        );
+        let mut wrong_slot = admin_context(&call);
+        wrong_slot.observed_slot += 1;
+        assert!(
+            dispatch_admin_bytes(&mut actor, call.encode().unwrap(), Some(wrong_slot),).is_empty()
+        );
+        let mut ambient_role = admin_context(&call);
+        ambient_role.roles.space = Some(RoleId([0xa7; 32]));
+        assert!(
+            dispatch_admin_bytes(&mut actor, call.encode().unwrap(), Some(ambient_role),)
+                .is_empty()
+        );
+        let mut wrong_credential = admin_context(&call);
+        wrong_credential.origin.credential = Some(CredentialId([0xa8; 32]));
+        assert!(
+            dispatch_admin_bytes(&mut actor, call.encode().unwrap(), Some(wrong_credential),)
+                .is_empty()
+        );
+        assert!(dispatch_admin_bytes(&mut actor, call.encode().unwrap(), None).is_empty());
+        assert_eq!(actor.state, pristine);
+    }
+
+    #[test]
+    fn admin_generation_and_invocation_conflicts_fail_closed() {
+        let config = configuration();
+        let key = signing(0x21);
+        let principal = PrincipalId([0xb1; 32]);
+        let mut actor = actor();
+        let call = admin_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xb1,
+            1,
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal,
+                credential: enrollment(&signing(0xb2), AuthorityCredentialKind::Api),
+            },
+        );
+        let first = dispatch_admin(&mut actor, &call);
+        assert!(!first.is_empty());
+        let after_first = actor.state.clone();
+        assert_eq!(dispatch_admin(&mut actor, &call), first);
+        assert_eq!(actor.state, after_first);
+
+        let stale = admin_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xb3,
+            1,
+            AuthorityAdminOperation::BindNodeOwner {
+                node: NodeId([0xb3; 32]),
+                owner: principal,
+            },
+        );
+        assert!(dispatch_admin(&mut actor, &stale).is_empty());
+
+        let mut conflict = call;
+        conflict.operation = AuthorityAdminOperation::BindNodeOwner {
+            node: NodeId([0xb4; 32]),
+            owner: principal,
+        };
+        resign_admin(&mut conflict, &key);
+        assert!(dispatch_admin(&mut actor, &conflict).is_empty());
+        assert_eq!(actor.state, after_first);
+
+        let colliding_management = create_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0xb1,
+            AgentProfile::Local,
+            0xb5,
+        );
+        assert!(dispatch(&mut actor, &colliding_management).is_empty());
+        assert_eq!(actor.state, after_first);
+
+        let mut management_first = SystemAuthority::new(&config.encode());
+        let management = create_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0xb6,
+            AgentProfile::Local,
+            0xb7,
+        );
+        assert!(!dispatch(&mut management_first, &management).is_empty());
+        let colliding_admin = admin_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xb6,
+            1,
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal: PrincipalId([0xb8; 32]),
+                credential: enrollment(&signing(0xb9), AuthorityCredentialKind::Ssh),
+            },
+        );
+        let before_collision = management_first.state.clone();
+        assert!(dispatch_admin(&mut management_first, &colliding_admin).is_empty());
+        assert_eq!(management_first.state, before_collision);
+    }
+
+    #[test]
+    fn admin_lockout_safety_requires_an_accessible_admin() {
+        let config = configuration();
+        let bootstrap_key = signing(0x21);
+        let inaccessible = PrincipalId([0xc1; 32]);
+        let inaccessible_key = signing(0xc2);
+        let replacement_key = signing(0xc3);
+        let replacement_node = NodeId([0xc4; 32]);
+        let mut actor = actor();
+
+        let enroll = admin_call(
+            config,
+            &bootstrap_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xc1,
+            1,
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal: inaccessible,
+                credential: enrollment(&inaccessible_key, AuthorityCredentialKind::Ssh),
+            },
+        );
+        assert!(!dispatch_admin(&mut actor, &enroll).is_empty());
+        let promote = admin_call(
+            config,
+            &bootstrap_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xc2,
+            2,
+            AuthorityAdminOperation::SetBuiltinRole {
+                principal: inaccessible,
+                role: AuthorityBuiltinRole::Admin,
+            },
+        );
+        assert!(!dispatch_admin(&mut actor, &promote).is_empty());
+        assert!(
+            actor
+                .state
+                .nodes
+                .iter()
+                .all(|row| row.owner != inaccessible.0)
+        );
+        let no_node_admin = admin_call(
+            config,
+            &inaccessible_key,
+            inaccessible,
+            ADMIN_NODE,
+            0xc0,
+            3,
+            AuthorityAdminOperation::AddCredential {
+                principal: inaccessible,
+                credential: enrollment(&signing(0xcf), AuthorityCredentialKind::Api),
+            },
+        );
+        let before = actor.state.clone();
+        assert!(dispatch_admin(&mut actor, &no_node_admin).is_empty());
+        assert_eq!(actor.state, before);
+
+        for (invocation, operation) in [
+            (
+                0xc5,
+                AuthorityAdminOperation::SetBuiltinRole {
+                    principal: ADMIN_PRINCIPAL,
+                    role: AuthorityBuiltinRole::Member,
+                },
+            ),
+            (
+                0xc6,
+                AuthorityAdminOperation::UnbindNodeOwner {
+                    node: ADMIN_NODE,
+                    owner: ADMIN_PRINCIPAL,
+                },
+            ),
+        ] {
+            let denied = admin_call(
+                config,
+                &bootstrap_key,
+                ADMIN_PRINCIPAL,
+                ADMIN_NODE,
+                invocation,
+                3,
+                operation,
+            );
+            let before = actor.state.clone();
+            assert!(dispatch_admin(&mut actor, &denied).is_empty());
+            assert_eq!(actor.state, before);
+        }
+
+        let add_replacement = admin_call(
+            config,
+            &bootstrap_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xc7,
+            3,
+            AuthorityAdminOperation::AddCredential {
+                principal: ADMIN_PRINCIPAL,
+                credential: enrollment(&replacement_key, AuthorityCredentialKind::Api),
+            },
+        );
+        assert!(!dispatch_admin(&mut actor, &add_replacement).is_empty());
+        let revoke_bootstrap = admin_call(
+            config,
+            &replacement_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xc8,
+            4,
+            AuthorityAdminOperation::RevokeCredential {
+                principal: ADMIN_PRINCIPAL,
+                credential: CredentialId::of_public_key(&bootstrap_key.verifying_key().to_bytes()),
+            },
+        );
+        assert!(!dispatch_admin(&mut actor, &revoke_bootstrap).is_empty());
+        let revoke_last = admin_call(
+            config,
+            &replacement_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xc9,
+            5,
+            AuthorityAdminOperation::RevokeCredential {
+                principal: ADMIN_PRINCIPAL,
+                credential: CredentialId::of_public_key(
+                    &replacement_key.verifying_key().to_bytes(),
+                ),
+            },
+        );
+        let before = actor.state.clone();
+        assert!(dispatch_admin(&mut actor, &revoke_last).is_empty());
+        assert_eq!(actor.state, before);
+
+        let bind_replacement = admin_call(
+            config,
+            &replacement_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xca,
+            5,
+            AuthorityAdminOperation::BindNodeOwner {
+                node: replacement_node,
+                owner: inaccessible,
+            },
+        );
+        assert!(!dispatch_admin(&mut actor, &bind_replacement).is_empty());
+        let demote_bootstrap = admin_call(
+            config,
+            &replacement_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xcb,
+            6,
+            AuthorityAdminOperation::SetBuiltinRole {
+                principal: ADMIN_PRINCIPAL,
+                role: AuthorityBuiltinRole::Member,
+            },
+        );
+        assert!(!dispatch_admin(&mut actor, &demote_bootstrap).is_empty());
+        let unbind_last_admin_node = admin_call(
+            config,
+            &inaccessible_key,
+            inaccessible,
+            replacement_node,
+            0xcc,
+            7,
+            AuthorityAdminOperation::UnbindNodeOwner {
+                node: replacement_node,
+                owner: inaccessible,
+            },
+        );
+        let before = actor.state.clone();
+        assert!(dispatch_admin(&mut actor, &unbind_last_admin_node).is_empty());
+        assert_eq!(actor.state, before);
+    }
+
+    #[test]
+    fn admin_state_rejects_reordered_duplicates_and_forged_retry_bytes() {
+        let config = configuration();
+        let mut actor = actor();
+        let call = admin_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xd1,
+            1,
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal: PrincipalId([0xd1; 32]),
+                credential: enrollment(&signing(0xd2), AuthorityCredentialKind::Ssh),
+            },
+        );
+        assert!(!dispatch_admin(&mut actor, &call).is_empty());
+        let bind = admin_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xd2,
+            2,
+            AuthorityAdminOperation::BindNodeOwner {
+                node: NodeId([0xd3; 32]),
+                owner: PrincipalId([0xd1; 32]),
+            },
+        );
+        assert!(!dispatch_admin(&mut actor, &bind).is_empty());
+        assert!(authority_state_is_valid(&config, &actor.state));
+
+        let mut reordered = actor.state.clone();
+        reordered.credentials.swap(0, 1);
+        assert!(!authority_state_is_valid(&config, &reordered));
+        let mut reordered_history = actor.state.clone();
+        reordered_history.admin_retries.swap(0, 1);
+        assert!(!authority_state_is_valid(&config, &reordered_history));
+        let mut duplicate = actor.state.clone();
+        duplicate.roles.push(duplicate.roles[0].clone());
+        assert!(!authority_state_is_valid(&config, &duplicate));
+        let mut forged = actor.state.clone();
+        forged.admin_retries[0].result_bytes[0] ^= 1;
+        assert!(!authority_state_is_valid(&config, &forged));
+        let mut substituted = actor.state.clone();
+        substituted.admin_retries[0].call_commitment[0] ^= 1;
+        assert!(!authority_state_is_valid(&config, &substituted));
+        let mut unsigned_role_change = actor.state.clone();
+        let enrolled = unsigned_role_change
+            .roles
+            .iter_mut()
+            .find(|row| row.principal == [0xd1; 32])
+            .unwrap();
+        enrolled.role = BuiltinPrincipalRole::Developer;
+        assert!(!authority_state_is_valid(&config, &unsigned_role_change));
+        let mut invalid_kind = actor.state.clone();
+        invalid_kind
+            .credentials
+            .iter_mut()
+            .find(|row| row.principal == [0xd1; 32])
+            .unwrap()
+            .kind = 2;
+        assert!(!authority_state_is_valid(&config, &invalid_kind));
+        let mut dangling_node = actor.state.clone();
+        dangling_node
+            .nodes
+            .iter_mut()
+            .find(|row| row.node == [0xd3; 32])
+            .unwrap()
+            .owner = [0xd4; 32];
+        assert!(!authority_state_is_valid(&config, &dangling_node));
+
+        let mut orphaned_agent = actor.state.clone();
+        orphaned_agent.managed_agents.push(ManagedAgentRow {
+            agent: [0xd5; 32],
+            owner: [0xd6; 32],
+            profile: AgentProfile::Private as u8,
+            runtime_deployment: [0xd7; 32],
+            runtime_program: [0xd8; 32],
+            runtime_producer: [0xd9; 32],
+            authority: config.binding,
+        });
+        assert!(!authority_state_is_valid(&config, &orphaned_agent));
+    }
+
+    #[test]
+    fn authority_identity_tables_enforce_explicit_bounds() {
+        let config = configuration();
+        let mut actor = actor();
+        for ordinal in 1..MAX_AUTHORITY_PRINCIPALS {
+            let mut seed = [0xe1; 32];
+            seed[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
+            let key = SigningKey::from_bytes(&seed);
+            let mut principal = [0xe2; 32];
+            principal[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
+            let mut node = [0xe3; 32];
+            node[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
+            enroll(
+                &mut actor,
+                &key,
+                PrincipalId(principal),
+                NodeId(node),
+                BuiltinPrincipalRole::Member,
+            );
+        }
+        assert_eq!(actor.state.roles.len(), MAX_AUTHORITY_PRINCIPALS);
+        assert_eq!(actor.state.credentials.len(), MAX_AUTHORITY_CREDENTIALS);
+        assert_eq!(actor.state.nodes.len(), MAX_AUTHORITY_NODES);
+        assert!(authority_state_is_valid(&config, &actor.state));
+
+        let call = admin_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xe4,
+            actor.state.administration_generation,
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal: PrincipalId([0xe4; 32]),
+                credential: enrollment(&signing(0xe5), AuthorityCredentialKind::Api),
+            },
+        );
+        let before = actor.state.clone();
+        assert!(dispatch_admin(&mut actor, &call).is_empty());
+        assert_eq!(actor.state, before);
+    }
+
+    #[test]
     fn read_only_management_has_no_acc1_actor_message() {
         let config = configuration();
         let descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Local, 0x61);
@@ -2247,15 +3567,28 @@ mod tests {
     }
 
     #[test]
-    fn generated_agent_schema_marks_authorize_as_explicit_linear_public_preflight() {
+    fn generated_agent_schema_marks_authority_methods_as_explicit_linear_public_preflight() {
         let method = SystemAuthorityMsg::AGENT_METHODS;
-        assert_eq!(method.len(), 2);
+        assert_eq!(method.len(), 3);
         assert_eq!(method[0].name, "authorize");
         assert_eq!(method[0].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[0].explicit);
         assert_eq!(method[1].name, "finalize");
         assert_eq!(method[1].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[1].explicit);
-        assert_eq!(SystemAuthorityMsg::AGENT_AUTHORIZATIONS.len(), 2);
+        assert_eq!(method[2].name, "administer");
+        assert_eq!(method[2].mode, vos::agent_sdk::schema::MethodMode::Linear);
+        assert!(method[2].explicit);
+        assert_eq!(SystemAuthorityMsg::AGENT_AUTHORIZATIONS.len(), 3);
+        assert!(
+            SystemAuthorityMsg::AGENT_AUTHORIZATIONS
+                .iter()
+                .all(|method| {
+                    matches!(
+                        method.selector,
+                        vos::metadata::AgentAuthorizationSelectorMeta::Public
+                    )
+                })
+        );
     }
 }

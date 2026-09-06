@@ -10,8 +10,10 @@ use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
 use crate::authority::{
     AUTHORITY_PUBLIC_KEY_BYTES, AUTHORITY_SIGNATURE_BYTES, AgentAuthorityBinding,
-    AuthorityActorTarget, AuthorityCredentialCall, AuthorityEvidence, AuthorityIssuer,
-    AuthorityLaneRoots, AuthorityOperationKind, AuthorityReceipt, AuthorityReceiptSelector,
+    AuthorityActorTarget, AuthorityAdminCall, AuthorityAdminOperation, AuthorityAdminResult,
+    AuthorityBuiltinRole, AuthorityCredentialCall, AuthorityCredentialEnrollment,
+    AuthorityCredentialKind, AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots,
+    AuthorityOperationKind, AuthorityReceipt, AuthorityReceiptSelector,
     CREDENTIAL_PUBLIC_KEY_BYTES, CREDENTIAL_SIGNATURE_BYTES, ManagedAgentTarget,
     ManagementApplicationAck, ManagementApproval,
 };
@@ -33,6 +35,8 @@ pub const MAX_DIRECTORY_PAGE_WIRE_BYTES: usize =
     HEADER_BYTES + 4 + MAX_DIRECTORY_PAGE_ENTRIES * (MAX_ACTOR_ENTRY_WIRE_BYTES + 128) + 33;
 pub const MAX_AUTHORITY_RECEIPT_WIRE_BYTES: usize = 1_024;
 pub const MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
+pub const MAX_AUTHORITY_ADMIN_CALL_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
+pub const MAX_AUTHORITY_ADMIN_RESULT_WIRE_BYTES: usize = MAX_INVOCATION_REPLY_BYTES;
 pub const MAX_MANAGEMENT_APPROVAL_WIRE_BYTES: usize = MAX_INVOCATION_REPLY_BYTES;
 pub const MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
 pub const MAX_CATALOG_MUTATION_REQUEST_WIRE_BYTES: usize = 2 * 1024;
@@ -43,6 +47,7 @@ pub const MAX_CATALOG_PAGE_REQUEST_WIRE_BYTES: usize = 1_024;
 pub const MAX_CATALOG_PAGE_WIRE_BYTES: usize = MAX_INVOCATION_REPLY_BYTES;
 pub const MAX_AGENT_DESCRIPTOR_WIRE_BYTES: usize = 64 * 1024;
 pub const MAX_INVOCATION_CONTEXT_WIRE_BYTES: usize = 512;
+pub const MAX_INVOCATION_AUTHORIZATION_WIRE_BYTES: usize = 2 * 1024;
 pub const MAX_RUNTIME_WORK_WIRE_BYTES: usize =
     HEADER_BYTES + MAX_RUNTIME_STATE_BYTES + MAX_RUNTIME_AVAILABILITY_BYTES + 512 * 1024;
 pub const MAX_RUNTIME_TRANSITION_WIRE_BYTES: usize =
@@ -969,6 +974,253 @@ impl CanonicalWire for AuthorityCredentialCall {
             requested_expires_at,
             request,
             signature,
+        };
+        value
+            .validate_shape()
+            .is_ok()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
+fn encode_authority_credential_enrollment(
+    encoder: &mut Encoder<'_>,
+    value: AuthorityCredentialEnrollment,
+) {
+    encoder.fixed(value.credential.as_bytes());
+    encoder.u8(value.kind as u8);
+    encoder.0.extend_from_slice(&value.public_key);
+}
+
+fn decode_authority_credential_enrollment(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityCredentialEnrollment, DecodeError> {
+    let value = AuthorityCredentialEnrollment {
+        credential: CredentialId(decoder.fixed()?),
+        kind: match decoder.u8()? {
+            0 => AuthorityCredentialKind::Ssh,
+            1 => AuthorityCredentialKind::Api,
+            _ => return Err(DecodeError::InvalidTag),
+        },
+        public_key: decoder
+            .take(CREDENTIAL_PUBLIC_KEY_BYTES)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?,
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_authority_admin_operation(encoder: &mut Encoder<'_>, value: &AuthorityAdminOperation) {
+    match value {
+        AuthorityAdminOperation::EnrollPrincipal {
+            principal,
+            credential,
+        } => {
+            encoder.u8(0);
+            encoder.fixed(principal.as_bytes());
+            encode_authority_credential_enrollment(encoder, *credential);
+        }
+        AuthorityAdminOperation::AddCredential {
+            principal,
+            credential,
+        } => {
+            encoder.u8(1);
+            encoder.fixed(principal.as_bytes());
+            encode_authority_credential_enrollment(encoder, *credential);
+        }
+        AuthorityAdminOperation::RevokeCredential {
+            principal,
+            credential,
+        } => {
+            encoder.u8(2);
+            encoder.fixed(principal.as_bytes());
+            encoder.fixed(credential.as_bytes());
+        }
+        AuthorityAdminOperation::BindNodeOwner { node, owner } => {
+            encoder.u8(3);
+            encoder.fixed(node.as_bytes());
+            encoder.fixed(owner.as_bytes());
+        }
+        AuthorityAdminOperation::UnbindNodeOwner { node, owner } => {
+            encoder.u8(4);
+            encoder.fixed(node.as_bytes());
+            encoder.fixed(owner.as_bytes());
+        }
+        AuthorityAdminOperation::SetBuiltinRole { principal, role } => {
+            encoder.u8(5);
+            encoder.fixed(principal.as_bytes());
+            encoder.u8(*role as u8);
+        }
+    }
+}
+
+fn decode_authority_admin_operation(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityAdminOperation, DecodeError> {
+    let value = match decoder.u8()? {
+        0 => AuthorityAdminOperation::EnrollPrincipal {
+            principal: PrincipalId(decoder.fixed()?),
+            credential: decode_authority_credential_enrollment(decoder)?,
+        },
+        1 => AuthorityAdminOperation::AddCredential {
+            principal: PrincipalId(decoder.fixed()?),
+            credential: decode_authority_credential_enrollment(decoder)?,
+        },
+        2 => AuthorityAdminOperation::RevokeCredential {
+            principal: PrincipalId(decoder.fixed()?),
+            credential: CredentialId(decoder.fixed()?),
+        },
+        3 => AuthorityAdminOperation::BindNodeOwner {
+            node: NodeId(decoder.fixed()?),
+            owner: PrincipalId(decoder.fixed()?),
+        },
+        4 => AuthorityAdminOperation::UnbindNodeOwner {
+            node: NodeId(decoder.fixed()?),
+            owner: PrincipalId(decoder.fixed()?),
+        },
+        5 => AuthorityAdminOperation::SetBuiltinRole {
+            principal: PrincipalId(decoder.fixed()?),
+            role: match decoder.u8()? {
+                0 => AuthorityBuiltinRole::Member,
+                1 => AuthorityBuiltinRole::Developer,
+                2 => AuthorityBuiltinRole::Admin,
+                _ => return Err(DecodeError::InvalidTag),
+            },
+        },
+        _ => return Err(DecodeError::InvalidTag),
+    };
+    value
+        .validate_shape()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+pub(crate) fn authority_admin_operation_commitment(value: &AuthorityAdminOperation) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"AAOP");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_authority_admin_operation(&mut Encoder(&mut bytes), value);
+    Hash::digest(b"vos/agent/authority-admin-operation/v1", &[&bytes])
+}
+
+fn encode_authority_admin_call_unsigned(encoder: &mut Encoder<'_>, value: &AuthorityAdminCall) {
+    encoder.fixed(value.invocation.as_bytes());
+    encode_authority_actor_target(encoder, value.authority);
+    encoder.fixed(value.administrator.as_bytes());
+    encoder.fixed(value.credential.as_bytes());
+    encoder.0.extend_from_slice(&value.credential_public_key);
+    encoder.fixed(value.authenticated_node.as_bytes());
+    encoder.u64(value.observed_slot);
+    encoder.u64(value.expected_generation.get());
+    encode_authority_admin_operation(encoder, &value.operation);
+}
+
+pub(crate) fn authority_admin_call_signing_bytes(value: &AuthorityAdminCall) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"AADS");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_authority_admin_call_unsigned(&mut Encoder(&mut bytes), value);
+    bytes
+}
+
+pub(crate) fn authority_admin_call_encoded_len(value: &AuthorityAdminCall) -> usize {
+    let mut body = Vec::new();
+    encode_authority_admin_call_unsigned(&mut Encoder(&mut body), value);
+    HEADER_BYTES
+        .saturating_add(body.len())
+        .saturating_add(CREDENTIAL_SIGNATURE_BYTES)
+}
+
+fn encode_authority_admin_call_body(encoder: &mut Encoder<'_>, value: &AuthorityAdminCall) {
+    encode_authority_admin_call_unsigned(encoder, value);
+    encoder.0.extend_from_slice(&value.signature);
+}
+
+fn decode_authority_admin_call_body(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityAdminCall, DecodeError> {
+    let value = AuthorityAdminCall {
+        invocation: InvocationId(decoder.fixed()?),
+        authority: decode_authority_actor_target(decoder)?,
+        administrator: PrincipalId(decoder.fixed()?),
+        credential: CredentialId(decoder.fixed()?),
+        credential_public_key: decoder
+            .take(CREDENTIAL_PUBLIC_KEY_BYTES)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?,
+        authenticated_node: NodeId(decoder.fixed()?),
+        observed_slot: decoder.u64()?,
+        expected_generation: core::num::NonZeroU64::new(decoder.u64()?)
+            .ok_or(DecodeError::NonCanonical)?,
+        operation: decode_authority_admin_operation(decoder)?,
+        signature: decoder
+            .take(CREDENTIAL_SIGNATURE_BYTES)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?,
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+impl CanonicalWire for AuthorityAdminCall {
+    const MAGIC: [u8; 4] = *b"AAD1";
+    const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_ADMIN_CALL_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_authority_admin_call_body(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_authority_admin_call_body(decoder)
+    }
+}
+
+fn encode_authority_admin_result_body(encoder: &mut Encoder<'_>, value: &AuthorityAdminResult) {
+    encode_authority_admin_call_body(encoder, &value.call);
+    encoder.u64(value.generation.get());
+}
+
+pub(crate) fn authority_admin_result_encoded_len(value: &AuthorityAdminResult) -> usize {
+    let mut body = Vec::new();
+    encode_authority_admin_result_body(&mut Encoder(&mut body), value);
+    HEADER_BYTES.saturating_add(body.len())
+}
+
+pub(crate) fn authority_admin_result_commitment(value: &AuthorityAdminResult) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"AARC");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_authority_admin_result_body(&mut Encoder(&mut bytes), value);
+    Hash::digest(b"vos/agent/authority-admin-result/v1", &[&bytes])
+}
+
+impl CanonicalWire for AuthorityAdminResult {
+    const MAGIC: [u8; 4] = *b"AAR1";
+    const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_ADMIN_RESULT_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_authority_admin_result_body(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            call: decode_authority_admin_call_body(decoder)?,
+            generation: core::num::NonZeroU64::new(decoder.u64()?)
+                .ok_or(DecodeError::NonCanonical)?,
         };
         value
             .validate_shape()
@@ -2103,19 +2355,64 @@ pub(crate) fn invocation_work_commitment(value: &InvocationWork) -> Hash {
     Hash::digest(b"vos/agent/invocation", &[&bytes])
 }
 
-fn authority_matches_invocation(
-    receipt: &AuthorityReceipt,
-    invocation: &InvocationWork,
-    _observed_slot: u64,
-) -> bool {
-    receipt.validate_shape().is_ok()
-        && receipt.selector.operation == AuthorityOperationKind::InvokeActor
-        && receipt.selector.space == invocation.space
-        && receipt.selector.agent == invocation.agent
-        && receipt.selector.runtime_deployment == invocation.runtime_deployment
-        && receipt.selector.actor == Some(invocation.actor)
-        && receipt.selector.actor_deployment == Some(invocation.deployment)
-        && receipt.selector.request == invocation_work_commitment(invocation)
+fn encode_invocation_authorization(encoder: &mut Encoder<'_>, value: &InvocationAuthorization) {
+    match value {
+        InvocationAuthorization::AuthorityReceipt(receipt) => {
+            encoder.u8(0);
+            <AuthorityReceipt as CanonicalWire>::encode_body(receipt, encoder);
+        }
+        InvocationAuthorization::PublicPreflight(preflight) => {
+            encoder.u8(1);
+            encoder.fixed(preflight.work.as_bytes());
+            encode_origin(encoder, preflight.origin);
+            encoder.u64(preflight.observed_slot);
+        }
+    }
+}
+
+fn decode_invocation_authorization(
+    decoder: &mut Decoder<'_>,
+) -> Result<InvocationAuthorization, DecodeError> {
+    let value = match decoder.u8()? {
+        0 => InvocationAuthorization::AuthorityReceipt(
+            <AuthorityReceipt as CanonicalWire>::decode_body(decoder)?,
+        ),
+        1 => InvocationAuthorization::PublicPreflight(PublicPreflight {
+            work: Hash(decoder.fixed()?),
+            origin: decode_origin(decoder)?,
+            observed_slot: decoder.u64()?,
+        }),
+        _ => return Err(DecodeError::InvalidTag),
+    };
+    value
+        .validate_shape()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+pub(crate) fn invocation_authorization_commitment(value: &InvocationAuthorization) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"IAU1");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_invocation_authorization(&mut Encoder(&mut bytes), value);
+    Hash::digest(b"vos/agent/invocation-authorization-envelope/v1", &[&bytes])
+}
+
+impl CanonicalWire for InvocationAuthorization {
+    const MAGIC: [u8; 4] = *b"IAU1";
+    const MAX_ENCODED_BYTES: usize = MAX_INVOCATION_AUTHORIZATION_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_invocation_authorization(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_invocation_authorization(decoder)
+    }
 }
 
 fn encode_resume_input(encoder: &mut Encoder<'_>, value: &ResumeInput) {
@@ -2224,22 +2521,22 @@ fn runtime_work_valid(value: &RuntimeWork) -> bool {
         RuntimeWork::Invoke {
             state,
             invocation,
-            authority,
+            authorization,
             observed_slot,
         } => {
             state.validate()
                 && invocation.validate()
-                && authority_matches_invocation(authority, invocation, *observed_slot)
+                && authorization.matches_invoke(invocation, *observed_slot)
         }
         RuntimeWork::Resume { state, resume } => state.validate() && resume.validate(),
         RuntimeWork::Acknowledge {
             state,
             invocation,
-            authority,
+            authorization,
         } => {
             state.validate()
                 && invocation.validate()
-                && authority_matches_invocation(authority, invocation, 0)
+                && authorization.matches_acknowledgement(invocation)
         }
     }
 }
@@ -2277,13 +2574,13 @@ impl CanonicalWire for RuntimeWork {
             RuntimeWork::Invoke {
                 state,
                 invocation,
-                authority,
+                authorization,
                 observed_slot,
             } => {
                 encoder.u8(1);
                 encode_runtime_state(encoder, state);
                 encode_invocation_work(encoder, invocation);
-                <AuthorityReceipt as CanonicalWire>::encode_body(authority, encoder);
+                encode_invocation_authorization(encoder, authorization);
                 encoder.u64(*observed_slot);
             }
             RuntimeWork::Resume { state, resume } => {
@@ -2294,12 +2591,12 @@ impl CanonicalWire for RuntimeWork {
             RuntimeWork::Acknowledge {
                 state,
                 invocation,
-                authority,
+                authorization,
             } => {
                 encoder.u8(3);
                 encode_runtime_state(encoder, state);
                 encode_invocation_work(encoder, invocation);
-                <AuthorityReceipt as CanonicalWire>::encode_body(authority, encoder);
+                encode_invocation_authorization(encoder, authorization);
             }
         }
     }
@@ -2320,9 +2617,7 @@ impl CanonicalWire for RuntimeWork {
             1 => RuntimeWork::Invoke {
                 state: decode_runtime_state(decoder)?,
                 invocation: alloc::boxed::Box::new(decode_invocation_work(decoder)?),
-                authority: alloc::boxed::Box::new(
-                    <AuthorityReceipt as CanonicalWire>::decode_body(decoder)?,
-                ),
+                authorization: alloc::boxed::Box::new(decode_invocation_authorization(decoder)?),
                 observed_slot: decoder.u64()?,
             },
             2 => RuntimeWork::Resume {
@@ -2332,9 +2627,7 @@ impl CanonicalWire for RuntimeWork {
             3 => RuntimeWork::Acknowledge {
                 state: decode_runtime_state(decoder)?,
                 invocation: alloc::boxed::Box::new(decode_invocation_work(decoder)?),
-                authority: alloc::boxed::Box::new(
-                    <AuthorityReceipt as CanonicalWire>::decode_body(decoder)?,
-                ),
+                authorization: alloc::boxed::Box::new(decode_invocation_authorization(decoder)?),
             },
             _ => return Err(DecodeError::InvalidTag),
         };
@@ -2606,7 +2899,7 @@ fn encode_invocation_acknowledgement(encoder: &mut Encoder<'_>, value: &Invocati
     encoder.fixed(value.deployment.as_bytes());
     encoder.u8(value.mode as u8);
     encoder.fixed(value.work.as_bytes());
-    encoder.fixed(value.authority.as_bytes());
+    encoder.fixed(value.authorization.as_bytes());
 }
 
 fn decode_invocation_acknowledgement(
@@ -2619,7 +2912,7 @@ fn decode_invocation_acknowledgement(
         deployment: DeploymentId(decoder.fixed()?),
         mode: decode_method_mode(decoder)?,
         work: Hash(decoder.fixed()?),
-        authority: Hash(decoder.fixed()?),
+        authorization: Hash(decoder.fixed()?),
     };
     value
         .validate()
@@ -3493,6 +3786,28 @@ mod tests {
         }
     }
 
+    fn authority_admin_call() -> AuthorityAdminCall {
+        let credential_public_key = [0x61; CREDENTIAL_PUBLIC_KEY_BYTES];
+        AuthorityAdminCall {
+            invocation: InvocationId([0x62; 32]),
+            authority: authority_actor_target(),
+            administrator: PrincipalId([0x63; 32]),
+            credential: CredentialId::of_public_key(&credential_public_key),
+            credential_public_key,
+            authenticated_node: NodeId([0x64; 32]),
+            observed_slot: 65,
+            expected_generation: core::num::NonZeroU64::new(7).unwrap(),
+            operation: AuthorityAdminOperation::EnrollPrincipal {
+                principal: PrincipalId([0x66; 32]),
+                credential: AuthorityCredentialEnrollment::from_public_key(
+                    AuthorityCredentialKind::Api,
+                    [0x67; CREDENTIAL_PUBLIC_KEY_BYTES],
+                ),
+            },
+            signature: [0x68; CREDENTIAL_SIGNATURE_BYTES],
+        }
+    }
+
     #[test]
     fn authority_actor_protocol_has_bounded_distinct_golden_wires() {
         let call = authority_credential_call();
@@ -3503,8 +3818,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/acc1-golden", &[&call_bytes]).0,
             [
-                90, 250, 220, 139, 155, 107, 6, 220, 252, 38, 59, 251, 76, 158, 220, 80, 203, 246,
-                97, 246, 32, 123, 56, 7, 79, 98, 181, 126, 36, 145, 45, 152,
+                0, 129, 102, 136, 52, 35, 157, 157, 121, 2, 170, 164, 20, 232, 121, 95, 7, 234, 7,
+                98, 121, 234, 33, 120, 221, 0, 119, 45, 171, 76, 92, 231,
             ]
         );
 
@@ -3516,8 +3831,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/map1-golden", &[&approval_bytes]).0,
             [
-                42, 217, 27, 175, 118, 72, 31, 252, 62, 206, 196, 11, 253, 242, 233, 214, 190, 46,
-                46, 157, 120, 163, 203, 32, 128, 42, 28, 199, 120, 47, 217, 227,
+                234, 232, 236, 192, 5, 113, 255, 62, 13, 132, 77, 70, 87, 165, 209, 140, 126, 14,
+                152, 82, 191, 255, 134, 217, 184, 33, 38, 70, 129, 121, 219, 221,
             ]
         );
 
@@ -3532,10 +3847,71 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/maa1-golden", &[&acknowledgement_bytes]).0,
             [
-                42, 18, 158, 201, 157, 107, 247, 163, 84, 203, 82, 151, 184, 235, 99, 147, 117, 14,
-                170, 116, 121, 102, 187, 49, 19, 64, 206, 177, 56, 30, 179, 165,
+                90, 212, 112, 243, 166, 54, 207, 156, 236, 125, 192, 126, 249, 196, 81, 153, 124,
+                26, 168, 250, 9, 212, 47, 7, 125, 140, 69, 98, 195, 153, 171, 126,
             ]
         );
+    }
+
+    #[test]
+    fn authority_admin_call_and_result_are_exact_bounded_clean_wires() {
+        let call = authority_admin_call();
+        let bytes = call.encode().unwrap();
+        assert_eq!(bytes.get(..4), Some(b"AAD1".as_slice()));
+        assert!(bytes.len() <= MAX_AUTHORITY_ADMIN_CALL_WIRE_BYTES);
+        assert_eq!(AuthorityAdminCall::decode(&bytes), Ok(call.clone()));
+        assert_eq!(
+            Hash::digest(b"vos/test/aad1-golden", &[&bytes]).0,
+            [
+                63, 106, 248, 168, 149, 90, 112, 163, 135, 54, 49, 11, 201, 60, 42, 203, 112, 95,
+                32, 35, 120, 152, 222, 83, 178, 135, 209, 63, 117, 222, 18, 135,
+            ]
+        );
+
+        let result = AuthorityAdminResult::from_call(call.clone()).unwrap();
+        let result_bytes = result.encode().unwrap();
+        assert_eq!(result_bytes.get(..4), Some(b"AAR1".as_slice()));
+        assert!(result_bytes.len() <= MAX_AUTHORITY_ADMIN_RESULT_WIRE_BYTES);
+        assert_eq!(
+            AuthorityAdminResult::decode(&result_bytes),
+            Ok(result.clone())
+        );
+        assert_eq!(
+            Hash::digest(b"vos/test/aar1-golden", &[&result_bytes]).0,
+            [
+                91, 168, 155, 97, 17, 21, 56, 171, 95, 214, 2, 31, 23, 12, 240, 24, 10, 61, 50,
+                192, 173, 254, 28, 238, 132, 46, 82, 171, 7, 202, 193, 179,
+            ]
+        );
+        assert_ne!(call.commitment(), result.commitment());
+
+        let mut changed_node = call.clone();
+        changed_node.authenticated_node = NodeId([0x69; 32]);
+        assert_ne!(changed_node.signing_bytes(), call.signing_bytes());
+        let mut changed_generation = call.clone();
+        changed_generation.expected_generation = core::num::NonZeroU64::new(8).unwrap();
+        assert_ne!(changed_generation.signing_bytes(), call.signing_bytes());
+        let mut changed_kind = call.clone();
+        let AuthorityAdminOperation::EnrollPrincipal { credential, .. } =
+            &mut changed_kind.operation
+        else {
+            unreachable!()
+        };
+        credential.kind = AuthorityCredentialKind::Ssh;
+        assert_ne!(changed_kind.signing_bytes(), call.signing_bytes());
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(AuthorityAdminCall::decode(&trailing).is_err());
+        let mut prior_abi = bytes;
+        prior_abi[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
+        assert!(AuthorityAdminCall::decode(&prior_abi).is_err());
+        let mut unknown_operation = call.encode().unwrap();
+        // Header + invocation + full AuthorityActorTarget + caller tuple,
+        // observed slot, and expected generation precede the operation tag.
+        let operation_tag = 36 + 32 + 328 + 32 + 32 + 32 + 32 + 8 + 8;
+        unknown_operation[operation_tag] = 0xff;
+        assert!(AuthorityAdminCall::decode(&unknown_operation).is_err());
     }
 
     #[test]
@@ -3671,7 +4047,7 @@ mod tests {
         let call = authority_credential_call();
         let encoded = call.encode().unwrap();
         let mut old = encoded.clone();
-        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r7");
+        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
         assert_eq!(
             AuthorityCredentialCall::decode(&old),
             Err(WireError::Decode(DecodeError::InvalidPlatform))
@@ -3682,7 +4058,7 @@ mod tests {
             .expect("nested canonical management request");
         let mut old_nested_request = encoded.clone();
         old_nested_request[request_at + 4..request_at + HEADER_BYTES]
-            .copy_from_slice(b"vos-agent-runtime-abi-20260906r7");
+            .copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
         assert_eq!(
             AuthorityCredentialCall::decode(&old_nested_request),
             Err(WireError::Decode(DecodeError::InvalidPlatform))
@@ -3707,7 +4083,7 @@ mod tests {
         let approval = management_approval();
         let encoded = approval.encode().unwrap();
         let mut old = encoded.clone();
-        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r7");
+        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
         assert_eq!(
             ManagementApproval::decode(&old),
             Err(WireError::Decode(DecodeError::InvalidPlatform))
@@ -3735,7 +4111,7 @@ mod tests {
         let acknowledgement = management_application_ack();
         let encoded = acknowledgement.encode().unwrap();
         let mut old = encoded.clone();
-        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r7");
+        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
         assert_eq!(
             ManagementApplicationAck::decode(&old),
             Err(WireError::Decode(DecodeError::InvalidPlatform))
@@ -4011,8 +4387,8 @@ mod tests {
         assert_eq!(
             golden.0,
             [
-                7, 130, 211, 96, 229, 170, 74, 208, 253, 92, 151, 185, 47, 149, 229, 152, 248, 75,
-                111, 54, 242, 191, 231, 133, 6, 68, 70, 126, 35, 175, 103, 202,
+                17, 55, 61, 44, 229, 230, 47, 224, 126, 87, 208, 46, 179, 203, 228, 183, 174, 193,
+                32, 145, 31, 145, 211, 216, 232, 224, 41, 158, 67, 146, 65, 34,
             ]
         );
 
@@ -4041,7 +4417,7 @@ mod tests {
         let encoded = context.encode().unwrap();
 
         let mut previous_generation = encoded.clone();
-        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r7");
+        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
         assert_eq!(
             InvocationContext::decode(&previous_generation),
             Err(WireError::Decode(DecodeError::InvalidPlatform))
@@ -4145,7 +4521,9 @@ mod tests {
         let invocation = invocation();
         let work = RuntimeWork::Invoke {
             state: RuntimeState::default(),
-            authority: alloc::boxed::Box::new(receipt_for(&invocation)),
+            authorization: alloc::boxed::Box::new(InvocationAuthorization::AuthorityReceipt(
+                receipt_for(&invocation),
+            )),
             invocation: alloc::boxed::Box::new(invocation),
             observed_slot: 45,
         };
@@ -4162,7 +4540,7 @@ mod tests {
         );
 
         let RuntimeWork::Invoke {
-            mut authority,
+            mut authorization,
             state,
             invocation,
             observed_slot,
@@ -4170,24 +4548,103 @@ mod tests {
         else {
             unreachable!()
         };
+        let InvocationAuthorization::AuthorityReceipt(authority) = authorization.as_mut() else {
+            unreachable!()
+        };
         authority.selector.request = Hash([99; 32]);
         let mismatched = RuntimeWork::Invoke {
             state,
             invocation,
-            authority,
+            authorization,
             observed_slot,
         };
         assert_eq!(mismatched.encode(), Err(WireError::InvalidValue));
     }
 
     #[test]
-    fn acknowledgement_work_and_outcome_have_one_r8_canonical_wire() {
+    fn public_preflight_wire_binds_exact_work_origin_and_acceptance_slot() {
+        let mut invocation = invocation();
+        invocation.origin.capability = None;
+        invocation.roles = InvocationRoleClaims::none();
+        let authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&invocation, 45));
+        let work = RuntimeWork::Invoke {
+            state: RuntimeState::default(),
+            invocation: alloc::boxed::Box::new(invocation.clone()),
+            authorization: alloc::boxed::Box::new(authorization.clone()),
+            observed_slot: 45,
+        };
+        let encoded = work.encode().unwrap();
+        assert_eq!(RuntimeWork::decode(&encoded), Ok(work.clone()));
+        assert_eq!(
+            InvocationAuthorization::decode(&authorization.encode().unwrap()),
+            Ok(authorization.clone())
+        );
+
+        let mut different_slot = work.clone();
+        let RuntimeWork::Invoke { observed_slot, .. } = &mut different_slot else {
+            unreachable!()
+        };
+        *observed_slot += 1;
+        let encoded_retry = different_slot.encode().unwrap();
+        assert_eq!(RuntimeWork::decode(&encoded_retry), Ok(different_slot));
+        assert!(authorization.matches_invoke(&invocation, 46));
+        let InvocationAuthorization::PublicPreflight(preflight) = &authorization else {
+            unreachable!()
+        };
+        assert!(!preflight.matches(&invocation, 46));
+
+        let mut regressed_slot = work.clone();
+        let RuntimeWork::Invoke { observed_slot, .. } = &mut regressed_slot else {
+            unreachable!()
+        };
+        *observed_slot -= 1;
+        assert_eq!(regressed_slot.encode(), Err(WireError::InvalidValue));
+
+        let mut different_origin = work.clone();
+        let RuntimeWork::Invoke {
+            invocation: mutated_invocation,
+            ..
+        } = &mut different_origin
+        else {
+            unreachable!()
+        };
+        mutated_invocation.origin.transport_node = Some(NodeId([0x91; 32]));
+        assert_eq!(different_origin.encode(), Err(WireError::InvalidValue));
+
+        let mut claimed_role = invocation.clone();
+        claimed_role.roles.space = Some(RoleId([0x92; 32]));
+        let claimed = RuntimeWork::Invoke {
+            state: RuntimeState::default(),
+            authorization: alloc::boxed::Box::new(InvocationAuthorization::PublicPreflight(
+                PublicPreflight::for_work(&claimed_role, 45),
+            )),
+            invocation: alloc::boxed::Box::new(claimed_role),
+            observed_slot: 45,
+        };
+        assert_eq!(claimed.encode(), Err(WireError::InvalidValue));
+
+        let acknowledgement = RuntimeWork::Acknowledge {
+            state: RuntimeState::default(),
+            invocation: alloc::boxed::Box::new(invocation),
+            authorization: alloc::boxed::Box::new(authorization),
+        };
+        assert_eq!(
+            RuntimeWork::decode(&acknowledgement.encode().unwrap()),
+            Ok(acknowledgement)
+        );
+    }
+
+    #[test]
+    fn acknowledgement_work_and_outcome_have_one_r10_canonical_wire() {
         let invocation = invocation();
         let authority = receipt_for(&invocation);
         let work = RuntimeWork::Acknowledge {
             state: RuntimeState::default(),
             invocation: alloc::boxed::Box::new(invocation.clone()),
-            authority: alloc::boxed::Box::new(authority.clone()),
+            authorization: alloc::boxed::Box::new(InvocationAuthorization::AuthorityReceipt(
+                authority.clone(),
+            )),
         };
         let encoded = work.encode().unwrap();
         assert!(encoded.len() <= RuntimeWork::MAX_ENCODED_BYTES);
@@ -4195,7 +4652,7 @@ mod tests {
         assert_eq!(RuntimeWork::decode(&encoded), Ok(work.clone()));
 
         let mut previous_generation = encoded.clone();
-        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r7");
+        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
         assert_eq!(
             RuntimeWork::decode(&previous_generation),
             Err(WireError::Decode(DecodeError::InvalidPlatform))
@@ -4210,9 +4667,14 @@ mod tests {
 
         let mut mismatched = work;
         let RuntimeWork::Acknowledge {
-            authority: mismatched_authority,
+            authorization: mismatched_authorization,
             ..
         } = &mut mismatched
+        else {
+            unreachable!()
+        };
+        let InvocationAuthorization::AuthorityReceipt(mismatched_authority) =
+            mismatched_authorization.as_mut()
         else {
             unreachable!()
         };
@@ -4226,7 +4688,7 @@ mod tests {
             deployment: invocation.deployment,
             mode: invocation.mode,
             work: invocation.commitment(),
-            authority: authority.commitment(),
+            authorization: InvocationAuthorization::AuthorityReceipt(authority).commitment(),
         };
         let transition = RuntimeTransition {
             state: RuntimeState::default(),

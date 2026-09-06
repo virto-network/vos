@@ -138,7 +138,7 @@ impl fmt::Display for AgentNetworkError {
             Self::Timeout => formatter.write_str("clean Agent request timed out"),
             Self::Disconnected => formatter.write_str("clean Agent destination disconnected"),
             Self::UnsupportedProtocol => {
-                formatter.write_str("peer does not support /vos/agent/2.0.0")
+                formatter.write_str("peer does not support /vos/agent/3.0.0")
             }
             Self::Transport => formatter.write_str("clean Agent transport failure"),
         }
@@ -1328,8 +1328,9 @@ mod tests {
         AuthorityReceipt, AuthorityReceiptSelector,
     };
     use vos_agent_sdk::{
-        ActorId, AgentId, DeploymentId, InvocationId, InvocationOrigin, InvocationRoleClaims,
-        MethodMode, PrincipalId, ProducerId, ProgramId, RuntimeOutcome, SpaceId,
+        ActorId, AgentId, DeploymentId, InvocationAuthorization, InvocationId, InvocationOrigin,
+        InvocationRoleClaims, MethodMode, PrincipalId, ProducerId, ProgramId, PublicPreflight,
+        RuntimeOutcome, SpaceId,
     };
 
     use super::*;
@@ -1553,7 +1554,10 @@ mod tests {
             public_key,
             signature: [71; 64],
         };
-        InvocationRequest { work, authority }
+        InvocationRequest {
+            work,
+            authorization: InvocationAuthorization::AuthorityReceipt(authority),
+        }
     }
 
     fn invocation_pending(
@@ -1577,6 +1581,39 @@ mod tests {
             },
             receiver,
         )
+    }
+
+    #[test]
+    fn public_preflight_crosses_canonical_noise_authenticated_ingress() {
+        let peer = key(17).public().to_peer_id();
+        let route = test_route(18);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registration = registration(vec![node(peer)], calls.clone());
+        let routes = Arc::new(Mutex::new(BTreeMap::from([(
+            route,
+            Arc::clone(&registration),
+        )])));
+        let mut request = invocation_request(route, ActorId(id(19)), InvocationId(id(20)));
+        request.work.origin = InvocationOrigin {
+            principal: Some(PrincipalId(id(21))),
+            transport_node: Some(node(peer)),
+            credential: Some(vos_agent_sdk::CredentialId(id(22))),
+            actor: None,
+            capability: None,
+        };
+        request.work.roles = InvocationRoleClaims::none();
+        request.authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&request.work, 23));
+        let encoded = frame(peer, route, AgentMessage::InvokeRequest(request))
+            .encode()
+            .unwrap();
+        let decoded = AgentFrame::decode(&encoded).unwrap();
+        let (authenticated, admitted) = authorize_inbound(peer, decoded, &routes).unwrap();
+        assert!(matches!(
+            admitted.handler.handle(authenticated),
+            Ok(AgentMessage::Merge(MergeMessage::Heads(_)))
+        ));
+        assert_eq!(*calls.lock().unwrap(), vec![node(peer)]);
     }
 
     #[test]

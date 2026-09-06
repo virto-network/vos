@@ -288,11 +288,11 @@ pub(crate) struct StandardMachineContinuation {
     /// equal to `request` and have no accepted clean work metadata.
     pub work: Hash,
     pub ready_sequence: u64,
-    /// Clean work and authority accepted on the first slice. Immutable
+    /// Clean work and authorization accepted on the first slice. Immutable
     /// availability bytes are deliberately absent; only their sorted refs are
     /// retained and every resume must supply the exact preimages again.
     pub accepted: Option<StandardAcceptedInvocation>,
-    pub authority: Option<crate::agent_sdk::authority::AuthorityReceipt>,
+    pub authorization: Option<crate::agent_sdk::InvocationAuthorization>,
     pub observed_slot: u64,
     pub continuation: super::execution::ActorMachineContinuation,
 }
@@ -403,16 +403,16 @@ impl StandardAcceptedInvocation {
     }
 }
 
-/// Immutable clean authority accepted with one retained terminal `Done`.
+/// Immutable clean authorization accepted with one retained terminal `Done`.
 ///
 /// Availability payloads are represented by their canonical references so a
-/// result cannot retain caller-sized blob preimages. The signed receipt is
-/// retained in full: restore must be able to re-verify its signature and prove
-/// that `observed_slot` was inside the originally accepted window.
+/// result cannot retain caller-sized blob preimages. Signed receipts are
+/// retained in full for guest re-verification; unsigned PublicPreflight values
+/// retain their exact work/origin/acceptance-slot binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StandardCleanInvocationResult {
     pub accepted: StandardAcceptedInvocation,
-    pub authority: crate::agent_sdk::authority::AuthorityReceipt,
+    pub authorization: crate::agent_sdk::InvocationAuthorization,
     pub work: crate::agent_sdk::Hash,
     pub observed_slot: u64,
 }
@@ -420,12 +420,12 @@ pub(crate) struct StandardCleanInvocationResult {
 impl StandardCleanInvocationResult {
     fn from_work(
         work: &crate::agent_sdk::InvocationWork,
-        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: crate::agent_sdk::InvocationAuthorization,
         observed_slot: u64,
     ) -> Self {
         Self {
             accepted: StandardAcceptedInvocation::from_work(work),
-            authority,
+            authorization,
             work: work.commitment(),
             observed_slot,
         }
@@ -434,12 +434,12 @@ impl StandardCleanInvocationResult {
     fn matches(
         &self,
         work: &crate::agent_sdk::InvocationWork,
-        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
     ) -> bool {
         self.accepted == StandardAcceptedInvocation::from_work(work)
             && self.work == work.commitment()
-            && self.authority == *authority
-            && self.authority.commitment() == authority.commitment()
+            && self.authorization == *authorization
+            && self.authorization.commitment() == authorization.commitment()
     }
 }
 
@@ -449,8 +449,8 @@ impl StandardMachineContinuation {
     }
 
     pub(crate) fn validate_record(&self) -> bool {
-        let clean_pair = match (&self.accepted, &self.authority) {
-            (Some(accepted), Some(authority)) => {
+        let clean_pair = match (&self.accepted, &self.authorization) {
+            (Some(accepted), Some(authorization)) => {
                 accepted.validate()
                     && accepted.invocation.0 == self.invocation.0
                     && accepted.actor.0 == self.actor.0
@@ -458,13 +458,12 @@ impl StandardMachineContinuation {
                     && accepted.deployment.0 == self.deployment.0
                     && accepted.program.0 == self.program.0
                     && accepted.mode as u8 == self.mode as u8
-                    && authority.validate_shape().is_ok()
-                    && authority.selector.space == accepted.space
-                    && authority.selector.agent == accepted.agent
-                    && authority.selector.runtime_deployment == accepted.runtime_deployment
-                    && authority.selector.actor == Some(accepted.actor)
-                    && authority.selector.actor_deployment == Some(accepted.deployment)
-                    && authority.selector.request.0 == self.work.0
+                    && clean_authorization_matches_accepted(
+                        accepted,
+                        authorization,
+                        self.work,
+                        self.observed_slot,
+                    )
             }
             (None, None) => self.work == self.request,
             _ => false,
@@ -512,6 +511,64 @@ impl StandardMachineContinuation {
             required: accepted.required.clone(),
             reason: crate::agent_sdk::YieldReason::Cooperative,
         })
+    }
+}
+
+fn clean_authorization_matches_accepted(
+    accepted: &StandardAcceptedInvocation,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+    expected_work: Hash,
+    observed_slot: u64,
+) -> bool {
+    use crate::agent_sdk::InvocationAuthorization;
+    use crate::agent_sdk::authority::AuthorityOperationKind;
+
+    match authorization {
+        InvocationAuthorization::AuthorityReceipt(receipt) => {
+            receipt.validate_shape().is_ok()
+                && receipt.selector.operation == AuthorityOperationKind::InvokeActor
+                && receipt.selector.space == accepted.space
+                && receipt.selector.agent == accepted.agent
+                && receipt.selector.runtime_deployment == accepted.runtime_deployment
+                && receipt.selector.actor == Some(accepted.actor)
+                && receipt.selector.actor_deployment == Some(accepted.deployment)
+                && receipt.selector.request.0 == expected_work.0
+        }
+        InvocationAuthorization::PublicPreflight(preflight) => {
+            authorization.validate_shape()
+                && preflight.work.0 == expected_work.0
+                && preflight.origin == accepted.origin
+                && preflight.observed_slot == observed_slot
+                && accepted.roles == crate::agent_sdk::InvocationRoleClaims::none()
+                && accepted.origin.capability.is_none()
+        }
+    }
+}
+
+pub(crate) fn clean_authorization_is_live_at(
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+    observed_slot: u64,
+) -> bool {
+    match authorization {
+        crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt) => {
+            receipt.selector.is_live_at(observed_slot)
+        }
+        crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight) => {
+            preflight.observed_slot == observed_slot
+        }
+    }
+}
+
+pub(crate) fn clean_authorization_work(
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+) -> Hash {
+    match authorization {
+        crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt) => {
+            Hash(receipt.selector.request.0)
+        }
+        crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight) => {
+            Hash(preflight.work.0)
+        }
     }
 }
 
@@ -679,7 +736,6 @@ fn clean_blob_to_legacy(reference: &crate::agent_sdk::BlobRef) -> crate::service
     }
 }
 
-#[cfg(feature = "pvm")]
 fn clean_reference_matches_record(
     reference: &crate::agent_sdk::BlobRef,
     expected: &crate::service::BlobRef,
@@ -1311,7 +1367,7 @@ impl StandardAgentRuntime {
                 Some(binding) => {
                     binding.accepted.validate()
                         && binding.work != crate::agent_sdk::Hash::ZERO
-                        && binding.authority.commitment() != crate::agent_sdk::Hash::ZERO
+                        && binding.authorization.commitment() != crate::agent_sdk::Hash::ZERO
                         && binding.accepted.invocation.0 == result.invocation.0
                         && binding.accepted.actor.0 == result.reply.actor.0
                         && binding.accepted.incarnation.0 == result.incarnation.0
@@ -1321,13 +1377,17 @@ impl StandardAgentRuntime {
                             actor.record.entry.program.0 == binding.accepted.program.0
                         })
                         && runtime
-                            .verify_clean_accepted_authority(
+                            .verify_clean_accepted_authorization(
                                 &binding.accepted,
-                                &binding.authority,
+                                &binding.authorization,
                                 Hash(binding.work.0),
+                                binding.observed_slot,
                             )
                             .is_ok()
-                        && binding.authority.selector.is_live_at(binding.observed_slot)
+                        && clean_authorization_is_live_at(
+                            &binding.authorization,
+                            binding.observed_slot,
+                        )
                         && runtime
                             .result_authority_slot(result.storage)
                             .is_some_and(|slot| slot >= binding.observed_slot)
@@ -1356,16 +1416,24 @@ impl StandardAgentRuntime {
         }
         for continuation in state.machine_continuations {
             let actor = runtime.actors.get(&continuation.actor);
-            let clean_target_valid = match (&continuation.accepted, &continuation.authority) {
-                (Some(accepted), Some(authority)) => {
+            let clean_target_valid = match (&continuation.accepted, &continuation.authorization) {
+                (Some(accepted), Some(authorization)) => {
                     runtime
-                        .verify_clean_accepted_authority(accepted, authority, continuation.work)
+                        .verify_clean_accepted_authorization(
+                            accepted,
+                            authorization,
+                            continuation.work,
+                            continuation.observed_slot,
+                        )
                         .is_ok()
                         // The immutable acceptance slot is checked against
                         // the signed window once on every hostile-state
                         // restore. Current-time expiry is deliberately not
                         // reapplied when Resume later executes.
-                        && authority.selector.is_live_at(continuation.observed_slot)
+                        && clean_authorization_is_live_at(
+                            authorization,
+                            continuation.observed_slot,
+                        )
                         && runtime
                             .result_authority_slot(continuation.storage())
                             .is_some_and(|high_water| high_water >= continuation.observed_slot)
@@ -1865,20 +1933,20 @@ impl StandardAgentRuntime {
     }
 
     /// Recover only a result created through the clean SDK ABI. Both the
-    /// canonical work commitment and the complete signed-receipt commitment
+    /// canonical work commitment and complete typed-authorization commitment
     /// must match the immutable acceptance record; a legacy result with the
     /// same invocation key is deliberately divergent rather than adaptable.
     #[cfg(feature = "pvm")]
     pub(crate) fn recover_clean_execution(
         &mut self,
         work: &crate::agent_sdk::InvocationWork,
-        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
         observed_slot: u64,
     ) -> Result<Option<super::execution::ActorExecutionReply>, crate::agent_sdk::InvocationError>
     {
         use crate::agent_sdk::InvocationError;
 
-        self.verify_clean_invocation_authority(work, authority)?;
+        self.verify_clean_invocation_authorization(work, authorization, observed_slot)?;
         let scope = clean_method_mode(work.mode).invocation_scope();
         let key = (scope, InvocationId(work.invocation.0));
         let Some(result) = self.invocation_results.get(&key) else {
@@ -1888,8 +1956,9 @@ impl StandardAgentRuntime {
             .clean
             .as_ref()
             .ok_or(InvocationError::DivergentInvocation)?;
-        if !binding.matches(work, authority)
-            || !authority.selector.is_live_at(binding.observed_slot)
+        if !binding.matches(work, authorization)
+            || !clean_authorization_is_live_at(&binding.authorization, binding.observed_slot)
+            || observed_slot < binding.observed_slot
             || self
                 .result_authority_slot(result.storage)
                 .is_none_or(|slot| slot < binding.observed_slot)
@@ -1935,102 +2004,109 @@ impl StandardAgentRuntime {
             .map_err(|_| ActorExecutionError::InvalidAuthorization)
     }
 
-    pub(crate) fn verify_clean_invocation_authority(
+    pub(crate) fn verify_clean_invocation_authorization(
         &self,
         invocation: &crate::agent_sdk::InvocationWork,
-        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
     ) -> Result<(), crate::agent_sdk::InvocationError> {
         use crate::agent_sdk::InvocationError;
-        use crate::agent_sdk::authority::AuthorityOperationKind;
 
         let descriptor = self
             .clean_descriptor
             .as_ref()
             .ok_or(InvocationError::NotCreated)?;
-        let selector = &authority.selector;
         if !invocation.validate()
-            || authority.validate_shape().is_err()
-            || !descriptor.authority.accepts(authority)
-            || selector.operation != AuthorityOperationKind::InvokeActor
-            || selector.space != invocation.space
-            || selector.agent != invocation.agent
-            || selector.runtime_deployment != invocation.runtime_deployment
-            || selector.actor != Some(invocation.actor)
-            || selector.actor_deployment != Some(invocation.deployment)
-            || selector.request != invocation.commitment()
+            || !authorization.matches_invoke(invocation, observed_slot)
             || invocation.space != descriptor.identity.space
             || invocation.agent != descriptor.identity.agent
             || invocation.runtime_deployment != descriptor.identity.runtime_deployment
-            || !super::authority::verify_raw_ed25519(
-                &authority.public_key,
-                &authority.signing_bytes(),
-                &authority.signature,
-            )
         {
             return Err(InvocationError::InvalidAuthorization);
         }
-        Ok(())
+        match authorization {
+            crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt) => {
+                if !descriptor.authority.accepts(receipt)
+                    || !super::authority::verify_raw_ed25519(
+                        &receipt.public_key,
+                        &receipt.signing_bytes(),
+                        &receipt.signature,
+                    )
+                {
+                    return Err(InvocationError::InvalidAuthorization);
+                }
+                Ok(())
+            }
+            crate::agent_sdk::InvocationAuthorization::PublicPreflight(_) => Ok(()),
+        }
     }
 
-    /// Revalidate the immutable authorization proof embedded in a portable
-    /// continuation without applying its logical-slot window again. Restore
-    /// treats runtime state as hostile input, so accepting a merely
-    /// well-shaped receipt here would turn state corruption into an
-    /// authorization bypass on Resume.
-    fn verify_clean_accepted_authority(
+    /// Revalidate the immutable authorization embedded in portable state.
+    /// Signed receipts are verified again. PublicPreflight remains only a
+    /// structural, exact-input binding; the installed AMP2 selector is
+    /// resolved again before a retry, Resume, acknowledgement, or execution.
+    fn verify_clean_accepted_authorization(
         &self,
         accepted: &StandardAcceptedInvocation,
-        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
         expected_work: Hash,
+        observed_slot: u64,
     ) -> Result<(), crate::agent_sdk::InvocationError> {
         use crate::agent_sdk::InvocationError;
-        use crate::agent_sdk::authority::AuthorityOperationKind;
 
         let descriptor = self
             .clean_descriptor
             .as_ref()
             .ok_or(InvocationError::NotCreated)?;
-        let selector = &authority.selector;
         if !accepted.validate()
-            || authority.validate_shape().is_err()
-            || !descriptor.authority.accepts(authority)
-            || selector.operation != AuthorityOperationKind::InvokeActor
-            || selector.space != accepted.space
-            || selector.agent != accepted.agent
-            || selector.runtime_deployment != accepted.runtime_deployment
-            || selector.actor != Some(accepted.actor)
-            || selector.actor_deployment != Some(accepted.deployment)
-            || selector.request.0 != expected_work.0
+            || !clean_authorization_matches_accepted(
+                accepted,
+                authorization,
+                expected_work,
+                observed_slot,
+            )
             || accepted.space != descriptor.identity.space
             || accepted.agent != descriptor.identity.agent
             || accepted.runtime_deployment != descriptor.identity.runtime_deployment
-            || !super::authority::verify_raw_ed25519(
-                &authority.public_key,
-                &authority.signing_bytes(),
-                &authority.signature,
-            )
         {
             return Err(InvocationError::InvalidAuthorization);
         }
-        Ok(())
+        match authorization {
+            crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt) => {
+                if !descriptor.authority.accepts(receipt)
+                    || !super::authority::verify_raw_ed25519(
+                        &receipt.public_key,
+                        &receipt.signing_bytes(),
+                        &receipt.signature,
+                    )
+                {
+                    return Err(InvocationError::InvalidAuthorization);
+                }
+                Ok(())
+            }
+            crate::agent_sdk::InvocationAuthorization::PublicPreflight(_) => Ok(()),
+        }
     }
 
     #[cfg(feature = "pvm")]
     pub(crate) fn validate_clean_unseen_invocation_slot(
         &self,
-        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
         observed_slot: u64,
     ) -> Result<(), crate::agent_sdk::InvocationError> {
         use crate::agent_sdk::InvocationError;
 
-        if !authority.selector.is_live_at(observed_slot) {
+        if !clean_authorization_is_live_at(authorization, observed_slot) {
             return Err(InvocationError::AuthorityExpired);
         }
-        if self
-            .clean_authority_epoch_high_water
-            .is_some_and(|high_water| authority.selector.epoch < high_water)
+        if let crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt) = authorization
         {
-            return Err(InvocationError::InvalidAuthorization);
+            if self
+                .clean_authority_epoch_high_water
+                .is_some_and(|high_water| receipt.selector.epoch < high_water)
+            {
+                return Err(InvocationError::InvalidAuthorization);
+            }
         }
         if self
             .logical_slot_high_water()
@@ -2308,7 +2384,8 @@ impl StandardAgentRuntime {
     pub(crate) fn recover_clean_yield(
         &self,
         work: &crate::agent_sdk::InvocationWork,
-        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
     ) -> Result<Option<crate::agent_sdk::YieldedInvocation>, crate::agent_sdk::InvocationError>
     {
         use crate::agent_sdk::InvocationError;
@@ -2319,13 +2396,15 @@ impl StandardAgentRuntime {
         }) else {
             return Ok(None);
         };
+        let (invocation, ..) = self.resolve_clean_invocation(work)?;
         let expected = StandardAcceptedInvocation::from_work(work);
         if record.accepted.as_ref() != Some(&expected)
             || record.work.0 != work.commitment().0
-            || record
-                .authority
-                .as_ref()
-                .is_none_or(|accepted| accepted.commitment() != authority.commitment())
+            || record.request != invocation.commitment()
+            || observed_slot < record.observed_slot
+            || record.authorization.as_ref().is_none_or(|accepted| {
+                accepted != authorization || accepted.commitment() != authorization.commitment()
+            })
         {
             return Err(InvocationError::DivergentInvocation);
         }
@@ -2396,10 +2475,14 @@ impl StandardAgentRuntime {
             return Err(InvocationError::InvalidAvailability);
         }
         if work.commitment().0 != record.work.0
-            || record
-                .authority
-                .as_ref()
-                .is_none_or(|authority| authority.selector.request.0 != record.work.0)
+            || record.authorization.as_ref().is_none_or(|authorization| {
+                !clean_authorization_matches_accepted(
+                    accepted,
+                    authorization,
+                    record.work,
+                    record.observed_slot,
+                )
+            })
         {
             return Err(InvocationError::StaleContinuation);
         }
@@ -2449,7 +2532,7 @@ impl StandardAgentRuntime {
         continuation: super::execution::ActorMachineContinuation,
         accepted: Option<(
             StandardAcceptedInvocation,
-            crate::agent_sdk::authority::AuthorityReceipt,
+            crate::agent_sdk::InvocationAuthorization,
         )>,
     ) -> Result<(), super::execution::ActorExecutionError> {
         // Yield is one atomic runtime transition even when this method is
@@ -2481,7 +2564,7 @@ impl StandardAgentRuntime {
         continuation: super::execution::ActorMachineContinuation,
         accepted: Option<(
             StandardAcceptedInvocation,
-            crate::agent_sdk::authority::AuthorityReceipt,
+            crate::agent_sdk::InvocationAuthorization,
         )>,
     ) -> Result<(), super::execution::ActorExecutionError> {
         use super::execution::{ActorExecutionError, ActorExecutionStatus};
@@ -2559,11 +2642,11 @@ impl StandardAgentRuntime {
             .max(expected_sequence.unwrap_or(0))
             .checked_add(1)
             .ok_or(ActorExecutionError::ResultCapacity)?;
-        let (work, accepted, authority) = match accepted {
-            Some((accepted, authority)) => (
-                Hash(authority.selector.request.0),
+        let (work, accepted, authorization) = match accepted {
+            Some((accepted, authorization)) => (
+                clean_authorization_work(&authorization),
                 Some(accepted),
-                Some(authority),
+                Some(authorization),
             ),
             None => (invocation.commitment(), None, None),
         };
@@ -2578,7 +2661,7 @@ impl StandardAgentRuntime {
             work,
             ready_sequence,
             accepted,
-            authority,
+            authorization,
             observed_slot,
             continuation,
         };
@@ -2673,10 +2756,10 @@ impl StandardAgentRuntime {
     /// Resolve the exact AMP2 method policy and enforce it against the clean
     /// authenticated invocation envelope. The policy is closed over the exact
     /// AAS2 preimage before its selected method can authorize execution.
-    #[cfg(feature = "pvm")]
     pub(crate) fn authorize_clean_execution(
         &self,
         work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
         schema_blob: &crate::agent_sdk::RuntimeBlob,
         policy_blob: &crate::agent_sdk::RuntimeBlob,
     ) -> Result<bool, super::execution::ActorExecutionError> {
@@ -2715,24 +2798,37 @@ impl StandardAgentRuntime {
         if policy.mode != work.mode || policy.attestation != AttestationRequirement::None {
             return Err(ActorExecutionError::UnsupportedMethod);
         }
-        Ok(match policy.authorization_policy {
-            AuthorizationPolicySelector::Public => {
-                work.origin.capability.is_none()
+        Ok(match authorization {
+            crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight) => {
+                // PublicPreflight is deliberately unsigned. The exact
+                // installed AMP2 Public selector is the sole admission
+                // policy; the envelope itself authenticates no identity.
+                preflight.matches(work, preflight.observed_slot)
+                    && policy.authorization_policy == AuthorizationPolicySelector::Public
+                    && work.origin.capability.is_none()
                     && work.roles == crate::agent_sdk::InvocationRoleClaims::none()
             }
-            AuthorizationPolicySelector::Capability(required) => {
-                work.origin.capability == Some(required)
-                    && work.roles == crate::agent_sdk::InvocationRoleClaims::none()
-            }
-            AuthorizationPolicySelector::SpaceRole(required) => {
-                work.origin.capability.is_none()
-                    && work.roles.space == Some(required)
-                    && work.roles.actor.is_none()
-            }
-            AuthorizationPolicySelector::ActorRole(required) => {
-                work.origin.capability.is_none()
-                    && work.roles.actor == Some(required)
-                    && work.roles.space.is_none()
+            crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(_) => {
+                match policy.authorization_policy {
+                    AuthorizationPolicySelector::Public => {
+                        work.origin.capability.is_none()
+                            && work.roles == crate::agent_sdk::InvocationRoleClaims::none()
+                    }
+                    AuthorizationPolicySelector::Capability(required) => {
+                        work.origin.capability == Some(required)
+                            && work.roles == crate::agent_sdk::InvocationRoleClaims::none()
+                    }
+                    AuthorizationPolicySelector::SpaceRole(required) => {
+                        work.origin.capability.is_none()
+                            && work.roles.space == Some(required)
+                            && work.roles.actor.is_none()
+                    }
+                    AuthorizationPolicySelector::ActorRole(required) => {
+                        work.origin.capability.is_none()
+                            && work.roles.actor == Some(required)
+                            && work.roles.space.is_none()
+                    }
+                }
             }
         })
     }
@@ -2992,7 +3088,7 @@ impl StandardAgentRuntime {
     pub(crate) fn commit_clean_execution(
         &mut self,
         work: &crate::agent_sdk::InvocationWork,
-        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
         invocation: &super::execution::ActorInvocation,
         reply: &mut super::execution::ActorExecutionReply,
         before: &super::execution::ActorStateLanes,
@@ -3002,12 +3098,12 @@ impl StandardAgentRuntime {
     ) -> Result<(), super::execution::ActorExecutionError> {
         use super::execution::ActorExecutionError;
 
-        self.verify_clean_invocation_authority(work, authority)
+        self.verify_clean_invocation_authorization(work, authorization, observed_slot)
             .map_err(|error| match error {
                 crate::agent_sdk::InvocationError::NotCreated => ActorExecutionError::NotCreated,
                 _ => ActorExecutionError::InvalidAuthorization,
             })?;
-        if !authority.selector.is_live_at(observed_slot) {
+        if !clean_authorization_is_live_at(authorization, observed_slot) {
             return Err(ActorExecutionError::AuthorityExpired);
         }
         let accepted = StandardAcceptedInvocation::from_work(work);
@@ -3036,7 +3132,7 @@ impl StandardAgentRuntime {
         }
         result.clean = Some(StandardCleanInvocationResult::from_work(
             work,
-            authority.clone(),
+            authorization.clone(),
             observed_slot,
         ));
         *self = candidate;
@@ -3044,17 +3140,23 @@ impl StandardAgentRuntime {
     }
 
     /// Retire one exact clean terminal result after re-authenticating the
-    /// original work and receipt. No clock or state is touched until every
+    /// original work and typed authorization. No clock or state is touched until every
     /// comparison has succeeded.
     pub(crate) fn acknowledge_clean_invocation(
         &mut self,
         work: &crate::agent_sdk::InvocationWork,
-        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
     ) -> Result<crate::agent_sdk::InvocationAcknowledgement, crate::agent_sdk::InvocationError>
     {
         use crate::agent_sdk::{InvocationAcknowledgement, InvocationError};
 
-        self.verify_clean_invocation_authority(work, authority)?;
+        let authorization_slot = match authorization {
+            crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(_) => 0,
+            crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight) => {
+                preflight.observed_slot
+            }
+        };
+        self.verify_clean_invocation_authorization(work, authorization, authorization_slot)?;
         let scope = clean_method_mode(work.mode).invocation_scope();
         let key = (scope, InvocationId(work.invocation.0));
         let result = self
@@ -3065,8 +3167,9 @@ impl StandardAgentRuntime {
             .clean
             .as_ref()
             .ok_or(InvocationError::DivergentInvocation)?;
-        if !binding.matches(work, authority)
-            || !binding.authority.selector.is_live_at(binding.observed_slot)
+        self.verify_clean_invocation_authorization(work, authorization, binding.observed_slot)?;
+        if !binding.matches(work, authorization)
+            || !clean_authorization_is_live_at(&binding.authorization, binding.observed_slot)
             || self
                 .result_authority_slot(result.storage)
                 .is_none_or(|slot| slot < binding.observed_slot)
@@ -3091,7 +3194,7 @@ impl StandardAgentRuntime {
             deployment: work.deployment,
             mode: work.mode,
             work: binding.work,
-            authority: binding.authority.commitment(),
+            authorization: binding.authorization.commitment(),
         };
         self.invocation_results.remove(&key);
         Ok(acknowledgement)
@@ -4757,6 +4860,56 @@ mod tests {
 
     fn authority_key() -> SigningKey {
         SigningKey::from_bytes(&[0x42; 32])
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_authority_receipt(
+        config: &AgentConfig,
+        work: &crate::agent_sdk::InvocationWork,
+    ) -> crate::agent_sdk::authority::AuthorityReceipt {
+        use crate::agent_sdk::authority::{
+            AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots, AuthorityOperationKind,
+            AuthorityReceipt, AuthorityReceiptSelector,
+        };
+
+        let public_key = authority_key().verifying_key().to_bytes();
+        let binding = &config.authority;
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: crate::agent_sdk::Hash([0x31; 32]),
+                issuer: AuthorityIssuer {
+                    principal: crate::agent_sdk::PrincipalId(config.identity.owner.0),
+                    actor: crate::agent_sdk::ActorId(binding.actor.0),
+                    deployment: crate::agent_sdk::DeploymentId(binding.deployment.0),
+                    program: crate::agent_sdk::ProgramId(binding.program.0),
+                    producer: crate::agent_sdk::ProducerId::of_public_key(&public_key),
+                },
+                space: crate::agent_sdk::SpaceId(config.identity.space.0),
+                agent: crate::agent_sdk::AgentId(config.identity.agent.0),
+                operation: AuthorityOperationKind::InvokeActor,
+                runtime_deployment: crate::agent_sdk::DeploymentId(
+                    config.identity.runtime_deployment.0,
+                ),
+                actor: Some(work.actor),
+                actor_deployment: Some(work.deployment),
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: crate::agent_sdk::Hash([0x32; 32]),
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch: 1,
+                decision_sequence: 0,
+                acknowledged_through: 0,
+                valid_from: 1,
+                expires_at: 2,
+                request: work.commitment(),
+            },
+            public_key,
+            signature: [1; 64],
+        };
+        receipt.signature = authority_key().sign(&receipt.signing_bytes()).to_bytes();
+        receipt
     }
 
     fn config(max_actors: u32) -> AgentConfig {
@@ -8017,14 +8170,27 @@ mod tests {
             runtime.validate_clean_execution_installation_data(&work, None),
             Ok(())
         );
+        let public_authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, 1),
+        );
         assert_eq!(
-            runtime.authorize_clean_execution(&work, &schema_blob, &public_policy),
+            runtime.authorize_clean_execution(
+                &work,
+                &public_authorization,
+                &schema_blob,
+                &public_policy,
+            ),
             Ok(true)
         );
         work.origin.principal = Some(crate::agent_sdk::PrincipalId([0x60; 32]));
         work.roles.space = Some(CleanRoleId([0x61; 32]));
         assert_eq!(
-            runtime.authorize_clean_execution(&work, &schema_blob, &public_policy),
+            runtime.authorize_clean_execution(
+                &work,
+                &public_authorization,
+                &schema_blob,
+                &public_policy,
+            ),
             Ok(false),
             "AMP2 Public means no role or capability claim"
         );
@@ -8032,11 +8198,19 @@ mod tests {
         work.origin.principal = None;
         work.origin.capability = Some(crate::agent_sdk::CapabilityId([0x62; 32]));
         assert_eq!(
-            runtime.authorize_clean_execution(&work, &schema_blob, &public_policy),
+            runtime.authorize_clean_execution(
+                &work,
+                &public_authorization,
+                &schema_blob,
+                &public_policy,
+            ),
             Ok(false),
             "AMP2 Public cannot ignore a capability claim"
         );
         work.origin.capability = None;
+        let public_authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, 1),
+        );
 
         let mut tampered_schema = schema_blob.clone();
         *tampered_schema.bytes.last_mut().unwrap() ^= 1;
@@ -8055,7 +8229,12 @@ mod tests {
         runtime.actors.get_mut(&actor).unwrap().record.role_policies =
             clean_blob_to_legacy(&mismatched_policy.reference);
         assert_eq!(
-            runtime.authorize_clean_execution(&work, &schema_blob, &mismatched_policy),
+            runtime.authorize_clean_execution(
+                &work,
+                &public_authorization,
+                &schema_blob,
+                &mismatched_policy,
+            ),
             Err(super::super::execution::ActorExecutionError::InvalidAvailability),
             "AMP2 must close over the exact supplied AAS2 preimage"
         );
@@ -8067,14 +8246,33 @@ mod tests {
         );
         runtime.actors.get_mut(&actor).unwrap().record.role_policies =
             clean_blob_to_legacy(&capability_policy.reference);
-        work.origin.capability = Some(capability);
+        let public_authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, 1),
+        );
         assert_eq!(
-            runtime.authorize_clean_execution(&work, &schema_blob, &capability_policy),
+            runtime.authorize_clean_execution(
+                &work,
+                &public_authorization,
+                &schema_blob,
+                &capability_policy,
+            ),
+            Ok(false),
+            "an unsigned PublicPreflight cannot select a non-Public AMP2 method",
+        );
+        work.origin.capability = Some(capability);
+        let signed = crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+            clean_authority_receipt(&config, &work),
+        );
+        assert_eq!(
+            runtime.authorize_clean_execution(&work, &signed, &schema_blob, &capability_policy),
             Ok(true)
         );
         work.origin.capability = Some(crate::agent_sdk::CapabilityId([0x64; 32]));
+        let signed = crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+            clean_authority_receipt(&config, &work),
+        );
         assert_eq!(
-            runtime.authorize_clean_execution(&work, &schema_blob, &capability_policy),
+            runtime.authorize_clean_execution(&work, &signed, &schema_blob, &capability_policy),
             Ok(false)
         );
 
@@ -8088,13 +8286,19 @@ mod tests {
         runtime.actors.get_mut(&actor).unwrap().record.role_policies =
             clean_blob_to_legacy(&space_policy.reference);
         work.roles.space = Some(space_role);
+        let signed = crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+            clean_authority_receipt(&config, &work),
+        );
         assert_eq!(
-            runtime.authorize_clean_execution(&work, &schema_blob, &space_policy),
+            runtime.authorize_clean_execution(&work, &signed, &schema_blob, &space_policy),
             Ok(true)
         );
         work.roles.space = Some(CleanRoleId([0x67; 32]));
+        let signed = crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+            clean_authority_receipt(&config, &work),
+        );
         assert_eq!(
-            runtime.authorize_clean_execution(&work, &schema_blob, &space_policy),
+            runtime.authorize_clean_execution(&work, &signed, &schema_blob, &space_policy),
             Ok(false)
         );
 
@@ -8107,14 +8311,20 @@ mod tests {
             clean_blob_to_legacy(&actor_policy.reference);
         work.roles.space = None;
         work.roles.actor = Some(actor_role);
+        let signed = crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+            clean_authority_receipt(&config, &work),
+        );
         assert_eq!(
-            runtime.authorize_clean_execution(&work, &schema_blob, &actor_policy),
+            runtime.authorize_clean_execution(&work, &signed, &schema_blob, &actor_policy),
             Ok(true)
         );
         work.roles.actor = None;
         work.roles.space = Some(actor_role);
+        let signed = crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+            clean_authority_receipt(&config, &work),
+        );
         assert_eq!(
-            runtime.authorize_clean_execution(&work, &schema_blob, &actor_policy),
+            runtime.authorize_clean_execution(&work, &signed, &schema_blob, &actor_policy),
             Ok(false),
             "equal role bytes in a different scope must not authorize"
         );
@@ -8555,7 +8765,7 @@ mod tests {
                 work: request,
                 ready_sequence: 1,
                 accepted: None,
-                authority: None,
+                authorization: None,
                 observed_slot: 1,
                 continuation: super::super::execution::ActorMachineContinuation {
                     machine: super::super::execution::PortableMachineSnapshot {

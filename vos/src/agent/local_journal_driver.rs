@@ -710,14 +710,15 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             .ok_or(LocalReplayExecutorError::TrustUnavailable)
     }
 
-    /// Verify clean invocation authority and availability against the exact
+    /// Verify clean invocation authorization and availability against the exact
     /// currently materialized Standard runtime without minting replay's
     /// one-shot execution capability. Shared consensus uses this before a
     /// command can enter Raft; replay repeats the same checks at application.
     pub(crate) fn verify_clean_invocation_input(
         &self,
         work: &crate::agent_sdk::InvocationWork,
-        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
         state: &RuntimeState,
         binding: &RuntimeBinding,
     ) -> Result<(), LocalReplayExecutorError> {
@@ -731,7 +732,9 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         let runtime = StandardAgentRuntime::restore(decoded)
             .map_err(|_| LocalReplayExecutorError::InvalidState)?;
         runtime
-            .verify_clean_invocation_authority(work, authority)
+            .verify_clean_invocation_authorization(work, authorization, observed_slot)
+            .map_err(|_| LocalReplayExecutorError::InvalidAuthority)?;
+        super::wire::admit_clean_public_preflight(&runtime, work, authorization)
             .map_err(|_| LocalReplayExecutorError::InvalidAuthority)?;
         match runtime.resolve_clean_invocation(work) {
             Err(
@@ -1606,11 +1609,18 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                     .map_err(|_| LocalReplayExecutorError::InvalidAuthority)
             }
             ReplayOperation::CleanInvoke {
-                work, authority, ..
-            } => StandardAgentRuntime::restore(decoded.clone())
-                .map_err(|_| LocalReplayExecutorError::InvalidState)?
-                .verify_clean_invocation_authority(work, authority)
-                .map_err(|_| LocalReplayExecutorError::InvalidAuthority),
+                work,
+                authorization,
+                observed_slot,
+            } => {
+                let runtime = StandardAgentRuntime::restore(decoded.clone())
+                    .map_err(|_| LocalReplayExecutorError::InvalidState)?;
+                runtime
+                    .verify_clean_invocation_authorization(work, authorization, *observed_slot)
+                    .map_err(|_| LocalReplayExecutorError::InvalidAuthority)?;
+                super::wire::admit_clean_public_preflight(&runtime, work, authorization)
+                    .map_err(|_| LocalReplayExecutorError::InvalidAuthority)
+            }
             ReplayOperation::SealMerge => Ok(()),
         }?;
         self.authenticated_execution = Some(AuthenticatedLocalExecution {
@@ -1788,7 +1798,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
             }
             ReplayOperation::CleanInvoke {
                 work,
-                authority,
+                authorization,
                 observed_slot,
             } => {
                 let sdk_work = crate::agent_sdk::RuntimeWork::Invoke {
@@ -1799,7 +1809,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                         local: before.local.clone(),
                     },
                     invocation: Box::new(work.clone()),
-                    authority: Box::new(authority.clone()),
+                    authorization: Box::new(authorization.clone()),
                     observed_slot: *observed_slot,
                 };
                 let encoded = sdk_work

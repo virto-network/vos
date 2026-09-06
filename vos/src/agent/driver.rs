@@ -624,7 +624,7 @@ fn expected_standard_sdk_acknowledgement_transition(
     let crate::agent_sdk::RuntimeWork::Acknowledge {
         state,
         invocation,
-        authority,
+        authorization,
     } = work
     else {
         return Err(AgentDriverError::InvalidRuntime);
@@ -633,7 +633,8 @@ fn expected_standard_sdk_acknowledgement_transition(
         .map_err(|_| AgentDriverError::InvalidRuntime)?;
     let mut runtime = super::standard::StandardAgentRuntime::restore(decoded)
         .map_err(|_| AgentDriverError::InvalidRuntime)?;
-    let result = runtime.acknowledge_clean_invocation(invocation, authority);
+    let result = super::wire::admit_clean_public_preflight(&runtime, invocation, authorization)
+        .and_then(|()| runtime.acknowledge_clean_invocation(invocation, authorization));
     Ok(crate::agent_sdk::RuntimeTransition {
         state: if result.is_ok() {
             legacy_state_as_sdk(&super::wire::encode_standard_runtime_state(
@@ -677,8 +678,9 @@ fn valid_stored_policy(bytes: &[u8]) -> bool {
 }
 
 /// Driver-owned source of logical time and signed-package trust. Lifecycle
-/// and invocation authority is carried as canonical signed receipts and
-/// verified again by the runtime guest.
+/// authority remains a canonical signed receipt. Invocation authorization is
+/// either that guest-verified receipt or an unsigned PublicPreflight which the
+/// guest admits only after resolving the exact installed Public policy.
 pub trait AgentTrustProvider: Send + Sync {
     fn current_logical_slot(&self) -> Option<u64>;
 
@@ -3306,7 +3308,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
     pub fn invoke_sdk(
         &mut self,
         invocation: crate::agent_sdk::InvocationWork,
-        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, AgentDriverError> {
         if !invocation.validate() {
             return Err(AgentDriverError::InvalidRuntime);
@@ -3326,7 +3328,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             crate::agent_sdk::RuntimeWork::Invoke {
                 state: legacy_state_as_sdk(&self.image.runtime_state),
                 invocation: Box::new(invocation),
-                authority: Box::new(authority),
+                authorization: Box::new(authorization),
                 observed_slot,
             },
             gas,
@@ -3360,12 +3362,12 @@ impl<S: AgentImageStore> AgentDriver<S> {
     }
 
     /// Retire one delivered clean terminal result. The original canonical
-    /// work and exact signed authority receipt are replayed to the guest; no
+    /// work and exact typed authorization are replayed to the guest; no
     /// host-derived legacy receipt or invocation shorthand is accepted.
     pub fn acknowledge_sdk(
         &mut self,
         invocation: crate::agent_sdk::InvocationWork,
-        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, AgentDriverError> {
         if !invocation.validate() {
             return Err(AgentDriverError::InvalidRuntime);
@@ -3377,7 +3379,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let work = crate::agent_sdk::RuntimeWork::Acknowledge {
             state: legacy_state_as_sdk(&self.image.runtime_state),
             invocation: Box::new(invocation),
-            authority: Box::new(authority),
+            authorization: Box::new(authorization),
         };
         let encoded = work
             .encode()
@@ -5308,7 +5310,9 @@ mod tests {
                 local: prior.local.clone(),
             },
             invocation: Box::new(clean),
-            authority: Box::new(authority),
+            authorization: Box::new(crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+                authority,
+            )),
             observed_slot,
         }
     }
@@ -5321,7 +5325,7 @@ mod tests {
         let (prior, _, invocation) = standard_exact_transition_fixture(observed_slot);
         let RuntimeWork::Invoke {
             invocation,
-            authority,
+            authorization,
             ..
         } = sdk_exact_invoke_work(&prior, &invocation, observed_slot)
         else {
@@ -5330,7 +5334,7 @@ mod tests {
         let work = RuntimeWork::Acknowledge {
             state: legacy_state_as_sdk(&prior),
             invocation,
-            authority,
+            authorization,
         };
         let expected = expected_standard_sdk_acknowledgement_transition(&work).unwrap();
         assert_eq!(

@@ -13649,7 +13649,9 @@ mod tests {
                 runtime,
                 operation: ReplayOperation::CleanInvoke {
                     work,
-                    authority,
+                    authorization: crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+                        authority,
+                    ),
                     observed_slot: 12,
                 },
             },

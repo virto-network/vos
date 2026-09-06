@@ -16,29 +16,28 @@ use async_trait::async_trait;
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response::Codec;
 use libp2p::{PeerId, StreamProtocol};
-use vos_agent_sdk::authority::{AuthorityOperationKind, AuthorityReceipt};
 use vos_agent_sdk::wire::{
-    CanonicalWire, MAX_AUTHORITY_RECEIPT_WIRE_BYTES, MAX_RUNTIME_TRANSITION_WIRE_BYTES,
+    CanonicalWire, MAX_INVOCATION_AUTHORIZATION_WIRE_BYTES, MAX_RUNTIME_TRANSITION_WIRE_BYTES,
     MAX_RUNTIME_WORK_WIRE_BYTES, WireError,
 };
 use vos_agent_sdk::{
-    ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, Hash, InvocationId,
-    InvocationOrigin, InvocationRoleClaims, InvocationWork, MAX_RUNTIME_AVAILABILITY_BYTES,
-    MAX_RUNTIME_AVAILABILITY_ITEMS, MethodMode, NodeId, PrincipalId, ProgramId, RoleId,
-    RuntimeBlob, RuntimeOutcome, RuntimeState, RuntimeTransition, SpaceId,
+    ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, Hash,
+    InvocationAuthorization, InvocationId, InvocationOrigin, InvocationRoleClaims, InvocationWork,
+    MAX_RUNTIME_AVAILABILITY_BYTES, MAX_RUNTIME_AVAILABILITY_ITEMS, MethodMode, NodeId,
+    PrincipalId, ProgramId, RoleId, RuntimeBlob, RuntimeOutcome, RuntimeState, RuntimeTransition,
+    SpaceId,
 };
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
 /// The clean Agent protocol is a separate negotiation generation.  It is not
 /// a version alias or fallback for `/vos/0.1.0`.
-pub(crate) const PROTOCOL: StreamProtocol = StreamProtocol::new("/vos/agent/2.0.0");
+pub(crate) const PROTOCOL: StreamProtocol = StreamProtocol::new("/vos/agent/3.0.0");
 
-// Invocation replies became lossless canonical `RuntimeOutcome` values before
-// the live host attachment was enabled.  Keep that incompatible schema
-// visibly distinct from the earlier projected status/payload prototype and
-// negotiate a distinct `/vos/agent/2.0.0` stream protocol generation.
-const MAGIC: [u8; 4] = *b"VAN2";
-const VERSION: u16 = 2;
+// Invocation authorization became an explicit signed-receipt/PublicPreflight
+// sum. Keep that incompatible request schema visibly distinct from the prior
+// signed-only transport generation; there is no compatibility decoder.
+const MAGIC: [u8; 4] = *b"VAN3";
+const VERSION: u16 = 3;
 
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Enough for one complete clean Ordered command, including its maximum-size
@@ -172,15 +171,15 @@ fn option_nonzero<T: Copy + PartialEq>(value: Option<T>, zero: T) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InvocationRequest {
-    /// Complete canonical SDK work selected by the authority receipt.  The
+    /// Complete canonical SDK work selected by the authorization.  The
     /// work contains every Principal, Credential, transport Node, Actor, and
     /// invocation identity delivered to the runtime; none is hidden in an
     /// opaque payload.
     pub(crate) work: InvocationWork,
-    /// Typed, canonically decoded authority evidence.  This is intentionally
-    /// not an opaque subframe: decoding produces an [`AuthorityReceipt`] and
-    /// the outer route and actor are checked against its selector.
-    pub(crate) authority: AuthorityReceipt,
+    /// Typed, canonically decoded authorization. This is intentionally not an
+    /// opaque subframe: both signed authority receipts and unsigned structural
+    /// Public preflights are bound to the complete work before routing.
+    pub(crate) authorization: InvocationAuthorization,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,10 +200,10 @@ pub(crate) struct InvocationRedirect {
 
 pub(crate) fn invocation_request_correlation(request: &InvocationRequest) -> Hash {
     let work = request.work.commitment();
-    let authority = request.authority.commitment();
+    let authorization = request.authorization.commitment();
     Hash::digest(
-        b"vos/agent/network/invocation-correlation/v1",
-        &[work.as_bytes(), authority.as_bytes()],
+        b"vos/agent/network/invocation-correlation/v2",
+        &[work.as_bytes(), authorization.as_bytes()],
     )
 }
 
@@ -528,16 +527,19 @@ fn message_is_valid(message: &AgentMessage, route: AgentGenerationRoute, sender:
     match message {
         AgentMessage::InvokeRequest(request) => {
             request.work.validate()
-                && request.authority.validate_shape().is_ok()
-                && request.authority.selector.operation == AuthorityOperationKind::InvokeActor
                 && request.work.space == route.space
                 && request.work.agent == route.agent
-                && request.authority.selector.space == request.work.space
-                && request.authority.selector.agent == request.work.agent
-                && request.authority.selector.runtime_deployment == request.work.runtime_deployment
-                && request.authority.selector.actor == Some(request.work.actor)
-                && request.authority.selector.actor_deployment == Some(request.work.deployment)
-                && request.authority.selector.request == request.work.commitment()
+                && request.authorization.validate_shape()
+                && request.authorization.matches_work(&request.work)
+                // The encoded sender becomes trustworthy only after the
+                // surrounding frame is matched to the complete Noise PeerId.
+                // Once authenticated, an explicitly asserted transport origin
+                // must be that exact node; anonymous/actor origins may omit it.
+                && request
+                    .work
+                    .origin
+                    .transport_node
+                    .is_none_or(|node| node == sender)
         }
         AgentMessage::InvokeReply(reply) => {
             reply.request != Hash::ZERO
@@ -690,8 +692,8 @@ fn encode_message(
         AgentMessage::InvokeRequest(request) => {
             encoder.u8(TAG_INVOKE_REQUEST);
             encode_invocation_work(encoder, &request.work);
-            let authority = request.authority.encode()?;
-            encoder.bytes(&authority);
+            let authorization = request.authorization.encode()?;
+            encoder.bytes(&authorization);
         }
         AgentMessage::InvokeReply(reply) => {
             encoder.u8(TAG_INVOKE_REPLY);
@@ -937,11 +939,12 @@ fn decode_message(decoder: &mut Decoder<'_>) -> Result<AgentMessage, AgentProtoc
     match tag {
         TAG_INVOKE_REQUEST => {
             let work = decode_invocation_work(decoder)?;
-            let authority_wire = decoder.bytes_ref_bounded(MAX_AUTHORITY_RECEIPT_WIRE_BYTES)?;
-            let authority = AuthorityReceipt::decode(authority_wire)?;
+            let authorization_wire =
+                decoder.bytes_ref_bounded(MAX_INVOCATION_AUTHORIZATION_WIRE_BYTES)?;
+            let authorization = InvocationAuthorization::decode(authorization_wire)?;
             Ok(AgentMessage::InvokeRequest(InvocationRequest {
                 work,
-                authority,
+                authorization,
             }))
         }
         TAG_INVOKE_REPLY => {
@@ -1348,9 +1351,10 @@ mod tests {
     use libp2p::futures::io::Cursor;
     use libp2p::identity::Keypair;
     use vos_agent_sdk::authority::{
-        AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots, AuthorityReceiptSelector,
+        AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots, AuthorityOperationKind,
+        AuthorityReceipt, AuthorityReceiptSelector,
     };
-    use vos_agent_sdk::{DeploymentId, ProducerId, ProgramId};
+    use vos_agent_sdk::{DeploymentId, ProducerId, ProgramId, PublicPreflight};
 
     use super::*;
 
@@ -1429,7 +1433,7 @@ mod tests {
             mode: MethodMode::Merge,
             origin: InvocationOrigin {
                 principal: Some(PrincipalId(id::<7>())),
-                transport_node: Some(NodeId(id::<9>())),
+                transport_node: Some(node(peer)),
                 credential: Some(CredentialId(id::<8>())),
                 actor: Some(ActorId(id::<10>())),
                 capability: None,
@@ -1447,12 +1451,27 @@ mod tests {
             gas: 1_000,
             recovery_only: false,
         };
-        let authority = receipt(&work);
+        let authorization = InvocationAuthorization::AuthorityReceipt(receipt(&work));
         AgentFrame {
             route,
             sender: node(peer),
-            message: AgentMessage::InvokeRequest(InvocationRequest { work, authority }),
+            message: AgentMessage::InvokeRequest(InvocationRequest {
+                work,
+                authorization,
+            }),
         }
+    }
+
+    fn public_invoke_frame(peer: &PeerId, observed_slot: u64) -> AgentFrame {
+        let mut frame = invoke_frame(peer);
+        let AgentMessage::InvokeRequest(request) = &mut frame.message else {
+            unreachable!()
+        };
+        request.work.roles = InvocationRoleClaims::none();
+        request.authorization = InvocationAuthorization::PublicPreflight(
+            PublicPreflight::for_work(&request.work, observed_slot),
+        );
+        frame
     }
 
     fn round_trip(frame: AgentFrame) {
@@ -1463,7 +1482,7 @@ mod tests {
 
     #[test]
     fn protocol_generation_is_distinct() {
-        assert_eq!(PROTOCOL.as_ref(), "/vos/agent/2.0.0");
+        assert_eq!(PROTOCOL.as_ref(), "/vos/agent/3.0.0");
         assert_ne!(PROTOCOL.as_ref(), "/vos/0.1.0");
     }
 
@@ -1682,7 +1701,7 @@ mod tests {
                 deployment: request.work.deployment,
                 mode: request.work.mode,
                 work: request.work.commitment(),
-                authority: request.authority.commitment(),
+                authorization: request.authorization.commitment(),
             })),
         ];
         for outcome in outcomes {
@@ -2150,7 +2169,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_invocation_work_and_receipt_binding_is_required() {
+    fn exact_invocation_work_authorization_and_transport_binding_is_required() {
         let sender_peer = peer(10);
         let mut missing_principal = invoke_frame(&sender_peer);
         let AgentMessage::InvokeRequest(request) = &mut missing_principal.message else {
@@ -2166,7 +2185,11 @@ mod tests {
         let AgentMessage::InvokeRequest(request) = &mut wrong_route.message else {
             unreachable!();
         };
-        request.authority.selector.agent = AgentId(id::<99>());
+        let InvocationAuthorization::AuthorityReceipt(authority) = &mut request.authorization
+        else {
+            unreachable!()
+        };
+        authority.selector.agent = AgentId(id::<99>());
         assert_eq!(wrong_route.encode(), Err(AgentProtocolError::InvalidValue));
 
         let mut changed_message = invoke_frame(&sender_peer);
@@ -2198,5 +2221,19 @@ mod tests {
             changed_deployment.encode(),
             Err(AgentProtocolError::InvalidValue)
         );
+
+        let mut relayed_public = public_invoke_frame(&sender_peer, 7);
+        let AgentMessage::InvokeRequest(request) = &mut relayed_public.message else {
+            unreachable!()
+        };
+        request.work.origin.transport_node = Some(NodeId(id::<79>()));
+        request.authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&request.work, 7));
+        assert_eq!(
+            relayed_public.encode(),
+            Err(AgentProtocolError::InvalidValue)
+        );
+
+        round_trip(public_invoke_frame(&sender_peer, 7));
     }
 }

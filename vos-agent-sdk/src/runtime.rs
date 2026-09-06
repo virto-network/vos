@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::authority::AuthorityReceipt;
+use crate::authority::{AuthorityOperationKind, AuthorityReceipt};
 use crate::contract::RuntimePackageContract;
 use crate::{
     ActorDirectoryPage, ActorEntry, ActorId, ActorLifecycleDebt, AgentDescriptor, AgentIdentity,
@@ -123,7 +123,10 @@ fn required_refs_valid(values: &[BlobRef], installation_data: Option<&BlobRef>) 
             .is_some_and(|total| total <= MAX_RUNTIME_AVAILABILITY_BYTES as u64)
 }
 
-/// Explicit authenticated caller identities. Principals, transport nodes, and
+/// Explicit caller identity fields. Their authentication comes from the
+/// selected authorization path: a normal authority receipt covers them via
+/// the work commitment, while a self-authenticating Public actor verifies the
+/// corresponding signed message itself. Principals, transport nodes, and
 /// credentials are non-interchangeable; actor provenance is independent of
 /// all three.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -193,13 +196,16 @@ impl InvocationRoleClaims {
     }
 }
 
-/// Authenticated invocation context delivered unchanged across the standard
-/// runtime's private inner-actor ABI.
+/// Exact invocation context delivered unchanged across the standard runtime's
+/// private inner-actor ABI.
 ///
-/// These fields become trusted only after the runtime verifies the enclosing
-/// authority receipt against the exact [`InvocationWork`] commitment. The
-/// logical slot is the monotonic observation at which unseen work was
-/// accepted, not an actor message field.
+/// On the normal path these fields become trusted only after the runtime
+/// verifies the enclosing authority receipt against the exact
+/// [`InvocationWork`] commitment. A [`PublicPreflight`] authenticates no
+/// identity; a self-authenticating Public actor must verify any identity it
+/// consumes from this context against its signed message. The logical slot is
+/// the monotonic observation at which unseen work was accepted, not an actor
+/// message field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InvocationContext {
     pub invocation: InvocationId,
@@ -275,6 +281,115 @@ impl InvocationWork {
     /// Commitment matched by an Invoke authority selector.
     pub fn commitment(&self) -> Hash {
         crate::wire::invocation_work_commitment(self)
+    }
+}
+
+/// Unsigned structural admission for one invocation of an installed AMP2
+/// `Public` method. This value authenticates no caller identity: the runtime
+/// must resolve the exact installed policy and accept this variant only when
+/// that method selects [`crate::method_policy::AuthorizationPolicySelector::Public`].
+/// Repeating the work commitment, origin, and observation slot makes any
+/// substitution across retry, continuation, or acknowledgement boundaries
+/// structurally divergent; it does not turn an untrusted host into an identity
+/// authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicPreflight {
+    pub work: Hash,
+    pub origin: InvocationOrigin,
+    pub observed_slot: u64,
+}
+
+impl PublicPreflight {
+    pub fn for_work(work: &InvocationWork, observed_slot: u64) -> Self {
+        Self {
+            work: work.commitment(),
+            origin: work.origin,
+            observed_slot,
+        }
+    }
+
+    /// Match the immutable application work independently of the host's
+    /// current logical observation. An exact retry may be observed after the
+    /// original acceptance slot, but the preflight itself never changes.
+    pub fn matches_work(&self, work: &InvocationWork) -> bool {
+        self.work != Hash::ZERO
+            && self.origin.validate()
+            && self.work == work.commitment()
+            && self.origin == work.origin
+            && work.roles == InvocationRoleClaims::none()
+            && work.origin.capability.is_none()
+    }
+
+    /// Match an unseen acceptance at one exact trusted logical slot.
+    pub fn matches(&self, work: &InvocationWork, observed_slot: u64) -> bool {
+        self.matches_work(work) && self.observed_slot == observed_slot
+    }
+}
+
+/// Exact authorization accepted with one portable actor invocation. A normal
+/// authority receipt remains guest-signature-verified. [`PublicPreflight`] is
+/// deliberately unsigned and is useful only after the runtime resolves the
+/// installed AMP2 method selector as Public.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvocationAuthorization {
+    AuthorityReceipt(AuthorityReceipt),
+    PublicPreflight(PublicPreflight),
+}
+
+impl InvocationAuthorization {
+    pub fn validate_shape(&self) -> bool {
+        match self {
+            Self::AuthorityReceipt(receipt) => receipt.validate_shape().is_ok(),
+            Self::PublicPreflight(preflight) => {
+                preflight.work != Hash::ZERO
+                    && preflight.origin.validate()
+                    && preflight.origin.capability.is_none()
+            }
+        }
+    }
+
+    pub fn matches_invoke(&self, work: &InvocationWork, observed_slot: u64) -> bool {
+        if !self.matches_work(work) {
+            return false;
+        }
+        match self {
+            Self::AuthorityReceipt(_) => true,
+            // `observed_slot` is the host's current trusted observation. It
+            // equals the immutable preflight slot for unseen work, while an
+            // exact durable retry may occur later. The runtime distinguishes
+            // those cases from its retained result/continuation before it can
+            // execute application code.
+            Self::PublicPreflight(preflight) => {
+                preflight.matches_work(work) && observed_slot >= preflight.observed_slot
+            }
+        }
+    }
+
+    /// Match all immutable invocation fields without making a claim about the
+    /// host's current logical observation. Transport and durable replay use
+    /// this before the live runtime resolves the installed method policy.
+    pub fn matches_work(&self, work: &InvocationWork) -> bool {
+        match self {
+            Self::AuthorityReceipt(receipt) => {
+                receipt.validate_shape().is_ok()
+                    && receipt.selector.operation == AuthorityOperationKind::InvokeActor
+                    && receipt.selector.space == work.space
+                    && receipt.selector.agent == work.agent
+                    && receipt.selector.runtime_deployment == work.runtime_deployment
+                    && receipt.selector.actor == Some(work.actor)
+                    && receipt.selector.actor_deployment == Some(work.deployment)
+                    && receipt.selector.request == work.commitment()
+            }
+            Self::PublicPreflight(preflight) => preflight.matches_work(work),
+        }
+    }
+
+    pub fn matches_acknowledgement(&self, work: &InvocationWork) -> bool {
+        self.matches_work(work)
+    }
+
+    pub fn commitment(&self) -> Hash {
+        crate::wire::invocation_authorization_commitment(self)
     }
 }
 
@@ -396,10 +511,15 @@ pub enum RuntimeWork {
         authority: Option<Box<AuthorityReceipt>>,
         observed_slot: u64,
     },
+    /// Invoke or recover one exact application operation. `observed_slot` is
+    /// the host's current trusted observation. For unseen PublicPreflight
+    /// work it must equal the preflight's immutable acceptance slot; a retry
+    /// may carry a later current observation only when guest state already
+    /// retains the exact original authorization and result/continuation.
     Invoke {
         state: RuntimeState,
         invocation: Box<InvocationWork>,
-        authority: Box<AuthorityReceipt>,
+        authorization: Box<InvocationAuthorization>,
         observed_slot: u64,
     },
     Resume {
@@ -407,12 +527,12 @@ pub enum RuntimeWork {
         resume: Box<ResumeWork>,
     },
     /// Retire one delivered exact invocation result. The original work and
-    /// its authority receipt are resupplied so the guest can authenticate the
-    /// exact retained result without trusting a host-created shorthand.
+    /// its exact authorization are resupplied so the guest can authenticate
+    /// the retained result without trusting a host-created shorthand.
     Acknowledge {
         state: RuntimeState,
         invocation: Box<InvocationWork>,
-        authority: Box<AuthorityReceipt>,
+        authorization: Box<InvocationAuthorization>,
     },
 }
 
@@ -559,8 +679,8 @@ pub struct InvocationAcknowledgement {
     pub mode: MethodMode,
     /// Commitment of the original canonical [`InvocationWork`].
     pub work: Hash,
-    /// Commitment of the exact signed authority receipt accepted with it.
-    pub authority: Hash,
+    /// Commitment of the exact typed authorization accepted with it.
+    pub authorization: Hash,
 }
 
 impl InvocationAcknowledgement {
@@ -570,7 +690,7 @@ impl InvocationAcknowledgement {
             && self.incarnation != Hash::ZERO
             && self.deployment != DeploymentId::ZERO
             && self.work != Hash::ZERO
-            && self.authority != Hash::ZERO
+            && self.authorization != Hash::ZERO
     }
 }
 

@@ -1,6 +1,6 @@
 //! Live clean-network attachment for journal-backed Shared Agents.
 //!
-//! This module owns the only bridge from `/vos/agent/2.0.0` to a
+//! This module owns the only bridge from `/vos/agent/3.0.0` to a
 //! `SharedAgentHost`. Every inbound frame has already crossed Noise PeerId
 //! authentication and exact route membership in `agent_network`; this layer
 //! then dispatches typed Raft, invocation, and Merge work to the durable
@@ -754,11 +754,20 @@ impl SharedRouteHandler {
 
     fn handle_invocation(
         &self,
+        sender: NodeId,
         request: super::agent_protocol::InvocationRequest,
     ) -> Result<AgentMessage, AgentHandlerError> {
+        if request
+            .work
+            .origin
+            .transport_node
+            .is_some_and(|node| node != sender)
+        {
+            return Err(AgentHandlerError);
+        }
         let correlation = invocation_request_correlation(&request);
         let work = request.work;
-        let authority = request.authority;
+        let authorization = request.authorization;
         match work.mode {
             MethodMode::Query | MethodMode::LinearizableQuery | MethodMode::Linear => {
                 // One leader handler admits at most one uncommitted Ordered
@@ -786,7 +795,7 @@ impl SharedRouteHandler {
                     drain_committed(&mut host, self.agent, &self.ordered_replies)
                         .map_err(|_| AgentHandlerError)?;
                     let prepared = host
-                        .prepare_clean_ordered(self.agent, work.clone(), authority)
+                        .prepare_clean_ordered(self.agent, work.clone(), authorization)
                         .map_err(|_| AgentHandlerError)?;
                     let input = prepared.input();
                     self.ordered_replies.register(input)?;
@@ -811,7 +820,7 @@ impl SharedRouteHandler {
                     .host
                     .lock()
                     .map_err(|_| AgentHandlerError)?
-                    .apply_clean_merge(self.agent, work, authority)
+                    .apply_clean_merge(self.agent, work, authorization)
                     .map_err(|_| AgentHandlerError)?;
                 Ok(reply_for_outcome(correlation, outcome))
             }
@@ -820,7 +829,7 @@ impl SharedRouteHandler {
                     .host
                     .lock()
                     .map_err(|_| AgentHandlerError)?
-                    .apply_clean_local(self.agent, work, authority)
+                    .apply_clean_local(self.agent, work, authorization)
                     .map_err(|_| AgentHandlerError)?;
                 Ok(reply_for_outcome(correlation, outcome))
             }
@@ -1150,7 +1159,7 @@ impl AgentRouteHandler for SharedRouteHandler {
             return Err(AgentHandlerError);
         }
         match frame.message {
-            AgentMessage::InvokeRequest(request) => self.handle_invocation(request),
+            AgentMessage::InvokeRequest(request) => self.handle_invocation(sender, request),
             AgentMessage::Raft(message) => self.handle_raft(sender, message),
             AgentMessage::Merge(message) => self.handle_merge(sender, message),
             _ => Err(AgentHandlerError),

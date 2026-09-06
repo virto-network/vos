@@ -19,8 +19,8 @@ use fs2::FileExt as _;
 
 use crate::agent_sdk::authority::AuthorityReceipt;
 use crate::agent_sdk::{
-    AgentDescriptor, AgentId, AgentProfile, InvocationWork, ManagementRequest, NodeId, ResumeWork,
-    RuntimeOutcome, SpaceId,
+    AgentDescriptor, AgentId, AgentProfile, InvocationAuthorization, InvocationWork,
+    ManagementRequest, NodeId, ResumeWork, RuntimeOutcome, SpaceId,
 };
 
 use super::driver::{
@@ -273,6 +273,19 @@ impl LocalAgentHost {
         self.scope.node
     }
 
+    /// Return the same clean logical slot that will be bound into the next
+    /// invocation transition. Callers that sign a self-authenticating Public
+    /// actor request use this value in both that request and PublicPreflight;
+    /// it is time data, never ambient identity or authorization.
+    pub fn current_logical_slot(&self) -> Result<u64, LocalAgentHostError> {
+        self.verify_root_scope()?;
+        self.trust
+            .current_logical_slot()
+            .ok_or(LocalAgentHostError::Driver(
+                AgentDriverError::TrustUnavailable,
+            ))
+    }
+
     pub fn list(&self) -> Result<Vec<AgentId>, LocalAgentHostError> {
         self.verify_root_scope()?;
         Ok(self.agents.keys().copied().collect())
@@ -409,7 +422,7 @@ impl LocalAgentHost {
         &mut self,
         agent: AgentId,
         invocation: InvocationWork,
-        authority: AuthorityReceipt,
+        authorization: InvocationAuthorization,
     ) -> Result<RuntimeOutcome, LocalAgentHostError> {
         self.verify_root_scope()?;
         if invocation.space != self.scope.space || invocation.agent != agent {
@@ -420,7 +433,7 @@ impl LocalAgentHost {
                 .agents
                 .get_mut(&agent)
                 .ok_or(LocalAgentHostError::NotFound)?;
-            hosted.driver.invoke_sdk(invocation, authority)
+            hosted.driver.invoke_sdk(invocation, authorization)
         };
         self.finish_driver_operation(agent, result)
     }
@@ -445,7 +458,7 @@ impl LocalAgentHost {
         &mut self,
         agent: AgentId,
         invocation: InvocationWork,
-        authority: AuthorityReceipt,
+        authorization: InvocationAuthorization,
     ) -> Result<RuntimeOutcome, LocalAgentHostError> {
         self.verify_root_scope()?;
         if invocation.space != self.scope.space || invocation.agent != agent {
@@ -456,7 +469,7 @@ impl LocalAgentHost {
                 .agents
                 .get_mut(&agent)
                 .ok_or(LocalAgentHostError::NotFound)?;
-            hosted.driver.acknowledge_sdk(invocation, authority)
+            hosted.driver.acknowledge_sdk(invocation, authorization)
         };
         self.finish_driver_operation(agent, result)
     }
@@ -2222,10 +2235,18 @@ mod tests {
         let mut forged = authority.clone();
         forged.signature[0] ^= 1;
         assert_eq!(
-            host.invoke(agent, work.clone(), forged).unwrap(),
+            host.invoke(
+                agent,
+                work.clone(),
+                sdk::InvocationAuthorization::AuthorityReceipt(forged),
+            )
+            .unwrap(),
             RuntimeOutcome::Completed(Err(sdk::InvocationError::InvalidAuthorization))
         );
-        let completed = host.invoke(agent, work.clone(), authority.clone()).unwrap();
+        let authorization = sdk::InvocationAuthorization::AuthorityReceipt(authority.clone());
+        let completed = host
+            .invoke(agent, work.clone(), authorization.clone())
+            .unwrap();
         let RuntimeOutcome::Completed(Ok(reply)) = &completed else {
             panic!("physical invoke did not complete successfully: {completed:?}")
         };
@@ -2249,12 +2270,13 @@ mod tests {
         slot.store(100, Ordering::SeqCst);
         let mut host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
         assert_eq!(
-            host.invoke(agent, work.clone(), authority.clone()).unwrap(),
+            host.invoke(agent, work.clone(), authorization.clone())
+                .unwrap(),
             completed,
             "an expired exact retry recovers the result without re-execution"
         );
         let acknowledgement = host
-            .acknowledge_sdk(agent, work.clone(), authority.clone())
+            .acknowledge_sdk(agent, work.clone(), authorization.clone())
             .unwrap();
         assert_eq!(
             acknowledgement,
@@ -2265,12 +2287,12 @@ mod tests {
                 deployment: work.deployment,
                 mode: work.mode,
                 work: work.commitment(),
-                authority: authority.commitment(),
+                authorization: authorization.commitment(),
             }))
         );
         let acknowledged_state = host.agents[&agent].driver.image().runtime_state.clone();
         assert_eq!(
-            host.acknowledge_sdk(agent, work, authority).unwrap(),
+            host.acknowledge_sdk(agent, work, authorization).unwrap(),
             RuntimeOutcome::Acknowledged(Err(sdk::InvocationError::NotFound))
         );
         assert_eq!(
@@ -2375,7 +2397,12 @@ mod tests {
             .invoke(
                 agent,
                 work.clone(),
-                invocation_receipt(&descriptor, &work, 3, 3),
+                sdk::InvocationAuthorization::AuthorityReceipt(invocation_receipt(
+                    &descriptor,
+                    &work,
+                    3,
+                    3,
+                )),
             )
             .unwrap();
         let RuntimeOutcome::Yielded(first) = outcome else {

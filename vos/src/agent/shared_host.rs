@@ -617,13 +617,13 @@ impl SharedAgentHost {
         &self,
         agent: AgentId,
         work: crate::agent_sdk::InvocationWork,
-        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<super::shared_journal_driver::PreparedCleanOrdered, SharedAgentHostError> {
         self.agents
             .get(&agent)
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
-            .prepare_clean_ordered(work, authority)
+            .prepare_clean_ordered(work, authorization)
             .map_err(map_driver_error)
     }
 
@@ -631,14 +631,14 @@ impl SharedAgentHost {
         &mut self,
         agent: AgentId,
         work: crate::agent_sdk::InvocationWork,
-        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedAgentHostError> {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
         self.agents
             .get_mut(&agent)
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
-            .apply_clean_local(work, authority)
+            .apply_clean_local(work, authorization)
             .map_err(map_driver_error)
     }
 
@@ -646,14 +646,14 @@ impl SharedAgentHost {
         &mut self,
         agent: AgentId,
         work: crate::agent_sdk::InvocationWork,
-        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedAgentHostError> {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
         self.agents
             .get_mut(&agent)
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
-            .apply_clean_merge(work, authority)
+            .apply_clean_merge(work, authorization)
             .map_err(map_driver_error)
     }
 

@@ -15348,13 +15348,20 @@ pub(crate) mod tests {
                     .filter(|byte| *byte == 0xaa)
                     .map(|_| ())
                     .ok_or(()),
-                ReplayOperation::CleanInvoke { authority, .. } => authority
-                    .signature
-                    .first()
-                    .copied()
-                    .filter(|byte| *byte == 0xaa)
-                    .map(|_| ())
-                    .ok_or(()),
+                ReplayOperation::CleanInvoke { authorization, .. } => {
+                    let crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority) =
+                        authorization
+                    else {
+                        return Err(());
+                    };
+                    authority
+                        .signature
+                        .first()
+                        .copied()
+                        .filter(|byte| *byte == 0xaa)
+                        .map(|_| ())
+                        .ok_or(())
+                }
                 ReplayOperation::Management { .. } | ReplayOperation::SealMerge => Ok(()),
             }
         }
@@ -16283,7 +16290,14 @@ pub(crate) mod tests {
             let signature: &[u8] = match &input.operation {
                 ReplayOperation::Invoke { authority, .. }
                 | ReplayOperation::Acknowledge { authority, .. } => authority.signature.as_slice(),
-                ReplayOperation::CleanInvoke { authority, .. } => authority.signature.as_slice(),
+                ReplayOperation::CleanInvoke { authorization, .. } => {
+                    let crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority) =
+                        authorization
+                    else {
+                        return Err(());
+                    };
+                    authority.signature.as_slice()
+                }
                 ReplayOperation::Management { .. } | ReplayOperation::SealMerge => return Ok(()),
             };
             signature

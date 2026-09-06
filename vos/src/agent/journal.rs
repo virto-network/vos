@@ -1412,12 +1412,12 @@ pub enum ReplayOperation {
         observed_slot: u64,
     },
     /// Clean-generation invocation retained without conversion to the legacy
-    /// actor invocation or authority receipt model. The SDK work and receipt
-    /// remain distinct authenticated values even when their initial caller
-    /// identity was derived from the same authenticator.
+    /// actor invocation or signed-only authority model. The SDK work and
+    /// typed authorization remain distinct values even when their initial
+    /// caller identity was derived from the same authenticator.
     CleanInvoke {
         work: crate::agent_sdk::InvocationWork,
-        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        authorization: crate::agent_sdk::InvocationAuthorization,
         observed_slot: u64,
     },
     /// Retire the exact result produced by `invocation`. Keeping the complete
@@ -1492,9 +1492,14 @@ impl ReplayInput {
             }
             ReplayOperation::CleanInvoke {
                 work,
-                authority,
+                authorization,
                 observed_slot,
-            } => validate_clean_invocation_receipt(&self.runtime, work, authority, *observed_slot)?,
+            } => validate_clean_invocation_authorization(
+                &self.runtime,
+                work,
+                authorization,
+                *observed_slot,
+            )?,
             ReplayOperation::Acknowledge {
                 invocation,
                 authority,
@@ -2772,14 +2777,14 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
         }
         ReplayOperation::CleanInvoke {
             work,
-            authority,
+            authorization,
             observed_slot,
         } => {
             encoder.u8(4);
             let canonical = crate::agent_sdk::RuntimeWork::Invoke {
                 state: crate::agent_sdk::RuntimeState::default(),
                 invocation: alloc::boxed::Box::new(work.clone()),
-                authority: alloc::boxed::Box::new(authority.clone()),
+                authorization: alloc::boxed::Box::new(authorization.clone()),
                 observed_slot: *observed_slot,
             }
             .encode()
@@ -2835,7 +2840,7 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
             let crate::agent_sdk::RuntimeWork::Invoke {
                 state,
                 invocation,
-                authority,
+                authorization,
                 observed_slot,
             } = canonical
             else {
@@ -2846,7 +2851,7 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
             }
             Ok(ReplayOperation::CleanInvoke {
                 work: *invocation,
-                authority: *authority,
+                authorization: *authorization,
                 observed_slot,
             })
         }
@@ -2854,16 +2859,16 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
     }
 }
 
-fn validate_clean_invocation_receipt(
+fn validate_clean_invocation_authorization(
     runtime: &RuntimeBinding,
     work: &crate::agent_sdk::InvocationWork,
-    authority: &crate::agent_sdk::authority::AuthorityReceipt,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
     observed_slot: u64,
 ) -> Result<(), DecodeError> {
     let canonical = crate::agent_sdk::RuntimeWork::Invoke {
         state: crate::agent_sdk::RuntimeState::default(),
         invocation: alloc::boxed::Box::new(work.clone()),
-        authority: alloc::boxed::Box::new(authority.clone()),
+        authorization: alloc::boxed::Box::new(authorization.clone()),
         observed_slot,
     };
     if canonical.encode().is_err()
@@ -3706,10 +3711,29 @@ mod tests {
             runtime,
             operation: ReplayOperation::CleanInvoke {
                 work,
-                authority,
+                authorization: crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+                    authority,
+                ),
                 observed_slot: 12,
             },
         }
+    }
+
+    fn public_clean_replay_input(mode: crate::agent_sdk::MethodMode) -> ReplayInput {
+        let mut input = clean_replay_input(mode);
+        let ReplayOperation::CleanInvoke {
+            work,
+            authorization,
+            observed_slot,
+        } = &mut input.operation
+        else {
+            unreachable!()
+        };
+        work.roles = crate::agent_sdk::InvocationRoleClaims::none();
+        *authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(work, *observed_slot),
+        );
+        input
     }
 
     fn management_input(inner: LifecycleRequest, capability: &str) -> ReplayInput {
@@ -4567,7 +4591,11 @@ mod tests {
         }
 
         let mut unbound = clean_replay_input(crate::agent_sdk::MethodMode::Linear);
-        let ReplayOperation::CleanInvoke { authority, .. } = &mut unbound.operation else {
+        let ReplayOperation::CleanInvoke { authorization, .. } = &mut unbound.operation else {
+            unreachable!()
+        };
+        let crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority) = authorization
+        else {
             unreachable!()
         };
         authority.selector.request = crate::agent_sdk::Hash([0xa1; 32]);
@@ -4576,7 +4604,7 @@ mod tests {
         let input = clean_replay_input(crate::agent_sdk::MethodMode::Merge);
         let ReplayOperation::CleanInvoke {
             work,
-            authority,
+            authorization,
             observed_slot,
         } = input.operation
         else {
@@ -4588,7 +4616,7 @@ mod tests {
                 ..crate::agent_sdk::RuntimeState::default()
             },
             invocation: Box::new(work),
-            authority: Box::new(authority),
+            authorization: Box::new(authorization),
             observed_slot,
         }
         .encode()
@@ -4601,6 +4629,23 @@ mod tests {
             decode_replay_operation(&mut Decoder::new(&encoded)),
             Err(DecodeError::NonCanonical)
         );
+
+        let public = public_clean_replay_input(crate::agent_sdk::MethodMode::Linear);
+        public.validate().unwrap();
+        roundtrip(&public);
+        let mut later_retry = public.clone();
+        let ReplayOperation::CleanInvoke { observed_slot, .. } = &mut later_retry.operation else {
+            unreachable!()
+        };
+        *observed_slot += 1;
+        later_retry.validate().unwrap();
+        roundtrip(&later_retry);
+        let mut regressed = public;
+        let ReplayOperation::CleanInvoke { observed_slot, .. } = &mut regressed.operation else {
+            unreachable!()
+        };
+        *observed_slot -= 1;
+        assert_eq!(regressed.validate(), Err(DecodeError::NonCanonical));
     }
 
     #[test]
