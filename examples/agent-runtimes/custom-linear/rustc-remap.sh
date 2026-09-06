@@ -21,5 +21,5 @@ while (($#)); do
 done
 
 exec "$rustc_bin" "${args[@]}" \
-    "-Cmetadata=vos-custom-linear-runtime" \
+    "-Cmetadata=vos-custom-scheduled-linear-runtime" \
     "--remap-path-prefix=$repository_root=vos-source"

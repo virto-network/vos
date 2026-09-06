@@ -1,10 +1,11 @@
-//! A small, real custom AgentRuntime with deterministic Linear semantics.
+//! A small, real custom AgentRuntime with deterministic Linear scheduling.
 //!
 //! The example deliberately implements the portable SDK contract directly:
 //! it authenticates Create/Install management, retains a canonical actor
-//! directory, admits one public Linear counter actor, retains one exact result
-//! until acknowledgement, and derives every output solely from `RuntimeWork`.
-//! It does not load keys, read clocks, or rely on process-local state.
+//! directory, admits one public Linear counter actor, persists deterministic
+//! timers, retains one exact result until acknowledgement, and derives every
+//! output solely from `RuntimeWork`. It does not load keys, read clocks, or
+//! rely on process-local state.
 
 #![no_std]
 
@@ -16,13 +17,17 @@ use alloc::vec::Vec;
 use ed25519_dalek::{Signature, VerifyingKey};
 use vos_agent_sdk::authority::{AuthorityReceipt, AuthorityVerifier};
 use vos_agent_sdk::protocol::wire::{DecodeError, Decoder, Encoder};
+use vos_agent_sdk::scheduling::{
+    DeterministicScheduler, ScheduleCadence, ScheduleEntry, ScheduleObservation,
+    ScheduleObservationSource, TimerScheduler,
+};
 use vos_agent_sdk::wire::CanonicalWire as _;
 use vos_agent_sdk::{
     ActorDirectoryPage, ActorDirectoryRecord, ActorId, AgentDescriptor, AgentProfile, AgentRuntime,
     Hash, InstallActor, InvocationAcknowledgement, InvocationAuthorization, InvocationError,
     InvocationReply, InvocationStatus, InvocationWork, LaneSet, ManagementError, ManagementReply,
     ManagementRequest, MethodMode, ProofSystemSet, RuntimeCapabilities, RuntimeOutcome,
-    RuntimeResourceUsage, RuntimeState, RuntimeTransition, RuntimeWork, StateLane,
+    RuntimeResourceUsage, RuntimeState, RuntimeTransition, RuntimeWork, ScheduleId, StateLane,
 };
 
 const CONTROL_MAGIC: [u8; 8] = *b"VCLCTL01";
@@ -30,11 +35,11 @@ const LINEAR_MAGIC: [u8; 8] = *b"VCLLIN01";
 const MAX_STORED_WORK_BYTES: usize = vos_agent_sdk::MAX_RUNTIME_STATE_BYTES / 2;
 const EXECUTION_GAS: u64 = 1;
 
-/// This example intentionally supports one installed Linear actor and no
-/// scheduling or proof backend.
+/// This example intentionally supports one installed Linear actor, durable
+/// deterministic scheduling, and no proof backend.
 pub const CUSTOM_LINEAR_CAPABILITIES: RuntimeCapabilities = RuntimeCapabilities {
     lanes: LaneSet::of(StateLane::Linear),
-    scheduling: false,
+    scheduling: true,
     proof_systems: ProofSystemSet::EMPTY,
     max_actors: 1,
 };
@@ -102,6 +107,89 @@ pub fn actor_incarnation(install: &InstallActor) -> Hash {
     )
 }
 
+/// Encode the counter's ordinary Linear mutation.
+pub fn add_message(delta: u64) -> Option<Vec<u8>> {
+    (delta != 0).then(|| delta.to_le_bytes().to_vec())
+}
+
+/// Encode a one-shot durable callback. The callback adds `delta` when a later
+/// work item carries a durable observation at or beyond `due_slot`.
+pub fn schedule_once_message(
+    schedule: ScheduleId,
+    due_slot: u64,
+    priority: u8,
+    delta: u64,
+) -> Option<Vec<u8>> {
+    schedule_message(schedule, due_slot, priority, ScheduleCadence::Once, delta)
+}
+
+/// Encode a drift-free interval callback. Each next occurrence advances from
+/// its previous due slot, not from a possibly late observation.
+pub fn schedule_interval_message(
+    schedule: ScheduleId,
+    due_slot: u64,
+    priority: u8,
+    slots: u64,
+    delta: u64,
+) -> Option<Vec<u8>> {
+    schedule_message(
+        schedule,
+        due_slot,
+        priority,
+        ScheduleCadence::Interval { slots },
+        delta,
+    )
+}
+
+/// Encode cancellation of one exact schedule identity.
+pub fn cancel_schedule_message(schedule: ScheduleId) -> Option<Vec<u8>> {
+    if schedule == ScheduleId::ZERO {
+        return None;
+    }
+    let mut message = Vec::with_capacity(33);
+    message.push(2);
+    message.extend_from_slice(schedule.as_bytes());
+    Some(message)
+}
+
+/// Encode an explicit tick. The host still supplies the durable observation;
+/// this message never carries a clock value of its own.
+pub fn tick_message() -> Vec<u8> {
+    let mut message = Vec::with_capacity(1);
+    message.push(3);
+    message
+}
+
+fn schedule_message(
+    schedule: ScheduleId,
+    due_slot: u64,
+    priority: u8,
+    cadence: ScheduleCadence,
+    delta: u64,
+) -> Option<Vec<u8>> {
+    if schedule == ScheduleId::ZERO || delta == 0 || !cadence.validate() {
+        return None;
+    }
+    let capacity = match cadence {
+        ScheduleCadence::Once => 51,
+        ScheduleCadence::Interval { .. } => 59,
+    };
+    let mut message = Vec::with_capacity(capacity);
+    message.push(1);
+    message.extend_from_slice(schedule.as_bytes());
+    message.extend_from_slice(&due_slot.to_le_bytes());
+    message.push(priority);
+    match cadence {
+        ScheduleCadence::Once => message.push(0),
+        ScheduleCadence::Interval { slots } => {
+            message.push(1);
+            message.extend_from_slice(&slots.to_le_bytes());
+        }
+    }
+    message.extend_from_slice(&delta.to_le_bytes());
+    (message.len() == capacity).then_some(message)
+}
+
 struct Ed25519Verifier;
 
 impl AuthorityVerifier for Ed25519Verifier {
@@ -128,6 +216,7 @@ struct LinearState {
     value: u64,
     revision: u64,
     retained_work: Option<Vec<u8>>,
+    scheduler: DeterministicScheduler,
 }
 
 #[derive(Clone)]
@@ -168,6 +257,9 @@ impl CustomState {
         let revision = linear.u64()?;
         let retained_work =
             linear.option(|decoder| decoder.bytes_bounded(MAX_STORED_WORK_BYTES))?;
+        let scheduler = DeterministicScheduler::decode(
+            linear.bytes_ref_bounded(vos_agent_sdk::scheduling::MAX_SCHEDULE_STATE_BYTES)?,
+        )?;
         if !linear.exhausted() || revision == 0 && retained_work.is_some() {
             return Err(DecodeError::NonCanonical);
         }
@@ -184,6 +276,7 @@ impl CustomState {
                 value,
                 revision,
                 retained_work,
+                scheduler,
             },
         };
         if decoded.encode().as_ref() != Some(state) {
@@ -210,6 +303,8 @@ impl CustomState {
         encoder.option(&self.linear.retained_work, |encoder, work| {
             encoder.bytes(work)
         });
+        let scheduler = self.linear.scheduler.encode().ok()?;
+        encoder.bytes(&scheduler);
 
         let state = RuntimeState {
             control,
@@ -312,6 +407,7 @@ fn apply_management(
                 value: 0,
                 revision: 0,
                 retained_work: None,
+                scheduler: DeterministicScheduler::default(),
             },
         };
         let Some(state) = model.encode() else {
@@ -363,7 +459,13 @@ fn apply_management(
             RuntimeOutcome::Management(Ok(ManagementReply::Resources(RuntimeResourceUsage {
                 actors: u32::from(model.control.install_work.is_some()),
                 proof_artifacts: 0,
-                schedules: 0,
+                schedules: model
+                    .linear
+                    .scheduler
+                    .entries()
+                    .len()
+                    .try_into()
+                    .unwrap_or(u32::MAX),
                 state_bytes: state_bytes(&state),
                 ..RuntimeResourceUsage::default()
             }))),
@@ -465,25 +567,22 @@ fn apply_invoke(
     {
         return invocation_error(prior, InvocationError::InvalidAuthorization);
     }
-    let Some(delta) = decode_delta(&work.message) else {
+    let Some(command) = decode_command(&work.message) else {
         return invocation_error(prior, InvocationError::InvalidInput);
-    };
-    let Some(value) = model.linear.value.checked_add(delta) else {
-        return invocation_error(prior, InvocationError::InvalidInput);
-    };
-    let Some(revision) = model.linear.revision.checked_add(1) else {
-        return invocation_error(prior, InvocationError::ResultCapacity);
     };
     let Some(stored_work) = stored_invoke_work(&work, &authorization, observed_slot) else {
         return invocation_error(prior, InvocationError::ResultCapacity);
     };
-    model.linear.value = value;
-    model.linear.revision = revision;
+    if observe_schedules(&mut model, &descriptor, &install, observed_slot).is_err()
+        || apply_command(&mut model, &descriptor, &install, command).is_err()
+    {
+        return invocation_error(prior, InvocationError::InvalidInput);
+    }
     model.linear.retained_work = Some(stored_work);
     let Some(state) = model.encode() else {
         return invocation_error(prior, InvocationError::ResultCapacity);
     };
-    completed_counter(state, &work, value, revision)
+    completed_counter(state, &work, model.linear.value, model.linear.revision)
 }
 
 fn apply_acknowledge(
@@ -602,9 +701,176 @@ fn public_authorization_matches(
     }
 }
 
+enum CounterCommand {
+    Add(u64),
+    Schedule {
+        schedule: ScheduleId,
+        due_slot: u64,
+        priority: u8,
+        cadence: ScheduleCadence,
+        delta: u64,
+    },
+    Cancel(ScheduleId),
+    Tick,
+}
+
 fn decode_delta(message: &[u8]) -> Option<u64> {
     let delta = u64::from_le_bytes(message.try_into().ok()?);
     (delta != 0).then_some(delta)
+}
+
+fn decode_command(message: &[u8]) -> Option<CounterCommand> {
+    if let Some(delta) = decode_delta(message) {
+        return Some(CounterCommand::Add(delta));
+    }
+    match message {
+        [1, rest @ ..] => {
+            let schedule: [u8; 32] = rest.get(..32)?.try_into().ok()?;
+            let due_slot = u64::from_le_bytes(schedule_bytes(rest, 32, 8)?);
+            let priority = *message.get(41)?;
+            let cadence_tag = *message.get(42)?;
+            let (cadence, delta_offset, expected_len) = match cadence_tag {
+                0 => (ScheduleCadence::Once, 43, 51),
+                1 => (
+                    ScheduleCadence::Interval {
+                        slots: u64::from_le_bytes(schedule_bytes(message, 43, 8)?),
+                    },
+                    51,
+                    59,
+                ),
+                _ => return None,
+            };
+            if message.len() != expected_len {
+                return None;
+            }
+            let delta = u64::from_le_bytes(schedule_bytes(message, delta_offset, 8)?);
+            let schedule = ScheduleId(schedule);
+            (schedule != ScheduleId::ZERO && delta != 0 && cadence.validate()).then_some(
+                CounterCommand::Schedule {
+                    schedule,
+                    due_slot,
+                    priority,
+                    cadence,
+                    delta,
+                },
+            )
+        }
+        [2, rest @ ..] if rest.len() == 32 => {
+            let schedule = ScheduleId(rest.try_into().ok()?);
+            (schedule != ScheduleId::ZERO).then_some(CounterCommand::Cancel(schedule))
+        }
+        [3] => Some(CounterCommand::Tick),
+        _ => None,
+    }
+}
+
+fn schedule_bytes(message: &[u8], offset: usize, len: usize) -> Option<[u8; 8]> {
+    if len != 8 {
+        return None;
+    }
+    message
+        .get(offset..offset.checked_add(len)?)?
+        .try_into()
+        .ok()
+}
+
+fn increment_revision(model: &mut CustomState) -> Result<(), ()> {
+    model.linear.revision = model.linear.revision.checked_add(1).ok_or(())?;
+    Ok(())
+}
+
+fn observe_schedules(
+    model: &mut CustomState,
+    descriptor: &AgentDescriptor,
+    install: &InstallActor,
+    observed_slot: u64,
+) -> Result<(), ()> {
+    let source = match descriptor.identity.profile {
+        AgentProfile::Local => ScheduleObservationSource::DurableLocal,
+        AgentProfile::Shared => ScheduleObservationSource::CommittedLeader,
+        AgentProfile::Private => return Err(()),
+    };
+    let before = model.linear.scheduler.clone();
+    let fires = model
+        .linear
+        .scheduler
+        .observe(
+            descriptor.identity.profile,
+            ScheduleObservation {
+                slot: observed_slot,
+                source,
+            },
+            vos_agent_sdk::scheduling::MAX_SCHEDULE_FIRES_PER_SLICE,
+        )
+        .map_err(|_| ())?;
+    if fires.is_empty() && model.linear.scheduler != before {
+        increment_revision(model)?;
+    }
+    for fire in fires {
+        if fire.actor != install.entry.actor
+            || fire.incarnation != actor_incarnation(install)
+            || fire.deployment != install.entry.deployment
+            || fire.program != install.entry.program
+            || fire.mode != MethodMode::Linear
+        {
+            return Err(());
+        }
+        let delta = decode_delta(&fire.message).ok_or(())?;
+        model.linear.value = model.linear.value.checked_add(delta).ok_or(())?;
+        increment_revision(model)?;
+    }
+    Ok(())
+}
+
+fn apply_command(
+    model: &mut CustomState,
+    descriptor: &AgentDescriptor,
+    install: &InstallActor,
+    command: CounterCommand,
+) -> Result<(), ()> {
+    match command {
+        CounterCommand::Add(delta) => {
+            model.linear.value = model.linear.value.checked_add(delta).ok_or(())?;
+            increment_revision(model)
+        }
+        CounterCommand::Schedule {
+            schedule,
+            due_slot,
+            priority,
+            cadence,
+            delta,
+        } => {
+            model
+                .linear
+                .scheduler
+                .schedule(
+                    descriptor.identity.profile,
+                    ScheduleEntry {
+                        schedule,
+                        actor: install.entry.actor,
+                        incarnation: actor_incarnation(install),
+                        deployment: install.entry.deployment,
+                        program: install.entry.program,
+                        mode: MethodMode::Linear,
+                        message: delta.to_le_bytes().to_vec(),
+                        due_slot,
+                        priority,
+                        cadence,
+                    },
+                )
+                .map_err(|_| ())?;
+            increment_revision(model)
+        }
+        CounterCommand::Cancel(schedule) => {
+            model
+                .linear
+                .scheduler
+                .cancel(descriptor.identity.profile, schedule)
+                .map_err(|_| ())?;
+            increment_revision(model)
+        }
+        CounterCommand::Tick => Ok(()),
+    }
 }
 
 fn completed_counter(
@@ -818,6 +1084,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::for_profile(AgentProfile::Local)
+        }
+
+        fn for_profile(profile: AgentProfile) -> Self {
             let key = SigningKey::from_bytes(&AUTHORITY_SEED);
             let public_key = key.verifying_key().to_bytes();
             let space = SpaceId([0x11; 32]);
@@ -836,7 +1106,7 @@ mod tests {
                     space,
                     agent,
                     owner,
-                    profile: AgentProfile::Local,
+                    profile,
                     runtime_deployment: DeploymentId([0x17; 32]),
                     runtime_program: ProgramId([0x18; 32]),
                     runtime_producer: ProducerId([0x19; 32]),
@@ -950,7 +1220,7 @@ mod tests {
                 contract: ActorPackageContract::canonical(),
                 requirements: RuntimeRequirements {
                     lanes: LaneSet::of(StateLane::Linear),
-                    scheduling: false,
+                    scheduling: true,
                     proof_systems: ProofSystemSet::EMPTY,
                 },
             }
@@ -975,6 +1245,15 @@ mod tests {
             discriminator: u8,
             delta: u64,
         ) -> InvocationWork {
+            self.invocation_message(install, discriminator, delta.to_le_bytes().to_vec())
+        }
+
+        fn invocation_message(
+            &self,
+            install: &InstallActor,
+            discriminator: u8,
+            message: Vec<u8>,
+        ) -> InvocationWork {
             InvocationWork {
                 space: self.descriptor.identity.space,
                 agent: self.descriptor.identity.agent,
@@ -987,7 +1266,7 @@ mod tests {
                 mode: MethodMode::Linear,
                 origin: InvocationOrigin::anonymous(),
                 roles: InvocationRoleClaims::none(),
-                message: delta.to_le_bytes().to_vec(),
+                message,
                 installation_data: None,
                 availability: Vec::new(),
                 gas: 10,
@@ -1124,7 +1403,7 @@ mod tests {
         let RuntimeOutcome::Completed(Ok(reply)) = next.outcome else {
             unreachable!()
         };
-        assert_eq!(reply.observation.linear_revision, Some(2));
+        assert_eq!(reply.observation.linear_revision, Some(4));
     }
 
     #[test]
@@ -1208,8 +1487,118 @@ mod tests {
         }
     }
 
+    fn scheduled_interval_survives_restart(profile: AgentProfile) {
+        let fixture = Fixture::for_profile(profile);
+        let (install, initial) = created_and_installed(&fixture);
+        let schedule = ScheduleId([0x51; 32]);
+        let schedule_work = fixture.invocation_message(
+            &install,
+            0x41,
+            schedule_interval_message(schedule, 10, 2, 3, 2).unwrap(),
+        );
+        let schedule_authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&schedule_work, 5));
+        let scheduled = dispatch(RuntimeWork::Invoke {
+            state: initial,
+            invocation: Box::new(schedule_work.clone()),
+            authorization: Box::new(schedule_authorization.clone()),
+            observed_slot: 5,
+        });
+        assert_eq!(completed_value(&scheduled), 0);
+        let scheduled_model = CustomState::decode(&scheduled.state).unwrap();
+        assert_eq!(scheduled_model.linear.scheduler.entries()[0].due_slot, 10);
+
+        let acknowledged = dispatch(RuntimeWork::Acknowledge {
+            state: scheduled.state,
+            invocation: Box::new(schedule_work),
+            authorization: Box::new(schedule_authorization),
+        });
+        let tick = fixture.invocation_message(&install, 0x42, tick_message());
+        let tick_authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&tick, 17));
+        let fired = dispatch(RuntimeWork::Invoke {
+            state: acknowledged.state,
+            invocation: Box::new(tick.clone()),
+            authorization: Box::new(tick_authorization.clone()),
+            observed_slot: 17,
+        });
+        assert_eq!(completed_value(&fired), 6);
+        let fired_model = CustomState::decode(&fired.state).unwrap();
+        assert_eq!(fired_model.linear.scheduler.last_observation(), Some(17));
+        assert_eq!(fired_model.linear.scheduler.entries()[0].due_slot, 19);
+
+        // A fresh guest receives the same state and exact work. Even an
+        // expired observation cannot duplicate the already retained fires.
+        let retried = dispatch(RuntimeWork::Invoke {
+            state: fired.state.clone(),
+            invocation: Box::new(tick.clone()),
+            authorization: Box::new(tick_authorization.clone()),
+            observed_slot: 99,
+        });
+        assert_eq!(retried, fired);
+
+        let acknowledged = dispatch(RuntimeWork::Acknowledge {
+            state: fired.state,
+            invocation: Box::new(tick),
+            authorization: Box::new(tick_authorization),
+        });
+        let regressed = fixture.invocation_message(&install, 0x43, tick_message());
+        let regressed_authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&regressed, 16));
+        let rejected = dispatch(RuntimeWork::Invoke {
+            state: acknowledged.state.clone(),
+            invocation: Box::new(regressed),
+            authorization: Box::new(regressed_authorization),
+            observed_slot: 16,
+        });
+        assert_eq!(rejected.state, acknowledged.state);
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::InvalidInput))
+        );
+    }
+
     #[test]
-    fn signed_vos3_custom_runtime_envelope_passes_physical_admission() {
+    fn local_and_shared_timers_survive_restart_and_leader_handoff_without_drift() {
+        scheduled_interval_survives_restart(AgentProfile::Local);
+        scheduled_interval_survives_restart(AgentProfile::Shared);
+    }
+
+    #[test]
+    fn scheduler_messages_are_canonical_and_reject_ambient_time() {
+        let schedule = ScheduleId([0x61; 32]);
+        let once = schedule_once_message(schedule, 7, 1, 3).unwrap();
+        assert!(matches!(
+            decode_command(&once),
+            Some(CounterCommand::Schedule {
+                due_slot: 7,
+                priority: 1,
+                cadence: ScheduleCadence::Once,
+                delta: 3,
+                ..
+            })
+        ));
+        let interval = schedule_interval_message(schedule, 7, 1, 4, 3).unwrap();
+        assert!(matches!(
+            decode_command(&interval),
+            Some(CounterCommand::Schedule {
+                cadence: ScheduleCadence::Interval { slots: 4 },
+                ..
+            })
+        ));
+        let mut trailing = interval;
+        trailing.push(0);
+        assert!(decode_command(&trailing).is_none());
+        assert!(schedule_interval_message(schedule, 7, 1, 0, 3).is_none());
+        assert!(schedule_once_message(ScheduleId::ZERO, 7, 1, 3).is_none());
+        assert!(matches!(
+            decode_command(&tick_message()),
+            Some(CounterCommand::Tick)
+        ));
+    }
+
+    #[test]
+    fn signed_vos3_scheduled_runtime_envelope_passes_physical_admission() {
         let mut assembler = Assembler::new();
         let program = assembler.load_imm_64(Reg::A0, 1).trap().build_standard();
         let artifact = PackageArtifact {
@@ -1220,7 +1609,7 @@ mod tests {
         let public_key = key.verifying_key().to_bytes();
         let mut package = PackageEnvelope {
             manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
-                name: "custom-linear-test".to_string(),
+                name: "custom-scheduled-linear-test".to_string(),
                 outer_program: artifact.identity.clone(),
                 contract: RuntimePackageContract::canonical(),
                 capabilities: CUSTOM_LINEAR_CAPABILITIES,

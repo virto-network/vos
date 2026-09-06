@@ -2,7 +2,7 @@
 
 [package]
 name = "custom-linear-agent-runtime"
-description = "Maintained portable custom VOS AgentRuntime example"
+description = "Maintained portable scheduled Linear VOS AgentRuntime example"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"

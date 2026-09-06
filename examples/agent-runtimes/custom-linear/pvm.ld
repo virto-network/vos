@@ -1,4 +1,4 @@
-/* Canonical custom AgentRuntime layout. */
+/* Canonical scheduled custom AgentRuntime layout. */
 ENTRY(_start)
 
 SECTIONS
