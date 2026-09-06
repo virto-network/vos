@@ -158,7 +158,8 @@ impl SystemCatalogConfiguration {
         bytes
     }
 
-    /// Decode exactly SCC1+r8. There is no prior-generation or legacy path.
+    /// Decode exactly SCC1 plus the current runtime ABI. There is no
+    /// prior-generation or legacy path.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != CONFIG_ENCODED_BYTES
             || bytes.get(..4) != Some(SYSTEM_CATALOG_CONFIGURATION_MAGIC.as_slice())
@@ -692,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn constructor_is_exact_r8_and_has_no_fallback() {
+    fn constructor_is_exact_current_abi_and_has_no_fallback() {
         let config = configuration();
         let bytes = config.encode();
         assert_eq!(SystemCatalogConfiguration::decode(&bytes), Some(config));
