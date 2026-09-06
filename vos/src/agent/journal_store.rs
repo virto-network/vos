@@ -105,6 +105,16 @@ const MAX_SHARED_ORDERED_COMMIT_BINDINGS: usize = 4_096;
 const MAX_SHARED_ORDERED_COMMIT_FILES: usize = 2 * MAX_SHARED_ORDERED_COMMIT_BINDINGS;
 const SHARED_ORDERED_COMMIT_DIRECTORY: &str = "shared-ordered-commits";
 
+/// Maximum cumulative immutable Merge objects retained by one physical
+/// journal. One replay suffix plus one full concurrent frontier fits, while
+/// authenticated anti-entropy cannot grow the staging namespace forever.
+pub(crate) const MAX_MERGE_EVENT_OBJECTS: usize =
+    MAX_REPLAY_SUFFIX_ENTRIES + super::journal::MAX_MERGE_FRONTIER_ENTRIES;
+/// Maximum cumulative canonical bytes occupied by immutable Merge objects in
+/// one physical journal. Snapshot-backed collection is required to free this
+/// budget after it is exhausted.
+pub(crate) const MAX_MERGE_EVENT_BYTES: usize = MAX_REPLAY_SUFFIX_BYTES;
+
 /// Durable, immutable bridge from a published Agent-journal entry back to the
 /// exact Shared Raft authority which selected it.
 ///
@@ -500,8 +510,8 @@ pub enum JournalStoreError {
     InvalidClass,
     NonCanonical,
     LimitExceeded,
-    /// A bounded authenticated-history retirement backlog must be covered by
-    /// a fresh checkpoint and collected before another history publication.
+    /// A bounded durable backlog or immutable staging namespace must be
+    /// covered by a fresh checkpoint and collected before another write.
     Backpressure,
     MissingObject,
     Corrupt,
@@ -4266,6 +4276,30 @@ impl MemoryAgentJournalStore {
             .map(Vec::as_slice)
     }
 
+    fn preflight_merge_event_insert(&self, encoded_bytes: usize) -> Result<(), JournalStoreError> {
+        let mut objects = 0_usize;
+        let mut bytes = 0_usize;
+        for ((class, _), stored) in &self.objects {
+            if *class != JournalStorageClass::MergeEvent {
+                continue;
+            }
+            objects = objects
+                .checked_add(1)
+                .ok_or(JournalStoreError::Backpressure)?;
+            bytes = bytes
+                .checked_add(stored.len())
+                .ok_or(JournalStoreError::Backpressure)?;
+        }
+        if objects >= MAX_MERGE_EVENT_OBJECTS
+            || bytes
+                .checked_add(encoded_bytes)
+                .is_none_or(|next| next > MAX_MERGE_EVENT_BYTES)
+        {
+            return Err(JournalStoreError::Backpressure);
+        }
+        Ok(())
+    }
+
     fn publish_anchor_with_mode<R: CanonicalJournalRecord>(
         &mut self,
         expected: JournalHeadsId,
@@ -4561,6 +4595,9 @@ impl AgentJournalStore for MemoryAgentJournalStore {
             Some(existing) if existing == &encoded.bytes => Ok(false),
             Some(_) => Err(JournalStoreError::Corrupt),
             None => {
+                if encoded.class == JournalStorageClass::MergeEvent {
+                    self.preflight_merge_event_insert(encoded.bytes.len())?;
+                }
                 self.objects.insert(key, encoded.bytes);
                 Ok(true)
             }
@@ -8984,6 +9021,9 @@ impl FileAgentJournalStore {
         ensure_writable_content_class(R::STORAGE_CLASS)?;
         let encoded = encode_object(record)?;
         let directory = self.object_directory(encoded.class)?;
+        if encoded.class == JournalStorageClass::MergeEvent {
+            preflight_file_merge_event_insert(self.directory(directory)?, &encoded)?;
+        }
         persist_immutable_at(
             self.directory(directory)?,
             &encode_hex(&encoded.id),
@@ -13505,6 +13545,238 @@ mod tests {
         }
     }
 
+    fn quota_merge_event(genesis: &AgentJournalGenesis, sequence: u64) -> MergeEvent {
+        let identity = Hash::digest(
+            b"vos/agent/journal-store/test/merge-quota-event",
+            &[&sequence.to_le_bytes()],
+        );
+        let mut invocation = invocation(MethodMode::Merge, sequence as u8);
+        invocation.invocation = InvocationId(identity.0);
+        invocation.message = sequence.to_le_bytes().to_vec();
+        let authority = invocation_receipt(&invocation);
+        let event = MergeEvent {
+            genesis: genesis.id(),
+            committee: None,
+            author: NodeId(identity.0),
+            ordered_base: OrderedBase::post_genesis(),
+            causal_height: 1,
+            parents: Vec::new(),
+            input: ReplayInput {
+                runtime: runtime_binding(),
+                operation: ReplayOperation::Invoke {
+                    invocation,
+                    authority,
+                    observed_slot: 15,
+                },
+            },
+            signature: vec![0x5a; ED25519_SIGNATURE_BYTES],
+        };
+        event.validate().unwrap();
+        event
+    }
+
+    fn large_quota_merge_event(
+        genesis: &AgentJournalGenesis,
+        sequence: u64,
+        availability_bytes: usize,
+    ) -> MergeEvent {
+        let runtime = runtime_binding();
+        let identity = Hash::digest(
+            b"vos/agent/journal-store/test/large-merge-quota-event",
+            &[&sequence.to_le_bytes()],
+        );
+        let bytes = vec![(sequence as u8).wrapping_add(1); availability_bytes];
+        let reference = crate::agent_sdk::BlobRef::of_bytes(&bytes);
+        let work = crate::agent_sdk::InvocationWork {
+            space: crate::agent_sdk::SpaceId(runtime.space.0),
+            agent: crate::agent_sdk::AgentId(runtime.agent.0),
+            runtime_deployment: crate::agent_sdk::DeploymentId(runtime.deployment.0),
+            invocation: crate::agent_sdk::InvocationId(identity.0),
+            actor: crate::agent_sdk::ActorId([0x82; 32]),
+            incarnation: crate::agent_sdk::Hash([0x83; 32]),
+            deployment: crate::agent_sdk::DeploymentId([0x84; 32]),
+            program: crate::agent_sdk::ProgramId([0x85; 32]),
+            mode: crate::agent_sdk::MethodMode::Merge,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::default(),
+            message: sequence.to_le_bytes().to_vec(),
+            installation_data: None,
+            availability: vec![crate::agent_sdk::RuntimeBlob { reference, bytes }],
+            gas: 10_000,
+            recovery_only: false,
+        };
+        let public_key = [0x91; 32];
+        let authority = crate::agent_sdk::authority::AuthorityReceipt {
+            selector: crate::agent_sdk::authority::AuthorityReceiptSelector {
+                policy: crate::agent_sdk::Hash([0x92; 32]),
+                issuer: crate::agent_sdk::authority::AuthorityIssuer {
+                    principal: crate::agent_sdk::PrincipalId([0x93; 32]),
+                    actor: crate::agent_sdk::ActorId([0x94; 32]),
+                    deployment: crate::agent_sdk::DeploymentId([0x95; 32]),
+                    program: crate::agent_sdk::ProgramId([0x96; 32]),
+                    producer: crate::agent_sdk::ProducerId::of_public_key(&public_key),
+                },
+                space: work.space,
+                agent: work.agent,
+                operation: crate::agent_sdk::authority::AuthorityOperationKind::InvokeActor,
+                runtime_deployment: work.runtime_deployment,
+                actor: Some(work.actor),
+                actor_deployment: Some(work.deployment),
+                evidence: crate::agent_sdk::authority::AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: crate::agent_sdk::Hash([0x97; 32]),
+                },
+                lane_roots: crate::agent_sdk::authority::AuthorityLaneRoots::default(),
+                epoch: 1,
+                decision_sequence: 0,
+                acknowledged_through: 0,
+                valid_from: 5,
+                expires_at: 50,
+                request: work.commitment(),
+            },
+            public_key,
+            signature: [0x98; 64],
+        };
+        let event = MergeEvent {
+            genesis: genesis.id(),
+            committee: None,
+            author: NodeId(identity.0),
+            ordered_base: OrderedBase::post_genesis(),
+            causal_height: 1,
+            parents: Vec::new(),
+            input: ReplayInput {
+                runtime,
+                operation: ReplayOperation::CleanInvoke {
+                    work,
+                    authority,
+                    observed_slot: 12,
+                },
+            },
+            signature: vec![0x6a; ED25519_SIGNATURE_BYTES],
+        };
+        event
+    }
+
+    #[test]
+    fn memory_merge_event_count_quota_allows_exact_retry_and_refuses_new_identity() {
+        assert_eq!(MAX_MERGE_EVENT_OBJECTS, 1_536);
+        assert_eq!(MAX_MERGE_EVENT_BYTES, 64 * 1024 * 1024);
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        let mut final_event = None;
+        for sequence in 0..MAX_MERGE_EVENT_OBJECTS as u64 {
+            let event = quota_merge_event(&genesis, sequence);
+            assert!(store.put(&event).unwrap());
+            final_event = Some(event);
+        }
+        let final_event = final_event.unwrap();
+        assert!(!store.put(&final_event).unwrap());
+
+        let overflow = quota_merge_event(&genesis, MAX_MERGE_EVENT_OBJECTS as u64);
+        assert_eq!(store.put(&overflow), Err(JournalStoreError::Backpressure));
+        assert_eq!(store.get::<MergeEvent>(overflow.id()).unwrap(), None);
+    }
+
+    #[test]
+    fn memory_merge_event_byte_quota_is_aggregate_and_retry_safe() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        let mut aggregate = 0_usize;
+        let mut last_sequence = None;
+        let overflow = (0..MAX_MERGE_EVENT_OBJECTS as u64)
+            .find_map(|sequence| {
+                let event = large_quota_merge_event(&genesis, sequence, 1_450_000);
+                let id = event.id();
+                let encoded = event.encode();
+                if aggregate + encoded.len() > MAX_MERGE_EVENT_BYTES {
+                    return Some(event);
+                }
+                if sequence == 0 {
+                    decode_object::<MergeEvent>(&encoded, id).unwrap();
+                }
+                assert!(
+                    store
+                        .objects
+                        .insert((JournalStorageClass::MergeEvent, *id.as_bytes()), encoded)
+                        .is_none()
+                );
+                aggregate += store
+                    .objects
+                    .get(&(JournalStorageClass::MergeEvent, *id.as_bytes()))
+                    .unwrap()
+                    .len();
+                last_sequence = Some(sequence);
+                None
+            })
+            .expect("the aggregate byte quota must precede the object quota");
+        assert!(aggregate <= MAX_MERGE_EVENT_BYTES);
+        let last = large_quota_merge_event(&genesis, last_sequence.unwrap(), 1_450_000);
+        assert!(!store.put(&last).unwrap());
+        assert_eq!(store.put(&overflow), Err(JournalStoreError::Backpressure));
+        assert_eq!(store.get::<MergeEvent>(overflow.id()).unwrap(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_merge_event_quota_survives_restart_and_promotes_exact_stage_at_limit() {
+        let directory = TestDirectory::new("merge-event-quota-restart");
+        let genesis = genesis();
+        let store = open_file_store(&directory);
+        let root = store.root().to_path_buf();
+        drop(store);
+
+        let merge_directory = root.join("records/merge-events");
+        for sequence in 0..(MAX_MERGE_EVENT_OBJECTS as u64 - 1) {
+            let event = quota_merge_event(&genesis, sequence);
+            fs::write(
+                merge_directory.join(encode_hex(event.id().as_bytes())),
+                event.encode(),
+            )
+            .unwrap();
+        }
+        let staged = quota_merge_event(&genesis, MAX_MERGE_EVENT_OBJECTS as u64 - 1);
+        let staged_name = sibling_next_name(&encode_hex(staged.id().as_bytes()));
+        fs::write(merge_directory.join(&staged_name), staged.encode()).unwrap();
+
+        let mut reopened = open_file_store(&directory);
+        assert!(reopened.put(&staged).unwrap());
+        assert!(!merge_directory.join(staged_name).exists());
+        assert!(
+            merge_directory
+                .join(encode_hex(staged.id().as_bytes()))
+                .is_file()
+        );
+        let overflow = quota_merge_event(&genesis, MAX_MERGE_EVENT_OBJECTS as u64);
+        let overflow_name = encode_hex(overflow.id().as_bytes());
+        assert_eq!(
+            reopened.put(&overflow),
+            Err(JournalStoreError::Backpressure)
+        );
+        assert!(!merge_directory.join(&overflow_name).exists());
+        assert!(
+            !merge_directory
+                .join(sibling_next_name(&overflow_name))
+                .exists()
+        );
+        drop(reopened);
+
+        let mut restarted = open_file_store(&directory);
+        assert!(!restarted.put(&staged).unwrap());
+        assert_eq!(
+            restarted.put(&overflow),
+            Err(JournalStoreError::Backpressure)
+        );
+        assert_eq!(
+            fs::read_dir(&merge_directory).unwrap().count(),
+            MAX_MERGE_EVENT_OBJECTS
+        );
+    }
+
     fn merge_successor(
         store: &mut MemoryAgentJournalStore,
         heads: &JournalHeads,
@@ -17646,6 +17918,153 @@ fn visit_directory_names_bounded(
     }
     result?;
     Ok(visited)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct MergeEventFileMetadata {
+    identity: FileIdentity,
+    bytes: usize,
+    links: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Default)]
+struct MergeEventFilePresence {
+    canonical: Option<MergeEventFileMetadata>,
+    staged: Option<MergeEventFileMetadata>,
+}
+
+#[cfg(target_os = "linux")]
+fn merge_event_file_metadata(
+    directory: &File,
+    name: &str,
+) -> Result<MergeEventFileMetadata, JournalStoreError> {
+    let status = stat_at(directory, &c_name(name)?)
+        .map_err(|_| JournalStoreError::Unavailable)?
+        .ok_or(JournalStoreError::Corrupt)?;
+    // SAFETY: `geteuid` has no preconditions or borrowed state.
+    let effective_user = unsafe { libc::geteuid() };
+    if status.st_mode & libc::S_IFMT != libc::S_IFREG
+        || status.st_uid != effective_user
+        || status.st_mode & 0o022 != 0
+        || status.st_size <= 0
+        || status.st_size as u64 > MAX_JOURNAL_RECORD_BYTES as u64
+        || status.st_nlink == 0
+    {
+        return Err(JournalStoreError::Corrupt);
+    }
+    Ok(MergeEventFileMetadata {
+        identity: status_identity(&status),
+        bytes: status.st_size as usize,
+        links: status.st_nlink as u64,
+    })
+}
+
+/// Validate and account for the complete descriptor-pinned Merge namespace
+/// before creating an inode for `incoming`. The stable external store lock
+/// and the exclusive `AgentJournalStore::put` borrow make this scan plus the
+/// following immutable install one single-writer transaction. A recognized
+/// `.next` crash stage reserves exactly one object and its encoded bytes; an
+/// exact retry may promote it even when the namespace is at its limit. The
+/// scan reads metadata only for retained identities, then reads and decodes
+/// only the incoming identity. This keeps repeated staging O(objects) rather
+/// than O(total retained bytes).
+#[cfg(target_os = "linux")]
+fn preflight_file_merge_event_insert(
+    directory: &File,
+    incoming: &EncodedObject,
+) -> Result<(), JournalStoreError> {
+    if incoming.class != JournalStorageClass::MergeEvent {
+        return Err(JournalStoreError::InvalidClass);
+    }
+
+    let mut entries = BTreeMap::<[u8; 32], MergeEventFilePresence>::new();
+    let maximum_physical_names = MAX_MERGE_EVENT_OBJECTS
+        .checked_mul(2)
+        .ok_or(JournalStoreError::Backpressure)?;
+    match visit_directory_names_bounded(directory, maximum_physical_names, |name| {
+        let (stem, staged) = name
+            .strip_suffix(".next")
+            .map_or((name, false), |stem| (stem, true));
+        let id = decode_hex_32(stem.as_bytes()).ok_or(JournalStoreError::Corrupt)?;
+        if !entries.contains_key(&id) && entries.len() == MAX_MERGE_EVENT_OBJECTS {
+            return Err(JournalStoreError::Backpressure);
+        }
+        let metadata = merge_event_file_metadata(directory, name)?;
+        let presence = entries.entry(id).or_default();
+        let slot = if staged {
+            &mut presence.staged
+        } else {
+            &mut presence.canonical
+        };
+        if slot.replace(metadata).is_some() {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(())
+    }) {
+        Err(JournalStoreError::LimitExceeded) => return Err(JournalStoreError::Backpressure),
+        result => result?,
+    };
+
+    let mut aggregate_bytes = 0_usize;
+    let mut incoming_presence = None;
+    for (id, presence) in &entries {
+        let metadata = match (presence.canonical, presence.staged) {
+            (Some(canonical), None) if canonical.links == 1 => canonical,
+            (None, Some(staged)) if staged.links == 1 => staged,
+            (Some(canonical), Some(staged))
+                if canonical.identity == staged.identity
+                    && canonical.bytes == staged.bytes
+                    && canonical.links == 2
+                    && staged.links == 2 =>
+            {
+                canonical
+            }
+            _ => return Err(JournalStoreError::Corrupt),
+        };
+        aggregate_bytes = aggregate_bytes
+            .checked_add(metadata.bytes)
+            .ok_or(JournalStoreError::Backpressure)?;
+        if aggregate_bytes > MAX_MERGE_EVENT_BYTES {
+            return Err(JournalStoreError::Backpressure);
+        }
+        if *id == incoming.id {
+            incoming_presence = Some(*presence);
+        }
+    }
+
+    if let Some(presence) = incoming_presence {
+        let canonical_name = encode_hex(&incoming.id);
+        let stored_name = if presence.canonical.is_some() {
+            canonical_name
+        } else {
+            sibling_next_name(&canonical_name)
+        };
+        let stored = read_bounded_regular_at(directory, &stored_name, MAX_JOURNAL_RECORD_BYTES)?
+            .ok_or(JournalStoreError::Corrupt)?;
+        decode_object::<MergeEvent>(&stored, MergeEventId(incoming.id))?;
+        if stored != incoming.bytes {
+            return Err(JournalStoreError::Corrupt);
+        }
+        return Ok(());
+    }
+    if entries.len() == MAX_MERGE_EVENT_OBJECTS
+        || aggregate_bytes
+            .checked_add(incoming.bytes.len())
+            .is_none_or(|next| next > MAX_MERGE_EVENT_BYTES)
+    {
+        return Err(JournalStoreError::Backpressure);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preflight_file_merge_event_insert(
+    _directory: &File,
+    _incoming: &EncodedObject,
+) -> Result<(), JournalStoreError> {
+    Err(JournalStoreError::Unavailable)
 }
 
 #[cfg(target_os = "linux")]

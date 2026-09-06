@@ -9,8 +9,6 @@
 //! derived from the complete Noise-authenticated [`PeerId`].  No compact node
 //! prefix is part of this schema.
 
-#![allow(dead_code)] // Live SharedAgentHost attachment lands separately.
-
 use std::fmt;
 use std::io;
 
@@ -19,29 +17,48 @@ use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response::Codec;
 use libp2p::{PeerId, StreamProtocol};
 use vos_agent_sdk::authority::{AuthorityOperationKind, AuthorityReceipt};
-use vos_agent_sdk::wire::{CanonicalWire, MAX_AUTHORITY_RECEIPT_WIRE_BYTES, WireError};
+use vos_agent_sdk::wire::{
+    CanonicalWire, MAX_AUTHORITY_RECEIPT_WIRE_BYTES, MAX_RUNTIME_TRANSITION_WIRE_BYTES,
+    MAX_RUNTIME_WORK_WIRE_BYTES, WireError,
+};
 use vos_agent_sdk::{
     ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, Hash, InvocationId,
-    InvocationOrigin, InvocationRoleClaims, InvocationWork, MAX_INVOCATION_REPLY_BYTES,
-    MAX_RUNTIME_AVAILABILITY_BYTES, MAX_RUNTIME_AVAILABILITY_ITEMS, MethodMode, NodeId,
-    PrincipalId, ProgramId, RoleId, RuntimeBlob, SpaceId,
+    InvocationOrigin, InvocationRoleClaims, InvocationWork, MAX_RUNTIME_AVAILABILITY_BYTES,
+    MAX_RUNTIME_AVAILABILITY_ITEMS, MethodMode, NodeId, PrincipalId, ProgramId, RoleId,
+    RuntimeBlob, RuntimeOutcome, RuntimeState, RuntimeTransition, SpaceId,
 };
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
 /// The clean Agent protocol is a separate negotiation generation.  It is not
 /// a version alias or fallback for `/vos/0.1.0`.
-pub(crate) const PROTOCOL: StreamProtocol = StreamProtocol::new("/vos/agent/1.0.0");
+pub(crate) const PROTOCOL: StreamProtocol = StreamProtocol::new("/vos/agent/2.0.0");
 
-const MAGIC: [u8; 4] = *b"VAN1";
-const VERSION: u16 = 1;
+// Invocation replies became lossless canonical `RuntimeOutcome` values before
+// the live host attachment was enabled.  Keep that incompatible schema
+// visibly distinct from the earlier projected status/payload prototype and
+// negotiate a distinct `/vos/agent/2.0.0` stream protocol generation.
+const MAGIC: [u8; 4] = *b"VAN2";
+const VERSION: u16 = 2;
 
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
-pub(crate) const MAX_RAFT_COMMAND_BYTES: usize = 64 * 1024;
+/// Enough for one complete clean Ordered command, including its maximum-size
+/// `InvocationWork`, journal record, and generation route envelopes.
+pub(crate) const MAX_RAFT_COMMAND_BYTES: usize = MAX_RUNTIME_WORK_WIRE_BYTES + 64 * 1024;
 pub(crate) const MAX_RAFT_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_MERGE_NODE_BYTES: usize = 4 * 1024 * 1024;
+/// A Merge event can retain the same maximum-size clean work as an Ordered
+/// entry; it must fit as one canonical node without an opaque subframe.
+pub(crate) const MAX_MERGE_NODE_BYTES: usize = MAX_RUNTIME_WORK_WIRE_BYTES + 64 * 1024;
 pub(crate) const MAX_RAFT_ENTRIES: usize = 256;
-pub(crate) const MAX_RAFT_MEMBERS: usize = 64;
-pub(crate) const MAX_MERGE_HEADS: usize = 256;
+/// Full legal Shared-agent committee width; smaller transport-only caps must
+/// not make an authority-valid generation impossible to attach.
+pub(crate) const MAX_RAFT_MEMBERS: usize = 256;
+/// Kept equal to the journal's canonical Merge-frontier bound.  The protocol
+/// module is deliberately storage-independent, so repeat the wire constant
+/// here and assert equality at the live adapter boundary.
+pub(crate) const MAX_MERGE_HEADS: usize = 512;
+
+const _: () = assert!(MAX_RAFT_COMMAND_BYTES + 1024 < MAX_FRAME_BYTES);
+const _: () = assert!(MAX_MERGE_NODE_BYTES + 1024 < MAX_FRAME_BYTES);
 
 const TAG_INVOKE_REQUEST: u8 = 0x10;
 const TAG_INVOKE_REPLY: u8 = 0x11;
@@ -166,40 +183,58 @@ pub(crate) struct InvocationRequest {
     pub(crate) authority: AuthorityReceipt,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum InvocationReplyStatus {
-    Complete = 0,
-    Rejected = 1,
-    NotFound = 2,
-    Failed = 3,
-}
-
-impl InvocationReplyStatus {
-    fn decode(tag: u8) -> Result<Self, AgentProtocolError> {
-        match tag {
-            0 => Ok(Self::Complete),
-            1 => Ok(Self::Rejected),
-            2 => Ok(Self::NotFound),
-            3 => Ok(Self::Failed),
-            _ => Err(AgentProtocolError::NonCanonical),
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InvocationReply {
-    pub(crate) actor: ActorId,
-    pub(crate) invocation: InvocationId,
-    pub(crate) status: InvocationReplyStatus,
-    pub(crate) payload: Vec<u8>,
+    /// Domain-separated commitment of the complete work and exact authority
+    /// receipt. It binds even error outcomes which carry no identity fields.
+    pub(crate) request: Hash,
+    /// Lossless canonical SDK outcome. No status, observation, error, yield,
+    /// or acknowledgement information is projected away by transport.
+    pub(crate) outcome: RuntimeOutcome,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InvocationRedirect {
-    pub(crate) actor: ActorId,
-    pub(crate) invocation: InvocationId,
+    pub(crate) request: Hash,
     pub(crate) leader: NodeId,
+}
+
+pub(crate) fn invocation_request_correlation(request: &InvocationRequest) -> Hash {
+    let work = request.work.commitment();
+    let authority = request.authority.commitment();
+    Hash::digest(
+        b"vos/agent/network/invocation-correlation/v1",
+        &[work.as_bytes(), authority.as_bytes()],
+    )
+}
+
+pub(crate) fn outcome_matches_work(outcome: &RuntimeOutcome, work: &InvocationWork) -> bool {
+    match outcome {
+        RuntimeOutcome::Completed(Ok(reply)) => {
+            reply.invocation == work.invocation
+                && reply.actor == work.actor
+                && reply.incarnation == work.incarnation
+                && reply.deployment == work.deployment
+                && reply.mode == work.mode
+                && reply.lane == work.mode.write_lane()
+                && reply.gas_remaining <= work.gas
+        }
+        RuntimeOutcome::Yielded(yielded) => {
+            yielded.invocation == work.invocation
+                && yielded.actor == work.actor
+                && yielded.incarnation == work.incarnation
+                && yielded.deployment == work.deployment
+                && yielded.program == work.program
+                && yielded.mode == work.mode
+        }
+        // Canonical invocation errors have no embedded request identities;
+        // their exact correlation is the outer request commitment, checked
+        // by both inbound and pending-reply paths. Management and
+        // acknowledgement outcomes belong to different RuntimeWork variants
+        // and are never valid replies to this InvocationWork envelope.
+        RuntimeOutcome::Completed(Err(_)) => true,
+        RuntimeOutcome::Acknowledged(_) | RuntimeOutcome::Management(_) => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -390,6 +425,12 @@ pub(crate) fn authenticate_sender(
 
 impl AgentFrame {
     pub(crate) fn encode(&self) -> Result<Vec<u8>, AgentProtocolError> {
+        // Every field has an individual bound, but an AppendEntries request
+        // can contain many individually legal maximum-size commands. Reject
+        // the aggregate before `Encoder` clones it into an oversized Vec.
+        if !message_fits_frame_allocation(&self.message) {
+            return Err(AgentProtocolError::LimitExceeded);
+        }
         if !self.is_valid() {
             return Err(AgentProtocolError::InvalidValue);
         }
@@ -446,6 +487,29 @@ impl AgentFrame {
     }
 }
 
+fn message_fits_frame_allocation(message: &AgentMessage) -> bool {
+    let AgentMessage::Raft(RaftMessage::AppendRequest { entries, .. }) = message else {
+        return true;
+    };
+    // 1 KiB covers the complete fixed frame/route/Raft envelope. Sixty-four
+    // bytes per entry covers term/index/tag/list framing; configuration node
+    // bytes and command payloads are then accounted exactly. This estimate is
+    // intentionally conservative and checked before any aggregate encoding.
+    entries
+        .iter()
+        .try_fold(1_024usize, |total, entry| {
+            let body = match &entry.kind {
+                RaftLogEntryKind::Command(payload) => payload.len(),
+                RaftLogEntryKind::Configuration { members, joint_old } => members
+                    .len()
+                    .checked_add(joint_old.as_ref().map_or(0, Vec::len))?
+                    .checked_mul(32)?,
+            };
+            total.checked_add(64)?.checked_add(body)
+        })
+        .is_some_and(|total| total <= MAX_FRAME_BYTES)
+}
+
 fn encode_route(encoder: &mut Encoder<'_>, route: AgentGenerationRoute) {
     encoder.fixed(route.space.as_bytes());
     encoder.fixed(route.agent.as_bytes());
@@ -476,14 +540,16 @@ fn message_is_valid(message: &AgentMessage, route: AgentGenerationRoute, sender:
                 && request.authority.selector.request == request.work.commitment()
         }
         AgentMessage::InvokeReply(reply) => {
-            reply.actor != ActorId::ZERO
-                && reply.invocation != InvocationId::ZERO
-                && reply.payload.len() <= MAX_INVOCATION_REPLY_BYTES
+            reply.request != Hash::ZERO
+                && RuntimeTransition {
+                    state: RuntimeState::default(),
+                    outcome: reply.outcome.clone(),
+                }
+                .encode()
+                .is_ok()
         }
         AgentMessage::InvokeRedirect(redirect) => {
-            redirect.actor != ActorId::ZERO
-                && redirect.invocation != InvocationId::ZERO
-                && redirect.leader != NodeId::ZERO
+            redirect.request != Hash::ZERO && redirect.leader != NodeId::ZERO
         }
         AgentMessage::Raft(message) => raft_message_is_valid(message, sender),
         AgentMessage::Merge(message) => merge_message_is_valid(message),
@@ -629,24 +695,24 @@ fn encode_message(
         }
         AgentMessage::InvokeReply(reply) => {
             encoder.u8(TAG_INVOKE_REPLY);
-            encode_invocation_header(encoder, reply.actor, reply.invocation);
-            encoder.u8(reply.status as u8);
-            encoder.bytes(&reply.payload);
+            encoder.fixed(reply.request.as_bytes());
+            let canonical = RuntimeTransition {
+                state: RuntimeState::default(),
+                outcome: reply.outcome.clone(),
+            }
+            .encode()
+            .map_err(AgentProtocolError::from)?;
+            encoder.bytes(&canonical);
         }
         AgentMessage::InvokeRedirect(redirect) => {
             encoder.u8(TAG_INVOKE_REDIRECT);
-            encode_invocation_header(encoder, redirect.actor, redirect.invocation);
+            encoder.fixed(redirect.request.as_bytes());
             encoder.fixed(redirect.leader.as_bytes());
         }
         AgentMessage::Raft(message) => encode_raft_message(encoder, message),
         AgentMessage::Merge(message) => encode_merge_message(encoder, message),
     }
     Ok(())
-}
-
-fn encode_invocation_header(encoder: &mut Encoder<'_>, actor: ActorId, invocation: InvocationId) {
-    encoder.fixed(actor.as_bytes());
-    encoder.fixed(invocation.as_bytes());
 }
 
 fn encode_invocation_work(encoder: &mut Encoder<'_>, work: &InvocationWork) {
@@ -879,22 +945,22 @@ fn decode_message(decoder: &mut Decoder<'_>) -> Result<AgentMessage, AgentProtoc
             }))
         }
         TAG_INVOKE_REPLY => {
-            let (actor, invocation) = decode_invocation_header(decoder)?;
-            let status = InvocationReplyStatus::decode(decoder.u8()?)?;
-            let payload = decoder.bytes_bounded(MAX_INVOCATION_REPLY_BYTES)?;
+            let request = Hash(decoder.fixed()?);
+            let canonical = decoder.bytes_ref_bounded(MAX_RUNTIME_TRANSITION_WIRE_BYTES)?;
+            let transition = RuntimeTransition::decode(canonical)?;
+            if !transition.state.is_empty() {
+                return Err(AgentProtocolError::NonCanonical);
+            }
             Ok(AgentMessage::InvokeReply(InvocationReply {
-                actor,
-                invocation,
-                status,
-                payload,
+                request,
+                outcome: transition.outcome,
             }))
         }
         TAG_INVOKE_REDIRECT => {
-            let (actor, invocation) = decode_invocation_header(decoder)?;
+            let request = Hash(decoder.fixed()?);
             let leader = NodeId(decoder.fixed()?);
             Ok(AgentMessage::InvokeRedirect(InvocationRedirect {
-                actor,
-                invocation,
+                request,
                 leader,
             }))
         }
@@ -913,14 +979,6 @@ fn decode_message(decoder: &mut Decoder<'_>) -> Result<AgentMessage, AgentProtoc
         | TAG_MERGE_ANNOUNCE_HEADS => decode_merge_message(tag, decoder).map(AgentMessage::Merge),
         _ => Err(AgentProtocolError::UnknownMessage(tag)),
     }
-}
-
-fn decode_invocation_header(
-    decoder: &mut Decoder<'_>,
-) -> Result<(ActorId, InvocationId), AgentProtocolError> {
-    let actor = ActorId(decoder.fixed()?);
-    let invocation = InvocationId(decoder.fixed()?);
-    Ok((actor, invocation))
 }
 
 fn decode_invocation_work(decoder: &mut Decoder<'_>) -> Result<InvocationWork, DecodeError> {
@@ -1405,7 +1463,7 @@ mod tests {
 
     #[test]
     fn protocol_generation_is_distinct() {
-        assert_eq!(PROTOCOL.as_ref(), "/vos/agent/1.0.0");
+        assert_eq!(PROTOCOL.as_ref(), "/vos/agent/2.0.0");
         assert_ne!(PROTOCOL.as_ref(), "/vos/0.1.0");
     }
 
@@ -1417,23 +1475,25 @@ mod tests {
         let mut members = vec![sender, member_b];
         members.sort_unstable();
 
-        round_trip(invoke_frame(&sender_peer));
+        let invocation_frame = invoke_frame(&sender_peer);
+        let AgentMessage::InvokeRequest(request) = &invocation_frame.message else {
+            unreachable!()
+        };
+        let correlation = invocation_request_correlation(request);
+        round_trip(invocation_frame);
         round_trip(AgentFrame {
             route: route(),
             sender,
             message: AgentMessage::InvokeReply(InvocationReply {
-                actor: ActorId(id::<4>()),
-                invocation: InvocationId(id::<5>()),
-                status: InvocationReplyStatus::Complete,
-                payload: b"done".to_vec(),
+                request: correlation,
+                outcome: RuntimeOutcome::Completed(Err(vos_agent_sdk::InvocationError::NotFound)),
             }),
         });
         round_trip(AgentFrame {
             route: route(),
             sender,
             message: AgentMessage::InvokeRedirect(InvocationRedirect {
-                actor: ActorId(id::<4>()),
-                invocation: InvocationId(id::<5>()),
+                request: correlation,
                 leader: member_b,
             }),
         });
@@ -1571,6 +1631,141 @@ mod tests {
         });
     }
 
+    #[test]
+    fn invocation_reply_preserves_every_canonical_outcome_and_rejects_projection_frames() {
+        let sender_peer = peer(21);
+        let request_frame = invoke_frame(&sender_peer);
+        let AgentMessage::InvokeRequest(request) = request_frame.message else {
+            unreachable!()
+        };
+        let correlation = invocation_request_correlation(&request);
+        let reply = vos_agent_sdk::InvocationReply {
+            invocation: request.work.invocation,
+            actor: request.work.actor,
+            incarnation: request.work.incarnation,
+            deployment: request.work.deployment,
+            mode: request.work.mode,
+            lane: request.work.mode.write_lane(),
+            status: vos_agent_sdk::InvocationStatus::Panicked,
+            reply: b"exact panic payload".to_vec(),
+            gas_remaining: 17,
+            observation: vos_agent_sdk::InvocationObservation {
+                linear_revision: Some(11),
+                merge_frontier: Some(Hash(id::<52>())),
+                local_revision: Some(13),
+            },
+        };
+        let outcomes = vec![
+            RuntimeOutcome::Completed(Ok(reply)),
+            RuntimeOutcome::Completed(Err(vos_agent_sdk::InvocationError::UnsupportedHostCall(77))),
+            RuntimeOutcome::Yielded(vos_agent_sdk::YieldedInvocation {
+                invocation: request.work.invocation,
+                actor: request.work.actor,
+                incarnation: request.work.incarnation,
+                deployment: request.work.deployment,
+                program: request.work.program,
+                mode: request.work.mode,
+                continuation: BlobRef {
+                    hash: Hash(id::<53>()),
+                    len: 9,
+                },
+                ready_sequence: 3,
+                installation_data: None,
+                required: Vec::new(),
+                reason: vos_agent_sdk::YieldReason::Cooperative,
+            }),
+            RuntimeOutcome::Management(Err(vos_agent_sdk::ManagementError::InvalidRequest)),
+            RuntimeOutcome::Acknowledged(Ok(vos_agent_sdk::InvocationAcknowledgement {
+                invocation: request.work.invocation,
+                actor: request.work.actor,
+                incarnation: request.work.incarnation,
+                deployment: request.work.deployment,
+                mode: request.work.mode,
+                work: request.work.commitment(),
+                authority: request.authority.commitment(),
+            })),
+        ];
+        for outcome in outcomes {
+            let matches_invocation = matches!(
+                &outcome,
+                RuntimeOutcome::Completed(_) | RuntimeOutcome::Yielded(_)
+            );
+            assert_eq!(
+                outcome_matches_work(&outcome, &request.work),
+                matches_invocation
+            );
+            round_trip(AgentFrame {
+                route: route(),
+                sender: node(&sender_peer),
+                message: AgentMessage::InvokeReply(InvocationReply {
+                    request: correlation,
+                    outcome,
+                }),
+            });
+        }
+
+        let wrong_lane = RuntimeOutcome::Completed(Ok(vos_agent_sdk::InvocationReply {
+            invocation: request.work.invocation,
+            actor: request.work.actor,
+            incarnation: request.work.incarnation,
+            deployment: request.work.deployment,
+            mode: request.work.mode,
+            lane: Some(vos_agent_sdk::StateLane::Local),
+            status: vos_agent_sdk::InvocationStatus::Done,
+            reply: Vec::new(),
+            gas_remaining: request.work.gas,
+            observation: vos_agent_sdk::InvocationObservation {
+                linear_revision: None,
+                merge_frontier: None,
+                local_revision: None,
+            },
+        }));
+        assert!(!outcome_matches_work(&wrong_lane, &request.work));
+
+        let mut oversized = vos_agent_sdk::InvocationReply {
+            invocation: request.work.invocation,
+            actor: request.work.actor,
+            incarnation: request.work.incarnation,
+            deployment: request.work.deployment,
+            mode: request.work.mode,
+            lane: Some(vos_agent_sdk::StateLane::Merge),
+            status: vos_agent_sdk::InvocationStatus::Done,
+            reply: vec![0; vos_agent_sdk::MAX_INVOCATION_REPLY_BYTES + 1],
+            gas_remaining: 1,
+            observation: vos_agent_sdk::InvocationObservation {
+                linear_revision: None,
+                merge_frontier: None,
+                local_revision: None,
+            },
+        };
+        let hostile = AgentFrame {
+            route: route(),
+            sender: node(&sender_peer),
+            message: AgentMessage::InvokeReply(InvocationReply {
+                request: correlation,
+                outcome: RuntimeOutcome::Completed(Ok(oversized.clone())),
+            }),
+        };
+        assert_eq!(hostile.encode(), Err(AgentProtocolError::InvalidValue));
+        oversized.reply.clear();
+
+        // The pre-live projected status/payload layout is not a compatibility
+        // subframe. Its actor bytes are interpreted as the new request
+        // commitment and its invocation prefix as an impossible SDK length.
+        let mut previous = Vec::new();
+        previous.extend_from_slice(&MAGIC);
+        previous.extend_from_slice(&VERSION.to_le_bytes());
+        let mut encoder = Encoder(&mut previous);
+        encode_route(&mut encoder, route());
+        encoder.fixed(node(&sender_peer).as_bytes());
+        encoder.u8(TAG_INVOKE_REPLY);
+        encoder.fixed(request.work.actor.as_bytes());
+        encoder.fixed(request.work.invocation.as_bytes());
+        encoder.u8(0);
+        encoder.bytes(b"projected");
+        assert!(AgentFrame::decode(&previous).is_err());
+    }
+
     #[tokio::test]
     async fn codec_uses_bounded_length_prefix_and_round_trips() {
         let frame = invoke_frame(&peer(3));
@@ -1666,11 +1861,19 @@ mod tests {
             Err(AgentProtocolError::InvalidMagic)
         );
 
+        let mut projected_agent_v1 = bytes.clone();
+        projected_agent_v1[..4].copy_from_slice(b"VAN1");
+        projected_agent_v1[4..6].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            AgentFrame::decode(&projected_agent_v1),
+            Err(AgentProtocolError::InvalidMagic)
+        );
+
         let mut previous_version = bytes.clone();
-        previous_version[4..6].copy_from_slice(&0u16.to_le_bytes());
+        previous_version[4..6].copy_from_slice(&1u16.to_le_bytes());
         assert_eq!(
             AgentFrame::decode(&previous_version),
-            Err(AgentProtocolError::UnsupportedVersion(0))
+            Err(AgentProtocolError::UnsupportedVersion(1))
         );
 
         let mut unknown = bytes.clone();
@@ -1716,6 +1919,36 @@ mod tests {
             AgentFrame::decode(&oversized_frame),
             Err(AgentProtocolError::LimitExceeded)
         );
+
+        let sender = node(&sender_peer);
+        let aggregate = AgentFrame {
+            route: route(),
+            sender,
+            message: AgentMessage::Raft(RaftMessage::AppendRequest {
+                term: 1,
+                leader: sender,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    RaftLogEntry {
+                        term: 1,
+                        index: 1,
+                        kind: RaftLogEntryKind::Command(vec![0; MAX_FRAME_BYTES / 2]),
+                    },
+                    RaftLogEntry {
+                        term: 1,
+                        index: 2,
+                        kind: RaftLogEntryKind::Command(vec![0; MAX_FRAME_BYTES / 2]),
+                    },
+                ],
+                leader_commit: 0,
+            }),
+        };
+        assert_eq!(
+            aggregate.encode(),
+            Err(AgentProtocolError::LimitExceeded),
+            "aggregate bounds must reject before encoding individually legal commands"
+        );
     }
 
     #[test]
@@ -1725,8 +1958,7 @@ mod tests {
             route: route(),
             sender,
             message: AgentMessage::InvokeRedirect(InvocationRedirect {
-                actor: ActorId(id::<4>()),
-                invocation: InvocationId(id::<5>()),
+                request: Hash(id::<4>()),
                 leader: NodeId(id::<7>()),
             }),
         };

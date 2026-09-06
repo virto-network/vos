@@ -80,7 +80,14 @@ pub const ARTIFACT_CHUNK_DATA_BYTES: usize = 64 * 1024;
 /// Maximum complete artifact chunk, including its repeated manifest.
 pub const MAX_ARTIFACT_CHUNK_WIRE_BYTES: usize = 96 * 1024;
 /// Maximum complete Shared Agent Raft command.
-pub const MAX_AGENT_RAFT_COMMAND_BYTES: usize = 192 * 1024;
+///
+/// An Ordered command retains the complete canonical journal record, which in
+/// turn may retain a maximum-size clean `InvocationWork`.  The route and
+/// command envelopes are small but independently bounded, so reserve their
+/// complete declared bound instead of imposing a legacy small-message cap on
+/// otherwise valid clean work.
+pub const MAX_AGENT_RAFT_COMMAND_BYTES: usize =
+    MAX_JOURNAL_RECORD_BYTES + MAX_AGENT_ROUTE_KEY_BYTES + 512;
 /// Maximum complete authorized committee-change preparation.
 pub const MAX_PREPARE_COMMITTEE_CHANGE_BYTES: usize = 160 * 1024;
 /// Maximum complete encoded physical `vos-raft` slot admitted by the Shared
@@ -732,10 +739,16 @@ impl ServiceWire for PrepareCommitteeChange {
         encoder.bytes(&self.next.encode());
         encode_raft_nodes(&mut encoder, &self.previous_voters);
         encode_raft_nodes(&mut encoder, &self.next_voters);
-        // Validation precedes every public construction and decode. A value
-        // which somehow becomes invalid still encodes an impossible empty
-        // nested receipt and is rejected by the outer command validator.
-        encoder.bytes(&self.authority.encode().unwrap_or_default());
+        // Every constructor and decoder validates this private field. If a
+        // future internal mutation violates that invariant, abort at the
+        // canonical-record boundary instead of silently substituting bytes
+        // that could acquire a different commitment.
+        encoder.bytes(
+            &self
+                .authority
+                .encode()
+                .expect("validated committee authority must encode canonically"),
+        );
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -1574,7 +1587,7 @@ fn validate_raft_configuration(
 /// legacy `EntryKind<u16>` bytes. The magic/version prevents a compact row
 /// from being reinterpreted as a full authenticated Node configuration.
 #[cfg(feature = "storage")]
-fn encode_agent_raft_entry_kind(
+pub(crate) fn encode_agent_raft_entry_kind(
     kind: &vos_raft::EntryKind<AgentNodeId>,
 ) -> Result<Vec<u8>, AgentRaftWireError> {
     use vos_raft::EntryKind;
@@ -1607,7 +1620,7 @@ fn encode_agent_raft_entry_kind(
 }
 
 #[cfg(feature = "storage")]
-fn decode_agent_raft_entry_kind(
+pub(crate) fn decode_agent_raft_entry_kind(
     bytes: &[u8],
 ) -> Result<vos_raft::EntryKind<AgentNodeId>, AgentRaftWireError> {
     use vos_raft::EntryKind;
@@ -4898,7 +4911,18 @@ mod application_ledger_v2 {
         writes: std::sync::Mutex<()>,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct AgentNetworkCommitteeState {
+        pub(crate) active: AgentReplicaCommittee,
+        pub(crate) next: Option<AgentReplicaCommittee>,
+        pub(crate) joint: bool,
+    }
+
     impl AgentRaftApplicationLedgerV2 {
+        pub(crate) fn database(&self) -> Arc<Database> {
+            Arc::clone(&self.database)
+        }
+
         pub(crate) fn open(
             database: Arc<Database>,
             generation: AgentGenerationRouteKey,
@@ -5105,6 +5129,27 @@ mod application_ledger_v2 {
             &self,
         ) -> Result<AgentReplicaCommittee, AgentRaftApplicationErrorV2> {
             Ok(self.committee_state()?.active)
+        }
+
+        /// Exact committee view needed by the live transport. During a
+        /// prepared or joint transition the next committee is already an
+        /// authenticated route participant even though `active` remains the
+        /// authority for journal application until the stable leg commits.
+        pub(crate) fn network_committee_state(
+            &self,
+        ) -> Result<AgentNetworkCommitteeState, AgentRaftApplicationErrorV2> {
+            let state = self.committee_state()?;
+            let (next, joint) = state.pending.map_or((None, false), |pending| {
+                (
+                    Some(pending.change.next().clone()),
+                    matches!(pending.phase, PendingCommitteePhaseV2::Joint { .. }),
+                )
+            });
+            Ok(AgentNetworkCommitteeState {
+                active: state.active,
+                next,
+                joint,
+            })
         }
 
         pub(crate) fn pending_transition(
@@ -7471,9 +7516,10 @@ mod application_ledger_v2 {
 #[cfg(all(feature = "std", feature = "storage"))]
 #[allow(unused_imports)]
 pub(crate) use application_ledger_v2::{
-    AgentRaftApplicationErrorV2, AgentRaftApplicationLedgerV2, AgentRaftCommandApplyOutcomeV2,
-    AgentRaftFoundationApplyOutcomeV2, AgentRaftJournalAuditV2, AgentRaftOrderedJournalAnchorV2,
-    AgentRaftPendingOrderedV2, AgentRaftSnapshotContextV2, InstalledAgentRaftSnapshotV2,
+    AgentNetworkCommitteeState, AgentRaftApplicationErrorV2, AgentRaftApplicationLedgerV2,
+    AgentRaftCommandApplyOutcomeV2, AgentRaftFoundationApplyOutcomeV2, AgentRaftJournalAuditV2,
+    AgentRaftOrderedJournalAnchorV2, AgentRaftPendingOrderedV2, AgentRaftSnapshotContextV2,
+    InstalledAgentRaftSnapshotV2,
 };
 
 #[cfg(test)]

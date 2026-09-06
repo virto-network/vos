@@ -13,6 +13,8 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::agent_sdk::wire::CanonicalWire as AgentCanonicalWire;
+
 use super::authority::{ActorInvocationReceipt, AgentAuthorityReceipt, ED25519_SIGNATURE_BYTES};
 use super::committee::GenesisIntentId;
 use super::execution::{
@@ -30,9 +32,13 @@ use crate::service::{
 };
 
 /// Maximum complete canonical replay input, including its wire header.
-pub const MAX_REPLAY_INPUT_BYTES: usize = 128 * 1024;
+///
+/// A clean invocation retains the complete bounded SDK availability closure
+/// so every replica replays exactly the work authorized by the receipt.
+pub const MAX_REPLAY_INPUT_BYTES: usize =
+    crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES + 1024;
 /// Maximum complete ordered, local, or Merge journal record.
-pub const MAX_JOURNAL_RECORD_BYTES: usize = 160 * 1024;
+pub const MAX_JOURNAL_RECORD_BYTES: usize = MAX_REPLAY_INPUT_BYTES + 32 * 1024;
 /// Maximum parents on a Merge event and entries in a Merge frontier.
 pub const MAX_MERGE_FRONTIER_ENTRIES: usize = 512;
 /// Maximum complete checkpoint or lane-state manifest.
@@ -1405,6 +1411,15 @@ pub enum ReplayOperation {
         authority: ActorInvocationReceipt,
         observed_slot: u64,
     },
+    /// Clean-generation invocation retained without conversion to the legacy
+    /// actor invocation or authority receipt model. The SDK work and receipt
+    /// remain distinct authenticated values even when their initial caller
+    /// identity was derived from the same authenticator.
+    CleanInvoke {
+        work: crate::agent_sdk::InvocationWork,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        observed_slot: u64,
+    },
     /// Retire the exact result produced by `invocation`. Keeping the complete
     /// invocation and receipt makes its owning result lane independently
     /// derivable; a bare invocation ID is deliberately insufficient.
@@ -1427,6 +1442,18 @@ impl ReplayOperation {
             Self::Invoke { invocation, .. } | Self::Acknowledge { invocation, .. } => {
                 PersistedLane::from_result_storage(invocation.mode.result_storage())
             }
+            Self::CleanInvoke { work, .. } => match work.mode.result_storage() {
+                crate::agent_sdk::InvocationResultStorage::Control => PersistedLane::Control,
+                crate::agent_sdk::InvocationResultStorage::Lane(
+                    crate::agent_sdk::StateLane::Linear,
+                ) => PersistedLane::Linear,
+                crate::agent_sdk::InvocationResultStorage::Lane(
+                    crate::agent_sdk::StateLane::Merge,
+                ) => PersistedLane::Merge,
+                crate::agent_sdk::InvocationResultStorage::Lane(
+                    crate::agent_sdk::StateLane::Local,
+                ) => PersistedLane::Local,
+            },
         }
     }
 }
@@ -1463,6 +1490,11 @@ impl ReplayInput {
             } => {
                 validate_invocation_receipt(&self.runtime, invocation, authority)?;
             }
+            ReplayOperation::CleanInvoke {
+                work,
+                authority,
+                observed_slot,
+            } => validate_clean_invocation_receipt(&self.runtime, work, authority, *observed_slot)?,
             ReplayOperation::Acknowledge {
                 invocation,
                 authority,
@@ -2738,6 +2770,22 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
             encoder.bytes(&authority.encode());
             encoder.u64(*observed_slot);
         }
+        ReplayOperation::CleanInvoke {
+            work,
+            authority,
+            observed_slot,
+        } => {
+            encoder.u8(4);
+            let canonical = crate::agent_sdk::RuntimeWork::Invoke {
+                state: crate::agent_sdk::RuntimeState::default(),
+                invocation: alloc::boxed::Box::new(work.clone()),
+                authority: alloc::boxed::Box::new(authority.clone()),
+                observed_slot: *observed_slot,
+            }
+            .encode()
+            .expect("validated CleanInvoke must have a canonical SDK encoding");
+            encoder.bytes(&canonical);
+        }
         ReplayOperation::Acknowledge {
             invocation,
             authority,
@@ -2778,8 +2826,54 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
             )?)?,
         }),
         3 => Ok(ReplayOperation::SealMerge),
+        4 => {
+            let canonical = crate::agent_sdk::RuntimeWork::decode(bounded_bytes_ref(
+                decoder,
+                crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES,
+            )?)
+            .map_err(|_| DecodeError::NonCanonical)?;
+            let crate::agent_sdk::RuntimeWork::Invoke {
+                state,
+                invocation,
+                authority,
+                observed_slot,
+            } = canonical
+            else {
+                return Err(DecodeError::NonCanonical);
+            };
+            if !state.is_empty() {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(ReplayOperation::CleanInvoke {
+                work: *invocation,
+                authority: *authority,
+                observed_slot,
+            })
+        }
         _ => Err(DecodeError::InvalidTag),
     }
+}
+
+fn validate_clean_invocation_receipt(
+    runtime: &RuntimeBinding,
+    work: &crate::agent_sdk::InvocationWork,
+    authority: &crate::agent_sdk::authority::AuthorityReceipt,
+    observed_slot: u64,
+) -> Result<(), DecodeError> {
+    let canonical = crate::agent_sdk::RuntimeWork::Invoke {
+        state: crate::agent_sdk::RuntimeState::default(),
+        invocation: alloc::boxed::Box::new(work.clone()),
+        authority: alloc::boxed::Box::new(authority.clone()),
+        observed_slot,
+    };
+    if canonical.encode().is_err()
+        || work.space.0 != runtime.space.0
+        || work.agent.0 != runtime.agent.0
+        || work.runtime_deployment.0 != runtime.deployment.0
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(())
 }
 
 fn validate_management_request(
@@ -3551,6 +3645,69 @@ mod tests {
                     authority,
                     observed_slot: 15,
                 }
+            },
+        }
+    }
+
+    fn clean_replay_input(mode: crate::agent_sdk::MethodMode) -> ReplayInput {
+        let runtime = runtime_binding();
+        let work = crate::agent_sdk::InvocationWork {
+            space: crate::agent_sdk::SpaceId(runtime.space.0),
+            agent: crate::agent_sdk::AgentId(runtime.agent.0),
+            runtime_deployment: crate::agent_sdk::DeploymentId(runtime.deployment.0),
+            invocation: crate::agent_sdk::InvocationId([0x81; 32]),
+            actor: crate::agent_sdk::ActorId([0x82; 32]),
+            incarnation: crate::agent_sdk::Hash([0x83; 32]),
+            deployment: crate::agent_sdk::DeploymentId([0x84; 32]),
+            program: crate::agent_sdk::ProgramId([0x85; 32]),
+            mode,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::default(),
+            message: b"clean replay".to_vec(),
+            installation_data: None,
+            availability: Vec::new(),
+            gas: 10_000,
+            recovery_only: false,
+        };
+        let public_key = [0x91; 32];
+        let authority = crate::agent_sdk::authority::AuthorityReceipt {
+            selector: crate::agent_sdk::authority::AuthorityReceiptSelector {
+                policy: crate::agent_sdk::Hash([0x92; 32]),
+                issuer: crate::agent_sdk::authority::AuthorityIssuer {
+                    principal: crate::agent_sdk::PrincipalId([0x93; 32]),
+                    actor: crate::agent_sdk::ActorId([0x94; 32]),
+                    deployment: crate::agent_sdk::DeploymentId([0x95; 32]),
+                    program: crate::agent_sdk::ProgramId([0x96; 32]),
+                    producer: crate::agent_sdk::ProducerId::of_public_key(&public_key),
+                },
+                space: work.space,
+                agent: work.agent,
+                operation: crate::agent_sdk::authority::AuthorityOperationKind::InvokeActor,
+                runtime_deployment: work.runtime_deployment,
+                actor: Some(work.actor),
+                actor_deployment: Some(work.deployment),
+                evidence: crate::agent_sdk::authority::AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: crate::agent_sdk::Hash([0x97; 32]),
+                },
+                lane_roots: crate::agent_sdk::authority::AuthorityLaneRoots::default(),
+                epoch: 1,
+                decision_sequence: 0,
+                acknowledged_through: 0,
+                valid_from: 5,
+                expires_at: 50,
+                request: work.commitment(),
+            },
+            public_key,
+            signature: [0x98; 64],
+        };
+        ReplayInput {
+            runtime,
+            operation: ReplayOperation::CleanInvoke {
+                work,
+                authority,
+                observed_slot: 12,
             },
         }
     }
@@ -4388,6 +4545,65 @@ mod tests {
     }
 
     #[test]
+    fn clean_replay_input_roundtrips_losslessly_and_refuses_hidden_state_or_unbound_authority() {
+        for (mode, expected_lane) in [
+            (crate::agent_sdk::MethodMode::Query, PersistedLane::Control),
+            (
+                crate::agent_sdk::MethodMode::LinearizableQuery,
+                PersistedLane::Linear,
+            ),
+            (crate::agent_sdk::MethodMode::Linear, PersistedLane::Linear),
+            (crate::agent_sdk::MethodMode::Merge, PersistedLane::Merge),
+            (
+                crate::agent_sdk::MethodMode::LocalQuery,
+                PersistedLane::Local,
+            ),
+            (crate::agent_sdk::MethodMode::Local, PersistedLane::Local),
+        ] {
+            let input = clean_replay_input(mode);
+            input.validate().unwrap();
+            assert_eq!(input.persisted_lane(), expected_lane);
+            roundtrip(&input);
+        }
+
+        let mut unbound = clean_replay_input(crate::agent_sdk::MethodMode::Linear);
+        let ReplayOperation::CleanInvoke { authority, .. } = &mut unbound.operation else {
+            unreachable!()
+        };
+        authority.selector.request = crate::agent_sdk::Hash([0xa1; 32]);
+        assert_eq!(unbound.validate(), Err(DecodeError::NonCanonical));
+
+        let input = clean_replay_input(crate::agent_sdk::MethodMode::Merge);
+        let ReplayOperation::CleanInvoke {
+            work,
+            authority,
+            observed_slot,
+        } = input.operation
+        else {
+            unreachable!()
+        };
+        let hidden_state = crate::agent_sdk::RuntimeWork::Invoke {
+            state: crate::agent_sdk::RuntimeState {
+                control: vec![1],
+                ..crate::agent_sdk::RuntimeState::default()
+            },
+            invocation: Box::new(work),
+            authority: Box::new(authority),
+            observed_slot,
+        }
+        .encode()
+        .unwrap();
+        let mut encoded = Vec::new();
+        let mut encoder = Encoder(&mut encoded);
+        encoder.u8(4);
+        encoder.bytes(&hidden_state);
+        assert_eq!(
+            decode_replay_operation(&mut Decoder::new(&encoded)),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
     fn receipt_window_is_execution_state_not_wire_canonicality() {
         let mut invoke = replay_input(MethodMode::Linear, false);
         let ReplayOperation::Invoke { observed_slot, .. } = &mut invoke.operation else {
@@ -4469,7 +4685,7 @@ mod tests {
         );
         assert!(decoder.exhausted());
 
-        let mut unknown = Decoder::new(&[4]);
+        let mut unknown = Decoder::new(&[0xff]);
         assert_eq!(
             decode_replay_operation(&mut unknown),
             Err(DecodeError::InvalidTag)

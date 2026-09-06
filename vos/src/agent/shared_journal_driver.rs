@@ -17,7 +17,10 @@ use std::sync::Arc;
 
 use super::driver::AgentTrustProvider;
 use super::execution::RuntimeBlob;
-use super::journal::{CanonicalJournalRecord, MergeEvent};
+use super::journal::{
+    CanonicalJournalRecord, LocalEntry, MergeEvent, MergeFrontier, OrderedBase, OrderedEntry,
+    PersistedLane, ReplayInput, ReplayInputId, ReplayOperation,
+};
 use super::journal_store::{
     AgentJournalGarbageCollection, AgentJournalStore, CatalogBlobResolverFactory, GcLimits,
     JournalBlobClass, JournalGc, JournalStoreError, ReverifiedRootJournalStore,
@@ -26,12 +29,11 @@ use super::journal_store::{
 use super::local_journal_driver::{
     LocalMergeAuthenticator, LocalReplayExecutorError, StandardLocalReplayExecutor,
 };
-#[cfg(test)]
-use super::replay::prepare_local;
 use super::replay::{
-    CommittedSharedOrdered, MaterializeError, NoPrunedOrderedBases, ReplayMaterialization,
-    ReplayPreparation, ReplaySource, SharedReplayPreparation, materialize_current, prepare_merge,
-    prepare_shared_checkpoint, prepare_shared_ordered, validate_published_shared_checkpoint,
+    CommittedSharedOrdered, MaterializeError, NoPrunedOrderedBases, ReplayExecutor,
+    ReplayMaterialization, ReplayPreparation, ReplaySource, SharedReplayPreparation,
+    materialize_current, prepare_local, prepare_merge, prepare_shared_checkpoint,
+    prepare_shared_ordered, validate_published_shared_checkpoint,
 };
 use super::shared_commit::{
     OrderedCommitClaim, SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim, SharedCommitError,
@@ -580,6 +582,16 @@ pub(crate) enum SharedPhysicalApplyOutcome {
     Idle,
 }
 
+/// Publication state of one canonical Merge object. Content storage is not a
+/// substitute for reachability from the authenticated journal head: fetched
+/// parents are durably staged before their complete closure is available.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SharedMergeObject {
+    Missing,
+    Staged(Vec<u8>),
+    Published(Vec<u8>),
+}
+
 /// Deterministic test executor used only to create a fully authenticated
 /// Local-head suffix around the snapshot predecessor regression. Production
 /// Shared replay always uses `StandardLocalReplayExecutor` above.
@@ -651,6 +663,7 @@ pub(crate) enum SharedJournalDriverError {
     InvalidArtifactBatch,
     CrossStoreMismatch,
     Snapshot(SharedCommitError),
+    Executor(LocalReplayExecutorError),
 }
 
 impl From<JournalStoreError> for SharedJournalDriverError {
@@ -680,6 +693,29 @@ impl From<SharedArtifactStagerError> for SharedJournalDriverError {
 impl From<SharedCommitError> for SharedJournalDriverError {
     fn from(error: SharedCommitError) -> Self {
         Self::Snapshot(error)
+    }
+}
+
+impl From<LocalReplayExecutorError> for SharedJournalDriverError {
+    fn from(error: LocalReplayExecutorError) -> Self {
+        Self::Executor(error)
+    }
+}
+
+/// Canonical Raft proposal and replay correlation for one clean ordered
+/// invocation. No mutable journal state changes while this value is built.
+pub(crate) struct PreparedCleanOrdered {
+    input: ReplayInputId,
+    payload: Vec<u8>,
+}
+
+impl PreparedCleanOrdered {
+    pub(crate) const fn input(&self) -> ReplayInputId {
+        self.input
+    }
+
+    pub(crate) fn into_payload(self) -> Vec<u8> {
+        self.payload
     }
 }
 
@@ -803,6 +839,12 @@ where
         Ok(self.ledger.active_committee()?)
     }
 
+    pub(crate) fn network_committee_state(
+        &self,
+    ) -> Result<super::shared_raft::AgentNetworkCommitteeState, SharedJournalDriverError> {
+        Ok(self.ledger.network_committee_state()?)
+    }
+
     pub(crate) fn engine_lanes(&self) -> Result<super::LaneSet, SharedJournalDriverError> {
         let state = super::wire::decode_standard_runtime_state(self.materialization.state())
             .map_err(|_| SharedJournalDriverError::InvalidProfile)?;
@@ -835,6 +877,43 @@ where
             .map(|event| event.encode()))
     }
 
+    pub(crate) fn merge_object(
+        &self,
+        id: super::journal::MergeEventId,
+    ) -> Result<SharedMergeObject, SharedJournalDriverError> {
+        let Some(event) = self.store.get::<MergeEvent>(id)? else {
+            return Ok(SharedMergeObject::Missing);
+        };
+        if event.id() != id || event.validate().is_err() {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let bytes = event.encode();
+        Ok(if self.materialization.contains_merge(id) {
+            SharedMergeObject::Published(bytes)
+        } else {
+            SharedMergeObject::Staged(bytes)
+        })
+    }
+
+    /// Persist one independently authenticated immutable Merge object without
+    /// moving journal heads. This is the crash-safe anti-entropy staging
+    /// boundary: full causal replay and publication remain in `import_merge`.
+    pub(crate) fn stage_merge(
+        &mut self,
+        event: &MergeEvent,
+    ) -> Result<bool, SharedJournalDriverError> {
+        let active = self.ledger.active_committee()?;
+        if event.validate().is_err()
+            || event.genesis != self.materialization.heads().genesis
+            || event.committee != Some(active.id())
+            || active.member_by_node(event.author).is_none()
+            || !self.executor.verify_merge_event(event)?
+        {
+            return Err(SharedJournalDriverError::WrongReplica);
+        }
+        self.store.put(event).map_err(Into::into)
+    }
+
     pub(crate) fn materialization(&self) -> &ReplayMaterialization {
         &self.materialization
     }
@@ -862,6 +941,287 @@ where
 
     pub(crate) fn ledger(&self) -> &AgentRaftApplicationLedgerV2 {
         &self.ledger
+    }
+
+    fn clean_invocation_input(
+        &self,
+        work: crate::agent_sdk::InvocationWork,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<ReplayInput, SharedJournalDriverError> {
+        let heads = self.materialization.heads();
+        let observed_slot = self.executor.current_logical_slot()?;
+        let input = ReplayInput {
+            runtime: heads.runtime.clone(),
+            operation: ReplayOperation::CleanInvoke {
+                work,
+                authority,
+                observed_slot,
+            },
+        };
+        input
+            .validate()
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let ReplayOperation::CleanInvoke {
+            work, authority, ..
+        } = &input.operation
+        else {
+            unreachable!()
+        };
+        self.executor.verify_clean_invocation_input(
+            work,
+            authority,
+            self.materialization.state(),
+            &input.runtime,
+        )?;
+        Ok(input)
+    }
+
+    /// Construct the exact clean ordered command which a live Raft worker
+    /// may propose. Authority and complete SDK work are verified before the
+    /// proposal bytes exist; replay repeats verification before publication.
+    pub(crate) fn prepare_clean_ordered(
+        &self,
+        work: crate::agent_sdk::InvocationWork,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        let input = self.clean_invocation_input(work, authority)?;
+        if !matches!(
+            input.persisted_lane(),
+            PersistedLane::Control | PersistedLane::Linear
+        ) {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let heads = self.materialization.heads();
+        let entry = OrderedEntry {
+            genesis: heads.genesis,
+            index: heads
+                .ordered_index
+                .checked_add(1)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+            parent: heads.ordered_head,
+            merge_frontier: heads.merge_frontier,
+            merge_seal: None,
+            input,
+        };
+        entry
+            .validate()
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let input = entry.input.id();
+        let payload = AgentRaftCommand::Ordered {
+            route: self.active_route()?,
+            artifact_batch: None,
+            entry,
+        }
+        .encode();
+        AgentRaftCommand::decode(&payload)
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        Ok(PreparedCleanOrdered { input, payload })
+    }
+
+    /// Publish one clean Local-lane invocation on this exact physical
+    /// replica. This never enters Raft; a routed request mutates only the
+    /// receiving replica's Local lane.
+    pub(crate) fn apply_clean_local(
+        &mut self,
+        work: crate::agent_sdk::InvocationWork,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        let input = self.clean_invocation_input(work, authority)?;
+        if input.persisted_lane() != PersistedLane::Local {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let input_id = input.id();
+        let heads = self.materialization.heads();
+        let entry = LocalEntry {
+            genesis: heads.genesis,
+            node: heads.node,
+            revision: heads
+                .local_revision
+                .checked_add(1)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+            parent: heads.local_head,
+            ordered_base: OrderedBase {
+                index: heads.ordered_index,
+                head: heads.ordered_head,
+            },
+            merge_frontier: heads.merge_frontier,
+            input,
+        };
+        match prepare_local(
+            &mut self.store,
+            &mut self.executor,
+            &self.materialization,
+            &entry,
+        )? {
+            ReplayPreparation::Ready(prepared) => {
+                let (_, successor, _) = prepared.publish()?;
+                self.materialization = successor;
+            }
+            ReplayPreparation::AlreadyCommitted(_) => {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+        }
+        self.executor
+            .take_clean_invocation_result(input_id)
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)
+    }
+
+    /// Publish one locally authored clean Merge invocation. The full active
+    /// committee authenticates membership, while the local replica key signs
+    /// the canonical event and replay verifies it again.
+    pub(crate) fn apply_clean_merge(
+        &mut self,
+        work: crate::agent_sdk::InvocationWork,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        let input = self.clean_invocation_input(work, authority)?;
+        if input.persisted_lane() != PersistedLane::Merge {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let input_id = input.id();
+        let heads = self.materialization.heads();
+        let frontier = self
+            .store
+            .get::<MergeFrontier>(heads.merge_frontier)?
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        if frontier.id() != heads.merge_frontier || frontier.genesis != heads.genesis {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let mut maximum = 0_u64;
+        for parent in &frontier.events {
+            let event = self
+                .store
+                .get::<MergeEvent>(*parent)?
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            if event.id() != *parent || event.genesis != heads.genesis {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            maximum = maximum.max(event.causal_height);
+        }
+        let causal_height = maximum
+            .checked_add(1)
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        let mut event = MergeEvent {
+            genesis: heads.genesis,
+            author: self.local_node,
+            committee: Some(self.ledger.active_committee()?.id()),
+            ordered_base: OrderedBase {
+                index: heads.ordered_index,
+                head: heads.ordered_head,
+            },
+            causal_height,
+            parents: frontier.events,
+            input,
+            signature: Vec::new(),
+        };
+        self.executor.sign_shared_merge_event(&mut event)?;
+        match prepare_merge(
+            &mut self.store,
+            &mut self.executor,
+            &NoPrunedOrderedBases,
+            &self.materialization,
+            &event,
+        )? {
+            ReplayPreparation::Ready(prepared) => {
+                let (_, successor, _) = prepared.publish()?;
+                self.materialization = successor;
+            }
+            ReplayPreparation::AlreadyCommitted(_) => {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+        }
+        self.executor
+            .take_clean_invocation_result(input_id)
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)
+    }
+
+    #[cfg(all(test, feature = "network"))]
+    pub(crate) fn publish_merge_for_test(
+        &mut self,
+        operation: ReplayOperation,
+    ) -> Result<super::journal::MergeEventId, SharedJournalDriverError> {
+        let heads = self.materialization.heads();
+        let input = ReplayInput {
+            runtime: heads.runtime.clone(),
+            operation,
+        };
+        input
+            .validate()
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        if input.persisted_lane() != PersistedLane::Merge {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let frontier = self
+            .store
+            .get::<MergeFrontier>(heads.merge_frontier)?
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        if frontier.id() != heads.merge_frontier || frontier.genesis != heads.genesis {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let mut maximum = 0_u64;
+        for parent in &frontier.events {
+            let event = self
+                .store
+                .get::<MergeEvent>(*parent)?
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            if event.id() != *parent || event.genesis != heads.genesis {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            maximum = maximum.max(event.causal_height);
+        }
+        let mut event = MergeEvent {
+            genesis: heads.genesis,
+            author: self.local_node,
+            committee: Some(self.ledger.active_committee()?.id()),
+            ordered_base: OrderedBase {
+                index: heads.ordered_index,
+                head: heads.ordered_head,
+            },
+            causal_height: maximum
+                .checked_add(1)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+            parents: frontier.events,
+            input,
+            signature: Vec::new(),
+        };
+        self.executor.sign_shared_merge_event(&mut event)?;
+        let id = event.id();
+        match prepare_merge(
+            &mut self.store,
+            &mut self.executor,
+            &NoPrunedOrderedBases,
+            &self.materialization,
+            &event,
+        )? {
+            ReplayPreparation::Ready(prepared) => {
+                let (_, successor, _) = prepared.publish()?;
+                self.materialization = successor;
+            }
+            ReplayPreparation::AlreadyCommitted(_) => {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+        }
+        Ok(id)
+    }
+
+    pub(crate) fn take_clean_ordered_result(
+        &mut self,
+        input: ReplayInputId,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        self.try_take_clean_ordered_result(input)?
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)
+    }
+
+    /// Poll the bounded synchronous response handoff. Absence is not journal
+    /// corruption: the relevant committed entry can be on another apply
+    /// thread, or its ephemeral response may have been lost across restart.
+    /// In either case an exact retry is recovered by the guest-owned result in
+    /// canonical runtime state.
+    pub(crate) fn try_take_clean_ordered_result(
+        &mut self,
+        input: ReplayInputId,
+    ) -> Result<Option<crate::agent_sdk::RuntimeOutcome>, SharedJournalDriverError> {
+        Ok(self.executor.take_clean_invocation_result(input))
     }
 
     /// Build one real seal-only Ordered command from the currently

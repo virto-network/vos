@@ -6,12 +6,12 @@
 //! every durable namespace, and the journal/Raft cross-store binding before an
 //! Agent becomes discoverable.
 //!
-//! This module deliberately does not attach the existing service-oriented
-//! Raft worker or the singleton service CRDT router. Those adapters carry a
-//! service snapshot format which is not an authenticated Agent journal
-//! snapshot. Transport remains explicitly unattached. Agent-specific
-//! checkpoint candidates, authenticated installation, and bounded journal
-//! retirement are instead driven through this host boundary.
+//! This module deliberately does not attach the service-oriented Raft worker
+//! or singleton service CRDT router. The clean network owner attaches the
+//! Agent-specific full-identity worker explicitly and reconstructs that
+//! process-only state after restart. Agent checkpoint candidates,
+//! authenticated installation, and bounded journal retirement remain driven
+//! through this host boundary.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -37,8 +37,8 @@ use super::local_journal_driver::LocalJournalAgentDriver;
 use super::shared_commit::{SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim};
 use super::shared_journal_driver::{
     FileSharedArtifactStager, SharedArtifactStagerError, SharedJournalAgentDriver,
-    SharedJournalDriverError, SharedPhysicalApplyOutcome, install_immutable_file,
-    read_regular_bounded,
+    SharedJournalDriverError, SharedMergeObject, SharedPhysicalApplyOutcome,
+    install_immutable_file, read_regular_bounded,
 };
 use super::shared_raft::{
     AgentGenerationRouteKey, AgentRaftApplicationErrorV2, AgentRaftApplicationLedgerV2,
@@ -106,6 +106,10 @@ impl core::error::Error for SharedAgentHostError {}
 #[non_exhaustive]
 pub enum SharedAgentTransportState {
     NotAttached,
+    /// The exact active generation/committee is owned by the clean
+    /// `/vos/agent/1.0.0` route directory. This is process state only and is
+    /// intentionally reconstructed after every restart.
+    Attached,
 }
 
 /// Durable Agent-specific snapshot state. This never describes the generic
@@ -213,6 +217,16 @@ pub struct SharedReplicaRoute {
     pub raft_slot: Option<u16>,
 }
 
+/// Authenticated next-committee route visible while the durable committee
+/// transition is prepared or joint. These replicas may be transport/Merge
+/// members before the stable leg makes them the active journal authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedCommitteeTransitionRoute {
+    pub next_committee: super::genesis::AgentReplicaCommitteeId,
+    pub next_replicas: Vec<SharedReplicaRoute>,
+    pub joint: bool,
+}
+
 /// Public status for one physical generation. `remaining_slots` is a hard
 /// bound, not an uptime estimate: reaching zero rejects the next application
 /// before artifact, journal, reservation, or Raft-apply mutation.
@@ -224,6 +238,7 @@ pub struct SharedAgentStatus {
     pub replication_id: [u8; 32],
     pub local_role: Option<ReplicaRole>,
     pub replicas: Vec<SharedReplicaRoute>,
+    pub committee_transition: Option<SharedCommitteeTransitionRoute>,
     pub engines: SharedAgentEnginePlan,
     pub applied_slots: u64,
     pub remaining_slots: u64,
@@ -384,12 +399,24 @@ struct HostedSharedAgent {
     driver: FileSharedDriver,
 }
 
+/// Process-only ownership of the live network/storage boundary. Every
+/// non-detached state blocks snapshot database replacement and journal GC:
+/// both operations would invalidate a worker cache or anti-entropy walk even
+/// while route setup or ordered shutdown is still in progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportLeaseState {
+    Attaching,
+    Attached,
+    Stopping,
+}
+
 /// Serialized owner of a directory containing independently durable Shared
 /// Agent replicas. Callers may place this behind their own command queue; the
 /// type itself intentionally requires `&mut self` for every mutation.
 pub struct SharedAgentHost {
     lease: AgentHostRootLease,
     agents: BTreeMap<AgentId, HostedSharedAgent>,
+    transport_leases: BTreeMap<AgentId, TransportLeaseState>,
     trust: Arc<dyn AgentTrustProvider>,
     merge: Arc<dyn LocalMergeAuthenticator>,
     finality: Arc<dyn AgentGenesisFinalityVerifier>,
@@ -438,6 +465,7 @@ impl SharedAgentHost {
         let mut host = Self {
             lease,
             agents: BTreeMap::new(),
+            transport_leases: BTreeMap::new(),
             trust,
             merge,
             finality,
@@ -494,7 +522,7 @@ impl SharedAgentHost {
             if existing.intent != intent {
                 return Err(SharedAgentHostError::Conflict);
             }
-            return status_for(existing);
+            return status_for(existing, self.transport_is_attached(agent));
         }
         if self.agents.len() == MAX_SHARED_HOST_AGENTS {
             return Err(SharedAgentHostError::CapacityExhausted);
@@ -514,17 +542,23 @@ impl SharedAgentHost {
                 ..GenerationFiles::default()
             },
         )?;
-        let status = status_for(&hosted)?;
+        let status = status_for(&hosted, false)?;
         self.agents.insert(agent, hosted);
         Ok(status)
     }
 
     pub fn list(&self) -> Result<Vec<SharedAgentStatus>, SharedAgentHostError> {
-        self.agents.values().map(status_for).collect()
+        self.agents
+            .iter()
+            .map(|(agent, hosted)| status_for(hosted, self.transport_is_attached(*agent)))
+            .collect()
     }
 
     pub fn show(&self, agent: AgentId) -> Result<Option<SharedAgentStatus>, SharedAgentHostError> {
-        self.agents.get(&agent).map(status_for).transpose()
+        self.agents
+            .get(&agent)
+            .map(|hosted| status_for(hosted, self.transport_is_attached(agent)))
+            .transpose()
     }
 
     pub fn role(&self, agent: AgentId) -> Result<Option<ReplicaRole>, SharedAgentHostError> {
@@ -577,6 +611,89 @@ impl SharedAgentHost {
             merge_frontier,
             runtime,
         })
+    }
+
+    pub(crate) fn prepare_clean_ordered(
+        &self,
+        agent: AgentId,
+        work: crate::agent_sdk::InvocationWork,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<super::shared_journal_driver::PreparedCleanOrdered, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .prepare_clean_ordered(work, authority)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn apply_clean_local(
+        &mut self,
+        agent: AgentId,
+        work: crate::agent_sdk::InvocationWork,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .apply_clean_local(work, authority)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn apply_clean_merge(
+        &mut self,
+        agent: AgentId,
+        work: crate::agent_sdk::InvocationWork,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .apply_clean_merge(work, authority)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn take_clean_ordered_result(
+        &mut self,
+        agent: AgentId,
+        input: super::journal::ReplayInputId,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedAgentHostError> {
+        self.agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .take_clean_ordered_result(input)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn try_take_clean_ordered_result(
+        &mut self,
+        agent: AgentId,
+        input: super::journal::ReplayInputId,
+    ) -> Result<Option<crate::agent_sdk::RuntimeOutcome>, SharedAgentHostError> {
+        self.agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .try_take_clean_ordered_result(input)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn raft_database(
+        &self,
+        agent: AgentId,
+    ) -> Result<Arc<Database>, SharedAgentHostError> {
+        Ok(self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .ledger()
+            .database())
     }
 
     /// Apply exactly one slot which the generation's durable Raft metadata
@@ -633,6 +750,36 @@ impl SharedAgentHost {
         self.import_merge(agent, &event)
     }
 
+    /// Persist one independently authenticated Merge object without moving
+    /// the journal head. Anti-entropy can therefore resume a parent walk after
+    /// timeout or process restart without treating mere storage as commit.
+    pub(crate) fn stage_merge(
+        &mut self,
+        agent: AgentId,
+        event: &MergeEvent,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .stage_merge(event)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn merge_object(
+        &self,
+        agent: AgentId,
+        event: MergeEventId,
+    ) -> Result<SharedMergeObject, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .merge_object(event)
+            .map_err(map_driver_error)
+    }
+
     /// Composite-network hook for serving an authenticated Merge frontier.
     /// The caller remains responsible for committee-gating the Noise peer.
     pub fn merge_roots(&self, agent: AgentId) -> Result<Vec<[u8; 32]>, SharedAgentHostError> {
@@ -658,13 +805,80 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
-    /// Explicit fail-closed gate until an Agent-specific transport adapter is
-    /// installed by a later slice.
+    /// Require a live exact-generation clean network attachment. A durable
+    /// Raft file alone is never attachment evidence, and reopen begins
+    /// detached until the route owner is installed again.
     pub fn require_transport(&self, agent: AgentId) -> Result<(), SharedAgentHostError> {
         if !self.agents.contains_key(&agent) {
             return Err(SharedAgentHostError::AgentNotFound);
         }
-        Err(SharedAgentHostError::TransportNotAttached)
+        if self.transport_is_attached(agent) {
+            Ok(())
+        } else {
+            Err(SharedAgentHostError::TransportNotAttached)
+        }
+    }
+
+    fn transport_is_attached(&self, agent: AgentId) -> bool {
+        self.transport_leases.get(&agent) == Some(&TransportLeaseState::Attached)
+    }
+
+    pub(crate) fn reserve_transport_attachment(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<(), SharedAgentHostError> {
+        if !self.agents.contains_key(&agent) {
+            return Err(SharedAgentHostError::AgentNotFound);
+        }
+        match self.transport_leases.entry(agent) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(TransportLeaseState::Attaching);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(SharedAgentHostError::Conflict),
+        }
+    }
+
+    pub(crate) fn mark_transport_attached(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<(), SharedAgentHostError> {
+        match self.transport_leases.get_mut(&agent) {
+            Some(state @ TransportLeaseState::Attaching) => {
+                *state = TransportLeaseState::Attached;
+                Ok(())
+            }
+            _ => Err(SharedAgentHostError::Conflict),
+        }
+    }
+
+    pub(crate) fn mark_transport_stopping(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<(), SharedAgentHostError> {
+        match self.transport_leases.get_mut(&agent) {
+            Some(state @ TransportLeaseState::Attached) => {
+                *state = TransportLeaseState::Stopping;
+                Ok(())
+            }
+            _ => Err(SharedAgentHostError::Conflict),
+        }
+    }
+
+    /// Release a failed setup or a completely stopped attachment. An active
+    /// attachment cannot be cleared directly: its owner must first enter
+    /// `Stopping` and drain the worker and handler leases.
+    pub(crate) fn release_transport_attachment(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<(), SharedAgentHostError> {
+        match self.transport_leases.get(&agent) {
+            Some(TransportLeaseState::Attaching | TransportLeaseState::Stopping) => {
+                self.transport_leases.remove(&agent);
+                Ok(())
+            }
+            _ => Err(SharedAgentHostError::Conflict),
+        }
     }
 
     /// Derive and locally verify an exact Agent checkpoint candidate without
@@ -696,6 +910,13 @@ impl SharedAgentHost {
         certificate: &SharedAgentSnapshotCertificate,
     ) -> Result<SharedAgentSnapshotInstall, SharedAgentHostError> {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
+        // The current full-NodeId worker intentionally has no generic byte
+        // snapshot bridge for an authenticated Agent journal certificate.
+        // Mutating its shared database underneath a live storage cache would
+        // desynchronize the worker and make its next reopen fail closed.
+        if self.transport_leases.contains_key(&agent) {
+            return Err(SharedAgentHostError::Conflict);
+        }
         let installed = self
             .agents
             .get_mut(&agent)
@@ -738,6 +959,15 @@ impl SharedAgentHost {
         limits: SharedAgentCompactionLimits,
     ) -> Result<SharedAgentCompaction, SharedAgentHostError> {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
+        // Live anti-entropy may have authenticated parent objects durably
+        // staged but not yet reachable from Heads. Generic journal GC quite
+        // correctly treats those as garbage, so compaction requires the exact
+        // generation transport to be retired first. Reattachment resumes from
+        // every staged object which survived a crash; an operator-triggered
+        // detached GC deliberately chooses to discard that cache and refetch.
+        if self.transport_leases.contains_key(&agent) {
+            return Err(SharedAgentHostError::Conflict);
+        }
         if limits.max_binding_unlinks == 0 {
             return Err(SharedAgentHostError::CapacityExhausted);
         }
@@ -966,11 +1196,18 @@ impl SharedAgentHost {
     }
 }
 
-fn status_for(hosted: &HostedSharedAgent) -> Result<SharedAgentStatus, SharedAgentHostError> {
+fn status_for(
+    hosted: &HostedSharedAgent,
+    transport_attached: bool,
+) -> Result<SharedAgentStatus, SharedAgentHostError> {
     let identity = hosted.driver.identity().map_err(map_driver_error)?;
     let generation = hosted.driver.ledger().generation();
     let route = hosted.driver.active_route().map_err(map_driver_error)?;
-    let committee = hosted.driver.active_committee().map_err(map_driver_error)?;
+    let committee_state = hosted
+        .driver
+        .network_committee_state()
+        .map_err(map_driver_error)?;
+    let committee = &committee_state.active;
     let local_role = hosted.driver.local_role().map_err(map_driver_error)?;
     let lanes = hosted.driver.engine_lanes().map_err(map_driver_error)?;
     let (applied_slots, remaining_slots, reservation_pending) =
@@ -983,17 +1220,21 @@ fn status_for(hosted: &HostedSharedAgent) -> Result<SharedAgentStatus, SharedAge
         },
         None => SharedAgentSnapshotState::None,
     };
-    let replicas = committee
-        .members()
-        .iter()
-        .map(|member| SharedReplicaRoute {
-            node: member.replica().node,
-            role: member.replica().role,
-            peer_id: member.peer_id().to_vec(),
-            ed25519_public_key: *member.ed25519_public_key(),
-            raft_slot: member.raft_slot(),
-        })
-        .collect();
+    let replica_route = |member: &super::genesis::AgentReplicaMember| SharedReplicaRoute {
+        node: member.replica().node,
+        role: member.replica().role,
+        peer_id: member.peer_id().to_vec(),
+        ed25519_public_key: *member.ed25519_public_key(),
+        raft_slot: member.raft_slot(),
+    };
+    let replicas = committee.members().iter().map(replica_route).collect();
+    let committee_transition = committee_state
+        .next
+        .map(|next| SharedCommitteeTransitionRoute {
+            next_committee: next.id(),
+            next_replicas: next.members().iter().map(replica_route).collect(),
+            joint: committee_state.joint,
+        });
     Ok(SharedAgentStatus {
         identity,
         generation,
@@ -1001,6 +1242,7 @@ fn status_for(hosted: &HostedSharedAgent) -> Result<SharedAgentStatus, SharedAge
         replication_id: generation.replication_id(),
         local_role,
         replicas,
+        committee_transition,
         engines: SharedAgentEnginePlan {
             control_raft: true,
             linear_raft: lanes.contains(StateLane::Linear),
@@ -1010,7 +1252,11 @@ fn status_for(hosted: &HostedSharedAgent) -> Result<SharedAgentStatus, SharedAge
         applied_slots,
         remaining_slots,
         reservation_pending,
-        transport: SharedAgentTransportState::NotAttached,
+        transport: if transport_attached {
+            SharedAgentTransportState::Attached
+        } else {
+            SharedAgentTransportState::NotAttached
+        },
         snapshots,
     })
 }
@@ -1066,12 +1312,20 @@ fn map_driver_error(error: SharedJournalDriverError) -> SharedAgentHostError {
         SharedJournalDriverError::WrongReplica | SharedJournalDriverError::InvalidProfile => {
             SharedAgentHostError::ScopeMismatch
         }
+        SharedJournalDriverError::Executor(
+            super::local_journal_driver::LocalReplayExecutorError::TrustUnavailable,
+        ) => SharedAgentHostError::Unavailable,
+        SharedJournalDriverError::Executor(
+            super::local_journal_driver::LocalReplayExecutorError::InvalidAuthority
+            | super::local_journal_driver::LocalReplayExecutorError::InvalidRequest,
+        ) => SharedAgentHostError::InvalidProvision,
         SharedJournalDriverError::Snapshot(
             super::shared_commit::SharedCommitError::WrongSnapshotClaim,
         ) => SharedAgentHostError::SnapshotReplay,
         SharedJournalDriverError::Snapshot(_) => SharedAgentHostError::SnapshotCertificateInvalid,
         SharedJournalDriverError::InvalidArtifactBatch
         | SharedJournalDriverError::CrossStoreMismatch
+        | SharedJournalDriverError::Executor(_)
         | SharedJournalDriverError::Replay(_)
         | SharedJournalDriverError::Store(_) => SharedAgentHostError::CorruptResidue,
     }
@@ -1378,6 +1632,20 @@ mod tests {
     };
 
     const PEER_ID_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
+
+    #[test]
+    fn merge_store_capacity_errors_have_one_stable_host_projection() {
+        for error in [
+            super::super::journal_store::JournalStoreError::Backpressure,
+            super::super::journal_store::JournalStoreError::LimitExceeded,
+        ] {
+            let driver_error: SharedJournalDriverError = error.into();
+            assert_eq!(
+                map_driver_error(driver_error),
+                SharedAgentHostError::CapacityExhausted
+            );
+        }
+    }
 
     struct TempDirectory(PathBuf);
 
@@ -1755,6 +2023,44 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "network")]
+    fn live_network(seed: u8, listen: Vec<libp2p::Multiaddr>) -> Arc<crate::network::Network> {
+        let keypair = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+        let peer = keypair.public().to_peer_id();
+        Arc::new(crate::network::Network::start(
+            crate::network::NetworkConfig {
+                keypair,
+                local_prefix: crate::network::derive_node_prefix(&peer),
+                listen,
+                bootstrap: Vec::new(),
+                auto_dial_mdns: false,
+            },
+        ))
+    }
+
+    #[cfg(feature = "network")]
+    fn wait_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if predicate() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(feature = "network")]
+    fn join_live_network(network: Arc<crate::network::Network>) {
+        network.shutdown();
+        assert!(wait_until(std::time::Duration::from_secs(5), || {
+            Arc::strong_count(&network) == 1
+        }));
+        Arc::try_unwrap(network).ok().unwrap().join();
+    }
+
     fn physical_bytes(directory: &TempDirectory) -> BTreeMap<PathBuf, Vec<u8>> {
         fn visit(root: &Path, at: &Path, output: &mut BTreeMap<PathBuf, Vec<u8>>) {
             let mut entries = fs::read_dir(at)
@@ -1863,6 +2169,55 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "network")]
+    fn publish_merge_invocation(
+        host: &mut SharedAgentHost,
+        fixture: &Fixture,
+        discriminator: u8,
+    ) -> MergeEventId {
+        let invocation = ActorInvocation {
+            invocation: InvocationId([discriminator; 32]),
+            actor: ActorId([discriminator.wrapping_add(1); 32]),
+            incarnation: Hash([discriminator.wrapping_add(2); 32]),
+            deployment: DeploymentId([discriminator.wrapping_add(3); 32]),
+            program: ProgramId([discriminator.wrapping_add(4); 32]),
+            mode: MethodMode::Merge,
+            auth: ActorInvocationAuth::anonymous(),
+            message: vec![discriminator],
+            availability: Vec::new(),
+            gas: 1_000,
+        };
+        let claim = ActorInvocationClaim {
+            authority: fixture.authority.clone(),
+            space: fixture.space,
+            agent: fixture.agent,
+            principal: None,
+            credential: None,
+            authorization: invocation.authorization_message(),
+            auth: invocation.auth.clone(),
+            valid_from: 10,
+            valid_until: 30,
+        };
+        let receipt = ActorInvocationReceipt {
+            signature: fixture
+                .authority_key
+                .sign(&claim.signing_message().0)
+                .to_bytes()
+                .to_vec(),
+            claim,
+        };
+        host.agents
+            .get_mut(&fixture.agent)
+            .unwrap()
+            .driver
+            .publish_merge_for_test(ReplayOperation::Invoke {
+                invocation,
+                authority: receipt,
+                observed_slot: 20,
+            })
+            .unwrap()
+    }
+
     fn snapshot_certificate(
         candidate: &VerifiedSharedAgentSnapshotCandidate,
         fixture: &Fixture,
@@ -1961,6 +2316,19 @@ mod tests {
         assert_eq!(status.identity.agent, fixture.agent);
         assert_eq!(status.replicas.len(), 3);
         assert_eq!(status.applied_slots, 0);
+        assert_eq!(
+            host.require_transport(fixture.agent),
+            Err(SharedAgentHostError::TransportNotAttached)
+        );
+        host.reserve_transport_attachment(fixture.agent).unwrap();
+        host.mark_transport_attached(fixture.agent).unwrap();
+        assert_eq!(host.require_transport(fixture.agent), Ok(()));
+        assert_eq!(
+            host.show(fixture.agent).unwrap().unwrap().transport,
+            SharedAgentTransportState::Attached
+        );
+        host.mark_transport_stopping(fixture.agent).unwrap();
+        host.release_transport_attachment(fixture.agent).unwrap();
         assert_eq!(
             host.require_transport(fixture.agent),
             Err(SharedAgentHostError::TransportNotAttached)
@@ -2246,6 +2614,64 @@ mod tests {
     }
 
     #[test]
+    fn live_transport_blocks_snapshot_database_replacement() {
+        let fixture = fixture(0x26);
+        let directory = TempDirectory::new("snapshot_live_transport");
+        let mut host = open_host(&directory, &fixture);
+        let candidate = provision_apply_candidate(&mut host, &fixture, 9);
+        let certificate = snapshot_certificate(&candidate, &fixture);
+        let before = physical_bytes(&directory);
+
+        host.reserve_transport_attachment(fixture.agent).unwrap();
+        assert_eq!(
+            host.install_snapshot(fixture.agent, &certificate),
+            Err(SharedAgentHostError::Conflict),
+            "setup must reserve the database before a worker can open it"
+        );
+        assert_eq!(
+            host.compact_snapshot(fixture.agent, compaction_limits(1)),
+            Err(SharedAgentHostError::Conflict)
+        );
+        assert_eq!(
+            host.reserve_transport_attachment(fixture.agent),
+            Err(SharedAgentHostError::Conflict)
+        );
+        host.mark_transport_attached(fixture.agent).unwrap();
+        assert_eq!(
+            host.reserve_transport_attachment(fixture.agent),
+            Err(SharedAgentHostError::Conflict)
+        );
+        assert_eq!(host.require_transport(fixture.agent), Ok(()));
+        assert_eq!(
+            host.release_transport_attachment(fixture.agent),
+            Err(SharedAgentHostError::Conflict),
+            "an active worker cannot drop its storage lease directly"
+        );
+        assert_eq!(
+            host.install_snapshot(fixture.agent, &certificate),
+            Err(SharedAgentHostError::Conflict)
+        );
+        assert_eq!(physical_bytes(&directory), before);
+
+        host.mark_transport_stopping(fixture.agent).unwrap();
+        assert_eq!(
+            host.reserve_transport_attachment(fixture.agent),
+            Err(SharedAgentHostError::Conflict)
+        );
+        assert_eq!(
+            host.install_snapshot(fixture.agent, &certificate),
+            Err(SharedAgentHostError::Conflict),
+            "ordered shutdown retains the lease until every cache is gone"
+        );
+        assert_eq!(
+            host.compact_snapshot(fixture.agent, compaction_limits(1)),
+            Err(SharedAgentHostError::Conflict)
+        );
+        host.release_transport_attachment(fixture.agent).unwrap();
+        assert!(host.install_snapshot(fixture.agent, &certificate).is_ok());
+    }
+
+    #[test]
     fn discovery_rejects_unknown_authority_namespace_residue() {
         let directory = TempDirectory::new("unknown_namespace");
         let fixture = fixture(0x14);
@@ -2293,5 +2719,320 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error, SharedAgentHostError::CorruptResidue);
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn authenticated_merge_staging_survives_restart_without_moving_heads() {
+        let directory_source = TempDirectory::new("merge_stage_source");
+        let directory_target = TempDirectory::new("merge_stage_target");
+        let fixture = fixture(0x27);
+        let source_node = NodeId::of_authenticated_peer(&peer_id(&fixture.replica_keys[0]));
+        let target_node = NodeId::of_authenticated_peer(&peer_id(&fixture.replica_keys[1]));
+        let mut source = open_host_on_node(&directory_source, &fixture, source_node);
+        let mut target = open_host_on_node(&directory_target, &fixture, target_node);
+        for host in [&mut source, &mut target] {
+            host.provision(
+                fixture.provision.clone(),
+                fixture.catalog.clone(),
+                fixture.committee_authority,
+            )
+            .unwrap();
+        }
+        let event_id = publish_merge_invocation(&mut source, &fixture, 0xd0);
+        let bytes = source.merge_node(fixture.agent, event_id).unwrap().unwrap();
+        let event = MergeEvent::decode(&bytes).unwrap();
+        let empty_roots = target.merge_roots(fixture.agent).unwrap();
+
+        assert!(target.stage_merge(fixture.agent, &event).unwrap());
+        assert_eq!(target.merge_roots(fixture.agent).unwrap(), empty_roots);
+        assert!(matches!(
+            target.merge_object(fixture.agent, event_id).unwrap(),
+            crate::agent::shared_journal_driver::SharedMergeObject::Staged(found) if found == bytes
+        ));
+
+        drop(target);
+        let mut reopened = open_host_on_node(&directory_target, &fixture, target_node);
+        assert_eq!(reopened.merge_roots(fixture.agent).unwrap(), empty_roots);
+        assert!(matches!(
+            reopened.merge_object(fixture.agent, event_id).unwrap(),
+            crate::agent::shared_journal_driver::SharedMergeObject::Staged(found) if found == bytes
+        ));
+        assert!(matches!(
+            reopened.import_merge(fixture.agent, &event).unwrap(),
+            SharedAgentApplyOutcome::Applied { .. }
+        ));
+        assert!(matches!(
+            reopened.merge_object(fixture.agent, event_id).unwrap(),
+            crate::agent::shared_journal_driver::SharedMergeObject::Published(found) if found == bytes
+        ));
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn observer_attaches_as_authenticated_merge_member_without_a_raft_worker() {
+        let directory = TempDirectory::new("clean_network_observer");
+        let fixture = fixture(0x2a);
+        let observer = NodeId::of_authenticated_peer(&peer_id(&fixture.replica_keys[2]));
+        let mut opened = open_host_on_node(&directory, &fixture, observer);
+        let status = opened
+            .provision(
+                fixture.provision.clone(),
+                fixture.catalog.clone(),
+                fixture.committee_authority,
+            )
+            .unwrap();
+        let route = crate::network::agent_protocol::AgentGenerationRoute {
+            space: crate::agent_sdk::SpaceId(status.generation.space().0),
+            agent: crate::agent_sdk::AgentId(status.generation.agent().0),
+            generation: crate::agent_sdk::Hash(status.replication_id),
+        };
+        let host = Arc::new(std::sync::Mutex::new(opened));
+        let network = live_network(0x33, Vec::new());
+        let attachment =
+            crate::network::SharedAgentNetworkHost::attach(Arc::clone(&host), Arc::clone(&network))
+                .unwrap();
+        let (handler, owns_worker) = attachment.attachment_for_test(fixture.agent).unwrap();
+        assert!(!owns_worker);
+        assert_eq!(
+            host.lock().unwrap().require_transport(fixture.agent),
+            Ok(())
+        );
+
+        let request = crate::network::agent_protocol::authenticate_sender(
+            &network.peer_id(),
+            crate::network::agent_protocol::AgentFrame {
+                route,
+                sender: network.agent_node_id(),
+                message: crate::network::agent_protocol::AgentMessage::Merge(
+                    crate::network::agent_protocol::MergeMessage::FetchHeads,
+                ),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            handler.handle(request),
+            Ok(crate::network::agent_protocol::AgentMessage::Merge(
+                crate::network::agent_protocol::MergeMessage::Heads(_)
+            ))
+        ));
+        let raft = crate::network::agent_protocol::authenticate_sender(
+            &network.peer_id(),
+            crate::network::agent_protocol::AgentFrame {
+                route,
+                sender: network.agent_node_id(),
+                message: crate::network::agent_protocol::AgentMessage::Raft(
+                    crate::network::agent_protocol::RaftMessage::StatusRequest,
+                ),
+            },
+        )
+        .unwrap();
+        assert!(handler.handle(raft).is_err());
+
+        drop(attachment);
+        drop(host);
+        join_live_network(network);
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn clean_network_attachment_retires_stale_owner_and_rebuilds_after_restart() {
+        let directory = TempDirectory::new("clean_network_restart");
+        let fixture = fixture(0x28);
+        let mut opened = open_host(&directory, &fixture);
+        let status = opened
+            .provision(
+                fixture.provision.clone(),
+                fixture.catalog.clone(),
+                fixture.committee_authority,
+            )
+            .unwrap();
+        opened
+            .agents
+            .get_mut(&fixture.agent)
+            .unwrap()
+            .driver
+            .append_ordered_for_test(5, authorized_management(&fixture, 2, 0xd7))
+            .unwrap();
+        assert_eq!(
+            opened.show(fixture.agent).unwrap().unwrap().applied_slots,
+            0
+        );
+        let route = crate::network::agent_protocol::AgentGenerationRoute {
+            space: crate::agent_sdk::SpaceId(status.generation.space().0),
+            agent: crate::agent_sdk::AgentId(status.generation.agent().0),
+            generation: crate::agent_sdk::Hash(status.replication_id),
+        };
+        let host = Arc::new(std::sync::Mutex::new(opened));
+        let network = live_network(0x31, Vec::new());
+        let mut attachment =
+            crate::network::SharedAgentNetworkHost::attach(Arc::clone(&host), Arc::clone(&network))
+                .unwrap();
+        assert_eq!(
+            host.lock()
+                .unwrap()
+                .show(fixture.agent)
+                .unwrap()
+                .unwrap()
+                .applied_slots,
+            1,
+            "attachment must drain a recovered committed suffix before exposing its route"
+        );
+        assert_eq!(
+            host.lock().unwrap().require_transport(fixture.agent),
+            Ok(())
+        );
+        assert!(matches!(
+            host.lock()
+                .unwrap()
+                .compact_snapshot(fixture.agent, compaction_limits(1)),
+            Err(SharedAgentHostError::Conflict)
+        ));
+        let (first_owner, owns_worker) = attachment.attachment_for_test(fixture.agent).unwrap();
+        assert!(owns_worker, "an active voter owns the full-NodeId worker");
+
+        assert!(attachment.mark_stale_for_test(fixture.agent));
+        attachment.refresh().unwrap();
+        let (replacement_owner, owns_worker) =
+            attachment.attachment_for_test(fixture.agent).unwrap();
+        assert!(!Arc::ptr_eq(&first_owner, &replacement_owner));
+        assert!(owns_worker);
+        let stale_request = crate::network::agent_protocol::authenticate_sender(
+            &network.peer_id(),
+            crate::network::agent_protocol::AgentFrame {
+                route,
+                sender: network.agent_node_id(),
+                message: crate::network::agent_protocol::AgentMessage::Merge(
+                    crate::network::agent_protocol::MergeMessage::FetchHeads,
+                ),
+            },
+        )
+        .unwrap();
+        assert!(
+            first_owner.handle(stale_request).is_err(),
+            "a cloned retired handler must not cross the generation lease"
+        );
+
+        drop(attachment);
+        assert_eq!(
+            host.lock().unwrap().require_transport(fixture.agent),
+            Err(SharedAgentHostError::TransportNotAttached)
+        );
+        let unknown = crate::agent_sdk::NodeId([0xfe; 32]);
+        assert!(matches!(
+            network
+                .send_agent_merge_fetch_heads(unknown, route)
+                .recv()
+                .unwrap(),
+            Err(crate::network::agent_network::AgentNetworkError::UnknownRoute(found))
+                if found == route
+        ));
+
+        drop(Arc::try_unwrap(host).ok().unwrap().into_inner().unwrap());
+        let reopened = Arc::new(std::sync::Mutex::new(open_host(&directory, &fixture)));
+        assert_eq!(
+            reopened.lock().unwrap().require_transport(fixture.agent),
+            Err(SharedAgentHostError::TransportNotAttached)
+        );
+        let restarted = crate::network::SharedAgentNetworkHost::attach(
+            Arc::clone(&reopened),
+            Arc::clone(&network),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.lock().unwrap().require_transport(fixture.agent),
+            Ok(())
+        );
+        assert!(restarted.attachment_for_test(fixture.agent).unwrap().1);
+        drop(restarted);
+        drop(reopened);
+        join_live_network(network);
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn clean_merge_pump_converges_two_real_hosts_after_partition() {
+        let directory_a = TempDirectory::new("clean_merge_source");
+        let directory_b = TempDirectory::new("clean_merge_target");
+        let fixture = fixture(0x29);
+        let node_a = NodeId::of_authenticated_peer(&peer_id(&fixture.replica_keys[0]));
+        let node_b = NodeId::of_authenticated_peer(&peer_id(&fixture.replica_keys[1]));
+        let mut opened_a = open_host_on_node(&directory_a, &fixture, node_a);
+        let mut opened_b = open_host_on_node(&directory_b, &fixture, node_b);
+        for host in [&mut opened_a, &mut opened_b] {
+            host.provision(
+                fixture.provision.clone(),
+                fixture.catalog.clone(),
+                fixture.committee_authority,
+            )
+            .unwrap();
+        }
+        let host_a = Arc::new(std::sync::Mutex::new(opened_a));
+        let host_b = Arc::new(std::sync::Mutex::new(opened_b));
+        let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        let network_a = live_network(0x31, vec![listen]);
+        let network_b = live_network(0x32, Vec::new());
+        assert_eq!(
+            network_a.agent_node_id(),
+            crate::agent_sdk::NodeId(node_a.0)
+        );
+        assert_eq!(
+            network_b.agent_node_id(),
+            crate::agent_sdk::NodeId(node_b.0)
+        );
+        let attachment_a = crate::network::SharedAgentNetworkHost::attach(
+            Arc::clone(&host_a),
+            Arc::clone(&network_a),
+        )
+        .unwrap();
+        let attachment_b = crate::network::SharedAgentNetworkHost::attach(
+            Arc::clone(&host_b),
+            Arc::clone(&network_b),
+        )
+        .unwrap();
+
+        let event = publish_merge_invocation(&mut host_a.lock().unwrap(), &fixture, 0xd1);
+        let source = host_a
+            .lock()
+            .unwrap()
+            .merge_node(fixture.agent, event)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            host_b
+                .lock()
+                .unwrap()
+                .merge_node(fixture.agent, event)
+                .unwrap(),
+            None,
+            "the partitioned replica cannot observe a local publication"
+        );
+
+        assert!(wait_until(std::time::Duration::from_secs(5), || {
+            !network_a.listen_addrs().is_empty()
+        }));
+        let address = network_a.listen_addrs()[0]
+            .clone()
+            .with(libp2p::multiaddr::Protocol::P2p(network_a.peer_id()));
+        network_b.connect(address);
+        assert!(wait_until(std::time::Duration::from_secs(10), || {
+            host_b
+                .lock()
+                .ok()
+                .and_then(|host| host.merge_node(fixture.agent, event).ok().flatten())
+                .as_ref()
+                == Some(&source)
+        }));
+        assert_eq!(
+            host_a.lock().unwrap().merge_roots(fixture.agent).unwrap(),
+            host_b.lock().unwrap().merge_roots(fixture.agent).unwrap()
+        );
+
+        drop(attachment_a);
+        drop(attachment_b);
+        drop(host_a);
+        drop(host_b);
+        join_live_network(network_a);
+        join_live_network(network_b);
     }
 }

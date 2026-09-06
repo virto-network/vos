@@ -3306,6 +3306,13 @@ impl ReplayMaterialization {
         self.heads.merge_frontier
     }
 
+    /// Whether an immutable Merge object is reachable from the authenticated
+    /// materialized head. A journal store may also contain crash-safe staged
+    /// objects; mere content presence is deliberately not publication proof.
+    pub(crate) fn contains_merge(&self, event: MergeEventId) -> bool {
+        self.merge_ancestry.contains(&event)
+    }
+
     pub const fn local_cursor(&self) -> (NodeId, u64, Option<LocalEntryId>) {
         (
             self.heads.node,
@@ -8107,7 +8114,9 @@ fn invocation_identity(
             invocation.commitment(),
             InvocationOwnershipOperation::Acknowledge,
         )),
-        ReplayOperation::Management { .. } | ReplayOperation::SealMerge => None,
+        ReplayOperation::Management { .. }
+        | ReplayOperation::CleanInvoke { .. }
+        | ReplayOperation::SealMerge => None,
     }
 }
 
@@ -8185,7 +8194,9 @@ fn validate_retained_outcome(
     let invocation = match &input.operation {
         ReplayOperation::Invoke { invocation, .. }
         | ReplayOperation::Acknowledge { invocation, .. } => invocation,
-        ReplayOperation::Management { .. } | ReplayOperation::SealMerge => {
+        ReplayOperation::Management { .. }
+        | ReplayOperation::CleanInvoke { .. }
+        | ReplayOperation::SealMerge => {
             return Err(InvocationOwnershipError::Unauthenticated);
         }
     };
@@ -8403,6 +8414,22 @@ fn validate_transition<SourceError, ExecutorError>(
                 synthetic_acknowledgement,
                 acknowledgement_outcome.ok_or(ReplayError::InvalidRecord)?,
             )?;
+            let authority_write = validate_lane_mutation(
+                input,
+                before,
+                &transition.state,
+                transition.disposition,
+                position,
+                None,
+            )?;
+            if authority_write.is_some() {
+                return Err(ReplayError::InvalidRecord);
+            }
+        }
+        ReplayOperation::CleanInvoke { .. } => {
+            if transition.result.is_some() || transition.next_runtime != *current_runtime {
+                return Err(ReplayError::TerminalMutation);
+            }
             let authority_write = validate_lane_mutation(
                 input,
                 before,
@@ -11039,7 +11066,9 @@ mod aggregate {
             ReplayOperation::Acknowledge { invocation, .. } => {
                 (invocation, InvocationOwnershipOperation::Acknowledge)
             }
-            ReplayOperation::Management { .. } | ReplayOperation::SealMerge => {
+            ReplayOperation::Management { .. }
+            | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::SealMerge => {
                 return Err(ReplayError::InvalidPosition);
             }
         };
@@ -15235,7 +15264,9 @@ pub(crate) mod tests {
                 invocation,
                 authority,
             } => (invocation, authority),
-            ReplayOperation::Management { .. } | ReplayOperation::SealMerge => {
+            ReplayOperation::Management { .. }
+            | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::SealMerge => {
                 panic!("test divergence requires an invocation")
             }
         };
@@ -15311,6 +15342,13 @@ pub(crate) mod tests {
             match &input.operation {
                 ReplayOperation::Invoke { authority, .. }
                 | ReplayOperation::Acknowledge { authority, .. } => authority
+                    .signature
+                    .first()
+                    .copied()
+                    .filter(|byte| *byte == 0xaa)
+                    .map(|_| ())
+                    .ok_or(()),
+                ReplayOperation::CleanInvoke { authority, .. } => authority
                     .signature
                     .first()
                     .copied()
@@ -16242,9 +16280,10 @@ pub(crate) mod tests {
             _position: ReplayPosition,
         ) -> Result<(), Self::Error> {
             self.authentications += 1;
-            let signature = match &input.operation {
+            let signature: &[u8] = match &input.operation {
                 ReplayOperation::Invoke { authority, .. }
-                | ReplayOperation::Acknowledge { authority, .. } => &authority.signature,
+                | ReplayOperation::Acknowledge { authority, .. } => authority.signature.as_slice(),
+                ReplayOperation::CleanInvoke { authority, .. } => authority.signature.as_slice(),
                 ReplayOperation::Management { .. } | ReplayOperation::SealMerge => return Ok(()),
             };
             signature

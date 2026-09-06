@@ -57,6 +57,21 @@ pub struct Config<N: NodeId> {
     /// production workloads with high churn can lower it.
     /// Embedded targets writing to flash may want it larger.
     pub compact_hysteresis: u64,
+    /// Maximum number of log entries included in one outbound
+    /// `AppendEntries` RPC. This bounds both the storage read and the
+    /// temporary cloned request before a transport applies its own byte/frame
+    /// limit.
+    ///
+    /// The default is `256`. The worker defensively treats `0` as `1`, so a
+    /// misconfigured replica still makes bounded forward progress.
+    pub max_append_entries: usize,
+    /// Maximum number of concurrent outbound replication RPCs
+    /// (`AppendEntries` plus `InstallSnapshot`) materialized by one leader.
+    /// Large committees are visited fairly and freed slots are refilled
+    /// immediately within the current heartbeat round.
+    ///
+    /// The default is `8`. The worker defensively treats `0` as `1`.
+    pub max_inflight_replications: usize,
     /// Enable the pre-vote phase (Ongaro thesis §9.6).
     ///
     /// When `true` (default), a follower whose election timer
@@ -142,6 +157,8 @@ impl<N: NodeId> Config<N> {
             heartbeat_interval_ms: 50,
             replication_id,
             compact_hysteresis: 16,
+            max_append_entries: 256,
+            max_inflight_replications: 8,
             pre_vote: true,
             install_snapshot_chunk_bytes: 32 * 1024,
             max_pending_reads: 1024,
@@ -177,5 +194,11 @@ mod tests {
         assert_eq!(cfg(vec![0xA, 0xB, 0xC]).quorum(), 2);
         assert_eq!(cfg(vec![0xA, 0xB, 0xC, 0xD, 0xE]).quorum(), 3);
         assert_eq!(cfg((0..7).collect()).quorum(), 4);
+    }
+
+    #[test]
+    fn append_batch_default_is_nonzero_and_bounded() {
+        assert_eq!(cfg(vec![0xA]).max_append_entries, 256);
+        assert_eq!(cfg(vec![0xA]).max_inflight_replications, 8);
     }
 }

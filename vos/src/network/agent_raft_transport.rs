@@ -5,10 +5,7 @@
 //! NodeId/PeerId directory and every reply passes the typed Agent correlation
 //! checks before it reaches the Raft worker.
 
-#![allow(dead_code)] // The live SharedAgentHost attachment lands separately.
-
-use std::sync::{Arc, mpsc as std_mpsc};
-use std::time::Duration;
+use std::sync::Arc;
 
 use vos_agent_sdk::NodeId;
 use vos_raft::{
@@ -17,13 +14,11 @@ use vos_raft::{
 };
 
 use super::Network;
-use super::agent_network::{AGENT_REQUEST_TIMEOUT, AgentNetworkError};
+use super::agent_network::AgentNetworkError;
 use super::agent_protocol::{
     AgentFrame, AgentGenerationRoute, AgentMessage, AgentProtocolError, MAX_RAFT_ENTRIES,
     RaftLogEntry, RaftLogEntryKind, RaftMessage, RaftVotePhase,
 };
-
-const RECEIVE_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub(crate) enum AgentRaftTransportError {
@@ -215,39 +210,12 @@ impl Transport<NodeId> for AgentRaftTransport {
     }
 }
 
-async fn receive<T: Send + 'static>(
-    receiver: std_mpsc::Receiver<Result<T, AgentNetworkError>>,
+async fn receive<T>(
+    receiver: futures_channel::oneshot::Receiver<Result<T, AgentNetworkError>>,
 ) -> Result<T, AgentRaftTransportError> {
-    const POLL_INTERVAL: Duration = Duration::from_millis(50);
-    let timeout = AGENT_REQUEST_TIMEOUT + RECEIVE_GRACE;
-    let (sender, output) = futures_channel::oneshot::channel();
-    std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if sender.is_canceled() {
-                return;
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                let _ = sender.send(None);
-                return;
-            }
-            match receiver.recv_timeout((deadline - now).min(POLL_INTERVAL)) {
-                Ok(result) => {
-                    let _ = sender.send(Some(result));
-                    return;
-                }
-                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = sender.send(None);
-                    return;
-                }
-            }
-        }
-    });
-    match output.await.ok().flatten() {
-        Some(Ok(value)) => Ok(value),
-        Some(Err(error)) => Err(AgentRaftTransportError::Network(error)),
-        None => Err(AgentRaftTransportError::NoReply),
+    match receiver.await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(AgentRaftTransportError::Network(error)),
+        Err(_) => Err(AgentRaftTransportError::NoReply),
     }
 }

@@ -12,6 +12,8 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use vos_pvm::refine_host::RefineContext;
 use vos_pvm::{ExitReason, Gas};
 
+use crate::agent_sdk::wire::CanonicalWire as AgentCanonicalWire;
+
 use super::authority::{ActorInvocationReceipt, AgentAuthorityReceipt};
 use super::committee::RootAnchorPins;
 use super::driver::{AgentTrustProvider, DEFAULT_MANAGEMENT_GAS};
@@ -72,6 +74,12 @@ use crate::service::wire::ServiceWire;
 use crate::service::{ActorId, BlobRef, CapabilityId, DeploymentId, Hash, NodeId};
 
 type LocalReplayError = MaterializeError<core::convert::Infallible, LocalReplayExecutorError>;
+
+/// Reply handoff is deliberately bounded and never participates in replay
+/// truth. Losing an entry only loses the synchronous transport response: an
+/// exact retry is re-applied and recovered from the guest-owned invocation
+/// result retained in canonical runtime state.
+const MAX_PENDING_CLEAN_INVOCATION_RESULTS: usize = 1_024;
 
 /// Immutable view of the exact catalog supplied alongside one sealed
 /// genesis. Create-time validation must not consult the destination store:
@@ -612,6 +620,7 @@ pub(crate) struct StandardLocalReplayExecutor<R> {
     shared_committees: BTreeMap<AgentReplicaCommitteeId, AgentReplicaCommittee>,
     management_gas: Gas,
     last_management_result: Option<(ReplayInputId, Result<LifecycleReply, LifecycleError>)>,
+    pending_clean_invocation_results: BTreeMap<ReplayInputId, crate::agent_sdk::RuntimeOutcome>,
     authenticated_execution: Option<AuthenticatedLocalExecution>,
 }
 
@@ -654,6 +663,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             shared_committees: BTreeMap::new(),
             management_gas: DEFAULT_MANAGEMENT_GAS,
             last_management_result: None,
+            pending_clean_invocation_results: BTreeMap::new(),
             authenticated_execution: None,
         }
     }
@@ -676,6 +686,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             shared_committees,
             management_gas: DEFAULT_MANAGEMENT_GAS,
             last_management_result: None,
+            pending_clean_invocation_results: BTreeMap::new(),
             authenticated_execution: None,
         }
     }
@@ -693,6 +704,59 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         self.authenticated_execution = None;
     }
 
+    pub(crate) fn current_logical_slot(&self) -> Result<u64, LocalReplayExecutorError> {
+        self.trust
+            .current_logical_slot()
+            .ok_or(LocalReplayExecutorError::TrustUnavailable)
+    }
+
+    /// Verify clean invocation authority and availability against the exact
+    /// currently materialized Standard runtime without minting replay's
+    /// one-shot execution capability. Shared consensus uses this before a
+    /// command can enter Raft; replay repeats the same checks at application.
+    pub(crate) fn verify_clean_invocation_input(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        state: &RuntimeState,
+        binding: &RuntimeBinding,
+    ) -> Result<(), LocalReplayExecutorError> {
+        let decoded = decode_standard_runtime_state(state)
+            .map_err(|_| LocalReplayExecutorError::InvalidState)?;
+        let config = decoded
+            .config
+            .as_ref()
+            .ok_or(LocalReplayExecutorError::InvalidState)?;
+        let _ = self.validate_local_config(config, binding)?;
+        let runtime = StandardAgentRuntime::restore(decoded)
+            .map_err(|_| LocalReplayExecutorError::InvalidState)?;
+        runtime
+            .verify_clean_invocation_authority(work, authority)
+            .map_err(|_| LocalReplayExecutorError::InvalidAuthority)?;
+        match runtime.resolve_clean_invocation(work) {
+            Err(
+                crate::agent_sdk::InvocationError::InvalidAvailability
+                | crate::agent_sdk::InvocationError::InvalidInput,
+            ) => Err(LocalReplayExecutorError::InvalidRequest),
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn sign_shared_merge_event(
+        &mut self,
+        event: &mut MergeEvent,
+    ) -> Result<(), LocalReplayExecutorError> {
+        if self.profile != AgentProfile::Shared
+            || event.author != self.merge.node()
+            || event.committee.is_none()
+            || !self.merge.sign_event(event)
+            || !self.verify_merge_event(event)?
+        {
+            return Err(LocalReplayExecutorError::InvalidAuthority);
+        }
+        Ok(())
+    }
+
     fn clear_management_result(&mut self) {
         self.last_management_result = None;
     }
@@ -705,6 +769,31 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             Some((committed, result)) if committed == input => Some(result),
             _ => None,
         }
+    }
+
+    pub(crate) fn take_clean_invocation_result(
+        &mut self,
+        input: ReplayInputId,
+    ) -> Option<crate::agent_sdk::RuntimeOutcome> {
+        self.pending_clean_invocation_results.remove(&input)
+    }
+
+    fn record_clean_invocation_result(
+        &mut self,
+        input: ReplayInputId,
+        result: crate::agent_sdk::RuntimeOutcome,
+    ) {
+        if !self.pending_clean_invocation_results.contains_key(&input)
+            && self.pending_clean_invocation_results.len() == MAX_PENDING_CLEAN_INVOCATION_RESULTS
+        {
+            // This cache is response handoff only. Deterministic eviction of
+            // the lowest canonical input id cannot affect journal or runtime
+            // state and exact retries recover through guest-owned state.
+            if let Some(evicted) = self.pending_clean_invocation_results.keys().next().copied() {
+                self.pending_clean_invocation_results.remove(&evicted);
+            }
+        }
+        self.pending_clean_invocation_results.insert(input, result);
     }
 
     fn config_for<'a>(
@@ -1348,6 +1437,27 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         T::decode(&output).map_err(|_| LocalReplayExecutorError::RuntimeOutput)
     }
 
+    fn execute_agent_wire<T: AgentCanonicalWire>(
+        &self,
+        runtime_pvm: &[u8],
+        gas: Gas,
+        input: &[u8],
+    ) -> Result<T, LocalReplayExecutorError> {
+        let invocation = RefineContext::load(runtime_pvm, input, gas)
+            .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
+            .run();
+        if invocation.exit != ExitReason::Halt {
+            return Err(LocalReplayExecutorError::RuntimeExit {
+                reason: invocation.exit,
+                pc: invocation.pc,
+            });
+        }
+        let output = invocation
+            .output()
+            .ok_or(LocalReplayExecutorError::RuntimeOutput)?;
+        T::decode(&output).map_err(|_| LocalReplayExecutorError::RuntimeOutput)
+    }
+
     fn validate_state_size(
         &self,
         state: &RuntimeState,
@@ -1495,6 +1605,12 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                     )
                     .map_err(|_| LocalReplayExecutorError::InvalidAuthority)
             }
+            ReplayOperation::CleanInvoke {
+                work, authority, ..
+            } => StandardAgentRuntime::restore(decoded.clone())
+                .map_err(|_| LocalReplayExecutorError::InvalidState)?
+                .verify_clean_invocation_authority(work, authority)
+                .map_err(|_| LocalReplayExecutorError::InvalidAuthority),
             ReplayOperation::SealMerge => Ok(()),
         }?;
         self.authenticated_execution = Some(AuthenticatedLocalExecution {
@@ -1666,6 +1782,93 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                     disposition: Self::disposition(&returned.result),
                     state: returned.state,
                     result: Some(returned.result),
+                    next_runtime: input.runtime.clone(),
+                    products: ReplayProducts::default(),
+                }
+            }
+            ReplayOperation::CleanInvoke {
+                work,
+                authority,
+                observed_slot,
+            } => {
+                let sdk_work = crate::agent_sdk::RuntimeWork::Invoke {
+                    state: crate::agent_sdk::RuntimeState {
+                        control: before.control.clone(),
+                        linear: before.linear.clone(),
+                        merge: before.merge.clone(),
+                        local: before.local.clone(),
+                    },
+                    invocation: Box::new(work.clone()),
+                    authority: Box::new(authority.clone()),
+                    observed_slot: *observed_slot,
+                };
+                let encoded = sdk_work
+                    .encode()
+                    .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+                #[cfg(all(test, feature = "pvm"))]
+                let returned: crate::agent_sdk::RuntimeTransition =
+                    if self.trust.use_native_standard_runtime_for_test() {
+                        super::wire::apply_standard_runtime_work(sdk_work)
+                            .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
+                    } else {
+                        self.execute_agent_wire(
+                            &runtime.pvm,
+                            self.management_gas.saturating_add(work.gas),
+                            &encoded,
+                        )?
+                    };
+                #[cfg(any(not(test), all(test, not(feature = "pvm"))))]
+                let returned: crate::agent_sdk::RuntimeTransition = self.execute_agent_wire(
+                    &runtime.pvm,
+                    self.management_gas.saturating_add(work.gas),
+                    &encoded,
+                )?;
+                match &returned.outcome {
+                    crate::agent_sdk::RuntimeOutcome::Completed(Ok(reply))
+                        if reply.invocation == work.invocation
+                            && reply.actor == work.actor
+                            && reply.incarnation == work.incarnation
+                            && reply.deployment == work.deployment
+                            && reply.mode == work.mode
+                            && reply.lane == work.mode.write_lane()
+                            && reply.gas_remaining <= work.gas => {}
+                    crate::agent_sdk::RuntimeOutcome::Completed(Err(_)) => {}
+                    crate::agent_sdk::RuntimeOutcome::Yielded(yielded)
+                        if yielded.invocation == work.invocation
+                            && yielded.actor == work.actor
+                            && yielded.incarnation == work.incarnation
+                            && yielded.deployment == work.deployment
+                            && yielded.program == work.program
+                            && yielded.mode == work.mode => {}
+                    _ => return Err(LocalReplayExecutorError::InvalidState),
+                }
+                let state = RuntimeState {
+                    control: returned.state.control.clone(),
+                    linear: returned.state.linear.clone(),
+                    merge: returned.state.merge.clone(),
+                    local: returned.state.local.clone(),
+                };
+                self.validate_state_size(&state, &config)?;
+                let disposition = match &returned.outcome {
+                    crate::agent_sdk::RuntimeOutcome::Completed(Ok(reply)) => match reply.status {
+                        crate::agent_sdk::InvocationStatus::Done => ReplayDisposition::Applied,
+                        crate::agent_sdk::InvocationStatus::Forbidden => {
+                            ReplayDisposition::Forbidden
+                        }
+                        crate::agent_sdk::InvocationStatus::Panicked => ReplayDisposition::Panicked,
+                        crate::agent_sdk::InvocationStatus::OutOfGas => ReplayDisposition::OutOfGas,
+                    },
+                    crate::agent_sdk::RuntimeOutcome::Completed(Err(_)) => {
+                        ReplayDisposition::Rejected
+                    }
+                    crate::agent_sdk::RuntimeOutcome::Yielded(_) => ReplayDisposition::Applied,
+                    _ => unreachable!("validated above"),
+                };
+                self.record_clean_invocation_result(input.id(), returned.outcome);
+                ReplayTransition {
+                    state,
+                    disposition,
+                    result: None,
                     next_runtime: input.runtime.clone(),
                     products: ReplayProducts::default(),
                 }
@@ -1957,7 +2160,9 @@ where
         let (invocation, acknowledgement) = match &input.operation {
             ReplayOperation::Invoke { invocation, .. } => (invocation, false),
             ReplayOperation::Acknowledge { invocation, .. } => (invocation, true),
-            ReplayOperation::Management { .. } | ReplayOperation::SealMerge => return Ok(None),
+            ReplayOperation::Management { .. }
+            | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::SealMerge => return Ok(None),
         };
         if invocation.mode.invocation_scope() != InvocationScope::Merge {
             return Ok(None);
@@ -3095,7 +3300,9 @@ where
                 invocation,
                 authority,
             } => (invocation, authority),
-            ReplayOperation::Management { .. } | ReplayOperation::SealMerge => {
+            ReplayOperation::Management { .. }
+            | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::SealMerge => {
                 return Err(LocalReplayExecutorError::InvalidRequest.into());
             }
         };
@@ -3251,7 +3458,12 @@ where
         let scope = match &input.operation {
             ReplayOperation::Invoke { invocation, .. }
             | ReplayOperation::Acknowledge { invocation, .. } => invocation.mode.invocation_scope(),
-            ReplayOperation::Management { .. } | ReplayOperation::SealMerge => {
+            // Clean InvocationWork has a separate lossless Shared-driver
+            // admission path. Never route it through this legacy
+            // ActorInvocation/result projection surface.
+            ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::Management { .. }
+            | ReplayOperation::SealMerge => {
                 return Err(LocalJournalDriverError::InvalidResult);
             }
         };
@@ -4230,9 +4442,9 @@ mod tests {
                         products: ReplayProducts::default(),
                     })
                 }
-                ReplayOperation::Acknowledge { .. } | ReplayOperation::SealMerge => {
-                    Err(LocalReplayExecutorError::InvalidRequest)
-                }
+                ReplayOperation::Acknowledge { .. }
+                | ReplayOperation::CleanInvoke { .. }
+                | ReplayOperation::SealMerge => Err(LocalReplayExecutorError::InvalidRequest),
             }
         }
     }
@@ -5499,6 +5711,57 @@ mod tests {
             },
             lifecycle_fault: None,
         }
+    }
+
+    #[test]
+    fn clean_reply_handoff_is_keyed_bounded_and_never_overwrites_another_caller() {
+        let mut driver = standard_test_driver();
+        let first = ReplayInputId([0x11; 32]);
+        let second = ReplayInputId([0x22; 32]);
+        let first_outcome = crate::agent_sdk::RuntimeOutcome::Completed(Err(
+            crate::agent_sdk::InvocationError::NotFound,
+        ));
+        let second_outcome = crate::agent_sdk::RuntimeOutcome::Completed(Err(
+            crate::agent_sdk::InvocationError::Suspended,
+        ));
+        driver
+            .core
+            .executor
+            .record_clean_invocation_result(first, first_outcome.clone());
+        driver
+            .core
+            .executor
+            .record_clean_invocation_result(second, second_outcome.clone());
+
+        assert_eq!(
+            driver.core.executor.take_clean_invocation_result(first),
+            Some(first_outcome)
+        );
+        assert_eq!(
+            driver.core.executor.take_clean_invocation_result(second),
+            Some(second_outcome)
+        );
+        assert_eq!(
+            driver.core.executor.take_clean_invocation_result(first),
+            None,
+            "reply handoff is one-shot and is not durable recovery state"
+        );
+
+        for value in 0..=MAX_PENDING_CLEAN_INVOCATION_RESULTS {
+            let mut id = [0; 32];
+            id[..8].copy_from_slice(&(value as u64).to_le_bytes());
+            id[31] = 1;
+            driver.core.executor.record_clean_invocation_result(
+                ReplayInputId(id),
+                crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                    crate::agent_sdk::InvocationError::NotFound,
+                )),
+            );
+        }
+        assert_eq!(
+            driver.core.executor.pending_clean_invocation_results.len(),
+            MAX_PENDING_CLEAN_INVOCATION_RESULTS
+        );
     }
 
     #[test]

@@ -14,8 +14,12 @@ pub(crate) mod agent_protocol;
 pub(crate) mod agent_raft_transport;
 mod codec;
 mod ops;
+#[cfg(feature = "storage")]
+pub(crate) mod shared_agent;
 mod wire;
 
+#[cfg(feature = "storage")]
+pub use shared_agent::SharedAgentNetworkHost;
 pub(crate) use wire::raft_append_prefix_len;
 pub use wire::{
     Frame, FrameError, MAX_FRAME_BYTES, ManifestBlob, RaftEntry, RaftEntryKind, RaftJoinResult,
@@ -37,8 +41,10 @@ use tracing::{debug, error, info, warn};
 use vos_agent_sdk::NodeId as AgentNodeId;
 
 use agent_network::{
-    AgentOutboundReplies, AgentPeerDirectory, AgentResponseChannel, AgentRouteDirectory,
-    fail_all_agent_requests, handle_agent_event, new_agent_peer_directory, send_agent_request,
+    AgentIngressPermits, AgentOutboundPermits, AgentOutboundReplies, AgentPeerDirectory,
+    AgentResponseChannel, AgentRouteDirectory, fail_all_agent_requests, handle_agent_event,
+    new_agent_ingress_permits, new_agent_outbound_permits, new_agent_peer_directory,
+    send_agent_request,
 };
 #[cfg(test)]
 use agent_protocol::AgentFrame;
@@ -839,6 +845,9 @@ pub struct Network {
     agent_routes: AgentRouteDirectory,
     /// Bijective clean NodeId <-> Noise PeerId outbound bindings.
     agent_peers: AgentPeerDirectory,
+    /// One permit covers a clean-Agent command from pre-enqueue admission
+    /// through its exact response or terminal failure.
+    agent_outbound_permits: AgentOutboundPermits,
     join: Option<JoinHandle<()>>,
 }
 
@@ -1107,6 +1116,7 @@ impl Network {
         let raft_handlers: RaftHandlerMap = Arc::new(Mutex::new(BTreeMap::new()));
         let agent_routes: AgentRouteDirectory = Arc::new(Mutex::new(BTreeMap::new()));
         let agent_peers = new_agent_peer_directory(peer_id);
+        let agent_outbound_permits = new_agent_outbound_permits();
         let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel();
         let (inbox_tx, inbox_rx) = std_mpsc::channel();
 
@@ -1150,6 +1160,7 @@ impl Network {
             raft_handlers,
             agent_routes,
             agent_peers,
+            agent_outbound_permits,
             join: Some(join),
         }
     }
@@ -1853,6 +1864,7 @@ async fn network_main(
         async_mpsc::unbounded_channel::<(request_response::ResponseChannel<Frame>, Frame)>();
     let (agent_response_tx, mut agent_response_rx) =
         async_mpsc::unbounded_channel::<AgentResponseChannel>();
+    let agent_ingress = new_agent_ingress_permits();
 
     // Per-replication-group hint senders. The agent's sync_loop
     // registers itself once on startup; gossipsub head announcements
@@ -1889,6 +1901,7 @@ async fn network_main(
                     &agent_routes,
                     &mut agent_outbound_replies,
                     &agent_response_tx,
+                    &agent_ingress,
                     &hint_senders,
                     auto_dial_mdns,
                 );
@@ -2279,7 +2292,7 @@ async fn network_main(
                     warn!("network: deferred response failed (channel closed)");
                 }
             }
-            Some((channel, frame)) = agent_response_rx.recv() => {
+            Some((channel, frame, _permit)) = agent_response_rx.recv() => {
                 if swarm
                     .behaviour_mut()
                     .agent_req_resp
@@ -2384,6 +2397,7 @@ fn handle_swarm_event(
     agent_routes: &AgentRouteDirectory,
     agent_outbound_replies: &mut AgentOutboundReplies,
     agent_response_tx: &async_mpsc::UnboundedSender<AgentResponseChannel>,
+    agent_ingress: &AgentIngressPermits,
     hint_senders: &HashMap<[u8; 32], std_mpsc::Sender<PeerId>>,
     auto_dial_mdns: bool,
 ) {
@@ -2483,6 +2497,7 @@ fn handle_swarm_event(
                 agent_routes,
                 agent_outbound_replies,
                 agent_response_tx,
+                agent_ingress,
             );
         }
         SwarmEvent::Behaviour(VosBehaviourEvent::Gossip(g_event)) => {

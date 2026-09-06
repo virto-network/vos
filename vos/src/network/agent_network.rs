@@ -5,28 +5,56 @@
 //! converted to a clean [`NodeId`] before a route directory, member set, or
 //! handler is consulted.
 
-#![allow(dead_code)] // Live SharedAgentHost attachment lands separately.
-
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::Duration;
 
+use futures_channel::oneshot;
 use libp2p::request_response::{self, Message};
 use libp2p::{PeerId, Swarm};
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, warn};
-use vos_agent_sdk::{ActorId, Hash, InvocationId, NodeId};
+use vos_agent_sdk::{Hash, NodeId};
 
 use super::agent_protocol::{
     AgentFrame, AgentGenerationRoute, AgentMessage, AgentProtocolError, AuthenticatedAgentFrame,
     InvocationRedirect, InvocationReply, InvocationRequest, MAX_RAFT_MEMBERS, MergeMessage,
-    RaftMessage, RaftStatus, RaftVotePhase, authenticate_sender,
+    RaftMessage, RaftStatus, RaftVotePhase, authenticate_sender, invocation_request_correlation,
+    outcome_matches_work,
 };
 use super::{Network, NetworkCmd, VosBehaviour};
 
 /// Agent consensus traffic has its own bounded timeout.  It must not inherit
 /// the legacy service invocation's five-minute extension budget.
 pub(super) const AGENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Global hard cap on authenticated clean-Agent handler jobs per Network.
+/// Admission happens before `spawn_blocking`, so a route member cannot create
+/// an unbounded Tokio blocking queue or an unbounded set of generation leases.
+pub(super) const MAX_AGENT_INBOUND_HANDLERS: usize = 256;
+const MAX_AGENT_INBOUND_RAFT_HANDLERS: usize = 64;
+const MAX_AGENT_INBOUND_APPLICATION_HANDLERS: usize =
+    MAX_AGENT_INBOUND_HANDLERS - MAX_AGENT_INBOUND_RAFT_HANDLERS;
+/// Global hard cap spanning clean-Agent commands waiting in the network
+/// mailbox and requests already tracked by libp2p.  A permit is acquired
+/// before an outbound frame is prepared and is released only when that exact
+/// request completes, fails, or is dropped during network shutdown.
+pub(super) const MAX_AGENT_OUTBOUND_REQUESTS: usize = 256;
+const MAX_AGENT_OUTBOUND_RAFT_REQUESTS: usize = 64;
+const MAX_AGENT_OUTBOUND_APPLICATION_REQUESTS: usize =
+    MAX_AGENT_OUTBOUND_REQUESTS - MAX_AGENT_OUTBOUND_RAFT_REQUESTS;
+const _: () = assert!(
+    MAX_AGENT_INBOUND_APPLICATION_HANDLERS + MAX_AGENT_INBOUND_RAFT_HANDLERS
+        == MAX_AGENT_INBOUND_HANDLERS
+);
+const _: () = assert!(
+    MAX_AGENT_OUTBOUND_APPLICATION_REQUESTS + MAX_AGENT_OUTBOUND_RAFT_REQUESTS
+        == MAX_AGENT_OUTBOUND_REQUESTS
+);
+/// A prepared/joint transition routes the union of two independently bounded
+/// committees even though each physical Raft configuration remains capped at
+/// `MAX_RAFT_MEMBERS`.
+const MAX_AGENT_ROUTE_MEMBERS: usize = MAX_RAFT_MEMBERS * 2;
 
 /// Stable reasons a typed clean Agent request did not complete.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +75,7 @@ pub(crate) enum AgentNetworkError {
     ResponseRouteMismatch,
     ResponseTypeMismatch,
     ResponseCorrelationMismatch,
+    OutboundCapacity,
     Timeout,
     Disconnected,
     UnsupportedProtocol,
@@ -103,10 +132,13 @@ impl fmt::Display for AgentNetworkError {
             Self::ResponseCorrelationMismatch => {
                 formatter.write_str("clean Agent response correlation does not match request")
             }
+            Self::OutboundCapacity => {
+                formatter.write_str("clean Agent outbound request capacity exhausted")
+            }
             Self::Timeout => formatter.write_str("clean Agent request timed out"),
             Self::Disconnected => formatter.write_str("clean Agent destination disconnected"),
             Self::UnsupportedProtocol => {
-                formatter.write_str("peer does not support /vos/agent/1.0.0")
+                formatter.write_str("peer does not support /vos/agent/2.0.0")
             }
             Self::Transport => formatter.write_str("clean Agent transport failure"),
         }
@@ -144,6 +176,8 @@ pub(super) type AgentRouteDirectory =
 pub(super) struct AgentPeerBindings {
     by_node: BTreeMap<NodeId, PeerId>,
     by_peer: HashMap<PeerId, NodeId>,
+    pinned: BTreeSet<NodeId>,
+    owners: BTreeMap<NodeId, BTreeSet<AgentGenerationRoute>>,
 }
 
 pub(super) type AgentPeerDirectory = Arc<Mutex<AgentPeerBindings>>;
@@ -153,6 +187,8 @@ pub(super) fn new_agent_peer_directory(local_peer: PeerId) -> AgentPeerDirectory
     Arc::new(Mutex::new(AgentPeerBindings {
         by_node: BTreeMap::from([(local_node, local_peer)]),
         by_peer: HashMap::from([(local_peer, local_node)]),
+        pinned: BTreeSet::from([local_node]),
+        owners: BTreeMap::new(),
     }))
 }
 
@@ -184,6 +220,7 @@ fn bind_peer(
     }
     bindings.by_node.insert(claimed, peer);
     bindings.by_peer.insert(peer, claimed);
+    bindings.pinned.insert(claimed);
     Ok(())
 }
 
@@ -195,7 +232,7 @@ fn resolve_peer(directory: &AgentPeerDirectory, node: NodeId) -> Option<PeerId> 
 
 fn valid_route_members(members: &[NodeId]) -> bool {
     !members.is_empty()
-        && members.len() <= MAX_RAFT_MEMBERS
+        && members.len() <= MAX_AGENT_ROUTE_MEMBERS
         && members.iter().all(|node| *node != NodeId::ZERO)
         && members.windows(2).all(|pair| pair[0] < pair[1])
 }
@@ -235,26 +272,26 @@ pub(super) struct PendingMeta {
 pub(super) enum PendingAgentReply {
     Invocation {
         meta: PendingMeta,
-        actor: ActorId,
-        invocation: InvocationId,
+        request: InvocationRequest,
         reply: std_mpsc::Sender<Result<AgentInvocationResponse, AgentNetworkError>>,
     },
     RaftAppend {
         meta: PendingMeta,
-        reply: std_mpsc::Sender<Result<AgentRaftAppendResponse, AgentNetworkError>>,
+        expected_match_index: u64,
+        reply: oneshot::Sender<Result<AgentRaftAppendResponse, AgentNetworkError>>,
     },
     RaftVote {
         meta: PendingMeta,
         phase: RaftVotePhase,
-        reply: std_mpsc::Sender<Result<AgentRaftVoteResponse, AgentNetworkError>>,
+        reply: oneshot::Sender<Result<AgentRaftVoteResponse, AgentNetworkError>>,
     },
     RaftInstallSnapshot {
         meta: PendingMeta,
-        reply: std_mpsc::Sender<Result<AgentRaftInstallSnapshotResponse, AgentNetworkError>>,
+        reply: oneshot::Sender<Result<AgentRaftInstallSnapshotResponse, AgentNetworkError>>,
     },
     RaftStatus {
         meta: PendingMeta,
-        reply: std_mpsc::Sender<Result<Option<RaftStatus>, AgentNetworkError>>,
+        reply: oneshot::Sender<Result<Option<RaftStatus>, AgentNetworkError>>,
     },
     MergeHeads {
         meta: PendingMeta,
@@ -322,26 +359,15 @@ impl PendingAgentReply {
         }
         let message = authenticated.into_frame().message;
         match (self, message) {
-            (
-                Self::Invocation {
-                    actor,
-                    invocation,
-                    reply,
-                    ..
-                },
-                AgentMessage::InvokeReply(response),
-            ) if response.actor == actor && response.invocation == invocation => {
+            (Self::Invocation { request, reply, .. }, AgentMessage::InvokeReply(response))
+                if response.request == invocation_request_correlation(&request)
+                    && outcome_matches_work(&response.outcome, &request.work) =>
+            {
                 let _ = reply.send(Ok(AgentInvocationResponse::Reply(response)));
             }
-            (
-                Self::Invocation {
-                    actor,
-                    invocation,
-                    reply,
-                    ..
-                },
-                AgentMessage::InvokeRedirect(response),
-            ) if response.actor == actor && response.invocation == invocation => {
+            (Self::Invocation { request, reply, .. }, AgentMessage::InvokeRedirect(response))
+                if response.request == invocation_request_correlation(&request) =>
+            {
                 let _ = reply.send(Ok(AgentInvocationResponse::Redirect(response)));
             }
             (Self::Invocation { reply, .. }, AgentMessage::InvokeReply(_))
@@ -349,18 +375,28 @@ impl PendingAgentReply {
                 let _ = reply.send(Err(AgentNetworkError::ResponseCorrelationMismatch));
             }
             (
-                Self::RaftAppend { reply, .. },
+                Self::RaftAppend {
+                    expected_match_index,
+                    reply,
+                    ..
+                },
                 AgentMessage::Raft(RaftMessage::AppendReply {
                     term,
                     success,
                     match_index,
                 }),
-            ) => {
+            ) if !success || match_index == expected_match_index => {
                 let _ = reply.send(Ok(AgentRaftAppendResponse {
                     term,
                     success,
                     match_index,
                 }));
+            }
+            (
+                Self::RaftAppend { reply, .. },
+                AgentMessage::Raft(RaftMessage::AppendReply { .. }),
+            ) => {
+                let _ = reply.send(Err(AgentNetworkError::ResponseCorrelationMismatch));
             }
             (
                 Self::RaftVote { phase, reply, .. },
@@ -417,11 +453,105 @@ pub(super) struct AgentOutboundRequest {
     pub(super) peer: PeerId,
     pub(super) frame: AgentFrame,
     pub(super) pending: PendingAgentReply,
+    permit: OwnedSemaphorePermit,
+}
+
+pub(super) struct TrackedAgentReply {
+    pending: PendingAgentReply,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl TrackedAgentReply {
+    fn fail(self, error: AgentNetworkError) {
+        self.pending.fail(error);
+    }
+
+    fn complete(self, peer: PeerId, authenticated: AuthenticatedAgentFrame) {
+        self.pending.complete(peer, authenticated);
+    }
 }
 
 pub(super) type AgentOutboundReplies =
-    HashMap<request_response::OutboundRequestId, PendingAgentReply>;
-pub(super) type AgentResponseChannel = (request_response::ResponseChannel<AgentFrame>, AgentFrame);
+    HashMap<request_response::OutboundRequestId, TrackedAgentReply>;
+pub(super) type AgentResponseChannel = (
+    request_response::ResponseChannel<AgentFrame>,
+    AgentFrame,
+    tokio::sync::OwnedSemaphorePermit,
+);
+#[derive(Clone, Copy)]
+enum AgentTrafficClass {
+    Application,
+    Raft,
+}
+
+impl AgentTrafficClass {
+    fn for_message(message: &AgentMessage) -> Self {
+        if matches!(message, AgentMessage::Raft(_)) {
+            Self::Raft
+        } else {
+            Self::Application
+        }
+    }
+}
+
+pub(super) struct AgentPermitPools {
+    application: Arc<tokio::sync::Semaphore>,
+    raft: Arc<tokio::sync::Semaphore>,
+}
+
+impl AgentPermitPools {
+    fn new(application: usize, raft: usize) -> Self {
+        Self {
+            application: Arc::new(tokio::sync::Semaphore::new(application)),
+            raft: Arc::new(tokio::sync::Semaphore::new(raft)),
+        }
+    }
+
+    fn try_acquire(
+        &self,
+        class: AgentTrafficClass,
+    ) -> Result<OwnedSemaphorePermit, AgentNetworkError> {
+        let permits = match class {
+            AgentTrafficClass::Application => &self.application,
+            AgentTrafficClass::Raft => &self.raft,
+        };
+        Arc::clone(permits)
+            .try_acquire_owned()
+            .map_err(|_| AgentNetworkError::OutboundCapacity)
+    }
+
+    #[cfg(test)]
+    fn available(&self, class: AgentTrafficClass) -> usize {
+        match class {
+            AgentTrafficClass::Application => self.application.available_permits(),
+            AgentTrafficClass::Raft => self.raft.available_permits(),
+        }
+    }
+}
+
+pub(super) type AgentIngressPermits = AgentPermitPools;
+pub(super) type AgentOutboundPermits = AgentPermitPools;
+
+pub(super) fn new_agent_ingress_permits() -> AgentIngressPermits {
+    AgentPermitPools::new(
+        MAX_AGENT_INBOUND_APPLICATION_HANDLERS,
+        MAX_AGENT_INBOUND_RAFT_HANDLERS,
+    )
+}
+
+pub(super) fn new_agent_outbound_permits() -> AgentOutboundPermits {
+    AgentPermitPools::new(
+        MAX_AGENT_OUTBOUND_APPLICATION_REQUESTS,
+        MAX_AGENT_OUTBOUND_RAFT_REQUESTS,
+    )
+}
+
+fn reserve_agent_outbound_permit(
+    permits: &AgentOutboundPermits,
+    class: AgentTrafficClass,
+) -> Result<OwnedSemaphorePermit, AgentNetworkError> {
+    permits.try_acquire(class)
+}
 
 impl Network {
     /// Full clean identity of this network's Noise key.
@@ -466,6 +596,125 @@ impl Network {
                 Err(AgentNetworkError::RouteAlreadyRegistered)
             }
         }
+    }
+
+    /// Atomically install or refresh one live Shared-Agent generation and
+    /// its exact Noise destinations. Existing registration is replaceable
+    /// only by the identical handler owner; a competing owner fails closed.
+    pub(crate) fn install_agent_route(
+        &self,
+        route: AgentGenerationRoute,
+        mut members: Vec<(NodeId, PeerId)>,
+        handler: Arc<dyn AgentRouteHandler>,
+    ) -> Result<(), AgentNetworkError> {
+        members.sort_unstable_by_key(|(node, _)| *node);
+        let nodes = members.iter().map(|(node, _)| *node).collect::<Vec<_>>();
+        if !route.is_valid()
+            || !valid_route_members(&nodes)
+            || nodes.binary_search(&self.agent_node_id).is_err()
+            || members
+                .iter()
+                .any(|(node, peer)| *node != NodeId::of_authenticated_peer(&peer.to_bytes()))
+        {
+            return Err(AgentNetworkError::InvalidMembership);
+        }
+        let Ok(mut bindings) = self.agent_peers.lock() else {
+            return Err(AgentNetworkError::Transport);
+        };
+        let Ok(mut routes) = self.agent_routes.lock() else {
+            return Err(AgentNetworkError::Transport);
+        };
+        if let Some(existing) = routes.get(&route)
+            && !Arc::ptr_eq(&existing.handler, &handler)
+        {
+            return Err(AgentNetworkError::RouteAlreadyRegistered);
+        }
+        for (node, peer) in &members {
+            if bindings
+                .by_node
+                .get(node)
+                .is_some_and(|existing| existing != peer)
+            {
+                return Err(AgentNetworkError::NodeAlreadyBound(*node));
+            }
+            if bindings
+                .by_peer
+                .get(peer)
+                .is_some_and(|existing| existing != node)
+            {
+                return Err(AgentNetworkError::PeerAlreadyBound(*peer));
+            }
+        }
+
+        let old_nodes = routes
+            .get(&route)
+            .map(|registration| registration.members.clone())
+            .unwrap_or_default();
+        for node in old_nodes {
+            if nodes.binary_search(&node).is_err() {
+                if let Some(owners) = bindings.owners.get_mut(&node) {
+                    owners.remove(&route);
+                    if owners.is_empty() {
+                        bindings.owners.remove(&node);
+                        if !bindings.pinned.contains(&node)
+                            && let Some(peer) = bindings.by_node.remove(&node)
+                        {
+                            bindings.by_peer.remove(&peer);
+                        }
+                    }
+                }
+            }
+        }
+        for (node, peer) in members {
+            bindings.by_node.entry(node).or_insert(peer);
+            bindings.by_peer.entry(peer).or_insert(node);
+            bindings.owners.entry(node).or_default().insert(route);
+        }
+        routes.insert(
+            route,
+            Arc::new(AgentRouteRegistration {
+                members: nodes,
+                handler,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Retire exactly one live generation owner and release only peer
+    /// bindings no longer used or explicitly pinned by another API owner.
+    pub(crate) fn retire_agent_route(
+        &self,
+        route: AgentGenerationRoute,
+        handler: &Arc<dyn AgentRouteHandler>,
+    ) -> bool {
+        let Ok(mut bindings) = self.agent_peers.lock() else {
+            return false;
+        };
+        let Ok(mut routes) = self.agent_routes.lock() else {
+            return false;
+        };
+        let Some(registration) = routes.get(&route) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&registration.handler, handler) {
+            return false;
+        }
+        let members = registration.members.clone();
+        routes.remove(&route);
+        for node in members {
+            if let Some(owners) = bindings.owners.get_mut(&node) {
+                owners.remove(&route);
+                if owners.is_empty() {
+                    bindings.owners.remove(&node);
+                    if !bindings.pinned.contains(&node)
+                        && let Some(peer) = bindings.by_node.remove(&node)
+                    {
+                        bindings.by_peer.remove(&peer);
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Remove only the exact handler registration supplied by its owner.
@@ -523,6 +772,13 @@ impl Network {
         }
     }
 
+    fn reserve_agent_outbound(
+        &self,
+        class: AgentTrafficClass,
+    ) -> Result<OwnedSemaphorePermit, AgentNetworkError> {
+        reserve_agent_outbound_permit(&self.agent_outbound_permits, class)
+    }
+
     pub(crate) fn send_agent_invocation(
         &self,
         target: NodeId,
@@ -530,20 +786,29 @@ impl Network {
         request: InvocationRequest,
     ) -> std_mpsc::Receiver<Result<AgentInvocationResponse, AgentNetworkError>> {
         let (reply, receiver) = std_mpsc::channel();
-        let actor = request.work.actor;
-        let invocation = request.work.invocation;
-        match self.prepare_agent_request(target, route, AgentMessage::InvokeRequest(request)) {
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Application) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return receiver;
+            }
+        };
+        match self.prepare_agent_request(
+            target,
+            route,
+            AgentMessage::InvokeRequest(request.clone()),
+        ) {
             Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
                 peer,
                 frame,
+                permit,
                 pending: PendingAgentReply::Invocation {
                     meta: PendingMeta {
                         route,
                         target_node: target,
                         target_peer: peer,
                     },
-                    actor,
-                    invocation,
+                    request,
                     reply,
                 },
             }),
@@ -559,22 +824,37 @@ impl Network {
         target: NodeId,
         route: AgentGenerationRoute,
         request: RaftMessage,
-    ) -> std_mpsc::Receiver<Result<AgentRaftAppendResponse, AgentNetworkError>> {
-        let (reply, receiver) = std_mpsc::channel();
-        if !matches!(request, RaftMessage::AppendRequest { .. }) {
+    ) -> oneshot::Receiver<Result<AgentRaftAppendResponse, AgentNetworkError>> {
+        let (reply, receiver) = oneshot::channel();
+        let RaftMessage::AppendRequest {
+            prev_log_index,
+            entries,
+            ..
+        } = &request
+        else {
             let _ = reply.send(Err(AgentNetworkError::InvalidRequestKind));
             return receiver;
-        }
+        };
+        let expected_match_index = entries.last().map_or(*prev_log_index, |entry| entry.index);
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Raft) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return receiver;
+            }
+        };
         match self.prepare_agent_request(target, route, AgentMessage::Raft(request)) {
             Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
                 peer,
                 frame,
+                permit,
                 pending: PendingAgentReply::RaftAppend {
                     meta: PendingMeta {
                         route,
                         target_node: target,
                         target_peer: peer,
                     },
+                    expected_match_index,
                     reply,
                 },
             }),
@@ -590,16 +870,24 @@ impl Network {
         target: NodeId,
         route: AgentGenerationRoute,
         request: RaftMessage,
-    ) -> std_mpsc::Receiver<Result<AgentRaftVoteResponse, AgentNetworkError>> {
-        let (reply, receiver) = std_mpsc::channel();
+    ) -> oneshot::Receiver<Result<AgentRaftVoteResponse, AgentNetworkError>> {
+        let (reply, receiver) = oneshot::channel();
         let RaftMessage::VoteRequest { phase, .. } = request else {
             let _ = reply.send(Err(AgentNetworkError::InvalidRequestKind));
             return receiver;
+        };
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Raft) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return receiver;
+            }
         };
         match self.prepare_agent_request(target, route, AgentMessage::Raft(request)) {
             Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
                 peer,
                 frame,
+                permit,
                 pending: PendingAgentReply::RaftVote {
                     meta: PendingMeta {
                         route,
@@ -622,16 +910,24 @@ impl Network {
         target: NodeId,
         route: AgentGenerationRoute,
         request: RaftMessage,
-    ) -> std_mpsc::Receiver<Result<AgentRaftInstallSnapshotResponse, AgentNetworkError>> {
-        let (reply, receiver) = std_mpsc::channel();
+    ) -> oneshot::Receiver<Result<AgentRaftInstallSnapshotResponse, AgentNetworkError>> {
+        let (reply, receiver) = oneshot::channel();
         if !matches!(request, RaftMessage::InstallSnapshotRequest { .. }) {
             let _ = reply.send(Err(AgentNetworkError::InvalidRequestKind));
             return receiver;
         }
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Raft) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return receiver;
+            }
+        };
         match self.prepare_agent_request(target, route, AgentMessage::Raft(request)) {
             Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
                 peer,
                 frame,
+                permit,
                 pending: PendingAgentReply::RaftInstallSnapshot {
                     meta: PendingMeta {
                         route,
@@ -652,8 +948,15 @@ impl Network {
         &self,
         target: NodeId,
         route: AgentGenerationRoute,
-    ) -> std_mpsc::Receiver<Result<Option<RaftStatus>, AgentNetworkError>> {
-        let (reply, receiver) = std_mpsc::channel();
+    ) -> oneshot::Receiver<Result<Option<RaftStatus>, AgentNetworkError>> {
+        let (reply, receiver) = oneshot::channel();
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Raft) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return receiver;
+            }
+        };
         match self.prepare_agent_request(
             target,
             route,
@@ -662,6 +965,7 @@ impl Network {
             Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
                 peer,
                 frame,
+                permit,
                 pending: PendingAgentReply::RaftStatus {
                     meta: PendingMeta {
                         route,
@@ -702,10 +1006,18 @@ impl Network {
         request: MergeMessage,
     ) -> std_mpsc::Receiver<Result<Vec<Hash>, AgentNetworkError>> {
         let (reply, receiver) = std_mpsc::channel();
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Application) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return receiver;
+            }
+        };
         match self.prepare_agent_request(target, route, AgentMessage::Merge(request)) {
             Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
                 peer,
                 frame,
+                permit,
                 pending: PendingAgentReply::MergeHeads {
                     meta: PendingMeta {
                         route,
@@ -729,6 +1041,13 @@ impl Network {
         hash: Hash,
     ) -> std_mpsc::Receiver<Result<Option<Vec<u8>>, AgentNetworkError>> {
         let (reply, receiver) = std_mpsc::channel();
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Application) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return receiver;
+            }
+        };
         match self.prepare_agent_request(
             target,
             route,
@@ -737,6 +1056,7 @@ impl Network {
             Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
                 peer,
                 frame,
+                permit,
                 pending: PendingAgentReply::MergeNode {
                     meta: PendingMeta {
                         route,
@@ -800,10 +1120,11 @@ fn is_request(message: &AgentMessage) -> bool {
 fn response_matches_request(request: &AgentMessage, response: &AgentMessage) -> bool {
     match (request, response) {
         (AgentMessage::InvokeRequest(request), AgentMessage::InvokeReply(response)) => {
-            response.actor == request.work.actor && response.invocation == request.work.invocation
+            response.request == invocation_request_correlation(request)
+                && outcome_matches_work(&response.outcome, &request.work)
         }
         (AgentMessage::InvokeRequest(request), AgentMessage::InvokeRedirect(response)) => {
-            response.actor == request.work.actor && response.invocation == request.work.invocation
+            response.request == invocation_request_correlation(request)
         }
         (
             AgentMessage::Raft(RaftMessage::AppendRequest { .. }),
@@ -860,11 +1181,23 @@ pub(super) fn send_agent_request(
     outbound: AgentOutboundRequest,
     pending: &mut AgentOutboundReplies,
 ) {
+    let AgentOutboundRequest {
+        peer,
+        frame,
+        pending: reply,
+        permit,
+    } = outbound;
     let request_id = swarm
         .behaviour_mut()
         .agent_req_resp
-        .send_request(&outbound.peer, outbound.frame);
-    pending.insert(request_id, outbound.pending);
+        .send_request(&peer, frame);
+    pending.insert(
+        request_id,
+        TrackedAgentReply {
+            pending: reply,
+            _permit: permit,
+        },
+    );
 }
 
 pub(super) fn fail_all_agent_requests(
@@ -882,6 +1215,7 @@ pub(super) fn handle_agent_event(
     routes: &AgentRouteDirectory,
     pending: &mut AgentOutboundReplies,
     response_tx: &tokio::sync::mpsc::UnboundedSender<AgentResponseChannel>,
+    ingress: &AgentIngressPermits,
 ) {
     match event {
         request_response::Event::Message { peer, message, .. } => match message {
@@ -897,6 +1231,11 @@ pub(super) fn handle_agent_event(
                     warn!(%peer, "network: clean Agent response arrived in request slot");
                     return;
                 }
+                let class = AgentTrafficClass::for_message(&authenticated.frame().message);
+                let Ok(permit) = ingress.try_acquire(class) else {
+                    debug!(%peer, "network: clean Agent inbound handler capacity exhausted");
+                    return;
+                };
                 let request_message = authenticated.frame().message.clone();
                 let route = authenticated.frame().route;
                 let response_tx = response_tx.clone();
@@ -917,7 +1256,9 @@ pub(super) fn handle_agent_event(
                         warn!(%peer, "network: clean Agent handler returned an invalid response");
                         return;
                     }
-                    let _ = response_tx.send((channel, response));
+                    // Move the permit with the response so both handler jobs
+                    // and not-yet-drained response channels share one cap.
+                    let _ = response_tx.send((channel, response, permit));
                 });
             }
             Message::Response {
@@ -982,7 +1323,14 @@ pub(super) fn handle_agent_event(
 mod tests {
     use libp2p::Multiaddr;
     use libp2p::identity;
-    use vos_agent_sdk::{AgentId, SpaceId};
+    use vos_agent_sdk::authority::{
+        AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots, AuthorityOperationKind,
+        AuthorityReceipt, AuthorityReceiptSelector,
+    };
+    use vos_agent_sdk::{
+        ActorId, AgentId, DeploymentId, InvocationId, InvocationOrigin, InvocationRoleClaims,
+        MethodMode, PrincipalId, ProducerId, ProgramId, RuntimeOutcome, SpaceId,
+    };
 
     use super::*;
     use crate::network::{NetworkConfig, derive_node_prefix};
@@ -1087,6 +1435,23 @@ mod tests {
     }
 
     #[test]
+    fn route_directory_admits_two_full_committees_but_not_an_unbounded_union() {
+        let mut members = (1..=MAX_AGENT_ROUTE_MEMBERS)
+            .map(|index| {
+                let mut bytes = [0_u8; 32];
+                bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                NodeId(bytes)
+            })
+            .collect::<Vec<_>>();
+        assert!(valid_route_members(&members));
+        let mut extra = [0xff; 32];
+        extra[..8].copy_from_slice(&((MAX_AGENT_ROUTE_MEMBERS + 1) as u64).to_be_bytes());
+        members.push(NodeId(extra));
+        members.sort_unstable();
+        assert!(!valid_route_members(&members));
+    }
+
+    #[test]
     fn sender_authentication_precedes_route_and_membership_access() {
         let honest = key(1).public().to_peer_id();
         let attacker = key(2).public().to_peer_id();
@@ -1132,11 +1497,69 @@ mod tests {
         assert!(calls.lock().unwrap().is_empty());
     }
 
-    fn invocation_pending(
-        peer: PeerId,
+    fn invocation_request(
         route: AgentGenerationRoute,
         actor: ActorId,
         invocation: InvocationId,
+    ) -> InvocationRequest {
+        let work = vos_agent_sdk::InvocationWork {
+            space: route.space,
+            agent: route.agent,
+            runtime_deployment: DeploymentId(id(60)),
+            invocation,
+            actor,
+            incarnation: Hash(id(61)),
+            deployment: DeploymentId(id(62)),
+            program: ProgramId(id(63)),
+            mode: MethodMode::Query,
+            origin: InvocationOrigin::anonymous(),
+            roles: InvocationRoleClaims::default(),
+            message: Vec::new(),
+            installation_data: None,
+            availability: Vec::new(),
+            gas: 10,
+            recovery_only: false,
+        };
+        let public_key = id(64);
+        let authority = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: Hash(id(65)),
+                issuer: AuthorityIssuer {
+                    principal: PrincipalId(id(66)),
+                    actor: ActorId(id(67)),
+                    deployment: DeploymentId(id(68)),
+                    program: ProgramId(id(69)),
+                    producer: ProducerId::of_public_key(&public_key),
+                },
+                space: work.space,
+                agent: work.agent,
+                operation: AuthorityOperationKind::InvokeActor,
+                runtime_deployment: work.runtime_deployment,
+                actor: Some(work.actor),
+                actor_deployment: Some(work.deployment),
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: Hash(id(70)),
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch: 1,
+                decision_sequence: 0,
+                acknowledged_through: 0,
+                valid_from: 1,
+                expires_at: 10,
+                request: work.commitment(),
+            },
+            public_key,
+            signature: [71; 64],
+        };
+        InvocationRequest { work, authority }
+    }
+
+    fn invocation_pending(
+        peer: PeerId,
+        route: AgentGenerationRoute,
+        request: InvocationRequest,
     ) -> (
         PendingAgentReply,
         std_mpsc::Receiver<Result<AgentInvocationResponse, AgentNetworkError>>,
@@ -1149,8 +1572,7 @@ mod tests {
                     target_node: node(peer),
                     target_peer: peer,
                 },
-                actor,
-                invocation,
+                request,
                 reply,
             },
             receiver,
@@ -1163,16 +1585,16 @@ mod tests {
         let route = test_route(40);
         let actor = ActorId(id(41));
         let invocation = InvocationId(id(42));
+        let request = invocation_request(route, actor, invocation);
+        let correlation = invocation_request_correlation(&request);
 
-        let (pending, receiver) = invocation_pending(peer, route, actor, invocation);
+        let (pending, receiver) = invocation_pending(peer, route, request.clone());
         let response = frame(
             peer,
             test_route(41),
             AgentMessage::InvokeReply(InvocationReply {
-                actor,
-                invocation,
-                status: super::super::agent_protocol::InvocationReplyStatus::Complete,
-                payload: Vec::new(),
+                request: correlation,
+                outcome: RuntimeOutcome::Completed(Err(vos_agent_sdk::InvocationError::NotFound)),
             }),
         );
         pending.complete(peer, authenticate_sender(&peer, response).unwrap());
@@ -1181,15 +1603,13 @@ mod tests {
             Err(AgentNetworkError::ResponseRouteMismatch)
         );
 
-        let (pending, receiver) = invocation_pending(peer, route, actor, invocation);
+        let (pending, receiver) = invocation_pending(peer, route, request.clone());
         let response = frame(
             peer,
             route,
             AgentMessage::InvokeReply(InvocationReply {
-                actor,
-                invocation: InvocationId(id(43)),
-                status: super::super::agent_protocol::InvocationReplyStatus::Complete,
-                payload: Vec::new(),
+                request: Hash(id(43)),
+                outcome: RuntimeOutcome::Completed(Err(vos_agent_sdk::InvocationError::NotFound)),
             }),
         );
         pending.complete(peer, authenticate_sender(&peer, response).unwrap());
@@ -1198,7 +1618,86 @@ mod tests {
             Err(AgentNetworkError::ResponseCorrelationMismatch)
         );
 
-        let (reply, receiver) = std_mpsc::channel();
+        let (pending, receiver) = invocation_pending(peer, route, request.clone());
+        let response = frame(
+            peer,
+            route,
+            AgentMessage::InvokeReply(InvocationReply {
+                request: correlation,
+                outcome: RuntimeOutcome::Completed(Ok(vos_agent_sdk::InvocationReply {
+                    invocation,
+                    actor,
+                    incarnation: request.work.incarnation,
+                    deployment: request.work.deployment,
+                    mode: request.work.mode,
+                    lane: Some(vos_agent_sdk::StateLane::Merge),
+                    status: vos_agent_sdk::InvocationStatus::Done,
+                    reply: Vec::new(),
+                    gas_remaining: request.work.gas,
+                    observation: vos_agent_sdk::InvocationObservation {
+                        linear_revision: None,
+                        merge_frontier: None,
+                        local_revision: None,
+                    },
+                })),
+            }),
+        );
+        pending.complete(peer, authenticate_sender(&peer, response).unwrap());
+        assert_eq!(
+            receiver.recv().unwrap(),
+            Err(AgentNetworkError::ResponseCorrelationMismatch),
+            "a canonical outcome with a lane inconsistent with the exact work is mismatched"
+        );
+
+        let (pending, receiver) = invocation_pending(peer, route, request.clone());
+        let response = frame(
+            peer,
+            route,
+            AgentMessage::InvokeReply(InvocationReply {
+                request: correlation,
+                outcome: RuntimeOutcome::Completed(Ok(vos_agent_sdk::InvocationReply {
+                    invocation,
+                    actor: ActorId(id(44)),
+                    incarnation: request.work.incarnation,
+                    deployment: request.work.deployment,
+                    mode: request.work.mode,
+                    lane: None,
+                    status: vos_agent_sdk::InvocationStatus::Done,
+                    reply: Vec::new(),
+                    gas_remaining: request.work.gas,
+                    observation: vos_agent_sdk::InvocationObservation {
+                        linear_revision: None,
+                        merge_frontier: None,
+                        local_revision: None,
+                    },
+                })),
+            }),
+        );
+        pending.complete(peer, authenticate_sender(&peer, response).unwrap());
+        assert_eq!(
+            receiver.recv().unwrap(),
+            Err(AgentNetworkError::ResponseCorrelationMismatch)
+        );
+
+        let (pending, receiver) = invocation_pending(peer, route, request.clone());
+        let response = frame(
+            peer,
+            route,
+            AgentMessage::InvokeReply(InvocationReply {
+                request: correlation,
+                outcome: RuntimeOutcome::Management(Err(
+                    vos_agent_sdk::ManagementError::InvalidRequest,
+                )),
+            }),
+        );
+        pending.complete(peer, authenticate_sender(&peer, response).unwrap());
+        assert_eq!(
+            receiver.recv().unwrap(),
+            Err(AgentNetworkError::ResponseCorrelationMismatch),
+            "a losslessly encoded outcome for another RuntimeWork variant is still mismatched"
+        );
+
+        let (reply, receiver) = oneshot::channel();
         let pending = PendingAgentReply::RaftVote {
             meta: PendingMeta {
                 route,
@@ -1219,8 +1718,34 @@ mod tests {
         );
         pending.complete(peer, authenticate_sender(&peer, response).unwrap());
         assert_eq!(
-            receiver.recv().unwrap(),
+            futures_executor::block_on(receiver).unwrap(),
             Err(AgentNetworkError::ResponseCorrelationMismatch)
+        );
+
+        let (reply, receiver) = oneshot::channel();
+        let pending = PendingAgentReply::RaftAppend {
+            meta: PendingMeta {
+                route,
+                target_node: node(peer),
+                target_peer: peer,
+            },
+            expected_match_index: 9,
+            reply,
+        };
+        let response = frame(
+            peer,
+            route,
+            AgentMessage::Raft(RaftMessage::AppendReply {
+                term: 7,
+                success: true,
+                match_index: u64::MAX,
+            }),
+        );
+        pending.complete(peer, authenticate_sender(&peer, response).unwrap());
+        assert_eq!(
+            futures_executor::block_on(receiver).unwrap(),
+            Err(AgentNetworkError::ResponseCorrelationMismatch),
+            "a voter cannot acknowledge entries outside the exact sent batch"
         );
 
         let (reply, receiver) = std_mpsc::channel();
@@ -1290,6 +1815,196 @@ mod tests {
             outbound_failure(&request_response::OutboundFailure::UnsupportedProtocols),
             AgentNetworkError::UnsupportedProtocol
         );
+    }
+
+    #[test]
+    fn clean_agent_handler_admission_is_hard_bounded() {
+        let ingress = new_agent_ingress_permits();
+        let mut admitted = Vec::new();
+        for _ in 0..MAX_AGENT_INBOUND_APPLICATION_HANDLERS {
+            admitted.push(
+                ingress
+                    .try_acquire(AgentTrafficClass::Application)
+                    .expect("declared capacity must be available exactly once"),
+            );
+        }
+        assert_eq!(ingress.available(AgentTrafficClass::Application), 0);
+        assert!(ingress.try_acquire(AgentTrafficClass::Application).is_err());
+        let raft = ingress
+            .try_acquire(AgentTrafficClass::Raft)
+            .expect("application saturation must reserve consensus admission");
+        assert_eq!(
+            ingress.available(AgentTrafficClass::Raft),
+            MAX_AGENT_INBOUND_RAFT_HANDLERS - 1
+        );
+        drop(admitted.pop());
+        assert!(ingress.try_acquire(AgentTrafficClass::Application).is_ok());
+        drop(raft);
+    }
+
+    #[test]
+    fn clean_agent_outbound_capacity_is_fail_fast_and_held_until_terminal_result() {
+        let permits = new_agent_outbound_permits();
+        let peer = key(82).public().to_peer_id();
+        let route = test_route(82);
+        let meta = PendingMeta {
+            route,
+            target_node: node(peer),
+            target_peer: peer,
+        };
+        let mut tracked = Vec::new();
+        for _ in 0..MAX_AGENT_OUTBOUND_APPLICATION_REQUESTS {
+            let permit = reserve_agent_outbound_permit(&permits, AgentTrafficClass::Application)
+                .expect("declared outbound capacity must be available exactly once");
+            let (reply, _receiver) = std_mpsc::channel();
+            tracked.push(TrackedAgentReply {
+                pending: PendingAgentReply::MergeHeads { meta, reply },
+                _permit: permit,
+            });
+        }
+        assert_eq!(permits.available(AgentTrafficClass::Application), 0);
+        assert_eq!(
+            reserve_agent_outbound_permit(&permits, AgentTrafficClass::Application).unwrap_err(),
+            AgentNetworkError::OutboundCapacity
+        );
+        let raft = reserve_agent_outbound_permit(&permits, AgentTrafficClass::Raft)
+            .expect("application saturation must reserve consensus capacity");
+        assert_eq!(
+            permits.available(AgentTrafficClass::Raft),
+            MAX_AGENT_OUTBOUND_RAFT_REQUESTS - 1
+        );
+
+        tracked.pop().unwrap().fail(AgentNetworkError::Timeout);
+        assert_eq!(permits.available(AgentTrafficClass::Application), 1);
+        let permit =
+            reserve_agent_outbound_permit(&permits, AgentTrafficClass::Application).unwrap();
+        let (reply, receiver) = std_mpsc::channel();
+        let pending = TrackedAgentReply {
+            pending: PendingAgentReply::MergeHeads { meta, reply },
+            _permit: permit,
+        };
+        assert_eq!(permits.available(AgentTrafficClass::Application), 0);
+        let response = frame(
+            peer,
+            route,
+            AgentMessage::Merge(MergeMessage::Heads(Vec::new())),
+        );
+        pending.complete(peer, authenticate_sender(&peer, response).unwrap());
+        assert_eq!(receiver.recv().unwrap(), Ok(Vec::new()));
+        assert_eq!(permits.available(AgentTrafficClass::Application), 1);
+
+        drop(tracked);
+        assert_eq!(
+            permits.available(AgentTrafficClass::Application),
+            MAX_AGENT_OUTBOUND_APPLICATION_REQUESTS
+        );
+        drop(raft);
+        assert_eq!(
+            permits.available(AgentTrafficClass::Raft),
+            MAX_AGENT_OUTBOUND_RAFT_REQUESTS
+        );
+    }
+
+    #[test]
+    fn live_route_refresh_and_retirement_require_the_exact_handler_owner() {
+        let local_key = key(80);
+        let local_peer = local_key.public().to_peer_id();
+        let local_node = node(local_peer);
+        let first_peer = key(81).public().to_peer_id();
+        let first_node = node(first_peer);
+        let second_peer = key(82).public().to_peer_id();
+        let second_node = node(second_peer);
+        let route = test_route(80);
+        let network = start_network(local_key, Vec::new());
+        let first: Arc<dyn AgentRouteHandler> = Arc::new(StaticHandler {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            response: None,
+            delay: None,
+        });
+        let replacement: Arc<dyn AgentRouteHandler> = Arc::new(StaticHandler {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            response: None,
+            delay: None,
+        });
+
+        network
+            .install_agent_route(
+                route,
+                vec![(local_node, local_peer), (first_node, first_peer)],
+                Arc::clone(&first),
+            )
+            .unwrap();
+        assert_eq!(
+            resolve_peer(&network.agent_peers, first_node),
+            Some(first_peer)
+        );
+        assert_eq!(
+            network.install_agent_route(
+                route,
+                vec![(local_node, local_peer), (second_node, second_peer)],
+                Arc::clone(&replacement),
+            ),
+            Err(AgentNetworkError::RouteAlreadyRegistered)
+        );
+        assert!(!network.retire_agent_route(route, &replacement));
+        assert!(
+            network
+                .prepare_agent_request(
+                    first_node,
+                    route,
+                    AgentMessage::Merge(MergeMessage::FetchHeads),
+                )
+                .is_ok()
+        );
+
+        // The current owner may atomically refresh its exact committee. A
+        // route-owned destination removed from every generation disappears,
+        // while the newly admitted full PeerId becomes routable.
+        network
+            .install_agent_route(
+                route,
+                vec![(local_node, local_peer), (second_node, second_peer)],
+                Arc::clone(&first),
+            )
+            .unwrap();
+        assert_eq!(resolve_peer(&network.agent_peers, first_node), None);
+        assert_eq!(
+            resolve_peer(&network.agent_peers, second_node),
+            Some(second_peer)
+        );
+
+        assert!(network.retire_agent_route(route, &first));
+        assert_eq!(resolve_peer(&network.agent_peers, second_node), None);
+        assert!(matches!(
+            network.prepare_agent_request(
+                local_node,
+                route,
+                AgentMessage::Merge(MergeMessage::FetchHeads),
+            ),
+            Err(AgentNetworkError::UnknownRoute(unknown)) if unknown == route
+        ));
+
+        network
+            .install_agent_route(
+                route,
+                vec![(local_node, local_peer), (second_node, second_peer)],
+                Arc::clone(&replacement),
+            )
+            .unwrap();
+        // A delayed cleanup from the retired worker cannot revoke the new
+        // route owner or its peer binding.
+        assert!(!network.retire_agent_route(route, &first));
+        assert!(
+            network
+                .prepare_agent_request(
+                    second_node,
+                    route,
+                    AgentMessage::Merge(MergeMessage::FetchHeads),
+                )
+                .is_ok()
+        );
+        assert!(network.retire_agent_route(route, &replacement));
+        network.join();
     }
 
     fn wait_for<T>(mut probe: impl FnMut() -> Option<T>, timeout: Duration) -> Option<T> {
