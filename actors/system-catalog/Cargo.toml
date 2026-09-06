@@ -1,0 +1,28 @@
+[workspace]
+
+[package]
+name = "system-catalog"
+description = "Clean no_std Merge-lane actor for the shared Agent catalog"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[features]
+default = ["bin"]
+bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+ed25519-dalek = { version = "2", default-features = false }
+vos = { path = "../../vos", default-features = false, features = ["macros", "pvm"] }
+
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
+ed25519-dalek = { version = "2", default-features = false }
+vos = { path = "../../vos", default-features = false, features = ["macros", "extension"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

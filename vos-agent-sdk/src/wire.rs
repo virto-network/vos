@@ -15,6 +15,12 @@ use crate::authority::{
     CREDENTIAL_PUBLIC_KEY_BYTES, CREDENTIAL_SIGNATURE_BYTES, ManagedAgentTarget,
     ManagementApplicationAck, ManagementApproval,
 };
+use crate::catalog::{
+    CatalogActorTarget, CatalogAlias, CatalogEntry, CatalogMutationCall, CatalogMutationKind,
+    CatalogMutationRequest, CatalogMutationResult, CatalogPage, CatalogPageRequest,
+    CatalogPublication, MAX_CATALOG_ALIAS_BYTES, MAX_CATALOG_NAMESPACE_BYTES,
+    MAX_CATALOG_PAGE_ENTRIES,
+};
 use crate::contract::{
     ActorAbiRange, ActorPackageContract, RuntimeMigrationPolicy, RuntimePackageContract,
     RuntimeResourceLimits,
@@ -29,6 +35,12 @@ pub const MAX_AUTHORITY_RECEIPT_WIRE_BYTES: usize = 1_024;
 pub const MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
 pub const MAX_MANAGEMENT_APPROVAL_WIRE_BYTES: usize = MAX_INVOCATION_REPLY_BYTES;
 pub const MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
+pub const MAX_CATALOG_MUTATION_REQUEST_WIRE_BYTES: usize = 2 * 1024;
+pub const MAX_CATALOG_MUTATION_CALL_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
+pub const MAX_CATALOG_MUTATION_RESULT_WIRE_BYTES: usize = 512;
+pub const MAX_CATALOG_ENTRY_WIRE_BYTES: usize = 2 * 1024;
+pub const MAX_CATALOG_PAGE_REQUEST_WIRE_BYTES: usize = 1_024;
+pub const MAX_CATALOG_PAGE_WIRE_BYTES: usize = MAX_INVOCATION_REPLY_BYTES;
 pub const MAX_AGENT_DESCRIPTOR_WIRE_BYTES: usize = 64 * 1024;
 pub const MAX_INVOCATION_CONTEXT_WIRE_BYTES: usize = 512;
 pub const MAX_RUNTIME_WORK_WIRE_BYTES: usize =
@@ -1154,6 +1166,354 @@ impl CanonicalWire for ManagementApplicationAck {
             reopened_state,
             applied_at,
             signature,
+        };
+        value
+            .validate_shape()
+            .is_ok()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
+fn encode_catalog_actor_target(encoder: &mut Encoder<'_>, value: CatalogActorTarget) {
+    encoder.fixed(value.space.as_bytes());
+    encoder.fixed(value.system_agent.as_bytes());
+    encoder.fixed(value.system_runtime_deployment.as_bytes());
+    encoder.fixed(value.actor.as_bytes());
+    encoder.fixed(value.deployment.as_bytes());
+    encoder.fixed(value.program.as_bytes());
+    encode_agent_authority_binding(encoder, value.authority);
+}
+
+fn decode_catalog_actor_target(
+    decoder: &mut Decoder<'_>,
+) -> Result<CatalogActorTarget, DecodeError> {
+    let value = CatalogActorTarget {
+        space: SpaceId(decoder.fixed()?),
+        system_agent: AgentId(decoder.fixed()?),
+        system_runtime_deployment: DeploymentId(decoder.fixed()?),
+        actor: ActorId(decoder.fixed()?),
+        deployment: DeploymentId(decoder.fixed()?),
+        program: ProgramId(decoder.fixed()?),
+        authority: decode_agent_authority_binding(decoder)?,
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_catalog_alias(encoder: &mut Encoder<'_>, value: &CatalogAlias) {
+    encoder.string(&value.namespace);
+    encoder.string(&value.name);
+}
+
+fn decode_catalog_alias(decoder: &mut Decoder<'_>) -> Result<CatalogAlias, DecodeError> {
+    let value = CatalogAlias {
+        namespace: decoder.string_bounded(MAX_CATALOG_NAMESPACE_BYTES)?,
+        name: decoder.string_bounded(MAX_CATALOG_ALIAS_BYTES)?,
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_catalog_publication(encoder: &mut Encoder<'_>, value: &CatalogPublication) {
+    encode_agent_identity(encoder, &value.identity);
+    encoder.fixed(value.actor.as_bytes());
+    encoder.fixed(value.actor_deployment.as_bytes());
+    encoder.fixed(value.actor_program.as_bytes());
+    encode_blob(encoder, &value.actor_package);
+    encode_blob(encoder, &value.content);
+}
+
+fn decode_catalog_publication(
+    decoder: &mut Decoder<'_>,
+) -> Result<CatalogPublication, DecodeError> {
+    let value = CatalogPublication {
+        identity: decode_agent_identity(decoder)?,
+        actor: ActorId(decoder.fixed()?),
+        actor_deployment: DeploymentId(decoder.fixed()?),
+        actor_program: ProgramId(decoder.fixed()?),
+        actor_package: decode_blob(decoder)?,
+        content: decode_blob(decoder)?,
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_catalog_mutation_kind(encoder: &mut Encoder<'_>, value: CatalogMutationKind) {
+    encoder.u8(value as u8);
+}
+
+fn decode_catalog_mutation_kind(
+    decoder: &mut Decoder<'_>,
+) -> Result<CatalogMutationKind, DecodeError> {
+    match decoder.u8()? {
+        0 => Ok(CatalogMutationKind::Publish),
+        1 => Ok(CatalogMutationKind::Withdraw),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn encode_catalog_mutation_request_without_invocation(
+    encoder: &mut Encoder<'_>,
+    value: &CatalogMutationRequest,
+) {
+    encode_catalog_actor_target(encoder, value.catalog);
+    encode_catalog_alias(encoder, &value.alias);
+    encoder.u64(value.generation.get());
+    encode_catalog_mutation_kind(encoder, value.kind);
+    encode_catalog_publication(encoder, &value.publication);
+}
+
+fn encode_catalog_mutation_request_body(encoder: &mut Encoder<'_>, value: &CatalogMutationRequest) {
+    encoder.fixed(value.invocation.as_bytes());
+    encode_catalog_mutation_request_without_invocation(encoder, value);
+}
+
+fn decode_catalog_mutation_request_body(
+    decoder: &mut Decoder<'_>,
+) -> Result<CatalogMutationRequest, DecodeError> {
+    let value = CatalogMutationRequest {
+        invocation: InvocationId(decoder.fixed()?),
+        catalog: decode_catalog_actor_target(decoder)?,
+        alias: decode_catalog_alias(decoder)?,
+        generation: core::num::NonZeroU64::new(decoder.u64()?).ok_or(DecodeError::NonCanonical)?,
+        kind: decode_catalog_mutation_kind(decoder)?,
+        publication: decode_catalog_publication(decoder)?,
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn canonical_catalog_mutation_request_bytes(value: &CatalogMutationRequest) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"CMT1");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_catalog_mutation_request_body(&mut Encoder(&mut bytes), value);
+    bytes
+}
+
+pub(crate) fn catalog_mutation_request_encoded_len(value: &CatalogMutationRequest) -> usize {
+    canonical_catalog_mutation_request_bytes(value).len()
+}
+
+pub(crate) fn catalog_mutation_request_commitment(value: &CatalogMutationRequest) -> Hash {
+    Hash::digest(
+        b"vos/agent/catalog-mutation-request/v1",
+        &[&canonical_catalog_mutation_request_bytes(value)],
+    )
+}
+
+pub(crate) fn catalog_mutation_semantic_commitment(value: &CatalogMutationRequest) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"CMS1");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_catalog_mutation_request_without_invocation(&mut Encoder(&mut bytes), value);
+    Hash::digest(b"vos/agent/catalog-mutation-semantic/v1", &[&bytes])
+}
+
+impl CanonicalWire for CatalogMutationRequest {
+    const MAGIC: [u8; 4] = *b"CMT1";
+    const MAX_ENCODED_BYTES: usize = MAX_CATALOG_MUTATION_REQUEST_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_catalog_mutation_request_body(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_catalog_mutation_request_body(decoder)
+    }
+}
+
+fn encode_catalog_mutation_call_body(encoder: &mut Encoder<'_>, value: &CatalogMutationCall) {
+    encode_catalog_mutation_request_body(encoder, &value.request);
+    encode_authority_receipt_body(encoder, &value.authority);
+}
+
+fn decode_catalog_mutation_call_body(
+    decoder: &mut Decoder<'_>,
+) -> Result<CatalogMutationCall, DecodeError> {
+    let value = CatalogMutationCall {
+        request: decode_catalog_mutation_request_body(decoder)?,
+        authority: decode_authority_receipt_body(decoder)?,
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn canonical_catalog_mutation_call_bytes(value: &CatalogMutationCall) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"CMC1");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_catalog_mutation_call_body(&mut Encoder(&mut bytes), value);
+    bytes
+}
+
+pub(crate) fn catalog_mutation_call_encoded_len(value: &CatalogMutationCall) -> usize {
+    canonical_catalog_mutation_call_bytes(value).len()
+}
+
+pub(crate) fn catalog_mutation_call_commitment(value: &CatalogMutationCall) -> Hash {
+    Hash::digest(
+        b"vos/agent/catalog-mutation-call/v1",
+        &[&canonical_catalog_mutation_call_bytes(value)],
+    )
+}
+
+impl CanonicalWire for CatalogMutationCall {
+    const MAGIC: [u8; 4] = *b"CMC1";
+    const MAX_ENCODED_BYTES: usize = MAX_CATALOG_MUTATION_CALL_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_catalog_mutation_call_body(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_catalog_mutation_call_body(decoder)
+    }
+}
+
+impl CanonicalWire for CatalogMutationResult {
+    const MAGIC: [u8; 4] = *b"CMO1";
+    const MAX_ENCODED_BYTES: usize = MAX_CATALOG_MUTATION_RESULT_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.is_valid()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encoder.fixed(self.invocation.as_bytes());
+        encoder.fixed(self.request.as_bytes());
+        encoder.fixed(self.mutation.as_bytes());
+        encoder.fixed(self.call.as_bytes());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            invocation: InvocationId(decoder.fixed()?),
+            request: Hash(decoder.fixed()?),
+            mutation: Hash(decoder.fixed()?),
+            call: Hash(decoder.fixed()?),
+        };
+        value
+            .is_valid()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
+fn encode_catalog_entry_body(encoder: &mut Encoder<'_>, value: &CatalogEntry) {
+    encode_catalog_mutation_request_body(encoder, &value.request);
+    encode_authority_receipt_body(encoder, &value.authority);
+}
+
+fn decode_catalog_entry_body(decoder: &mut Decoder<'_>) -> Result<CatalogEntry, DecodeError> {
+    let value = CatalogEntry {
+        request: decode_catalog_mutation_request_body(decoder)?,
+        authority: decode_authority_receipt_body(decoder)?,
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+pub(crate) fn catalog_entry_commitment(value: &CatalogEntry) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"CEN1");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_catalog_entry_body(&mut Encoder(&mut bytes), value);
+    Hash::digest(b"vos/agent/catalog-entry/v1", &[&bytes])
+}
+
+impl CanonicalWire for CatalogEntry {
+    const MAGIC: [u8; 4] = *b"CEN1";
+    const MAX_ENCODED_BYTES: usize = MAX_CATALOG_ENTRY_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_catalog_entry_body(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_catalog_entry_body(decoder)
+    }
+}
+
+impl CanonicalWire for CatalogPageRequest {
+    const MAGIC: [u8; 4] = *b"CPQ1";
+    const MAX_ENCODED_BYTES: usize = MAX_CATALOG_PAGE_REQUEST_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_catalog_actor_target(encoder, self.catalog);
+        encoder.string(&self.namespace);
+        encoder.option(&self.after, |encoder, value| encoder.string(value));
+        encoder.u16(self.limit);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            catalog: decode_catalog_actor_target(decoder)?,
+            namespace: decoder.string_bounded(MAX_CATALOG_NAMESPACE_BYTES)?,
+            after: decoder.option(|decoder| decoder.string_bounded(MAX_CATALOG_ALIAS_BYTES))?,
+            limit: decoder.u16()?,
+        };
+        value
+            .validate_shape()
+            .is_ok()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
+impl CanonicalWire for CatalogPage {
+    const MAGIC: [u8; 4] = *b"CAP1";
+    const MAX_ENCODED_BYTES: usize = MAX_CATALOG_PAGE_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_catalog_actor_target(encoder, self.catalog);
+        encoder.string(&self.namespace);
+        encoder.list(&self.entries, encode_catalog_entry_body);
+        encoder.option(&self.next, |encoder, value| encoder.string(value));
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            catalog: decode_catalog_actor_target(decoder)?,
+            namespace: decoder.string_bounded(MAX_CATALOG_NAMESPACE_BYTES)?,
+            entries: decoder.list_bounded(MAX_CATALOG_PAGE_ENTRIES, decode_catalog_entry_body)?,
+            next: decoder.option(|decoder| decoder.string_bounded(MAX_CATALOG_ALIAS_BYTES))?,
         };
         value
             .validate_shape()
