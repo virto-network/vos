@@ -38,6 +38,9 @@ const HEADER_BYTES: usize = 4 + 32;
 pub const MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES: usize = 4 * 1024;
 /// AOP1 repeats the call's identity tuple and one complete receipt selector.
 pub const MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES: usize = 4 * 1024;
+/// AOI1 contains one complete receipt and fixed-size retained-preimage
+/// commitments; it never embeds the AOC1 or AOP1 bytes themselves.
+pub const MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES: usize = 4 * 1024;
 
 /// Typed non-management authority intent.
 ///
@@ -620,6 +623,9 @@ pub struct AuthorityOperationApproval {
     pub operation_call: Hash,
     pub authorization_sequence: NonZeroU64,
     pub invocation: InvocationId,
+    /// Distinct Linear invocation reserved for acknowledging durable receipt
+    /// issuance. Its derivation commits the complete signed AOC1 preimage.
+    pub acknowledgement_invocation: InvocationId,
     pub authority: AuthorityActorTarget,
     pub principal: PrincipalId,
     pub credential: CredentialId,
@@ -630,6 +636,24 @@ pub struct AuthorityOperationApproval {
 }
 
 impl AuthorityOperationApproval {
+    /// Deterministically reserve a distinct acknowledgement invocation for
+    /// one exact call. An authority actor must still collision-check this ID
+    /// against every retained authorization and acknowledgement invocation
+    /// before admitting the call.
+    pub fn derive_acknowledgement_invocation(call: &AuthorityOperationCall) -> InvocationId {
+        InvocationId(
+            Hash::digest(
+                b"vos/agent/authority-operation-issuance-acknowledgement-invocation/v1",
+                &[
+                    crate::RUNTIME_ABI_ID.as_bytes(),
+                    call.invocation.as_bytes(),
+                    call.commitment().as_bytes(),
+                ],
+            )
+            .0,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Build an approval directly from its retained call preimage. Code which
     /// decodes an AOP1 instead must make the equivalent `matches_call` check
@@ -659,6 +683,7 @@ impl AuthorityOperationApproval {
             operation_call: call.commitment(),
             authorization_sequence,
             invocation: call.invocation,
+            acknowledgement_invocation: Self::derive_acknowledgement_invocation(call),
             authority: call.authority,
             principal: call.principal,
             credential: call.credential,
@@ -694,6 +719,8 @@ impl AuthorityOperationApproval {
     pub fn validate_shape(&self) -> Result<(), AuthorityOperationProtocolError> {
         if self.operation_call == Hash::ZERO
             || self.invocation == InvocationId::ZERO
+            || self.acknowledgement_invocation == InvocationId::ZERO
+            || self.acknowledgement_invocation == self.invocation
             || !self.authority.is_valid()
             || !self.intent.matches_authority(self.authority)
         {
@@ -745,6 +772,8 @@ impl AuthorityOperationApproval {
             && call.validate_shape().is_ok()
             && self.operation_call == call.commitment()
             && self.invocation == call.invocation
+            && self.acknowledgement_invocation == Self::derive_acknowledgement_invocation(call)
+            && self.acknowledgement_invocation != call.invocation
             && self.authority == call.authority
             && self.principal == call.principal
             && self.credential == call.credential
@@ -801,6 +830,248 @@ impl AuthorityOperationApproval {
     }
 }
 
+/// Authority-signed proof that one exact non-management receipt was issued.
+///
+/// The actor retains the AOC1 and AOP1 preimages until this AOI1 verifies and
+/// matches both. Only then may its authorization sequence become a retirement
+/// fact. Receipt issuance and acknowledgement use distinct Linear invocation
+/// IDs so exact retries can never reinterpret one message as the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityOperationIssuanceAck {
+    pub authorization_invocation: InvocationId,
+    pub acknowledgement_invocation: InvocationId,
+    pub authority: AuthorityActorTarget,
+    pub operation_call: Hash,
+    pub approval: Hash,
+    pub authorization_sequence: NonZeroU64,
+    pub receipt: AuthorityReceipt,
+    /// Logical slot at which the exact receipt was durably issued.
+    pub issued_at: u64,
+    pub signature: [u8; crate::authority::AUTHORITY_SIGNATURE_BYTES],
+}
+
+impl AuthorityOperationIssuanceAck {
+    /// Bytes covered by the issuance-acknowledgement authority signature.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        authority_operation_issuance_ack_signing_bytes(self)
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            b"vos/agent/authority-operation-issuance-ack/v1",
+            &[&self.signing_bytes(), &self.signature],
+        )
+    }
+
+    pub fn validate_shape(&self) -> Result<(), AuthorityOperationProtocolError> {
+        if self.authorization_invocation == InvocationId::ZERO
+            || self.acknowledgement_invocation == InvocationId::ZERO
+            || self.authorization_invocation == self.acknowledgement_invocation
+            || !self.authority.is_valid()
+        {
+            return Err(AuthorityOperationProtocolError::InvalidTarget);
+        }
+        if self.operation_call == Hash::ZERO
+            || self.approval == Hash::ZERO
+            || self.signature == [0; crate::authority::AUTHORITY_SIGNATURE_BYTES]
+        {
+            return Err(AuthorityOperationProtocolError::InvalidAcknowledgement);
+        }
+        let selector = &self.receipt.selector;
+        if self.receipt.validate_shape().is_err()
+            || !self.authority.binding.accepts(&self.receipt)
+            || selector.space != self.authority.space
+            || selector.operation.uses_management_decision_journal()
+            || selector.decision_sequence != 0
+            || selector.acknowledged_through != 0
+            || !selector.is_live_at(self.issued_at)
+        {
+            return Err(AuthorityOperationProtocolError::InvalidAcknowledgement);
+        }
+        if authority_operation_issuance_ack_encoded_len(self)
+            > MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES
+        {
+            return Err(AuthorityOperationProtocolError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    /// Verify both the issued receipt and AOI1 signature with an independently
+    /// selected authority binding. The encoded target is never its own trust
+    /// anchor.
+    pub fn verify_with<V: AuthorityVerifier>(
+        &self,
+        authority: crate::authority::AgentAuthorityBinding,
+        verifier: &V,
+    ) -> Result<(), AuthorityOperationProtocolError> {
+        self.validate_shape()?;
+        if authority != self.authority.binding || !authority.accepts(&self.receipt) {
+            return Err(AuthorityOperationProtocolError::InvalidAcknowledgement);
+        }
+        self.receipt
+            .verify_at(self.issued_at, verifier)
+            .map_err(|_| AuthorityOperationProtocolError::InvalidSignature)?;
+        if !verifier.verify(
+            &authority.public_key,
+            &self.signing_bytes(),
+            &self.signature,
+        ) {
+            return Err(AuthorityOperationProtocolError::InvalidSignature);
+        }
+        Ok(())
+    }
+
+    /// Match the exact actor-retained AOC1 and AOP1 preimages. A valid AOI1
+    /// must not retire anything unless this check and `verify_with` both pass.
+    pub fn matches_pending(
+        &self,
+        call: &AuthorityOperationCall,
+        approval: &AuthorityOperationApproval,
+    ) -> bool {
+        self.validate_shape().is_ok()
+            && approval.matches_call(call)
+            && self.authorization_invocation == call.invocation
+            && self.authorization_invocation == approval.invocation
+            && self.acknowledgement_invocation == approval.acknowledgement_invocation
+            && self.authority == call.authority
+            && self.authority == approval.authority
+            && self.operation_call == call.commitment()
+            && self.operation_call == approval.operation_call
+            && self.approval == approval.commitment()
+            && self.authorization_sequence == approval.authorization_sequence
+            && approval.matches_receipt(&self.receipt)
+    }
+
+    /// Bind AOI1 to its reserved Linear authority-actor invocation. The
+    /// authority signatures, not the relay's identity, authenticate issuance;
+    /// canonical principal/credential/Node relay fields are intentionally not
+    /// constrained. The runtime observation must equal the signed issuance
+    /// slot rather than merely fall within the receipt validity interval.
+    pub fn matches_invocation_context(&self, context: &InvocationContext) -> bool {
+        self.validate_shape().is_ok()
+            && context.validate()
+            && context.invocation == self.acknowledgement_invocation
+            && context.actor == self.authority.binding.issuer.actor
+            && context.mode == MethodMode::Linear
+            && context.observed_slot == self.issued_at
+            && context.origin.actor.is_none()
+            && context.origin.capability.is_none()
+            && context.roles == InvocationRoleClaims::none()
+    }
+
+    /// Convert an exact, verified AOI1 into the only fact which may advance
+    /// the authority actor's durable retirement floor.
+    pub fn verified_retirement_fact<V: AuthorityVerifier>(
+        &self,
+        call: &AuthorityOperationCall,
+        approval: &AuthorityOperationApproval,
+        verifier: &V,
+    ) -> Result<AuthorityOperationRetirementFact, AuthorityOperationProtocolError> {
+        if !self.matches_pending(call, approval) {
+            return Err(AuthorityOperationProtocolError::MismatchedAcknowledgement);
+        }
+        self.verify_with(call.authority.binding, verifier)?;
+        Ok(AuthorityOperationRetirementFact {
+            authority: self.authority,
+            authorization_sequence: self.authorization_sequence,
+            issuance_ack: self.commitment(),
+        })
+    }
+}
+
+/// Verified issuance evidence for exactly one authorization sequence.
+/// Fields are private so callers cannot manufacture a retirement capability
+/// without reopening the retained AOC1/AOP1 and verifying AOI1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthorityOperationRetirementFact {
+    authority: AuthorityActorTarget,
+    authorization_sequence: NonZeroU64,
+    issuance_ack: Hash,
+}
+
+impl AuthorityOperationRetirementFact {
+    pub const fn authority(&self) -> AuthorityActorTarget {
+        self.authority
+    }
+
+    pub const fn authorization_sequence(&self) -> NonZeroU64 {
+        self.authorization_sequence
+    }
+
+    pub const fn issuance_ack(&self) -> Hash {
+        self.issuance_ack
+    }
+}
+
+/// Durable inclusive prefix of issued non-management authorizations.
+///
+/// Out-of-order verified facts must remain pending. The actor may advance this
+/// floor only one sequence at a time, durably committing the new floor before
+/// discarding the corresponding AOC1/AOP1/AOI1 preimages. On restart it
+/// reopens this value from its own authenticated Linear state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthorityOperationRetirementFloor {
+    authority: AuthorityActorTarget,
+    retired_through: u64,
+}
+
+impl AuthorityOperationRetirementFloor {
+    pub fn initial(
+        authority: AuthorityActorTarget,
+    ) -> Result<Self, AuthorityOperationProtocolError> {
+        if !authority.is_valid() {
+            return Err(AuthorityOperationProtocolError::InvalidTarget);
+        }
+        Ok(Self {
+            authority,
+            retired_through: 0,
+        })
+    }
+
+    /// Reopen a floor only from the authority actor's already-authenticated
+    /// durable state. This constructor does not make an ambient host value
+    /// trustworthy.
+    pub fn reopen_durable(
+        authority: AuthorityActorTarget,
+        retired_through: u64,
+    ) -> Result<Self, AuthorityOperationProtocolError> {
+        if !authority.is_valid() {
+            return Err(AuthorityOperationProtocolError::InvalidTarget);
+        }
+        Ok(Self {
+            authority,
+            retired_through,
+        })
+    }
+
+    pub const fn authority(&self) -> AuthorityActorTarget {
+        self.authority
+    }
+
+    pub const fn retired_through(&self) -> u64 {
+        self.retired_through
+    }
+
+    /// Advance only the immediately adjacent sequence. Duplicate, stale,
+    /// out-of-order, cross-authority, and overflow transitions fail closed.
+    pub fn advance(
+        &mut self,
+        fact: AuthorityOperationRetirementFact,
+    ) -> Result<(), AuthorityOperationProtocolError> {
+        let Some(next) = self.retired_through.checked_add(1) else {
+            return Err(AuthorityOperationProtocolError::NonContiguousRetirement);
+        };
+        if fact.authority != self.authority
+            || fact.authorization_sequence.get() != next
+            || fact.issuance_ack == Hash::ZERO
+        {
+            return Err(AuthorityOperationProtocolError::NonContiguousRetirement);
+        }
+        self.retired_through = next;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthorityOperationProtocolError {
     InvalidTarget,
@@ -810,8 +1081,11 @@ pub enum AuthorityOperationProtocolError {
     UnsupportedIntent,
     InvalidSignature,
     InvalidApproval,
+    InvalidAcknowledgement,
     LimitExceeded,
     MismatchedCall,
+    MismatchedAcknowledgement,
+    NonContiguousRetirement,
 }
 
 impl core::fmt::Display for AuthorityOperationProtocolError {
@@ -1132,6 +1406,7 @@ fn encode_approval_body(encoder: &mut Encoder<'_>, value: &AuthorityOperationApp
     encoder.fixed(value.operation_call.as_bytes());
     encoder.u64(value.authorization_sequence.get());
     encoder.fixed(value.invocation.as_bytes());
+    encoder.fixed(value.acknowledgement_invocation.as_bytes());
     crate::wire::encode_authority_actor_target(encoder, value.authority);
     crate::wire::encode_credential_caller(
         encoder,
@@ -1175,6 +1450,7 @@ impl CanonicalWire for AuthorityOperationApproval {
         let authorization_sequence =
             NonZeroU64::new(decoder.u64()?).ok_or(DecodeError::NonCanonical)?;
         let invocation = InvocationId(decoder.fixed()?);
+        let acknowledgement_invocation = InvocationId(decoder.fixed()?);
         let authority = crate::wire::decode_authority_actor_target(decoder)?;
         let (principal, credential, credential_public_key, authenticated_node) =
             crate::wire::decode_credential_caller(decoder)?;
@@ -1182,6 +1458,7 @@ impl CanonicalWire for AuthorityOperationApproval {
             operation_call,
             authorization_sequence,
             invocation,
+            acknowledgement_invocation,
             authority,
             principal,
             credential,
@@ -1189,6 +1466,72 @@ impl CanonicalWire for AuthorityOperationApproval {
             authenticated_node,
             intent: decode_intent(decoder)?,
             selector: crate::wire::decode_authority_selector(decoder)?,
+        };
+        value
+            .validate_shape()
+            .is_ok()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
+fn encode_issuance_ack_unsigned(encoder: &mut Encoder<'_>, value: &AuthorityOperationIssuanceAck) {
+    encoder.fixed(value.authorization_invocation.as_bytes());
+    encoder.fixed(value.acknowledgement_invocation.as_bytes());
+    crate::wire::encode_authority_actor_target(encoder, value.authority);
+    encoder.fixed(value.operation_call.as_bytes());
+    encoder.fixed(value.approval.as_bytes());
+    encoder.u64(value.authorization_sequence.get());
+    crate::wire::encode_authority_receipt_body(encoder, &value.receipt);
+    encoder.u64(value.issued_at);
+}
+
+fn authority_operation_issuance_ack_signing_bytes(
+    value: &AuthorityOperationIssuanceAck,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"AOIS");
+    bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
+    encode_issuance_ack_unsigned(&mut Encoder(&mut bytes), value);
+    bytes
+}
+
+fn authority_operation_issuance_ack_encoded_len(value: &AuthorityOperationIssuanceAck) -> usize {
+    let mut body = Vec::new();
+    encode_issuance_ack_unsigned(&mut Encoder(&mut body), value);
+    HEADER_BYTES
+        .saturating_add(body.len())
+        .saturating_add(crate::authority::AUTHORITY_SIGNATURE_BYTES)
+}
+
+impl CanonicalWire for AuthorityOperationIssuanceAck {
+    const MAGIC: [u8; 4] = *b"AOI1";
+    const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_issuance_ack_unsigned(encoder, self);
+        encoder.0.extend_from_slice(&self.signature);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            authorization_invocation: InvocationId(decoder.fixed()?),
+            acknowledgement_invocation: InvocationId(decoder.fixed()?),
+            authority: crate::wire::decode_authority_actor_target(decoder)?,
+            operation_call: Hash(decoder.fixed()?),
+            approval: Hash(decoder.fixed()?),
+            authorization_sequence: NonZeroU64::new(decoder.u64()?)
+                .ok_or(DecodeError::NonCanonical)?,
+            receipt: crate::wire::decode_authority_receipt_body(decoder)?,
+            issued_at: decoder.u64()?,
+            signature: decoder
+                .take(crate::authority::AUTHORITY_SIGNATURE_BYTES)?
+                .try_into()
+                .map_err(|_| DecodeError::Truncated)?,
         };
         value
             .validate_shape()
@@ -1344,9 +1687,16 @@ mod tests {
     }
 
     fn approval(call: &AuthorityOperationCall) -> AuthorityOperationApproval {
+        approval_with_sequence(call, 7)
+    }
+
+    fn approval_with_sequence(
+        call: &AuthorityOperationCall,
+        authorization_sequence: u64,
+    ) -> AuthorityOperationApproval {
         AuthorityOperationApproval::from_call(
             call,
-            NonZeroU64::new(7).unwrap(),
+            NonZeroU64::new(authorization_sequence).unwrap(),
             AuthorityEvidence {
                 package: Some(BlobRef {
                     hash: Hash([0x42; 32]),
@@ -1376,6 +1726,29 @@ mod tests {
         };
         receipt.signature = test_signature(&receipt.public_key, &receipt.signing_bytes());
         receipt
+    }
+
+    fn issuance_ack(
+        call: &AuthorityOperationCall,
+        approval: &AuthorityOperationApproval,
+    ) -> AuthorityOperationIssuanceAck {
+        let mut acknowledgement = AuthorityOperationIssuanceAck {
+            authorization_invocation: call.invocation,
+            acknowledgement_invocation: approval.acknowledgement_invocation,
+            authority: call.authority,
+            operation_call: call.commitment(),
+            approval: approval.commitment(),
+            authorization_sequence: approval.authorization_sequence,
+            receipt: receipt(approval),
+            issued_at: 20,
+            signature: [0; AUTHORITY_SIGNATURE_BYTES],
+        };
+        acknowledgement.signature = test_signature(
+            &acknowledgement.authority.binding.public_key,
+            &acknowledgement.signing_bytes(),
+        );
+        acknowledgement.validate_shape().unwrap();
+        acknowledgement
     }
 
     fn catalog_target() -> CatalogActorTarget {
@@ -1542,7 +1915,7 @@ mod tests {
     }
 
     #[test]
-    fn aoc1_and_aop1_are_distinct_bounded_canonical_golden_wires() {
+    fn aoc1_aop1_and_aoi1_are_distinct_bounded_canonical_golden_wires() {
         let call = invoke_call();
         let call_bytes = call.encode().unwrap();
         assert_eq!(call_bytes.get(..4), Some(b"AOC1".as_slice()));
@@ -1571,8 +1944,24 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aop1-golden", &[&approval_bytes]).0,
             [
-                228, 145, 52, 113, 184, 191, 23, 207, 52, 68, 46, 211, 113, 7, 87, 3, 160, 165,
-                222, 57, 139, 53, 71, 245, 169, 11, 234, 57, 201, 236, 29, 213,
+                43, 208, 97, 30, 14, 1, 105, 251, 187, 173, 47, 199, 138, 151, 155, 105, 54, 107,
+                254, 58, 120, 94, 19, 74, 205, 48, 26, 232, 236, 16, 86, 155,
+            ]
+        );
+
+        let acknowledgement = issuance_ack(&call, &approval);
+        let acknowledgement_bytes = acknowledgement.encode().unwrap();
+        assert_eq!(acknowledgement_bytes.get(..4), Some(b"AOI1".as_slice()));
+        assert!(acknowledgement_bytes.len() <= MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES);
+        assert_eq!(
+            AuthorityOperationIssuanceAck::decode(&acknowledgement_bytes),
+            Ok(acknowledgement)
+        );
+        assert_eq!(
+            Hash::digest(b"vos/test/aoi1-golden", &[&acknowledgement_bytes]).0,
+            [
+                173, 120, 104, 168, 19, 218, 12, 142, 49, 130, 28, 88, 222, 27, 65, 2, 240, 207,
+                166, 118, 110, 208, 66, 167, 129, 42, 163, 111, 141, 240, 34, 51,
             ]
         );
     }
@@ -1635,6 +2024,15 @@ mod tests {
         let bytes = call.encode().unwrap();
         assert_eq!(AuthorityOperationCall::decode(&bytes), Ok(call.clone()));
         assert_eq!(call.verify_with(&TestVerifier), Ok(()));
+        let approved = approval(&call);
+        assert_eq!(approved.authenticated_node, None);
+        assert!(approved.matches_call(&call));
+        let acknowledged = issuance_ack(&call, &approved);
+        assert_eq!(
+            acknowledged.verify_with(call.authority.binding, &TestVerifier),
+            Ok(())
+        );
+        assert!(acknowledged.matches_pending(&call, &approved));
 
         let mut context = InvocationContext {
             invocation: call.invocation,
@@ -1664,6 +2062,209 @@ mod tests {
     }
 
     #[test]
+    fn issuance_ack_binds_pending_preimages_receipt_slot_and_own_invocation() {
+        let call = invoke_call();
+        let approval = approval(&call);
+        let acknowledgement = issuance_ack(&call, &approval);
+        assert_eq!(
+            approval.acknowledgement_invocation,
+            AuthorityOperationApproval::derive_acknowledgement_invocation(&call)
+        );
+        assert_ne!(approval.acknowledgement_invocation, call.invocation);
+        assert_eq!(
+            acknowledgement.verify_with(call.authority.binding, &TestVerifier),
+            Ok(())
+        );
+        let mut unrelated_binding = call.authority.binding;
+        unrelated_binding.policy = Hash([0x8f; 32]);
+        assert!(unrelated_binding.is_valid());
+        assert_eq!(
+            acknowledgement.verify_with(unrelated_binding, &TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidAcknowledgement)
+        );
+        assert!(acknowledgement.matches_pending(&call, &approval));
+
+        let context = InvocationContext {
+            invocation: acknowledgement.acknowledgement_invocation,
+            actor: acknowledgement.authority.binding.issuer.actor,
+            mode: MethodMode::Linear,
+            origin: InvocationOrigin::anonymous(),
+            roles: InvocationRoleClaims::none(),
+            observed_slot: acknowledgement.issued_at,
+        };
+        assert!(acknowledgement.matches_invocation_context(&context));
+        let mut changed_context = context;
+        changed_context.invocation = call.invocation;
+        assert!(!acknowledgement.matches_invocation_context(&changed_context));
+        changed_context = context;
+        changed_context.origin.actor = Some(ActorId([0x90; 32]));
+        assert!(!acknowledgement.matches_invocation_context(&changed_context));
+        changed_context = context;
+        changed_context.observed_slot += 1;
+        assert!(!acknowledgement.matches_invocation_context(&changed_context));
+
+        let mut relayed_context = context;
+        relayed_context.origin = InvocationOrigin {
+            principal: Some(call.principal),
+            transport_node: call.authenticated_node,
+            credential: Some(call.credential),
+            actor: None,
+            capability: None,
+        };
+        assert!(acknowledgement.matches_invocation_context(&relayed_context));
+
+        let mut same_invocation = acknowledgement.clone();
+        same_invocation.acknowledgement_invocation = same_invocation.authorization_invocation;
+        assert_eq!(
+            same_invocation.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidTarget)
+        );
+
+        let mut different_call = call.clone();
+        different_call.requested_expires_at -= 1;
+        different_call.signature = test_signature(
+            &different_call.credential_public_key,
+            &different_call.signing_bytes(),
+        );
+        assert_eq!(different_call.validate_shape(), Ok(()));
+        assert_ne!(
+            AuthorityOperationApproval::derive_acknowledgement_invocation(&different_call),
+            approval.acknowledgement_invocation
+        );
+        assert!(!acknowledgement.matches_pending(&different_call, &approval));
+
+        let mut changed_approval = approval.clone();
+        changed_approval.authorization_sequence = NonZeroU64::new(8).unwrap();
+        assert_eq!(changed_approval.validate_shape(), Ok(()));
+        assert!(!acknowledgement.matches_pending(&call, &changed_approval));
+
+        let mut changed = acknowledgement.clone();
+        changed.authority.system_agent = AgentId([0x91; 32]);
+        assert_eq!(changed.validate_shape(), Ok(()));
+        assert!(!changed.matches_pending(&call, &approval));
+        assert_eq!(
+            changed.verify_with(call.authority.binding, &TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidSignature)
+        );
+
+        let mut changed = acknowledgement.clone();
+        changed.issued_at -= 1;
+        assert_eq!(changed.validate_shape(), Ok(()));
+        assert_eq!(
+            changed.verify_with(call.authority.binding, &TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidSignature)
+        );
+
+        let mut invalid_receipt_signature = acknowledgement.clone();
+        invalid_receipt_signature.receipt.signature[0] ^= 1;
+        invalid_receipt_signature.signature = test_signature(
+            &invalid_receipt_signature.authority.binding.public_key,
+            &invalid_receipt_signature.signing_bytes(),
+        );
+        assert_eq!(invalid_receipt_signature.validate_shape(), Ok(()));
+        assert_eq!(
+            invalid_receipt_signature.verify_with(call.authority.binding, &TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidSignature)
+        );
+
+        let mut invalid_ack_signature = acknowledgement.clone();
+        invalid_ack_signature.signature[0] ^= 1;
+        assert_eq!(invalid_ack_signature.validate_shape(), Ok(()));
+        assert_eq!(
+            invalid_ack_signature.verify_with(call.authority.binding, &TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidSignature)
+        );
+
+        let mut management_replay = acknowledgement.clone();
+        management_replay.receipt.selector.decision_sequence = 1;
+        assert_eq!(
+            management_replay.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidAcknowledgement)
+        );
+        management_replay = acknowledgement.clone();
+        management_replay.receipt.selector.acknowledged_through = 1;
+        assert_eq!(
+            management_replay.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidAcknowledgement)
+        );
+
+        let mut outside_validity = acknowledgement.clone();
+        outside_validity.issued_at = outside_validity.receipt.selector.expires_at + 1;
+        assert_eq!(
+            outside_validity.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidAcknowledgement)
+        );
+
+        let mut changed = acknowledgement;
+        changed.receipt.selector.request = Hash([0x92; 32]);
+        assert_eq!(changed.validate_shape(), Ok(()));
+        assert!(!changed.matches_pending(&call, &approval));
+        assert_eq!(
+            changed.verify_with(call.authority.binding, &TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn verified_issuance_facts_advance_only_one_contiguous_authority_prefix() {
+        let make_fact = |discriminator, sequence| {
+            let call = call_with_intent(
+                AuthorityOperationIntent::invoke(&invocation_work()).unwrap(),
+                discriminator,
+            );
+            let approval = approval_with_sequence(&call, sequence);
+            issuance_ack(&call, &approval)
+                .verified_retirement_fact(&call, &approval, &TestVerifier)
+                .unwrap()
+        };
+        let first = make_fact(0x93, 1);
+        let second = make_fact(0x94, 2);
+        let third = make_fact(0x95, 3);
+        assert_eq!(first.authority(), authority_target());
+        assert_eq!(first.authorization_sequence().get(), 1);
+        assert_ne!(first.issuance_ack(), Hash::ZERO);
+
+        let mut floor = AuthorityOperationRetirementFloor::initial(authority_target()).unwrap();
+        assert_eq!(
+            floor.advance(second),
+            Err(AuthorityOperationProtocolError::NonContiguousRetirement)
+        );
+        assert_eq!(floor.retired_through(), 0);
+        assert_eq!(floor.advance(first), Ok(()));
+        assert_eq!(floor.retired_through(), 1);
+        assert_eq!(
+            floor.advance(first),
+            Err(AuthorityOperationProtocolError::NonContiguousRetirement)
+        );
+        assert_eq!(floor.advance(second), Ok(()));
+
+        let reopened = AuthorityOperationRetirementFloor::reopen_durable(
+            floor.authority(),
+            floor.retired_through(),
+        )
+        .unwrap();
+        assert_eq!(reopened, floor);
+
+        let mut cross_authority = third;
+        cross_authority.authority.system_agent = AgentId([0x96; 32]);
+        assert_eq!(
+            floor.advance(cross_authority),
+            Err(AuthorityOperationProtocolError::NonContiguousRetirement)
+        );
+        assert_eq!(floor.retired_through(), 2);
+        assert_eq!(floor.advance(third), Ok(()));
+        assert_eq!(floor.retired_through(), 3);
+
+        let mut exhausted =
+            AuthorityOperationRetirementFloor::reopen_durable(authority_target(), u64::MAX)
+                .unwrap();
+        assert_eq!(
+            exhausted.advance(third),
+            Err(AuthorityOperationProtocolError::NonContiguousRetirement)
+        );
+    }
+
+    #[test]
     fn invoke_approval_binds_complete_work_origin_roles_and_exact_receipt() {
         let call = invoke_call();
         let approval = approval(&call);
@@ -1685,6 +2286,10 @@ mod tests {
         detached.operation_call = Hash([0x7e; 32]);
         assert_eq!(detached.validate_shape(), Ok(()));
         assert!(!detached.matches_call(&call));
+        let mut wrong_acknowledgement = approval.clone();
+        wrong_acknowledgement.acknowledgement_invocation = InvocationId([0x7f; 32]);
+        assert_eq!(wrong_acknowledgement.validate_shape(), Ok(()));
+        assert!(!wrong_acknowledgement.matches_call(&call));
 
         let receipt = receipt(&approval);
         assert!(approval.matches_receipt(&receipt));
@@ -1895,6 +2500,23 @@ mod tests {
             AuthorityOperationApproval::decode(&vec![
                 0;
                 MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES
+                    + 1
+            ]),
+            Err(WireError::LimitExceeded)
+        );
+
+        let acknowledgement = issuance_ack(&call, &approved);
+        let encoded = acknowledgement.encode().unwrap();
+        let mut old = encoded.clone();
+        old[..4].copy_from_slice(b"MAA1");
+        assert!(AuthorityOperationIssuanceAck::decode(&old).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(AuthorityOperationIssuanceAck::decode(&trailing).is_err());
+        assert_eq!(
+            AuthorityOperationIssuanceAck::decode(&vec![
+                0;
+                MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES
                     + 1
             ]),
             Err(WireError::LimitExceeded)

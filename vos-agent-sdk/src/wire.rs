@@ -756,13 +756,13 @@ pub(crate) fn authority_signing_bytes(value: &AuthorityReceipt) -> Vec<u8> {
     bytes
 }
 
-fn encode_authority_receipt_body(encoder: &mut Encoder<'_>, value: &AuthorityReceipt) {
+pub(crate) fn encode_authority_receipt_body(encoder: &mut Encoder<'_>, value: &AuthorityReceipt) {
     encode_authority_selector(encoder, &value.selector);
     encoder.0.extend_from_slice(&value.public_key);
     encoder.0.extend_from_slice(&value.signature);
 }
 
-fn decode_authority_receipt_body(
+pub(crate) fn decode_authority_receipt_body(
     decoder: &mut Decoder<'_>,
 ) -> Result<AuthorityReceipt, DecodeError> {
     let value = AuthorityReceipt {
