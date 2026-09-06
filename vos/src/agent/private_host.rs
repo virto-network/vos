@@ -50,9 +50,9 @@ use super::private_store::{
     RestoreDisposition,
 };
 use super::private_sync::{
-    PrivateSyncApplyDisposition, PrivateSyncError, PrivateSyncPage, PrivateSyncRequest,
-    PrivateTransportAuthVerifier, apply_private_sync_page, serve_private_sync_page,
-    validate_private_actor_schema, validate_private_runtime_work,
+    PrivateSyncApplyDisposition, PrivateSyncError, PrivateSyncPage, PrivateSyncPhase,
+    PrivateSyncRequest, PrivateTransportAuthVerifier, apply_private_sync_page,
+    serve_private_sync_page, validate_private_actor_schema, validate_private_runtime_work,
 };
 
 pub const MAX_PRIVATE_HOST_AGENTS: usize = 4_096;
@@ -74,7 +74,7 @@ const STORE_DIRECTORY: &str = "store";
 const DESCRIPTOR_FILE: &str = "descriptor.enc";
 const RUNTIME_FILE: &str = "runtime.enc";
 const BOOTSTRAP_FILE: &str = "bootstrap.enc";
-const NEXT_SUFFIX: &str = ".next";
+const NEXT_PREFIX: &str = ".next-";
 const WRITE_SUFFIX: &str = ".write";
 const SIDECAR_FILES: [&str; 3] = [DESCRIPTOR_FILE, RUNTIME_FILE, BOOTSTRAP_FILE];
 
@@ -198,7 +198,10 @@ struct HostedPrivateAgent {
     runtime_package: Zeroizing<Vec<u8>>,
     bootstrap_metadata: Zeroizing<Vec<u8>>,
     owner_key: OwnerSigningKey,
-    data_key: PrivateDataKey,
+    /// Unwrapped only in memory, bounded by the authenticated control history,
+    /// and zeroized entry-by-entry on drop. The durable representation remains
+    /// node-recipient ciphertext in the store genesis/control artifacts.
+    data_keys: BTreeMap<u64, PrivateDataKey>,
 }
 
 struct AgentPlaintext {
@@ -489,8 +492,12 @@ impl PrivateAgentHost {
         self.verify_root_scope()?;
         let hosted = self.hosted_mut(agent)?;
         let binding = hosted.store.binding();
+        let data_key = hosted
+            .data_keys
+            .get(&binding.epoch)
+            .ok_or(PrivateAgentHostError::Corrupt)?;
         let object = encrypt_private_object(
-            &hosted.data_key,
+            data_key,
             binding.space,
             binding.agent,
             binding.epoch,
@@ -509,16 +516,11 @@ impl PrivateAgentHost {
     ) -> Result<Zeroizing<Vec<u8>>, PrivateAgentHostError> {
         let hosted = self.hosted(agent)?;
         let object = hosted.store.get_object(key)?;
-        // Historical application objects intentionally require historical
-        // key retention by the application. The host owns only the current
-        // epoch key and therefore fails closed for an older generation.
-        if object.epoch != hosted.store.binding().epoch {
-            return Err(PrivateAgentHostError::Unauthorized);
-        }
-        Ok(Zeroizing::new(decrypt_private_object(
-            &hosted.data_key,
-            &object,
-        )?))
+        let data_key = hosted
+            .data_keys
+            .get(&object.epoch)
+            .ok_or(PrivateAgentHostError::Unauthorized)?;
+        Ok(Zeroizing::new(decrypt_private_object(data_key, &object)?))
     }
 
     pub fn invite_node<V: PrivateNodeAuthorityVerifier>(
@@ -557,7 +559,10 @@ impl PrivateAgentHost {
             binding.space,
             binding.agent,
             binding.epoch,
-            &hosted.data_key,
+            hosted
+                .data_keys
+                .get(&binding.epoch)
+                .ok_or(PrivateAgentHostError::Corrupt)?,
             &node,
         )?;
         let operation = PrivateControlOperation::Invite {
@@ -694,13 +699,13 @@ impl PrivateAgentHost {
             {
                 Ok(disposition) => disposition,
                 Err(error) => {
-                    discard_next_sidecars(&slot);
+                    discard_next_sidecars(&slot, next_epoch.epoch);
                     return Err(error.into());
                 }
             };
         hosted.owner_key = next_owner;
-        hosted.data_key = next_data;
-        promote_next_sidecars(&slot)?;
+        hosted.data_keys.insert(next_epoch.epoch, next_data);
+        promote_next_sidecars(&slot, next_epoch.epoch)?;
         Ok(disposition)
     }
 
@@ -851,30 +856,38 @@ impl PrivateAgentHost {
         let peer = authenticate_peer_identity(hosted, peer, transport)?;
         let page = PrivateSyncPage::decode(page_bytes)?;
         let starting_epoch = hosted.store.binding().epoch;
-        let staged_keys = candidate_keys_from_page(&page, starting_epoch, &local_node, node_key)?;
-        if let Some((_, ref data)) = staged_keys {
-            stage_metadata(&slot, candidate_epoch_from_page(&page)?, data, hosted)?;
+        // Validate the complete signed control suffix before encrypting any
+        // host plaintext to a page-supplied epoch key. This prevents a valid
+        // transport peer from turning an unsigned key epoch into a plaintext
+        // disclosure sidecar.
+        let staged_keys = validated_candidate_keys_from_page(
+            &hosted.store,
+            &page,
+            &local_node,
+            node_key,
+            authority,
+        )?;
+        for candidate in &staged_keys {
+            stage_metadata(&slot, candidate.epoch, &candidate.data, hosted)?;
         }
-        let disposition =
-            match apply_private_sync_page(&mut hosted.store, peer, &page, authority, transport) {
-                Ok(disposition) => disposition,
-                Err(error) => {
-                    if staged_keys.is_some() {
-                        discard_next_sidecars(&slot);
-                    }
-                    return Err(error.into());
-                }
-            };
-        if let Some((owner, data)) = staged_keys {
-            if hosted.store.binding().epoch <= starting_epoch {
-                discard_next_sidecars(&slot);
-                return Err(PrivateAgentHostError::Corrupt);
+        let result = apply_private_sync_page(&mut hosted.store, peer, &page, authority, transport);
+        match result {
+            Ok(disposition) => {
+                reconcile_staged_sync_keys(&slot, hosted, starting_epoch, staged_keys, false)?;
+                Ok(disposition)
             }
-            hosted.owner_key = owner;
-            hosted.data_key = data;
-            promote_next_sidecars(&slot)?;
+            Err(error) => {
+                // The store commits each control independently. If its live
+                // binding advanced, install the exact visible prefix. If it
+                // did not, an I/O failure may still have durably published an
+                // index before the in-memory assignment; retain every staged
+                // generation so restart recovery can select the disk truth.
+                if hosted.store.binding().epoch > starting_epoch {
+                    reconcile_staged_sync_keys(&slot, hosted, starting_epoch, staged_keys, true)?;
+                }
+                Err(error.into())
+            }
         }
-        Ok(disposition)
     }
 
     fn export_archive(
@@ -1117,13 +1130,13 @@ where
     let disposition = match hosted.store.append_control(&control, authority) {
         Ok(disposition) => disposition,
         Err(error) => {
-            discard_next_sidecars(slot);
+            discard_next_sidecars(slot, next_epoch);
             return Err(error.into());
         }
     };
     hosted.owner_key = owner_key;
-    hosted.data_key = data_key;
-    promote_next_sidecars(slot)?;
+    hosted.data_keys.insert(next_epoch, data_key);
+    promote_next_sidecars(slot, next_epoch)?;
     Ok(disposition)
 }
 
@@ -1157,51 +1170,178 @@ fn authenticate_peer_identity<'a, T: PrivateTransportAuthVerifier>(
     Ok(peer)
 }
 
-fn candidate_epoch_from_page(page: &PrivateSyncPage) -> Result<u64, PrivateAgentHostError> {
-    let mut epoch = page.request.cursor.local.epoch;
-    for item in &page.items {
-        if let super::private_sync::PrivateSyncItem::Control {
-            resulting_epoch, ..
-        } = item
-        {
-            epoch = *resulting_epoch;
-        }
-    }
-    Ok(epoch)
+struct CandidateEpochKeys {
+    epoch: u64,
+    owner: OwnerSigningKey,
+    data: PrivateDataKey,
 }
 
-fn candidate_keys_from_page(
+fn validated_candidate_keys_from_page<V: PrivateNodeAuthorityVerifier>(
+    store: &PrivateStore,
     page: &PrivateSyncPage,
-    starting_epoch: u64,
     local_node: &PrivateNodeIdentity,
     node_key: &PrivateNodeDecryptionKey,
-) -> Result<Option<(OwnerSigningKey, PrivateDataKey)>, PrivateAgentHostError> {
-    let mut candidate = None;
+    authority: &V,
+) -> Result<Vec<CandidateEpochKeys>, PrivateAgentHostError> {
+    if page.phase != PrivateSyncPhase::Controls {
+        return Ok(Vec::new());
+    }
+    let binding = store.binding();
+    if page.request.cursor.space != binding.space || page.request.cursor.agent != binding.agent {
+        return Err(PrivateAgentHostError::Sync(PrivateSyncError::InvalidScope));
+    }
+    let mut records = Vec::new();
+    records
+        .try_reserve(page.items.len())
+        .map_err(|_| PrivateAgentHostError::LimitExceeded)?;
     for item in &page.items {
-        let super::private_sync::PrivateSyncItem::Control { wire, .. } = item else {
-            continue;
+        let super::private_sync::PrivateSyncItem::Control {
+            sequence,
+            commitment,
+            resulting_epoch,
+            wire,
+        } = item
+        else {
+            return Err(PrivateAgentHostError::Sync(PrivateSyncError::InvalidFrame));
         };
         let record = PrivateControlRecord::decode(wire)
             .map_err(|_| PrivateAgentHostError::Sync(PrivateSyncError::Tampered))?;
-        let epoch = match record.operation {
+        let transition_epoch = match &record.operation {
+            PrivateControlOperation::Revoke { next_epoch, .. }
+            | PrivateControlOperation::RotateKeys { next_epoch }
+            | PrivateControlOperation::Recover { next_epoch, .. } => Some(next_epoch.epoch),
+            _ => None,
+        };
+        if record.space != page.request.cursor.space
+            || record.agent != page.request.cursor.agent
+            || record.sequence != *sequence
+            || record.commitment() != *commitment
+            || transition_epoch.is_some_and(|epoch| epoch != *resulting_epoch)
+        {
+            return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
+        }
+        records.push(record);
+    }
+
+    // A retried page may contain a prefix already applied by this store. The
+    // prefix must be byte-identical; only the remaining suffix is reverified
+    // and considered for staging.
+    let expected_start = page.request.cursor.local;
+    let mut skip = 0usize;
+    if binding.epoch != expected_start.epoch || binding.control_head != expected_start.control_head
+    {
+        let Some(position) = page.items.iter().position(|item| {
+            matches!(
+                item,
+                super::private_sync::PrivateSyncItem::Control {
+                    commitment,
+                    resulting_epoch,
+                    ..
+                } if binding.control_head == Some(*commitment)
+                    && binding.epoch == *resulting_epoch
+            )
+        }) else {
+            return Err(PrivateAgentHostError::Sync(PrivateSyncError::Diverged));
+        };
+        skip = position
+            .checked_add(1)
+            .ok_or(PrivateAgentHostError::LimitExceeded)?;
+        for item in &page.items[..skip] {
+            let super::private_sync::PrivateSyncItem::Control {
+                commitment, wire, ..
+            } = item
+            else {
+                return Err(PrivateAgentHostError::Sync(PrivateSyncError::InvalidFrame));
+            };
+            if !store.control_is_exact(*commitment, wire)? {
+                return Err(PrivateAgentHostError::Sync(PrivateSyncError::Diverged));
+            }
+        }
+    }
+    if skip == records.len() {
+        return Ok(Vec::new());
+    }
+    let expected_epochs = store.prevalidate_controls(&records[skip..], authority)?;
+    for (expected, item) in expected_epochs.iter().zip(&page.items[skip..]) {
+        let super::private_sync::PrivateSyncItem::Control {
+            resulting_epoch, ..
+        } = item
+        else {
+            return Err(PrivateAgentHostError::Sync(PrivateSyncError::InvalidFrame));
+        };
+        if expected != resulting_epoch {
+            return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for record in &records[skip..] {
+        let epoch = match &record.operation {
             PrivateControlOperation::Revoke { next_epoch, .. }
             | PrivateControlOperation::RotateKeys { next_epoch }
             | PrivateControlOperation::Recover { next_epoch, .. } => Some(next_epoch),
             _ => None,
         };
         if let Some(epoch) = epoch {
-            candidate = Some(epoch);
+            if epoch.epoch <= binding.epoch {
+                return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
+            }
+            if candidates
+                .last()
+                .is_some_and(|candidate: &CandidateEpochKeys| candidate.epoch >= epoch.epoch)
+            {
+                return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
+            }
+            candidates.push(CandidateEpochKeys {
+                epoch: epoch.epoch,
+                owner: unwrap_owner_key(epoch, local_node, node_key)?,
+                data: unwrap_data_key(epoch, local_node, node_key)?,
+            });
         }
     }
-    let Some(epoch) = candidate else {
-        return Ok(None);
-    };
-    if epoch.epoch <= starting_epoch {
-        return Ok(None);
+    Ok(candidates)
+}
+
+fn reconcile_staged_sync_keys(
+    slot: &Path,
+    hosted: &mut HostedPrivateAgent,
+    starting_epoch: u64,
+    candidates: Vec<CandidateEpochKeys>,
+    retain_unobserved: bool,
+) -> Result<(), PrivateAgentHostError> {
+    let committed_epoch = hosted.store.binding().epoch;
+    if committed_epoch == starting_epoch {
+        return discard_all_next_sidecars(slot);
     }
-    let owner = unwrap_owner_key(&epoch, local_node, node_key)?;
-    let data = unwrap_data_key(&epoch, local_node, node_key)?;
-    Ok(Some((owner, data)))
+    let mut committed_owner = None;
+    let mut has_committed_generation = false;
+    for candidate in candidates {
+        if candidate.epoch > committed_epoch {
+            continue;
+        }
+        if candidate.epoch == committed_epoch {
+            has_committed_generation = true;
+            committed_owner = Some(candidate.owner);
+        }
+        if hosted.data_keys.contains_key(&candidate.epoch) {
+            return Err(PrivateAgentHostError::Alias);
+        }
+        hosted.data_keys.insert(candidate.epoch, candidate.data);
+    }
+    if !has_committed_generation {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    hosted.owner_key = committed_owner.ok_or(PrivateAgentHostError::Corrupt)?;
+    promote_next_sidecars(slot, committed_epoch)?;
+    if retain_unobserved {
+        // A later candidate can already be the durable disk generation even
+        // when the corresponding in-memory assignment was interrupted. Keep
+        // it for restart reconciliation; the exact authenticated store epoch
+        // will retire every unreachable generation on open.
+        Ok(())
+    } else {
+        discard_all_next_sidecars(slot)
+    }
 }
 
 fn encode_root_scope(scope: &RootScope) -> Result<Vec<u8>, PrivateAgentHostError> {
@@ -1597,25 +1737,26 @@ fn stage_metadata(
     };
     let identity = &plaintext.descriptor.identity;
     let sidecars = encrypt_sidecars(identity.space, identity.agent, epoch, data_key, &plaintext)?;
-    replace_staged_file(slot, DESCRIPTOR_FILE, &sidecars.descriptor)?;
-    replace_staged_file(slot, RUNTIME_FILE, &sidecars.runtime)?;
-    replace_staged_file(slot, BOOTSTRAP_FILE, &sidecars.bootstrap)?;
+    replace_staged_file(slot, DESCRIPTOR_FILE, epoch, &sidecars.descriptor)?;
+    replace_staged_file(slot, RUNTIME_FILE, epoch, &sidecars.runtime)?;
+    replace_staged_file(slot, BOOTSTRAP_FILE, epoch, &sidecars.bootstrap)?;
     sync_directory(slot)
 }
 
 fn replace_staged_file(
     slot: &Path,
     canonical: &str,
+    epoch: u64,
     bytes: &[u8],
 ) -> Result<(), PrivateAgentHostError> {
-    let next = slot.join(format!("{canonical}{NEXT_SUFFIX}"));
+    let next = slot.join(staged_sidecar_name(canonical, epoch));
     remove_regular_file_if_present(&next)?;
     write_new_synced(&next, bytes)
 }
 
-fn promote_next_sidecars(slot: &Path) -> Result<(), PrivateAgentHostError> {
+fn promote_next_sidecars(slot: &Path, epoch: u64) -> Result<(), PrivateAgentHostError> {
     for canonical in SIDECAR_FILES {
-        let next = slot.join(format!("{canonical}{NEXT_SUFFIX}"));
+        let next = slot.join(staged_sidecar_name(canonical, epoch));
         require_regular_file(&next)?;
         fs::rename(&next, slot.join(canonical)).map_err(map_io)?;
         sync_directory(slot)?;
@@ -1623,11 +1764,44 @@ fn promote_next_sidecars(slot: &Path) -> Result<(), PrivateAgentHostError> {
     Ok(())
 }
 
-fn discard_next_sidecars(slot: &Path) {
+fn discard_next_sidecars(slot: &Path, epoch: u64) {
     for canonical in SIDECAR_FILES {
-        let _ = remove_regular_file_if_present(&slot.join(format!("{canonical}{NEXT_SUFFIX}")));
+        let _ = remove_regular_file_if_present(&slot.join(staged_sidecar_name(canonical, epoch)));
     }
     let _ = sync_directory(slot);
+}
+
+fn discard_all_next_sidecars(slot: &Path) -> Result<(), PrivateAgentHostError> {
+    for entry in fs::read_dir(slot).map_err(map_io)? {
+        let entry = entry.map_err(map_io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| PrivateAgentHostError::InvalidRoot)?;
+        if SIDECAR_FILES
+            .iter()
+            .any(|canonical| staged_sidecar_epoch(&name, canonical).is_some())
+        {
+            remove_regular_file_if_present(&entry.path())?;
+        }
+    }
+    sync_directory(slot)
+}
+
+fn staged_sidecar_name(canonical: &str, epoch: u64) -> String {
+    format!("{canonical}{NEXT_PREFIX}{epoch:016x}")
+}
+
+fn staged_sidecar_epoch(name: &str, canonical: &str) -> Option<u64> {
+    let encoded = name.strip_prefix(&format!("{canonical}{NEXT_PREFIX}"))?;
+    if encoded.len() != 16
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    u64::from_str_radix(encoded, 16).ok()
 }
 
 fn open_hosted_agent<V: PrivateNodeAuthorityVerifier>(
@@ -1651,7 +1825,10 @@ fn open_hosted_agent<V: PrivateNodeAuthorityVerifier>(
     }
     require_exact_local_member(store.authorized_nodes(), local_node)?;
     let owner_key = unwrap_owner_key(store.key_epoch(), local_node, node_key)?;
-    let data_key = unwrap_data_key(store.key_epoch(), local_node, node_key)?;
+    let data_keys = unwrap_local_data_keyring(&store, local_node, node_key)?;
+    let data_key = data_keys
+        .get(&store.binding().epoch)
+        .ok_or(PrivateAgentHostError::Unauthorized)?;
     let plaintext = reconcile_and_open_sidecars(slot, &store, &data_key)?;
     if plaintext.descriptor.identity.space != expected_space
         || plaintext.descriptor.identity.agent != agent
@@ -1681,8 +1858,43 @@ fn open_hosted_agent<V: PrivateNodeAuthorityVerifier>(
         runtime_package: plaintext.runtime_package,
         bootstrap_metadata: plaintext.bootstrap_metadata,
         owner_key,
-        data_key,
+        data_keys,
     })
+}
+
+fn unwrap_local_data_keyring(
+    store: &PrivateStore,
+    local_node: &PrivateNodeIdentity,
+    node_key: &PrivateNodeDecryptionKey,
+) -> Result<BTreeMap<u64, PrivateDataKey>, PrivateAgentHostError> {
+    // History is available only where the authenticated epoch actually
+    // contains a seal for this exact node recipient. A later Invite or
+    // replacement Recovery deliberately does not synthesize access to epochs
+    // that predate that identity's authorization.
+    let mut data_keys = BTreeMap::new();
+    for epoch in store.key_epochs() {
+        let Some(sealed) = epoch
+            .sealed_data_keys
+            .iter()
+            .find(|sealed| sealed.node == local_node.node)
+        else {
+            continue;
+        };
+        // A later authority binding may legitimately reuse a NodeId with a
+        // different encryption recipient. It must not make an old seal usable
+        // by the new identity.
+        if sealed.recipient_key != local_node.encryption_public_key {
+            continue;
+        }
+        let data_key = unwrap_data_key(epoch, local_node, node_key)?;
+        if data_keys.insert(epoch.epoch, data_key).is_some() {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+    }
+    if data_keys.len() > store.control_count().saturating_add(1) {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    Ok(data_keys)
 }
 
 fn reconcile_and_open_sidecars(
@@ -1731,6 +1943,10 @@ fn reconcile_and_open_sidecars(
         binding.epoch,
         MAX_PRIVATE_BOOTSTRAP_METADATA_BYTES,
     )?;
+    // Any other pre-staged generation belongs to an uncommitted suffix of a
+    // sync page. Once all three sidecars for the authenticated store epoch are
+    // selected, those generations are unreachable and may be retired.
+    discard_all_next_sidecars(slot)?;
     Ok(AgentPlaintext {
         descriptor,
         runtime_package,
@@ -1749,7 +1965,7 @@ fn select_sidecar_generation(
     data_key: &PrivateDataKey,
 ) -> Result<Zeroizing<Vec<u8>>, PrivateAgentHostError> {
     let current_path = slot.join(canonical);
-    let next_path = slot.join(format!("{canonical}{NEXT_SUFFIX}"));
+    let next_path = slot.join(staged_sidecar_name(canonical, epoch));
     let current = read_and_decrypt_sidecar(&current_path, space, agent, epoch, kind, data_key);
     let next = match fs::symlink_metadata(&next_path) {
         Ok(_) => Some(read_and_decrypt_sidecar(
@@ -1829,9 +2045,9 @@ fn validate_slot_layout(slot: &Path) -> Result<(), PrivateAgentHostError> {
             seen_store = true;
             continue;
         }
-        let canonical = SIDECAR_FILES
-            .iter()
-            .find(|canonical| name == **canonical || name == format!("{canonical}{NEXT_SUFFIX}"));
+        let canonical = SIDECAR_FILES.iter().find(|canonical| {
+            name == **canonical || staged_sidecar_epoch(&name, canonical).is_some()
+        });
         let Some(_) = canonical else {
             return Err(PrivateAgentHostError::Corrupt);
         };
@@ -2130,8 +2346,10 @@ mod tests {
     };
 
     use crate::agent::private_crypto::{RecoverySigningKey, sign_recovery_control_record};
+    use crate::agent::private_store::CommitStop;
     use crate::agent::private_sync::{
-        MAX_PRIVATE_SYNC_ITEMS, MAX_PRIVATE_SYNC_PAGE_BYTES, PrivateSyncCursor,
+        MAX_PRIVATE_SYNC_ITEMS, MAX_PRIVATE_SYNC_PAGE_BYTES, PrivateSyncCursor, PrivateSyncItem,
+        PrivateSyncPhase,
     };
     use vos_pvm_compiler::assembler::{Assembler, Reg};
 
@@ -2531,10 +2749,25 @@ mod tests {
         let mut primary = create_host(&fixture, 0, "primary");
         let agent = create_agent(&mut primary, &fixture);
         let old_epoch = primary.binding(agent).unwrap().epoch;
+        let revoked_epoch_key = unwrap_data_key(
+            primary.agents[&agent].store.key_epoch(),
+            &fixture.nodes[1].identity,
+            &fixture.nodes[1].key(),
+        )
+        .unwrap();
         primary
             .revoke_node(agent, fixture.nodes[1].identity.node, &TestAuthority)
             .unwrap();
         assert_eq!(primary.binding(agent).unwrap().epoch, old_epoch + 1);
+        assert!(
+            unwrap_data_key(
+                primary.agents[&agent].store.key_epoch(),
+                &fixture.nodes[1].identity,
+                &fixture.nodes[1].key(),
+            )
+            .is_err(),
+            "the revoked node must not unwrap the successor data epoch"
+        );
 
         let malformed = b"not-even-a-sync-request";
         primary.reset_artifact_read_spy(agent);
@@ -2613,6 +2846,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(future.epoch, old_epoch + 1);
+        let future_ciphertext = primary.get_encrypted_object(agent, future).unwrap();
+        assert!(decrypt_private_object(&revoked_epoch_key, &future_ciphertext).is_err());
         let request = PrivateSyncRequest {
             cursor: PrivateSyncCursor::start(fixture.space, agent, old_epoch, None).unwrap(),
             max_items: 1,
@@ -2645,6 +2880,364 @@ mod tests {
             reopened.get_and_decrypt(agent, future).unwrap().as_slice(),
             b"post-revocation-state"
         );
+    }
+
+    #[test]
+    fn authorized_survivors_reopen_and_decrypt_objects_across_multiple_rotations() {
+        let fixture = fixture(2);
+        let mut primary = create_host(&fixture, 0, "historical-primary");
+        let agent = create_agent(&mut primary, &fixture);
+        let epoch_zero = primary
+            .encrypt_and_put(agent, EncryptedObjectKind::CrdtNode, b"epoch-zero-state")
+            .unwrap();
+        primary.rotate_keys(agent, &TestAuthority).unwrap();
+        let epoch_one = primary
+            .encrypt_and_put(agent, EncryptedObjectKind::Snapshot, b"epoch-one-state")
+            .unwrap();
+        primary.rotate_keys(agent, &TestAuthority).unwrap();
+        let epoch_two = primary
+            .encrypt_and_put(agent, EncryptedObjectKind::Blob, b"epoch-two-state")
+            .unwrap();
+
+        assert_eq!(primary.agents[&agent].data_keys.len(), 3);
+        for (key, expected) in [
+            (epoch_zero, b"epoch-zero-state".as_slice()),
+            (epoch_one, b"epoch-one-state".as_slice()),
+            (epoch_two, b"epoch-two-state".as_slice()),
+        ] {
+            assert_eq!(
+                primary.get_and_decrypt(agent, key).unwrap().as_slice(),
+                expected
+            );
+        }
+
+        let backup = primary
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        drop(primary);
+        let primary = PrivateAgentHost::open(
+            fixture.directory.child("historical-primary"),
+            fixture.space,
+            fixture.owner,
+            fixture.nodes[0].identity.clone(),
+            fixture.nodes[0].key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(primary.agents[&agent].data_keys.len(), 3);
+        assert_eq!(
+            primary
+                .get_and_decrypt(agent, epoch_zero)
+                .unwrap()
+                .as_slice(),
+            b"epoch-zero-state"
+        );
+
+        let mut survivor = create_host(&fixture, 1, "historical-survivor");
+        survivor
+            .restore_encrypted_backup(
+                agent,
+                DurableRecoveryPublicKey::from_durable_keystore(fixture.recovery.verifying_key())
+                    .unwrap(),
+                &backup,
+                &TestAuthority,
+            )
+            .unwrap();
+        assert_eq!(survivor.agents[&agent].data_keys.len(), 3);
+        assert_eq!(
+            survivor
+                .get_and_decrypt(agent, epoch_zero)
+                .unwrap()
+                .as_slice(),
+            b"epoch-zero-state"
+        );
+    }
+
+    #[test]
+    fn post_history_invite_gets_current_epoch_but_not_retroactive_history() {
+        let fixture = fixture(1);
+        let invited = node(fixture.space, fixture.owner, 99);
+        let mut primary = create_host(&fixture, 0, "late-invite-primary");
+        let agent = create_agent(&mut primary, &fixture);
+        let historical = primary
+            .encrypt_and_put(agent, EncryptedObjectKind::CrdtNode, b"before-invite")
+            .unwrap();
+        primary.rotate_keys(agent, &TestAuthority).unwrap();
+        let current = primary
+            .encrypt_and_put(agent, EncryptedObjectKind::Snapshot, b"current-at-invite")
+            .unwrap();
+        primary
+            .invite_node(agent, invited.identity.clone(), &TestAuthority)
+            .unwrap();
+        let backup = primary
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+
+        let invited_root = fixture.directory.child("late-invite-peer");
+        let mut invited_host = PrivateAgentHost::create(
+            &invited_root,
+            fixture.space,
+            fixture.owner,
+            invited.identity.clone(),
+            invited.key(),
+        )
+        .unwrap();
+        invited_host
+            .restore_encrypted_backup(
+                agent,
+                DurableRecoveryPublicKey::from_durable_keystore(fixture.recovery.verifying_key())
+                    .unwrap(),
+                &backup,
+                &TestAuthority,
+            )
+            .unwrap();
+        assert_eq!(invited_host.agents[&agent].data_keys.len(), 1);
+        assert_eq!(
+            invited_host
+                .get_and_decrypt(agent, current)
+                .unwrap()
+                .as_slice(),
+            b"current-at-invite"
+        );
+        assert_eq!(
+            invited_host.get_and_decrypt(agent, historical),
+            Err(PrivateAgentHostError::Unauthorized)
+        );
+
+        drop(invited_host);
+        let invited_host = PrivateAgentHost::open(
+            &invited_root,
+            fixture.space,
+            fixture.owner,
+            invited.identity.clone(),
+            invited.key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(invited_host.agents[&agent].data_keys.len(), 1);
+        assert_eq!(
+            invited_host.get_and_decrypt(agent, historical),
+            Err(PrivateAgentHostError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn multi_rotation_sync_stages_every_epoch_for_each_store_commit_boundary() {
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "multi-rotation-source");
+        let agent = create_agent(&mut source, &fixture);
+        let historical = source
+            .encrypt_and_put(agent, EncryptedObjectKind::CrdtNode, b"survivor-history")
+            .unwrap();
+        let base_backup = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        source.rotate_keys(agent, &TestAuthority).unwrap();
+        source.rotate_keys(agent, &TestAuthority).unwrap();
+
+        let request = PrivateSyncRequest {
+            cursor: PrivateSyncCursor::start(fixture.space, agent, 0, None).unwrap(),
+            max_items: MAX_PRIVATE_SYNC_ITEMS as u16,
+            max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+        };
+        let page_bytes = source
+            .serve_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[1].identity),
+                &request.encode().unwrap(),
+                &TestTransport,
+            )
+            .unwrap();
+        let page = PrivateSyncPage::decode(&page_bytes).unwrap();
+        assert_eq!(page.phase, PrivateSyncPhase::Controls);
+        assert_eq!(page.items.len(), 2);
+        let records: Vec<_> = page
+            .items
+            .iter()
+            .map(|item| {
+                let PrivateSyncItem::Control { wire, .. } = item else {
+                    panic!("control page contained an object")
+                };
+                PrivateControlRecord::decode(wire).unwrap()
+            })
+            .collect();
+
+        for control_index in 0..records.len() {
+            for (label, stop) in [
+                ("stage", CommitStop::AfterStage),
+                ("artifact", CommitStop::AfterArtifact),
+                ("index", CommitStop::AfterIndex),
+            ] {
+                let root = fixture
+                    .directory
+                    .child(&format!("multi-rotation-{control_index}-{label}"));
+                let mut peer = PrivateAgentHost::create(
+                    &root,
+                    fixture.space,
+                    fixture.owner,
+                    fixture.nodes[1].identity.clone(),
+                    fixture.nodes[1].key(),
+                )
+                .unwrap();
+                peer.restore_encrypted_backup(
+                    agent,
+                    DurableRecoveryPublicKey::from_durable_keystore(
+                        fixture.recovery.verifying_key(),
+                    )
+                    .unwrap(),
+                    &base_backup,
+                    &TestAuthority,
+                )
+                .unwrap();
+
+                let slot = peer.agent_path(agent);
+                let candidates = validated_candidate_keys_from_page(
+                    &peer.agents[&agent].store,
+                    &page,
+                    &fixture.nodes[1].identity,
+                    &peer.node_key,
+                    &TestAuthority,
+                )
+                .unwrap();
+                assert_eq!(candidates.len(), 2);
+                {
+                    let hosted = peer.agents.get_mut(&agent).unwrap();
+                    for candidate in &candidates {
+                        stage_metadata(&slot, candidate.epoch, &candidate.data, hosted).unwrap();
+                    }
+                    for record in &records[..control_index] {
+                        hosted.store.append_control(record, &TestAuthority).unwrap();
+                    }
+                    assert_eq!(
+                        hosted.store.append_control_with_stop(
+                            &records[control_index],
+                            &TestAuthority,
+                            stop,
+                        ),
+                        Err(PrivateStoreError::Interrupted)
+                    );
+                }
+                // Model the host error path when a verified prefix is already
+                // visible in memory. A later durable-but-unassigned control
+                // still needs its distinct staged generation after restart.
+                if peer.binding(agent).unwrap().epoch > 0 {
+                    reconcile_staged_sync_keys(
+                        &slot,
+                        peer.agents.get_mut(&agent).unwrap(),
+                        0,
+                        candidates,
+                        true,
+                    )
+                    .unwrap();
+                } else {
+                    drop(candidates);
+                }
+                // Process loss discards unwrapped keys. Store recovery must
+                // select exactly the epoch whose control became durable.
+                drop(peer);
+
+                let reopened = PrivateAgentHost::open(
+                    &root,
+                    fixture.space,
+                    fixture.owner,
+                    fixture.nodes[1].identity.clone(),
+                    fixture.nodes[1].key(),
+                    &TestAuthority,
+                )
+                .unwrap();
+                let expected_epoch = u64::try_from(control_index + 1).unwrap();
+                assert_eq!(reopened.binding(agent).unwrap().epoch, expected_epoch);
+                assert_eq!(
+                    reopened
+                        .get_and_decrypt(agent, historical)
+                        .unwrap()
+                        .as_slice(),
+                    b"survivor-history"
+                );
+                assert_eq!(reopened.agents[&agent].data_keys.len(), control_index + 2);
+                for name in SIDECAR_FILES {
+                    assert!(slot.join(name).is_file());
+                    assert!(fs::read_dir(&slot).unwrap().all(|entry| {
+                        staged_sidecar_epoch(&entry.unwrap().file_name().to_string_lossy(), name)
+                            .is_none()
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsigned_sync_epoch_never_receives_encrypted_host_sidecars() {
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "unsigned-epoch-source");
+        let agent = create_agent(&mut source, &fixture);
+        let base_backup = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        source.rotate_keys(agent, &TestAuthority).unwrap();
+
+        let request = PrivateSyncRequest {
+            cursor: PrivateSyncCursor::start(fixture.space, agent, 0, None).unwrap(),
+            max_items: MAX_PRIVATE_SYNC_ITEMS as u16,
+            max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+        };
+        let page_bytes = source
+            .serve_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[1].identity),
+                &request.encode().unwrap(),
+                &TestTransport,
+            )
+            .unwrap();
+        let mut page = PrivateSyncPage::decode(&page_bytes).unwrap();
+        let PrivateSyncItem::Control {
+            commitment, wire, ..
+        } = &mut page.items[0]
+        else {
+            panic!("rotation page contained an object")
+        };
+        let mut unsigned = PrivateControlRecord::decode(wire).unwrap();
+        unsigned.signature[0] ^= 1;
+        *wire = unsigned.encode().unwrap();
+        *commitment = unsigned.commitment();
+        page.target.control_head = Some(*commitment);
+        if let Some(next) = &mut page.next {
+            next.local.control_head = Some(*commitment);
+            next.target = Some(page.target);
+        }
+
+        let root = fixture.directory.child("unsigned-epoch-peer");
+        let mut peer = PrivateAgentHost::create(
+            &root,
+            fixture.space,
+            fixture.owner,
+            fixture.nodes[1].identity.clone(),
+            fixture.nodes[1].key(),
+        )
+        .unwrap();
+        peer.restore_encrypted_backup(
+            agent,
+            DurableRecoveryPublicKey::from_durable_keystore(fixture.recovery.verifying_key())
+                .unwrap(),
+            &base_backup,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert!(
+            peer.apply_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                &page.encode().unwrap(),
+                &TestAuthority,
+                &TestTransport,
+            )
+            .is_err()
+        );
+        let slot = peer.agent_path(agent);
+        assert!(fs::read_dir(slot).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            !name.to_string_lossy().contains(NEXT_PREFIX)
+        }));
     }
 
     #[test]
@@ -2825,7 +3418,11 @@ mod tests {
         assert_eq!(reopened.binding(agent).unwrap().epoch, binding.epoch + 1);
         for name in SIDECAR_FILES {
             assert!(slot.join(name).is_file());
-            assert!(!slot.join(format!("{name}{NEXT_SUFFIX}")).exists());
+            assert!(
+                !slot
+                    .join(staged_sidecar_name(name, binding.epoch + 1))
+                    .exists()
+            );
         }
     }
 

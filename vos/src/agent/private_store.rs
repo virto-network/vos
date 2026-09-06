@@ -200,7 +200,7 @@ struct VerifiedEncryptedBackup {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CommitStop {
+pub(crate) enum CommitStop {
     Never,
     #[cfg(test)]
     AfterStage,
@@ -1071,6 +1071,10 @@ pub struct PrivateStore {
     metadata: RecoveryMetadata,
     index: StoreIndex,
     chain: PrivateControlChainVerifier,
+    /// Authenticated epoch records reconstructed from immutable genesis and
+    /// the verified control chain. These contain recipient ciphertext only;
+    /// unwrapped keys remain a host concern.
+    key_epochs: Vec<PrivateKeyEpoch>,
     #[cfg(test)]
     artifact_reads: core::cell::Cell<u64>,
 }
@@ -1119,6 +1123,7 @@ impl PrivateStore {
             genesis_nodes.clone(),
             authority,
         )?;
+        let key_epochs = vec![genesis_epoch.clone()];
         let metadata = RecoveryMetadata {
             space,
             agent,
@@ -1149,6 +1154,7 @@ impl PrivateStore {
             metadata,
             index,
             chain,
+            key_epochs,
             #[cfg(test)]
             artifact_reads: core::cell::Cell::new(0),
         })
@@ -1195,6 +1201,7 @@ impl PrivateStore {
             metadata.genesis_nodes.clone(),
             authority,
         )?;
+        let mut key_epochs = vec![metadata.genesis_epoch.clone()];
         for entry in &index.controls {
             let bytes = verify_file_identity(
                 &root
@@ -1208,6 +1215,7 @@ impl PrivateStore {
                 .map_err(|_| PrivateStoreError::InvalidRecord)?;
             validate_control_index_entry(entry, &record)?;
             apply_control_transition(&mut chain, &record, authority)?;
+            advance_key_epochs(&mut key_epochs, &record)?;
             if chain.epoch().epoch != entry.resulting_epoch
                 || chain.head() != Some(entry.commitment)
                 || chain.next_sequence()
@@ -1222,6 +1230,7 @@ impl PrivateStore {
         if chain.epoch().epoch != index.epoch
             || chain.head() != index.control_head
             || chain.next_sequence() != index.next_sequence
+            || key_epochs.last() != Some(chain.epoch())
         {
             return Err(PrivateStoreError::Corrupt);
         }
@@ -1246,6 +1255,7 @@ impl PrivateStore {
             metadata,
             index,
             chain,
+            key_epochs,
             #[cfg(test)]
             artifact_reads: core::cell::Cell::new(0),
         })
@@ -1392,6 +1402,13 @@ impl PrivateStore {
         self.chain.epoch()
     }
 
+    /// Authenticated, bounded history of sealed epoch records reconstructed
+    /// from durable genesis/control artifacts. It exposes no unwrapped key
+    /// material.
+    pub(crate) fn key_epochs(&self) -> &[PrivateKeyEpoch] {
+        &self.key_epochs
+    }
+
     /// Offline recovery verification key pinned by immutable genesis
     /// metadata. The corresponding signing key is deliberately never stored
     /// by this type.
@@ -1483,6 +1500,16 @@ impl PrivateStore {
         self.append_control_inner(record, authority, CommitStop::Never)
     }
 
+    #[cfg(test)]
+    pub(crate) fn append_control_with_stop<V: PrivateNodeAuthorityVerifier>(
+        &mut self,
+        record: &PrivateControlRecord,
+        authority: &V,
+        stop: CommitStop,
+    ) -> Result<PutDisposition, PrivateStoreError> {
+        self.append_control_inner(record, authority, stop)
+    }
+
     fn append_control_inner<V: PrivateNodeAuthorityVerifier>(
         &mut self,
         record: &PrivateControlRecord,
@@ -1522,6 +1549,11 @@ impl PrivateStore {
         }
         let mut next_chain = self.chain.clone();
         apply_control_transition(&mut next_chain, record, authority)?;
+        let mut next_key_epochs = self.key_epochs.clone();
+        advance_key_epochs(&mut next_key_epochs, record)?;
+        if next_key_epochs.last() != Some(next_chain.epoch()) {
+            return Err(PrivateStoreError::Corrupt);
+        }
         let superseded_heads = match &record.operation {
             PrivateControlOperation::Recover {
                 superseded_heads, ..
@@ -1551,6 +1583,7 @@ impl PrivateStore {
             stop,
         )?;
         self.chain = next_chain;
+        self.key_epochs = next_key_epochs;
         self.index = next;
         Ok(PutDisposition::Inserted)
     }
@@ -1880,6 +1913,54 @@ fn validate_control_index_entry(
         || superseded_heads != entry.superseded_heads
     {
         return Err(PrivateStoreError::Corrupt);
+    }
+    Ok(())
+}
+
+/// Advance the ciphertext-only epoch history in lockstep with one control
+/// record which has already passed full chain verification.
+fn advance_key_epochs(
+    epochs: &mut Vec<PrivateKeyEpoch>,
+    record: &PrivateControlRecord,
+) -> Result<(), PrivateStoreError> {
+    let current = epochs.last_mut().ok_or(PrivateStoreError::Corrupt)?;
+    match &record.operation {
+        PrivateControlOperation::Invite {
+            node,
+            epoch,
+            sealed_owner_key,
+            sealed_data_key,
+        } => {
+            if current.epoch != *epoch {
+                return Err(PrivateStoreError::Corrupt);
+            }
+            let position = current
+                .sealed_owner_keys
+                .binary_search_by_key(&node.node, |sealed| sealed.node)
+                .err()
+                .ok_or(PrivateStoreError::Corrupt)?;
+            current
+                .sealed_owner_keys
+                .insert(position, sealed_owner_key.clone());
+            current
+                .sealed_data_keys
+                .insert(position, sealed_data_key.clone());
+            if !current.validate() {
+                return Err(PrivateStoreError::Corrupt);
+            }
+        }
+        PrivateControlOperation::Revoke { next_epoch, .. }
+        | PrivateControlOperation::RotateKeys { next_epoch }
+        | PrivateControlOperation::Recover { next_epoch, .. } => {
+            if next_epoch.epoch <= current.epoch
+                || epochs.len() >= MAX_PRIVATE_STORE_CONTROLS.saturating_add(1)
+            {
+                return Err(PrivateStoreError::Corrupt);
+            }
+            epochs.push(next_epoch.clone());
+        }
+        PrivateControlOperation::SetResourcePolicy { .. }
+        | PrivateControlOperation::ActorLifecycle { .. } => {}
     }
     Ok(())
 }
