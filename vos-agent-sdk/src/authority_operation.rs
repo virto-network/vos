@@ -3415,7 +3415,7 @@ mod tests {
         assert!(!recovery_intent.matches_private_control(&changed_recovery));
 
         let mut changed_recovery_members = controls[2].clone();
-        let replacement = private_node(0x8c);
+        let replacement = private_node(0x6c);
         let PrivateControlOperation::Recover {
             next_epoch,
             replacement_nodes,

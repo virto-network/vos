@@ -4,10 +4,11 @@ use core::num::NonZeroU64;
 
 use alloc::vec::Vec;
 
+use crate::private::NodeEncryptionEnrollment;
 use crate::{
     ActorId, AgentId, BlobRef, CredentialId, DeploymentId, Hash, InvocationContext, InvocationId,
-    InvocationRoleClaims, ManagementRequest, MethodMode, NodeId, PrincipalId, ProducerId,
-    ProgramId, SpaceId,
+    InvocationRoleClaims, ManagementReply, ManagementRequest, MethodMode, NodeId, PrincipalId,
+    ProducerId, ProgramId, SpaceId,
 };
 
 pub const AUTHORITY_PUBLIC_KEY_BYTES: usize = 32;
@@ -290,12 +291,12 @@ pub enum AuthorityAdminOperation {
         principal: PrincipalId,
         credential: CredentialId,
     },
-    /// Assign the full authenticated NodeId as an authority act. Possession
-    /// of the new Node identity is proved later by transport enrollment; this
-    /// operation never derives or accepts a compact/short Node identifier.
-    BindNodeOwner {
-        node: NodeId,
-        owner: PrincipalId,
+    /// Enroll one exact NEN1 transport/encryption identity. The enclosing
+    /// Admin signature authorizes its Principal binding while NEN1's nested
+    /// transport signature independently proves possession of the full
+    /// Ed25519 PeerId.
+    EnrollNode {
+        enrollment: NodeEncryptionEnrollment,
     },
     UnbindNodeOwner {
         node: NodeId,
@@ -322,7 +323,8 @@ impl AuthorityAdminOperation {
                 principal,
                 credential,
             } => *principal != PrincipalId::ZERO && *credential != CredentialId::ZERO,
-            Self::BindNodeOwner { node, owner } | Self::UnbindNodeOwner { node, owner } => {
+            Self::EnrollNode { enrollment } => enrollment.validate_shape(),
+            Self::UnbindNodeOwner { node, owner } => {
                 *node != NodeId::ZERO && *owner != PrincipalId::ZERO
             }
             Self::SetBuiltinRole { principal, .. } => *principal != PrincipalId::ZERO,
@@ -360,7 +362,7 @@ impl AuthorityAdminCall {
 
     pub fn commitment(&self) -> Hash {
         Hash::digest(
-            b"vos/agent/authority-admin-call/v1",
+            b"vos/agent/authority-admin-call/v2",
             &[&self.signing_bytes(), &self.signature],
         )
     }
@@ -645,6 +647,8 @@ pub struct ManagementApplicationAck {
     pub authorization_sequence: NonZeroU64,
     pub request: Hash,
     pub receipt: AuthorityReceipt,
+    /// Exact typed reply durably reopened for this authorized request.
+    pub application: ManagementReply,
     pub reopened_state: Hash,
     pub applied_at: u64,
     pub signature: [u8; AUTHORITY_SIGNATURE_BYTES],
@@ -658,7 +662,7 @@ impl ManagementApplicationAck {
 
     pub fn commitment(&self) -> Hash {
         Hash::digest(
-            b"vos/agent/management-application-ack/v1",
+            b"vos/agent/management-application-ack/v2",
             &[&self.signing_bytes(), &self.signature],
         )
     }
@@ -676,6 +680,7 @@ impl ManagementApplicationAck {
         if self.credential_call == Hash::ZERO
             || self.approval == Hash::ZERO
             || self.request == Hash::ZERO
+            || !crate::wire::management_reply_valid(&self.application)
             || self.reopened_state == Hash::ZERO
             || self.signature == [0; AUTHORITY_SIGNATURE_BYTES]
         {
@@ -740,6 +745,7 @@ impl ManagementApplicationAck {
             && self.approval == approval.commitment()
             && self.authorization_sequence == approval.authorization_sequence
             && self.request == approval.request_commitment
+            && management_application_reply_matches(call, &self.application)
             && receipt_matches_approval(&self.receipt, approval)
     }
 
@@ -755,6 +761,74 @@ impl ManagementApplicationAck {
             && context.origin.actor.is_none()
             && context.origin.capability.is_none()
             && context.roles == InvocationRoleClaims::none()
+    }
+}
+
+fn management_application_reply_matches(
+    call: &AuthorityCredentialCall,
+    application: &ManagementReply,
+) -> bool {
+    match (&call.request, application) {
+        (ManagementRequest::Create(descriptor), ManagementReply::Created(identity)) => {
+            *identity == descriptor.identity
+        }
+        (ManagementRequest::Install(install), ManagementReply::Installed(entry)) => {
+            *entry == install.entry
+        }
+        (ManagementRequest::UpgradeActor(upgrade), ManagementReply::Upgraded(entry)) => {
+            entry.actor == upgrade.actor
+                && entry.deployment == upgrade.to_deployment
+                && entry.program == upgrade.to_program
+                && entry.package == upgrade.package
+                && entry.agent_schema == upgrade.agent_schema
+                && entry.method_policy == upgrade.method_policy
+                && entry.constructor_abi == upgrade.constructor_abi
+                && entry.state_layout == upgrade.state_layout
+                && entry.lanes == upgrade.requirements.lanes
+        }
+        (
+            ManagementRequest::Suspend {
+                actor,
+                expected_deployment,
+            },
+            ManagementReply::Suspended(entry),
+        ) => entry.actor == *actor && entry.deployment == *expected_deployment && entry.suspended,
+        (
+            ManagementRequest::Resume {
+                actor,
+                expected_deployment,
+            },
+            ManagementReply::Resumed(entry),
+        ) => entry.actor == *actor && entry.deployment == *expected_deployment && !entry.suspended,
+        (ManagementRequest::RemoveLeaf { actor, .. }, ManagementReply::Removed(removed)) => {
+            actor == removed
+        }
+        (
+            ManagementRequest::UpgradeRuntime(upgrade),
+            ManagementReply::RuntimeUpgraded(identity),
+        ) => {
+            identity.space == call.managed.space
+                && identity.agent == call.managed.agent
+                && identity.runtime_deployment == upgrade.to_deployment
+                && identity.runtime_program == upgrade.to_program
+                && identity.runtime_producer == upgrade.producer
+        }
+        (
+            ManagementRequest::ChangeReplicas { .. },
+            ManagementReply::ReplicasChanged { generation },
+        ) => *generation != Hash::ZERO,
+        (ManagementRequest::InspectActors { .. }, _)
+        | (ManagementRequest::InspectResources, _)
+        | (_, ManagementReply::Actors(_))
+        | (_, ManagementReply::Resources(_))
+        | (_, ManagementReply::Created(_))
+        | (_, ManagementReply::Installed(_))
+        | (_, ManagementReply::Upgraded(_))
+        | (_, ManagementReply::Suspended(_))
+        | (_, ManagementReply::Resumed(_))
+        | (_, ManagementReply::Removed(_))
+        | (_, ManagementReply::RuntimeUpgraded(_))
+        | (_, ManagementReply::ReplicasChanged { .. }) => false,
     }
 }
 
@@ -1199,6 +1273,28 @@ mod tests {
         call: &AuthorityCredentialCall,
         approval: &ManagementApproval,
     ) -> ManagementApplicationAck {
+        let (actor, deployment) = match call.request {
+            ManagementRequest::Suspend {
+                actor,
+                expected_deployment,
+            } => (actor, expected_deployment),
+            _ => panic!("application acknowledgement fixture requires Suspend"),
+        };
+        let application = ManagementReply::Suspended(crate::ActorEntry {
+            actor,
+            name: "fixture".into(),
+            parent: None,
+            deployment,
+            program: ProgramId([40; 32]),
+            package: BlobRef::of_bytes(b"fixture-package"),
+            agent_schema: BlobRef::of_bytes(b"fixture-schema"),
+            method_policy: BlobRef::of_bytes(b"fixture-policy"),
+            constructor_abi: Hash([41; 32]),
+            installation_data: None,
+            state_layout: Hash([42; 32]),
+            lanes: crate::LaneSet::NONE,
+            suspended: true,
+        });
         let actor = approval.request.authority_actor();
         let mut receipt = AuthorityReceipt {
             selector: AuthorityReceiptSelector {
@@ -1232,6 +1328,7 @@ mod tests {
             approval: approval.commitment(),
             authorization_sequence: approval.authorization_sequence,
             request: approval.request_commitment,
+            application,
             receipt,
             reopened_state: Hash([44; 32]),
             applied_at: approval.valid_from,

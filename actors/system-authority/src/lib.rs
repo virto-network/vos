@@ -1,7 +1,7 @@
 //! Clean, portable policy actor for standard Agent management.
 //!
 //! The actor accepts canonical `ACC1` management calls, canonical `AOC1`
-//! general-operation calls, and self-authenticating `AAD1` identity-admin calls
+//! general-operation calls, and self-authenticating `AAD2` identity-admin calls
 //! delivered with an exact clean `AIC1` invocation context. It performs policy,
 //! credential, and Admin-accessibility checks inside the guest and retains exact
 //! results for replay. Agent and actor lifecycle approvals remain pending until
@@ -29,18 +29,23 @@ use vos::agent_sdk::authority_operation::{
     AuthorityOperationIssuanceAck, PrivateControlApplicationAck, PrivateControlApplicationFact,
     private_member_set_commitment,
 };
-use vos::agent_sdk::private::MAX_PRIVATE_NODES;
+use vos::agent_sdk::private::{
+    ED25519_TRANSPORT_PEER_ID_BYTES, MAX_PRIVATE_NODES, NodeEncryptionEnrollment,
+    NodeEncryptionEnrollmentVerifier, PRIVATE_SIGNATURE_BYTES, PrivateNodeIdentity,
+    valid_x25519_public_key,
+};
 use vos::agent_sdk::wire::CanonicalWire as _;
 use vos::agent_sdk::{
-    ActorId, AgentId, AgentProfile, CredentialId, DeploymentId, Hash, InvocationContext,
-    InvocationId, InvocationRoleClaims, MAX_INVOCATION_MESSAGE_BYTES, MAX_INVOCATION_REPLY_BYTES,
-    MAX_RUNTIME_STATE_BYTES, ManagementRequest, PrincipalId, ProducerId, ProgramId, RUNTIME_ABI_ID,
-    SpaceId,
+    ActorId, AgentId, AgentIdentity, AgentProfile, AgentReplica, CredentialId, DeploymentId, Hash,
+    InvocationContext, InvocationId, InvocationRoleClaims, MAX_AGENT_REPLICAS,
+    MAX_INVOCATION_MESSAGE_BYTES, MAX_INVOCATION_REPLY_BYTES, MAX_RUNTIME_STATE_BYTES,
+    ManagementReply, ManagementRequest, PrincipalId, ProducerId, ProgramId, RUNTIME_ABI_ID,
+    ReplicaRole, SpaceId, replica_set_generation,
 };
 use vos::prelude::*;
 
 /// Fixed installation-data wire for [`SystemAuthorityConfiguration`].
-pub const SYSTEM_AUTHORITY_CONFIGURATION_MAGIC: [u8; 4] = *b"SAC2";
+pub const SYSTEM_AUTHORITY_CONFIGURATION_MAGIC: [u8; 4] = *b"SAC3";
 
 /// The root admission consumes exactly one Create decision and one authority
 /// actor Install decision before this portable issuer can run.
@@ -73,8 +78,8 @@ pub const MAX_RETIRED_AUTHORITY_OPERATIONS: usize = 4_096;
 /// ceiling. Compact rows preserve exact PCA1 retry and invocation collision
 /// identity after a later control supersedes the current projection.
 pub const MAX_PRIVATE_APPLICATION_RECORDS: usize = 4_096;
-/// Worst-case canonical ACC1/AOC1/AAD1 calls plus MAP1/AOP1/AAR1 results and
-/// MAA1/AOI1 acknowledgements retained by the bounded exact-retry tables. This
+/// Worst-case canonical ACC1/AOC1/AAD2 calls plus MAP1/AOP1/AAR2 results and
+/// MAA2/AOI1 acknowledgements retained by the bounded exact-retry tables. This
 /// leaves over one MiB of the standard state ceiling for row metadata and
 /// actor framing.
 pub const MAX_RETAINED_EXACT_WIRE_BYTES: usize = MAX_EXACT_RETRY_RECORDS
@@ -83,13 +88,15 @@ pub const MAX_RETAINED_EXACT_WIRE_BYTES: usize = MAX_EXACT_RETRY_RECORDS
 /// slot at which unseen work was accepted.
 pub const MAX_APPROVAL_VALIDITY_SLOTS: u64 = 4_096;
 
-const CONFIG_FIXED_FIELDS: usize = 15;
+const CONFIG_FIXED_FIELDS: usize = 18;
 const CONFIG_U64_FIELDS: usize = 2;
 const CONFIG_ENCODED_BYTES: usize = SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len()
     + 32
     + CONFIG_FIXED_FIELDS * 32
     + CONFIG_U64_FIELDS * 8
-    + 1;
+    + 1
+    + ED25519_TRANSPORT_PEER_ID_BYTES
+    + PRIVATE_SIGNATURE_BYTES;
 const EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/policy-evidence/v1";
 const OPERATION_EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/operation-evidence/v1";
 
@@ -166,7 +173,6 @@ impl AuthorityBindingState {
     Clone,
     Copy,
     Debug,
-    Default,
     PartialEq,
     Eq,
 )]
@@ -180,14 +186,54 @@ pub struct SystemAuthorityConfiguration {
     pub binding: AuthorityBindingState,
     /// Exact durable issuer sequence already consumed by root admission.
     pub bootstrap_authorization_high_water: u64,
+    pub bootstrap_system_agent_creation_nonce: [u8; 32],
     pub bootstrap_principal: [u8; 32],
     pub bootstrap_credential_public_key: [u8; 32],
     /// Canonical [`vos::agent_sdk::authority::AuthorityCredentialKind`] tag.
     pub bootstrap_credential_kind: u8,
     pub bootstrap_node: [u8; 32],
+    pub bootstrap_node_transport_public_key: [u8; 32],
+    pub bootstrap_node_transport_peer_id: [u8; ED25519_TRANSPORT_PEER_ID_BYTES],
+    pub bootstrap_node_encryption_public_key: [u8; 32],
+    pub bootstrap_node_transport_signature: [u8; PRIVATE_SIGNATURE_BYTES],
+}
+
+impl Default for SystemAuthorityConfiguration {
+    fn default() -> Self {
+        Self {
+            space: [0; 32],
+            system_agent: [0; 32],
+            system_runtime_deployment: [0; 32],
+            system_runtime_program: [0; 32],
+            system_runtime_producer: [0; 32],
+            binding: AuthorityBindingState::default(),
+            bootstrap_authorization_high_water: 0,
+            bootstrap_system_agent_creation_nonce: [0; 32],
+            bootstrap_principal: [0; 32],
+            bootstrap_credential_public_key: [0; 32],
+            bootstrap_credential_kind: 0,
+            bootstrap_node: [0; 32],
+            bootstrap_node_transport_public_key: [0; 32],
+            bootstrap_node_transport_peer_id: [0; ED25519_TRANSPORT_PEER_ID_BYTES],
+            bootstrap_node_encryption_public_key: [0; 32],
+            bootstrap_node_transport_signature: [0; PRIVATE_SIGNATURE_BYTES],
+        }
+    }
 }
 
 impl SystemAuthorityConfiguration {
+    fn bootstrap_node_enrollment(self) -> NodeEncryptionEnrollment {
+        NodeEncryptionEnrollment {
+            space: SpaceId(self.space),
+            principal: PrincipalId(self.bootstrap_principal),
+            node: vos::agent_sdk::NodeId(self.bootstrap_node),
+            transport_public_key: self.bootstrap_node_transport_public_key,
+            transport_peer_id: self.bootstrap_node_transport_peer_id,
+            encryption_public_key: self.bootstrap_node_encryption_public_key,
+            transport_signature: self.bootstrap_node_transport_signature,
+        }
+    }
+
     pub fn is_valid(self) -> bool {
         self.space != [0; 32]
             && self.system_agent != [0; 32]
@@ -195,12 +241,21 @@ impl SystemAuthorityConfiguration {
             && self.system_runtime_program != [0; 32]
             && self.system_runtime_producer != [0; 32]
             && self.bootstrap_authorization_high_water == ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER
+            && self.bootstrap_system_agent_creation_nonce != [0; 32]
             && self.bootstrap_principal != [0; 32]
+            && AgentId::derive(
+                SpaceId(self.space),
+                PrincipalId(self.bootstrap_principal),
+                &self.bootstrap_system_agent_creation_nonce,
+            )
+            .0 == self.system_agent
             && canonical_credential_public_key(&self.bootstrap_credential_public_key)
             && CredentialId::of_public_key(&self.bootstrap_credential_public_key)
                 != CredentialId::ZERO
             && matches!(self.bootstrap_credential_kind, 0 | 1)
-            && self.bootstrap_node != [0; 32]
+            && self
+                .bootstrap_node_enrollment()
+                .verify_with(&Ed25519CredentialVerifier)
             && self.binding.sdk().is_valid()
     }
 
@@ -223,14 +278,19 @@ impl SystemAuthorityConfiguration {
         bytes.extend_from_slice(&self.binding.public_key);
         bytes.extend_from_slice(&self.binding.initial_epoch.to_le_bytes());
         bytes.extend_from_slice(&self.bootstrap_authorization_high_water.to_le_bytes());
+        bytes.extend_from_slice(&self.bootstrap_system_agent_creation_nonce);
         bytes.extend_from_slice(&self.bootstrap_principal);
         bytes.extend_from_slice(&self.bootstrap_credential_public_key);
         bytes.push(self.bootstrap_credential_kind);
         bytes.extend_from_slice(&self.bootstrap_node);
+        bytes.extend_from_slice(&self.bootstrap_node_transport_public_key);
+        bytes.extend_from_slice(&self.bootstrap_node_transport_peer_id);
+        bytes.extend_from_slice(&self.bootstrap_node_encryption_public_key);
+        bytes.extend_from_slice(&self.bootstrap_node_transport_signature);
         bytes
     }
 
-    /// Decode SAC2 exactly. Prior clean generations, truncation, and trailing
+    /// Decode SAC3 exactly. Prior clean generations, truncation, and trailing
     /// data are all rejected; there is no legacy constructor fallback.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != CONFIG_ENCODED_BYTES
@@ -259,11 +319,16 @@ impl SystemAuthorityConfiguration {
         let bootstrap_authorization_high_water =
             u64::from_le_bytes(bytes.get(cursor..cursor + 8)?.try_into().ok()?);
         cursor += 8;
+        let bootstrap_system_agent_creation_nonce = take_fixed(bytes, &mut cursor)?;
         let bootstrap_principal = take_fixed(bytes, &mut cursor)?;
         let bootstrap_credential_public_key = take_fixed(bytes, &mut cursor)?;
         let bootstrap_credential_kind = *bytes.get(cursor)?;
         cursor += 1;
         let bootstrap_node = take_fixed(bytes, &mut cursor)?;
+        let bootstrap_node_transport_public_key = take_fixed(bytes, &mut cursor)?;
+        let bootstrap_node_transport_peer_id = take_array(bytes, &mut cursor)?;
+        let bootstrap_node_encryption_public_key = take_fixed(bytes, &mut cursor)?;
+        let bootstrap_node_transport_signature = take_array(bytes, &mut cursor)?;
         if cursor != bytes.len() {
             return None;
         }
@@ -280,21 +345,30 @@ impl SystemAuthorityConfiguration {
                 initial_epoch,
             },
             bootstrap_authorization_high_water,
+            bootstrap_system_agent_creation_nonce,
             bootstrap_principal,
             bootstrap_credential_public_key,
             bootstrap_credential_kind,
             bootstrap_node,
+            bootstrap_node_transport_public_key,
+            bootstrap_node_transport_peer_id,
+            bootstrap_node_encryption_public_key,
+            bootstrap_node_transport_signature,
         };
         value.is_valid().then_some(value)
     }
 }
 
 fn take_fixed(bytes: &[u8], cursor: &mut usize) -> Option<[u8; 32]> {
+    take_array(bytes, cursor)
+}
+
+fn take_array<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Option<[u8; N]> {
     let value = bytes
-        .get(*cursor..cursor.checked_add(32)?)?
+        .get(*cursor..cursor.checked_add(N)?)?
         .try_into()
         .ok()?;
-    *cursor += 32;
+    *cursor += N;
     Some(value)
 }
 
@@ -353,6 +427,39 @@ pub struct CredentialRow {
 pub struct NodeOwnerRow {
     pub node: [u8; 32],
     pub owner: [u8; 32],
+    pub space: [u8; 32],
+    pub transport_public_key: [u8; 32],
+    pub transport_peer_id: [u8; ED25519_TRANSPORT_PEER_ID_BYTES],
+    pub encryption_public_key: [u8; 32],
+    pub transport_signature: [u8; PRIVATE_SIGNATURE_BYTES],
+    pub enrollment_commitment: [u8; 32],
+}
+
+impl NodeOwnerRow {
+    fn from_enrollment(enrollment: NodeEncryptionEnrollment) -> Self {
+        Self {
+            node: enrollment.node.0,
+            owner: enrollment.principal.0,
+            space: enrollment.space.0,
+            transport_public_key: enrollment.transport_public_key,
+            transport_peer_id: enrollment.transport_peer_id,
+            encryption_public_key: enrollment.encryption_public_key,
+            transport_signature: enrollment.transport_signature,
+            enrollment_commitment: enrollment.commitment().0,
+        }
+    }
+
+    fn enrollment(&self) -> NodeEncryptionEnrollment {
+        NodeEncryptionEnrollment {
+            space: SpaceId(self.space),
+            principal: PrincipalId(self.owner),
+            node: vos::agent_sdk::NodeId(self.node),
+            transport_public_key: self.transport_public_key,
+            transport_peer_id: self.transport_peer_id,
+            encryption_public_key: self.encryption_public_key,
+            transport_signature: self.transport_signature,
+        }
+    }
 }
 
 #[derive(
@@ -362,6 +469,47 @@ pub struct NodeOwnerRow {
 pub struct PrincipalRoleRow {
     pub principal: [u8; 32],
     pub role: BuiltinPrincipalRole,
+}
+
+#[derive(
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct ManagedReplicaRow {
+    pub node: [u8; 32],
+    pub principal: [u8; 32],
+    /// Canonical [`ReplicaRole`] tag.
+    pub role: u8,
+}
+
+impl ManagedReplicaRow {
+    fn from_sdk(replica: AgentReplica) -> Self {
+        Self {
+            node: replica.node.0,
+            principal: replica.principal.0,
+            role: replica.role as u8,
+        }
+    }
+
+    fn sdk(self) -> Option<AgentReplica> {
+        let role = match self.role {
+            value if value == ReplicaRole::Voter as u8 => ReplicaRole::Voter,
+            value if value == ReplicaRole::Observer as u8 => ReplicaRole::Observer,
+            _ => return None,
+        };
+        Some(AgentReplica {
+            node: vos::agent_sdk::NodeId(self.node),
+            principal: PrincipalId(self.principal),
+            role,
+        })
+    }
 }
 
 #[derive(
@@ -376,6 +524,9 @@ pub struct ManagedAgentRow {
     pub runtime_program: [u8; 32],
     pub runtime_producer: [u8; 32],
     pub authority: AuthorityBindingState,
+    pub creation_nonce: [u8; 32],
+    pub replicas: Vec<ManagedReplicaRow>,
+    pub replica_generation: [u8; 32],
 }
 
 #[derive(
@@ -416,7 +567,7 @@ pub struct ManagedActorRow {
     pub root_provenance: bool,
     pub suspended: bool,
     // Runtime-selected incarnation and lifecycle debt are deliberately absent:
-    // neither is carried by ACC1/MAP1/MAA1, so the authority cannot prove them
+    // neither is carried by ACC1/MAP1/MAA2, so the authority cannot prove them
     // from the signed durable-reopen protocol.
     pub installation_id: [u8; 32],
     pub registry_reservation: [u8; 32],
@@ -433,7 +584,7 @@ pub struct RetiredActorInstallationRow {
 }
 
 fn root_managed_agent(config: SystemAuthorityConfiguration) -> ManagedAgentRow {
-    ManagedAgentRow {
+    let mut row = ManagedAgentRow {
         agent: config.system_agent,
         owner: config.bootstrap_principal,
         profile: AgentProfile::Shared as u8,
@@ -441,7 +592,52 @@ fn root_managed_agent(config: SystemAuthorityConfiguration) -> ManagedAgentRow {
         runtime_program: config.system_runtime_program,
         runtime_producer: config.system_runtime_producer,
         authority: config.binding,
-    }
+        creation_nonce: config.bootstrap_system_agent_creation_nonce,
+        replicas: vec![ManagedReplicaRow {
+            node: config.bootstrap_node,
+            principal: config.bootstrap_principal,
+            role: ReplicaRole::Voter as u8,
+        }],
+        replica_generation: [0; 32],
+    };
+    row.replica_generation = managed_replica_generation(&config, &row)
+        .expect("valid root replica generation")
+        .0;
+    row
+}
+
+fn managed_replica_rows(replicas: &[AgentReplica]) -> Vec<ManagedReplicaRow> {
+    replicas
+        .iter()
+        .copied()
+        .map(ManagedReplicaRow::from_sdk)
+        .collect()
+}
+
+fn managed_replica_generation(
+    configuration: &SystemAuthorityConfiguration,
+    row: &ManagedAgentRow,
+) -> Option<Hash> {
+    let profile = agent_profile(row.profile)?;
+    let replicas = row
+        .replicas
+        .iter()
+        .copied()
+        .map(ManagedReplicaRow::sdk)
+        .collect::<Option<Vec<_>>>()?;
+    Some(replica_set_generation(
+        &AgentIdentity {
+            space: SpaceId(configuration.space),
+            agent: AgentId(row.agent),
+            owner: PrincipalId(row.owner),
+            profile,
+            runtime_deployment: DeploymentId(row.runtime_deployment),
+            runtime_program: ProgramId(row.runtime_program),
+            runtime_producer: ProducerId(row.runtime_producer),
+        },
+        Hash(row.creation_nonce),
+        &replicas,
+    ))
 }
 
 #[derive(
@@ -451,6 +647,12 @@ fn root_managed_agent(config: SystemAuthorityConfiguration) -> ManagedAgentRow {
 pub enum PendingManagementEffect {
     None,
     Create(ManagedAgentRow),
+    ChangeReplicas {
+        agent: [u8; 32],
+        from_generation: [u8; 32],
+        to_generation: [u8; 32],
+        replicas: Vec<ManagedReplicaRow>,
+    },
     InstallActor {
         agent: [u8; 32],
         actor: [u8; 32],
@@ -490,7 +692,7 @@ pub enum PendingManagementEffect {
 #[rkyv(crate = vos::rkyv)]
 pub struct ExactRetryRecord {
     pub invocation: [u8; 32],
-    /// Deterministic MAA1 invocation reserved atomically with this ACC1.
+    /// Deterministic MAA2 invocation reserved atomically with this ACC1.
     pub acknowledgement_invocation: [u8; 32],
     pub credential_call: [u8; 32],
     pub credential_call_bytes: Vec<u8>,
@@ -729,10 +931,9 @@ impl AuthorityLinearState {
             status: CredentialStatus::Active,
         });
         let mut nodes = Vec::with_capacity(1);
-        nodes.push(NodeOwnerRow {
-            node: config.bootstrap_node,
-            owner: config.bootstrap_principal,
-        });
+        nodes.push(NodeOwnerRow::from_enrollment(
+            config.bootstrap_node_enrollment(),
+        ));
         let mut roles = Vec::with_capacity(1);
         roles.push(PrincipalRoleRow {
             principal: config.bootstrap_principal,
@@ -765,7 +966,7 @@ impl AuthorityLinearState {
 }
 
 /// Linear policy state for one Space's built-in system Agent.
-#[actor(agent, state_version = 7)]
+#[actor(agent, state_version = 8)]
 pub struct SystemAuthority {
     #[state(const)]
     configuration: SystemAuthorityConfiguration,
@@ -798,7 +999,7 @@ impl SystemAuthority {
     }
 
     /// Finalize a pending policy effect only after the durable issuer signs a
-    /// canonical MAA1 post-reopen acknowledgement. Exact acknowledgement
+    /// canonical MAA2 post-reopen acknowledgement. Exact acknowledgement
     /// retries return `true` without changing state.
     #[msg(linear)]
     fn finalize(&mut self, ack: Vec<u8>, ctx: &mut Context<Self>) -> bool {
@@ -873,6 +1074,12 @@ impl AuthorityCredentialVerifier for Ed25519CredentialVerifier {
             && verifying_key
                 .verify_strict(message, &Signature::from_bytes(signature))
                 .is_ok()
+    }
+}
+
+impl NodeEncryptionEnrollmentVerifier for Ed25519CredentialVerifier {
+    fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+        <Self as AuthorityCredentialVerifier>::verify(self, public_key, message, signature)
     }
 }
 
@@ -1233,7 +1440,7 @@ fn administer_call(
                 return Vec::new();
             };
             let mut candidate = state.clone();
-            if !apply_admin_operation(&mut candidate, &call.operation) {
+            if !apply_admin_operation(configuration, &mut candidate, &call.operation) {
                 return Vec::new();
             }
             candidate.administration_generation = generation.get();
@@ -1297,6 +1504,7 @@ fn authenticated_admin(state: &AuthorityLinearState, call: &AuthorityAdminCall) 
 }
 
 fn apply_admin_operation(
+    configuration: &SystemAuthorityConfiguration,
     state: &mut AuthorityLinearState,
     operation: &AuthorityAdminOperation,
 ) -> bool {
@@ -1377,31 +1585,33 @@ fn apply_admin_operation(
             }
             state.credentials[index].status = CredentialStatus::Revoked;
         }
-        AuthorityAdminOperation::BindNodeOwner { node, owner } => {
+        AuthorityAdminOperation::EnrollNode { enrollment } => {
             if state.nodes.len() >= MAX_AUTHORITY_NODES
+                || enrollment.space != SpaceId(configuration.space)
+                || !valid_x25519_public_key(&enrollment.encryption_public_key)
+                || !enrollment.verify_with(&Ed25519CredentialVerifier)
                 || state
                     .roles
-                    .binary_search_by(|row| row.principal.cmp(&owner.0))
+                    .binary_search_by(|row| row.principal.cmp(&enrollment.principal.0))
                     .is_err()
             {
                 return false;
             }
-            let Err(index) = state.nodes.binary_search_by(|row| row.node.cmp(&node.0)) else {
+            let Err(index) = state
+                .nodes
+                .binary_search_by(|row| row.node.cmp(&enrollment.node.0))
+            else {
                 return false;
             };
-            state.nodes.insert(
-                index,
-                NodeOwnerRow {
-                    node: node.0,
-                    owner: owner.0,
-                },
-            );
+            state
+                .nodes
+                .insert(index, NodeOwnerRow::from_enrollment(*enrollment));
         }
         AuthorityAdminOperation::UnbindNodeOwner { node, owner } => {
             let Ok(index) = state.nodes.binary_search_by(|row| row.node.cmp(&node.0)) else {
                 return false;
             };
-            if state.nodes[index].owner != owner.0 {
+            if state.nodes[index].owner != owner.0 || node_is_in_use(configuration, state, *node) {
                 return false;
             }
             state.nodes.remove(index);
@@ -1421,6 +1631,59 @@ fn apply_admin_operation(
         }
     }
     true
+}
+
+fn node_is_in_use(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    node: vos::agent_sdk::NodeId,
+) -> bool {
+    if node.0 == configuration.bootstrap_node
+        || state.managed_agents.iter().any(|managed| {
+            managed
+                .replicas
+                .iter()
+                .any(|replica| replica.node == node.0)
+        })
+        || state
+            .private_agents
+            .iter()
+            .any(|private| private.members.contains(&node.0))
+        || state
+            .private_applications
+            .iter()
+            .any(|application| application.node == node.0)
+        || state.retired_authority_operations.iter().any(|record| {
+            record
+                .private_operation
+                .is_some_and(|operation| operation.node == Some(node.0))
+        })
+    {
+        return true;
+    }
+    if state.retries.iter().any(|record| match &record.effect {
+        PendingManagementEffect::Create(row) => {
+            row.replicas.iter().any(|replica| replica.node == node.0)
+        }
+        PendingManagementEffect::ChangeReplicas { replicas, .. } => {
+            replicas.iter().any(|replica| replica.node == node.0)
+        }
+        _ => false,
+    }) {
+        return true;
+    }
+    state.operation_retries.iter().any(|record| {
+        AuthorityOperationCall::decode(&record.operation_call_bytes)
+            .ok()
+            .and_then(|call| match call.intent {
+                AuthorityOperationIntent::InvitePrivateNode { node, .. }
+                | AuthorityOperationIntent::RevokePrivateNode { node, .. } => Some(node),
+                AuthorityOperationIntent::InvokeActor { .. }
+                | AuthorityOperationIntent::Catalog { .. }
+                | AuthorityOperationIntent::RecoverPrivateAgent { .. } => None,
+            })
+            == Some(node)
+    })
 }
 
 fn credential_row(
@@ -1762,10 +2025,42 @@ fn acknowledge_private_control_application(
     candidate.private_application_commitment =
         private_application_commitment(Hash(candidate.private_application_commitment), &record).0;
     candidate.private_applications.push(record);
-    if !authority_state_is_valid(configuration, &candidate) {
+    if !synchronize_private_managed_replicas(configuration, &mut candidate, private_index)
+        || !authority_state_is_valid(configuration, &candidate)
+    {
         return false;
     }
     *state = candidate;
+    true
+}
+
+fn synchronize_private_managed_replicas(
+    configuration: &SystemAuthorityConfiguration,
+    state: &mut AuthorityLinearState,
+    private_index: usize,
+) -> bool {
+    let Some(projection) = state.private_agents.get(private_index) else {
+        return false;
+    };
+    let Ok(managed_index) = managed_agent(state, AgentId(projection.agent)) else {
+        return false;
+    };
+    let owner = projection.owner;
+    let replicas = projection
+        .members
+        .iter()
+        .map(|node| ManagedReplicaRow {
+            node: *node,
+            principal: owner,
+            role: ReplicaRole::Observer as u8,
+        })
+        .collect::<Vec<_>>();
+    let row = &mut state.managed_agents[managed_index];
+    row.replicas = replicas;
+    let Some(generation) = managed_replica_generation(configuration, row) else {
+        return false;
+    };
+    row.replica_generation = generation.0;
     true
 }
 
@@ -2032,7 +2327,7 @@ fn advance_operation_retirement_floor(state: &mut AuthorityLinearState) -> bool 
         if next > state.authorization_sequence {
             return true;
         }
-        // ACC1/MAP1/MAA1 rows remain byte-exactly retained in their separate
+        // ACC1/MAP1/MAA2 rows remain byte-exactly retained in their separate
         // journal. A management position merely proves there is no general
         // AOC1/AOP1 material to retire at this shared sequence number.
         if state
@@ -2093,6 +2388,11 @@ enum ApplicationPlan {
         row: ManagedAgentRow,
         private: Option<(usize, PrivateAgentProjectionRow)>,
     },
+    ChangeReplicas {
+        index: usize,
+        replicas: Vec<ManagedReplicaRow>,
+        generation: [u8; 32],
+    },
     InstallActor {
         index: usize,
         row: ManagedActorRow,
@@ -2144,6 +2444,10 @@ fn application_plan(
             let ManagementRequest::Create(descriptor) = &call.request else {
                 return None;
             };
+            if acknowledgement.application != ManagementReply::Created(descriptor.identity.clone())
+            {
+                return None;
+            }
             let private = if descriptor.identity.profile == AgentProfile::Private {
                 let members = descriptor
                     .replicas
@@ -2182,6 +2486,38 @@ fn application_plan(
                 private,
             })
         }
+        PendingManagementEffect::ChangeReplicas {
+            agent,
+            from_generation,
+            to_generation,
+            replicas,
+        } => {
+            let ManagementRequest::ChangeReplicas {
+                expected_generation,
+                replicas: requested,
+            } = &call.request
+            else {
+                return None;
+            };
+            let index = managed_agent(state, call.managed.agent).ok()?;
+            let row = &state.managed_agents[index];
+            if row.agent != *agent
+                || row.replica_generation != *from_generation
+                || expected_generation.0 != *from_generation
+                || managed_replica_rows(requested) != *replicas
+                || acknowledgement.application
+                    != (ManagementReply::ReplicasChanged {
+                        generation: Hash(*to_generation),
+                    })
+            {
+                return None;
+            }
+            Some(ApplicationPlan::ChangeReplicas {
+                index,
+                replicas: replicas.clone(),
+                generation: *to_generation,
+            })
+        }
         PendingManagementEffect::InstallActor { .. } => {
             let ManagementRequest::Install(install) = &call.request else {
                 return None;
@@ -2192,6 +2528,9 @@ fn application_plan(
                         .bootstrap_authorization_high_water
                         .checked_add(1)?;
             let row = installed_actor_row(call.managed.agent, install, root_provenance);
+            if acknowledgement.application != ManagementReply::Installed(install.entry.clone()) {
+                return None;
+            }
             let index = managed_actor(state, call.managed.agent, install.entry.actor).err()?;
             Some(ApplicationPlan::InstallActor { index, row })
         }
@@ -2201,6 +2540,10 @@ fn application_plan(
             };
             let index = managed_actor(state, call.managed.agent, upgrade.actor).ok()?;
             let row = upgraded_actor_row(&state.managed_actors[index], upgrade)?;
+            if acknowledgement.application != ManagementReply::Upgraded(managed_actor_entry(&row)?)
+            {
+                return None;
+            }
             Some(ApplicationPlan::ReplaceActor { index, row })
         }
         PendingManagementEffect::SetActorSuspended { suspended, .. } => {
@@ -2224,6 +2567,14 @@ fn application_plan(
                 return None;
             }
             row.suspended = *suspended;
+            let expected_application = if *suspended {
+                ManagementReply::Suspended(managed_actor_entry(&row)?)
+            } else {
+                ManagementReply::Resumed(managed_actor_entry(&row)?)
+            };
+            if acknowledgement.application != expected_application {
+                return None;
+            }
             Some(ApplicationPlan::ReplaceActor { index, row })
         }
         PendingManagementEffect::RemoveActor { .. } => {
@@ -2238,6 +2589,7 @@ fn application_plan(
             let row = &state.managed_actors[index];
             if row.deployment != expected_deployment.0
                 || state.retired_actor_installations.len() >= MAX_RETIRED_ACTOR_INSTALLATIONS
+                || acknowledgement.application != ManagementReply::Removed(*actor)
             {
                 return None;
             }
@@ -2287,6 +2639,18 @@ fn application_plan(
             } else {
                 None
             };
+            let mut upgraded = row.clone();
+            upgraded.runtime_deployment = *to_deployment;
+            upgraded.runtime_program = *to_program;
+            upgraded.runtime_producer = *producer;
+            if acknowledgement.application
+                != ManagementReply::RuntimeUpgraded(managed_agent_identity(
+                    configuration,
+                    &upgraded,
+                )?)
+            {
+                return None;
+            }
             Some(ApplicationPlan::UpgradeRuntime {
                 index,
                 private_index,
@@ -2310,6 +2674,14 @@ fn apply_application_plan(state: &mut AuthorityLinearState, plan: ApplicationPla
             if let Some((private_index, private)) = private {
                 state.private_agents.insert(private_index, private);
             }
+        }
+        ApplicationPlan::ChangeReplicas {
+            index,
+            replicas,
+            generation,
+        } => {
+            state.managed_agents[index].replicas = replicas;
+            state.managed_agents[index].replica_generation = generation;
         }
         ApplicationPlan::InstallActor { index, row } => state.managed_actors.insert(index, row),
         ApplicationPlan::ReplaceActor { index, row } => state.managed_actors[index] = row,
@@ -2491,6 +2863,103 @@ fn authenticated_credential_role(
         .map(|index| state.roles[index].role)
 }
 
+fn enrolled_node<'a>(
+    state: &'a AuthorityLinearState,
+    node: vos::agent_sdk::NodeId,
+) -> Option<&'a NodeOwnerRow> {
+    state
+        .nodes
+        .binary_search_by(|row| row.node.cmp(&node.0))
+        .ok()
+        .map(|index| &state.nodes[index])
+}
+
+fn enrolled_private_identity(
+    state: &AuthorityLinearState,
+    node: vos::agent_sdk::NodeId,
+    owner: PrincipalId,
+) -> Option<PrivateNodeIdentity> {
+    let row = enrolled_node(state, node)?;
+    if row.owner != owner.0 {
+        return None;
+    }
+    let enrollment = row.enrollment();
+    let identity = enrollment.verified_private_identity(&Ed25519CredentialVerifier)?;
+    identity.matches_enrollment(&enrollment).then_some(identity)
+}
+
+fn enrolled_private_identity_commitment(
+    state: &AuthorityLinearState,
+    node: vos::agent_sdk::NodeId,
+    owner: PrincipalId,
+) -> Option<Hash> {
+    let identity = enrolled_private_identity(state, node, owner)?;
+    Some(vos::agent_sdk::wire::authority_private_node_identity_commitment(&identity))
+}
+
+fn replicas_are_enrolled(state: &AuthorityLinearState, replicas: &[AgentReplica]) -> bool {
+    replicas.iter().all(|replica| {
+        enrolled_node(state, replica.node).is_some_and(|row| row.owner == replica.principal.0)
+    })
+}
+
+fn descriptor_replicas_are_enrolled(
+    state: &AuthorityLinearState,
+    descriptor: &vos::agent_sdk::AgentDescriptor,
+) -> bool {
+    replicas_are_enrolled(state, &descriptor.replicas)
+        && (descriptor.identity.profile != AgentProfile::Private
+            || descriptor
+                .replicas
+                .iter()
+                .all(|replica| replica.principal == descriptor.identity.owner))
+}
+
+fn managed_agent_row_from_descriptor(
+    configuration: &SystemAuthorityConfiguration,
+    descriptor: &vos::agent_sdk::AgentDescriptor,
+) -> Option<ManagedAgentRow> {
+    let mut row = ManagedAgentRow {
+        agent: descriptor.identity.agent.0,
+        owner: descriptor.identity.owner.0,
+        profile: descriptor.identity.profile as u8,
+        runtime_deployment: descriptor.identity.runtime_deployment.0,
+        runtime_program: descriptor.identity.runtime_program.0,
+        runtime_producer: descriptor.identity.runtime_producer.0,
+        authority: configuration.binding,
+        creation_nonce: descriptor.creation_nonce.0,
+        replicas: managed_replica_rows(&descriptor.replicas),
+        replica_generation: [0; 32],
+    };
+    row.replica_generation = managed_replica_generation(configuration, &row)?.0;
+    Some(row)
+}
+
+fn replica_change_effect(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    row: &ManagedAgentRow,
+    expected_generation: Hash,
+    replicas: &[AgentReplica],
+) -> Option<PendingManagementEffect> {
+    if row.profile != AgentProfile::Shared as u8
+        || expected_generation.0 != row.replica_generation
+        || !replicas_are_enrolled(state, replicas)
+    {
+        return None;
+    }
+    let projected = managed_replica_rows(replicas);
+    let mut updated = row.clone();
+    updated.replicas.clone_from(&projected);
+    let to_generation = managed_replica_generation(configuration, &updated)?.0;
+    (to_generation != row.replica_generation).then_some(PendingManagementEffect::ChangeReplicas {
+        agent: row.agent,
+        from_generation: row.replica_generation,
+        to_generation,
+        replicas: projected,
+    })
+}
+
 fn policy_effect(
     configuration: &SystemAuthorityConfiguration,
     state: &AuthorityLinearState,
@@ -2507,21 +2976,16 @@ fn policy_effect(
                     .roles
                     .binary_search_by(|row| row.principal.cmp(&descriptor.identity.owner.0))
                     .is_err()
+                || !descriptor_replicas_are_enrolled(state, descriptor)
                 || managed_agent(state, call.managed.agent).is_ok()
                 || pending_create_exists(state, call.managed.agent)
                 || live_and_pending_agent_count(state) >= MAX_MANAGED_AGENTS
             {
                 return None;
             }
-            Some(PendingManagementEffect::Create(ManagedAgentRow {
-                agent: descriptor.identity.agent.0,
-                owner: descriptor.identity.owner.0,
-                profile: descriptor.identity.profile as u8,
-                runtime_deployment: descriptor.identity.runtime_deployment.0,
-                runtime_program: descriptor.identity.runtime_program.0,
-                runtime_producer: descriptor.identity.runtime_producer.0,
-                authority: configuration.binding,
-            }))
+            Some(PendingManagementEffect::Create(
+                managed_agent_row_from_descriptor(configuration, descriptor)?,
+            ))
         }
         ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => None,
         ManagementRequest::Install(_)
@@ -2537,14 +3001,17 @@ fn policy_effect(
             }
             projected_actor_effect(configuration, state, call)
         }
-        ManagementRequest::ChangeReplicas { .. } => {
+        ManagementRequest::ChangeReplicas {
+            expected_generation,
+            replicas,
+        } => {
             let row = lifecycle_owner(configuration, state, call, role)?;
-            if row.profile == AgentProfile::Private as u8
-                || pending_runtime_transition_conflicts(state, call)
+            if pending_runtime_transition_conflicts(state, call)
+                || pending_replica_transition_conflicts(state, call)
             {
                 return None;
             }
-            Some(PendingManagementEffect::None)
+            replica_change_effect(configuration, state, row, *expected_generation, replicas)
         }
         ManagementRequest::UpgradeRuntime(upgrade) => {
             let row = lifecycle_owner(configuration, state, call, role)?;
@@ -2650,6 +3117,7 @@ fn operation_policy_allows(
             control_previous,
             epoch,
             node,
+            node_identity,
             ..
         } => {
             let Ok(index) = private_agent(state, target.agent) else {
@@ -2660,6 +3128,8 @@ fn operation_policy_allows(
                 && managed.owner == call.principal.0
                 && projection.owner == managed.owner
                 && projection.runtime_deployment == managed.runtime_deployment
+                && enrolled_private_identity_commitment(state, *node, PrincipalId(managed.owner))
+                    == Some(*node_identity)
                 && state.private_applications.len() < MAX_PRIVATE_APPLICATION_RECORDS
                 && !outstanding_private_operation_exists(state, target.agent)
                 && private_control_position_is_next(
@@ -2808,6 +3278,23 @@ fn pending_create_exists(state: &AuthorityLinearState, agent: AgentId) -> bool {
     })
 }
 
+fn pending_replica_transition_conflicts(
+    state: &AuthorityLinearState,
+    call: &AuthorityCredentialCall,
+) -> bool {
+    state.retries.iter().any(|record| {
+        record.invocation != call.invocation.0
+            && !record.finalized
+            && matches!(
+                &record.effect,
+                PendingManagementEffect::ChangeReplicas {
+                    agent: pending_agent,
+                    ..
+                } if *pending_agent == call.managed.agent.0
+            )
+    })
+}
+
 fn live_and_pending_agent_count(state: &AuthorityLinearState) -> usize {
     state.managed_agents.len()
         + state
@@ -2950,7 +3437,8 @@ fn pending_runtime_transition_conflicts(
                 pending.managed.agent.0
             }
             PendingManagementEffect::Create(row) => row.agent,
-            PendingManagementEffect::InstallActor { agent, .. }
+            PendingManagementEffect::ChangeReplicas { agent, .. }
+            | PendingManagementEffect::InstallActor { agent, .. }
             | PendingManagementEffect::UpgradeActor { agent, .. }
             | PendingManagementEffect::SetActorSuspended { agent, .. }
             | PendingManagementEffect::RemoveActor { agent, .. }
@@ -3106,6 +3594,54 @@ fn authority_blob(reference: &vos::agent_sdk::BlobRef) -> AuthorityBlobRow {
         hash: reference.hash.0,
         len: reference.len,
     }
+}
+
+fn managed_agent_identity(
+    configuration: &SystemAuthorityConfiguration,
+    row: &ManagedAgentRow,
+) -> Option<AgentIdentity> {
+    Some(AgentIdentity {
+        space: SpaceId(configuration.space),
+        agent: AgentId(row.agent),
+        owner: PrincipalId(row.owner),
+        profile: agent_profile(row.profile)?,
+        runtime_deployment: DeploymentId(row.runtime_deployment),
+        runtime_program: ProgramId(row.runtime_program),
+        runtime_producer: ProducerId(row.runtime_producer),
+    })
+}
+
+fn managed_actor_entry(row: &ManagedActorRow) -> Option<vos::agent_sdk::ActorEntry> {
+    Some(vos::agent_sdk::ActorEntry {
+        actor: ActorId(row.actor),
+        name: row.name.clone(),
+        parent: row.parent.map(ActorId),
+        deployment: DeploymentId(row.deployment),
+        program: ProgramId(row.program),
+        package: vos::agent_sdk::BlobRef {
+            hash: Hash(row.package.hash),
+            len: row.package.len,
+        },
+        agent_schema: vos::agent_sdk::BlobRef {
+            hash: Hash(row.agent_schema.hash),
+            len: row.agent_schema.len,
+        },
+        method_policy: vos::agent_sdk::BlobRef {
+            hash: Hash(row.method_policy.hash),
+            len: row.method_policy.len,
+        },
+        constructor_abi: Hash(row.constructor_abi),
+        installation_data: row
+            .installation_data
+            .as_ref()
+            .map(|data| vos::agent_sdk::BlobRef {
+                hash: Hash(data.hash),
+                len: data.len,
+            }),
+        state_layout: Hash(row.state_layout),
+        lanes: vos::agent_sdk::LaneSet::from_bits(row.lanes)?,
+        suspended: row.suspended,
+    })
 }
 
 fn installed_actor_row(
@@ -3298,6 +3834,77 @@ fn authority_blob_is_valid(row: &AuthorityBlobRow, installation_data: bool) -> b
         } else {
             row.len != 0 && row.len <= vos::agent_sdk::MAX_CATALOG_ARTIFACT_BYTES
         }
+}
+
+fn node_owner_row_is_valid(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    row: &NodeOwnerRow,
+) -> bool {
+    let enrollment = row.enrollment();
+    row.space == configuration.space
+        && state
+            .roles
+            .binary_search_by(|role| role.principal.cmp(&row.owner))
+            .is_ok()
+        && enrollment.verify_with(&Ed25519CredentialVerifier)
+        && valid_x25519_public_key(&row.encryption_public_key)
+        && enrollment.commitment().0 == row.enrollment_commitment
+}
+
+fn managed_agent_projection_is_valid(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    row: &ManagedAgentRow,
+) -> bool {
+    let Some(profile) = agent_profile(row.profile) else {
+        return false;
+    };
+    if row.agent == [0; 32]
+        || row.owner == [0; 32]
+        || row.creation_nonce == [0; 32]
+        || AgentId::derive(
+            SpaceId(configuration.space),
+            PrincipalId(row.owner),
+            &row.creation_nonce,
+        )
+        .0 != row.agent
+        || row.runtime_deployment == [0; 32]
+        || row.runtime_program == [0; 32]
+        || row.runtime_producer == [0; 32]
+        || row.authority != configuration.binding
+        || row.replicas.is_empty()
+        || row.replicas.len() > MAX_AGENT_REPLICAS
+        || !row
+            .replicas
+            .windows(2)
+            .all(|pair| pair[0].node < pair[1].node)
+        || row.replicas.iter().any(|replica| {
+            replica.node == [0; 32]
+                || replica.principal == [0; 32]
+                || replica.sdk().is_none()
+                || enrolled_node(state, vos::agent_sdk::NodeId(replica.node))
+                    .is_none_or(|node| node.owner != replica.principal)
+        })
+        || state
+            .roles
+            .binary_search_by(|role| role.principal.cmp(&row.owner))
+            .is_err()
+        || managed_replica_generation(configuration, row).map(|value| value.0)
+            != Some(row.replica_generation)
+    {
+        return false;
+    }
+    match profile {
+        AgentProfile::Local => row.replicas.len() == 1,
+        AgentProfile::Shared => row
+            .replicas
+            .iter()
+            .any(|replica| replica.role == ReplicaRole::Voter as u8),
+        AgentProfile::Private => row.replicas.iter().all(|replica| {
+            replica.principal == row.owner && replica.role == ReplicaRole::Observer as u8
+        }),
+    }
 }
 
 fn narrowed_validity(call: &AuthorityCredentialCall, observed_slot: u64) -> Option<(u64, u64)> {
@@ -3675,6 +4282,16 @@ fn private_projection_is_valid(
         if managed.profile != AgentProfile::Private as u8
             || managed.owner != row.owner
             || managed.runtime_deployment != row.runtime_deployment
+            || managed.replicas.len() != row.members.len()
+            || !managed
+                .replicas
+                .iter()
+                .zip(&row.members)
+                .all(|(replica, member)| {
+                    replica.node == *member
+                        && replica.principal == row.owner
+                        && replica.role == ReplicaRole::Observer as u8
+                })
             || row.members.is_empty()
             || row.members.len() > MAX_PRIVATE_NODES
             || row.members.iter().any(|node| *node == [0; 32])
@@ -3729,9 +4346,13 @@ fn private_projection_is_valid(
         };
         let valid_node_identity =
             if record.operation == AuthorityOperationKind::InvitePrivateNode as u8 {
-                record
-                    .node_identity
-                    .is_some_and(|identity| identity != [0; 32])
+                record.node_identity.is_some_and(|identity| {
+                    enrolled_private_identity_commitment(
+                        state,
+                        vos::agent_sdk::NodeId(record.node),
+                        PrincipalId(record.owner),
+                    ) == Some(Hash(identity))
+                })
             } else if record.operation == AuthorityOperationKind::RevokePrivateNode as u8 {
                 record.node_identity.is_none()
             } else {
@@ -3852,14 +4473,10 @@ fn authority_state_is_valid(
                     .binary_search_by(|role| role.principal.cmp(&row.principal))
                     .is_ok()
         })
-        && state.nodes.iter().all(|row| {
-            row.node != [0; 32]
-                && row.owner != [0; 32]
-                && state
-                    .roles
-                    .binary_search_by(|role| role.principal.cmp(&row.owner))
-                    .is_ok()
-        })
+        && state
+            .nodes
+            .iter()
+            .all(|row| node_owner_row_is_valid(configuration, state, row))
         && state.roles.iter().all(|row| {
             row.principal != [0; 32]
                 && state.credentials.iter().any(|credential| {
@@ -3868,19 +4485,10 @@ fn authority_state_is_valid(
                 })
         })
         && accessible_admin_exists(state)
-        && state.managed_agents.iter().all(|row| {
-            row.agent != [0; 32]
-                && row.owner != [0; 32]
-                && matches!(row.profile, 0..=2)
-                && row.runtime_deployment != [0; 32]
-                && row.runtime_program != [0; 32]
-                && row.runtime_producer != [0; 32]
-                && row.authority == configuration.binding
-                && state
-                    .roles
-                    .binary_search_by(|role| role.principal.cmp(&row.owner))
-                    .is_ok()
-        })
+        && state
+            .managed_agents
+            .iter()
+            .all(|row| managed_agent_projection_is_valid(configuration, state, row))
         && actor_projection_is_valid(configuration, state)
         && state.retries.iter().all(|row| {
             row.invocation != [0; 32]
@@ -4199,7 +4807,7 @@ fn apply_private_application_for_policy_reconstruction(
         return false;
     }
     state.private_applications.push(*record);
-    true
+    synchronize_private_managed_replicas(configuration, state, index)
 }
 
 fn reconstruction_effect(
@@ -4210,6 +4818,7 @@ fn reconstruction_effect(
     match &call.request {
         ManagementRequest::Create(descriptor) => {
             if descriptor.authority != configuration.binding.sdk()
+                || !descriptor_replicas_are_enrolled(state, descriptor)
                 || managed_agent(state, descriptor.identity.agent).is_ok()
                 || state.retries.iter().any(|record| {
                     record.invocation != call.invocation.0
@@ -4234,15 +4843,9 @@ fn reconstruction_effect(
             {
                 return None;
             }
-            Some(PendingManagementEffect::Create(ManagedAgentRow {
-                agent: descriptor.identity.agent.0,
-                owner: descriptor.identity.owner.0,
-                profile: descriptor.identity.profile as u8,
-                runtime_deployment: descriptor.identity.runtime_deployment.0,
-                runtime_program: descriptor.identity.runtime_program.0,
-                runtime_producer: descriptor.identity.runtime_producer.0,
-                authority: configuration.binding,
-            }))
+            Some(PendingManagementEffect::Create(
+                managed_agent_row_from_descriptor(configuration, descriptor)?,
+            ))
         }
         ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => None,
         ManagementRequest::Install(_)
@@ -4258,14 +4861,17 @@ fn reconstruction_effect(
             }
             projected_actor_effect(configuration, state, call)
         }
-        ManagementRequest::ChangeReplicas { .. } => {
+        ManagementRequest::ChangeReplicas {
+            expected_generation,
+            replicas,
+        } => {
             let row = reconstruction_lifecycle_row(configuration, state, call)?;
-            if row.profile == AgentProfile::Private as u8
-                || pending_runtime_transition_conflicts(state, call)
+            if pending_runtime_transition_conflicts(state, call)
+                || pending_replica_transition_conflicts(state, call)
             {
                 return None;
             }
-            Some(PendingManagementEffect::None)
+            replica_change_effect(configuration, state, row, *expected_generation, replicas)
         }
         ManagementRequest::UpgradeRuntime(upgrade) => {
             let row = reconstruction_lifecycle_row(configuration, state, call)?;
@@ -4367,7 +4973,7 @@ fn admin_history_reconstructs_identity(
                 .next_generation()
                 .is_none_or(|generation| generation.get() != record.generation)
             || !authenticated_admin(&replay, &call)
-            || !apply_admin_operation(&mut replay, &call.operation)
+            || !apply_admin_operation(configuration, &mut replay, &call.operation)
         {
             return false;
         }
@@ -4535,18 +5141,65 @@ mod tests {
     };
 
     const ADMIN_PRINCIPAL: PrincipalId = PrincipalId([0x31; 32]);
-    const ADMIN_NODE: NodeId = NodeId([0x41; 32]);
+    const ADMIN_NODE: NodeId = NodeId([
+        0x14, 0x74, 0xc7, 0x7f, 0xe2, 0x1c, 0x0e, 0x0e, 0x49, 0x7f, 0xe5, 0x18, 0x98, 0x22, 0x97,
+        0x7b, 0x51, 0xb6, 0xdf, 0xc1, 0xc0, 0xc2, 0x55, 0x6a, 0x29, 0xbf, 0x66, 0xf7, 0x4e, 0xb0,
+        0x54, 0xf8,
+    ]);
     const OBSERVED_SLOT: u64 = 100;
 
     fn signing(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
     }
 
+    fn signed_node_enrollment(
+        space: SpaceId,
+        principal: PrincipalId,
+        signing_byte: u8,
+    ) -> NodeEncryptionEnrollment {
+        let key = signing(signing_byte);
+        let encryption_byte = signing_byte.wrapping_add(1) & 0x7f;
+        let encryption_byte = if encryption_byte < 2 {
+            2
+        } else {
+            encryption_byte
+        };
+        let mut enrollment = NodeEncryptionEnrollment::from_keys(
+            space,
+            principal,
+            key.verifying_key().to_bytes(),
+            [encryption_byte; 32],
+            [1; PRIVATE_SIGNATURE_BYTES],
+        );
+        resign_node_enrollment(&mut enrollment, &key);
+        enrollment
+    }
+
+    fn resign_node_enrollment(enrollment: &mut NodeEncryptionEnrollment, key: &SigningKey) {
+        enrollment.transport_signature = [1; PRIVATE_SIGNATURE_BYTES];
+        enrollment.transport_signature = key.sign(&enrollment.signing_bytes()).to_bytes();
+    }
+
+    fn node_enrollment(
+        config: SystemAuthorityConfiguration,
+        principal: PrincipalId,
+    ) -> NodeEncryptionEnrollment {
+        signed_node_enrollment(SpaceId(config.space), principal, principal.0[0])
+    }
+
+    fn node_for_principal(config: SystemAuthorityConfiguration, principal: PrincipalId) -> NodeId {
+        node_enrollment(config, principal).node
+    }
+
     fn configuration() -> SystemAuthorityConfiguration {
         let authority_key = signing(0x71).verifying_key().to_bytes();
+        let space = SpaceId([0x11; 32]);
+        let creation_nonce = Hash([0x12; 32]);
+        let bootstrap_enrollment = signed_node_enrollment(space, ADMIN_PRINCIPAL, 0x31);
+        assert_eq!(bootstrap_enrollment.node, ADMIN_NODE);
         SystemAuthorityConfiguration {
-            space: [0x11; 32],
-            system_agent: [0x12; 32],
+            space: space.0,
+            system_agent: AgentId::derive(space, ADMIN_PRINCIPAL, creation_nonce.as_bytes()).0,
             system_runtime_deployment: [0x13; 32],
             system_runtime_program: [0x19; 32],
             system_runtime_producer: [0x1a; 32],
@@ -4563,10 +5216,15 @@ mod tests {
                 initial_epoch: 7,
             },
             bootstrap_authorization_high_water: ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER,
+            bootstrap_system_agent_creation_nonce: creation_nonce.0,
             bootstrap_principal: ADMIN_PRINCIPAL.0,
             bootstrap_credential_public_key: signing(0x21).verifying_key().to_bytes(),
             bootstrap_credential_kind: 0,
-            bootstrap_node: ADMIN_NODE.0,
+            bootstrap_node: bootstrap_enrollment.node.0,
+            bootstrap_node_transport_public_key: bootstrap_enrollment.transport_public_key,
+            bootstrap_node_transport_peer_id: bootstrap_enrollment.transport_peer_id,
+            bootstrap_node_encryption_public_key: bootstrap_enrollment.encryption_public_key,
+            bootstrap_node_transport_signature: bootstrap_enrollment.transport_signature,
         }
     }
 
@@ -4612,7 +5270,7 @@ mod tests {
             runtime_contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities::standard(),
             replicas: vec![AgentReplica {
-                node: NodeId([nonce_byte.wrapping_add(4); 32]),
+                node: node_for_principal(config, owner),
                 principal: owner,
                 role: replica_role,
             }],
@@ -5102,6 +5760,13 @@ mod tests {
         }
     }
 
+    fn fixture_member_set(nodes: impl IntoIterator<Item = NodeId>) -> Hash {
+        let mut nodes = nodes.into_iter().collect::<Vec<_>>();
+        nodes.sort_unstable();
+        private_member_set_commitment(nodes.into_iter())
+            .expect("fixture member set is canonical and bounded")
+    }
+
     fn private_application_ack(
         call: &AuthorityOperationCall,
         approval: &AuthorityOperationApproval,
@@ -5210,9 +5875,87 @@ mod tests {
 
     fn application_ack(
         config: SystemAuthorityConfiguration,
+        state: &AuthorityLinearState,
         call: &AuthorityCredentialCall,
         approval: &ManagementApproval,
     ) -> ManagementApplicationAck {
+        let application = match &call.request {
+            ManagementRequest::Create(descriptor) => {
+                ManagementReply::Created(descriptor.identity.clone())
+            }
+            ManagementRequest::Install(install) => {
+                ManagementReply::Installed(install.entry.clone())
+            }
+            ManagementRequest::UpgradeActor(upgrade) => {
+                let index = managed_actor(state, call.managed.agent, upgrade.actor)
+                    .expect("upgrade fixture actor must be installed");
+                let row = upgraded_actor_row(&state.managed_actors[index], upgrade)
+                    .expect("upgrade fixture must be valid");
+                ManagementReply::Upgraded(
+                    managed_actor_entry(&row).expect("upgrade fixture entry must be valid"),
+                )
+            }
+            ManagementRequest::Suspend {
+                actor,
+                expected_deployment,
+            }
+            | ManagementRequest::Resume {
+                actor,
+                expected_deployment,
+            } => {
+                let index = managed_actor(state, call.managed.agent, *actor)
+                    .expect("suspension fixture actor must be installed");
+                let mut row = state.managed_actors[index].clone();
+                assert_eq!(row.deployment, expected_deployment.0);
+                row.suspended = matches!(&call.request, ManagementRequest::Suspend { .. });
+                let entry = managed_actor_entry(&row).expect("suspension fixture entry is valid");
+                if row.suspended {
+                    ManagementReply::Suspended(entry)
+                } else {
+                    ManagementReply::Resumed(entry)
+                }
+            }
+            ManagementRequest::RemoveLeaf { actor, .. } => ManagementReply::Removed(*actor),
+            ManagementRequest::UpgradeRuntime(_) => {
+                let effect = reconstruction_effect(&config, state, call)
+                    .expect("runtime-upgrade fixture must be permitted");
+                let PendingManagementEffect::UpgradeRuntime {
+                    agent,
+                    to_deployment,
+                    to_program,
+                    producer,
+                    ..
+                } = effect
+                else {
+                    panic!("runtime-upgrade fixture must retain its exact effect");
+                };
+                let index = state
+                    .managed_agents
+                    .binary_search_by(|row| row.agent.cmp(&agent))
+                    .expect("runtime-upgrade fixture Agent must exist");
+                let mut row = state.managed_agents[index].clone();
+                row.runtime_deployment = to_deployment;
+                row.runtime_program = to_program;
+                row.runtime_producer = producer;
+                ManagementReply::RuntimeUpgraded(
+                    managed_agent_identity(&config, &row)
+                        .expect("runtime-upgrade fixture identity must be valid"),
+                )
+            }
+            ManagementRequest::ChangeReplicas { .. } => {
+                let effect = reconstruction_effect(&config, state, call)
+                    .expect("replica-change fixture must be permitted");
+                let PendingManagementEffect::ChangeReplicas { to_generation, .. } = effect else {
+                    panic!("replica-change fixture must retain its exact effect");
+                };
+                ManagementReply::ReplicasChanged {
+                    generation: Hash(to_generation),
+                }
+            }
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
+                panic!("read-only requests never receive management application acknowledgements")
+            }
+        };
         let mut ack = ManagementApplicationAck {
             authorization_invocation: call.invocation,
             acknowledgement_invocation: approval.acknowledgement_invocation,
@@ -5222,6 +5965,7 @@ mod tests {
             approval: approval.commitment(),
             authorization_sequence: approval.authorization_sequence,
             request: approval.request_commitment,
+            application,
             receipt: receipt_for(config, approval, approval.authorization_sequence.get()),
             reopened_state: Hash([0x73; 32]),
             applied_at: approval.valid_from,
@@ -5336,7 +6080,7 @@ mod tests {
     fn dispatch_admin(actor: &mut SystemAuthority, call: &AuthorityAdminCall) -> Vec<u8> {
         dispatch_admin_bytes(
             actor,
-            call.encode().expect("valid AAD1 fixture"),
+            call.encode().expect("valid AAD2 fixture"),
             Some(admin_context(call)),
         )
     }
@@ -5384,7 +6128,11 @@ mod tests {
         resign_admin(&mut call, &key);
         assert!(authenticated_admin(&actor.state, &call));
         let generation = call.next_generation().unwrap();
-        assert!(apply_admin_operation(&mut actor.state, &call.operation));
+        assert!(apply_admin_operation(
+            &actor.configuration,
+            &mut actor.state,
+            &call.operation,
+        ));
         actor.state.administration_generation = generation.get();
         let result = AuthorityAdminResult::from_call(call.clone()).unwrap();
         let call_bytes = call.encode().unwrap();
@@ -5501,9 +6249,18 @@ mod tests {
     fn dispatch_ack(actor: &mut SystemAuthority, ack: &ManagementApplicationAck) -> bool {
         dispatch_ack_bytes(
             actor,
-            ack.encode().expect("valid MAA1 fixture"),
+            ack.encode().expect("valid MAA2 fixture"),
             Some(acknowledgement_context(ack)),
         )
+    }
+
+    fn dispatch_application_ack(
+        actor: &mut SystemAuthority,
+        call: &AuthorityCredentialCall,
+        approval: &ManagementApproval,
+    ) -> bool {
+        let ack = application_ack(actor.configuration, &actor.state, call, approval);
+        dispatch_ack(actor, &ack)
     }
 
     fn enroll(
@@ -5513,6 +6270,19 @@ mod tests {
         node: NodeId,
         role: BuiltinPrincipalRole,
     ) {
+        let enrollment = node_enrollment(actor.configuration, principal);
+        assert_eq!(enrollment.node, node);
+        enroll_exact(actor, key, enrollment, role);
+    }
+
+    fn enroll_exact(
+        actor: &mut SystemAuthority,
+        key: &SigningKey,
+        node_enrollment: NodeEncryptionEnrollment,
+        role: BuiltinPrincipalRole,
+    ) {
+        let principal = node_enrollment.principal;
+        let node = node_enrollment.node;
         let credential = enrollment(key, AuthorityCredentialKind::Ssh);
         let invocation = |step: u8| {
             InvocationId(
@@ -5534,9 +6304,8 @@ mod tests {
         dispatch_fixture_admin(
             actor,
             invocation(1),
-            AuthorityAdminOperation::BindNodeOwner {
-                node,
-                owner: principal,
+            AuthorityAdminOperation::EnrollNode {
+                enrollment: node_enrollment,
             },
         );
         let role = match role {
@@ -5549,6 +6318,37 @@ mod tests {
             invocation(2),
             AuthorityAdminOperation::SetBuiltinRole { principal, role },
         );
+    }
+
+    fn enroll_additional_node(
+        actor: &mut SystemAuthority,
+        principal: PrincipalId,
+        signing_byte: u8,
+    ) -> NodeId {
+        let enrollment =
+            signed_node_enrollment(SpaceId(actor.configuration.space), principal, signing_byte);
+        let invocation = InvocationId(
+            Hash::digest(
+                b"vos/test/system-authority/additional-node/v1",
+                &[enrollment.commitment().as_bytes()],
+            )
+            .0,
+        );
+        dispatch_fixture_admin(
+            actor,
+            invocation,
+            AuthorityAdminOperation::EnrollNode { enrollment },
+        );
+        enrollment.node
+    }
+
+    fn enrolled_identity_commitment(
+        actor: &SystemAuthority,
+        node: NodeId,
+        principal: PrincipalId,
+    ) -> Hash {
+        enrolled_private_identity_commitment(&actor.state, node, principal)
+            .expect("fixture node must have one exact enrolled Private identity")
     }
 
     fn insert_live(actor: &mut SystemAuthority, descriptor: &AgentDescriptor) {
@@ -5572,10 +6372,7 @@ mod tests {
         resign(&mut call, &signing(0x21));
         let approval = ManagementApproval::decode(&dispatch(actor, &call))
             .expect("fixture Create must be authorized");
-        assert!(dispatch_ack(
-            actor,
-            &application_ack(config, &call, &approval)
-        ));
+        assert!(dispatch_application_ack(actor, &call, &approval));
     }
 
     fn install_catalog_projection(actor: &mut SystemAuthority) -> InstallActor {
@@ -5593,10 +6390,7 @@ mod tests {
         let approval = ManagementApproval::decode(&dispatch(actor, &call))
             .expect("root catalog install must be authorized");
         assert_eq!(approval.authorization_sequence.get(), 3);
-        assert!(dispatch_ack(
-            actor,
-            &application_ack(config, &call, &approval),
-        ));
+        assert!(dispatch_application_ack(actor, &call, &approval));
         install
     }
 
@@ -5624,24 +6418,24 @@ mod tests {
     }
 
     #[test]
-    fn sac2_configuration_is_exact_and_clean_generation_bound() {
+    fn sac3_configuration_is_exact_and_clean_generation_bound() {
         let config = configuration();
         let encoded = config.encode();
         assert_eq!(encoded.len(), CONFIG_ENCODED_BYTES);
-        assert_eq!(encoded.get(..4), Some(b"SAC2".as_slice()));
+        assert_eq!(encoded.get(..4), Some(b"SAC3".as_slice()));
         assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
         assert_eq!(
             <SystemAuthority as vos::Actor>::STATE_SCHEMA_VERSION,
-            7,
-            "Private application projection is a clean Linear state generation",
+            8,
+            "node identity and replica projection is a clean Linear state generation",
         );
 
         let mut old_generation = encoded.clone();
-        old_generation[..4].copy_from_slice(b"SAC1");
+        old_generation[..4].copy_from_slice(b"SAC2");
         assert_eq!(SystemAuthorityConfiguration::decode(&old_generation), None);
-        let mut old_sac1_shape = vec![0; CONFIG_ENCODED_BYTES - 72];
-        old_sac1_shape[..4].copy_from_slice(b"SAC1");
-        assert_eq!(SystemAuthorityConfiguration::decode(&old_sac1_shape), None);
+        let mut old_sac2_shape = vec![0; CONFIG_ENCODED_BYTES - 198];
+        old_sac2_shape[..4].copy_from_slice(b"SAC2");
+        assert_eq!(SystemAuthorityConfiguration::decode(&old_sac2_shape), None);
         let mut wrong_abi = encoded.clone();
         wrong_abi[4] ^= 1;
         assert_eq!(SystemAuthorityConfiguration::decode(&wrong_abi), None);
@@ -5686,6 +6480,37 @@ mod tests {
                 None
             );
         }
+
+        let mut wrong_node = config;
+        wrong_node.bootstrap_node[0] ^= 1;
+        assert_eq!(
+            SystemAuthorityConfiguration::decode(&wrong_node.encode()),
+            None
+        );
+        let mut wrong_transport_key = config;
+        wrong_transport_key.bootstrap_node_transport_public_key[0] ^= 1;
+        assert_eq!(
+            SystemAuthorityConfiguration::decode(&wrong_transport_key.encode()),
+            None
+        );
+        let mut wrong_peer_id = config;
+        wrong_peer_id.bootstrap_node_transport_peer_id[6] ^= 1;
+        assert_eq!(
+            SystemAuthorityConfiguration::decode(&wrong_peer_id.encode()),
+            None
+        );
+        let mut high_bit_x25519 = config;
+        high_bit_x25519.bootstrap_node_encryption_public_key[31] |= 0x80;
+        assert_eq!(
+            SystemAuthorityConfiguration::decode(&high_bit_x25519.encode()),
+            None
+        );
+        let mut wrong_transport_signature = config;
+        wrong_transport_signature.bootstrap_node_transport_signature[0] ^= 1;
+        assert_eq!(
+            SystemAuthorityConfiguration::decode(&wrong_transport_signature.encode()),
+            None
+        );
 
         let inert = SystemAuthority::new(&old_generation);
         assert!(!inert.state.initialized);
@@ -5736,7 +6561,7 @@ mod tests {
         ));
         assert!(authority_state_is_valid(&config, &actor.state));
 
-        let ack = application_ack(config, &call, &approval);
+        let ack = application_ack(config, &actor.state, &call, &approval);
         let expected_actor = installed_actor_row(AgentId(config.system_agent), &install, true);
         assert!(dispatch_ack(&mut actor, &ack));
         assert_eq!(actor.state.managed_actors, vec![expected_actor.clone()]);
@@ -5812,7 +6637,7 @@ mod tests {
             None,
             None,
         )
-        .expect("seeded SAC2 authority state restarts");
+        .expect("seeded SAC3 authority state restarts");
         assert_eq!(restarted.state.authorization_sequence, 3);
         assert_eq!(restarted.state.managed_agents, vec![expected_seed]);
         assert_eq!(restarted.state.managed_actors, vec![expected_actor]);
@@ -5858,7 +6683,7 @@ mod tests {
         assert!(dispatch(&mut actor, &duplicate).is_empty());
         assert_eq!(actor.state, pending);
 
-        let install_ack = application_ack(config, &install_call, &install_approval);
+        let install_ack = application_ack(config, &actor.state, &install_call, &install_approval);
         let installed = installed_actor_row(managed.agent, &install, false);
         assert!(dispatch_ack(&mut actor, &install_ack));
         assert_eq!(actor.state.managed_actors, vec![installed.clone()]);
@@ -5899,7 +6724,7 @@ mod tests {
             .expect("compatible UpgradeActor is approved");
         assert_eq!(upgrade_approval.authorization_sequence.get(), 5);
         assert_eq!(actor.state.managed_actors, before_upgrade_ack);
-        let upgrade_ack = application_ack(config, &upgrade_call, &upgrade_approval);
+        let upgrade_ack = application_ack(config, &actor.state, &upgrade_call, &upgrade_approval);
         let mut divergent_ack = upgrade_ack.clone();
         divergent_ack.request = Hash([0x58; 32]);
         divergent_ack.receipt.selector.request = divergent_ack.request;
@@ -5964,9 +6789,10 @@ mod tests {
             .expect("exact Suspend is approved");
         assert_eq!(suspend_approval.authorization_sequence.get(), 6);
         assert!(!actor.state.managed_actors[0].suspended);
-        assert!(dispatch_ack(
+        assert!(dispatch_application_ack(
             &mut actor,
-            &application_ack(config, &suspend_call, &suspend_approval)
+            &suspend_call,
+            &suspend_approval,
         ));
         assert!(actor.state.managed_actors[0].suspended);
 
@@ -5986,9 +6812,10 @@ mod tests {
             .expect("exact Resume is approved");
         assert_eq!(resume_approval.authorization_sequence.get(), 7);
         assert!(actor.state.managed_actors[0].suspended);
-        assert!(dispatch_ack(
+        assert!(dispatch_application_ack(
             &mut actor,
-            &application_ack(config, &resume_call, &resume_approval)
+            &resume_call,
+            &resume_approval,
         ));
         assert!(!actor.state.managed_actors[0].suspended);
 
@@ -6008,9 +6835,10 @@ mod tests {
             .expect("exact RemoveLeaf is approved");
         assert_eq!(remove_approval.authorization_sequence.get(), 8);
         assert_eq!(actor.state.managed_actors.len(), 1);
-        assert!(dispatch_ack(
+        assert!(dispatch_application_ack(
             &mut actor,
-            &application_ack(config, &remove_call, &remove_approval)
+            &remove_call,
+            &remove_approval,
         ));
         assert!(actor.state.managed_actors.is_empty());
         assert_eq!(
@@ -6049,6 +6877,148 @@ mod tests {
     }
 
     #[test]
+    fn shared_replica_projection_requires_exact_cas_and_maa2_generation() {
+        let config = configuration();
+        let mut actor = actor();
+        let additional_node = enroll_additional_node(&mut actor, ADMIN_PRINCIPAL, 0x65);
+        let shared = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Shared, 0x66);
+        insert_live(&mut actor, &shared);
+        let managed = target_for(&shared);
+        let shared_index = managed_agent(&actor.state, managed.agent).unwrap();
+        let original = actor.state.managed_agents[shared_index].clone();
+
+        let mut replacement = shared.replicas.clone();
+        replacement.push(AgentReplica {
+            node: additional_node,
+            principal: ADMIN_PRINCIPAL,
+            role: ReplicaRole::Observer,
+        });
+        replacement.sort_by_key(|replica| replica.node);
+        let change = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x67,
+            managed,
+            ManagementRequest::ChangeReplicas {
+                expected_generation: Hash(original.replica_generation),
+                replicas: replacement.clone(),
+            },
+        );
+        let approval = ManagementApproval::decode(&dispatch(&mut actor, &change))
+            .expect("exact Shared replica CAS is approved");
+        assert_eq!(actor.state.managed_agents[shared_index], original);
+
+        let acknowledgement = application_ack(config, &actor.state, &change, &approval);
+        let expected_generation = match acknowledgement.application {
+            ManagementReply::ReplicasChanged { generation } => generation,
+            _ => panic!("replica change must produce an exact typed application fact"),
+        };
+        let mut wrong_generation = acknowledgement.clone();
+        wrong_generation.application = ManagementReply::ReplicasChanged {
+            generation: Hash([0x68; 32]),
+        };
+        resign_ack(&mut wrong_generation);
+        let before_wrong_generation = actor.state.clone();
+        assert!(!dispatch_ack(&mut actor, &wrong_generation));
+        assert_eq!(actor.state, before_wrong_generation);
+
+        let mut wrong_variant = acknowledgement.clone();
+        wrong_variant.application = ManagementReply::Removed(ActorId([0x69; 32]));
+        resign_ack(&mut wrong_variant);
+        let before_wrong_variant = actor.state.clone();
+        assert!(!dispatch_ack(&mut actor, &wrong_variant));
+        assert_eq!(actor.state, before_wrong_variant);
+
+        assert!(dispatch_ack(&mut actor, &acknowledgement));
+        let projected = &actor.state.managed_agents[shared_index];
+        assert_eq!(projected.replicas, managed_replica_rows(&replacement));
+        assert_eq!(projected.replica_generation, expected_generation.0);
+
+        let unbind_in_use = admin_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0x6a,
+            actor.state.administration_generation,
+            AuthorityAdminOperation::UnbindNodeOwner {
+                node: additional_node,
+                owner: ADMIN_PRINCIPAL,
+            },
+        );
+        let before_unbind = actor.state.clone();
+        assert!(dispatch_admin(&mut actor, &unbind_in_use).is_empty());
+        assert_eq!(actor.state, before_unbind);
+
+        let stale_revert = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x6b,
+            managed,
+            ManagementRequest::ChangeReplicas {
+                expected_generation: Hash(original.replica_generation),
+                replicas: shared.replicas.clone(),
+            },
+        );
+        let before_stale = actor.state.clone();
+        assert!(dispatch(&mut actor, &stale_revert).is_empty());
+        assert_eq!(actor.state, before_stale);
+
+        for (invocation, profile, nonce) in [
+            (0x6c, AgentProfile::Local, 0x6d),
+            (0x6e, AgentProfile::Private, 0x6f),
+        ] {
+            let descriptor = descriptor(config, ADMIN_PRINCIPAL, profile, nonce);
+            insert_live(&mut actor, &descriptor);
+            let index = managed_agent(&actor.state, descriptor.identity.agent).unwrap();
+            let row = actor.state.managed_agents[index].clone();
+            let mut proposed = descriptor.replicas.clone();
+            proposed.push(AgentReplica {
+                node: additional_node,
+                principal: ADMIN_PRINCIPAL,
+                role: ReplicaRole::Observer,
+            });
+            proposed.sort_by_key(|replica| replica.node);
+            let denied = credential_call(
+                config,
+                &signing(0x21),
+                ADMIN_PRINCIPAL,
+                Some(ADMIN_NODE),
+                invocation,
+                target_for(&descriptor),
+                ManagementRequest::ChangeReplicas {
+                    expected_generation: Hash(row.replica_generation),
+                    replicas: proposed,
+                },
+            );
+            let before = actor.state.clone();
+            assert!(dispatch(&mut actor, &denied).is_empty());
+            assert_eq!(actor.state, before);
+        }
+
+        let mut corrupt_generation = actor.state.clone();
+        corrupt_generation.managed_agents[shared_index].replica_generation[0] ^= 1;
+        assert!(!authority_state_is_valid(&config, &corrupt_generation));
+        let mut corrupt_roster = actor.state.clone();
+        corrupt_roster.managed_agents[shared_index].replicas[0].principal[0] ^= 1;
+        assert!(!authority_state_is_valid(&config, &corrupt_roster));
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("exact replica projection restarts");
+        assert_eq!(restarted.state, actor.state);
+    }
+
+    #[test]
     fn pending_parent_and_runtime_transitions_are_serialized() {
         let config = configuration();
         let descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Local, 0x7f);
@@ -6068,9 +7038,10 @@ mod tests {
         );
         let parent_approval = ManagementApproval::decode(&dispatch(&mut actor, &parent_call))
             .expect("parent install approved");
-        assert!(dispatch_ack(
+        assert!(dispatch_application_ack(
             &mut actor,
-            &application_ack(config, &parent_call, &parent_approval)
+            &parent_call,
+            &parent_approval,
         ));
 
         let mut child = actor_install(managed.agent, "child", 0x82);
@@ -6142,9 +7113,10 @@ mod tests {
         assert!(dispatch(&mut actor, &blocked_runtime).is_empty());
         assert_eq!(actor.state, before);
 
-        assert!(dispatch_ack(
+        assert!(dispatch_application_ack(
             &mut actor,
-            &application_ack(config, &child_call, &child_approval)
+            &child_call,
+            &child_approval,
         ));
         let runtime_call = credential_call(
             config,
@@ -6260,9 +7232,10 @@ mod tests {
             ManagementRequest::Install(Box::new(install.clone())),
         );
         let approval = ManagementApproval::decode(&dispatch(&mut actor, &install_call)).unwrap();
-        assert!(dispatch_ack(
+        assert!(dispatch_application_ack(
             &mut actor,
-            &application_ack(config, &install_call, &approval)
+            &install_call,
+            &approval,
         ));
 
         let cross_agent = credential_call(
@@ -6310,10 +7283,7 @@ mod tests {
         );
         let mut actor = actor();
         let approval = ManagementApproval::decode(&dispatch(&mut actor, &call)).unwrap();
-        assert!(dispatch_ack(
-            &mut actor,
-            &application_ack(config, &call, &approval)
-        ));
+        assert!(dispatch_application_ack(&mut actor, &call, &approval));
         let row = actor.state.managed_actors[0].clone();
 
         let mut altered = actor.state.clone();
@@ -6344,9 +7314,10 @@ mod tests {
         );
         let later_approval =
             ManagementApproval::decode(&dispatch(&mut actor, &later_call)).unwrap();
-        assert!(dispatch_ack(
+        assert!(dispatch_application_ack(
             &mut actor,
-            &application_ack(config, &later_call, &later_approval)
+            &later_call,
+            &later_approval,
         ));
         assert!(authority_state_is_valid(&config, &actor.state));
         let root_index = actor
@@ -6421,10 +7392,7 @@ mod tests {
         );
         let approval = ManagementApproval::decode(&dispatch(&mut actor, &call)).unwrap();
         assert_eq!(approval.authorization_sequence.get(), 3);
-        assert!(dispatch_ack(
-            &mut actor,
-            &application_ack(config, &call, &approval)
-        ));
+        assert!(dispatch_application_ack(&mut actor, &call, &approval));
         let system = &actor.state.managed_agents
             [managed_agent(&actor.state, AgentId(config.system_agent)).unwrap()];
         assert_eq!(system.runtime_deployment, [0x2c; 32]);
@@ -6893,7 +7861,7 @@ mod tests {
     fn private_controls_require_exact_owner_and_recovery_remains_unproved() {
         let config = configuration();
         let owner = PrincipalId([0xb1; 32]);
-        let owner_node = NodeId([0xb2; 32]);
+        let owner_node = node_for_principal(config, owner);
         let owner_key = signing(0xb3);
         let admin_key = signing(0x21);
         let mut actor = actor();
@@ -6927,12 +7895,10 @@ mod tests {
         assert!(dispatch(&mut actor, &generic_replica_change).is_empty());
         assert_eq!(actor.state, before_replica_change);
         let initial_member_set =
-            private_member_set_commitment(descriptor.replicas.iter().map(|replica| replica.node))
-                .unwrap();
-        let invited_node = NodeId([0xf6; 32]);
-        let invited_member_set =
-            private_member_set_commitment([descriptor.replicas[0].node, invited_node].into_iter())
-                .unwrap();
+            fixture_member_set(descriptor.replicas.iter().map(|replica| replica.node));
+        let invited_node = enroll_additional_node(&mut actor, owner, 0xf6);
+        let invited_identity = enrolled_identity_commitment(&actor, invited_node, owner);
+        let invited_member_set = fixture_member_set([descriptor.replicas[0].node, invited_node]);
         let invite = AuthorityOperationIntent::InvitePrivateNode {
             managed,
             control: Hash([0xb5; 32]),
@@ -6940,7 +7906,7 @@ mod tests {
             control_previous: None,
             epoch: 0,
             node: invited_node,
-            node_identity: Hash([0xb7; 32]),
+            node_identity: invited_identity,
         };
         let revoke = AuthorityOperationIntent::RevokePrivateNode {
             managed,
@@ -7014,7 +7980,7 @@ mod tests {
     fn tombstoned_pca1_advances_only_the_exact_private_projection_and_restarts() {
         let config = configuration();
         let owner = PrincipalId([0xc1; 32]);
-        let owner_node = NodeId([0xc2; 32]);
+        let owner_node = node_for_principal(config, owner);
         let owner_key = signing(0xc3);
         let mut actor = actor();
         enroll(
@@ -7027,8 +7993,7 @@ mod tests {
         let descriptor = descriptor(config, owner, AgentProfile::Private, 0xc4);
         let managed = target_for(&descriptor);
         let initial_member_set =
-            private_member_set_commitment(descriptor.replicas.iter().map(|replica| replica.node))
-                .unwrap();
+            fixture_member_set(descriptor.replicas.iter().map(|replica| replica.node));
         insert_live(&mut actor, &descriptor);
         assert_eq!(actor.state.private_agents.len(), 1);
         assert_eq!(actor.state.private_agents[0].owner, owner.0);
@@ -7044,10 +8009,9 @@ mod tests {
             initial_member_set.0
         );
 
-        let invited_node = NodeId([0xf0; 32]);
-        let invited_member_set =
-            private_member_set_commitment([descriptor.replicas[0].node, invited_node].into_iter())
-                .unwrap();
+        let invited_node = enroll_additional_node(&mut actor, owner, 0xf0);
+        let invited_identity = enrolled_identity_commitment(&actor, invited_node, owner);
+        let invited_member_set = fixture_member_set([descriptor.replicas[0].node, invited_node]);
         let invite_control = Hash([0xc5; 32]);
         let invite_call = operation_call(
             config,
@@ -7062,7 +8026,7 @@ mod tests {
                 control_previous: None,
                 epoch: 0,
                 node: invited_node,
-                node_identity: Hash([0xc7; 32]),
+                node_identity: invited_identity,
             },
         );
         let private_before_issuance = actor.state.private_agents.clone();
@@ -7085,10 +8049,26 @@ mod tests {
         );
         let authorization_sequence = actor.state.authorization_sequence;
         let retirement_floor = actor.state.operation_retirement_floor;
-        let management_projection = actor.state.managed_agents.clone();
+        let mut management_projection = actor.state.managed_agents.clone();
         let actor_projection = actor.state.managed_actors.clone();
         let management_journal = actor.state.retries.clone();
         assert!(dispatch_private_application(&mut actor, &invite_pca));
+        let projected_index = management_projection
+            .binary_search_by(|row| row.agent.cmp(&managed.agent.0))
+            .unwrap();
+        management_projection[projected_index].replicas = actor.state.private_agents[0]
+            .members
+            .iter()
+            .map(|node| ManagedReplicaRow {
+                node: *node,
+                principal: owner.0,
+                role: ReplicaRole::Observer as u8,
+            })
+            .collect();
+        management_projection[projected_index].replica_generation =
+            managed_replica_generation(&config, &management_projection[projected_index])
+                .unwrap()
+                .0;
         assert_eq!(actor.state.authorization_sequence, authorization_sequence);
         assert_eq!(actor.state.operation_retirement_floor, retirement_floor);
         assert_eq!(actor.state.managed_agents, management_projection);
@@ -7099,10 +8079,9 @@ mod tests {
         assert_eq!(projected.control_head, Some(invite_control.0));
         assert_eq!(projected.control_sequence, Some(0));
         assert_eq!(projected.epoch, 0);
-        assert_eq!(
-            projected.members,
-            vec![descriptor.replicas[0].node.0, invited_node.0]
-        );
+        let mut expected_members = vec![descriptor.replicas[0].node.0, invited_node.0];
+        expected_members.sort_unstable();
+        assert_eq!(projected.members, expected_members);
         assert_eq!(projected.member_set, invited_member_set.0);
         assert_eq!(projected.reopened_control_state, Some([0xc8; 32]));
         assert_eq!(projected.applied_at, Some(OBSERVED_SLOT + 1));
@@ -7180,7 +8159,7 @@ mod tests {
     fn pending_pca1_source_remains_valid_when_aoi_floor_later_compacts_it() {
         let config = configuration();
         let owner = PrincipalId([0xd1; 32]);
-        let owner_node = NodeId([0xd2; 32]);
+        let owner_node = node_for_principal(config, owner);
         let owner_key = signing(0xd3);
         let mut actor = actor();
         enroll(
@@ -7196,7 +8175,10 @@ mod tests {
         let descriptor = descriptor(config, owner, AgentProfile::Private, 0xd4);
         let managed = target_for(&descriptor);
         insert_live(&mut actor, &descriptor);
-        let invited_node = NodeId([0xf1; 32]);
+        let gap_node = enroll_additional_node(&mut actor, owner, 0xf0);
+        let gap_node_identity = enrolled_identity_commitment(&actor, gap_node, owner);
+        let invited_node = enroll_additional_node(&mut actor, owner, 0xf1);
+        let invited_identity = enrolled_identity_commitment(&actor, invited_node, owner);
 
         let gap_call = operation_call(
             config,
@@ -7210,8 +8192,8 @@ mod tests {
                 control_sequence: 0,
                 control_previous: None,
                 epoch: 0,
-                node: NodeId([0xf0; 32]),
-                node_identity: Hash([0xd7; 32]),
+                node: gap_node,
+                node_identity: gap_node_identity,
             },
         );
         let gap_approval =
@@ -7231,7 +8213,7 @@ mod tests {
                 control_previous: None,
                 epoch: 0,
                 node: invited_node,
-                node_identity: Hash([0xda; 32]),
+                node_identity: invited_identity,
             },
         );
         let (target_approval, target_issuance) =
@@ -7241,9 +8223,7 @@ mod tests {
         assert!(actor.state.operation_retries.iter().any(|record| {
             record.invocation == target_call.invocation.0 && record.issuance_ack.is_some()
         }));
-        let member_set =
-            private_member_set_commitment([descriptor.replicas[0].node, invited_node].into_iter())
-                .unwrap();
+        let member_set = fixture_member_set([descriptor.replicas[0].node, invited_node]);
         let pca = private_application_ack(
             &target_call,
             &target_approval,
@@ -7272,7 +8252,7 @@ mod tests {
     fn delayed_old_runtime_pca1_is_authenticated_by_its_source_after_upgrade() {
         let config = configuration();
         let owner = PrincipalId([0xe1; 32]);
-        let owner_node = NodeId([0xe2; 32]);
+        let owner_node = node_for_principal(config, owner);
         let owner_key = signing(0xe3);
         let mut actor = actor();
         enroll(
@@ -7285,7 +8265,8 @@ mod tests {
         let descriptor = descriptor(config, owner, AgentProfile::Private, 0xe4);
         let old_managed = target_for(&descriptor);
         insert_live(&mut actor, &descriptor);
-        let invited_node = NodeId([0xf2; 32]);
+        let invited_node = enroll_additional_node(&mut actor, owner, 0xf2);
+        let invited_identity = enrolled_identity_commitment(&actor, invited_node, owner);
         let invite_call = operation_call(
             config,
             &owner_key,
@@ -7299,14 +8280,12 @@ mod tests {
                 control_previous: None,
                 epoch: 0,
                 node: invited_node,
-                node_identity: Hash([0xe7; 32]),
+                node_identity: invited_identity,
             },
         );
         let (invite_approval, invite_issuance) =
             authorize_and_issue_operation(&mut actor, &invite_call);
-        let member_set =
-            private_member_set_commitment([descriptor.replicas[0].node, invited_node].into_iter())
-                .unwrap();
+        let member_set = fixture_member_set([descriptor.replicas[0].node, invited_node]);
         let delayed_pca = private_application_ack(
             &invite_call,
             &invite_approval,
@@ -7339,12 +8318,14 @@ mod tests {
         );
         let upgrade_approval = ManagementApproval::decode(&dispatch(&mut actor, &upgrade_call))
             .expect("runtime upgrade authorized");
-        let mut upgrade_ack = application_ack(config, &upgrade_call, &upgrade_approval);
+        let mut upgrade_ack =
+            application_ack(config, &actor.state, &upgrade_call, &upgrade_approval);
         upgrade_ack.applied_at = OBSERVED_SLOT + 2;
         resign_ack(&mut upgrade_ack);
         assert!(dispatch_ack(&mut actor, &upgrade_ack));
+        let managed_index = managed_agent(&actor.state, old_managed.agent).unwrap();
         assert_eq!(
-            actor.state.managed_agents[1].runtime_deployment,
+            actor.state.managed_agents[managed_index].runtime_deployment,
             new_deployment.0
         );
         assert_eq!(
@@ -7369,7 +8350,7 @@ mod tests {
     fn pca1_rejects_missing_issuance_substitution_and_cross_domain_collisions() {
         let config = configuration();
         let owner = PrincipalId([0xa1; 32]);
-        let owner_node = NodeId([0xa2; 32]);
+        let owner_node = node_for_principal(config, owner);
         let owner_key = signing(0xa3);
         let mut actor = actor();
         enroll(
@@ -7382,10 +8363,9 @@ mod tests {
         let descriptor = descriptor(config, owner, AgentProfile::Private, 0xa4);
         let managed = target_for(&descriptor);
         insert_live(&mut actor, &descriptor);
-        let invited_node = NodeId([0xf3; 32]);
-        let member_set =
-            private_member_set_commitment([descriptor.replicas[0].node, invited_node].into_iter())
-                .unwrap();
+        let invited_node = enroll_additional_node(&mut actor, owner, 0xf3);
+        let invited_identity = enrolled_identity_commitment(&actor, invited_node, owner);
+        let member_set = fixture_member_set([descriptor.replicas[0].node, invited_node]);
         let call = operation_call(
             config,
             &owner_key,
@@ -7399,7 +8379,7 @@ mod tests {
                 control_previous: None,
                 epoch: 0,
                 node: invited_node,
-                node_identity: Hash([0xa7; 32]),
+                node_identity: invited_identity,
             },
         );
         let approval =
@@ -7560,7 +8540,7 @@ mod tests {
     fn private_projection_rejects_out_of_order_gaps_forks_epochs_and_slot_rollback() {
         let config = configuration();
         let owner = PrincipalId([0x61; 32]);
-        let owner_node = NodeId([0x62; 32]);
+        let owner_node = node_for_principal(config, owner);
         let owner_key = signing(0x63);
         let mut actor = actor();
         enroll(
@@ -7574,12 +8554,10 @@ mod tests {
         let managed = target_for(&descriptor);
         insert_live(&mut actor, &descriptor);
         let initial_member_set =
-            private_member_set_commitment(descriptor.replicas.iter().map(|replica| replica.node))
-                .unwrap();
-        let invited_node = NodeId([0xf4; 32]);
-        let invited_member_set =
-            private_member_set_commitment([descriptor.replicas[0].node, invited_node].into_iter())
-                .unwrap();
+            fixture_member_set(descriptor.replicas.iter().map(|replica| replica.node));
+        let invited_node = enroll_additional_node(&mut actor, owner, 0xf4);
+        let invited_identity = enrolled_identity_commitment(&actor, invited_node, owner);
+        let invited_member_set = fixture_member_set([descriptor.replicas[0].node, invited_node]);
 
         let first_control = Hash([0x65; 32]);
         let first_call = operation_call(
@@ -7595,7 +8573,7 @@ mod tests {
                 control_previous: None,
                 epoch: 0,
                 node: invited_node,
-                node_identity: Hash([0x67; 32]),
+                node_identity: invited_identity,
             },
         );
         let (first_approval, first_issuance) =
@@ -7645,10 +8623,9 @@ mod tests {
         );
 
         let third_control = Hash([0x6c; 32]);
-        let third_node = NodeId([0xf5; 32]);
-        let third_member_set =
-            private_member_set_commitment([descriptor.replicas[0].node, third_node].into_iter())
-                .unwrap();
+        let third_node = enroll_additional_node(&mut actor, owner, 0xf5);
+        let third_identity = enrolled_identity_commitment(&actor, third_node, owner);
+        let third_member_set = fixture_member_set([descriptor.replicas[0].node, third_node]);
         let third_call = operation_call(
             config,
             &owner_key,
@@ -7662,7 +8639,7 @@ mod tests {
                 control_previous: Some(second_control),
                 epoch: 1,
                 node: third_node,
-                node_identity: Hash([0x6f; 32]),
+                node_identity: third_identity,
             },
         );
         let before_out_of_order = actor.state.clone();
@@ -7780,11 +8757,10 @@ mod tests {
             assert_eq!(actor.state, before);
         }
 
-        let fourth_node = NodeId([0xf9; 32]);
-        let fourth_member_set = private_member_set_commitment(
-            [descriptor.replicas[0].node, third_node, fourth_node].into_iter(),
-        )
-        .unwrap();
+        let fourth_node = enroll_additional_node(&mut actor, owner, 0xf9);
+        let fourth_identity = enrolled_identity_commitment(&actor, fourth_node, owner);
+        let fourth_member_set =
+            fixture_member_set([descriptor.replicas[0].node, third_node, fourth_node]);
         let fourth_call = operation_call(
             config,
             &owner_key,
@@ -7798,7 +8774,7 @@ mod tests {
                 control_previous: Some(third_control),
                 epoch: 1,
                 node: fourth_node,
-                node_identity: Hash([0x8b; 32]),
+                node_identity: fourth_identity,
             },
         );
         let (fourth_approval, fourth_issuance) =
@@ -7853,7 +8829,7 @@ mod tests {
     fn private_projection_reconstruction_rejects_corruption_and_explicit_overflow() {
         let config = configuration();
         let owner = PrincipalId([0x51; 32]);
-        let owner_node = NodeId([0x52; 32]);
+        let owner_node = node_for_principal(config, owner);
         let owner_key = signing(0x53);
         let mut actor = actor();
         enroll(
@@ -7866,10 +8842,9 @@ mod tests {
         let descriptor = descriptor(config, owner, AgentProfile::Private, 0x54);
         let managed = target_for(&descriptor);
         insert_live(&mut actor, &descriptor);
-        let invited_node = NodeId([0xf6; 32]);
-        let member_set =
-            private_member_set_commitment([descriptor.replicas[0].node, invited_node].into_iter())
-                .unwrap();
+        let invited_node = enroll_additional_node(&mut actor, owner, 0xf6);
+        let invited_identity = enrolled_identity_commitment(&actor, invited_node, owner);
+        let member_set = fixture_member_set([descriptor.replicas[0].node, invited_node]);
         let call = operation_call(
             config,
             &owner_key,
@@ -7883,7 +8858,7 @@ mod tests {
                 control_previous: None,
                 epoch: 0,
                 node: invited_node,
-                node_identity: Hash([0x57; 32]),
+                node_identity: invited_identity,
             },
         );
         let (approval, issuance) = authorize_and_issue_operation(&mut actor, &call);
@@ -7927,9 +8902,7 @@ mod tests {
         let mut rewritten_members = actor.state.clone();
         rewritten_members.private_agents[0].members = vec![descriptor.replicas[0].node.0];
         rewritten_members.private_agents[0].member_set =
-            private_member_set_commitment(descriptor.replicas.iter().map(|replica| replica.node))
-                .unwrap()
-                .0;
+            fixture_member_set(descriptor.replicas.iter().map(|replica| replica.node)).0;
         assert!(!authority_state_is_valid(&config, &rewritten_members));
 
         let mut duplicate_member = actor.state.clone();
@@ -8165,7 +9138,7 @@ mod tests {
             let config = configuration();
             let key = signing(0x30 + ordinal as u8);
             let principal = PrincipalId([0x50 + ordinal as u8; 32]);
-            let node = NodeId([0x60 + ordinal as u8; 32]);
+            let node = node_for_principal(config, principal);
             let mut actor = actor();
             enroll(&mut actor, &key, principal, node, role);
             let call = create_call(
@@ -8208,13 +9181,13 @@ mod tests {
 
         let member_key = signing(0x83);
         let member = PrincipalId([0x84; 32]);
-        let member_node = NodeId([0x85; 32]);
+        let member_node = node_for_principal(config, member);
         let mut actor = actor();
         enroll(
             &mut actor,
             &signing(0x80),
             beneficiary,
-            NodeId([0x80; 32]),
+            node_for_principal(config, beneficiary),
             BuiltinPrincipalRole::Member,
         );
         enroll(
@@ -8274,10 +9247,10 @@ mod tests {
         let config = configuration();
         let owner_key = signing(0x91);
         let owner = PrincipalId([0x92; 32]);
-        let owner_node = NodeId([0x93; 32]);
+        let owner_node = node_for_principal(config, owner);
         let outsider_key = signing(0x94);
         let outsider = PrincipalId([0x95; 32]);
-        let outsider_node = NodeId([0x96; 32]);
+        let outsider_node = node_for_principal(config, outsider);
         let managed_descriptor = descriptor(config, owner, AgentProfile::Private, 0x97);
         let managed = target_for(&managed_descriptor);
 
@@ -8310,9 +9283,10 @@ mod tests {
         );
         let install_approval = ManagementApproval::decode(&dispatch(&mut actor, &install_call))
             .expect("admin installs the owned actor");
-        assert!(dispatch_ack(
+        assert!(dispatch_application_ack(
             &mut actor,
-            &application_ack(config, &install_call, &install_approval)
+            &install_call,
+            &install_approval,
         ));
         let request = ManagementRequest::Suspend {
             actor: install.entry.actor,
@@ -8343,9 +9317,10 @@ mod tests {
         );
         let owner_approval = ManagementApproval::decode(&dispatch(&mut actor, &owner_call))
             .expect("owner may suspend an exactly projected actor");
-        assert!(dispatch_ack(
+        assert!(dispatch_application_ack(
             &mut actor,
-            &application_ack(config, &owner_call, &owner_approval)
+            &owner_call,
+            &owner_approval,
         ));
 
         let admin_call = credential_call(
@@ -8362,9 +9337,10 @@ mod tests {
         );
         let admin_approval = ManagementApproval::decode(&dispatch(&mut actor, &admin_call))
             .expect("admin may resume an exactly projected actor");
-        assert!(dispatch_ack(
+        assert!(dispatch_application_ack(
             &mut actor,
-            &application_ack(config, &admin_call, &admin_approval)
+            &admin_call,
+            &admin_approval,
         ));
 
         let mismatched_target = vos::agent_sdk::authority::ManagedAgentTarget {
@@ -8455,46 +9431,48 @@ mod tests {
         right_principal_bytes[31] = 2;
         let left_principal = PrincipalId(left_principal_bytes);
         let right_principal = PrincipalId(right_principal_bytes);
-        let mut left_node_bytes = [0xee; 32];
-        left_node_bytes[31] = 1;
-        let mut right_node_bytes = left_node_bytes;
-        right_node_bytes[31] = 2;
-        let left_node = NodeId(left_node_bytes);
-        let right_node = NodeId(right_node_bytes);
-
         let config = configuration();
+        let left_node_enrollment =
+            signed_node_enrollment(SpaceId(config.space), left_principal, 0xee);
+        let right_node_enrollment =
+            signed_node_enrollment(SpaceId(config.space), right_principal, 0xef);
+        let left_node = left_node_enrollment.node;
+        let right_node = right_node_enrollment.node;
+        assert_ne!(left_node, right_node);
         let mut actor = actor();
-        enroll(
+        enroll_exact(
             &mut actor,
             &left_key,
-            left_principal,
-            left_node,
+            left_node_enrollment,
             BuiltinPrincipalRole::Member,
         );
-        enroll(
+        enroll_exact(
             &mut actor,
             &right_key,
-            right_principal,
-            right_node,
+            right_node_enrollment,
             BuiltinPrincipalRole::Member,
         );
-        let left = create_call(
+        let mut left_descriptor = descriptor(config, left_principal, AgentProfile::Private, 0xd2);
+        left_descriptor.replicas[0].node = left_node;
+        let left = credential_call(
             config,
             &left_key,
             left_principal,
             Some(left_node),
             0xd1,
-            AgentProfile::Private,
-            0xd2,
+            target_for(&left_descriptor),
+            ManagementRequest::Create(Box::new(left_descriptor)),
         );
-        let right = create_call(
+        let mut right_descriptor = descriptor(config, right_principal, AgentProfile::Private, 0xd4);
+        right_descriptor.replicas[0].node = right_node;
+        let right = credential_call(
             config,
             &right_key,
             right_principal,
             Some(right_node),
             0xd3,
-            AgentProfile::Private,
-            0xd4,
+            target_for(&right_descriptor),
+            ManagementRequest::Create(Box::new(right_descriptor)),
         );
         assert!(!dispatch(&mut actor, &left).is_empty());
         assert!(!dispatch(&mut actor, &right).is_empty());
@@ -8582,9 +9560,12 @@ mod tests {
             ADMIN_NODE,
             0xf3,
             2,
-            AuthorityAdminOperation::BindNodeOwner {
-                node: NodeId([0xf4; 32]),
-                owner: PrincipalId([0xf1; 32]),
+            AuthorityAdminOperation::EnrollNode {
+                enrollment: signed_node_enrollment(
+                    SpaceId(config.space),
+                    PrincipalId([0xf1; 32]),
+                    0xf4,
+                ),
             },
         );
         assert!(dispatch_admin(&mut actor, &fresh).is_empty());
@@ -8661,9 +9642,9 @@ mod tests {
         );
         assert_eq!(actor.state.managed_agents, vec![root_managed_agent(config)]);
 
-        let ack = application_ack(config, &call, &approval);
+        let ack = application_ack(config, &actor.state, &call, &approval);
         let ack_bytes = ack.encode().unwrap();
-        assert_eq!(ack_bytes.get(..4), Some(b"MAA1".as_slice()));
+        assert_eq!(ack_bytes.get(..4), Some(b"MAA2".as_slice()));
         assert!(dispatch_ack(&mut actor, &ack));
         let live = &actor.state.managed_agents
             [managed_agent(&actor.state, call.managed.agent).expect("acknowledged Agent is live")];
@@ -8703,7 +9684,7 @@ mod tests {
         );
         let mut pending = actor();
         let approval = ManagementApproval::decode(&dispatch(&mut pending, &call)).unwrap();
-        let valid = application_ack(config, &call, &approval);
+        let valid = application_ack(config, &pending.state, &call, &approval);
 
         let mut variants = Vec::new();
         let mut bad_ack_signature = valid.clone();
@@ -8798,7 +9779,7 @@ mod tests {
         );
         let candidate_ack = ManagementApproval::derive_acknowledgement_invocation(&candidate);
 
-        // First reserve the candidate's prospective MAA1 ID as another ACC1
+        // First reserve the candidate's prospective MAA2 ID as another ACC1
         // ID. The candidate must be denied before consuming a sequence or
         // adding its pending Create effect.
         let mut blocker = create_call(
@@ -8821,7 +9802,7 @@ mod tests {
         assert_eq!(actor.state, before);
 
         // The reciprocal collision is also reserved immediately: a later
-        // ACC1 cannot claim the blocker's prospective MAA1 ID while the
+        // ACC1 cannot claim the blocker's prospective MAA2 ID while the
         // blocker is still pending finalization.
         let mut authorization_collision = create_call(
             config,
@@ -8852,7 +9833,7 @@ mod tests {
         );
         let mut actor = actor();
         let approval = ManagementApproval::decode(&dispatch(&mut actor, &call)).unwrap();
-        let ack = application_ack(config, &call, &approval);
+        let ack = application_ack(config, &actor.state, &call, &approval);
         assert!(dispatch_ack(&mut actor, &ack));
 
         let mut conflict = ack.clone();
@@ -8874,10 +9855,169 @@ mod tests {
         other_call.invocation = ack.acknowledgement_invocation;
         resign(&mut other_call, &signing(0x21));
         let before = actor.state.clone();
-        // The actor also rejects an ACC1 that reuses a finalized MAA1 runtime
+        // The actor also rejects an ACC1 that reuses a finalized MAA2 runtime
         // invocation, even though the runtime should catch this first.
         assert!(dispatch(&mut actor, &other_call).is_empty());
         assert_eq!(actor.state, before);
+    }
+
+    #[test]
+    fn exact_node_enrollment_and_replica_use_reject_substitution_and_unbind() {
+        let config = configuration();
+        let admin_key = signing(0x21);
+        let principal = PrincipalId([0x79; 32]);
+        let principal_key = signing(0x78);
+        let transport_key = signing(0x7a);
+        let mut actor = actor();
+
+        let enroll_principal = admin_call(
+            config,
+            &admin_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0x70,
+            1,
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal,
+                credential: enrollment(&principal_key, AuthorityCredentialKind::Ssh),
+            },
+        );
+        assert!(!dispatch_admin(&mut actor, &enroll_principal).is_empty());
+
+        for (index, profile) in [
+            AgentProfile::Shared,
+            AgentProfile::Local,
+            AgentProfile::Private,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut descriptor = descriptor(config, principal, profile, 0x60 + index as u8);
+            descriptor.replicas[0].node = NodeId([0x7b + index as u8; 32]);
+            let call = credential_call(
+                config,
+                &admin_key,
+                ADMIN_PRINCIPAL,
+                Some(ADMIN_NODE),
+                0x73 + index as u8,
+                target_for(&descriptor),
+                ManagementRequest::Create(Box::new(descriptor)),
+            );
+            let before = actor.state.clone();
+            assert!(dispatch(&mut actor, &call).is_empty());
+            assert_eq!(actor.state, before);
+        }
+
+        let good = signed_node_enrollment(SpaceId(config.space), principal, 0x7a);
+
+        let mut wrong_peer_id = good;
+        wrong_peer_id.transport_peer_id[6] ^= 1;
+        let mut wrong_transport_key = good;
+        wrong_transport_key.transport_public_key[0] ^= 1;
+        let mut high_bit_x25519 = good;
+        high_bit_x25519.encryption_public_key[31] |= 0x80;
+        resign_node_enrollment(&mut high_bit_x25519, &transport_key);
+        let mut low_order_x25519 = good;
+        low_order_x25519.encryption_public_key =
+            vos::agent_sdk::private::X25519_LOW_ORDER_PUBLIC_KEYS[1];
+        resign_node_enrollment(&mut low_order_x25519, &transport_key);
+        for (index, invalid) in [
+            wrong_peer_id,
+            wrong_transport_key,
+            high_bit_x25519,
+            low_order_x25519,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let call = admin_call(
+                config,
+                &admin_key,
+                ADMIN_PRINCIPAL,
+                ADMIN_NODE,
+                0x80 + index as u8,
+                2,
+                AuthorityAdminOperation::EnrollNode {
+                    enrollment: invalid,
+                },
+            );
+            assert!(call.encode().is_err());
+        }
+
+        let mut wrong_space = good;
+        wrong_space.space = SpaceId([0x7d; 32]);
+        resign_node_enrollment(&mut wrong_space, &transport_key);
+        let mut missing_owner = good;
+        missing_owner.principal = PrincipalId([0x7e; 32]);
+        resign_node_enrollment(&mut missing_owner, &transport_key);
+        let mut wrong_signature = good;
+        wrong_signature.transport_signature[0] ^= 1;
+        for (index, invalid) in [wrong_space, missing_owner, wrong_signature]
+            .into_iter()
+            .enumerate()
+        {
+            let call = admin_call(
+                config,
+                &admin_key,
+                ADMIN_PRINCIPAL,
+                ADMIN_NODE,
+                0x84 + index as u8,
+                2,
+                AuthorityAdminOperation::EnrollNode {
+                    enrollment: invalid,
+                },
+            );
+            let before = actor.state.clone();
+            assert!(dispatch_admin(&mut actor, &call).is_empty());
+            assert_eq!(actor.state, before);
+        }
+
+        let enroll_node = admin_call(
+            config,
+            &admin_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0x87,
+            2,
+            AuthorityAdminOperation::EnrollNode { enrollment: good },
+        );
+        assert!(!dispatch_admin(&mut actor, &enroll_node).is_empty());
+        assert_eq!(
+            enrolled_node(&actor.state, good.node).unwrap().enrollment(),
+            good
+        );
+
+        let duplicate = admin_call(
+            config,
+            &admin_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0x88,
+            3,
+            AuthorityAdminOperation::EnrollNode { enrollment: good },
+        );
+        let before_duplicate = actor.state.clone();
+        assert!(dispatch_admin(&mut actor, &duplicate).is_empty());
+        assert_eq!(actor.state, before_duplicate);
+
+        let mut local = descriptor(config, principal, AgentProfile::Local, 0x68);
+        local.replicas[0].node = good.node;
+        insert_live(&mut actor, &local);
+        let unbind = admin_call(
+            config,
+            &admin_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0x89,
+            3,
+            AuthorityAdminOperation::UnbindNodeOwner {
+                node: good.node,
+                owner: principal,
+            },
+        );
+        let before_unbind = actor.state.clone();
+        assert!(dispatch_admin(&mut actor, &unbind).is_empty());
+        assert_eq!(actor.state, before_unbind);
     }
 
     #[test]
@@ -8887,8 +10027,9 @@ mod tests {
         let principal = PrincipalId([0x81; 32]);
         let first_key = signing(0x82);
         let second_key = signing(0x83);
-        let first_node = NodeId([0x84; 32]);
-        let second_node = NodeId([0x85; 32]);
+        let first_node_enrollment = signed_node_enrollment(SpaceId(config.space), principal, 0x84);
+        let second_node_enrollment = signed_node_enrollment(SpaceId(config.space), principal, 0x85);
+        let first_node = first_node_enrollment.node;
         let mut actor = actor();
 
         let enroll_call = admin_call(
@@ -8931,16 +10072,14 @@ mod tests {
             ),
             (
                 0x83,
-                AuthorityAdminOperation::BindNodeOwner {
-                    node: first_node,
-                    owner: principal,
+                AuthorityAdminOperation::EnrollNode {
+                    enrollment: first_node_enrollment,
                 },
             ),
             (
                 0x84,
-                AuthorityAdminOperation::BindNodeOwner {
-                    node: second_node,
-                    owner: principal,
+                AuthorityAdminOperation::EnrollNode {
+                    enrollment: second_node_enrollment,
                 },
             ),
             (
@@ -9138,17 +10277,15 @@ mod tests {
             ADMIN_NODE,
             0xb3,
             1,
-            AuthorityAdminOperation::BindNodeOwner {
-                node: NodeId([0xb3; 32]),
-                owner: principal,
+            AuthorityAdminOperation::EnrollNode {
+                enrollment: signed_node_enrollment(SpaceId(config.space), principal, 0xb3),
             },
         );
         assert!(dispatch_admin(&mut actor, &stale).is_empty());
 
         let mut conflict = call;
-        conflict.operation = AuthorityAdminOperation::BindNodeOwner {
-            node: NodeId([0xb4; 32]),
-            owner: principal,
+        conflict.operation = AuthorityAdminOperation::EnrollNode {
+            enrollment: signed_node_enrollment(SpaceId(config.space), principal, 0xb4),
         };
         resign_admin(&mut conflict, &key);
         assert!(dispatch_admin(&mut actor, &conflict).is_empty());
@@ -9201,7 +10338,9 @@ mod tests {
         let inaccessible = PrincipalId([0xc1; 32]);
         let inaccessible_key = signing(0xc2);
         let replacement_key = signing(0xc3);
-        let replacement_node = NodeId([0xc4; 32]);
+        let replacement_node_enrollment =
+            signed_node_enrollment(SpaceId(config.space), inaccessible, 0xc4);
+        let replacement_node = replacement_node_enrollment.node;
         let mut actor = actor();
 
         let enroll = admin_call(
@@ -9334,9 +10473,8 @@ mod tests {
             ADMIN_NODE,
             0xca,
             5,
-            AuthorityAdminOperation::BindNodeOwner {
-                node: replacement_node,
-                owner: inaccessible,
+            AuthorityAdminOperation::EnrollNode {
+                enrollment: replacement_node_enrollment,
             },
         );
         assert!(!dispatch_admin(&mut actor, &bind_replacement).is_empty());
@@ -9394,9 +10532,12 @@ mod tests {
             ADMIN_NODE,
             0xd2,
             2,
-            AuthorityAdminOperation::BindNodeOwner {
-                node: NodeId([0xd3; 32]),
-                owner: PrincipalId([0xd1; 32]),
+            AuthorityAdminOperation::EnrollNode {
+                enrollment: signed_node_enrollment(
+                    SpaceId(config.space),
+                    PrincipalId([0xd1; 32]),
+                    0xd3,
+                ),
             },
         );
         assert!(!dispatch_admin(&mut actor, &bind).is_empty());
@@ -9437,20 +10578,54 @@ mod tests {
         dangling_node
             .nodes
             .iter_mut()
-            .find(|row| row.node == [0xd3; 32])
+            .find(|row| row.owner == [0xd1; 32])
             .unwrap()
             .owner = [0xd4; 32];
         assert!(!authority_state_is_valid(&config, &dangling_node));
+
+        let node_index = actor
+            .state
+            .nodes
+            .iter()
+            .position(|row| row.owner == [0xd1; 32])
+            .unwrap();
+        let mut wrong_node_space = actor.state.clone();
+        wrong_node_space.nodes[node_index].space[0] ^= 1;
+        assert!(!authority_state_is_valid(&config, &wrong_node_space));
+        let mut wrong_transport_key = actor.state.clone();
+        wrong_transport_key.nodes[node_index].transport_public_key[0] ^= 1;
+        assert!(!authority_state_is_valid(&config, &wrong_transport_key));
+        let mut wrong_peer_id = actor.state.clone();
+        wrong_peer_id.nodes[node_index].transport_peer_id[6] ^= 1;
+        assert!(!authority_state_is_valid(&config, &wrong_peer_id));
+        let mut wrong_x25519 = actor.state.clone();
+        wrong_x25519.nodes[node_index].encryption_public_key[31] |= 0x80;
+        assert!(!authority_state_is_valid(&config, &wrong_x25519));
+        let mut wrong_transport_signature = actor.state.clone();
+        wrong_transport_signature.nodes[node_index].transport_signature[0] ^= 1;
+        assert!(!authority_state_is_valid(
+            &config,
+            &wrong_transport_signature
+        ));
+        let mut wrong_enrollment_commitment = actor.state.clone();
+        wrong_enrollment_commitment.nodes[node_index].enrollment_commitment[0] ^= 1;
+        assert!(!authority_state_is_valid(
+            &config,
+            &wrong_enrollment_commitment
+        ));
 
         let mut orphaned_agent = actor.state.clone();
         orphaned_agent.managed_agents.push(ManagedAgentRow {
             agent: [0xd5; 32],
             owner: [0xd6; 32],
             profile: AgentProfile::Private as u8,
+            creation_nonce: [0xda; 32],
             runtime_deployment: [0xd7; 32],
             runtime_program: [0xd8; 32],
             runtime_producer: [0xd9; 32],
             authority: config.binding,
+            replicas: Vec::new(),
+            replica_generation: [0xdb; 32],
         });
         assert!(!authority_state_is_valid(&config, &orphaned_agent));
     }
@@ -9465,10 +10640,12 @@ mod tests {
             let key = SigningKey::from_bytes(&seed);
             let mut principal = [0xe2; 32];
             principal[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
-            let mut node = [0xe3; 32];
-            node[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
             let principal = PrincipalId(principal);
-            let node = NodeId(node);
+            let node_enrollment = signed_node_enrollment(
+                SpaceId(config.space),
+                principal,
+                u8::try_from(ordinal).unwrap().wrapping_add(0x80),
+            );
             let credential = enrollment(&key, AuthorityCredentialKind::Ssh);
             let invocation = |step: u8| {
                 InvocationId(
@@ -9490,9 +10667,8 @@ mod tests {
             record_fixture_admin(
                 &mut actor,
                 invocation(1),
-                AuthorityAdminOperation::BindNodeOwner {
-                    node,
-                    owner: principal,
+                AuthorityAdminOperation::EnrollNode {
+                    enrollment: node_enrollment,
                 },
             );
         }

@@ -1045,10 +1045,9 @@ fn encode_authority_admin_operation(encoder: &mut Encoder<'_>, value: &Authority
             encoder.fixed(principal.as_bytes());
             encoder.fixed(credential.as_bytes());
         }
-        AuthorityAdminOperation::BindNodeOwner { node, owner } => {
+        AuthorityAdminOperation::EnrollNode { enrollment } => {
             encoder.u8(3);
-            encoder.fixed(node.as_bytes());
-            encoder.fixed(owner.as_bytes());
+            encoder.bytes(&encode_node_encryption_enrollment_wire(enrollment));
         }
         AuthorityAdminOperation::UnbindNodeOwner { node, owner } => {
             encoder.u8(4);
@@ -1079,9 +1078,11 @@ fn decode_authority_admin_operation(
             principal: PrincipalId(decoder.fixed()?),
             credential: CredentialId(decoder.fixed()?),
         },
-        3 => AuthorityAdminOperation::BindNodeOwner {
-            node: NodeId(decoder.fixed()?),
-            owner: PrincipalId(decoder.fixed()?),
+        3 => AuthorityAdminOperation::EnrollNode {
+            enrollment: NodeEncryptionEnrollment::decode(
+                decoder.bytes_ref_bounded(MAX_NODE_ENCRYPTION_ENROLLMENT_WIRE_BYTES)?,
+            )
+            .map_err(|_| DecodeError::NonCanonical)?,
         },
         4 => AuthorityAdminOperation::UnbindNodeOwner {
             node: NodeId(decoder.fixed()?),
@@ -1106,10 +1107,10 @@ fn decode_authority_admin_operation(
 
 pub(crate) fn authority_admin_operation_commitment(value: &AuthorityAdminOperation) -> Hash {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AAOP");
+    bytes.extend_from_slice(b"AAO2");
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_authority_admin_operation(&mut Encoder(&mut bytes), value);
-    Hash::digest(b"vos/agent/authority-admin-operation/v1", &[&bytes])
+    Hash::digest(b"vos/agent/authority-admin-operation/v2", &[&bytes])
 }
 
 fn encode_authority_admin_call_unsigned(encoder: &mut Encoder<'_>, value: &AuthorityAdminCall) {
@@ -1126,7 +1127,7 @@ fn encode_authority_admin_call_unsigned(encoder: &mut Encoder<'_>, value: &Autho
 
 pub(crate) fn authority_admin_call_signing_bytes(value: &AuthorityAdminCall) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AADS");
+    bytes.extend_from_slice(b"AA2S");
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_authority_admin_call_unsigned(&mut Encoder(&mut bytes), value);
     bytes
@@ -1175,7 +1176,7 @@ fn decode_authority_admin_call_body(
 }
 
 impl CanonicalWire for AuthorityAdminCall {
-    const MAGIC: [u8; 4] = *b"AAD1";
+    const MAGIC: [u8; 4] = *b"AAD2";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_ADMIN_CALL_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -1204,14 +1205,14 @@ pub(crate) fn authority_admin_result_encoded_len(value: &AuthorityAdminResult) -
 
 pub(crate) fn authority_admin_result_commitment(value: &AuthorityAdminResult) -> Hash {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AARC");
+    bytes.extend_from_slice(b"AAR2");
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_authority_admin_result_body(&mut Encoder(&mut bytes), value);
-    Hash::digest(b"vos/agent/authority-admin-result/v1", &[&bytes])
+    Hash::digest(b"vos/agent/authority-admin-result/v2", &[&bytes])
 }
 
 impl CanonicalWire for AuthorityAdminResult {
-    const MAGIC: [u8; 4] = *b"AAR1";
+    const MAGIC: [u8; 4] = *b"AAR2";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_ADMIN_RESULT_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -1359,6 +1360,7 @@ fn encode_management_application_ack_unsigned(
     encoder.u64(value.authorization_sequence.get());
     encoder.fixed(value.request.as_bytes());
     encode_authority_receipt_body(encoder, &value.receipt);
+    encode_management_reply(encoder, &value.application);
     encoder.fixed(value.reopened_state.as_bytes());
     encoder.u64(value.applied_at);
 }
@@ -1367,7 +1369,7 @@ pub(crate) fn management_application_ack_signing_bytes(
     value: &ManagementApplicationAck,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"MAAS");
+    bytes.extend_from_slice(b"MA2S");
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_management_application_ack_unsigned(&mut Encoder(&mut bytes), value);
     bytes
@@ -1382,7 +1384,7 @@ pub(crate) fn management_application_ack_encoded_len(value: &ManagementApplicati
 }
 
 impl CanonicalWire for ManagementApplicationAck {
-    const MAGIC: [u8; 4] = *b"MAA1";
+    const MAGIC: [u8; 4] = *b"MAA2";
     const MAX_ENCODED_BYTES: usize = MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -1405,6 +1407,7 @@ impl CanonicalWire for ManagementApplicationAck {
             core::num::NonZeroU64::new(decoder.u64()?).ok_or(DecodeError::NonCanonical)?;
         let request = Hash(decoder.fixed()?);
         let receipt = decode_authority_receipt_body(decoder)?;
+        let application = decode_management_reply(decoder)?;
         let reopened_state = Hash(decoder.fixed()?);
         let applied_at = decoder.u64()?;
         let signature = decoder
@@ -1421,6 +1424,7 @@ impl CanonicalWire for ManagementApplicationAck {
             authorization_sequence,
             request,
             receipt,
+            application,
             reopened_state,
             applied_at,
             signature,
@@ -2705,7 +2709,7 @@ fn identity_valid(value: &AgentIdentity) -> bool {
         && value.runtime_producer != ProducerId::ZERO
 }
 
-fn management_reply_valid(value: &ManagementReply) -> bool {
+pub(crate) fn management_reply_valid(value: &ManagementReply) -> bool {
     match value {
         ManagementReply::Created(identity) | ManagementReply::RuntimeUpgraded(identity) => {
             identity_valid(identity)
@@ -2723,6 +2727,16 @@ fn management_reply_valid(value: &ManagementReply) -> bool {
         ManagementReply::Removed(actor) => *actor != ActorId::ZERO,
         ManagementReply::ReplicasChanged { generation } => *generation != Hash::ZERO,
     }
+}
+
+/// Commitment of one exact typed management application reply. Durable
+/// issuers use this while pledging an MAA2 before invoking an external signer.
+pub fn management_reply_commitment(value: &ManagementReply) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"MRC2");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_management_reply(&mut Encoder(&mut bytes), value);
+    Hash::digest(b"vos/agent/management-reply/v2", &[&bytes])
 }
 
 fn encode_management_reply(encoder: &mut Encoder<'_>, value: &ManagementReply) {
@@ -3187,6 +3201,15 @@ fn encode_node_encryption_enrollment_fields(
     encoder.0.extend_from_slice(&value.encryption_public_key);
 }
 
+fn encode_node_encryption_enrollment_wire(value: &NodeEncryptionEnrollment) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(MAX_NODE_ENCRYPTION_ENROLLMENT_WIRE_BYTES);
+    bytes.extend_from_slice(b"NEN1");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_node_encryption_enrollment_fields(&mut Encoder(&mut bytes), value);
+    bytes.extend_from_slice(&value.transport_signature);
+    bytes
+}
+
 /// Exact Ed25519 possession-proof preimage. This is deliberately a sibling
 /// domain of the full `NEN1` wire so a signature cannot be replayed as any
 /// other canonical message or over a representation which already contains
@@ -3210,8 +3233,8 @@ impl CanonicalWire for NodeEncryptionEnrollment {
     }
 
     fn encode_body(&self, encoder: &mut Encoder<'_>) {
-        encode_node_encryption_enrollment_fields(encoder, self);
-        encoder.0.extend_from_slice(&self.transport_signature);
+        let nested = encode_node_encryption_enrollment_wire(self);
+        encoder.0.extend_from_slice(&nested[HEADER_BYTES..]);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -3250,6 +3273,20 @@ pub(crate) fn encode_private_node(encoder: &mut Encoder<'_>, value: &PrivateNode
     encoder.0.extend_from_slice(&value.encryption_public_key);
     encoder.fixed(value.authority_binding.as_bytes());
     encoder.0.extend_from_slice(&value.transport_signature);
+}
+
+/// Commitment carried by an AOC1 Private Invite for one exact enrolled
+/// transport/encryption identity.
+///
+/// This public computation lets an authority guest compare the compact AOC1
+/// field with its verified NEN1 row without trusting a caller-supplied second
+/// encoding of the identity.
+pub fn authority_private_node_identity_commitment(value: &PrivateNodeIdentity) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"APNI");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_private_node(&mut Encoder(&mut bytes), value);
+    Hash::digest(b"vos/agent/authority-private-node/v1", &[&bytes])
 }
 
 fn decode_private_node(decoder: &mut Decoder<'_>) -> Result<PrivateNodeIdentity, DecodeError> {
@@ -3823,6 +3860,8 @@ mod tests {
     fn management_application_ack() -> ManagementApplicationAck {
         let call = authority_credential_call();
         let approval = management_approval();
+        let mut applied_actor = actor(0x30);
+        applied_actor.suspended = true;
         let actor = approval.request.authority_actor();
         let receipt = AuthorityReceipt {
             selector: AuthorityReceiptSelector {
@@ -3855,6 +3894,7 @@ mod tests {
             approval: approval.commitment(),
             authorization_sequence: approval.authorization_sequence,
             request: approval.request_commitment,
+            application: ManagementReply::Suspended(applied_actor),
             receipt,
             reopened_state: Hash([0x52; 32]),
             applied_at: approval.valid_from,
@@ -3914,17 +3954,17 @@ mod tests {
 
         let acknowledgement = management_application_ack();
         let acknowledgement_bytes = acknowledgement.encode().unwrap();
-        assert_eq!(acknowledgement_bytes.get(..4), Some(b"MAA1".as_slice()));
+        assert_eq!(acknowledgement_bytes.get(..4), Some(b"MAA2".as_slice()));
         assert!(acknowledgement_bytes.len() <= MAX_INVOCATION_MESSAGE_BYTES);
         assert_eq!(
             ManagementApplicationAck::decode(&acknowledgement_bytes),
             Ok(acknowledgement)
         );
         assert_eq!(
-            Hash::digest(b"vos/test/maa1-golden", &[&acknowledgement_bytes]).0,
+            Hash::digest(b"vos/test/maa2-golden", &[&acknowledgement_bytes]).0,
             [
-                90, 212, 112, 243, 166, 54, 207, 156, 236, 125, 192, 126, 249, 196, 81, 153, 124,
-                26, 168, 250, 9, 212, 47, 7, 125, 140, 69, 98, 195, 153, 171, 126,
+                75, 120, 138, 76, 173, 29, 115, 44, 75, 8, 137, 177, 72, 124, 130, 44, 137, 137,
+                126, 244, 162, 67, 209, 253, 125, 111, 12, 97, 229, 197, 142, 224,
             ]
         );
     }
@@ -3933,30 +3973,30 @@ mod tests {
     fn authority_admin_call_and_result_are_exact_bounded_clean_wires() {
         let call = authority_admin_call();
         let bytes = call.encode().unwrap();
-        assert_eq!(bytes.get(..4), Some(b"AAD1".as_slice()));
+        assert_eq!(bytes.get(..4), Some(b"AAD2".as_slice()));
         assert!(bytes.len() <= MAX_AUTHORITY_ADMIN_CALL_WIRE_BYTES);
         assert_eq!(AuthorityAdminCall::decode(&bytes), Ok(call.clone()));
         assert_eq!(
-            Hash::digest(b"vos/test/aad1-golden", &[&bytes]).0,
+            Hash::digest(b"vos/test/aad2-golden", &[&bytes]).0,
             [
-                63, 106, 248, 168, 149, 90, 112, 163, 135, 54, 49, 11, 201, 60, 42, 203, 112, 95,
-                32, 35, 120, 152, 222, 83, 178, 135, 209, 63, 117, 222, 18, 135,
+                15, 102, 177, 154, 123, 213, 113, 83, 196, 171, 213, 250, 170, 107, 110, 185, 5,
+                44, 29, 248, 196, 214, 130, 163, 207, 204, 105, 163, 158, 21, 87, 255,
             ]
         );
 
         let result = AuthorityAdminResult::from_call(call.clone()).unwrap();
         let result_bytes = result.encode().unwrap();
-        assert_eq!(result_bytes.get(..4), Some(b"AAR1".as_slice()));
+        assert_eq!(result_bytes.get(..4), Some(b"AAR2".as_slice()));
         assert!(result_bytes.len() <= MAX_AUTHORITY_ADMIN_RESULT_WIRE_BYTES);
         assert_eq!(
             AuthorityAdminResult::decode(&result_bytes),
             Ok(result.clone())
         );
         assert_eq!(
-            Hash::digest(b"vos/test/aar1-golden", &[&result_bytes]).0,
+            Hash::digest(b"vos/test/aar2-golden", &[&result_bytes]).0,
             [
-                91, 168, 155, 97, 17, 21, 56, 171, 95, 214, 2, 31, 23, 12, 240, 24, 10, 61, 50,
-                192, 173, 254, 28, 238, 132, 46, 82, 171, 7, 202, 193, 179,
+                81, 197, 104, 54, 223, 138, 161, 87, 2, 136, 118, 99, 156, 96, 210, 204, 4, 77, 88,
+                177, 204, 146, 170, 50, 162, 235, 164, 1, 216, 48, 184, 206,
             ]
         );
         assert_ne!(call.commitment(), result.commitment());
@@ -3979,6 +4019,12 @@ mod tests {
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(AuthorityAdminCall::decode(&trailing).is_err());
+        let mut previous_generation = bytes.clone();
+        previous_generation[..4].copy_from_slice(b"AAD1");
+        assert!(AuthorityAdminCall::decode(&previous_generation).is_err());
+        let mut previous_result_generation = result_bytes;
+        previous_result_generation[..4].copy_from_slice(b"AAR1");
+        assert!(AuthorityAdminResult::decode(&previous_result_generation).is_err());
         let mut prior_abi = bytes;
         prior_abi[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
         assert!(AuthorityAdminCall::decode(&prior_abi).is_err());
@@ -4186,6 +4232,9 @@ mod tests {
 
         let acknowledgement = management_application_ack();
         let encoded = acknowledgement.encode().unwrap();
+        let mut previous_generation = encoded.clone();
+        previous_generation[..4].copy_from_slice(b"MAA1");
+        assert!(ManagementApplicationAck::decode(&previous_generation).is_err());
         let mut old = encoded.clone();
         old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
         assert_eq!(

@@ -30,6 +30,29 @@ pub const PRIVATE_NONCE_BYTES: usize = 24;
 
 const ED25519_TRANSPORT_PEER_ID_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
 
+/// The complete canonical Montgomery-u low-order set published by
+/// curve25519-dalek. Scalar multiplication with any of these inputs produces
+/// the all-zero shared secret.
+#[rustfmt::skip]
+pub const X25519_LOW_ORDER_PUBLIC_KEYS: [[u8; 32]; 7] = [
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00],
+    [0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57],
+    [0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+    [0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+    [0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+];
+
+/// Accept only one canonical, contributory X25519 public-key encoding.
+///
+/// RFC 7748 masks bit 255 during scalar multiplication. Rejecting that bit
+/// here prevents high-bit aliases of the low-order inputs (and of ordinary
+/// keys) from entering durable identity state.
+pub fn valid_x25519_public_key(public_key: &[u8; 32]) -> bool {
+    public_key[31] & 0x80 == 0 && !X25519_LOW_ORDER_PUBLIC_KEYS.contains(public_key)
+}
+
 /// Construct the one canonical libp2p PeerId representation accepted for a
 /// clean-generation Ed25519 transport public key.
 pub fn canonical_ed25519_peer_id(public_key: &[u8; 32]) -> [u8; ED25519_TRANSPORT_PEER_ID_BYTES] {
@@ -102,7 +125,7 @@ impl NodeEncryptionEnrollment {
             && self.transport_peer_id == canonical_ed25519_peer_id(&self.transport_public_key)
             && self.node == NodeId::of_authenticated_peer(&self.transport_peer_id)
             && self.node != NodeId::ZERO
-            && self.encryption_public_key != [0; 32]
+            && valid_x25519_public_key(&self.encryption_public_key)
             && self.transport_signature != [0; PRIVATE_SIGNATURE_BYTES]
     }
 
@@ -165,7 +188,7 @@ impl PrivateNodeIdentity {
             && !self.transport_identity.is_empty()
             && self.transport_identity.len() <= MAX_TRANSPORT_IDENTITY_BYTES
             && NodeId::of_authenticated_peer(&self.transport_identity) == self.node
-            && self.encryption_public_key != [0; 32]
+            && valid_x25519_public_key(&self.encryption_public_key)
             && self.authority_binding != Hash::ZERO
             && self.transport_signature != [0; PRIVATE_SIGNATURE_BYTES]
     }
@@ -656,14 +679,67 @@ mod tests {
         substituted_node.node = NodeId([7; 32]);
         assert!(!substituted_node.validate_shape());
 
+        let mut substituted_public_key = enrollment;
+        substituted_public_key.transport_public_key[0] ^= 1;
+        assert!(!substituted_public_key.validate_shape());
+
+        let mut substituted_peer_id = enrollment;
+        substituted_peer_id.transport_peer_id[6] ^= 1;
+        assert!(!substituted_peer_id.validate_shape());
+
         let mut substituted_recipient = enrollment;
         substituted_recipient.encryption_public_key = [8; 32];
         assert!(substituted_recipient.validate_shape());
         assert!(!substituted_recipient.verify_with(&verifier));
 
+        let mut substituted_signature = enrollment;
+        substituted_signature.transport_signature[0] ^= 1;
+        assert!(substituted_signature.validate_shape());
+        assert!(!substituted_signature.verify_with(&verifier));
+
         let mut old_abi = enrollment.encode().unwrap();
         old_abi[4] ^= 0xff;
         assert!(NodeEncryptionEnrollment::decode(&old_abi).is_err());
+    }
+
+    #[test]
+    fn x25519_identity_rejects_every_low_order_key_and_high_bit_alias() {
+        let enrollment = enrollment();
+        let identity = PrivateNodeIdentity {
+            node: enrollment.node,
+            principal: enrollment.principal,
+            transport_identity: enrollment.transport_peer_id.to_vec(),
+            encryption_public_key: enrollment.encryption_public_key,
+            authority_binding: enrollment.commitment(),
+            transport_signature: enrollment.transport_signature,
+        };
+
+        for low_order in X25519_LOW_ORDER_PUBLIC_KEYS {
+            assert!(!valid_x25519_public_key(&low_order));
+
+            let mut invalid_enrollment = enrollment;
+            invalid_enrollment.encryption_public_key = low_order;
+            assert!(!invalid_enrollment.validate_shape());
+
+            let mut invalid_identity = identity.clone();
+            invalid_identity.encryption_public_key = low_order;
+            assert!(!invalid_identity.validate());
+
+            let mut high_bit_alias = low_order;
+            high_bit_alias[31] |= 0x80;
+            assert!(!valid_x25519_public_key(&high_bit_alias));
+
+            invalid_enrollment.encryption_public_key = high_bit_alias;
+            assert!(!invalid_enrollment.validate_shape());
+            invalid_identity.encryption_public_key = high_bit_alias;
+            assert!(!invalid_identity.validate());
+        }
+
+        let ordinary = [0x42; 32];
+        assert!(valid_x25519_public_key(&ordinary));
+        let mut ordinary_high_bit_alias = ordinary;
+        ordinary_high_bit_alias[31] |= 0x80;
+        assert!(!valid_x25519_public_key(&ordinary_high_bit_alias));
     }
 
     #[test]
