@@ -210,6 +210,12 @@ pub(crate) struct VerifiedEncryptedBackup {
 pub(crate) enum CommitStop {
     Never,
     #[cfg(test)]
+    AfterStagedArtifact,
+    #[cfg(test)]
+    AfterStagedIndex,
+    #[cfg(test)]
+    AfterPending,
+    #[cfg(test)]
     AfterStage,
     #[cfg(test)]
     AfterArtifact,
@@ -1440,7 +1446,7 @@ pub struct PrivateStore {
 
 impl PrivateStore {
     #[allow(clippy::too_many_arguments)]
-    pub fn create<V: PrivateNodeAuthorityVerifier>(
+    pub(crate) fn create<V: PrivateNodeAuthorityVerifier>(
         root: impl AsRef<Path>,
         space: SpaceId,
         agent: AgentId,
@@ -1640,7 +1646,7 @@ impl PrivateStore {
     /// archive authentication, opening an existing store may first reconcile
     /// one of its own previously staged transactions.
     #[allow(clippy::too_many_arguments)]
-    pub fn restore_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
+    pub(crate) fn restore_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
         root: impl AsRef<Path>,
         expected_space: SpaceId,
         expected_agent: AgentId,
@@ -1714,11 +1720,32 @@ impl PrivateStore {
     /// authenticated local head supplied by the recovery ceremony. Only the
     /// signed SDK `Recover` operation is accepted; no secret or caller-owned
     /// authorization assertion crosses this API.
-    pub fn apply_offline_recovery<V: PrivateNodeAuthorityVerifier>(
+    pub(crate) fn apply_offline_recovery<V: PrivateNodeAuthorityVerifier>(
         &mut self,
         expected_prior_head: Option<Hash>,
         record: &PrivateControlRecord,
         authority: &V,
+    ) -> Result<PutDisposition, PrivateStoreError> {
+        self.apply_offline_recovery_inner(expected_prior_head, record, authority, CommitStop::Never)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_offline_recovery_with_stop<V: PrivateNodeAuthorityVerifier>(
+        &mut self,
+        expected_prior_head: Option<Hash>,
+        record: &PrivateControlRecord,
+        authority: &V,
+        stop: CommitStop,
+    ) -> Result<PutDisposition, PrivateStoreError> {
+        self.apply_offline_recovery_inner(expected_prior_head, record, authority, stop)
+    }
+
+    fn apply_offline_recovery_inner<V: PrivateNodeAuthorityVerifier>(
+        &mut self,
+        expected_prior_head: Option<Hash>,
+        record: &PrivateControlRecord,
+        authority: &V,
+        stop: CommitStop,
     ) -> Result<PutDisposition, PrivateStoreError> {
         if expected_prior_head == Some(Hash::ZERO)
             || record.signer != PrivateControlSigner::Recovery
@@ -1741,12 +1768,12 @@ impl PrivateStore {
         }
         let commitment = record.commitment();
         if self.chain.head() == Some(commitment) {
-            return self.append_control(record, authority);
+            return self.append_control_inner(record, authority, stop);
         }
         if self.chain.head() != expected_prior_head {
             return Err(PrivateStoreError::Diverged);
         }
-        self.append_control(record, authority)
+        self.append_control_inner(record, authority, stop)
     }
 
     pub fn binding(&self) -> PrivateStoreBinding {
@@ -1896,7 +1923,7 @@ impl PrivateStore {
         Ok(PutDisposition::Inserted)
     }
 
-    pub fn append_control<V: PrivateNodeAuthorityVerifier>(
+    pub(crate) fn append_control<V: PrivateNodeAuthorityVerifier>(
         &mut self,
         record: &PrivateControlRecord,
         authority: &V,
@@ -1998,6 +2025,43 @@ impl PrivateStore {
         self.latest_recovery_keyring = next_recovery_keyring;
         self.index = next;
         Ok(PutDisposition::Inserted)
+    }
+
+    /// Validate the complete next signed control transition without touching
+    /// the filesystem. The authoritative Private-application adapter uses
+    /// this before staging epoch sidecars, so an invalid PCTL cannot leave
+    /// attacker-selected ciphertext in a crash-recovery slot.
+    pub(crate) fn validate_next_control<V: PrivateNodeAuthorityVerifier>(
+        &self,
+        record: &PrivateControlRecord,
+        authority: &V,
+    ) -> Result<(), PrivateStoreError> {
+        if self.index.controls.len() >= MAX_PRIVATE_STORE_CONTROLS {
+            return Err(PrivateStoreError::LimitExceeded);
+        }
+        if self
+            .index
+            .controls
+            .iter()
+            .any(|entry| entry.sequence == record.sequence)
+        {
+            return Err(PrivateStoreError::Alias);
+        }
+        let mut next_chain = self.chain.clone();
+        apply_control_transition(&mut next_chain, record, authority)?;
+        let mut next_key_epochs = self.key_epochs.clone();
+        advance_key_epochs(&mut next_key_epochs, record)?;
+        if next_key_epochs.last() != Some(next_chain.epoch())
+            || next_chain.head() != Some(record.commitment())
+            || next_chain.next_sequence()
+                != record
+                    .sequence
+                    .checked_add(1)
+                    .ok_or(PrivateStoreError::LimitExceeded)?
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        Ok(())
     }
 
     pub fn get_object(
@@ -2157,7 +2221,15 @@ impl PrivateStore {
         remove_file_if_present(&staged_artifact)?;
         remove_file_if_present(&staged_index)?;
         write_new_synced(&staged_artifact, artifact_bytes)?;
+        #[cfg(test)]
+        if stop == CommitStop::AfterStagedArtifact {
+            return Err(PrivateStoreError::Interrupted);
+        }
         write_new_synced(&staged_index, index_bytes)?;
+        #[cfg(test)]
+        if stop == CommitStop::AfterStagedIndex {
+            return Err(PrivateStoreError::Interrupted);
+        }
         let pending = PendingTransaction {
             artifact,
             artifact_hash: raw_wire_hash(artifact_bytes),
@@ -2170,7 +2242,7 @@ impl PrivateStore {
         write_new_synced(&pending_path, &encode_pending(&pending)?)?;
         sync_directory(&stage_dir)?;
         #[cfg(test)]
-        if stop == CommitStop::AfterStage {
+        if matches!(stop, CommitStop::AfterPending | CommitStop::AfterStage) {
             return Err(PrivateStoreError::Interrupted);
         }
         let _ = stop;

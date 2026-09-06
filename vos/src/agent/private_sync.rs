@@ -1023,7 +1023,16 @@ fn serve_object_page(
 /// Apply one page received over an authenticated transport. The sender must
 /// be an exact member of the receiver's current verified control view before
 /// any persisted artifact is opened or changed.
-pub fn apply_private_sync_page<A: PrivateNodeAuthorityVerifier, T: PrivateTransportAuthVerifier>(
+/// Low-level page application for already-authorized host wiring.
+///
+/// This remains crate-private until the production sync envelope binds every
+/// carried control to its exact authority issuance and PCA acknowledgement;
+/// transport authentication and a valid PCTL signature alone are not policy
+/// authorization.
+pub(crate) fn apply_private_sync_page<
+    A: PrivateNodeAuthorityVerifier,
+    T: PrivateTransportAuthVerifier,
+>(
     store: &mut PrivateStore,
     peer: &PrivateNodeIdentity,
     page: &PrivateSyncPage,
