@@ -2045,10 +2045,7 @@ fn validate_sealed_ordinary_genesis_shape<T: ReplaySealedOrdinaryGenesis>(
     {
         return Err(JournalStoreError::LimitExceeded);
     }
-    let decoded =
-        decode_standard_runtime_state(post_create).map_err(|_| JournalStoreError::NonCanonical)?;
-    let config = decoded.config.ok_or(JournalStoreError::NonCanonical)?;
-    if config.validate().is_err() || !sealed.validates_config(&config) {
+    if !sealed.validates_post_create_state() {
         return Err(JournalStoreError::ScopeMismatch);
     }
     if let Some(admission) = sealed.admission_record()
@@ -4427,7 +4424,7 @@ impl MemoryAgentJournalStore {
     }
 
     #[cfg(test)]
-    fn initialize_raw_for_test(
+    pub(crate) fn initialize_raw_for_test(
         &mut self,
         genesis: &AgentJournalGenesis,
     ) -> Result<bool, JournalStoreError> {

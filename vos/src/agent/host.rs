@@ -34,7 +34,7 @@ use super::bootstrap::{
     seal_prepared_system_agent_genesis, validate_prepared_system_agent_genesis_root,
 };
 use super::committee::RootAnchorPins;
-use super::driver::AgentTrustProvider;
+use super::driver::{AgentTrustProvider, SdkManagementArtifacts};
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorInvocation, MAX_EXECUTION_AVAILABILITY_BYTES,
     MAX_EXECUTION_BLOBS, MAX_EXECUTION_GAS, MAX_EXECUTION_MESSAGE_BYTES,
@@ -50,8 +50,9 @@ use super::journal_store::{
 #[cfg(all(feature = "storage", target_os = "linux"))]
 use super::local_journal_driver::LocalJournalUnexposedOpenError;
 use super::local_journal_driver::{
-    LocalJournalAgentDriver, LocalJournalDriverError, LocalLifecycleOperation,
-    LocalReplayExecutorError, LocalSettledAcknowledgementResult, LocalSettledInvocationResult,
+    LocalCleanManagementResult, LocalJournalAgentDriver, LocalJournalDriverError,
+    LocalLifecycleOperation, LocalReplayExecutorError, LocalSettledAcknowledgementResult,
+    LocalSettledInvocationResult,
 };
 use super::package::{
     MAX_ENCODED_PACKAGE_BYTES, MAX_PACKAGE_DIAGNOSTICS_BYTES, MAX_PACKAGE_INTERFACES_BYTES,
@@ -2674,6 +2675,28 @@ impl AgentHost {
             .ok_or(AgentHostError::AgentNotFound)?
             .inspect(after, limit)
             .map_err(map_local_driver_error)
+    }
+
+    /// Journal one exact clean SDK management mutation for an already
+    /// clean-created Local Agent. Read-only Inspect and Create are rejected by
+    /// the journal driver and never enter this mutation path.
+    pub(crate) fn manage_clean(
+        &mut self,
+        agent: AgentId,
+        request: crate::agent_sdk::ManagementRequest,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        artifacts: SdkManagementArtifacts<'_>,
+    ) -> Result<LocalCleanManagementResult, AgentHostError> {
+        self._root_lease.validate_live()?;
+        let hosted = self
+            .agents
+            .get_mut(&agent)
+            .ok_or(AgentHostError::AgentNotFound)?;
+        hosted.with_root_mutation(|driver| {
+            driver
+                .clean_manage(request, authority, artifacts)
+                .map_err(map_local_driver_error)
+        })
     }
 
     pub fn install_actor(

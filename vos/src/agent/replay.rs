@@ -93,6 +93,7 @@ use super::{
     AgentProfile, AgentReplica, AgentRuntime, InvocationResultStorage, LifecycleReply,
     LifecycleRequest, StateLane,
 };
+use crate::agent_sdk::wire::CanonicalWire as AgentCanonicalWire;
 use crate::service::wire::ServiceWire;
 use crate::service::{BlobRef, Hash, InvocationId, NodeId};
 
@@ -266,6 +267,25 @@ impl ReplaySystemAuthorityExecution {
 pub trait ReplayExecutor {
     type Error;
 
+    /// Bind immutable agent identity carried by the durable genesis before
+    /// replay starts. This is called even when an authenticated checkpoint
+    /// supplies the runtime-state base, so executors never need to recover
+    /// authority or profile metadata from opaque guest state.
+    fn seed_genesis(&mut self, _genesis: &AgentJournalGenesis) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Return the independently genesis-authenticated SDK descriptor for the
+    /// exact current runtime binding, when this is a clean-generation
+    /// executor. Legacy executors return `None` and retain their state-carried
+    /// configuration checks.
+    fn trusted_clean_descriptor(
+        &self,
+        _runtime: &RuntimeBinding,
+    ) -> Result<Option<crate::agent_sdk::AgentDescriptor>, Self::Error> {
+        Ok(None)
+    }
+
     fn verify_merge_event(&mut self, event: &MergeEvent) -> Result<bool, Self::Error>;
 
     /// Authenticate one canonical input against the exact pre-transition
@@ -294,6 +314,19 @@ pub trait ReplayExecutor {
         before: &RuntimeState,
         position: ReplayPosition,
     ) -> Result<ReplayTransition, Self::Error>;
+
+    /// Prove that a clean management transition came from a decoded SDK
+    /// `RuntimeOutcome::Management` for this exact input. The generic replay
+    /// layer cannot reconstruct custom-runtime state, so implementations must
+    /// retain the canonical guest outcome they just decoded. The fail-closed
+    /// default prevents a transition-only executor from admitting CleanManage.
+    fn validates_clean_management_transition(
+        &self,
+        _input: &ReplayInput,
+        _transition: &ReplayTransition,
+    ) -> bool {
+        false
+    }
 
     /// Execute with replay-authenticated journal context. Executors which do
     /// not understand the bundled Standard runtime deliberately receive no
@@ -1449,6 +1482,66 @@ pub(crate) struct ReplayPreparedGenesis {
     expectations: SystemAgentGenesisExpectations,
 }
 
+enum PreparedGenesisCreate<'a> {
+    Legacy {
+        config: &'a super::AgentConfig,
+        request: &'a LifecycleRequest,
+        sequence: u64,
+    },
+    Clean {
+        descriptor: &'a crate::agent_sdk::AgentDescriptor,
+        request: &'a crate::agent_sdk::ManagementRequest,
+        sequence: u64,
+    },
+}
+
+impl PreparedGenesisCreate<'_> {
+    fn matches_replica(&self, replica: AgentReplica) -> bool {
+        match self {
+            Self::Legacy { config, .. } => match config.identity.profile {
+                AgentProfile::Local => config.replicas.as_slice() == [replica],
+                AgentProfile::Shared => config.replicas.contains(&replica),
+                AgentProfile::Private => false,
+            },
+            Self::Clean { descriptor, .. } => {
+                let expected = descriptor.replicas.iter().any(|candidate| {
+                    candidate.node.0 == replica.node.0
+                        && candidate.principal.0 == replica.principal.0
+                        && matches!(
+                            (candidate.role, replica.role),
+                            (
+                                crate::agent_sdk::ReplicaRole::Voter,
+                                super::ReplicaRole::Voter
+                            ) | (
+                                crate::agent_sdk::ReplicaRole::Observer,
+                                super::ReplicaRole::Observer
+                            )
+                        )
+                });
+                expected
+                    && match descriptor.identity.profile {
+                        crate::agent_sdk::AgentProfile::Local => descriptor.replicas.len() == 1,
+                        crate::agent_sdk::AgentProfile::Shared => true,
+                        crate::agent_sdk::AgentProfile::Private => false,
+                    }
+            }
+        }
+    }
+
+    fn request_commitment(&self) -> Hash {
+        match self {
+            Self::Legacy { request, .. } => request.commitment(),
+            Self::Clean { request, .. } => Hash(request.commitment().0),
+        }
+    }
+
+    const fn sequence(&self) -> u64 {
+        match self {
+            Self::Legacy { sequence, .. } | Self::Clean { sequence, .. } => *sequence,
+        }
+    }
+}
+
 impl ReplayPreparedGenesis {
     pub(crate) fn prepare<E: ReplayExecutor>(
         create: ReplayInput,
@@ -1459,19 +1552,35 @@ impl ReplayPreparedGenesis {
             return Err(ReplayError::InvalidRecord);
         }
         validate_position(&create, ReplayPosition::Genesis)?;
-        let ReplayOperation::Management { request } = &create.operation else {
-            return Err(ReplayError::InvalidRecord);
+        let create_kind = match &create.operation {
+            ReplayOperation::Management {
+                request: LifecycleRequest::Authorized { admission, request },
+            } => {
+                let LifecycleRequest::Create(config) = request.as_ref() else {
+                    return Err(ReplayError::InvalidRecord);
+                };
+                PreparedGenesisCreate::Legacy {
+                    config,
+                    request,
+                    sequence: admission.receipt.claim.sequence,
+                }
+            }
+            ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+                authority,
+                ..
+            } => PreparedGenesisCreate::Clean {
+                descriptor,
+                request: match &create.operation {
+                    ReplayOperation::CleanManage { request, .. } => request,
+                    _ => unreachable!(),
+                },
+                sequence: authority.selector.decision_sequence,
+            },
+            _ => return Err(ReplayError::InvalidRecord),
         };
-        let LifecycleRequest::Authorized { request, .. } = request else {
-            return Err(ReplayError::InvalidRecord);
-        };
-        let LifecycleRequest::Create(config) = request.as_ref() else {
-            return Err(ReplayError::InvalidRecord);
-        };
-        match config.identity.profile {
-            super::AgentProfile::Local if config.replicas.as_slice() == [replica] => {}
-            super::AgentProfile::Shared if config.replicas.contains(&replica) => {}
-            _ => return Err(ReplayError::ScopeMismatch),
+        if !create_kind.matches_replica(replica) {
+            return Err(ReplayError::ScopeMismatch);
         }
 
         let before = RuntimeState::default();
@@ -1482,6 +1591,11 @@ impl ReplayPreparedGenesis {
         let transition = executor
             .execute(&create, &before, ReplayPosition::Genesis)
             .map_err(ReplayError::Executor)?;
+        if matches!(create.operation, ReplayOperation::CleanManage { .. })
+            && !executor.validates_clean_management_transition(&create, &transition)
+        {
+            return Err(ReplayError::InvalidManagementTransition);
+        }
         validate_runtime_state_bound(&transition.state)?;
         let system_authority_write = validate_transition(
             &create,
@@ -1505,52 +1619,61 @@ impl ReplayPreparedGenesis {
         }
 
         let post_create = transition.state;
-        let decoded =
-            decode_standard_runtime_state(&post_create).map_err(|_| ReplayError::InvalidRecord)?;
-        if decoded.config.as_ref() != Some(config)
-            || !decoded
-                .config
-                .as_ref()
-                .is_some_and(|created| match created.identity.profile {
-                    super::AgentProfile::Local => created.replicas.as_slice() == [replica],
-                    super::AgentProfile::Shared => created.replicas.contains(&replica),
-                    super::AgentProfile::Private => false,
-                })
-        {
-            return Err(ReplayError::InvalidManagementTransition);
-        }
-        let expected_system_authority = config
-            .system_authority_genesis
-            .as_ref()
-            .map(|genesis| {
-                super::system_authority::SystemAuthorityState::from_genesis(
-                    config.identity.agent,
-                    genesis,
+        let artifacts = match &create_kind {
+            PreparedGenesisCreate::Legacy { config, .. } => {
+                let decoded = decode_standard_runtime_state(&post_create)
+                    .map_err(|_| ReplayError::InvalidRecord)?;
+                if decoded.config.as_ref() != Some(*config)
+                    || !decoded.config.as_ref().is_some_and(|created| {
+                        match created.identity.profile {
+                            super::AgentProfile::Local => created.replicas.as_slice() == [replica],
+                            super::AgentProfile::Shared => created.replicas.contains(&replica),
+                            super::AgentProfile::Private => false,
+                        }
+                    })
+                {
+                    return Err(ReplayError::InvalidManagementTransition);
+                }
+                let expected_system_authority = config
+                    .system_authority_genesis
+                    .as_ref()
+                    .map(|genesis| {
+                        super::system_authority::SystemAuthorityState::from_genesis(
+                            config.identity.agent,
+                            genesis,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|_| ReplayError::InvalidManagementTransition)?;
+                if decoded.system_authority != expected_system_authority {
+                    return Err(ReplayError::InvalidManagementTransition);
+                }
+                derive_standard_artifact_references::<core::convert::Infallible>(
+                    &create.runtime,
+                    &post_create,
                 )
-            })
-            .transpose()
-            .map_err(|_| ReplayError::InvalidManagementTransition)?;
-        if decoded.system_authority != expected_system_authority {
-            return Err(ReplayError::InvalidManagementTransition);
-        }
-        let artifacts = derive_standard_artifact_references::<core::convert::Infallible>(
-            &create.runtime,
-            &post_create,
-        )
-        .map_err(|error| error.map_executor(|never| match never {}))?;
+                .map_err(|error| error.map_executor(|never| match never {}))?
+            }
+            PreparedGenesisCreate::Clean { descriptor, .. } => {
+                if post_create.is_empty()
+                    || descriptor.runtime_package.hash.0 != create.runtime.package.hash.0
+                    || descriptor.runtime_package.len != create.runtime.package.len
+                {
+                    return Err(ReplayError::InvalidManagementTransition);
+                }
+                vec![create.runtime.package.clone()]
+            }
+        };
+        let request_commitment = create_kind.request_commitment();
+        let sequence = create_kind.sequence();
         let expectations = SystemAgentGenesisExpectations::new(
             create.runtime.commitment(),
-            request.commitment(),
+            request_commitment,
             system_genesis_post_create_state_commitment(&post_create)
                 .map_err(|_| ReplayError::InvalidRecord)?,
             system_genesis_artifact_closure_commitment(&artifacts)
                 .map_err(|_| ReplayError::InvalidRecord)?,
-            match &create.operation {
-                ReplayOperation::Management {
-                    request: LifecycleRequest::Authorized { admission, .. },
-                } => admission.receipt.claim.sequence,
-                _ => unreachable!("validated genesis operation"),
-            },
+            sequence,
         )
         .map_err(|_| ReplayError::InvalidRecord)?;
 
@@ -1597,6 +1720,52 @@ pub(crate) struct ReplayedLocalGenesisAdmission {
     artifacts: Hash,
 }
 
+fn local_genesis_facts(create: &ReplayInput) -> Option<(Hash, Hash, NodeId)> {
+    match &create.operation {
+        ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { admission, request },
+        } => {
+            let LifecycleRequest::Create(config) = request.as_ref() else {
+                return None;
+            };
+            if config.identity.profile != AgentProfile::Local
+                || config.system_authority_genesis.is_some()
+                || config.replicas.len() != 1
+                || admission.receipt.claim.authority != config.authority
+            {
+                return None;
+            }
+            Some((
+                config.authority.commitment(),
+                Hash::digest(
+                    b"vos/agent/local-genesis-receipt/v1",
+                    &[&admission.receipt.encode()],
+                ),
+                config.replicas[0].node,
+            ))
+        }
+        ReplayOperation::CleanManage {
+            request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+            authority,
+            ..
+        } => {
+            let [replica] = descriptor.replicas.as_slice() else {
+                return None;
+            };
+            if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Local {
+                return None;
+            }
+            let receipt = authority.encode().ok()?;
+            Some((
+                Hash(descriptor.authority.commitment().0),
+                Hash::digest(b"vos/agent/local-genesis-receipt/v1", &[&receipt]),
+                NodeId(replica.node.0),
+            ))
+        }
+        _ => None,
+    }
+}
+
 impl ReplayedLocalGenesisAdmission {
     pub(crate) const fn id(self) -> AgentGenesisAdmissionId {
         self.admission
@@ -1607,29 +1776,12 @@ impl ReplayedLocalGenesisAdmission {
     }
 
     fn from_prepared(prepared: &ReplayPreparedGenesis) -> Result<Self, ReplayValidationError> {
-        let ReplayOperation::Management {
-            request: LifecycleRequest::Authorized { admission, request },
-        } = &prepared.create.operation
-        else {
-            return Err(ReplayError::InvalidRecord);
-        };
-        let LifecycleRequest::Create(config) = request.as_ref() else {
-            return Err(ReplayError::InvalidRecord);
-        };
-        if config.identity.profile != AgentProfile::Local
-            || config.system_authority_genesis.is_some()
-            || config.replicas.as_slice() != [prepared.replica]
-            || admission.receipt.claim.authority != config.authority
-        {
+        let (authority, receipt, node) =
+            local_genesis_facts(&prepared.create).ok_or(ReplayError::InvalidRecord)?;
+        if node != prepared.replica.node {
             return Err(ReplayError::ScopeMismatch);
         }
         let create = prepared.create.id();
-        let authority = config.authority.commitment();
-        let receipt = Hash::digest(
-            b"vos/agent/local-genesis-receipt/v1",
-            &[&admission.receipt.encode()],
-        );
-        let node = prepared.replica.node;
         let post_create = prepared.expectations.post_create_state();
         let artifacts = prepared.expectations.artifact_closure();
         let admission = AgentGenesisAdmissionId::from_bytes(
@@ -1666,27 +1818,13 @@ impl ReplayedLocalGenesisAdmission {
         post_create: &RuntimeState,
         artifacts: &ArtifactClosure,
     ) -> Result<(), ReplayValidationError> {
-        let ReplayOperation::Management {
-            request: LifecycleRequest::Authorized { admission, request },
-        } = &genesis.create.operation
-        else {
-            return Err(ReplayError::InvalidRecord);
-        };
-        let LifecycleRequest::Create(config) = request.as_ref() else {
-            return Err(ReplayError::InvalidRecord);
-        };
-        let receipt = Hash::digest(
-            b"vos/agent/local-genesis-receipt/v1",
-            &[&admission.receipt.encode()],
-        );
+        let (authority, receipt, node) =
+            local_genesis_facts(&genesis.create).ok_or(ReplayError::InvalidRecord)?;
         if genesis.admission != self.admission
             || genesis.create.id() != self.create
-            || config.identity.profile != AgentProfile::Local
-            || config.system_authority_genesis.is_some()
-            || config.authority.commitment() != self.authority
+            || authority != self.authority
             || receipt != self.receipt
-            || config.replicas.len() != 1
-            || config.replicas[0].node != self.node
+            || node != self.node
             || system_genesis_post_create_state_commitment(post_create)
                 .map_err(|_| ReplayError::InvalidRecord)?
                 != self.post_create
@@ -1845,6 +1983,55 @@ impl ReplaySealedLocalGenesis {
     }
 }
 
+fn sdk_replica_matches_legacy(sdk: &crate::agent_sdk::AgentReplica, legacy: AgentReplica) -> bool {
+    sdk.node.0 == legacy.node.0
+        && sdk.principal.0 == legacy.principal.0
+        && matches!(
+            (sdk.role, legacy.role),
+            (
+                crate::agent_sdk::ReplicaRole::Voter,
+                super::ReplicaRole::Voter
+            ) | (
+                crate::agent_sdk::ReplicaRole::Observer,
+                super::ReplicaRole::Observer
+            )
+        )
+}
+
+fn validates_shared_create_committee(
+    create: &ReplayInput,
+    committee: &AgentReplicaCommittee,
+) -> bool {
+    match &create.operation {
+        ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { request, .. },
+        } => {
+            let LifecycleRequest::Create(config) = request.as_ref() else {
+                return false;
+            };
+            config.identity.profile == AgentProfile::Shared
+                && config.system_authority_genesis.is_none()
+                && committee.validate_for(config).is_ok()
+        }
+        ReplayOperation::CleanManage {
+            request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+            ..
+        } => {
+            descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared
+                && committee.profile() == AgentProfile::Shared
+                && committee.space().0 == descriptor.identity.space.0
+                && committee.agent().0 == descriptor.identity.agent.0
+                && committee.members().len() == descriptor.replicas.len()
+                && committee
+                    .members()
+                    .iter()
+                    .zip(&descriptor.replicas)
+                    .all(|(member, replica)| sdk_replica_matches_legacy(replica, member.replica()))
+        }
+        _ => false,
+    }
+}
+
 /// Opaque, system-finality-verified clean-generation seal for one physical
 /// replica of an ordinary Shared Agent.
 ///
@@ -1875,7 +2062,6 @@ impl ReplaySealedSharedGenesis {
             .validate()
             .map_err(|_| ReplayError::InvalidRecord)?;
         let proposal = provision.proposal();
-        let config = proposal.config().map_err(|_| ReplayError::InvalidRecord)?;
         let expected = AgentGenesisExpectations::new(
             prepared.expectations.runtime_binding(),
             prepared.expectations.inner_create_request(),
@@ -1888,8 +2074,6 @@ impl ReplaySealedSharedGenesis {
         if proposal.create() != &prepared.create
             || proposal.expectations() != expected
             || proposal.catalog() != prepared.artifacts.as_slice()
-            || config.identity.profile != AgentProfile::Shared
-            || config.system_authority_genesis.is_some()
             || committee.profile() != AgentProfile::Shared
             || committee.space() != prepared.create.runtime.space
             || committee.agent() != prepared.create.runtime.agent
@@ -1900,9 +2084,9 @@ impl ReplaySealedSharedGenesis {
         {
             return Err(ReplayError::ScopeMismatch);
         }
-        committee
-            .validate_for(config)
-            .map_err(|_| ReplayError::ScopeMismatch)?;
+        if !validates_shared_create_committee(&prepared.create, committee) {
+            return Err(ReplayError::ScopeMismatch);
+        }
         let admission_record = provision
             .admission_record()
             .map_err(|_| ReplayError::InvalidRecord)?;
@@ -2065,23 +2249,12 @@ impl ReplaySealedSharedGenesis {
         self.admission_record
             .validate()
             .map_err(|_| ReplayError::InvalidRecord)?;
-        let ReplayOperation::Management {
-            request: LifecycleRequest::Authorized { request, .. },
-        } = &self.genesis.create.operation
-        else {
-            return Err(ReplayError::InvalidRecord);
-        };
-        let LifecycleRequest::Create(config) = request.as_ref() else {
-            return Err(ReplayError::InvalidRecord);
-        };
         if self.genesis.admission != self.admission_record.id()
             || !matches!(
                 &self.admission_record,
                 AgentGenesisAdmissionRecord::SystemAuthorized { .. }
             )
-            || config.identity.profile != AgentProfile::Shared
-            || config.system_authority_genesis.is_some()
-            || self.committee.validate_for(config).is_err()
+            || !validates_shared_create_committee(&self.genesis.create, &self.committee)
             || self
                 .committee
                 .member_by_node(self.replica.node)
@@ -2114,7 +2287,7 @@ pub(crate) trait ReplaySealedOrdinaryGenesis {
     fn admission_commitment(&self) -> Hash;
     fn lane_manifest(&self, lane: PersistedLane) -> LaneStateManifest;
     fn initial_heads(&self) -> JournalHeads;
-    fn validates_config(&self, config: &super::AgentConfig) -> bool;
+    fn validates_post_create_state(&self) -> bool;
     fn admission_record(&self) -> Option<&AgentGenesisAdmissionRecord>;
     fn validate_seal(&self) -> Result<(), ReplayValidationError>;
 }
@@ -2164,11 +2337,30 @@ impl ReplaySealedOrdinaryGenesis for ReplaySealedLocalGenesis {
         self.initial_heads()
     }
 
-    fn validates_config(&self, config: &super::AgentConfig) -> bool {
-        config.identity.profile == AgentProfile::Local
-            && config.system_authority_genesis.is_none()
-            && config.replicas.as_slice() == [self.replica]
-            && self.admission.node() == self.replica.node
+    fn validates_post_create_state(&self) -> bool {
+        match &self.genesis.create.operation {
+            ReplayOperation::Management { .. } => decode_standard_runtime_state(&self.post_create)
+                .ok()
+                .and_then(|state| state.config)
+                .is_some_and(|config| {
+                    config.validate().is_ok()
+                        && config.identity.profile == AgentProfile::Local
+                        && config.system_authority_genesis.is_none()
+                        && config.replicas.as_slice() == [self.replica]
+                        && self.admission.node() == self.replica.node
+                }),
+            ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+                ..
+            } => {
+                !self.post_create.is_empty()
+                    && descriptor.identity.profile == crate::agent_sdk::AgentProfile::Local
+                    && descriptor.replicas.as_slice().len() == 1
+                    && sdk_replica_matches_legacy(&descriptor.replicas[0], self.replica)
+                    && self.admission.node() == self.replica.node
+            }
+            _ => false,
+        }
     }
 
     fn admission_record(&self) -> Option<&AgentGenesisAdmissionRecord> {
@@ -2225,10 +2417,9 @@ impl ReplaySealedOrdinaryGenesis for ReplaySealedSharedGenesis {
         self.initial_heads()
     }
 
-    fn validates_config(&self, config: &super::AgentConfig) -> bool {
-        config.identity.profile == AgentProfile::Shared
-            && config.system_authority_genesis.is_none()
-            && self.committee.validate_for(config).is_ok()
+    fn validates_post_create_state(&self) -> bool {
+        !self.post_create.is_empty()
+            && validates_shared_create_committee(&self.genesis.create, &self.committee)
             && self
                 .committee
                 .member_by_node(self.replica.node)
@@ -3300,6 +3491,10 @@ impl ReplayMaterialization {
             index: self.heads.ordered_index,
             head: self.heads.ordered_head,
         }
+    }
+
+    pub(crate) const fn replay_boundary(&self) -> OrderedBase {
+        self.replay_boundary
     }
 
     pub const fn merge_frontier(&self) -> MergeFrontierId {
@@ -6726,6 +6921,11 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 )
                 .map_err(ReplayError::Executor)?
         };
+        if matches!(input.operation, ReplayOperation::CleanManage { .. })
+            && !executor.validates_clean_management_transition(input, &transition)
+        {
+            return Err(ReplayError::InvalidManagementTransition);
+        }
         if prior_owner.is_none()
             && matches!(
                 invocation_owner,
@@ -7942,6 +8142,126 @@ fn derive_standard_artifact_closure<SourceError>(
     Ok(closure)
 }
 
+fn sdk_artifact_reference(reference: &crate::agent_sdk::BlobRef) -> BlobRef {
+    BlobRef {
+        hash: Hash(reference.hash.0),
+        len: reference.len,
+    }
+}
+
+/// Exact append-only artifact reachability selected by one clean management
+/// request. Custom runtime state is opaque to the host, so the closure is
+/// advanced from the authenticated predecessor plus the request's admitted
+/// artifacts rather than by decoding a Standard-runtime directory oracle.
+fn clean_management_artifact_references(
+    request: &crate::agent_sdk::ManagementRequest,
+) -> Vec<BlobRef> {
+    let mut artifacts = match request {
+        crate::agent_sdk::ManagementRequest::Install(install) => {
+            let mut artifacts = vec![
+                sdk_artifact_reference(&install.package),
+                sdk_artifact_reference(&install.agent_schema),
+                sdk_artifact_reference(&install.method_policy),
+            ];
+            if let Some(data) = &install.installation_data {
+                artifacts.push(sdk_artifact_reference(&data.reference));
+            }
+            artifacts
+        }
+        crate::agent_sdk::ManagementRequest::UpgradeActor(upgrade) => vec![
+            sdk_artifact_reference(&upgrade.package),
+            sdk_artifact_reference(&upgrade.agent_schema),
+            sdk_artifact_reference(&upgrade.method_policy),
+        ],
+        crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade) => {
+            vec![sdk_artifact_reference(&upgrade.package)]
+        }
+        crate::agent_sdk::ManagementRequest::Create(descriptor) => {
+            vec![sdk_artifact_reference(&descriptor.runtime_package)]
+        }
+        crate::agent_sdk::ManagementRequest::InspectActors { .. }
+        | crate::agent_sdk::ManagementRequest::InspectResources
+        | crate::agent_sdk::ManagementRequest::Suspend { .. }
+        | crate::agent_sdk::ManagementRequest::Resume { .. }
+        | crate::agent_sdk::ManagementRequest::RemoveLeaf { .. }
+        | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. } => Vec::new(),
+    };
+    artifacts.sort_unstable_by_key(|artifact| (artifact.hash, artifact.len));
+    artifacts.dedup();
+    artifacts
+}
+
+fn derive_genesis_artifact_closure(
+    genesis: AgentJournalGenesisId,
+    input: &ReplayInput,
+    state: &RuntimeState,
+) -> Result<ArtifactClosure, ReplayValidationError> {
+    let artifacts = match &input.operation {
+        ReplayOperation::CleanManage {
+            request: request @ crate::agent_sdk::ManagementRequest::Create(_),
+            ..
+        } => clean_management_artifact_references(request),
+        ReplayOperation::Management { .. } => {
+            return derive_standard_artifact_closure(genesis, &input.runtime, state);
+        }
+        ReplayOperation::CleanManage { .. }
+        | ReplayOperation::Invoke { .. }
+        | ReplayOperation::CleanInvoke { .. }
+        | ReplayOperation::Acknowledge { .. }
+        | ReplayOperation::SealMerge => return Err(ReplayError::InvalidRecord),
+    };
+    let closure = ArtifactClosure { genesis, artifacts };
+    if closure.validate().is_err() || !closure.artifacts.contains(&input.runtime.package) {
+        return Err(ReplayError::InvalidRecord);
+    }
+    Ok(closure)
+}
+
+fn derive_successor_artifact_closure(
+    current: &ArtifactClosure,
+    input: &ReplayInput,
+    next_runtime: &RuntimeBinding,
+    state: &RuntimeState,
+    outcome: ReplayStepOutcome,
+) -> Result<ArtifactClosure, ReplayValidationError> {
+    if current.validate().is_err()
+        || current.genesis == AgentJournalGenesisId::ZERO
+        || !current.artifacts.contains(&input.runtime.package)
+    {
+        return Err(ReplayError::InvalidRecord);
+    }
+    let mut closure = match &input.operation {
+        ReplayOperation::Management { .. } => {
+            return derive_standard_artifact_closure(current.genesis, next_runtime, state);
+        }
+        ReplayOperation::CleanManage { request, .. } => {
+            let ReplayStepOutcome::Applied(disposition) = outcome else {
+                return Err(ReplayError::InvalidManagementTransition);
+            };
+            let mut closure = current.clone();
+            if disposition == ReplayDisposition::Applied {
+                closure
+                    .artifacts
+                    .extend(clean_management_artifact_references(request));
+                closure
+                    .artifacts
+                    .sort_unstable_by_key(|artifact| (artifact.hash, artifact.len));
+                closure.artifacts.dedup();
+            }
+            closure
+        }
+        ReplayOperation::Invoke { .. }
+        | ReplayOperation::CleanInvoke { .. }
+        | ReplayOperation::Acknowledge { .. }
+        | ReplayOperation::SealMerge => current.clone(),
+    };
+    closure.genesis = current.genesis;
+    if closure.validate().is_err() || !closure.artifacts.contains(&next_runtime.package) {
+        return Err(ReplayError::InvalidRecord);
+    }
+    Ok(closure)
+}
+
 fn derive_standard_artifact_references<SourceError>(
     runtime: &RuntimeBinding,
     state: &RuntimeState,
@@ -8040,19 +8360,29 @@ fn validate_position<SourceError, ExecutorError>(
     position: ReplayPosition,
 ) -> Result<(), ReplayError<SourceError, ExecutorError>> {
     let valid = match position {
-        ReplayPosition::Genesis => matches!(
-            input.operation,
-            ReplayOperation::Management {
-                request: LifecycleRequest::Authorized { ref request, .. }
-            } if matches!(request.as_ref(), LifecycleRequest::Create(_))
-        ),
+        ReplayPosition::Genesis => {
+            matches!(
+                input.operation,
+                ReplayOperation::Management {
+                    request: LifecycleRequest::Authorized { ref request, .. }
+                } if matches!(request.as_ref(), LifecycleRequest::Create(_))
+            ) || matches!(
+                input.operation,
+                ReplayOperation::CleanManage {
+                    request: crate::agent_sdk::ManagementRequest::Create(_),
+                    ..
+                }
+            )
+        }
         ReplayPosition::Ordered { merge_seal, .. } => {
             matches!(
                 input.persisted_lane(),
                 PersistedLane::Control | PersistedLane::Linear
             ) && (matches!(
                 input.operation,
-                ReplayOperation::Management { .. } | ReplayOperation::SealMerge
+                ReplayOperation::Management { .. }
+                    | ReplayOperation::CleanManage { .. }
+                    | ReplayOperation::SealMerge
             ) == merge_seal.is_some())
         }
         ReplayPosition::Merge { .. } => input.persisted_lane() == PersistedLane::Merge,
@@ -8115,6 +8445,7 @@ fn invocation_identity(
             InvocationOwnershipOperation::Acknowledge,
         )),
         ReplayOperation::Management { .. }
+        | ReplayOperation::CleanManage { .. }
         | ReplayOperation::CleanInvoke { .. }
         | ReplayOperation::SealMerge => None,
     }
@@ -8195,6 +8526,7 @@ fn validate_retained_outcome(
         ReplayOperation::Invoke { invocation, .. }
         | ReplayOperation::Acknowledge { invocation, .. } => invocation,
         ReplayOperation::Management { .. }
+        | ReplayOperation::CleanManage { .. }
         | ReplayOperation::CleanInvoke { .. }
         | ReplayOperation::SealMerge => {
             return Err(InvocationOwnershipError::Unauthenticated);
@@ -8442,7 +8774,7 @@ fn validate_transition<SourceError, ExecutorError>(
                 return Err(ReplayError::InvalidRecord);
             }
         }
-        ReplayOperation::Management { .. } => {
+        ReplayOperation::Management { .. } | ReplayOperation::CleanManage { .. } => {
             if transition.result.is_some() {
                 return Err(ReplayError::InvalidManagementTransition);
             }
@@ -8640,31 +8972,47 @@ fn validate_runtime_successor<SourceError, ExecutorError>(
 }
 
 fn runtime_upgrade_target(input: &ReplayInput, current: &RuntimeBinding) -> Option<RuntimeBinding> {
-    let ReplayOperation::Management {
-        request: LifecycleRequest::Authorized { request, .. },
-    } = &input.operation
-    else {
-        return None;
-    };
-    let LifecycleRequest::UpgradeRuntime {
-        from_deployment,
-        to_deployment,
-        to_program,
-        producer,
-        package,
-        ..
-    } = request.as_ref()
-    else {
-        return None;
-    };
-    if *from_deployment != current.deployment {
-        return None;
-    }
     let mut target = current.clone();
-    target.deployment = *to_deployment;
-    target.program = *to_program;
-    target.producer = *producer;
-    target.package = package.clone();
+    match &input.operation {
+        ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { request, .. },
+        } => {
+            let LifecycleRequest::UpgradeRuntime {
+                from_deployment,
+                to_deployment,
+                to_program,
+                producer,
+                package,
+                ..
+            } = request.as_ref()
+            else {
+                return None;
+            };
+            if *from_deployment != current.deployment {
+                return None;
+            }
+            target.deployment = *to_deployment;
+            target.program = *to_program;
+            target.producer = *producer;
+            target.package = package.clone();
+        }
+        ReplayOperation::CleanManage {
+            request: crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade),
+            ..
+        } => {
+            if upgrade.from_deployment.0 != current.deployment.0 {
+                return None;
+            }
+            target.deployment = crate::service::DeploymentId(upgrade.to_deployment.0);
+            target.program = crate::service::ProgramId(upgrade.to_program.0);
+            target.producer = crate::service::ProducerId(upgrade.producer.0);
+            target.package = crate::service::BlobRef {
+                hash: crate::service::Hash(upgrade.package.hash.0),
+                len: upgrade.package.len,
+            };
+        }
+        _ => return None,
+    }
     Some(target)
 }
 
@@ -8676,7 +9024,10 @@ fn validate_lane_mutation<SourceError, ExecutorError>(
     position: ReplayPosition,
     system_authority_execution: Option<ReplaySystemAuthorityExecution>,
 ) -> Result<Option<ReplaySystemAuthorityWrite>, ReplayError<SourceError, ExecutorError>> {
-    if matches!(input.operation, ReplayOperation::Management { .. }) {
+    if matches!(
+        input.operation,
+        ReplayOperation::Management { .. } | ReplayOperation::CleanManage { .. }
+    ) {
         if !matches!(
             position,
             ReplayPosition::Genesis
@@ -8687,13 +9038,20 @@ fn validate_lane_mutation<SourceError, ExecutorError>(
         ) {
             return Err(ReplayError::InvalidFence);
         }
-        return validate_standard_management_transition(
-            input,
-            before,
-            after,
-            disposition,
-            system_authority_execution,
-        );
+        return match &input.operation {
+            ReplayOperation::Management { .. } => validate_standard_management_transition(
+                input,
+                before,
+                after,
+                disposition,
+                system_authority_execution,
+            ),
+            ReplayOperation::CleanManage { .. } if system_authority_execution.is_none() => {
+                validate_clean_management_lanes(input, before, after, disposition)
+            }
+            ReplayOperation::CleanManage { .. } => Err(ReplayError::ScopeMismatch),
+            _ => unreachable!("matched management operation above"),
+        };
     }
 
     let lane = input.persisted_lane();
@@ -8724,6 +9082,60 @@ fn validate_lane_mutation<SourceError, ExecutorError>(
     } else {
         Ok(None)
     }
+}
+
+fn validate_clean_management_lanes<SourceError, ExecutorError>(
+    input: &ReplayInput,
+    before: &RuntimeState,
+    after: &RuntimeState,
+    disposition: ReplayDisposition,
+) -> Result<Option<ReplaySystemAuthorityWrite>, ReplayError<SourceError, ExecutorError>> {
+    let ReplayOperation::CleanManage { request, .. } = &input.operation else {
+        return Err(ReplayError::InvalidPosition);
+    };
+    let allowed = if disposition == ReplayDisposition::Applied {
+        match request {
+            crate::agent_sdk::ManagementRequest::Install(install) => {
+                install.requirements.lanes.bits()
+            }
+            crate::agent_sdk::ManagementRequest::UpgradeActor(upgrade) => {
+                upgrade.requirements.lanes.bits()
+            }
+            crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade) => {
+                upgrade.capabilities.lanes.bits()
+            }
+            // Removing an actor may clear state in any lane the retired actor
+            // owned. The exact guest request/result still determines whether
+            // the removal succeeded.
+            crate::agent_sdk::ManagementRequest::RemoveLeaf { .. } => {
+                crate::agent_sdk::LaneSet::ALL.bits()
+            }
+            crate::agent_sdk::ManagementRequest::Create(_)
+            | crate::agent_sdk::ManagementRequest::Suspend { .. }
+            | crate::agent_sdk::ManagementRequest::Resume { .. }
+            | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. } => {
+                crate::agent_sdk::LaneSet::NONE.bits()
+            }
+            crate::agent_sdk::ManagementRequest::InspectActors { .. }
+            | crate::agent_sdk::ManagementRequest::InspectResources => {
+                return Err(ReplayError::InvalidManagementTransition);
+            }
+        }
+    } else {
+        // A rejected mutation may durably consume authority in Control but
+        // cannot initialize, migrate, or clear actor-owned lane state.
+        crate::agent_sdk::LaneSet::NONE.bits()
+    };
+    let linear = crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Linear).bits();
+    let merge = crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Merge).bits();
+    let local = crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Local).bits();
+    if (after.linear != before.linear && allowed & linear == 0)
+        || (after.merge != before.merge && allowed & merge == 0)
+        || (after.local != before.local && allowed & local == 0)
+    {
+        return Err(ReplayError::CrossLaneMutation);
+    }
+    Ok(None)
 }
 
 fn validate_standard_management_transition<SourceError, ExecutorError>(
@@ -8886,6 +9298,7 @@ mod aggregate {
 
     struct ReplayBase {
         state: RuntimeState,
+        artifacts: Option<ArtifactClosure>,
         ordered: OrderedBase,
         local_revision: u64,
         local_head: Option<LocalEntryId>,
@@ -8980,6 +9393,23 @@ mod aggregate {
         AgentJournalStore::get(store, id)
             .map_err(journal)?
             .ok_or_else(|| journal(JournalStoreError::MissingObject))
+    }
+
+    fn require_genesis<S, ResolverError, ExecutorError>(
+        store: &S,
+        id: AgentJournalGenesisId,
+    ) -> Result<AgentJournalGenesis, MaterializeError<ResolverError, ExecutorError>>
+    where
+        S: AgentJournalStore,
+    {
+        let genesis = store
+            .genesis()
+            .map_err(journal)?
+            .ok_or_else(|| journal(JournalStoreError::NotInitialized))?;
+        if genesis.validate().is_err() || genesis.id() != id {
+            return Err(ReplayError::InvalidRecord);
+        }
+        Ok(genesis)
     }
 
     fn require_blob<S, ResolverError, ExecutorError>(
@@ -9186,10 +9616,28 @@ mod aggregate {
         validate_runtime_state_bound(&state)?;
 
         let artifacts: ArtifactClosure = require_record(store, checkpoint.artifacts)?;
-        let expected_artifacts =
-            derive_standard_artifact_closure(checkpoint.genesis, &checkpoint.runtime, &state)
-                .map_err(lift_validation)?;
-        if artifacts.id() != checkpoint.artifacts || artifacts != expected_artifacts {
+        let genesis = require_genesis(store, checkpoint.genesis)?;
+        let clean_checkpoint = matches!(
+            &genesis.create.operation,
+            ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(_),
+                ..
+            }
+        );
+        let exact_artifacts = if clean_checkpoint {
+            artifacts.genesis == checkpoint.genesis
+                && artifacts.artifacts.contains(&checkpoint.runtime.package)
+        } else {
+            let expected =
+                derive_standard_artifact_closure(checkpoint.genesis, &checkpoint.runtime, &state)
+                    .map_err(lift_validation)?;
+            artifacts == expected
+        };
+        if genesis.id() != checkpoint.genesis
+            || genesis.validate().is_err()
+            || artifacts.id() != checkpoint.artifacts
+            || !exact_artifacts
+        {
             return Err(ReplayError::InvalidRecord);
         }
         authenticate_artifacts(store, &artifacts)?;
@@ -9224,6 +9672,7 @@ mod aggregate {
         .map_err(lift_validation)?;
         Ok(ReplayBase {
             state,
+            artifacts: Some(artifacts),
             ordered,
             local_revision,
             local_head,
@@ -9298,6 +9747,7 @@ mod aggregate {
         }
         Ok(ReplayBase {
             state: RuntimeState::default(),
+            artifacts: None,
             ordered: OrderedBase::post_genesis(),
             local_revision: 0,
             local_head: None,
@@ -9649,7 +10099,9 @@ mod aggregate {
         if entry.merge_seal != Some(dependency.id)
             || !matches!(
                 entry.input.operation,
-                ReplayOperation::Management { .. } | ReplayOperation::SealMerge
+                ReplayOperation::Management { .. }
+                    | ReplayOperation::CleanManage { .. }
+                    | ReplayOperation::SealMerge
             )
             || dependency.seal.genesis != entry.genesis
             || dependency.seal.frontier != frontier
@@ -9718,6 +10170,7 @@ mod aggregate {
             ownership: indexes,
             fence: base.fence.take(),
         };
+        let mut artifacts = base.artifacts.take();
         let mut state = base.state;
         let mut snapshots = base.snapshots;
         let mut current_ordered = base.ordered;
@@ -9762,6 +10215,9 @@ mod aggregate {
             if step.runtime != input.runtime {
                 return Err(ReplayError::RuntimeMismatch);
             }
+            let initial_artifacts = derive_genesis_artifact_closure(heads.genesis, &input, &state)
+                .map_err(lift_validation)?;
+            artifacts = Some(initial_artifacts);
             snapshots
                 .insert(
                     OrderedBase::post_genesis(),
@@ -9972,6 +10428,14 @@ mod aggregate {
                             },
                         )
                         .map_err(historical_replay_error)?;
+                    let next_artifacts = derive_successor_artifact_closure(
+                        artifacts.as_ref().ok_or(ReplayError::InvalidRecord)?,
+                        &entry.input,
+                        &step.runtime,
+                        &step.state,
+                        step.outcome,
+                    )
+                    .map_err(lift_validation)?;
                     if canonical_head.head == Some(id) && canonical_head.index == entry.index {
                         final_system_authority_write =
                             step.system_authority_write.clone().map(|write| {
@@ -9982,6 +10446,7 @@ mod aggregate {
                             });
                     }
                     state = step.state;
+                    artifacts = Some(next_artifacts);
                     validate_runtime_state_bound(&state)?;
                     current_ordered = OrderedBase {
                         index: entry.index,
@@ -10067,8 +10532,12 @@ mod aggregate {
         drop(machine);
         validate_runtime_state_bound(&state)?;
 
-        let artifacts = derive_standard_artifact_closure(heads.genesis, &heads.runtime, &state)
-            .map_err(lift_validation)?;
+        let artifacts = artifacts.ok_or(ReplayError::InvalidRecord)?;
+        if artifacts.genesis != heads.genesis
+            || !artifacts.artifacts.contains(&heads.runtime.package)
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
         authenticate_artifacts(store, &artifacts)?;
         if !fence_ancestry.validate()
             || fence_ancestry.genesis() != heads.genesis
@@ -10119,6 +10588,16 @@ mod aggregate {
         if heads.validate().is_err() || heads.id() == JournalHeadsId::ZERO {
             return Err(ReplayError::InvalidRecord);
         }
+        let genesis = store
+            .genesis()
+            .map_err(journal)?
+            .ok_or_else(|| journal(JournalStoreError::NotInitialized))?;
+        if genesis.validate().is_err() || genesis.id() != heads.genesis {
+            return Err(ReplayError::InvalidRecord);
+        }
+        executor
+            .seed_genesis(&genesis)
+            .map_err(ReplayError::Executor)?;
         let base = match heads.checkpoint {
             Some(checkpoint) => {
                 load_checkpoint_base::<S, E, R>(store, executor, &heads, checkpoint)?
@@ -10157,6 +10636,16 @@ mod aggregate {
         {
             return Err(ReplayError::ScopeMismatch);
         }
+        let genesis = store
+            .genesis()
+            .map_err(journal)?
+            .ok_or_else(|| journal(JournalStoreError::NotInitialized))?;
+        if genesis.validate().is_err() || genesis.id() != heads.genesis {
+            return Err(ReplayError::InvalidRecord);
+        }
+        executor
+            .seed_genesis(&genesis)
+            .map_err(ReplayError::Executor)?;
         let base = match heads.checkpoint {
             Some(checkpoint) => {
                 load_checkpoint_base::<S, E, R>(store, executor, &heads, checkpoint)?
@@ -11067,6 +11556,7 @@ mod aggregate {
                 (invocation, InvocationOwnershipOperation::Acknowledge)
             }
             ReplayOperation::Management { .. }
+            | ReplayOperation::CleanManage { .. }
             | ReplayOperation::CleanInvoke { .. }
             | ReplayOperation::SealMerge => {
                 return Err(ReplayError::InvalidPosition);
@@ -11337,16 +11827,23 @@ mod aggregate {
 
     fn successor_artifacts<S, ResolverError, E>(
         store: &S,
+        current: &ArtifactClosure,
+        input: &ReplayInput,
         heads: &JournalHeads,
         state: &RuntimeState,
+        outcome: ReplayStepOutcome,
     ) -> Result<ArtifactClosure, MaterializeError<ResolverError, E::Error>>
     where
         S: AgentJournalStore,
         E: ReplayExecutor,
     {
         validate_runtime_state_bound(state)?;
-        let artifacts = derive_standard_artifact_closure(heads.genesis, &heads.runtime, state)
-            .map_err(lift_validation)?;
+        if current.genesis != heads.genesis {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let artifacts =
+            derive_successor_artifact_closure(current, input, &heads.runtime, state, outcome)
+                .map_err(lift_validation)?;
         authenticate_artifacts(store, &artifacts)?;
         Ok(artifacts)
     }
@@ -11738,8 +12235,14 @@ mod aggregate {
                 },
             )
             .map_err(lift_validation)?;
-        let artifacts =
-            successor_artifacts::<S, core::convert::Infallible, E>(store, &next, &step.state)?;
+        let artifacts = successor_artifacts::<S, core::convert::Infallible, E>(
+            store,
+            &materialization.artifacts,
+            &entry.input,
+            &next,
+            &step.state,
+            step.outcome,
+        )?;
         let (
             merge_boundary_roots,
             merge_boundary_ancestry,
@@ -11819,13 +12322,23 @@ mod aggregate {
         let entry = committed.authenticated_entry().map_err(lift_validation)?;
         let current = &materialization.heads;
         let id = entry.id();
-        let decoded = decode_standard_runtime_state(&materialization.state)
-            .map_err(|_| ReplayError::InvalidRecord)?;
-        let config = decoded.config.as_ref().ok_or(ReplayError::InvalidRecord)?;
+        let clean_descriptor = executor
+            .trusted_clean_descriptor(&current.runtime)
+            .map_err(ReplayError::Executor)?;
+        let identity_matches = if let Some(descriptor) = clean_descriptor {
+            descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared
+                && descriptor.identity.space.0 == committed.committee.space().0
+                && descriptor.identity.agent.0 == committed.committee.agent().0
+        } else {
+            let decoded = decode_standard_runtime_state(&materialization.state)
+                .map_err(|_| ReplayError::InvalidRecord)?;
+            let config = decoded.config.as_ref().ok_or(ReplayError::InvalidRecord)?;
+            config.identity.profile == AgentProfile::Shared
+                && config.identity.space == committed.committee.space()
+                && config.identity.agent == committed.committee.agent()
+        };
         if committed.committee.profile() != AgentProfile::Shared
-            || config.identity.profile != AgentProfile::Shared
-            || config.identity.space != committed.committee.space()
-            || config.identity.agent != committed.committee.agent()
+            || !identity_matches
             || store.instance_id() != committed.journal_store
             || current.node != committed.local_node
             || current.genesis != committed.route.genesis()
@@ -12320,10 +12833,12 @@ mod aggregate {
             state.merge = materialization.state.merge.clone();
         }
         validate_runtime_state_bound(&state)?;
-        let projected_artifacts = derive_standard_artifact_closure::<core::convert::Infallible>(
-            next.genesis,
+        let projected_artifacts = derive_successor_artifact_closure(
+            &materialization.artifacts,
+            &entry.input,
             &next.runtime,
             &state,
+            step.outcome,
         )
         .map_err(lift_validation)?;
         let output_base = OrderedBase {
@@ -12408,7 +12923,14 @@ mod aggregate {
         let fence_ancestry = sealed.fence_ancestry.clone();
         let fence = machine.fence.clone();
         drop(machine);
-        let artifacts = successor_artifacts::<S, R::Error, E>(store, &next, &state)?;
+        let artifacts = successor_artifacts::<S, R::Error, E>(
+            store,
+            &materialization.artifacts,
+            &entry.input,
+            &next,
+            &state,
+            step.outcome,
+        )?;
         if artifacts != projected_artifacts {
             return Err(ReplayError::InvalidRecord);
         }
@@ -12598,8 +13120,14 @@ mod aggregate {
         let mut state = materialization.state.clone();
         state.local = step.state.local;
         validate_runtime_state_bound(&state)?;
-        let artifacts =
-            successor_artifacts::<S, core::convert::Infallible, E>(store, &next, &state)?;
+        let artifacts = successor_artifacts::<S, core::convert::Infallible, E>(
+            store,
+            &materialization.artifacts,
+            &entry.input,
+            &next,
+            &state,
+            step.outcome,
+        )?;
         Ok(ReplayPreparation::Ready(ReplayPreparedPublication {
             store,
             sealed,
@@ -12925,7 +13453,14 @@ mod aggregate {
             .map_err(lift_validation)?;
         let fence_ancestry = sealed.fence_ancestry.clone();
         drop(machine);
-        let artifacts = successor_artifacts::<S, R::Error, E>(store, &next, &state)?;
+        let artifacts = successor_artifacts::<S, R::Error, E>(
+            store,
+            &materialization.artifacts,
+            &event.input,
+            &next,
+            &state,
+            step.outcome,
+        )?;
         let mut next_roots = materialization
             .merge_roots
             .iter()
@@ -12999,15 +13534,38 @@ mod aggregate {
     {
         require_current_materialization(store, materialization)?;
         let current = &materialization.heads;
-        let decoded = decode_standard_runtime_state(&materialization.state)
-            .map_err(|_| ReplayError::InvalidRecord)?;
-        if decoded
-            .config
-            .as_ref()
-            .is_none_or(|config| config.identity.profile != AgentProfile::Shared)
-        {
-            return Err(ReplayError::InvalidRecord);
-        }
+        let genesis = require_genesis(store, current.genesis)?;
+        let clean_generation = match &genesis.create.operation {
+            ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+                ..
+            } => {
+                if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+                    || descriptor.identity.space.0 != current.runtime.space.0
+                    || descriptor.identity.agent.0 != current.runtime.agent.0
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                true
+            }
+            ReplayOperation::Management { .. } => {
+                let decoded = decode_standard_runtime_state(&materialization.state)
+                    .map_err(|_| ReplayError::InvalidRecord)?;
+                if decoded
+                    .config
+                    .as_ref()
+                    .is_none_or(|config| config.identity.profile != AgentProfile::Shared)
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                false
+            }
+            ReplayOperation::CleanManage { .. }
+            | ReplayOperation::Invoke { .. }
+            | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::Acknowledge { .. }
+            | ReplayOperation::SealMerge => return Err(ReplayError::InvalidRecord),
+        };
         let indexes = InvocationIndexes::open(
             store,
             current.ordered_invocations,
@@ -13030,9 +13588,18 @@ mod aggregate {
             }
         }
         drop(indexes);
-        let state = compact_standard_checkpoint(&materialization.state)?;
-        let artifacts = derive_standard_artifact_closure(current.genesis, &current.runtime, &state)
-            .map_err(lift_validation)?;
+        let (state, artifacts) = if clean_generation {
+            (
+                materialization.state.clone(),
+                materialization.artifacts.clone(),
+            )
+        } else {
+            let state = compact_standard_checkpoint(&materialization.state)?;
+            let artifacts =
+                derive_standard_artifact_closure(current.genesis, &current.runtime, &state)
+                    .map_err(lift_validation)?;
+            (state, artifacts)
+        };
         authenticate_artifacts(store, &artifacts)?;
         let ordered = materialization.ordered_base();
         let cursors = [
@@ -13332,19 +13899,41 @@ mod aggregate {
     {
         require_current_materialization(store, materialization)?;
         let current = &materialization.heads;
-        let decoded = decode_standard_runtime_state(&materialization.state)
-            .map_err(|_| ReplayError::InvalidRecord)?;
-        if decoded
-            .config
-            .as_ref()
-            .is_some_and(|config| config.identity.profile == AgentProfile::Shared)
-        {
-            // Shared compaction requires a certified snapshot which retains
-            // the complete ordered claim/QC and pinned Merge audit closure.
-            // The canonical Local checkpoint capability carries none of that
-            // authority, so it must fail closed even before ledger anchoring.
-            return Err(ReplayError::InvalidRecord);
-        }
+        let genesis = require_genesis(store, current.genesis)?;
+        let clean_generation = match &genesis.create.operation {
+            ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+                ..
+            } => {
+                if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Local
+                    || descriptor.identity.space.0 != current.runtime.space.0
+                    || descriptor.identity.agent.0 != current.runtime.agent.0
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                true
+            }
+            ReplayOperation::Management { .. } => {
+                let decoded = decode_standard_runtime_state(&materialization.state)
+                    .map_err(|_| ReplayError::InvalidRecord)?;
+                if decoded
+                    .config
+                    .as_ref()
+                    .is_some_and(|config| config.identity.profile == AgentProfile::Shared)
+                {
+                    // Shared compaction requires a certified snapshot which
+                    // retains the complete ordered claim/QC and pinned Merge
+                    // audit closure.
+                    return Err(ReplayError::InvalidRecord);
+                }
+                false
+            }
+            ReplayOperation::CleanManage { .. }
+            | ReplayOperation::Invoke { .. }
+            | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::Acknowledge { .. }
+            | ReplayOperation::SealMerge => return Err(ReplayError::InvalidRecord),
+        };
         let indexes = InvocationIndexes::open(
             store,
             current.ordered_invocations,
@@ -13367,9 +13956,18 @@ mod aggregate {
             }
         }
         drop(indexes);
-        let state = compact_standard_checkpoint(&materialization.state)?;
-        let artifacts = derive_standard_artifact_closure(current.genesis, &current.runtime, &state)
-            .map_err(lift_validation)?;
+        let (state, artifacts) = if clean_generation {
+            (
+                materialization.state.clone(),
+                materialization.artifacts.clone(),
+            )
+        } else {
+            let state = compact_standard_checkpoint(&materialization.state)?;
+            let artifacts =
+                derive_standard_artifact_closure(current.genesis, &current.runtime, &state)
+                    .map_err(lift_validation)?;
+            (state, artifacts)
+        };
         authenticate_artifacts(store, &artifacts)?;
         let ordered = materialization.ordered_base();
         let cursors = [
@@ -15265,6 +15863,7 @@ pub(crate) mod tests {
                 authority,
             } => (invocation, authority),
             ReplayOperation::Management { .. }
+            | ReplayOperation::CleanManage { .. }
             | ReplayOperation::CleanInvoke { .. }
             | ReplayOperation::SealMerge => {
                 panic!("test divergence requires an invocation")
@@ -15317,6 +15916,461 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
+    fn opaque_clean_fixture() -> (
+        ReplayInput,
+        crate::agent_sdk::AgentDescriptor,
+        SigningKey,
+        AgentReplica,
+    ) {
+        use crate::agent_sdk::authority::{
+            AgentAuthorityBinding as CleanAuthorityBinding, AuthorityIssuer,
+        };
+
+        let signing = SigningKey::from_bytes(&[0x31; 32]);
+        let public_key = signing.verifying_key().to_bytes();
+        let space = crate::agent_sdk::SpaceId([0x32; 32]);
+        let owner = crate::agent_sdk::PrincipalId([0x33; 32]);
+        let nonce = crate::agent_sdk::Hash([0x34; 32]);
+        let agent = crate::agent_sdk::AgentId::derive(space, owner, nonce.as_bytes());
+        let replica = AgentReplica {
+            node: NodeId([0x35; 32]),
+            principal: PrincipalId(owner.0),
+            role: ReplicaRole::Voter,
+        };
+        let runtime_bytes = b"opaque-clean-runtime-v1";
+        let runtime_reference = BlobRef::of_bytes(runtime_bytes);
+        let descriptor = crate::agent_sdk::AgentDescriptor {
+            identity: crate::agent_sdk::AgentIdentity {
+                space,
+                agent,
+                owner,
+                profile: crate::agent_sdk::AgentProfile::Local,
+                runtime_deployment: crate::agent_sdk::DeploymentId([0x36; 32]),
+                runtime_program: crate::agent_sdk::ProgramId([0x37; 32]),
+                runtime_producer: crate::agent_sdk::ProducerId([0x38; 32]),
+            },
+            creation_nonce: nonce,
+            authority: CleanAuthorityBinding {
+                policy: crate::agent_sdk::Hash([0x39; 32]),
+                issuer: AuthorityIssuer {
+                    principal: owner,
+                    actor: crate::agent_sdk::ActorId([0x3a; 32]),
+                    deployment: crate::agent_sdk::DeploymentId([0x3b; 32]),
+                    program: crate::agent_sdk::ProgramId([0x3c; 32]),
+                    producer: crate::agent_sdk::ProducerId::of_public_key(&public_key),
+                },
+                public_key,
+                initial_epoch: 1,
+            },
+            runtime_package: crate::agent_sdk::BlobRef {
+                hash: crate::agent_sdk::Hash(runtime_reference.hash.0),
+                len: runtime_reference.len,
+            },
+            runtime_contract: crate::agent_sdk::contract::RuntimePackageContract::canonical(),
+            capabilities: crate::agent_sdk::RuntimeCapabilities::standard(),
+            replicas: vec![crate::agent_sdk::AgentReplica {
+                node: crate::agent_sdk::NodeId(replica.node.0),
+                principal: owner,
+                role: crate::agent_sdk::ReplicaRole::Voter,
+            }],
+        };
+        descriptor.validate().unwrap();
+        let runtime = RuntimeBinding {
+            space: SpaceId(space.0),
+            agent: AgentId(agent.0),
+            deployment: DeploymentId(descriptor.identity.runtime_deployment.0),
+            program: ProgramId(descriptor.identity.runtime_program.0),
+            producer: ProducerId(descriptor.identity.runtime_producer.0),
+            package: BlobRef {
+                hash: Hash(descriptor.runtime_package.hash.0),
+                len: descriptor.runtime_package.len,
+            },
+            runtime_abi: super::super::RUNTIME_ABI_ID,
+            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+        };
+        let request = crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+        let authority = signed_opaque_clean_receipt(
+            &descriptor,
+            &request,
+            descriptor.identity.runtime_deployment,
+            1,
+            &signing,
+        );
+        (
+            ReplayInput {
+                runtime,
+                operation: ReplayOperation::CleanManage {
+                    request,
+                    authority,
+                    observed_slot: 10,
+                },
+            },
+            descriptor,
+            signing,
+            replica,
+        )
+    }
+
+    #[cfg(feature = "std")]
+    fn signed_opaque_clean_receipt(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        request: &crate::agent_sdk::ManagementRequest,
+        runtime_deployment: crate::agent_sdk::DeploymentId,
+        decision_sequence: u64,
+        signing: &SigningKey,
+    ) -> crate::agent_sdk::authority::AuthorityReceipt {
+        use crate::agent_sdk::authority::{
+            AuthorityEvidence, AuthorityLaneRoots, AuthorityReceipt, AuthorityReceiptSelector,
+        };
+
+        let (actor, actor_deployment) = request
+            .authority_actor()
+            .map_or((None, None), |(actor, deployment)| {
+                (Some(actor), Some(deployment))
+            });
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: descriptor.authority.policy,
+                issuer: descriptor.authority.issuer,
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                operation: request.authority_operation().unwrap(),
+                runtime_deployment,
+                actor,
+                actor_deployment,
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: crate::agent_sdk::Hash([0x3d; 32]),
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch: 1,
+                decision_sequence,
+                acknowledged_through: 0,
+                valid_from: 1,
+                expires_at: 100,
+                request: request.commitment(),
+            },
+            public_key: signing.verifying_key().to_bytes(),
+            signature: [0; 64],
+        };
+        receipt.signature = signing.sign(&receipt.signing_bytes()).to_bytes();
+        receipt.validate_shape().unwrap();
+        receipt
+    }
+
+    #[cfg(feature = "std")]
+    #[derive(Default)]
+    struct OpaqueCleanReplayExecutor {
+        descriptor: Option<crate::agent_sdk::AgentDescriptor>,
+        last: Option<(
+            super::super::journal::ReplayInputId,
+            crate::agent_sdk::RuntimeOutcome,
+            RuntimeState,
+            RuntimeBinding,
+            ReplayDisposition,
+        )>,
+    }
+
+    #[cfg(feature = "std")]
+    impl ReplayExecutor for OpaqueCleanReplayExecutor {
+        type Error = ();
+
+        fn seed_genesis(&mut self, genesis: &AgentJournalGenesis) -> Result<(), Self::Error> {
+            let ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+                ..
+            } = &genesis.create.operation
+            else {
+                return Err(());
+            };
+            if descriptor.validate().is_err() {
+                return Err(());
+            }
+            self.descriptor = Some((**descriptor).clone());
+            Ok(())
+        }
+
+        fn verify_merge_event(&mut self, _event: &MergeEvent) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        fn authenticate(
+            &mut self,
+            input: &ReplayInput,
+            _before: &RuntimeState,
+            _position: ReplayPosition,
+        ) -> Result<(), Self::Error> {
+            let ReplayOperation::CleanManage {
+                request,
+                authority,
+                observed_slot,
+            } = &input.operation
+            else {
+                return Err(());
+            };
+            let descriptor = match request {
+                crate::agent_sdk::ManagementRequest::Create(descriptor) => descriptor.as_ref(),
+                _ => self.descriptor.as_ref().ok_or(())?,
+            };
+            if !descriptor.authority.accepts(authority)
+                || !authority.selector.is_live_at(*observed_slot)
+                || authority.selector.request != request.commitment()
+                || !super::super::authority::verify_raw_ed25519(
+                    &authority.public_key,
+                    &authority.signing_bytes(),
+                    &authority.signature,
+                )
+            {
+                return Err(());
+            }
+            Ok(())
+        }
+
+        fn execute(
+            &mut self,
+            input: &ReplayInput,
+            before: &RuntimeState,
+            _position: ReplayPosition,
+        ) -> Result<ReplayTransition, Self::Error> {
+            let ReplayOperation::CleanManage { request, .. } = &input.operation else {
+                return Err(());
+            };
+            if let crate::agent_sdk::ManagementRequest::Create(descriptor) = request {
+                self.descriptor = Some((**descriptor).clone());
+            }
+            let descriptor = self.descriptor.as_ref().ok_or(())?;
+            let (state, next_runtime, disposition, outcome) = match request {
+                crate::agent_sdk::ManagementRequest::Create(created) => {
+                    if !before.is_empty() || created.as_ref() != descriptor {
+                        return Err(());
+                    }
+                    (
+                        RuntimeState {
+                            control: b"OPAQUE-CONTROL-V1".to_vec(),
+                            linear: Vec::new(),
+                            merge: Vec::new(),
+                            local: Vec::new(),
+                        },
+                        input.runtime.clone(),
+                        ReplayDisposition::Applied,
+                        crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                            crate::agent_sdk::ManagementReply::Created(descriptor.identity.clone()),
+                        )),
+                    )
+                }
+                crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade) => {
+                    let mut state = before.clone();
+                    if state.control == b"OPAQUE-CONTROL-V1" {
+                        state.control = b"OPAQUE-CONTROL-V2".to_vec();
+                    } else if state.control != b"OPAQUE-CONTROL-V2" {
+                        return Err(());
+                    }
+                    let mut identity = descriptor.identity.clone();
+                    identity.runtime_deployment = upgrade.to_deployment;
+                    identity.runtime_program = upgrade.to_program;
+                    identity.runtime_producer = upgrade.producer;
+                    (
+                        state,
+                        RuntimeBinding {
+                            space: input.runtime.space,
+                            agent: input.runtime.agent,
+                            deployment: DeploymentId(upgrade.to_deployment.0),
+                            program: ProgramId(upgrade.to_program.0),
+                            producer: ProducerId(upgrade.producer.0),
+                            package: BlobRef {
+                                hash: Hash(upgrade.package.hash.0),
+                                len: upgrade.package.len,
+                            },
+                            runtime_abi: input.runtime.runtime_abi,
+                            execution_semantics: input.runtime.execution_semantics,
+                        },
+                        ReplayDisposition::Applied,
+                        crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                            crate::agent_sdk::ManagementReply::RuntimeUpgraded(identity),
+                        )),
+                    )
+                }
+                crate::agent_sdk::ManagementRequest::Suspend { .. } => (
+                    before.clone(),
+                    input.runtime.clone(),
+                    ReplayDisposition::Rejected,
+                    crate::agent_sdk::RuntimeOutcome::Management(Err(
+                        crate::agent_sdk::ManagementError::NotFound,
+                    )),
+                ),
+                _ => return Err(()),
+            };
+            self.last = Some((
+                input.id(),
+                outcome,
+                state.clone(),
+                next_runtime.clone(),
+                disposition,
+            ));
+            Ok(ReplayTransition {
+                state,
+                disposition,
+                result: None,
+                next_runtime,
+                products: ReplayProducts::default(),
+            })
+        }
+
+        fn validates_clean_management_transition(
+            &self,
+            input: &ReplayInput,
+            transition: &ReplayTransition,
+        ) -> bool {
+            self.last
+                .as_ref()
+                .is_some_and(|(id, outcome, state, runtime, disposition)| {
+                    *id == input.id()
+                        && matches!(outcome, crate::agent_sdk::RuntimeOutcome::Management(_))
+                        && state == &transition.state
+                        && runtime == &transition.next_runtime
+                        && disposition == &transition.disposition
+                })
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn opaque_clean_genesis_upgrade_retry_and_checkpoint_reopen_never_use_standard_state() {
+        let (create, descriptor, signing, replica) = opaque_clean_fixture();
+        let mut executor = OpaqueCleanReplayExecutor::default();
+        let prepared = ReplayPreparedGenesis::prepare(create, replica, &mut executor).unwrap();
+        let sealed = ReplaySealedLocalGenesis::from_prepared(prepared).unwrap();
+        sealed.validate().unwrap();
+        assert!(decode_standard_runtime_state(sealed.post_create()).is_err());
+
+        let mut store =
+            MemoryAgentJournalStore::new(AgentId(descriptor.identity.agent.0), replica.node)
+                .unwrap();
+        let initial_runtime_bytes = b"opaque-clean-runtime-v1";
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &BlobRef {
+                    hash: Hash(descriptor.runtime_package.hash.0),
+                    len: descriptor.runtime_package.len,
+                },
+                initial_runtime_bytes,
+            )
+            .unwrap();
+        store.initialize_raw_for_test(sealed.genesis()).unwrap();
+
+        let mut executor = OpaqueCleanReplayExecutor::default();
+        let initial =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        assert_eq!(initial.state(), sealed.post_create());
+        assert_eq!(executor.descriptor.as_ref(), Some(&descriptor));
+        assert!(decode_standard_runtime_state(initial.state()).is_err());
+
+        let target_runtime_bytes = b"opaque-clean-runtime-v2";
+        let target_runtime_reference = BlobRef::of_bytes(target_runtime_bytes);
+        let upgrade = crate::agent_sdk::RuntimeUpgrade {
+            from_deployment: descriptor.identity.runtime_deployment,
+            to_deployment: crate::agent_sdk::DeploymentId([0x41; 32]),
+            to_program: crate::agent_sdk::ProgramId([0x42; 32]),
+            producer: crate::agent_sdk::ProducerId([0x43; 32]),
+            package: crate::agent_sdk::BlobRef {
+                hash: crate::agent_sdk::Hash(target_runtime_reference.hash.0),
+                len: target_runtime_reference.len,
+            },
+            contract: crate::agent_sdk::contract::RuntimePackageContract::canonical(),
+            capabilities: crate::agent_sdk::RuntimeCapabilities::standard(),
+        };
+        let request = crate::agent_sdk::ManagementRequest::UpgradeRuntime(Box::new(upgrade));
+        let authority = signed_opaque_clean_receipt(
+            &descriptor,
+            &request,
+            descriptor.identity.runtime_deployment,
+            2,
+            &signing,
+        );
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &target_runtime_reference,
+                target_runtime_bytes,
+            )
+            .unwrap();
+        let merge_seal = persist_merge_seal(&mut store, &initial);
+        let first = OrderedEntry {
+            genesis: initial.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: initial.merge_frontier(),
+            merge_seal: Some(merge_seal),
+            input: ReplayInput {
+                runtime: initial.runtime().clone(),
+                operation: ReplayOperation::CleanManage {
+                    request: request.clone(),
+                    authority: authority.clone(),
+                    observed_slot: 10,
+                },
+            },
+        };
+        let prepared = match prepare_ordered(&mut store, &mut executor, &initial, &first).unwrap() {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_, upgraded, _) = prepared.publish().unwrap();
+        assert_eq!(upgraded.heads().ordered_index, 1);
+        assert_eq!(upgraded.runtime().deployment.0, [0x41; 32]);
+        assert_eq!(upgraded.state().control, b"OPAQUE-CONTROL-V2");
+        assert!(decode_standard_runtime_state(upgraded.state()).is_err());
+
+        // A result-loss retry executes the currently bound runtime while the
+        // immutable work selector remains the authorized historical `from`.
+        // Its successful no-op is still a new durable ordered transition.
+        let merge_seal = persist_merge_seal(&mut store, &upgraded);
+        let retry = OrderedEntry {
+            genesis: upgraded.heads().genesis,
+            index: 2,
+            parent: upgraded.heads().ordered_head,
+            merge_frontier: upgraded.merge_frontier(),
+            merge_seal: Some(merge_seal),
+            input: ReplayInput {
+                runtime: upgraded.runtime().clone(),
+                operation: ReplayOperation::CleanManage {
+                    request,
+                    authority,
+                    observed_slot: 10,
+                },
+            },
+        };
+        retry.input.validate().unwrap();
+        let before_retry = upgraded.state().clone();
+        let prepared = match prepare_ordered(&mut store, &mut executor, &upgraded, &retry).unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_, retried, _) = prepared.publish().unwrap();
+        assert_eq!(retried.heads().ordered_index, 2);
+        assert_eq!(retried.state(), &before_retry);
+        assert_eq!(retried.runtime(), upgraded.runtime());
+
+        let checkpoint = prepare_checkpoint(&mut store, &retried).unwrap();
+        let (_, checkpointed, _) = checkpoint.publish().unwrap();
+        let mut reopened_store = store.clone();
+        let mut reopened_executor = OpaqueCleanReplayExecutor::default();
+        let reopened = materialize_current(
+            &mut reopened_store,
+            &mut reopened_executor,
+            &NoPrunedOrderedBases,
+        )
+        .unwrap();
+        assert_eq!(reopened.state(), checkpointed.state());
+        assert_eq!(reopened.runtime(), checkpointed.runtime());
+        assert_eq!(reopened.heads().ordered_index, 2);
+        assert_eq!(reopened_executor.descriptor.as_ref(), Some(&descriptor));
+        assert!(decode_standard_runtime_state(reopened.state()).is_err());
+    }
+
+    #[cfg(feature = "std")]
     #[derive(Default)]
     struct ExactCreateRejectInvocations {
         executions: usize,
@@ -15362,7 +16416,9 @@ pub(crate) mod tests {
                         .map(|_| ())
                         .ok_or(())
                 }
-                ReplayOperation::Management { .. } | ReplayOperation::SealMerge => Ok(()),
+                ReplayOperation::Management { .. }
+                | ReplayOperation::CleanManage { .. }
+                | ReplayOperation::SealMerge => Ok(()),
             }
         }
 
@@ -16298,7 +17354,9 @@ pub(crate) mod tests {
                     };
                     authority.signature.as_slice()
                 }
-                ReplayOperation::Management { .. } | ReplayOperation::SealMerge => return Ok(()),
+                ReplayOperation::Management { .. }
+                | ReplayOperation::CleanManage { .. }
+                | ReplayOperation::SealMerge => return Ok(()),
             };
             signature
                 .first()

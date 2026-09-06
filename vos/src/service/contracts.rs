@@ -302,7 +302,7 @@ impl BlobRef {
     /// a VOS service service invocation.
     pub fn of_bytes(bytes: &[u8]) -> Self {
         Self {
-            hash: Hash::digest(b"vos/blob/service", &[bytes]),
+            hash: Hash::digest(b"vos/blob", &[bytes]),
             len: bytes.len() as u64,
         }
     }
@@ -5938,6 +5938,23 @@ fn ensure_sorted_unique<T, K: Ord>(values: &[T], key: impl Fn(&T) -> K) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blob_identity_is_the_clean_protocol_domain_and_rejects_retired_service_refs() {
+        let bytes = b"canonical portable artifact";
+        let canonical = BlobRef::of_bytes(bytes);
+        let sdk = crate::agent_sdk::BlobRef::of_bytes(bytes);
+        assert_eq!(canonical.hash.0, sdk.hash.0);
+        assert_eq!(canonical.len, sdk.len);
+        assert!(canonical.matches(bytes));
+
+        let retired = BlobRef {
+            hash: Hash::digest(b"vos/blob/service", &[bytes]),
+            len: bytes.len() as u64,
+        };
+        assert_ne!(retired, canonical);
+        assert!(!retired.matches(bytes));
+    }
 
     fn role_policies(methods: Vec<MethodPolicy>) -> Vec<u8> {
         super::super::PackageRolePolicies {

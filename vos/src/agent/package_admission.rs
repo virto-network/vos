@@ -302,6 +302,313 @@ fn artifact_bytes<'a>(
 }
 
 #[cfg(test)]
+pub(crate) fn admitted_standard_actor_for_test(
+    name: &str,
+    lane: vos_agent_sdk::StateLane,
+    signing_seed: u8,
+) -> AdmittedActorPackage {
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use vos_agent_sdk::contract::ActorPackageContract;
+    use vos_agent_sdk::introspection::ActorIntrospectionArtifact;
+    use vos_agent_sdk::method_policy::ActorMethodPolicyArtifact;
+    use vos_agent_sdk::package::{PackageArtifact, PackageSigning};
+    use vos_agent_sdk::schema::{
+        ConstructorContract, ParsedField, ParsedInlineField, ParsedSchema,
+    };
+    use vos_agent_sdk::task::TaskDependencySetArtifact;
+    use vos_agent_sdk::wire::CanonicalWire as _;
+    use vos_agent_sdk::{FieldPersistence, Hash, LaneSet, ProofSystemSet};
+    use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+    let mut assembler = Assembler::new();
+    let program = assembler.load_imm_64(Reg::A0, 1).trap().build_standard();
+    let schema = ParsedSchema {
+        constructor: ConstructorContract::Forbidden,
+        fields: vec![ParsedField::Inline(ParsedInlineField {
+            source_index: 0,
+            name: "value".into(),
+            type_identity: "core::primitive::u64".into(),
+            persistence: FieldPersistence::State(lane),
+        })],
+        methods: Vec::new(),
+    }
+    .encode()
+    .unwrap();
+    let method_policy = ActorMethodPolicyArtifact {
+        actor_schema: BlobRef::of_bytes(&schema),
+        methods: Vec::new(),
+    }
+    .encode()
+    .unwrap();
+    let introspection = ActorIntrospectionArtifact {
+        actor_schema: BlobRef::of_bytes(&schema),
+        method_policy: BlobRef::of_bytes(&method_policy),
+        actor_doc: "clean journal lane fixture".into(),
+        methods: Vec::new(),
+    }
+    .encode()
+    .unwrap();
+    let tasks = TaskDependencySetArtifact {
+        dependencies: Vec::new(),
+    }
+    .encode()
+    .unwrap();
+    let artifact = |bytes: &[u8]| PackageArtifact {
+        identity: BlobRef::of_bytes(bytes),
+        bytes: bytes.to_vec(),
+    };
+    let signing = SigningKey::from_bytes(&[signing_seed; 32]);
+    let public_key = signing.verifying_key().to_bytes();
+    let package_signing = PackageSigning {
+        producer: ProducerId::of_public_key(&public_key),
+        public_key,
+        signature: [0; 64],
+    };
+    let mut artifacts = vec![
+        artifact(&program),
+        artifact(&schema),
+        artifact(&method_policy),
+        artifact(&introspection),
+        artifact(&tasks),
+    ];
+    artifacts.sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+    let mut package = PackageEnvelope {
+        manifest: PackageManifest::Actor(ActorPackageManifest {
+            name: name.into(),
+            program: BlobRef::of_bytes(&program),
+            contract: ActorPackageContract::canonical(),
+            state_lane_schema: BlobRef::of_bytes(&schema),
+            method_policy: BlobRef::of_bytes(&method_policy),
+            introspection: BlobRef::of_bytes(&introspection),
+            task_dependencies: BlobRef::of_bytes(&tasks),
+            scheduling: false,
+            requirements: RuntimeRequirements {
+                lanes: LaneSet::of(lane),
+                scheduling: false,
+                proof_systems: ProofSystemSet::EMPTY,
+            },
+            signing: package_signing,
+        }),
+        artifacts,
+    };
+    let signing_bytes = package.signing_bytes().unwrap();
+    package.manifest.signing_mut().signature = signing.sign(&signing_bytes).to_bytes();
+    let exact = package.encode().unwrap();
+    let admitted = admit_actor_package(&exact).unwrap();
+    assert_eq!(admitted.manifest().name, name);
+    assert_ne!(admitted.manifest().state_lane_schema.hash, Hash::ZERO);
+    admitted
+}
+
+#[cfg(test)]
+pub(crate) fn admitted_standard_runtime_for_test(
+    name: &str,
+    signing_seed: u8,
+) -> AdmittedRuntimePackage {
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use vos_agent_sdk::contract::RuntimePackageContract;
+    use vos_agent_sdk::package::{PackageArtifact, PackageSigning};
+
+    let program = include_bytes!("../../../vosx/blobs/agent_runtime.pvm");
+    let signing = SigningKey::from_bytes(&[signing_seed; 32]);
+    let public_key = signing.verifying_key().to_bytes();
+    let mut package = PackageEnvelope {
+        manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
+            name: name.into(),
+            outer_program: BlobRef::of_bytes(program),
+            contract: RuntimePackageContract::canonical(),
+            capabilities: RuntimeCapabilities::standard(),
+            signing: PackageSigning {
+                producer: ProducerId::of_public_key(&public_key),
+                public_key,
+                signature: [0; 64],
+            },
+        }),
+        artifacts: vec![PackageArtifact {
+            identity: BlobRef::of_bytes(program),
+            bytes: program.to_vec(),
+        }],
+    };
+    let signing_bytes = package.signing_bytes().unwrap();
+    package.manifest.signing_mut().signature = signing.sign(&signing_bytes).to_bytes();
+    admit_runtime_package(&package.encode().unwrap()).unwrap()
+}
+
+/// One exact current-ABI response implemented by a physically executed test
+/// runtime. Cases are selected by canonical input length; callers must use
+/// unique lengths and may copy identity bytes from the read-only input window
+/// into an otherwise fixed canonical output.
+#[cfg(test)]
+pub(crate) struct ScriptedRuntimeCase {
+    pub(crate) input: Vec<u8>,
+    pub(crate) output: Vec<u8>,
+    pub(crate) copies: Vec<ScriptedRuntimeCopy>,
+}
+
+#[cfg(test)]
+pub(crate) struct ScriptedRuntimeCopy {
+    pub(crate) input_offset: usize,
+    pub(crate) output_offset: usize,
+    pub(crate) len: usize,
+}
+
+/// Admit a signed VOS3 package around a small opaque PVM which really reads
+/// the current canonical input and returns one of the supplied transitions.
+/// This intentionally does not call the native Standard runtime oracle.
+#[cfg(test)]
+pub(crate) fn admitted_scripted_runtime_for_test(
+    name: &str,
+    signing_seed: u8,
+    cases: Vec<ScriptedRuntimeCase>,
+) -> AdmittedRuntimePackage {
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use vos_agent_sdk::contract::RuntimePackageContract;
+    use vos_agent_sdk::package::{PackageArtifact, PackageSigning};
+    use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+    assert!(!cases.is_empty());
+    let discriminators = cases
+        .iter()
+        .enumerate()
+        .map(|(index, case)| {
+            let same_length = cases
+                .iter()
+                .enumerate()
+                .filter(|(other, candidate)| {
+                    *other != index && candidate.input.len() == case.input.len()
+                })
+                .map(|(_, candidate)| candidate)
+                .collect::<Vec<_>>();
+            if same_length.is_empty() {
+                return None;
+            }
+            (0..case.input.len())
+                .find(|offset| {
+                    same_length
+                        .iter()
+                        .all(|candidate| candidate.input[*offset] != case.input[*offset])
+                })
+                .map(|offset| (offset, case.input[offset]))
+                .or_else(|| panic!("same-length scripted inputs need a byte discriminator"))
+        })
+        .collect::<Vec<_>>();
+    for case in &cases {
+        assert!(case.input.len() <= i32::MAX as usize);
+        assert!(!case.output.is_empty());
+        for copy in &case.copies {
+            assert!(copy.len != 0);
+            assert!(
+                copy.input_offset
+                    .checked_add(copy.len)
+                    .is_some_and(|end| end <= case.input.len())
+            );
+            assert!(
+                copy.output_offset
+                    .checked_add(copy.len)
+                    .is_some_and(|end| end <= case.output.len())
+            );
+        }
+    }
+
+    let mut data = Vec::new();
+    let mut output_offsets = Vec::with_capacity(cases.len());
+    for case in &cases {
+        output_offsets.push(data.len());
+        data.extend_from_slice(&case.output);
+    }
+    let rw_base = 2_u64 * u64::from(vos_pvm::PVM_ZONE_SIZE);
+    let mut assembler = Assembler::new();
+    assembler.set_rw_data(data);
+    for ((case, discriminator), data_offset) in cases.iter().zip(discriminators).zip(output_offsets)
+    {
+        let copy_instructions = case
+            .copies
+            .iter()
+            .map(|copy| (copy.len / 8 + copy.len % 8).checked_mul(12).unwrap())
+            .sum::<usize>();
+        let return_instructions = 26_usize;
+        let block_len = copy_instructions
+            .checked_add(return_instructions)
+            .expect("scripted runtime block length");
+        let discriminator_len = discriminator.map_or(0, |_| 16_usize);
+        assembler.branch_ne_imm(
+            Reg::A1,
+            i32::try_from(case.input.len()).unwrap(),
+            u32::try_from(10 + discriminator_len + block_len).unwrap(),
+        );
+        if let Some((offset, value)) = discriminator {
+            assembler
+                .load_ind_u8(Reg::T1, Reg::A0, i32::try_from(offset).unwrap())
+                .branch_ne_imm(
+                    Reg::T1,
+                    i32::from(value),
+                    u32::try_from(10 + block_len).unwrap(),
+                );
+        }
+        for copy in &case.copies {
+            let mut copied = 0;
+            while copy.len - copied >= 8 {
+                assembler
+                    .load_ind_u64(
+                        Reg::T0,
+                        Reg::A0,
+                        i32::try_from(copy.input_offset + copied).unwrap(),
+                    )
+                    .store_u64(
+                        Reg::T0,
+                        u32::try_from(rw_base + (data_offset + copy.output_offset + copied) as u64)
+                            .unwrap(),
+                    );
+                copied += 8;
+            }
+            while copied < copy.len {
+                assembler
+                    .load_ind_u8(
+                        Reg::T0,
+                        Reg::A0,
+                        i32::try_from(copy.input_offset + copied).unwrap(),
+                    )
+                    .store_u8(
+                        Reg::T0,
+                        u32::try_from(rw_base + (data_offset + copy.output_offset + copied) as u64)
+                            .unwrap(),
+                    );
+                copied += 1;
+            }
+        }
+        assembler
+            .load_imm_64(Reg::A0, rw_base + data_offset as u64)
+            .load_imm_64(Reg::A1, case.output.len() as u64)
+            .jump_ind(Reg::RA, 0);
+    }
+    assembler.trap();
+    let program = assembler.build_standard();
+
+    let signing = SigningKey::from_bytes(&[signing_seed; 32]);
+    let public_key = signing.verifying_key().to_bytes();
+    let mut package = PackageEnvelope {
+        manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
+            name: name.into(),
+            outer_program: BlobRef::of_bytes(&program),
+            contract: RuntimePackageContract::canonical(),
+            capabilities: RuntimeCapabilities::standard(),
+            signing: PackageSigning {
+                producer: ProducerId::of_public_key(&public_key),
+                public_key,
+                signature: [0; 64],
+            },
+        }),
+        artifacts: vec![PackageArtifact {
+            identity: BlobRef::of_bytes(&program),
+            bytes: program,
+        }],
+    };
+    let signing_bytes = package.signing_bytes().unwrap();
+    package.manifest.signing_mut().signature = signing.sign(&signing_bytes).to_bytes();
+    admit_runtime_package(&package.encode().unwrap()).unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use ed25519_dalek::{Signer as _, SigningKey};
     use vos_agent_sdk::contract::{ActorPackageContract, RuntimePackageContract};

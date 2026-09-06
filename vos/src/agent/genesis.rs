@@ -279,6 +279,13 @@ impl AgentGenesisProposal {
         create_config(&self.create).ok_or(AgentGenesisError::InvalidProposal)
     }
 
+    /// Clean-generation descriptor retained by an exact SDK Create proposal.
+    pub fn clean_descriptor(
+        &self,
+    ) -> Result<&crate::agent_sdk::AgentDescriptor, AgentGenesisError> {
+        create_clean_descriptor(&self.create).ok_or(AgentGenesisError::InvalidProposal)
+    }
+
     pub fn id(&self) -> AgentGenesisProposalId {
         AgentGenesisProposalId(Hash::digest(PROPOSAL_ID_DOMAIN, &[&self.encode()]).0)
     }
@@ -289,16 +296,14 @@ impl AgentGenesisProposal {
         self.create
             .validate()
             .map_err(|_| AgentGenesisError::InvalidProposal)?;
-        let config = self.config()?;
-        let (inner, sequence) =
-            create_request_and_sequence(&self.create).ok_or(AgentGenesisError::InvalidProposal)?;
-        if config.identity.space != self.locator.space
-            || config.identity.agent != self.locator.agent
+        let identity = create_identity(&self.create).ok_or(AgentGenesisError::InvalidProposal)?;
+        if identity.space != self.locator.space
+            || identity.agent != self.locator.agent
             || self.create.runtime.space != self.locator.space
             || self.create.runtime.agent != self.locator.agent
             || self.expectations.runtime_binding != self.create.runtime.commitment()
-            || self.expectations.inner_create_request != inner.commitment()
-            || self.expectations.sequence != sequence
+            || self.expectations.inner_create_request != identity.request
+            || self.expectations.sequence != identity.sequence
             || self.catalog.as_slice() != [self.create.runtime.package.clone()]
             || system_genesis_artifact_closure_commitment(&self.catalog)
                 .map_err(|_| AgentGenesisError::InvalidCatalog)?
@@ -645,16 +650,17 @@ impl AgentGenesisClaim {
         replicas: &AgentReplicaCommittee,
     ) -> Result<Self, AgentGenesisError> {
         proposal.validate()?;
-        let config = proposal.config()?;
-        replicas.validate_for(config)?;
+        let identity =
+            create_identity(proposal.create()).ok_or(AgentGenesisError::InvalidProposal)?;
+        validate_committee_for_create(replicas, proposal.create())?;
         let claim = Self {
             space: proposal.locator.space,
             system_agent,
             system_genesis,
             system_admission,
             agent: proposal.locator.agent,
-            profile: config.identity.profile,
-            authority_binding: config.authority.commitment(),
+            profile: identity.profile,
+            authority_binding: identity.authority_binding,
             proposal: proposal.id(),
             create_input: proposal.create.id(),
             genesis_intent: proposal.expectations.genesis_intent()?,
@@ -743,13 +749,16 @@ impl AgentGenesisClaim {
     ) -> Result<(), AgentGenesisError> {
         self.validate()?;
         proposal.validate()?;
-        let config = proposal.config()?;
-        replicas.validate_for(config)?;
+        let identity =
+            create_identity(proposal.create()).ok_or(AgentGenesisError::InvalidProposal)?;
+        validate_committee_for_create(replicas, proposal.create())?;
         if self.space != proposal.locator.space
-            || self.system_agent != config.authority.agent
+            || identity
+                .system_agent
+                .is_some_and(|system_agent| self.system_agent != system_agent)
             || self.agent != proposal.locator.agent
-            || self.profile != config.identity.profile
-            || self.authority_binding != config.authority.commitment()
+            || self.profile != identity.profile
+            || self.authority_binding != identity.authority_binding
             || self.proposal != proposal.id()
             || self.create_input != proposal.create.id()
             || self.genesis_intent != proposal.expectations.genesis_intent()?
@@ -1189,7 +1198,7 @@ impl AgentGenesisProvision {
 
     pub fn validate(&self) -> Result<(), AgentGenesisError> {
         self.proposal.validate()?;
-        self.replicas.validate_for(self.proposal.config()?)?;
+        validate_committee_for_create(&self.replicas, self.proposal.create())?;
         self.evidence.validate()?;
         self.evidence
             .claim
@@ -1426,15 +1435,105 @@ fn create_config(create: &ReplayInput) -> Option<&AgentConfig> {
     Some(config)
 }
 
-fn create_request_and_sequence(create: &ReplayInput) -> Option<(&LifecycleRequest, u64)> {
-    let ReplayOperation::Management {
-        request: LifecycleRequest::Authorized { admission, request },
+fn create_clean_descriptor(create: &ReplayInput) -> Option<&crate::agent_sdk::AgentDescriptor> {
+    let ReplayOperation::CleanManage {
+        request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+        ..
     } = &create.operation
     else {
         return None;
     };
-    matches!(request.as_ref(), LifecycleRequest::Create(_))
-        .then_some((request.as_ref(), admission.receipt.claim.sequence))
+    Some(descriptor)
+}
+
+#[derive(Clone, Copy)]
+struct GenesisCreateIdentity {
+    space: SpaceId,
+    agent: AgentId,
+    profile: AgentProfile,
+    authority_binding: Hash,
+    system_agent: Option<AgentId>,
+    request: Hash,
+    sequence: u64,
+}
+
+fn create_identity(create: &ReplayInput) -> Option<GenesisCreateIdentity> {
+    match &create.operation {
+        ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { admission, request },
+        } => {
+            let LifecycleRequest::Create(config) = request.as_ref() else {
+                return None;
+            };
+            Some(GenesisCreateIdentity {
+                space: config.identity.space,
+                agent: config.identity.agent,
+                profile: config.identity.profile,
+                authority_binding: config.authority.commitment(),
+                system_agent: Some(config.authority.agent),
+                request: request.commitment(),
+                sequence: admission.receipt.claim.sequence,
+            })
+        }
+        ReplayOperation::CleanManage {
+            request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+            authority,
+            ..
+        } => Some(GenesisCreateIdentity {
+            space: SpaceId(descriptor.identity.space.0),
+            agent: AgentId(descriptor.identity.agent.0),
+            profile: match descriptor.identity.profile {
+                crate::agent_sdk::AgentProfile::Local => AgentProfile::Local,
+                crate::agent_sdk::AgentProfile::Shared => AgentProfile::Shared,
+                crate::agent_sdk::AgentProfile::Private => AgentProfile::Private,
+            },
+            authority_binding: Hash(descriptor.authority.commitment().0),
+            system_agent: None,
+            request: Hash(
+                crate::agent_sdk::ManagementRequest::Create(descriptor.clone())
+                    .commitment()
+                    .0,
+            ),
+            sequence: authority.selector.decision_sequence,
+        }),
+        _ => None,
+    }
+}
+
+fn validate_committee_for_create(
+    committee: &AgentReplicaCommittee,
+    create: &ReplayInput,
+) -> Result<(), AgentGenesisError> {
+    if let Some(config) = create_config(create) {
+        return committee.validate_for(config);
+    }
+    let descriptor = create_clean_descriptor(create).ok_or(AgentGenesisError::InvalidProposal)?;
+    committee.validate()?;
+    let identity = create_identity(create).ok_or(AgentGenesisError::InvalidProposal)?;
+    if committee.space != identity.space
+        || committee.agent != identity.agent
+        || committee.profile != identity.profile
+        || committee.members.len() != descriptor.replicas.len()
+        || committee
+            .members
+            .iter()
+            .zip(&descriptor.replicas)
+            .any(|(member, replica)| {
+                member.replica.node.0 != replica.node.0
+                    || member.replica.principal.0 != replica.principal.0
+                    || !matches!(
+                        (member.replica.role, replica.role),
+                        (ReplicaRole::Voter, crate::agent_sdk::ReplicaRole::Voter)
+                            | (
+                                ReplicaRole::Observer,
+                                crate::agent_sdk::ReplicaRole::Observer
+                            )
+                    )
+            })
+    {
+        return Err(AgentGenesisError::InvalidReplicaCommittee);
+    }
+    Ok(())
 }
 
 fn encode_expectations(encoder: &mut Encoder<'_>, expectations: AgentGenesisExpectations) {

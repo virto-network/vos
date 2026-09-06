@@ -15,7 +15,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::driver::AgentTrustProvider;
+use super::driver::{AgentTrustProvider, SdkManagementArtifacts};
 use super::execution::RuntimeBlob;
 use super::journal::{
     CanonicalJournalRecord, LocalEntry, MergeEvent, MergeFrontier, OrderedBase, OrderedEntry,
@@ -28,6 +28,7 @@ use super::journal_store::{
 };
 use super::local_journal_driver::{
     LocalMergeAuthenticator, LocalReplayExecutorError, StandardLocalReplayExecutor,
+    recent_clean_management_input,
 };
 use super::replay::{
     CommittedSharedOrdered, MaterializeError, NoPrunedOrderedBases, ReplayExecutor,
@@ -39,12 +40,13 @@ use super::shared_commit::{
     OrderedCommitClaim, SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim, SharedCommitError,
 };
 use super::shared_raft::{
-    AgentGenerationRouteKey, AgentRaftApplicationErrorV2, AgentRaftApplicationLedgerV2,
-    AgentRaftAuditDisposition, AgentRaftCommand, AgentRaftFoundationApplyOutcomeV2,
-    AgentRaftJournalAuditV2, AgentRaftOrderedJournalAnchorV2, AgentRaftPendingOrderedV2,
-    ArtifactBatchId, ArtifactBatchManifest, ArtifactChunk, CommittedSharedRaftSlot,
-    InstalledAgentRaftSnapshotV2,
+    ARTIFACT_CHUNK_DATA_BYTES, AgentGenerationRouteKey, AgentRaftApplicationErrorV2,
+    AgentRaftApplicationLedgerV2, AgentRaftAuditDisposition, AgentRaftCommand,
+    AgentRaftFoundationApplyOutcomeV2, AgentRaftJournalAuditV2, AgentRaftOrderedJournalAnchorV2,
+    AgentRaftPendingOrderedV2, ArtifactBatchId, ArtifactBatchManifest, ArtifactChunk,
+    CommittedSharedRaftSlot, InstalledAgentRaftSnapshotV2,
 };
+use super::wire::RuntimeState;
 use super::{AgentProfile, ReplicaRole};
 use crate::service::wire::ServiceWire;
 use crate::service::{BlobRef, Hash, NodeId};
@@ -719,6 +721,50 @@ impl PreparedCleanOrdered {
     }
 }
 
+/// Result of clean management proposal preparation. An unchanged denial is
+/// nondurable and allocates no Raft slot. A successful no-op returns an
+/// Ordered command unless a bounded durable suffix lookup proves this exact
+/// request and receipt were already committed.
+#[derive(Debug)]
+pub(crate) enum PreparedCleanManagement {
+    Denied(crate::agent_sdk::RuntimeOutcome),
+    Retained(crate::agent_sdk::RuntimeOutcome),
+    Proposal {
+        input: ReplayInputId,
+        commands: Vec<Vec<u8>>,
+    },
+}
+
+impl PreparedCleanManagement {
+    pub(crate) const fn input(&self) -> Option<ReplayInputId> {
+        match self {
+            Self::Denied(_) | Self::Retained(_) => None,
+            Self::Proposal { input, .. } => Some(*input),
+        }
+    }
+
+    pub(crate) fn denied(&self) -> Option<&crate::agent_sdk::RuntimeOutcome> {
+        match self {
+            Self::Denied(outcome) => Some(outcome),
+            Self::Retained(_) | Self::Proposal { .. } => None,
+        }
+    }
+
+    pub(crate) fn retained(&self) -> Option<&crate::agent_sdk::RuntimeOutcome> {
+        match self {
+            Self::Retained(outcome) => Some(outcome),
+            Self::Denied(_) | Self::Proposal { .. } => None,
+        }
+    }
+
+    pub(crate) fn into_commands(self) -> Vec<Vec<u8>> {
+        match self {
+            Self::Denied(_) | Self::Retained(_) => Vec::new(),
+            Self::Proposal { commands, .. } => commands,
+        }
+    }
+}
+
 /// One independently durable physical Shared replica.
 pub(crate) struct SharedJournalAgentDriver<S, A>
 where
@@ -766,19 +812,34 @@ where
             StandardLocalReplayExecutor::new_shared(resolver, trust, merge, committees);
         let materialization =
             materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases)?;
-        let config = super::wire::decode_standard_runtime_state(materialization.state())
-            .map_err(|_| SharedJournalDriverError::InvalidProfile)?
-            .config
-            .ok_or(SharedJournalDriverError::InvalidProfile)?;
         let active = ledger.active_committee()?;
         let route = ledger.generation();
-        if config.identity.profile != AgentProfile::Shared
+        let (space, agent, shared_profile) = if executor.seeded_clean_descriptor().is_some() {
+            let descriptor =
+                executor.trusted_current_clean_descriptor(materialization.runtime())?;
+            (
+                crate::service::SpaceId(descriptor.identity.space.0),
+                crate::service::AgentId(descriptor.identity.agent.0),
+                descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared,
+            )
+        } else {
+            let config = super::wire::decode_standard_runtime_state(materialization.state())
+                .map_err(|_| SharedJournalDriverError::InvalidProfile)?
+                .config
+                .ok_or(SharedJournalDriverError::InvalidProfile)?;
+            (
+                config.identity.space,
+                config.identity.agent,
+                config.identity.profile == AgentProfile::Shared,
+            )
+        };
+        if !shared_profile
             || active.profile() != AgentProfile::Shared
             || active.validate().is_err()
-            || active.space() != config.identity.space
-            || active.agent() != config.identity.agent
-            || route.space() != config.identity.space
-            || route.agent() != config.identity.agent
+            || active.space() != space
+            || active.agent() != agent
+            || route.space() != space
+            || route.agent() != agent
             || route.genesis() != materialization.heads().genesis
             || route.admission() != materialization.heads().admission
             || materialization.heads().node != local_node
@@ -812,6 +873,25 @@ where
     }
 
     pub(crate) fn identity(&self) -> Result<super::AgentIdentity, SharedJournalDriverError> {
+        if self.executor.seeded_clean_descriptor().is_some() {
+            let identity = self
+                .executor
+                .trusted_current_clean_descriptor(self.materialization.runtime())?
+                .identity;
+            return Ok(super::AgentIdentity {
+                space: crate::service::SpaceId(identity.space.0),
+                agent: crate::service::AgentId(identity.agent.0),
+                owner: crate::service::PrincipalId(identity.owner.0),
+                profile: match identity.profile {
+                    crate::agent_sdk::AgentProfile::Local => AgentProfile::Local,
+                    crate::agent_sdk::AgentProfile::Shared => AgentProfile::Shared,
+                    crate::agent_sdk::AgentProfile::Private => AgentProfile::Private,
+                },
+                runtime_deployment: crate::service::DeploymentId(identity.runtime_deployment.0),
+                runtime_program: crate::service::ProgramId(identity.runtime_program.0),
+                runtime_producer: crate::service::ProducerId(identity.runtime_producer.0),
+            });
+        }
         let state = super::wire::decode_standard_runtime_state(self.materialization.state())
             .map_err(|_| SharedJournalDriverError::InvalidProfile)?;
         Ok(state
@@ -846,6 +926,15 @@ where
     }
 
     pub(crate) fn engine_lanes(&self) -> Result<super::LaneSet, SharedJournalDriverError> {
+        if self.executor.seeded_clean_descriptor().is_some() {
+            return self
+                .executor
+                .clean_installed_actor_lanes(
+                    self.materialization.runtime(),
+                    self.materialization.state(),
+                )
+                .map_err(Into::into);
+        }
         let state = super::wire::decode_standard_runtime_state(self.materialization.state())
             .map_err(|_| SharedJournalDriverError::InvalidProfile)?;
         let mut lanes = super::LaneSet::NONE;
@@ -941,6 +1030,225 @@ where
 
     pub(crate) fn ledger(&self) -> &AgentRaftApplicationLedgerV2 {
         &self.ledger
+    }
+
+    fn clean_management_catalog(
+        &self,
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        request: &crate::agent_sdk::ManagementRequest,
+        artifacts: SdkManagementArtifacts<'_>,
+    ) -> Result<Vec<RuntimeBlob>, SharedJournalDriverError> {
+        if matches!(artifacts, SdkManagementArtifacts::None)
+            && matches!(
+                request,
+                crate::agent_sdk::ManagementRequest::Install(_)
+                    | crate::agent_sdk::ManagementRequest::UpgradeActor(_)
+                    | crate::agent_sdk::ManagementRequest::UpgradeRuntime(_)
+            )
+        {
+            self.executor
+                .validate_clean_management_artifacts(descriptor, request)?;
+            return Ok(Vec::new());
+        }
+        super::driver::validate_sdk_management_artifacts(descriptor, request, artifacts)
+            .map_err(|_| SharedJournalDriverError::InvalidArtifactBatch)?;
+        let runtime_blob = |bytes: Vec<u8>| RuntimeBlob {
+            reference: BlobRef::of_bytes(&bytes),
+            bytes,
+        };
+        let mut catalog = Vec::new();
+        match (request, artifacts) {
+            (
+                crate::agent_sdk::ManagementRequest::Install(install),
+                SdkManagementArtifacts::Actor(package),
+            ) => {
+                catalog.push(runtime_blob(package.exact_bytes().to_vec()));
+                catalog.push(runtime_blob(package.state_lane_schema_bytes().to_vec()));
+                catalog.push(runtime_blob(package.method_policy_bytes().to_vec()));
+                if let Some(data) = &install.installation_data {
+                    catalog.push(runtime_blob(data.bytes.clone()));
+                }
+            }
+            (
+                crate::agent_sdk::ManagementRequest::UpgradeActor(_),
+                SdkManagementArtifacts::Actor(package),
+            ) => {
+                catalog.push(runtime_blob(package.exact_bytes().to_vec()));
+                catalog.push(runtime_blob(package.state_lane_schema_bytes().to_vec()));
+                catalog.push(runtime_blob(package.method_policy_bytes().to_vec()));
+            }
+            (
+                crate::agent_sdk::ManagementRequest::UpgradeRuntime(_),
+                SdkManagementArtifacts::Runtime(package),
+            ) => catalog.push(runtime_blob(package.exact_bytes().to_vec())),
+            (_, SdkManagementArtifacts::None) => {}
+            _ => return Err(SharedJournalDriverError::InvalidArtifactBatch),
+        }
+        catalog.sort_by_key(|blob| blob.reference.hash);
+        for pair in catalog.windows(2) {
+            if pair[0].reference.hash == pair[1].reference.hash && pair[0] != pair[1] {
+                return Err(SharedJournalDriverError::InvalidArtifactBatch);
+            }
+        }
+        catalog.dedup();
+        Ok(catalog)
+    }
+
+    fn stage_current_merge_seal(
+        &mut self,
+    ) -> Result<super::journal::MergeSealId, SharedJournalDriverError> {
+        let heads = self.materialization.heads().clone();
+        let merge_state = self.materialization.state().merge.clone();
+        let state = BlobRef::of_bytes(&merge_state);
+        self.store
+            .put_blob(JournalBlobClass::LaneState, &state, &merge_state)?;
+        let manifest = super::journal::LaneStateManifest {
+            genesis: heads.genesis,
+            runtime: heads.runtime.clone(),
+            lane: PersistedLane::Merge,
+            cursor: super::journal::LaneCursor::Merge {
+                frontier: heads.merge_frontier,
+            },
+            state,
+        };
+        self.store.put(&manifest)?;
+        let seal = super::journal::MergeSeal {
+            genesis: heads.genesis,
+            frontier: heads.merge_frontier,
+            ordered_base: OrderedBase {
+                index: heads.ordered_index,
+                head: heads.ordered_head,
+            },
+            merge_state: manifest.id(),
+        };
+        self.store.put(&seal)?;
+        Ok(seal.id())
+    }
+
+    /// Prepare the exact command sequence for one clean SDK management
+    /// mutation. Artifact bytes are content-admitted first, but become journal
+    /// catalog truth only when their chunk commands commit and apply. Only an
+    /// exact request/receipt found in the bounded durable Ordered suffix may
+    /// return its replay-derived result without another Raft slot.
+    pub(crate) fn prepare_clean_management(
+        &mut self,
+        request: crate::agent_sdk::ManagementRequest,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        artifacts: SdkManagementArtifacts<'_>,
+    ) -> Result<PreparedCleanManagement, SharedJournalDriverError> {
+        if matches!(
+            request,
+            crate::agent_sdk::ManagementRequest::Create(_)
+                | crate::agent_sdk::ManagementRequest::InspectActors { .. }
+                | crate::agent_sdk::ManagementRequest::InspectResources
+                | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. }
+        ) {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let runtime = self.materialization.runtime().clone();
+        let descriptor = self.executor.trusted_current_clean_descriptor(&runtime)?;
+        let catalog = self.clean_management_catalog(&descriptor, &request, artifacts)?;
+        if let Some(input) =
+            recent_clean_management_input(&self.store, &self.materialization, &request, &authority)?
+        {
+            let outcome = self
+                .executor
+                .clean_management_result(input)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            return Ok(PreparedCleanManagement::Retained(outcome));
+        }
+        let observed_slot = self.executor.current_logical_slot()?;
+        let input = ReplayInput {
+            runtime: runtime.clone(),
+            operation: ReplayOperation::CleanManage {
+                request: request.clone(),
+                authority: authority.clone(),
+                observed_slot,
+            },
+        };
+        input
+            .validate()
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let preview = self.executor.preview_clean_management(
+            &runtime,
+            self.materialization.state(),
+            &request,
+            &authority,
+            observed_slot,
+            false,
+        )?;
+        let preview_state = RuntimeState {
+            control: preview.state.control,
+            linear: preview.state.linear,
+            merge: preview.state.merge,
+            local: preview.state.local,
+        };
+        if preview_state == *self.materialization.state()
+            && matches!(
+                &preview.outcome,
+                crate::agent_sdk::RuntimeOutcome::Management(Err(_))
+            )
+        {
+            return Ok(PreparedCleanManagement::Denied(preview.outcome));
+        }
+        let input_id = input.id();
+        let route = self.active_route()?;
+        let mut commands = Vec::new();
+        let artifact_batch = if catalog.is_empty() {
+            None
+        } else {
+            let manifest = ArtifactBatchManifest::new(
+                route,
+                catalog.iter().map(|blob| blob.reference.clone()).collect(),
+            )
+            .map_err(|_| SharedJournalDriverError::InvalidArtifactBatch)?;
+            let batch = manifest.id();
+            for (artifact_index, blob) in catalog.iter().enumerate() {
+                for (chunk_index, bytes) in blob.bytes.chunks(ARTIFACT_CHUNK_DATA_BYTES).enumerate()
+                {
+                    let offset = chunk_index
+                        .checked_mul(ARTIFACT_CHUNK_DATA_BYTES)
+                        .and_then(|offset| u64::try_from(offset).ok())
+                        .ok_or(SharedJournalDriverError::InvalidArtifactBatch)?;
+                    let chunk = ArtifactChunk::new(
+                        manifest.clone(),
+                        u32::try_from(artifact_index)
+                            .map_err(|_| SharedJournalDriverError::InvalidArtifactBatch)?,
+                        offset,
+                        bytes.to_vec(),
+                    )
+                    .map_err(|_| SharedJournalDriverError::InvalidArtifactBatch)?;
+                    commands.push(AgentRaftCommand::ArtifactChunk(chunk).encode());
+                }
+            }
+            Some(batch)
+        };
+        let merge_seal = self.stage_current_merge_seal()?;
+        let heads = self.materialization.heads();
+        let entry = OrderedEntry {
+            genesis: heads.genesis,
+            index: heads
+                .ordered_index
+                .checked_add(1)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+            parent: heads.ordered_head,
+            merge_frontier: heads.merge_frontier,
+            merge_seal: Some(merge_seal),
+            input,
+        };
+        let ordered = AgentRaftCommand::Ordered {
+            route,
+            artifact_batch,
+            entry,
+        };
+        ordered
+            .validate()
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        commands.push(ordered.encode());
+        Ok(PreparedCleanManagement::Proposal {
+            input: input_id,
+            commands,
+        })
     }
 
     fn clean_invocation_input(
@@ -1217,9 +1525,8 @@ where
 
     /// Poll the bounded synchronous response handoff. Absence is not journal
     /// corruption: the relevant committed entry can be on another apply
-    /// thread, or its ephemeral response may have been lost across restart.
-    /// In either case an exact retry is recovered by the guest-owned result in
-    /// canonical runtime state.
+    /// thread, or the caller may already have consumed its response. Exact
+    /// management retries use the separate bounded replay-derived cache.
     pub(crate) fn try_take_clean_ordered_result(
         &mut self,
         input: ReplayInputId,
@@ -1634,11 +1941,35 @@ where
                     AgentRaftCommand::Ordered {
                         route,
                         artifact_batch,
-                        ..
+                        entry,
                     } => {
+                        let expected_clean_artifacts =
+                            clean_management_artifact_references(&entry.input.operation);
+                        if let Some(expected) = &expected_clean_artifacts {
+                            if expected.is_empty() && artifact_batch.is_some() {
+                                return Err(SharedJournalDriverError::InvalidArtifactBatch);
+                            }
+                            if !expected.is_empty() && artifact_batch.is_none() {
+                                for reference in expected {
+                                    let bytes = self
+                                        .store
+                                        .load_blob(JournalBlobClass::CatalogArtifact, reference)?
+                                        .ok_or(SharedJournalDriverError::InvalidArtifactBatch)?;
+                                    if BlobRef::of_bytes(&bytes) != *reference {
+                                        return Err(SharedJournalDriverError::InvalidArtifactBatch);
+                                    }
+                                }
+                            }
+                        }
                         let validated_batch = if let Some(batch) = artifact_batch {
                             let (manifest, blobs) = self.artifacts.load_complete(*route, *batch)?;
                             validate_complete_batch(*route, *batch, &manifest, &blobs)?;
+                            if expected_clean_artifacts
+                                .as_ref()
+                                .is_some_and(|expected| manifest.artifacts() != expected)
+                            {
+                                return Err(SharedJournalDriverError::InvalidArtifactBatch);
+                            }
                             for blob in blobs {
                                 self.store.put_blob(
                                     JournalBlobClass::CatalogArtifact,
@@ -1752,6 +2083,47 @@ fn command_outcome(
             SharedPhysicalApplyOutcome::Duplicate { index }
         }
     }
+}
+
+fn clean_management_artifact_references(operation: &ReplayOperation) -> Option<Vec<BlobRef>> {
+    let ReplayOperation::CleanManage { request, .. } = operation else {
+        return None;
+    };
+    let clean = |reference: &crate::agent_sdk::BlobRef| BlobRef {
+        hash: Hash(reference.hash.0),
+        len: reference.len,
+    };
+    let mut artifacts = match request {
+        crate::agent_sdk::ManagementRequest::Install(install) => {
+            let mut artifacts = vec![
+                clean(&install.package),
+                clean(&install.agent_schema),
+                clean(&install.method_policy),
+            ];
+            if let Some(data) = &install.installation_data {
+                artifacts.push(clean(&data.reference));
+            }
+            artifacts
+        }
+        crate::agent_sdk::ManagementRequest::UpgradeActor(upgrade) => vec![
+            clean(&upgrade.package),
+            clean(&upgrade.agent_schema),
+            clean(&upgrade.method_policy),
+        ],
+        crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade) => {
+            vec![clean(&upgrade.package)]
+        }
+        crate::agent_sdk::ManagementRequest::Create(_)
+        | crate::agent_sdk::ManagementRequest::InspectActors { .. }
+        | crate::agent_sdk::ManagementRequest::InspectResources
+        | crate::agent_sdk::ManagementRequest::Suspend { .. }
+        | crate::agent_sdk::ManagementRequest::Resume { .. }
+        | crate::agent_sdk::ManagementRequest::RemoveLeaf { .. }
+        | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. } => Vec::new(),
+    };
+    artifacts.sort_by_key(|artifact| artifact.hash);
+    artifacts.dedup();
+    Some(artifacts)
 }
 
 fn validate_complete_batch(

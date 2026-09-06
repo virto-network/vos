@@ -42,10 +42,8 @@ const MAX_STORED_PACKAGE_BYTES: usize = if super::package::MAX_ENCODED_PACKAGE_B
     crate::agent_sdk::package::MAX_PACKAGE_ENCODED_BYTES
 };
 
-fn stored_blob_matches(reference: &BlobRef, bytes: &[u8]) -> bool {
+fn canonical_blob_matches(reference: &BlobRef, bytes: &[u8]) -> bool {
     reference.matches(bytes)
-        || (reference.len == bytes.len() as u64
-            && reference.hash.0 == crate::agent_sdk::BlobRef::of_bytes(bytes).hash.0)
 }
 
 fn sdk_blob_as_legacy(reference: &crate::agent_sdk::BlobRef) -> BlobRef {
@@ -219,11 +217,11 @@ fn clean_management_actor(
     }
 }
 
-fn verify_clean_management_receipt(
+pub(crate) fn verify_clean_management_receipt(
     descriptor: &crate::agent_sdk::AgentDescriptor,
     request: &crate::agent_sdk::ManagementRequest,
     receipt: &crate::agent_sdk::authority::AuthorityReceipt,
-    _observed_slot: u64,
+    observed_slot: u64,
     allow_historical_runtime: bool,
 ) -> Result<(), AgentDriverError> {
     let runtime_deployment = match request {
@@ -240,6 +238,7 @@ fn verify_clean_management_receipt(
             | crate::agent_sdk::ManagementRequest::UpgradeRuntime(_)
     );
     if receipt.validate_shape().is_err()
+        || !selector.is_live_at(observed_slot)
         || !descriptor.authority.accepts(receipt)
         || selector.space != descriptor.identity.space
         || selector.agent != descriptor.identity.agent
@@ -264,7 +263,7 @@ fn verify_clean_management_receipt(
     Ok(())
 }
 
-fn validate_sdk_management_artifacts(
+pub(crate) fn validate_sdk_management_artifacts(
     descriptor: &crate::agent_sdk::AgentDescriptor,
     request: &crate::agent_sdk::ManagementRequest,
     artifacts: SdkManagementArtifacts<'_>,
@@ -494,7 +493,7 @@ fn stage_sdk_runtime_artifacts<S: AgentImageStore>(
     Ok(())
 }
 
-fn sdk_management_reply_matches(
+pub(crate) fn sdk_management_reply_matches(
     current: &crate::agent_sdk::AgentDescriptor,
     request: &crate::agent_sdk::ManagementRequest,
     outcome: &crate::agent_sdk::RuntimeOutcome,
@@ -1065,7 +1064,7 @@ impl AgentImageStore for MemoryAgentStore {
     }
 
     fn put_package(&mut self, reference: &BlobRef, bytes: &[u8]) -> Result<bool, AgentStoreError> {
-        if bytes.len() > MAX_STORED_PACKAGE_BYTES || !stored_blob_matches(reference, bytes) {
+        if bytes.len() > MAX_STORED_PACKAGE_BYTES || !canonical_blob_matches(reference, bytes) {
             return Err(AgentStoreError::Corrupt);
         }
         put_memory_artifact(&mut self.packages, reference.hash, bytes)
@@ -1073,7 +1072,7 @@ impl AgentImageStore for MemoryAgentStore {
 
     fn load_package(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, AgentStoreError> {
         match self.packages.get(&reference.hash) {
-            Some(bytes) if stored_blob_matches(reference, bytes) => Ok(Some(bytes.clone())),
+            Some(bytes) if canonical_blob_matches(reference, bytes) => Ok(Some(bytes.clone())),
             Some(_) => Err(AgentStoreError::Corrupt),
             None => Ok(None),
         }
@@ -1091,7 +1090,7 @@ impl AgentImageStore for MemoryAgentStore {
         bytes: &[u8],
     ) -> Result<bool, AgentStoreError> {
         if deployment == DeploymentId::ZERO
-            || !stored_blob_matches(reference, bytes)
+            || !canonical_blob_matches(reference, bytes)
             || !valid_stored_schema(bytes)
         {
             return Err(AgentStoreError::Corrupt);
@@ -1133,7 +1132,7 @@ impl AgentImageStore for MemoryAgentStore {
     ) -> Result<bool, AgentStoreError> {
         if deployment == DeploymentId::ZERO
             || bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES
-            || !stored_blob_matches(reference, bytes)
+            || !canonical_blob_matches(reference, bytes)
             || !valid_stored_policy(bytes)
         {
             return Err(AgentStoreError::Corrupt);
@@ -1173,7 +1172,7 @@ impl AgentImageStore for MemoryAgentStore {
         bytes: &[u8],
     ) -> Result<bool, AgentStoreError> {
         if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES
-            || !stored_blob_matches(reference, bytes)
+            || !canonical_blob_matches(reference, bytes)
         {
             return Err(AgentStoreError::Corrupt);
         }
@@ -1187,7 +1186,7 @@ impl AgentImageStore for MemoryAgentStore {
         match self.installation_data.get(&reference.hash) {
             Some(bytes)
                 if bytes.len() <= super::MAX_INSTALLATION_DATA_BYTES
-                    && stored_blob_matches(reference, bytes) =>
+                    && canonical_blob_matches(reference, bytes) =>
             {
                 Ok(Some(RuntimeBlob {
                     reference: reference.clone(),
@@ -1231,7 +1230,7 @@ impl AgentImageStore for MemoryAgentStore {
         // Authenticate every mandatory artifact before changing any map.
         for (hash, reference) in &keep.required_packages {
             let bytes = self.packages.get(hash).ok_or(AgentStoreError::Corrupt)?;
-            if !stored_blob_matches(reference, bytes) {
+            if !canonical_blob_matches(reference, bytes) {
                 return Err(AgentStoreError::Corrupt);
             }
         }
@@ -1247,7 +1246,7 @@ impl AgentImageStore for MemoryAgentStore {
                 .get(deployment)
                 .ok_or(AgentStoreError::Corrupt)?;
             if blob.reference != *reference
-                || !stored_blob_matches(reference, &blob.bytes)
+                || !canonical_blob_matches(reference, &blob.bytes)
                 || !valid_stored_schema(&blob.bytes)
             {
                 return Err(AgentStoreError::Corrupt);
@@ -1259,7 +1258,7 @@ impl AgentImageStore for MemoryAgentStore {
                 .get(deployment)
                 .ok_or(AgentStoreError::Corrupt)?;
             if blob.reference != *reference
-                || !stored_blob_matches(reference, &blob.bytes)
+                || !canonical_blob_matches(reference, &blob.bytes)
                 || blob.bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES
                 || !valid_stored_policy(&blob.bytes)
             {
@@ -1272,7 +1271,7 @@ impl AgentImageStore for MemoryAgentStore {
                 .get(hash)
                 .ok_or(AgentStoreError::Corrupt)?;
             if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES
-                || !stored_blob_matches(reference, bytes)
+                || !canonical_blob_matches(reference, bytes)
             {
                 return Err(AgentStoreError::Corrupt);
             }
@@ -1646,7 +1645,7 @@ impl AgentImageStore for FileAgentStore {
     }
 
     fn put_package(&mut self, reference: &BlobRef, bytes: &[u8]) -> Result<bool, AgentStoreError> {
-        if bytes.len() > MAX_STORED_PACKAGE_BYTES || !stored_blob_matches(reference, bytes) {
+        if bytes.len() > MAX_STORED_PACKAGE_BYTES || !canonical_blob_matches(reference, bytes) {
             return Err(AgentStoreError::Corrupt);
         }
         self.put_artifact(
@@ -1658,7 +1657,7 @@ impl AgentImageStore for FileAgentStore {
     fn load_package(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, AgentStoreError> {
         let path = self.catalog_path("packages", &reference.hash.0, "vos");
         match self.read_regular_artifact(&path)? {
-            Some(bytes) if stored_blob_matches(reference, &bytes) => Ok(Some(bytes)),
+            Some(bytes) if canonical_blob_matches(reference, &bytes) => Ok(Some(bytes)),
             Some(_) => Err(AgentStoreError::Corrupt),
             None => Ok(None),
         }
@@ -1675,7 +1674,7 @@ impl AgentImageStore for FileAgentStore {
         bytes: &[u8],
     ) -> Result<bool, AgentStoreError> {
         if deployment == DeploymentId::ZERO
-            || !stored_blob_matches(reference, bytes)
+            || !canonical_blob_matches(reference, bytes)
             || !valid_stored_schema(bytes)
         {
             return Err(AgentStoreError::Corrupt);
@@ -1710,7 +1709,7 @@ impl AgentImageStore for FileAgentStore {
     ) -> Result<bool, AgentStoreError> {
         if deployment == DeploymentId::ZERO
             || bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES
-            || !stored_blob_matches(reference, bytes)
+            || !canonical_blob_matches(reference, bytes)
             || !valid_stored_policy(bytes)
         {
             return Err(AgentStoreError::Corrupt);
@@ -1751,7 +1750,7 @@ impl AgentImageStore for FileAgentStore {
         bytes: &[u8],
     ) -> Result<bool, AgentStoreError> {
         if bytes.len() > super::MAX_INSTALLATION_DATA_BYTES
-            || !stored_blob_matches(reference, bytes)
+            || !canonical_blob_matches(reference, bytes)
         {
             return Err(AgentStoreError::Corrupt);
         }
@@ -1767,7 +1766,7 @@ impl AgentImageStore for FileAgentStore {
     ) -> Result<Option<RuntimeBlob>, AgentStoreError> {
         let path = self.catalog_path("installation-data", &reference.hash.0, "args");
         match self.read_bounded_regular(&path, super::MAX_INSTALLATION_DATA_BYTES)? {
-            Some(bytes) if stored_blob_matches(reference, &bytes) => Ok(Some(RuntimeBlob {
+            Some(bytes) if canonical_blob_matches(reference, &bytes) => Ok(Some(RuntimeBlob {
                 reference: reference.clone(),
                 bytes,
             })),
@@ -1825,7 +1824,7 @@ impl AgentImageStore for FileAgentStore {
             let bytes = self
                 .read_regular_artifact(&path)?
                 .ok_or(AgentStoreError::Corrupt)?;
-            if !stored_blob_matches(reference, &bytes) {
+            if !canonical_blob_matches(reference, &bytes) {
                 return Err(AgentStoreError::Corrupt);
             }
         }
@@ -1843,7 +1842,7 @@ impl AgentImageStore for FileAgentStore {
             let bytes = self
                 .read_regular_artifact(&path)?
                 .ok_or(AgentStoreError::Corrupt)?;
-            if !stored_blob_matches(reference, &bytes) || !valid_stored_schema(&bytes) {
+            if !canonical_blob_matches(reference, &bytes) || !valid_stored_schema(&bytes) {
                 return Err(AgentStoreError::Corrupt);
             }
         }
@@ -1853,7 +1852,7 @@ impl AgentImageStore for FileAgentStore {
                 .read_regular_artifact(&path)?
                 .ok_or(AgentStoreError::Corrupt)?;
             if bytes.len() > super::execution::MAX_EXECUTION_POLICY_BYTES
-                || !stored_blob_matches(reference, &bytes)
+                || !canonical_blob_matches(reference, &bytes)
                 || !valid_stored_policy(&bytes)
             {
                 return Err(AgentStoreError::Corrupt);
@@ -1864,7 +1863,7 @@ impl AgentImageStore for FileAgentStore {
             let bytes = self
                 .read_bounded_regular(&path, super::MAX_INSTALLATION_DATA_BYTES)?
                 .ok_or(AgentStoreError::Corrupt)?;
-            if !stored_blob_matches(reference, &bytes) {
+            if !canonical_blob_matches(reference, &bytes) {
                 return Err(AgentStoreError::Corrupt);
             }
         }
@@ -4936,7 +4935,7 @@ mod tests {
                 decision_sequence: 2,
                 acknowledged_through: 0,
                 valid_from: 1,
-                expires_at: 2,
+                expires_at: 200,
                 request: request.commitment(),
             },
             public_key,
@@ -4989,6 +4988,25 @@ mod tests {
         );
         assert_eq!(
             verify_clean_management_receipt(&descriptor, &request, &receipt, 100, false),
+            Err(AgentDriverError::SdkManagement(
+                crate::agent_sdk::ManagementError::InvalidRequest
+            ))
+        );
+
+        let mut not_yet_live = receipt.clone();
+        not_yet_live.selector.valid_from = 101;
+        not_yet_live.signature = signing.sign(&not_yet_live.signing_bytes()).to_bytes();
+        assert_eq!(
+            verify_clean_management_receipt(&descriptor, &request, &not_yet_live, 100, true),
+            Err(AgentDriverError::SdkManagement(
+                crate::agent_sdk::ManagementError::InvalidRequest
+            ))
+        );
+        let mut expired = receipt.clone();
+        expired.selector.expires_at = 99;
+        expired.signature = signing.sign(&expired.signing_bytes()).to_bytes();
+        assert_eq!(
+            verify_clean_management_receipt(&descriptor, &request, &expired, 100, true),
             Err(AgentDriverError::SdkManagement(
                 crate::agent_sdk::ManagementError::InvalidRequest
             ))

@@ -5,7 +5,7 @@
 //! [`ReplayMaterialization`] is replaced only after a consuming replay
 //! publication wins the durable heads CAS.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -16,7 +16,7 @@ use crate::agent_sdk::wire::CanonicalWire as AgentCanonicalWire;
 
 use super::authority::{ActorInvocationReceipt, AgentAuthorityReceipt};
 use super::committee::RootAnchorPins;
-use super::driver::{AgentTrustProvider, DEFAULT_MANAGEMENT_GAS};
+use super::driver::{AgentTrustProvider, DEFAULT_MANAGEMENT_GAS, SdkManagementArtifacts};
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation, RuntimeBlob,
     RuntimeExecutionCall, RuntimeExecutionReturn,
@@ -71,15 +71,54 @@ use super::{
     LifecycleError, LifecycleReply, LifecycleRequest, PackageKind, UpgradeActor,
 };
 use crate::service::wire::ServiceWire;
-use crate::service::{ActorId, BlobRef, CapabilityId, DeploymentId, Hash, NodeId};
+use crate::service::{
+    ActorId, BlobRef, CapabilityId, DeploymentId, Hash, NodeId, ProducerId, ProgramId,
+};
 
 type LocalReplayError = MaterializeError<core::convert::Infallible, LocalReplayExecutorError>;
 
-/// Reply handoff is deliberately bounded and never participates in replay
-/// truth. Losing an entry only loses the synchronous transport response: an
-/// exact retry is re-applied and recovered from the guest-owned invocation
-/// result retained in canonical runtime state.
+/// Replay-derived result recovery and exact-management retry discovery are
+/// deliberately bounded to the same newest Ordered suffix. State equality by
+/// itself is never treated as retry evidence.
 const MAX_PENDING_CLEAN_INVOCATION_RESULTS: usize = 1_024;
+
+pub(super) fn recent_clean_management_input<S: AgentJournalStore>(
+    store: &S,
+    materialization: &ReplayMaterialization,
+    request: &crate::agent_sdk::ManagementRequest,
+    authority: &crate::agent_sdk::authority::AuthorityReceipt,
+) -> Result<Option<ReplayInputId>, JournalStoreError> {
+    let mut cursor = materialization.heads().ordered_head;
+    for _ in 0..MAX_PENDING_CLEAN_INVOCATION_RESULTS {
+        let Some(id) = cursor else {
+            return Ok(None);
+        };
+        if materialization.replay_boundary().head == Some(id) {
+            return Ok(None);
+        }
+        let entry = store
+            .get::<OrderedEntry>(id)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        if entry.id() != id
+            || entry.genesis != materialization.heads().genesis
+            || entry.index > materialization.heads().ordered_index
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        if matches!(
+            &entry.input.operation,
+            ReplayOperation::CleanManage {
+                request: prior_request,
+                authority: prior_authority,
+                ..
+            } if prior_request == request && prior_authority == authority
+        ) {
+            return Ok(Some(entry.input.id()));
+        }
+        cursor = entry.parent;
+    }
+    Ok(None)
+}
 
 /// Immutable view of the exact catalog supplied alongside one sealed
 /// genesis. Create-time validation must not consult the destination store:
@@ -563,6 +602,12 @@ pub(crate) struct LocalLifecycleResult {
     pub finalized_merge_invocations: Vec<FinalizedMergeInvocation>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalCleanManagementResult {
+    pub outcome: crate::agent_sdk::RuntimeOutcome,
+    pub finalized_merge_invocations: Vec<FinalizedMergeInvocation>,
+}
+
 /// One deterministic lifecycle request bound to its complete, exact catalog
 /// input. The host may expose `request()` for authority signing and later
 /// consume the same value for publication; callers cannot accidentally pair
@@ -621,6 +666,9 @@ pub(crate) struct StandardLocalReplayExecutor<R> {
     management_gas: Gas,
     last_management_result: Option<(ReplayInputId, Result<LifecycleReply, LifecycleError>)>,
     pending_clean_invocation_results: BTreeMap<ReplayInputId, crate::agent_sdk::RuntimeOutcome>,
+    recent_clean_management_results: BTreeMap<ReplayInputId, crate::agent_sdk::RuntimeOutcome>,
+    recent_clean_management_order: VecDeque<ReplayInputId>,
+    clean_genesis_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
     authenticated_execution: Option<AuthenticatedLocalExecution>,
 }
 
@@ -633,7 +681,9 @@ struct AuthenticatedLocalExecution {
     input: ReplayInputId,
     before: RuntimeState,
     position: ReplayPosition,
-    runtime: Package,
+    runtime_pvm: Vec<u8>,
+    runtime_state_limit: usize,
+    clean_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
 }
 
 struct ActorCatalogAdmission<'a> {
@@ -650,6 +700,456 @@ struct ActorCatalogAdmission<'a> {
 }
 
 impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
+    fn clean_blob(reference: &crate::agent_sdk::BlobRef) -> BlobRef {
+        BlobRef {
+            hash: Hash(reference.hash.0),
+            len: reference.len,
+        }
+    }
+
+    fn validate_clean_genesis_descriptor(
+        &self,
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+    ) -> Result<(), LocalReplayExecutorError> {
+        let expected_profile = match self.profile {
+            AgentProfile::Local => crate::agent_sdk::AgentProfile::Local,
+            AgentProfile::Shared => crate::agent_sdk::AgentProfile::Shared,
+            AgentProfile::Private => crate::agent_sdk::AgentProfile::Private,
+        };
+        let local_node = self.merge.node();
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != expected_profile
+            || (self.profile == AgentProfile::Local && descriptor.replicas.len() != 1)
+            || !descriptor
+                .replicas
+                .iter()
+                .any(|replica| replica.node.0 == local_node.0)
+        {
+            return Err(LocalReplayExecutorError::InvalidState);
+        }
+        Ok(())
+    }
+
+    fn clean_runtime_package(
+        &self,
+        binding: &RuntimeBinding,
+    ) -> Result<super::package_admission::AdmittedRuntimePackage, LocalReplayExecutorError> {
+        if binding.runtime_abi != super::RUNTIME_ABI_ID
+            || binding.execution_semantics != super::EXECUTION_SEMANTICS_ID
+        {
+            return Err(LocalReplayExecutorError::InvalidState);
+        }
+        let reference = binding.package.clone();
+        let bytes = self.load(&reference)?;
+        let package = super::package_admission::admit_runtime_package(&bytes)
+            .map_err(|_| LocalReplayExecutorError::InvalidArtifact(reference.clone()))?;
+        if package.package_ref().hash.0 != binding.package.hash.0
+            || package.package_ref().len != binding.package.len
+            || package.deployment().0 != binding.deployment.0
+            || package.program().0 != binding.program.0
+            || package.producer().0 != binding.producer.0
+        {
+            return Err(LocalReplayExecutorError::InvalidArtifact(reference));
+        }
+        Ok(package)
+    }
+
+    fn current_clean_descriptor(
+        genesis: &crate::agent_sdk::AgentDescriptor,
+        binding: &RuntimeBinding,
+        runtime: &super::package_admission::AdmittedRuntimePackage,
+    ) -> Result<crate::agent_sdk::AgentDescriptor, LocalReplayExecutorError> {
+        let mut descriptor = genesis.clone();
+        if descriptor.identity.space.0 != binding.space.0
+            || descriptor.identity.agent.0 != binding.agent.0
+        {
+            return Err(LocalReplayExecutorError::InvalidState);
+        }
+        descriptor.identity.runtime_deployment = runtime.deployment();
+        descriptor.identity.runtime_program = runtime.program();
+        descriptor.identity.runtime_producer = runtime.producer();
+        descriptor.runtime_package = runtime.package_ref().clone();
+        descriptor.runtime_contract = runtime.manifest().contract;
+        descriptor.capabilities = runtime.capabilities();
+        Ok(descriptor)
+    }
+
+    pub(crate) fn seeded_clean_descriptor(&self) -> Option<&crate::agent_sdk::AgentDescriptor> {
+        self.clean_genesis_descriptor.as_ref()
+    }
+
+    pub(crate) fn trusted_current_clean_descriptor(
+        &self,
+        binding: &RuntimeBinding,
+    ) -> Result<crate::agent_sdk::AgentDescriptor, LocalReplayExecutorError> {
+        let genesis = self
+            .clean_genesis_descriptor
+            .as_ref()
+            .ok_or(LocalReplayExecutorError::InvalidState)?;
+        let runtime = self.clean_runtime_package(binding)?;
+        Self::current_clean_descriptor(genesis, binding, &runtime)
+    }
+
+    pub(crate) fn preview_clean_management(
+        &self,
+        binding: &RuntimeBinding,
+        before: &RuntimeState,
+        request: &crate::agent_sdk::ManagementRequest,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        observed_slot: u64,
+        validate_catalog: bool,
+    ) -> Result<crate::agent_sdk::RuntimeTransition, LocalReplayExecutorError> {
+        let runtime = self.clean_runtime_package(binding)?;
+        let descriptor = Self::current_clean_descriptor(
+            self.clean_genesis_descriptor
+                .as_ref()
+                .ok_or(LocalReplayExecutorError::InvalidState)?,
+            binding,
+            &runtime,
+        )?;
+        super::driver::verify_clean_management_receipt(
+            &descriptor,
+            request,
+            authority,
+            observed_slot,
+            true,
+        )
+        .map_err(|_| LocalReplayExecutorError::InvalidAuthority)?;
+        if validate_catalog {
+            self.validate_clean_management_artifacts(&descriptor, request)?;
+        }
+        let work = crate::agent_sdk::RuntimeWork::Manage {
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            runtime_deployment: authority.selector.runtime_deployment,
+            state: crate::agent_sdk::RuntimeState {
+                control: before.control.clone(),
+                linear: before.linear.clone(),
+                merge: before.merge.clone(),
+                local: before.local.clone(),
+            },
+            request: Box::new(request.clone()),
+            authority: Some(Box::new(authority.clone())),
+            observed_slot,
+        };
+        let encoded = work
+            .encode()
+            .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+        let returned: crate::agent_sdk::RuntimeTransition =
+            self.execute_agent_wire(runtime.program_bytes(), self.management_gas, &encoded)?;
+        if !super::driver::sdk_management_reply_matches(&descriptor, request, &returned.outcome)
+            || returned.state.encoded_len().is_none_or(|bytes| {
+                bytes
+                    > runtime
+                        .manifest()
+                        .contract
+                        .resources
+                        .max_runtime_state_bytes as usize
+            })
+        {
+            return Err(LocalReplayExecutorError::InvalidState);
+        }
+        Ok(returned)
+    }
+
+    pub(crate) fn clean_installed_actor_lanes(
+        &self,
+        binding: &RuntimeBinding,
+        before: &RuntimeState,
+    ) -> Result<super::LaneSet, LocalReplayExecutorError> {
+        use crate::agent_sdk::{ManagementReply, ManagementRequest, RuntimeOutcome, RuntimeWork};
+
+        let runtime = self.clean_runtime_package(binding)?;
+        let descriptor = Self::current_clean_descriptor(
+            self.clean_genesis_descriptor
+                .as_ref()
+                .ok_or(LocalReplayExecutorError::InvalidState)?,
+            binding,
+            &runtime,
+        )?;
+        let observed_slot = self.current_logical_slot()?;
+        let mut after = None;
+        let mut lanes = crate::agent_sdk::LaneSet::NONE;
+        let mut seen = 0_u32;
+        loop {
+            let request = ManagementRequest::InspectActors {
+                after,
+                limit: crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16,
+            };
+            let work = RuntimeWork::Manage {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                state: crate::agent_sdk::RuntimeState {
+                    control: before.control.clone(),
+                    linear: before.linear.clone(),
+                    merge: before.merge.clone(),
+                    local: before.local.clone(),
+                },
+                request: Box::new(request.clone()),
+                authority: None,
+                observed_slot,
+            };
+            let encoded = work
+                .encode()
+                .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+            let returned: crate::agent_sdk::RuntimeTransition =
+                self.execute_agent_wire(runtime.program_bytes(), self.management_gas, &encoded)?;
+            if returned.state.control != before.control
+                || returned.state.linear != before.linear
+                || returned.state.merge != before.merge
+                || returned.state.local != before.local
+                || !super::driver::sdk_management_reply_matches(
+                    &descriptor,
+                    &request,
+                    &returned.outcome,
+                )
+            {
+                return Err(LocalReplayExecutorError::InvalidState);
+            }
+            let RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) = returned.outcome
+            else {
+                return Err(LocalReplayExecutorError::InvalidState);
+            };
+            page.validate()
+                .map_err(|_| LocalReplayExecutorError::InvalidState)?;
+            if page
+                .entries
+                .first()
+                .is_some_and(|record| after.is_some_and(|cursor| record.entry.actor <= cursor))
+            {
+                return Err(LocalReplayExecutorError::InvalidState);
+            }
+            seen = seen
+                .checked_add(
+                    u32::try_from(page.entries.len())
+                        .map_err(|_| LocalReplayExecutorError::InvalidState)?,
+                )
+                .ok_or(LocalReplayExecutorError::InvalidState)?;
+            if seen > descriptor.capabilities.max_actors
+                || page.entries.iter().any(|record| {
+                    record
+                        .entry
+                        .validate_for_profile(descriptor.identity.profile)
+                        .is_err()
+                        || record.entry.lanes.bits() & !descriptor.capabilities.lanes.bits() != 0
+                })
+            {
+                return Err(LocalReplayExecutorError::InvalidState);
+            }
+            for record in &page.entries {
+                lanes =
+                    crate::agent_sdk::LaneSet::from_bits(lanes.bits() | record.entry.lanes.bits())
+                        .ok_or(LocalReplayExecutorError::InvalidState)?;
+            }
+            let Some(next) = page.next else {
+                break;
+            };
+            if page.entries.is_empty() || after.is_some_and(|cursor| next <= cursor) {
+                return Err(LocalReplayExecutorError::InvalidState);
+            }
+            after = Some(next);
+        }
+        super::LaneSet::from_bits(lanes.bits()).ok_or(LocalReplayExecutorError::InvalidState)
+    }
+
+    fn execute_clean_invocation_transition(
+        &mut self,
+        input: &ReplayInput,
+        before: &RuntimeState,
+        runtime_pvm: &[u8],
+        runtime_state_limit: usize,
+        allow_native_standard_for_test: bool,
+    ) -> Result<ReplayTransition, LocalReplayExecutorError> {
+        let ReplayOperation::CleanInvoke {
+            work,
+            authorization,
+            observed_slot,
+        } = &input.operation
+        else {
+            return Err(LocalReplayExecutorError::InvalidRequest);
+        };
+        let sdk_work = crate::agent_sdk::RuntimeWork::Invoke {
+            state: crate::agent_sdk::RuntimeState {
+                control: before.control.clone(),
+                linear: before.linear.clone(),
+                merge: before.merge.clone(),
+                local: before.local.clone(),
+            },
+            invocation: Box::new(work.clone()),
+            authorization: Box::new(authorization.clone()),
+            observed_slot: *observed_slot,
+        };
+        let encoded = sdk_work
+            .encode()
+            .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+        #[cfg(all(test, feature = "pvm"))]
+        let returned: crate::agent_sdk::RuntimeTransition = if allow_native_standard_for_test
+            && self.trust.use_native_standard_runtime_for_test()
+        {
+            super::wire::apply_standard_runtime_work(sdk_work)
+                .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
+        } else {
+            self.execute_agent_wire(
+                runtime_pvm,
+                self.management_gas.saturating_add(work.gas),
+                &encoded,
+            )?
+        };
+        #[cfg(any(not(test), all(test, not(feature = "pvm"))))]
+        let returned: crate::agent_sdk::RuntimeTransition = {
+            let _ = allow_native_standard_for_test;
+            self.execute_agent_wire(
+                runtime_pvm,
+                self.management_gas.saturating_add(work.gas),
+                &encoded,
+            )?
+        };
+        match &returned.outcome {
+            crate::agent_sdk::RuntimeOutcome::Completed(Ok(reply))
+                if reply.invocation == work.invocation
+                    && reply.actor == work.actor
+                    && reply.incarnation == work.incarnation
+                    && reply.deployment == work.deployment
+                    && reply.mode == work.mode
+                    && reply.lane == work.mode.write_lane()
+                    && reply.gas_remaining <= work.gas => {}
+            crate::agent_sdk::RuntimeOutcome::Completed(Err(_)) => {}
+            crate::agent_sdk::RuntimeOutcome::Yielded(yielded)
+                if yielded.invocation == work.invocation
+                    && yielded.actor == work.actor
+                    && yielded.incarnation == work.incarnation
+                    && yielded.deployment == work.deployment
+                    && yielded.program == work.program
+                    && yielded.mode == work.mode => {}
+            _ => return Err(LocalReplayExecutorError::InvalidState),
+        }
+        let state = RuntimeState {
+            control: returned.state.control.clone(),
+            linear: returned.state.linear.clone(),
+            merge: returned.state.merge.clone(),
+            local: returned.state.local.clone(),
+        };
+        if state
+            .encoded_len()
+            .is_none_or(|bytes| bytes > runtime_state_limit)
+        {
+            return Err(LocalReplayExecutorError::RuntimeStateTooLarge);
+        }
+        let disposition = match &returned.outcome {
+            crate::agent_sdk::RuntimeOutcome::Completed(Ok(reply)) => match reply.status {
+                crate::agent_sdk::InvocationStatus::Done => ReplayDisposition::Applied,
+                crate::agent_sdk::InvocationStatus::Forbidden => ReplayDisposition::Forbidden,
+                crate::agent_sdk::InvocationStatus::Panicked => ReplayDisposition::Panicked,
+                crate::agent_sdk::InvocationStatus::OutOfGas => ReplayDisposition::OutOfGas,
+            },
+            crate::agent_sdk::RuntimeOutcome::Completed(Err(_)) => ReplayDisposition::Rejected,
+            crate::agent_sdk::RuntimeOutcome::Yielded(_) => ReplayDisposition::Applied,
+            _ => unreachable!("validated above"),
+        };
+        self.record_clean_invocation_result(input.id(), returned.outcome);
+        Ok(ReplayTransition {
+            state,
+            disposition,
+            result: None,
+            next_runtime: input.runtime.clone(),
+            products: ReplayProducts::default(),
+        })
+    }
+
+    pub(super) fn validate_clean_management_artifacts(
+        &self,
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        request: &crate::agent_sdk::ManagementRequest,
+    ) -> Result<(), LocalReplayExecutorError> {
+        use super::driver::SdkManagementArtifacts;
+        use crate::agent_sdk::ManagementRequest;
+
+        match request {
+            ManagementRequest::Install(install) => {
+                let package_ref = Self::clean_blob(&install.package);
+                let bytes = self.load(&package_ref)?;
+                let package = super::package_admission::admit_actor_package(&bytes)
+                    .map_err(|_| LocalReplayExecutorError::InvalidArtifact(package_ref.clone()))?;
+                super::driver::validate_sdk_management_artifacts(
+                    descriptor,
+                    request,
+                    SdkManagementArtifacts::Actor(&package),
+                )
+                .map_err(|_| LocalReplayExecutorError::InvalidArtifact(package_ref.clone()))?;
+                for (reference, expected) in [
+                    (&install.agent_schema, package.state_lane_schema_bytes()),
+                    (&install.method_policy, package.method_policy_bytes()),
+                ] {
+                    let stored = self.load(&Self::clean_blob(reference))?;
+                    if stored.as_slice() != expected {
+                        return Err(LocalReplayExecutorError::InvalidArtifact(Self::clean_blob(
+                            reference,
+                        )));
+                    }
+                }
+                if let Some(data) = &install.installation_data {
+                    let stored = self.load(&Self::clean_blob(&data.reference))?;
+                    if stored != data.bytes {
+                        return Err(LocalReplayExecutorError::InvalidArtifact(Self::clean_blob(
+                            &data.reference,
+                        )));
+                    }
+                }
+            }
+            ManagementRequest::UpgradeActor(upgrade) => {
+                let package_ref = Self::clean_blob(&upgrade.package);
+                let bytes = self.load(&package_ref)?;
+                let package = super::package_admission::admit_actor_package(&bytes)
+                    .map_err(|_| LocalReplayExecutorError::InvalidArtifact(package_ref.clone()))?;
+                super::driver::validate_sdk_management_artifacts(
+                    descriptor,
+                    request,
+                    SdkManagementArtifacts::Actor(&package),
+                )
+                .map_err(|_| LocalReplayExecutorError::InvalidArtifact(package_ref.clone()))?;
+                for (reference, expected) in [
+                    (&upgrade.agent_schema, package.state_lane_schema_bytes()),
+                    (&upgrade.method_policy, package.method_policy_bytes()),
+                ] {
+                    let stored = self.load(&Self::clean_blob(reference))?;
+                    if stored.as_slice() != expected {
+                        return Err(LocalReplayExecutorError::InvalidArtifact(Self::clean_blob(
+                            reference,
+                        )));
+                    }
+                }
+            }
+            ManagementRequest::UpgradeRuntime(upgrade) => {
+                let package_ref = Self::clean_blob(&upgrade.package);
+                let bytes = self.load(&package_ref)?;
+                let package = super::package_admission::admit_runtime_package(&bytes)
+                    .map_err(|_| LocalReplayExecutorError::InvalidArtifact(package_ref.clone()))?;
+                super::driver::validate_sdk_management_artifacts(
+                    descriptor,
+                    request,
+                    SdkManagementArtifacts::Runtime(&package),
+                )
+                .map_err(|_| LocalReplayExecutorError::InvalidArtifact(package_ref))?;
+            }
+            ManagementRequest::Create(_)
+            | ManagementRequest::Suspend { .. }
+            | ManagementRequest::Resume { .. }
+            | ManagementRequest::RemoveLeaf { .. }
+            | ManagementRequest::ChangeReplicas { .. } => {
+                super::driver::validate_sdk_management_artifacts(
+                    descriptor,
+                    request,
+                    SdkManagementArtifacts::None,
+                )
+                .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+            }
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
+                return Err(LocalReplayExecutorError::InvalidRequest);
+            }
+        }
+        Ok(())
+    }
     fn new(
         resolver: R,
         trust: Arc<dyn AgentTrustProvider>,
@@ -664,6 +1164,9 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             management_gas: DEFAULT_MANAGEMENT_GAS,
             last_management_result: None,
             pending_clean_invocation_results: BTreeMap::new(),
+            recent_clean_management_results: BTreeMap::new(),
+            recent_clean_management_order: VecDeque::new(),
+            clean_genesis_descriptor: None,
             authenticated_execution: None,
         }
     }
@@ -687,6 +1190,9 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             management_gas: DEFAULT_MANAGEMENT_GAS,
             last_management_result: None,
             pending_clean_invocation_results: BTreeMap::new(),
+            recent_clean_management_results: BTreeMap::new(),
+            recent_clean_management_order: VecDeque::new(),
+            clean_genesis_descriptor: None,
             authenticated_execution: None,
         }
     }
@@ -722,6 +1228,17 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         state: &RuntimeState,
         binding: &RuntimeBinding,
     ) -> Result<(), LocalReplayExecutorError> {
+        if self.clean_genesis_descriptor.is_some() {
+            let descriptor = self.trusted_current_clean_descriptor(binding)?;
+            Self::validate_clean_invocation_envelope(
+                &descriptor,
+                work,
+                authorization,
+                observed_slot,
+            )?;
+            let _ = state;
+            return Ok(());
+        }
         let decoded = decode_standard_runtime_state(state)
             .map_err(|_| LocalReplayExecutorError::InvalidState)?;
         let config = decoded
@@ -743,6 +1260,33 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             ) => Err(LocalReplayExecutorError::InvalidRequest),
             _ => Ok(()),
         }
+    }
+
+    fn validate_clean_invocation_envelope(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<(), LocalReplayExecutorError> {
+        if !work.validate()
+            || !authorization.matches_invoke(work, observed_slot)
+            || work.space != descriptor.identity.space
+            || work.agent != descriptor.identity.agent
+            || work.runtime_deployment != descriptor.identity.runtime_deployment
+        {
+            return Err(LocalReplayExecutorError::InvalidAuthority);
+        }
+        if let crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt) = authorization
+            && (!descriptor.authority.accepts(receipt)
+                || !super::authority::verify_raw_ed25519(
+                    &receipt.public_key,
+                    &receipt.signing_bytes(),
+                    &receipt.signature,
+                ))
+        {
+            return Err(LocalReplayExecutorError::InvalidAuthority);
+        }
+        Ok(())
     }
 
     pub(crate) fn sign_shared_merge_event(
@@ -781,6 +1325,13 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         self.pending_clean_invocation_results.remove(&input)
     }
 
+    pub(crate) fn clean_management_result(
+        &self,
+        input: ReplayInputId,
+    ) -> Option<crate::agent_sdk::RuntimeOutcome> {
+        self.recent_clean_management_results.get(&input).cloned()
+    }
+
     fn record_clean_invocation_result(
         &mut self,
         input: ReplayInputId,
@@ -789,14 +1340,32 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         if !self.pending_clean_invocation_results.contains_key(&input)
             && self.pending_clean_invocation_results.len() == MAX_PENDING_CLEAN_INVOCATION_RESULTS
         {
-            // This cache is response handoff only. Deterministic eviction of
-            // the lowest canonical input id cannot affect journal or runtime
-            // state and exact retries recover through guest-owned state.
+            // This is only the synchronous response handoff. Deterministic
+            // eviction cannot affect journal state or management retry proof.
             if let Some(evicted) = self.pending_clean_invocation_results.keys().next().copied() {
                 self.pending_clean_invocation_results.remove(&evicted);
             }
         }
         self.pending_clean_invocation_results.insert(input, result);
+    }
+
+    fn record_clean_management_result(
+        &mut self,
+        input: ReplayInputId,
+        result: crate::agent_sdk::RuntimeOutcome,
+    ) {
+        self.record_clean_invocation_result(input, result.clone());
+        if self.recent_clean_management_results.contains_key(&input) {
+            self.recent_clean_management_results.insert(input, result);
+            return;
+        }
+        if self.recent_clean_management_results.len() == MAX_PENDING_CLEAN_INVOCATION_RESULTS
+            && let Some(evicted) = self.recent_clean_management_order.pop_front()
+        {
+            self.recent_clean_management_results.remove(&evicted);
+        }
+        self.recent_clean_management_order.push_back(input);
+        self.recent_clean_management_results.insert(input, result);
     }
 
     fn config_for<'a>(
@@ -1539,10 +2108,87 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         next.package = package.clone();
         next
     }
+
+    fn clean_runtime_upgrade_target(input: &ReplayInput, applied: bool) -> RuntimeBinding {
+        if !applied {
+            return input.runtime.clone();
+        }
+        let ReplayOperation::CleanManage {
+            request: crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade),
+            ..
+        } = &input.operation
+        else {
+            return input.runtime.clone();
+        };
+        if upgrade.from_deployment.0 != input.runtime.deployment.0 {
+            return input.runtime.clone();
+        }
+        let mut next = input.runtime.clone();
+        next.deployment = DeploymentId(upgrade.to_deployment.0);
+        next.program = ProgramId(upgrade.to_program.0);
+        next.producer = ProducerId(upgrade.producer.0);
+        next.package = Self::clean_blob(&upgrade.package);
+        next
+    }
 }
 
 impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
     type Error = LocalReplayExecutorError;
+
+    fn trusted_clean_descriptor(
+        &self,
+        runtime: &RuntimeBinding,
+    ) -> Result<Option<crate::agent_sdk::AgentDescriptor>, Self::Error> {
+        self.clean_genesis_descriptor
+            .as_ref()
+            .map(|_| self.trusted_current_clean_descriptor(runtime))
+            .transpose()
+    }
+
+    fn validates_clean_management_transition(
+        &self,
+        input: &ReplayInput,
+        transition: &ReplayTransition,
+    ) -> bool {
+        let Some(crate::agent_sdk::RuntimeOutcome::Management(result)) =
+            self.recent_clean_management_results.get(&input.id())
+        else {
+            return false;
+        };
+        matches!(
+            (result, transition.disposition),
+            (Ok(_), ReplayDisposition::Applied) | (Err(_), ReplayDisposition::Rejected)
+        )
+    }
+
+    fn seed_genesis(
+        &mut self,
+        genesis: &super::journal::AgentJournalGenesis,
+    ) -> Result<(), Self::Error> {
+        match &genesis.create.operation {
+            ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+                ..
+            } => {
+                self.validate_clean_genesis_descriptor(descriptor)?;
+                if self
+                    .clean_genesis_descriptor
+                    .as_ref()
+                    .is_some_and(|seeded| seeded != descriptor.as_ref())
+                {
+                    return Err(LocalReplayExecutorError::InvalidState);
+                }
+                self.clean_genesis_descriptor = Some((**descriptor).clone());
+            }
+            ReplayOperation::Management { .. } => {
+                if self.clean_genesis_descriptor.is_some() {
+                    return Err(LocalReplayExecutorError::InvalidState);
+                }
+            }
+            _ => return Err(LocalReplayExecutorError::InvalidRequest),
+        }
+        Ok(())
+    }
 
     fn verify_merge_event(&mut self, event: &MergeEvent) -> Result<bool, Self::Error> {
         if self.profile == AgentProfile::Local {
@@ -1579,14 +2225,106 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
         // Authentication mints a one-shot execution capability. Invalidate a
         // prior capability first so every error path fails closed.
         self.authenticated_execution = None;
+        if let ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot,
+        } = &input.operation
+        {
+            let genesis_descriptor = match request {
+                crate::agent_sdk::ManagementRequest::Create(descriptor) => {
+                    self.validate_clean_genesis_descriptor(descriptor)?;
+                    if self
+                        .clean_genesis_descriptor
+                        .as_ref()
+                        .is_some_and(|seeded| seeded != descriptor.as_ref())
+                    {
+                        return Err(LocalReplayExecutorError::InvalidState);
+                    }
+                    descriptor.as_ref().clone()
+                }
+                _ => self
+                    .clean_genesis_descriptor
+                    .clone()
+                    .ok_or(LocalReplayExecutorError::InvalidState)?,
+            };
+            let runtime = self.clean_runtime_package(&input.runtime)?;
+            let descriptor =
+                Self::current_clean_descriptor(&genesis_descriptor, &input.runtime, &runtime)?;
+            if matches!(request, crate::agent_sdk::ManagementRequest::Create(created) if created.as_ref() != &descriptor)
+            {
+                return Err(LocalReplayExecutorError::InvalidState);
+            }
+            super::driver::verify_clean_management_receipt(
+                &descriptor,
+                request,
+                authority,
+                *observed_slot,
+                true,
+            )
+            .map_err(|_| LocalReplayExecutorError::InvalidAuthority)?;
+            self.validate_clean_management_artifacts(&descriptor, request)?;
+            self.clean_genesis_descriptor = Some(genesis_descriptor);
+            self.authenticated_execution = Some(AuthenticatedLocalExecution {
+                input: input.id(),
+                before: before.clone(),
+                position,
+                runtime_pvm: runtime.program_bytes().to_vec(),
+                runtime_state_limit: runtime
+                    .manifest()
+                    .contract
+                    .resources
+                    .max_runtime_state_bytes as usize,
+                clean_descriptor: Some(descriptor),
+            });
+            return Ok(());
+        }
+        if let ReplayOperation::CleanInvoke {
+            work,
+            authorization,
+            observed_slot,
+        } = &input.operation
+            && self.clean_genesis_descriptor.is_some()
+        {
+            let runtime = self.clean_runtime_package(&input.runtime)?;
+            let descriptor = self.trusted_current_clean_descriptor(&input.runtime)?;
+            Self::validate_clean_invocation_envelope(
+                &descriptor,
+                work,
+                authorization,
+                *observed_slot,
+            )?;
+            self.authenticated_execution = Some(AuthenticatedLocalExecution {
+                input: input.id(),
+                before: before.clone(),
+                position,
+                runtime_pvm: runtime.program_bytes().to_vec(),
+                runtime_state_limit: runtime
+                    .manifest()
+                    .contract
+                    .resources
+                    .max_runtime_state_bytes as usize,
+                clean_descriptor: Some(descriptor),
+            });
+            return Ok(());
+        }
         let decoded = decode_standard_runtime_state(before)
             .map_err(|_| LocalReplayExecutorError::InvalidState)?;
         let config = self.config_for(input, &decoded)?;
-        let runtime = self.validate_local_config(config, &input.runtime)?;
+        let runtime_pvm = if matches!(input.operation, ReplayOperation::CleanInvoke { .. })
+            && self.clean_genesis_descriptor.is_some()
+        {
+            self.clean_runtime_package(&input.runtime)?
+                .program_bytes()
+                .to_vec()
+        } else {
+            self.validate_local_config(config, &input.runtime)?.pvm
+        };
         match &input.operation {
             ReplayOperation::Management { request } => {
                 self.authenticate_management(config, request)
             }
+            ReplayOperation::CleanManage { .. } => unreachable!("handled above"),
             ReplayOperation::Invoke {
                 invocation,
                 authority,
@@ -1627,7 +2365,9 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
             input: input.id(),
             before: before.clone(),
             position,
-            runtime,
+            runtime_pvm,
+            runtime_state_limit: config.runtime_contract.resources.max_runtime_state_bytes as usize,
+            clean_descriptor: None,
         });
         Ok(())
     }
@@ -1658,10 +2398,92 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
         {
             return Err(LocalReplayExecutorError::InvalidAuthority);
         }
+        let runtime_pvm = authenticated.runtime_pvm;
+        if let ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot,
+        } = &input.operation
+        {
+            if journal_context.is_some() {
+                return Err(LocalReplayExecutorError::InvalidState);
+            }
+            let descriptor = authenticated
+                .clean_descriptor
+                .as_ref()
+                .ok_or(LocalReplayExecutorError::InvalidState)?;
+            let work = crate::agent_sdk::RuntimeWork::Manage {
+                space: crate::agent_sdk::SpaceId(input.runtime.space.0),
+                agent: crate::agent_sdk::AgentId(input.runtime.agent.0),
+                runtime_deployment: authority.selector.runtime_deployment,
+                state: crate::agent_sdk::RuntimeState {
+                    control: before.control.clone(),
+                    linear: before.linear.clone(),
+                    merge: before.merge.clone(),
+                    local: before.local.clone(),
+                },
+                request: Box::new(request.clone()),
+                authority: Some(Box::new(authority.clone())),
+                observed_slot: *observed_slot,
+            };
+            let encoded = work
+                .encode()
+                .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+            let returned: crate::agent_sdk::RuntimeTransition =
+                self.execute_agent_wire(&runtime_pvm, self.management_gas, &encoded)?;
+            if !super::driver::sdk_management_reply_matches(descriptor, request, &returned.outcome)
+                || returned
+                    .state
+                    .encoded_len()
+                    .is_none_or(|bytes| bytes > authenticated.runtime_state_limit)
+            {
+                return Err(LocalReplayExecutorError::InvalidState);
+            }
+            let applied = matches!(
+                returned.outcome,
+                crate::agent_sdk::RuntimeOutcome::Management(Ok(_))
+            );
+            if applied
+                && matches!(request, crate::agent_sdk::ManagementRequest::Create(_))
+                && returned.state.is_empty()
+            {
+                return Err(LocalReplayExecutorError::InvalidState);
+            }
+            let state = RuntimeState {
+                control: returned.state.control,
+                linear: returned.state.linear,
+                merge: returned.state.merge,
+                local: returned.state.local,
+            };
+            let next_runtime = Self::clean_runtime_upgrade_target(input, applied);
+            self.record_clean_management_result(input.id(), returned.outcome);
+            return Ok(ReplayTransition {
+                state,
+                disposition: if applied {
+                    ReplayDisposition::Applied
+                } else {
+                    ReplayDisposition::Rejected
+                },
+                result: None,
+                next_runtime,
+                products: ReplayProducts::default(),
+            });
+        }
+        if matches!(input.operation, ReplayOperation::CleanInvoke { .. })
+            && authenticated.clean_descriptor.is_some()
+        {
+            return self.execute_clean_invocation_transition(
+                input,
+                before,
+                &runtime_pvm,
+                authenticated.runtime_state_limit,
+                false,
+            );
+        }
+
         let decoded = decode_standard_runtime_state(before)
             .map_err(|_| LocalReplayExecutorError::InvalidState)?;
         let config = self.config_for(input, &decoded)?.clone();
-        let runtime = authenticated.runtime;
 
         let transition = match &input.operation {
             ReplayOperation::Management { request } => {
@@ -1698,11 +2520,11 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                         result: expected_result.clone(),
                     }
                 } else {
-                    self.execute_wire(&runtime.pvm, self.management_gas, &call.encode())?
+                    self.execute_wire(&runtime_pvm, self.management_gas, &call.encode())?
                 };
                 #[cfg(not(test))]
                 let returned: RuntimeReturn =
-                    self.execute_wire(&runtime.pvm, self.management_gas, &call.encode())?;
+                    self.execute_wire(&runtime_pvm, self.management_gas, &call.encode())?;
                 if returned.result != expected_result {
                     return Err(LocalReplayExecutorError::InvalidState);
                 }
@@ -1728,6 +2550,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                     products: ReplayProducts::default(),
                 }
             }
+            ReplayOperation::CleanManage { .. } => unreachable!("handled above"),
             ReplayOperation::Acknowledge {
                 invocation,
                 authority,
@@ -1739,7 +2562,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                     authority: Box::new(authority.clone()),
                 };
                 let returned: RuntimeReturn = self.execute_wire(
-                    &runtime.pvm,
+                    &runtime_pvm,
                     self.management_gas,
                     &RuntimeCall::new(before.clone(), request).encode(),
                 )?;
@@ -1772,7 +2595,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                 let (actor_pvm, actor_schema, actor_policies, installation_data) =
                     artifacts.unwrap_or_else(|| (Vec::new(), empty(), empty(), None));
                 let returned: RuntimeExecutionReturn = self.execute_wire(
-                    &runtime.pvm,
+                    &runtime_pvm,
                     self.management_gas.saturating_add(invocation.gas),
                     &RuntimeExecutionCall {
                         state: before.clone(),
@@ -1822,14 +2645,14 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                             .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
                     } else {
                         self.execute_agent_wire(
-                            &runtime.pvm,
+                            &runtime_pvm,
                             self.management_gas.saturating_add(work.gas),
                             &encoded,
                         )?
                     };
                 #[cfg(any(not(test), all(test, not(feature = "pvm"))))]
                 let returned: crate::agent_sdk::RuntimeTransition = self.execute_agent_wire(
-                    &runtime.pvm,
+                    &runtime_pvm,
                     self.management_gas.saturating_add(work.gas),
                     &encoded,
                 )?;
@@ -2171,6 +2994,7 @@ where
             ReplayOperation::Invoke { invocation, .. } => (invocation, false),
             ReplayOperation::Acknowledge { invocation, .. } => (invocation, true),
             ReplayOperation::Management { .. }
+            | ReplayOperation::CleanManage { .. }
             | ReplayOperation::CleanInvoke { .. }
             | ReplayOperation::SealMerge => return Ok(None),
         };
@@ -2425,6 +3249,68 @@ where
         ))
     }
 
+    /// Construct the exact clean SDK Create replay input and runtime catalog
+    /// for an ordinary Local Agent. The descriptor and receipt remain SDK
+    /// values; no legacy lifecycle projection is created.
+    pub(crate) fn clean_local_genesis_input(
+        descriptor: crate::agent_sdk::AgentDescriptor,
+        runtime_package: &super::package_admission::AdmittedRuntimePackage,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        trust: &Arc<dyn AgentTrustProvider>,
+        merge: &Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<(ReplayInput, Vec<RuntimeBlob>), LocalJournalDriverError> {
+        let [replica] = descriptor.replicas.as_slice() else {
+            return Err(LocalReplayExecutorError::WrongReplica.into());
+        };
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Local
+            || replica.node.0 != merge.node().0
+            || descriptor.runtime_package != *runtime_package.package_ref()
+            || descriptor.identity.runtime_deployment != runtime_package.deployment()
+            || descriptor.identity.runtime_program != runtime_package.program()
+            || descriptor.identity.runtime_producer != runtime_package.producer()
+            || descriptor.runtime_contract != runtime_package.manifest().contract
+            || descriptor.capabilities != runtime_package.capabilities()
+        {
+            return Err(LocalReplayExecutorError::InvalidRequest.into());
+        }
+        let observed_slot = trust
+            .current_logical_slot()
+            .ok_or(LocalReplayExecutorError::TrustUnavailable)?;
+        let request = crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+        super::driver::verify_clean_management_receipt(
+            &descriptor,
+            &request,
+            &authority,
+            observed_slot,
+            false,
+        )
+        .map_err(|_| LocalReplayExecutorError::InvalidAuthority)?;
+        let catalog = vec![Self::runtime_blob(runtime_package.exact_bytes().to_vec())];
+        let runtime = RuntimeBinding {
+            space: crate::service::SpaceId(descriptor.identity.space.0),
+            agent: crate::service::AgentId(descriptor.identity.agent.0),
+            deployment: DeploymentId(descriptor.identity.runtime_deployment.0),
+            program: ProgramId(descriptor.identity.runtime_program.0),
+            producer: ProducerId(descriptor.identity.runtime_producer.0),
+            package: catalog[0].reference.clone(),
+            runtime_abi: super::RUNTIME_ABI_ID,
+            execution_semantics: super::EXECUTION_SEMANTICS_ID,
+        };
+        let create = ReplayInput {
+            runtime,
+            operation: ReplayOperation::CleanManage {
+                request,
+                authority,
+                observed_slot,
+            },
+        };
+        create
+            .validate()
+            .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+        Ok((create, catalog))
+    }
+
     /// Execute and authenticate the bootstrap-owned Create input without
     /// writing a destination store. The returned opaque replay token is the
     /// sole input accepted by the independent genesis proposal/seal path.
@@ -2608,14 +3494,31 @@ where
         {
             return Err(LocalJournalDriverError::InvalidResult);
         }
-        Self::validate_create_state(
-            sealed.post_create(),
-            sealed.genesis().runtime(),
-            sealed.replica(),
-            resolver,
-            trust,
-            merge,
-        )
+        if matches!(
+            sealed.genesis().create.operation,
+            ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(_),
+                ..
+            }
+        ) {
+            if sealed.post_create().is_empty() {
+                return Err(LocalReplayExecutorError::InvalidState.into());
+            }
+            let mut executor =
+                StandardLocalReplayExecutor::new(resolver, Arc::clone(trust), Arc::clone(merge));
+            executor.seed_genesis(sealed.genesis())?;
+            executor.trusted_current_clean_descriptor(sealed.genesis().runtime())?;
+            Ok(())
+        } else {
+            Self::validate_create_state(
+                sealed.post_create(),
+                sealed.genesis().runtime(),
+                sealed.replica(),
+                resolver,
+                trust,
+                merge,
+            )
+        }
     }
 
     /// Initialize only from a root/QC-admitted, exactly executed genesis.
@@ -2674,6 +3577,30 @@ where
         &self,
         sealed_replica: Option<AgentReplica>,
     ) -> Result<(), LocalJournalDriverError> {
+        if let Some(descriptor) = self.core.executor.seeded_clean_descriptor() {
+            let [replica] = descriptor.replicas.as_slice() else {
+                return Err(LocalReplayExecutorError::WrongReplica.into());
+            };
+            let role = match replica.role {
+                crate::agent_sdk::ReplicaRole::Voter => super::ReplicaRole::Voter,
+                crate::agent_sdk::ReplicaRole::Observer => super::ReplicaRole::Observer,
+            };
+            let replica = AgentReplica {
+                node: NodeId(replica.node.0),
+                principal: crate::service::PrincipalId(replica.principal.0),
+                role,
+            };
+            if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Local
+                || replica.node != self.core.materialization.heads().node
+                || sealed_replica.is_some_and(|sealed| sealed != replica)
+            {
+                return Err(LocalReplayExecutorError::WrongReplica.into());
+            }
+            self.core
+                .executor
+                .trusted_current_clean_descriptor(self.core.materialization.runtime())?;
+            return Ok(());
+        }
         let state = decode_standard_runtime_state(self.core.materialization.state())
             .map_err(|_| LocalReplayExecutorError::InvalidState)?;
         let config = state
@@ -2700,6 +3627,26 @@ where
     }
 
     pub(crate) fn identity(&self) -> Result<AgentIdentity, LocalJournalDriverError> {
+        if self.core.executor.seeded_clean_descriptor().is_some() {
+            let identity = self
+                .core
+                .executor
+                .trusted_current_clean_descriptor(self.core.materialization.runtime())?
+                .identity;
+            return Ok(AgentIdentity {
+                space: crate::service::SpaceId(identity.space.0),
+                agent: crate::service::AgentId(identity.agent.0),
+                owner: crate::service::PrincipalId(identity.owner.0),
+                profile: match identity.profile {
+                    crate::agent_sdk::AgentProfile::Local => AgentProfile::Local,
+                    crate::agent_sdk::AgentProfile::Shared => AgentProfile::Shared,
+                    crate::agent_sdk::AgentProfile::Private => AgentProfile::Private,
+                },
+                runtime_deployment: DeploymentId(identity.runtime_deployment.0),
+                runtime_program: ProgramId(identity.runtime_program.0),
+                runtime_producer: ProducerId(identity.runtime_producer.0),
+            });
+        }
         Ok(self.config()?.identity)
     }
 
@@ -2725,6 +3672,69 @@ where
 
     fn runtime_package_catalog(package: &Package) -> Vec<RuntimeBlob> {
         vec![Self::runtime_blob(package.encode())]
+    }
+
+    fn clean_management_catalog(
+        &self,
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        request: &crate::agent_sdk::ManagementRequest,
+        artifacts: SdkManagementArtifacts<'_>,
+    ) -> Result<Vec<RuntimeBlob>, LocalJournalDriverError> {
+        if matches!(artifacts, SdkManagementArtifacts::None)
+            && matches!(
+                request,
+                crate::agent_sdk::ManagementRequest::Install(_)
+                    | crate::agent_sdk::ManagementRequest::UpgradeActor(_)
+                    | crate::agent_sdk::ManagementRequest::UpgradeRuntime(_)
+            )
+        {
+            self.core
+                .executor
+                .validate_clean_management_artifacts(descriptor, request)?;
+            return Ok(Vec::new());
+        }
+        super::driver::validate_sdk_management_artifacts(descriptor, request, artifacts)
+            .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+        let mut catalog = Vec::new();
+        match (request, artifacts) {
+            (
+                crate::agent_sdk::ManagementRequest::Install(install),
+                SdkManagementArtifacts::Actor(package),
+            ) => {
+                catalog.push(Self::runtime_blob(package.exact_bytes().to_vec()));
+                catalog.push(Self::runtime_blob(
+                    package.state_lane_schema_bytes().to_vec(),
+                ));
+                catalog.push(Self::runtime_blob(package.method_policy_bytes().to_vec()));
+                if let Some(data) = &install.installation_data {
+                    catalog.push(Self::runtime_blob(data.bytes.clone()));
+                }
+            }
+            (
+                crate::agent_sdk::ManagementRequest::UpgradeActor(_),
+                SdkManagementArtifacts::Actor(package),
+            ) => {
+                catalog.push(Self::runtime_blob(package.exact_bytes().to_vec()));
+                catalog.push(Self::runtime_blob(
+                    package.state_lane_schema_bytes().to_vec(),
+                ));
+                catalog.push(Self::runtime_blob(package.method_policy_bytes().to_vec()));
+            }
+            (
+                crate::agent_sdk::ManagementRequest::UpgradeRuntime(_),
+                SdkManagementArtifacts::Runtime(package),
+            ) => catalog.push(Self::runtime_blob(package.exact_bytes().to_vec())),
+            (_, SdkManagementArtifacts::None) => {}
+            _ => return Err(LocalReplayExecutorError::InvalidRequest.into()),
+        }
+        catalog.sort_by_key(|blob| blob.reference.hash);
+        for pair in catalog.windows(2) {
+            if pair[0].reference.hash == pair[1].reference.hash && pair[0] != pair[1] {
+                return Err(LocalReplayExecutorError::InvalidRequest.into());
+            }
+        }
+        catalog.dedup();
+        Ok(catalog)
     }
 
     fn lifecycle_operation(
@@ -3101,6 +4111,142 @@ where
         self.core.persist_current_merge_seal()
     }
 
+    /// Execute and journal one exact clean SDK management mutation. An
+    /// unchanged denial is nondurable. A result is retained without another
+    /// slot only when a bounded Ordered-suffix lookup proves the exact request
+    /// and receipt were already durable; a fresh successful no-op is still
+    /// ordered.
+    pub(crate) fn clean_manage(
+        &mut self,
+        request: crate::agent_sdk::ManagementRequest,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        artifacts: SdkManagementArtifacts<'_>,
+    ) -> Result<LocalCleanManagementResult, LocalJournalDriverError> {
+        if matches!(
+            request,
+            crate::agent_sdk::ManagementRequest::Create(_)
+                | crate::agent_sdk::ManagementRequest::InspectActors { .. }
+                | crate::agent_sdk::ManagementRequest::InspectResources
+                | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. }
+        ) {
+            return Err(LocalReplayExecutorError::InvalidRequest.into());
+        }
+        let runtime = self.core.materialization.runtime().clone();
+        let descriptor = self
+            .core
+            .executor
+            .trusted_current_clean_descriptor(&runtime)?;
+        let catalog = self.clean_management_catalog(&descriptor, &request, artifacts)?;
+        let staged = self.stage_catalog(&catalog)?;
+        let mut published = false;
+        let result = (|| -> Result<LocalCleanManagementResult, LocalJournalDriverError> {
+            if let Some(input) = recent_clean_management_input(
+                &self.core.store,
+                &self.core.materialization,
+                &request,
+                &authority,
+            )? {
+                let outcome = self
+                    .core
+                    .executor
+                    .clean_management_result(input)
+                    .ok_or(LocalJournalDriverError::InvalidResult)?;
+                return Ok(LocalCleanManagementResult {
+                    outcome,
+                    finalized_merge_invocations: Vec::new(),
+                });
+            }
+            let observed_slot = self.core.executor.current_logical_slot()?;
+            let input = ReplayInput {
+                runtime: runtime.clone(),
+                operation: ReplayOperation::CleanManage {
+                    request: request.clone(),
+                    authority: authority.clone(),
+                    observed_slot,
+                },
+            };
+            input
+                .validate()
+                .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+            let preview = self.core.executor.preview_clean_management(
+                &runtime,
+                self.core.materialization.state(),
+                &request,
+                &authority,
+                observed_slot,
+                true,
+            )?;
+            let preview_state = RuntimeState {
+                control: preview.state.control.clone(),
+                linear: preview.state.linear.clone(),
+                merge: preview.state.merge.clone(),
+                local: preview.state.local.clone(),
+            };
+            if preview_state == *self.core.materialization.state()
+                && matches!(
+                    &preview.outcome,
+                    crate::agent_sdk::RuntimeOutcome::Management(Err(_))
+                )
+            {
+                return Ok(LocalCleanManagementResult {
+                    outcome: preview.outcome,
+                    finalized_merge_invocations: Vec::new(),
+                });
+            }
+            let input_id = input.id();
+            let merge_seal = self.persist_merge_seal()?;
+            let heads = self.core.materialization.heads();
+            let entry = OrderedEntry {
+                genesis: heads.genesis,
+                index: heads
+                    .ordered_index
+                    .checked_add(1)
+                    .ok_or(LocalJournalDriverError::InvalidResult)?,
+                parent: heads.ordered_head,
+                merge_frontier: heads.merge_frontier,
+                merge_seal: Some(merge_seal),
+                input,
+            };
+            let executions = self.core.publish_ordered(&entry)?.executions;
+            published = true;
+            if executions
+                .iter()
+                .any(|execution| !execution.products().is_empty())
+            {
+                return Err(LocalJournalDriverError::InvalidResult);
+            }
+            let outcome = self
+                .core
+                .executor
+                .take_clean_invocation_result(input_id)
+                .ok_or(LocalJournalDriverError::InvalidResult)?;
+            if outcome != preview.outcome {
+                return Err(LocalJournalDriverError::InvalidResult);
+            }
+            let finalized_merge_invocations = executions
+                .into_iter()
+                .filter_map(|execution| {
+                    execution
+                        .result()
+                        .cloned()
+                        .map(|result| FinalizedMergeInvocation {
+                            input: execution.input(),
+                            position: execution.position(),
+                            result,
+                        })
+                })
+                .collect();
+            Ok(LocalCleanManagementResult {
+                outcome,
+                finalized_merge_invocations,
+            })
+        })();
+        if !published {
+            self.rollback_staged_catalog(staged)?;
+        }
+        result
+    }
+
     /// Seal and apply one authority-signed lifecycle mutation. The trusted
     /// logical slot is sampled here and cannot be supplied by the caller.
     /// Catalog bytes for an install or upgrade are persisted before the
@@ -3311,6 +4457,7 @@ where
                 authority,
             } => (invocation, authority),
             ReplayOperation::Management { .. }
+            | ReplayOperation::CleanManage { .. }
             | ReplayOperation::CleanInvoke { .. }
             | ReplayOperation::SealMerge => {
                 return Err(LocalReplayExecutorError::InvalidRequest.into());
@@ -3472,6 +4619,7 @@ where
             // admission path. Never route it through this legacy
             // ActorInvocation/result projection surface.
             ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::CleanManage { .. }
             | ReplayOperation::Management { .. }
             | ReplayOperation::SealMerge => {
                 return Err(LocalJournalDriverError::InvalidResult);
@@ -4291,7 +5439,7 @@ mod tests {
     use ed25519_dalek::{Signer as _, SigningKey};
     use std::sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     };
 
     struct StaticTrust {
@@ -4358,6 +5506,24 @@ mod tests {
         }
     }
 
+    struct CleanClockTrust {
+        slot: Arc<AtomicU64>,
+    }
+
+    impl AgentTrustProvider for CleanClockTrust {
+        fn current_logical_slot(&self) -> Option<u64> {
+            Some(self.slot.load(Ordering::SeqCst))
+        }
+
+        fn authority_for_space(&self, _space: SpaceId) -> Option<AgentAuthorityBinding> {
+            None
+        }
+
+        fn verify_package(&self, _agent: &AgentConfig, _package: &Package) -> bool {
+            false
+        }
+    }
+
     struct StaticMerge(NodeId);
 
     impl LocalMergeAuthenticator for StaticMerge {
@@ -4377,6 +5543,449 @@ mod tests {
             event.author == self.0
                 && event.signature.len() == super::super::authority::ED25519_SIGNATURE_BYTES
         }
+    }
+
+    fn clean_test_descriptor(
+        runtime: &super::super::package_admission::AdmittedRuntimePackage,
+        node: NodeId,
+        authority_key: &SigningKey,
+    ) -> crate::agent_sdk::AgentDescriptor {
+        let space = crate::agent_sdk::SpaceId([0x31; 32]);
+        let owner = crate::agent_sdk::PrincipalId([0x32; 32]);
+        let creation_nonce = crate::agent_sdk::Hash([0x33; 32]);
+        let agent = crate::agent_sdk::AgentId::derive(space, owner, creation_nonce.as_bytes());
+        let public_key = authority_key.verifying_key().to_bytes();
+        let descriptor = crate::agent_sdk::AgentDescriptor {
+            identity: crate::agent_sdk::AgentIdentity {
+                space,
+                agent,
+                owner,
+                profile: crate::agent_sdk::AgentProfile::Local,
+                runtime_deployment: runtime.deployment(),
+                runtime_program: runtime.program(),
+                runtime_producer: runtime.producer(),
+            },
+            creation_nonce,
+            authority: crate::agent_sdk::authority::AgentAuthorityBinding {
+                policy: crate::agent_sdk::Hash([0x34; 32]),
+                issuer: crate::agent_sdk::authority::AuthorityIssuer {
+                    principal: crate::agent_sdk::PrincipalId([0x35; 32]),
+                    actor: crate::agent_sdk::ActorId([0x36; 32]),
+                    deployment: crate::agent_sdk::DeploymentId([0x37; 32]),
+                    program: crate::agent_sdk::ProgramId([0x38; 32]),
+                    producer: crate::agent_sdk::ProducerId::of_public_key(&public_key),
+                },
+                public_key,
+                initial_epoch: 1,
+            },
+            runtime_package: runtime.package_ref().clone(),
+            runtime_contract: runtime.manifest().contract,
+            capabilities: runtime.capabilities(),
+            replicas: vec![crate::agent_sdk::AgentReplica {
+                node: crate::agent_sdk::NodeId(node.0),
+                principal: owner,
+                role: crate::agent_sdk::ReplicaRole::Voter,
+            }],
+        };
+        descriptor.validate().unwrap();
+        descriptor
+    }
+
+    fn clean_test_receipt(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        request: &crate::agent_sdk::ManagementRequest,
+        sequence: u64,
+        authority_key: &SigningKey,
+    ) -> crate::agent_sdk::authority::AuthorityReceipt {
+        use crate::agent_sdk::authority::{
+            AuthorityEvidence, AuthorityLaneRoots, AuthorityOperationKind, AuthorityReceipt,
+            AuthorityReceiptSelector,
+        };
+
+        let (operation, actor, actor_deployment) = match request {
+            crate::agent_sdk::ManagementRequest::Create(_) => {
+                (AuthorityOperationKind::CreateAgent, None, None)
+            }
+            crate::agent_sdk::ManagementRequest::Suspend {
+                actor,
+                expected_deployment,
+            } => (
+                AuthorityOperationKind::SuspendActor,
+                Some(*actor),
+                Some(*expected_deployment),
+            ),
+            crate::agent_sdk::ManagementRequest::Resume {
+                actor,
+                expected_deployment,
+            } => (
+                AuthorityOperationKind::ResumeActor,
+                Some(*actor),
+                Some(*expected_deployment),
+            ),
+            crate::agent_sdk::ManagementRequest::ChangeReplicas { .. } => {
+                (AuthorityOperationKind::ChangeReplicaSet, None, None)
+            }
+            _ => panic!("unsupported clean local test request"),
+        };
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: descriptor.authority.policy,
+                issuer: descriptor.authority.issuer,
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                operation,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                actor,
+                actor_deployment,
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: crate::agent_sdk::Hash([0x39; 32]),
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch: 1,
+                decision_sequence: sequence,
+                acknowledged_through: 0,
+                valid_from: 1,
+                expires_at: 100,
+                request: request.commitment(),
+            },
+            public_key: descriptor.authority.public_key,
+            signature: [0; 64],
+        };
+        receipt.signature = authority_key.sign(&receipt.signing_bytes()).to_bytes();
+        receipt.validate_shape().unwrap();
+        receipt
+    }
+
+    fn clean_test_state(control: &[u8]) -> crate::agent_sdk::RuntimeState {
+        crate::agent_sdk::RuntimeState {
+            control: control.to_vec(),
+            linear: Vec::new(),
+            merge: Vec::new(),
+            local: Vec::new(),
+        }
+    }
+
+    fn clean_test_identity_bytes(identity: &crate::agent_sdk::AgentIdentity) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(193);
+        bytes.extend_from_slice(identity.space.as_bytes());
+        bytes.extend_from_slice(identity.agent.as_bytes());
+        bytes.extend_from_slice(identity.owner.as_bytes());
+        bytes.push(identity.profile as u8);
+        bytes.extend_from_slice(identity.runtime_deployment.as_bytes());
+        bytes.extend_from_slice(identity.runtime_program.as_bytes());
+        bytes.extend_from_slice(identity.runtime_producer.as_bytes());
+        bytes
+    }
+
+    fn clean_test_unique_offset(haystack: &[u8], needle: &[u8]) -> usize {
+        let mut matches = haystack
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == needle).then_some(offset));
+        let offset = matches.next().unwrap();
+        assert!(matches.next().is_none());
+        offset
+    }
+
+    fn clean_test_scripted_case(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        state: crate::agent_sdk::RuntimeState,
+        request: crate::agent_sdk::ManagementRequest,
+        sequence: u64,
+        authority_key: &SigningKey,
+        next_state: crate::agent_sdk::RuntimeState,
+        outcome: crate::agent_sdk::RuntimeOutcome,
+    ) -> super::super::package_admission::ScriptedRuntimeCase {
+        let authority = clean_test_receipt(descriptor, &request, sequence, authority_key);
+        let input = crate::agent_sdk::RuntimeWork::Manage {
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            runtime_deployment: authority.selector.runtime_deployment,
+            state,
+            request: Box::new(request),
+            authority: Some(Box::new(authority)),
+            observed_slot: 20,
+        }
+        .encode()
+        .unwrap();
+        let output = crate::agent_sdk::RuntimeTransition {
+            state: next_state,
+            outcome,
+        }
+        .encode()
+        .unwrap();
+        super::super::package_admission::ScriptedRuntimeCase {
+            input,
+            output,
+            copies: Vec::new(),
+        }
+    }
+
+    fn clean_test_runtime_fixture() -> (
+        super::super::package_admission::AdmittedRuntimePackage,
+        crate::agent_sdk::AgentDescriptor,
+        SigningKey,
+        crate::agent_sdk::ManagementRequest,
+        crate::agent_sdk::ManagementRequest,
+    ) {
+        use super::super::package_admission::{
+            ScriptedRuntimeCopy, admitted_scripted_runtime_for_test,
+            admitted_standard_runtime_for_test,
+        };
+
+        let node = NodeId([0x40; 32]);
+        let authority_key = SigningKey::from_bytes(&[0x41; 32]);
+        let placeholder = admitted_standard_runtime_for_test("local-script-shape", 0x42);
+        let placeholder_descriptor = clean_test_descriptor(&placeholder, node, &authority_key);
+        let actor = crate::agent_sdk::ActorId::top_level(
+            placeholder_descriptor.identity.agent,
+            "opaque-child",
+        );
+        let deployment = crate::agent_sdk::DeploymentId([0x43; 32]);
+        let suspended_entry = crate::agent_sdk::ActorEntry {
+            actor,
+            name: "opaque-child".into(),
+            parent: None,
+            deployment,
+            program: crate::agent_sdk::ProgramId([0x44; 32]),
+            package: crate::agent_sdk::BlobRef::of_bytes(b"opaque-child-package"),
+            agent_schema: crate::agent_sdk::BlobRef::of_bytes(b"opaque-child-schema"),
+            method_policy: crate::agent_sdk::BlobRef::of_bytes(b"opaque-child-policy"),
+            constructor_abi: crate::agent_sdk::Hash([0x45; 32]),
+            installation_data: None,
+            state_layout: crate::agent_sdk::Hash([0x46; 32]),
+            lanes: crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Linear),
+            suspended: true,
+        };
+        suspended_entry.validate().unwrap();
+        let success = crate::agent_sdk::ManagementRequest::Suspend {
+            actor,
+            expected_deployment: deployment,
+        };
+        let denied = crate::agent_sdk::ManagementRequest::Resume {
+            actor,
+            expected_deployment: deployment,
+        };
+        let state = clean_test_state(&[1]);
+        let create =
+            crate::agent_sdk::ManagementRequest::Create(Box::new(placeholder_descriptor.clone()));
+        let mut create_case = clean_test_scripted_case(
+            &placeholder_descriptor,
+            crate::agent_sdk::RuntimeState::default(),
+            create.clone(),
+            1,
+            &authority_key,
+            state.clone(),
+            crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                crate::agent_sdk::ManagementReply::Created(placeholder_descriptor.identity.clone()),
+            )),
+        );
+        let identity = clean_test_identity_bytes(&placeholder_descriptor.identity);
+        create_case.copies.push(ScriptedRuntimeCopy {
+            input_offset: clean_test_unique_offset(&create_case.input, &identity),
+            output_offset: clean_test_unique_offset(&create_case.output, &identity),
+            len: identity.len(),
+        });
+        let cases = vec![
+            create_case,
+            clean_test_scripted_case(
+                &placeholder_descriptor,
+                state.clone(),
+                success.clone(),
+                2,
+                &authority_key,
+                state.clone(),
+                crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                    crate::agent_sdk::ManagementReply::Suspended(suspended_entry),
+                )),
+            ),
+            clean_test_scripted_case(
+                &placeholder_descriptor,
+                state.clone(),
+                denied.clone(),
+                3,
+                &authority_key,
+                state,
+                crate::agent_sdk::RuntimeOutcome::Management(Err(
+                    crate::agent_sdk::ManagementError::NotFound,
+                )),
+            ),
+        ];
+        let runtime = admitted_scripted_runtime_for_test("local-current-abi", 0x47, cases);
+        let descriptor = clean_test_descriptor(&runtime, node, &authority_key);
+        (runtime, descriptor, authority_key, success, denied)
+    }
+
+    #[cfg(all(feature = "pvm", feature = "storage", target_os = "linux"))]
+    #[test]
+    fn physical_current_abi_custom_local_create_manage_restart_and_retry_is_exact() {
+        use super::super::journal_store::FileLocalAgentJournalSlot;
+        use std::fs::{self, File};
+
+        let (runtime, descriptor, authority_key, success, denied) = clean_test_runtime_fixture();
+        let slot = Arc::new(AtomicU64::new(20));
+        let trust: Arc<dyn AgentTrustProvider> = Arc::new(CleanClockTrust {
+            slot: Arc::clone(&slot),
+        });
+        let replica = AgentReplica {
+            node: NodeId(descriptor.replicas[0].node.0),
+            principal: crate::service::PrincipalId(descriptor.replicas[0].principal.0),
+            role: super::super::ReplicaRole::Voter,
+        };
+        let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(StaticMerge(replica.node));
+        let create_request =
+            crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+        let create_receipt = clean_test_receipt(&descriptor, &create_request, 1, &authority_key);
+        let (create, catalog) =
+            LocalJournalAgentDriver::<FileAgentJournalStore>::clean_local_genesis_input(
+                descriptor.clone(),
+                &runtime,
+                create_receipt,
+                &trust,
+                &merge,
+            )
+            .unwrap();
+        let sealed = LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_local_genesis(
+            create.clone(),
+            replica,
+            &catalog,
+            Arc::clone(&trust),
+            Arc::clone(&merge),
+        )
+        .unwrap();
+        let reopen_seal = LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_local_genesis(
+            create,
+            replica,
+            &catalog,
+            Arc::clone(&trust),
+            Arc::clone(&merge),
+        )
+        .unwrap();
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("vos-clean-local-{}-{unique}", std::process::id()));
+        let journal_parent_path = base.join("journals");
+        let authority_parent_path = base.join("authority");
+        fs::create_dir_all(&journal_parent_path).unwrap();
+        fs::create_dir_all(&authority_parent_path).unwrap();
+        let encoded_agent = descriptor
+            .identity
+            .agent
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let journal_path = journal_parent_path.join(format!("{encoded_agent}.agent"));
+        let lock_path = authority_parent_path.join(format!("{encoded_agent}.agent-lock"));
+        let journal_parent = File::open(&journal_parent_path).unwrap();
+        let authority_parent = File::open(&authority_parent_path).unwrap();
+        let intent = Hash::digest(b"vos/test/clean-local-intent/v1", &[&[0x51]]);
+        let physical = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+            &journal_path,
+            &lock_path,
+            replica.node,
+            intent,
+            &journal_parent,
+            &authority_parent,
+        )
+        .unwrap();
+        let store = physical.open(&sealed, false).unwrap();
+        let mut driver = LocalJournalAgentDriver::create_local(
+            store,
+            sealed,
+            intent,
+            &catalog,
+            Arc::clone(&trust),
+            Arc::clone(&merge),
+        )
+        .unwrap();
+        assert_eq!(driver.core.materialization.heads().ordered_index, 0);
+
+        slot.store(21, Ordering::SeqCst);
+        let success_receipt = clean_test_receipt(&descriptor, &success, 2, &authority_key);
+        let first = driver
+            .clean_manage(
+                success.clone(),
+                success_receipt.clone(),
+                SdkManagementArtifacts::None,
+            )
+            .unwrap();
+        assert!(matches!(
+            &first.outcome,
+            crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                crate::agent_sdk::ManagementReply::Suspended(_)
+            ))
+        ));
+        assert_eq!(driver.core.materialization.heads().ordered_index, 1);
+        let immediate_retry = driver
+            .clean_manage(
+                success.clone(),
+                success_receipt.clone(),
+                SdkManagementArtifacts::None,
+            )
+            .unwrap();
+        assert_eq!(immediate_retry.outcome, first.outcome);
+        assert_eq!(driver.core.materialization.heads().ordered_index, 1);
+        drop(driver);
+
+        let physical = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+            &journal_path,
+            &lock_path,
+            replica.node,
+            intent,
+            &journal_parent,
+            &authority_parent,
+        )
+        .unwrap();
+        let store = physical.open(&reopen_seal, true).unwrap();
+        let mut driver = LocalJournalAgentDriver::open_local(
+            store,
+            &reopen_seal,
+            intent,
+            Arc::clone(&trust),
+            Arc::clone(&merge),
+        )
+        .unwrap();
+        slot.store(22, Ordering::SeqCst);
+        let retained = driver
+            .clean_manage(success, success_receipt, SdkManagementArtifacts::None)
+            .unwrap();
+        assert_eq!(retained.outcome, first.outcome);
+        assert_eq!(driver.core.materialization.heads().ordered_index, 1);
+
+        slot.store(23, Ordering::SeqCst);
+        let denied_receipt = clean_test_receipt(&descriptor, &denied, 3, &authority_key);
+        let denial = driver
+            .clean_manage(denied, denied_receipt, SdkManagementArtifacts::None)
+            .unwrap();
+        assert_eq!(
+            denial.outcome,
+            crate::agent_sdk::RuntimeOutcome::Management(Err(
+                crate::agent_sdk::ManagementError::NotFound
+            ))
+        );
+        assert_eq!(driver.core.materialization.heads().ordered_index, 1);
+
+        let change = crate::agent_sdk::ManagementRequest::ChangeReplicas {
+            expected_generation: descriptor.replica_generation(),
+            replicas: descriptor.replicas.clone(),
+        };
+        let change_receipt = clean_test_receipt(&descriptor, &change, 4, &authority_key);
+        assert!(matches!(
+            driver.clean_manage(change, change_receipt, SdkManagementArtifacts::None),
+            Err(LocalJournalDriverError::Executor(
+                LocalReplayExecutorError::InvalidRequest
+            ))
+        ));
+        assert_eq!(driver.core.materialization.heads().ordered_index, 1);
+        drop(driver);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[derive(Default)]
@@ -4453,6 +6062,7 @@ mod tests {
                     })
                 }
                 ReplayOperation::Acknowledge { .. }
+                | ReplayOperation::CleanManage { .. }
                 | ReplayOperation::CleanInvoke { .. }
                 | ReplayOperation::SealMerge => Err(LocalReplayExecutorError::InvalidRequest),
             }
@@ -5724,7 +7334,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_reply_handoff_is_keyed_bounded_and_never_overwrites_another_caller() {
+    fn clean_reply_handoff_and_management_recovery_are_keyed_and_bounded() {
         let mut driver = standard_test_driver();
         let first = ReplayInputId([0x11; 32]);
         let second = ReplayInputId([0x22; 32]);
@@ -5745,7 +7355,7 @@ mod tests {
 
         assert_eq!(
             driver.core.executor.take_clean_invocation_result(first),
-            Some(first_outcome)
+            Some(first_outcome.clone())
         );
         assert_eq!(
             driver.core.executor.take_clean_invocation_result(second),
@@ -5754,7 +7364,7 @@ mod tests {
         assert_eq!(
             driver.core.executor.take_clean_invocation_result(first),
             None,
-            "reply handoff is one-shot and is not durable recovery state"
+            "the synchronous handoff remains one-shot"
         );
 
         for value in 0..=MAX_PENDING_CLEAN_INVOCATION_RESULTS {
@@ -5770,6 +7380,47 @@ mod tests {
         }
         assert_eq!(
             driver.core.executor.pending_clean_invocation_results.len(),
+            MAX_PENDING_CLEAN_INVOCATION_RESULTS
+        );
+
+        let management_outcome = crate::agent_sdk::RuntimeOutcome::Management(Err(
+            crate::agent_sdk::ManagementError::NotFound,
+        ));
+        for value in 0..=MAX_PENDING_CLEAN_INVOCATION_RESULTS {
+            let mut id = [0; 32];
+            id[..8].copy_from_slice(&(value as u64).to_le_bytes());
+            id[31] = 2;
+            driver
+                .core
+                .executor
+                .record_clean_management_result(ReplayInputId(id), management_outcome.clone());
+        }
+        let mut oldest = [0; 32];
+        oldest[31] = 2;
+        assert_eq!(
+            driver
+                .core
+                .executor
+                .clean_management_result(ReplayInputId(oldest)),
+            None,
+            "FIFO eviction is aligned with the newest durable suffix"
+        );
+        let mut newest = [0; 32];
+        newest[..8].copy_from_slice(&(MAX_PENDING_CLEAN_INVOCATION_RESULTS as u64).to_le_bytes());
+        newest[31] = 2;
+        assert!(
+            driver
+                .core
+                .executor
+                .clean_management_result(ReplayInputId(newest))
+                .is_some()
+        );
+        assert_eq!(
+            driver.core.executor.recent_clean_management_results.len(),
+            MAX_PENDING_CLEAN_INVOCATION_RESULTS
+        );
+        assert_eq!(
+            driver.core.executor.recent_clean_management_order.len(),
             MAX_PENDING_CLEAN_INVOCATION_RESULTS
         );
     }

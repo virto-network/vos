@@ -1404,6 +1404,15 @@ pub enum ReplayOperation {
     /// Authority-admitted management mutation. Read-only inspection and
     /// invocation acknowledgement are not accepted through this variant.
     Management { request: LifecycleRequest },
+    /// Exact clean-generation management mutation. The SDK request and its
+    /// durable authority receipt are retained without projecting either value
+    /// into the transitional lifecycle protocol. Read-only inspection is not
+    /// journaled through this variant.
+    CleanManage {
+        request: crate::agent_sdk::ManagementRequest,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        observed_slot: u64,
+    },
     /// Exact authenticated actor invocation. Executable and policy artifacts
     /// are resolved from the checkpoint/catalog closure during replay.
     Invoke {
@@ -1438,7 +1447,9 @@ pub enum ReplayOperation {
 impl ReplayOperation {
     pub const fn persisted_lane(&self) -> PersistedLane {
         match self {
-            Self::Management { .. } | Self::SealMerge => PersistedLane::Control,
+            Self::Management { .. } | Self::CleanManage { .. } | Self::SealMerge => {
+                PersistedLane::Control
+            }
             Self::Invoke { invocation, .. } | Self::Acknowledge { invocation, .. } => {
                 PersistedLane::from_result_storage(invocation.mode.result_storage())
             }
@@ -1483,6 +1494,16 @@ impl ReplayInput {
             ReplayOperation::Management { request } => {
                 validate_management_request(&self.runtime, request)?;
             }
+            ReplayOperation::CleanManage {
+                request,
+                authority,
+                observed_slot,
+            } => validate_clean_management_request(
+                &self.runtime,
+                request,
+                authority,
+                *observed_slot,
+            )?,
             ReplayOperation::Invoke {
                 invocation,
                 authority,
@@ -1567,32 +1588,59 @@ impl AgentJournalGenesis {
 
     /// Recompute the cycle-free intent certified by the system authority.
     pub fn genesis_intent(&self) -> Result<GenesisIntentId, DecodeError> {
-        let ReplayOperation::Management { request } = &self.create.operation else {
-            return Err(DecodeError::NonCanonical);
+        let request = match &self.create.operation {
+            ReplayOperation::Management { request } => {
+                let LifecycleRequest::Authorized { request, .. } = request else {
+                    return Err(DecodeError::NonCanonical);
+                };
+                let LifecycleRequest::Create(_) = request.as_ref() else {
+                    return Err(DecodeError::NonCanonical);
+                };
+                request.commitment()
+            }
+            ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+                ..
+            } => Hash(
+                crate::agent_sdk::ManagementRequest::Create(descriptor.clone())
+                    .commitment()
+                    .0,
+            ),
+            ReplayOperation::CleanManage { .. }
+            | ReplayOperation::Invoke { .. }
+            | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::Acknowledge { .. }
+            | ReplayOperation::SealMerge => return Err(DecodeError::NonCanonical),
         };
-        let LifecycleRequest::Authorized { request, .. } = request else {
-            return Err(DecodeError::NonCanonical);
-        };
-        let LifecycleRequest::Create(_) = request.as_ref() else {
-            return Err(DecodeError::NonCanonical);
-        };
-        GenesisIntentId::from_commitments(self.create.runtime.commitment(), request.commitment())
+        GenesisIntentId::from_commitments(self.create.runtime.commitment(), request)
             .map_err(|_| DecodeError::NonCanonical)
     }
 
     /// Authority sequence of the exact receipt which admits the inner Create.
     pub fn genesis_authority_sequence(&self) -> Result<u64, DecodeError> {
-        let ReplayOperation::Management { request } = &self.create.operation else {
-            return Err(DecodeError::NonCanonical);
+        let sequence = match &self.create.operation {
+            ReplayOperation::Management { request } => {
+                let LifecycleRequest::Authorized { admission, request } = request else {
+                    return Err(DecodeError::NonCanonical);
+                };
+                let LifecycleRequest::Create(_) = request.as_ref() else {
+                    return Err(DecodeError::NonCanonical);
+                };
+                admission.receipt.claim.sequence
+            }
+            ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(_),
+                authority,
+                ..
+            } => authority.selector.decision_sequence,
+            ReplayOperation::CleanManage { .. }
+            | ReplayOperation::Invoke { .. }
+            | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::Acknowledge { .. }
+            | ReplayOperation::SealMerge => return Err(DecodeError::NonCanonical),
         };
-        let LifecycleRequest::Authorized { admission, request } = request else {
-            return Err(DecodeError::NonCanonical);
-        };
-        let LifecycleRequest::Create(_) = request.as_ref() else {
-            return Err(DecodeError::NonCanonical);
-        };
-        (admission.receipt.claim.sequence != 0)
-            .then_some(admission.receipt.claim.sequence)
+        (sequence != 0)
+            .then_some(sequence)
             .ok_or(DecodeError::NonCanonical)
     }
 
@@ -1601,25 +1649,47 @@ impl AgentJournalGenesis {
             return Err(DecodeError::NonCanonical);
         }
         self.create.validate()?;
-        let ReplayOperation::Management { request } = &self.create.operation else {
-            return Err(DecodeError::NonCanonical);
-        };
-        let LifecycleRequest::Authorized { request, .. } = request else {
-            return Err(DecodeError::NonCanonical);
-        };
-        let LifecycleRequest::Create(config) = request.as_ref() else {
-            return Err(DecodeError::NonCanonical);
-        };
         let runtime = &self.create.runtime;
-        if config.validate().is_err()
-            || config.identity.space != runtime.space
-            || config.identity.agent != runtime.agent
-            || config.identity.runtime_deployment != runtime.deployment
-            || config.identity.runtime_program != runtime.program
-            || config.identity.runtime_producer != runtime.producer
-            || config.runtime_package != runtime.package
-        {
-            return Err(DecodeError::NonCanonical);
+        match &self.create.operation {
+            ReplayOperation::Management { request } => {
+                let LifecycleRequest::Authorized { request, .. } = request else {
+                    return Err(DecodeError::NonCanonical);
+                };
+                let LifecycleRequest::Create(config) = request.as_ref() else {
+                    return Err(DecodeError::NonCanonical);
+                };
+                if config.validate().is_err()
+                    || config.identity.space != runtime.space
+                    || config.identity.agent != runtime.agent
+                    || config.identity.runtime_deployment != runtime.deployment
+                    || config.identity.runtime_program != runtime.program
+                    || config.identity.runtime_producer != runtime.producer
+                    || config.runtime_package != runtime.package
+                {
+                    return Err(DecodeError::NonCanonical);
+                }
+            }
+            ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+                ..
+            } => {
+                if descriptor.validate().is_err()
+                    || descriptor.identity.space.0 != runtime.space.0
+                    || descriptor.identity.agent.0 != runtime.agent.0
+                    || descriptor.identity.runtime_deployment.0 != runtime.deployment.0
+                    || descriptor.identity.runtime_program.0 != runtime.program.0
+                    || descriptor.identity.runtime_producer.0 != runtime.producer.0
+                    || descriptor.runtime_package.hash.0 != runtime.package.hash.0
+                    || descriptor.runtime_package.len != runtime.package.len
+                {
+                    return Err(DecodeError::NonCanonical);
+                }
+            }
+            ReplayOperation::CleanManage { .. }
+            | ReplayOperation::Invoke { .. }
+            | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::Acknowledge { .. }
+            | ReplayOperation::SealMerge => return Err(DecodeError::NonCanonical),
         }
         self.genesis_intent()?;
         self.genesis_authority_sequence()?;
@@ -1699,7 +1769,9 @@ impl OrderedEntry {
             || is_create_operation(&self.input.operation)
             || (matches!(
                 &self.input.operation,
-                ReplayOperation::Management { .. } | ReplayOperation::SealMerge
+                ReplayOperation::Management { .. }
+                    | ReplayOperation::CleanManage { .. }
+                    | ReplayOperation::SealMerge
             ) != self.merge_seal.is_some())
         {
             return Err(DecodeError::NonCanonical);
@@ -2765,6 +2837,25 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
             let call = RuntimeCall::new(RuntimeState::default(), request.clone());
             encoder.bytes(&call.encode());
         }
+        ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot,
+        } => {
+            encoder.u8(5);
+            let canonical = crate::agent_sdk::RuntimeWork::Manage {
+                space: authority.selector.space,
+                agent: authority.selector.agent,
+                runtime_deployment: authority.selector.runtime_deployment,
+                state: crate::agent_sdk::RuntimeState::default(),
+                request: alloc::boxed::Box::new(request.clone()),
+                authority: Some(alloc::boxed::Box::new(authority.clone())),
+                observed_slot: *observed_slot,
+            }
+            .encode()
+            .expect("validated CleanManage must have a canonical SDK encoding");
+            encoder.bytes(&canonical);
+        }
         ReplayOperation::Invoke {
             invocation,
             authority,
@@ -2855,8 +2946,104 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
                 observed_slot,
             })
         }
+        5 => {
+            let encoded =
+                bounded_bytes_ref(decoder, crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES)?;
+            let canonical = crate::agent_sdk::RuntimeWork::decode(encoded)
+                .map_err(|_| DecodeError::NonCanonical)?;
+            if canonical.encode().map_err(|_| DecodeError::NonCanonical)? != encoded {
+                return Err(DecodeError::NonCanonical);
+            }
+            let crate::agent_sdk::RuntimeWork::Manage {
+                space,
+                agent,
+                runtime_deployment,
+                state,
+                request,
+                authority: Some(authority),
+                observed_slot,
+            } = canonical
+            else {
+                return Err(DecodeError::NonCanonical);
+            };
+            if !state.is_empty()
+                || request.authority_operation().is_none()
+                || space != authority.selector.space
+                || agent != authority.selector.agent
+                || runtime_deployment != authority.selector.runtime_deployment
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(ReplayOperation::CleanManage {
+                request: *request,
+                authority: *authority,
+                observed_slot,
+            })
+        }
         _ => Err(DecodeError::InvalidTag),
     }
+}
+
+fn validate_clean_management_request(
+    runtime: &RuntimeBinding,
+    request: &crate::agent_sdk::ManagementRequest,
+    authority: &crate::agent_sdk::authority::AuthorityReceipt,
+    observed_slot: u64,
+) -> Result<(), DecodeError> {
+    let selector_deployment = authority.selector.runtime_deployment;
+    let current_deployment = selector_deployment.0 == runtime.deployment.0;
+    let retained_runtime_upgrade = matches!(
+        request,
+        crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade)
+            if selector_deployment == upgrade.from_deployment
+                && upgrade.to_deployment.0 == runtime.deployment.0
+                && upgrade.to_program.0 == runtime.program.0
+                && upgrade.producer.0 == runtime.producer.0
+                && upgrade.package.hash.0 == runtime.package.hash.0
+                && upgrade.package.len == runtime.package.len
+    );
+    if request.authority_operation().is_none()
+        || authority.selector.space.0 != runtime.space.0
+        || authority.selector.agent.0 != runtime.agent.0
+        || (!current_deployment && !retained_runtime_upgrade)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    let canonical = crate::agent_sdk::RuntimeWork::Manage {
+        space: crate::agent_sdk::SpaceId(runtime.space.0),
+        agent: crate::agent_sdk::AgentId(runtime.agent.0),
+        runtime_deployment: selector_deployment,
+        state: crate::agent_sdk::RuntimeState::default(),
+        request: alloc::boxed::Box::new(request.clone()),
+        authority: Some(alloc::boxed::Box::new(authority.clone())),
+        observed_slot,
+    };
+    if canonical.encode().is_err() {
+        return Err(DecodeError::NonCanonical);
+    }
+    match request {
+        crate::agent_sdk::ManagementRequest::Create(descriptor) => {
+            if descriptor.identity.space.0 != runtime.space.0
+                || descriptor.identity.agent.0 != runtime.agent.0
+                || descriptor.identity.runtime_deployment.0 != runtime.deployment.0
+                || descriptor.identity.runtime_program.0 != runtime.program.0
+                || descriptor.identity.runtime_producer.0 != runtime.producer.0
+                || descriptor.runtime_package.hash.0 != runtime.package.hash.0
+                || descriptor.runtime_package.len != runtime.package.len
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
+        crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade) => {
+            if upgrade.from_deployment != selector_deployment
+                || (!current_deployment && !retained_runtime_upgrade)
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn validate_clean_invocation_authorization(
@@ -2953,6 +3140,12 @@ fn is_create_operation(operation: &ReplayOperation) -> bool {
         ReplayOperation::Management {
             request: LifecycleRequest::Authorized { request, .. }
         } if matches!(request.as_ref(), LifecycleRequest::Create(_))
+    ) || matches!(
+        operation,
+        ReplayOperation::CleanManage {
+            request: crate::agent_sdk::ManagementRequest::Create(_),
+            ..
+        }
     )
 }
 
@@ -3734,6 +3927,58 @@ mod tests {
             crate::agent_sdk::PublicPreflight::for_work(work, *observed_slot),
         );
         input
+    }
+
+    fn clean_management_input(request: crate::agent_sdk::ManagementRequest) -> ReplayInput {
+        let runtime = runtime_binding();
+        let public_key = [0x91; 32];
+        let (actor, actor_deployment) = request
+            .authority_actor()
+            .map_or((None, None), |(actor, deployment)| {
+                (Some(actor), Some(deployment))
+            });
+        let authority = crate::agent_sdk::authority::AuthorityReceipt {
+            selector: crate::agent_sdk::authority::AuthorityReceiptSelector {
+                policy: crate::agent_sdk::Hash([0x92; 32]),
+                issuer: crate::agent_sdk::authority::AuthorityIssuer {
+                    principal: crate::agent_sdk::PrincipalId([0x93; 32]),
+                    actor: crate::agent_sdk::ActorId([0x94; 32]),
+                    deployment: crate::agent_sdk::DeploymentId([0x95; 32]),
+                    program: crate::agent_sdk::ProgramId([0x96; 32]),
+                    producer: crate::agent_sdk::ProducerId::of_public_key(&public_key),
+                },
+                space: crate::agent_sdk::SpaceId(runtime.space.0),
+                agent: crate::agent_sdk::AgentId(runtime.agent.0),
+                operation: request
+                    .authority_operation()
+                    .expect("fixture request is mutating"),
+                runtime_deployment: crate::agent_sdk::DeploymentId(runtime.deployment.0),
+                actor,
+                actor_deployment,
+                evidence: crate::agent_sdk::authority::AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: crate::agent_sdk::Hash([0x97; 32]),
+                },
+                lane_roots: crate::agent_sdk::authority::AuthorityLaneRoots::default(),
+                epoch: 1,
+                decision_sequence: 1,
+                acknowledged_through: 0,
+                valid_from: 5,
+                expires_at: 50,
+                request: request.commitment(),
+            },
+            public_key,
+            signature: [0x98; 64],
+        };
+        ReplayInput {
+            runtime,
+            operation: ReplayOperation::CleanManage {
+                request,
+                authority,
+                observed_slot: 12,
+            },
+        }
     }
 
     fn management_input(inner: LifecycleRequest, capability: &str) -> ReplayInput {
@@ -4646,6 +4891,131 @@ mod tests {
         };
         *observed_slot -= 1;
         assert_eq!(regressed.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn clean_manage_tag_five_is_lossless_and_rejects_hostile_sdk_envelopes() {
+        let request = crate::agent_sdk::ManagementRequest::Suspend {
+            actor: crate::agent_sdk::ActorId([0x31; 32]),
+            expected_deployment: crate::agent_sdk::DeploymentId([0x32; 32]),
+        };
+        let input = clean_management_input(request.clone());
+        input.validate().unwrap();
+        assert_eq!(input.persisted_lane(), PersistedLane::Control);
+        roundtrip(&input);
+
+        let ReplayOperation::CleanManage {
+            authority: base_authority,
+            observed_slot: base_observed_slot,
+            ..
+        } = &input.operation
+        else {
+            unreachable!()
+        };
+        let authority = base_authority.clone();
+        let observed_slot = *base_observed_slot;
+        let canonical_work = crate::agent_sdk::RuntimeWork::Manage {
+            space: authority.selector.space,
+            agent: authority.selector.agent,
+            runtime_deployment: authority.selector.runtime_deployment,
+            state: crate::agent_sdk::RuntimeState::default(),
+            request: Box::new(request.clone()),
+            authority: Some(Box::new(authority.clone())),
+            observed_slot,
+        }
+        .encode()
+        .unwrap();
+
+        let decode_wrapped = |work: &[u8]| {
+            let mut bytes = Vec::new();
+            let mut encoder = Encoder(&mut bytes);
+            encoder.u8(5);
+            encoder.bytes(work);
+            decode_replay_operation(&mut Decoder::new(&bytes))
+        };
+
+        let mut wrong_space = input.clone();
+        {
+            let ReplayOperation::CleanManage { authority, .. } = &mut wrong_space.operation else {
+                unreachable!()
+            };
+            authority.selector.space = crate::agent_sdk::SpaceId([0xa1; 32]);
+        }
+        assert_eq!(wrong_space.validate(), Err(DecodeError::NonCanonical));
+
+        let mut wrong_deployment = input.clone();
+        {
+            let ReplayOperation::CleanManage { authority, .. } = &mut wrong_deployment.operation
+            else {
+                unreachable!()
+            };
+            authority.selector.runtime_deployment = crate::agent_sdk::DeploymentId([0xa2; 32]);
+        }
+        assert_eq!(wrong_deployment.validate(), Err(DecodeError::NonCanonical));
+
+        let mut hidden_state = crate::agent_sdk::RuntimeWork::decode(&canonical_work).unwrap();
+        let crate::agent_sdk::RuntimeWork::Manage { state, .. } = &mut hidden_state else {
+            unreachable!()
+        };
+        state.control.push(1);
+        assert_eq!(
+            decode_wrapped(&hidden_state.encode().unwrap()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let missing_receipt = crate::agent_sdk::RuntimeWork::Manage {
+            space: authority.selector.space,
+            agent: authority.selector.agent,
+            runtime_deployment: authority.selector.runtime_deployment,
+            state: crate::agent_sdk::RuntimeState::default(),
+            request: Box::new(request.clone()),
+            authority: None,
+            observed_slot,
+        }
+        .encode();
+        assert!(missing_receipt.is_err());
+
+        let inspect = crate::agent_sdk::RuntimeWork::Manage {
+            space: authority.selector.space,
+            agent: authority.selector.agent,
+            runtime_deployment: authority.selector.runtime_deployment,
+            state: crate::agent_sdk::RuntimeState::default(),
+            request: Box::new(crate::agent_sdk::ManagementRequest::InspectResources),
+            authority: None,
+            observed_slot,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(decode_wrapped(&inspect), Err(DecodeError::NonCanonical));
+
+        let mut divergent = input.clone();
+        let ReplayOperation::CleanManage { authority, .. } = &mut divergent.operation else {
+            unreachable!()
+        };
+        authority.selector.request = crate::agent_sdk::Hash([0xa3; 32]);
+        assert_eq!(divergent.validate(), Err(DecodeError::NonCanonical));
+
+        let mut old_magic = canonical_work.clone();
+        old_magic[0] ^= 0xff;
+        assert!(decode_wrapped(&old_magic).is_err());
+
+        let mut trailing_inner = canonical_work;
+        trailing_inner.push(0);
+        assert!(decode_wrapped(&trailing_inner).is_err());
+
+        let old_runtime_call = RuntimeCall::new(
+            RuntimeState::default(),
+            LifecycleRequest::Inspect {
+                after: None,
+                limit: 1,
+            },
+        )
+        .encode();
+        assert!(decode_wrapped(&old_runtime_call).is_err());
+
+        let mut trailing_outer = input.encode();
+        trailing_outer.push(0);
+        assert!(ReplayInput::decode(&trailing_outer).is_err());
     }
 
     #[test]

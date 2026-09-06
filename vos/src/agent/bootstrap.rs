@@ -1244,10 +1244,10 @@ mod tests {
         });
         resign_create_input(&mut shared_input);
         let mut executor = ExactCreateExecutor::default();
-        assert!(matches!(
-            ReplayPreparedGenesis::prepare(shared_input, config().replicas[0], &mut executor,),
-            Err(super::super::replay::ReplayError::ScopeMismatch)
-        ));
+        let shared =
+            ReplayPreparedGenesis::prepare(shared_input, config().replicas[0], &mut executor)
+                .expect("ordinary Shared genesis now uses the common exact preparation boundary");
+        assert_eq!(shared.replica(), config().replicas[0]);
 
         let mut state_mutator = ExactCreateExecutor {
             mutate_state: true,
