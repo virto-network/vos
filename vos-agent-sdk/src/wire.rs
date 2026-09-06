@@ -13,7 +13,7 @@ use crate::authority::{
     AuthorityActorTarget, AuthorityCredentialCall, AuthorityEvidence, AuthorityIssuer,
     AuthorityLaneRoots, AuthorityOperationKind, AuthorityReceipt, AuthorityReceiptSelector,
     CREDENTIAL_PUBLIC_KEY_BYTES, CREDENTIAL_SIGNATURE_BYTES, ManagedAgentTarget,
-    ManagementApproval,
+    ManagementApplicationAck, ManagementApproval,
 };
 use crate::contract::{
     ActorAbiRange, ActorPackageContract, RuntimeMigrationPolicy, RuntimePackageContract,
@@ -28,6 +28,7 @@ pub const MAX_DIRECTORY_PAGE_WIRE_BYTES: usize =
 pub const MAX_AUTHORITY_RECEIPT_WIRE_BYTES: usize = 1_024;
 pub const MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
 pub const MAX_MANAGEMENT_APPROVAL_WIRE_BYTES: usize = MAX_INVOCATION_REPLY_BYTES;
+pub const MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
 pub const MAX_AGENT_DESCRIPTOR_WIRE_BYTES: usize = 64 * 1024;
 pub const MAX_INVOCATION_CONTEXT_WIRE_BYTES: usize = 512;
 pub const MAX_RUNTIME_WORK_WIRE_BYTES: usize =
@@ -735,6 +736,33 @@ pub(crate) fn authority_signing_bytes(value: &AuthorityReceipt) -> Vec<u8> {
     bytes
 }
 
+fn encode_authority_receipt_body(encoder: &mut Encoder<'_>, value: &AuthorityReceipt) {
+    encode_authority_selector(encoder, &value.selector);
+    encoder.0.extend_from_slice(&value.public_key);
+    encoder.0.extend_from_slice(&value.signature);
+}
+
+fn decode_authority_receipt_body(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityReceipt, DecodeError> {
+    let value = AuthorityReceipt {
+        selector: decode_authority_selector(decoder)?,
+        public_key: decoder
+            .take(AUTHORITY_PUBLIC_KEY_BYTES)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?,
+        signature: decoder
+            .take(AUTHORITY_SIGNATURE_BYTES)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?,
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
 impl CanonicalWire for AuthorityReceipt {
     const MAGIC: [u8; 4] = *b"AURC";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_RECEIPT_WIRE_BYTES;
@@ -744,28 +772,11 @@ impl CanonicalWire for AuthorityReceipt {
     }
 
     fn encode_body(&self, encoder: &mut Encoder<'_>) {
-        encode_authority_selector(encoder, &self.selector);
-        encoder.0.extend_from_slice(&self.public_key);
-        encoder.0.extend_from_slice(&self.signature);
+        encode_authority_receipt_body(encoder, self);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        let value = Self {
-            selector: decode_authority_selector(decoder)?,
-            public_key: decoder
-                .take(AUTHORITY_PUBLIC_KEY_BYTES)?
-                .try_into()
-                .map_err(|_| DecodeError::Truncated)?,
-            signature: decoder
-                .take(AUTHORITY_SIGNATURE_BYTES)?
-                .try_into()
-                .map_err(|_| DecodeError::Truncated)?,
-        };
-        value
-            .validate_shape()
-            .is_ok()
-            .then_some(value)
-            .ok_or(DecodeError::NonCanonical)
+        decode_authority_receipt_body(decoder)
     }
 }
 
@@ -773,7 +784,7 @@ fn encode_authority_actor_target(encoder: &mut Encoder<'_>, value: AuthorityActo
     encoder.fixed(value.space.as_bytes());
     encoder.fixed(value.system_agent.as_bytes());
     encoder.fixed(value.system_runtime_deployment.as_bytes());
-    encode_authority_issuer(encoder, value.issuer);
+    encode_agent_authority_binding(encoder, value.binding);
 }
 
 fn decode_authority_actor_target(
@@ -783,7 +794,7 @@ fn decode_authority_actor_target(
         space: SpaceId(decoder.fixed()?),
         system_agent: AgentId(decoder.fixed()?),
         system_runtime_deployment: DeploymentId(decoder.fixed()?),
-        issuer: decode_authority_issuer(decoder)?,
+        binding: decode_agent_authority_binding(decoder)?,
     };
     value
         .is_valid()
@@ -976,6 +987,7 @@ fn decode_authority_evidence(decoder: &mut Decoder<'_>) -> Result<AuthorityEvide
 fn encode_management_approval_body(encoder: &mut Encoder<'_>, value: &ManagementApproval) {
     encoder.fixed(value.credential_call.as_bytes());
     encoder.u64(value.authorization_sequence.get());
+    encoder.fixed(value.acknowledgement_invocation.as_bytes());
     encode_authority_actor_target(encoder, value.authority);
     encode_managed_agent_target(encoder, value.managed);
     encode_credential_caller(
@@ -1024,6 +1036,7 @@ impl CanonicalWire for ManagementApproval {
         let credential_call = Hash(decoder.fixed()?);
         let authorization_sequence =
             core::num::NonZeroU64::new(decoder.u64()?).ok_or(DecodeError::NonCanonical)?;
+        let acknowledgement_invocation = InvocationId(decoder.fixed()?);
         let authority = decode_authority_actor_target(decoder)?;
         let managed = decode_managed_agent_target(decoder)?;
         let (principal, credential, credential_public_key, authenticated_node) =
@@ -1040,6 +1053,7 @@ impl CanonicalWire for ManagementApproval {
         let value = Self {
             credential_call,
             authorization_sequence,
+            acknowledgement_invocation,
             authority,
             managed,
             principal,
@@ -1053,6 +1067,93 @@ impl CanonicalWire for ManagementApproval {
             expires_at,
             request,
             request_commitment,
+        };
+        value
+            .validate_shape()
+            .is_ok()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
+fn encode_management_application_ack_unsigned(
+    encoder: &mut Encoder<'_>,
+    value: &ManagementApplicationAck,
+) {
+    encoder.fixed(value.authorization_invocation.as_bytes());
+    encoder.fixed(value.acknowledgement_invocation.as_bytes());
+    encode_authority_actor_target(encoder, value.authority);
+    encode_managed_agent_target(encoder, value.managed);
+    encoder.fixed(value.credential_call.as_bytes());
+    encoder.fixed(value.approval.as_bytes());
+    encoder.u64(value.authorization_sequence.get());
+    encoder.fixed(value.request.as_bytes());
+    encode_authority_receipt_body(encoder, &value.receipt);
+    encoder.fixed(value.reopened_state.as_bytes());
+    encoder.u64(value.applied_at);
+}
+
+pub(crate) fn management_application_ack_signing_bytes(
+    value: &ManagementApplicationAck,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"MAAS");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_management_application_ack_unsigned(&mut Encoder(&mut bytes), value);
+    bytes
+}
+
+pub(crate) fn management_application_ack_encoded_len(value: &ManagementApplicationAck) -> usize {
+    let mut body = Vec::new();
+    encode_management_application_ack_unsigned(&mut Encoder(&mut body), value);
+    HEADER_BYTES
+        .saturating_add(body.len())
+        .saturating_add(AUTHORITY_SIGNATURE_BYTES)
+}
+
+impl CanonicalWire for ManagementApplicationAck {
+    const MAGIC: [u8; 4] = *b"MAA1";
+    const MAX_ENCODED_BYTES: usize = MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_management_application_ack_unsigned(encoder, self);
+        encoder.0.extend_from_slice(&self.signature);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let authorization_invocation = InvocationId(decoder.fixed()?);
+        let acknowledgement_invocation = InvocationId(decoder.fixed()?);
+        let authority = decode_authority_actor_target(decoder)?;
+        let managed = decode_managed_agent_target(decoder)?;
+        let credential_call = Hash(decoder.fixed()?);
+        let approval = Hash(decoder.fixed()?);
+        let authorization_sequence =
+            core::num::NonZeroU64::new(decoder.u64()?).ok_or(DecodeError::NonCanonical)?;
+        let request = Hash(decoder.fixed()?);
+        let receipt = decode_authority_receipt_body(decoder)?;
+        let reopened_state = Hash(decoder.fixed()?);
+        let applied_at = decoder.u64()?;
+        let signature = decoder
+            .take(AUTHORITY_SIGNATURE_BYTES)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?;
+        let value = Self {
+            authorization_invocation,
+            acknowledgement_invocation,
+            authority,
+            managed,
+            credential_call,
+            approval,
+            authorization_sequence,
+            request,
+            receipt,
+            reopened_state,
+            applied_at,
+            signature,
         };
         value
             .validate_shape()
@@ -2845,16 +2946,22 @@ mod tests {
     }
 
     fn authority_actor_target() -> AuthorityActorTarget {
+        let public_key = [0x28; AUTHORITY_PUBLIC_KEY_BYTES];
         AuthorityActorTarget {
             space: SpaceId([0x21; 32]),
             system_agent: AgentId([0x22; 32]),
             system_runtime_deployment: DeploymentId([0x23; 32]),
-            issuer: AuthorityIssuer {
-                principal: PrincipalId([0x24; 32]),
-                actor: ActorId([0x25; 32]),
-                deployment: DeploymentId([0x26; 32]),
-                program: ProgramId([0x27; 32]),
-                producer: ProducerId([0x28; 32]),
+            binding: AgentAuthorityBinding {
+                policy: Hash([0x20; 32]),
+                issuer: AuthorityIssuer {
+                    principal: PrincipalId([0x24; 32]),
+                    actor: ActorId([0x25; 32]),
+                    deployment: DeploymentId([0x26; 32]),
+                    program: ProgramId([0x27; 32]),
+                    producer: ProducerId::of_public_key(&public_key),
+                },
+                public_key,
+                initial_epoch: 1,
             },
         }
     }
@@ -2910,6 +3017,48 @@ mod tests {
         .unwrap()
     }
 
+    fn management_application_ack() -> ManagementApplicationAck {
+        let call = authority_credential_call();
+        let approval = management_approval();
+        let actor = approval.request.authority_actor();
+        let receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: approval.authority.binding.policy,
+                issuer: approval.authority.binding.issuer,
+                space: approval.managed.space,
+                agent: approval.managed.agent,
+                operation: approval.request.authority_operation().unwrap(),
+                runtime_deployment: approval.managed.runtime_deployment,
+                actor: actor.map(|(actor, _)| actor),
+                actor_deployment: actor.map(|(_, deployment)| deployment),
+                evidence: approval.evidence.clone(),
+                lane_roots: approval.lane_roots,
+                epoch: approval.epoch,
+                decision_sequence: 1,
+                acknowledged_through: 0,
+                valid_from: approval.valid_from,
+                expires_at: approval.expires_at,
+                request: approval.request_commitment,
+            },
+            public_key: approval.authority.binding.public_key,
+            signature: [0x50; AUTHORITY_SIGNATURE_BYTES],
+        };
+        ManagementApplicationAck {
+            authorization_invocation: call.invocation,
+            acknowledgement_invocation: approval.acknowledgement_invocation,
+            authority: approval.authority,
+            managed: approval.managed,
+            credential_call: call.commitment(),
+            approval: approval.commitment(),
+            authorization_sequence: approval.authorization_sequence,
+            request: approval.request_commitment,
+            receipt,
+            reopened_state: Hash([0x52; 32]),
+            applied_at: approval.valid_from,
+            signature: [0x53; AUTHORITY_SIGNATURE_BYTES],
+        }
+    }
+
     #[test]
     fn authority_actor_protocol_has_bounded_distinct_golden_wires() {
         let call = authority_credential_call();
@@ -2920,8 +3069,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/acc1-golden", &[&call_bytes]).0,
             [
-                205, 62, 117, 57, 76, 88, 188, 162, 22, 88, 57, 167, 215, 209, 185, 199, 76, 211,
-                144, 215, 110, 93, 170, 98, 152, 75, 97, 107, 72, 48, 210, 23,
+                110, 95, 57, 199, 51, 237, 53, 146, 30, 31, 186, 212, 47, 2, 205, 79, 197, 64, 24,
+                252, 109, 113, 29, 29, 213, 175, 96, 246, 100, 187, 186, 51,
             ]
         );
 
@@ -2933,8 +3082,24 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/map1-golden", &[&approval_bytes]).0,
             [
-                172, 136, 101, 85, 233, 28, 48, 97, 87, 116, 151, 23, 86, 88, 93, 33, 9, 61, 132,
-                80, 187, 229, 16, 195, 135, 207, 31, 220, 39, 166, 134, 164,
+                234, 62, 135, 87, 53, 142, 215, 187, 93, 83, 43, 136, 132, 4, 130, 227, 207, 129,
+                150, 249, 24, 127, 0, 132, 178, 33, 207, 59, 116, 150, 168, 65,
+            ]
+        );
+
+        let acknowledgement = management_application_ack();
+        let acknowledgement_bytes = acknowledgement.encode().unwrap();
+        assert_eq!(acknowledgement_bytes.get(..4), Some(b"MAA1".as_slice()));
+        assert!(acknowledgement_bytes.len() <= MAX_INVOCATION_MESSAGE_BYTES);
+        assert_eq!(
+            ManagementApplicationAck::decode(&acknowledgement_bytes),
+            Ok(acknowledgement)
+        );
+        assert_eq!(
+            Hash::digest(b"vos/test/maa1-golden", &[&acknowledgement_bytes]).0,
+            [
+                171, 140, 167, 24, 112, 250, 196, 172, 142, 143, 4, 26, 76, 120, 101, 197, 45, 37,
+                194, 248, 96, 150, 92, 43, 176, 150, 206, 92, 239, 100, 37, 224,
             ]
         );
     }
@@ -2961,35 +3126,48 @@ mod tests {
         value.authority.system_runtime_deployment = DeploymentId([0x43; 32]);
         variants.push(value);
         let mut value = call.clone();
-        value.authority.issuer.principal = PrincipalId([0x44; 32]);
+        value.authority.binding.issuer.principal = PrincipalId([0x44; 32]);
         variants.push(value);
         let mut value = call.clone();
-        value.authority.issuer.actor = ActorId([0x45; 32]);
+        value.authority.binding.issuer.actor = ActorId([0x45; 32]);
         variants.push(value);
         let mut value = call.clone();
-        value.authority.issuer.deployment = DeploymentId([0x46; 32]);
+        value.authority.binding.issuer.deployment = DeploymentId([0x46; 32]);
         variants.push(value);
         let mut value = call.clone();
-        value.authority.issuer.program = ProgramId([0x47; 32]);
+        value.authority.binding.issuer.program = ProgramId([0x47; 32]);
         variants.push(value);
         let mut value = call.clone();
-        value.authority.issuer.producer = ProducerId([0x48; 32]);
+        value.authority.binding.public_key = [0x48; 32];
+        value.authority.binding.issuer.producer =
+            ProducerId::of_public_key(&value.authority.binding.public_key);
         variants.push(value);
         let mut value = call.clone();
-        value.managed.agent = AgentId([0x49; 32]);
+        value.authority.binding.policy = Hash([0x49; 32]);
         variants.push(value);
         let mut value = call.clone();
-        value.managed.runtime_deployment = DeploymentId([0x4a; 32]);
+        value.authority.binding.public_key = [0x4a; 32];
+        value.authority.binding.issuer.producer =
+            ProducerId::of_public_key(&value.authority.binding.public_key);
         variants.push(value);
         let mut value = call.clone();
-        value.principal = PrincipalId([0x4b; 32]);
+        value.authority.binding.initial_epoch += 1;
         variants.push(value);
         let mut value = call.clone();
-        value.credential_public_key = [0x4c; 32];
+        value.managed.agent = AgentId([0x4b; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.managed.runtime_deployment = DeploymentId([0x4c; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.principal = PrincipalId([0x4d; 32]);
+        variants.push(value);
+        let mut value = call.clone();
+        value.credential_public_key = [0x4e; 32];
         value.credential = CredentialId::of_public_key(&value.credential_public_key);
         variants.push(value);
         let mut value = call.clone();
-        value.authenticated_node = Some(NodeId([0x4d; 32]));
+        value.authenticated_node = Some(NodeId([0x4f; 32]));
         variants.push(value);
         let mut value = call.clone();
         value.requested_valid_from += 1;
@@ -3026,6 +3204,9 @@ mod tests {
         value.authorization_sequence = core::num::NonZeroU64::new(62).unwrap();
         variants.push(value);
         let mut value = approval.clone();
+        value.acknowledgement_invocation = InvocationId([0x50; 32]);
+        variants.push(value);
+        let mut value = approval.clone();
         value.evidence.commitment = Hash([0x51; 32]);
         variants.push(value);
         let mut value = approval.clone();
@@ -3056,7 +3237,7 @@ mod tests {
         let call = authority_credential_call();
         let encoded = call.encode().unwrap();
         let mut old = encoded.clone();
-        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r6");
+        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r7");
         assert_eq!(
             AuthorityCredentialCall::decode(&old),
             Err(WireError::Decode(DecodeError::InvalidPlatform))
@@ -3067,7 +3248,7 @@ mod tests {
             .expect("nested canonical management request");
         let mut old_nested_request = encoded.clone();
         old_nested_request[request_at + 4..request_at + HEADER_BYTES]
-            .copy_from_slice(b"vos-agent-runtime-abi-20260906r6");
+            .copy_from_slice(b"vos-agent-runtime-abi-20260906r7");
         assert_eq!(
             AuthorityCredentialCall::decode(&old_nested_request),
             Err(WireError::Decode(DecodeError::InvalidPlatform))
@@ -3092,7 +3273,7 @@ mod tests {
         let approval = management_approval();
         let encoded = approval.encode().unwrap();
         let mut old = encoded.clone();
-        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r6");
+        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r7");
         assert_eq!(
             ManagementApproval::decode(&old),
             Err(WireError::Decode(DecodeError::InvalidPlatform))
@@ -3103,6 +3284,12 @@ mod tests {
             ManagementApproval::decode(&zero_sequence),
             Err(WireError::Decode(DecodeError::NonCanonical))
         );
+        let mut zero_acknowledgement = encoded.clone();
+        zero_acknowledgement[HEADER_BYTES + 40..HEADER_BYTES + 72].fill(0);
+        assert_eq!(
+            ManagementApproval::decode(&zero_acknowledgement),
+            Err(WireError::Decode(DecodeError::NonCanonical))
+        );
         let mut zero_request_commitment = encoded;
         let end = zero_request_commitment.len();
         zero_request_commitment[end - 32..].fill(0);
@@ -3110,6 +3297,24 @@ mod tests {
             ManagementApproval::decode(&zero_request_commitment),
             Err(WireError::Decode(DecodeError::NonCanonical))
         );
+
+        let acknowledgement = management_application_ack();
+        let encoded = acknowledgement.encode().unwrap();
+        let mut old = encoded.clone();
+        old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r7");
+        assert_eq!(
+            ManagementApplicationAck::decode(&old),
+            Err(WireError::Decode(DecodeError::InvalidPlatform))
+        );
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            ManagementApplicationAck::decode(&trailing),
+            Err(WireError::Decode(DecodeError::TrailingBytes))
+        );
+        let mut same_invocation = acknowledgement;
+        same_invocation.acknowledgement_invocation = same_invocation.authorization_invocation;
+        assert_eq!(same_invocation.encode(), Err(WireError::InvalidValue));
     }
 
     #[test]
@@ -3372,8 +3577,8 @@ mod tests {
         assert_eq!(
             golden.0,
             [
-                180, 54, 249, 211, 225, 179, 175, 169, 116, 42, 253, 217, 4, 121, 244, 111, 15, 17,
-                224, 9, 230, 92, 101, 194, 205, 166, 19, 236, 120, 113, 166, 175,
+                42, 247, 148, 121, 88, 221, 84, 30, 19, 182, 28, 62, 218, 202, 71, 75, 156, 54, 16,
+                38, 36, 209, 238, 158, 54, 10, 67, 199, 227, 173, 50, 145,
             ]
         );
 
@@ -3402,7 +3607,7 @@ mod tests {
         let encoded = context.encode().unwrap();
 
         let mut previous_generation = encoded.clone();
-        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r6");
+        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r7");
         assert_eq!(
             InvocationContext::decode(&previous_generation),
             Err(WireError::Decode(DecodeError::InvalidPlatform))
@@ -3542,7 +3747,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgement_work_and_outcome_have_one_r7_canonical_wire() {
+    fn acknowledgement_work_and_outcome_have_one_r8_canonical_wire() {
         let invocation = invocation();
         let authority = receipt_for(&invocation);
         let work = RuntimeWork::Acknowledge {
@@ -3556,7 +3761,7 @@ mod tests {
         assert_eq!(RuntimeWork::decode(&encoded), Ok(work.clone()));
 
         let mut previous_generation = encoded.clone();
-        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r6");
+        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r7");
         assert_eq!(
             RuntimeWork::decode(&previous_generation),
             Err(WireError::Decode(DecodeError::InvalidPlatform))

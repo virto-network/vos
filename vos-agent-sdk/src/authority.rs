@@ -17,14 +17,15 @@ pub const CREDENTIAL_SIGNATURE_BYTES: usize = 64;
 
 /// Exact installed system-authority route selected by a credential call.
 ///
-/// The complete issuer is carried here so an authority Principal or Producer
-/// cannot be changed while retaining the same actor/deployment/program tuple.
+/// The complete independently selected binding is carried here. An issuer
+/// identity alone is not a trust anchor: policy, signing key, and initial
+/// epoch must not be substituted while retaining the same actor route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthorityActorTarget {
     pub space: SpaceId,
     pub system_agent: AgentId,
     pub system_runtime_deployment: DeploymentId,
-    pub issuer: AuthorityIssuer,
+    pub binding: AgentAuthorityBinding,
 }
 
 impl AuthorityActorTarget {
@@ -32,7 +33,7 @@ impl AuthorityActorTarget {
         self.space != SpaceId::ZERO
             && self.system_agent != AgentId::ZERO
             && self.system_runtime_deployment != DeploymentId::ZERO
-            && self.issuer.is_valid()
+            && self.binding.is_valid()
     }
 }
 
@@ -215,7 +216,7 @@ impl AuthorityCredentialCall {
         self.validate_shape().is_ok()
             && context.validate()
             && context.invocation == self.invocation
-            && context.actor == self.authority.issuer.actor
+            && context.actor == self.authority.binding.issuer.actor
             && context.mode == MethodMode::Linear
             && context.origin.principal == Some(self.principal)
             && context.origin.credential == Some(self.credential)
@@ -247,6 +248,9 @@ pub trait AuthorityCredentialVerifier {
 pub struct ManagementApproval {
     pub credential_call: Hash,
     pub authorization_sequence: NonZeroU64,
+    /// Distinct invocation ID reserved by the authority actor for the
+    /// post-durability acknowledgement before this approval is published.
+    pub acknowledgement_invocation: InvocationId,
     pub authority: AuthorityActorTarget,
     pub managed: ManagedAgentTarget,
     pub principal: PrincipalId,
@@ -263,6 +267,24 @@ pub struct ManagementApproval {
 }
 
 impl ManagementApproval {
+    /// Derive the acknowledgement invocation reserved alongside one exact
+    /// signed credential call. The authority actor must collision-check this
+    /// value against every retained authorization and acknowledgement ID
+    /// before admitting the call.
+    pub fn derive_acknowledgement_invocation(call: &AuthorityCredentialCall) -> InvocationId {
+        InvocationId(
+            Hash::digest(
+                b"vos/agent/management-acknowledgement-invocation/v1",
+                &[
+                    crate::RUNTIME_ABI_ID.as_bytes(),
+                    call.invocation.as_bytes(),
+                    call.commitment().as_bytes(),
+                ],
+            )
+            .0,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn from_call(
         call: &AuthorityCredentialCall,
@@ -277,6 +299,7 @@ impl ManagementApproval {
         let value = Self {
             credential_call: call.commitment(),
             authorization_sequence,
+            acknowledgement_invocation: Self::derive_acknowledgement_invocation(call),
             authority: call.authority,
             managed: call.managed,
             principal: call.principal,
@@ -300,6 +323,7 @@ impl ManagementApproval {
 
     pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
         if self.credential_call == Hash::ZERO
+            || self.acknowledgement_invocation == InvocationId::ZERO
             || !self.authority.is_valid()
             || !self.managed.is_valid()
             || self.authority.space != self.managed.space
@@ -337,6 +361,8 @@ impl ManagementApproval {
         self.validate_shape().is_ok()
             && call.validate_shape().is_ok()
             && self.credential_call == call.commitment()
+            && self.acknowledgement_invocation == Self::derive_acknowledgement_invocation(call)
+            && self.acknowledgement_invocation != call.invocation
             && self.authority == call.authority
             && self.managed == call.managed
             && self.principal == call.principal
@@ -354,6 +380,157 @@ impl ManagementApproval {
     }
 }
 
+/// Authority-signed acknowledgement produced only after the managed Agent's
+/// exact result has been durably reopened.
+///
+/// Authorization and acknowledgement are distinct actor invocations. Reusing
+/// the authorization invocation identifier for a different acknowledgement
+/// message would violate the runtime's exact-retry contract, so both IDs are
+/// explicit and must differ. The actor retains the ACC1 and MAP1 preimages;
+/// this bounded message carries their commitments rather than embedding them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagementApplicationAck {
+    pub authorization_invocation: InvocationId,
+    pub acknowledgement_invocation: InvocationId,
+    pub authority: AuthorityActorTarget,
+    pub managed: ManagedAgentTarget,
+    pub credential_call: Hash,
+    pub approval: Hash,
+    pub authorization_sequence: NonZeroU64,
+    pub request: Hash,
+    pub receipt: AuthorityReceipt,
+    pub reopened_state: Hash,
+    pub applied_at: u64,
+    pub signature: [u8; AUTHORITY_SIGNATURE_BYTES],
+}
+
+impl ManagementApplicationAck {
+    /// Bytes covered by the post-application authority signature.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        crate::wire::management_application_ack_signing_bytes(self)
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            b"vos/agent/management-application-ack/v1",
+            &[&self.signing_bytes(), &self.signature],
+        )
+    }
+
+    pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        if self.authorization_invocation == InvocationId::ZERO
+            || self.acknowledgement_invocation == InvocationId::ZERO
+            || self.authorization_invocation == self.acknowledgement_invocation
+            || !self.authority.is_valid()
+            || !self.managed.is_valid()
+            || self.authority.space != self.managed.space
+        {
+            return Err(AuthorityActorProtocolError::InvalidTarget);
+        }
+        if self.credential_call == Hash::ZERO
+            || self.approval == Hash::ZERO
+            || self.request == Hash::ZERO
+            || self.reopened_state == Hash::ZERO
+            || self.signature == [0; AUTHORITY_SIGNATURE_BYTES]
+        {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        let selector = &self.receipt.selector;
+        if self.receipt.validate_shape().is_err()
+            || !self.authority.binding.accepts(&self.receipt)
+            || selector.space != self.managed.space
+            || selector.agent != self.managed.agent
+            || selector.runtime_deployment != self.managed.runtime_deployment
+            || !selector.operation.uses_management_decision_journal()
+            || selector.request != self.request
+            || !selector.is_live_at(self.applied_at)
+        {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        if crate::wire::management_application_ack_encoded_len(self)
+            > crate::MAX_INVOCATION_MESSAGE_BYTES
+        {
+            return Err(AuthorityActorProtocolError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    /// Verify both the original receipt and the distinct post-application
+    /// signature using the independently selected binding key.
+    pub fn verify_with<V: AuthorityVerifier>(
+        &self,
+        verifier: &V,
+    ) -> Result<(), AuthorityActorProtocolError> {
+        self.validate_shape()?;
+        self.receipt
+            .verify_at(self.applied_at, verifier)
+            .map_err(|_| AuthorityActorProtocolError::InvalidSignature)?;
+        if !verifier.verify(
+            &self.authority.binding.public_key,
+            &self.signing_bytes(),
+            &self.signature,
+        ) {
+            return Err(AuthorityActorProtocolError::InvalidSignature);
+        }
+        Ok(())
+    }
+
+    /// Match the exact actor-retained credential call and approval preimages.
+    pub fn matches_pending(
+        &self,
+        call: &AuthorityCredentialCall,
+        approval: &ManagementApproval,
+    ) -> bool {
+        self.validate_shape().is_ok()
+            && approval.matches_call(call)
+            && self.authorization_invocation == call.invocation
+            && self.acknowledgement_invocation == approval.acknowledgement_invocation
+            && self.authority == call.authority
+            && self.authority == approval.authority
+            && self.managed == call.managed
+            && self.managed == approval.managed
+            && self.credential_call == call.commitment()
+            && self.credential_call == approval.credential_call
+            && self.approval == approval.commitment()
+            && self.authorization_sequence == approval.authorization_sequence
+            && self.request == approval.request_commitment
+            && receipt_matches_approval(&self.receipt, approval)
+    }
+
+    /// Bind the acknowledgement to its own Linear actor invocation. The
+    /// signature, rather than caller identity, authenticates the issuer, so a
+    /// client may safely relay the exact acknowledgement bytes.
+    pub fn matches_invocation_context(&self, context: &InvocationContext) -> bool {
+        self.validate_shape().is_ok()
+            && context.validate()
+            && context.invocation == self.acknowledgement_invocation
+            && context.actor == self.authority.binding.issuer.actor
+            && context.mode == MethodMode::Linear
+            && context.origin.actor.is_none()
+            && context.origin.capability.is_none()
+            && context.roles == InvocationRoleClaims::none()
+    }
+}
+
+fn receipt_matches_approval(receipt: &AuthorityReceipt, approval: &ManagementApproval) -> bool {
+    let selector = &receipt.selector;
+    let actor = approval.request.authority_actor();
+    selector.policy == approval.authority.binding.policy
+        && selector.issuer == approval.authority.binding.issuer
+        && selector.space == approval.managed.space
+        && selector.agent == approval.managed.agent
+        && Some(selector.operation) == approval.request.authority_operation()
+        && selector.runtime_deployment == approval.managed.runtime_deployment
+        && selector.actor == actor.map(|(actor, _)| actor)
+        && selector.actor_deployment == actor.map(|(_, deployment)| deployment)
+        && selector.evidence == approval.evidence
+        && selector.lane_roots == approval.lane_roots
+        && selector.epoch == approval.epoch
+        && selector.valid_from == approval.valid_from
+        && selector.expires_at == approval.expires_at
+        && selector.request == approval.request_commitment
+}
+
 fn mutating_request_matches_targets(
     authority: &AuthorityActorTarget,
     managed: &ManagedAgentTarget,
@@ -367,7 +544,7 @@ fn mutating_request_matches_targets(
             descriptor.identity.space == managed.space
                 && descriptor.identity.agent == managed.agent
                 && descriptor.identity.runtime_deployment == managed.runtime_deployment
-                && descriptor.authority.issuer == authority.issuer
+                && descriptor.authority == authority.binding
         }
         ManagementRequest::UpgradeRuntime(upgrade) => {
             upgrade.from_deployment == managed.runtime_deployment
@@ -383,6 +560,7 @@ pub enum AuthorityActorProtocolError {
     InvalidValidity,
     InvalidRequest,
     InvalidSignature,
+    InvalidApplication,
     LimitExceeded,
     MismatchedCall,
 }
@@ -660,17 +838,29 @@ mod tests {
         }
     }
 
+    impl AuthorityVerifier for TestCredentialVerifier {
+        fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+            *signature == test_signature(public_key, message)
+        }
+    }
+
     fn authority_target() -> AuthorityActorTarget {
+        let public_key = [28; AUTHORITY_PUBLIC_KEY_BYTES];
         AuthorityActorTarget {
             space: SpaceId([21; 32]),
             system_agent: AgentId([22; 32]),
             system_runtime_deployment: DeploymentId([23; 32]),
-            issuer: AuthorityIssuer {
-                principal: PrincipalId([24; 32]),
-                actor: ActorId([25; 32]),
-                deployment: DeploymentId([26; 32]),
-                program: ProgramId([27; 32]),
-                producer: ProducerId([28; 32]),
+            binding: AgentAuthorityBinding {
+                policy: Hash([20; 32]),
+                issuer: AuthorityIssuer {
+                    principal: PrincipalId([24; 32]),
+                    actor: ActorId([25; 32]),
+                    deployment: DeploymentId([26; 32]),
+                    program: ProgramId([27; 32]),
+                    producer: ProducerId::of_public_key(&public_key),
+                },
+                public_key,
+                initial_epoch: 1,
             },
         }
     }
@@ -733,6 +923,52 @@ mod tests {
             119,
         )
         .unwrap()
+    }
+
+    fn application_ack(
+        call: &AuthorityCredentialCall,
+        approval: &ManagementApproval,
+    ) -> ManagementApplicationAck {
+        let actor = approval.request.authority_actor();
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: approval.authority.binding.policy,
+                issuer: approval.authority.binding.issuer,
+                space: approval.managed.space,
+                agent: approval.managed.agent,
+                operation: approval.request.authority_operation().unwrap(),
+                runtime_deployment: approval.managed.runtime_deployment,
+                actor: actor.map(|(actor, _)| actor),
+                actor_deployment: actor.map(|(_, deployment)| deployment),
+                evidence: approval.evidence.clone(),
+                lane_roots: approval.lane_roots,
+                epoch: approval.epoch,
+                decision_sequence: 1,
+                acknowledged_through: 0,
+                valid_from: approval.valid_from,
+                expires_at: approval.expires_at,
+                request: approval.request_commitment,
+            },
+            public_key: approval.authority.binding.public_key,
+            signature: [1; AUTHORITY_SIGNATURE_BYTES],
+        };
+        receipt.signature = test_signature(&receipt.public_key, &receipt.signing_bytes());
+        let mut ack = ManagementApplicationAck {
+            authorization_invocation: call.invocation,
+            acknowledgement_invocation: approval.acknowledgement_invocation,
+            authority: call.authority,
+            managed: call.managed,
+            credential_call: call.commitment(),
+            approval: approval.commitment(),
+            authorization_sequence: approval.authorization_sequence,
+            request: approval.request_commitment,
+            receipt,
+            reopened_state: Hash([44; 32]),
+            applied_at: approval.valid_from,
+            signature: [1; AUTHORITY_SIGNATURE_BYTES],
+        };
+        ack.signature = test_signature(&ack.authority.binding.public_key, &ack.signing_bytes());
+        ack
     }
 
     fn selector(producer: ProducerId) -> AuthorityReceiptSelector {
@@ -872,7 +1108,7 @@ mod tests {
 
         let context = InvocationContext {
             invocation: call.invocation,
-            actor: call.authority.issuer.actor,
+            actor: call.authority.binding.issuer.actor,
             mode: MethodMode::Linear,
             origin: crate::InvocationOrigin {
                 principal: Some(call.principal),
@@ -946,6 +1182,11 @@ mod tests {
         let value = approval(&call);
         assert_eq!(value.validate_shape(), Ok(()));
         assert!(value.matches_call(&call));
+        assert_eq!(
+            value.acknowledgement_invocation,
+            ManagementApproval::derive_acknowledgement_invocation(&call)
+        );
+        assert_ne!(value.acknowledgement_invocation, call.invocation);
         assert_ne!(value.commitment(), Hash::ZERO);
 
         let mut wider = value.clone();
@@ -954,6 +1195,10 @@ mod tests {
         let mut divergent = call.clone();
         divergent.signature[0] ^= 1;
         assert!(!value.matches_call(&divergent));
+        let mut wrong_acknowledgement = value.clone();
+        wrong_acknowledgement.acknowledgement_invocation = InvocationId([46; 32]);
+        assert_eq!(wrong_acknowledgement.validate_shape(), Ok(()));
+        assert!(!wrong_acknowledgement.matches_call(&call));
         let mut wrong_request = value;
         wrong_request.request_commitment = Hash([45; 32]);
         assert_eq!(
@@ -963,10 +1208,82 @@ mod tests {
     }
 
     #[test]
+    fn application_ack_requires_distinct_invocation_exact_pending_preimages_and_two_signatures() {
+        let call = credential_call(mutating_request());
+        let approval = approval(&call);
+        let ack = application_ack(&call, &approval);
+        assert_eq!(ack.validate_shape(), Ok(()));
+        assert!(ack.matches_pending(&call, &approval));
+        assert_eq!(ack.verify_with(&TestCredentialVerifier), Ok(()));
+        assert_ne!(ack.commitment(), Hash::ZERO);
+
+        let context = InvocationContext {
+            invocation: ack.acknowledgement_invocation,
+            actor: ack.authority.binding.issuer.actor,
+            mode: MethodMode::Linear,
+            origin: crate::InvocationOrigin {
+                principal: None,
+                transport_node: None,
+                credential: None,
+                actor: None,
+                capability: None,
+            },
+            roles: InvocationRoleClaims::none(),
+            observed_slot: ack.applied_at,
+        };
+        assert!(ack.matches_invocation_context(&context));
+
+        let mut reused_invocation = ack.clone();
+        reused_invocation.acknowledgement_invocation = reused_invocation.authorization_invocation;
+        assert_eq!(
+            reused_invocation.validate_shape(),
+            Err(AuthorityActorProtocolError::InvalidTarget)
+        );
+        let mut wrong_approval = ack.clone();
+        wrong_approval.approval = Hash([45; 32]);
+        assert!(!wrong_approval.matches_pending(&call, &approval));
+        let mut wrong_reserved_invocation = ack.clone();
+        wrong_reserved_invocation.acknowledgement_invocation = InvocationId([46; 32]);
+        wrong_reserved_invocation.signature = test_signature(
+            &wrong_reserved_invocation.authority.binding.public_key,
+            &wrong_reserved_invocation.signing_bytes(),
+        );
+        assert!(!wrong_reserved_invocation.matches_pending(&call, &approval));
+        let mut expired = ack.clone();
+        expired.applied_at = expired.receipt.selector.expires_at + 1;
+        assert_eq!(
+            expired.validate_shape(),
+            Err(AuthorityActorProtocolError::InvalidApplication)
+        );
+        let mut forged_receipt = ack.clone();
+        forged_receipt.receipt.signature[0] ^= 1;
+        forged_receipt.signature = test_signature(
+            &forged_receipt.authority.binding.public_key,
+            &forged_receipt.signing_bytes(),
+        );
+        assert_eq!(
+            forged_receipt.verify_with(&TestCredentialVerifier),
+            Err(AuthorityActorProtocolError::InvalidSignature)
+        );
+        let mut forged_ack = ack.clone();
+        forged_ack.signature[0] ^= 1;
+        assert_eq!(
+            forged_ack.verify_with(&TestCredentialVerifier),
+            Err(AuthorityActorProtocolError::InvalidSignature)
+        );
+        let mut wrong_context = context;
+        wrong_context.invocation = call.invocation;
+        assert!(!ack.matches_invocation_context(&wrong_context));
+    }
+
+    #[test]
     fn create_and_runtime_upgrade_cross_check_exact_targets() {
         let authority_public_key = [46; AUTHORITY_PUBLIC_KEY_BYTES];
         let mut authority = authority_target();
-        authority.issuer.producer = ProducerId::of_public_key(&authority_public_key);
+        authority.binding.policy = Hash([52; 32]);
+        authority.binding.public_key = authority_public_key;
+        authority.binding.issuer.producer = ProducerId::of_public_key(&authority_public_key);
+        authority.binding.initial_epoch = 2;
         let owner = PrincipalId([47; 32]);
         let creation_nonce = Hash([48; 32]);
         let agent = AgentId::derive(authority.space, owner, creation_nonce.as_bytes());
@@ -986,12 +1303,7 @@ mod tests {
                 runtime_producer: ProducerId([51; 32]),
             },
             creation_nonce,
-            authority: AgentAuthorityBinding {
-                policy: Hash([52; 32]),
-                issuer: authority.issuer,
-                public_key: authority_public_key,
-                initial_epoch: 2,
-            },
+            authority: authority.binding,
             runtime_package: BlobRef {
                 hash: Hash([53; 32]),
                 len: 1,

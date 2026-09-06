@@ -102,6 +102,14 @@ impl CleanManagementReceiptSigner for CleanOperatorIdentitySigner<'_> {
             .try_into()
             .map_err(|_| CleanIdentitySignerError::InvalidSignatureLength)
     }
+
+    fn sign_management_application_ack(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error> {
+        self.keypair
+            .sign(message)
+            .map_err(|_| CleanIdentitySignerError::SigningFailed)?
+            .try_into()
+            .map_err(|_| CleanIdentitySignerError::InvalidSignatureLength)
+    }
 }
 
 /// Derive the clean Node identity from every byte of an already-authenticated

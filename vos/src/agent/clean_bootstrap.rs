@@ -374,8 +374,9 @@ impl CleanSystemAgentBootstrapRecord {
             &decoder.bytes_bounded(MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES)?,
         )?;
         let runtime_package_bytes = decode_large_bytes(&mut decoder, MAX_PACKAGE_ENCODED_BYTES)?;
-        let decision = AuthorizedCleanManagementDecision::from_canonical_bytes(
+        let decision = AuthorizedCleanManagementDecision::from_bootstrap_canonical_bytes(
             &decoder.bytes_bounded(MAX_AUTHORIZED_DECISION_BYTES)?,
+            pins.descriptor(),
         )?;
         let receipt = decoder.option(|decoder| {
             AuthorityReceipt::decode(&decoder.bytes_bounded(MAX_AUTHORITY_RECEIPT_WIRE_BYTES)?)
@@ -1206,6 +1207,14 @@ mod tests {
         }
 
         fn sign_authority_receipt(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error> {
+            self.calls += 1;
+            Ok(self.key.sign(message).to_bytes())
+        }
+
+        fn sign_management_application_ack(
+            &mut self,
+            message: &[u8],
+        ) -> Result<[u8; 64], Self::Error> {
             self.calls += 1;
             Ok(self.key.sign(message).to_bytes())
         }

@@ -10,13 +10,15 @@
 use core::{convert::Infallible, fmt, num::NonZeroU64};
 
 use crate::agent::sdk::authority::{
-    AgentAuthorityBinding, AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots,
-    AuthorityOperationKind, AuthorityReceipt, AuthorityReceiptSelector,
+    AgentAuthorityBinding, AuthorityActorTarget, AuthorityCredentialCall,
+    AuthorityCredentialVerifier, AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots,
+    AuthorityOperationKind, AuthorityReceipt, AuthorityReceiptSelector, ManagedAgentTarget,
+    ManagementApplicationAck, ManagementApproval,
 };
 use crate::agent::sdk::wire::CanonicalWire;
 use crate::agent::sdk::{
-    ActorId, AgentId, BlobRef, DeploymentId, Hash, ManagementRequest, PrincipalId, ProducerId,
-    ProgramId, SpaceId,
+    ActorId, AgentId, BlobRef, DeploymentId, Hash, InvocationId, ManagementRequest, PrincipalId,
+    ProducerId, ProgramId, SpaceId,
 };
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
@@ -85,15 +87,103 @@ pub struct AuthorizedCleanManagementDecision {
     valid_from: u64,
     expires_at: u64,
     request: Hash,
+    application: Option<CleanManagementApplicationContext>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CleanManagementApplicationContext {
+    authorization_invocation: InvocationId,
+    acknowledgement_invocation: InvocationId,
+    authority: AuthorityActorTarget,
+    managed: ManagedAgentTarget,
+    credential_call: Hash,
+    approval: Hash,
 }
 
 impl AuthorizedCleanManagementDecision {
-    /// Bind an already-authorized typed request to its exact signed selector.
-    /// Read-only inspection is rejected because it requires no receipt.
-    pub fn new(
+    /// Convert one exact, runtime-authenticated authority-actor result into
+    /// the only general management value accepted by the durable issuer.
+    ///
+    /// This constructor and [`DurableCleanManagementIssuer::issue`] are
+    /// crate-private so an SDK caller cannot synthesize MAP1 with the public
+    /// actor helper and reach the signer. The eventual coordinator must call
+    /// this only for the exact result of the configured actor's authenticated
+    /// Linear transition. The credential signature is reverified, the
+    /// retained signed call must be byte-for-byte selected by the approval,
+    /// and both complete routes must agree with independently loaded system-
+    /// and managed-Agent targets. For Agent creation, the selected authority
+    /// binding must also be the complete binding embedded in the request.
+    pub(crate) fn from_approval<V: AuthorityCredentialVerifier>(
+        expected_authority: AuthorityActorTarget,
+        expected_managed: ManagedAgentTarget,
+        call: &AuthorityCredentialCall,
+        approval: &ManagementApproval,
+        credential_verifier: &V,
+    ) -> Result<Self, CleanManagementDecisionError> {
+        call.verify_with(credential_verifier)
+            .map_err(|_| CleanManagementDecisionError::InvalidApproval)?;
+        let binding = expected_authority.binding;
+        if !expected_authority.is_valid()
+            || !expected_managed.is_valid()
+            || !approval.matches_call(call)
+            || call.authority != expected_authority
+            || approval.authority != expected_authority
+            || call.managed != expected_managed
+            || approval.managed != expected_managed
+            || approval.epoch < binding.initial_epoch
+            || matches!(
+                &approval.request,
+                ManagementRequest::Create(descriptor) if descriptor.authority != binding
+            )
+        {
+            return Err(CleanManagementDecisionError::InvalidApproval);
+        }
+        let decision = Self::from_verified_approval_parts(
+            approval.authorization_sequence,
+            CleanManagementDecisionContext {
+                space: approval.managed.space,
+                agent: approval.managed.agent,
+                runtime_deployment: approval.managed.runtime_deployment,
+                evidence: approval.evidence.clone(),
+                lane_roots: approval.lane_roots,
+                epoch: approval.epoch,
+                valid_from: approval.valid_from,
+                expires_at: approval.expires_at,
+            },
+            &approval.request,
+            Some(CleanManagementApplicationContext {
+                authorization_invocation: call.invocation,
+                acknowledgement_invocation: approval.acknowledgement_invocation,
+                authority: approval.authority,
+                managed: approval.managed,
+                credential_call: approval.credential_call,
+                approval: approval.commitment(),
+            }),
+        )?;
+        (decision.request == approval.request_commitment)
+            .then_some(decision)
+            .ok_or(CleanManagementDecisionError::InvalidApproval)
+    }
+
+    /// Test-only seam for constructing retained decisions directly. Production
+    /// callers must enter through [`Self::from_approval`].
+    #[cfg(test)]
+    pub(crate) fn new(
         authorization_id: NonZeroU64,
         context: CleanManagementDecisionContext,
         request: &ManagementRequest,
+    ) -> Result<Self, CleanManagementDecisionError> {
+        Self::from_verified_approval_parts(authorization_id, context, request, None)
+    }
+
+    /// Bind fields from an already verified, exact authority-actor approval
+    /// to the durable signed selector. Keeping this constructor private makes
+    /// [`Self::from_approval`] the sole production entry point.
+    fn from_verified_approval_parts(
+        authorization_id: NonZeroU64,
+        context: CleanManagementDecisionContext,
+        request: &ManagementRequest,
+        application: Option<CleanManagementApplicationContext>,
     ) -> Result<Self, CleanManagementDecisionError> {
         if !request.is_valid() {
             return Err(CleanManagementDecisionError::InvalidRequest);
@@ -135,6 +225,7 @@ impl AuthorizedCleanManagementDecision {
             valid_from: context.valid_from,
             expires_at: context.expires_at,
             request: request.commitment(),
+            application,
         };
         value
             .is_valid()
@@ -166,8 +257,15 @@ impl AuthorizedCleanManagementDecision {
         encode_authorized_decision(self)
     }
 
-    pub(crate) fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
-        decode_authorized_decision(bytes)
+    pub(crate) fn from_bootstrap_canonical_bytes(
+        bytes: &[u8],
+        descriptor: &crate::agent::sdk::AgentDescriptor,
+    ) -> Result<Self, DecodeError> {
+        let decision = decode_authorized_decision(bytes)?;
+        decision
+            .matches_creation(descriptor)
+            .then_some(decision)
+            .ok_or(DecodeError::NonCanonical)
     }
 
     pub(crate) fn matches_creation(&self, descriptor: &crate::agent::sdk::AgentDescriptor) -> bool {
@@ -178,6 +276,7 @@ impl AuthorizedCleanManagementDecision {
             && self.runtime_deployment == descriptor.identity.runtime_deployment
             && self.actor.is_none()
             && self.actor_deployment.is_none()
+            && self.application.is_none()
             && self.creation_authority == Some(descriptor.authority)
             && self.request == ManagementRequest::Create(Box::new(descriptor.clone())).commitment()
     }
@@ -205,6 +304,20 @@ impl AuthorizedCleanManagementDecision {
             && self.evidence.is_valid()
             && self.lane_roots.is_valid()
             && self.valid_from <= self.expires_at
+            && self.application.is_none_or(|application| {
+                application.authorization_invocation != InvocationId::ZERO
+                    && application.acknowledgement_invocation != InvocationId::ZERO
+                    && application.acknowledgement_invocation
+                        != application.authorization_invocation
+                    && application.authority.is_valid()
+                    && application.managed.is_valid()
+                    && application.authority.space == self.space
+                    && application.managed.space == self.space
+                    && application.managed.agent == self.agent
+                    && application.managed.runtime_deployment == self.runtime_deployment
+                    && application.credential_call != Hash::ZERO
+                    && application.approval != Hash::ZERO
+            })
             && match (self.operation, self.creation_authority) {
                 (AuthorityOperationKind::CreateAgent, Some(binding)) => binding.is_valid(),
                 (AuthorityOperationKind::CreateAgent, None) => false,
@@ -230,6 +343,7 @@ pub enum CleanManagementDecisionError {
     InvalidRequest,
     ReadOnlyRequest,
     InvalidDecision,
+    InvalidApproval,
 }
 
 impl fmt::Display for CleanManagementDecisionError {
@@ -255,6 +369,8 @@ pub trait CleanManagementReceiptSigner {
     fn public_key(&self) -> [u8; 32];
 
     fn sign_authority_receipt(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error>;
+
+    fn sign_management_application_ack(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,6 +386,9 @@ pub enum CleanManagementIssuerRejection {
     SequenceExhausted,
     InvalidObservation,
     ObservationNotLatest,
+    ApplicationAckRequired,
+    ApplicationFinalizationRequired,
+    DivergentApplicationAck,
 }
 
 /// Issuance/open/acknowledgement error. `Signer` is uninhabited for methods
@@ -310,12 +429,22 @@ struct RetainedDecision {
     sequence: u64,
     decision: Vec<u8>,
     receipt: Vec<u8>,
+    application_ack: Option<Vec<u8>>,
+    application_finalized: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingDecision {
     sequence: u64,
     decision: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingApplicationAck {
+    sequence: u64,
+    acknowledgement_invocation: InvocationId,
+    reopened_state: Hash,
+    applied_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,6 +459,7 @@ struct CleanManagementIssuerImage {
     acknowledged: Option<RetainedDecision>,
     retained: Vec<RetainedDecision>,
     pending: Option<PendingDecision>,
+    pending_application_ack: Option<PendingApplicationAck>,
 }
 
 impl CleanManagementIssuerImage {
@@ -345,6 +475,7 @@ impl CleanManagementIssuerImage {
             acknowledged: None,
             retained: Vec::new(),
             pending: None,
+            pending_application_ack: None,
         }
     }
 
@@ -358,6 +489,7 @@ impl CleanManagementIssuerImage {
                 .epoch_high_water
                 .is_some_and(|epoch| epoch < self.binding.initial_epoch)
             || (self.acknowledged_through == 0) != self.acknowledged.is_none()
+            || (self.pending.is_some() && self.pending_application_ack.is_some())
         {
             return false;
         }
@@ -367,6 +499,7 @@ impl CleanManagementIssuerImage {
                 || self.epoch_high_water.is_some()
                 || self.acknowledged.is_some()
                 || !self.retained.is_empty()
+                || self.pending_application_ack.is_some()
             {
                 return false;
             }
@@ -381,7 +514,7 @@ impl CleanManagementIssuerImage {
         {
             return false;
         }
-        self.pending.as_ref().is_none_or(|pending| {
+        let pending_decision_valid = self.pending.as_ref().is_none_or(|pending| {
             self.retained.len() < MAX_CLEAN_MANAGEMENT_ISSUER_DECISIONS
                 && pending.sequence
                     == self
@@ -389,7 +522,18 @@ impl CleanManagementIssuerImage {
                         .checked_add(1)
                         .unwrap_or(0)
                 && pending.decision.len() <= MAX_AUTHORIZED_DECISION_BYTES
-        })
+        });
+        let pending_application_valid = self.pending_application_ack.is_none_or(|pending| {
+            pending.sequence == self.decision_sequence_high_water
+                && pending.sequence > self.acknowledged_through
+                && pending.acknowledgement_invocation != InvocationId::ZERO
+                && pending.reopened_state != Hash::ZERO
+                && self
+                    .retained
+                    .last()
+                    .is_some_and(|record| record.sequence == pending.sequence)
+        });
+        pending_decision_valid && pending_application_valid
     }
 
     fn is_valid(&self) -> bool {
@@ -399,10 +543,15 @@ impl CleanManagementIssuerImage {
 
         let mut previous_authorization = None;
         let mut previous_epoch = None;
+        let mut unacknowledged_application = false;
+        let mut actor_finalization_pending = false;
         if let Some(record) = &self.acknowledged {
             if record.sequence != self.acknowledged_through
                 || record.decision.len() > MAX_AUTHORIZED_DECISION_BYTES
                 || record.receipt.len() > crate::agent::sdk::wire::MAX_AUTHORITY_RECEIPT_WIRE_BYTES
+                || record.application_ack.as_ref().is_some_and(|bytes| {
+                    bytes.len() > crate::agent::sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES
+                })
             {
                 return false;
             }
@@ -424,6 +573,9 @@ impl CleanManagementIssuerImage {
                 || decision
                     .creation_authority
                     .is_some_and(|binding| binding != self.binding)
+                || decision
+                    .application
+                    .is_some_and(|application| application.authority.binding != self.binding)
                 || receipt.selector != expected
                 || !self.binding.accepts(&receipt)
                 || receipt.public_key != self.binding.public_key
@@ -433,13 +585,46 @@ impl CleanManagementIssuerImage {
                     &receipt.signing_bytes(),
                     &receipt.signature,
                 )
+                || match (
+                    &decision.application,
+                    &record.application_ack,
+                    record.application_finalized,
+                ) {
+                    (None, None, false) => false,
+                    (Some(_), Some(bytes), _) => {
+                        let Ok(ack) = ManagementApplicationAck::decode(bytes) else {
+                            return false;
+                        };
+                        ack.encode().ok().as_deref() != Some(bytes.as_slice())
+                            || !application_ack_matches_decision(
+                                &self.binding,
+                                &decision,
+                                &receipt,
+                                &ack,
+                            )
+                    }
+                    _ => true,
+                }
             {
                 return false;
             }
             previous_authorization = Some(decision.authorization_id.get());
             previous_epoch = Some(decision.epoch);
+            actor_finalization_pending =
+                decision.application.is_some() && !record.application_finalized;
+        }
+        if actor_finalization_pending && (!self.retained.is_empty() || self.pending.is_some()) {
+            return false;
         }
         for (index, record) in self.retained.iter().enumerate() {
+            // A post-application acknowledgement retires the complete
+            // retained prefix. An application-bearing decision must
+            // therefore be the final unacknowledged record; otherwise a
+            // later receipt could retire it without ever finalizing its
+            // authority-actor effect.
+            if unacknowledged_application {
+                return false;
+            }
             let Some(expected_sequence) = self
                 .acknowledged_through
                 .checked_add(index as u64)
@@ -450,6 +635,8 @@ impl CleanManagementIssuerImage {
             if record.sequence != expected_sequence
                 || record.decision.len() > MAX_AUTHORIZED_DECISION_BYTES
                 || record.receipt.len() > crate::agent::sdk::wire::MAX_AUTHORITY_RECEIPT_WIRE_BYTES
+                || record.application_ack.is_some()
+                || record.application_finalized
             {
                 return false;
             }
@@ -461,6 +648,9 @@ impl CleanManagementIssuerImage {
                 || decision
                     .creation_authority
                     .is_some_and(|binding| binding != self.binding)
+                || decision
+                    .application
+                    .is_some_and(|application| application.authority.binding != self.binding)
                 || previous_authorization
                     .is_some_and(|previous| previous >= decision.authorization_id.get())
                 || previous_epoch.is_some_and(|previous| previous > decision.epoch)
@@ -490,6 +680,7 @@ impl CleanManagementIssuerImage {
             }
             previous_authorization = Some(decision.authorization_id.get());
             previous_epoch = Some(decision.epoch);
+            unacknowledged_application = decision.application.is_some();
         }
         if let Some(last) = self.retained.last() {
             let Ok(decision) = decode_authorized_decision(&last.decision) else {
@@ -512,6 +703,9 @@ impl CleanManagementIssuerImage {
             }
         }
 
+        if self.pending.is_some() && unacknowledged_application {
+            return false;
+        }
         if let Some(pending) = &self.pending {
             let Ok(decision) = decode_authorized_decision(&pending.decision) else {
                 return false;
@@ -521,6 +715,9 @@ impl CleanManagementIssuerImage {
                 || decision
                     .creation_authority
                     .is_some_and(|binding| binding != self.binding)
+                || decision
+                    .application
+                    .is_some_and(|application| application.authority.binding != self.binding)
                 || decision.authorization_id.get() <= self.authorization_high_water
                 || decision.epoch < self.epoch_high_water.unwrap_or(self.binding.initial_epoch)
                 || selector_for(
@@ -531,6 +728,26 @@ impl CleanManagementIssuerImage {
                 )
                 .validate()
                 .is_err()
+            {
+                return false;
+            }
+        }
+        if let Some(pending) = self.pending_application_ack {
+            let Some(record) = self.retained.last() else {
+                return false;
+            };
+            let Ok(decision) = decode_authorized_decision(&record.decision) else {
+                return false;
+            };
+            let Ok(receipt) = AuthorityReceipt::decode(&record.receipt) else {
+                return false;
+            };
+            let Some(application) = decision.application else {
+                return false;
+            };
+            if application.authority.binding != self.binding
+                || pending.acknowledgement_invocation != application.acknowledgement_invocation
+                || !receipt.selector.is_live_at(pending.applied_at)
             {
                 return false;
             }
@@ -559,6 +776,12 @@ impl CleanManagementIssuerImage {
         encoder.option(&self.pending, |encoder, pending| {
             encoder.u64(pending.sequence);
             encoder.bytes(&pending.decision);
+        });
+        encoder.option(&self.pending_application_ack, |encoder, pending| {
+            encoder.u64(pending.sequence);
+            encoder.fixed(pending.acknowledgement_invocation.as_bytes());
+            encoder.fixed(pending.reopened_state.as_bytes());
+            encoder.u64(pending.applied_at);
         });
         output
     }
@@ -599,6 +822,14 @@ impl CleanManagementIssuerImage {
             let decision = decoder.bytes_bounded(MAX_AUTHORIZED_DECISION_BYTES)?;
             Ok(PendingDecision { sequence, decision })
         })?;
+        let pending_application_ack = decoder.option(|decoder| {
+            Ok(PendingApplicationAck {
+                sequence: decoder.u64()?,
+                acknowledgement_invocation: InvocationId(decoder.fixed()?),
+                reopened_state: Hash(decoder.fixed()?),
+                applied_at: decoder.u64()?,
+            })
+        })?;
         let value = Self {
             binding,
             space,
@@ -610,6 +841,7 @@ impl CleanManagementIssuerImage {
             acknowledged,
             retained,
             pending,
+            pending_application_ack,
         };
         if !decoder.exhausted() || !value.is_valid() {
             return Err(DecodeError::NonCanonical);
@@ -691,7 +923,7 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
 
     /// Allocate, pledge, sign, and retain one exact authorized decision.
     /// Exact retained retries return before inspecting or invoking `signer`.
-    pub fn issue<S: CleanManagementReceiptSigner>(
+    pub(crate) fn issue<S: CleanManagementReceiptSigner>(
         &mut self,
         decision: &AuthorizedCleanManagementDecision,
         signer: &mut S,
@@ -703,6 +935,9 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
             || decision
                 .creation_authority
                 .is_some_and(|binding| binding != self.image.binding)
+            || decision
+                .application
+                .is_some_and(|application| application.authority.binding != self.image.binding)
         {
             return Err(CleanManagementIssuerError::Rejected(
                 CleanManagementIssuerRejection::WrongRoute,
@@ -730,6 +965,30 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
             }
             return AuthorityReceipt::decode(&retained.receipt)
                 .map_err(|_| CleanManagementIssuerError::InvalidState);
+        }
+        if self
+            .image
+            .acknowledged
+            .as_ref()
+            .is_some_and(|record| record.application_ack.is_some() && !record.application_finalized)
+        {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::ApplicationFinalizationRequired,
+            ));
+        }
+        if self.image.pending_application_ack.is_some() {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::ApplicationAckRequired,
+            ));
+        }
+        if self.image.retained.iter().any(|record| {
+            decode_authorized_decision(&record.decision)
+                .map(|decision| decision.application.is_some())
+                .unwrap_or(true)
+        }) {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::ApplicationAckRequired,
+            ));
         }
         if decision.authorization_id.get() <= self.image.authorization_high_water {
             return Err(CleanManagementIssuerError::Rejected(
@@ -846,9 +1105,236 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
             sequence: pending.sequence,
             decision: decision_bytes,
             receipt: receipt_bytes,
+            application_ack: None,
+            application_finalized: false,
         });
         self.commit_candidate::<S::Error>(completed)?;
         Ok(receipt)
+    }
+
+    /// Pledge and sign an acknowledgement only after the caller has reopened
+    /// the exact durable managed-Agent result. The pledge is committed before
+    /// invoking the signer, so a crash or signer failure can only retry the
+    /// same acknowledgement bytes. A completed exact retry returns the stored
+    /// acknowledgement without inspecting or invoking `signer`.
+    pub(crate) fn observe_durable_application<S: CleanManagementReceiptSigner>(
+        &mut self,
+        receipt: &AuthorityReceipt,
+        reopened_state: Hash,
+        applied_at: u64,
+        signer: &mut S,
+    ) -> Result<ManagementApplicationAck, CleanManagementIssuerError<B::Error, S::Error>> {
+        self.ensure_live()?;
+        if self.image.pending.is_some() {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::PendingDecision,
+            ));
+        }
+        let receipt_bytes = receipt.encode().map_err(|_| {
+            CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
+        })?;
+        if !self.image.binding.accepts(receipt)
+            || receipt.selector.space != self.image.space
+            || receipt.selector.agent != self.image.agent
+            || !receipt
+                .selector
+                .operation
+                .uses_management_decision_journal()
+            || !crate::agent::authority::verify_raw_ed25519(
+                &receipt.public_key,
+                &receipt.signing_bytes(),
+                &receipt.signature,
+            )
+        {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::InvalidObservation,
+            ));
+        }
+
+        let sequence = receipt.selector.decision_sequence;
+        if sequence <= self.image.acknowledged_through {
+            let Some(record) =
+                self.image.acknowledged.as_ref().filter(|record| {
+                    record.sequence == sequence && record.receipt == receipt_bytes
+                })
+            else {
+                return Err(CleanManagementIssuerError::Rejected(
+                    CleanManagementIssuerRejection::InvalidObservation,
+                ));
+            };
+            let decision = decode_authorized_decision(&record.decision)
+                .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+            let acknowledgement = record
+                .application_ack
+                .as_ref()
+                .ok_or(CleanManagementIssuerError::InvalidState)
+                .and_then(|bytes| {
+                    ManagementApplicationAck::decode(bytes)
+                        .map_err(|_| CleanManagementIssuerError::InvalidState)
+                })?;
+            if acknowledgement.reopened_state != reopened_state
+                || acknowledgement.applied_at != applied_at
+                || !application_ack_matches_decision(
+                    &self.image.binding,
+                    &decision,
+                    receipt,
+                    &acknowledgement,
+                )
+            {
+                return Err(CleanManagementIssuerError::Rejected(
+                    CleanManagementIssuerRejection::DivergentApplicationAck,
+                ));
+            }
+            return Ok(acknowledgement);
+        }
+        if sequence != self.image.decision_sequence_high_water {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::ObservationNotLatest,
+            ));
+        }
+        let Some(record) = self
+            .image
+            .retained
+            .last()
+            .filter(|record| record.sequence == sequence && record.receipt == receipt_bytes)
+            .cloned()
+        else {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::InvalidObservation,
+            ));
+        };
+        let decision = decode_authorized_decision(&record.decision)
+            .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+        let Some(application) = decision.application else {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::ApplicationAckRequired,
+            ));
+        };
+        let requested = PendingApplicationAck {
+            sequence,
+            acknowledgement_invocation: application.acknowledgement_invocation,
+            reopened_state,
+            applied_at,
+        };
+        if application.acknowledgement_invocation == InvocationId::ZERO
+            || application.acknowledgement_invocation == application.authorization_invocation
+            || reopened_state == Hash::ZERO
+            || !receipt.selector.is_live_at(applied_at)
+        {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::InvalidObservation,
+            ));
+        }
+        // A caller without the independently loaded signing capability must
+        // not be able to durably pledge arbitrary application parameters and
+        // freeze this issuer route. This check is non-mutating; the actual
+        // signature remains strictly after the pledge.
+        if signer.public_key() != self.image.binding.public_key {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::WrongSigner,
+            ));
+        }
+        match self.image.pending_application_ack {
+            Some(existing) if existing != requested => {
+                return Err(CleanManagementIssuerError::Rejected(
+                    CleanManagementIssuerRejection::DivergentApplicationAck,
+                ));
+            }
+            Some(_) => {}
+            None => {
+                let mut pledged = self.image.clone();
+                pledged.pending_application_ack = Some(requested);
+                self.commit_candidate::<S::Error>(pledged)?;
+            }
+        }
+        let mut acknowledgement = application_ack_for(&decision, receipt, requested, [0; 64])
+            .ok_or(CleanManagementIssuerError::InvalidState)?;
+        let message = acknowledgement.signing_bytes();
+        acknowledgement.signature = signer
+            .sign_management_application_ack(&message)
+            .map_err(CleanManagementIssuerError::Signer)?;
+        if !application_ack_matches_decision(
+            &self.image.binding,
+            &decision,
+            receipt,
+            &acknowledgement,
+        ) {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::WrongSigner,
+            ));
+        }
+        let acknowledgement_bytes = acknowledgement
+            .encode()
+            .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+        let mut completed = self.image.clone();
+        completed.acknowledged_through = sequence;
+        let mut acknowledged = record;
+        acknowledged.application_ack = Some(acknowledgement_bytes);
+        completed.acknowledged = Some(acknowledged);
+        completed.retained.clear();
+        completed.pending_application_ack = None;
+        self.commit_candidate::<S::Error>(completed)?;
+        Ok(acknowledgement)
+    }
+
+    /// Retire the issuer-side two-phase barrier only after the authority
+    /// actor has durably consumed the exact stored acknowledgement. A crash
+    /// before this marker is committed is recovered by replaying the same
+    /// MAA1 to the actor; its Linear exact-retry record makes that replay
+    /// idempotent. No later decision may be issued while this barrier is set.
+    ///
+    /// This method is crate-private because a relay observing an in-memory
+    /// `true` result is not sufficient. The owning coordinator may call it
+    /// only after reopening the exact authority-actor transition.
+    pub(crate) fn observe_durable_actor_finalization(
+        &mut self,
+        acknowledgement: &ManagementApplicationAck,
+    ) -> Result<bool, CleanManagementIssuerError<B::Error>> {
+        self.ensure_live()?;
+        if self.image.pending.is_some() || self.image.pending_application_ack.is_some() {
+            return Err(CleanManagementIssuerError::InvalidState);
+        }
+        let acknowledgement_bytes = acknowledgement.encode().map_err(|_| {
+            CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
+        })?;
+        let Some(record) = self.image.acknowledged.as_ref() else {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::InvalidObservation,
+            ));
+        };
+        if record.sequence != self.image.acknowledged_through
+            || record.application_ack.as_deref() != Some(acknowledgement_bytes.as_slice())
+        {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::DivergentApplicationAck,
+            ));
+        }
+        let decision = decode_authorized_decision(&record.decision)
+            .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+        let receipt = AuthorityReceipt::decode(&record.receipt)
+            .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+        if !application_ack_matches_decision(
+            &self.image.binding,
+            &decision,
+            &receipt,
+            acknowledgement,
+        ) {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::InvalidObservation,
+            ));
+        }
+        if record.application_finalized {
+            return Ok(false);
+        }
+
+        let mut completed = self.image.clone();
+        completed
+            .acknowledged
+            .as_mut()
+            .ok_or(CleanManagementIssuerError::InvalidState)?
+            .application_finalized = true;
+        self.commit_candidate::<Infallible>(completed)?;
+        Ok(true)
     }
 
     /// Persist an Agent-owned proof boundary that the exact latest issued
@@ -868,6 +1354,21 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         if self.image.pending.is_some() {
             return Err(CleanManagementIssuerError::Rejected(
                 CleanManagementIssuerRejection::PendingDecision,
+            ));
+        }
+        if self.image.pending_application_ack.is_some() {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::ApplicationAckRequired,
+            ));
+        }
+        if self
+            .image
+            .acknowledged
+            .as_ref()
+            .is_some_and(|record| record.application_ack.is_some() && !record.application_finalized)
+        {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::ApplicationFinalizationRequired,
             ));
         }
         let receipt_bytes = receipt.encode().map_err(|_| {
@@ -905,6 +1406,20 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         if !exact_latest {
             return Err(CleanManagementIssuerError::Rejected(
                 CleanManagementIssuerRejection::InvalidObservation,
+            ));
+        }
+        let decision = decode_authorized_decision(
+            &self
+                .image
+                .retained
+                .last()
+                .ok_or(CleanManagementIssuerError::InvalidState)?
+                .decision,
+        )
+        .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+        if decision.application.is_some() {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::ApplicationAckRequired,
             ));
         }
         let mut acknowledged = self.image.clone();
@@ -981,10 +1496,67 @@ fn selector_for(
     }
 }
 
+fn application_ack_for(
+    decision: &AuthorizedCleanManagementDecision,
+    receipt: &AuthorityReceipt,
+    pending: PendingApplicationAck,
+    signature: [u8; 64],
+) -> Option<ManagementApplicationAck> {
+    let application = decision.application?;
+    if pending.acknowledgement_invocation != application.acknowledgement_invocation {
+        return None;
+    }
+    Some(ManagementApplicationAck {
+        authorization_invocation: application.authorization_invocation,
+        acknowledgement_invocation: application.acknowledgement_invocation,
+        authority: application.authority,
+        managed: application.managed,
+        credential_call: application.credential_call,
+        approval: application.approval,
+        authorization_sequence: decision.authorization_id,
+        request: decision.request,
+        receipt: receipt.clone(),
+        reopened_state: pending.reopened_state,
+        applied_at: pending.applied_at,
+        signature,
+    })
+}
+
+fn application_ack_matches_decision(
+    binding: &AgentAuthorityBinding,
+    decision: &AuthorizedCleanManagementDecision,
+    receipt: &AuthorityReceipt,
+    acknowledgement: &ManagementApplicationAck,
+) -> bool {
+    let Some(application) = decision.application else {
+        return false;
+    };
+    acknowledgement.validate_shape().is_ok()
+        && acknowledgement.authority.binding == *binding
+        && acknowledgement.authorization_invocation == application.authorization_invocation
+        && acknowledgement.acknowledgement_invocation == application.acknowledgement_invocation
+        && acknowledgement.authority == application.authority
+        && acknowledgement.managed == application.managed
+        && acknowledgement.credential_call == application.credential_call
+        && acknowledgement.approval == application.approval
+        && acknowledgement.authorization_sequence == decision.authorization_id
+        && acknowledgement.request == decision.request
+        && acknowledgement.receipt == *receipt
+        && crate::agent::authority::verify_raw_ed25519(
+            &binding.public_key,
+            &acknowledgement.signing_bytes(),
+            &acknowledgement.signature,
+        )
+}
+
 fn encode_retained_decision(encoder: &mut Encoder<'_>, record: &RetainedDecision) {
     encoder.u64(record.sequence);
     encoder.bytes(&record.decision);
     encoder.bytes(&record.receipt);
+    encoder.option(&record.application_ack, |encoder, bytes| {
+        encoder.bytes(bytes)
+    });
+    encoder.bool(record.application_finalized);
 }
 
 fn decode_retained_decision(decoder: &mut Decoder<'_>) -> Result<RetainedDecision, DecodeError> {
@@ -992,17 +1564,23 @@ fn decode_retained_decision(decoder: &mut Decoder<'_>) -> Result<RetainedDecisio
     let decision = decoder.bytes_bounded(MAX_AUTHORIZED_DECISION_BYTES)?;
     let receipt =
         decoder.bytes_bounded(crate::agent::sdk::wire::MAX_AUTHORITY_RECEIPT_WIRE_BYTES)?;
+    let application_ack = decoder.option(|decoder| {
+        decoder.bytes_bounded(crate::agent::sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES)
+    })?;
+    let application_finalized = decoder.bool()?;
     Ok(RetainedDecision {
         sequence,
         decision,
         receipt,
+        application_ack,
+        application_finalized,
     })
 }
 
 fn encode_authorized_decision(value: &AuthorizedCleanManagementDecision) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut encoder = Encoder(&mut bytes);
-    encoder.u8(1);
+    encoder.u8(2);
     encoder.u64(value.authorization_id.get());
     encoder.fixed(value.space.as_bytes());
     encoder.fixed(value.agent.as_bytes());
@@ -1021,6 +1599,14 @@ fn encode_authorized_decision(value: &AuthorizedCleanManagementDecision) -> Vec<
     encoder.u64(value.valid_from);
     encoder.u64(value.expires_at);
     encoder.fixed(value.request.as_bytes());
+    encoder.option(&value.application, |encoder, application| {
+        encoder.fixed(application.authorization_invocation.as_bytes());
+        encoder.fixed(application.acknowledgement_invocation.as_bytes());
+        encode_authority_actor_target(encoder, application.authority);
+        encode_managed_agent_target(encoder, application.managed);
+        encoder.fixed(application.credential_call.as_bytes());
+        encoder.fixed(application.approval.as_bytes());
+    });
     bytes
 }
 
@@ -1031,7 +1617,7 @@ fn decode_authorized_decision(
         return Err(DecodeError::LimitExceeded);
     }
     let mut decoder = Decoder::new(bytes);
-    if decoder.u8()? != 1 {
+    if decoder.u8()? != 2 {
         return Err(DecodeError::InvalidTag);
     }
     let authorization_id = NonZeroU64::new(decoder.u64()?).ok_or(DecodeError::NonCanonical)?;
@@ -1054,6 +1640,16 @@ fn decode_authorized_decision(
         valid_from: decoder.u64()?,
         expires_at: decoder.u64()?,
         request: Hash(decoder.fixed()?),
+        application: decoder.option(|decoder| {
+            Ok(CleanManagementApplicationContext {
+                authorization_invocation: InvocationId(decoder.fixed()?),
+                acknowledgement_invocation: InvocationId(decoder.fixed()?),
+                authority: decode_authority_actor_target(decoder)?,
+                managed: decode_managed_agent_target(decoder)?,
+                credential_call: Hash(decoder.fixed()?),
+                approval: Hash(decoder.fixed()?),
+            })
+        })?,
     };
     if !decoder.exhausted() || !value.is_valid() || encode_authorized_decision(&value) != bytes {
         return Err(DecodeError::NonCanonical);
@@ -1066,6 +1662,48 @@ fn encode_binding(encoder: &mut Encoder<'_>, binding: AgentAuthorityBinding) {
     encode_issuer(encoder, binding.issuer);
     encoder.fixed(&binding.public_key);
     encoder.u64(binding.initial_epoch);
+}
+
+fn encode_authority_actor_target(encoder: &mut Encoder<'_>, target: AuthorityActorTarget) {
+    encoder.fixed(target.space.as_bytes());
+    encoder.fixed(target.system_agent.as_bytes());
+    encoder.fixed(target.system_runtime_deployment.as_bytes());
+    encode_binding(encoder, target.binding);
+}
+
+fn decode_authority_actor_target(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityActorTarget, DecodeError> {
+    let value = AuthorityActorTarget {
+        space: SpaceId(decoder.fixed()?),
+        system_agent: AgentId(decoder.fixed()?),
+        system_runtime_deployment: DeploymentId(decoder.fixed()?),
+        binding: decode_binding(decoder)?,
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_managed_agent_target(encoder: &mut Encoder<'_>, target: ManagedAgentTarget) {
+    encoder.fixed(target.space.as_bytes());
+    encoder.fixed(target.agent.as_bytes());
+    encoder.fixed(target.runtime_deployment.as_bytes());
+}
+
+fn decode_managed_agent_target(
+    decoder: &mut Decoder<'_>,
+) -> Result<ManagedAgentTarget, DecodeError> {
+    let value = ManagedAgentTarget {
+        space: SpaceId(decoder.fixed()?),
+        agent: AgentId(decoder.fixed()?),
+        runtime_deployment: DeploymentId(decoder.fixed()?),
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
 }
 
 fn decode_binding(decoder: &mut Decoder<'_>) -> Result<AgentAuthorityBinding, DecodeError> {
@@ -1161,7 +1799,7 @@ fn decode_management_operation(tag: u8) -> Result<AuthorityOperationKind, Decode
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use ed25519_dalek::{Signer as _, SigningKey};
+    use ed25519_dalek::{Signer as _, SigningKey, Verifier as _};
 
     use super::*;
 
@@ -1275,6 +1913,38 @@ mod tests {
             }
             Ok(self.key.sign(message).to_bytes())
         }
+
+        fn sign_management_application_ack(
+            &mut self,
+            message: &[u8],
+        ) -> Result<[u8; 64], Self::Error> {
+            self.calls += 1;
+            if self.fail_next {
+                self.fail_next = false;
+                return Err(TestSignerError);
+            }
+            Ok(self.key.sign(message).to_bytes())
+        }
+    }
+
+    struct TestCredentialVerifier;
+
+    impl AuthorityCredentialVerifier for TestCredentialVerifier {
+        fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+            ed25519_dalek::VerifyingKey::from_bytes(public_key).is_ok_and(|key| {
+                key.verify(message, &ed25519_dalek::Signature::from_bytes(signature))
+                    .is_ok()
+            })
+        }
+    }
+
+    impl crate::agent::sdk::authority::AuthorityVerifier for TestCredentialVerifier {
+        fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+            ed25519_dalek::VerifyingKey::from_bytes(public_key).is_ok_and(|key| {
+                key.verify(message, &ed25519_dalek::Signature::from_bytes(signature))
+                    .is_ok()
+            })
+        }
     }
 
     #[derive(Clone)]
@@ -1348,6 +2018,411 @@ mod tests {
     ) -> DurableCleanManagementIssuer<MemoryImageStore> {
         DurableCleanManagementIssuer::open(store, fixture.binding, fixture.space, fixture.agent)
             .unwrap()
+    }
+
+    fn approved_call(
+        fixture: &Fixture,
+        authorization_sequence: u64,
+        request: ManagementRequest,
+    ) -> (AuthorityCredentialCall, ManagementApproval) {
+        let credential_key = SigningKey::from_bytes(&[0x29; 32]);
+        let credential_public_key = credential_key.verifying_key().to_bytes();
+        let invocation_byte = u8::try_from(authorization_sequence)
+            .ok()
+            .and_then(|value| value.checked_add(0x20))
+            .unwrap();
+        let mut call = AuthorityCredentialCall {
+            invocation: crate::agent::sdk::InvocationId([invocation_byte; 32]),
+            authority: crate::agent::sdk::authority::AuthorityActorTarget {
+                space: fixture.space,
+                system_agent: AgentId([0x22; 32]),
+                system_runtime_deployment: DeploymentId([0x23; 32]),
+                binding: fixture.binding,
+            },
+            managed: crate::agent::sdk::authority::ManagedAgentTarget {
+                space: fixture.space,
+                agent: fixture.agent,
+                runtime_deployment: fixture.context.runtime_deployment,
+            },
+            principal: PrincipalId([0x24; 32]),
+            credential: crate::agent::sdk::CredentialId::of_public_key(&credential_public_key),
+            credential_public_key,
+            authenticated_node: Some(crate::agent::sdk::NodeId([0x25; 32])),
+            requested_valid_from: 1,
+            requested_expires_at: 20_000,
+            request,
+            signature: [0; 64],
+        };
+        call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
+        let approval = ManagementApproval::from_call(
+            &call,
+            NonZeroU64::new(authorization_sequence).unwrap(),
+            fixture.context.evidence.clone(),
+            fixture.context.lane_roots,
+            fixture.context.epoch,
+            fixture.context.valid_from,
+            fixture.context.expires_at,
+        )
+        .unwrap();
+        (call, approval)
+    }
+
+    #[test]
+    fn exact_actor_approval_is_the_only_durable_issuer_input() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x28);
+        let fixture = fixture(&signer);
+        let request = request(0x2a);
+        let (call, approval) = approved_call(&fixture, 1, request.clone());
+        let decision = AuthorizedCleanManagementDecision::from_approval(
+            call.authority,
+            call.managed,
+            &call,
+            &approval,
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        assert_eq!(decision.authorization_id(), approval.authorization_sequence);
+        assert_eq!(decision.request(), request.commitment());
+
+        let receipt = open(store, &fixture).issue(&decision, &mut signer).unwrap();
+        assert!(decision.matches_receipt(fixture.binding, &receipt));
+
+        let mut forged_call = call.clone();
+        forged_call.signature[0] ^= 1;
+        assert_eq!(
+            AuthorizedCleanManagementDecision::from_approval(
+                call.authority,
+                call.managed,
+                &forged_call,
+                &approval,
+                &TestCredentialVerifier,
+            ),
+            Err(CleanManagementDecisionError::InvalidApproval)
+        );
+
+        let mut wrong_binding = fixture.binding;
+        wrong_binding.issuer.principal = PrincipalId([0x2b; 32]);
+        let mut wrong_authority = call.authority;
+        wrong_authority.binding = wrong_binding;
+        assert_eq!(
+            AuthorizedCleanManagementDecision::from_approval(
+                wrong_authority,
+                call.managed,
+                &call,
+                &approval,
+                &TestCredentialVerifier,
+            ),
+            Err(CleanManagementDecisionError::InvalidApproval)
+        );
+
+        let mut wrong_authority_route = call.authority;
+        wrong_authority_route.system_agent = AgentId([0x2e; 32]);
+        assert_eq!(
+            AuthorizedCleanManagementDecision::from_approval(
+                wrong_authority_route,
+                call.managed,
+                &call,
+                &approval,
+                &TestCredentialVerifier,
+            ),
+            Err(CleanManagementDecisionError::InvalidApproval)
+        );
+        let mut wrong_managed_route = call.managed;
+        wrong_managed_route.runtime_deployment = DeploymentId([0x2f; 32]);
+        assert_eq!(
+            AuthorizedCleanManagementDecision::from_approval(
+                call.authority,
+                wrong_managed_route,
+                &call,
+                &approval,
+                &TestCredentialVerifier,
+            ),
+            Err(CleanManagementDecisionError::InvalidApproval)
+        );
+
+        let mut wrong_policy = fixture.binding;
+        wrong_policy.policy = Hash([0x2c; 32]);
+        let mut wrong_authority = call.authority;
+        wrong_authority.binding = wrong_policy;
+        assert_eq!(
+            AuthorizedCleanManagementDecision::from_approval(
+                wrong_authority,
+                call.managed,
+                &call,
+                &approval,
+                &TestCredentialVerifier,
+            ),
+            Err(CleanManagementDecisionError::InvalidApproval)
+        );
+        let mut wrong_key = fixture.binding;
+        wrong_key.public_key = SigningKey::from_bytes(&[0x2d; 32])
+            .verifying_key()
+            .to_bytes();
+        wrong_key.issuer.producer = ProducerId::of_public_key(&wrong_key.public_key);
+        let mut wrong_authority = call.authority;
+        wrong_authority.binding = wrong_key;
+        assert_eq!(
+            AuthorizedCleanManagementDecision::from_approval(
+                wrong_authority,
+                call.managed,
+                &call,
+                &approval,
+                &TestCredentialVerifier,
+            ),
+            Err(CleanManagementDecisionError::InvalidApproval)
+        );
+        let mut wrong_initial_epoch = fixture.binding;
+        wrong_initial_epoch.initial_epoch -= 1;
+        let mut wrong_authority = call.authority;
+        wrong_authority.binding = wrong_initial_epoch;
+        assert_eq!(
+            AuthorizedCleanManagementDecision::from_approval(
+                wrong_authority,
+                call.managed,
+                &call,
+                &approval,
+                &TestCredentialVerifier,
+            ),
+            Err(CleanManagementDecisionError::InvalidApproval)
+        );
+
+        let mut regressed_epoch = approval;
+        regressed_epoch.epoch = fixture.binding.initial_epoch - 1;
+        assert_eq!(regressed_epoch.validate_shape(), Ok(()));
+        assert_eq!(
+            AuthorizedCleanManagementDecision::from_approval(
+                call.authority,
+                call.managed,
+                &call,
+                &regressed_epoch,
+                &TestCredentialVerifier,
+            ),
+            Err(CleanManagementDecisionError::InvalidApproval)
+        );
+    }
+
+    #[test]
+    fn application_ack_is_pledged_after_reopen_and_is_exact_across_restart() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x28);
+        let fixture = fixture(&signer);
+        let management_request = request(0x2c);
+        let (call, approval) = approved_call(&fixture, 1, management_request);
+        let approved_decision = AuthorizedCleanManagementDecision::from_approval(
+            call.authority,
+            call.managed,
+            &call,
+            &approval,
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        let mut issuer = open(store.clone(), &fixture);
+        let receipt = issuer.issue(&approved_decision, &mut signer).unwrap();
+
+        let (second_call, second_approval) = approved_call(&fixture, 2, request(0x2f));
+        let second_decision = AuthorizedCleanManagementDecision::from_approval(
+            second_call.authority,
+            second_call.managed,
+            &second_call,
+            &second_approval,
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        let before_blocked_issue = store.image().unwrap();
+        let calls_before_blocked_issue = signer.calls;
+        assert!(matches!(
+            issuer.issue(&second_decision, &mut signer),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::ApplicationAckRequired
+            ))
+        ));
+        assert_eq!(store.image().unwrap(), before_blocked_issue);
+        assert_eq!(signer.calls, calls_before_blocked_issue);
+
+        assert!(matches!(
+            issuer.observe_durable(&receipt),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::ApplicationAckRequired
+            ))
+        ));
+
+        let reopened_state = Hash([0x2e; 32]);
+        let applied_at = fixture.context.valid_from;
+        let before_pledge = store.image().unwrap();
+        let mut wrong_signer = CountingSigner::new(0x2d);
+        assert!(matches!(
+            issuer.observe_durable_application(
+                &receipt,
+                reopened_state,
+                applied_at,
+                &mut wrong_signer,
+            ),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::WrongSigner
+            ))
+        ));
+        assert_eq!(store.image().unwrap(), before_pledge);
+        assert!(issuer.image.pending_application_ack.is_none());
+
+        signer.fail_next = true;
+        assert!(matches!(
+            issuer.observe_durable_application(&receipt, reopened_state, applied_at, &mut signer,),
+            Err(CleanManagementIssuerError::Signer(TestSignerError))
+        ));
+        assert_ne!(store.image().unwrap(), before_pledge);
+        assert!(issuer.image.pending_application_ack.is_some());
+        assert!(matches!(
+            issuer.issue(&decision(&fixture, 2, &request(0x2f)), &mut signer),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::ApplicationAckRequired
+            ))
+        ));
+
+        drop(issuer);
+        let mut issuer = open(store.clone(), &fixture);
+        let calls = signer.calls;
+        assert!(matches!(
+            issuer
+                .observe_durable_application(&receipt, Hash([0x30; 32]), applied_at, &mut signer,),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::DivergentApplicationAck
+            ))
+        ));
+        assert_eq!(signer.calls, calls);
+
+        let acknowledgement = issuer
+            .observe_durable_application(&receipt, reopened_state, applied_at, &mut signer)
+            .unwrap();
+        assert!(acknowledgement.matches_pending(&call, &approval));
+        assert_eq!(
+            acknowledgement.acknowledgement_invocation,
+            approval.acknowledgement_invocation
+        );
+        assert_eq!(acknowledgement.verify_with(&TestCredentialVerifier), Ok(()));
+        assert_eq!(issuer.acknowledged_through(), 1);
+        assert_eq!(issuer.retained_decisions(), 0);
+        assert!(
+            !issuer
+                .image
+                .acknowledged
+                .as_ref()
+                .unwrap()
+                .application_finalized
+        );
+
+        drop(issuer);
+        let mut issuer = open(store, &fixture);
+        let mut unavailable_signer = CountingSigner::new(0x31);
+        unavailable_signer.fail_next = true;
+        let exact_retry = issuer
+            .observe_durable_application(
+                &receipt,
+                reopened_state,
+                applied_at,
+                &mut unavailable_signer,
+            )
+            .unwrap();
+        assert_eq!(exact_retry, acknowledgement);
+        assert_eq!(unavailable_signer.calls, 0);
+        assert!(matches!(
+            issuer.issue(&second_decision, &mut unavailable_signer),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::ApplicationFinalizationRequired
+            ))
+        ));
+        assert!(matches!(
+            issuer.observe_durable_application(
+                &receipt,
+                Hash([0x32; 32]),
+                applied_at,
+                &mut unavailable_signer,
+            ),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::DivergentApplicationAck
+            ))
+        ));
+
+        let mut forged_acknowledgement = acknowledgement.clone();
+        forged_acknowledgement.signature[0] ^= 1;
+        assert!(matches!(
+            issuer.observe_durable_actor_finalization(&forged_acknowledgement),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::DivergentApplicationAck
+            ))
+        ));
+        assert!(matches!(
+            issuer.observe_durable_actor_finalization(&acknowledgement),
+            Ok(true)
+        ));
+        assert!(matches!(
+            issuer.observe_durable_actor_finalization(&acknowledgement),
+            Ok(false)
+        ));
+        assert!(
+            issuer
+                .image
+                .acknowledged
+                .as_ref()
+                .unwrap()
+                .application_finalized
+        );
+        assert!(issuer.issue(&second_decision, &mut signer).is_ok());
+
+        // A restart image cannot splice valid later receipts behind a rolled-
+        // back finalization marker, even though every individual signature is
+        // authentic.
+        let mut rolled_back_barrier = issuer.image.clone();
+        rolled_back_barrier
+            .acknowledged
+            .as_mut()
+            .unwrap()
+            .application_finalized = false;
+        assert!(CleanManagementIssuerImage::decode(&rolled_back_barrier.encode()).is_err());
+    }
+
+    #[test]
+    fn application_ack_recovers_an_ambiguous_final_commit_without_resigning() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x34);
+        let fixture = fixture(&signer);
+        let (call, approval) = approved_call(&fixture, 1, request(0x35));
+        let decision = AuthorizedCleanManagementDecision::from_approval(
+            call.authority,
+            call.managed,
+            &call,
+            &approval,
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        let mut issuer = open(store.clone(), &fixture);
+        let receipt = issuer.issue(&decision, &mut signer).unwrap();
+        let reopened_state = Hash([0x37; 32]);
+        let applied_at = fixture.context.valid_from;
+        store.fail_after_commit(2);
+        assert!(matches!(
+            issuer.observe_durable_application(&receipt, reopened_state, applied_at, &mut signer,),
+            Err(CleanManagementIssuerError::Storage(MemoryStoreError))
+        ));
+        assert!(issuer.is_poisoned());
+        let calls = signer.calls;
+
+        drop(issuer);
+        let mut issuer = open(store, &fixture);
+        let mut unavailable_signer = CountingSigner::new(0x38);
+        unavailable_signer.fail_next = true;
+        let acknowledgement = issuer
+            .observe_durable_application(
+                &receipt,
+                reopened_state,
+                applied_at,
+                &mut unavailable_signer,
+            )
+            .unwrap();
+        assert!(acknowledgement.matches_pending(&call, &approval));
+        assert_eq!(acknowledgement.verify_with(&TestCredentialVerifier), Ok(()));
+        assert_eq!(unavailable_signer.calls, 0);
+        assert_eq!(signer.calls, calls);
     }
 
     #[test]

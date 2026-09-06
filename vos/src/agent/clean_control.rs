@@ -678,6 +678,13 @@ mod tests {
         fn sign_authority_receipt(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error> {
             Ok(self.0.sign(message).to_bytes())
         }
+
+        fn sign_management_application_ack(
+            &mut self,
+            message: &[u8],
+        ) -> Result<[u8; 64], Self::Error> {
+            Ok(self.0.sign(message).to_bytes())
+        }
     }
 
     struct Fixture {
