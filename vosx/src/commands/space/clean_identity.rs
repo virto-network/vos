@@ -2,17 +2,18 @@
 //!
 //! These adapters do not discover, load, generate, clone, or serialize private
 //! key material. The caller owns both identities: an operator/root Ed25519
-//! keypair used for clean management receipts and an authenticated libp2p
-//! [`PeerId`] used for the transport node. Keeping those inputs explicit also
-//! prevents a compact legacy node prefix from becoming an authorization
-//! identity during the clean cutover.
+//! keypair used for clean management receipts and a node-transport Ed25519
+//! keypair whose exact libp2p [`PeerId`] identifies the replica. Keeping those
+//! inputs explicit also prevents a compact legacy node prefix from becoming
+//! an authorization identity during the clean cutover.
 
 use core::fmt;
 
 use libp2p::PeerId;
 use libp2p::identity::{KeyType, Keypair};
 use vos::agent::clean_authority_issuer::CleanManagementReceiptSigner;
-use vos::agent::sdk::{CredentialId, NodeId, PrincipalId};
+use vos::agent::sdk::private::{NodeEncryptionEnrollment, PRIVATE_SIGNATURE_BYTES};
+use vos::agent::sdk::{CredentialId, NodeId, PrincipalId, SpaceId};
 
 /// Stable failure surface for the explicit clean operator signer.
 ///
@@ -26,6 +27,8 @@ pub(crate) enum CleanIdentitySignerError {
     PublicKeyUnavailable,
     SigningFailed,
     InvalidSignatureLength,
+    InvalidEnrollment,
+    NonCanonicalPeerId,
 }
 
 impl fmt::Display for CleanIdentitySignerError {
@@ -33,9 +36,11 @@ impl fmt::Display for CleanIdentitySignerError {
         let message = match self {
             Self::NonEd25519Key => "clean operator identity is not Ed25519",
             Self::PublicKeyUnavailable => "clean operator Ed25519 public key is unavailable",
-            Self::SigningFailed => "clean operator Ed25519 signing failed",
-            Self::InvalidSignatureLength => {
-                "clean operator Ed25519 signer returned a non-64-byte signature"
+            Self::SigningFailed => "clean Ed25519 signing failed",
+            Self::InvalidSignatureLength => "clean Ed25519 signer returned a non-64-byte signature",
+            Self::InvalidEnrollment => "clean node encryption enrollment is invalid",
+            Self::NonCanonicalPeerId => {
+                "libp2p Ed25519 PeerId differs from the clean protocol encoding"
             }
         };
         formatter.write_str(message)
@@ -116,6 +121,44 @@ impl CleanManagementReceiptSigner for CleanOperatorIdentitySigner<'_> {
 /// libp2p PeerId. Compact routing hints are deliberately not accepted here.
 pub(crate) fn node_id_from_authenticated_peer(peer_id: &PeerId) -> NodeId {
     NodeId::of_authenticated_peer(&peer_id.to_bytes())
+}
+
+/// Produce the exact node-possession proof submitted with an authority node
+/// enrollment. The X25519 secret never enters this adapter: the caller passes
+/// only its public recipient key, and the independently owned libp2p transport
+/// key signs the complete Space/Principal/Node/key tuple.
+pub(crate) fn sign_node_encryption_enrollment(
+    transport_keypair: &Keypair,
+    space: SpaceId,
+    principal: PrincipalId,
+    encryption_public_key: [u8; 32],
+) -> Result<NodeEncryptionEnrollment, CleanIdentitySignerError> {
+    require_ed25519_key_type(transport_keypair.key_type())?;
+    let transport_public_key = transport_keypair
+        .public()
+        .try_into_ed25519()
+        .map_err(|_| CleanIdentitySignerError::PublicKeyUnavailable)?
+        .to_bytes();
+    let mut enrollment = NodeEncryptionEnrollment::from_keys(
+        space,
+        principal,
+        transport_public_key,
+        encryption_public_key,
+        [0; PRIVATE_SIGNATURE_BYTES],
+    );
+    if enrollment.transport_peer_id.as_slice() != transport_keypair.public().to_peer_id().to_bytes()
+    {
+        return Err(CleanIdentitySignerError::NonCanonicalPeerId);
+    }
+    enrollment.transport_signature = transport_keypair
+        .sign(&enrollment.signing_bytes())
+        .map_err(|_| CleanIdentitySignerError::SigningFailed)?
+        .try_into()
+        .map_err(|_| CleanIdentitySignerError::InvalidSignatureLength)?;
+    enrollment
+        .validate_shape()
+        .then_some(enrollment)
+        .ok_or(CleanIdentitySignerError::InvalidEnrollment)
 }
 
 fn require_ed25519_key_type(key_type: KeyType) -> Result<(), CleanIdentitySignerError> {
@@ -260,6 +303,44 @@ mod tests {
         let mut tampered = receipt;
         tampered.selector.request.0[0] ^= 1;
         assert!(tampered.verify_at(8, &StrictRawVerifier).is_err());
+    }
+
+    #[test]
+    fn node_enrollment_uses_libp2p_exact_peer_id_and_transport_signature() {
+        let keypair = operator_keypair();
+        let space = SpaceId([0x71; 32]);
+        let principal = PrincipalId([0x72; 32]);
+        let enrollment = sign_node_encryption_enrollment(&keypair, space, principal, [0x73; 32])
+            .expect("canonical node enrollment");
+
+        assert_eq!(enrollment.space, space);
+        assert_eq!(enrollment.principal, principal);
+        assert_eq!(
+            enrollment.transport_peer_id.as_slice(),
+            keypair.public().to_peer_id().to_bytes()
+        );
+        assert_eq!(
+            enrollment.node,
+            node_id_from_authenticated_peer(&keypair.public().to_peer_id())
+        );
+        let key = VerifyingKey::from_bytes(&enrollment.transport_public_key).unwrap();
+        assert!(
+            key.verify_strict(
+                &enrollment.signing_bytes(),
+                &Signature::from_bytes(&enrollment.transport_signature),
+            )
+            .is_ok()
+        );
+
+        let mut substituted = enrollment;
+        substituted.encryption_public_key[0] ^= 1;
+        assert!(
+            key.verify_strict(
+                &substituted.signing_bytes(),
+                &Signature::from_bytes(&substituted.transport_signature),
+            )
+            .is_err()
+        );
     }
 
     #[test]
