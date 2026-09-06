@@ -3,9 +3,9 @@
 //! The actor accepts canonical `ACC1` management calls and self-authenticating
 //! `AAD1` identity-admin calls delivered with an exact clean `AIC1` invocation
 //! context. It performs policy, credential, and Admin-accessibility checks
-//! inside the guest and retains exact results for replay. A Create approval
-//! remains pending until a separately signed durable-application
-//! acknowledgement is observed.
+//! inside the guest and retains exact results for replay. Agent and actor
+//! lifecycle approvals remain pending until separately signed exact
+//! durable-application acknowledgements are observed.
 
 #![cfg_attr(target_arch = "riscv64", no_std)]
 
@@ -41,6 +41,15 @@ pub const MAX_AUTHORITY_NODES: usize = 64;
 pub const MAX_AUTHORITY_PRINCIPALS: usize = 64;
 /// Maximum Agents for which this actor retains lifecycle policy state.
 pub const MAX_MANAGED_AGENTS: usize = 256;
+/// Actor-directory rows retained across all managed Agents. One Agent may use
+/// the complete standard-runtime actor ceiling; the authority's aggregate
+/// state-image limit is the intentionally stricter multi-Agent bound.
+pub const MAX_MANAGED_ACTORS: usize = vos::agent_sdk::STANDARD_MAX_ACTORS as usize;
+/// Removed installation identities remain consumed and cannot be reused. This
+/// is the maximum number of two-hash tombstone payloads that could fit in an
+/// otherwise empty canonical actor state; aggregate state sizing is stricter.
+pub const MAX_RETIRED_ACTOR_INSTALLATIONS: usize =
+    MAX_RUNTIME_STATE_BYTES / (2 * core::mem::size_of::<[u8; 32]>());
 /// Exact approvals are deliberately bounded. Saturation fails closed; records
 /// may only be retired by a future, explicitly ordered acknowledgement floor.
 pub const MAX_EXACT_RETRY_RECORDS: usize = 128;
@@ -348,6 +357,60 @@ pub struct ManagedAgentRow {
     pub authority: AuthorityBindingState,
 }
 
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct AuthorityBlobRow {
+    pub hash: [u8; 32],
+    pub len: u64,
+}
+
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct ManagedActorRow {
+    pub agent: [u8; 32],
+    pub actor: [u8; 32],
+    pub name: String,
+    pub parent: Option<[u8; 32]>,
+    pub deployment: [u8; 32],
+    pub program: [u8; 32],
+    pub producer: [u8; 32],
+    pub package: AuthorityBlobRow,
+    pub agent_schema: AuthorityBlobRow,
+    pub method_policy: AuthorityBlobRow,
+    pub constructor_abi: [u8; 32],
+    pub installation_data: Option<AuthorityBlobRow>,
+    pub state_layout: [u8; 32],
+    pub lanes: u8,
+    pub scheduling: bool,
+    pub proof_systems: Vec<[u8; 32]>,
+    pub actor_abi: u32,
+    /// The first post-bootstrap system-Agent install is the root catalog
+    /// admitted by authorization sequence three. It may not be suspended or
+    /// removed; only the same compatibility checks as an in-place upgrade may
+    /// evolve its package projection.
+    pub root_provenance: bool,
+    pub suspended: bool,
+    // Runtime-selected incarnation and lifecycle debt are deliberately absent:
+    // neither is carried by ACC1/MAP1/MAA1, so the authority cannot prove them
+    // from the signed durable-reopen protocol.
+    pub installation_id: [u8; 32],
+    pub registry_reservation: [u8; 32],
+    pub install_request: [u8; 32],
+}
+
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct RetiredActorInstallationRow {
+    pub agent: [u8; 32],
+    pub installation_id: [u8; 32],
+}
+
 fn root_managed_agent(config: SystemAuthorityConfiguration) -> ManagedAgentRow {
     ManagedAgentRow {
         agent: config.system_agent,
@@ -367,6 +430,30 @@ fn root_managed_agent(config: SystemAuthorityConfiguration) -> ManagedAgentRow {
 pub enum PendingManagementEffect {
     None,
     Create(ManagedAgentRow),
+    InstallActor {
+        agent: [u8; 32],
+        actor: [u8; 32],
+        parent: Option<[u8; 32]>,
+        installation_id: [u8; 32],
+    },
+    UpgradeActor {
+        agent: [u8; 32],
+        actor: [u8; 32],
+        from_deployment: [u8; 32],
+        to_deployment: [u8; 32],
+    },
+    SetActorSuspended {
+        agent: [u8; 32],
+        actor: [u8; 32],
+        deployment: [u8; 32],
+        suspended: bool,
+    },
+    RemoveActor {
+        agent: [u8; 32],
+        actor: [u8; 32],
+        deployment: [u8; 32],
+        installation_id: [u8; 32],
+    },
     UpgradeRuntime {
         agent: [u8; 32],
         from_deployment: [u8; 32],
@@ -423,6 +510,8 @@ pub struct AuthorityLinearState {
     nodes: Vec<NodeOwnerRow>,
     roles: Vec<PrincipalRoleRow>,
     managed_agents: Vec<ManagedAgentRow>,
+    managed_actors: Vec<ManagedActorRow>,
+    retired_actor_installations: Vec<RetiredActorInstallationRow>,
     retries: Vec<ExactRetryRecord>,
     admin_retries: Vec<AdminRetryRecord>,
 }
@@ -438,6 +527,8 @@ impl AuthorityLinearState {
             nodes: Vec::new(),
             roles: Vec::new(),
             managed_agents: Vec::new(),
+            managed_actors: Vec::new(),
+            retired_actor_installations: Vec::new(),
             retries: Vec::new(),
             admin_retries: Vec::new(),
         }
@@ -474,6 +565,8 @@ impl AuthorityLinearState {
             nodes,
             roles,
             managed_agents,
+            managed_actors: Vec::new(),
+            retired_actor_installations: Vec::new(),
             retries: Vec::new(),
             admin_retries: Vec::new(),
         }
@@ -481,7 +574,7 @@ impl AuthorityLinearState {
 }
 
 /// Linear policy state for one Space's built-in system Agent.
-#[actor(agent, state_version = 4)]
+#[actor(agent, state_version = 5)]
 pub struct SystemAuthority {
     #[state(const)]
     configuration: SystemAuthorityConfiguration,
@@ -1053,7 +1146,7 @@ fn finalize_application(
         return false;
     }
 
-    let Some(plan) = application_plan(configuration, state, &record.effect) else {
+    let Some(plan) = application_plan(configuration, state, &record.effect, &call, &ack) else {
         return false;
     };
     apply_application_plan(state, plan);
@@ -1072,6 +1165,19 @@ enum ApplicationPlan {
         index: usize,
         row: ManagedAgentRow,
     },
+    InstallActor {
+        index: usize,
+        row: ManagedActorRow,
+    },
+    ReplaceActor {
+        index: usize,
+        row: ManagedActorRow,
+    },
+    RemoveActor {
+        index: usize,
+        retired_index: usize,
+        retired: RetiredActorInstallationRow,
+    },
     UpgradeRuntime {
         index: usize,
         to_deployment: [u8; 32],
@@ -1084,7 +1190,12 @@ fn application_plan(
     configuration: &SystemAuthorityConfiguration,
     state: &AuthorityLinearState,
     effect: &PendingManagementEffect,
+    call: &AuthorityCredentialCall,
+    acknowledgement: &ManagementApplicationAck,
 ) -> Option<ApplicationPlan> {
+    if reconstruction_effect(configuration, state, call).as_ref() != Some(effect) {
+        return None;
+    }
     match effect {
         PendingManagementEffect::None => Some(ApplicationPlan::None),
         PendingManagementEffect::Create(row) => {
@@ -1104,6 +1215,81 @@ fn application_plan(
             Some(ApplicationPlan::Create {
                 index,
                 row: row.clone(),
+            })
+        }
+        PendingManagementEffect::InstallActor { .. } => {
+            let ManagementRequest::Install(install) = &call.request else {
+                return None;
+            };
+            let root_provenance = call.managed.agent.0 == configuration.system_agent
+                && acknowledgement.authorization_sequence.get()
+                    == configuration
+                        .bootstrap_authorization_high_water
+                        .checked_add(1)?;
+            let row = installed_actor_row(call.managed.agent, install, root_provenance);
+            let index = managed_actor(state, call.managed.agent, install.entry.actor).err()?;
+            Some(ApplicationPlan::InstallActor { index, row })
+        }
+        PendingManagementEffect::UpgradeActor { .. } => {
+            let ManagementRequest::UpgradeActor(upgrade) = &call.request else {
+                return None;
+            };
+            let index = managed_actor(state, call.managed.agent, upgrade.actor).ok()?;
+            let row = upgraded_actor_row(&state.managed_actors[index], upgrade)?;
+            Some(ApplicationPlan::ReplaceActor { index, row })
+        }
+        PendingManagementEffect::SetActorSuspended { suspended, .. } => {
+            let (actor, expected_deployment, requested_suspended) = match &call.request {
+                ManagementRequest::Suspend {
+                    actor,
+                    expected_deployment,
+                } => (*actor, *expected_deployment, true),
+                ManagementRequest::Resume {
+                    actor,
+                    expected_deployment,
+                } => (*actor, *expected_deployment, false),
+                _ => return None,
+            };
+            if requested_suspended != *suspended {
+                return None;
+            }
+            let index = managed_actor(state, call.managed.agent, actor).ok()?;
+            let mut row = state.managed_actors[index].clone();
+            if row.deployment != expected_deployment.0 || row.suspended == *suspended {
+                return None;
+            }
+            row.suspended = *suspended;
+            Some(ApplicationPlan::ReplaceActor { index, row })
+        }
+        PendingManagementEffect::RemoveActor { .. } => {
+            let ManagementRequest::RemoveLeaf {
+                actor,
+                expected_deployment,
+            } = &call.request
+            else {
+                return None;
+            };
+            let index = managed_actor(state, call.managed.agent, *actor).ok()?;
+            let row = &state.managed_actors[index];
+            if row.deployment != expected_deployment.0
+                || state.retired_actor_installations.len() >= MAX_RETIRED_ACTOR_INSTALLATIONS
+            {
+                return None;
+            }
+            let retired = RetiredActorInstallationRow {
+                agent: call.managed.agent.0,
+                installation_id: row.installation_id,
+            };
+            let retired_index = retired_actor_installation(
+                state,
+                call.managed.agent,
+                vos::agent_sdk::InstallationId(row.installation_id),
+            )
+            .err()?;
+            Some(ApplicationPlan::RemoveActor {
+                index,
+                retired_index,
+                retired,
             })
         }
         PendingManagementEffect::UpgradeRuntime {
@@ -1140,6 +1326,18 @@ fn apply_application_plan(state: &mut AuthorityLinearState, plan: ApplicationPla
     match plan {
         ApplicationPlan::None => {}
         ApplicationPlan::Create { index, row } => state.managed_agents.insert(index, row),
+        ApplicationPlan::InstallActor { index, row } => state.managed_actors.insert(index, row),
+        ApplicationPlan::ReplaceActor { index, row } => state.managed_actors[index] = row,
+        ApplicationPlan::RemoveActor {
+            index,
+            retired_index,
+            retired,
+        } => {
+            state.managed_actors.remove(index);
+            state
+                .retired_actor_installations
+                .insert(retired_index, retired);
+        }
         ApplicationPlan::UpgradeRuntime {
             index,
             to_deployment,
@@ -1250,13 +1448,27 @@ fn policy_effect(
         | ManagementRequest::UpgradeActor(_)
         | ManagementRequest::Suspend { .. }
         | ManagementRequest::Resume { .. }
-        | ManagementRequest::RemoveLeaf { .. }
-        | ManagementRequest::ChangeReplicas { .. } => {
+        | ManagementRequest::RemoveLeaf { .. } => {
             lifecycle_owner(configuration, state, call, role)?;
+            if pending_runtime_transition_conflicts(state, call)
+                || pending_actor_effect_conflicts(state, call)
+            {
+                return None;
+            }
+            projected_actor_effect(configuration, state, call)
+        }
+        ManagementRequest::ChangeReplicas { .. } => {
+            lifecycle_owner(configuration, state, call, role)?;
+            if pending_runtime_transition_conflicts(state, call) {
+                return None;
+            }
             Some(PendingManagementEffect::None)
         }
         ManagementRequest::UpgradeRuntime(upgrade) => {
             let row = lifecycle_owner(configuration, state, call, role)?;
+            if pending_runtime_transition_conflicts(state, call) {
+                return None;
+            }
             Some(PendingManagementEffect::UpgradeRuntime {
                 agent: row.agent,
                 from_deployment: row.runtime_deployment,
@@ -1324,6 +1536,487 @@ fn live_and_pending_agent_count(state: &AuthorityLinearState) -> usize {
             .count()
 }
 
+fn managed_actor(
+    state: &AuthorityLinearState,
+    agent: AgentId,
+    actor: ActorId,
+) -> core::result::Result<usize, usize> {
+    state.managed_actors.binary_search_by(|row| {
+        row.agent
+            .cmp(&agent.0)
+            .then_with(|| row.actor.cmp(&actor.0))
+    })
+}
+
+fn retired_actor_installation(
+    state: &AuthorityLinearState,
+    agent: AgentId,
+    installation: vos::agent_sdk::InstallationId,
+) -> core::result::Result<usize, usize> {
+    state.retired_actor_installations.binary_search_by(|row| {
+        row.agent
+            .cmp(&agent.0)
+            .then_with(|| row.installation_id.cmp(&installation.0))
+    })
+}
+
+fn protected_authority_actor(configuration: &SystemAuthorityConfiguration, actor: ActorId) -> bool {
+    actor.0 == configuration.binding.issuer.actor
+}
+
+fn pending_actor_effect_conflicts(
+    state: &AuthorityLinearState,
+    call: &AuthorityCredentialCall,
+) -> bool {
+    let (actor, installation, parent, disrupts_children) = match &call.request {
+        ManagementRequest::Install(install) => {
+            if state.managed_actors.len()
+                + state
+                    .retries
+                    .iter()
+                    .filter(|record| {
+                        record.invocation != call.invocation.0
+                            && !record.finalized
+                            && matches!(record.effect, PendingManagementEffect::InstallActor { .. })
+                    })
+                    .count()
+                >= MAX_MANAGED_ACTORS
+            {
+                return true;
+            }
+            (
+                install.entry.actor,
+                Some(install.installation_id),
+                install.entry.parent,
+                false,
+            )
+        }
+        ManagementRequest::UpgradeActor(upgrade) => (upgrade.actor, None, None, false),
+        ManagementRequest::Suspend { actor, .. } | ManagementRequest::RemoveLeaf { actor, .. } => {
+            (*actor, None, None, true)
+        }
+        ManagementRequest::Resume { actor, .. } => (*actor, None, None, false),
+        _ => return false,
+    };
+    state.retries.iter().any(|record| {
+        if record.invocation == call.invocation.0 || record.finalized {
+            return false;
+        }
+        match &record.effect {
+            PendingManagementEffect::InstallActor {
+                agent,
+                actor: pending_actor,
+                parent: pending_parent,
+                installation_id,
+            } => {
+                *pending_actor == actor.0
+                    || (*agent == call.managed.agent.0
+                        && (installation.is_some_and(|value| value.0 == *installation_id)
+                            || (disrupts_children && *pending_parent == Some(actor.0))))
+            }
+            PendingManagementEffect::UpgradeActor {
+                agent,
+                actor: pending_actor,
+                ..
+            } => *agent == call.managed.agent.0 && *pending_actor == actor.0,
+            PendingManagementEffect::SetActorSuspended {
+                agent,
+                actor: pending_actor,
+                suspended,
+                ..
+            } => {
+                *agent == call.managed.agent.0
+                    && (*pending_actor == actor.0
+                        || (*suspended && parent == Some(ActorId(*pending_actor))))
+            }
+            PendingManagementEffect::RemoveActor {
+                agent,
+                actor: pending_actor,
+                ..
+            } => {
+                *agent == call.managed.agent.0
+                    && (*pending_actor == actor.0 || parent == Some(ActorId(*pending_actor)))
+            }
+            _ => false,
+        }
+    })
+}
+
+fn pending_runtime_transition_conflicts(
+    state: &AuthorityLinearState,
+    call: &AuthorityCredentialCall,
+) -> bool {
+    let incoming_runtime_upgrade = matches!(&call.request, ManagementRequest::UpgradeRuntime(_));
+    state.retries.iter().any(|record| {
+        if record.invocation == call.invocation.0 || record.finalized {
+            return false;
+        }
+        if !incoming_runtime_upgrade {
+            return matches!(
+                &record.effect,
+                PendingManagementEffect::UpgradeRuntime { agent, .. }
+                    if *agent == call.managed.agent.0
+            );
+        }
+        let pending_agent = match &record.effect {
+            PendingManagementEffect::None => {
+                let Ok(pending) = AuthorityCredentialCall::decode(&record.credential_call_bytes)
+                else {
+                    return true;
+                };
+                pending.managed.agent.0
+            }
+            PendingManagementEffect::Create(row) => row.agent,
+            PendingManagementEffect::InstallActor { agent, .. }
+            | PendingManagementEffect::UpgradeActor { agent, .. }
+            | PendingManagementEffect::SetActorSuspended { agent, .. }
+            | PendingManagementEffect::RemoveActor { agent, .. }
+            | PendingManagementEffect::UpgradeRuntime { agent, .. } => *agent,
+        };
+        pending_agent == call.managed.agent.0
+    })
+}
+
+fn projected_actor_effect(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    call: &AuthorityCredentialCall,
+) -> Option<PendingManagementEffect> {
+    let agent = call.managed.agent;
+    let managed = &state.managed_agents[managed_agent(state, agent).ok()?];
+    let profile = agent_profile(managed.profile)?;
+    match &call.request {
+        ManagementRequest::Install(install) => {
+            if protected_authority_actor(configuration, install.entry.actor)
+                || install.entry.suspended
+                || install.validate_for_profile(profile).is_err()
+                || state.managed_actors.len() >= MAX_MANAGED_ACTORS
+                || state
+                    .managed_actors
+                    .iter()
+                    .any(|row| row.actor == install.entry.actor.0)
+                || state.managed_actors.iter().any(|row| {
+                    row.agent == agent.0 && row.installation_id == install.installation_id.0
+                })
+                || retired_actor_installation(state, agent, install.installation_id).is_ok()
+            {
+                return None;
+            }
+            let expected_actor = match install.entry.parent {
+                Some(parent) => {
+                    let parent_index = managed_actor(state, agent, parent).ok()?;
+                    if state.managed_actors[parent_index].suspended {
+                        return None;
+                    }
+                    ActorId::owned_child(parent, &install.entry.name)
+                }
+                None => ActorId::top_level(agent, &install.entry.name),
+            };
+            if expected_actor != install.entry.actor {
+                return None;
+            }
+            Some(PendingManagementEffect::InstallActor {
+                agent: agent.0,
+                actor: install.entry.actor.0,
+                parent: install.entry.parent.map(|parent| parent.0),
+                installation_id: install.installation_id.0,
+            })
+        }
+        ManagementRequest::UpgradeActor(upgrade) => {
+            if protected_authority_actor(configuration, upgrade.actor)
+                || !upgrade.requirements.supported_by(profile)
+            {
+                return None;
+            }
+            let row = &state.managed_actors[managed_actor(state, agent, upgrade.actor).ok()?];
+            let proof_systems = upgrade
+                .requirements
+                .proof_systems
+                .as_slice()
+                .iter()
+                .map(|system| system.0)
+                .collect::<Vec<_>>();
+            if row.deployment != upgrade.from_deployment.0
+                || row.constructor_abi != upgrade.constructor_abi.0
+                || row.state_layout != upgrade.state_layout.0
+                || row.lanes != upgrade.requirements.lanes.bits()
+                || row.scheduling != upgrade.requirements.scheduling
+                || row.proof_systems != proof_systems
+                || row.actor_abi != upgrade.contract.actor_abi
+                || (row.lanes != 0 && row.program != upgrade.to_program.0)
+            {
+                return None;
+            }
+            Some(PendingManagementEffect::UpgradeActor {
+                agent: agent.0,
+                actor: upgrade.actor.0,
+                from_deployment: upgrade.from_deployment.0,
+                to_deployment: upgrade.to_deployment.0,
+            })
+        }
+        ManagementRequest::Suspend {
+            actor,
+            expected_deployment,
+        }
+        | ManagementRequest::Resume {
+            actor,
+            expected_deployment,
+        } => {
+            if protected_authority_actor(configuration, *actor) {
+                return None;
+            }
+            let row = &state.managed_actors[managed_actor(state, agent, *actor).ok()?];
+            let suspended = matches!(&call.request, ManagementRequest::Suspend { .. });
+            if row.root_provenance
+                || row.deployment != expected_deployment.0
+                || row.suspended == suspended
+            {
+                return None;
+            }
+            Some(PendingManagementEffect::SetActorSuspended {
+                agent: agent.0,
+                actor: actor.0,
+                deployment: expected_deployment.0,
+                suspended,
+            })
+        }
+        ManagementRequest::RemoveLeaf {
+            actor,
+            expected_deployment,
+        } => {
+            if protected_authority_actor(configuration, *actor)
+                || state.retired_actor_installations.len() >= MAX_RETIRED_ACTOR_INSTALLATIONS
+            {
+                return None;
+            }
+            let row = &state.managed_actors[managed_actor(state, agent, *actor).ok()?];
+            if row.root_provenance
+                || row.deployment != expected_deployment.0
+                || state.managed_actors.iter().any(|candidate| {
+                    candidate.agent == agent.0 && candidate.parent == Some(actor.0)
+                })
+            {
+                return None;
+            }
+            Some(PendingManagementEffect::RemoveActor {
+                agent: agent.0,
+                actor: actor.0,
+                deployment: expected_deployment.0,
+                installation_id: row.installation_id,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn agent_profile(tag: u8) -> Option<AgentProfile> {
+    match tag {
+        value if value == AgentProfile::Local as u8 => Some(AgentProfile::Local),
+        value if value == AgentProfile::Shared as u8 => Some(AgentProfile::Shared),
+        value if value == AgentProfile::Private as u8 => Some(AgentProfile::Private),
+        _ => None,
+    }
+}
+
+fn authority_blob(reference: &vos::agent_sdk::BlobRef) -> AuthorityBlobRow {
+    AuthorityBlobRow {
+        hash: reference.hash.0,
+        len: reference.len,
+    }
+}
+
+fn installed_actor_row(
+    agent: AgentId,
+    install: &vos::agent_sdk::InstallActor,
+    root_provenance: bool,
+) -> ManagedActorRow {
+    let request = ManagementRequest::Install(Box::new(install.clone()));
+    ManagedActorRow {
+        agent: agent.0,
+        actor: install.entry.actor.0,
+        name: install.entry.name.clone(),
+        parent: install.entry.parent.map(|value| value.0),
+        deployment: install.entry.deployment.0,
+        program: install.entry.program.0,
+        producer: install.producer.0,
+        package: authority_blob(&install.package),
+        agent_schema: authority_blob(&install.agent_schema),
+        method_policy: authority_blob(&install.method_policy),
+        constructor_abi: install.constructor_abi.0,
+        installation_data: install
+            .installation_data
+            .as_ref()
+            .map(|data| authority_blob(&data.reference)),
+        state_layout: install.state_layout.0,
+        lanes: install.requirements.lanes.bits(),
+        scheduling: install.requirements.scheduling,
+        proof_systems: install
+            .requirements
+            .proof_systems
+            .as_slice()
+            .iter()
+            .map(|system| system.0)
+            .collect(),
+        actor_abi: install.contract.actor_abi,
+        root_provenance,
+        suspended: false,
+        installation_id: install.installation_id.0,
+        registry_reservation: install.registry_reservation.0,
+        install_request: request.commitment().0,
+    }
+}
+
+fn upgraded_actor_row(
+    current: &ManagedActorRow,
+    upgrade: &vos::agent_sdk::UpgradeActor,
+) -> Option<ManagedActorRow> {
+    let proof_systems = upgrade
+        .requirements
+        .proof_systems
+        .as_slice()
+        .iter()
+        .map(|system| system.0)
+        .collect::<Vec<_>>();
+    if current.actor != upgrade.actor.0
+        || current.deployment != upgrade.from_deployment.0
+        || current.constructor_abi != upgrade.constructor_abi.0
+        || current.state_layout != upgrade.state_layout.0
+        || current.lanes != upgrade.requirements.lanes.bits()
+        || current.scheduling != upgrade.requirements.scheduling
+        || current.proof_systems != proof_systems
+        || current.actor_abi != upgrade.contract.actor_abi
+        || (current.lanes != 0 && current.program != upgrade.to_program.0)
+    {
+        return None;
+    }
+    let mut row = current.clone();
+    row.deployment = upgrade.to_deployment.0;
+    row.program = upgrade.to_program.0;
+    row.producer = upgrade.producer.0;
+    row.package = authority_blob(&upgrade.package);
+    row.agent_schema = authority_blob(&upgrade.agent_schema);
+    row.method_policy = authority_blob(&upgrade.method_policy);
+    row.constructor_abi = upgrade.constructor_abi.0;
+    row.state_layout = upgrade.state_layout.0;
+    row.lanes = upgrade.requirements.lanes.bits();
+    row.scheduling = upgrade.requirements.scheduling;
+    row.proof_systems = proof_systems;
+    row.actor_abi = upgrade.contract.actor_abi;
+    Some(row)
+}
+
+fn actor_projection_is_valid(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+) -> bool {
+    if state.managed_actors.len() > MAX_MANAGED_ACTORS
+        || state.retired_actor_installations.len() > MAX_RETIRED_ACTOR_INSTALLATIONS
+        || state
+            .managed_actors
+            .iter()
+            .filter(|row| row.root_provenance)
+            .count()
+            > 1
+        || state
+            .managed_actors
+            .windows(2)
+            .any(|pair| (pair[0].agent, pair[0].actor) >= (pair[1].agent, pair[1].actor))
+        || state.retired_actor_installations.windows(2).any(|pair| {
+            (pair[0].agent, pair[0].installation_id) >= (pair[1].agent, pair[1].installation_id)
+        })
+    {
+        return false;
+    }
+    let mut actor_ids = state
+        .managed_actors
+        .iter()
+        .map(|row| row.actor)
+        .collect::<Vec<_>>();
+    actor_ids.sort_unstable();
+    if actor_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return false;
+    }
+    let mut installation_ids = state
+        .managed_actors
+        .iter()
+        .map(|row| (row.agent, row.installation_id))
+        .collect::<Vec<_>>();
+    installation_ids.sort_unstable();
+    if installation_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return false;
+    }
+    for row in &state.managed_actors {
+        let Ok(agent_index) = managed_agent(state, AgentId(row.agent)) else {
+            return false;
+        };
+        let Some(profile) = agent_profile(state.managed_agents[agent_index].profile) else {
+            return false;
+        };
+        let Some(lanes) = vos::agent_sdk::LaneSet::from_bits(row.lanes) else {
+            return false;
+        };
+        let expected_actor = match row.parent {
+            Some(parent) => {
+                if managed_actor(state, AgentId(row.agent), ActorId(parent)).is_err() {
+                    return false;
+                }
+                ActorId::owned_child(ActorId(parent), &row.name)
+            }
+            None => ActorId::top_level(AgentId(row.agent), &row.name),
+        };
+        if row.agent == [0; 32]
+            || row.actor == [0; 32]
+            || protected_authority_actor(configuration, ActorId(row.actor))
+            || row.name.is_empty()
+            || row.name.len() > vos::agent_sdk::MAX_ACTOR_NAME_BYTES
+            || expected_actor.0 != row.actor
+            || row.deployment == [0; 32]
+            || row.program == [0; 32]
+            || row.producer == [0; 32]
+            || !authority_blob_is_valid(&row.package, false)
+            || !authority_blob_is_valid(&row.agent_schema, false)
+            || !authority_blob_is_valid(&row.method_policy, false)
+            || row
+                .installation_data
+                .as_ref()
+                .is_some_and(|blob| !authority_blob_is_valid(blob, true))
+            || row.constructor_abi == [0; 32]
+            || row.state_layout == [0; 32]
+            || !lanes.supported_by(profile)
+            || row.proof_systems.len() > vos::agent_sdk::proof_system::MAX_PROOF_SYSTEMS
+            || row.proof_systems.iter().any(|system| *system == [0; 32])
+            || row.proof_systems.windows(2).any(|pair| pair[0] >= pair[1])
+            || row.actor_abi == 0
+            || (row.root_provenance && row.agent != configuration.system_agent)
+            || row.installation_id == [0; 32]
+            || row.registry_reservation == [0; 32]
+            || row.install_request == [0; 32]
+            || retired_actor_installation(
+                state,
+                AgentId(row.agent),
+                vos::agent_sdk::InstallationId(row.installation_id),
+            )
+            .is_ok()
+        {
+            return false;
+        }
+    }
+    state.retired_actor_installations.iter().all(|row| {
+        row.agent != [0; 32]
+            && row.installation_id != [0; 32]
+            && managed_agent(state, AgentId(row.agent)).is_ok()
+    })
+}
+
+fn authority_blob_is_valid(row: &AuthorityBlobRow, installation_data: bool) -> bool {
+    row.hash != [0; 32]
+        && if installation_data {
+            row.len <= vos::agent_sdk::MAX_INSTALLATION_DATA_BYTES as u64
+        } else {
+            row.len != 0 && row.len <= vos::agent_sdk::MAX_CATALOG_ARTIFACT_BYTES
+        }
+}
+
 fn narrowed_validity(call: &AuthorityCredentialCall, observed_slot: u64) -> Option<(u64, u64)> {
     let horizon = observed_slot.saturating_add(MAX_APPROVAL_VALIDITY_SLOTS);
     let valid_from = max(call.requested_valid_from, observed_slot);
@@ -1354,6 +2047,8 @@ fn authority_state_is_valid(
         && state.nodes.len() <= MAX_AUTHORITY_NODES
         && state.roles.len() <= MAX_AUTHORITY_PRINCIPALS
         && state.managed_agents.len() <= MAX_MANAGED_AGENTS
+        && state.managed_actors.len() <= MAX_MANAGED_ACTORS
+        && state.retired_actor_installations.len() <= MAX_RETIRED_ACTOR_INSTALLATIONS
         && state
             .retries
             .len()
@@ -1405,6 +2100,7 @@ fn authority_state_is_valid(
                     .binary_search_by(|role| role.principal.cmp(&row.owner))
                     .is_ok()
         })
+        && actor_projection_is_valid(configuration, state)
         && state.retries.iter().all(|row| {
             row.invocation != [0; 32]
                 && row.acknowledgement_invocation != [0; 32]
@@ -1489,14 +2185,18 @@ fn management_history_reconstructs_policy(
             {
                 return false;
             }
-            let Some(plan) = application_plan(configuration, &replay, &record.effect) else {
+            let Some(plan) = application_plan(configuration, &replay, &record.effect, &call, &ack)
+            else {
                 return false;
             };
             apply_application_plan(&mut replay, plan);
         }
+        replay.retries.push((*record).clone());
     }
     replay.authorization_sequence == state.authorization_sequence
         && replay.managed_agents == state.managed_agents
+        && replay.managed_actors == state.managed_actors
+        && replay.retired_actor_installations == state.retired_actor_installations
 }
 
 fn reconstruction_effect(
@@ -1506,7 +2206,29 @@ fn reconstruction_effect(
 ) -> Option<PendingManagementEffect> {
     match &call.request {
         ManagementRequest::Create(descriptor) => {
-            if descriptor.authority != configuration.binding.sdk() {
+            if descriptor.authority != configuration.binding.sdk()
+                || managed_agent(state, descriptor.identity.agent).is_ok()
+                || state.retries.iter().any(|record| {
+                    record.invocation != call.invocation.0
+                        && !record.finalized
+                        && matches!(
+                            &record.effect,
+                            PendingManagementEffect::Create(row)
+                                if row.agent == descriptor.identity.agent.0
+                        )
+                })
+                || state.managed_agents.len()
+                    + state
+                        .retries
+                        .iter()
+                        .filter(|record| {
+                            record.invocation != call.invocation.0
+                                && !record.finalized
+                                && matches!(record.effect, PendingManagementEffect::Create(_))
+                        })
+                        .count()
+                    >= MAX_MANAGED_AGENTS
+            {
                 return None;
             }
             Some(PendingManagementEffect::Create(ManagedAgentRow {
@@ -1524,13 +2246,27 @@ fn reconstruction_effect(
         | ManagementRequest::UpgradeActor(_)
         | ManagementRequest::Suspend { .. }
         | ManagementRequest::Resume { .. }
-        | ManagementRequest::RemoveLeaf { .. }
-        | ManagementRequest::ChangeReplicas { .. } => {
+        | ManagementRequest::RemoveLeaf { .. } => {
             reconstruction_lifecycle_row(configuration, state, call)?;
+            if pending_runtime_transition_conflicts(state, call)
+                || pending_actor_effect_conflicts(state, call)
+            {
+                return None;
+            }
+            projected_actor_effect(configuration, state, call)
+        }
+        ManagementRequest::ChangeReplicas { .. } => {
+            reconstruction_lifecycle_row(configuration, state, call)?;
+            if pending_runtime_transition_conflicts(state, call) {
+                return None;
+            }
             Some(PendingManagementEffect::None)
         }
         ManagementRequest::UpgradeRuntime(upgrade) => {
             let row = reconstruction_lifecycle_row(configuration, state, call)?;
+            if pending_runtime_transition_conflicts(state, call) {
+                return None;
+            }
             Some(PendingManagementEffect::UpgradeRuntime {
                 agent: row.agent,
                 from_deployment: row.runtime_deployment,
@@ -1716,8 +2452,9 @@ mod tests {
     use vos::agent_sdk::contract::{ActorPackageContract, RuntimePackageContract};
     use vos::agent_sdk::{
         ActorEntry, AgentDescriptor, AgentIdentity, AgentReplica, BlobRef, InstallActor,
-        InstallationId, InvocationOrigin, InvocationRoleClaims, LaneSet, MethodMode, NodeId,
-        ProofSystemSet, ReplicaRole, RoleId, RuntimeCapabilities, RuntimeRequirements,
+        InstallationData, InstallationId, InvocationOrigin, InvocationRoleClaims, LaneSet,
+        MethodMode, NodeId, ProofSystemSet, ReplicaRole, RoleId, RuntimeCapabilities,
+        RuntimeRequirements, UpgradeActor,
     };
 
     const ADMIN_PRINCIPAL: PrincipalId = PrincipalId([0x31; 32]);
@@ -1823,35 +2560,40 @@ mod tests {
         }
     }
 
-    fn catalog_install(config: SystemAuthorityConfiguration) -> InstallActor {
-        let package = BlobRef::of_bytes(b"system-catalog-package");
-        let agent_schema = BlobRef::of_bytes(b"system-catalog-schema");
-        let method_policy = BlobRef::of_bytes(b"system-catalog-policy");
+    fn actor_install(agent: AgentId, name: &str, marker: u8) -> InstallActor {
+        let package = BlobRef::of_bytes(&[marker, 1]);
+        let agent_schema = BlobRef::of_bytes(&[marker, 2]);
+        let method_policy = BlobRef::of_bytes(&[marker, 3]);
+        let installation_bytes = vec![marker, 4];
+        let installation_data = InstallationData {
+            reference: BlobRef::of_bytes(&installation_bytes),
+            bytes: installation_bytes,
+        };
         let lanes = LaneSet::of(vos::agent_sdk::StateLane::Merge);
         let entry = ActorEntry {
-            actor: ActorId::top_level(AgentId(config.system_agent), "system-catalog"),
-            name: "system-catalog".into(),
+            actor: ActorId::top_level(agent, name),
+            name: name.into(),
             parent: None,
-            deployment: DeploymentId([0x24; 32]),
-            program: ProgramId([0x25; 32]),
+            deployment: DeploymentId([marker; 32]),
+            program: ProgramId([marker.wrapping_add(1); 32]),
             package: package.clone(),
             agent_schema: agent_schema.clone(),
             method_policy: method_policy.clone(),
-            constructor_abi: Hash([0x26; 32]),
-            installation_data: None,
-            state_layout: Hash([0x27; 32]),
+            constructor_abi: Hash([marker.wrapping_add(2); 32]),
+            installation_data: Some(installation_data.reference.clone()),
+            state_layout: Hash([marker.wrapping_add(3); 32]),
             lanes,
             suspended: false,
         };
         InstallActor {
-            installation_id: InstallationId([0x28; 32]),
-            registry_reservation: Hash([0x29; 32]),
-            producer: ProducerId([0x2a; 32]),
+            installation_id: InstallationId([marker.wrapping_add(4); 32]),
+            registry_reservation: Hash([marker.wrapping_add(5); 32]),
+            producer: ProducerId([marker.wrapping_add(6); 32]),
             package,
             agent_schema,
             method_policy,
             constructor_abi: entry.constructor_abi,
-            installation_data: None,
+            installation_data: Some(installation_data),
             state_layout: entry.state_layout,
             contract: ActorPackageContract::canonical(),
             requirements: RuntimeRequirements {
@@ -1861,6 +2603,79 @@ mod tests {
             },
             entry,
         }
+    }
+
+    fn catalog_install(config: SystemAuthorityConfiguration) -> InstallActor {
+        actor_install(AgentId(config.system_agent), "system-catalog", 0x24)
+    }
+
+    fn actor_upgrade(install: &InstallActor, marker: u8) -> UpgradeActor {
+        UpgradeActor {
+            actor: install.entry.actor,
+            from_deployment: install.entry.deployment,
+            to_deployment: DeploymentId([marker; 32]),
+            // The fixture is stateful, so the runtime's no-migration rule
+            // requires an exact program identity across an in-place upgrade.
+            to_program: install.entry.program,
+            producer: ProducerId([marker.wrapping_add(1); 32]),
+            package: BlobRef::of_bytes(&[marker, 1]),
+            agent_schema: BlobRef::of_bytes(&[marker, 2]),
+            method_policy: BlobRef::of_bytes(&[marker, 3]),
+            constructor_abi: install.constructor_abi,
+            state_layout: install.state_layout,
+            contract: install.contract,
+            requirements: install.requirements,
+        }
+    }
+
+    fn assert_installed_projection(
+        row: &ManagedActorRow,
+        agent: AgentId,
+        install: &InstallActor,
+        root_provenance: bool,
+    ) {
+        assert_eq!(row.agent, agent.0);
+        assert_eq!(row.actor, install.entry.actor.0);
+        assert_eq!(row.name, install.entry.name);
+        assert_eq!(row.parent, install.entry.parent.map(|parent| parent.0));
+        assert_eq!(row.deployment, install.entry.deployment.0);
+        assert_eq!(row.program, install.entry.program.0);
+        assert_eq!(row.producer, install.producer.0);
+        assert_eq!(row.package, authority_blob(&install.package));
+        assert_eq!(row.agent_schema, authority_blob(&install.agent_schema));
+        assert_eq!(row.method_policy, authority_blob(&install.method_policy));
+        assert_eq!(row.constructor_abi, install.constructor_abi.0);
+        assert_eq!(
+            row.installation_data,
+            install
+                .installation_data
+                .as_ref()
+                .map(|data| authority_blob(&data.reference))
+        );
+        assert_eq!(row.state_layout, install.state_layout.0);
+        assert_eq!(row.lanes, install.requirements.lanes.bits());
+        assert_eq!(row.scheduling, install.requirements.scheduling);
+        assert_eq!(
+            row.proof_systems,
+            install
+                .requirements
+                .proof_systems
+                .as_slice()
+                .iter()
+                .map(|system| system.0)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(row.actor_abi, install.contract.actor_abi);
+        assert_eq!(row.root_provenance, root_provenance);
+        assert!(!row.suspended);
+        assert_eq!(row.installation_id, install.installation_id.0);
+        assert_eq!(row.registry_reservation, install.registry_reservation.0);
+        assert_eq!(
+            row.install_request,
+            ManagementRequest::Install(Box::new(install.clone()))
+                .commitment()
+                .0
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2147,6 +2962,124 @@ mod tests {
         assert!(!dispatch_admin(actor, &call).is_empty());
     }
 
+    /// Build a canonical Admin history without revalidating its entire prefix
+    /// after every fixture operation. Tests using this helper validate the
+    /// completed state once, exercising the same replay invariant in linear
+    /// rather than quadratic signature-verification time.
+    fn record_fixture_admin(
+        actor: &mut SystemAuthority,
+        invocation: InvocationId,
+        operation: AuthorityAdminOperation,
+    ) {
+        let key = signing(0x21);
+        let mut call = admin_call(
+            actor.configuration,
+            &key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            1,
+            actor.state.administration_generation,
+            operation,
+        );
+        call.invocation = invocation;
+        resign_admin(&mut call, &key);
+        assert!(authenticated_admin(&actor.state, &call));
+        let generation = call.next_generation().unwrap();
+        assert!(apply_admin_operation(&mut actor.state, &call.operation));
+        actor.state.administration_generation = generation.get();
+        let result = AuthorityAdminResult::from_call(call.clone()).unwrap();
+        let call_bytes = call.encode().unwrap();
+        let result_bytes = result.encode().unwrap();
+        let index = actor
+            .state
+            .admin_retries
+            .binary_search_by(|record| record.invocation.cmp(&invocation.0))
+            .expect_err("fixture Admin invocation must be unique");
+        actor.state.admin_retries.insert(
+            index,
+            AdminRetryRecord {
+                invocation: invocation.0,
+                call_commitment: call.commitment().0,
+                call_bytes,
+                result_commitment: result.commitment().0,
+                result_bytes,
+                generation: generation.get(),
+            },
+        );
+    }
+
+    /// Append one canonical pending approval without replaying every existing
+    /// history prefix. Capacity tests validate the completed history once.
+    fn record_fixture_approval(
+        actor: &mut SystemAuthority,
+        call: &AuthorityCredentialCall,
+    ) -> Vec<u8> {
+        let state = &mut actor.state;
+        let encoded_call = call.encode().unwrap();
+        assert!(call.verify_with(&Ed25519CredentialVerifier).is_ok());
+        let acknowledgement_invocation =
+            ManagementApproval::derive_acknowledgement_invocation(call);
+        assert!(invocation_pair_is_available(
+            state,
+            call.invocation,
+            acknowledgement_invocation,
+        ));
+        let role = authenticated_role(state, call).unwrap();
+        let effect = policy_effect(&actor.configuration, state, call, role).unwrap();
+        let authorization_sequence = state.authorization_sequence.checked_add(1).unwrap();
+        let sequence = NonZeroU64::new(authorization_sequence).unwrap();
+        let (valid_from, expires_at) = narrowed_validity(call, OBSERVED_SLOT).unwrap();
+        let approval = ManagementApproval::from_call(
+            call,
+            sequence,
+            AuthorityEvidence {
+                package: None,
+                proof: None,
+                commitment: Hash::digest(
+                    EVIDENCE_DOMAIN,
+                    &[
+                        &actor.configuration.binding.policy,
+                        call.commitment().as_bytes(),
+                        &[role as u8],
+                        &authorization_sequence.to_le_bytes(),
+                        &OBSERVED_SLOT.to_le_bytes(),
+                    ],
+                ),
+            },
+            AuthorityLaneRoots::default(),
+            state.epoch,
+            valid_from,
+            expires_at,
+        )
+        .unwrap();
+        assert_eq!(
+            approval.acknowledgement_invocation,
+            acknowledgement_invocation
+        );
+        let approval_bytes = approval.encode().unwrap();
+        let index = retry_record(state, call.invocation).unwrap_err();
+        state.authorization_sequence = authorization_sequence;
+        state.retries.insert(
+            index,
+            ExactRetryRecord {
+                invocation: call.invocation.0,
+                acknowledgement_invocation: acknowledgement_invocation.0,
+                credential_call: call.commitment().0,
+                credential_call_bytes: encoded_call,
+                approval_commitment: approval.commitment().0,
+                authorization_sequence,
+                approval: approval_bytes.clone(),
+                effect,
+                finalized: false,
+                acknowledgement: None,
+                acknowledgement_bytes: None,
+                reopened_state: None,
+                applied_at: None,
+            },
+        );
+        approval_bytes
+    }
+
     fn enrollment(
         key: &SigningKey,
         kind: AuthorityCredentialKind,
@@ -2241,6 +3174,11 @@ mod tests {
         let config = actor.configuration;
         for ordinal in 1..=count {
             let byte = u8::try_from(ordinal).expect("bounded retry fixture");
+            let install = actor_install(
+                AgentId(config.system_agent),
+                &std::format!("pending-{ordinal}"),
+                byte,
+            );
             let call = credential_call(
                 config,
                 &signing(0x21),
@@ -2248,12 +3186,9 @@ mod tests {
                 Some(ADMIN_NODE),
                 byte,
                 system_target(config),
-                ManagementRequest::Suspend {
-                    actor: ActorId([byte; 32]),
-                    expected_deployment: DeploymentId([byte.wrapping_add(1); 32]),
-                },
+                ManagementRequest::Install(Box::new(install)),
             );
-            assert!(!dispatch(actor, &call).is_empty());
+            assert!(!record_fixture_approval(actor, &call).is_empty());
         }
     }
 
@@ -2266,8 +3201,8 @@ mod tests {
         assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
         assert_eq!(
             <SystemAuthority as vos::Actor>::STATE_SCHEMA_VERSION,
-            4,
-            "the seeded Linear state is a clean state generation",
+            5,
+            "the actor projection is a clean Linear state generation",
         );
 
         let mut old_generation = encoded.clone();
@@ -2338,7 +3273,8 @@ mod tests {
         assert_eq!(actor.state.managed_agents, vec![expected_seed.clone()]);
         assert!(authority_state_is_valid(&config, &actor.state));
 
-        let request = ManagementRequest::Install(Box::new(catalog_install(config)));
+        let install = catalog_install(config);
+        let request = ManagementRequest::Install(Box::new(install.clone()));
         let call = credential_call(
             config,
             &signing(0x21),
@@ -2354,10 +3290,89 @@ mod tests {
         assert_eq!(approval.authorization_sequence.get(), 3);
         assert_eq!(actor.state.authorization_sequence, 3);
         assert_eq!(actor.state.managed_agents, vec![expected_seed.clone()]);
+        assert!(actor.state.managed_actors.is_empty());
         assert!(matches!(
-            actor.state.retries[0].effect,
-            PendingManagementEffect::None
+            &actor.state.retries[0].effect,
+            PendingManagementEffect::InstallActor {
+                agent,
+                actor,
+                parent,
+                installation_id,
+            } if *agent == config.system_agent
+                && *actor == install.entry.actor.0
+                && parent.is_none()
+                && *installation_id == install.installation_id.0
         ));
+        assert!(authority_state_is_valid(&config, &actor.state));
+
+        let ack = application_ack(config, &call, &approval);
+        let expected_actor = installed_actor_row(AgentId(config.system_agent), &install, true);
+        assert!(dispatch_ack(&mut actor, &ack));
+        assert_eq!(actor.state.managed_actors, vec![expected_actor.clone()]);
+        assert_installed_projection(
+            &actor.state.managed_actors[0],
+            AgentId(config.system_agent),
+            &install,
+            true,
+        );
+        assert_eq!(actor.state.managed_actors[0].name, "system-catalog");
+        assert!(actor.state.managed_actors[0].root_provenance);
+        assert_eq!(
+            actor.state.managed_actors[0].installation_data,
+            install
+                .installation_data
+                .as_ref()
+                .map(|data| authority_blob(&data.reference))
+        );
+        let protected = actor.state.clone();
+        for (invocation, request) in [
+            (
+                0x2c,
+                ManagementRequest::Suspend {
+                    actor: install.entry.actor,
+                    expected_deployment: install.entry.deployment,
+                },
+            ),
+            (
+                0x2d,
+                ManagementRequest::Resume {
+                    actor: install.entry.actor,
+                    expected_deployment: install.entry.deployment,
+                },
+            ),
+            (
+                0x2e,
+                ManagementRequest::RemoveLeaf {
+                    actor: install.entry.actor,
+                    expected_deployment: install.entry.deployment,
+                },
+            ),
+        ] {
+            let protected_call = credential_call(
+                config,
+                &signing(0x21),
+                ADMIN_PRINCIPAL,
+                Some(ADMIN_NODE),
+                invocation,
+                system_target(config),
+                request,
+            );
+            assert!(dispatch(&mut actor, &protected_call).is_empty());
+            assert_eq!(actor.state, protected);
+        }
+        let mut incompatible = actor_upgrade(&install, 0x2f);
+        incompatible.state_layout = Hash([0x30; 32]);
+        let incompatible_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x32,
+            system_target(config),
+            ManagementRequest::UpgradeActor(Box::new(incompatible)),
+        );
+        assert!(dispatch(&mut actor, &incompatible_call).is_empty());
+        assert_eq!(actor.state, protected);
 
         let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
         let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
@@ -2369,8 +3384,364 @@ mod tests {
         .expect("seeded SAC2 authority state restarts");
         assert_eq!(restarted.state.authorization_sequence, 3);
         assert_eq!(restarted.state.managed_agents, vec![expected_seed]);
+        assert_eq!(restarted.state.managed_actors, vec![expected_actor]);
         assert!(authority_state_is_valid(&config, &restarted.state));
         assert_eq!(dispatch(&mut restarted, &call), approval_bytes);
+        let finalized = restarted.state.clone();
+        assert!(dispatch_ack(&mut restarted, &ack));
+        assert_eq!(restarted.state, finalized);
+    }
+
+    #[test]
+    fn actor_projection_changes_only_after_exact_acknowledged_lifecycle_operations() {
+        let config = configuration();
+        let mut actor = actor();
+        let managed_descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Local, 0x4f);
+        insert_live(&mut actor, &managed_descriptor);
+        let managed = target_for(&managed_descriptor);
+        let install = actor_install(managed.agent, "lifecycle", 0x50);
+        let install_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x51,
+            managed,
+            ManagementRequest::Install(Box::new(install.clone())),
+        );
+        let install_approval = ManagementApproval::decode(&dispatch(&mut actor, &install_call))
+            .expect("valid Install is approved");
+        assert_eq!(install_approval.authorization_sequence.get(), 4);
+        assert!(actor.state.managed_actors.is_empty());
+
+        let duplicate = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x52,
+            managed,
+            ManagementRequest::Install(Box::new(install.clone())),
+        );
+        let pending = actor.state.clone();
+        assert!(dispatch(&mut actor, &duplicate).is_empty());
+        assert_eq!(actor.state, pending);
+
+        let install_ack = application_ack(config, &install_call, &install_approval);
+        let installed = installed_actor_row(managed.agent, &install, false);
+        assert!(dispatch_ack(&mut actor, &install_ack));
+        assert_eq!(actor.state.managed_actors, vec![installed.clone()]);
+        assert_installed_projection(
+            &actor.state.managed_actors[0],
+            managed.agent,
+            &install,
+            false,
+        );
+
+        let mut stale_upgrade = actor_upgrade(&install, 0x53);
+        stale_upgrade.from_deployment = DeploymentId([0x54; 32]);
+        let stale_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x55,
+            managed,
+            ManagementRequest::UpgradeActor(Box::new(stale_upgrade)),
+        );
+        let before_stale = actor.state.clone();
+        assert!(dispatch(&mut actor, &stale_call).is_empty());
+        assert_eq!(actor.state, before_stale);
+
+        let upgrade = actor_upgrade(&install, 0x56);
+        let upgrade_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x57,
+            managed,
+            ManagementRequest::UpgradeActor(Box::new(upgrade.clone())),
+        );
+        let before_upgrade_ack = actor.state.managed_actors.clone();
+        let upgrade_approval = ManagementApproval::decode(&dispatch(&mut actor, &upgrade_call))
+            .expect("compatible UpgradeActor is approved");
+        assert_eq!(upgrade_approval.authorization_sequence.get(), 5);
+        assert_eq!(actor.state.managed_actors, before_upgrade_ack);
+        let upgrade_ack = application_ack(config, &upgrade_call, &upgrade_approval);
+        let mut divergent_ack = upgrade_ack.clone();
+        divergent_ack.request = Hash([0x58; 32]);
+        divergent_ack.receipt.selector.request = divergent_ack.request;
+        resign_receipt(&mut divergent_ack.receipt);
+        resign_ack(&mut divergent_ack);
+        let before_divergent_ack = actor.state.clone();
+        assert!(!dispatch_ack(&mut actor, &divergent_ack));
+        assert_eq!(actor.state, before_divergent_ack);
+        assert!(dispatch_ack(&mut actor, &upgrade_ack));
+        let upgraded = upgraded_actor_row(&installed, &upgrade).expect("compatible row update");
+        assert_eq!(actor.state.managed_actors, vec![upgraded.clone()]);
+        let projected = &actor.state.managed_actors[0];
+        assert_eq!(projected.deployment, upgrade.to_deployment.0);
+        assert_eq!(projected.program, upgrade.to_program.0);
+        assert_eq!(projected.producer, upgrade.producer.0);
+        assert_eq!(projected.package, authority_blob(&upgrade.package));
+        assert_eq!(
+            projected.agent_schema,
+            authority_blob(&upgrade.agent_schema)
+        );
+        assert_eq!(
+            projected.method_policy,
+            authority_blob(&upgrade.method_policy)
+        );
+        assert_eq!(projected.installation_data, installed.installation_data);
+        assert_eq!(projected.installation_id, installed.installation_id);
+        assert_eq!(
+            projected.registry_reservation,
+            installed.registry_reservation
+        );
+        assert_eq!(projected.install_request, installed.install_request);
+
+        let stale_after_upgrade = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x59,
+            managed,
+            ManagementRequest::Suspend {
+                actor: install.entry.actor,
+                expected_deployment: install.entry.deployment,
+            },
+        );
+        let before_stale = actor.state.clone();
+        assert!(dispatch(&mut actor, &stale_after_upgrade).is_empty());
+        assert_eq!(actor.state, before_stale);
+
+        let suspend_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x5a,
+            managed,
+            ManagementRequest::Suspend {
+                actor: install.entry.actor,
+                expected_deployment: upgrade.to_deployment,
+            },
+        );
+        let suspend_approval = ManagementApproval::decode(&dispatch(&mut actor, &suspend_call))
+            .expect("exact Suspend is approved");
+        assert_eq!(suspend_approval.authorization_sequence.get(), 6);
+        assert!(!actor.state.managed_actors[0].suspended);
+        assert!(dispatch_ack(
+            &mut actor,
+            &application_ack(config, &suspend_call, &suspend_approval)
+        ));
+        assert!(actor.state.managed_actors[0].suspended);
+
+        let resume_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x5b,
+            managed,
+            ManagementRequest::Resume {
+                actor: install.entry.actor,
+                expected_deployment: upgrade.to_deployment,
+            },
+        );
+        let resume_approval = ManagementApproval::decode(&dispatch(&mut actor, &resume_call))
+            .expect("exact Resume is approved");
+        assert_eq!(resume_approval.authorization_sequence.get(), 7);
+        assert!(actor.state.managed_actors[0].suspended);
+        assert!(dispatch_ack(
+            &mut actor,
+            &application_ack(config, &resume_call, &resume_approval)
+        ));
+        assert!(!actor.state.managed_actors[0].suspended);
+
+        let remove_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x5c,
+            managed,
+            ManagementRequest::RemoveLeaf {
+                actor: install.entry.actor,
+                expected_deployment: upgrade.to_deployment,
+            },
+        );
+        let remove_approval = ManagementApproval::decode(&dispatch(&mut actor, &remove_call))
+            .expect("exact RemoveLeaf is approved");
+        assert_eq!(remove_approval.authorization_sequence.get(), 8);
+        assert_eq!(actor.state.managed_actors.len(), 1);
+        assert!(dispatch_ack(
+            &mut actor,
+            &application_ack(config, &remove_call, &remove_approval)
+        ));
+        assert!(actor.state.managed_actors.is_empty());
+        assert_eq!(
+            actor.state.retired_actor_installations,
+            vec![RetiredActorInstallationRow {
+                agent: managed.agent.0,
+                installation_id: install.installation_id.0,
+            }]
+        );
+
+        let mut reuse = actor_install(managed.agent, "replacement", 0x5d);
+        reuse.installation_id = install.installation_id;
+        let reuse_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x5e,
+            managed,
+            ManagementRequest::Install(Box::new(reuse)),
+        );
+        let before_reuse = actor.state.clone();
+        assert!(dispatch(&mut actor, &reuse_call).is_empty());
+        assert_eq!(actor.state, before_reuse);
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("acknowledged actor lifecycle projection restarts");
+        assert_eq!(restarted.state, actor.state);
+        assert!(authority_state_is_valid(&config, &restarted.state));
+    }
+
+    #[test]
+    fn pending_parent_and_runtime_transitions_are_serialized() {
+        let config = configuration();
+        let descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Local, 0x7f);
+        let managed = target_for(&descriptor);
+        let mut actor = actor();
+        insert_live(&mut actor, &descriptor);
+
+        let parent = actor_install(managed.agent, "parent", 0x80);
+        let parent_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x81,
+            managed,
+            ManagementRequest::Install(Box::new(parent.clone())),
+        );
+        let parent_approval = ManagementApproval::decode(&dispatch(&mut actor, &parent_call))
+            .expect("parent install approved");
+        assert!(dispatch_ack(
+            &mut actor,
+            &application_ack(config, &parent_call, &parent_approval)
+        ));
+
+        let mut child = actor_install(managed.agent, "child", 0x82);
+        child.entry.parent = Some(parent.entry.actor);
+        child.entry.actor = ActorId::owned_child(parent.entry.actor, &child.entry.name);
+        let child_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x83,
+            managed,
+            ManagementRequest::Install(Box::new(child.clone())),
+        );
+        let child_approval = ManagementApproval::decode(&dispatch(&mut actor, &child_call))
+            .expect("child install approved");
+        assert_eq!(actor.state.managed_actors.len(), 1);
+
+        for (invocation, request) in [
+            (
+                0x84,
+                ManagementRequest::Suspend {
+                    actor: parent.entry.actor,
+                    expected_deployment: parent.entry.deployment,
+                },
+            ),
+            (
+                0x85,
+                ManagementRequest::RemoveLeaf {
+                    actor: parent.entry.actor,
+                    expected_deployment: parent.entry.deployment,
+                },
+            ),
+        ] {
+            let call = credential_call(
+                config,
+                &signing(0x21),
+                ADMIN_PRINCIPAL,
+                Some(ADMIN_NODE),
+                invocation,
+                managed,
+                request,
+            );
+            let before = actor.state.clone();
+            assert!(dispatch(&mut actor, &call).is_empty());
+            assert_eq!(actor.state, before);
+        }
+
+        let runtime_request =
+            ManagementRequest::UpgradeRuntime(Box::new(vos::agent_sdk::RuntimeUpgrade {
+                from_deployment: managed.runtime_deployment,
+                to_deployment: DeploymentId([0x86; 32]),
+                to_program: ProgramId([0x87; 32]),
+                producer: ProducerId([0x88; 32]),
+                package: BlobRef::of_bytes(b"serialized-runtime-upgrade"),
+                contract: RuntimePackageContract::canonical(),
+                capabilities: RuntimeCapabilities::standard(),
+            }));
+        let blocked_runtime = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x89,
+            managed,
+            runtime_request.clone(),
+        );
+        let before = actor.state.clone();
+        assert!(dispatch(&mut actor, &blocked_runtime).is_empty());
+        assert_eq!(actor.state, before);
+
+        assert!(dispatch_ack(
+            &mut actor,
+            &application_ack(config, &child_call, &child_approval)
+        ));
+        let runtime_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x8a,
+            managed,
+            runtime_request,
+        );
+        assert!(ManagementApproval::decode(&dispatch(&mut actor, &runtime_call)).is_ok());
+
+        let child_suspend = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x8b,
+            managed,
+            ManagementRequest::Suspend {
+                actor: child.entry.actor,
+                expected_deployment: child.entry.deployment,
+            },
+        );
+        let before = actor.state.clone();
+        assert!(dispatch(&mut actor, &child_suspend).is_empty());
+        assert_eq!(actor.state, before);
+        assert!(authority_state_is_valid(&config, &actor.state));
     }
 
     #[test]
@@ -2395,6 +3766,204 @@ mod tests {
             altered.authorization_sequence = altered_high_water;
             assert!(!authority_state_is_valid(&config, &altered));
         }
+    }
+
+    #[test]
+    fn authority_and_cross_agent_actor_targets_fail_closed() {
+        let config = configuration();
+        let authority_actor = ActorId(config.binding.issuer.actor);
+        let authority_deployment = DeploymentId(config.binding.issuer.deployment);
+        let mut forged_install = actor_install(
+            AgentId(config.system_agent),
+            "forged-system-authority",
+            0x60,
+        );
+        forged_install.entry.actor = authority_actor;
+        let mut forged_upgrade = actor_upgrade(&catalog_install(config), 0x61);
+        forged_upgrade.actor = authority_actor;
+        forged_upgrade.from_deployment = authority_deployment;
+        let requests = [
+            ManagementRequest::Install(Box::new(forged_install)),
+            ManagementRequest::UpgradeActor(Box::new(forged_upgrade)),
+            ManagementRequest::Suspend {
+                actor: authority_actor,
+                expected_deployment: authority_deployment,
+            },
+            ManagementRequest::Resume {
+                actor: authority_actor,
+                expected_deployment: authority_deployment,
+            },
+            ManagementRequest::RemoveLeaf {
+                actor: authority_actor,
+                expected_deployment: authority_deployment,
+            },
+        ];
+        let mut actor = actor();
+        assert!(protected_authority_actor(&config, authority_actor));
+        for (offset, request) in requests.into_iter().enumerate() {
+            let call = credential_call(
+                config,
+                &signing(0x21),
+                ADMIN_PRINCIPAL,
+                Some(ADMIN_NODE),
+                0x62 + u8::try_from(offset).unwrap(),
+                system_target(config),
+                request,
+            );
+            let before = actor.state.clone();
+            assert!(dispatch(&mut actor, &call).is_empty());
+            assert_eq!(actor.state, before);
+        }
+
+        let descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Local, 0x68);
+        insert_live(&mut actor, &descriptor);
+        let managed = target_for(&descriptor);
+        let install = actor_install(managed.agent, "agent-scoped", 0x69);
+        let install_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x6a,
+            managed,
+            ManagementRequest::Install(Box::new(install.clone())),
+        );
+        let approval = ManagementApproval::decode(&dispatch(&mut actor, &install_call)).unwrap();
+        assert!(dispatch_ack(
+            &mut actor,
+            &application_ack(config, &install_call, &approval)
+        ));
+
+        let cross_agent = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x6b,
+            system_target(config),
+            ManagementRequest::Suspend {
+                actor: install.entry.actor,
+                expected_deployment: install.entry.deployment,
+            },
+        );
+        let before = actor.state.clone();
+        assert!(dispatch(&mut actor, &cross_agent).is_empty());
+        assert_eq!(actor.state, before);
+
+        let wrong_agent_install = actor_install(managed.agent, "wrong-agent", 0x6c);
+        let wrong_agent_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x6d,
+            system_target(config),
+            ManagementRequest::Install(Box::new(wrong_agent_install)),
+        );
+        assert!(dispatch(&mut actor, &wrong_agent_call).is_empty());
+        assert_eq!(actor.state, before);
+    }
+
+    #[test]
+    fn actor_projection_rejects_unbacked_rows_corruption_and_explicit_limit_overflow() {
+        let config = configuration();
+        let install = catalog_install(config);
+        let call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x70,
+            system_target(config),
+            ManagementRequest::Install(Box::new(install)),
+        );
+        let mut actor = actor();
+        let approval = ManagementApproval::decode(&dispatch(&mut actor, &call)).unwrap();
+        assert!(dispatch_ack(
+            &mut actor,
+            &application_ack(config, &call, &approval)
+        ));
+        let row = actor.state.managed_actors[0].clone();
+
+        let mut altered = actor.state.clone();
+        altered.managed_actors[0].deployment[0] ^= 1;
+        assert!(!authority_state_is_valid(&config, &altered));
+
+        let mut lost_root_provenance = actor.state.clone();
+        lost_root_provenance.managed_actors[0].root_provenance = false;
+        assert!(!authority_state_is_valid(&config, &lost_root_provenance));
+
+        let mut duplicate = actor.state.clone();
+        duplicate.managed_actors.push(row.clone());
+        assert!(!authority_state_is_valid(&config, &duplicate));
+
+        let mut unbacked = AuthorityLinearState::bootstrap(config);
+        unbacked.managed_actors.push(row.clone());
+        assert!(!authority_state_is_valid(&config, &unbacked));
+
+        let later_install = actor_install(AgentId(config.system_agent), "later-system", 0x72);
+        let later_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x73,
+            system_target(config),
+            ManagementRequest::Install(Box::new(later_install.clone())),
+        );
+        let later_approval =
+            ManagementApproval::decode(&dispatch(&mut actor, &later_call)).unwrap();
+        assert!(dispatch_ack(
+            &mut actor,
+            &application_ack(config, &later_call, &later_approval)
+        ));
+        assert!(authority_state_is_valid(&config, &actor.state));
+        let root_index = actor
+            .state
+            .managed_actors
+            .iter()
+            .position(|candidate| candidate.root_provenance)
+            .unwrap();
+        let later_index = managed_actor(
+            &actor.state,
+            AgentId(config.system_agent),
+            later_install.entry.actor,
+        )
+        .unwrap();
+
+        let mut deleted_marker = actor.state.clone();
+        deleted_marker.managed_actors[root_index].root_provenance = false;
+        assert!(!authority_state_is_valid(&config, &deleted_marker));
+
+        let mut moved_marker = deleted_marker;
+        moved_marker.managed_actors[later_index].root_provenance = true;
+        assert!(!authority_state_is_valid(&config, &moved_marker));
+
+        let mut marked_later = actor.state.clone();
+        marked_later.managed_actors[later_index].root_provenance = true;
+        assert!(!authority_state_is_valid(&config, &marked_later));
+
+        assert_eq!(
+            MAX_MANAGED_ACTORS,
+            vos::agent_sdk::STANDARD_MAX_ACTORS as usize
+        );
+        let mut actor_overflow = AuthorityLinearState::bootstrap(config);
+        actor_overflow.managed_actors = vec![row; MAX_MANAGED_ACTORS + 1];
+        assert!(!authority_state_is_valid(&config, &actor_overflow));
+
+        assert_eq!(
+            MAX_RETIRED_ACTOR_INSTALLATIONS,
+            MAX_RUNTIME_STATE_BYTES / (2 * core::mem::size_of::<[u8; 32]>())
+        );
+        let mut retired_overflow = AuthorityLinearState::bootstrap(config);
+        retired_overflow.retired_actor_installations = vec![
+            RetiredActorInstallationRow {
+                agent: config.system_agent,
+                installation_id: [0x71; 32],
+            };
+            MAX_RETIRED_ACTOR_INSTALLATIONS + 1
+        ];
+        assert!(!authority_state_is_valid(&config, &retired_overflow));
     }
 
     #[test]
@@ -2659,10 +4228,6 @@ mod tests {
         let outsider_node = NodeId([0x96; 32]);
         let managed_descriptor = descriptor(config, owner, AgentProfile::Private, 0x97);
         let managed = target_for(&managed_descriptor);
-        let request = ManagementRequest::Suspend {
-            actor: ActorId([0x98; 32]),
-            expected_deployment: DeploymentId([0x99; 32]),
-        };
 
         let mut actor = actor();
         enroll(
@@ -2681,16 +4246,26 @@ mod tests {
         );
         insert_live(&mut actor, &managed_descriptor);
 
-        let owner_call = credential_call(
+        let install = actor_install(managed.agent, "owned", 0x98);
+        let install_call = credential_call(
             config,
-            &owner_key,
-            owner,
-            Some(owner_node),
-            0xa0,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x99,
             managed,
-            request.clone(),
+            ManagementRequest::Install(Box::new(install.clone())),
         );
-        assert!(!dispatch(&mut actor, &owner_call).is_empty());
+        let install_approval = ManagementApproval::decode(&dispatch(&mut actor, &install_call))
+            .expect("admin installs the owned actor");
+        assert!(dispatch_ack(
+            &mut actor,
+            &application_ack(config, &install_call, &install_approval)
+        ));
+        let request = ManagementRequest::Suspend {
+            actor: install.entry.actor,
+            expected_deployment: install.entry.deployment,
+        };
 
         let outsider_call = credential_call(
             config,
@@ -2705,6 +4280,22 @@ mod tests {
         assert!(dispatch(&mut actor, &outsider_call).is_empty());
         assert_eq!(actor.state, before);
 
+        let owner_call = credential_call(
+            config,
+            &owner_key,
+            owner,
+            Some(owner_node),
+            0xa0,
+            managed,
+            request.clone(),
+        );
+        let owner_approval = ManagementApproval::decode(&dispatch(&mut actor, &owner_call))
+            .expect("owner may suspend an exactly projected actor");
+        assert!(dispatch_ack(
+            &mut actor,
+            &application_ack(config, &owner_call, &owner_approval)
+        ));
+
         let admin_call = credential_call(
             config,
             &signing(0x21),
@@ -2712,9 +4303,17 @@ mod tests {
             Some(ADMIN_NODE),
             0xa2,
             managed,
-            request.clone(),
+            ManagementRequest::Resume {
+                actor: install.entry.actor,
+                expected_deployment: install.entry.deployment,
+            },
         );
-        assert!(!dispatch(&mut actor, &admin_call).is_empty());
+        let admin_approval = ManagementApproval::decode(&dispatch(&mut actor, &admin_call))
+            .expect("admin may resume an exactly projected actor");
+        assert!(dispatch_ack(
+            &mut actor,
+            &application_ack(config, &admin_call, &admin_approval)
+        ));
 
         let mismatched_target = vos::agent_sdk::authority::ManagedAgentTarget {
             runtime_deployment: DeploymentId([0xaa; 32]),
@@ -3816,12 +5415,33 @@ mod tests {
             principal[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
             let mut node = [0xe3; 32];
             node[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
-            enroll(
+            let principal = PrincipalId(principal);
+            let node = NodeId(node);
+            let credential = enrollment(&key, AuthorityCredentialKind::Ssh);
+            let invocation = |step: u8| {
+                InvocationId(
+                    Hash::digest(
+                        b"vos/test/system-authority/bounded-admin-history/v1",
+                        &[&(ordinal as u64).to_le_bytes(), &[step]],
+                    )
+                    .0,
+                )
+            };
+            record_fixture_admin(
                 &mut actor,
-                &key,
-                PrincipalId(principal),
-                NodeId(node),
-                BuiltinPrincipalRole::Member,
+                invocation(0),
+                AuthorityAdminOperation::EnrollPrincipal {
+                    principal,
+                    credential,
+                },
+            );
+            record_fixture_admin(
+                &mut actor,
+                invocation(1),
+                AuthorityAdminOperation::BindNodeOwner {
+                    node,
+                    owner: principal,
+                },
             );
         }
         assert_eq!(actor.state.roles.len(), MAX_AUTHORITY_PRINCIPALS);
