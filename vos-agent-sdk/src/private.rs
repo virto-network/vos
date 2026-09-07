@@ -4,6 +4,14 @@ use alloc::vec::Vec;
 
 use crate::{ActorId, AgentId, BlobRef, Hash, NodeId, PrincipalId, SpaceId};
 
+const RECOVERY_SIGNING_PUBLIC_KEY_DOMAIN: &[u8] = b"vos/private/recovery-signing-public/v1";
+
+/// Stable commitment pinned by a Private agent descriptor without exposing
+/// the offline recovery signing key as an ambient authority credential.
+pub fn recovery_signing_public_key_commitment(public_key: &[u8; 32]) -> Hash {
+    Hash::digest(RECOVERY_SIGNING_PUBLIC_KEY_DOMAIN, &[public_key])
+}
+
 pub const MAX_PRIVATE_NODES: usize = 256;
 pub const MAX_TRANSPORT_IDENTITY_BYTES: usize = 512;
 /// Exact multihash length of an inline libp2p Ed25519 public key.

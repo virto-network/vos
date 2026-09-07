@@ -1118,6 +1118,12 @@ mod tests {
                     public_key,
                     initial_epoch: 1,
                 },
+                private_recovery: (profile == AgentProfile::Private).then_some(
+                    vos::agent_sdk::PrivateRecoveryBinding {
+                        signing_key_commitment: Hash([0x1d; 32]),
+                        encryption_public_key: [0x1e; 32],
+                    },
+                ),
                 runtime_package: blob(0x1b, 64),
                 runtime_contract: RuntimePackageContract::canonical(),
                 capabilities: CUSTOM_LINEAR_CAPABILITIES,

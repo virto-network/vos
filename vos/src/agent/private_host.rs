@@ -32,7 +32,7 @@ use vos_agent_sdk::contract::{
 use vos_agent_sdk::private::{
     EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_CIPHERTEXT_BYTES, MAX_PRIVATE_NODES,
     MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS, PrivateControlOperation, PrivateControlRecord,
-    PrivateControlSigner, PrivateNodeIdentity,
+    PrivateControlSigner, PrivateNodeIdentity, recovery_signing_public_key_commitment,
 };
 #[cfg(test)]
 use vos_agent_sdk::private::{PrivateActorLifecycleKind, PrivateKeyEpoch};
@@ -42,8 +42,9 @@ use vos_agent_sdk::wire::{
 };
 use vos_agent_sdk::{
     ActorDescriptor, ActorId, AgentDescriptor, AgentId, AgentIdentity, AgentProfile, AgentReplica,
-    BlobRef, CredentialId, DeploymentId, Hash, LaneSet, NodeId, PrincipalId, ProducerId, ProgramId,
-    ProofSystemSet, ReplicaRole, RuntimeCapabilities, RuntimeWork, SpaceId, StorageFieldDescriptor,
+    BlobRef, CredentialId, DeploymentId, Hash, LaneSet, NodeId, PrincipalId,
+    PrivateRecoveryBinding, ProducerId, ProgramId, ProofSystemSet, ReplicaRole,
+    RuntimeCapabilities, RuntimeWork, SpaceId, StorageFieldDescriptor,
 };
 use zeroize::Zeroizing;
 
@@ -84,7 +85,7 @@ pub const MAX_PRIVATE_HOST_AGENTS: usize = 4_096;
 pub const MAX_PRIVATE_BOOTSTRAP_METADATA_BYTES: usize = 1024 * 1024;
 pub const MAX_PRIVATE_HOST_ARCHIVE_BYTES: usize = MAX_PRIVATE_BACKUP_BYTES + 32 * 1024 * 1024;
 
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 const ROOT_SCOPE_MAGIC: &[u8; 4] = b"PVHR";
 const DESCRIPTOR_MAGIC: &[u8; 4] = b"PVHD";
 const RUNTIME_MAGIC: &[u8; 4] = b"PVHP";
@@ -2505,12 +2506,19 @@ fn validate_create_request(
     request: &PrivateAgentCreate<'_>,
 ) -> Result<(), PrivateAgentHostError> {
     let descriptor = request.descriptor;
+    let expected_recovery = PrivateRecoveryBinding {
+        signing_key_commitment: recovery_signing_public_key_commitment(
+            &request.recovery_recipient.signing_public_key(),
+        ),
+        encryption_public_key: request.recovery_recipient.encryption_public_key(),
+    };
     descriptor
         .validate()
         .map_err(|_| PrivateAgentHostError::InvalidDescriptor)?;
     if descriptor.identity.profile != AgentProfile::Private
         || descriptor.identity.space != scope.space
         || descriptor.identity.owner != scope.owner
+        || descriptor.private_recovery != Some(expected_recovery)
         || descriptor.runtime_package != *request.runtime_package.package_ref()
         || descriptor.identity.runtime_deployment != request.runtime_package.deployment()
         || descriptor.identity.runtime_program != request.runtime_package.program()
@@ -2976,6 +2984,10 @@ fn encode_agent_descriptor(encoder: &mut Encoder<'_>, value: &AgentDescriptor) {
     encoder.fixed(identity.runtime_producer.as_bytes());
     encoder.fixed(value.creation_nonce.as_bytes());
     encode_authority_binding(encoder, value.authority);
+    encoder.option(&value.private_recovery, |encoder, binding| {
+        encoder.fixed(binding.signing_key_commitment.as_bytes());
+        encoder.fixed(&binding.encryption_public_key);
+    });
     encode_blob_ref(encoder, &value.runtime_package);
     encode_runtime_contract(encoder, value.runtime_contract);
     encode_runtime_capabilities(encoder, value.capabilities);
@@ -3003,6 +3015,12 @@ fn decode_agent_descriptor(decoder: &mut Decoder<'_>) -> Result<AgentDescriptor,
     };
     let creation_nonce = Hash(decoder.fixed()?);
     let authority = decode_authority_binding(decoder)?;
+    let private_recovery = decoder.option(|decoder| {
+        Ok(PrivateRecoveryBinding {
+            signing_key_commitment: Hash(decoder.fixed()?),
+            encryption_public_key: decoder.fixed()?,
+        })
+    })?;
     let runtime_package = decode_blob_ref(decoder)?;
     let runtime_contract = decode_runtime_contract(decoder)?;
     let capabilities = decode_runtime_capabilities(decoder)?;
@@ -3021,6 +3039,7 @@ fn decode_agent_descriptor(decoder: &mut Decoder<'_>) -> Result<AgentDescriptor,
         identity,
         creation_nonce,
         authority,
+        private_recovery,
         runtime_package,
         runtime_contract,
         capabilities,
@@ -3370,6 +3389,13 @@ fn open_hosted_agent<V: PrivateNodeAuthorityVerifier>(
         || plaintext.descriptor.identity.agent != agent
         || plaintext.descriptor.identity.owner != expected_owner
         || plaintext.descriptor.identity.profile != AgentProfile::Private
+        || plaintext.descriptor.private_recovery
+            != Some(PrivateRecoveryBinding {
+                signing_key_commitment: recovery_signing_public_key_commitment(
+                    &store.recovery_public_key(),
+                ),
+                encryption_public_key: store.recovery_encryption_public_key(),
+            })
         || !plaintext
             .descriptor
             .runtime_package
@@ -4432,6 +4458,16 @@ mod tests {
                 public_key: authority_key,
                 initial_epoch: 1,
             },
+            private_recovery: Some(PrivateRecoveryBinding {
+                signing_key_commitment: recovery_signing_public_key_commitment(
+                    &RecoverySigningKey::from_seed([13; 32])
+                        .unwrap()
+                        .verifying_key(),
+                ),
+                encryption_public_key: OfflineRecoveryDecryptionKey::from_bytes([77; 32])
+                    .unwrap()
+                    .public_key(),
+            }),
             runtime_package: runtime.package_ref().clone(),
             runtime_contract: runtime.manifest().contract,
             capabilities: runtime.capabilities(),
@@ -4934,6 +4970,59 @@ mod tests {
             issuance_ack: request.issuance_ack.clone(),
             application_ack: application.encode().unwrap(),
         }
+    }
+
+    #[test]
+    fn creation_requires_the_exact_descriptor_recovery_binding() {
+        let fixture = fixture(1);
+        let mut host = create_host(&fixture, 0, "recovery-binding");
+        let runtime = admit_runtime_package(&fixture.runtime).unwrap();
+        let nodes = identities(&fixture);
+        let recipient = DurableRecoveryRecipient::from_durable_keystore(
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+        )
+        .unwrap();
+
+        let mut wrong_signing = fixture.descriptor.clone();
+        wrong_signing
+            .private_recovery
+            .as_mut()
+            .unwrap()
+            .signing_key_commitment = Hash([0x91; 32]);
+        assert_eq!(
+            host.create_agent(
+                PrivateAgentCreate {
+                    descriptor: &wrong_signing,
+                    nodes: &nodes,
+                    recovery_recipient: recipient,
+                    runtime_package: &runtime,
+                    bootstrap_metadata: &fixture.bootstrap,
+                },
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::InvalidDescriptor)
+        );
+
+        let mut wrong_encryption = fixture.descriptor.clone();
+        wrong_encryption
+            .private_recovery
+            .as_mut()
+            .unwrap()
+            .encryption_public_key = [0x92; 32];
+        assert_eq!(
+            host.create_agent(
+                PrivateAgentCreate {
+                    descriptor: &wrong_encryption,
+                    nodes: &nodes,
+                    recovery_recipient: recipient,
+                    runtime_package: &runtime,
+                    bootstrap_metadata: &fixture.bootstrap,
+                },
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::InvalidDescriptor)
+        );
     }
 
     #[test]

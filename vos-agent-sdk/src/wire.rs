@@ -414,10 +414,29 @@ fn decode_agent_authority_binding(
         .ok_or(DecodeError::NonCanonical)
 }
 
+fn encode_private_recovery_binding(encoder: &mut Encoder<'_>, value: &PrivateRecoveryBinding) {
+    encoder.fixed(value.signing_key_commitment.as_bytes());
+    encoder.fixed(&value.encryption_public_key);
+}
+
+fn decode_private_recovery_binding(
+    decoder: &mut Decoder<'_>,
+) -> Result<PrivateRecoveryBinding, DecodeError> {
+    let value = PrivateRecoveryBinding {
+        signing_key_commitment: Hash(decoder.fixed()?),
+        encryption_public_key: decoder.fixed()?,
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
 fn encode_agent_descriptor(encoder: &mut Encoder<'_>, value: &AgentDescriptor) {
     encode_agent_identity(encoder, &value.identity);
     encoder.fixed(value.creation_nonce.as_bytes());
     encode_agent_authority_binding(encoder, value.authority);
+    encoder.option(&value.private_recovery, encode_private_recovery_binding);
     encode_blob(encoder, &value.runtime_package);
     encode_runtime_contract(encoder, value.runtime_contract);
     encode_capabilities(encoder, value.capabilities);
@@ -429,6 +448,7 @@ fn decode_agent_descriptor(decoder: &mut Decoder<'_>) -> Result<AgentDescriptor,
         identity: decode_agent_identity(decoder)?,
         creation_nonce: Hash(decoder.fixed()?),
         authority: decode_agent_authority_binding(decoder)?,
+        private_recovery: decoder.option(decode_private_recovery_binding)?,
         runtime_package: decode_blob(decoder)?,
         runtime_contract: decode_runtime_contract(decoder)?,
         capabilities: decode_capabilities(decoder)?,
@@ -4957,6 +4977,7 @@ mod tests {
                 public_key: authority.public_key,
                 initial_epoch: authority.selector.epoch,
             },
+            private_recovery: None,
             runtime_package: blob(47),
             runtime_contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities::standard(),

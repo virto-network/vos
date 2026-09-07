@@ -25,7 +25,8 @@ use vos_agent_sdk::private::{
     NodeEncryptionEnrollmentVerifier, PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES, PRIVATE_NONCE_BYTES,
     PrivateControlOperation, PrivateControlRecord, PrivateControlSigner, PrivateInviteHistoryGrant,
     PrivateKeyEpoch, PrivateNodeIdentity, PrivateRecoveryKeyringGrant, SealedPrivateKey,
-    SealedRecoveryKey, valid_x25519_public_key as sdk_valid_x25519_public_key,
+    SealedRecoveryKey, recovery_signing_public_key_commitment,
+    valid_x25519_public_key as sdk_valid_x25519_public_key,
 };
 use vos_agent_sdk::{AgentId, Hash, NodeId, PrincipalId, SpaceId};
 
@@ -48,7 +49,6 @@ pub const MAX_PRIVATE_CONTROL_RECORDS: u64 = 4_096;
 
 const OWNER_PUBLIC_DOMAIN: &[u8] = b"vos/private/owner-signing-public/v1";
 const DATA_KEY_DOMAIN: &[u8] = b"vos/private/data-key/v1";
-const RECOVERY_PUBLIC_DOMAIN: &[u8] = b"vos/private/recovery-signing-public/v1";
 const CONTENT_IDENTITY_DOMAIN: &[u8] = b"vos/private/content-identity/v2";
 const SEAL_KDF_DOMAIN: &[u8] = b"vos/private/key-seal/kdf/v1";
 const SEAL_AAD_DOMAIN: &[u8] = b"vos/private/key-seal/aad/v1";
@@ -331,7 +331,7 @@ fn owner_public_key_commitment(public_key: &[u8; SECRET_BYTES]) -> Hash {
 }
 
 fn recovery_public_key_commitment(public_key: &[u8; SECRET_BYTES]) -> Hash {
-    Hash::digest(RECOVERY_PUBLIC_DOMAIN, &[public_key])
+    recovery_signing_public_key_commitment(public_key)
 }
 
 fn data_key_commitment(key: &[u8; SECRET_BYTES]) -> Hash {

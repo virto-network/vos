@@ -2344,6 +2344,7 @@ mod tests {
                 },
                 creation_nonce: nonce,
                 authority,
+                private_recovery: None,
                 runtime_package: runtime.package_ref().clone(),
                 runtime_contract: runtime.manifest().contract,
                 capabilities: runtime.capabilities(),

@@ -1487,6 +1487,12 @@ mod tests {
                 public_key,
                 initial_epoch: 1,
             },
+            private_recovery: (profile == AgentProfile::Private).then_some(
+                crate::agent_sdk::PrivateRecoveryBinding {
+                    signing_key_commitment: Hash([0x86; 32]),
+                    encryption_public_key: [0x87; 32],
+                },
+            ),
             runtime_package: runtime.package_ref().clone(),
             runtime_contract: runtime.manifest().contract,
             capabilities: runtime.capabilities(),

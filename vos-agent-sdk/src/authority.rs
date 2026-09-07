@@ -1829,6 +1829,7 @@ mod tests {
             },
             creation_nonce,
             authority: authority.binding,
+            private_recovery: None,
             runtime_package: BlobRef {
                 hash: Hash([53; 32]),
                 len: 1,

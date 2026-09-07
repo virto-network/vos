@@ -4888,6 +4888,7 @@ mod tests {
             },
             creation_nonce: nonce,
             authority,
+            private_recovery: None,
             runtime_package: crate::agent_sdk::BlobRef {
                 hash: crate::agent_sdk::Hash([0x6d; 32]),
                 len: 1,

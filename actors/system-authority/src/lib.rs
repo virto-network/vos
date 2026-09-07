@@ -5971,6 +5971,12 @@ mod tests {
             },
             creation_nonce,
             authority: config.binding.sdk(),
+            private_recovery: (profile == AgentProfile::Private).then_some(
+                vos::agent_sdk::PrivateRecoveryBinding {
+                    signing_key_commitment: Hash([nonce_byte.wrapping_add(4); 32]),
+                    encryption_public_key: [nonce_byte.wrapping_add(5); 32],
+                },
+            ),
             runtime_package: BlobRef::of_bytes(&[nonce_byte]),
             runtime_contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities::standard(),

@@ -3952,6 +3952,12 @@ mod tests {
                 public_key,
                 initial_epoch: 1,
             },
+            private_recovery: (profile == crate::agent_sdk::AgentProfile::Private).then_some(
+                crate::agent_sdk::PrivateRecoveryBinding {
+                    signing_key_commitment: crate::agent_sdk::Hash([0x32; 32]),
+                    encryption_public_key: [0x33; 32],
+                },
+            ),
             runtime_package: crate::agent_sdk::BlobRef {
                 hash: crate::agent_sdk::Hash([7; 32]),
                 len: 100,

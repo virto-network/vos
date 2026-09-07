@@ -124,6 +124,7 @@ fn descriptor(runtime: &AdmittedRuntimePackage, discriminator: u8) -> AgentDescr
             public_key,
             initial_epoch: 1,
         },
+        private_recovery: None,
         runtime_package: runtime.package_ref().clone(),
         runtime_contract: runtime.manifest().contract,
         capabilities: runtime.capabilities(),

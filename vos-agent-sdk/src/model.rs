@@ -370,6 +370,23 @@ pub struct AgentIdentity {
     pub runtime_producer: ProducerId,
 }
 
+/// Immutable offline-recovery identity selected when a Private agent is
+/// created. The signing half is commitment-only; possession is proven only by
+/// a domain-separated recovery signature. The independent X25519 public key
+/// remains available for sealing epoch data into offline backups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateRecoveryBinding {
+    pub signing_key_commitment: Hash,
+    pub encryption_public_key: [u8; 32],
+}
+
+impl PrivateRecoveryBinding {
+    pub fn is_valid(self) -> bool {
+        self.signing_key_commitment != Hash::ZERO
+            && crate::private::valid_x25519_public_key(&self.encryption_public_key)
+    }
+}
+
 /// Host-independent immutable creation descriptor. Authority evidence is
 /// carried by the enclosing [`crate::RuntimeWork`], never embedded as ambient
 /// process policy.
@@ -381,6 +398,8 @@ pub struct AgentDescriptor {
     /// creation receipt must match this binding; it cannot select its own
     /// policy, issuer, or verification key.
     pub authority: AgentAuthorityBinding,
+    /// Present exactly for Private agents and immutable for their lifetime.
+    pub private_recovery: Option<PrivateRecoveryBinding>,
     pub runtime_package: BlobRef,
     pub runtime_contract: RuntimePackageContract,
     pub capabilities: RuntimeCapabilities,
@@ -423,6 +442,11 @@ impl AgentDescriptor {
             || !self.authority.is_valid()
         {
             return Err(ModelError::InvalidRuntime);
+        }
+        match (self.identity.profile, self.private_recovery) {
+            (AgentProfile::Private, Some(binding)) if binding.is_valid() => {}
+            (AgentProfile::Private, _) | (_, Some(_)) => return Err(ModelError::InvalidProfile),
+            _ => {}
         }
         // Runtime capabilities are a superset declaration. A Private agent
         // may use the standard ALL-lane runtime; admission rejects installed
@@ -799,6 +823,10 @@ mod tests {
                 public_key: [14; 32],
                 initial_epoch: 1,
             },
+            private_recovery: Some(PrivateRecoveryBinding {
+                signing_key_commitment: Hash([15; 32]),
+                encryption_public_key: [16; 32],
+            }),
             runtime_package: BlobRef {
                 hash: Hash([7; 32]),
                 len: 1,
@@ -814,6 +842,16 @@ mod tests {
 
         assert!(descriptor.capabilities.lanes.contains(StateLane::Linear));
         assert_eq!(descriptor.validate(), Ok(()));
+        let mut missing_recovery = descriptor.clone();
+        missing_recovery.private_recovery = None;
+        assert_eq!(missing_recovery.validate(), Err(ModelError::InvalidProfile));
+        let mut invalid_recovery = descriptor.clone();
+        invalid_recovery
+            .private_recovery
+            .as_mut()
+            .unwrap()
+            .encryption_public_key = [0; 32];
+        assert_eq!(invalid_recovery.validate(), Err(ModelError::InvalidProfile));
         let generation = descriptor.replica_generation();
         let mut changed = descriptor.clone();
         changed.replicas[0].node = NodeId([15; 32]);

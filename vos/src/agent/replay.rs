@@ -15060,6 +15060,12 @@ pub(crate) mod tests {
                 public_key: authority_public_key,
                 initial_epoch: 1,
             },
+            private_recovery: (config.identity.profile == AgentProfile::Private).then_some(
+                crate::agent_sdk::PrivateRecoveryBinding {
+                    signing_key_commitment: crate::agent_sdk::Hash([0x8a; 32]),
+                    encryption_public_key: [0x8b; 32],
+                },
+            ),
             runtime_package: crate::agent_sdk::BlobRef {
                 hash: crate::agent_sdk::Hash(config.runtime_package.hash.0),
                 len: config.runtime_package.len,
@@ -15639,6 +15645,7 @@ pub(crate) mod tests {
                 public_key,
                 initial_epoch: 1,
             },
+            private_recovery: None,
             runtime_package: crate::agent_sdk::BlobRef {
                 hash: crate::agent_sdk::Hash(runtime_reference.hash.0),
                 len: runtime_reference.len,
