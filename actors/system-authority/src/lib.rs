@@ -95,7 +95,7 @@ const CONFIG_ENCODED_BYTES: usize = SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len()
     + PRIVATE_SIGNATURE_BYTES;
 const EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/policy-evidence/v1";
 const OPERATION_EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/operation-evidence/v1";
-const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v10";
+const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v11";
 
 const _: () = assert!(MAX_RETAINED_EXACT_WIRE_BYTES < MAX_RUNTIME_STATE_BYTES);
 
@@ -4411,7 +4411,7 @@ fn encode_optional_hash(bytes: &mut Vec<u8>, value: Option<[u8; 32]>) {
 
 fn initial_private_application_commitment(configuration: SystemAuthorityConfiguration) -> Hash {
     Hash::digest(
-        b"vos/system-authority/private-application-root/v2",
+        b"vos/system-authority/private-application-root/v3",
         &[RUNTIME_ABI_ID.as_bytes(), &configuration.encode()],
     )
 }
@@ -4444,7 +4444,7 @@ fn private_application_commitment(previous: Hash, record: &PrivateApplicationRec
     bytes.extend_from_slice(&record.issued_at.to_le_bytes());
     bytes.extend_from_slice(&record.applied_at.to_le_bytes());
     Hash::digest(
-        b"vos/system-authority/private-application/v2",
+        b"vos/system-authority/private-application/v3",
         &[previous.as_bytes(), &bytes],
     )
 }
