@@ -7,11 +7,11 @@
 //! - `PAPL1` is the pending/completed application of one exact PCTL. It keeps
 //!   the receipt and AOI1 preimages but can represent only a positive result.
 //! - `PCRS2` reopens the exact completed application, Store position, and
-//!   successor runtime image before downstream PCAF/PCA1/PSE2 evidence exists.
+//!   successor runtime image before downstream PCAF2/PCA2/PSE2 evidence exists.
 //!
 //! The Store position deliberately excludes PVRI/PAPL/PCRS and every
 //! authority acknowledgement derived from them. This preserves the acyclic
-//! commitment order `AOI1 -> PAPL1 -> (PVRI1, Store) -> PCRS2/PCAF -> PCA1 ->
+//! commitment order `AOI1 -> PAPL1 -> (PVRI1, Store) -> PCRS2/PCAF2 -> PCA2 ->
 //! PSE2`. Runtime images and applications include the local NodeId and are
 //! never suitable as cross-replica equality claims; only
 //! [`PrivateRuntimeStableProjection`] is replica-stable.
@@ -39,9 +39,9 @@ use vos_agent_sdk::wire::{
 };
 use vos_agent_sdk::{
     ActorEntry, ActorId, AgentDescriptor, AgentId, AgentProfile, BlobRef, DeploymentId, Hash,
-    MAX_CATALOG_ARTIFACT_BYTES, MAX_RUNTIME_STATE_BYTES, ManagementReply, ManagementRequest,
-    NodeId, PrincipalId, PrivateRuntimeMutation, RUNTIME_ABI_ID, RuntimeOutcome, RuntimeState,
-    RuntimeTransition, SpaceId,
+    MAX_CATALOG_ARTIFACT_BYTES, MAX_RUNTIME_STATE_BYTES, ManagementError, ManagementReply,
+    ManagementRequest, NodeId, PrincipalId, PrivateRuntimeMutation, RUNTIME_ABI_ID, RuntimeOutcome,
+    RuntimeState, RuntimeTransition, SpaceId,
 };
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
@@ -378,8 +378,8 @@ pub fn private_key_epoch_root(
 /// Cycle-free position in the ciphertext/control Store.
 ///
 /// `object_root`, `control_root`, and `key_epoch_root` commit only Store core
-/// indices. In particular they must never include PVRI, PAPL, PCRS, PCAF,
-/// PCA1, or PSE2 bytes. A later Store row may attach those values alongside
+/// indices. In particular they must never include PVRI, PAPL, PCRS, PCAF2,
+/// PCA2, or PSE2 bytes. A later Store row may attach those values alongside
 /// this immutable core position without changing its commitment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrivateStoreCorePosition {
@@ -663,6 +663,130 @@ impl CanonicalWire for PrivateRuntimeSuccess {
         };
         value.validate().map_err(|_| DecodeError::NonCanonical)?;
         Ok(value)
+    }
+}
+
+/// Trusted interpretation of one successfully decoded Private-control runtime
+/// transition.
+///
+/// A guest denial is terminal only when it returns the exact full predecessor
+/// state. It deliberately has no PAPL/PVRI representation because downstream
+/// Private application evidence records positive dispositions only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrivateRuntimeControlDisposition {
+    Applied {
+        state: RuntimeState,
+        success: PrivateRuntimeSuccess,
+    },
+    RetiredUnapplied {
+        error: ManagementError,
+    },
+}
+
+/// Validate the exact post-Create transition before constructing the genesis
+/// PVRI image.
+///
+/// This is intentionally independent of receipt verification. The physical
+/// host must first execute the exact receipt-authorized `Create` work, then
+/// pass the transition here, and finally give that same receipt and trusted
+/// observation slot to [`PrivateRuntimeImage::genesis`].
+pub fn validate_private_runtime_genesis_transition(
+    descriptor: &AgentDescriptor,
+    transition: RuntimeTransition,
+) -> Result<RuntimeState, PrivateRuntimeEvidenceError> {
+    if descriptor.validate().is_err() || descriptor.identity.profile != AgentProfile::Private {
+        return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
+    }
+    let RuntimeTransition { state, outcome } = transition;
+    if !state.validate()
+        || state.is_empty()
+        || !state.linear.is_empty()
+        || state.encoded_len().is_none_or(|length| {
+            length > descriptor.initial_resource_policy().max_runtime_state_bytes as usize
+        })
+    {
+        return Err(PrivateRuntimeEvidenceError::InvalidState);
+    }
+    match outcome {
+        RuntimeOutcome::Management(Ok(ManagementReply::Created(identity)))
+            if identity == descriptor.identity =>
+        {
+            Ok(state)
+        }
+        _ => Err(PrivateRuntimeEvidenceError::InvalidSuccess),
+    }
+}
+
+/// Classify one Private-control guest transition after the caller has
+/// authenticated its pending PAPL inputs.
+///
+/// Only a matching positive management reply can produce successor runtime
+/// evidence. A management error is a durable terminal denial only when the
+/// guest returned the byte-for-byte-equivalent full predecessor state. Every
+/// other outcome is fail-closed and must leave the Store and PVRI unchanged.
+pub fn classify_private_runtime_control_transition(
+    predecessor: &PrivateRuntimeImage,
+    request: &ManagementRequest,
+    transition: RuntimeTransition,
+) -> Result<PrivateRuntimeControlDisposition, PrivateRuntimeEvidenceError> {
+    predecessor.validate()?;
+    let ManagementRequest::PrivateControl { control, .. } = request else {
+        return Err(PrivateRuntimeEvidenceError::InvalidApplication);
+    };
+    if !request.is_valid()
+        || control.space != predecessor.managed().space
+        || control.agent != predecessor.managed().agent
+    {
+        return Err(PrivateRuntimeEvidenceError::InvalidApplication);
+    }
+
+    let RuntimeTransition { state, outcome } = transition;
+    if !state.validate() {
+        return Err(PrivateRuntimeEvidenceError::InvalidState);
+    }
+    match outcome {
+        RuntimeOutcome::Management(Ok(reply)) => {
+            if !request.private_runtime_reply_matches(&reply) {
+                return Err(PrivateRuntimeEvidenceError::InvalidSuccess);
+            }
+            if !private_state_transition_matches(predecessor.state(), &state, true)
+                || state.is_empty()
+            {
+                return Err(PrivateRuntimeEvidenceError::InvalidState);
+            }
+            let success = match reply {
+                ManagementReply::ResourcePolicySet(value) => {
+                    PrivateRuntimeSuccess::ResourcePolicySet(value)
+                }
+                ManagementReply::Installed(value) => PrivateRuntimeSuccess::Installed(value),
+                ManagementReply::Upgraded(value) => PrivateRuntimeSuccess::Upgraded(value),
+                ManagementReply::Suspended(value) => PrivateRuntimeSuccess::Suspended(value),
+                ManagementReply::Resumed(value) => PrivateRuntimeSuccess::Resumed(value),
+                ManagementReply::Removed(value) => PrivateRuntimeSuccess::Removed(value),
+                _ => return Err(PrivateRuntimeEvidenceError::InvalidSuccess),
+            };
+            if !success_is_private(&success) || success.validate().is_err() {
+                return Err(PrivateRuntimeEvidenceError::InvalidSuccess);
+            }
+            let active_policy = match &success {
+                PrivateRuntimeSuccess::ResourcePolicySet(policy) => *policy,
+                _ => predecessor.active_resource_policy(),
+            };
+            if state
+                .encoded_len()
+                .is_none_or(|length| length > active_policy.max_runtime_state_bytes as usize)
+            {
+                return Err(PrivateRuntimeEvidenceError::InvalidState);
+            }
+            Ok(PrivateRuntimeControlDisposition::Applied { state, success })
+        }
+        RuntimeOutcome::Management(Err(error)) => {
+            if state != *predecessor.state() {
+                return Err(PrivateRuntimeEvidenceError::InvalidState);
+            }
+            Ok(PrivateRuntimeControlDisposition::RetiredUnapplied { error })
+        }
+        _ => Err(PrivateRuntimeEvidenceError::InvalidSuccess),
     }
 }
 
@@ -2151,7 +2275,7 @@ impl CanonicalWire for PrivateRuntimeApplication {
 /// Exact reopened Store/runtime/application aggregate (`PCRS2`).
 ///
 /// A PCRS2 is intentionally unsigned. Its commitment is the preimage later
-/// bound by PCAF/PCA1/PSE2; callers must still verify those downstream
+/// bound by PCAF2/PCA2/PSE2; callers must still verify those downstream
 /// authority signatures independently.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateControlReopenedState {
@@ -3147,6 +3271,159 @@ mod tests {
         encoder.u8(1);
         encoder.bytes(&denial);
         assert!(PrivateRuntimeSuccess::decode(&denial_wire).is_err());
+    }
+
+    #[test]
+    fn genesis_transition_requires_exact_created_identity_and_private_state() {
+        let fixture = Fixture::new();
+        let state = fixture.predecessor.state().clone();
+        let accepted = RuntimeTransition {
+            state: state.clone(),
+            outcome: RuntimeOutcome::Management(Ok(ManagementReply::Created(
+                fixture.descriptor.identity.clone(),
+            ))),
+        };
+        assert_eq!(
+            validate_private_runtime_genesis_transition(&fixture.descriptor, accepted),
+            Ok(state.clone())
+        );
+
+        let mut wrong_identity = fixture.descriptor.identity.clone();
+        wrong_identity.agent = AgentId([0xa4; 32]);
+        assert_eq!(
+            validate_private_runtime_genesis_transition(
+                &fixture.descriptor,
+                RuntimeTransition {
+                    state: state.clone(),
+                    outcome: RuntimeOutcome::Management(Ok(ManagementReply::Created(
+                        wrong_identity,
+                    ))),
+                },
+            ),
+            Err(PrivateRuntimeEvidenceError::InvalidSuccess)
+        );
+        assert_eq!(
+            validate_private_runtime_genesis_transition(
+                &fixture.descriptor,
+                RuntimeTransition {
+                    state: RuntimeState::default(),
+                    outcome: RuntimeOutcome::Management(Ok(ManagementReply::Created(
+                        fixture.descriptor.identity.clone(),
+                    ))),
+                },
+            ),
+            Err(PrivateRuntimeEvidenceError::InvalidState)
+        );
+        assert_eq!(
+            validate_private_runtime_genesis_transition(
+                &fixture.descriptor,
+                RuntimeTransition {
+                    state,
+                    outcome: RuntimeOutcome::Management(Err(ManagementError::InvalidRequest)),
+                },
+            ),
+            Err(PrivateRuntimeEvidenceError::InvalidSuccess)
+        );
+    }
+
+    #[test]
+    fn control_transition_classifier_separates_application_from_exact_denial() {
+        let fixture = Fixture::new();
+        let (control, mutation) = policy_control(&fixture);
+        let request = ManagementRequest::PrivateControl {
+            control: Box::new(control),
+            mutation: Box::new(mutation),
+        };
+        let mut applied_state = fixture.predecessor.state().clone();
+        applied_state.control = vec![0xa5];
+        assert_eq!(
+            classify_private_runtime_control_transition(
+                &fixture.predecessor,
+                &request,
+                RuntimeTransition {
+                    state: applied_state.clone(),
+                    outcome: RuntimeOutcome::Management(Ok(ManagementReply::ResourcePolicySet(
+                        narrowed_policy(),
+                    ))),
+                },
+            ),
+            Ok(PrivateRuntimeControlDisposition::Applied {
+                state: applied_state.clone(),
+                success: PrivateRuntimeSuccess::ResourcePolicySet(narrowed_policy()),
+            })
+        );
+
+        assert_eq!(
+            classify_private_runtime_control_transition(
+                &fixture.predecessor,
+                &request,
+                RuntimeTransition {
+                    state: fixture.predecessor.state().clone(),
+                    outcome: RuntimeOutcome::Management(Err(ManagementError::InvalidRequest)),
+                },
+            ),
+            Ok(PrivateRuntimeControlDisposition::RetiredUnapplied {
+                error: ManagementError::InvalidRequest,
+            })
+        );
+
+        let mut changed_denial = fixture.predecessor.state().clone();
+        changed_denial.local.push(0xa6);
+        assert_eq!(
+            classify_private_runtime_control_transition(
+                &fixture.predecessor,
+                &request,
+                RuntimeTransition {
+                    state: changed_denial,
+                    outcome: RuntimeOutcome::Management(Err(ManagementError::InvalidRequest)),
+                },
+            ),
+            Err(PrivateRuntimeEvidenceError::InvalidState)
+        );
+
+        assert_eq!(
+            classify_private_runtime_control_transition(
+                &fixture.predecessor,
+                &request,
+                RuntimeTransition {
+                    state: applied_state.clone(),
+                    outcome: RuntimeOutcome::Management(Ok(ManagementReply::ResourcePolicySet(
+                        RuntimeResourcePolicy::standard(),
+                    ))),
+                },
+            ),
+            Err(PrivateRuntimeEvidenceError::InvalidSuccess)
+        );
+
+        let mut changed_merge = applied_state;
+        changed_merge.merge.push(0xa7);
+        assert_eq!(
+            classify_private_runtime_control_transition(
+                &fixture.predecessor,
+                &request,
+                RuntimeTransition {
+                    state: changed_merge,
+                    outcome: RuntimeOutcome::Management(Ok(ManagementReply::ResourcePolicySet(
+                        narrowed_policy(),
+                    ))),
+                },
+            ),
+            Err(PrivateRuntimeEvidenceError::InvalidState)
+        );
+
+        assert_eq!(
+            classify_private_runtime_control_transition(
+                &fixture.predecessor,
+                &request,
+                RuntimeTransition {
+                    state: fixture.predecessor.state().clone(),
+                    outcome: RuntimeOutcome::Completed(Err(
+                        vos_agent_sdk::InvocationError::InvalidInput,
+                    )),
+                },
+            ),
+            Err(PrivateRuntimeEvidenceError::InvalidSuccess)
+        );
     }
 
     #[test]
