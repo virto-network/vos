@@ -15,6 +15,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
+use vos_agent_sdk::authority_operation::{
+    MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
+    MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES,
+    MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES,
+};
 use vos_agent_sdk::private::{
     EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_NODES, PrivateControlOperation,
     PrivateControlRecord, PrivateControlSigner, PrivateKeyEpoch, PrivateNodeIdentity,
@@ -35,7 +40,18 @@ pub const MAX_PRIVATE_STORE_OBJECTS: usize = 16_384;
 pub const MAX_PRIVATE_STORE_CONTROLS: usize = MAX_PRIVATE_CONTROL_RECORDS as usize;
 pub const MAX_PRIVATE_STORE_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_PRIVATE_STORE_INDEX_BYTES: usize = 48 * 1024 * 1024;
-pub const MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES: usize = 9 * 1024;
+/// Exact maximum PSE2 framing: magic/version, AOI1, PCA1, recovery-proof tag,
+/// and an optional canonical PRA1. Normal controls use the same frame with an
+/// absent proof; Recover controls require the full third field.
+pub const MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES: usize = 4
+    + 2
+    + 4
+    + MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES
+    + 4
+    + MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES
+    + 1
+    + 4
+    + MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES;
 pub const MAX_PRIVATE_RECOVERY_METADATA_BYTES: usize = MAX_PRIVATE_KEY_EPOCH_WIRE_BYTES
     + MAX_PRIVATE_NODES * MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES
     + 512;
@@ -216,7 +232,7 @@ pub(crate) struct VerifiedEncryptedBackup {
     metadata: RecoveryMetadata,
     index: StoreIndex,
     controls: Vec<PrivateControlRecord>,
-    /// One exact PSE1 envelope per control when coordinator attachment had
+    /// One exact PSE2 envelope per control when coordinator attachment had
     /// completed. `None` is a crash-valid intermediate state and is retained
     /// so recovery never fabricates authority evidence.
     control_evidence: Vec<Option<Vec<u8>>>,
@@ -1063,6 +1079,21 @@ impl VerifiedEncryptedBackup {
     /// exact archived epoch keys before it can publish a successor.
     pub(crate) fn objects(&self) -> &[EncryptedPrivateObject] {
         &self.objects
+    }
+
+    /// Exact authenticated control rows and their optional canonical PSE2
+    /// envelopes. Recovery preflight uses this read-only view to reject a
+    /// historical Recover whose authority evidence was never durably
+    /// attached, before a new authority application is pledged.
+    pub(crate) fn controls_with_authority_evidence(
+        &self,
+    ) -> impl Iterator<Item = (&StoredControlIndex, &PrivateControlRecord, Option<&[u8]>)> {
+        self.index
+            .controls
+            .iter()
+            .zip(&self.controls)
+            .zip(&self.control_evidence)
+            .map(|((index, control), evidence)| (index, control, evidence.as_deref()))
     }
 
     fn merge_compatible_control_evidence(
@@ -2383,7 +2414,7 @@ impl PrivateStore {
         }
     }
 
-    /// Attach the exact post-coordinator PSE1 bytes to an existing PCTL.
+    /// Attach the exact post-coordinator PSE2 bytes to an existing PCTL.
     ///
     /// The store intentionally treats the bytes as opaque. The host adapter
     /// independently verifies their AOI1/PCA1 signatures and exact route and
@@ -3132,7 +3163,7 @@ mod tests {
             let mut store = create_store(&path, &fixture);
             let record = control(&fixture, 0, None);
             store.append_control(&record, &TestAuthority).unwrap();
-            let mut evidence = b"PSE1-exact-authority-evidence-".to_vec();
+            let mut evidence = b"PSE2-exact-authority-evidence-".to_vec();
             evidence.push(index as u8);
             assert_eq!(
                 store.persist_control_authority_evidence_inner(
@@ -3179,7 +3210,7 @@ mod tests {
         let record = control(&fixture, 0, None);
         store.append_control(&record, &TestAuthority).unwrap();
 
-        // A crash-valid local control may temporarily have no attached PSE1.
+        // A crash-valid local control may temporarily have no attached PSE2.
         let pending_backup = store
             .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
             .unwrap();
@@ -3195,7 +3226,7 @@ mod tests {
         .unwrap();
         assert_eq!(pending.control_evidence, vec![None]);
 
-        let evidence = b"PSE1-canonical-bytes-preserved-byte-for-byte".to_vec();
+        let evidence = b"PSE2-canonical-bytes-preserved-byte-for-byte".to_vec();
         store
             .persist_control_authority_evidence(record.commitment(), &evidence)
             .unwrap();

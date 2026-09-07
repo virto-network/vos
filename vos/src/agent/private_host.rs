@@ -23,8 +23,12 @@ use vos_agent_sdk::authority::{
     AuthorityReceipt, AuthorityVerifier, ManagedAgentTarget,
 };
 use vos_agent_sdk::authority_operation::{
-    AuthorityOperationIntent, AuthorityOperationIssuanceAck, PrivateControlApplicationAck,
-    PrivateControlApplicationFact, private_member_set_commitment,
+    AuthorityOperationIntent, AuthorityOperationIssuanceAck,
+    MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
+    MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES,
+    MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES, PrivateControlApplicationAck,
+    PrivateControlApplicationFact, PrivateRecoveryAuthorityProof,
+    PrivateRecoveryAuthorityProofVerifier, private_member_set_commitment,
 };
 use vos_agent_sdk::contract::{
     ActorAbiRange, RuntimeMigrationPolicy, RuntimePackageContract, RuntimeResourceLimits,
@@ -38,7 +42,8 @@ use vos_agent_sdk::private::{
 use vos_agent_sdk::private::{PrivateActorLifecycleKind, PrivateKeyEpoch};
 use vos_agent_sdk::protocol::wire::{DecodeError, Decoder, Encoder};
 use vos_agent_sdk::wire::{
-    CanonicalWire, MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES, MAX_PRIVATE_OBJECT_WIRE_BYTES,
+    CanonicalWire, MAX_PRIVATE_CONTROL_WIRE_BYTES, MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES,
+    MAX_PRIVATE_OBJECT_WIRE_BYTES,
 };
 use vos_agent_sdk::{
     ActorDescriptor, ActorId, AgentDescriptor, AgentId, AgentIdentity, AgentProfile, AgentReplica,
@@ -48,6 +53,7 @@ use vos_agent_sdk::{
 };
 use zeroize::Zeroizing;
 
+use super::authority_operation_issuer::private_intent_matches_application;
 use super::package_admission::{AdmittedRuntimePackage, admit_runtime_package};
 #[cfg(test)]
 use super::private_control_application_coordinator::decode_private_application_fact;
@@ -93,8 +99,8 @@ const BOOTSTRAP_MAGIC: &[u8; 4] = b"PVHM";
 const BACKUP_MAGIC: &[u8; 4] = b"PVHB";
 const SNAPSHOT_MAGIC: &[u8; 4] = b"PVHS";
 const RECOVERY_PLAN_MAGIC: &[u8; 4] = b"PVRP";
-const RECOVERY_PLAN_VERSION: u16 = 2;
-const RECOVERY_PLAN_HASH_DOMAIN: &[u8] = b"vos/private/recovery-plan-bytes/v2";
+const RECOVERY_PLAN_VERSION: u16 = 3;
+const RECOVERY_PLAN_HASH_DOMAIN: &[u8] = b"vos/private/recovery-plan-bytes/v3";
 const RECOVERY_SOURCE_ARCHIVE_HASH_DOMAIN: &[u8] = b"vos/private/recovery-source-archive/v2";
 const RECOVERY_SOURCE_SET_HASH_DOMAIN: &[u8] = b"vos/private/recovery-source-set/v2";
 const RECOVERY_REPLACEMENTS_DOMAIN: &[u8] = b"vos/private/recovery-replacements/v1";
@@ -111,8 +117,16 @@ const NEXT_PREFIX: &str = ".next-";
 const WRITE_SUFFIX: &str = ".write";
 const RECOVERY_PLAN_FILE: &str = "recovery.plan";
 const RECOVERY_PLAN_WRITE_FILE: &str = "recovery.plan.write";
+const RETIRED_DUPLICATE_SUFFIX: &str = ".retired";
 const SIDECAR_FILES: [&str; 3] = [DESCRIPTOR_FILE, RUNTIME_FILE, BOOTSTRAP_FILE];
-const MAX_PRIVATE_RECOVERY_PLAN_BYTES: usize = MAX_PRIVATE_HOST_ARCHIVE_BYTES + 512;
+const RECOVERY_PLAN_FIXED_BYTES: usize =
+    4 + 2 + 32 + 8 * 32 + 5 * core::mem::size_of::<u32>() + 1 + 32 + 32;
+const MAX_PRIVATE_RECOVERY_PLAN_BYTES: usize = MAX_PRIVATE_HOST_ARCHIVE_BYTES
+    .saturating_add(MAX_PRIVATE_CONTROL_WIRE_BYTES)
+    .saturating_add(MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES)
+    .saturating_add(MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES)
+    .saturating_add(MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES)
+    .saturating_add(RECOVERY_PLAN_FIXED_BYTES);
 const MAX_PRIVATE_RECOVERY_SOURCE_BYTES: usize =
     MAX_PRIVATE_HOST_ARCHIVE_BYTES.saturating_mul(MAX_PRIVATE_NODES);
 
@@ -143,14 +157,9 @@ pub enum PrivateAgentHostError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryInstallStop {
     Never,
+    AfterStageDirectory,
+    AfterPlanFile,
     AfterPlan,
-    AfterStore,
-    AfterDescriptor,
-    AfterRuntime,
-    AfterBootstrap,
-    AfterVerification,
-    AfterPlanRetired,
-    AfterPublish,
 }
 
 impl fmt::Display for PrivateAgentHostError {
@@ -254,6 +263,34 @@ pub struct PrivateAgentCreate<'a> {
     pub bootstrap_metadata: &'a [u8],
 }
 
+/// Durable, ciphertext-only handoff from an offline recovery ceremony to the
+/// normal authority-operation issuer and Private application coordinator.
+/// Possession of this value is not authorization: the embedded intent still
+/// has to cross AOC4/AOP4/AOI1 before the host will restore any staged files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedPrivateRecovery {
+    route: ManagedAgentTarget,
+    control_wire: Vec<u8>,
+    proof: PrivateRecoveryAuthorityProof,
+}
+
+impl PreparedPrivateRecovery {
+    pub(crate) const fn route(&self) -> ManagedAgentTarget {
+        self.route
+    }
+
+    pub(crate) fn control_wire(&self) -> &[u8] {
+        &self.control_wire
+    }
+
+    pub(crate) fn authorization_intent(
+        &self,
+    ) -> Result<AuthorityOperationIntent, PrivateAgentHostError> {
+        AuthorityOperationIntent::private_recovery_control(self.proof.clone())
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)
+    }
+}
+
 /// Transport identity accepted by Private sync ingress.  Principal and SSH
 /// credential identities are represented explicitly so they fail closed
 /// before any persisted artifact is read.
@@ -318,6 +355,17 @@ pub(crate) struct PrivateAgentRuntimeApplication<'host, V> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrivateRuntimeApplicationStop {
     Never,
+    AfterRecoveryStore,
+    AfterRecoveryDescriptor,
+    AfterRecoveryRuntime,
+    AfterRecoveryBootstrap,
+    AfterRecoveryReopen,
+    AfterRecoveryPlanWrite,
+    AfterRecoveryPlanCommitted,
+    AfterRecoveryPlanRetired,
+    AfterRecoveryRename,
+    AfterRecoveryDestinationSync,
+    AfterRecoveryPublished,
     AfterDescriptorStaged,
     AfterRuntimeStaged,
     AfterBootstrapStaged,
@@ -356,6 +404,19 @@ struct RawAuthorityVerifier;
 
 impl AuthorityVerifier for RawAuthorityVerifier {
     fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+        super::authority::verify_raw_ed25519(public_key, message, signature)
+    }
+}
+
+struct RawRecoveryAuthorityProofVerifier;
+
+impl PrivateRecoveryAuthorityProofVerifier for RawRecoveryAuthorityProofVerifier {
+    fn verify_private_recovery_authority_proof(
+        &self,
+        public_key: &[u8; 32],
+        message: &[u8],
+        signature: &[u8; 64],
+    ) -> bool {
         super::authority::verify_raw_ed25519(public_key, message, signature)
     }
 }
@@ -527,6 +588,43 @@ impl PrivateAgentHost {
             node_authority,
             stop: PrivateRuntimeApplicationStop::Never,
         })
+    }
+
+    /// Reopen one authenticated but not-yet-published offline recovery plan.
+    /// This never restores its ciphertext archive or advances it to the live
+    /// Agent map; callers must resume the retained authority/coordinator flow.
+    pub(crate) fn prepared_recovery(
+        &self,
+        agent: AgentId,
+    ) -> Result<Option<PreparedPrivateRecovery>, PrivateAgentHostError> {
+        self.verify_root_scope()?;
+        if self.agents.contains_key(&agent) || fs::symlink_metadata(self.agent_path(agent)).is_ok()
+        {
+            return Ok(None);
+        }
+        let path = self.creating_path(agent).join(RECOVERY_PLAN_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let plan = read_and_authenticate_recovery_plan(&path, &self.node_key)?;
+                if plan.route.agent != agent
+                    || plan.route.space != self.scope.space
+                    || plan.owner != self.scope.owner
+                    || plan.completion.is_some()
+                {
+                    return Err(PrivateAgentHostError::Corrupt);
+                }
+                let (control, proof) = validate_recovery_plan_material(&plan)?;
+                Ok(Some(PreparedPrivateRecovery {
+                    route: plan.route,
+                    control_wire: control
+                        .encode()
+                        .map_err(|_| PrivateAgentHostError::Corrupt)?,
+                    proof,
+                }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(PrivateAgentHostError::Io),
+        }
     }
 
     pub(crate) fn create_agent<V: PrivateNodeAuthorityVerifier>(
@@ -849,7 +947,7 @@ impl PrivateAgentHost {
     pub fn apply_recovery_record<V: PrivateNodeAuthorityVerifier>(
         &mut self,
         agent: AgentId,
-        expected_prior_head: Hash,
+        expected_prior_head: Option<Hash>,
         record: &PrivateControlRecord,
         authority: &V,
     ) -> Result<PutDisposition, PrivateAgentHostError> {
@@ -890,7 +988,7 @@ impl PrivateAgentHost {
         let disposition =
             match hosted
                 .store
-                .apply_offline_recovery(Some(expected_prior_head), record, authority)
+                .apply_offline_recovery(expected_prior_head, record, authority)
             {
                 Ok(disposition) => disposition,
                 Err(error) => {
@@ -945,6 +1043,7 @@ impl PrivateAgentHost {
     /// production attachment must additionally correlate the imported control
     /// head with the authority/PCA pipeline. No descriptor, runtime, bootstrap,
     /// or key plaintext crosses the archive boundary.
+    #[cfg(test)]
     pub(crate) fn restore_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
         &mut self,
         agent: AgentId,
@@ -1028,16 +1127,18 @@ impl PrivateAgentHost {
     /// the Ed25519 half signs one exact replacement control. The prepared
     /// archive persisted for crash recovery contains ciphertext and public
     /// metadata only.
-    pub(crate) fn recover_from_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
+    pub(crate) fn prepare_recovery_from_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
         &mut self,
-        agent: AgentId,
+        route: ManagedAgentTarget,
+        superseded_authority_head: Option<Hash>,
         recovery_kit: &OfflineRecoveryKit,
         replacement_nodes: &[PrivateNodeIdentity],
         bytes: &[u8],
         authority: &V,
-    ) -> Result<RestoreDisposition, PrivateAgentHostError> {
-        self.recover_from_encrypted_backups_inner(
-            agent,
+    ) -> Result<PreparedPrivateRecovery, PrivateAgentHostError> {
+        self.prepare_recovery_from_encrypted_backups_inner(
+            route,
+            superseded_authority_head,
             recovery_kit,
             replacement_nodes,
             &[bytes],
@@ -1049,16 +1150,18 @@ impl PrivateAgentHost {
     /// Recover from the deterministic union of complete independently held
     /// ciphertext archives. Every archive, control head, epoch, sidecar, and
     /// object is authenticated before a recovery plan is made durable.
-    pub(crate) fn recover_from_encrypted_backups<V: PrivateNodeAuthorityVerifier>(
+    pub(crate) fn prepare_recovery_from_encrypted_backups<V: PrivateNodeAuthorityVerifier>(
         &mut self,
-        agent: AgentId,
+        route: ManagedAgentTarget,
+        superseded_authority_head: Option<Hash>,
         recovery_kit: &OfflineRecoveryKit,
         replacement_nodes: &[PrivateNodeIdentity],
         backups: &[&[u8]],
         authority: &V,
-    ) -> Result<RestoreDisposition, PrivateAgentHostError> {
-        self.recover_from_encrypted_backups_inner(
-            agent,
+    ) -> Result<PreparedPrivateRecovery, PrivateAgentHostError> {
+        self.prepare_recovery_from_encrypted_backups_inner(
+            route,
+            superseded_authority_head,
             recovery_kit,
             replacement_nodes,
             backups,
@@ -1068,17 +1171,19 @@ impl PrivateAgentHost {
     }
 
     #[cfg(test)]
-    fn recover_from_encrypted_backup_with_stop<V: PrivateNodeAuthorityVerifier>(
+    fn prepare_recovery_from_encrypted_backup_with_stop<V: PrivateNodeAuthorityVerifier>(
         &mut self,
-        agent: AgentId,
+        route: ManagedAgentTarget,
+        superseded_authority_head: Option<Hash>,
         recovery_kit: &OfflineRecoveryKit,
         replacement_nodes: &[PrivateNodeIdentity],
         bytes: &[u8],
         authority: &V,
         stop: RecoveryInstallStop,
-    ) -> Result<RestoreDisposition, PrivateAgentHostError> {
-        self.recover_from_encrypted_backups_inner(
-            agent,
+    ) -> Result<PreparedPrivateRecovery, PrivateAgentHostError> {
+        self.prepare_recovery_from_encrypted_backups_inner(
+            route,
+            superseded_authority_head,
             recovery_kit,
             replacement_nodes,
             &[bytes],
@@ -1088,17 +1193,19 @@ impl PrivateAgentHost {
     }
 
     #[cfg(test)]
-    fn recover_from_encrypted_backups_with_stop<V: PrivateNodeAuthorityVerifier>(
+    fn prepare_recovery_from_encrypted_backups_with_stop<V: PrivateNodeAuthorityVerifier>(
         &mut self,
-        agent: AgentId,
+        route: ManagedAgentTarget,
+        superseded_authority_head: Option<Hash>,
         recovery_kit: &OfflineRecoveryKit,
         replacement_nodes: &[PrivateNodeIdentity],
         backups: &[&[u8]],
         authority: &V,
         stop: RecoveryInstallStop,
-    ) -> Result<RestoreDisposition, PrivateAgentHostError> {
-        self.recover_from_encrypted_backups_inner(
-            agent,
+    ) -> Result<PreparedPrivateRecovery, PrivateAgentHostError> {
+        self.prepare_recovery_from_encrypted_backups_inner(
+            route,
+            superseded_authority_head,
             recovery_kit,
             replacement_nodes,
             backups,
@@ -1108,16 +1215,21 @@ impl PrivateAgentHost {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn recover_from_encrypted_backups_inner<V: PrivateNodeAuthorityVerifier>(
+    fn prepare_recovery_from_encrypted_backups_inner<V: PrivateNodeAuthorityVerifier>(
         &mut self,
-        agent: AgentId,
+        route: ManagedAgentTarget,
+        superseded_authority_head: Option<Hash>,
         recovery_kit: &OfflineRecoveryKit,
         replacement_nodes: &[PrivateNodeIdentity],
         backups: &[&[u8]],
         authority: &V,
         stop: RecoveryInstallStop,
-    ) -> Result<RestoreDisposition, PrivateAgentHostError> {
+    ) -> Result<PreparedPrivateRecovery, PrivateAgentHostError> {
         self.verify_root_scope()?;
+        if !route.is_valid() || route.space != self.scope.space {
+            return Err(PrivateAgentHostError::InvalidScope);
+        }
+        let agent = route.agent;
         require_exact_local_member(replacement_nodes, &self.scope.local_node)?;
         let source_hash = recovery_sources_hash(backups)?;
         let replacements_hash = recovery_replacements_hash(
@@ -1137,29 +1249,35 @@ impl PrivateAgentHost {
                 &stage.join(RECOVERY_PLAN_FILE),
                 &self.node_key,
             )?;
-            if plan.space != self.scope.space
-                || plan.agent != agent
+            if plan.route != route
                 || plan.owner != self.scope.owner
                 || plan.source_hash != source_hash
                 || plan.replacements_hash != replacements_hash
                 || plan.recovery_signing_public_key != recovery_kit.signing_public_key()
                 || plan.recovery_encryption_public_key != recovery_kit.encryption_public_key()
+                || plan.completion.is_some()
             {
                 return Err(PrivateAgentHostError::Alias);
             }
-            let disposition = self.complete_recovery_plan(agent, authority, stop)?;
-            let hosted = open_hosted_agent(
-                &self.agent_path(agent),
-                self.scope.space,
-                self.scope.owner,
-                &self.scope.local_node,
-                &self.node_key,
-                authority,
-            )?;
-            if self.agents.insert(agent, hosted).is_some() {
+            let (control, proof) = validate_recovery_plan_material(&plan)?;
+            if proof.superseded_authority_head != superseded_authority_head {
                 return Err(PrivateAgentHostError::Alias);
             }
-            return Ok(disposition);
+            // The first process may have committed PVRP3 but failed while
+            // syncing the newly linked staging directory. Replaying both
+            // durability edges is mandatory before returning an authority
+            // handoff, even though the plan bytes themselves are exact.
+            sync_directory(&stage)?;
+            recovery_stop(stop, RecoveryInstallStop::AfterPlanFile)?;
+            sync_directory(&self.root.join(CREATING_DIRECTORY))?;
+            recovery_stop(stop, RecoveryInstallStop::AfterPlan)?;
+            return Ok(PreparedPrivateRecovery {
+                route,
+                control_wire: control
+                    .encode()
+                    .map_err(|_| PrivateAgentHostError::Corrupt)?,
+                proof,
+            });
         }
 
         let mut sources = Vec::new();
@@ -1273,6 +1391,20 @@ impl PrivateAgentHost {
             .descriptor
             .validate()
             .map_err(|_| PrivateAgentHostError::InvalidDescriptor)?;
+        if plaintext.descriptor.identity.space != route.space
+            || plaintext.descriptor.identity.agent != route.agent
+            || plaintext.descriptor.identity.runtime_deployment != route.runtime_deployment
+            || plaintext.descriptor.private_recovery
+                != Some(PrivateRecoveryBinding {
+                    signing_key_commitment: recovery_signing_public_key_commitment(
+                        &recovery_kit.signing_public_key(),
+                    ),
+                    encryption_public_key: recovery_kit.encryption_public_key(),
+                })
+        {
+            return Err(PrivateAgentHostError::InvalidScope);
+        }
+        validate_verified_backup_recovery_evidence(&verified, &plaintext.descriptor)?;
 
         let successor_epoch = prior_binding
             .epoch
@@ -1310,6 +1442,13 @@ impl PrivateAgentHost {
             signature: [0; 64],
         };
         sign_recovery_control_record(&mut recovery_record, recovery_kit.signing_key())?;
+        let proof = PrivateRecoveryAuthorityProof::from_control(
+            route.runtime_deployment,
+            &recovery_record,
+            superseded_authority_head,
+            recovery_kit.signing_key(),
+        )
+        .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
         verified.append_offline_recovery(&recovery_record, authority)?;
         let recovered_store = verified.encode_backup(MAX_PRIVATE_BACKUP_BYTES)?;
         let recovered_sidecars = encrypt_sidecars(
@@ -1332,45 +1471,49 @@ impl PrivateAgentHost {
             MAX_PRIVATE_HOST_ARCHIVE_BYTES,
         )?;
         let plan = RecoveryPlan {
-            space: self.scope.space,
-            agent,
+            route,
             owner: self.scope.owner,
             source_hash,
             replacements_hash,
             recovery_signing_public_key: recovery_kit.signing_public_key(),
             recovery_encryption_public_key: recovery_kit.encryption_public_key(),
+            control_wire: recovery_record
+                .encode()
+                .map_err(|_| PrivateAgentHostError::InvalidArtifact)?,
+            proof_wire: proof
+                .encode()
+                .map_err(|_| PrivateAgentHostError::InvalidArtifact)?,
             recovered_archive,
+            completion: None,
         };
         let plan_bytes = encode_recovery_plan(&plan, &self.node_key)?;
         fs::create_dir(&stage).map_err(map_io)?;
+        recovery_stop(stop, RecoveryInstallStop::AfterStageDirectory)?;
         let publish_result = publish_recovery_plan(&stage, &plan_bytes);
         if let Err(error) = publish_result {
             let _ = fs::remove_dir_all(&stage);
             let _ = sync_directory(&self.root.join(CREATING_DIRECTORY));
             return Err(error);
         }
+        // `publish_recovery_plan` commits the file within the new directory;
+        // the parent sync is the separate durability edge for the staging
+        // directory name itself. Authority handoff cannot begin before both.
+        recovery_stop(stop, RecoveryInstallStop::AfterPlanFile)?;
+        sync_directory(&self.root.join(CREATING_DIRECTORY))?;
         recovery_stop(stop, RecoveryInstallStop::AfterPlan)?;
-        let disposition = self.complete_recovery_plan(agent, authority, stop)?;
-        let hosted = open_hosted_agent(
-            &self.agent_path(agent),
-            self.scope.space,
-            self.scope.owner,
-            &self.scope.local_node,
-            &self.node_key,
-            authority,
-        )?;
-        if self.agents.insert(agent, hosted).is_some() {
-            return Err(PrivateAgentHostError::Alias);
-        }
-        Ok(disposition)
+        Ok(PreparedPrivateRecovery {
+            route,
+            control_wire: plan.control_wire,
+            proof,
+        })
     }
 
-    fn complete_recovery_plan<V: PrivateNodeAuthorityVerifier>(
+    fn stage_recovery_plan<V: PrivateNodeAuthorityVerifier>(
         &self,
         agent: AgentId,
         authority: &V,
-        stop: RecoveryInstallStop,
-    ) -> Result<RestoreDisposition, PrivateAgentHostError> {
+        stop: PrivateRuntimeApplicationStop,
+    ) -> Result<(HostedPrivateAgent, RestoreDisposition), PrivateAgentHostError> {
         let stage = self.creating_path(agent);
         let destination = self.agent_path(agent);
         if fs::symlink_metadata(&destination).is_ok() {
@@ -1378,7 +1521,11 @@ impl PrivateAgentHost {
         }
         let plan =
             read_and_authenticate_recovery_plan(&stage.join(RECOVERY_PLAN_FILE), &self.node_key)?;
-        if plan.space != self.scope.space || plan.agent != agent || plan.owner != self.scope.owner {
+        if plan.route.space != self.scope.space
+            || plan.route.agent != agent
+            || plan.owner != self.scope.owner
+            || plan.completion.is_some()
+        {
             return Err(PrivateAgentHostError::InvalidScope);
         }
         let archive = decode_host_archive(&plan.recovered_archive, true)?;
@@ -1415,13 +1562,13 @@ impl PrivateAgentHost {
             Err(error) => return Err(error.into()),
         };
         drop(store);
-        recovery_stop(stop, RecoveryInstallStop::AfterStore)?;
+        application_stop(stop, PrivateRuntimeApplicationStop::AfterRecoveryStore)?;
         write_exact_or_new_synced(&stage.join(DESCRIPTOR_FILE), &archive.descriptor)?;
-        recovery_stop(stop, RecoveryInstallStop::AfterDescriptor)?;
+        application_stop(stop, PrivateRuntimeApplicationStop::AfterRecoveryDescriptor)?;
         write_exact_or_new_synced(&stage.join(RUNTIME_FILE), &archive.runtime)?;
-        recovery_stop(stop, RecoveryInstallStop::AfterRuntime)?;
+        application_stop(stop, PrivateRuntimeApplicationStop::AfterRecoveryRuntime)?;
         write_exact_or_new_synced(&stage.join(BOOTSTRAP_FILE), &archive.bootstrap)?;
-        recovery_stop(stop, RecoveryInstallStop::AfterBootstrap)?;
+        application_stop(stop, PrivateRuntimeApplicationStop::AfterRecoveryBootstrap)?;
         sync_directory(&stage)?;
         let hosted = open_hosted_agent(
             &stage,
@@ -1431,16 +1578,9 @@ impl PrivateAgentHost {
             &self.node_key,
             authority,
         )?;
-        drop(hosted);
-        recovery_stop(stop, RecoveryInstallStop::AfterVerification)?;
-        remove_regular_file_if_present(&stage.join(RECOVERY_PLAN_FILE))?;
-        sync_directory(&stage)?;
-        recovery_stop(stop, RecoveryInstallStop::AfterPlanRetired)?;
-        fs::rename(&stage, &destination).map_err(map_io)?;
-        sync_directory(&self.root.join(CREATING_DIRECTORY))?;
-        sync_directory(&self.root)?;
-        recovery_stop(stop, RecoveryInstallStop::AfterPublish)?;
-        Ok(disposition)
+        validate_recovery_plan_host(&plan, &hosted)?;
+        application_stop(stop, PrivateRuntimeApplicationStop::AfterRecoveryReopen)?;
+        Ok((hosted, disposition))
     }
 
     /// Decode and serve one exact authenticated sync request. Authentication
@@ -1560,6 +1700,23 @@ impl PrivateAgentHost {
     {
         self.verify_root_scope()?;
         let agent = request.route.agent;
+        if !self.agents.contains_key(&agent)
+            && fs::symlink_metadata(self.creating_path(agent).join(RECOVERY_PLAN_FILE)).is_ok()
+        {
+            return self.apply_authorized_staged_recovery(authority, node_authority, request, stop);
+        }
+        if self.agents.contains_key(&agent) {
+            let control = PrivateControlRecord::decode(&request.control)
+                .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+            if matches!(control.operation, PrivateControlOperation::Recover { .. }) {
+                // Recover is a replacement-host operation. A fresh transition
+                // must be selected by an authenticated PVRP3 stage; accepting
+                // it against an already-live slot would create a second,
+                // coordinator-bypassing recovery pipeline. Published retries
+                // are recovered through the exact PSE2 evidence callback.
+                return Err(PrivateAgentHostError::UnsupportedOperation);
+            }
+        }
         let prepared = prepare_private_application(
             self.hosted(agent)?,
             &self.scope.local_node,
@@ -1643,6 +1800,53 @@ impl PrivateAgentHost {
         })
     }
 
+    fn apply_authorized_staged_recovery<V>(
+        &mut self,
+        authority: AuthorityActorTarget,
+        node_authority: &V,
+        request: &PrivateControlRuntimeApplicationRequest,
+        stop: PrivateRuntimeApplicationStop,
+    ) -> Result<PrivateControlRuntimeApplicationResult, PrivateAgentHostError>
+    where
+        V: PrivateNodeAuthorityVerifier,
+    {
+        let agent = request.route.agent;
+        if self.agents.contains_key(&agent) || fs::symlink_metadata(self.agent_path(agent)).is_ok()
+        {
+            return Err(PrivateAgentHostError::AlreadyExists);
+        }
+        let plan = read_and_authenticate_recovery_plan(
+            &self.creating_path(agent).join(RECOVERY_PLAN_FILE),
+            &self.node_key,
+        )?;
+        validate_staged_recovery_application_request(&plan, authority, request)?;
+        // This callback is reached only after the coordinator has durably
+        // pledged the exact authorization invocation, PCTL, and apply slot.
+        // Until now the post-Recover archive existed solely inside the
+        // authenticated plan and selected no live filesystem state.
+        let (hosted, _) = self.stage_recovery_plan(agent, node_authority, stop)?;
+        let prepared = prepare_staged_recovery_application(&plan, &hosted)?;
+        if !prepared.already_applied
+            || prepared.operation != AuthorityOperationKind::RecoverPrivateAgent
+        {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        let fact = reopened_private_application_fact(&hosted, request, &prepared)?;
+        drop(hosted);
+        Ok(PrivateControlRuntimeApplicationResult {
+            route: request.route,
+            authority: request.authority,
+            control: request.control.clone(),
+            receipt: request.receipt.clone(),
+            issuance_ack: request.issuance_ack.clone(),
+            applied_at: request.applied_at,
+            authenticated: true,
+            durably_applied: true,
+            durably_reopened: true,
+            application_fact: encode_private_application_fact(&fact),
+        })
+    }
+
     fn persist_completed_private_control_evidence<V>(
         &mut self,
         authority: AuthorityActorTarget,
@@ -1656,6 +1860,17 @@ impl PrivateAgentHost {
         self.verify_root_scope()?;
         if request.authority != authority || !request.route.is_valid() {
             return Err(PrivateAgentHostError::InvalidScope);
+        }
+        let agent = request.route.agent;
+        if !self.agents.contains_key(&agent)
+            && fs::symlink_metadata(self.creating_path(agent).join(RECOVERY_PLAN_FILE)).is_ok()
+        {
+            return self.persist_completed_staged_recovery_evidence(
+                authority,
+                node_authority,
+                request,
+                stop,
+            );
         }
         let control = PrivateControlRecord::decode(&request.control)
             .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
@@ -1672,37 +1887,106 @@ impl PrivateAgentHost {
         {
             return Err(PrivateAgentHostError::InvalidArtifact);
         }
-        let evidence =
-            PrivateControlAuthorityEvidence::from_acknowledgements(&issuance, &application)?;
-        evidence.verify_for(
-            &control,
-            application.application.epoch,
-            request.route,
-            authority,
+        let recovery_proof = request
+            .recovery_proof
+            .as_deref()
+            .map(PrivateRecoveryAuthorityProof::decode)
+            .transpose()
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+        let evidence = PrivateControlAuthorityEvidence::from_acknowledgements(
+            &issuance,
+            &application,
+            recovery_proof.as_ref(),
         )?;
         let evidence_wire = evidence.encode()?;
+        let recovery = matches!(&control.operation, PrivateControlOperation::Recover { .. });
+        if recovery && !self.agents.contains_key(&agent) {
+            // The evidence callback may lose its result after PVRP3 was
+            // retired or after the cross-directory rename. Reconcile only a
+            // self-authenticating planless Recover slot (or its already-live
+            // destination), then fall through to the byte-identical no-write
+            // evidence lookup below. This does not replay the transition.
+            self.reopen_recovery_result_loss_target(
+                agent,
+                &control,
+                &evidence_wire,
+                request.route,
+                authority,
+                node_authority,
+            )?;
+        }
+        if recovery {
+            let proof = recovery_proof
+                .as_ref()
+                .ok_or(PrivateAgentHostError::Unauthorized)?;
+            verify_recovery_authority_evidence(
+                &evidence,
+                &control,
+                proof,
+                application.application.epoch,
+                request.route,
+                authority,
+            )?;
+        } else {
+            evidence.verify_for(
+                &control,
+                application.application.epoch,
+                request.route,
+                authority,
+            )?;
+        }
         let evidence_commitment = evidence.commitment()?;
-        let agent = request.route.agent;
         let hosted = self.hosted(agent)?;
         let binding = hosted.store.binding();
+        let entry = hosted
+            .store
+            .indexed_controls()
+            .iter()
+            .find(|entry| entry.commitment == control.commitment())
+            .ok_or(PrivateAgentHostError::InvalidArtifact)?;
         if request.route.space != binding.space
             || request.route.agent != binding.agent
             || request.route.runtime_deployment != hosted.descriptor.identity.runtime_deployment
             || authority.space != binding.space
             || authority.binding != hosted.descriptor.authority
-            || application.application.epoch
-                != hosted
-                    .store
-                    .indexed_controls()
-                    .iter()
-                    .find(|entry| entry.commitment == control.commitment())
-                    .ok_or(PrivateAgentHostError::InvalidArtifact)?
-                    .resulting_epoch
+            || application.application.epoch != entry.resulting_epoch
             || !hosted
                 .store
                 .control_is_exact(control.commitment(), &request.control)?
         {
             return Err(PrivateAgentHostError::InvalidScope);
+        }
+        if recovery {
+            if control.signer != PrivateControlSigner::Recovery
+                || control.signer_public_key != hosted.store.recovery_public_key()
+            {
+                return Err(PrivateAgentHostError::Unauthorized);
+            }
+            // PVRP3 is retired before a recovered slot becomes live. A live
+            // Recover callback is therefore only a result-loss retry and may
+            // never attach new evidence after the authenticated plan vanished.
+            // Exact retained PSE2 bytes prove the transition crossed the sole
+            // staged recovery path; missing or divergent bytes fail closed.
+            if hosted
+                .store
+                .read_control_authority_evidence(entry)?
+                .as_deref()
+                != Some(evidence_wire.as_slice())
+            {
+                return Err(PrivateAgentHostError::Unauthorized);
+            }
+            return Ok(PrivateControlRuntimeEvidenceResult {
+                route: request.route,
+                authority: request.authority,
+                control: request.control.clone(),
+                issuance_ack: request.issuance_ack.clone(),
+                application_ack: request.application_ack.clone(),
+                recovery_proof: request.recovery_proof.clone(),
+                evidence_commitment,
+                authenticated: true,
+                durably_persisted: true,
+                durably_reopened: true,
+            });
         }
 
         #[cfg(test)]
@@ -1796,6 +2080,206 @@ impl PrivateAgentHost {
             control: request.control.clone(),
             issuance_ack: request.issuance_ack.clone(),
             application_ack: request.application_ack.clone(),
+            recovery_proof: request.recovery_proof.clone(),
+            evidence_commitment,
+            authenticated: true,
+            durably_persisted: true,
+            durably_reopened: true,
+        })
+    }
+
+    fn persist_completed_staged_recovery_evidence<V>(
+        &mut self,
+        authority: AuthorityActorTarget,
+        node_authority: &V,
+        request: &PrivateControlRuntimeEvidenceRequest,
+        stop: PrivateRuntimeApplicationStop,
+    ) -> Result<PrivateControlRuntimeEvidenceResult, PrivateAgentHostError>
+    where
+        V: PrivateNodeAuthorityVerifier,
+    {
+        let agent = request.route.agent;
+        let stage = self.creating_path(agent);
+        let destination = self.agent_path(agent);
+        if self.agents.contains_key(&agent) || fs::symlink_metadata(&destination).is_ok() {
+            return Err(PrivateAgentHostError::AlreadyExists);
+        }
+        let mut plan =
+            read_and_authenticate_recovery_plan(&stage.join(RECOVERY_PLAN_FILE), &self.node_key)?;
+        if request.authority != authority
+            || request.route != plan.route
+            || request.control != plan.control_wire
+            || request.recovery_proof.as_deref() != Some(plan.proof_wire.as_slice())
+        {
+            return Err(PrivateAgentHostError::InvalidScope);
+        }
+        let (control, proof) = validate_recovery_plan_material(&plan)?;
+        let plan_write = stage.join(RECOVERY_PLAN_WRITE_FILE);
+        if fs::symlink_metadata(&plan_write).is_ok() {
+            // The canonical authenticated plan is the commit point. A lost
+            // result while replacing it may leave a regular, partially or
+            // fully written successor temp. Once the exact callback has been
+            // matched to the canonical plan, retire that uncommitted temp so
+            // slot reopening cannot be poisoned and the update can be rebuilt.
+            require_regular_file(&plan_write)?;
+            remove_regular_file_if_present(&plan_write)?;
+            sync_directory(&stage)?;
+        }
+        let issuance = AuthorityOperationIssuanceAck::decode(&request.issuance_ack)
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+        let application = PrivateControlApplicationAck::decode(&request.application_ack)
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+        if issuance.encode().ok().as_deref() != Some(request.issuance_ack.as_slice())
+            || application.encode().ok().as_deref() != Some(request.application_ack.as_slice())
+        {
+            return Err(PrivateAgentHostError::InvalidArtifact);
+        }
+        let evidence = PrivateControlAuthorityEvidence::from_acknowledgements(
+            &issuance,
+            &application,
+            Some(&proof),
+        )?;
+        verify_recovery_authority_evidence(
+            &evidence,
+            &control,
+            &proof,
+            application.application.epoch,
+            request.route,
+            authority,
+        )?;
+        let evidence_wire = evidence.encode()?;
+        let evidence_commitment = evidence.commitment()?;
+        let expected_completion = RecoveryPlanCompletion {
+            issuance_ack: request.issuance_ack.clone(),
+            application_ack: request.application_ack.clone(),
+            evidence_commitment,
+        };
+        if plan
+            .completion
+            .as_ref()
+            .is_some_and(|retained| retained != &expected_completion)
+        {
+            return Err(PrivateAgentHostError::Alias);
+        }
+
+        // Runtime.apply has already staged and reopened this exact archive.
+        // A completed plan may be observed on an exact retry after the plan
+        // update commit point; in that case its evidence must already be
+        // physically present and is checked again below.
+        let mut hosted = open_hosted_agent(
+            &stage,
+            self.scope.space,
+            self.scope.owner,
+            &self.scope.local_node,
+            &self.node_key,
+            node_authority,
+        )?;
+        if plan.completion.is_none() {
+            validate_recovery_plan_host(&plan, &hosted)?;
+        }
+        if authority.binding != hosted.descriptor.authority {
+            return Err(PrivateAgentHostError::Unauthorized);
+        }
+
+        #[cfg(test)]
+        let evidence_stop = match stop {
+            PrivateRuntimeApplicationStop::AfterEvidenceStaged => {
+                ControlEvidenceCommitStop::AfterStaged
+            }
+            PrivateRuntimeApplicationStop::AfterEvidencePending => {
+                ControlEvidenceCommitStop::AfterPending
+            }
+            PrivateRuntimeApplicationStop::AfterEvidencePublished => {
+                ControlEvidenceCommitStop::AfterPublished
+            }
+            PrivateRuntimeApplicationStop::AfterEvidenceRetired => {
+                ControlEvidenceCommitStop::AfterRetired
+            }
+            _ => ControlEvidenceCommitStop::Never,
+        };
+        #[cfg(not(test))]
+        let evidence_stop = ControlEvidenceCommitStop::Never;
+        hosted
+            .store
+            .persist_control_authority_evidence_with_stop_for_runtime(
+                control.commitment(),
+                &evidence_wire,
+                evidence_stop,
+            )?;
+        drop(hosted);
+
+        let reopened = open_hosted_agent(
+            &stage,
+            self.scope.space,
+            self.scope.owner,
+            &self.scope.local_node,
+            &self.node_key,
+            node_authority,
+        )?;
+        let entry = reopened
+            .store
+            .indexed_controls()
+            .iter()
+            .find(|entry| entry.commitment == control.commitment())
+            .ok_or(PrivateAgentHostError::Corrupt)?;
+        if reopened
+            .store
+            .read_control_authority_evidence(entry)?
+            .as_deref()
+            != Some(evidence_wire.as_slice())
+        {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        #[cfg(test)]
+        if stop == PrivateRuntimeApplicationStop::AfterEvidenceReopen {
+            return Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted));
+        }
+
+        if plan.completion.is_none() {
+            plan.completion = Some(expected_completion);
+            commit_completed_recovery_plan(&stage, &plan, &self.node_key, stop)?;
+        }
+        validate_recovery_plan_host(&plan, &reopened)?;
+        drop(reopened);
+
+        // The plan is legal only below `.creating`. Retire and sync it before
+        // the directory rename so every published slot has the ordinary live
+        // layout. A stop here leaves a planless, fully authenticated staged
+        // slot which normal create recovery may safely publish on reopen.
+        remove_regular_file_if_present(&stage.join(RECOVERY_PLAN_FILE))?;
+        sync_directory(&stage)?;
+        application_stop(
+            stop,
+            PrivateRuntimeApplicationStop::AfterRecoveryPlanRetired,
+        )?;
+        fs::rename(&stage, &destination).map_err(map_io)?;
+        application_stop(stop, PrivateRuntimeApplicationStop::AfterRecoveryRename)?;
+        sync_directory(&self.root)?;
+        application_stop(
+            stop,
+            PrivateRuntimeApplicationStop::AfterRecoveryDestinationSync,
+        )?;
+        sync_directory(&self.root.join(CREATING_DIRECTORY))?;
+        application_stop(stop, PrivateRuntimeApplicationStop::AfterRecoveryPublished)?;
+
+        let reopened = open_hosted_agent(
+            &destination,
+            self.scope.space,
+            self.scope.owner,
+            &self.scope.local_node,
+            &self.node_key,
+            node_authority,
+        )?;
+        if self.agents.insert(agent, reopened).is_some() {
+            return Err(PrivateAgentHostError::Alias);
+        }
+        Ok(PrivateControlRuntimeEvidenceResult {
+            route: request.route,
+            authority: request.authority,
+            control: request.control.clone(),
+            issuance_ack: request.issuance_ack.clone(),
+            application_ack: request.application_ack.clone(),
+            recovery_proof: request.recovery_proof.clone(),
             evidence_commitment,
             authenticated: true,
             durably_persisted: true,
@@ -1873,21 +2357,64 @@ impl PrivateAgentHost {
         authority: &V,
     ) -> Result<(), PrivateAgentHostError> {
         let creating = self.root.join(CREATING_DIRECTORY);
+        retire_duplicate_tombstones(&creating)?;
         let mut staged = scan_agent_directories(&creating)?;
         staged.sort_unstable();
         for agent in staged {
             let source = self.creating_path(agent);
             let destination = self.agent_path(agent);
             if fs::symlink_metadata(&destination).is_ok() {
-                return Err(PrivateAgentHostError::Alias);
+                reconcile_exact_duplicate_slot(
+                    &source,
+                    &destination,
+                    self.scope.space,
+                    self.scope.owner,
+                    &self.scope.local_node,
+                    &self.node_key,
+                    authority,
+                )?;
+                retire_exact_duplicate_slot(&source, &creating, agent)?;
+                sync_directory(&creating)?;
+                continue;
             }
             let plan = source.join(RECOVERY_PLAN_FILE);
             let unpublished_plan = source.join(RECOVERY_PLAN_WRITE_FILE);
             if fs::symlink_metadata(&plan).is_ok() {
                 if fs::symlink_metadata(&unpublished_plan).is_ok() {
-                    return Err(PrivateAgentHostError::Alias);
+                    // The canonical plan is the last committed state. A stop
+                    // before rename leaves only an uncommitted replacement;
+                    // retire it without interpreting its bytes.
+                    require_regular_file(&unpublished_plan)?;
+                    remove_regular_file_if_present(&unpublished_plan)?;
+                    sync_directory(&source)?;
                 }
-                self.complete_recovery_plan(agent, authority, RecoveryInstallStop::Never)?;
+                let plan = read_and_authenticate_recovery_plan(&plan, &self.node_key)?;
+                if plan.route.space != self.scope.space
+                    || plan.route.agent != agent
+                    || plan.owner != self.scope.owner
+                {
+                    return Err(PrivateAgentHostError::InvalidScope);
+                }
+                // An authenticated preparation is deliberately inert. Only
+                // the post-authority evidence transition marks it publishable.
+                if plan.completion.is_none() {
+                    continue;
+                }
+                let hosted = open_hosted_agent(
+                    &source,
+                    self.scope.space,
+                    self.scope.owner,
+                    &self.scope.local_node,
+                    &self.node_key,
+                    authority,
+                )?;
+                validate_recovery_plan_host(&plan, &hosted)?;
+                drop(hosted);
+                remove_regular_file_if_present(&source.join(RECOVERY_PLAN_FILE))?;
+                sync_directory(&source)?;
+                fs::rename(&source, &destination).map_err(map_io)?;
+                sync_directory(&self.root)?;
+                sync_directory(&creating)?;
                 continue;
             }
             if fs::symlink_metadata(&unpublished_plan).is_ok() {
@@ -1901,6 +2428,15 @@ impl PrivateAgentHost {
                 sync_directory(&creating)?;
                 continue;
             }
+            require_real_directory(&source)?;
+            if fs::read_dir(&source).map_err(map_io)?.next().is_none() {
+                // Preparation creates this exact staging directory before it
+                // publishes PVRP3. A stop before the first file write leaves
+                // no authenticated state to retain and no data to interpret.
+                fs::remove_dir(&source).map_err(map_io)?;
+                sync_directory(&creating)?;
+                continue;
+            }
             let hosted = open_hosted_agent(
                 &source,
                 self.scope.space,
@@ -1909,10 +2445,94 @@ impl PrivateAgentHost {
                 &self.node_key,
                 authority,
             )?;
+            validate_planless_staged_recovery(&hosted, false)?;
             drop(hosted);
             fs::rename(&source, &destination).map_err(map_io)?;
-            sync_directory(&creating)?;
             sync_directory(&self.root)?;
+            sync_directory(&creating)?;
+        }
+        Ok(())
+    }
+
+    fn reopen_recovery_result_loss_target<V: PrivateNodeAuthorityVerifier>(
+        &mut self,
+        agent: AgentId,
+        expected_control: &PrivateControlRecord,
+        expected_evidence_wire: &[u8],
+        expected_route: ManagedAgentTarget,
+        expected_authority: AuthorityActorTarget,
+        authority: &V,
+    ) -> Result<(), PrivateAgentHostError> {
+        if self.agents.contains_key(&agent) {
+            return Ok(());
+        }
+        let creating = self.root.join(CREATING_DIRECTORY);
+        let source = self.creating_path(agent);
+        let destination = self.agent_path(agent);
+        if fs::symlink_metadata(&destination).is_ok() {
+            if fs::symlink_metadata(&source).is_ok() {
+                reconcile_exact_duplicate_slot(
+                    &source,
+                    &destination,
+                    self.scope.space,
+                    self.scope.owner,
+                    &self.scope.local_node,
+                    &self.node_key,
+                    authority,
+                )?;
+                retire_exact_duplicate_slot(&source, &creating, agent)?;
+            }
+        } else {
+            require_real_directory(&source)?;
+            if fs::symlink_metadata(source.join(RECOVERY_PLAN_FILE)).is_ok()
+                || fs::symlink_metadata(source.join(RECOVERY_PLAN_WRITE_FILE)).is_ok()
+            {
+                return Err(PrivateAgentHostError::Unauthorized);
+            }
+            let staged = open_hosted_agent(
+                &source,
+                self.scope.space,
+                self.scope.owner,
+                &self.scope.local_node,
+                &self.node_key,
+                authority,
+            )?;
+            validate_exact_recovery_result_loss_target(
+                &staged,
+                expected_control,
+                expected_evidence_wire,
+                expected_route,
+                expected_authority,
+            )?;
+            drop(staged);
+            // Repair an ambiguous failure of the preceding PVRP unlink
+            // directory sync before moving this name into the live parent.
+            sync_directory(&source)?;
+            fs::rename(&source, &destination).map_err(map_io)?;
+        }
+        // Whether this call performed the rename or merely observed its
+        // destination after a lost result, replay both namespace durability
+        // edges in destination-first order before returning success.
+        sync_directory(&self.root)?;
+        sync_directory(&creating)?;
+        let hosted = open_hosted_agent(
+            &destination,
+            self.scope.space,
+            self.scope.owner,
+            &self.scope.local_node,
+            &self.node_key,
+            authority,
+        )?;
+        validate_exact_recovery_result_loss_target(
+            &hosted,
+            expected_control,
+            expected_evidence_wire,
+            expected_route,
+            expected_authority,
+        )?;
+        if hosted.descriptor.identity.agent != agent || self.agents.insert(agent, hosted).is_some()
+        {
+            return Err(PrivateAgentHostError::Alias);
         }
         Ok(())
     }
@@ -1966,6 +2586,78 @@ impl<V> PrivateAgentRuntimeApplication<'_, V> {
     }
 }
 
+fn validate_staged_recovery_application_request(
+    plan: &RecoveryPlan,
+    authority: AuthorityActorTarget,
+    request: &PrivateControlRuntimeApplicationRequest,
+) -> Result<(), PrivateAgentHostError> {
+    if plan.completion.is_some()
+        || request.authority != authority
+        || request.route != plan.route
+        || authority.space != plan.route.space
+    {
+        return Err(PrivateAgentHostError::InvalidScope);
+    }
+    let (_control, proof) = validate_recovery_plan_material(plan)?;
+    if request.control != plan.control_wire || proof.managed != request.route {
+        return Err(PrivateAgentHostError::InvalidArtifact);
+    }
+    let receipt = AuthorityReceipt::decode(&request.receipt)
+        .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+    let issuance = AuthorityOperationIssuanceAck::decode(&request.issuance_ack)
+        .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+    let selector = &receipt.selector;
+    if receipt.encode().ok().as_deref() != Some(request.receipt.as_slice())
+        || issuance.encode().ok().as_deref() != Some(request.issuance_ack.as_slice())
+        || issuance.authority != authority
+        || issuance.receipt != receipt
+        || issuance.issued_at > request.applied_at
+        || selector.space != plan.route.space
+        || selector.agent != plan.route.agent
+        || selector.runtime_deployment != plan.route.runtime_deployment
+        || selector.operation != AuthorityOperationKind::RecoverPrivateAgent
+        || selector.actor.is_some()
+        || selector.actor_deployment.is_some()
+        || selector.request != proof.commitment()
+        || issuance
+            .verify_with(authority.binding, &RawAuthorityVerifier)
+            .is_err()
+        || receipt
+            .verify_at(request.applied_at, &RawAuthorityVerifier)
+            .is_err()
+    {
+        return Err(PrivateAgentHostError::Unauthorized);
+    }
+    Ok(())
+}
+
+fn prepare_staged_recovery_application(
+    plan: &RecoveryPlan,
+    hosted: &HostedPrivateAgent,
+) -> Result<PreparedPrivateApplication, PrivateAgentHostError> {
+    validate_recovery_plan_host(plan, hosted)?;
+    let (control, proof) = validate_recovery_plan_material(plan)?;
+    let expected_members: Vec<NodeId> = hosted
+        .store
+        .authorized_nodes()
+        .iter()
+        .map(|node| node.node)
+        .collect();
+    if private_member_set_commitment(expected_members.iter().copied())
+        != Some(proof.replacement_member_set)
+    {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    Ok(PreparedPrivateApplication {
+        control,
+        control_wire: plan.control_wire.clone(),
+        operation: AuthorityOperationKind::RecoverPrivateAgent,
+        expected_epoch: proof.next_epoch,
+        expected_members,
+        already_applied: true,
+    })
+}
+
 fn prepare_private_application<V>(
     hosted: &HostedPrivateAgent,
     local_node: &PrivateNodeIdentity,
@@ -2007,6 +2699,9 @@ where
         // HostedPrivateAgent has no durably reopenable runtime image. Refuse
         // before inspecting or mutating the store until a real runtime bridge
         // can commit and reopen the selected policy/actor-forest transition.
+        return Err(PrivateAgentHostError::UnsupportedOperation);
+    }
+    if matches!(control.operation, PrivateControlOperation::Recover { .. }) {
         return Err(PrivateAgentHostError::UnsupportedOperation);
     }
     let intent =
@@ -2094,11 +2789,6 @@ where
             member_set: expected,
             ..
         } if *expected != member_set => {
-            return Err(PrivateAgentHostError::InvalidMembership);
-        }
-        AuthorityOperationIntent::RecoverPrivateAgent { proof }
-            if proof.replacement_member_set != member_set =>
-        {
             return Err(PrivateAgentHostError::InvalidMembership);
         }
         _ => {}
@@ -3828,6 +4518,12 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), PrivateAgentHostErr
 }
 
 fn write_exact_or_new_synced(path: &Path, bytes: &[u8]) -> Result<(), PrivateAgentHostError> {
+    let parent = path.parent().ok_or(PrivateAgentHostError::InvalidRoot)?;
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or(PrivateAgentHostError::InvalidRoot)?;
+    let temporary = parent.join(format!("{file_name}{WRITE_SUFFIX}"));
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -3836,9 +4532,18 @@ fn write_exact_or_new_synced(path: &Path, bytes: &[u8]) -> Result<(), PrivateAge
             if read_bounded_file(path, bytes.len())? != bytes {
                 return Err(PrivateAgentHostError::Alias);
             }
-            Ok(())
+            remove_regular_file_if_present(&temporary)?;
+            sync_directory(parent)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => write_new_synced(path, bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A stopped first attempt can leave only this unpublished file.
+            // PVRP3 authenticates the exact canonical bytes, so discarding the
+            // temporary and replaying them is deterministic and safe.
+            remove_regular_file_if_present(&temporary)?;
+            write_new_synced(&temporary, bytes)?;
+            fs::rename(&temporary, path).map_err(map_io)?;
+            sync_directory(parent)
+        }
         Err(_) => Err(PrivateAgentHostError::Io),
     }
 }
@@ -3902,14 +4607,23 @@ struct HostArchive {
 }
 
 struct RecoveryPlan {
-    space: SpaceId,
-    agent: AgentId,
+    route: ManagedAgentTarget,
     owner: PrincipalId,
     source_hash: Hash,
     replacements_hash: Hash,
     recovery_signing_public_key: [u8; 32],
     recovery_encryption_public_key: [u8; 32],
+    control_wire: Vec<u8>,
+    proof_wire: Vec<u8>,
     recovered_archive: Vec<u8>,
+    completion: Option<RecoveryPlanCompletion>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecoveryPlanCompletion {
+    issuance_ack: Vec<u8>,
+    application_ack: Vec<u8>,
+    evidence_commitment: Hash,
 }
 
 fn recovery_sources_hash(backups: &[&[u8]]) -> Result<Hash, PrivateAgentHostError> {
@@ -3998,14 +4712,20 @@ fn encode_recovery_plan(
     plan: &RecoveryPlan,
     node_key: &PrivateNodeDecryptionKey,
 ) -> Result<Vec<u8>, PrivateAgentHostError> {
-    if plan.space == SpaceId::ZERO
-        || plan.agent == AgentId::ZERO
+    if !plan.route.is_valid()
         || plan.owner == PrincipalId::ZERO
         || plan.source_hash == Hash::ZERO
         || plan.replacements_hash == Hash::ZERO
         || plan.recovery_signing_public_key == [0; 32]
         || !valid_x25519_public_key(&plan.recovery_encryption_public_key)
+        || plan.control_wire.len() > MAX_PRIVATE_CONTROL_WIRE_BYTES
+        || plan.proof_wire.len() > MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES
         || plan.recovered_archive.len() > MAX_PRIVATE_HOST_ARCHIVE_BYTES
+        || plan.completion.as_ref().is_some_and(|completion| {
+            completion.issuance_ack.len() > MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES
+                || completion.application_ack.len() > MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES
+                || completion.evidence_commitment == Hash::ZERO
+        })
     {
         return Err(PrivateAgentHostError::InvalidArtifact);
     }
@@ -4014,14 +4734,22 @@ fn encode_recovery_plan(
     bytes.extend_from_slice(&RECOVERY_PLAN_VERSION.to_le_bytes());
     bytes.extend_from_slice(vos_agent_sdk::RUNTIME_ABI_ID.as_bytes());
     let mut encoder = Encoder(&mut bytes);
-    encoder.fixed(plan.space.as_bytes());
-    encoder.fixed(plan.agent.as_bytes());
+    encoder.fixed(plan.route.space.as_bytes());
+    encoder.fixed(plan.route.agent.as_bytes());
+    encoder.fixed(plan.route.runtime_deployment.as_bytes());
     encoder.fixed(plan.owner.as_bytes());
     encoder.fixed(plan.source_hash.as_bytes());
     encoder.fixed(plan.replacements_hash.as_bytes());
     encoder.fixed(&plan.recovery_signing_public_key);
     encoder.fixed(&plan.recovery_encryption_public_key);
+    encoder.bytes(&plan.control_wire);
+    encoder.bytes(&plan.proof_wire);
     encoder.bytes(&plan.recovered_archive);
+    encoder.option(&plan.completion, |encoder, completion| {
+        encoder.bytes(&completion.issuance_ack);
+        encoder.bytes(&completion.application_ack);
+        encoder.fixed(completion.evidence_commitment.as_bytes());
+    });
     if bytes.len().saturating_add(32) > MAX_PRIVATE_RECOVERY_PLAN_BYTES {
         return Err(PrivateAgentHostError::LimitExceeded);
     }
@@ -4050,26 +4778,50 @@ fn decode_recovery_plan(
         return Err(PrivateAgentHostError::Corrupt);
     }
     let plan = RecoveryPlan {
-        space: SpaceId(decoder.fixed().map_err(map_decode)?),
-        agent: AgentId(decoder.fixed().map_err(map_decode)?),
+        route: ManagedAgentTarget {
+            space: SpaceId(decoder.fixed().map_err(map_decode)?),
+            agent: AgentId(decoder.fixed().map_err(map_decode)?),
+            runtime_deployment: DeploymentId(decoder.fixed().map_err(map_decode)?),
+        },
         owner: PrincipalId(decoder.fixed().map_err(map_decode)?),
         source_hash: Hash(decoder.fixed().map_err(map_decode)?),
         replacements_hash: Hash(decoder.fixed().map_err(map_decode)?),
         recovery_signing_public_key: decoder.fixed().map_err(map_decode)?,
         recovery_encryption_public_key: decoder.fixed().map_err(map_decode)?,
+        control_wire: decoder
+            .bytes_bounded(MAX_PRIVATE_CONTROL_WIRE_BYTES)
+            .map_err(map_decode)?,
+        proof_wire: decoder
+            .bytes_bounded(MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES)
+            .map_err(map_decode)?,
         recovered_archive: decoder
             .bytes_bounded(MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .map_err(map_decode)?,
+        completion: decoder
+            .option(|decoder| {
+                Ok(RecoveryPlanCompletion {
+                    issuance_ack: decoder
+                        .bytes_bounded(MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES)?,
+                    application_ack: decoder
+                        .bytes_bounded(MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES)?,
+                    evidence_commitment: Hash(decoder.fixed()?),
+                })
+            })
             .map_err(map_decode)?,
     };
     let authenticator = Hash(decoder.fixed().map_err(map_decode)?);
     if !decoder.exhausted()
-        || plan.space == SpaceId::ZERO
-        || plan.agent == AgentId::ZERO
+        || !plan.route.is_valid()
         || plan.owner == PrincipalId::ZERO
         || plan.source_hash == Hash::ZERO
         || plan.replacements_hash == Hash::ZERO
         || plan.recovery_signing_public_key == [0; 32]
         || !valid_x25519_public_key(&plan.recovery_encryption_public_key)
+        || plan.completion.as_ref().is_some_and(|completion| {
+            completion.evidence_commitment == Hash::ZERO
+                || completion.issuance_ack.is_empty()
+                || completion.application_ack.is_empty()
+        })
     {
         return Err(PrivateAgentHostError::Corrupt);
     }
@@ -4077,7 +4829,509 @@ fn decode_recovery_plan(
     if node_key.recovery_plan_authenticator(plan_hash)? != authenticator {
         return Err(PrivateAgentHostError::Corrupt);
     }
+    validate_recovery_plan_material(&plan)?;
+    if encode_recovery_plan(&plan, node_key)? != bytes {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
     Ok(plan)
+}
+
+fn validate_recovery_plan_material(
+    plan: &RecoveryPlan,
+) -> Result<(PrivateControlRecord, PrivateRecoveryAuthorityProof), PrivateAgentHostError> {
+    let control = PrivateControlRecord::decode(&plan.control_wire)
+        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    let proof = PrivateRecoveryAuthorityProof::decode(&plan.proof_wire)
+        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    if control.encode().ok().as_deref() != Some(plan.control_wire.as_slice())
+        || proof.encode().ok().as_deref() != Some(plan.proof_wire.as_slice())
+        || !matches!(&control.operation, PrivateControlOperation::Recover { .. })
+        || control.signer != PrivateControlSigner::Recovery
+        || control.signer_public_key != plan.recovery_signing_public_key
+        || !proof.matches_control(&control)
+        || proof.managed != plan.route
+        || proof.recovery_public_key != plan.recovery_signing_public_key
+        || proof
+            .verify_with(&RawRecoveryAuthorityProofVerifier)
+            .is_err()
+    {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    verify_control_record_signature(&control).map_err(|_| PrivateAgentHostError::Corrupt)?;
+    let archive = decode_host_archive(&plan.recovered_archive, true)?;
+    if archive.space != plan.route.space || archive.agent != plan.route.agent {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    if let Some(completion) = &plan.completion {
+        let issuance = AuthorityOperationIssuanceAck::decode(&completion.issuance_ack)
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        let application = PrivateControlApplicationAck::decode(&completion.application_ack)
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        let evidence = PrivateControlAuthorityEvidence::from_acknowledgements(
+            &issuance,
+            &application,
+            Some(&proof),
+        )
+        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        if issuance.encode().ok().as_deref() != Some(completion.issuance_ack.as_slice())
+            || application.encode().ok().as_deref() != Some(completion.application_ack.as_slice())
+            || evidence.commitment().ok() != Some(completion.evidence_commitment)
+            || issuance.authority != application.authority
+            || issuance.receipt.selector.operation != AuthorityOperationKind::RecoverPrivateAgent
+            || issuance.receipt.selector.space != plan.route.space
+            || issuance.receipt.selector.agent != plan.route.agent
+            || issuance.receipt.selector.runtime_deployment != plan.route.runtime_deployment
+            || issuance.receipt.selector.request != proof.commitment()
+            || application.application.managed != plan.route
+            || application.application.operation != AuthorityOperationKind::RecoverPrivateAgent
+            || application.application.control != control.commitment()
+            || application.application.control_sequence != control.sequence
+            || application.application.control_previous != control.previous
+            || application.application.epoch != proof.next_epoch
+            || application.application.post_member_set != proof.replacement_member_set
+        {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+    }
+    Ok((control, proof))
+}
+
+fn validate_recovery_plan_host(
+    plan: &RecoveryPlan,
+    hosted: &HostedPrivateAgent,
+) -> Result<(), PrivateAgentHostError> {
+    let (control, proof) = validate_recovery_plan_material(plan)?;
+    let binding = hosted.store.binding();
+    let member_set =
+        private_member_set_commitment(hosted.store.authorized_nodes().iter().map(|node| node.node))
+            .ok_or(PrivateAgentHostError::Corrupt)?;
+    if binding.space != plan.route.space
+        || binding.agent != plan.route.agent
+        || binding.owner != plan.owner
+        || binding.epoch != proof.next_epoch
+        || binding.control_head != Some(control.commitment())
+        || binding.next_sequence
+            != control
+                .sequence
+                .checked_add(1)
+                .ok_or(PrivateAgentHostError::LimitExceeded)?
+        || hosted.descriptor.identity.space != plan.route.space
+        || hosted.descriptor.identity.agent != plan.route.agent
+        || hosted.descriptor.identity.owner != plan.owner
+        || hosted.descriptor.identity.runtime_deployment != plan.route.runtime_deployment
+        || hosted.descriptor.private_recovery
+            != Some(PrivateRecoveryBinding {
+                signing_key_commitment: recovery_signing_public_key_commitment(
+                    &plan.recovery_signing_public_key,
+                ),
+                encryption_public_key: plan.recovery_encryption_public_key,
+            })
+        || hosted.store.recovery_public_key() != plan.recovery_signing_public_key
+        || hosted.store.recovery_encryption_public_key() != plan.recovery_encryption_public_key
+        || member_set != proof.replacement_member_set
+        || !hosted
+            .store
+            .control_is_exact(control.commitment(), &plan.control_wire)?
+    {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    if let Some(completion) = &plan.completion {
+        verify_completed_recovery_evidence(plan, hosted, completion)?;
+        // Publication is gated on the whole imported recovery history, not
+        // merely the new head. This keeps a missing, mixed-version, or forged
+        // historical PSE from becoming live on the no-crash success path.
+        validate_planless_staged_recovery(hosted, true)?;
+    }
+    Ok(())
+}
+
+/// A planless staging slot is normally an ordinary create that stopped after
+/// its own authenticated files were complete. Recovery has a stronger gate:
+/// PVRP3 is retired immediately before publication, so the exact Recover head
+/// must already carry a self-contained PSE2 with PRA1+AOI1+PCA1. This check
+/// prevents a nonempty, planless partial recovery from being mistaken for an
+/// ordinary completed create.
+fn validate_planless_staged_recovery(
+    hosted: &HostedPrivateAgent,
+    recovery_required: bool,
+) -> Result<(), PrivateAgentHostError> {
+    let binding = hosted.store.binding();
+    let mut saw_recovery = false;
+    let mut current_head_is_verified_recovery = false;
+    for indexed in hosted.store.indexed_controls() {
+        let indexed_wire = hosted.store.read_control_wire(indexed)?;
+        let indexed_control = PrivateControlRecord::decode(&indexed_wire)
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        if !matches!(
+            &indexed_control.operation,
+            PrivateControlOperation::Recover { .. }
+        ) {
+            continue;
+        }
+        saw_recovery = true;
+        if indexed_control.signer != PrivateControlSigner::Recovery
+            || indexed_control.signer_public_key != hosted.store.recovery_public_key()
+        {
+            return Err(PrivateAgentHostError::Unauthorized);
+        }
+        let evidence_wire = hosted
+            .store
+            .read_control_authority_evidence(indexed)?
+            .ok_or(PrivateAgentHostError::Unauthorized)?;
+        let evidence = PrivateControlAuthorityEvidence::decode(&evidence_wire)?;
+        let issuance = AuthorityOperationIssuanceAck::decode(&evidence.issuance_ack)
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        let selector = &issuance.receipt.selector;
+        let authority = issuance.authority;
+        let route = ManagedAgentTarget {
+            space: selector.space,
+            agent: selector.agent,
+            runtime_deployment: selector.runtime_deployment,
+        };
+        let is_current = binding.control_head == Some(indexed.commitment);
+        if !route.is_valid()
+            || route.space != hosted.descriptor.identity.space
+            || route.agent != hosted.descriptor.identity.agent
+            || (is_current
+                && route.runtime_deployment != hosted.descriptor.identity.runtime_deployment)
+            || authority.space != route.space
+            || authority.binding != hosted.descriptor.authority
+        {
+            return Err(PrivateAgentHostError::Unauthorized);
+        }
+        evidence.verify_for(&indexed_control, indexed.resulting_epoch, route, authority)?;
+        current_head_is_verified_recovery |= is_current;
+    }
+    let Some(_) = binding.control_head else {
+        if saw_recovery || recovery_required {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        return Ok(());
+    };
+    if !current_head_is_verified_recovery {
+        // Ordinary create staging has no control head. The recovery staging
+        // flow publishes immediately after attaching evidence, so its current
+        // head must be the exact Recover carried by PVRP3. Historical Recover
+        // entries are permitted only when their own PSE2 is valid, but a
+        // later owner control cannot pass through this recovery-only path.
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    Ok(())
+}
+
+fn validate_verified_backup_recovery_evidence(
+    backup: &super::private_store::VerifiedEncryptedBackup,
+    descriptor: &AgentDescriptor,
+) -> Result<(), PrivateAgentHostError> {
+    for (index, control, evidence_wire) in backup.controls_with_authority_evidence() {
+        if !matches!(&control.operation, PrivateControlOperation::Recover { .. }) {
+            continue;
+        }
+        let recovery = descriptor
+            .private_recovery
+            .as_ref()
+            .ok_or(PrivateAgentHostError::Corrupt)?;
+        if control.signer != PrivateControlSigner::Recovery
+            || recovery.signing_key_commitment
+                != recovery_signing_public_key_commitment(&control.signer_public_key)
+        {
+            return Err(PrivateAgentHostError::Unauthorized);
+        }
+        let evidence_wire = evidence_wire.ok_or(PrivateAgentHostError::Unauthorized)?;
+        let evidence = PrivateControlAuthorityEvidence::decode(evidence_wire)?;
+        let issuance = AuthorityOperationIssuanceAck::decode(&evidence.issuance_ack)
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        let selector = &issuance.receipt.selector;
+        let route = ManagedAgentTarget {
+            space: selector.space,
+            agent: selector.agent,
+            runtime_deployment: selector.runtime_deployment,
+        };
+        if route.space != descriptor.identity.space
+            || route.agent != descriptor.identity.agent
+            || issuance.authority.space != route.space
+            || issuance.authority.binding != descriptor.authority
+        {
+            return Err(PrivateAgentHostError::Unauthorized);
+        }
+        evidence.verify_for(control, index.resulting_epoch, route, issuance.authority)?;
+    }
+    Ok(())
+}
+
+fn validate_exact_recovery_result_loss_target(
+    hosted: &HostedPrivateAgent,
+    expected_control: &PrivateControlRecord,
+    expected_evidence_wire: &[u8],
+    expected_route: ManagedAgentTarget,
+    expected_authority: AuthorityActorTarget,
+) -> Result<(), PrivateAgentHostError> {
+    validate_planless_staged_recovery(hosted, true)?;
+    let binding = hosted.store.binding();
+    let commitment = expected_control.commitment();
+    let entry = hosted
+        .store
+        .indexed_controls()
+        .iter()
+        .find(|entry| entry.commitment == commitment)
+        .ok_or(PrivateAgentHostError::Unauthorized)?;
+    if binding.control_head != Some(commitment)
+        || binding.space != expected_route.space
+        || binding.agent != expected_route.agent
+        || hosted.descriptor.identity.runtime_deployment != expected_route.runtime_deployment
+        || expected_authority.space != binding.space
+        || hosted.descriptor.authority != expected_authority.binding
+        || !hosted.store.control_is_exact(
+            commitment,
+            &expected_control
+                .encode()
+                .map_err(|_| PrivateAgentHostError::InvalidArtifact)?,
+        )?
+        || hosted
+            .store
+            .read_control_authority_evidence(entry)?
+            .as_deref()
+            != Some(expected_evidence_wire)
+    {
+        return Err(PrivateAgentHostError::Unauthorized);
+    }
+    let evidence = PrivateControlAuthorityEvidence::decode(expected_evidence_wire)?;
+    evidence.verify_for(
+        expected_control,
+        entry.resulting_epoch,
+        expected_route,
+        expected_authority,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_exact_duplicate_slot<V: PrivateNodeAuthorityVerifier>(
+    source: &Path,
+    destination: &Path,
+    space: SpaceId,
+    owner: PrincipalId,
+    local_node: &PrivateNodeIdentity,
+    node_key: &PrivateNodeDecryptionKey,
+    authority: &V,
+) -> Result<(), PrivateAgentHostError> {
+    require_real_directory(source)?;
+    require_real_directory(destination)?;
+    if fs::symlink_metadata(source.join(RECOVERY_PLAN_FILE)).is_ok()
+        || fs::symlink_metadata(source.join(RECOVERY_PLAN_WRITE_FILE)).is_ok()
+    {
+        return Err(PrivateAgentHostError::Alias);
+    }
+    let staged = open_hosted_agent(source, space, owner, local_node, node_key, authority)?;
+    let published = open_hosted_agent(destination, space, owner, local_node, node_key, authority)?;
+    validate_planless_staged_recovery(&staged, true)?;
+    validate_planless_staged_recovery(&published, true)?;
+    let exact_archive =
+        |slot: &Path, hosted: &HostedPrivateAgent| -> Result<Vec<u8>, PrivateAgentHostError> {
+            let archive = HostArchive {
+                space,
+                agent: hosted.descriptor.identity.agent,
+                store: hosted
+                    .store
+                    .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)?,
+                descriptor: read_sidecar_wire(slot, DESCRIPTOR_FILE)?,
+                runtime: read_sidecar_wire(slot, RUNTIME_FILE)?,
+                bootstrap: read_sidecar_wire(slot, BOOTSTRAP_FILE)?,
+            };
+            encode_host_archive(&archive, true, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+        };
+    if exact_archive(source, &staged)? != exact_archive(destination, &published)? {
+        return Err(PrivateAgentHostError::Alias);
+    }
+    drop(staged);
+    drop(published);
+    Ok(())
+}
+
+fn retired_duplicate_path(creating: &Path, agent: AgentId) -> PathBuf {
+    creating.join(format!(
+        "{}{RETIRED_DUPLICATE_SUFFIX}",
+        encode_agent_id(agent)
+    ))
+}
+
+/// Retire an already-proven byte-identical staging duplicate through one
+/// atomic name change. Once the parent sync publishes the reserved tombstone,
+/// recursive cleanup is restartable: no partial tree is ever interpreted as
+/// an Agent slot again.
+fn retire_exact_duplicate_slot(
+    source: &Path,
+    creating: &Path,
+    agent: AgentId,
+) -> Result<(), PrivateAgentHostError> {
+    let retired = retired_duplicate_path(creating, agent);
+    match fs::symlink_metadata(&retired) {
+        Ok(_) => return Err(PrivateAgentHostError::Alias),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(PrivateAgentHostError::Io),
+    }
+    fs::rename(source, &retired).map_err(map_io)?;
+    sync_directory(creating)?;
+    require_real_directory(&retired)?;
+    fs::remove_dir_all(&retired).map_err(map_io)?;
+    sync_directory(creating)
+}
+
+/// Resume only names which the exact duplicate-retirement protocol can have
+/// published. The atomic tombstone is sufficient authorization to finish
+/// removal; arbitrary names and symlinks remain fail-closed for the normal
+/// staging-directory scanner.
+fn retire_duplicate_tombstones(creating: &Path) -> Result<(), PrivateAgentHostError> {
+    let mut retired = Vec::new();
+    for entry in fs::read_dir(creating).map_err(map_io)? {
+        let entry = entry.map_err(map_io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| PrivateAgentHostError::InvalidRoot)?;
+        let Some(agent_name) = name.strip_suffix(RETIRED_DUPLICATE_SUFFIX) else {
+            continue;
+        };
+        if decode_agent_id(agent_name).is_none() {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(map_io)?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return Err(PrivateAgentHostError::Alias);
+        }
+        retired.push(entry.path());
+    }
+    retired.sort_unstable();
+    for path in retired {
+        require_real_directory(&path)?;
+        fs::remove_dir_all(&path).map_err(map_io)?;
+        sync_directory(creating)?;
+    }
+    Ok(())
+}
+
+fn verify_completed_recovery_evidence(
+    plan: &RecoveryPlan,
+    hosted: &HostedPrivateAgent,
+    completion: &RecoveryPlanCompletion,
+) -> Result<(), PrivateAgentHostError> {
+    let (control, proof) = validate_recovery_plan_material(plan)?;
+    let issuance = AuthorityOperationIssuanceAck::decode(&completion.issuance_ack)
+        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    let application = PrivateControlApplicationAck::decode(&completion.application_ack)
+        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    let authority = issuance.authority;
+    let evidence = PrivateControlAuthorityEvidence::from_acknowledgements(
+        &issuance,
+        &application,
+        Some(&proof),
+    )
+    .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    if authority.space != plan.route.space || authority.binding != hosted.descriptor.authority {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    verify_recovery_authority_evidence(
+        &evidence,
+        &control,
+        &proof,
+        proof.next_epoch,
+        plan.route,
+        authority,
+    )
+    .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    if evidence.commitment().ok() != Some(completion.evidence_commitment) {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    let entry = hosted
+        .store
+        .indexed_controls()
+        .iter()
+        .find(|entry| entry.commitment == control.commitment())
+        .ok_or(PrivateAgentHostError::Corrupt)?;
+    let evidence_wire = evidence.encode()?;
+    if hosted
+        .store
+        .read_control_authority_evidence(entry)?
+        .as_deref()
+        != Some(evidence_wire.as_slice())
+    {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    Ok(())
+}
+
+/// Verify recovery completion against the exact retained PRA1 rather than
+/// attempting the normal private-control intent reconstruction (which
+/// deliberately rejects Recover). Neither AOI1 nor PCA1 is accepted as a
+/// substitute for possession of the independently signed recovery proof.
+fn verify_recovery_authority_evidence(
+    evidence: &PrivateControlAuthorityEvidence,
+    control: &PrivateControlRecord,
+    proof: &PrivateRecoveryAuthorityProof,
+    resulting_epoch: u64,
+    route: ManagedAgentTarget,
+    authority: AuthorityActorTarget,
+) -> Result<(), PrivateAgentHostError> {
+    if !route.is_valid()
+        || !authority.is_valid()
+        || route.space != authority.space
+        || control.space != route.space
+        || control.agent != route.agent
+        || proof.managed != route
+        || !proof.matches_control(control)
+        || proof
+            .verify_with(&RawRecoveryAuthorityProofVerifier)
+            .is_err()
+        || evidence.recovery_proof.as_deref() != proof.encode().ok().as_deref()
+    {
+        return Err(PrivateAgentHostError::Unauthorized);
+    }
+    verify_control_record_signature(control)?;
+    let issuance = AuthorityOperationIssuanceAck::decode(&evidence.issuance_ack)
+        .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+    let application = PrivateControlApplicationAck::decode(&evidence.application_ack)
+        .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+    if issuance.encode().ok().as_deref() != Some(evidence.issuance_ack.as_slice())
+        || application.encode().ok().as_deref() != Some(evidence.application_ack.as_slice())
+    {
+        return Err(PrivateAgentHostError::InvalidArtifact);
+    }
+    let intent = AuthorityOperationIntent::RecoverPrivateAgent {
+        proof: proof.clone(),
+    };
+    let selector = &issuance.receipt.selector;
+    if issuance.authority != authority
+        || application.authority != authority
+        || issuance
+            .verify_with(authority.binding, &RawAuthorityVerifier)
+            .is_err()
+        || application
+            .verify_issuance_tombstone_with(
+                authority,
+                issuance.authorization_invocation,
+                issuance.acknowledgement_invocation,
+                issuance.authorization_sequence,
+                issuance.commitment(),
+                &RawAuthorityVerifier,
+            )
+            .is_err()
+        || application.operation_call != issuance.operation_call
+        || application.approval != issuance.approval
+        || application.receipt != issuance.receipt
+        || application.issued_at != issuance.issued_at
+        || !private_intent_matches_application(&intent, &application.application)
+        || application.application.epoch != resulting_epoch
+        || selector.request != proof.commitment()
+        || selector.operation != AuthorityOperationKind::RecoverPrivateAgent
+        || selector.actor.is_some()
+        || selector.actor_deployment.is_some()
+        || selector.space != route.space
+        || selector.agent != route.agent
+        || selector.runtime_deployment != route.runtime_deployment
+    {
+        return Err(PrivateAgentHostError::Unauthorized);
+    }
+    Ok(())
 }
 
 fn read_and_authenticate_recovery_plan(
@@ -4094,6 +5348,27 @@ fn publish_recovery_plan(slot: &Path, bytes: &[u8]) -> Result<(), PrivateAgentHo
     write_new_synced(&temporary, bytes)?;
     fs::rename(&temporary, &canonical).map_err(map_io)?;
     sync_directory(slot)
+}
+
+fn commit_completed_recovery_plan(
+    slot: &Path,
+    plan: &RecoveryPlan,
+    node_key: &PrivateNodeDecryptionKey,
+    stop: PrivateRuntimeApplicationStop,
+) -> Result<(), PrivateAgentHostError> {
+    let temporary = slot.join(RECOVERY_PLAN_WRITE_FILE);
+    let canonical = slot.join(RECOVERY_PLAN_FILE);
+    require_regular_file(&canonical)?;
+    remove_regular_file_if_present(&temporary)?;
+    let bytes = encode_recovery_plan(plan, node_key)?;
+    write_new_synced(&temporary, &bytes)?;
+    application_stop(stop, PrivateRuntimeApplicationStop::AfterRecoveryPlanWrite)?;
+    fs::rename(&temporary, &canonical).map_err(map_io)?;
+    sync_directory(slot)?;
+    application_stop(
+        stop,
+        PrivateRuntimeApplicationStop::AfterRecoveryPlanCommitted,
+    )
 }
 
 fn recovery_stop(
@@ -4808,7 +6083,6 @@ mod tests {
         AuthorityActorTarget,
         PrivateControlRuntimeApplicationRequest,
     ) {
-        let (authority, key) = authority_target(fixture);
         let route = ManagedAgentTarget {
             space: fixture.space,
             agent: control.agent,
@@ -4816,9 +6090,53 @@ mod tests {
         };
         let intent =
             AuthorityOperationIntent::private_control(route.runtime_deployment, control).unwrap();
+        runtime_application_request_for_intent(fixture, control, intent, issued_at, applied_at)
+    }
+
+    fn recovery_runtime_application_request(
+        fixture: &Fixture,
+        control: &PrivateControlRecord,
+        superseded_authority_head: Option<Hash>,
+        issued_at: u64,
+        applied_at: u64,
+    ) -> (
+        AuthorityActorTarget,
+        PrivateControlRuntimeApplicationRequest,
+        PrivateRecoveryAuthorityProof,
+    ) {
+        let route = recovery_route(fixture, control.agent);
+        let proof = PrivateRecoveryAuthorityProof::from_control(
+            route.runtime_deployment,
+            control,
+            superseded_authority_head,
+            &fixture.recovery,
+        )
+        .unwrap();
+        let intent = AuthorityOperationIntent::RecoverPrivateAgent {
+            proof: proof.clone(),
+        };
+        let (authority, request) =
+            runtime_application_request_for_intent(fixture, control, intent, issued_at, applied_at);
+        (authority, request, proof)
+    }
+
+    fn runtime_application_request_for_intent(
+        fixture: &Fixture,
+        control: &PrivateControlRecord,
+        intent: AuthorityOperationIntent,
+        issued_at: u64,
+        applied_at: u64,
+    ) -> (
+        AuthorityActorTarget,
+        PrivateControlRuntimeApplicationRequest,
+    ) {
+        let (authority, key) = authority_target(fixture);
+        let route = intent.managed();
+        assert_eq!(route.space, fixture.space);
+        assert_eq!(route.agent, control.agent);
         let operation = intent.operation();
-        let actor = match intent {
-            AuthorityOperationIntent::PrivateActorLifecycle { actor, .. } => Some(actor),
+        let actor = match &intent {
+            AuthorityOperationIntent::PrivateActorLifecycle { actor, .. } => Some(*actor),
             _ => None,
         };
         let mut receipt = AuthorityReceipt {
@@ -4847,7 +6165,10 @@ mod tests {
                 acknowledged_through: 0,
                 valid_from: issued_at,
                 expires_at: applied_at.saturating_add(100),
-                request: control.commitment(),
+                request: match &intent {
+                    AuthorityOperationIntent::RecoverPrivateAgent { proof } => proof.commitment(),
+                    _ => control.commitment(),
+                },
             },
             public_key: authority.binding.public_key,
             signature: [0; 64],
@@ -4893,6 +6214,14 @@ mod tests {
         )
     }
 
+    fn recovery_route(fixture: &Fixture, agent: AgentId) -> ManagedAgentTarget {
+        ManagedAgentTarget {
+            space: fixture.space,
+            agent,
+            runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+        }
+    }
+
     fn canonical_sidecars(host: &PrivateAgentHost, agent: AgentId) -> [Vec<u8>; 3] {
         let slot = host.agent_path(agent);
         SIDECAR_FILES.map(|name| fs::read(slot.join(name)).unwrap())
@@ -4929,6 +6258,78 @@ mod tests {
             .persist_completed_evidence(&evidence_request)
             .unwrap();
         assert!(evidence.authenticated && evidence.durably_persisted && evidence.durably_reopened);
+        (result, application)
+    }
+
+    fn apply_and_attach_test_recovery_authority_evidence(
+        host: &mut PrivateAgentHost,
+        fixture: &Fixture,
+        control: &PrivateControlRecord,
+        superseded_authority_head: Option<Hash>,
+        issued_at: u64,
+        applied_at: u64,
+    ) -> (
+        PrivateControlRuntimeApplicationResult,
+        PrivateControlApplicationAck,
+    ) {
+        let (_authority, request, proof) = recovery_runtime_application_request(
+            fixture,
+            control,
+            superseded_authority_head,
+            issued_at,
+            applied_at,
+        );
+        // Sync fixtures need an authenticated historical Recover row but must
+        // not reopen the production live-adapter recovery path. Apply through
+        // the explicitly test-only PCTL helper, construct the exact reopened
+        // fact, and attach its proof-bound PSE2 directly to the test store.
+        host.apply_recovery_record(control.agent, control.previous, control, &TestAuthority)
+            .unwrap();
+        let expected_members: Vec<NodeId> = host.agents[&control.agent]
+            .store
+            .authorized_nodes()
+            .iter()
+            .map(|node| node.node)
+            .collect();
+        let prepared = PreparedPrivateApplication {
+            control: control.clone(),
+            control_wire: request.control.clone(),
+            operation: AuthorityOperationKind::RecoverPrivateAgent,
+            expected_epoch: proof.next_epoch,
+            expected_members,
+            already_applied: true,
+        };
+        let application_fact =
+            reopened_private_application_fact(&host.agents[&control.agent], &request, &prepared)
+                .unwrap();
+        let result = PrivateControlRuntimeApplicationResult {
+            route: request.route,
+            authority: request.authority,
+            control: request.control.clone(),
+            receipt: request.receipt.clone(),
+            issuance_ack: request.issuance_ack.clone(),
+            applied_at: request.applied_at,
+            authenticated: true,
+            durably_applied: true,
+            durably_reopened: true,
+            application_fact: encode_private_application_fact(&application_fact),
+        };
+        let application = signed_test_application_ack(fixture, &request, &result);
+        let issuance = AuthorityOperationIssuanceAck::decode(&request.issuance_ack).unwrap();
+        let evidence = PrivateControlAuthorityEvidence::from_acknowledgements(
+            &issuance,
+            &application,
+            Some(&proof),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        host.agents
+            .get_mut(&control.agent)
+            .unwrap()
+            .store
+            .persist_control_authority_evidence(control.commitment(), &evidence)
+            .unwrap();
         (result, application)
     }
 
@@ -4970,7 +6371,49 @@ mod tests {
             control: request.control.clone(),
             issuance_ack: request.issuance_ack.clone(),
             application_ack: application.encode().unwrap(),
+            recovery_proof: None,
         }
+    }
+
+    fn test_recovery_evidence_request(
+        request: &PrivateControlRuntimeApplicationRequest,
+        application: &PrivateControlApplicationAck,
+        proof: &PrivateRecoveryAuthorityProof,
+    ) -> PrivateControlRuntimeEvidenceRequest {
+        PrivateControlRuntimeEvidenceRequest {
+            route: request.route,
+            authority: request.authority,
+            control: request.control.clone(),
+            issuance_ack: request.issuance_ack.clone(),
+            application_ack: application.encode().unwrap(),
+            recovery_proof: Some(proof.encode().unwrap()),
+        }
+    }
+
+    fn complete_prepared_recovery(
+        host: &mut PrivateAgentHost,
+        fixture: &Fixture,
+        prepared: &PreparedPrivateRecovery,
+    ) -> Result<PrivateControlRuntimeEvidenceResult, PrivateAgentHostError> {
+        let (authority, request) = prepared_recovery_runtime_request(fixture, prepared);
+        let result = apply_runtime_request(host, authority, &request)?;
+        let application = signed_test_application_ack(fixture, &request, &result);
+        let evidence_request =
+            test_recovery_evidence_request(&request, &application, &prepared.proof);
+        host.runtime_application_adapter(authority, &TestAuthority)?
+            .persist_completed_evidence(&evidence_request)
+    }
+
+    fn prepared_recovery_runtime_request(
+        fixture: &Fixture,
+        prepared: &PreparedPrivateRecovery,
+    ) -> (
+        AuthorityActorTarget,
+        PrivateControlRuntimeApplicationRequest,
+    ) {
+        let control = PrivateControlRecord::decode(prepared.control_wire()).unwrap();
+        let intent = prepared.authorization_intent().unwrap();
+        runtime_application_request_for_intent(fixture, &control, intent, 80, 85)
     }
 
     #[test]
@@ -5171,6 +6614,7 @@ mod tests {
             let expected = PrivateControlAuthorityEvidence::from_acknowledgements(
                 &AuthorityOperationIssuanceAck::decode(&request.issuance_ack).unwrap(),
                 &application,
+                None,
             )
             .unwrap();
             let expected_wire = expected.encode().unwrap();
@@ -5755,9 +7199,9 @@ mod tests {
     }
 
     #[test]
-    fn authorized_existing_host_recovery_reopens_exact_replacement_and_history() {
+    fn direct_live_recover_is_rejected_without_an_authenticated_pvrp3_stage() {
         let fixture = fixture(2);
-        let mut host = create_host(&fixture, 0, "authorized-recovery");
+        let mut host = create_host(&fixture, 0, "direct-live-recovery");
         let agent = create_agent(&mut host, &fixture);
         let revoke = signed_revoke_control(&host, agent, fixture.nodes[1].identity.node);
         let (authority, revoke_request) = runtime_application_request(&fixture, &revoke, 70, 75);
@@ -5765,31 +7209,57 @@ mod tests {
 
         let replacements = identities(&fixture);
         let recovery = signed_recovery_control(&host, agent, &replacements, &fixture.recovery);
-        let (_, recovery_request) = runtime_application_request(&fixture, &recovery, 80, 85);
-        let result = apply_runtime_request(&mut host, authority, &recovery_request).unwrap();
-        assert!(result.authenticated && result.durably_applied && result.durably_reopened);
-        let binding = host.binding(agent).unwrap();
-        assert_eq!(binding.epoch, 2);
-        assert_eq!(binding.control_head, Some(recovery.commitment()));
-        assert_eq!(host.agents[&agent].store.authorized_nodes(), replacements);
-        assert_eq!(host.agents[&agent].data_keys.len(), 3);
-
-        drop(host);
-        let mut reopened = reopen_host(&fixture, 0, "authorized-recovery");
+        let (_, recovery_request, _) =
+            recovery_runtime_application_request(&fixture, &recovery, None, 80, 85);
+        let before_binding = host.binding(agent).unwrap();
+        let mut before = Vec::new();
+        collect_files(&host.agent_path(agent), &mut before);
         assert_eq!(
-            apply_runtime_request(&mut reopened, authority, &recovery_request).unwrap(),
-            result
+            apply_runtime_request(&mut host, authority, &recovery_request),
+            Err(PrivateAgentHostError::UnsupportedOperation)
         );
-        assert_eq!(reopened.agents[&agent].data_keys.len(), 3);
+        assert_eq!(host.binding(agent).unwrap(), before_binding);
+        let mut after = Vec::new();
+        collect_files(&host.agent_path(agent), &mut after);
+        assert_eq!(after, before);
+        assert_eq!(
+            apply_runtime_request(&mut host, authority, &recovery_request),
+            Err(PrivateAgentHostError::UnsupportedOperation)
+        );
     }
 
     #[test]
-    fn authorized_genesis_head_recovery_is_exact_and_restart_safe() {
+    fn staged_genesis_head_recovery_is_exact_and_restart_safe() {
         let fixture = fixture(1);
-        let mut host = create_host(&fixture, 0, "authorized-genesis-recovery");
-        let agent = create_agent(&mut host, &fixture);
-        let replacements = identities(&fixture);
-        let recovery = signed_recovery_control(&host, agent, &replacements, &fixture.recovery);
+        let mut source = create_host(&fixture, 0, "genesis-recovery-source");
+        let agent = create_agent(&mut source, &fixture);
+        let backup = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        drop(source);
+
+        let replacement = node(fixture.space, fixture.owner, 99);
+        let replacements = vec![replacement.identity.clone()];
+        let root = fixture.directory.child("genesis-recovery-target");
+        let mut host = PrivateAgentHost::create(
+            &root,
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+        )
+        .unwrap();
+        let prepared = host
+            .prepare_recovery_from_encrypted_backup(
+                recovery_route(&fixture, agent),
+                None,
+                &recovery_kit(),
+                &replacements,
+                &backup,
+                &TestAuthority,
+            )
+            .unwrap();
+        let recovery = PrivateControlRecord::decode(prepared.control_wire()).unwrap();
         assert_eq!(recovery.previous, None);
         let PrivateControlOperation::Recover {
             superseded_heads, ..
@@ -5798,8 +7268,8 @@ mod tests {
             unreachable!();
         };
         assert!(superseded_heads.is_empty());
-        let (authority, request) = runtime_application_request(&fixture, &recovery, 90, 95);
-        let result = apply_runtime_request(&mut host, authority, &request).unwrap();
+        assert_eq!(prepared.proof.superseded_authority_head, None);
+        complete_prepared_recovery(&mut host, &fixture, &prepared).unwrap();
         assert_eq!(host.binding(agent).unwrap().epoch, 1);
         assert_eq!(
             host.binding(agent).unwrap().control_head,
@@ -5807,11 +7277,299 @@ mod tests {
         );
         drop(host);
 
-        let mut reopened = reopen_host(&fixture, 0, "authorized-genesis-recovery");
+        let reopened = PrivateAgentHost::open(
+            &root,
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(reopened.binding(agent).unwrap().epoch, 1);
         assert_eq!(
-            apply_runtime_request(&mut reopened, authority, &request).unwrap(),
-            result
+            reopened.binding(agent).unwrap().control_head,
+            Some(recovery.commitment())
         );
+    }
+
+    #[test]
+    fn pvrp3_rejects_old_trailing_noncanonical_and_oversize_frames() {
+        let fixture = fixture(1);
+        let mut source = create_host(&fixture, 0, "pvrp3-wire-source");
+        let agent = create_agent(&mut source, &fixture);
+        let backup = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        drop(source);
+
+        let replacement = node(fixture.space, fixture.owner, 99);
+        let replacements = vec![replacement.identity.clone()];
+        let mut target = PrivateAgentHost::create(
+            fixture.directory.child("pvrp3-wire-target"),
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+        )
+        .unwrap();
+        assert_eq!(
+            target.prepare_recovery_from_encrypted_backup_with_stop(
+                recovery_route(&fixture, agent),
+                None,
+                &recovery_kit(),
+                &replacements,
+                &backup,
+                &TestAuthority,
+                RecoveryInstallStop::AfterPlan,
+            ),
+            Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted))
+        );
+        let exact = fs::read(target.creating_path(agent).join(RECOVERY_PLAN_FILE)).unwrap();
+        assert!(decode_recovery_plan(&exact, &target.node_key).is_ok());
+
+        let authenticate = |body: &mut Vec<u8>| {
+            let plan_hash = Hash::digest(RECOVERY_PLAN_HASH_DOMAIN, &[body]);
+            let authenticator = target
+                .node_key
+                .recovery_plan_authenticator(plan_hash)
+                .unwrap();
+            body.extend_from_slice(authenticator.as_bytes());
+        };
+
+        // PVRP2-looking bytes signed by this exact node are still an
+        // incompatible clean-break format, not a compatibility input.
+        let mut old_version = exact[..exact.len() - 32].to_vec();
+        old_version[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        authenticate(&mut old_version);
+        assert!(matches!(
+            decode_recovery_plan(&old_version, &target.node_key),
+            Err(PrivateAgentHostError::Corrupt)
+        ));
+
+        // An authenticated suffix cannot be normalized away.
+        let mut trailing = exact[..exact.len() - 32].to_vec();
+        trailing.push(0);
+        authenticate(&mut trailing);
+        assert!(matches!(
+            decode_recovery_plan(&trailing, &target.node_key),
+            Err(PrivateAgentHostError::Corrupt)
+        ));
+
+        // Completion is a typed AOI1/PCA1/PSE2 closure. Merely placing
+        // nonempty bounded payloads in its canonical frame is insufficient.
+        let mut noncanonical_completion = decode_recovery_plan(&exact, &target.node_key).unwrap();
+        noncanonical_completion.completion = Some(RecoveryPlanCompletion {
+            issuance_ack: vec![1],
+            application_ack: vec![2],
+            evidence_commitment: Hash([3; 32]),
+        });
+        let noncanonical_completion =
+            encode_recovery_plan(&noncanonical_completion, &target.node_key).unwrap();
+        assert!(matches!(
+            decode_recovery_plan(&noncanonical_completion, &target.node_key),
+            Err(PrivateAgentHostError::Corrupt)
+        ));
+
+        assert_eq!(
+            MAX_PRIVATE_RECOVERY_PLAN_BYTES,
+            MAX_PRIVATE_HOST_ARCHIVE_BYTES
+                + MAX_PRIVATE_CONTROL_WIRE_BYTES
+                + MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES
+                + MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES
+                + MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES
+                + RECOVERY_PLAN_FIXED_BYTES
+        );
+        let boundary = vec![0_u8; MAX_PRIVATE_RECOVERY_PLAN_BYTES + 1];
+        assert!(matches!(
+            decode_recovery_plan(
+                &boundary[..MAX_PRIVATE_RECOVERY_PLAN_BYTES],
+                &target.node_key,
+            ),
+            Err(PrivateAgentHostError::Corrupt)
+        ));
+        assert!(matches!(
+            decode_recovery_plan(&boundary, &target.node_key),
+            Err(PrivateAgentHostError::LimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn recovery_preflight_rejects_missing_historical_pse2_before_staging() {
+        let fixture = fixture(1);
+        let mut source = create_host(&fixture, 0, "missing-historical-pse-source");
+        let agent = create_agent(&mut source, &fixture);
+        let recovery =
+            signed_recovery_control(&source, agent, &identities(&fixture), &fixture.recovery);
+        source
+            .apply_recovery_record(agent, recovery.previous, &recovery, &TestAuthority)
+            .unwrap();
+        let backup = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        drop(source);
+
+        let replacement = node(fixture.space, fixture.owner, 99);
+        let mut target = PrivateAgentHost::create(
+            fixture.directory.child("missing-historical-pse-target"),
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+        )
+        .unwrap();
+        assert_eq!(
+            target.prepare_recovery_from_encrypted_backup(
+                recovery_route(&fixture, agent),
+                None,
+                &recovery_kit(),
+                core::slice::from_ref(&replacement.identity),
+                &backup,
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::Unauthorized)
+        );
+        assert!(!target.creating_path(agent).exists());
+        assert!(!target.agent_path(agent).exists());
+    }
+
+    #[test]
+    fn planless_recovery_requires_recover_at_the_current_authenticated_head() {
+        let fixture = fixture(1);
+        let root = fixture.directory.child("planless-non-recover-head");
+        let mut host = PrivateAgentHost::create(
+            &root,
+            fixture.space,
+            fixture.owner,
+            fixture.nodes[0].identity.clone(),
+            fixture.nodes[0].key(),
+        )
+        .unwrap();
+        let agent = create_agent(&mut host, &fixture);
+        let recovery =
+            signed_recovery_control(&host, agent, &identities(&fixture), &fixture.recovery);
+        apply_and_attach_test_recovery_authority_evidence(
+            &mut host, &fixture, &recovery, None, 80, 85,
+        );
+        host.record_actor_lifecycle(
+            agent,
+            ActorId([0x51; 32]),
+            PrivateActorLifecycleKind::Install,
+            Hash([0x52; 32]),
+            &TestAuthority,
+        )
+        .unwrap();
+        let source = host.agent_path(agent);
+        let stage = host.creating_path(agent);
+        drop(host);
+        fs::rename(&source, &stage).unwrap();
+
+        assert!(matches!(
+            PrivateAgentHost::open(
+                &root,
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[0].identity.clone(),
+                fixture.nodes[0].key(),
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::Corrupt)
+        ));
+        assert!(!source.exists());
+        assert!(stage.exists());
+    }
+
+    #[test]
+    fn recovery_result_loss_rejects_empty_or_divergent_planless_stages() {
+        let fixture = fixture(1);
+        let mut source = create_host(&fixture, 0, "result-loss-source");
+        let agent = create_agent(&mut source, &fixture);
+        let backup = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        drop(source);
+
+        let replacement = node(fixture.space, fixture.owner, 99);
+        let replacements = vec![replacement.identity.clone()];
+        let target_root = fixture.directory.child("result-loss-planless");
+        let mut target = PrivateAgentHost::create(
+            &target_root,
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+        )
+        .unwrap();
+        let prepared = target
+            .prepare_recovery_from_encrypted_backup(
+                recovery_route(&fixture, agent),
+                None,
+                &recovery_kit(),
+                &replacements,
+                &backup,
+                &TestAuthority,
+            )
+            .unwrap();
+        let (authority, request) = prepared_recovery_runtime_request(&fixture, &prepared);
+        let result = apply_runtime_request(&mut target, authority, &request).unwrap();
+        let application = signed_test_application_ack(&fixture, &request, &result);
+        let evidence_request =
+            test_recovery_evidence_request(&request, &application, &prepared.proof);
+        {
+            let mut runtime = target
+                .runtime_application_adapter(authority, &TestAuthority)
+                .unwrap();
+            runtime.stop_after(PrivateRuntimeApplicationStop::AfterRecoveryPlanRetired);
+            assert_eq!(
+                runtime.persist_completed_evidence(&evidence_request),
+                Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted))
+            );
+        }
+        assert!(target.creating_path(agent).exists());
+        assert!(!target.agent_path(agent).exists());
+
+        let mut divergent = evidence_request.clone();
+        let last = divergent.application_ack.len() - 1;
+        divergent.application_ack[last] ^= 1;
+        assert!(
+            target
+                .runtime_application_adapter(authority, &TestAuthority)
+                .unwrap()
+                .persist_completed_evidence(&divergent)
+                .is_err()
+        );
+        assert!(target.creating_path(agent).exists());
+        assert!(!target.agent_path(agent).exists());
+        target
+            .runtime_application_adapter(authority, &TestAuthority)
+            .unwrap()
+            .persist_completed_evidence(&evidence_request)
+            .unwrap();
+        assert!(target.agent_path(agent).exists());
+        assert!(!target.creating_path(agent).exists());
+
+        // An unrelated empty ordinary-create stage for the same Agent cannot
+        // be promoted by replaying the otherwise valid Recover callback.
+        let empty_root = fixture.directory.child("result-loss-empty");
+        let mut empty = PrivateAgentHost::create(
+            &empty_root,
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+        )
+        .unwrap();
+        fs::create_dir(empty.creating_path(agent)).unwrap();
+        assert!(
+            empty
+                .runtime_application_adapter(authority, &TestAuthority)
+                .unwrap()
+                .persist_completed_evidence(&evidence_request)
+                .is_err()
+        );
+        assert!(empty.creating_path(agent).exists());
+        assert!(!empty.agent_path(agent).exists());
+        assert_eq!(empty.binding(agent), Err(PrivateAgentHostError::NotFound));
     }
 
     fn collect_files(path: &Path, output: &mut Vec<u8>) {
@@ -6351,10 +8109,24 @@ mod tests {
             .unwrap();
         let first =
             signed_recovery_control(&source, agent, &identities(&fixture), &fixture.recovery);
-        apply_and_attach_test_authority_evidence(&mut source, &fixture, &first, 40, 41);
+        apply_and_attach_test_recovery_authority_evidence(
+            &mut source,
+            &fixture,
+            &first,
+            None,
+            40,
+            41,
+        );
         let second =
             signed_recovery_control(&source, agent, &identities(&fixture), &fixture.recovery);
-        apply_and_attach_test_authority_evidence(&mut source, &fixture, &second, 42, 43);
+        apply_and_attach_test_recovery_authority_evidence(
+            &mut source,
+            &fixture,
+            &second,
+            None,
+            42,
+            43,
+        );
 
         let request = PrivateSyncRequest {
             cursor: PrivateSyncCursor::start(fixture.space, agent, 0, None).unwrap(),
@@ -6499,7 +8271,14 @@ mod tests {
             .unwrap();
         let recovery =
             signed_recovery_control(&source, agent, &identities(&fixture), &fixture.recovery);
-        apply_and_attach_test_authority_evidence(&mut source, &fixture, &recovery, 40, 41);
+        apply_and_attach_test_recovery_authority_evidence(
+            &mut source,
+            &fixture,
+            &recovery,
+            None,
+            40,
+            41,
+        );
 
         let request = PrivateSyncRequest {
             cursor: PrivateSyncCursor::start(fixture.space, agent, 0, None).unwrap(),
@@ -6627,7 +8406,7 @@ mod tests {
         };
         sign_recovery_control_record(&mut recovery, &fixture.recovery).unwrap();
         primary
-            .apply_recovery_record(agent, prior_head, &recovery, &TestAuthority)
+            .apply_recovery_record(agent, Some(prior_head), &recovery, &TestAuthority)
             .unwrap();
         assert_eq!(primary.binding(agent).unwrap().epoch, binding.epoch + 1);
         assert_eq!(
@@ -6737,8 +8516,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            retry_host.recover_from_encrypted_backups_with_stop(
-                agent,
+            retry_host.prepare_recovery_from_encrypted_backups_with_stop(
+                recovery_route(&fixture, agent),
+                None,
                 &recovery_kit(),
                 &replacements,
                 &ordered,
@@ -6749,103 +8529,76 @@ mod tests {
         );
         let plan_path = retry_host.creating_path(agent).join(RECOVERY_PLAN_FILE);
         let exact_plan = fs::read(&plan_path).unwrap();
-        assert_eq!(
-            retry_host.recover_from_encrypted_backups_with_stop(
-                agent,
+        let prepared = retry_host
+            .prepare_recovery_from_encrypted_backups(
+                recovery_route(&fixture, agent),
+                None,
                 &recovery_kit(),
                 &replacements,
                 &reversed,
                 &TestAuthority,
-                RecoveryInstallStop::AfterStore,
-            ),
-            Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted))
-        );
+            )
+            .unwrap();
         assert_eq!(fs::read(&plan_path).unwrap(), exact_plan);
+        assert_eq!(
+            retry_host.binding(agent),
+            Err(PrivateAgentHostError::NotFound)
+        );
         drop(retry_host);
 
-        let mut roots = vec![retry_root];
-        for (position, stop) in [
-            RecoveryInstallStop::AfterDescriptor,
-            RecoveryInstallStop::AfterVerification,
-            RecoveryInstallStop::AfterPublish,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let root = fixture.directory.child(&format!("union-stop-{position}"));
-            let mut host = PrivateAgentHost::create(
-                &root,
-                fixture.space,
-                fixture.owner,
-                replacement.identity.clone(),
-                replacement.key(),
-            )
-            .unwrap();
-            let sources = if position % 2 == 0 {
-                &ordered[..]
-            } else {
-                &reversed[..]
-            };
-            assert_eq!(
-                host.recover_from_encrypted_backups_with_stop(
-                    agent,
-                    &recovery_kit(),
-                    &replacements,
-                    sources,
-                    &TestAuthority,
-                    stop,
-                ),
-                Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted))
-            );
-            drop(host);
-            roots.push(root);
-        }
-
-        for root in roots {
-            let reopened = PrivateAgentHost::open(
-                &root,
-                fixture.space,
-                fixture.owner,
-                replacement.identity.clone(),
-                replacement.key(),
-                &TestAuthority,
-            )
-            .unwrap();
-            let binding = reopened.binding(agent).unwrap();
-            assert_eq!(binding.epoch, 1);
-            assert_eq!(binding.next_sequence, 2);
-            assert_eq!(
-                reopened
-                    .get_and_decrypt(agent, left_object)
-                    .unwrap()
-                    .as_slice(),
-                b"left-fork-object"
-            );
-            assert_eq!(
-                reopened
-                    .get_and_decrypt(agent, right_object)
-                    .unwrap()
-                    .as_slice(),
-                b"right-fork-object"
-            );
-            let controls = reopened.agents[&agent].store.indexed_controls();
-            assert_eq!(controls.len(), 2);
-            assert_eq!(controls[0].commitment, selected_head);
-            let recovery = PrivateControlRecord::decode(
-                &reopened.agents[&agent]
-                    .store
-                    .read_control_wire(controls.last().unwrap())
-                    .unwrap(),
-            )
-            .unwrap();
-            let PrivateControlOperation::Recover {
-                superseded_heads, ..
-            } = recovery.operation
-            else {
-                panic!("union did not finish with an offline recovery record")
-            };
-            assert_eq!(superseded_heads, expected_heads);
-        }
+        // Reopen retains the authenticated plan but still exposes no Agent.
+        let mut reopened = PrivateAgentHost::open(
+            &retry_root,
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.binding(agent),
+            Err(PrivateAgentHostError::NotFound)
+        );
+        assert_eq!(
+            reopened.prepared_recovery(agent).unwrap().unwrap(),
+            prepared
+        );
+        complete_prepared_recovery(&mut reopened, &fixture, &prepared).unwrap();
+        let binding = reopened.binding(agent).unwrap();
+        assert_eq!(binding.epoch, 1);
+        assert_eq!(binding.next_sequence, 2);
+        assert_eq!(
+            reopened
+                .get_and_decrypt(agent, left_object)
+                .unwrap()
+                .as_slice(),
+            b"left-fork-object"
+        );
+        assert_eq!(
+            reopened
+                .get_and_decrypt(agent, right_object)
+                .unwrap()
+                .as_slice(),
+            b"right-fork-object"
+        );
+        let controls = reopened.agents[&agent].store.indexed_controls();
+        assert_eq!(controls.len(), 2);
+        assert_eq!(controls[0].commitment, selected_head);
+        let recovery = PrivateControlRecord::decode(
+            &reopened.agents[&agent]
+                .store
+                .read_control_wire(controls.last().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let PrivateControlOperation::Recover {
+            superseded_heads, ..
+        } = recovery.operation
+        else {
+            panic!("union did not finish with an offline recovery record")
+        };
+        assert_eq!(superseded_heads, expected_heads);
     }
 
     #[test]
@@ -6898,8 +8651,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            hostile.recover_from_encrypted_backups(
-                agent,
+            hostile.prepare_recovery_from_encrypted_backups(
+                recovery_route(&fixture, agent),
+                None,
                 &recovery_kit(),
                 &replacements,
                 &[left_alias_backup.as_slice(), right_alias_backup.as_slice()],
@@ -6909,8 +8663,9 @@ mod tests {
         );
         assert!(!hostile.creating_path(agent).exists());
         assert_eq!(
-            hostile.recover_from_encrypted_backups(
-                agent,
+            hostile.prepare_recovery_from_encrypted_backups(
+                recovery_route(&fixture, agent),
+                None,
                 &recovery_kit(),
                 &replacements,
                 &[left_alias_backup.as_slice(), left_alias_backup.as_slice()],
@@ -6924,8 +8679,9 @@ mod tests {
         let cross_scope =
             encode_host_archive(&cross_scope, true, MAX_PRIVATE_HOST_ARCHIVE_BYTES).unwrap();
         assert_eq!(
-            hostile.recover_from_encrypted_backups(
-                agent,
+            hostile.prepare_recovery_from_encrypted_backups(
+                recovery_route(&fixture, agent),
+                None,
                 &recovery_kit(),
                 &replacements,
                 &[left_alias_backup.as_slice(), cross_scope.as_slice()],
@@ -6935,8 +8691,9 @@ mod tests {
         );
         let too_many = vec![base.as_slice(); MAX_PRIVATE_NODES + 1];
         assert_eq!(
-            hostile.recover_from_encrypted_backups(
-                agent,
+            hostile.prepare_recovery_from_encrypted_backups(
+                recovery_route(&fixture, agent),
+                None,
                 &recovery_kit(),
                 &replacements,
                 &too_many,
@@ -6972,8 +8729,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            incompatible.recover_from_encrypted_backups(
-                agent,
+            incompatible.prepare_recovery_from_encrypted_backups(
+                recovery_route(&fixture, agent),
+                None,
                 &recovery_kit(),
                 &replacements,
                 &[left_rotated.as_slice(), right_rotated.as_slice()],
@@ -6995,15 +8753,21 @@ mod tests {
             replacement.key(),
         )
         .unwrap();
-        rollback
-            .recover_from_encrypted_backups(
-                agent,
+        let prepared = rollback
+            .prepare_recovery_from_encrypted_backups(
+                recovery_route(&fixture, agent),
+                None,
                 &recovery_kit(),
                 &replacements,
                 &[base.as_slice(), left_rotated.as_slice()],
                 &TestAuthority,
             )
             .unwrap();
+        assert_eq!(
+            rollback.binding(agent),
+            Err(PrivateAgentHostError::NotFound)
+        );
+        complete_prepared_recovery(&mut rollback, &fixture, &prepared).unwrap();
         let binding = rollback.binding(agent).unwrap();
         assert_eq!(binding.epoch, 2);
         assert_eq!(binding.next_sequence, 2);
@@ -7072,8 +8836,9 @@ mod tests {
         .unwrap();
         assert!(
             wrong_signing
-                .recover_from_encrypted_backup(
-                    agent,
+                .prepare_recovery_from_encrypted_backup(
+                    recovery_route(&fixture, agent),
+                    None,
                     &wrong_signing_kit,
                     &replacements,
                     &backup,
@@ -7100,8 +8865,9 @@ mod tests {
         .unwrap();
         assert!(
             wrong_encryption
-                .recover_from_encrypted_backup(
-                    agent,
+                .prepare_recovery_from_encrypted_backup(
+                    recovery_route(&fixture, agent),
+                    None,
                     &wrong_encryption_kit,
                     &replacements,
                     &backup,
@@ -7126,8 +8892,9 @@ mod tests {
         forged_backup[last] ^= 1;
         assert!(
             forged_host
-                .recover_from_encrypted_backup(
-                    agent,
+                .prepare_recovery_from_encrypted_backup(
+                    recovery_route(&fixture, agent),
+                    None,
                     &recovery_kit(),
                     &replacements,
                     &forged_backup,
@@ -7172,8 +8939,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            forged_object_host.recover_from_encrypted_backups(
-                agent,
+            forged_object_host.prepare_recovery_from_encrypted_backups(
+                recovery_route(&fixture, agent),
+                None,
                 &audit_kit,
                 &replacements,
                 &[backup.as_slice(), forged_object_backup.as_slice()],
@@ -7200,8 +8968,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            forged_plan_host.recover_from_encrypted_backup_with_stop(
-                agent,
+            forged_plan_host.prepare_recovery_from_encrypted_backup_with_stop(
+                recovery_route(&fixture, agent),
+                None,
                 &recovery_kit(),
                 &replacements,
                 &backup,
@@ -7230,17 +8999,17 @@ mod tests {
             Err(PrivateAgentHostError::Corrupt)
         ));
 
-        let stops = [
+        // Preparing never restores the post-Recover archive. Each durable
+        // boundary either retires an unpublished empty stage or reopens the
+        // exact inert PVRP3 for an authority/coordinator retry.
+        for (index, stop) in [
+            RecoveryInstallStop::AfterStageDirectory,
+            RecoveryInstallStop::AfterPlanFile,
             RecoveryInstallStop::AfterPlan,
-            RecoveryInstallStop::AfterStore,
-            RecoveryInstallStop::AfterDescriptor,
-            RecoveryInstallStop::AfterRuntime,
-            RecoveryInstallStop::AfterBootstrap,
-            RecoveryInstallStop::AfterVerification,
-            RecoveryInstallStop::AfterPlanRetired,
-            RecoveryInstallStop::AfterPublish,
-        ];
-        for (index, stop) in stops.into_iter().enumerate() {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let root = fixture.directory.child(&format!("recovery-stop-{index}"));
             let mut host = PrivateAgentHost::create(
                 &root,
@@ -7251,8 +9020,9 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                host.recover_from_encrypted_backup_with_stop(
-                    agent,
+                host.prepare_recovery_from_encrypted_backup_with_stop(
+                    recovery_route(&fixture, agent),
+                    None,
                     &recovery_kit(),
                     &replacements,
                     &backup,
@@ -7264,22 +9034,6 @@ mod tests {
             let mut disk = Vec::new();
             collect_files(&root, &mut disk);
             assert!(!contains(&disk, SENTINEL));
-            if stop == RecoveryInstallStop::AfterStore {
-                let plan_path = host.creating_path(agent).join(RECOVERY_PLAN_FILE);
-                let exact_plan = fs::read(&plan_path).unwrap();
-                assert_eq!(
-                    host.recover_from_encrypted_backup_with_stop(
-                        agent,
-                        &recovery_kit(),
-                        &replacements,
-                        &backup,
-                        &TestAuthority,
-                        RecoveryInstallStop::AfterStore,
-                    ),
-                    Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted))
-                );
-                assert_eq!(fs::read(plan_path).unwrap(), exact_plan);
-            }
             drop(host);
 
             let mut reopened = PrivateAgentHost::open(
@@ -7291,6 +9045,24 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
+            assert_eq!(
+                reopened.binding(agent),
+                Err(PrivateAgentHostError::NotFound)
+            );
+            let prepared = match reopened.prepared_recovery(agent).unwrap() {
+                Some(prepared) => prepared,
+                None => reopened
+                    .prepare_recovery_from_encrypted_backup(
+                        recovery_route(&fixture, agent),
+                        None,
+                        &recovery_kit(),
+                        &replacements,
+                        &backup,
+                        &TestAuthority,
+                    )
+                    .unwrap(),
+            };
+            complete_prepared_recovery(&mut reopened, &fixture, &prepared).unwrap();
             assert_eq!(reopened.binding(agent).unwrap().epoch, 3);
             assert_eq!(
                 reopened
@@ -7351,6 +9123,187 @@ mod tests {
             collect_files(&root, &mut disk);
             assert!(!contains(&disk, SENTINEL));
         }
+
+        // After the durable application pledge, every store/sidecar/reopen
+        // boundary remains non-live and retains PVRP3. Replaying the exact
+        // authorized request completes the same transition.
+        for (index, stop) in [
+            PrivateRuntimeApplicationStop::AfterRecoveryStore,
+            PrivateRuntimeApplicationStop::AfterRecoveryDescriptor,
+            PrivateRuntimeApplicationStop::AfterRecoveryRuntime,
+            PrivateRuntimeApplicationStop::AfterRecoveryBootstrap,
+            PrivateRuntimeApplicationStop::AfterRecoveryReopen,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("recovery-apply-stop-{index}");
+            let root = fixture.directory.child(&name);
+            let mut host = PrivateAgentHost::create(
+                &root,
+                fixture.space,
+                fixture.owner,
+                replacement.identity.clone(),
+                replacement.key(),
+            )
+            .unwrap();
+            let prepared = host
+                .prepare_recovery_from_encrypted_backup(
+                    recovery_route(&fixture, agent),
+                    None,
+                    &recovery_kit(),
+                    &replacements,
+                    &backup,
+                    &TestAuthority,
+                )
+                .unwrap();
+            let (authority, request) = prepared_recovery_runtime_request(&fixture, &prepared);
+            let interrupted = {
+                let mut runtime = host
+                    .runtime_application_adapter(authority, &TestAuthority)
+                    .unwrap();
+                runtime.stop_after(stop);
+                runtime.apply(&request)
+            };
+            assert_eq!(
+                interrupted,
+                Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted)),
+                "boundary {stop:?}"
+            );
+            drop(host);
+
+            let mut reopened = PrivateAgentHost::open(
+                &root,
+                fixture.space,
+                fixture.owner,
+                replacement.identity.clone(),
+                replacement.key(),
+                &TestAuthority,
+            )
+            .unwrap();
+            assert_eq!(
+                reopened.binding(agent),
+                Err(PrivateAgentHostError::NotFound)
+            );
+            assert_eq!(
+                reopened.prepared_recovery(agent).unwrap(),
+                Some(prepared.clone())
+            );
+            complete_prepared_recovery(&mut reopened, &fixture, &prepared).unwrap();
+            assert_eq!(reopened.binding(agent).unwrap().epoch, 3);
+        }
+
+        // Evidence attachment and PVRP3 retirement are independently
+        // restartable. Once publication has happened, the same callback is a
+        // read-only result-loss retry over byte-identical stored PSE2.
+        for (index, stop) in [
+            PrivateRuntimeApplicationStop::AfterEvidenceStaged,
+            PrivateRuntimeApplicationStop::AfterEvidencePending,
+            PrivateRuntimeApplicationStop::AfterEvidencePublished,
+            PrivateRuntimeApplicationStop::AfterEvidenceRetired,
+            PrivateRuntimeApplicationStop::AfterEvidenceReopen,
+            PrivateRuntimeApplicationStop::AfterRecoveryPlanWrite,
+            PrivateRuntimeApplicationStop::AfterRecoveryPlanCommitted,
+            PrivateRuntimeApplicationStop::AfterRecoveryPlanRetired,
+            PrivateRuntimeApplicationStop::AfterRecoveryRename,
+            PrivateRuntimeApplicationStop::AfterRecoveryDestinationSync,
+            PrivateRuntimeApplicationStop::AfterRecoveryPublished,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("recovery-evidence-stop-{index}");
+            let root = fixture.directory.child(&name);
+            let mut host = PrivateAgentHost::create(
+                &root,
+                fixture.space,
+                fixture.owner,
+                replacement.identity.clone(),
+                replacement.key(),
+            )
+            .unwrap();
+            let prepared = host
+                .prepare_recovery_from_encrypted_backup(
+                    recovery_route(&fixture, agent),
+                    None,
+                    &recovery_kit(),
+                    &replacements,
+                    &backup,
+                    &TestAuthority,
+                )
+                .unwrap();
+            let (authority, request) = prepared_recovery_runtime_request(&fixture, &prepared);
+            let application_result = apply_runtime_request(&mut host, authority, &request).unwrap();
+            let application = signed_test_application_ack(&fixture, &request, &application_result);
+            let evidence_request =
+                test_recovery_evidence_request(&request, &application, &prepared.proof);
+            let interrupted = {
+                let mut runtime = host
+                    .runtime_application_adapter(authority, &TestAuthority)
+                    .unwrap();
+                runtime.stop_after(stop);
+                runtime.persist_completed_evidence(&evidence_request)
+            };
+            assert_eq!(
+                interrupted,
+                Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted)),
+                "boundary {stop:?}"
+            );
+            let same_process_result = matches!(
+                stop,
+                PrivateRuntimeApplicationStop::AfterRecoveryPlanWrite
+                    | PrivateRuntimeApplicationStop::AfterRecoveryPlanCommitted
+                    | PrivateRuntimeApplicationStop::AfterRecoveryPlanRetired
+                    | PrivateRuntimeApplicationStop::AfterRecoveryRename
+                    | PrivateRuntimeApplicationStop::AfterRecoveryDestinationSync
+                    | PrivateRuntimeApplicationStop::AfterRecoveryPublished
+            )
+            .then(|| {
+                host.runtime_application_adapter(authority, &TestAuthority)
+                    .unwrap()
+                    .persist_completed_evidence(&evidence_request)
+                    .unwrap()
+            });
+            drop(host);
+
+            let mut reopened = PrivateAgentHost::open(
+                &root,
+                fixture.space,
+                fixture.owner,
+                replacement.identity.clone(),
+                replacement.key(),
+                &TestAuthority,
+            )
+            .unwrap();
+            let before = reopened
+                .agents
+                .get(&agent)
+                .map(|hosted| hosted.store.control_count());
+            let result = reopened
+                .runtime_application_adapter(authority, &TestAuthority)
+                .unwrap()
+                .persist_completed_evidence(&evidence_request)
+                .unwrap();
+            if let Some(same_process_result) = same_process_result {
+                assert_eq!(result, same_process_result);
+            }
+            assert!(result.authenticated && result.durably_persisted && result.durably_reopened);
+            assert_eq!(reopened.binding(agent).unwrap().epoch, 3);
+            let after = reopened.agents[&agent].store.control_count();
+            if let Some(before) = before {
+                assert_eq!(
+                    after, before,
+                    "result-loss retry duplicated control at {stop:?}"
+                );
+            }
+            let retry = reopened
+                .runtime_application_adapter(authority, &TestAuthority)
+                .unwrap()
+                .persist_completed_evidence(&evidence_request)
+                .unwrap();
+            assert_eq!(retry, result);
+            assert_eq!(reopened.agents[&agent].store.control_count(), after);
+        }
     }
 
     #[test]
@@ -7383,15 +9336,17 @@ mod tests {
             replacement.key(),
         )
         .unwrap();
-        recovered
-            .recover_from_encrypted_backup(
-                agent,
+        let prepared = recovered
+            .prepare_recovery_from_encrypted_backup(
+                recovery_route(&fixture, agent),
+                None,
                 &recovery_kit(),
                 core::slice::from_ref(&replacement.identity),
                 &source_backup,
                 &TestAuthority,
             )
             .unwrap();
+        complete_prepared_recovery(&mut recovered, &fixture, &prepared).unwrap();
         assert_eq!(recovered.binding(agent).unwrap().epoch, 2);
 
         let invited = node(fixture.space, fixture.owner, 122);

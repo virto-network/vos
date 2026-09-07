@@ -28,6 +28,8 @@ use crate::agent::sdk::authority::{
     AgentAuthorityBinding, AuthorityActorTarget, AuthorityIssuer, AuthorityVerifier,
     ManagedAgentTarget,
 };
+#[cfg(test)]
+use crate::agent::sdk::authority_operation::PrivateRecoveryAuthorityProof;
 use crate::agent::sdk::authority_operation::{
     AuthorityOperationIntent, PrivateControlApplicationAck, PrivateControlApplicationFact,
 };
@@ -83,6 +85,8 @@ pub(crate) struct PrivateControlRuntimeEvidenceRequest {
     pub(crate) control: Vec<u8>,
     pub(crate) issuance_ack: Vec<u8>,
     pub(crate) application_ack: Vec<u8>,
+    /// Canonical PRA1 for Recover and absent for every other control family.
+    pub(crate) recovery_proof: Option<Vec<u8>>,
 }
 
 /// Echoed proof that the exact evidence envelope was durably attached and
@@ -94,6 +98,7 @@ pub(crate) struct PrivateControlRuntimeEvidenceResult {
     pub(crate) control: Vec<u8>,
     pub(crate) issuance_ack: Vec<u8>,
     pub(crate) application_ack: Vec<u8>,
+    pub(crate) recovery_proof: Option<Vec<u8>>,
     pub(crate) evidence_commitment: Hash,
     pub(crate) authenticated: bool,
     pub(crate) durably_persisted: bool,
@@ -539,14 +544,7 @@ where
                 PrivateControlApplicationCoordinatorRejection::WrongRoute,
             ));
         }
-        let expected_intent = AuthorityOperationIntent::private_control(
-            retained.call.intent.managed().runtime_deployment,
-            &control,
-        )
-        .map_err(|_| {
-            Self::rejected(PrivateControlApplicationCoordinatorRejection::InvalidControl)
-        })?;
-        if expected_intent != retained.call.intent
+        if !retained.call.intent.matches_private_control(&control)
             || !retained.approval.matches_private_control(&control)
             || !issuance.matches_pending(&retained.call, &retained.approval)
             || issuance
@@ -746,6 +744,17 @@ where
         let application_ack = acknowledgement
             .encode()
             .map_err(|_| PrivateControlApplicationCoordinatorError::InvalidState)?;
+        let recovery_proof = match &retained.call.intent {
+            AuthorityOperationIntent::RecoverPrivateAgent { proof } => Some(proof),
+            _ => None,
+        };
+        let recovery_proof_wire = recovery_proof
+            .map(|proof| {
+                proof
+                    .encode()
+                    .map_err(|_| PrivateControlApplicationCoordinatorError::InvalidState)
+            })
+            .transpose()?;
         let request = PrivateControlRuntimeEvidenceRequest {
             route: retained.call.intent.managed(),
             authority: self.authority,
@@ -758,11 +767,15 @@ where
                 .clone(),
             issuance_ack,
             application_ack,
+            recovery_proof: recovery_proof_wire,
         };
-        let expected =
-            PrivateControlAuthorityEvidence::from_acknowledgements(issuance, acknowledgement)
-                .and_then(|evidence| evidence.commitment())
-                .map_err(|_| PrivateControlApplicationCoordinatorError::InvalidState)?;
+        let expected = PrivateControlAuthorityEvidence::from_acknowledgements(
+            issuance,
+            acknowledgement,
+            recovery_proof,
+        )
+        .and_then(|evidence| evidence.commitment())
+        .map_err(|_| PrivateControlApplicationCoordinatorError::InvalidState)?;
         if expected == Hash::ZERO {
             return Err(PrivateControlApplicationCoordinatorError::InvalidState);
         }
@@ -782,6 +795,7 @@ where
             || result.control != request.control
             || result.issuance_ack != request.issuance_ack
             || result.application_ack != request.application_ack
+            || result.recovery_proof != request.recovery_proof
             || result.evidence_commitment != expected
             || !result.authenticated
             || !result.durably_persisted
@@ -996,13 +1010,7 @@ fn coordinator_matches_issuer<I: AuthorityOperationIssuerStore>(
         let Ok(control) = PrivateControlRecord::decode(&record.control) else {
             return false;
         };
-        let Ok(expected_intent) = AuthorityOperationIntent::private_control(
-            retained.call.intent.managed().runtime_deployment,
-            &control,
-        ) else {
-            return false;
-        };
-        if expected_intent != retained.call.intent
+        if !retained.call.intent.matches_private_control(&control)
             || retained.call.authority != image.authority
             || record.application_invocation
                 != PrivateControlApplicationAck::derive_application_invocation(issuance)
@@ -1036,9 +1044,15 @@ fn coordinator_matches_issuer<I: AuthorityOperationIssuerStore>(
             let Some(acknowledgement) = retained.application_ack.as_ref() else {
                 return false;
             };
-            let Ok(evidence) =
-                PrivateControlAuthorityEvidence::from_acknowledgements(issuance, acknowledgement)
-            else {
+            let recovery_proof = match &retained.call.intent {
+                AuthorityOperationIntent::RecoverPrivateAgent { proof } => Some(proof),
+                _ => None,
+            };
+            let Ok(evidence) = PrivateControlAuthorityEvidence::from_acknowledgements(
+                issuance,
+                acknowledgement,
+                recovery_proof,
+            ) else {
                 return false;
             };
             if evidence.commitment().ok() != Some(persisted) {
@@ -1275,6 +1289,7 @@ mod tests {
         AuthorityOperationEvidenceSigner, AuthorityOperationIssuerRejection,
         AuthorityOperationIssuerStore,
     };
+    use crate::agent::private_crypto::{RecoverySigningKey, sign_recovery_control_record};
     use crate::agent::sdk::authority::{
         AuthorityEvidence, AuthorityLaneRoots, AuthorityOperationKind, CREDENTIAL_SIGNATURE_BYTES,
     };
@@ -1282,8 +1297,9 @@ mod tests {
         AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIssuanceAck,
     };
     use crate::agent::sdk::private::{
-        PRIVATE_SIGNATURE_BYTES, PrivateControlOperation, PrivateControlSigner,
-        PrivateNodeIdentity, SealedPrivateKey,
+        EncryptedObjectKind, EncryptedPrivateObject, PRIVATE_SIGNATURE_BYTES,
+        PrivateControlOperation, PrivateControlSigner, PrivateKeyEpoch, PrivateNodeIdentity,
+        PrivateRecoveryKeyringGrant, SealedPrivateKey, SealedRecoveryKey,
     };
     use crate::agent::sdk::{CredentialId, NodeId};
 
@@ -1629,10 +1645,19 @@ mod tests {
                 .map_err(|_| TestError)?;
             let application = PrivateControlApplicationAck::decode(&request.application_ack)
                 .map_err(|_| TestError)?;
-            let commitment =
-                PrivateControlAuthorityEvidence::from_acknowledgements(&issuance, &application)
-                    .and_then(|evidence| evidence.commitment())
-                    .map_err(|_| TestError)?;
+            let recovery_proof = request
+                .recovery_proof
+                .as_deref()
+                .map(PrivateRecoveryAuthorityProof::decode)
+                .transpose()
+                .map_err(|_| TestError)?;
+            let commitment = PrivateControlAuthorityEvidence::from_acknowledgements(
+                &issuance,
+                &application,
+                recovery_proof.as_ref(),
+            )
+            .and_then(|evidence| evidence.commitment())
+            .map_err(|_| TestError)?;
             match state
                 .retained_evidence
                 .iter()
@@ -1652,6 +1677,7 @@ mod tests {
                 control: request.control.clone(),
                 issuance_ack: request.issuance_ack.clone(),
                 application_ack: request.application_ack.clone(),
+                recovery_proof: request.recovery_proof.clone(),
                 evidence_commitment: commitment,
                 authenticated: true,
                 durably_persisted: true,
@@ -1867,6 +1893,20 @@ mod tests {
             sequence: u64,
             control: &PrivateControlRecord,
         ) -> (AuthorityOperationCall, AuthorityOperationApproval) {
+            let intent = AuthorityOperationIntent::private_control(
+                DeploymentId(id(0x32, discriminator)),
+                control,
+            )
+            .unwrap();
+            self.approved_intent(discriminator, sequence, intent)
+        }
+
+        fn approved_intent(
+            &self,
+            discriminator: u64,
+            sequence: u64,
+            intent: AuthorityOperationIntent,
+        ) -> (AuthorityOperationCall, AuthorityOperationApproval) {
             let public_key = self.credential_key.verifying_key().to_bytes();
             let principal = PrincipalId(id(0x22, 1));
             let credential = CredentialId::of_public_key(&public_key);
@@ -1880,11 +1920,7 @@ mod tests {
                 authenticated_node: Some(NodeId(id(0x23, 1))),
                 requested_valid_from: 10,
                 requested_expires_at: 40,
-                intent: AuthorityOperationIntent::private_control(
-                    DeploymentId(id(0x32, discriminator)),
-                    control,
-                )
-                .unwrap(),
+                intent,
                 signature: [0; CREDENTIAL_SIGNATURE_BYTES],
             };
             call.invocation = call.expected_invocation();
@@ -1935,6 +1971,41 @@ mod tests {
         let fixture = Fixture::new(&signer);
         let control = fixture.control(discriminator);
         let (call, approval) = fixture.approved(discriminator, discriminator, &control);
+        let issuer_store = MemoryImageStore::default();
+        let mut issuer =
+            DurableAuthorityOperationIssuer::open(issuer_store.clone(), fixture.authority).unwrap();
+        let issued = issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+        let actor = FakeAuthorityActor::default();
+        actor.register(call.clone(), approval, issued.issuance_ack);
+        Prepared {
+            fixture,
+            signer,
+            issuer_store,
+            issuer,
+            actor,
+            call,
+            control,
+        }
+    }
+
+    fn prepare_recovery(discriminator: u64) -> Prepared {
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let (control, recovery_key) =
+            private_recovery_control(fixture.authority.space, discriminator);
+        let runtime_deployment = DeploymentId(id(0x32, discriminator));
+        let proof = PrivateRecoveryAuthorityProof::from_control(
+            runtime_deployment,
+            &control,
+            control.previous,
+            &recovery_key,
+        )
+        .unwrap();
+        let (call, approval) = fixture.approved_intent(
+            discriminator,
+            discriminator,
+            AuthorityOperationIntent::RecoverPrivateAgent { proof },
+        );
         let issuer_store = MemoryImageStore::default();
         let mut issuer =
             DurableAuthorityOperationIssuer::open(issuer_store.clone(), fixture.authority).unwrap();
@@ -2019,16 +2090,104 @@ mod tests {
         control
     }
 
+    fn private_recovery_control(
+        space: SpaceId,
+        discriminator: u64,
+    ) -> (PrivateControlRecord, RecoverySigningKey) {
+        let agent = AgentId(id(0x45, discriminator));
+        let transport_identity = discriminator.to_le_bytes().to_vec();
+        let node = NodeId::of_authenticated_peer(&transport_identity);
+        let encryption_public_key = id(0x51, discriminator);
+        let identity = PrivateNodeIdentity {
+            node,
+            principal: PrincipalId(id(0x52, discriminator)),
+            transport_identity,
+            encryption_public_key,
+            authority_binding: Hash(id(0x53, discriminator)),
+            transport_signature: [0x54; PRIVATE_SIGNATURE_BYTES],
+        };
+        let sealed = SealedPrivateKey {
+            node,
+            recipient_key: encryption_public_key,
+            sealed: vec![0x55; 48],
+        };
+        let next_epoch = PrivateKeyEpoch {
+            space,
+            agent,
+            epoch: 2,
+            owner_key_commitment: Hash(id(0x56, discriminator)),
+            data_key_commitment: Hash(id(0x57, discriminator)),
+            recovery_key_commitment: Hash(id(0x58, discriminator)),
+            recovery_encryption_public_key: id(0x59, discriminator),
+            sealed_recovery_data_key: SealedRecoveryKey {
+                recipient_key: id(0x59, discriminator),
+                sealed: vec![0x5a; 48],
+            },
+            sealed_owner_keys: vec![sealed.clone()],
+            sealed_data_keys: vec![sealed.clone()],
+        };
+        let historical_keyring = PrivateRecoveryKeyringGrant {
+            key_commitment: Hash(id(0x5b, discriminator)),
+            sealed_keys: vec![sealed],
+            ciphertext: EncryptedPrivateObject {
+                space,
+                agent,
+                epoch: 2,
+                kind: EncryptedObjectKind::Control,
+                content: Hash(id(0x5c, discriminator)),
+                nonce: [0x5d; 24],
+                ciphertext: vec![0x5e; 48],
+            },
+        };
+        let recovery_key = RecoverySigningKey::from_seed(id(0x5f, discriminator)).unwrap();
+        let previous = Hash(id(0x60, discriminator));
+        let mut control = PrivateControlRecord {
+            space,
+            agent,
+            sequence: 1,
+            previous: Some(previous),
+            operation: PrivateControlOperation::Recover {
+                superseded_heads: vec![previous],
+                next_epoch,
+                replacement_nodes: vec![identity],
+                historical_keyring,
+            },
+            signer: PrivateControlSigner::Recovery,
+            signer_public_key: [0; 32],
+            signature: [0; PRIVATE_SIGNATURE_BYTES],
+        };
+        sign_recovery_control_record(&mut control, &recovery_key).unwrap();
+        assert!(control.validate_shape());
+        (control, recovery_key)
+    }
+
     fn application_fact(
         route: ManagedAgentTarget,
         control: &PrivateControlRecord,
         applied_at: u64,
     ) -> PrivateControlApplicationFact {
-        let (operation, epoch) = match &control.operation {
-            PrivateControlOperation::Invite { epoch, .. } => {
-                (AuthorityOperationKind::InvitePrivateNode, *epoch)
-            }
-            _ => panic!("Invite fixture"),
+        let (operation, epoch, post_member_set) = match &control.operation {
+            PrivateControlOperation::Invite { epoch, .. } => (
+                AuthorityOperationKind::InvitePrivateNode,
+                *epoch,
+                Hash::digest(
+                    b"vos/test/private-post-member-set/v1",
+                    &[control.commitment().as_bytes()],
+                ),
+            ),
+            PrivateControlOperation::Recover {
+                next_epoch,
+                replacement_nodes,
+                ..
+            } => (
+                AuthorityOperationKind::RecoverPrivateAgent,
+                next_epoch.epoch,
+                crate::agent::sdk::authority_operation::private_member_set_commitment(
+                    replacement_nodes.iter().map(|node| node.node),
+                )
+                .unwrap(),
+            ),
+            _ => panic!("private coordinator fixture"),
         };
         PrivateControlApplicationFact {
             managed: route,
@@ -2037,10 +2196,7 @@ mod tests {
             control_sequence: control.sequence,
             control_previous: control.previous,
             epoch,
-            post_member_set: Hash::digest(
-                b"vos/test/private-post-member-set/v1",
-                &[control.commitment().as_bytes()],
-            ),
+            post_member_set,
             reopened_control_state: Hash::digest(
                 b"vos/test/private-reopened-state/v1",
                 &[control.commitment().as_bytes(), &applied_at.to_le_bytes()],
@@ -2125,6 +2281,58 @@ mod tests {
         );
         assert_eq!(coordinator.retained_applications(), 1);
         assert!(!coordinator.has_pending_application());
+    }
+
+    #[test]
+    fn retained_recover_intent_matches_exact_control_and_carries_pra_to_evidence() {
+        let mut prepared = prepare_recovery(14);
+        let AuthorityOperationIntent::RecoverPrivateAgent { proof } = &prepared.call.intent else {
+            panic!("recovery fixture did not retain RecoverPrivateAgent intent")
+        };
+        assert!(proof.matches_control(&prepared.control));
+        let exact_proof = proof.encode().unwrap();
+        let store = MemoryImageStore::default();
+        let runtime = FakeRuntime::default();
+        let authority = prepared.fixture.authority;
+        let wire = control_wire(&prepared);
+        let mut coordinator = open_coordinator(
+            store,
+            runtime.clone(),
+            prepared.actor.clone(),
+            prepared.issuer,
+            authority,
+        );
+
+        let acknowledgement = coordinator
+            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .unwrap();
+        assert_eq!(
+            (
+                runtime.calls(),
+                runtime.transitions(),
+                runtime.evidence_calls()
+            ),
+            (1, 1, 1)
+        );
+        let retained_proof = runtime.inner.lock().unwrap().retained_evidence[0]
+            .0
+            .recovery_proof
+            .clone();
+        assert_eq!(retained_proof.as_deref(), Some(exact_proof.as_slice()));
+
+        let mut coordinator = restart(coordinator, authority);
+        let retry = coordinator
+            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .unwrap();
+        assert_eq!(retry, acknowledgement);
+        assert_eq!(
+            (
+                runtime.calls(),
+                runtime.transitions(),
+                runtime.evidence_calls()
+            ),
+            (1, 1, 1)
+        );
     }
 
     #[test]
@@ -2388,7 +2596,7 @@ mod tests {
             assert_eq!(actor.calls(), if fail_after { 1 } else { 2 });
         }
 
-        // The third coordinator commit records that the exact PSE1 was
+        // The third coordinator commit records that the exact PSE2 was
         // durably attached and reopened. Before/after ambiguity must poison
         // the current handle; restart either re-drives the exact callback or
         // trusts the already committed marker without re-signing.

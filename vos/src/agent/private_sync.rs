@@ -17,7 +17,9 @@ use core::fmt;
 use vos_agent_sdk::authority::{AuthorityActorTarget, AuthorityVerifier, ManagedAgentTarget};
 use vos_agent_sdk::authority_operation::{
     AuthorityOperationIntent, AuthorityOperationIssuanceAck,
-    MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES, PrivateControlApplicationAck,
+    MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES,
+    MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES, PrivateControlApplicationAck,
+    PrivateRecoveryAuthorityProof, PrivateRecoveryAuthorityProofVerifier,
 };
 use vos_agent_sdk::private::{
     EncryptedPrivateObject, PrivateControlOperation, PrivateControlRecord, PrivateNodeIdentity,
@@ -45,9 +47,9 @@ pub const MAX_PRIVATE_SYNC_FRAME_BYTES: usize = MAX_PRIVATE_SYNC_PAGE_BYTES + 32
 const FORMAT_VERSION: u16 = 2;
 const REQUEST_MAGIC: &[u8; 4] = b"PSRQ";
 const PAGE_MAGIC: &[u8; 4] = b"PSPG";
-const EVIDENCE_MAGIC: &[u8; 4] = b"PSE1";
+const EVIDENCE_MAGIC: &[u8; 4] = b"PSE2";
 const SYNC_WIRE_DOMAIN: &[u8] = b"vos/private/stored-wire/v1";
-const EVIDENCE_WIRE_DOMAIN: &[u8] = b"vos/private/control-authority-evidence/v1";
+const EVIDENCE_WIRE_DOMAIN: &[u8] = b"vos/private/control-authority-evidence/v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateSyncError {
@@ -104,12 +106,17 @@ impl From<PrivateCryptoError> for PrivateSyncError {
 pub(crate) struct PrivateControlAuthorityEvidence {
     pub(crate) issuance_ack: Vec<u8>,
     pub(crate) application_ack: Vec<u8>,
+    /// Exact PRA1 retained only for Recover. This compact signed proof makes
+    /// a live retry and another replacement Node independent of the retired
+    /// host-local PVRP3 staging plan.
+    pub(crate) recovery_proof: Option<Vec<u8>>,
 }
 
 impl PrivateControlAuthorityEvidence {
     pub(crate) fn from_acknowledgements(
         issuance: &AuthorityOperationIssuanceAck,
         application: &PrivateControlApplicationAck,
+        recovery_proof: Option<&PrivateRecoveryAuthorityProof>,
     ) -> Result<Self, PrivateSyncError> {
         let evidence = Self {
             issuance_ack: issuance
@@ -118,6 +125,9 @@ impl PrivateControlAuthorityEvidence {
             application_ack: application
                 .encode()
                 .map_err(|_| PrivateSyncError::InvalidFrame)?,
+            recovery_proof: recovery_proof
+                .map(|proof| proof.encode().map_err(|_| PrivateSyncError::InvalidFrame))
+                .transpose()?,
         };
         // Encoding supplies the common bound and catches an unexpectedly
         // enlarged SDK acknowledgement before it reaches persistent storage.
@@ -130,14 +140,35 @@ impl PrivateControlAuthorityEvidence {
             .map_err(|_| PrivateSyncError::InvalidFrame)?;
         let application = PrivateControlApplicationAck::decode(&self.application_ack)
             .map_err(|_| PrivateSyncError::InvalidFrame)?;
+        let recovery_proof = self
+            .recovery_proof
+            .as_deref()
+            .map(PrivateRecoveryAuthorityProof::decode)
+            .transpose()
+            .map_err(|_| PrivateSyncError::InvalidFrame)?;
         if issuance.encode().ok().as_deref() != Some(self.issuance_ack.as_slice())
             || application.encode().ok().as_deref() != Some(self.application_ack.as_slice())
+            || recovery_proof
+                .as_ref()
+                .and_then(|proof| proof.encode().ok())
+                .as_deref()
+                != self.recovery_proof.as_deref()
+            || (issuance.receipt.selector.operation
+                == vos_agent_sdk::authority::AuthorityOperationKind::RecoverPrivateAgent)
+                != recovery_proof.is_some()
         {
             return Err(PrivateSyncError::InvalidFrame);
         }
         let mut encoder = Encoder::new(EVIDENCE_MAGIC);
         encoder.bytes(&self.issuance_ack)?;
         encoder.bytes(&self.application_ack)?;
+        match &self.recovery_proof {
+            Some(proof) => {
+                encoder.u8(1);
+                encoder.bytes(proof)?;
+            }
+            None => encoder.u8(0),
+        }
         encoder.finish(MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES)
     }
 
@@ -152,6 +183,11 @@ impl PrivateControlAuthorityEvidence {
                 vos_agent_sdk::authority_operation::MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
             )?,
             application_ack: decoder.bytes(MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES)?,
+            recovery_proof: match decoder.u8()? {
+                0 => None,
+                1 => Some(decoder.bytes(MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES)?),
+                _ => return Err(PrivateSyncError::InvalidFrame),
+            },
         };
         decoder.finish()?;
         if evidence.encode()?.as_slice() != bytes {
@@ -188,8 +224,27 @@ impl PrivateControlAuthorityEvidence {
         {
             return Err(PrivateSyncError::Tampered);
         }
-        let intent = AuthorityOperationIntent::private_control(route.runtime_deployment, control)
-            .map_err(|_| PrivateSyncError::Tampered)?;
+        let intent = match (&control.operation, self.recovery_proof.as_deref()) {
+            (PrivateControlOperation::Recover { .. }, Some(bytes)) => {
+                let proof = PrivateRecoveryAuthorityProof::decode(bytes)
+                    .map_err(|_| PrivateSyncError::Tampered)?;
+                if proof.encode().ok().as_deref() != Some(bytes)
+                    || proof.managed != route
+                    || !proof.matches_control(control)
+                    || proof.verify_with(&RawRecoveryProofVerifier).is_err()
+                {
+                    return Err(PrivateSyncError::Tampered);
+                }
+                AuthorityOperationIntent::RecoverPrivateAgent { proof }
+            }
+            (PrivateControlOperation::Recover { .. }, None) | (_, Some(_)) => {
+                return Err(PrivateSyncError::Tampered);
+            }
+            (_, None) => {
+                AuthorityOperationIntent::private_control(route.runtime_deployment, control)
+                    .map_err(|_| PrivateSyncError::Tampered)?
+            }
+        };
         let expected_actor = match &intent {
             AuthorityOperationIntent::PrivateActorLifecycle { actor, .. } => Some(*actor),
             _ => None,
@@ -214,7 +269,8 @@ impl PrivateControlAuthorityEvidence {
             || application.issued_at != issuance.issued_at
             || !private_intent_matches_application(&intent, &application.application)
             || application.application.epoch != resulting_epoch
-            || issuance.receipt.selector.request != control.commitment()
+            || intent.request_commitment(issuance.authorization_sequence, issuance.operation_call)
+                != Some(issuance.receipt.selector.request)
             || issuance.receipt.selector.operation != intent.operation()
             || issuance.receipt.selector.actor != expected_actor
             || issuance.receipt.selector.actor_deployment.is_some()
@@ -232,6 +288,19 @@ struct RawAuthorityVerifier;
 
 impl AuthorityVerifier for RawAuthorityVerifier {
     fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+        crate::agent::authority::verify_raw_ed25519(public_key, message, signature)
+    }
+}
+
+struct RawRecoveryProofVerifier;
+
+impl PrivateRecoveryAuthorityProofVerifier for RawRecoveryProofVerifier {
+    fn verify_private_recovery_authority_proof(
+        &self,
+        public_key: &[u8; 32],
+        message: &[u8],
+        signature: &[u8; 64],
+    ) -> bool {
         crate::agent::authority::verify_raw_ed25519(public_key, message, signature)
     }
 }
@@ -354,7 +423,7 @@ pub enum PrivateSyncItem {
         commitment: Hash,
         resulting_epoch: u64,
         wire: Vec<u8>,
-        /// Exact canonical PSE1 envelope for this PCTL. A control item without
+        /// Exact canonical PSE2 envelope for this PCTL. A control item without
         /// AOI1+PCA1 evidence is never a valid synchronization item.
         evidence: Vec<u8>,
     },
@@ -1805,17 +1874,57 @@ mod tests {
         store: &PrivateStore,
         control: &PrivateControlRecord,
     ) -> PrivateControlAuthorityEvidence {
-        let authority = test_authority_target(store);
         let route = test_route(store);
-        let key = SigningKey::from_bytes(&[0x71; 32]);
         let intent =
             AuthorityOperationIntent::private_control(route.runtime_deployment, control).unwrap();
+        signed_evidence_for_intent(store, control, intent, None)
+    }
+
+    fn signed_recovery_evidence(
+        store: &PrivateStore,
+        control: &PrivateControlRecord,
+        recovery: &RecoverySigningKey,
+        superseded_authority_head: Option<Hash>,
+    ) -> PrivateControlAuthorityEvidence {
+        let route = test_route(store);
+        let proof = PrivateRecoveryAuthorityProof::from_control(
+            route.runtime_deployment,
+            control,
+            superseded_authority_head,
+            recovery,
+        )
+        .unwrap();
+        signed_evidence_for_intent(
+            store,
+            control,
+            AuthorityOperationIntent::RecoverPrivateAgent {
+                proof: proof.clone(),
+            },
+            Some(&proof),
+        )
+    }
+
+    fn signed_evidence_for_intent(
+        store: &PrivateStore,
+        control: &PrivateControlRecord,
+        intent: AuthorityOperationIntent,
+        recovery_proof: Option<&PrivateRecoveryAuthorityProof>,
+    ) -> PrivateControlAuthorityEvidence {
+        let authority = test_authority_target(store);
+        let route = test_route(store);
+        assert_eq!(intent.managed(), route);
+        let key = SigningKey::from_bytes(&[0x71; 32]);
         let selector_actor = match &intent {
             AuthorityOperationIntent::PrivateActorLifecycle { actor, .. } => Some(*actor),
             _ => None,
         };
         let issued_at = control.sequence.saturating_add(20);
         let applied_at = issued_at.saturating_add(1);
+        let authorization_sequence = NonZeroU64::new(control.sequence + 1).unwrap();
+        let operation_call = Hash::digest(
+            b"vos/test/private-sync-operation-call/v1",
+            &[control.commitment().as_bytes()],
+        );
         let mut receipt = AuthorityReceipt {
             selector: AuthorityReceiptSelector {
                 policy: authority.binding.policy,
@@ -1842,7 +1951,9 @@ mod tests {
                 acknowledged_through: 0,
                 valid_from: issued_at,
                 expires_at: applied_at + 100,
-                request: control.commitment(),
+                request: intent
+                    .request_commitment(authorization_sequence, operation_call)
+                    .unwrap(),
             },
             public_key: authority.binding.public_key,
             signature: [0; 64],
@@ -1856,15 +1967,12 @@ mod tests {
             authorization_invocation: InvocationId(authorization),
             acknowledgement_invocation: InvocationId(issuance_invocation),
             authority,
-            operation_call: Hash::digest(
-                b"vos/test/private-sync-operation-call/v1",
-                &[control.commitment().as_bytes()],
-            ),
+            operation_call,
             approval: Hash::digest(
                 b"vos/test/private-sync-operation-approval/v1",
                 &[control.commitment().as_bytes()],
             ),
-            authorization_sequence: NonZeroU64::new(control.sequence + 1).unwrap(),
+            authorization_sequence,
             receipt: receipt.clone(),
             issued_at,
             signature: [0; 64],
@@ -1902,9 +2010,12 @@ mod tests {
             signature: [0; 64],
         };
         application.signature = key.sign(&application.signing_bytes()).to_bytes();
-        let evidence =
-            PrivateControlAuthorityEvidence::from_acknowledgements(&issuance, &application)
-                .unwrap();
+        let evidence = PrivateControlAuthorityEvidence::from_acknowledgements(
+            &issuance,
+            &application,
+            recovery_proof,
+        )
+        .unwrap();
         evidence
             .verify_for(control, store.binding().epoch, route, authority)
             .unwrap();
@@ -1913,6 +2024,21 @@ mod tests {
 
     fn attach_signed_evidence(store: &mut PrivateStore, control: &PrivateControlRecord) {
         let evidence = signed_evidence(store, control).encode().unwrap();
+        store
+            .persist_control_authority_evidence(control.commitment(), &evidence)
+            .unwrap();
+    }
+
+    fn attach_signed_recovery_evidence(
+        store: &mut PrivateStore,
+        control: &PrivateControlRecord,
+        recovery: &RecoverySigningKey,
+        superseded_authority_head: Option<Hash>,
+    ) {
+        let evidence =
+            signed_recovery_evidence(store, control, recovery, superseded_authority_head)
+                .encode()
+                .unwrap();
         store
             .persist_control_authority_evidence(control.commitment(), &evidence)
             .unwrap();
@@ -2418,7 +2544,7 @@ mod tests {
         .unwrap();
 
         // Model process loss after the PCTL index became visible but before
-        // its PSE1 transaction began. Reopen must preserve this state, and an
+        // its PSE2 transaction began. Reopen must preserve this state, and an
         // exact retained page retry attaches evidence without appending the
         // control a second time.
         client.append_control(&control, &TestAuthority).unwrap();
@@ -2492,6 +2618,7 @@ mod tests {
         reject(PrivateControlAuthorityEvidence {
             issuance_ack: issuance.encode().unwrap(),
             application_ack: evidence.application_ack.clone(),
+            recovery_proof: None,
         });
 
         let issuance = AuthorityOperationIssuanceAck::decode(&evidence.issuance_ack).unwrap();
@@ -2501,6 +2628,7 @@ mod tests {
         reject(PrivateControlAuthorityEvidence {
             issuance_ack: evidence.issuance_ack.clone(),
             application_ack: application.encode().unwrap(),
+            recovery_proof: None,
         });
 
         let mut substituted_issuance = issuance.clone();
@@ -2519,6 +2647,7 @@ mod tests {
             PrivateControlAuthorityEvidence::from_acknowledgements(
                 &substituted_issuance,
                 &substituted_application,
+                None,
             )
             .unwrap(),
         );
@@ -2546,6 +2675,7 @@ mod tests {
             PrivateControlAuthorityEvidence::from_acknowledgements(
                 &substituted_issuance,
                 &substituted_application,
+                None,
             )
             .unwrap(),
         );
@@ -2562,7 +2692,11 @@ mod tests {
                 _ => unreachable!(),
             }
             application.signature = key.sign(&application.signing_bytes()).to_bytes();
-            match PrivateControlAuthorityEvidence::from_acknowledgements(&issuance, &application) {
+            match PrivateControlAuthorityEvidence::from_acknowledgements(
+                &issuance,
+                &application,
+                None,
+            ) {
                 Ok(candidate) => reject(candidate),
                 Err(error) => assert_eq!(error, PrivateSyncError::InvalidFrame),
             }
@@ -2574,6 +2708,159 @@ mod tests {
         noncanonical.push(0);
         assert_eq!(
             PrivateControlAuthorityEvidence::decode(&noncanonical),
+            Err(PrivateSyncError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn pse2_binds_exact_recovery_proof_and_rejects_old_mixed_or_missing_proof_frames() {
+        let directory = TestDirectory::new("recovery-evidence-proof-binding");
+        let fixture = fixture();
+        let mut store = create_store(&directory.child("recovery"), &fixture);
+        let first_head = policy_record(&fixture, 0, None, 41);
+        let second_head = policy_record(&fixture, 0, None, 42);
+        store.append_control(&first_head, &TestAuthority).unwrap();
+        let successor = generate_fresh_private_epoch(
+            fixture.space,
+            fixture.agent,
+            1,
+            fixture.owner,
+            &fixture.nodes,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let historical_keys = BTreeMap::from([(
+            fixture.epoch.record.epoch,
+            unwrap_data_key(
+                &fixture.epoch.record,
+                &fixture.recipients[0].identity,
+                &fixture.recipients[0].key,
+            )
+            .unwrap(),
+        )]);
+        let historical_keyring = build_recovery_keyring_grant(
+            core::slice::from_ref(&fixture.epoch.record),
+            &historical_keys,
+            &successor.record,
+            &fixture.nodes,
+        )
+        .unwrap();
+        let mut superseded_heads = vec![first_head.commitment(), second_head.commitment()];
+        superseded_heads.sort();
+        let mut recovery = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: 1,
+            previous: Some(first_head.commitment()),
+            operation: PrivateControlOperation::Recover {
+                superseded_heads,
+                next_epoch: successor.record,
+                replacement_nodes: fixture.nodes.clone(),
+                historical_keyring,
+            },
+            signer: PrivateControlSigner::Recovery,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_recovery_control_record(&mut recovery, &fixture.recovery).unwrap();
+        store.append_control(&recovery, &TestAuthority).unwrap();
+
+        let first = signed_recovery_evidence(
+            &store,
+            &recovery,
+            &fixture.recovery,
+            Some(first_head.commitment()),
+        );
+        let second = signed_recovery_evidence(
+            &store,
+            &recovery,
+            &fixture.recovery,
+            Some(second_head.commitment()),
+        );
+        let first_wire = first.encode().unwrap();
+        assert_eq!(
+            PrivateControlAuthorityEvidence::decode(&first_wire),
+            Ok(first.clone())
+        );
+        first
+            .verify_for(
+                &recovery,
+                store.binding().epoch,
+                test_route(&store),
+                test_authority_target(&store),
+            )
+            .unwrap();
+        assert_ne!(first.recovery_proof, second.recovery_proof);
+
+        // AOI1 and PCA1 were signed for the first PRA1 selector. A second,
+        // independently valid PRA1 for the same PCTL but another authority
+        // projection head cannot be substituted into the retained envelope.
+        let mixed = PrivateControlAuthorityEvidence {
+            issuance_ack: first.issuance_ack.clone(),
+            application_ack: first.application_ack.clone(),
+            recovery_proof: second.recovery_proof.clone(),
+        };
+        assert_eq!(
+            mixed.verify_for(
+                &recovery,
+                store.binding().epoch,
+                test_route(&store),
+                test_authority_target(&store),
+            ),
+            Err(PrivateSyncError::Tampered)
+        );
+
+        let mut missing = first.clone();
+        missing.recovery_proof = None;
+        assert_eq!(missing.encode(), Err(PrivateSyncError::InvalidFrame));
+
+        let mut normal_store = create_store(&directory.child("normal"), &fixture);
+        let normal_control = invite_record(&normal_store, &fixture, 50);
+        normal_store
+            .append_control(&normal_control, &TestAuthority)
+            .unwrap();
+        let mut unexpected = signed_evidence(&normal_store, &normal_control);
+        unexpected.recovery_proof = first.recovery_proof.clone();
+        assert_eq!(unexpected.encode(), Err(PrivateSyncError::InvalidFrame));
+
+        let mut old = first_wire.clone();
+        old[..4].copy_from_slice(b"PSE1");
+        assert_eq!(
+            PrivateControlAuthorityEvidence::decode(&old),
+            Err(PrivateSyncError::InvalidFrame)
+        );
+        let proof_tag = 4 + 2 + 4 + first.issuance_ack.len() + 4 + first.application_ack.len();
+        let mut mixed_frame = first_wire.clone();
+        mixed_frame[proof_tag] = 0;
+        assert_eq!(
+            PrivateControlAuthorityEvidence::decode(&mixed_frame),
+            Err(PrivateSyncError::InvalidFrame)
+        );
+        let mut trailing = first_wire;
+        trailing.push(0);
+        assert_eq!(
+            PrivateControlAuthorityEvidence::decode(&trailing),
+            Err(PrivateSyncError::InvalidFrame)
+        );
+        assert_eq!(
+            MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES,
+            4 + 2
+                + 4
+                + vos_agent_sdk::authority_operation::MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES
+                + 4
+                + MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES
+                + 1
+                + 4
+                + MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES
+        );
+        assert_eq!(
+            PrivateControlAuthorityEvidence::decode(&vec![
+                0;
+                MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES
+                    + 1
+            ]),
             Err(PrivateSyncError::InvalidFrame)
         );
     }
@@ -2629,6 +2916,7 @@ mod tests {
         let substituted = PrivateControlAuthorityEvidence::from_acknowledgements(
             &substituted_issuance,
             &substituted_application,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2887,7 +3175,7 @@ mod tests {
         };
         sign_recovery_control_record(&mut recovery, &fixture.recovery).unwrap();
         server.append_control(&recovery, &TestAuthority).unwrap();
-        attach_signed_evidence(&mut server, &recovery);
+        attach_signed_recovery_evidence(&mut server, &recovery, &fixture.recovery, None);
 
         let request = request_for(&client, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32);
         let page = serve_private_sync_page(
@@ -2954,7 +3242,7 @@ mod tests {
         )
         .unwrap();
         // Genesis is represented by the empty control chain. Object sync at
-        // that exact head needs no synthetic or fabricated PSE1.
+        // that exact head needs no synthetic or fabricated PSE2.
         assert_eq!(page.phase, PrivateSyncPhase::Objects);
         assert_eq!(page.items.len(), 1);
         assert!(page.next.is_some());
