@@ -28,7 +28,7 @@ use super::journal_store::{
 };
 use super::local_journal_driver::{
     LocalMergeAuthenticator, LocalReplayExecutorError, StandardLocalReplayExecutor,
-    recent_clean_management_input,
+    recent_clean_management_operation, recent_clean_ordered_input,
 };
 use super::replay::{
     CommittedSharedOrdered, MaterializeError, NoPrunedOrderedBases, ReplayExecutor,
@@ -73,6 +73,10 @@ pub(crate) trait SharedArtifactStager {
     fn audit(&self, generation: AgentGenerationRouteKey) -> Result<(), SharedArtifactStagerError>;
 
     fn stage(&mut self, chunk: &ArtifactChunk) -> Result<(), SharedArtifactStagerError>;
+
+    /// Return true only when this exact canonical chunk is already durable.
+    /// A conflicting manifest or byte body is corruption, never a cache hit.
+    fn contains(&self, chunk: &ArtifactChunk) -> Result<bool, SharedArtifactStagerError>;
 
     fn abort(
         &mut self,
@@ -297,6 +301,40 @@ impl SharedArtifactStager for FileSharedArtifactStager {
         )?;
         self.audit_batch(chunk.batch(), &path, false)?;
         Ok(())
+    }
+
+    fn contains(&self, chunk: &ArtifactChunk) -> Result<bool, SharedArtifactStagerError> {
+        chunk
+            .validate()
+            .map_err(|_| SharedArtifactStagerError::Corrupt)?;
+        if chunk.manifest().route().generation() != self.generation {
+            return Err(SharedArtifactStagerError::Conflict);
+        }
+        let path = self.batch_path(chunk.batch());
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(SharedArtifactStagerError::Unavailable),
+            Ok(_) => require_directory(&path)?,
+        }
+        if self.manifest(chunk.batch(), &path)? != *chunk.manifest() {
+            return Err(SharedArtifactStagerError::Conflict);
+        }
+        let chunk_path = path.join(chunk_file_name(chunk.artifact_index(), chunk.offset()));
+        match fs::symlink_metadata(&chunk_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(SharedArtifactStagerError::Unavailable),
+            Ok(_) => {
+                require_regular(&chunk_path)?;
+                let bytes = read_regular_bounded(
+                    &chunk_path,
+                    super::shared_raft::ARTIFACT_CHUNK_DATA_BYTES + STAGING_FILE_OVERHEAD_BYTES,
+                )?;
+                if bytes != chunk.bytes() {
+                    return Err(SharedArtifactStagerError::Conflict);
+                }
+                Ok(true)
+            }
+        }
     }
 
     fn abort(
@@ -597,56 +635,6 @@ pub(crate) enum SharedMergeObject {
 /// Deterministic test executor used only to create a fully authenticated
 /// Local-head suffix around the snapshot predecessor regression. Production
 /// Shared replay always uses `StandardLocalReplayExecutor` above.
-#[cfg(test)]
-struct RejectedInvocationTestExecutor;
-
-#[cfg(test)]
-impl super::replay::ReplayExecutor for RejectedInvocationTestExecutor {
-    type Error = core::convert::Infallible;
-
-    fn verify_merge_event(&mut self, _event: &MergeEvent) -> Result<bool, Self::Error> {
-        Ok(true)
-    }
-
-    fn authenticate(
-        &mut self,
-        input: &super::journal::ReplayInput,
-        _before: &super::wire::RuntimeState,
-        _position: super::replay::ReplayPosition,
-    ) -> Result<(), Self::Error> {
-        assert!(input.validate().is_ok());
-        Ok(())
-    }
-
-    fn execute(
-        &mut self,
-        input: &super::journal::ReplayInput,
-        before: &super::wire::RuntimeState,
-        _position: super::replay::ReplayPosition,
-    ) -> Result<super::replay::ReplayTransition, Self::Error> {
-        let super::journal::ReplayOperation::Invoke {
-            invocation,
-            observed_slot,
-            ..
-        } = &input.operation
-        else {
-            panic!("the acknowledgement short-circuits before test execution")
-        };
-        let decoded = super::wire::decode_standard_runtime_state(before).unwrap();
-        let mut runtime = super::standard::StandardAgentRuntime::restore(decoded).unwrap();
-        runtime
-            .commit_exact_outcome_clock(invocation, *observed_slot)
-            .unwrap();
-        Ok(super::replay::ReplayTransition {
-            state: super::wire::encode_standard_runtime_state(&runtime.snapshot()),
-            disposition: super::replay::ReplayDisposition::Rejected,
-            result: Some(Err(super::execution::ActorExecutionError::NotFound)),
-            next_runtime: input.runtime.clone(),
-            products: super::replay::ReplayProducts::default(),
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SharedSnapshotCompactionOutcome {
     pub(crate) bindings_removed: usize,
@@ -706,18 +694,36 @@ impl From<LocalReplayExecutorError> for SharedJournalDriverError {
 
 /// Canonical Raft proposal and replay correlation for one clean ordered
 /// invocation. No mutable journal state changes while this value is built.
-pub(crate) struct PreparedCleanOrdered {
-    input: ReplayInputId,
-    payload: Vec<u8>,
+pub(crate) enum PreparedCleanOrdered {
+    Retained {
+        input: ReplayInputId,
+        outcome: crate::agent_sdk::RuntimeOutcome,
+    },
+    Proposal {
+        input: ReplayInputId,
+        payload: Vec<u8>,
+    },
 }
 
 impl PreparedCleanOrdered {
     pub(crate) const fn input(&self) -> ReplayInputId {
-        self.input
+        match self {
+            Self::Retained { input, .. } | Self::Proposal { input, .. } => *input,
+        }
     }
 
-    pub(crate) fn into_payload(self) -> Vec<u8> {
-        self.payload
+    pub(crate) fn retained(&self) -> Option<&crate::agent_sdk::RuntimeOutcome> {
+        match self {
+            Self::Retained { outcome, .. } => Some(outcome),
+            Self::Proposal { .. } => None,
+        }
+    }
+
+    pub(crate) fn into_payload(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Retained { .. } => None,
+            Self::Proposal { payload, .. } => Some(payload),
+        }
     }
 }
 
@@ -727,10 +733,17 @@ impl PreparedCleanOrdered {
 /// request and receipt were already committed.
 #[derive(Debug)]
 pub(crate) enum PreparedCleanManagement {
-    Denied(crate::agent_sdk::RuntimeOutcome),
-    Retained(crate::agent_sdk::RuntimeOutcome),
+    Denied {
+        outcome: crate::agent_sdk::RuntimeOutcome,
+        observed_slot: u64,
+    },
+    Retained {
+        outcome: crate::agent_sdk::RuntimeOutcome,
+        observed_slot: u64,
+    },
     Proposal {
         input: ReplayInputId,
+        observed_slot: u64,
         commands: Vec<Vec<u8>>,
     },
 }
@@ -738,28 +751,36 @@ pub(crate) enum PreparedCleanManagement {
 impl PreparedCleanManagement {
     pub(crate) const fn input(&self) -> Option<ReplayInputId> {
         match self {
-            Self::Denied(_) | Self::Retained(_) => None,
+            Self::Denied { .. } | Self::Retained { .. } => None,
             Self::Proposal { input, .. } => Some(*input),
+        }
+    }
+
+    pub(crate) const fn observed_slot(&self) -> u64 {
+        match self {
+            Self::Denied { observed_slot, .. }
+            | Self::Retained { observed_slot, .. }
+            | Self::Proposal { observed_slot, .. } => *observed_slot,
         }
     }
 
     pub(crate) fn denied(&self) -> Option<&crate::agent_sdk::RuntimeOutcome> {
         match self {
-            Self::Denied(outcome) => Some(outcome),
-            Self::Retained(_) | Self::Proposal { .. } => None,
+            Self::Denied { outcome, .. } => Some(outcome),
+            Self::Retained { .. } | Self::Proposal { .. } => None,
         }
     }
 
     pub(crate) fn retained(&self) -> Option<&crate::agent_sdk::RuntimeOutcome> {
         match self {
-            Self::Retained(outcome) => Some(outcome),
-            Self::Denied(_) | Self::Proposal { .. } => None,
+            Self::Retained { outcome, .. } => Some(outcome),
+            Self::Denied { .. } | Self::Proposal { .. } => None,
         }
     }
 
     pub(crate) fn into_commands(self) -> Vec<Vec<u8>> {
         match self {
-            Self::Denied(_) | Self::Retained(_) => Vec::new(),
+            Self::Denied { .. } | Self::Retained { .. } => Vec::new(),
             Self::Proposal { commands, .. } => commands,
         }
     }
@@ -1148,14 +1169,20 @@ where
         let runtime = self.materialization.runtime().clone();
         let descriptor = self.executor.trusted_current_clean_descriptor(&runtime)?;
         let catalog = self.clean_management_catalog(&descriptor, &request, artifacts)?;
-        if let Some(input) =
-            recent_clean_management_input(&self.store, &self.materialization, &request, &authority)?
-        {
+        if let Some((input, observed_slot)) = recent_clean_management_operation(
+            &self.store,
+            &self.materialization,
+            &request,
+            &authority,
+        )? {
             let outcome = self
                 .executor
                 .clean_management_result(input)
                 .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
-            return Ok(PreparedCleanManagement::Retained(outcome));
+            return Ok(PreparedCleanManagement::Retained {
+                outcome,
+                observed_slot,
+            });
         }
         let observed_slot = self.executor.current_logical_slot()?;
         let input = ReplayInput {
@@ -1189,7 +1216,10 @@ where
                 crate::agent_sdk::RuntimeOutcome::Management(Err(_))
             )
         {
-            return Ok(PreparedCleanManagement::Denied(preview.outcome));
+            return Ok(PreparedCleanManagement::Denied {
+                outcome: preview.outcome,
+                observed_slot,
+            });
         }
         let input_id = input.id();
         let route = self.active_route()?;
@@ -1218,7 +1248,9 @@ where
                         bytes.to_vec(),
                     )
                     .map_err(|_| SharedJournalDriverError::InvalidArtifactBatch)?;
-                    commands.push(AgentRaftCommand::ArtifactChunk(chunk).encode());
+                    if !self.artifacts.contains(&chunk)? {
+                        commands.push(AgentRaftCommand::ArtifactChunk(chunk).encode());
+                    }
                 }
             }
             Some(batch)
@@ -1247,8 +1279,30 @@ where
         commands.push(ordered.encode());
         Ok(PreparedCleanManagement::Proposal {
             input: input_id,
+            observed_slot,
             commands,
         })
+    }
+
+    pub(crate) fn inspect_clean_management(
+        &self,
+        request: &crate::agent_sdk::ManagementRequest,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        self.executor
+            .inspect_clean_management(
+                self.materialization.runtime(),
+                self.materialization.state(),
+                request,
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn clean_state_commitment(
+        &self,
+    ) -> Result<crate::agent_sdk::Hash, SharedJournalDriverError> {
+        super::journal::system_genesis_post_create_state_commitment(self.materialization.state())
+            .map(|commitment| crate::agent_sdk::Hash(commitment.0))
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)
     }
 
     fn clean_invocation_input(
@@ -1295,6 +1349,15 @@ where
         work: crate::agent_sdk::InvocationWork,
         authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        if let Some(input) =
+            recent_clean_ordered_input(&self.store, &self.materialization, &work, &authorization)?
+        {
+            let outcome = self
+                .executor
+                .clean_ordered_result(input)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            return Ok(PreparedCleanOrdered::Retained { input, outcome });
+        }
         let input = self.clean_invocation_input(work, authorization)?;
         if !matches!(
             input.persisted_lane(),
@@ -1326,7 +1389,7 @@ where
         .encode();
         AgentRaftCommand::decode(&payload)
             .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
-        Ok(PreparedCleanOrdered { input, payload })
+        Ok(PreparedCleanOrdered::Proposal { input, payload })
     }
 
     /// Publish one clean Local-lane invocation on this exact physical
@@ -1596,52 +1659,6 @@ where
                 },
             )
             .map_err(SharedJournalDriverError::from)
-    }
-
-    /// Publish a rejected Local invocation and its acknowledgement through
-    /// the generic replay/store boundary. This is test-only scaffolding for
-    /// proving that snapshot recovery binds the actual post-Ordered head.
-    #[cfg(test)]
-    pub(crate) fn append_acknowledged_local_for_test(
-        &mut self,
-        invocation: super::journal::ReplayOperation,
-        acknowledgement: super::journal::ReplayOperation,
-    ) -> Result<(), SharedJournalDriverError> {
-        let mut executor = RejectedInvocationTestExecutor;
-        for operation in [invocation, acknowledgement] {
-            let heads = self.materialization.heads().clone();
-            let entry = super::journal::LocalEntry {
-                genesis: heads.genesis,
-                node: heads.node,
-                revision: heads
-                    .local_revision
-                    .checked_add(1)
-                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
-                parent: heads.local_head,
-                ordered_base: super::journal::OrderedBase {
-                    index: heads.ordered_index,
-                    head: heads.ordered_head,
-                },
-                merge_frontier: heads.merge_frontier,
-                input: super::journal::ReplayInput {
-                    runtime: heads.runtime,
-                    operation,
-                },
-            };
-            let prepared = prepare_local(
-                &mut self.store,
-                &mut executor,
-                &self.materialization,
-                &entry,
-            )
-            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
-            let ReplayPreparation::Ready(prepared) = prepared else {
-                return Err(SharedJournalDriverError::CrossStoreMismatch);
-            };
-            let (_, successor, _) = prepared.publish()?;
-            self.materialization = successor;
-        }
-        Ok(())
     }
 
     pub(crate) fn capacity(&self) -> Result<(u64, u64, bool), SharedJournalDriverError> {
@@ -2030,11 +2047,11 @@ where
 impl
     SharedJournalAgentDriver<super::journal_store::FileAgentJournalStore, FileSharedArtifactStager>
 {
-    pub(crate) fn create_shared_unexposed(
+    pub(crate) fn create_shared_unexposed<T: super::replay::ReplaySealedOrdinaryGenesis>(
         mut store: super::journal_store::FileAgentJournalStore,
         artifacts: FileSharedArtifactStager,
         ledger: AgentRaftApplicationLedgerV2,
-        sealed: &super::replay::ReplaySealedSharedGenesis,
+        sealed: &T,
         catalog: &[RuntimeBlob],
         trust: Arc<dyn AgentTrustProvider>,
         merge: Arc<dyn LocalMergeAuthenticator>,
@@ -2061,9 +2078,9 @@ impl
         Self::open(store, artifacts, ledger, trust, merge)
     }
 
-    pub(crate) fn commit_exposure(
+    pub(crate) fn commit_exposure<T: super::replay::ReplaySealedOrdinaryGenesis>(
         &mut self,
-        sealed: &super::replay::ReplaySealedSharedGenesis,
+        sealed: &T,
         intent: crate::service::Hash,
     ) -> Result<(), SharedJournalDriverError> {
         self.store.commit_shared_exposure(sealed, intent)?;

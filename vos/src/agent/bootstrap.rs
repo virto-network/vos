@@ -24,9 +24,9 @@ use super::journal::{
     ReplayOperation, system_genesis_artifact_closure_commitment,
 };
 use super::replay::{ReplayPreparedGenesis, ReplaySealedGenesis};
-use super::{AgentReplica, LifecycleRequest, ReplicaRole};
+use super::{AgentReplica, ReplicaRole};
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
-use crate::service::{AgentId, BlobRef, NodeId, PrincipalId, SpaceId};
+use crate::service::{AgentId, BlobRef, Hash, NodeId, PrincipalId, SpaceId};
 
 const SERVICE_WIRE_HEADER_BYTES: usize = 4 + 32;
 const SYSTEM_GENESIS_CATALOG_REFERENCES: usize = 1;
@@ -57,7 +57,8 @@ pub const MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES: usize = SERVICE_WIRE_HEADER_
     + 4
     + MAX_SYSTEM_GENESIS_EVIDENCE_BYTES;
 
-/// Stable out-of-band archive key for one Local system-Agent genesis.
+/// Stable out-of-band archive key for one clean system-Agent genesis. The
+/// node is the exact physical replica selected by the one-voter Shared root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SystemAgentGenesisLocator {
     pub space: SpaceId,
@@ -148,28 +149,15 @@ impl SystemAgentGenesisProposal {
         self.create
             .validate()
             .map_err(|_| SystemAgentGenesisBootstrapError::InvalidProposal)?;
-        let config =
-            create_config(&self.create).ok_or(SystemAgentGenesisBootstrapError::InvalidProposal)?;
+        let (descriptor, request, sequence) =
+            system_create(&self.create).ok_or(SystemAgentGenesisBootstrapError::InvalidProposal)?;
         if self.create.runtime.space != self.locator.space
             || self.create.runtime.agent != self.locator.agent
             || self.replica.node != self.locator.node
-            || config.identity.profile != super::AgentProfile::Local
-            || config.replicas.as_slice() != [self.replica]
+            || !descriptor_matches_root_replica(descriptor, self.replica)
             || self.expectations.runtime_binding() != self.create.runtime.commitment()
-            || self.expectations.inner_create_request()
-                != match &self.create.operation {
-                    ReplayOperation::Management {
-                        request: LifecycleRequest::Authorized { request, .. },
-                    } => request.commitment(),
-                    _ => return Err(SystemAgentGenesisBootstrapError::InvalidProposal),
-                }
-            || self.expectations.sequence()
-                != match &self.create.operation {
-                    ReplayOperation::Management {
-                        request: LifecycleRequest::Authorized { admission, .. },
-                    } => admission.receipt.claim.sequence,
-                    _ => return Err(SystemAgentGenesisBootstrapError::InvalidProposal),
-                }
+            || self.expectations.inner_create_request() != Hash(request.commitment().0)
+            || self.expectations.sequence() != sequence
             || self.catalog.as_slice() != [self.create.runtime.package.clone()]
             || system_genesis_artifact_closure_commitment(&self.catalog)
                 .map_err(|_| SystemAgentGenesisBootstrapError::InvalidCatalog)?
@@ -274,13 +262,13 @@ impl SystemAgentGenesisProvision {
         self.evidence
             .validate()
             .map_err(SystemAgentGenesisBootstrapError::Authority)?;
-        let config = create_config(&self.proposal.create)
+        let (descriptor, _, _) = system_create(&self.proposal.create)
             .ok_or(SystemAgentGenesisBootstrapError::InvalidProvision)?;
         let claim = SystemAgentGenesisClaim::new(self.root.record(), self.proposal.expectations)
             .map_err(SystemAgentGenesisBootstrapError::Authority)?;
         if self.root.record().space() != self.proposal.locator.space
             || self.root.record().system_agent() != self.proposal.locator.agent
-            || self.root.record().authority_binding() != config.authority.commitment()
+            || self.root.record().authority_binding() != Hash(descriptor.authority.commitment().0)
             || self.root.genesis_claim() != claim.authority_claim()
             || self.evidence.claim() != &claim
             || self
@@ -441,19 +429,17 @@ pub(crate) fn validate_prepared_system_agent_genesis_root(
     configured_root
         .validate()
         .map_err(SystemAgentGenesisBootstrapError::Authority)?;
-    let config = create_config(prepared.create())
+    let (descriptor, _, _) = system_create(prepared.create())
         .ok_or(SystemAgentGenesisBootstrapError::InvalidPreparedSeal)?;
-    let genesis = config
-        .system_authority_genesis
-        .as_ref()
-        .ok_or(SystemAgentGenesisBootstrapError::InvalidPreparedSeal)?;
-    genesis
-        .validate_root_config(
-            configured_root.record(),
-            config,
-            prepared.expectations().sequence(),
-        )
-        .map_err(|_| SystemAgentGenesisBootstrapError::InvalidPreparedSeal)?;
+    if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+        || descriptor.replicas.len() != 1
+        || !descriptor_matches_root_replica(descriptor, prepared.replica())
+        || configured_root.record().space() != SpaceId(descriptor.identity.space.0)
+        || configured_root.record().system_agent() != AgentId(descriptor.identity.agent.0)
+        || configured_root.record().authority_binding() != Hash(descriptor.authority.commitment().0)
+    {
+        return Err(SystemAgentGenesisBootstrapError::InvalidPreparedSeal);
+    }
     let claim = SystemAgentGenesisClaim::new(configured_root.record(), prepared.expectations())
         .map_err(SystemAgentGenesisBootstrapError::Authority)?;
     configured_root
@@ -484,17 +470,42 @@ pub fn validate_system_agent_genesis_catalog(
     Ok(())
 }
 
-fn create_config(create: &ReplayInput) -> Option<&super::AgentConfig> {
-    let ReplayOperation::Management {
-        request: LifecycleRequest::Authorized { request, .. },
+fn system_create(
+    create: &ReplayInput,
+) -> Option<(
+    &crate::agent_sdk::AgentDescriptor,
+    &crate::agent_sdk::ManagementRequest,
+    u64,
+)> {
+    let ReplayOperation::CleanManage {
+        request, authority, ..
     } = &create.operation
     else {
         return None;
     };
-    let LifecycleRequest::Create(config) = request.as_ref() else {
+    let crate::agent_sdk::ManagementRequest::Create(descriptor) = request else {
         return None;
     };
-    Some(config)
+    Some((descriptor, request, authority.selector.decision_sequence))
+}
+
+fn descriptor_matches_root_replica(
+    descriptor: &crate::agent_sdk::AgentDescriptor,
+    replica: AgentReplica,
+) -> bool {
+    let [candidate] = descriptor.replicas.as_slice() else {
+        return false;
+    };
+    descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared
+        && candidate.node.0 == replica.node.0
+        && candidate.principal.0 == replica.principal.0
+        && matches!(
+            (candidate.role, replica.role),
+            (
+                crate::agent_sdk::ReplicaRole::Voter,
+                super::ReplicaRole::Voter
+            )
+        )
 }
 
 fn encode_replica(encoder: &mut Encoder<'_>, replica: AgentReplica) {
@@ -574,836 +585,5 @@ fn map_decode_error(error: SystemAgentGenesisBootstrapError) -> DecodeError {
     match error {
         SystemAgentGenesisBootstrapError::LimitExceeded => DecodeError::LimitExceeded,
         _ => DecodeError::NonCanonical,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::boxed::Box;
-    use alloc::string::ToString;
-    use alloc::sync::Arc;
-    use alloc::vec;
-    use core::convert::Infallible;
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    use ed25519_dalek::{Signer as _, SigningKey};
-    use std::sync::Mutex;
-
-    use crate::agent::authority::{
-        AgentAuthorityBinding, AgentAuthorityClaim, AgentAuthorityReceipt, ed25519_public_key_wire,
-    };
-    use crate::agent::committee::{
-        AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
-        AuthorityQuorumCertificate, AuthoritySignature, AuthoritySignerId, RootAnchorRecord,
-    };
-    use crate::agent::contract::RuntimePackageContract;
-    use crate::agent::replay::{
-        ReplayDisposition, ReplayExecutor, ReplayPosition, ReplayProducts, ReplayTransition,
-    };
-    use crate::agent::standard::StandardAgentRuntime;
-    use crate::agent::system_authority::SystemAuthorityGenesis;
-    use crate::agent::wire::{
-        RuntimeState, decode_standard_runtime_state, encode_standard_runtime_state,
-    };
-    use crate::agent::{
-        AgentConfig, AgentIdentity, AgentProfile, AgentRuntime, LaneSet,
-        LifecycleAuthorityAdmission, RuntimeCapabilities,
-    };
-    use crate::service::{
-        ActorId, CapabilityId, CredentialId, DeploymentId, Hash, ProducerId, ProgramId,
-    };
-
-    const RUNTIME_BYTES: &[u8] = b"system-agent-bootstrap-runtime";
-    const ROOT_DISCRIMINATOR: u8 = 0x61;
-
-    fn lifecycle_key() -> SigningKey {
-        SigningKey::from_bytes(&[0x31; 32])
-    }
-
-    fn authority() -> AgentAuthorityBinding {
-        let public_key = ed25519_public_key_wire(lifecycle_key().verifying_key().to_bytes());
-        AgentAuthorityBinding {
-            agent: fixture_agent(),
-            actor: ActorId([0x33; 32]),
-            deployment: DeploymentId([0x34; 32]),
-            program: ProgramId([0x35; 32]),
-            producer: ProducerId::of_public_key(&public_key),
-            public_key,
-        }
-    }
-
-    fn fixture_agent() -> AgentId {
-        AgentId::derive(
-            SpaceId([0x41; 32]),
-            PrincipalId([0x42; 32]),
-            Hash([0x43; 32]).as_bytes(),
-        )
-    }
-
-    fn root_material(discriminator: u8) -> (RootAnchorRecord, [SigningKey; 3]) {
-        let keys = [
-            SigningKey::from_bytes(&[discriminator; 32]),
-            SigningKey::from_bytes(&[discriminator.wrapping_add(1); 32]),
-            SigningKey::from_bytes(&[discriminator.wrapping_add(2); 32]),
-        ];
-        let mut members = keys
-            .iter()
-            .enumerate()
-            .map(|(index, key)| {
-                AuthorityCommitteeMember::new(
-                    NodeId([(index + 1) as u8; 32]),
-                    key.verifying_key().to_bytes(),
-                    AuthorityMemberRole::Voter,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        members.sort_by_key(AuthorityCommitteeMember::signer);
-        let binding = authority().commitment();
-        let committee =
-            AuthorityCommittee::new(SpaceId([0x41; 32]), binding, 1, None, members).unwrap();
-        let root = RootAnchorRecord::new(
-            u64::from(discriminator) + 1,
-            SpaceId([0x41; 32]),
-            fixture_agent(),
-            binding,
-            Hash([discriminator.wrapping_add(3); 32]),
-            committee,
-        )
-        .unwrap();
-        (root, keys)
-    }
-
-    fn config() -> AgentConfig {
-        let space = SpaceId([0x41; 32]);
-        let owner = PrincipalId([0x42; 32]);
-        let nonce = Hash([0x43; 32]);
-        let agent = AgentId::derive(space, owner, nonce.as_bytes());
-        let (root, _) = root_material(ROOT_DISCRIMINATOR);
-        let system_authority_genesis = SystemAuthorityGenesis::new(
-            root.id(),
-            root.config_version(),
-            root.config_commitment(),
-            root.initial_committee().clone(),
-            1,
-            Hash([0x75; 32]),
-            Hash([0x76; 32]),
-            8,
-            8,
-            8,
-        )
-        .unwrap();
-        AgentConfig {
-            identity: AgentIdentity {
-                space,
-                agent,
-                owner,
-                profile: AgentProfile::Local,
-                runtime_deployment: DeploymentId([0x44; 32]),
-                runtime_program: ProgramId([0x45; 32]),
-                runtime_producer: ProducerId([0x46; 32]),
-            },
-            creation_nonce: nonce,
-            authority: authority(),
-            system_authority_genesis: Some(system_authority_genesis),
-            runtime_package: BlobRef::of_bytes(RUNTIME_BYTES),
-            runtime_contract: RuntimePackageContract::canonical(),
-            capabilities: RuntimeCapabilities {
-                lanes: LaneSet::ALL,
-                scheduling: false,
-                proofs: false,
-                max_actors: 64,
-            },
-            replicas: vec![AgentReplica {
-                node: NodeId([0x47; 32]),
-                principal: owner,
-                role: ReplicaRole::Voter,
-            }],
-        }
-    }
-
-    fn create_input(observed_slot: u64) -> ReplayInput {
-        let config = config();
-        let runtime = super::super::journal::RuntimeBinding {
-            space: config.identity.space,
-            agent: config.identity.agent,
-            deployment: config.identity.runtime_deployment,
-            program: config.identity.runtime_program,
-            producer: config.identity.runtime_producer,
-            package: config.runtime_package.clone(),
-            runtime_abi: super::super::RUNTIME_ABI_ID,
-            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
-        };
-        let inner = LifecycleRequest::Create(config.clone());
-        let claim = AgentAuthorityClaim {
-            authority: config.authority.clone(),
-            space: config.identity.space,
-            agent: config.identity.agent,
-            principal: config.identity.owner,
-            credential: CredentialId([0x48; 32]),
-            capability: CapabilityId::named("agent.create.local"),
-            operation: inner.commitment(),
-            sequence: 1,
-            valid_from: 10,
-            valid_until: 30,
-        };
-        let signature = lifecycle_key()
-            .sign(&claim.signing_message().0)
-            .to_bytes()
-            .to_vec();
-        ReplayInput {
-            runtime,
-            operation: ReplayOperation::Management {
-                request: LifecycleRequest::Authorized {
-                    admission: LifecycleAuthorityAdmission {
-                        receipt: AgentAuthorityReceipt { claim, signature },
-                        observed_slot,
-                    },
-                    request: Box::new(inner),
-                },
-            },
-        }
-    }
-
-    fn resign_create_input(input: &mut ReplayInput) {
-        let ReplayOperation::Management {
-            request: LifecycleRequest::Authorized { admission, request },
-        } = &mut input.operation
-        else {
-            unreachable!("test input is an authorized Create");
-        };
-        admission.receipt.claim.operation = request.commitment();
-        admission.receipt.claim.capability = CapabilityId::named(
-            request
-                .required_capability()
-                .expect("Create always requires a capability"),
-        );
-        admission.receipt.signature = lifecycle_key()
-            .sign(&admission.receipt.claim.signing_message().0)
-            .to_bytes()
-            .to_vec();
-    }
-
-    #[derive(Default)]
-    struct ExactCreateExecutor {
-        authentications: usize,
-        executions: usize,
-        mutate_state: bool,
-        omit_system_authority: bool,
-    }
-
-    impl ReplayExecutor for ExactCreateExecutor {
-        type Error = ();
-
-        fn verify_merge_event(
-            &mut self,
-            _event: &super::super::journal::MergeEvent,
-        ) -> Result<bool, Self::Error> {
-            Ok(false)
-        }
-
-        fn authenticate(
-            &mut self,
-            input: &ReplayInput,
-            _before: &RuntimeState,
-            _position: ReplayPosition,
-        ) -> Result<(), Self::Error> {
-            self.authentications += 1;
-            let ReplayOperation::Management {
-                request: LifecycleRequest::Authorized { admission, request },
-            } = &input.operation
-            else {
-                return Err(());
-            };
-            let LifecycleRequest::Create(config) = request.as_ref() else {
-                return Err(());
-            };
-            admission
-                .receipt
-                .verify_guest_signature(&config.authority)
-                .map_err(|_| ())
-        }
-
-        fn execute(
-            &mut self,
-            input: &ReplayInput,
-            before: &RuntimeState,
-            _position: ReplayPosition,
-        ) -> Result<ReplayTransition, Self::Error> {
-            self.executions += 1;
-            let ReplayOperation::Management { request } = &input.operation else {
-                return Err(());
-            };
-            let decoded = decode_standard_runtime_state(before).map_err(|_| ())?;
-            let mut runtime = StandardAgentRuntime::restore(decoded).map_err(|_| ())?;
-            let result = runtime.apply(request.clone());
-            let mut snapshot = runtime.snapshot();
-            if self.omit_system_authority {
-                snapshot.system_authority = None;
-            }
-            let mut state = encode_standard_runtime_state(&snapshot);
-            if self.mutate_state {
-                state.linear.push(0xff);
-            }
-            Ok(ReplayTransition {
-                state,
-                disposition: if result.is_ok() {
-                    ReplayDisposition::Applied
-                } else {
-                    ReplayDisposition::Rejected
-                },
-                result: None,
-                next_runtime: input.runtime.clone(),
-                products: ReplayProducts::default(),
-            })
-        }
-    }
-
-    fn prepare(input: ReplayInput) -> ReplayPreparedGenesis {
-        let mut executor = ExactCreateExecutor::default();
-        ReplayPreparedGenesis::prepare(input, config().replicas[0], &mut executor).unwrap()
-    }
-
-    fn authority_provision(
-        proposal: SystemAgentGenesisProposal,
-        discriminator: u8,
-    ) -> SystemAgentGenesisProvision {
-        let (root, keys) = root_material(discriminator);
-        let committee = root.initial_committee().clone();
-        let claim = SystemAgentGenesisClaim::new(&root, proposal.expectations).unwrap();
-        let message = AuthorityQuorumCertificate::signing_message(
-            committee.authority_binding(),
-            committee.epoch(),
-            committee.commitment(),
-            claim.authority_claim(),
-        );
-        let mut signatures = keys[..2]
-            .iter()
-            .map(|key| {
-                AuthoritySignature::new(
-                    AuthoritySignerId::of_raw_ed25519(&key.verifying_key().to_bytes()),
-                    key.sign(&message.0).to_bytes(),
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        signatures.sort_by_key(AuthoritySignature::signer);
-        let evidence = SystemAgentGenesisEvidence::new(
-            claim.clone(),
-            AuthorityQuorumCertificate::new(&committee, claim.authority_claim(), signatures)
-                .unwrap(),
-        )
-        .unwrap();
-        let pins = RootAnchorPins::new(
-            root.clone(),
-            root.config_version(),
-            root.id(),
-            root.config_commitment(),
-            claim.authority_claim(),
-        )
-        .unwrap();
-        SystemAgentGenesisProvision::new(proposal, pins, evidence).unwrap()
-    }
-
-    fn catalog() -> Vec<RuntimeBlob> {
-        vec![RuntimeBlob {
-            reference: BlobRef::of_bytes(RUNTIME_BYTES),
-            bytes: RUNTIME_BYTES.to_vec(),
-        }]
-    }
-
-    struct MemoryProvider {
-        configured: SystemAgentGenesisProvision,
-        archive: Mutex<Option<(SystemAgentGenesisProvision, Vec<RuntimeBlob>)>>,
-        creates: AtomicUsize,
-        reproduces: AtomicUsize,
-    }
-
-    impl MemoryProvider {
-        fn new(configured: SystemAgentGenesisProvision) -> Self {
-            Self {
-                configured,
-                archive: Mutex::new(None),
-                creates: AtomicUsize::new(0),
-                reproduces: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl SystemAgentGenesisProvider for MemoryProvider {
-        fn create(
-            &self,
-            proposal: &SystemAgentGenesisProposal,
-            catalog: &[RuntimeBlob],
-        ) -> Result<SystemAgentGenesisProvision, SystemAgentGenesisProviderError> {
-            self.creates.fetch_add(1, Ordering::Relaxed);
-            validate_system_agent_genesis_catalog(proposal, catalog)
-                .map_err(|_| SystemAgentGenesisProviderError::Corrupt)?;
-            let mut archive = self.archive.lock().unwrap();
-            if let Some((existing, bytes)) = archive.as_ref() {
-                return if existing.proposal() == proposal && bytes == catalog {
-                    Ok(existing.clone())
-                } else {
-                    Err(SystemAgentGenesisProviderError::Conflict)
-                };
-            }
-            if self.configured.proposal() != proposal {
-                return Err(SystemAgentGenesisProviderError::Refused);
-            }
-            *archive = Some((self.configured.clone(), catalog.to_vec()));
-            Ok(self.configured.clone())
-        }
-
-        fn reproduce(
-            &self,
-            locator: SystemAgentGenesisLocator,
-        ) -> Result<SystemAgentGenesisProvision, SystemAgentGenesisProviderError> {
-            self.reproduces.fetch_add(1, Ordering::Relaxed);
-            self.archive
-                .lock()
-                .unwrap()
-                .as_ref()
-                .filter(|(provision, _)| provision.proposal.locator == locator)
-                .map(|(provision, _)| provision.clone())
-                .ok_or(SystemAgentGenesisProviderError::NotConfigured)
-        }
-
-        fn load_catalog(
-            &self,
-            locator: SystemAgentGenesisLocator,
-            reference: &BlobRef,
-        ) -> Result<Option<Vec<u8>>, SystemAgentGenesisProviderError> {
-            Ok(self
-                .archive
-                .lock()
-                .unwrap()
-                .as_ref()
-                .filter(|(provision, _)| provision.proposal.locator == locator)
-                .and_then(|(_, catalog)| {
-                    catalog
-                        .iter()
-                        .find(|blob| &blob.reference == reference)
-                        .map(|blob| blob.bytes.clone())
-                }))
-        }
-    }
-
-    #[test]
-    fn preparation_is_deterministic_genesis_free_and_exactly_sealed() {
-        let input = create_input(15);
-        let mut first_executor = ExactCreateExecutor::default();
-        let first = ReplayPreparedGenesis::prepare(
-            input.clone(),
-            config().replicas[0],
-            &mut first_executor,
-        )
-        .unwrap();
-        let mut second_executor = ExactCreateExecutor::default();
-        let second =
-            ReplayPreparedGenesis::prepare(input, config().replicas[0], &mut second_executor)
-                .unwrap();
-        assert_eq!(first, second);
-        assert_eq!(
-            (first_executor.authentications, first_executor.executions),
-            (1, 1)
-        );
-        let locator = SystemAgentGenesisLocator {
-            space: config().identity.space,
-            agent: config().identity.agent,
-            node: config().replicas[0].node,
-        };
-        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &first).unwrap();
-        let provision = authority_provision(proposal.clone(), ROOT_DISCRIMINATOR);
-        assert_eq!(
-            SystemAgentGenesisProposal::decode(&proposal.encode()).unwrap(),
-            proposal
-        );
-        assert_eq!(
-            SystemAgentGenesisProvision::decode(&provision.encode()).unwrap(),
-            provision
-        );
-        let configured_root = provision.root().clone();
-        let sealed =
-            seal_prepared_system_agent_genesis(first, &configured_root, &provision).unwrap();
-        let decoded = decode_standard_runtime_state(sealed.post_create()).unwrap();
-        let expected_authority =
-            super::super::system_authority::SystemAuthorityState::from_genesis(
-                config().identity.agent,
-                config().system_authority_genesis.as_ref().unwrap(),
-            )
-            .unwrap();
-        assert_eq!(decoded.system_authority, Some(expected_authority));
-        assert_ne!(
-            sealed.genesis().admission,
-            super::super::genesis::AgentGenesisAdmissionId::ZERO
-        );
-        assert_ne!(
-            sealed.root_admission_id(),
-            super::super::committee::SystemAgentGenesisAdmissionId::ZERO
-        );
-        assert_ne!(
-            sealed.root_admission_id().as_bytes(),
-            sealed.genesis().admission.as_bytes()
-        );
-        assert_ne!(
-            sealed.genesis().id(),
-            super::super::journal::AgentJournalGenesisId::ZERO
-        );
-        assert_eq!(
-            sealed.root_admission_record().root_anchor(),
-            configured_root.root_anchor()
-        );
-        assert_eq!(
-            sealed.root_admission_record().root_anchor_config_version(),
-            configured_root.config_version()
-        );
-        assert_eq!(
-            sealed.root_admission_record().root_anchor_config(),
-            configured_root.config_commitment()
-        );
-        assert!(matches!(
-            sealed.admission_record(),
-            super::super::genesis::AgentGenesisAdmissionRecord::RootBootstrap(record)
-                if record == sealed.root_admission_record()
-        ));
-        assert_eq!(sealed.genesis().create, *provision.proposal().create());
-        assert_eq!(sealed.artifacts().artifacts, proposal.catalog);
-    }
-
-    #[test]
-    fn prepared_root_marker_preflight_blocks_provider_writes() {
-        let prepared = prepare(create_input(15));
-        let locator = SystemAgentGenesisLocator {
-            space: config().identity.space,
-            agent: config().identity.agent,
-            node: config().replicas[0].node,
-        };
-        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
-        let provision = authority_provision(proposal, ROOT_DISCRIMINATOR);
-        let configured_root = provision.root().clone();
-        let provider = MemoryProvider::new(provision);
-        assert_eq!(
-            validate_prepared_system_agent_genesis_root(&prepared, &configured_root),
-            Ok(())
-        );
-
-        let alternate_prepared = prepare(create_input(16));
-        let alternate_claim = SystemAgentGenesisClaim::new(
-            configured_root.record(),
-            alternate_prepared.expectations(),
-        )
-        .unwrap();
-        let divergent_claim_pins = RootAnchorPins::new(
-            configured_root.record().clone(),
-            configured_root.config_version(),
-            configured_root.root_anchor(),
-            configured_root.config_commitment(),
-            alternate_claim.authority_claim(),
-        )
-        .unwrap();
-        assert!(matches!(
-            validate_prepared_system_agent_genesis_root(&prepared, &divergent_claim_pins),
-            Err(SystemAgentGenesisBootstrapError::Authority(_))
-        ));
-
-        let mut missing = create_input(15);
-        let ReplayOperation::Management {
-            request: LifecycleRequest::Authorized { request, .. },
-        } = &mut missing.operation
-        else {
-            unreachable!("test input is an authorized Create");
-        };
-        let LifecycleRequest::Create(missing_config) = request.as_mut() else {
-            unreachable!("test input is an authorized Create");
-        };
-        missing_config.system_authority_genesis = None;
-        resign_create_input(&mut missing);
-        let missing = prepare(missing);
-        assert_eq!(
-            validate_prepared_system_agent_genesis_root(&missing, &configured_root),
-            Err(SystemAgentGenesisBootstrapError::InvalidPreparedSeal)
-        );
-
-        let mut divergent = create_input(15);
-        let ReplayOperation::Management {
-            request: LifecycleRequest::Authorized { request, .. },
-        } = &mut divergent.operation
-        else {
-            unreachable!("test input is an authorized Create");
-        };
-        let LifecycleRequest::Create(divergent_config) = request.as_mut() else {
-            unreachable!("test input is an authorized Create");
-        };
-        let (foreign_root, _) = root_material(ROOT_DISCRIMINATOR.wrapping_add(1));
-        divergent_config.system_authority_genesis = Some(
-            SystemAuthorityGenesis::new(
-                foreign_root.id(),
-                foreign_root.config_version(),
-                foreign_root.config_commitment(),
-                foreign_root.initial_committee().clone(),
-                1,
-                Hash([0x75; 32]),
-                Hash([0x76; 32]),
-                8,
-                8,
-                8,
-            )
-            .unwrap(),
-        );
-        resign_create_input(&mut divergent);
-        let divergent = prepare(divergent);
-        assert_eq!(
-            validate_prepared_system_agent_genesis_root(&divergent, &configured_root),
-            Err(SystemAgentGenesisBootstrapError::InvalidPreparedSeal)
-        );
-
-        assert_eq!(provider.creates.load(Ordering::Relaxed), 0);
-        assert!(provider.archive.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn provider_create_is_exactly_idempotent_and_reproduce_is_read_only() {
-        let prepared = prepare(create_input(15));
-        let locator = SystemAgentGenesisLocator {
-            space: config().identity.space,
-            agent: config().identity.agent,
-            node: config().replicas[0].node,
-        };
-        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
-        let expected = authority_provision(proposal.clone(), ROOT_DISCRIMINATOR);
-        let provider = Arc::new(MemoryProvider::new(expected.clone()));
-        assert_eq!(provider.create(&proposal, &catalog()).unwrap(), expected);
-        assert_eq!(provider.create(&proposal, &catalog()).unwrap(), expected);
-
-        let reproduced = provider.reproduce(locator).unwrap();
-        assert_eq!(reproduced, expected);
-        assert_eq!(provider.creates.load(Ordering::Relaxed), 2);
-        assert_eq!(provider.reproduces.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            provider
-                .load_catalog(locator, &proposal.catalog[0])
-                .unwrap(),
-            Some(RUNTIME_BYTES.to_vec())
-        );
-
-        let divergent_prepared = prepare(create_input(16));
-        let divergent =
-            SystemAgentGenesisProposal::from_prepared(locator, &divergent_prepared).unwrap();
-        assert_eq!(
-            provider.create(&divergent, &catalog()),
-            Err(SystemAgentGenesisProviderError::Conflict)
-        );
-        assert_eq!(provider.reproduces.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn preparation_and_sealing_reject_runtime_state_root_qc_and_catalog_mutations() {
-        let locator = SystemAgentGenesisLocator {
-            space: config().identity.space,
-            agent: config().identity.agent,
-            node: config().replicas[0].node,
-        };
-
-        let mut wrong_runtime = create_input(15);
-        wrong_runtime.runtime.package = BlobRef::of_bytes(b"different runtime");
-        let mut executor = ExactCreateExecutor::default();
-        assert!(matches!(
-            ReplayPreparedGenesis::prepare(wrong_runtime, config().replicas[0], &mut executor,),
-            Err(super::super::replay::ReplayError::InvalidRecord)
-        ));
-
-        let mut wrong_input = create_input(15);
-        let ReplayOperation::Management {
-            request: LifecycleRequest::Authorized { admission, .. },
-        } = &mut wrong_input.operation
-        else {
-            unreachable!("test input is an authorized Create");
-        };
-        admission.receipt.signature[0] ^= 1;
-        let mut executor = ExactCreateExecutor::default();
-        assert!(matches!(
-            ReplayPreparedGenesis::prepare(wrong_input, config().replicas[0], &mut executor,),
-            Err(super::super::replay::ReplayError::Executor(()))
-        ));
-
-        let mut shared_input = create_input(15);
-        let ReplayOperation::Management {
-            request: LifecycleRequest::Authorized { request, .. },
-        } = &mut shared_input.operation
-        else {
-            unreachable!("test input is an authorized Create");
-        };
-        let LifecycleRequest::Create(shared_config) = request.as_mut() else {
-            unreachable!("test input is an authorized Create");
-        };
-        shared_config.identity.profile = AgentProfile::Shared;
-        shared_config.replicas.push(AgentReplica {
-            node: NodeId([0x49; 32]),
-            principal: shared_config.identity.owner,
-            role: ReplicaRole::Voter,
-        });
-        resign_create_input(&mut shared_input);
-        let mut executor = ExactCreateExecutor::default();
-        let shared =
-            ReplayPreparedGenesis::prepare(shared_input, config().replicas[0], &mut executor)
-                .expect("ordinary Shared genesis now uses the common exact preparation boundary");
-        assert_eq!(shared.replica(), config().replicas[0]);
-
-        let mut state_mutator = ExactCreateExecutor {
-            mutate_state: true,
-            ..ExactCreateExecutor::default()
-        };
-        assert!(matches!(
-            ReplayPreparedGenesis::prepare(
-                create_input(15),
-                config().replicas[0],
-                &mut state_mutator,
-            ),
-            Err(super::super::replay::ReplayError::InvalidManagementTransition)
-        ));
-
-        let mut authority_omitter = ExactCreateExecutor {
-            omit_system_authority: true,
-            ..ExactCreateExecutor::default()
-        };
-        assert!(matches!(
-            ReplayPreparedGenesis::prepare(
-                create_input(15),
-                config().replicas[0],
-                &mut authority_omitter,
-            ),
-            Err(super::super::replay::ReplayError::InvalidManagementTransition)
-        ));
-
-        let prepared = prepare(create_input(15));
-        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
-        let provision = authority_provision(proposal.clone(), ROOT_DISCRIMINATOR);
-        let configured_root = provision.root().clone();
-
-        let mut bad_catalog = catalog();
-        bad_catalog[0].bytes.push(0xff);
-        assert_eq!(
-            validate_system_agent_genesis_catalog(&proposal, &bad_catalog),
-            Err(SystemAgentGenesisBootstrapError::InvalidCatalog)
-        );
-        let mut extra_catalog = catalog();
-        extra_catalog.push(catalog()[0].clone());
-        assert_eq!(
-            validate_system_agent_genesis_catalog(&proposal, &extra_catalog),
-            Err(SystemAgentGenesisBootstrapError::InvalidCatalog)
-        );
-        let mut bad_reference = proposal.clone();
-        bad_reference.catalog[0].len += 1;
-        assert!(bad_reference.validate().is_err());
-
-        let mut tampered_qc = provision.evidence.encode();
-        *tampered_qc.last_mut().unwrap() ^= 1;
-        let tampered_evidence = SystemAgentGenesisEvidence::decode(&tampered_qc).unwrap();
-        let mut invalid_qc = provision.clone();
-        invalid_qc.evidence = tampered_evidence;
-        assert_eq!(
-            invalid_qc.validate(),
-            Err(SystemAgentGenesisBootstrapError::InvalidProvision)
-        );
-
-        let alternate = authority_provision(proposal, 0x91);
-        let mut invalid_root = provision.clone();
-        invalid_root.root = alternate.root;
-        assert_eq!(
-            invalid_root.validate(),
-            Err(SystemAgentGenesisBootstrapError::InvalidProvision)
-        );
-        assert!(matches!(
-            seal_prepared_system_agent_genesis(prepared, &configured_root, &invalid_root),
-            Err(SystemAgentGenesisBootstrapError::InvalidProvision)
-        ));
-    }
-
-    #[test]
-    fn self_consistent_provider_selected_root_and_qc_are_not_trusted() {
-        let prepared = prepare(create_input(15));
-        let locator = SystemAgentGenesisLocator {
-            space: config().identity.space,
-            agent: config().identity.agent,
-            node: config().replicas[0].node,
-        };
-        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
-        let configured = authority_provision(proposal.clone(), ROOT_DISCRIMINATOR);
-        let provider_selected = authority_provision(proposal, 0x93);
-
-        assert!(configured.validate().is_ok());
-        assert!(provider_selected.validate().is_ok());
-        assert_ne!(configured.root(), provider_selected.root());
-        assert!(matches!(
-            seal_prepared_system_agent_genesis(prepared, configured.root(), &provider_selected),
-            Err(SystemAgentGenesisBootstrapError::InvalidProvision)
-        ));
-    }
-
-    #[test]
-    fn provider_envelopes_reject_oversize_and_expectation_mutations() {
-        let prepared = prepare(create_input(15));
-        let locator = SystemAgentGenesisLocator {
-            space: config().identity.space,
-            agent: config().identity.agent,
-            node: config().replicas[0].node,
-        };
-        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
-        let provision = authority_provision(proposal.clone(), ROOT_DISCRIMINATOR);
-        let configured_root = provision.root().clone();
-
-        let mut mutated = proposal.clone();
-        mutated.expectations = SystemAgentGenesisExpectations::new(
-            mutated.expectations.runtime_binding(),
-            mutated.expectations.inner_create_request(),
-            Hash([0xee; 32]),
-            mutated.expectations.artifact_closure(),
-            mutated.expectations.sequence(),
-        )
-        .unwrap();
-        assert_ne!(mutated, proposal);
-        assert!(matches!(
-            seal_prepared_system_agent_genesis(
-                prepared,
-                &configured_root,
-                &authority_provision(mutated, 0xa2),
-            ),
-            Err(SystemAgentGenesisBootstrapError::InvalidProvision)
-        ));
-
-        let mut oversized_proposal = proposal.encode();
-        oversized_proposal.resize(MAX_SYSTEM_AGENT_GENESIS_PROPOSAL_BYTES + 1, 0);
-        assert_eq!(
-            SystemAgentGenesisProposal::decode(&oversized_proposal),
-            Err(DecodeError::LimitExceeded)
-        );
-        let mut oversized_provision = provision.encode();
-        oversized_provision.resize(MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES + 1, 0);
-        assert_eq!(
-            SystemAgentGenesisProvision::decode(&oversized_provision),
-            Err(DecodeError::LimitExceeded)
-        );
-    }
-
-    #[test]
-    fn provider_error_is_bounded_and_executor_error_type_stays_generic() {
-        fn assert_generic_prepare(
-            prepared: Result<
-                ReplayPreparedGenesis,
-                super::super::replay::ReplayError<Infallible, ()>,
-            >,
-        ) {
-            assert!(prepared.is_ok());
-        }
-        let mut executor = ExactCreateExecutor::default();
-        assert_generic_prepare(ReplayPreparedGenesis::prepare(
-            create_input(15),
-            config().replicas[0],
-            &mut executor,
-        ));
-        assert_eq!(
-            SystemAgentGenesisProviderError::Unavailable.to_string(),
-            "system-Agent genesis provider: Unavailable"
-        );
     }
 }

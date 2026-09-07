@@ -1983,11 +1983,11 @@ impl ReplaySealedLocalGenesis {
     }
 }
 
-fn sdk_replica_matches_legacy(sdk: &crate::agent_sdk::AgentReplica, legacy: AgentReplica) -> bool {
-    sdk.node.0 == legacy.node.0
-        && sdk.principal.0 == legacy.principal.0
+fn sdk_replica_matches_host(sdk: &crate::agent_sdk::AgentReplica, host: AgentReplica) -> bool {
+    sdk.node.0 == host.node.0
+        && sdk.principal.0 == host.principal.0
         && matches!(
-            (sdk.role, legacy.role),
+            (sdk.role, host.role),
             (
                 crate::agent_sdk::ReplicaRole::Voter,
                 super::ReplicaRole::Voter
@@ -2003,16 +2003,6 @@ fn validates_shared_create_committee(
     committee: &AgentReplicaCommittee,
 ) -> bool {
     match &create.operation {
-        ReplayOperation::Management {
-            request: LifecycleRequest::Authorized { request, .. },
-        } => {
-            let LifecycleRequest::Create(config) = request.as_ref() else {
-                return false;
-            };
-            config.identity.profile == AgentProfile::Shared
-                && config.system_authority_genesis.is_none()
-                && committee.validate_for(config).is_ok()
-        }
         ReplayOperation::CleanManage {
             request: crate::agent_sdk::ManagementRequest::Create(descriptor),
             ..
@@ -2026,7 +2016,7 @@ fn validates_shared_create_committee(
                     .members()
                     .iter()
                     .zip(&descriptor.replicas)
-                    .all(|(member, replica)| sdk_replica_matches_legacy(replica, member.replica()))
+                    .all(|(member, replica)| sdk_replica_matches_host(replica, member.replica()))
         }
         _ => false,
     }
@@ -2356,7 +2346,7 @@ impl ReplaySealedOrdinaryGenesis for ReplaySealedLocalGenesis {
                 !self.post_create.is_empty()
                     && descriptor.identity.profile == crate::agent_sdk::AgentProfile::Local
                     && descriptor.replicas.as_slice().len() == 1
-                    && sdk_replica_matches_legacy(&descriptor.replicas[0], self.replica)
+                    && sdk_replica_matches_host(&descriptor.replicas[0], self.replica)
                     && self.admission.node() == self.replica.node
             }
             _ => false,
@@ -2436,7 +2426,7 @@ impl ReplaySealedOrdinaryGenesis for ReplaySealedSharedGenesis {
     }
 }
 
-/// Root-admitted, exactly executed clean-generation journal bootstrap.
+/// Root/QC-admitted, exactly executed clean system-Agent journal bootstrap.
 ///
 /// Storage may inspect this closure, but cannot manufacture one from a merely
 /// self-canonical genesis record or decoded authority evidence.
@@ -2571,15 +2561,23 @@ impl ReplaySealedGenesis {
         admission_evidence: SystemAgentGenesisEvidence,
         prepared: ReplayPreparedGenesis,
     ) -> Result<Self, ReplayValidationError> {
-        let ReplayOperation::Management { request } = &prepared.create.operation else {
+        let ReplayOperation::CleanManage {
+            request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+            ..
+        } = &prepared.create.operation
+        else {
             return Err(ReplayError::InvalidRecord);
         };
-        let LifecycleRequest::Authorized { request, .. } = request else {
+        let [replica] = descriptor.replicas.as_slice() else {
             return Err(ReplayError::InvalidRecord);
         };
-        let LifecycleRequest::Create(config) = request.as_ref() else {
+        if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+            || !sdk_replica_matches_host(replica, prepared.replica)
+            || prepared.replica.role != super::ReplicaRole::Voter
+        {
             return Err(ReplayError::InvalidRecord);
-        };
+        }
+        let authority_binding = Hash(descriptor.authority.commitment().0);
         let root_admission = verified.admission_record();
         let root_anchor = verified.root_anchor().clone();
         if root_admission.evidence() != verified.evidence_id()
@@ -2589,14 +2587,12 @@ impl ReplaySealedGenesis {
             || admission_evidence.id() != verified.evidence_id()
             || verified.space() != prepared.create.runtime.space
             || verified.system_agent() != prepared.create.runtime.agent
-            || verified.authority_binding() != config.authority.commitment()
+            || verified.authority_binding() != authority_binding
             || verified.genesis_intent() != prepared.expectations.genesis_intent()
             || verified.runtime_binding() != prepared.expectations.runtime_binding()
             || verified.post_create_state() != prepared.expectations.post_create_state()
             || verified.artifact_closure() != prepared.expectations.artifact_closure()
             || verified.sequence() != prepared.expectations.sequence()
-            || config.identity.profile != super::AgentProfile::Local
-            || config.replicas.as_slice() != [prepared.replica]
         {
             return Err(ReplayError::InvalidRecord);
         }
@@ -2710,6 +2706,104 @@ impl ReplaySealedGenesis {
             self.empty_frontier.id(),
             self.genesis.runtime().clone(),
         )
+    }
+}
+
+impl ReplaySealedOrdinaryGenesis for ReplaySealedGenesis {
+    fn genesis(&self) -> &AgentJournalGenesis {
+        self.genesis()
+    }
+
+    fn post_create(&self) -> &RuntimeState {
+        self.post_create()
+    }
+
+    fn empty_frontier(&self) -> &MergeFrontier {
+        self.empty_frontier()
+    }
+
+    fn ordered_invocations(&self) -> &InvocationIndexManifest {
+        self.ordered_invocations()
+    }
+
+    fn merge_invocations(&self) -> &InvocationIndexManifest {
+        self.merge_invocations()
+    }
+
+    fn local_invocations(&self) -> &InvocationIndexManifest {
+        self.local_invocations()
+    }
+
+    fn artifacts(&self) -> &ArtifactClosure {
+        self.artifacts()
+    }
+
+    fn replica(&self) -> AgentReplica {
+        self.replica()
+    }
+
+    fn admission_commitment(&self) -> Hash {
+        self.admission_commitment()
+    }
+
+    fn lane_manifest(&self, lane: PersistedLane) -> LaneStateManifest {
+        self.lane_manifest(lane)
+    }
+
+    fn initial_heads(&self) -> JournalHeads {
+        self.initial_heads()
+    }
+
+    fn validates_post_create_state(&self) -> bool {
+        let ReplayOperation::CleanManage {
+            request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+            ..
+        } = &self.genesis.create.operation
+        else {
+            return false;
+        };
+        let [replica] = descriptor.replicas.as_slice() else {
+            return false;
+        };
+        !self.post_create.is_empty()
+            && descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared
+            && sdk_replica_matches_host(replica, self.replica)
+            && self.replica.role == super::ReplicaRole::Voter
+    }
+
+    fn admission_record(&self) -> Option<&AgentGenesisAdmissionRecord> {
+        Some(&self.admission_record)
+    }
+
+    fn validate_seal(&self) -> Result<(), ReplayValidationError> {
+        self.replayed_root_identity()?;
+        let claim = self.admission_evidence.claim();
+        if self.admission_evidence.validate().is_err()
+            || claim.space() != self.genesis.runtime().space
+            || claim.system_agent() != self.genesis.runtime().agent
+            || claim.authority_binding() != self.root_anchor.authority_binding()
+            || claim.root_certification() != self.root_anchor.root_certification()
+            || claim.post_create_state()
+                != system_genesis_post_create_state_commitment(&self.post_create)
+                    .map_err(|_| ReplayError::InvalidRecord)?
+            || claim.artifact_closure()
+                != self
+                    .artifacts
+                    .system_genesis_commitment()
+                    .map_err(|_| ReplayError::InvalidRecord)?
+            || self
+                .admission_evidence
+                .certificate()
+                .verify(
+                    self.root_anchor.initial_committee(),
+                    claim.authority_claim(),
+                )
+                .is_err()
+            || !self.validates_post_create_state()
+        {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -14146,11 +14240,6 @@ pub(crate) mod tests {
         ActorInvocationClaim, ActorInvocationReceipt, AgentAuthorityBinding, AgentAuthorityClaim,
         AgentAuthorityReceipt, ED25519_SIGNATURE_BYTES, ed25519_public_key_wire,
     };
-    #[cfg(all(feature = "std", feature = "storage"))]
-    use crate::agent::catalog_finality::{
-        CatalogMutation, CatalogMutationDisposition, CatalogMutationIntent, CatalogMutationKind,
-        CatalogMutationResult, FinalizedCatalogMutationFact, FinalizedCatalogMutationReceipt,
-    };
     #[cfg(feature = "std")]
     use crate::agent::committee::{
         AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
@@ -14162,8 +14251,10 @@ pub(crate) mod tests {
     #[cfg(feature = "std")]
     use crate::agent::genesis::{
         AgentGenesisAdmissionId, AgentGenesisClaim, AgentGenesisDecision, AgentGenesisEvidence,
-        AgentGenesisExpectations, AgentGenesisLocator, AgentGenesisProposal, AgentReplicaCommittee,
-        AgentReplicaCommitteeId, AgentReplicaMember, derive_replica_raft_slot,
+        AgentGenesisExpectations, AgentGenesisFinalityError, AgentGenesisFinalityVerifier,
+        AgentGenesisLocator, AgentGenesisProposal, AgentGenesisProvision, AgentReplicaCommittee,
+        AgentReplicaCommitteeId, AgentReplicaMember, VerifiedAgentGenesisProvision,
+        derive_replica_raft_slot,
     };
     #[cfg(feature = "std")]
     use crate::agent::invocation_history::{InvocationHistoryNode, InvocationHistoryStore};
@@ -14173,8 +14264,6 @@ pub(crate) mod tests {
     use crate::agent::journal::InvocationHistoryNodeId;
     #[cfg(all(feature = "std", feature = "storage"))]
     use crate::agent::journal_store::ReverifiedRootJournalStore;
-    #[cfg(feature = "std")]
-    use crate::agent::journal_store::SystemAuthorityHistoryStore;
     #[cfg(feature = "std")]
     use crate::agent::journal_store::{
         AgentJournalGarbageCollection, AgentJournalStore, GcLimits, JournalBlobClass,
@@ -14192,28 +14281,17 @@ pub(crate) mod tests {
         AgentRaftCommand, AgentRouteKey, ArtifactBatchId, CommittedAgentRaftEntry,
         DurableAgentRaftLogWitness,
     };
-    #[cfg(all(feature = "std", feature = "storage"))]
-    use crate::agent::system_authority::{
-        SystemAuthorityCatalogFinalize, SystemAuthorityCatalogProof, SystemAuthorityJournalScope,
-        SystemAuthorityRotation, SystemAuthorityRotationClaim, SystemAuthorityRotationProof,
-    };
     #[cfg(feature = "std")]
     use crate::agent::system_authority::{
         SystemAuthorityDecisionProof, SystemAuthorityFinalize, SystemAuthorityGenesis,
-    };
-    #[cfg(all(feature = "std", feature = "storage"))]
-    use crate::agent::system_authority_ledger::{
-        ReplayedSystemAuthorityView, SystemAuthorityCatalogReservationRequest,
-        SystemAuthorityCommitteeLeg, SystemAuthorityEvidenceLedger,
-        SystemAuthorityRotationReservationRequest, SystemAuthoritySigner,
     };
     use crate::agent::{
         AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LaneSet,
         LifecycleAuthorityAdmission, ReplicaRole, RuntimeCapabilities,
     };
     use crate::service::{
-        ActorId, AgentId, CapabilityId, CredentialId, DeploymentId, OperationId, PrincipalId,
-        ProducerId, ProgramId, SpaceId,
+        ActorId, AgentId, CapabilityId, CredentialId, DeploymentId, PrincipalId, ProducerId,
+        ProgramId, SpaceId,
     };
     #[cfg(feature = "std")]
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -14846,59 +14924,9 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
-    fn admitted_root_material(config: &AgentConfig) -> (RootAnchorRecord, [SigningKey; 3]) {
-        let keys = [
-            SigningKey::from_bytes(&[0xd1; 32]),
-            SigningKey::from_bytes(&[0xd2; 32]),
-            SigningKey::from_bytes(&[0xd3; 32]),
-        ];
-        let mut members = keys
-            .iter()
-            .enumerate()
-            .map(|(index, key)| {
-                AuthorityCommitteeMember::new(
-                    NodeId([(index + 1) as u8; 32]),
-                    key.verifying_key().to_bytes(),
-                    AuthorityMemberRole::Voter,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        members.sort_by_key(AuthorityCommitteeMember::signer);
-        let binding = config.authority.commitment();
-        let committee =
-            AuthorityCommittee::new(config.identity.space, binding, 1, None, members).unwrap();
-        let root = RootAnchorRecord::new(
-            1,
-            config.identity.space,
-            config.identity.agent,
-            binding,
-            Hash([0xd4; 32]),
-            committee,
-        )
-        .unwrap();
-        (root, keys)
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    struct AuthorityTestSigner(SigningKey);
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    impl SystemAuthoritySigner for AuthorityTestSigner {
-        type Error = ();
-
-        fn signer(&self) -> AuthoritySignerId {
-            AuthoritySignerId::of_raw_ed25519(&self.0.verifying_key().to_bytes())
-        }
-
-        fn sign_authority_message(&self, message: Hash) -> Result<[u8; 64], Self::Error> {
-            Ok(self.0.sign(&message.0).to_bytes())
-        }
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    fn rotated_committee(
-        retiring: &AuthorityCommittee,
+    fn admitted_committee(
+        space: SpaceId,
+        binding: Hash,
         keys: &[SigningKey; 3],
     ) -> AuthorityCommittee {
         let mut members = keys
@@ -14914,548 +14942,44 @@ pub(crate) mod tests {
             })
             .collect::<Vec<_>>();
         members.sort_by_key(AuthorityCommitteeMember::signer);
-        AuthorityCommittee::new(
-            retiring.space(),
-            retiring.authority_binding(),
-            retiring.epoch() + 1,
-            Some(retiring.commitment()),
-            members,
-        )
-        .unwrap()
+        AuthorityCommittee::new(space, binding, 1, None, members).unwrap()
     }
 
-    #[cfg(all(feature = "std", feature = "storage"))]
-    fn retain_rotation_qc_leg(
-        ledger: &SystemAuthorityEvidenceLedger,
-        reserved: &ReservedSystemAuthorityClaim,
-        leg: SystemAuthorityCommitteeLeg,
-        committee: &AuthorityCommittee,
-        keys: &[SigningKey; 3],
-    ) {
-        let local = AuthorityTestSigner(keys[0].clone());
-        ledger.sign_reserved_leg(reserved, leg, &local).unwrap();
-        let claim = reserved.request().claim();
-        let message = AuthorityQuorumCertificate::signing_message(
-            committee.authority_binding(),
-            committee.epoch(),
-            committee.commitment(),
-            claim,
-        );
-        let remote = AuthoritySignature::new(
-            AuthoritySignerId::of_raw_ed25519(&keys[1].verifying_key().to_bytes()),
-            keys[1].sign(&message.0).to_bytes(),
-        )
-        .unwrap();
-        assert!(
-            ledger
-                .record_remote_share(reserved, leg, remote)
-                .unwrap()
-                .certificate()
-                .is_some()
-        );
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    struct RotationPublicationFixture {
-        store: MemoryAgentJournalStore,
-        executor: ExactCreateRejectInvocations,
-        predecessor: ReplayMaterialization,
-        ledger: SystemAuthorityEvidenceLedger,
-        reserved: ReservedSystemAuthorityClaim,
-        entry: OrderedEntry,
-        database: alloc::sync::Arc<Database>,
-        directory: std::path::PathBuf,
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    fn rotation_publication_fixture(seed: u8) -> RotationPublicationFixture {
-        let sealed = admitted_genesis(seed);
-        let node = admitted_config().replicas[0].node;
-        let mut store = MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
-        store
-            .put_blob(
-                JournalBlobClass::CatalogArtifact,
-                &admitted_runtime().package,
-                b"replay-runtime-package",
-            )
-            .unwrap();
-        assert!(store.initialize(&sealed).unwrap());
-
-        let mut executor = ExactCreateRejectInvocations::default();
-        let predecessor =
-            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
+    #[cfg(feature = "std")]
+    fn admitted_root_material(config: &AgentConfig) -> (RootAnchorRecord, [SigningKey; 3]) {
+        let keys = [
+            SigningKey::from_bytes(&[0xd1; 32]),
+            SigningKey::from_bytes(&[0xd2; 32]),
+            SigningKey::from_bytes(&[0xd3; 32]),
+        ];
+        let descriptor = admitted_clean_descriptor(config);
+        let space = SpaceId(descriptor.identity.space.0);
+        let system_agent = AgentId(descriptor.identity.agent.0);
+        let binding = Hash(descriptor.authority.commitment().0);
+        let committee = admitted_committee(space, binding, &keys);
+        let root =
+            RootAnchorRecord::new(1, space, system_agent, binding, Hash([0xd4; 32]), committee)
                 .unwrap();
-        let identity = predecessor.replayed_root().unwrap();
-        let scope = SystemAuthorityJournalScope::from_replayed_root(&identity).unwrap();
-        let decoded = decode_standard_runtime_state(predecessor.state()).unwrap();
-        let authority = decoded.system_authority.unwrap();
-        let retiring = authority.current_committee().clone();
-        let (_, keys) = admitted_root_material(&admitted_config());
-        let incoming = rotated_committee(&retiring, &keys);
-        let transition = SystemAuthorityRotationClaim::new(
-            authority.root_anchor(),
-            authority.root_anchor_config_version(),
-            authority.root_anchor_config(),
-            scope.commitment(authority.root_anchor()).unwrap(),
-            &retiring,
-            &incoming,
-            2,
-            3,
-        )
-        .unwrap();
-        let request = SystemAuthorityRotationReservationRequest::new(
-            retiring.clone(),
-            incoming.clone(),
-            transition,
-        )
-        .unwrap();
-        let predecessor_control = derive_lane_state::<(), ()>(
-            predecessor.heads().genesis,
-            predecessor.runtime().clone(),
-            PersistedLane::Control,
-            LaneCursor::Ordered {
-                base: predecessor.ordered_base(),
-            },
-            &predecessor.state().control,
-        )
-        .unwrap()
-        .id();
-        let view = ReplayedSystemAuthorityView::from_authenticated_replay(
-            scope,
-            &authority,
-            store.instance_id(),
-            predecessor.heads_id(),
-            predecessor_control,
-        )
-        .unwrap();
-
-        let directory = std::env::temp_dir().join(alloc::format!(
-            "vos_authority_recovery_{}_{}_{}",
-            std::process::id(),
-            seed,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let database =
-            alloc::sync::Arc::new(Database::create(directory.join("evidence.redb")).unwrap());
-        let local_signer = AuthoritySignerId::of_raw_ed25519(&keys[0].verifying_key().to_bytes());
-        let local_node = retiring.member(local_signer).unwrap().node();
-        let ledger = SystemAuthorityEvidenceLedger::open(
-            database.clone(),
-            view.route(),
-            store.instance_id(),
-            local_node,
-            local_signer,
-        )
-        .unwrap();
-        let reserved = ledger
-            .reserve_or_reconcile(&view, request)
-            .unwrap()
-            .into_reserved();
-        retain_rotation_qc_leg(
-            &ledger,
-            &reserved,
-            SystemAuthorityCommitteeLeg::Retiring,
-            &retiring,
-            &keys,
-        );
-        retain_rotation_qc_leg(
-            &ledger,
-            &reserved,
-            SystemAuthorityCommitteeLeg::Incoming,
-            &incoming,
-            &keys,
-        );
-        let certificate = ledger
-            .joint_rotation_certificate(&reserved)
-            .unwrap()
-            .unwrap();
-        let command = SystemAuthorityRotation::new(
-            incoming,
-            certificate,
-            SystemAuthorityRotationProof::vacant(retiring.epoch() + 1, vec![]).unwrap(),
-        )
-        .unwrap();
-        let merge_seal = persist_merge_seal(&mut store, &predecessor);
-        let entry = OrderedEntry {
-            genesis: predecessor.heads().genesis,
-            index: 1,
-            parent: None,
-            merge_frontier: predecessor.merge_frontier(),
-            merge_seal: Some(merge_seal),
-            input: ReplayInput {
-                runtime: predecessor.runtime().clone(),
-                operation: ReplayOperation::Management {
-                    request: LifecycleRequest::RotateSystemAuthority(command),
-                },
-            },
-        };
-
-        RotationPublicationFixture {
-            store,
-            executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        }
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    struct CatalogPublicationFixture {
-        store: MemoryAgentJournalStore,
-        executor: ExactCreateRejectInvocations,
-        predecessor: ReplayMaterialization,
-        ledger: SystemAuthorityEvidenceLedger,
-        reserved: ReservedSystemAuthorityClaim,
-        entry: OrderedEntry,
-        database: alloc::sync::Arc<Database>,
-        directory: std::path::PathBuf,
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    fn catalog_publication_fixture(seed: u8) -> CatalogPublicationFixture {
-        let sealed = admitted_genesis(seed);
-        let node = admitted_config().replicas[0].node;
-        let mut store = MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
-        store
-            .put_blob(
-                JournalBlobClass::CatalogArtifact,
-                &admitted_runtime().package,
-                b"replay-runtime-package",
-            )
-            .unwrap();
-        assert!(store.initialize(&sealed).unwrap());
-
-        let mut executor = ExactCreateRejectInvocations::default();
-        let predecessor =
-            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
-                .unwrap();
-        let identity = predecessor.replayed_root().unwrap();
-        let scope = SystemAuthorityJournalScope::from_replayed_root(&identity).unwrap();
-        let decoded = decode_standard_runtime_state(predecessor.state()).unwrap();
-        let authority = decoded.system_authority.unwrap();
-        let committee = authority.current_committee().clone();
-        let binding = authority.catalog_binding_record().unwrap();
-        let operation = OperationId([seed.wrapping_add(0x31); 32]);
-        let intent = CatalogMutationIntent::new(
-            binding,
-            authority.authority_generation(),
-            authority.catalog_head(),
-            PrincipalId([seed.wrapping_add(0x32); 32]),
-            CredentialId([seed.wrapping_add(0x33); 32]),
-            CapabilityId::named("catalog.update.metadata"),
-            operation,
-            CatalogMutation::new(
-                CatalogMutationKind::UpdateMetadata,
-                vec![seed, seed.wrapping_add(1)],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let fact = FinalizedCatalogMutationFact::new(
-            intent,
-            authority.authority_generation(),
-            authority.catalog_head(),
-            CatalogMutationResult::new(
-                CatalogMutationDisposition::Applied,
-                vec![seed.wrapping_add(2)],
-            )
-            .unwrap(),
-            2,
-        )
-        .unwrap();
-        let proof = SystemAuthorityCatalogProof::vacant(operation, vec![]).unwrap();
-        let request = SystemAuthorityCatalogReservationRequest::new(
-            committee.clone(),
-            fact.clone(),
-            proof.clone(),
-        )
-        .unwrap();
-        let predecessor_control = derive_lane_state::<(), ()>(
-            predecessor.heads().genesis,
-            predecessor.runtime().clone(),
-            PersistedLane::Control,
-            LaneCursor::Ordered {
-                base: predecessor.ordered_base(),
-            },
-            &predecessor.state().control,
-        )
-        .unwrap()
-        .id();
-        let view = ReplayedSystemAuthorityView::from_authenticated_replay(
-            scope,
-            &authority,
-            store.instance_id(),
-            predecessor.heads_id(),
-            predecessor_control,
-        )
-        .unwrap();
-
-        let directory = std::env::temp_dir().join(alloc::format!(
-            "vos_catalog_authority_recovery_{}_{}_{}",
-            std::process::id(),
-            seed,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let database =
-            alloc::sync::Arc::new(Database::create(directory.join("evidence.redb")).unwrap());
-        let (_, keys) = admitted_root_material(&admitted_config());
-        let local_signer = AuthoritySignerId::of_raw_ed25519(&keys[0].verifying_key().to_bytes());
-        let local_node = committee.member(local_signer).unwrap().node();
-        let ledger = SystemAuthorityEvidenceLedger::open(
-            database.clone(),
-            view.route(),
-            store.instance_id(),
-            local_node,
-            local_signer,
-        )
-        .unwrap();
-        let reserved = ledger
-            .reserve_catalog_or_reconcile(&view, request)
-            .unwrap()
-            .into_reserved();
-        retain_rotation_qc_leg(
-            &ledger,
-            &reserved,
-            SystemAuthorityCommitteeLeg::Current,
-            &committee,
-            &keys,
-        );
-        let certificate = ledger
-            .owner()
-            .certificate(&reserved, SystemAuthorityCommitteeLeg::Current)
-            .unwrap()
-            .unwrap();
-        let receipt =
-            FinalizedCatalogMutationReceipt::new(fact, certificate, binding, &committee).unwrap();
-        let command = SystemAuthorityCatalogFinalize::new(receipt, proof).unwrap();
-        let merge_seal = persist_merge_seal(&mut store, &predecessor);
-        let entry = OrderedEntry {
-            genesis: predecessor.heads().genesis,
-            index: 1,
-            parent: None,
-            merge_frontier: predecessor.merge_frontier(),
-            merge_seal: Some(merge_seal),
-            input: ReplayInput {
-                runtime: predecessor.runtime().clone(),
-                operation: ReplayOperation::Management {
-                    request: LifecycleRequest::FinalizeCatalog(command),
-                },
-            },
-        };
-
-        CatalogPublicationFixture {
-            store,
-            executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        }
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    fn catalog_fact_for_authority(
-        authority: &crate::agent::system_authority::SystemAuthorityState,
-        operation: OperationId,
-        sequence: u64,
-        seed: u8,
-    ) -> FinalizedCatalogMutationFact {
-        let intent = CatalogMutationIntent::new(
-            authority.catalog_binding_record().unwrap(),
-            authority.authority_generation(),
-            authority.catalog_head(),
-            PrincipalId([seed.wrapping_add(1); 32]),
-            CredentialId([seed.wrapping_add(2); 32]),
-            CapabilityId::named("catalog.update.metadata"),
-            operation,
-            CatalogMutation::new(
-                CatalogMutationKind::UpdateMetadata,
-                vec![seed, seed.wrapping_add(3)],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        FinalizedCatalogMutationFact::new(
-            intent,
-            authority.authority_generation(),
-            authority.catalog_head(),
-            CatalogMutationResult::new(
-                CatalogMutationDisposition::Applied,
-                vec![seed.wrapping_add(4)],
-            )
-            .unwrap(),
-            sequence,
-        )
-        .unwrap()
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    fn signed_catalog_receipt(
-        fact: FinalizedCatalogMutationFact,
-        committee: &AuthorityCommittee,
-        keys: &[SigningKey; 3],
-    ) -> FinalizedCatalogMutationReceipt {
-        let message = AuthorityQuorumCertificate::signing_message(
-            committee.authority_binding(),
-            committee.epoch(),
-            committee.commitment(),
-            fact.authority_claim(),
-        );
-        let mut signatures = keys[..2]
-            .iter()
-            .map(|key| {
-                AuthoritySignature::new(
-                    AuthoritySignerId::of_raw_ed25519(&key.verifying_key().to_bytes()),
-                    key.sign(&message.0).to_bytes(),
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        signatures.sort_by_key(AuthoritySignature::signer);
-        let certificate =
-            AuthorityQuorumCertificate::new(committee, fact.authority_claim(), signatures).unwrap();
-        FinalizedCatalogMutationReceipt::new(
-            fact.clone(),
-            certificate,
-            fact.intent().binding(),
-            committee,
-        )
-        .unwrap()
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    fn catalog_ordered_entry(
-        store: &mut MemoryAgentJournalStore,
-        predecessor: &ReplayMaterialization,
-        command: SystemAuthorityCatalogFinalize,
-    ) -> OrderedEntry {
-        let merge_seal = persist_merge_seal(store, predecessor);
-        OrderedEntry {
-            genesis: predecessor.heads().genesis,
-            index: predecessor.heads().ordered_index + 1,
-            parent: predecessor.heads().ordered_head,
-            merge_frontier: predecessor.merge_frontier(),
-            merge_seal: Some(merge_seal),
-            input: ReplayInput {
-                runtime: predecessor.runtime().clone(),
-                operation: ReplayOperation::Management {
-                    request: LifecycleRequest::FinalizeCatalog(command),
-                },
-            },
-        }
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    fn publish_test_rotation(
-        store: &mut MemoryAgentJournalStore,
-        executor: &mut ExactCreateRejectInvocations,
-        predecessor: &ReplayMaterialization,
-        ledger: &SystemAuthorityEvidenceLedger,
-        keys: &[SigningKey; 3],
-        rotation_sequence: u64,
-        first_sequence: u64,
-    ) -> ReplayMaterialization {
-        let (scope, view) = materialized_system_authority_view(store, predecessor).unwrap();
-        let authority = view.authority_state();
-        let retiring = authority.current_committee().clone();
-        let incoming = rotated_committee(&retiring, keys);
-        let transition = SystemAuthorityRotationClaim::new(
-            authority.root_anchor(),
-            authority.root_anchor_config_version(),
-            authority.root_anchor_config(),
-            scope.commitment(authority.root_anchor()).unwrap(),
-            &retiring,
-            &incoming,
-            rotation_sequence,
-            first_sequence,
-        )
-        .unwrap();
-        let request = SystemAuthorityRotationReservationRequest::new(
-            retiring.clone(),
-            incoming.clone(),
-            transition,
-        )
-        .unwrap();
-        let reserved = ledger
-            .reserve_or_reconcile(&view, request)
-            .unwrap()
-            .into_reserved();
-        retain_rotation_qc_leg(
-            ledger,
-            &reserved,
-            SystemAuthorityCommitteeLeg::Retiring,
-            &retiring,
-            keys,
-        );
-        retain_rotation_qc_leg(
-            ledger,
-            &reserved,
-            SystemAuthorityCommitteeLeg::Incoming,
-            &incoming,
-            keys,
-        );
-        let certificate = ledger
-            .joint_rotation_certificate(&reserved)
-            .unwrap()
-            .unwrap();
-        let command = SystemAuthorityRotation::new(
-            incoming,
-            certificate,
-            SystemAuthorityRotationProof::vacant(retiring.epoch() + 1, vec![]).unwrap(),
-        )
-        .unwrap();
-        let merge_seal = persist_merge_seal(store, predecessor);
-        let entry = OrderedEntry {
-            genesis: predecessor.heads().genesis,
-            index: predecessor.heads().ordered_index + 1,
-            parent: predecessor.heads().ordered_head,
-            merge_frontier: predecessor.merge_frontier(),
-            merge_seal: Some(merge_seal),
-            input: ReplayInput {
-                runtime: predecessor.runtime().clone(),
-                operation: ReplayOperation::Management {
-                    request: LifecycleRequest::RotateSystemAuthority(command),
-                },
-            },
-        };
-        let prepared = match prepare_ordered(store, executor, predecessor, &entry).unwrap() {
-            ReplayPreparation::Ready(prepared) => prepared,
-            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-        }
-        .prepare_system_authority_rotation(reserved)
-        .unwrap();
-        let published = prepared
-            .publish_system_authority_rotation(ledger.owner())
-            .unwrap();
-        let (_, successor, _) = ledger.owner().retire_published_rotation(published).unwrap();
-        successor
+        (root, keys)
     }
 
     #[cfg(feature = "std")]
     fn admitted_config() -> AgentConfig {
+        const PEER_ID_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
         let space = SpaceId([0x91; 32]);
         let owner = PrincipalId([0x92; 32]);
         let creation_nonce = Hash([0x93; 32]);
         let agent = AgentId::derive(space, owner, creation_nonce.as_bytes());
+        let replica_key = SigningKey::from_bytes(&[0xc2; 32]);
+        let replica_public_key = replica_key.verifying_key().to_bytes();
+        let mut replica_peer_id = PEER_ID_PREFIX.to_vec();
+        replica_peer_id.extend_from_slice(&replica_public_key);
         let mut config = AgentConfig {
             identity: AgentIdentity {
                 space,
                 agent,
                 owner,
-                profile: AgentProfile::Local,
+                profile: AgentProfile::Shared,
                 runtime_deployment: DeploymentId([0x94; 32]),
                 runtime_program: ProgramId([0x95; 32]),
                 runtime_producer: ProducerId([0x96; 32]),
@@ -15472,18 +14996,20 @@ pub(crate) mod tests {
                 max_actors: 64,
             },
             replicas: vec![AgentReplica {
-                node: NodeId([0x97; 32]),
-                principal: owner,
+                node: NodeId::of_authenticated_peer(&replica_peer_id),
+                principal: PrincipalId::of_public_key(&replica_public_key),
                 role: ReplicaRole::Voter,
             }],
         };
-        let (root, _) = admitted_root_material(&config);
+        let (root, keys) = admitted_root_material(&config);
+        let authority_committee =
+            admitted_committee(config.identity.space, config.authority.commitment(), &keys);
         config.system_authority_genesis = Some(
             SystemAuthorityGenesis::new(
                 root.id(),
                 root.config_version(),
                 root.config_commitment(),
-                root.initial_committee().clone(),
+                authority_committee,
                 1,
                 Hash([0x75; 32]),
                 Hash([0x76; 32]),
@@ -15498,17 +15024,84 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
+    fn admitted_clean_descriptor(config: &AgentConfig) -> crate::agent_sdk::AgentDescriptor {
+        let authority_key = admitted_authority_key();
+        let authority_public_key = authority_key.verifying_key().to_bytes();
+        let descriptor = crate::agent_sdk::AgentDescriptor {
+            identity: crate::agent_sdk::AgentIdentity {
+                space: crate::agent_sdk::SpaceId(config.identity.space.0),
+                agent: crate::agent_sdk::AgentId::derive(
+                    crate::agent_sdk::SpaceId(config.identity.space.0),
+                    crate::agent_sdk::PrincipalId(config.identity.owner.0),
+                    config.creation_nonce.as_bytes(),
+                ),
+                owner: crate::agent_sdk::PrincipalId(config.identity.owner.0),
+                profile: match config.identity.profile {
+                    AgentProfile::Local => crate::agent_sdk::AgentProfile::Local,
+                    AgentProfile::Shared => crate::agent_sdk::AgentProfile::Shared,
+                    AgentProfile::Private => crate::agent_sdk::AgentProfile::Private,
+                },
+                runtime_deployment: crate::agent_sdk::DeploymentId(
+                    config.identity.runtime_deployment.0,
+                ),
+                runtime_program: crate::agent_sdk::ProgramId(config.identity.runtime_program.0),
+                runtime_producer: crate::agent_sdk::ProducerId(config.identity.runtime_producer.0),
+            },
+            creation_nonce: crate::agent_sdk::Hash(config.creation_nonce.0),
+            authority: crate::agent_sdk::authority::AgentAuthorityBinding {
+                policy: crate::agent_sdk::Hash([0x89; 32]),
+                issuer: crate::agent_sdk::authority::AuthorityIssuer {
+                    principal: crate::agent_sdk::PrincipalId(config.identity.owner.0),
+                    actor: crate::agent_sdk::ActorId(config.authority.actor.0),
+                    deployment: crate::agent_sdk::DeploymentId(config.authority.deployment.0),
+                    program: crate::agent_sdk::ProgramId(config.authority.program.0),
+                    producer: crate::agent_sdk::ProducerId::of_public_key(&authority_public_key),
+                },
+                public_key: authority_public_key,
+                initial_epoch: 1,
+            },
+            runtime_package: crate::agent_sdk::BlobRef {
+                hash: crate::agent_sdk::Hash(config.runtime_package.hash.0),
+                len: config.runtime_package.len,
+            },
+            runtime_contract: crate::agent_sdk::contract::RuntimePackageContract::canonical(),
+            capabilities: crate::agent_sdk::RuntimeCapabilities {
+                lanes: crate::agent_sdk::LaneSet::from_bits(config.capabilities.lanes.bits())
+                    .unwrap(),
+                scheduling: config.capabilities.scheduling,
+                proof_systems: crate::agent_sdk::proof_system::ProofSystemSet::EMPTY,
+                max_actors: config.capabilities.max_actors,
+            },
+            replicas: config
+                .replicas
+                .iter()
+                .map(|replica| crate::agent_sdk::AgentReplica {
+                    node: crate::agent_sdk::NodeId(replica.node.0),
+                    principal: crate::agent_sdk::PrincipalId(replica.principal.0),
+                    role: match replica.role {
+                        ReplicaRole::Voter => crate::agent_sdk::ReplicaRole::Voter,
+                        ReplicaRole::Observer => crate::agent_sdk::ReplicaRole::Observer,
+                    },
+                })
+                .collect(),
+        };
+        descriptor.validate().unwrap();
+        descriptor
+    }
+
+    #[cfg(feature = "std")]
     fn shared_admitted_config() -> AgentConfig {
         let mut config = admitted_config();
-        config.identity.profile = AgentProfile::Shared;
         config.system_authority_genesis = None;
-        let runtime = admitted_runtime();
-        let (committee, _) = shared_test_committee(&runtime);
-        config.replicas = committee
-            .members()
-            .iter()
-            .map(|member| member.replica())
-            .collect();
+        config.validate().unwrap();
+        config
+    }
+
+    #[cfg(feature = "std")]
+    fn ordinary_local_config() -> AgentConfig {
+        let mut config = admitted_config();
+        config.identity.profile = AgentProfile::Local;
+        config.system_authority_genesis = None;
         config.validate().unwrap();
         config
     }
@@ -15542,16 +15135,8 @@ pub(crate) mod tests {
     ) -> AdmittedFinalizeFixture {
         const PEER_ID_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
 
-        let ReplayOperation::Management {
-            request: LifecycleRequest::Authorized { request, .. },
-        } = &sealed.genesis().create.operation
-        else {
-            unreachable!()
-        };
-        let LifecycleRequest::Create(system) = request.as_ref() else {
-            unreachable!()
-        };
-        let (root, committee_keys) = admitted_root_material(system);
+        let system = admitted_config();
+        let (root, committee_keys) = admitted_root_material(&system);
         assert_eq!(&root, sealed.root_anchor());
 
         let raw_member_key = [0x31; 32];
@@ -15571,6 +15156,8 @@ pub(crate) mod tests {
         let owner = PrincipalId([0x12; 32]);
         let nonce = Hash([0x10_u8.wrapping_add(sequence as u8); 32]);
         let agent = AgentId::derive(system.identity.space, owner, nonce.as_bytes());
+        let mut target_authority = system.authority.clone();
+        target_authority.agent = sealed.genesis().runtime().agent;
         let target = AgentConfig {
             identity: AgentIdentity {
                 space: system.identity.space,
@@ -15582,7 +15169,7 @@ pub(crate) mod tests {
                 runtime_producer: ProducerId([0x23; 32]),
             },
             creation_nonce: nonce,
-            authority: system.authority.clone(),
+            authority: target_authority,
             system_authority_genesis: None,
             runtime_package: BlobRef::of_bytes(b"ordinary-replay-runtime"),
             runtime_contract: RuntimePackageContract::canonical(),
@@ -15657,14 +15244,18 @@ pub(crate) mod tests {
         let (system_genesis, system_admission) =
             signed_scope.unwrap_or((sealed.genesis().id(), sealed.genesis().admission));
         let claim = AgentGenesisClaim::new(
-            system.identity.agent,
+            AgentId(sealed.genesis().runtime().agent.0),
             system_genesis,
             system_admission,
             &proposal,
             &replicas,
         )
         .unwrap();
-        let committee = root.initial_committee();
+        let committee = admitted_committee(
+            system.identity.space,
+            target.authority.commitment(),
+            &committee_keys,
+        );
         let message = AuthorityQuorumCertificate::signing_message(
             committee.authority_binding(),
             committee.epoch(),
@@ -15683,7 +15274,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         signatures.sort_by_key(AuthoritySignature::signer);
         let certificate =
-            AuthorityQuorumCertificate::new(committee, claim.authority_claim(), signatures)
+            AuthorityQuorumCertificate::new(&committee, claim.authority_claim(), signatures)
                 .unwrap();
         let evidence = AgentGenesisEvidence::new(claim, certificate).unwrap();
         let decision = AgentGenesisDecision::new(&proposal, &replicas, &evidence).unwrap();
@@ -15724,8 +15315,54 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
-    fn admitted_create_input_for(config: AgentConfig, credential: u8) -> ReplayInput {
-        let runtime = admitted_runtime();
+    fn admitted_clean_create_input_for(config: &AgentConfig, discriminator: u8) -> ReplayInput {
+        let descriptor = admitted_clean_descriptor(config);
+        let request = crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+        let signing = admitted_authority_key();
+        let mut authority = signed_opaque_clean_receipt(
+            &descriptor,
+            &request,
+            descriptor.identity.runtime_deployment,
+            1,
+            &signing,
+        );
+        authority.selector.evidence.commitment = crate::agent_sdk::Hash([discriminator.max(1); 32]);
+        authority.signature = signing.sign(&authority.signing_bytes()).to_bytes();
+        authority.validate_shape().unwrap();
+        ReplayInput {
+            runtime: RuntimeBinding {
+                space: SpaceId(descriptor.identity.space.0),
+                agent: AgentId(descriptor.identity.agent.0),
+                deployment: DeploymentId(descriptor.identity.runtime_deployment.0),
+                program: ProgramId(descriptor.identity.runtime_program.0),
+                producer: ProducerId(descriptor.identity.runtime_producer.0),
+                package: BlobRef {
+                    hash: Hash(descriptor.runtime_package.hash.0),
+                    len: descriptor.runtime_package.len,
+                },
+                runtime_abi: super::super::RUNTIME_ABI_ID,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            },
+            operation: ReplayOperation::CleanManage {
+                request,
+                authority,
+                observed_slot: 10,
+            },
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn admitted_local_create_input_for(config: &AgentConfig, credential: u8) -> ReplayInput {
+        let runtime = RuntimeBinding {
+            space: config.identity.space,
+            agent: config.identity.agent,
+            deployment: config.identity.runtime_deployment,
+            program: config.identity.runtime_program,
+            producer: config.identity.runtime_producer,
+            package: config.runtime_package.clone(),
+            runtime_abi: super::super::RUNTIME_ABI_ID,
+            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+        };
         let inner = LifecycleRequest::Create(config.clone());
         let claim = AgentAuthorityClaim {
             authority: config.authority.clone(),
@@ -15751,41 +15388,7 @@ pub(crate) mod tests {
                         receipt: AgentAuthorityReceipt { claim, signature },
                         observed_slot: 15,
                     },
-                    request: alloc::boxed::Box::new(inner),
-                },
-            },
-        }
-    }
-
-    #[cfg(feature = "std")]
-    fn shared_admitted_create_input_for(config: AgentConfig, credential: u8) -> ReplayInput {
-        let runtime = admitted_runtime();
-        let inner = LifecycleRequest::Create(config.clone());
-        let claim = AgentAuthorityClaim {
-            authority: config.authority.clone(),
-            space: runtime.space,
-            agent: runtime.agent,
-            principal: config.identity.owner,
-            credential: CredentialId([credential; 32]),
-            capability: CapabilityId::named("agent.create.shared"),
-            operation: inner.commitment(),
-            sequence: 1,
-            valid_from: 10,
-            valid_until: 20,
-        };
-        let signature = admitted_authority_key()
-            .sign(&claim.signing_message().0)
-            .to_bytes()
-            .to_vec();
-        ReplayInput {
-            runtime,
-            operation: ReplayOperation::Management {
-                request: LifecycleRequest::Authorized {
-                    admission: LifecycleAuthorityAdmission {
-                        receipt: AgentAuthorityReceipt { claim, signature },
-                        observed_slot: 15,
-                    },
-                    request: alloc::boxed::Box::new(inner),
+                    request: Box::new(inner),
                 },
             },
         }
@@ -15828,6 +15431,80 @@ pub(crate) mod tests {
                 observed_slot: 15,
             },
         }
+    }
+
+    #[cfg(feature = "std")]
+    fn clean_admitted_invocation(
+        runtime: &RuntimeBinding,
+        mode: MethodMode,
+        discriminator: u8,
+    ) -> ReplayInput {
+        let mode = match mode {
+            MethodMode::Query => crate::agent_sdk::MethodMode::Query,
+            MethodMode::LinearizableQuery => crate::agent_sdk::MethodMode::LinearizableQuery,
+            MethodMode::Linear => crate::agent_sdk::MethodMode::Linear,
+            MethodMode::Merge => crate::agent_sdk::MethodMode::Merge,
+            MethodMode::LocalQuery => crate::agent_sdk::MethodMode::LocalQuery,
+            MethodMode::Local => crate::agent_sdk::MethodMode::Local,
+        };
+        let work = crate::agent_sdk::InvocationWork {
+            space: crate::agent_sdk::SpaceId(runtime.space.0),
+            agent: crate::agent_sdk::AgentId(runtime.agent.0),
+            runtime_deployment: crate::agent_sdk::DeploymentId(runtime.deployment.0),
+            invocation: crate::agent_sdk::InvocationId([discriminator; 32]),
+            actor: crate::agent_sdk::ActorId([0xa1; 32]),
+            incarnation: crate::agent_sdk::Hash([0xa0; 32]),
+            deployment: crate::agent_sdk::DeploymentId([0xa2; 32]),
+            program: crate::agent_sdk::ProgramId([0xa3; 32]),
+            mode,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            message: vec![discriminator],
+            installation_data: None,
+            availability: Vec::new(),
+            gas: 1_000,
+            recovery_only: false,
+        };
+        let observed_slot = 15;
+        let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, observed_slot),
+        );
+        ReplayInput {
+            runtime: runtime.clone(),
+            operation: ReplayOperation::CleanInvoke {
+                work,
+                authorization,
+                observed_slot,
+            },
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn clean_admitted_management(
+        runtime: &RuntimeBinding,
+        request: crate::agent_sdk::ManagementRequest,
+        sequence: u64,
+    ) -> ReplayInput {
+        let descriptor = admitted_clean_descriptor(&shared_admitted_config());
+        assert_eq!(descriptor.identity.space.0, runtime.space.0);
+        assert_eq!(descriptor.identity.agent.0, runtime.agent.0);
+        let authority = signed_opaque_clean_receipt(
+            &descriptor,
+            &request,
+            crate::agent_sdk::DeploymentId(runtime.deployment.0),
+            sequence,
+            &admitted_authority_key(),
+        );
+        let input = ReplayInput {
+            runtime: runtime.clone(),
+            operation: ReplayOperation::CleanManage {
+                request,
+                authority,
+                observed_slot: 10,
+            },
+        };
+        input.validate().unwrap();
+        input
     }
 
     #[cfg(feature = "std")]
@@ -16376,11 +16053,54 @@ pub(crate) mod tests {
         executions: usize,
         merge_verifications: usize,
         merge_execution_order: Vec<MergeEventId>,
+        clean_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
+        last_clean_management: Option<(
+            super::super::journal::ReplayInputId,
+            crate::agent_sdk::RuntimeOutcome,
+            RuntimeState,
+            RuntimeBinding,
+            ReplayDisposition,
+        )>,
     }
 
     #[cfg(feature = "std")]
     impl ReplayExecutor for ExactCreateRejectInvocations {
         type Error = ();
+
+        fn seed_genesis(&mut self, genesis: &AgentJournalGenesis) -> Result<(), Self::Error> {
+            let descriptor = match &genesis.create.operation {
+                ReplayOperation::CleanManage {
+                    request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+                    ..
+                } => Some((**descriptor).clone()),
+                _ => None,
+            };
+            if self
+                .clean_descriptor
+                .as_ref()
+                .zip(descriptor.as_ref())
+                .is_some_and(|(seeded, durable)| seeded != durable)
+            {
+                return Err(());
+            }
+            self.clean_descriptor = descriptor;
+            Ok(())
+        }
+
+        fn trusted_clean_descriptor(
+            &self,
+            runtime: &RuntimeBinding,
+        ) -> Result<Option<crate::agent_sdk::AgentDescriptor>, Self::Error> {
+            Ok(self.clean_descriptor.clone().filter(|descriptor| {
+                descriptor.identity.space.0 == runtime.space.0
+                    && descriptor.identity.agent.0 == runtime.agent.0
+                    && descriptor.identity.runtime_deployment.0 == runtime.deployment.0
+                    && descriptor.identity.runtime_program.0 == runtime.program.0
+                    && descriptor.identity.runtime_producer.0 == runtime.producer.0
+                    && descriptor.runtime_package.hash.0 == runtime.package.hash.0
+                    && descriptor.runtime_package.len == runtime.package.len
+            }))
+        }
 
         fn verify_merge_event(&mut self, _event: &MergeEvent) -> Result<bool, Self::Error> {
             self.merge_verifications += 1;
@@ -16402,23 +16122,50 @@ pub(crate) mod tests {
                     .filter(|byte| *byte == 0xaa)
                     .map(|_| ())
                     .ok_or(()),
-                ReplayOperation::CleanInvoke { authorization, .. } => {
-                    let crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority) =
-                        authorization
-                    else {
-                        return Err(());
+                ReplayOperation::CleanInvoke {
+                    work,
+                    authorization,
+                    observed_slot,
+                } => match authorization {
+                    crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority) => {
+                        authority
+                            .signature
+                            .first()
+                            .copied()
+                            .filter(|byte| *byte == 0xaa)
+                            .map(|_| ())
+                            .ok_or(())
+                    }
+                    crate::agent_sdk::InvocationAuthorization::PublicPreflight(_) => authorization
+                        .matches_invoke(work, *observed_slot)
+                        .then_some(())
+                        .ok_or(()),
+                },
+                ReplayOperation::CleanManage {
+                    request,
+                    authority,
+                    observed_slot,
+                } => {
+                    let descriptor = match request {
+                        crate::agent_sdk::ManagementRequest::Create(descriptor) => {
+                            descriptor.as_ref()
+                        }
+                        _ => self.clean_descriptor.as_ref().ok_or(())?,
                     };
-                    authority
-                        .signature
-                        .first()
-                        .copied()
-                        .filter(|byte| *byte == 0xaa)
-                        .map(|_| ())
-                        .ok_or(())
+                    if !descriptor.authority.accepts(authority)
+                        || !authority.selector.is_live_at(*observed_slot)
+                        || authority.selector.request != request.commitment()
+                        || !super::super::authority::verify_raw_ed25519(
+                            &authority.public_key,
+                            &authority.signing_bytes(),
+                            &authority.signature,
+                        )
+                    {
+                        return Err(());
+                    }
+                    Ok(())
                 }
-                ReplayOperation::Management { .. }
-                | ReplayOperation::CleanManage { .. }
-                | ReplayOperation::SealMerge => Ok(()),
+                ReplayOperation::Management { .. } | ReplayOperation::SealMerge => Ok(()),
             }
         }
 
@@ -16448,6 +16195,75 @@ pub(crate) mod tests {
                     products: ReplayProducts::default(),
                 });
             }
+            if let ReplayOperation::CleanManage { request, .. } = &input.operation {
+                let (state, disposition, outcome) = match request {
+                    crate::agent_sdk::ManagementRequest::Create(descriptor) => {
+                        if !before.is_empty() {
+                            return Err(());
+                        }
+                        self.clean_descriptor = Some((**descriptor).clone());
+                        (
+                            RuntimeState {
+                                control: b"OPAQUE-CLEAN-ROOT-TEST-V1".to_vec(),
+                                linear: Vec::new(),
+                                merge: Vec::new(),
+                                local: Vec::new(),
+                            },
+                            ReplayDisposition::Applied,
+                            crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                                crate::agent_sdk::ManagementReply::Created(
+                                    descriptor.identity.clone(),
+                                ),
+                            )),
+                        )
+                    }
+                    _ => {
+                        if before.is_empty() || self.clean_descriptor.is_none() {
+                            return Err(());
+                        }
+                        (
+                            before.clone(),
+                            ReplayDisposition::Rejected,
+                            crate::agent_sdk::RuntimeOutcome::Management(Err(
+                                crate::agent_sdk::ManagementError::NotFound,
+                            )),
+                        )
+                    }
+                };
+                self.last_clean_management = Some((
+                    input.id(),
+                    outcome,
+                    state.clone(),
+                    input.runtime.clone(),
+                    disposition,
+                ));
+                return Ok(ReplayTransition {
+                    state,
+                    disposition,
+                    result: None,
+                    next_runtime: input.runtime.clone(),
+                    products: ReplayProducts::default(),
+                });
+            }
+            if let ReplayOperation::CleanInvoke { work, .. } = &input.operation {
+                let mut state = before.clone();
+                let lane = match work.mode {
+                    crate::agent_sdk::MethodMode::Linear => &mut state.linear,
+                    crate::agent_sdk::MethodMode::Merge => &mut state.merge,
+                    crate::agent_sdk::MethodMode::Local => &mut state.local,
+                    crate::agent_sdk::MethodMode::Query
+                    | crate::agent_sdk::MethodMode::LinearizableQuery
+                    | crate::agent_sdk::MethodMode::LocalQuery => return Err(()),
+                };
+                lane.push(work.message.first().copied().ok_or(())?);
+                return Ok(ReplayTransition {
+                    state,
+                    disposition: ReplayDisposition::Applied,
+                    result: None,
+                    next_runtime: input.runtime.clone(),
+                    products: ReplayProducts::default(),
+                });
+            }
             Ok(ReplayTransition {
                 state: clock_only_state(input, before),
                 disposition: ReplayDisposition::Rejected,
@@ -16455,6 +16271,22 @@ pub(crate) mod tests {
                 next_runtime: input.runtime.clone(),
                 products: ReplayProducts::default(),
             })
+        }
+
+        fn validates_clean_management_transition(
+            &self,
+            input: &ReplayInput,
+            transition: &ReplayTransition,
+        ) -> bool {
+            self.last_clean_management.as_ref().is_some_and(
+                |(id, outcome, state, runtime, disposition)| {
+                    *id == input.id()
+                        && matches!(outcome, crate::agent_sdk::RuntimeOutcome::Management(_))
+                        && state == &transition.state
+                        && runtime == &transition.next_runtime
+                        && disposition == &transition.disposition
+                },
+            )
         }
 
         fn execute_with_journal_context(
@@ -16494,27 +16326,108 @@ pub(crate) mod tests {
     #[cfg(feature = "std")]
     pub(crate) fn admitted_genesis(admission: u8) -> ReplaySealedGenesis {
         let config = admitted_config();
-        let create = admitted_create_input_for(config.clone(), admission);
+        let create = admitted_clean_create_input_for(&config, admission);
         admitted_genesis_for(config, create)
     }
 
     #[cfg(feature = "std")]
-    fn shared_admitted_genesis(admission: u8) -> ReplaySealedGenesis {
+    struct AcceptTestGenesisFinality;
+
+    #[cfg(feature = "std")]
+    impl AgentGenesisFinalityVerifier for AcceptTestGenesisFinality {
+        fn verify_finalized(
+            &self,
+            _provision: &AgentGenesisProvision,
+        ) -> Result<(), AgentGenesisFinalityError> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn shared_admitted_genesis(admission: u8) -> ReplaySealedSharedGenesis {
         let config = shared_admitted_config();
-        let create = shared_admitted_create_input_for(config.clone(), admission);
-        admitted_genesis_for(config, create)
+        let create = admitted_clean_create_input_for(&config, admission);
+        let mut executor = ExactCreateRejectInvocations::default();
+        let replica = config.replicas[0];
+        let prepared = ReplayPreparedGenesis::prepare(create, replica, &mut executor).unwrap();
+        let create = prepared.create().clone();
+        let expectations = prepared.expectations();
+        let proposal = AgentGenesisProposal::new(
+            AgentGenesisLocator {
+                space: create.runtime.space,
+                agent: create.runtime.agent,
+            },
+            create.clone(),
+            AgentGenesisExpectations::new(
+                expectations.runtime_binding(),
+                expectations.inner_create_request(),
+                expectations.post_create_state(),
+                expectations.artifact_closure(),
+                expectations.sequence(),
+            )
+            .unwrap(),
+            prepared.artifacts().to_vec(),
+        )
+        .unwrap();
+        let (replicas, _) = shared_test_committee(&create.runtime);
+        let descriptor = match &create.operation {
+            ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+                ..
+            } => descriptor,
+            _ => unreachable!("ordinary clean Shared fixture requires CleanManage(Create)"),
+        };
+        let system_key = SigningKey::from_bytes(&[0xd5; 32]);
+        let system_member = AuthorityCommitteeMember::new(
+            NodeId([0xd6; 32]),
+            system_key.verifying_key().to_bytes(),
+            AuthorityMemberRole::Voter,
+        )
+        .unwrap();
+        let system_signer = system_member.signer();
+        let system_committee = AuthorityCommittee::new(
+            create.runtime.space,
+            Hash(descriptor.authority.commitment().0),
+            1,
+            None,
+            vec![system_member],
+        )
+        .unwrap();
+        let claim = AgentGenesisClaim::new(
+            AgentId([0xd7; 32]),
+            AgentJournalGenesisId::new([0xd8; 32]),
+            AgentGenesisAdmissionId::from_bytes([0xd9; 32]),
+            &proposal,
+            &replicas,
+        )
+        .unwrap();
+        let message = AuthorityQuorumCertificate::signing_message(
+            system_committee.authority_binding(),
+            system_committee.epoch(),
+            system_committee.commitment(),
+            claim.authority_claim(),
+        );
+        let signature =
+            AuthoritySignature::new(system_signer, system_key.sign(&message.0).to_bytes()).unwrap();
+        let certificate = AuthorityQuorumCertificate::new(
+            &system_committee,
+            claim.authority_claim(),
+            vec![signature],
+        )
+        .unwrap();
+        let evidence = AgentGenesisEvidence::new(claim, certificate).unwrap();
+        let decision = AgentGenesisDecision::new(&proposal, &replicas, &evidence).unwrap();
+        let provision = AgentGenesisProvision::new(proposal, replicas, evidence, decision).unwrap();
+        let verified =
+            VerifiedAgentGenesisProvision::verify(provision, &AcceptTestGenesisFinality).unwrap();
+        ReplaySealedSharedGenesis::from_prepared_verified(&verified, prepared).unwrap()
     }
 
     #[cfg(feature = "std")]
     fn admitted_genesis_for(config: AgentConfig, create: ReplayInput) -> ReplaySealedGenesis {
         let mut executor = ExactCreateRejectInvocations::default();
-        let is_shared = config.identity.profile == AgentProfile::Shared;
         let replica = config.replicas[0];
-        let prepared = if config.identity.profile == AgentProfile::Shared {
-            prepare_shared_genesis_for_test(create, replica, &mut executor)
-        } else {
-            ReplayPreparedGenesis::prepare(create, replica, &mut executor).unwrap()
-        };
+        let prepared = ReplayPreparedGenesis::prepare(create, replica, &mut executor).unwrap();
         let expected = prepared.expectations();
         let (root, signing_keys) = admitted_root_material(&config);
         let committee = root.initial_committee().clone();
@@ -16549,193 +16462,25 @@ pub(crate) mod tests {
                 .unwrap();
         let evidence = SystemAgentGenesisEvidence::new(claim, certificate).unwrap();
         let verified = evidence.verify(&trusted, expected).unwrap();
-        if is_shared {
-            seal_shared_prepared_genesis_for_test(&verified, evidence, prepared)
-        } else {
-            ReplaySealedGenesis::from_prepared_verified(&verified, evidence, prepared).unwrap()
-        }
+        ReplaySealedGenesis::from_prepared_verified(&verified, evidence, prepared).unwrap()
     }
 
     #[cfg(feature = "std")]
-    fn seal_shared_prepared_genesis_for_test(
-        verified: &VerifiedSystemAgentGenesis,
-        admission_evidence: SystemAgentGenesisEvidence,
-        prepared: ReplayPreparedGenesis,
-    ) -> ReplaySealedGenesis {
-        let ReplayOperation::Management { request } = &prepared.create.operation else {
-            unreachable!()
-        };
-        let LifecycleRequest::Authorized { request, .. } = request else {
-            unreachable!()
-        };
-        let LifecycleRequest::Create(config) = request.as_ref() else {
-            unreachable!()
-        };
-        assert_eq!(config.identity.profile, AgentProfile::Shared);
-        assert!(config.replicas.contains(&prepared.replica));
-        let root_admission = verified.admission_record();
-        let root_anchor = verified.root_anchor().clone();
-        assert_eq!(root_admission.evidence(), verified.evidence_id());
-        assert_eq!(admission_evidence.id(), verified.evidence_id());
-        assert_eq!(verified.space(), prepared.create.runtime.space);
-        assert_eq!(verified.system_agent(), prepared.create.runtime.agent);
-        assert_eq!(verified.authority_binding(), config.authority.commitment());
-        assert_eq!(
-            verified.genesis_intent(),
-            prepared.expectations.genesis_intent()
-        );
-        assert_eq!(
-            verified.runtime_binding(),
-            prepared.expectations.runtime_binding()
-        );
-        assert_eq!(
-            verified.post_create_state(),
-            prepared.expectations.post_create_state()
-        );
-        assert_eq!(
-            verified.artifact_closure(),
-            prepared.expectations.artifact_closure()
-        );
-        assert_eq!(verified.sequence(), prepared.expectations.sequence());
-
-        let admission_record = AgentGenesisAdmissionRecord::root_bootstrap(root_admission).unwrap();
-
-        let genesis = AgentJournalGenesis {
-            admission: admission_record.id(),
-            create: prepared.create,
-        };
-        genesis.validate().unwrap();
-        let genesis_id = genesis.id();
-        let artifacts = ArtifactClosure {
-            genesis: genesis_id,
-            artifacts: prepared.artifacts,
-        };
-        artifacts.validate().unwrap();
-        let post_create = prepared.post_create;
-        let replica = prepared.replica;
-        let empty_frontier = MergeFrontier {
-            genesis: genesis_id,
-            events: Vec::new(),
-        };
-        ReplaySealedGenesis {
-            genesis,
-            post_create,
-            empty_frontier,
-            ordered_invocations: InvocationIndexManifest::empty(
-                genesis_id,
-                InvocationOwnershipScope::Ordered,
-            ),
-            merge_invocations: InvocationIndexManifest::empty(
-                genesis_id,
-                InvocationOwnershipScope::Merge,
-            ),
-            local_invocations: InvocationIndexManifest::empty(
-                genesis_id,
-                InvocationOwnershipScope::Local(replica.node),
-            ),
-            artifacts,
-            root_anchor,
-            root_admission_record: root_admission,
-            admission_record,
-            admission_evidence,
-            replica,
-        }
-    }
-
-    #[cfg(feature = "std")]
-    fn prepare_shared_genesis_for_test(
-        create: ReplayInput,
-        replica: AgentReplica,
-        executor: &mut ExactCreateRejectInvocations,
-    ) -> ReplayPreparedGenesis {
-        create.validate().unwrap();
-        validate_position::<(), ()>(&create, ReplayPosition::Genesis).unwrap();
-        let ReplayOperation::Management { request } = &create.operation else {
-            unreachable!()
-        };
-        let LifecycleRequest::Authorized { request, .. } = request else {
-            unreachable!()
-        };
-        let LifecycleRequest::Create(config) = request.as_ref() else {
-            unreachable!()
-        };
-        assert_eq!(config.identity.profile, AgentProfile::Shared);
-        assert!(config.replicas.contains(&replica));
-
-        let before = RuntimeState::default();
-        executor
-            .authenticate(&create, &before, ReplayPosition::Genesis)
-            .unwrap();
-        let transition = executor
-            .execute(&create, &before, ReplayPosition::Genesis)
-            .unwrap();
-        validate_transition::<(), ()>(
-            &create,
-            &before,
-            &transition,
-            ReplayPosition::Genesis,
-            &create.runtime,
-            false,
-            false,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(transition.disposition, ReplayDisposition::Applied);
-        assert!(transition.result.is_none());
-        assert_eq!(transition.next_runtime, create.runtime);
-        let post_create = transition.state;
-        let decoded = decode_standard_runtime_state(&post_create).unwrap();
-        assert_eq!(decoded.config.as_ref(), Some(config));
-        let artifacts = derive_standard_artifact_references::<core::convert::Infallible>(
-            &create.runtime,
-            &post_create,
-        )
-        .unwrap();
-        let expectations = SystemAgentGenesisExpectations::new(
-            create.runtime.commitment(),
-            request.commitment(),
-            system_genesis_post_create_state_commitment(&post_create).unwrap(),
-            system_genesis_artifact_closure_commitment(&artifacts).unwrap(),
-            match &create.operation {
-                ReplayOperation::Management {
-                    request: LifecycleRequest::Authorized { admission, .. },
-                } => admission.receipt.claim.sequence,
-                _ => unreachable!(),
-            },
-        )
-        .unwrap();
-        ReplayPreparedGenesis {
-            create,
-            replica,
-            post_create,
-            artifacts,
-            expectations,
-        }
+    pub(crate) fn admitted_local_genesis(admission: u8) -> ReplaySealedLocalGenesis {
+        let config = ordinary_local_config();
+        let create = admitted_local_create_input_for(&config, admission);
+        let mut executor = ExactCreateRejectInvocations::default();
+        let prepared =
+            ReplayPreparedGenesis::prepare(create, config.replicas[0], &mut executor).unwrap();
+        ReplaySealedLocalGenesis::from_prepared(prepared).unwrap()
     }
 
     #[cfg(feature = "std")]
     fn initialized_replay_store() -> MemoryAgentJournalStore {
-        let sealed = admitted_genesis(0xb1);
-        let node = admitted_config().replicas[0].node;
-        let mut store = MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
-        store
-            .put_blob(
-                JournalBlobClass::CatalogArtifact,
-                &admitted_runtime().package,
-                b"replay-runtime-package",
-            )
-            .unwrap();
-        assert!(store.initialize(&sealed).unwrap());
-        store
-    }
-
-    #[cfg(feature = "std")]
-    fn initialized_shared_replay_store() -> MemoryAgentJournalStore {
-        let sealed = shared_admitted_genesis(0xc5);
-        let config = shared_admitted_config();
+        let sealed = admitted_local_genesis(0xb1);
+        let config = ordinary_local_config();
+        let runtime = sealed.genesis().runtime();
         let node = config.replicas[0].node;
-        let runtime = admitted_runtime();
         let mut store = MemoryAgentJournalStore::new(runtime.agent, node).unwrap();
         store
             .put_blob(
@@ -16744,7 +16489,25 @@ pub(crate) mod tests {
                 b"replay-runtime-package",
             )
             .unwrap();
-        assert!(store.initialize(&sealed).unwrap());
+        assert!(store.initialize_ordinary_for_test(&sealed).unwrap());
+        store
+    }
+
+    #[cfg(feature = "std")]
+    fn initialized_shared_replay_store() -> MemoryAgentJournalStore {
+        let sealed = shared_admitted_genesis(0xc5);
+        let config = shared_admitted_config();
+        let node = config.replicas[0].node;
+        let runtime = sealed.genesis().runtime();
+        let mut store = MemoryAgentJournalStore::new(runtime.agent, node).unwrap();
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &runtime.package,
+                b"replay-runtime-package",
+            )
+            .unwrap();
+        assert!(store.initialize_ordinary_for_test(&sealed).unwrap());
         store
     }
 
@@ -16786,7 +16549,7 @@ pub(crate) mod tests {
     #[cfg(feature = "std")]
     fn shared_test_committee(runtime: &RuntimeBinding) -> (AgentReplicaCommittee, Vec<SigningKey>) {
         const PEER_ID_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
-        let keys = [0xc2, 0xc3, 0xc4]
+        let keys = [0xc2]
             .into_iter()
             .map(|byte| SigningKey::from_bytes(&[byte; 32]))
             .collect::<Vec<_>>();
@@ -17299,34 +17062,6 @@ pub(crate) mod tests {
     struct RejectingExecutor {
         calls: usize,
         authentications: usize,
-    }
-
-    struct RejectingAuthenticationExecutor;
-
-    impl ReplayExecutor for RejectingAuthenticationExecutor {
-        type Error = ();
-
-        fn verify_merge_event(&mut self, _event: &MergeEvent) -> Result<bool, Self::Error> {
-            Ok(true)
-        }
-
-        fn authenticate(
-            &mut self,
-            _input: &ReplayInput,
-            _before: &RuntimeState,
-            _position: ReplayPosition,
-        ) -> Result<(), Self::Error> {
-            Err(())
-        }
-
-        fn execute(
-            &mut self,
-            _input: &ReplayInput,
-            _before: &RuntimeState,
-            _position: ReplayPosition,
-        ) -> Result<ReplayTransition, Self::Error> {
-            Err(())
-        }
     }
 
     impl ReplayExecutor for RejectingExecutor {
@@ -18581,14 +18316,15 @@ pub(crate) mod tests {
         bare.validate().unwrap();
         assert_eq!(ReplayInput::decode(&bare.encode()).unwrap(), bare);
 
+        let legacy_create = admitted_local_create_input_for(&ordinary_local_config(), 0xc1);
         let ReplayOperation::Management {
             request: LifecycleRequest::Authorized { admission, .. },
-        } = &sealed.genesis().create.operation
+        } = &legacy_create.operation
         else {
             unreachable!()
         };
         let wrapped = ReplayInput {
-            runtime: sealed.genesis().runtime().clone(),
+            runtime: legacy_create.runtime,
             operation: ReplayOperation::Management {
                 request: LifecycleRequest::Authorized {
                     admission: admission.clone(),
@@ -18626,6 +18362,23 @@ pub(crate) mod tests {
 
     #[cfg(feature = "std")]
     #[test]
+    fn ordinary_shared_genesis_rejects_legacy_create_even_with_exact_committee() {
+        let config = shared_admitted_config();
+        let legacy = admitted_local_create_input_for(&config, 0xc7);
+        let (legacy_committee, _) = shared_test_committee(&legacy.runtime);
+        assert!(legacy_committee.validate_for(&config).is_ok());
+        assert!(!validates_shared_create_committee(
+            &legacy,
+            &legacy_committee
+        ));
+
+        let clean = admitted_clean_create_input_for(&config, 0xc8);
+        let (clean_committee, _) = shared_test_committee(&clean.runtime);
+        assert!(validates_shared_create_committee(&clean, &clean_committee));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
     fn raw_genesis_replay_cannot_acquire_system_authority_scope() {
         let sealed = admitted_genesis(0xc7);
         let input = authority_finalize_input(&sealed, admitted_finalize_for_test(&sealed, 2));
@@ -18650,162 +18403,17 @@ pub(crate) mod tests {
         assert_eq!(executor.executions, 0);
     }
 
-    #[cfg(feature = "std")]
-    #[test]
-    fn scoped_replay_selects_reply_bound_native_authority_write() {
-        let sealed = admitted_genesis(0xca);
-        let input = authority_finalize_input(&sealed, admitted_finalize_for_test(&sealed, 2));
-        let mut machine =
-            ReplayMachine::from_replayed_root_genesis(&sealed, sealed.genesis().runtime().clone())
-                .unwrap();
-        let mut executor = ExactCreateRejectInvocations::default();
-        let step = machine
-            .apply::<_, ()>(
-                &mut executor,
-                &input,
-                sealed.post_create(),
-                ReplayPosition::Ordered {
-                    id: OrderedEntryId([0xcb; 32]),
-                    index: 1,
-                    merge_frontier: sealed.empty_frontier().id(),
-                    merge_seal: Some(MergeSealId([0xcc; 32])),
-                },
-            )
-            .unwrap();
-        let write = step.system_authority_write.as_ref().unwrap();
-        let ReplayOperation::Management { request } = &input.operation else {
-            unreachable!()
-        };
-        assert_eq!(write.operation(), request.commitment());
-        assert!(matches!(
-            write.result(),
-            LifecycleReply::SystemAuthorityFinalized(
-                crate::agent::system_authority::SystemAuthorityFinalizeOutcome::Admitted(_)
-            )
-        ));
-        assert!(matches!(
-            write.selected(),
-            StandardSystemAuthorityWrite::Finalize { .. }
-        ));
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn wrong_scope_and_invalid_direct_authority_commands_never_prepare() {
-        let sealed = admitted_genesis(0xcd);
-        let foreign = admitted_finalize_fixture(
-            &sealed,
-            2,
-            Some((
-                AgentJournalGenesisId::new([0xce; 32]),
-                AgentGenesisAdmissionId::from_bytes([0xcf; 32]),
-            )),
-        );
-        let wrong_scope = authority_finalize_input(&sealed, foreign.command);
-        let stale = authority_finalize_input(&sealed, admitted_finalize_for_test(&sealed, 1));
-        let position = ReplayPosition::Ordered {
-            id: OrderedEntryId([0xd0; 32]),
-            index: 1,
-            merge_frontier: sealed.empty_frontier().id(),
-            merge_seal: Some(MergeSealId([0xd1; 32])),
-        };
-        for input in [wrong_scope, stale] {
-            let mut machine = ReplayMachine::from_replayed_root_genesis(
-                &sealed,
-                sealed.genesis().runtime().clone(),
-            )
-            .unwrap();
-            let mut executor = ExactCreateRejectInvocations::default();
-            assert!(matches!(
-                machine.apply::<_, ()>(&mut executor, &input, sealed.post_create(), position),
-                Err(ReplayError::InvalidManagementTransition)
-            ));
-        }
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn custom_executor_authority_write_cannot_cross_generic_publish_seam() {
-        let sealed = admitted_genesis(0xd2);
-        let node = admitted_config().replicas[0].node;
-        let mut store = MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
-        store
-            .put_blob(
-                JournalBlobClass::CatalogArtifact,
-                &admitted_runtime().package,
-                b"replay-runtime-package",
-            )
-            .unwrap();
-        assert!(store.initialize(&sealed).unwrap());
-        let mut executor = ExactCreateRejectInvocations::default();
-        let mut materialized =
-            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
-        materialized.attach_replayed_root(&sealed).unwrap();
-        let merge_seal = persist_merge_seal(&mut store, &materialized);
-        let entry = OrderedEntry {
-            genesis: materialized.heads().genesis,
-            index: 1,
-            parent: None,
-            merge_frontier: materialized.merge_frontier(),
-            merge_seal: Some(merge_seal),
-            input: authority_finalize_input(&sealed, admitted_finalize_for_test(&sealed, 2)),
-        };
-        let heads_before = store.heads().unwrap().unwrap();
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &materialized, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            };
-        let write = prepared.sealed.system_authority_write().unwrap();
-        assert!(matches!(
-            write.result(),
-            LifecycleReply::SystemAuthorityFinalized(_)
-        ));
-        let StandardSystemAuthorityWrite::Finalize { history, .. } = write.selected() else {
-            unreachable!()
-        };
-        let authority_nodes = history
-            .nodes()
-            .iter()
-            .map(|node| node.id())
-            .collect::<Vec<_>>();
-        let direct = prepared.sealed.clone();
-        drop(prepared);
-        assert_eq!(store.publish(&direct), Err(JournalStoreError::NonCanonical));
-        assert_eq!(store.heads().unwrap().unwrap(), heads_before);
-        assert!(authority_nodes.iter().all(|id| {
-            store
-                .load_system_authority_decision_node(*id)
-                .unwrap()
-                .is_none()
-        }));
-        assert!(store.get::<OrderedEntry>(entry.id()).unwrap().is_none());
-
-        let invalid = OrderedEntry {
-            genesis: materialized.heads().genesis,
-            index: 1,
-            parent: None,
-            merge_frontier: materialized.merge_frontier(),
-            merge_seal: Some(merge_seal),
-            input: authority_finalize_input(&sealed, admitted_finalize_for_test(&sealed, 1)),
-        };
-        assert!(matches!(
-            prepare_ordered(&mut store, &mut executor, &materialized, &invalid),
-            Err(ReplayError::InvalidManagementTransition)
-        ));
-        assert_eq!(store.heads().unwrap().unwrap(), heads_before);
-    }
-
     #[cfg(all(feature = "std", feature = "storage"))]
     #[test]
     fn memory_clone_drops_root_provenance_while_original_remains_reverified() {
         let sealed = admitted_genesis(0xd6);
         let node = admitted_config().replicas[0].node;
-        let mut store = MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
+        let runtime = sealed.genesis().runtime();
+        let mut store = MemoryAgentJournalStore::new(runtime.agent, node).unwrap();
         store
             .put_blob(
                 JournalBlobClass::CatalogArtifact,
-                &admitted_runtime().package,
+                &runtime.package,
                 b"replay-runtime-package",
             )
             .unwrap();
@@ -18835,1393 +18443,21 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn fresh_rotation_publishes_dependencies_then_retires_exact_receipt() {
-        let sealed = admitted_genesis(0xd7);
-        let node = admitted_config().replicas[0].node;
-        let mut store = MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
-        store
-            .put_blob(
-                JournalBlobClass::CatalogArtifact,
-                &admitted_runtime().package,
-                b"replay-runtime-package",
-            )
-            .unwrap();
-        assert!(store.initialize(&sealed).unwrap());
-
-        let mut executor = ExactCreateRejectInvocations::default();
-        let predecessor =
-            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
-                .unwrap();
-        let identity = predecessor.replayed_root().unwrap();
-        let scope = SystemAuthorityJournalScope::from_replayed_root(&identity).unwrap();
-        let decoded = decode_standard_runtime_state(predecessor.state()).unwrap();
-        let authority = decoded.system_authority.unwrap();
-        let retiring = authority.current_committee().clone();
-        let (_, keys) = admitted_root_material(&admitted_config());
-        let incoming = rotated_committee(&retiring, &keys);
-        let transition = SystemAuthorityRotationClaim::new(
-            authority.root_anchor(),
-            authority.root_anchor_config_version(),
-            authority.root_anchor_config(),
-            scope.commitment(authority.root_anchor()).unwrap(),
-            &retiring,
-            &incoming,
-            2,
-            3,
-        )
-        .unwrap();
-        let request = SystemAuthorityRotationReservationRequest::new(
-            retiring.clone(),
-            incoming.clone(),
-            transition,
-        )
-        .unwrap();
-        let predecessor_control = derive_lane_state::<(), ()>(
-            predecessor.heads().genesis,
-            predecessor.runtime().clone(),
-            PersistedLane::Control,
-            LaneCursor::Ordered {
-                base: predecessor.ordered_base(),
-            },
-            &predecessor.state().control,
-        )
-        .unwrap()
-        .id();
-        let view = ReplayedSystemAuthorityView::from_authenticated_replay(
-            scope,
-            &authority,
-            store.instance_id(),
-            predecessor.heads_id(),
-            predecessor_control,
-        )
-        .unwrap();
-
-        let directory = std::env::temp_dir().join(alloc::format!(
-            "vos_authority_publication_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let database =
-            alloc::sync::Arc::new(Database::create(directory.join("evidence.redb")).unwrap());
-        let local_signer = AuthoritySignerId::of_raw_ed25519(&keys[0].verifying_key().to_bytes());
-        let local_node = retiring.member(local_signer).unwrap().node();
-        let ledger = SystemAuthorityEvidenceLedger::open(
-            database.clone(),
-            view.route(),
-            store.instance_id(),
-            local_node,
-            local_signer,
-        )
-        .unwrap();
-        let reserved = ledger
-            .reserve_or_reconcile(&view, request)
-            .unwrap()
-            .into_reserved();
-        retain_rotation_qc_leg(
-            &ledger,
-            &reserved,
-            SystemAuthorityCommitteeLeg::Retiring,
-            &retiring,
-            &keys,
-        );
-        retain_rotation_qc_leg(
-            &ledger,
-            &reserved,
-            SystemAuthorityCommitteeLeg::Incoming,
-            &incoming,
-            &keys,
-        );
-        let certificate = ledger
-            .joint_rotation_certificate(&reserved)
-            .unwrap()
-            .unwrap();
-        let command = SystemAuthorityRotation::new(
-            incoming.clone(),
-            certificate,
-            SystemAuthorityRotationProof::vacant(incoming.epoch(), vec![]).unwrap(),
-        )
-        .unwrap();
-        let merge_seal = persist_merge_seal(&mut store, &predecessor);
-        let entry = OrderedEntry {
-            genesis: predecessor.heads().genesis,
-            index: 1,
-            parent: None,
-            merge_frontier: predecessor.merge_frontier(),
-            merge_seal: Some(merge_seal),
-            input: ReplayInput {
-                runtime: predecessor.runtime().clone(),
-                operation: ReplayOperation::Management {
-                    request: LifecycleRequest::RotateSystemAuthority(command),
-                },
-            },
-        };
-        let heads_before = store.heads().unwrap().unwrap();
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            };
-        let StandardSystemAuthorityWrite::Rotation { record, history } =
-            prepared.sealed.system_authority_write().unwrap().selected()
-        else {
-            unreachable!()
-        };
-        let record = record.clone();
-        let root = history.root();
-        let generic = prepared.sealed.clone();
-        assert_eq!(
-            prepared.store.publish(&generic),
-            Err(JournalStoreError::NonCanonical)
-        );
-        assert_eq!(prepared.store.heads().unwrap(), Some(heads_before));
-        assert!(
-            prepared
-                .store
-                .load_system_authority_rotation_node(record.leaf_id())
-                .unwrap()
-                .is_none()
-        );
-
-        let prepared = prepared
-            .prepare_system_authority_rotation(reserved)
-            .unwrap();
-        let published = prepared
-            .publish_system_authority_rotation(ledger.owner())
-            .unwrap();
-        assert_eq!(published.facts().record(), &record);
-        assert_eq!(published.facts().root(), root);
-        assert!(ledger.recover_pending_claim().unwrap().is_some());
-        let (publication, successor, _) =
-            ledger.owner().retire_published_rotation(published).unwrap();
-        assert!(publication.heads_advanced);
-        assert_eq!(store.heads().unwrap().unwrap().id(), successor.heads_id());
-        assert!(ledger.recover_pending_claim().unwrap().is_none());
-        assert_eq!(
-            store
-                .load_system_authority_rotation_node(record.leaf_id())
-                .unwrap(),
-            Some(SystemAuthorityRotationNode::Leaf(record.clone()))
-        );
-        assert_eq!(
-            prove_rotation(root, record.new_epoch(), |id| {
-                store
-                    .load_system_authority_rotation_node(id)
-                    .map(|node| node.map(|node| node.encode()))
-            })
-            .unwrap()
-            .occupied_record(),
-            Some(&record)
-        );
-        assert!(
-            store
-                .load_system_authority_committee_record(record.old_committee())
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            store
-                .load_system_authority_committee_record(record.new_committee())
-                .unwrap()
-                .is_some()
-        );
-        drop(ledger);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn fresh_catalog_publishes_exact_history_and_retry_cannot_reserve_a_second_cas() {
-        let CatalogPublicationFixture {
-            mut store,
-            mut executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        } = catalog_publication_fixture(0x42);
-        let stale_reservation = reserved.clone();
-        let heads_before = store.heads().unwrap().unwrap();
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            };
-        let StandardSystemAuthorityWrite::Catalog {
-            record: Some(record),
-            history,
-        } = prepared.sealed.system_authority_write().unwrap().selected()
-        else {
-            unreachable!()
-        };
-        let record = record.clone();
-        let root = history.root();
-        assert!(history.inserted());
-        let generic = prepared.sealed.clone();
-        assert_eq!(
-            prepared.store.publish(&generic),
-            Err(JournalStoreError::NonCanonical)
-        );
-        assert_eq!(prepared.store.heads().unwrap(), Some(heads_before));
-        assert!(
-            prepared
-                .store
-                .load_system_authority_catalog_record(record.id())
-                .unwrap()
-                .is_none()
-        );
-
-        let prepared = prepared.prepare_system_authority_catalog(reserved).unwrap();
-        let facts = prepared.publication_facts().unwrap();
-        assert_eq!(facts.record(), &record);
-        assert_eq!(facts.root(), root);
-        assert_ne!(facts.storage_plan(), Hash::ZERO);
-        let published = prepared
-            .publish_system_authority_catalog(ledger.owner())
-            .unwrap();
-        assert!(ledger.recover_pending_claim().unwrap().is_some());
-        let (publication, successor, _) =
-            ledger.owner().retire_published_catalog(published).unwrap();
-        assert!(publication.heads_advanced);
-        assert_eq!(store.heads().unwrap().unwrap().id(), successor.heads_id());
-        assert!(ledger.recover_pending_claim().unwrap().is_none());
-        assert_eq!(
-            store
-                .load_system_authority_catalog_record(record.id())
-                .unwrap(),
-            Some(record.clone())
-        );
-        let occupied = prove_catalog(root, record.operation_id(), |id| {
-            store
-                .load_system_authority_catalog_node(id)
-                .map(|node| node.map(|node| node.encode()))
-        })
-        .unwrap();
-        assert_eq!(occupied.occupied_record_id(), Some(record.id()));
-
-        // A historical response-loss retry is resolved by the occupied
-        // OperationId record. Replay may reconstruct its deterministic reply,
-        // but the fresh reservation/publication constructor rejects it before
-        // any second dependency staging or Heads CAS.
-        let retry =
-            SystemAuthorityCatalogFinalize::new(record.receipt().clone(), occupied).unwrap();
-        let merge_seal = persist_merge_seal(&mut store, &successor);
-        let retry_entry = OrderedEntry {
-            genesis: successor.heads().genesis,
-            index: successor.heads().ordered_index + 1,
-            parent: successor.heads().ordered_head,
-            merge_frontier: successor.merge_frontier(),
-            merge_seal: Some(merge_seal),
-            input: ReplayInput {
-                runtime: successor.runtime().clone(),
-                operation: ReplayOperation::Management {
-                    request: LifecycleRequest::FinalizeCatalog(retry),
-                },
-            },
-        };
-        let retry_prepared =
-            match prepare_ordered(&mut store, &mut executor, &successor, &retry_entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            };
-        let StandardSystemAuthorityWrite::Catalog { history, .. } = retry_prepared
-            .sealed
-            .system_authority_write()
-            .unwrap()
-            .selected()
-        else {
-            unreachable!()
-        };
-        assert!(!history.inserted());
-        assert!(matches!(
-            retry_prepared.prepare_system_authority_catalog(stale_reservation),
-            Err(JournalStoreError::NonCanonical)
-        ));
-        assert_eq!(store.heads().unwrap().unwrap().id(), successor.heads_id());
-
-        drop(ledger);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn first_catalog_after_rotation_consumes_marker_and_wrong_sequence_is_no_write() {
-        let RotationPublicationFixture {
-            mut store,
-            mut executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        } = rotation_publication_fixture(0x45);
-        let (_, keys) = admitted_root_material(&admitted_config());
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            }
-            .prepare_system_authority_rotation(reserved)
-            .unwrap();
-        let published = prepared
-            .publish_system_authority_rotation(ledger.owner())
-            .unwrap();
-        let (_, rotated, _) = ledger.owner().retire_published_rotation(published).unwrap();
-        let (_, rotated_view) = materialized_system_authority_view(&store, &rotated).unwrap();
-        let first = rotated_view.rotation_first_sequence().unwrap();
-        assert_eq!(rotated_view.committee_sequence_high_water(), first - 1);
-        assert!(ledger.recover_pending_claim().unwrap().is_none());
-
-        let committee = rotated_view.committee().clone();
-        let wrong_operation = OperationId([0x46; 32]);
-        let wrong_fact = catalog_fact_for_authority(
-            rotated_view.authority_state(),
-            wrong_operation,
-            first + 1,
-            0x47,
-        );
-        let wrong_request = SystemAuthorityCatalogReservationRequest::new(
-            committee.clone(),
-            wrong_fact,
-            SystemAuthorityCatalogProof::vacant(wrong_operation, vec![]).unwrap(),
-        )
-        .unwrap();
-        let heads_before = store.heads().unwrap().unwrap();
-        assert!(matches!(
-            ledger.reserve_catalog_or_reconcile(&rotated_view, wrong_request),
-            Err(SystemAuthorityLedgerError::Wire(_))
-        ));
-        assert_eq!(store.heads().unwrap(), Some(heads_before.clone()));
-        assert!(ledger.recover_pending_claim().unwrap().is_none());
-        assert!(!ledger.is_fail_stopped().unwrap());
-
-        let operation = OperationId([0x48; 32]);
-        let fact =
-            catalog_fact_for_authority(rotated_view.authority_state(), operation, first, 0x49);
-        let proof = SystemAuthorityCatalogProof::vacant(operation, vec![]).unwrap();
-        let request = SystemAuthorityCatalogReservationRequest::new(
-            committee.clone(),
-            fact.clone(),
-            proof.clone(),
-        )
-        .unwrap();
-        let reserved = ledger
-            .reserve_catalog_or_reconcile(&rotated_view, request)
-            .unwrap()
-            .into_reserved();
-        retain_rotation_qc_leg(
-            &ledger,
-            &reserved,
-            SystemAuthorityCommitteeLeg::Current,
-            &committee,
-            &keys,
-        );
-        let certificate = ledger
-            .owner()
-            .certificate(&reserved, SystemAuthorityCommitteeLeg::Current)
-            .unwrap()
-            .unwrap();
-        let receipt = FinalizedCatalogMutationReceipt::new(
-            fact,
-            certificate,
-            rotated_view
-                .authority_state()
-                .catalog_binding_record()
-                .unwrap(),
-            &committee,
-        )
-        .unwrap();
-        let command = SystemAuthorityCatalogFinalize::new(receipt, proof).unwrap();
-        let catalog_entry = catalog_ordered_entry(&mut store, &rotated, command);
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &rotated, &catalog_entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            };
-        let write = prepared.sealed.system_authority_write().unwrap();
-        assert_eq!(
-            write.predecessor_authority().rotation_first_sequence(),
-            Some(first)
-        );
-        assert_eq!(
-            write
-                .predecessor_authority()
-                .committee_sequence_high_water(),
-            first - 1
-        );
-        assert_eq!(write.successor_authority().rotation_first_sequence(), None);
-        assert_eq!(
-            write.successor_authority().committee_sequence_high_water(),
-            first
-        );
-        let prepared = prepared.prepare_system_authority_catalog(reserved).unwrap();
-        let published = prepared
-            .publish_system_authority_catalog(ledger.owner())
-            .unwrap();
-        let (_, successor, _) = ledger.owner().retire_published_catalog(published).unwrap();
-        let (_, successor_view) = materialized_system_authority_view(&store, &successor).unwrap();
-        assert_eq!(successor_view.rotation_first_sequence(), None);
-        assert_eq!(successor_view.committee_sequence_high_water(), first);
-        assert_eq!(successor_view.committee(), &committee);
-        assert!(ledger.recover_pending_claim().unwrap().is_none());
-
-        drop(ledger);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn occupied_catalog_retry_and_conflict_preserve_post_rotation_marker_without_writes() {
-        let CatalogPublicationFixture {
-            mut store,
-            mut executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        } = catalog_publication_fixture(0x4a);
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            }
-            .prepare_system_authority_catalog(reserved)
-            .unwrap();
-        let original_record = prepared.publication_facts().unwrap().record().clone();
-        let published = prepared
-            .publish_system_authority_catalog(ledger.owner())
-            .unwrap();
-        let (_, after_catalog, _) = ledger.owner().retire_published_catalog(published).unwrap();
-
-        let (_, keys) = admitted_root_material(&admitted_config());
-        let rotated = publish_test_rotation(
-            &mut store,
-            &mut executor,
-            &after_catalog,
-            &ledger,
-            &keys,
-            3,
-            4,
-        );
-        let (scope, rotated_view) = materialized_system_authority_view(&store, &rotated).unwrap();
-        assert_eq!(rotated_view.committee_sequence_high_water(), 3);
-        assert_eq!(rotated_view.rotation_first_sequence(), Some(4));
-        let occupied = prove_catalog(
-            rotated_view.authority_state().catalog_history_root(),
-            original_record.operation_id(),
-            |id| {
-                store
-                    .load_system_authority_catalog_node(id)
-                    .map(|node| node.map(|node| node.encode()))
-            },
-        )
-        .unwrap();
-        assert_eq!(occupied.occupied_record_id(), Some(original_record.id()));
-        assert!(
-            SystemAuthorityCatalogReservationRequest::new(
-                rotated_view.committee().clone(),
-                original_record.receipt().fact().clone(),
-                occupied.clone(),
-            )
-            .is_err()
-        );
-
-        let exact = SystemAuthorityCatalogFinalize::new(
-            original_record.receipt().clone(),
-            occupied.clone(),
-        )
-        .unwrap();
-        let exact_entry = catalog_ordered_entry(&mut store, &rotated, exact);
-        let heads_before = store.heads().unwrap().unwrap();
-        {
-            let prepared =
-                match prepare_ordered(&mut store, &mut executor, &rotated, &exact_entry).unwrap() {
-                    ReplayPreparation::Ready(prepared) => prepared,
-                    ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-                };
-            let write = prepared.sealed.system_authority_write().unwrap();
-            let StandardSystemAuthorityWrite::Catalog { record, history } = write.selected() else {
-                unreachable!()
-            };
-            assert_eq!(record.as_ref(), Some(&original_record));
-            assert!(!history.inserted());
-            assert_eq!(
-                write.predecessor_authority().rotation_first_sequence(),
-                Some(4)
-            );
-            assert_eq!(
-                write.successor_authority().rotation_first_sequence(),
-                Some(4)
-            );
-            assert_eq!(write.predecessor_authority(), write.successor_authority());
-            let generic = prepared.sealed.clone();
-            assert_eq!(
-                prepared.store.publish(&generic),
-                Err(JournalStoreError::NonCanonical)
-            );
-        }
-        assert_eq!(store.heads().unwrap(), Some(heads_before.clone()));
-        assert!(ledger.recover_pending_claim().unwrap().is_none());
-
-        let divergent_fact = catalog_fact_for_authority(
-            rotated_view.authority_state(),
-            original_record.operation_id(),
-            4,
-            0x4b,
-        );
-        let divergent_receipt =
-            signed_catalog_receipt(divergent_fact.clone(), rotated_view.committee(), &keys);
-        let divergent_record = SystemAuthorityCatalogRecord::new(
-            divergent_receipt.clone(),
-            rotated_view
-                .authority_state()
-                .catalog_binding_record()
-                .unwrap(),
-            rotated_view.committee(),
-        )
-        .unwrap();
-        assert_ne!(divergent_record.id(), original_record.id());
-        assert!(
-            store
-                .load_system_authority_catalog_record(divergent_record.id())
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            SystemAuthorityCatalogReservationRequest::new(
-                rotated_view.committee().clone(),
-                divergent_fact,
-                occupied.clone(),
-            )
-            .is_err()
-        );
-        let conflict = SystemAuthorityCatalogFinalize::new(divergent_receipt, occupied).unwrap();
-        let conflict_entry = catalog_ordered_entry(&mut store, &rotated, conflict);
-        {
-            let prepared = match prepare_ordered(
-                &mut store,
-                &mut executor,
-                &rotated,
-                &conflict_entry,
-            )
-            .unwrap()
-            {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            };
-            let write = prepared.sealed.system_authority_write().unwrap();
-            let StandardSystemAuthorityWrite::Catalog { record, history } = write.selected() else {
-                unreachable!()
-            };
-            assert!(record.is_none());
-            assert!(!history.inserted());
-            assert!(matches!(
-                write.result(),
-                LifecycleReply::CatalogFinalized(outcome) if outcome.operation_conflicted()
-            ));
-            assert_eq!(
-                write.predecessor_authority().rotation_first_sequence(),
-                Some(4)
-            );
-            assert_eq!(
-                write.successor_authority().rotation_first_sequence(),
-                Some(4)
-            );
-            assert_eq!(write.predecessor_authority(), write.successor_authority());
-            let generic = prepared.sealed.clone();
-            assert_eq!(
-                prepared.store.publish(&generic),
-                Err(JournalStoreError::NonCanonical)
-            );
-        }
-        assert_eq!(store.heads().unwrap(), Some(heads_before));
-        assert!(
-            store
-                .load_system_authority_catalog_record(divergent_record.id())
-                .unwrap()
-                .is_none()
-        );
-        assert!(ledger.recover_pending_claim().unwrap().is_none());
-
-        // The retry/conflict paths used the authenticated post-rotation state,
-        // but neither could consume its one-shot marker without a fresh vacant
-        // reservation and an exact durable publication.
-        let (_, durable_view) = materialized_system_authority_view(&store, &rotated).unwrap();
-        assert_eq!(durable_view.committee_sequence_high_water(), 3);
-        assert_eq!(durable_view.rotation_first_sequence(), Some(4));
-        assert_eq!(
-            durable_view.authority_state().journal_binding(),
-            Some(scope.binding())
-        );
-
-        drop(ledger);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn cold_catalog_pre_cas_intent_resumes_and_retires_without_a_signer() {
-        let CatalogPublicationFixture {
-            mut store,
-            mut executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        } = catalog_publication_fixture(0x43);
-        let route = ledger.route();
-        let local_node = ledger.local_node();
-        let journal_store = ledger.journal_store();
-        let retained = reserved.clone();
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            }
-            .prepare_system_authority_catalog(reserved)
-            .unwrap();
-        let facts = prepared.publication_facts().unwrap();
-        let predecessor_heads = predecessor.heads_id();
-        let certificate = ledger
-            .owner()
-            .certificate(&retained, SystemAuthorityCommitteeLeg::Current)
-            .unwrap()
-            .unwrap();
-        let injected = ledger
-            .owner()
-            .with_active_catalog_publication_reservation(&retained, &certificate, &facts, || {
-                Err::<(), _>(JournalStoreError::Unavailable)
-            })
-            .unwrap();
-        assert_eq!(injected, Err(JournalStoreError::Unavailable));
-        drop(prepared);
-        drop(retained);
-        drop(predecessor);
-        drop(executor);
-        let database_path = directory.join("evidence.redb");
-        drop(ledger);
-        drop(database);
-
-        let database = alloc::sync::Arc::new(Database::open(&database_path).unwrap());
-        let owner = SystemAuthorityLedgerRouteOwner::open(
-            database.clone(),
-            route,
-            journal_store,
-            local_node,
-        )
-        .unwrap();
-        let mut materializer = ExactCreateRejectInvocations::default();
-        let predecessor =
-            materialize_current_reverified(&mut store, &mut materializer, &NoPrunedOrderedBases)
-                .unwrap();
-        assert_eq!(predecessor.heads_id(), predecessor_heads);
-        let pending = owner.recover_pending_claim().unwrap().unwrap();
-        assert!(pending.catalog_request().is_some());
-        assert_eq!(
-            pending.expected_successor_heads(),
-            Some(facts.successor_heads())
-        );
-        let mut divergent = RejectingAuthenticationExecutor;
-        assert!(matches!(
-            recover_pending_system_authority_catalog(
-                &mut store,
-                &mut divergent,
-                predecessor.clone(),
-                pending,
-                &owner,
-            ),
-            Err(SystemAuthorityRecoveryError::Replay(_))
-        ));
-        assert_eq!(store.heads().unwrap().unwrap().id(), predecessor_heads);
-        let pending = owner.recover_pending_claim().unwrap().unwrap();
-        let mut executor = ExactCreateRejectInvocations::default();
-        let retired = match recover_pending_system_authority_catalog(
-            &mut store,
-            &mut executor,
-            predecessor,
-            pending,
-            &owner,
-        )
-        .unwrap()
-        {
-            PendingSystemAuthorityCatalogRecovery::Retired(retired) => retired,
-            PendingSystemAuthorityCatalogRecovery::Pending(_) => unreachable!(),
-        };
-        assert_eq!(
-            retired.materialization().heads_id(),
-            facts.successor_heads()
-        );
-        assert!(retired.publication().unwrap().heads_advanced);
-        assert_eq!(
-            store.heads().unwrap().unwrap().id(),
-            facts.successor_heads()
-        );
-        assert!(owner.recover_pending_claim().unwrap().is_none());
-
-        drop(owner);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn cold_catalog_successor_recovers_and_retires_exact_intent() {
-        let CatalogPublicationFixture {
-            mut store,
-            mut executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        } = catalog_publication_fixture(0x44);
-        let route = ledger.route();
-        let local_node = ledger.local_node();
-        let journal_store = ledger.journal_store();
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            }
-            .prepare_system_authority_catalog(reserved)
-            .unwrap();
-        let published = prepared
-            .publish_system_authority_catalog(ledger.owner())
-            .unwrap();
-        let expected_successor = published.facts().successor_heads();
-        drop(published);
-
-        // Simulate process loss after the catalog dependencies and Heads CAS
-        // are durable, but before the exact publication intent is retired.
-        let database_path = directory.join("evidence.redb");
-        drop(ledger);
-        drop(database);
-        let database = alloc::sync::Arc::new(Database::open(&database_path).unwrap());
-        let owner = SystemAuthorityLedgerRouteOwner::open(
-            database.clone(),
-            route,
-            journal_store,
-            local_node,
-        )
-        .unwrap();
-        let current =
-            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
-                .unwrap();
-        assert_eq!(current.heads_id(), expected_successor);
-        let pending = owner.recover_pending_claim().unwrap().unwrap();
-        let retired = match recover_pending_system_authority_catalog(
-            &mut store,
-            &mut executor,
-            current,
-            pending,
-            &owner,
-        )
-        .unwrap()
-        {
-            PendingSystemAuthorityCatalogRecovery::Retired(retired) => retired,
-            PendingSystemAuthorityCatalogRecovery::Pending(_) => unreachable!(),
-        };
-        assert!(retired.publication().is_none());
-        assert_eq!(retired.materialization().heads_id(), expected_successor);
-        assert_eq!(store.heads().unwrap().unwrap().id(), expected_successor);
-        assert!(owner.recover_pending_claim().unwrap().is_none());
-
-        drop(owner);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn cold_catalog_recovery_rejects_tampered_write_and_history_without_retirement() {
-        let CatalogPublicationFixture {
-            mut store,
-            mut executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        } = catalog_publication_fixture(0x4c);
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            }
-            .prepare_system_authority_catalog(reserved)
-            .unwrap();
-        let published = prepared
-            .publish_system_authority_catalog(ledger.owner())
-            .unwrap();
-        drop(published);
-        let current =
-            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
-                .unwrap();
-
-        let mut tampered_operation = current.clone();
-        tampered_operation
-            .final_system_authority_write
-            .as_mut()
-            .unwrap()
-            .write
-            .operation = Hash([0x4d; 32]);
-        let pending = ledger.recover_pending_claim().unwrap().unwrap();
-        assert!(matches!(
-            recover_pending_system_authority_catalog(
-                &mut store,
-                &mut executor,
-                tampered_operation,
-                pending,
-                ledger.owner(),
-            ),
-            Err(SystemAuthorityRecoveryError::Journal(
-                JournalStoreError::NonCanonical
-            ))
-        ));
-        assert!(ledger.recover_pending_claim().unwrap().is_some());
-
-        // Replace the fresh inserted history with a separately valid exact-
-        // retry plan. Every record and proof remains individually canonical,
-        // but it is not the storage closure committed by the durable intent.
-        let decoded = decode_standard_runtime_state(current.state()).unwrap();
-        let authority = decoded.system_authority.unwrap();
-        let identity = current.replayed_root().unwrap();
-        let scope = SystemAuthorityJournalScope::from_replayed_root(&identity).unwrap();
-        let final_write = current.final_system_authority_write.as_ref().unwrap();
-        let ReplayOperation::Management {
-            request: LifecycleRequest::FinalizeCatalog(command),
-        } = &final_write.entry.input.operation
-        else {
-            unreachable!()
-        };
-        let StandardSystemAuthorityWrite::Catalog {
-            record: Some(record),
-            ..
-        } = final_write.write.selected()
-        else {
-            unreachable!()
-        };
-        let occupied = prove_catalog(
-            authority.catalog_history_root(),
-            record.operation_id(),
-            |id| {
-                store
-                    .load_system_authority_catalog_node(id)
-                    .map(|node| node.map(|node| node.encode()))
-            },
-        )
-        .unwrap();
-        let retry =
-            SystemAuthorityCatalogFinalize::new(command.receipt().clone(), occupied).unwrap();
-        let retry_transition = authority.apply_catalog_finalize(scope, &retry).unwrap();
-        assert!(retry_transition.outcome().exact_retry());
-        assert!(!retry_transition.history().inserted());
-        let mut tampered_history = current.clone();
-        let materialized_write = tampered_history
-            .final_system_authority_write
-            .as_mut()
-            .unwrap();
-        materialized_write.write.selected = StandardSystemAuthorityWrite::Catalog {
-            record: Some(record.clone()),
-            history: retry_transition.history().clone(),
-        };
-        let pending = ledger.recover_pending_claim().unwrap().unwrap();
-        assert!(matches!(
-            recover_pending_system_authority_catalog(
-                &mut store,
-                &mut executor,
-                tampered_history,
-                pending,
-                ledger.owner(),
-            ),
-            Err(SystemAuthorityRecoveryError::Journal(
-                JournalStoreError::NonCanonical
-            ))
-        ));
-        assert!(ledger.recover_pending_claim().unwrap().is_some());
-
-        let pending = ledger.recover_pending_claim().unwrap().unwrap();
-        let retired = match recover_pending_system_authority_catalog(
-            &mut store,
-            &mut executor,
-            current,
-            pending,
-            ledger.owner(),
-        )
-        .unwrap()
-        {
-            PendingSystemAuthorityCatalogRecovery::Retired(retired) => retired,
-            PendingSystemAuthorityCatalogRecovery::Pending(_) => unreachable!(),
-        };
-        assert!(retired.publication().is_none());
-        assert!(ledger.recover_pending_claim().unwrap().is_none());
-
-        drop(ledger);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn cold_catalog_recovery_rejects_a_later_unrelated_head_and_retains_intent() {
-        let CatalogPublicationFixture {
-            mut store,
-            mut executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        } = catalog_publication_fixture(0x4e);
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            }
-            .prepare_system_authority_catalog(reserved)
-            .unwrap();
-        let published = prepared
-            .publish_system_authority_catalog(ledger.owner())
-            .unwrap();
-        let exact_successor = published.facts().successor_heads();
-        drop(published);
-        let current =
-            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
-                .unwrap();
-        assert_eq!(current.heads_id(), exact_successor);
-        let checkpoint = prepare_checkpoint(&mut store, &current).unwrap();
-        let (_, later, _) = checkpoint.publish().unwrap();
-        assert_ne!(later.heads_id(), exact_successor);
-        assert_eq!(later.heads().previous, Some(exact_successor));
-
-        let pending = ledger.recover_pending_claim().unwrap().unwrap();
-        assert!(matches!(
-            recover_pending_system_authority_catalog(
-                &mut store,
-                &mut executor,
-                later,
-                pending,
-                ledger.owner(),
-            ),
-            Err(SystemAuthorityRecoveryError::Journal(
-                JournalStoreError::Conflict
-            ))
-        ));
-        let pending = ledger.recover_pending_claim().unwrap().unwrap();
-        assert_eq!(pending.expected_successor_heads(), Some(exact_successor));
-
-        drop(ledger);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn cold_pre_cas_intent_resumes_and_retires_without_a_signer() {
-        let RotationPublicationFixture {
-            mut store,
-            mut executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        } = rotation_publication_fixture(0xd8);
-        let route = ledger.route();
-        let local_node = ledger.local_node();
-        let journal_store = ledger.journal_store();
-        let retained = reserved.clone();
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            }
-            .prepare_system_authority_rotation(reserved)
-            .unwrap();
-        let facts = prepared.publication_facts().unwrap();
-        let predecessor_heads = predecessor.heads_id();
-        let certificate = ledger
-            .joint_rotation_certificate(&retained)
-            .unwrap()
-            .unwrap();
-        let injected = ledger
-            .owner()
-            .with_active_publication_reservation(&retained, &certificate, &facts, || {
-                Err::<(), _>(JournalStoreError::Unavailable)
-            })
-            .unwrap();
-        assert_eq!(injected, Err(JournalStoreError::Unavailable));
-        drop(prepared);
-        drop(retained);
-        drop(predecessor);
-        drop(executor);
-        let database_path = directory.join("evidence.redb");
-        drop(ledger);
-        drop(database);
-
-        // Reopen only the signer-independent route owner. No Reserved bearer
-        // or signer child survives the simulated process loss.
-        let database = alloc::sync::Arc::new(Database::open(&database_path).unwrap());
-        let owner = SystemAuthorityLedgerRouteOwner::open(
-            database.clone(),
-            route,
-            journal_store,
-            local_node,
-        )
-        .unwrap();
-        let mut materializer = ExactCreateRejectInvocations::default();
-        let predecessor =
-            materialize_current_reverified(&mut store, &mut materializer, &NoPrunedOrderedBases)
-                .unwrap();
-        assert_eq!(predecessor.heads_id(), predecessor_heads);
-        let pending = owner.recover_pending_claim().unwrap().unwrap();
-        assert_eq!(pending.predecessor_heads(), predecessor.heads_id());
-        assert_eq!(
-            pending.expected_successor_heads(),
-            Some(facts.successor_heads())
-        );
-        assert_eq!(store.heads().unwrap().unwrap().id(), predecessor.heads_id());
-        let mut divergent = RejectingAuthenticationExecutor;
-        assert!(matches!(
-            recover_pending_system_authority_rotation(
-                &mut store,
-                &mut divergent,
-                predecessor.clone(),
-                pending,
-                &owner,
-            ),
-            Err(SystemAuthorityRecoveryError::Replay(_))
-        ));
-        assert_eq!(store.heads().unwrap().unwrap().id(), predecessor_heads);
-        let pending = owner.recover_pending_claim().unwrap().unwrap();
-        assert_eq!(
-            pending.expected_successor_heads(),
-            Some(facts.successor_heads())
-        );
-        let mut executor = ExactCreateRejectInvocations::default();
-        let retired = match recover_pending_system_authority_rotation(
-            &mut store,
-            &mut executor,
-            predecessor.clone(),
-            pending,
-            &owner,
-        )
-        .unwrap()
-        {
-            PendingSystemAuthorityRotationRecovery::Retired(retired) => retired,
-            PendingSystemAuthorityRotationRecovery::Pending(_) => unreachable!(),
-        };
-        assert_eq!(
-            retired.materialization().heads_id(),
-            facts.successor_heads()
-        );
-        assert!(retired.publication().unwrap().heads_advanced);
-        assert_eq!(
-            store.heads().unwrap().unwrap().id(),
-            facts.successor_heads()
-        );
-        assert!(owner.recover_pending_claim().unwrap().is_none());
-
-        drop(owner);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn cold_pre_cas_resume_rejects_missing_intent_merge_seal_and_retains_pending() {
-        let RotationPublicationFixture {
-            mut store,
-            mut executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        } = rotation_publication_fixture(0xdc);
-        let retained = reserved.clone();
-        let mut missing_dependency = entry.clone();
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            }
-            .prepare_system_authority_rotation(reserved)
-            .unwrap();
-        let facts = prepared.publication_facts().unwrap();
-        let certificate = ledger
-            .owner()
-            .joint_rotation_certificate(&retained)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            ledger
-                .owner()
-                .with_active_publication_reservation(
-                    &retained,
-                    &certificate,
-                    &facts,
-                    || Err::<(), _>(JournalStoreError::Unavailable),
-                )
-                .unwrap(),
-            Err(JournalStoreError::Unavailable)
-        );
-        drop(prepared);
-        missing_dependency.merge_seal = Some(MergeSealId([0xed; 32]));
-        ledger
-            .owner()
-            .replace_pending_ordered_entry_for_test(missing_dependency)
-            .unwrap();
-
-        let heads_before = store.heads().unwrap().unwrap();
-        let pending = ledger.owner().recover_pending_claim().unwrap().unwrap();
-        let mut cold_executor = ExactCreateRejectInvocations::default();
-        assert!(matches!(
-            recover_pending_system_authority_rotation(
-                &mut store,
-                &mut cold_executor,
-                predecessor,
-                pending,
-                ledger.owner(),
-            ),
-            Err(SystemAuthorityRecoveryError::Replay(_))
-        ));
-        assert_eq!(store.heads().unwrap(), Some(heads_before));
-        assert!(ledger.owner().recover_pending_claim().unwrap().is_some());
-
-        drop(ledger);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn cold_immediate_rotation_successor_recovers_and_retires_exact_intent() {
-        let RotationPublicationFixture {
-            mut store,
-            mut executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        } = rotation_publication_fixture(0xd9);
-        let route = ledger.route();
-        let local_node = ledger.local_node();
-        let journal_store = ledger.journal_store();
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            }
-            .prepare_system_authority_rotation(reserved)
-            .unwrap();
-        let published = prepared
-            .publish_system_authority_rotation(ledger.owner())
-            .unwrap();
-        let expected_successor = published.facts().successor_heads();
-        drop(published);
-
-        // Memory journal durability is simulated by retaining the physical
-        // store while discarding all process-local replay and ledger objects.
-        let database_path = directory.join("evidence.redb");
-        drop(ledger);
-        drop(database);
-        let database = alloc::sync::Arc::new(Database::open(&database_path).unwrap());
-        let owner = SystemAuthorityLedgerRouteOwner::open(
-            database.clone(),
-            route,
-            journal_store,
-            local_node,
-        )
-        .unwrap();
-        let current =
-            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
-                .unwrap();
-        assert_eq!(current.heads_id(), expected_successor);
-        let pending = owner.recover_pending_claim().unwrap().unwrap();
-        let retired = match recover_pending_system_authority_rotation(
-            &mut store,
-            &mut executor,
-            current,
-            pending,
-            &owner,
-        )
-        .unwrap()
-        {
-            PendingSystemAuthorityRotationRecovery::Retired(retired) => retired,
-            PendingSystemAuthorityRotationRecovery::Pending(_) => unreachable!(),
-        };
-        assert!(retired.publication().is_none());
-        assert_eq!(retired.materialization().heads_id(), expected_successor);
-        assert_eq!(store.heads().unwrap().unwrap().id(), expected_successor);
-        assert!(owner.recover_pending_claim().unwrap().is_none());
-
-        drop(owner);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn cold_rotation_recovery_rejects_tampered_replay_write_without_retirement() {
-        let RotationPublicationFixture {
-            mut store,
-            mut executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        } = rotation_publication_fixture(0xda);
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            }
-            .prepare_system_authority_rotation(reserved)
-            .unwrap();
-        let published = prepared
-            .publish_system_authority_rotation(ledger.owner())
-            .unwrap();
-        drop(published);
-        let current =
-            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
-                .unwrap();
-        let mut tampered = current.clone();
-        tampered
-            .final_system_authority_write
-            .as_mut()
-            .unwrap()
-            .write
-            .operation = Hash([0x5a; 32]);
-        let pending = ledger.recover_pending_claim().unwrap().unwrap();
-        assert!(matches!(
-            recover_pending_system_authority_rotation(
-                &mut store,
-                &mut executor,
-                tampered,
-                pending,
-                ledger.owner(),
-            ),
-            Err(SystemAuthorityRecoveryError::Journal(
-                JournalStoreError::NonCanonical
-            ))
-        ));
-        assert!(ledger.recover_pending_claim().unwrap().is_some());
-
-        let pending = ledger.recover_pending_claim().unwrap().unwrap();
-        let retired = match recover_pending_system_authority_rotation(
-            &mut store,
-            &mut executor,
-            current,
-            pending,
-            ledger.owner(),
-        )
-        .unwrap()
-        {
-            PendingSystemAuthorityRotationRecovery::Retired(retired) => retired,
-            PendingSystemAuthorityRotationRecovery::Pending(_) => unreachable!(),
-        };
-        assert!(retired.publication().is_none());
-        assert!(ledger.recover_pending_claim().unwrap().is_none());
-
-        drop(ledger);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(all(feature = "std", feature = "storage"))]
-    #[test]
-    fn cold_rotation_recovery_rejects_a_later_unrelated_head() {
-        let RotationPublicationFixture {
-            mut store,
-            mut executor,
-            predecessor,
-            ledger,
-            reserved,
-            entry,
-            database,
-            directory,
-        } = rotation_publication_fixture(0xdb);
-        let prepared =
-            match prepare_ordered(&mut store, &mut executor, &predecessor, &entry).unwrap() {
-                ReplayPreparation::Ready(prepared) => prepared,
-                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-            }
-            .prepare_system_authority_rotation(reserved)
-            .unwrap();
-        let published = prepared
-            .publish_system_authority_rotation(ledger.owner())
-            .unwrap();
-        let exact_successor = published.facts().successor_heads();
-        drop(published);
-        let current =
-            materialize_current_reverified(&mut store, &mut executor, &NoPrunedOrderedBases)
-                .unwrap();
-        assert_eq!(current.heads_id(), exact_successor);
-        let checkpoint = prepare_checkpoint(&mut store, &current).unwrap();
-        let (_, later, _) = checkpoint.publish().unwrap();
-        assert_ne!(later.heads_id(), exact_successor);
-        assert_eq!(later.heads().previous, Some(exact_successor));
-
-        let pending = ledger.recover_pending_claim().unwrap().unwrap();
-        assert!(matches!(
-            recover_pending_system_authority_rotation(
-                &mut store,
-                &mut executor,
-                later,
-                pending,
-                ledger.owner(),
-            ),
-            Err(SystemAuthorityRecoveryError::Journal(
-                JournalStoreError::Conflict
-            ))
-        ));
-        assert!(ledger.recover_pending_claim().unwrap().is_some());
-
-        drop(ledger);
-        drop(database);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
     #[cfg(feature = "std")]
     #[test]
-    fn checkpoint_constructor_does_not_inherit_root_authority_provenance() {
-        let sealed = admitted_genesis(0xd3);
-        let node = admitted_config().replicas[0].node;
-        let mut store = MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
+    fn ordinary_local_checkpoint_cannot_acquire_root_authority_provenance() {
+        let sealed = admitted_local_genesis(0xd3);
+        let node = ordinary_local_config().replicas[0].node;
+        let runtime = sealed.genesis().runtime();
+        let mut store = MemoryAgentJournalStore::new(runtime.agent, node).unwrap();
         store
             .put_blob(
                 JournalBlobClass::CatalogArtifact,
-                &admitted_runtime().package,
+                &runtime.package,
                 b"replay-runtime-package",
             )
             .unwrap();
-        assert!(store.initialize(&sealed).unwrap());
+        assert!(store.initialize_ordinary_for_test(&sealed).unwrap());
         let mut executor = ExactCreateRejectInvocations::default();
         let materialized =
             materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
@@ -20236,7 +18472,15 @@ pub(crate) mod tests {
         };
         let mut machine = ReplayMachine::from_checkpoint(&checkpoint, ownership, None).unwrap();
         assert!(machine.replayed_root.is_none());
-        let input = authority_finalize_input(&sealed, admitted_finalize_for_test(&sealed, 2));
+        let root = admitted_genesis(0xd4);
+        let input = ReplayInput {
+            runtime: materialized.runtime().clone(),
+            operation: ReplayOperation::Management {
+                request: LifecycleRequest::FinalizeSystemAuthority(admitted_finalize_for_test(
+                    &root, 2,
+                )),
+            },
+        };
         assert!(matches!(
             machine.apply::<_, ()>(
                 &mut executor,
@@ -20275,11 +18519,12 @@ pub(crate) mod tests {
             root_admission.id().as_bytes()
         );
         let node = admitted_config().replicas[0].node;
-        let mut store = MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
+        let runtime = sealed.genesis().runtime();
+        let mut store = MemoryAgentJournalStore::new(runtime.agent, node).unwrap();
         store
             .put_blob(
                 JournalBlobClass::CatalogArtifact,
-                &admitted_runtime().package,
+                &runtime.package,
                 b"replay-runtime-package",
             )
             .unwrap();
@@ -20296,12 +18541,11 @@ pub(crate) mod tests {
         );
 
         let foreign_node = NodeId([0xc3; 32]);
-        let mut foreign_store =
-            MemoryAgentJournalStore::new(admitted_runtime().agent, foreign_node).unwrap();
+        let mut foreign_store = MemoryAgentJournalStore::new(runtime.agent, foreign_node).unwrap();
         foreign_store
             .put_blob(
                 JournalBlobClass::CatalogArtifact,
-                &admitted_runtime().package,
+                &runtime.package,
                 b"replay-runtime-package",
             )
             .unwrap();
@@ -20312,12 +18556,11 @@ pub(crate) mod tests {
 
         let mut wrong_principal = admitted_genesis(0xc4);
         wrong_principal.replica.principal = PrincipalId([0xc5; 32]);
-        let mut principal_store =
-            MemoryAgentJournalStore::new(admitted_runtime().agent, node).unwrap();
+        let mut principal_store = MemoryAgentJournalStore::new(runtime.agent, node).unwrap();
         principal_store
             .put_blob(
                 JournalBlobClass::CatalogArtifact,
-                &admitted_runtime().package,
+                &runtime.package,
                 b"replay-runtime-package",
             )
             .unwrap();
@@ -21914,7 +20157,7 @@ pub(crate) mod tests {
             parent: None,
             merge_frontier: authorized_state.merge_frontier(),
             merge_seal: None,
-            input: admitted_invocation(MethodMode::Linear, 0x6f),
+            input: clean_admitted_invocation(authorized_state.runtime(), MethodMode::Linear, 0x6f),
         };
         let committed =
             committed_shared_for_test(entry, &authorized_state, authorized.instance_id()).unwrap();
@@ -21946,7 +20189,7 @@ pub(crate) mod tests {
             parent: None,
             merge_frontier: heads.merge_frontier,
             merge_seal: None,
-            input: admitted_invocation(MethodMode::Linear, 0x70),
+            input: clean_admitted_invocation(materialized.runtime(), MethodMode::Linear, 0x70),
         };
         let (committee, _) = shared_test_committee(&entry.input.runtime);
         let route = AgentRouteKey::new(
@@ -22017,7 +20260,7 @@ pub(crate) mod tests {
             ordered_base: left_base.ordered_base(),
             causal_height: 1,
             parents: Vec::new(),
-            input: admitted_invocation(MethodMode::Merge, discriminator),
+            input: clean_admitted_invocation(left_base.runtime(), MethodMode::Merge, discriminator),
             signature: vec![discriminator; ED25519_SIGNATURE_BYTES],
         };
         let pinned_event = event(0x71);
@@ -22075,7 +20318,7 @@ pub(crate) mod tests {
             parent: None,
             merge_frontier: pinned_frontier.id(),
             merge_seal: None,
-            input: admitted_invocation(MethodMode::Linear, 0x74),
+            input: clean_admitted_invocation(left_active.runtime(), MethodMode::Linear, 0x74),
         };
         let expected = match prepare_ordered(
             &mut oracle_store,
@@ -22256,7 +20499,7 @@ pub(crate) mod tests {
             parent: None,
             merge_frontier: missing,
             merge_seal: None,
-            input: admitted_invocation(MethodMode::Linear, 0x82),
+            input: clean_admitted_invocation(base.runtime(), MethodMode::Linear, 0x82),
         };
         let missing_commit =
             committed_placeholder_for_test(missing_entry, &base, store.instance_id()).unwrap();
@@ -22278,7 +20521,7 @@ pub(crate) mod tests {
             ordered_base: base.ordered_base(),
             causal_height: 1,
             parents: Vec::new(),
-            input: admitted_invocation(MethodMode::Merge, 0x83),
+            input: clean_admitted_invocation(base.runtime(), MethodMode::Merge, 0x83),
             signature: vec![0x83; ED25519_SIGNATURE_BYTES],
         };
         let noncausal = MergeEvent {
@@ -22288,7 +20531,7 @@ pub(crate) mod tests {
             ordered_base: base.ordered_base(),
             causal_height: 3,
             parents: vec![causal_parent.id()],
-            input: admitted_invocation(MethodMode::Merge, 0x85),
+            input: clean_admitted_invocation(base.runtime(), MethodMode::Merge, 0x85),
             signature: vec![0x85; ED25519_SIGNATURE_BYTES],
         };
         let frontier = MergeFrontier {
@@ -22304,7 +20547,7 @@ pub(crate) mod tests {
             parent: None,
             merge_frontier: frontier.id(),
             merge_seal: None,
-            input: admitted_invocation(MethodMode::Linear, 0x84),
+            input: clean_admitted_invocation(base.runtime(), MethodMode::Linear, 0x84),
         };
         let noncausal_commit =
             committed_placeholder_for_test(noncausal_entry, &base, store.instance_id()).unwrap();
@@ -22323,7 +20566,7 @@ pub(crate) mod tests {
 
     #[cfg(all(feature = "std", feature = "storage"))]
     #[test]
-    fn shared_fence_rejects_excluded_pending_owner_and_accepts_full_frontier() {
+    fn shared_fence_rejects_excluded_active_merge_and_accepts_full_frontier() {
         let mut store = initialized_shared_replay_store();
         let mut executor = ExactCreateRejectInvocations::default();
         let base = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
@@ -22334,14 +20577,12 @@ pub(crate) mod tests {
             ordered_base: base.ordered_base(),
             causal_height: 1,
             parents: Vec::new(),
-            input: admitted_invocation(MethodMode::Merge, discriminator),
+            input: clean_admitted_invocation(base.runtime(), MethodMode::Merge, discriminator),
             signature: vec![discriminator; ED25519_SIGNATURE_BYTES],
         };
         let retained = event(0x91);
         let excluded = event(0x92);
         let after_retained = publish_test_merge(&mut store, &mut executor, &base, &retained);
-        let mut excluding_oracle_store = store.clone();
-        let mut excluding_oracle_executor = ExactCreateRejectInvocations::default();
         let active = publish_test_merge(&mut store, &mut executor, &after_retained, &excluded);
         let retained_frontier = after_retained.merge_frontier();
         let retained_seal = persist_projection_seal(
@@ -22350,13 +20591,6 @@ pub(crate) mod tests {
             retained_frontier,
             &after_retained.state().merge,
         );
-        let oracle_retained_seal = persist_projection_seal(
-            &mut excluding_oracle_store,
-            &after_retained,
-            retained_frontier,
-            &after_retained.state().merge,
-        );
-        assert_eq!(oracle_retained_seal, retained_seal);
         let excluding_entry = OrderedEntry {
             genesis: active.heads().genesis,
             index: 1,
@@ -22368,18 +20602,6 @@ pub(crate) mod tests {
                 operation: ReplayOperation::SealMerge,
             },
         };
-        let excluding_expected = match prepare_ordered(
-            &mut excluding_oracle_store,
-            &mut excluding_oracle_executor,
-            &after_retained,
-            &excluding_entry,
-        )
-        .unwrap()
-        {
-            ReplayPreparation::Ready(prepared) => prepared,
-            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
-        };
-        let (_, _excluding_successor, _) = excluding_expected.publish().unwrap();
         let excluding_commit =
             committed_shared_for_test(excluding_entry, &active, store.instance_id()).unwrap();
         assert!(matches!(
@@ -22393,19 +20615,11 @@ pub(crate) mod tests {
             Err(ReplayError::InvalidFence)
         ));
         assert_eq!(store.heads().unwrap().unwrap(), *active.heads());
-        assert_eq!(
-            recover_invocation(
-                &mut store,
-                &active,
-                &excluded.input,
-                merge_position(&excluded),
-            )
-            .unwrap(),
-            ReplayInvocationRecovery::Pending
-        );
-
         let mut inclusive_oracle_store = store.clone();
         let mut inclusive_oracle_executor = ExactCreateRejectInvocations::default();
+        inclusive_oracle_executor
+            .seed_genesis(&inclusive_oracle_store.genesis().unwrap().unwrap())
+            .unwrap();
         let inclusive_seal = persist_merge_seal(&mut store, &active);
         let oracle_inclusive_seal = persist_merge_seal(&mut inclusive_oracle_store, &active);
         assert_eq!(oracle_inclusive_seal, inclusive_seal);
@@ -22415,10 +20629,14 @@ pub(crate) mod tests {
             parent: None,
             merge_frontier: active.merge_frontier(),
             merge_seal: Some(inclusive_seal),
-            input: ReplayInput {
-                runtime: active.runtime().clone(),
-                operation: ReplayOperation::SealMerge,
-            },
+            input: clean_admitted_management(
+                active.runtime(),
+                crate::agent_sdk::ManagementRequest::Suspend {
+                    actor: crate::agent_sdk::ActorId([0x94; 32]),
+                    expected_deployment: crate::agent_sdk::DeploymentId([0x95; 32]),
+                },
+                2,
+            ),
         };
         let inclusive_expected = match prepare_ordered(
             &mut inclusive_oracle_store,
@@ -22460,7 +20678,7 @@ pub(crate) mod tests {
         assert_eq!(receipt.claim(), &expected_claim);
         assert_eq!(fenced.merge_frontier(), active.merge_frontier());
         assert_eq!(fenced.heads().merge_fence.index, inclusive_entry.index);
-        assert_eq!(finalized.len(), 3);
+        assert_eq!(finalized.len(), 1);
         let reopened =
             materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
         assert_eq!(reopened.heads(), fenced.heads());

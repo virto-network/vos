@@ -88,6 +88,22 @@ pub(super) fn recent_clean_management_input<S: AgentJournalStore>(
     request: &crate::agent_sdk::ManagementRequest,
     authority: &crate::agent_sdk::authority::AuthorityReceipt,
 ) -> Result<Option<ReplayInputId>, JournalStoreError> {
+    Ok(
+        recent_clean_management_operation(store, materialization, request, authority)?
+            .map(|(input, _)| input),
+    )
+}
+
+/// Locate the exact durable clean-management input and retain the logical
+/// slot at which the guest originally admitted it. Post-application authority
+/// acknowledgements must bind that historical slot on a result-loss retry;
+/// resampling the current clock would produce a different application proof.
+pub(super) fn recent_clean_management_operation<S: AgentJournalStore>(
+    store: &S,
+    materialization: &ReplayMaterialization,
+    request: &crate::agent_sdk::ManagementRequest,
+    authority: &crate::agent_sdk::authority::AuthorityReceipt,
+) -> Result<Option<(ReplayInputId, u64)>, JournalStoreError> {
     let mut cursor = materialization.heads().ordered_head;
     for _ in 0..MAX_PENDING_CLEAN_INVOCATION_RESULTS {
         let Some(id) = cursor else {
@@ -105,15 +121,58 @@ pub(super) fn recent_clean_management_input<S: AgentJournalStore>(
         {
             return Err(JournalStoreError::Corrupt);
         }
-        if matches!(
-            &entry.input.operation,
-            ReplayOperation::CleanManage {
-                request: prior_request,
-                authority: prior_authority,
-                ..
-            } if prior_request == request && prior_authority == authority
-        ) {
-            return Ok(Some(entry.input.id()));
+        if let ReplayOperation::CleanManage {
+            request: prior_request,
+            authority: prior_authority,
+            observed_slot,
+        } = &entry.input.operation
+            && prior_request == request
+            && prior_authority == authority
+        {
+            return Ok(Some((entry.input.id(), *observed_slot)));
+        }
+        cursor = entry.parent;
+    }
+    Ok(None)
+}
+
+/// Locate an exact clean ordered invocation in the bounded durable suffix.
+/// The historical observation slot is deliberately retained by the journal;
+/// retry identity is the immutable work and authorization pair.
+pub(super) fn recent_clean_ordered_input<S: AgentJournalStore>(
+    store: &S,
+    materialization: &ReplayMaterialization,
+    work: &crate::agent_sdk::InvocationWork,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+) -> Result<Option<ReplayInputId>, JournalStoreError> {
+    let mut cursor = materialization.heads().ordered_head;
+    for _ in 0..MAX_PENDING_CLEAN_INVOCATION_RESULTS {
+        let Some(id) = cursor else {
+            return Ok(None);
+        };
+        if materialization.replay_boundary().head == Some(id) {
+            return Ok(None);
+        }
+        let entry = store
+            .get::<OrderedEntry>(id)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        if entry.id() != id
+            || entry.genesis != materialization.heads().genesis
+            || entry.index > materialization.heads().ordered_index
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        if let ReplayOperation::CleanInvoke {
+            work: prior_work,
+            authorization: prior_authorization,
+            ..
+        } = &entry.input.operation
+            && prior_work.invocation == work.invocation
+        {
+            if prior_work == work && prior_authorization == authorization {
+                return Ok(Some(entry.input.id()));
+            }
+            return Err(JournalStoreError::Conflict);
         }
         cursor = entry.parent;
     }
@@ -666,6 +725,8 @@ pub(crate) struct StandardLocalReplayExecutor<R> {
     management_gas: Gas,
     last_management_result: Option<(ReplayInputId, Result<LifecycleReply, LifecycleError>)>,
     pending_clean_invocation_results: BTreeMap<ReplayInputId, crate::agent_sdk::RuntimeOutcome>,
+    recent_clean_ordered_results: BTreeMap<ReplayInputId, crate::agent_sdk::RuntimeOutcome>,
+    recent_clean_ordered_order: VecDeque<ReplayInputId>,
     recent_clean_management_results: BTreeMap<ReplayInputId, crate::agent_sdk::RuntimeOutcome>,
     recent_clean_management_order: VecDeque<ReplayInputId>,
     clean_genesis_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
@@ -850,6 +911,61 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             return Err(LocalReplayExecutorError::InvalidState);
         }
         Ok(returned)
+    }
+
+    /// Execute one read-only SDK management query against the exact current
+    /// runtime/state. The transition must preserve every lane byte-for-byte;
+    /// this is observational and never enters a journal or Raft slot.
+    pub(crate) fn inspect_clean_management(
+        &self,
+        binding: &RuntimeBinding,
+        before: &RuntimeState,
+        request: &crate::agent_sdk::ManagementRequest,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, LocalReplayExecutorError> {
+        if !matches!(
+            request,
+            crate::agent_sdk::ManagementRequest::InspectActors { .. }
+                | crate::agent_sdk::ManagementRequest::InspectResources
+        ) {
+            return Err(LocalReplayExecutorError::InvalidRequest);
+        }
+        let runtime = self.clean_runtime_package(binding)?;
+        let descriptor = Self::current_clean_descriptor(
+            self.clean_genesis_descriptor
+                .as_ref()
+                .ok_or(LocalReplayExecutorError::InvalidState)?,
+            binding,
+            &runtime,
+        )?;
+        let observed_slot = self.current_logical_slot()?;
+        let work = crate::agent_sdk::RuntimeWork::Manage {
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            runtime_deployment: descriptor.identity.runtime_deployment,
+            state: crate::agent_sdk::RuntimeState {
+                control: before.control.clone(),
+                linear: before.linear.clone(),
+                merge: before.merge.clone(),
+                local: before.local.clone(),
+            },
+            request: Box::new(request.clone()),
+            authority: None,
+            observed_slot,
+        };
+        let encoded = work
+            .encode()
+            .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+        let returned: crate::agent_sdk::RuntimeTransition =
+            self.execute_agent_wire(runtime.program_bytes(), self.management_gas, &encoded)?;
+        if returned.state.control != before.control
+            || returned.state.linear != before.linear
+            || returned.state.merge != before.merge
+            || returned.state.local != before.local
+            || !super::driver::sdk_management_reply_matches(&descriptor, request, &returned.outcome)
+        {
+            return Err(LocalReplayExecutorError::InvalidState);
+        }
+        Ok(returned.outcome)
     }
 
     pub(crate) fn clean_installed_actor_lanes(
@@ -1164,6 +1280,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             management_gas: DEFAULT_MANAGEMENT_GAS,
             last_management_result: None,
             pending_clean_invocation_results: BTreeMap::new(),
+            recent_clean_ordered_results: BTreeMap::new(),
+            recent_clean_ordered_order: VecDeque::new(),
             recent_clean_management_results: BTreeMap::new(),
             recent_clean_management_order: VecDeque::new(),
             clean_genesis_descriptor: None,
@@ -1190,6 +1308,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             management_gas: DEFAULT_MANAGEMENT_GAS,
             last_management_result: None,
             pending_clean_invocation_results: BTreeMap::new(),
+            recent_clean_ordered_results: BTreeMap::new(),
+            recent_clean_ordered_order: VecDeque::new(),
             recent_clean_management_results: BTreeMap::new(),
             recent_clean_management_order: VecDeque::new(),
             clean_genesis_descriptor: None,
@@ -1332,6 +1452,13 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         self.recent_clean_management_results.get(&input).cloned()
     }
 
+    pub(crate) fn clean_ordered_result(
+        &self,
+        input: ReplayInputId,
+    ) -> Option<crate::agent_sdk::RuntimeOutcome> {
+        self.recent_clean_ordered_results.get(&input).cloned()
+    }
+
     fn record_clean_invocation_result(
         &mut self,
         input: ReplayInputId,
@@ -1346,7 +1473,19 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 self.pending_clean_invocation_results.remove(&evicted);
             }
         }
-        self.pending_clean_invocation_results.insert(input, result);
+        self.pending_clean_invocation_results
+            .insert(input, result.clone());
+        if self.recent_clean_ordered_results.contains_key(&input) {
+            self.recent_clean_ordered_results.insert(input, result);
+            return;
+        }
+        if self.recent_clean_ordered_results.len() == MAX_PENDING_CLEAN_INVOCATION_RESULTS
+            && let Some(evicted) = self.recent_clean_ordered_order.pop_front()
+        {
+            self.recent_clean_ordered_results.remove(&evicted);
+        }
+        self.recent_clean_ordered_order.push_back(input);
+        self.recent_clean_ordered_results.insert(input, result);
     }
 
     fn record_clean_management_result(
@@ -1503,8 +1642,14 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         else {
             return Err(LocalReplayExecutorError::Package(PackageError::WrongKind));
         };
-        let parsed_schema = super::schema::decode(schema)
-            .ok_or_else(|| LocalReplayExecutorError::InvalidArtifact(admission.schema.clone()))?;
+        let parsed_schema = crate::agent_sdk::schema::decode(schema)
+            .map_err(|_| LocalReplayExecutorError::InvalidArtifact(admission.schema.clone()))?;
+        let state_layout = Hash(
+            parsed_schema
+                .state_layout_hash()
+                .map_err(|_| LocalReplayExecutorError::InvalidArtifact(admission.schema.clone()))?
+                .0,
+        );
         if package.deployment_id() != admission.deployment
             || package.manifest.program != admission.program
             || package.deployment_signature.producer != admission.producer
@@ -1521,8 +1666,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             || package_requirements != admission.requirements
             || !config.runtime_contract.supports(admission.contract)
             || !config.capabilities.satisfies(admission.requirements)
-            || parsed_schema.state_layout_hash() != admission.state_layout
-            || parsed_schema.lanes() != admission.requirements.lanes
+            || state_layout != admission.state_layout
             || crate::service::PackageRolePolicies::decode(policies).is_err()
         {
             return Err(LocalReplayExecutorError::InvalidArtifact(
@@ -1924,9 +2068,16 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         };
         let schema = self.load(&record.agent_schema)?;
         let policies = self.load(&record.role_policies)?;
-        let parsed_schema = super::schema::decode(&schema).ok_or_else(|| {
-            LocalReplayExecutorError::InvalidArtifact(record.agent_schema.clone())
-        })?;
+        let parsed_schema = crate::agent_sdk::schema::decode(&schema)
+            .map_err(|_| LocalReplayExecutorError::InvalidArtifact(record.agent_schema.clone()))?;
+        let state_layout = Hash(
+            parsed_schema
+                .state_layout_hash()
+                .map_err(|_| {
+                    LocalReplayExecutorError::InvalidArtifact(record.agent_schema.clone())
+                })?
+                .0,
+        );
         if package.deployment_id() != record.entry.deployment
             || package.manifest.program != record.entry.program
             || package.deployment_signature.producer != record.producer
@@ -1950,8 +2101,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             || record.entry.state_layout != record.state_layout
             || !config.runtime_contract.supports(contract)
             || !config.capabilities.satisfies(requirements)
-            || parsed_schema.state_layout_hash() != record.state_layout
-            || parsed_schema.lanes() != record.entry.lanes
+            || state_layout != record.state_layout
             || crate::service::PackageRolePolicies::decode(&policies).is_err()
             || !package
                 .accepts_installation_data_reference(record.installation_data.as_ref())
@@ -2561,11 +2711,17 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                     request: invocation.commitment(),
                     authority: Box::new(authority.clone()),
                 };
-                let returned: RuntimeReturn = self.execute_wire(
-                    &runtime_pvm,
-                    self.management_gas,
-                    &RuntimeCall::new(before.clone(), request).encode(),
-                )?;
+                let call = RuntimeCall::new(before.clone(), request);
+                #[cfg(test)]
+                let returned = if self.trust.use_native_standard_runtime_for_test() {
+                    super::wire::apply_standard(call)
+                        .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
+                } else {
+                    self.execute_wire(&runtime_pvm, self.management_gas, &call.encode())?
+                };
+                #[cfg(not(test))]
+                let returned: RuntimeReturn =
+                    self.execute_wire(&runtime_pvm, self.management_gas, &call.encode())?;
                 self.validate_state_size(&returned.state, &config)?;
                 if !matches!(
                     returned.result,
@@ -2594,21 +2750,33 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                 let empty = Self::empty_blob;
                 let (actor_pvm, actor_schema, actor_policies, installation_data) =
                     artifacts.unwrap_or_else(|| (Vec::new(), empty(), empty(), None));
+                let call = RuntimeExecutionCall {
+                    state: before.clone(),
+                    invocation: invocation.clone(),
+                    authority: authority.clone(),
+                    observed_slot: *observed_slot,
+                    recovery_only,
+                    actor_pvm,
+                    actor_schema,
+                    actor_policies,
+                    installation_data,
+                };
+                #[cfg(all(test, feature = "pvm"))]
+                let returned = if self.trust.use_native_standard_runtime_for_test() {
+                    super::wire::apply_standard_execution(call)
+                        .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
+                } else {
+                    self.execute_wire(
+                        &runtime_pvm,
+                        self.management_gas.saturating_add(invocation.gas),
+                        &call.encode(),
+                    )?
+                };
+                #[cfg(any(not(test), all(test, not(feature = "pvm"))))]
                 let returned: RuntimeExecutionReturn = self.execute_wire(
                     &runtime_pvm,
                     self.management_gas.saturating_add(invocation.gas),
-                    &RuntimeExecutionCall {
-                        state: before.clone(),
-                        invocation: invocation.clone(),
-                        authority: authority.clone(),
-                        observed_slot: *observed_slot,
-                        recovery_only,
-                        actor_pvm,
-                        actor_schema,
-                        actor_policies,
-                        installation_data,
-                    }
-                    .encode(),
+                    &call.encode(),
                 )?;
                 self.validate_state_size(&returned.state, &config)?;
                 ReplayTransition {
@@ -3311,6 +3479,76 @@ where
         Ok((create, catalog))
     }
 
+    /// Construct the exact clean SDK Create input used by the independently
+    /// root/QC-authorized one-voter Shared system Agent. This is deliberately
+    /// separate from ordinary system-Agent finality: it performs only package,
+    /// descriptor, receipt, clock, and physical-replica binding. The returned
+    /// input still has to pass [`Self::prepare_system_genesis`] and the root
+    /// seal before any Shared journal bytes may be initialized.
+    pub(crate) fn clean_shared_system_genesis_input(
+        descriptor: crate::agent_sdk::AgentDescriptor,
+        runtime_package: &super::package_admission::AdmittedRuntimePackage,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        observed_slot: u64,
+        trust: &Arc<dyn AgentTrustProvider>,
+        merge: &Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<(ReplayInput, Vec<RuntimeBlob>), LocalJournalDriverError> {
+        let [replica] = descriptor.replicas.as_slice() else {
+            return Err(LocalReplayExecutorError::WrongReplica.into());
+        };
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+            || replica.role != crate::agent_sdk::ReplicaRole::Voter
+            || replica.node.0 != merge.node().0
+            || descriptor.runtime_package != *runtime_package.package_ref()
+            || descriptor.identity.runtime_deployment != runtime_package.deployment()
+            || descriptor.identity.runtime_program != runtime_package.program()
+            || descriptor.identity.runtime_producer != runtime_package.producer()
+            || descriptor.runtime_contract != runtime_package.manifest().contract
+            || descriptor.capabilities != runtime_package.capabilities()
+        {
+            return Err(LocalReplayExecutorError::InvalidRequest.into());
+        }
+        if trust
+            .current_logical_slot()
+            .is_none_or(|current| current < observed_slot)
+        {
+            return Err(LocalReplayExecutorError::TrustUnavailable.into());
+        }
+        let request = crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+        super::driver::verify_clean_management_receipt(
+            &descriptor,
+            &request,
+            &authority,
+            observed_slot,
+            false,
+        )
+        .map_err(|_| LocalReplayExecutorError::InvalidAuthority)?;
+        let catalog = vec![Self::runtime_blob(runtime_package.exact_bytes().to_vec())];
+        let runtime = RuntimeBinding {
+            space: crate::service::SpaceId(descriptor.identity.space.0),
+            agent: crate::service::AgentId(descriptor.identity.agent.0),
+            deployment: DeploymentId(descriptor.identity.runtime_deployment.0),
+            program: ProgramId(descriptor.identity.runtime_program.0),
+            producer: ProducerId(descriptor.identity.runtime_producer.0),
+            package: catalog[0].reference.clone(),
+            runtime_abi: super::RUNTIME_ABI_ID,
+            execution_semantics: super::EXECUTION_SEMANTICS_ID,
+        };
+        let create = ReplayInput {
+            runtime,
+            operation: ReplayOperation::CleanManage {
+                request,
+                authority,
+                observed_slot,
+            },
+        };
+        create
+            .validate()
+            .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+        Ok((create, catalog))
+    }
+
     /// Execute and authenticate the bootstrap-owned Create input without
     /// writing a destination store. The returned opaque replay token is the
     /// sole input accepted by the independent genesis proposal/seal path.
@@ -3324,9 +3562,27 @@ where
         if replica.node != merge.node() {
             return Err(LocalReplayExecutorError::WrongReplica.into());
         }
+        let ReplayOperation::CleanManage {
+            request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+            ..
+        } = &create.operation
+        else {
+            return Err(LocalReplayExecutorError::InvalidRequest.into());
+        };
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+            || descriptor.replicas.len() != 1
+            || descriptor.replicas[0].role != crate::agent_sdk::ReplicaRole::Voter
+            || descriptor.replicas[0].node.0 != replica.node.0
+            || descriptor.replicas[0].principal.0 != replica.principal.0
+            || replica.role != super::ReplicaRole::Voter
+        {
+            return Err(LocalReplayExecutorError::InvalidRequest.into());
+        }
         let supplied = SuppliedCatalogBlobResolver::from_catalog(catalog)?;
         let expected_catalog = supplied.blobs.clone();
-        let mut executor = StandardLocalReplayExecutor::new(supplied, trust, merge);
+        let mut executor =
+            StandardLocalReplayExecutor::new_shared(supplied, trust, merge, Vec::new());
         let prepared = ReplayPreparedGenesis::prepare(create, replica, &mut executor)
             .map_err(lift_prepared_genesis_error)?;
         if expected_catalog.len() != prepared.artifacts().len()
@@ -3351,7 +3607,23 @@ where
         trust: Arc<dyn AgentTrustProvider>,
         merge: Arc<dyn LocalMergeAuthenticator>,
     ) -> Result<ReplaySealedLocalGenesis, LocalJournalDriverError> {
-        let prepared = Self::prepare_system_genesis(create, replica, catalog, trust, merge)?;
+        if replica.node != merge.node() {
+            return Err(LocalReplayExecutorError::WrongReplica.into());
+        }
+        let supplied = SuppliedCatalogBlobResolver::from_catalog(catalog)?;
+        let expected_catalog = supplied.blobs.clone();
+        let mut executor = StandardLocalReplayExecutor::new(supplied, trust, merge);
+        let prepared = ReplayPreparedGenesis::prepare(create, replica, &mut executor)
+            .map_err(lift_prepared_genesis_error)?;
+        if expected_catalog.len() != prepared.artifacts().len()
+            || prepared.artifacts().iter().any(|reference| {
+                expected_catalog
+                    .get(&(reference.hash, reference.len))
+                    .is_none_or(|bytes| !reference.matches(bytes))
+            })
+        {
+            return Err(LocalJournalDriverError::InvalidResult);
+        }
         ReplaySealedLocalGenesis::from_prepared(prepared).map_err(|error| {
             LocalJournalDriverError::Replay(
                 error
@@ -3803,9 +4075,8 @@ where
         else {
             return Err(LocalReplayExecutorError::Package(PackageError::WrongKind).into());
         };
-        let schema = super::schema::decode(&package.agent_schema).ok_or(
-            LocalReplayExecutorError::Package(PackageError::InvalidActorArtifacts),
-        )?;
+        let schema = crate::agent_sdk::schema::decode(&package.agent_schema)
+            .map_err(|_| LocalReplayExecutorError::Package(PackageError::InvalidActorArtifacts))?;
         let config = self.trusted_current_config()?;
         let actor = match parent {
             Some(parent) => ActorId::owned_child(parent, &name),
@@ -3825,7 +4096,14 @@ where
         let package_reference = catalog[0].reference.clone();
         let schema_reference = catalog[1].reference.clone();
         let policies_reference = catalog[2].reference.clone();
-        let state_layout = schema.state_layout_hash();
+        let state_layout = Hash(
+            schema
+                .state_layout_hash()
+                .map_err(|_| {
+                    LocalReplayExecutorError::Package(PackageError::InvalidActorArtifacts)
+                })?
+                .0,
+        );
         let constructor_abi = package
             .constructor_abi()
             .map_err(LocalReplayExecutorError::Package)?;
@@ -3886,9 +4164,8 @@ where
         else {
             return Err(LocalReplayExecutorError::Package(PackageError::WrongKind).into());
         };
-        let schema = super::schema::decode(&package.agent_schema).ok_or(
-            LocalReplayExecutorError::Package(PackageError::InvalidActorArtifacts),
-        )?;
+        let schema = crate::agent_sdk::schema::decode(&package.agent_schema)
+            .map_err(|_| LocalReplayExecutorError::Package(PackageError::InvalidActorArtifacts))?;
         let constructor_abi = package
             .constructor_abi()
             .map_err(LocalReplayExecutorError::Package)?;
@@ -3920,7 +4197,14 @@ where
                 agent_schema: catalog[1].reference.clone(),
                 role_policies: catalog[2].reference.clone(),
                 constructor_abi,
-                state_layout: schema.state_layout_hash(),
+                state_layout: Hash(
+                    schema
+                        .state_layout_hash()
+                        .map_err(|_| {
+                            LocalReplayExecutorError::Package(PackageError::InvalidActorArtifacts)
+                        })?
+                        .0,
+                ),
                 contract,
                 requirements,
             }),
@@ -5071,6 +5355,25 @@ where
         let mut expected = StandardAgentRuntime::restore(decoded)
             .map_err(|_| LocalJournalDriverError::InvalidResult)?;
         let expected_result = expected.apply(request.clone());
+        #[cfg(test)]
+        let returned = if self
+            .core
+            .executor
+            .trust
+            .use_native_standard_runtime_for_test()
+        {
+            RuntimeReturn {
+                state: encode_standard_runtime_state(&expected.snapshot()),
+                result: expected_result.clone(),
+            }
+        } else {
+            self.core.executor.execute_wire(
+                &runtime.pvm,
+                self.core.executor.management_gas,
+                &RuntimeCall::new(self.core.materialization.state().clone(), request).encode(),
+            )?
+        };
+        #[cfg(not(test))]
         let returned: RuntimeReturn = self.core.executor.execute_wire(
             &runtime.pvm,
             self.core.executor.management_gas,
@@ -5411,26 +5714,16 @@ mod tests {
     use super::super::authority::{
         ActorInvocationClaim, AgentAuthorityBinding, AgentAuthorityClaim,
     };
-    use super::super::bootstrap::{
-        SystemAgentGenesisLocator, SystemAgentGenesisProposal, SystemAgentGenesisProvision,
-        seal_prepared_system_agent_genesis,
-    };
-    use super::super::committee::{
-        AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
-        AuthorityQuorumCertificate, AuthoritySignature, AuthoritySignerId, RootAnchorPins,
-        RootAnchorRecord, SystemAgentGenesisClaim, SystemAgentGenesisEvidence,
-    };
     use super::super::contract::{ActorPackageContract, RuntimePackageContract};
     use super::super::execution::ActorInvocationAuth;
     use super::super::journal_store::{
         AgentJournalGarbageCollection, GcLimits, MemoryAgentJournalStore,
     };
-    use super::super::package::{PackageManifest, actor_runtime_requirements};
-    use super::super::system_authority::{SystemAuthorityGenesis, SystemAuthorityState};
+    use super::super::package::{PackageManifest, sdk_actor_runtime_requirements};
     use super::super::wire::encode_standard_runtime_state;
     use super::super::{
-        ActorEntry, FieldPersistence, InstallActor, LaneSet, MethodMode, RuntimeCapabilities,
-        RuntimeRequirements, StateLane,
+        ActorEntry, InstallActor, LaneSet, MethodMode, RuntimeCapabilities, RuntimeRequirements,
+        StateLane,
     };
     use crate::service::{
         ActorId, CapabilityId, CredentialId, DeploymentId, DeploymentSignature, InvocationId,
@@ -5439,7 +5732,7 @@ mod tests {
     use ed25519_dalek::{Signer as _, SigningKey};
     use std::sync::{
         Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     };
 
     struct StaticTrust {
@@ -5460,6 +5753,10 @@ mod tests {
         fn verify_package(&self, _agent: &AgentConfig, _package: &Package) -> bool {
             self.trust_packages
         }
+
+        fn use_native_standard_runtime_for_test(&self) -> bool {
+            true
+        }
     }
 
     struct MutableTrust {
@@ -5477,31 +5774,6 @@ mod tests {
         }
 
         fn verify_package(&self, _agent: &AgentConfig, _package: &Package) -> bool {
-            true
-        }
-    }
-
-    struct CountingTrust {
-        slot: u64,
-        authority: AgentAuthorityBinding,
-        slot_samples: AtomicUsize,
-        authority_checks: AtomicUsize,
-        package_checks: AtomicUsize,
-    }
-
-    impl AgentTrustProvider for CountingTrust {
-        fn current_logical_slot(&self) -> Option<u64> {
-            self.slot_samples.fetch_add(1, Ordering::Relaxed);
-            Some(self.slot)
-        }
-
-        fn authority_for_space(&self, _space: SpaceId) -> Option<AgentAuthorityBinding> {
-            self.authority_checks.fetch_add(1, Ordering::Relaxed);
-            Some(self.authority.clone())
-        }
-
-        fn verify_package(&self, _agent: &AgentConfig, _package: &Package) -> bool {
-            self.package_checks.fetch_add(1, Ordering::Relaxed);
             true
         }
     }
@@ -5907,6 +6179,28 @@ mod tests {
         .unwrap();
         assert_eq!(driver.core.materialization.heads().ordered_index, 0);
 
+        let mut not_yet_valid = clean_test_receipt(&descriptor, &success, 2, &authority_key);
+        not_yet_valid.selector.valid_from = 21;
+        not_yet_valid.signature = authority_key
+            .sign(&not_yet_valid.signing_bytes())
+            .to_bytes();
+        assert!(matches!(
+            driver.clean_manage(success.clone(), not_yet_valid, SdkManagementArtifacts::None,),
+            Err(LocalJournalDriverError::Executor(
+                LocalReplayExecutorError::InvalidAuthority
+            ))
+        ));
+        let mut expired = clean_test_receipt(&descriptor, &success, 2, &authority_key);
+        expired.selector.expires_at = 19;
+        expired.signature = authority_key.sign(&expired.signing_bytes()).to_bytes();
+        assert!(matches!(
+            driver.clean_manage(success.clone(), expired, SdkManagementArtifacts::None),
+            Err(LocalJournalDriverError::Executor(
+                LocalReplayExecutorError::InvalidAuthority
+            ))
+        ));
+        assert_eq!(driver.core.materialization.heads().ordered_index, 0);
+
         slot.store(21, Ordering::SeqCst);
         let success_receipt = clean_test_receipt(&descriptor, &success, 2, &authority_key);
         let first = driver
@@ -6070,7 +6364,7 @@ mod tests {
     }
 
     fn initialized_core() -> LocalJournalCore<MemoryAgentJournalStore, ExactTestExecutor> {
-        let sealed = super::super::replay::tests::admitted_genesis(0xe1);
+        let sealed = super::super::replay::tests::admitted_local_genesis(0xe1);
         let node = sealed.replica().node;
         let mut store =
             MemoryAgentJournalStore::new(sealed.genesis().runtime().agent, node).unwrap();
@@ -6085,7 +6379,7 @@ mod tests {
                 runtime_bytes,
             )
             .unwrap();
-        store.initialize(&sealed).unwrap();
+        assert!(store.initialize_ordinary_for_test(&sealed).unwrap());
         LocalJournalCore::open(store, ExactTestExecutor::default()).unwrap()
     }
 
@@ -6214,26 +6508,54 @@ mod tests {
             mode: crate::agent_sdk::MethodMode::Merge,
             explicit: false,
         }];
+    const HOST_SURFACE_ACTOR_FIELDS: &[crate::agent_sdk::schema::FieldMeta] =
+        &[crate::agent_sdk::schema::FieldMeta::Inline(
+            crate::agent_sdk::schema::InlineFieldMeta {
+                source_index: 0,
+                name: "value",
+                type_identity: "fixture::Vec<u8>",
+                persistence: crate::agent_sdk::FieldPersistence::State(
+                    crate::agent_sdk::StateLane::Merge,
+                ),
+            },
+        )];
+    const HOST_SURFACE_U64_CONSTRUCTOR: &[crate::agent_sdk::schema::ConstructorArgumentMeta] =
+        &[crate::agent_sdk::schema::ConstructorArgumentMeta {
+            name: "tenant",
+            type_identity: "core::primitive::u64",
+        }];
+    const HOST_SURFACE_STRING_CONSTRUCTOR: &[crate::agent_sdk::schema::ConstructorArgumentMeta] =
+        &[crate::agent_sdk::schema::ConstructorArgumentMeta {
+            name: "tenant",
+            type_identity: "alloc::string::String",
+        }];
+    const HOST_SURFACE_ACTOR_SCHEMA: crate::agent_sdk::schema::SchemaMeta =
+        crate::agent_sdk::schema::SchemaMeta {
+            constructor: crate::agent_sdk::schema::ConstructorMeta::Forbidden,
+            fields: HOST_SURFACE_ACTOR_FIELDS,
+            methods: FRESH_UPGRADE_METHODS,
+        };
+    const HOST_SURFACE_U64_SCHEMA: crate::agent_sdk::schema::SchemaMeta =
+        crate::agent_sdk::schema::SchemaMeta {
+            constructor: crate::agent_sdk::schema::ConstructorMeta::RequiredNamed(
+                HOST_SURFACE_U64_CONSTRUCTOR,
+            ),
+            fields: HOST_SURFACE_ACTOR_FIELDS,
+            methods: FRESH_UPGRADE_METHODS,
+        };
+    const HOST_SURFACE_STRING_SCHEMA: crate::agent_sdk::schema::SchemaMeta =
+        crate::agent_sdk::schema::SchemaMeta {
+            constructor: crate::agent_sdk::schema::ConstructorMeta::RequiredNamed(
+                HOST_SURFACE_STRING_CONSTRUCTOR,
+            ),
+            fields: HOST_SURFACE_ACTOR_FIELDS,
+            methods: FRESH_UPGRADE_METHODS,
+        };
     const FRESH_UPGRADE_SCHEMA: crate::agent_sdk::schema::SchemaMeta =
         crate::agent_sdk::schema::SchemaMeta {
             constructor: crate::agent_sdk::schema::ConstructorMeta::Forbidden,
-            fields: &[],
+            fields: HOST_SURFACE_ACTOR_FIELDS,
             methods: FRESH_UPGRADE_METHODS,
-        };
-
-    const HOST_SURFACE_ACTOR_SCHEMA: super::super::schema::SchemaMeta =
-        super::super::schema::SchemaMeta {
-            uses_storage: false,
-            fields: &[super::super::schema::FieldMeta {
-                name: "value",
-                codec: "fixture::Vec<u8>",
-                persistence: FieldPersistence::State(StateLane::Merge),
-            }],
-            methods: &[super::super::schema::MethodMeta {
-                name: "mutate",
-                mode: MethodMode::Merge,
-                explicit: false,
-            }],
         };
 
     fn host_surface_actor_package() -> Package {
@@ -6259,13 +6581,18 @@ mod tests {
         let role_policies = PackageRolePolicies::from_metadata(&metadata)
             .unwrap()
             .encode();
-        let (schema_bytes, schema_len) = super::super::schema::encode_with_entry::<1024>(
-            &HOST_SURFACE_ACTOR_SCHEMA,
-            super::super::schema::ExecutionEntryKind::AgentActor,
-        );
+        let schema = match meta.constructor {
+            [] => &HOST_SURFACE_ACTOR_SCHEMA,
+            [field] if field.name == "tenant" && field.ty == "u64" => &HOST_SURFACE_U64_SCHEMA,
+            [field] if field.name == "tenant" && field.ty == "String" => {
+                &HOST_SURFACE_STRING_SCHEMA
+            }
+            _ => panic!("unsupported host-surface constructor fixture"),
+        };
+        let (schema_bytes, schema_len) = crate::agent_sdk::schema::encode::<1024>(schema);
         let agent_schema = schema_bytes[..schema_len].to_vec();
-        let parsed_schema = super::super::schema::decode(&agent_schema).unwrap();
-        let requirements = actor_runtime_requirements(&parsed_schema, &metadata, false);
+        let parsed_schema = crate::agent_sdk::schema::decode(&agent_schema).unwrap();
+        let requirements = sdk_actor_runtime_requirements(&parsed_schema, &metadata, false);
         let generated_interfaces = b"host-surface-actor-interface".to_vec();
         Package {
             manifest: PackageManifest {
@@ -6333,128 +6660,8 @@ mod tests {
         package
     }
 
-    fn host_surface_root_material(config: &AgentConfig) -> (RootAnchorRecord, [SigningKey; 3]) {
-        let keys = [
-            SigningKey::from_bytes(&[0x81; 32]),
-            SigningKey::from_bytes(&[0x82; 32]),
-            SigningKey::from_bytes(&[0x83; 32]),
-        ];
-        let mut members = keys
-            .iter()
-            .enumerate()
-            .map(|(index, key)| {
-                AuthorityCommitteeMember::new(
-                    NodeId([(index + 1) as u8; 32]),
-                    key.verifying_key().to_bytes(),
-                    AuthorityMemberRole::Voter,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        members.sort_by_key(AuthorityCommitteeMember::signer);
-        let binding = config.authority.commitment();
-        let committee =
-            AuthorityCommittee::new(config.identity.space, binding, 1, None, members).unwrap();
-        let root = RootAnchorRecord::new(
-            1,
-            config.identity.space,
-            config.identity.agent,
-            binding,
-            Hash([0x84; 32]),
-            committee.clone(),
-        )
-        .unwrap();
-        (root, keys)
-    }
-
-    fn host_surface_root_pins(
-        config: &AgentConfig,
-        receipt: &AgentAuthorityReceipt,
-        observed_slot: u64,
-    ) -> RootAnchorPins {
-        let runtime = RuntimeBinding {
-            space: config.identity.space,
-            agent: config.identity.agent,
-            deployment: config.identity.runtime_deployment,
-            program: config.identity.runtime_program,
-            producer: config.identity.runtime_producer,
-            package: config.runtime_package.clone(),
-            runtime_abi: super::super::RUNTIME_ABI_ID,
-            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
-        };
-        let create = ReplayInput {
-            runtime,
-            operation: ReplayOperation::Management {
-                request: LifecycleRequest::Authorized {
-                    admission: LifecycleAuthorityAdmission {
-                        receipt: receipt.clone(),
-                        observed_slot,
-                    },
-                    request: Box::new(LifecycleRequest::Create(config.clone())),
-                },
-            },
-        };
-        let mut executor = ExactTestExecutor::default();
-        let prepared =
-            ReplayPreparedGenesis::prepare(create, config.replicas[0], &mut executor).unwrap();
-        let (root, _) = host_surface_root_material(config);
-        let claim = SystemAgentGenesisClaim::new(&root, prepared.expectations()).unwrap();
-        RootAnchorPins::new(
-            root.clone(),
-            root.config_version(),
-            root.id(),
-            root.config_commitment(),
-            claim.authority_claim(),
-        )
-        .unwrap()
-    }
-
-    fn seal_host_surface_genesis(
-        config: &AgentConfig,
-        prepared: ReplayPreparedGenesis,
-        configured_root: &RootAnchorPins,
-    ) -> ReplaySealedGenesis {
-        let locator = SystemAgentGenesisLocator {
-            space: config.identity.space,
-            agent: config.identity.agent,
-            node: config.replicas[0].node,
-        };
-        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
-        let (root, keys) = host_surface_root_material(config);
-        assert_eq!(configured_root.record(), &root);
-        let committee = root.initial_committee().clone();
-        let claim = SystemAgentGenesisClaim::new(&root, proposal.expectations()).unwrap();
-        let message = AuthorityQuorumCertificate::signing_message(
-            committee.authority_binding(),
-            committee.epoch(),
-            committee.commitment(),
-            claim.authority_claim(),
-        );
-        let mut signatures = keys[..2]
-            .iter()
-            .map(|key| {
-                AuthoritySignature::new(
-                    AuthoritySignerId::of_raw_ed25519(&key.verifying_key().to_bytes()),
-                    key.sign(&message.0).to_bytes(),
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        signatures.sort_by_key(AuthoritySignature::signer);
-        let evidence = SystemAgentGenesisEvidence::new(
-            claim.clone(),
-            AuthorityQuorumCertificate::new(&committee, claim.authority_claim(), signatures)
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(configured_root.genesis_claim(), claim.authority_claim());
-        let provision =
-            SystemAgentGenesisProvision::new(proposal, configured_root.clone(), evidence).unwrap();
-        seal_prepared_system_agent_genesis(prepared, configured_root, &provision).unwrap()
-    }
-
     fn host_surface_config_and_runtime(name: &str) -> (AgentConfig, Package) {
-        let template = super::super::replay::tests::admitted_genesis(0xe7);
+        let template = super::super::replay::tests::admitted_local_genesis(0xe7);
         let mut config = decode_standard_runtime_state(template.post_create())
             .unwrap()
             .config
@@ -6473,22 +6680,7 @@ mod tests {
         };
         config.runtime_contract = contract;
         config.capabilities = capabilities;
-        let (root, _) = host_surface_root_material(&config);
-        config.system_authority_genesis = Some(
-            SystemAuthorityGenesis::new(
-                root.id(),
-                root.config_version(),
-                root.config_commitment(),
-                root.initial_committee().clone(),
-                1,
-                Hash([0x75; 32]),
-                Hash([0x76; 32]),
-                8,
-                8,
-                8,
-            )
-            .unwrap(),
-        );
+        config.system_authority_genesis = None;
         config.validate().unwrap();
         runtime_package.validate().unwrap();
         (config, runtime_package)
@@ -6510,18 +6702,16 @@ mod tests {
             Arc::new(StaticMerge(config.replicas[0].node));
         let create = LifecycleRequest::Create(config.clone());
         let receipt = lifecycle_receipt(&config, &create, 1);
-        let configured_root = host_surface_root_pins(&config, &receipt, 20);
         let (input, catalog) =
-            LocalJournalAgentDriver::<MemoryAgentJournalStore>::system_genesis_input(
+            LocalJournalAgentDriver::<MemoryAgentJournalStore>::local_genesis_input(
                 config.clone(),
                 &runtime_package,
                 receipt,
-                &configured_root,
                 &trust,
                 &merge,
             )
             .unwrap();
-        let prepared = LocalJournalAgentDriver::<MemoryAgentJournalStore>::prepare_system_genesis(
+        let sealed = LocalJournalAgentDriver::<MemoryAgentJournalStore>::prepare_local_genesis(
             input,
             config.replicas[0],
             &catalog,
@@ -6529,222 +6719,28 @@ mod tests {
             Arc::clone(&merge),
         )
         .unwrap();
-        let sealed = seal_host_surface_genesis(&config, prepared, &configured_root);
-        let store =
+        let mut store =
             MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
-        let driver = LocalJournalAgentDriver::create(
-            store,
-            sealed,
-            &catalog,
-            Arc::clone(&trust),
-            Arc::clone(&merge),
-        )
-        .unwrap();
-        (driver, config, trust, merge)
-    }
-
-    fn signed_invocation_receipt(
-        config: &AgentConfig,
-        invocation: &ActorInvocation,
-    ) -> ActorInvocationReceipt {
-        let claim = ActorInvocationClaim {
-            authority: config.authority.clone(),
-            space: config.identity.space,
-            agent: config.identity.agent,
-            principal: None,
-            credential: None,
-            authorization: invocation.authorization_message(),
-            auth: invocation.auth.clone(),
-            valid_from: 10,
-            valid_until: 100,
-        };
-        ActorInvocationReceipt {
-            signature: admitted_authority_key()
-                .sign(&claim.signing_message().0)
-                .to_bytes()
-                .to_vec(),
-            claim,
+        for blob in &catalog {
+            store
+                .put_blob(
+                    JournalBlobClass::CatalogArtifact,
+                    &blob.reference,
+                    &blob.bytes,
+                )
+                .unwrap();
         }
-    }
-
-    #[test]
-    fn prepared_genesis_crosses_each_live_trust_boundary_once() {
-        let (config, runtime_package) =
-            host_surface_config_and_runtime("single-auth-genesis-runtime");
-        let counted = Arc::new(CountingTrust {
-            slot: 20,
-            authority: config.authority.clone(),
-            slot_samples: AtomicUsize::new(0),
-            authority_checks: AtomicUsize::new(0),
-            package_checks: AtomicUsize::new(0),
-        });
-        let trust: Arc<dyn AgentTrustProvider> = counted.clone();
-        let merge: Arc<dyn LocalMergeAuthenticator> =
-            Arc::new(StaticMerge(config.replicas[0].node));
-        let create = LifecycleRequest::Create(config.clone());
-        let receipt = lifecycle_receipt(&config, &create, 1);
-        let configured_root = host_surface_root_pins(&config, &receipt, 20);
-
-        let (input, catalog) =
-            LocalJournalAgentDriver::<MemoryAgentJournalStore>::system_genesis_input(
-                config.clone(),
-                &runtime_package,
-                receipt,
-                &configured_root,
-                &trust,
-                &merge,
-            )
-            .unwrap();
-        assert_eq!(counted.slot_samples.load(Ordering::Relaxed), 1);
-        assert_eq!(counted.authority_checks.load(Ordering::Relaxed), 0);
-        assert_eq!(counted.package_checks.load(Ordering::Relaxed), 0);
-
-        LocalJournalAgentDriver::<MemoryAgentJournalStore>::prepare_system_genesis(
-            input,
-            config.replicas[0],
-            &catalog,
-            trust,
-            merge,
-        )
-        .unwrap();
-        assert_eq!(counted.slot_samples.load(Ordering::Relaxed), 1);
-        assert_eq!(counted.authority_checks.load(Ordering::Relaxed), 1);
-        assert_eq!(counted.package_checks.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn root_marker_mismatch_fails_before_clock_sampling_or_destination_work() {
-        let (config, runtime_package) =
-            host_surface_config_and_runtime("root-marker-preflight-runtime");
-        let create = LifecycleRequest::Create(config.clone());
-        let receipt = lifecycle_receipt(&config, &create, 1);
-        let configured_root = host_surface_root_pins(&config, &receipt, 20);
-        let counted = Arc::new(CountingTrust {
-            slot: 20,
-            authority: config.authority.clone(),
-            slot_samples: AtomicUsize::new(0),
-            authority_checks: AtomicUsize::new(0),
-            package_checks: AtomicUsize::new(0),
-        });
-        let trust: Arc<dyn AgentTrustProvider> = counted.clone();
-        let merge: Arc<dyn LocalMergeAuthenticator> =
-            Arc::new(StaticMerge(config.replicas[0].node));
-
-        let mut missing = config.clone();
-        missing.system_authority_genesis = None;
-        let missing_request = LifecycleRequest::Create(missing.clone());
-        let missing_receipt = lifecycle_receipt(&missing, &missing_request, 1);
-        assert_eq!(
-            LocalJournalAgentDriver::<MemoryAgentJournalStore>::system_genesis_input(
-                missing,
-                &runtime_package,
-                missing_receipt,
-                &configured_root,
-                &trust,
-                &merge,
-            ),
-            Err(LocalJournalDriverError::Executor(
-                LocalReplayExecutorError::InvalidRequest
-            ))
-        );
-
-        let mut divergent = config.clone();
-        let configured_record = configured_root.record();
-        let divergent_record = RootAnchorRecord::new(
-            configured_record.config_version() + 1,
-            configured_record.space(),
-            configured_record.system_agent(),
-            configured_record.authority_binding(),
-            Hash([0x85; 32]),
-            configured_record.initial_committee().clone(),
-        )
-        .unwrap();
-        divergent.system_authority_genesis = Some(
-            SystemAuthorityGenesis::new(
-                divergent_record.id(),
-                divergent_record.config_version(),
-                divergent_record.config_commitment(),
-                divergent_record.initial_committee().clone(),
-                1,
-                Hash([0x75; 32]),
-                Hash([0x76; 32]),
-                8,
-                8,
-                8,
-            )
-            .unwrap(),
-        );
-        let divergent_request = LifecycleRequest::Create(divergent.clone());
-        let divergent_receipt = lifecycle_receipt(&divergent, &divergent_request, 1);
-        assert_eq!(
-            LocalJournalAgentDriver::<MemoryAgentJournalStore>::system_genesis_input(
-                divergent,
-                &runtime_package,
-                divergent_receipt,
-                &configured_root,
-                &trust,
-                &merge,
-            ),
-            Err(LocalJournalDriverError::Executor(
-                LocalReplayExecutorError::InvalidRequest
-            ))
-        );
-
-        let mut wrong_sequence = config.clone();
-        let marker = wrong_sequence.system_authority_genesis.as_ref().unwrap();
-        wrong_sequence.system_authority_genesis = Some(
-            SystemAuthorityGenesis::new(
-                marker.root_anchor(),
-                marker.root_anchor_config_version(),
-                marker.root_anchor_config(),
-                marker.initial_committee().clone(),
-                2,
-                marker.catalog_binding(),
-                marker.initial_catalog_commitment(),
-                marker.decision_limit(),
-                marker.rotation_limit(),
-                marker.catalog_limit(),
-            )
-            .unwrap(),
-        );
-        let wrong_sequence_request = LifecycleRequest::Create(wrong_sequence.clone());
-        let wrong_sequence_receipt = lifecycle_receipt(&wrong_sequence, &wrong_sequence_request, 1);
-        assert_eq!(
-            LocalJournalAgentDriver::<MemoryAgentJournalStore>::system_genesis_input(
-                wrong_sequence,
-                &runtime_package,
-                wrong_sequence_receipt,
-                &configured_root,
-                &trust,
-                &merge,
-            ),
-            Err(LocalJournalDriverError::Executor(
-                LocalReplayExecutorError::InvalidRequest
-            ))
-        );
-
-        assert_eq!(counted.slot_samples.load(Ordering::Relaxed), 0);
-        assert_eq!(counted.authority_checks.load(Ordering::Relaxed), 0);
-        assert_eq!(counted.package_checks.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn seeded_root_authority_is_exact_after_create_and_reopen() {
-        let (driver, config, trust, merge) = host_surface_driver();
-        let expected = SystemAuthorityState::from_genesis(
-            config.identity.agent,
-            config.system_authority_genesis.as_ref().unwrap(),
-        )
-        .unwrap();
-        let created = decode_standard_runtime_state(driver.core.materialization.state()).unwrap();
-        assert_eq!(created.system_authority.as_ref(), Some(&expected));
-
-        let store = driver.core.store;
-        let reopened = LocalJournalAgentDriver::open(store, trust, merge).unwrap();
-        let restored =
-            decode_standard_runtime_state(reopened.core.materialization.state()).unwrap();
-        assert_eq!(restored.config.as_ref(), Some(&config));
-        assert_eq!(restored.system_authority, Some(expected));
+        assert!(store.initialize_ordinary_for_test(&sealed).unwrap());
+        let resolver = store.catalog_blob_resolver().unwrap();
+        let executor =
+            StandardLocalReplayExecutor::new(resolver, Arc::clone(&trust), Arc::clone(&merge));
+        let core = LocalJournalCore::open(store, executor).unwrap();
+        let mut driver = LocalJournalAgentDriver {
+            core,
+            lifecycle_fault: None,
+        };
+        driver.validate_opened(Some(config.replicas[0])).unwrap();
+        (driver, config, trust, merge)
     }
 
     #[test]
@@ -7146,7 +7142,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_host_surface_builds_exact_operations_and_settles_merge_calls() {
+    fn memory_host_surface_builds_exact_management_operations() {
         let (mut driver, config, _, _) = host_surface_driver();
         assert_eq!(driver.config().unwrap(), config);
         assert_eq!(driver.identity().unwrap(), config.identity);
@@ -7240,50 +7236,6 @@ mod tests {
                 && *to_deployment == target_runtime.deployment_id()
                 && package == &runtime_upgrade.catalog()[0].reference
         ));
-
-        let invocation = ActorInvocation {
-            invocation: InvocationId([0x93; 32]),
-            actor: entry.actor,
-            incarnation: record.incarnation,
-            deployment: entry.deployment,
-            program: entry.program,
-            mode: MethodMode::Merge,
-            auth: ActorInvocationAuth::anonymous(),
-            message: vec![1],
-            availability: Vec::new(),
-            gas: 100,
-        };
-        let authority = signed_invocation_receipt(&config, &invocation);
-        let before_invoke = driver.publication_revision();
-        assert!(matches!(
-            driver
-                .invoke_synchronous(invocation.clone(), authority.clone())
-                .unwrap(),
-            LocalSettledInvocationResult::Final(_)
-        ));
-        assert!(
-            driver.publication_revision() >= before_invoke + 2,
-            "Merge source and ordered finalizer must both become durable"
-        );
-
-        let before_acknowledge = driver.publication_revision();
-        assert_eq!(
-            driver
-                .acknowledge_invocation_synchronous(invocation.clone(), authority.clone())
-                .unwrap(),
-            LocalSettledAcknowledgementResult::Acknowledged
-        );
-        assert!(driver.publication_revision() >= before_acknowledge + 2);
-        let after_acknowledge = driver.publication_revision();
-        assert_eq!(
-            driver.invoke_synchronous(invocation, authority).unwrap(),
-            LocalSettledInvocationResult::Acknowledged
-        );
-        assert_eq!(
-            driver.publication_revision(),
-            after_acknowledge,
-            "permanent acknowledgement history resolves without a new publication"
-        );
     }
 
     fn authorized_at(
@@ -7741,7 +7693,7 @@ mod tests {
 
     #[test]
     fn create_preflight_rejects_profile_trust_binding_and_package_before_store_writes() {
-        let sealed = super::super::replay::tests::admitted_genesis(0xe4);
+        let sealed = super::super::replay::tests::admitted_local_genesis(0xe4);
         let node = sealed.replica().node;
         let store = MemoryAgentJournalStore::new(sealed.genesis().runtime().agent, node).unwrap();
         let decoded = decode_standard_runtime_state(sealed.post_create()).unwrap();
@@ -7758,7 +7710,7 @@ mod tests {
         let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(StaticMerge(node));
 
         assert!(matches!(
-            LocalJournalAgentDriver::<MemoryAgentJournalStore>::preflight_create(
+            LocalJournalAgentDriver::<MemoryAgentJournalStore>::preflight_local_create(
                 &sealed,
                 &catalog,
                 &trusted,

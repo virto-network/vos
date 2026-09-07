@@ -716,7 +716,183 @@ struct SharedRouteHandler {
     lifecycle: Arc<RwLock<bool>>,
 }
 
+/// Result of one authenticated clean Ordered submission through the live
+/// Raft worker. `new_slot == false` is possible only when the bounded durable
+/// journal suffix proved the exact request was already committed.
+pub(crate) struct CleanOrderedSubmission {
+    pub(crate) input: ReplayInputId,
+    pub(crate) outcome: RuntimeOutcome,
+    pub(crate) new_slot: bool,
+}
+
+/// Result of clean management admission through the live Raft worker.
+/// Guest denial is explicitly nondurable; every successful unseen request is
+/// applied from a real committed Ordered slot.
+pub(crate) enum CleanManagementSubmission {
+    Denied {
+        outcome: RuntimeOutcome,
+        observed_slot: u64,
+    },
+    Applied {
+        outcome: RuntimeOutcome,
+        observed_slot: u64,
+        new_slot: bool,
+    },
+}
+
 impl SharedRouteHandler {
+    fn has_local_proposer(&self, worker: &vos_raft::WorkerHandle<NodeId>) -> bool {
+        if worker.role() == vos_raft::Role::Leader {
+            return true;
+        }
+        // A freshly reopened one-voter generation has no remote leader to
+        // redirect to. Give its real Raft worker one bounded election window
+        // before reporting unavailability to the bootstrap state machine.
+        if self.route_nodes.len() != 1 {
+            return false;
+        }
+        let deadline = Instant::now() + ORDERED_REPLY_WAIT;
+        while worker.role() != vos_raft::Role::Leader {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    fn submit_clean_ordered(
+        &self,
+        work: crate::agent_sdk::InvocationWork,
+        authorization: crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
+        let _proposal = self
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let worker = self
+            .worker
+            .as_ref()
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if !self.has_local_proposer(worker) {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        let input = {
+            let mut host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+            let prepared = host.prepare_clean_ordered(self.agent, work, authorization)?;
+            let input = prepared.input();
+            if let Some(outcome) = prepared.retained().cloned() {
+                return Ok(CleanOrderedSubmission {
+                    input,
+                    outcome,
+                    new_slot: false,
+                });
+            }
+            self.ordered_replies
+                .register(input)
+                .map_err(|_| SharedAgentHostError::Conflict)?;
+            let payload = prepared
+                .into_payload()
+                .ok_or(SharedAgentHostError::Conflict)?;
+            if futures_executor::block_on(worker.propose(payload)).is_err() {
+                self.ordered_replies.cancel(input);
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            input
+        };
+        let mut host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+        drop(host);
+        let outcome = self
+            .ordered_replies
+            .wait(input)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        Ok(CleanOrderedSubmission {
+            input,
+            outcome,
+            new_slot: true,
+        })
+    }
+
+    fn submit_clean_management(
+        &self,
+        request: crate::agent_sdk::ManagementRequest,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        artifacts: crate::agent::driver::SdkManagementArtifacts<'_>,
+    ) -> Result<CleanManagementSubmission, SharedAgentHostError> {
+        let _proposal = self
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let worker = self
+            .worker
+            .as_ref()
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if !self.has_local_proposer(worker) {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        let input = {
+            let mut host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+            let prepared =
+                host.prepare_clean_management(self.agent, request, authority, artifacts)?;
+            let observed_slot = prepared.observed_slot();
+            if let Some(outcome) = prepared.denied().cloned() {
+                return Ok(CleanManagementSubmission::Denied {
+                    outcome,
+                    observed_slot,
+                });
+            }
+            if let Some(outcome) = prepared.retained().cloned() {
+                return Ok(CleanManagementSubmission::Applied {
+                    outcome,
+                    observed_slot,
+                    new_slot: false,
+                });
+            }
+            let input = prepared.input().ok_or(SharedAgentHostError::Conflict)?;
+            let commands = prepared.into_commands();
+            if commands.is_empty() {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            self.ordered_replies
+                .register(input)
+                .map_err(|_| SharedAgentHostError::Conflict)?;
+            for payload in commands {
+                if futures_executor::block_on(worker.propose(payload)).is_err() {
+                    self.ordered_replies.cancel(input);
+                    return Err(SharedAgentHostError::Unavailable);
+                }
+            }
+            (input, observed_slot)
+        };
+        let mut host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+        drop(host);
+        let outcome = self
+            .ordered_replies
+            .wait(input.0)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        Ok(CleanManagementSubmission::Applied {
+            outcome,
+            observed_slot: input.1,
+            new_slot: true,
+        })
+    }
+
     fn pump_merge_once(&self, local: NodeId, stop: &AtomicBool, cursor: &mut usize) {
         let Ok(live) = self.lifecycle.read() else {
             return;
@@ -797,10 +973,13 @@ impl SharedRouteHandler {
                     let prepared = host
                         .prepare_clean_ordered(self.agent, work.clone(), authorization)
                         .map_err(|_| AgentHandlerError)?;
+                    if let Some(outcome) = prepared.retained().cloned() {
+                        return Ok(reply_for_outcome(correlation, outcome));
+                    }
                     let input = prepared.input();
                     self.ordered_replies.register(input)?;
-                    if futures_executor::block_on(worker.propose(prepared.into_payload())).is_err()
-                    {
+                    let payload = prepared.into_payload().ok_or(AgentHandlerError)?;
+                    if futures_executor::block_on(worker.propose(payload)).is_err() {
                         self.ordered_replies.cancel(input);
                         return Err(AgentHandlerError);
                     }
@@ -1170,6 +1349,7 @@ impl AgentRouteHandler for SharedRouteHandler {
 struct AttachedGeneration {
     fingerprint: AttachmentFingerprint,
     handler: Arc<dyn AgentRouteHandler>,
+    coordinator: Arc<SharedRouteHandler>,
     worker: Option<vos_raft::Worker<NodeId>>,
     apply_thread: Option<JoinHandle<()>>,
     merge_stop: Arc<AtomicBool>,
@@ -1534,6 +1714,7 @@ impl SharedAgentNetworkHost {
             AttachedGeneration {
                 fingerprint,
                 handler,
+                coordinator: handler_impl,
                 worker,
                 apply_thread,
                 merge_stop,
@@ -1585,6 +1766,47 @@ impl SharedAgentNetworkHost {
             }
         }
         Ok(())
+    }
+
+    /// Submit an exact clean ordered invocation through the generation's
+    /// authenticated one-owner Raft proposer and synchronous apply path.
+    pub(crate) fn invoke_clean(
+        &self,
+        agent: crate::service::AgentId,
+        work: crate::agent_sdk::InvocationWork,
+        authorization: crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        attached
+            .coordinator
+            .submit_clean_ordered(work, authorization)
+    }
+
+    /// Submit an exact clean management request, including any deterministic
+    /// artifact chunk prefix, through the live Raft worker.
+    pub(crate) fn manage_clean(
+        &self,
+        agent: crate::service::AgentId,
+        request: crate::agent_sdk::ManagementRequest,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        artifacts: crate::agent::driver::SdkManagementArtifacts<'_>,
+    ) -> Result<CleanManagementSubmission, SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        attached
+            .coordinator
+            .submit_clean_management(request, authority, artifacts)
     }
 
     #[cfg(test)]

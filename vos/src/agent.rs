@@ -28,7 +28,12 @@ pub mod catalog_finality;
 pub mod clean_authority_issuer;
 #[cfg(feature = "std")]
 pub mod clean_bootstrap;
-#[cfg(feature = "std")]
+#[cfg(all(
+    feature = "std",
+    feature = "storage",
+    feature = "network",
+    target_os = "linux"
+))]
 pub mod clean_control;
 pub mod committee;
 pub mod contract;
@@ -52,7 +57,7 @@ pub mod machine;
 pub mod package;
 #[cfg(feature = "std")]
 pub mod package_admission;
-#[cfg(feature = "std")]
+#[cfg(feature = "private-agent-store")]
 pub(crate) mod private_control_application_coordinator;
 #[cfg(feature = "private-agent-crypto")]
 pub mod private_crypto;

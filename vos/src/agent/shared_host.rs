@@ -20,12 +20,17 @@ use std::sync::Arc;
 
 use redb::Database;
 
+use super::bootstrap::{
+    SystemAgentGenesisProvision, seal_prepared_system_agent_genesis,
+    validate_system_agent_genesis_catalog,
+};
+use super::committee::RootAnchorPins;
 use super::driver::AgentTrustProvider;
 use super::driver::SdkManagementArtifacts;
 use super::execution::RuntimeBlob;
 use super::genesis::{
     AgentGenesisFinalityError, AgentGenesisFinalityVerifier, AgentGenesisProvision,
-    AgentGenesisProvisionVerificationError, VerifiedAgentGenesisProvision,
+    AgentGenesisProvisionVerificationError, AgentReplicaCommittee, VerifiedAgentGenesisProvision,
     validate_agent_genesis_catalog,
 };
 use super::host::{AgentHostError, AgentHostRootLease, AgentHostScope, LocalMergeAuthenticator};
@@ -65,6 +70,8 @@ pub const MAX_SHARED_HOST_AGENTS: usize = 4096;
 /// catalog preimages. Ordinary genesis currently has exactly one catalog
 /// reference, but the aggregate bound remains explicit.
 pub const MAX_SHARED_GENESIS_INTENT_BYTES: usize = super::genesis::MAX_AGENT_GENESIS_PROVISION_BYTES
+    + super::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES
+    + super::genesis::MAX_AGENT_REPLICA_COMMITTEE_BYTES
     + super::MAX_CATALOG_ARTIFACT_REFERENCED_BYTES as usize
     + 4096;
 
@@ -280,8 +287,17 @@ pub enum SharedAgentApplyOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum SharedGenesisAuthority {
+    AuthorityFinalized(AgentGenesisProvision),
+    SystemBootstrap {
+        provision: SystemAgentGenesisProvision,
+        committee: AgentReplicaCommittee,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SharedGenesisIntent {
-    provision: AgentGenesisProvision,
+    authority: SharedGenesisAuthority,
     catalog: Vec<RuntimeBlob>,
     committee_authority: CommitteeChangeAuthorityBinding,
 }
@@ -293,7 +309,25 @@ impl SharedGenesisIntent {
         committee_authority: CommitteeChangeAuthorityBinding,
     ) -> Result<Self, SharedAgentHostError> {
         let intent = Self {
-            provision,
+            authority: SharedGenesisAuthority::AuthorityFinalized(provision),
+            catalog,
+            committee_authority,
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+
+    fn new_system_bootstrap(
+        provision: SystemAgentGenesisProvision,
+        committee: AgentReplicaCommittee,
+        catalog: Vec<RuntimeBlob>,
+        committee_authority: CommitteeChangeAuthorityBinding,
+    ) -> Result<Self, SharedAgentHostError> {
+        let intent = Self {
+            authority: SharedGenesisAuthority::SystemBootstrap {
+                provision,
+                committee,
+            },
             catalog,
             committee_authority,
         };
@@ -302,21 +336,48 @@ impl SharedGenesisIntent {
     }
 
     fn validate(&self) -> Result<(), SharedAgentHostError> {
-        self.provision
-            .validate()
-            .map_err(|_| SharedAgentHostError::InvalidProvision)?;
-        validate_agent_genesis_catalog(self.provision.proposal(), &self.catalog)
-            .map_err(|_| SharedAgentHostError::InvalidCatalog)?;
-        let proposal = self.provision.proposal();
-        let legacy_config = proposal.config().ok();
-        let clean_descriptor = proposal.clean_descriptor().ok();
-        let is_shared = legacy_config
-            .is_some_and(|config| config.identity.profile == AgentProfile::Shared)
-            || clean_descriptor.is_some_and(|descriptor| {
-                descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared
-            });
+        let is_shared = match &self.authority {
+            SharedGenesisAuthority::AuthorityFinalized(provision) => {
+                provision
+                    .validate()
+                    .map_err(|_| SharedAgentHostError::InvalidProvision)?;
+                validate_agent_genesis_catalog(provision.proposal(), &self.catalog)
+                    .map_err(|_| SharedAgentHostError::InvalidCatalog)?;
+                provision
+                    .proposal()
+                    .clean_descriptor()
+                    .map(|descriptor| {
+                        descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared
+                    })
+                    .map_err(|_| SharedAgentHostError::InvalidProvision)?
+            }
+            SharedGenesisAuthority::SystemBootstrap {
+                provision,
+                committee,
+            } => {
+                provision
+                    .validate()
+                    .map_err(|_| SharedAgentHostError::InvalidProvision)?;
+                validate_system_agent_genesis_catalog(provision.proposal(), &self.catalog)
+                    .map_err(|_| SharedAgentHostError::InvalidCatalog)?;
+                let descriptor = clean_system_bootstrap_descriptor(provision)?;
+                if committee.validate().is_err()
+                    || committee.profile() != AgentProfile::Shared
+                    || committee.space().0 != descriptor.identity.space.0
+                    || committee.agent().0 != descriptor.identity.agent.0
+                    || committee.members().len() != 1
+                    || committee.voter_count() != 1
+                    || committee
+                        .member_by_node(NodeId(descriptor.replicas[0].node.0))
+                        .map(|member| member.replica())
+                        != Some(provision.proposal().replica())
+                {
+                    return Err(SharedAgentHostError::InvalidProvision);
+                }
+                true
+            }
+        };
         if !is_shared
-            || legacy_config.is_some_and(|config| config.system_authority_genesis.is_some())
             || CommitteeChangeAuthorityBinding::decode(&self.committee_authority.encode())
                 .ok()
                 .as_ref()
@@ -336,14 +397,34 @@ impl SharedGenesisIntent {
     }
 
     fn agent(&self) -> Result<AgentId, SharedAgentHostError> {
-        let proposal = self.provision.proposal();
-        if let Ok(config) = proposal.config() {
-            return Ok(config.identity.agent);
+        match &self.authority {
+            SharedGenesisAuthority::AuthorityFinalized(provision) => provision
+                .proposal()
+                .clean_descriptor()
+                .map(|descriptor| AgentId(descriptor.identity.agent.0))
+                .map_err(|_| SharedAgentHostError::InvalidProvision),
+            SharedGenesisAuthority::SystemBootstrap { provision, .. } => {
+                Ok(provision.proposal().locator().agent)
+            }
         }
-        proposal
-            .clean_descriptor()
-            .map(|descriptor| AgentId(descriptor.identity.agent.0))
-            .map_err(|_| SharedAgentHostError::InvalidProvision)
+    }
+
+    fn space(&self) -> crate::service::SpaceId {
+        match &self.authority {
+            SharedGenesisAuthority::AuthorityFinalized(provision) => {
+                provision.proposal().locator().space
+            }
+            SharedGenesisAuthority::SystemBootstrap { provision, .. } => {
+                provision.proposal().locator().space
+            }
+        }
+    }
+
+    fn committee(&self) -> &AgentReplicaCommittee {
+        match &self.authority {
+            SharedGenesisAuthority::AuthorityFinalized(provision) => provision.replicas(),
+            SharedGenesisAuthority::SystemBootstrap { committee, .. } => committee,
+        }
     }
 
     fn id(&self) -> Hash {
@@ -351,12 +432,38 @@ impl SharedGenesisIntent {
     }
 }
 
+fn clean_system_bootstrap_descriptor(
+    provision: &SystemAgentGenesisProvision,
+) -> Result<&crate::agent_sdk::AgentDescriptor, SharedAgentHostError> {
+    let super::journal::ReplayOperation::CleanManage {
+        request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+        ..
+    } = &provision.proposal().create().operation
+    else {
+        return Err(SharedAgentHostError::InvalidProvision);
+    };
+    Ok(descriptor)
+}
+
 impl ServiceWire for SharedGenesisIntent {
     const MAGIC: [u8; 4] = *b"AGSI";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
-        encoder.bytes(&self.provision.encode());
+        match &self.authority {
+            SharedGenesisAuthority::AuthorityFinalized(provision) => {
+                encoder.u8(0);
+                encoder.bytes(&provision.encode());
+            }
+            SharedGenesisAuthority::SystemBootstrap {
+                provision,
+                committee,
+            } => {
+                encoder.u8(1);
+                encoder.bytes(&provision.encode());
+                encoder.bytes(&committee.encode());
+            }
+        }
         encoder.u32(self.catalog.len() as u32);
         for blob in &self.catalog {
             encoder.fixed(&blob.reference.hash.0);
@@ -370,7 +477,16 @@ impl ServiceWire for SharedGenesisIntent {
         if decoder.remaining() > MAX_SHARED_GENESIS_INTENT_BYTES {
             return Err(DecodeError::LimitExceeded);
         }
-        let provision = AgentGenesisProvision::decode(&decoder.bytes()?)?;
+        let authority = match decoder.u8()? {
+            0 => SharedGenesisAuthority::AuthorityFinalized(AgentGenesisProvision::decode(
+                &decoder.bytes()?,
+            )?),
+            1 => SharedGenesisAuthority::SystemBootstrap {
+                provision: SystemAgentGenesisProvision::decode(&decoder.bytes()?)?,
+                committee: AgentReplicaCommittee::decode(&decoder.bytes()?)?,
+            },
+            _ => return Err(DecodeError::InvalidTag),
+        };
         let count = decoder.u32()? as usize;
         if count > super::MAX_CATALOG_ARTIFACT_REFERENCES as usize {
             return Err(DecodeError::LimitExceeded);
@@ -389,12 +505,138 @@ impl ServiceWire for SharedGenesisIntent {
         }
         let committee_authority = CommitteeChangeAuthorityBinding::decode(&decoder.bytes()?)?;
         let intent = Self {
-            provision,
+            authority,
             catalog,
             committee_authority,
         };
         intent.validate().map_err(|_| DecodeError::NonCanonical)?;
         Ok(intent)
+    }
+}
+
+enum PreparedSharedGenesis {
+    AuthorityFinalized(super::replay::ReplaySealedSharedGenesis),
+    SystemBootstrap(super::replay::ReplaySealedGenesis),
+}
+
+impl PreparedSharedGenesis {
+    fn genesis(&self) -> &super::journal::AgentJournalGenesis {
+        match self {
+            Self::AuthorityFinalized(sealed) => sealed.genesis(),
+            Self::SystemBootstrap(sealed) => sealed.genesis(),
+        }
+    }
+
+    fn admission_record(&self) -> &super::genesis::AgentGenesisAdmissionRecord {
+        match self {
+            Self::AuthorityFinalized(sealed) => sealed.admission_record(),
+            Self::SystemBootstrap(sealed) => sealed.admission_record(),
+        }
+    }
+}
+
+impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
+    fn genesis(&self) -> &super::journal::AgentJournalGenesis {
+        self.genesis()
+    }
+
+    fn post_create(&self) -> &super::wire::RuntimeState {
+        match self {
+            Self::AuthorityFinalized(sealed) => sealed.post_create(),
+            Self::SystemBootstrap(sealed) => sealed.post_create(),
+        }
+    }
+
+    fn empty_frontier(&self) -> &super::journal::MergeFrontier {
+        match self {
+            Self::AuthorityFinalized(sealed) => sealed.empty_frontier(),
+            Self::SystemBootstrap(sealed) => sealed.empty_frontier(),
+        }
+    }
+
+    fn ordered_invocations(&self) -> &super::journal::InvocationIndexManifest {
+        match self {
+            Self::AuthorityFinalized(sealed) => sealed.ordered_invocations(),
+            Self::SystemBootstrap(sealed) => sealed.ordered_invocations(),
+        }
+    }
+
+    fn merge_invocations(&self) -> &super::journal::InvocationIndexManifest {
+        match self {
+            Self::AuthorityFinalized(sealed) => sealed.merge_invocations(),
+            Self::SystemBootstrap(sealed) => sealed.merge_invocations(),
+        }
+    }
+
+    fn local_invocations(&self) -> &super::journal::InvocationIndexManifest {
+        match self {
+            Self::AuthorityFinalized(sealed) => sealed.local_invocations(),
+            Self::SystemBootstrap(sealed) => sealed.local_invocations(),
+        }
+    }
+
+    fn artifacts(&self) -> &super::journal::ArtifactClosure {
+        match self {
+            Self::AuthorityFinalized(sealed) => sealed.artifacts(),
+            Self::SystemBootstrap(sealed) => sealed.artifacts(),
+        }
+    }
+
+    fn replica(&self) -> super::AgentReplica {
+        match self {
+            Self::AuthorityFinalized(sealed) => sealed.replica(),
+            Self::SystemBootstrap(sealed) => sealed.replica(),
+        }
+    }
+
+    fn admission_commitment(&self) -> Hash {
+        match self {
+            Self::AuthorityFinalized(sealed) => sealed.admission_commitment(),
+            Self::SystemBootstrap(sealed) => sealed.admission_commitment(),
+        }
+    }
+
+    fn lane_manifest(
+        &self,
+        lane: super::journal::PersistedLane,
+    ) -> super::journal::LaneStateManifest {
+        match self {
+            Self::AuthorityFinalized(sealed) => sealed.lane_manifest(lane),
+            Self::SystemBootstrap(sealed) => sealed.lane_manifest(lane),
+        }
+    }
+
+    fn initial_heads(&self) -> super::journal::JournalHeads {
+        match self {
+            Self::AuthorityFinalized(sealed) => sealed.initial_heads(),
+            Self::SystemBootstrap(sealed) => sealed.initial_heads(),
+        }
+    }
+
+    fn validates_post_create_state(&self) -> bool {
+        match self {
+            Self::AuthorityFinalized(sealed) => {
+                super::replay::ReplaySealedOrdinaryGenesis::validates_post_create_state(sealed)
+            }
+            Self::SystemBootstrap(sealed) => {
+                super::replay::ReplaySealedOrdinaryGenesis::validates_post_create_state(sealed)
+            }
+        }
+    }
+
+    fn admission_record(&self) -> Option<&super::genesis::AgentGenesisAdmissionRecord> {
+        Some(self.admission_record())
+    }
+
+    fn validate_seal(&self) -> Result<(), super::replay::ReplayValidationError> {
+        match self {
+            Self::AuthorityFinalized(sealed) => {
+                super::replay::ReplaySealedOrdinaryGenesis::validate_seal(sealed)
+            }
+            Self::SystemBootstrap(sealed) => {
+                super::replay::ReplaySealedOrdinaryGenesis::validate_seal(sealed)
+            }
+        }
     }
 }
 
@@ -425,6 +667,7 @@ pub struct SharedAgentHost {
     trust: Arc<dyn AgentTrustProvider>,
     merge: Arc<dyn LocalMergeAuthenticator>,
     finality: Arc<dyn AgentGenesisFinalityVerifier>,
+    root_pins: Option<RootAnchorPins>,
 }
 
 impl SharedAgentHost {
@@ -439,9 +682,47 @@ impl SharedAgentHost {
         merge: Arc<dyn LocalMergeAuthenticator>,
         finality: Arc<dyn AgentGenesisFinalityVerifier>,
     ) -> Result<Self, SharedAgentHostError> {
+        Self::open_with_optional_root(root, stable_lock_path, scope, trust, merge, finality, None)
+    }
+
+    /// Open a host which may additionally contain the exact root/QC-admitted
+    /// clean system Agent. The pins are an independent daemon input and are
+    /// never recovered from the host's own genesis intent.
+    pub(crate) fn open_with_root(
+        root: impl Into<PathBuf>,
+        stable_lock_path: impl Into<PathBuf>,
+        scope: AgentHostScope,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        finality: Arc<dyn AgentGenesisFinalityVerifier>,
+        root_pins: RootAnchorPins,
+    ) -> Result<Self, SharedAgentHostError> {
+        root_pins
+            .validate()
+            .map_err(|_| SharedAgentHostError::InvalidProvision)?;
+        Self::open_with_optional_root(
+            root,
+            stable_lock_path,
+            scope,
+            trust,
+            merge,
+            finality,
+            Some(root_pins),
+        )
+    }
+
+    fn open_with_optional_root(
+        root: impl Into<PathBuf>,
+        stable_lock_path: impl Into<PathBuf>,
+        scope: AgentHostScope,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        finality: Arc<dyn AgentGenesisFinalityVerifier>,
+        root_pins: Option<RootAnchorPins>,
+    ) -> Result<Self, SharedAgentHostError> {
         let lease = AgentHostRootLease::acquire(root, stable_lock_path, scope)
             .map_err(map_outer_lease_error)?;
-        Self::open_with_lease(lease, trust, merge, finality)
+        Self::open_with_lease_and_root(lease, trust, merge, finality, root_pins)
     }
 
     /// Reopen is intentionally an alias with no weaker recovery mode.
@@ -457,10 +738,20 @@ impl SharedAgentHost {
     }
 
     pub fn open_with_lease(
+        lease: AgentHostRootLease,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        finality: Arc<dyn AgentGenesisFinalityVerifier>,
+    ) -> Result<Self, SharedAgentHostError> {
+        Self::open_with_lease_and_root(lease, trust, merge, finality, None)
+    }
+
+    fn open_with_lease_and_root(
         mut lease: AgentHostRootLease,
         trust: Arc<dyn AgentTrustProvider>,
         merge: Arc<dyn LocalMergeAuthenticator>,
         finality: Arc<dyn AgentGenesisFinalityVerifier>,
+        root_pins: Option<RootAnchorPins>,
     ) -> Result<Self, SharedAgentHostError> {
         if lease.scope().validate().is_err() || merge.node() != lease.scope().node {
             return Err(SharedAgentHostError::InvalidScope);
@@ -474,6 +765,7 @@ impl SharedAgentHost {
             trust,
             merge,
             finality,
+            root_pins,
         };
         for (agent, files) in files {
             let (intent, encoded) = host.read_intent(agent, files)?;
@@ -512,11 +804,38 @@ impl SharedAgentHost {
     ) -> Result<SharedAgentStatus, SharedAgentHostError> {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
         let intent = SharedGenesisIntent::new(provision, catalog, committee_authority)?;
+        self.provision_intent(intent)
+    }
+
+    /// Provision the first system Agent from direct root/QC finality. Unlike
+    /// ordinary Shared admission this path never consults the system-Agent
+    /// finality verifier, which would be circular before the authority actor
+    /// exists.
+    pub(crate) fn provision_system_bootstrap(
+        &mut self,
+        provision: SystemAgentGenesisProvision,
+        committee: AgentReplicaCommittee,
+        catalog: Vec<RuntimeBlob>,
+        committee_authority: CommitteeChangeAuthorityBinding,
+    ) -> Result<SharedAgentStatus, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let intent = SharedGenesisIntent::new_system_bootstrap(
+            provision,
+            committee,
+            catalog,
+            committee_authority,
+        )?;
+        self.provision_intent(intent)
+    }
+
+    fn provision_intent(
+        &mut self,
+        intent: SharedGenesisIntent,
+    ) -> Result<SharedAgentStatus, SharedAgentHostError> {
         let agent = intent.agent()?;
-        if intent.provision.proposal().locator().space != self.scope().space
+        if intent.space() != self.scope().space
             || intent
-                .provision
-                .replicas()
+                .committee()
                 .member_by_node(self.scope().node)
                 .is_none()
         {
@@ -645,6 +964,31 @@ impl SharedAgentHost {
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
             .prepare_clean_management(request, authority, artifacts)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn inspect_clean_management(
+        &self,
+        agent: AgentId,
+        request: &crate::agent_sdk::ManagementRequest,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .inspect_clean_management(request)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn clean_state_commitment(
+        &self,
+        agent: AgentId,
+    ) -> Result<crate::agent_sdk::Hash, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .clean_state_commitment()
             .map_err(map_driver_error)
     }
 
@@ -1024,30 +1368,64 @@ impl SharedAgentHost {
     fn verify_and_prepare(
         &self,
         intent: &SharedGenesisIntent,
-    ) -> Result<super::replay::ReplaySealedSharedGenesis, SharedAgentHostError> {
+    ) -> Result<PreparedSharedGenesis, SharedAgentHostError> {
         intent.validate()?;
-        let verified =
-            VerifiedAgentGenesisProvision::verify(intent.provision.clone(), self.finality.as_ref())
+        match &intent.authority {
+            SharedGenesisAuthority::AuthorityFinalized(provision) => {
+                let verified = VerifiedAgentGenesisProvision::verify(
+                    provision.clone(),
+                    self.finality.as_ref(),
+                )
                 .map_err(map_provision_verification_error)?;
-        let member = verified
-            .provision()
-            .replicas()
-            .member_by_node(self.scope().node)
-            .ok_or(SharedAgentHostError::ScopeMismatch)?;
-        LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_shared_genesis(
-            &verified,
-            member.replica(),
-            &intent.catalog,
-            Arc::clone(&self.trust),
-            Arc::clone(&self.merge),
-        )
-        .map_err(|_| SharedAgentHostError::InvalidProvision)
+                let member = verified
+                    .provision()
+                    .replicas()
+                    .member_by_node(self.scope().node)
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_shared_genesis(
+                    &verified,
+                    member.replica(),
+                    &intent.catalog,
+                    Arc::clone(&self.trust),
+                    Arc::clone(&self.merge),
+                )
+                .map(PreparedSharedGenesis::AuthorityFinalized)
+                .map_err(|_| SharedAgentHostError::InvalidProvision)
+            }
+            SharedGenesisAuthority::SystemBootstrap {
+                provision,
+                committee,
+            } => {
+                let configured_root = self
+                    .root_pins
+                    .as_ref()
+                    .ok_or(SharedAgentHostError::InvalidProvision)?;
+                if provision.root() != configured_root {
+                    return Err(SharedAgentHostError::InvalidProvision);
+                }
+                let member = committee
+                    .member_by_node(self.scope().node)
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                let prepared =
+                    LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
+                        provision.proposal().create().clone(),
+                        member.replica(),
+                        &intent.catalog,
+                        Arc::clone(&self.trust),
+                        Arc::clone(&self.merge),
+                    )
+                    .map_err(|_| SharedAgentHostError::InvalidProvision)?;
+                seal_prepared_system_agent_genesis(prepared, configured_root, provision)
+                    .map(PreparedSharedGenesis::SystemBootstrap)
+                    .map_err(|_| SharedAgentHostError::InvalidProvision)
+            }
+        }
     }
 
     fn open_generation(
         &mut self,
         intent: SharedGenesisIntent,
-        sealed: &super::replay::ReplaySealedSharedGenesis,
+        sealed: &PreparedSharedGenesis,
         externally_exposed: bool,
         files: GenerationFiles,
     ) -> Result<HostedSharedAgent, SharedAgentHostError> {
@@ -1094,7 +1472,7 @@ impl SharedAgentHost {
             generation,
             store.instance_id(),
             scope.node,
-            sealed.committee().clone(),
+            intent.committee().clone(),
             intent.committee_authority,
         )
         .map_err(map_ledger_error)?;
@@ -1104,15 +1482,30 @@ impl SharedAgentHost {
         let artifacts = FileSharedArtifactStager::open(&artifact_path, generation)
             .map_err(map_artifact_error)?;
         let mut driver = match state {
-            (None, None) | (Some(_), None) => FileSharedDriver::create_shared_unexposed(
-                store,
-                artifacts,
-                ledger,
-                sealed,
-                &intent.catalog,
-                Arc::clone(&self.trust),
-                Arc::clone(&self.merge),
-            ),
+            (None, None) | (Some(_), None) => match sealed {
+                PreparedSharedGenesis::AuthorityFinalized(sealed) => {
+                    FileSharedDriver::create_shared_unexposed(
+                        store,
+                        artifacts,
+                        ledger,
+                        sealed,
+                        &intent.catalog,
+                        Arc::clone(&self.trust),
+                        Arc::clone(&self.merge),
+                    )
+                }
+                PreparedSharedGenesis::SystemBootstrap(sealed) => {
+                    FileSharedDriver::create_shared_unexposed(
+                        store,
+                        artifacts,
+                        ledger,
+                        sealed,
+                        &intent.catalog,
+                        Arc::clone(&self.trust),
+                        Arc::clone(&self.merge),
+                    )
+                }
+            },
             (Some(_), Some(_)) => FileSharedDriver::open_shared_unexposed(
                 store,
                 artifacts,
@@ -1127,9 +1520,15 @@ impl SharedAgentHost {
         self.lease
             .arm_after_agent_open()
             .map_err(map_outer_lease_error)?;
-        driver
-            .commit_exposure(sealed, intent.id())
-            .map_err(map_driver_error)?;
+        match sealed {
+            PreparedSharedGenesis::AuthorityFinalized(sealed) => {
+                driver.commit_exposure(sealed, intent.id())
+            }
+            PreparedSharedGenesis::SystemBootstrap(sealed) => {
+                driver.commit_exposure(sealed, intent.id())
+            }
+        }
+        .map_err(map_driver_error)?;
         install_host_record(&self.exposure_path(agent), intent.id().as_bytes())?;
         self.lease.validate_live().map_err(map_outer_lease_error)?;
         Ok(HostedSharedAgent {
@@ -1623,15 +2022,12 @@ mod tests {
     use vos_raft::EntryKind;
 
     use super::super::authority::{
-        ActorInvocationClaim, ActorInvocationReceipt, AgentAuthorityBinding, AgentAuthorityClaim,
-        AgentAuthorityReceipt, ED25519_SIGNATURE_BYTES, ed25519_public_key_wire,
+        AgentAuthorityBinding, ED25519_SIGNATURE_BYTES, ed25519_public_key_wire,
     };
     use super::super::committee::{
         AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
         AuthorityQuorumCertificate, AuthoritySignature,
     };
-    use super::super::contract::RuntimePackageContract;
-    use super::super::execution::{ActorInvocation, ActorInvocationAuth};
     use super::super::genesis::{
         AgentGenesisAdmissionId, AgentGenesisClaim, AgentGenesisDecision, AgentGenesisEvidence,
         AgentGenesisExpectations, AgentGenesisLocator, AgentGenesisProposal, AgentReplicaCommittee,
@@ -1641,18 +2037,10 @@ mod tests {
         ReplayInput, ReplayOperation, system_genesis_artifact_closure_commitment,
         system_genesis_post_create_state_commitment,
     };
-    use super::super::package::{Package, PackageManifest};
+    use super::super::package::Package;
     use super::super::shared_commit::ReplicaCommitSignature;
-    use super::super::standard::StandardAgentRuntime;
-    use super::super::wire::encode_standard_runtime_state;
-    use super::super::{
-        AgentConfig, AgentReplica, AgentRuntime, LifecycleAuthorityAdmission, LifecycleRequest,
-        MethodMode, PackageKind, RuntimeCapabilities,
-    };
-    use crate::service::{
-        ActorId, CapabilityId, CredentialId, DeploymentId, DeploymentSignature, InvocationId,
-        PrincipalId, ProducerId, ProgramId, SpaceId, artifact_hash, task_dependencies_hash,
-    };
+    use super::super::{AgentConfig, AgentReplica};
+    use crate::service::{ActorId, DeploymentId, PrincipalId, ProducerId, ProgramId, SpaceId};
 
     const PEER_ID_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
 
@@ -1776,6 +2164,7 @@ mod tests {
     struct Fixture {
         provision: AgentGenesisProvision,
         catalog: Vec<RuntimeBlob>,
+        descriptor: crate::agent_sdk::AgentDescriptor,
         authority: AgentAuthorityBinding,
         authority_key: SigningKey,
         committee_authority: CommitteeChangeAuthorityBinding,
@@ -1820,48 +2209,6 @@ mod tests {
         .unwrap()
     }
 
-    fn deployment_signature(byte: u8) -> DeploymentSignature {
-        let public_key = vec![byte; 32];
-        DeploymentSignature {
-            producer: ProducerId::of_public_key(&public_key),
-            public_key,
-            signature: vec![byte; ED25519_SIGNATURE_BYTES],
-        }
-    }
-
-    fn runtime_package() -> Package {
-        let pvm = include_bytes!("../../../vosx/blobs/agent_runtime.pvm").to_vec();
-        let generated_interfaces = b"shared-host-runtime-interface".to_vec();
-        let schemas = b"shared-host-runtime-schema".to_vec();
-        let package = Package {
-            manifest: PackageManifest {
-                name: "shared-host-runtime".into(),
-                platform: crate::service::PLATFORM_ID,
-                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
-                kind: PackageKind::AgentRuntime {
-                    contract: RuntimePackageContract::canonical(),
-                    capabilities: RuntimeCapabilities::standard(),
-                },
-                program: ProgramId::of_pvm(&pvm),
-                interfaces_hash: artifact_hash(b"interfaces", &generated_interfaces),
-                role_policies_hash: artifact_hash(b"role-policies", &[]),
-                schemas_hash: artifact_hash(b"schemas", &schemas),
-                agent_schema_hash: artifact_hash(b"agent-schema", &[]),
-                dependencies_hash: task_dependencies_hash(&[]),
-            },
-            pvm,
-            generated_interfaces,
-            role_policies: Vec::new(),
-            schemas,
-            agent_schema: Vec::new(),
-            task_dependencies: Vec::new(),
-            diagnostics: None,
-            deployment_signature: deployment_signature(0x71),
-        };
-        package.validate().unwrap();
-        package
-    }
-
     fn authority_binding(key: &SigningKey) -> AgentAuthorityBinding {
         let public_key = ed25519_public_key_wire(key.verifying_key().to_bytes());
         AgentAuthorityBinding {
@@ -1892,7 +2239,6 @@ mod tests {
         .unwrap()
     }
 
-    #[cfg(feature = "pvm")]
     fn clean_management_receipt(
         descriptor: &crate::agent_sdk::AgentDescriptor,
         request: &crate::agent_sdk::ManagementRequest,
@@ -1946,14 +2292,13 @@ mod tests {
         receipt
     }
 
-    #[cfg(feature = "pvm")]
     fn clean_descriptor_for_runtime(
         runtime: &super::super::package_admission::AdmittedRuntimePackage,
         space: crate::agent_sdk::SpaceId,
         agent: crate::agent_sdk::AgentId,
         owner: crate::agent_sdk::PrincipalId,
         nonce: crate::agent_sdk::Hash,
-        member: &AgentReplicaMember,
+        members: &[AgentReplicaMember],
         authority_key: &SigningKey,
     ) -> crate::agent_sdk::AgentDescriptor {
         let public_key = authority_key.verifying_key().to_bytes();
@@ -1983,17 +2328,22 @@ mod tests {
             runtime_package: runtime.package_ref().clone(),
             runtime_contract: runtime.manifest().contract,
             capabilities: runtime.capabilities(),
-            replicas: vec![crate::agent_sdk::AgentReplica {
-                node: crate::agent_sdk::NodeId(member.replica().node.0),
-                principal: crate::agent_sdk::PrincipalId(member.replica().principal.0),
-                role: crate::agent_sdk::ReplicaRole::Voter,
-            }],
+            replicas: members
+                .iter()
+                .map(|member| crate::agent_sdk::AgentReplica {
+                    node: crate::agent_sdk::NodeId(member.replica().node.0),
+                    principal: crate::agent_sdk::PrincipalId(member.replica().principal.0),
+                    role: match member.replica().role {
+                        ReplicaRole::Voter => crate::agent_sdk::ReplicaRole::Voter,
+                        ReplicaRole::Observer => crate::agent_sdk::ReplicaRole::Observer,
+                    },
+                })
+                .collect(),
         };
         descriptor.validate().unwrap();
         descriptor
     }
 
-    #[cfg(feature = "pvm")]
     fn clean_runtime_state(control: &[u8]) -> crate::agent_sdk::RuntimeState {
         crate::agent_sdk::RuntimeState {
             control: control.to_vec(),
@@ -2003,7 +2353,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "pvm")]
     fn clean_identity_bytes(identity: &crate::agent_sdk::AgentIdentity) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(193);
         bytes.extend_from_slice(identity.space.as_bytes());
@@ -2016,7 +2365,6 @@ mod tests {
         bytes
     }
 
-    #[cfg(feature = "pvm")]
     fn unique_subslice_offset(haystack: &[u8], needle: &[u8]) -> usize {
         let mut matches = haystack
             .windows(needle.len())
@@ -2027,7 +2375,36 @@ mod tests {
         offset
     }
 
-    #[cfg(feature = "pvm")]
+    fn copy_from_first_input_to_all_outputs(
+        case: &mut super::super::package_admission::ScriptedRuntimeCase,
+        needle: &[u8],
+    ) {
+        let mut inputs = case
+            .input
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == needle).then_some(offset));
+        let input_offset = inputs.next().expect("script input preimage");
+        assert!(
+            inputs.next().is_none(),
+            "script input preimage is ambiguous"
+        );
+        let outputs = case
+            .output
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == needle).then_some(offset))
+            .collect::<Vec<_>>();
+        assert!(!outputs.is_empty(), "script output preimage");
+        case.copies.extend(outputs.into_iter().map(|output_offset| {
+            super::super::package_admission::ScriptedRuntimeCopy {
+                input_offset,
+                output_offset,
+                len: needle.len(),
+            }
+        }));
+    }
+
     fn scripted_management_case(
         descriptor: &crate::agent_sdk::AgentDescriptor,
         state: crate::agent_sdk::RuntimeState,
@@ -2075,6 +2452,38 @@ mod tests {
         }
     }
 
+    fn scripted_rejected_invocation_case(
+        state: crate::agent_sdk::RuntimeState,
+        work: crate::agent_sdk::InvocationWork,
+    ) -> super::super::package_admission::ScriptedRuntimeCase {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+
+        let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, 20),
+        );
+        let input = crate::agent_sdk::RuntimeWork::Invoke {
+            state: state.clone(),
+            invocation: Box::new(work),
+            authorization: Box::new(authorization),
+            observed_slot: 20,
+        }
+        .encode()
+        .unwrap();
+        let output = crate::agent_sdk::RuntimeTransition {
+            state,
+            outcome: crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                crate::agent_sdk::InvocationError::NotFound,
+            )),
+        }
+        .encode()
+        .unwrap();
+        super::super::package_admission::ScriptedRuntimeCase {
+            input,
+            output,
+            copies: Vec::new(),
+        }
+    }
+
     #[cfg(feature = "pvm")]
     fn clean_fixture(nonce_byte: u8) -> CleanFixture {
         use super::super::package_admission::{
@@ -2103,7 +2512,7 @@ mod tests {
             agent,
             owner,
             nonce,
-            &member,
+            core::slice::from_ref(&member),
             &authority_key,
         );
         let actor_package = admitted_standard_actor_for_test(
@@ -2301,7 +2710,7 @@ mod tests {
             agent,
             owner,
             nonce,
-            &member,
+            core::slice::from_ref(&member),
             &authority_key,
         );
         let request = crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
@@ -2359,8 +2768,8 @@ mod tests {
             AgentReplicaCommittee::new(space, AgentId(agent.0), AgentProfile::Shared, vec![member])
                 .unwrap();
 
-        let legacy_authority_key = key(0x51);
-        let legacy_authority = authority_binding(&legacy_authority_key);
+        let host_authority_key = key(0x51);
+        let host_authority = authority_binding(&host_authority_key);
         let system_key = key(0x52);
         let system_member = AuthorityCommitteeMember::new(
             NodeId([0x53; 32]),
@@ -2378,7 +2787,7 @@ mod tests {
         )
         .unwrap();
         let genesis_claim = AgentGenesisClaim::new(
-            legacy_authority.agent,
+            host_authority.agent,
             AgentJournalGenesisId::new([0x92; 32]),
             AgentGenesisAdmissionId::from_bytes([0x93; 32]),
             &proposal,
@@ -2408,8 +2817,9 @@ mod tests {
                 reference: catalog_reference,
                 bytes: runtime.exact_bytes().to_vec(),
             }],
-            authority: legacy_authority,
-            authority_key: legacy_authority_key,
+            descriptor: descriptor.clone(),
+            authority: host_authority,
+            authority_key: host_authority_key,
             committee_authority: committee_authority_binding(&key(0xe1)),
             replica_keys,
             agent: AgentId(agent.0),
@@ -2466,12 +2876,17 @@ mod tests {
 
     fn fixture(nonce_byte: u8) -> Fixture {
         let space = SpaceId([0x11; 32]);
-        let owner = PrincipalId([0x12; 32]);
-        let nonce = Hash([nonce_byte; 32]);
-        let agent = AgentId::derive(space, owner, nonce.as_bytes());
+        let clean_space = crate::agent_sdk::SpaceId(space.0);
+        let owner = crate::agent_sdk::PrincipalId([0x12; 32]);
+        let nonce = crate::agent_sdk::Hash([nonce_byte; 32]);
+        let clean_agent = crate::agent_sdk::AgentId::derive(clean_space, owner, nonce.as_bytes());
+        let agent = AgentId(clean_agent.0);
         let authority_key = key(0x41);
         let authority = authority_binding(&authority_key);
-        let package = runtime_package();
+        let placeholder = super::super::package_admission::admitted_standard_runtime_for_test(
+            "shared-host-runtime",
+            0x71,
+        );
         let replica_keys = vec![key(0x31), key(0x32), key(0x33)];
         let mut members = vec![
             replica_member(&replica_keys[0], ReplicaRole::Voter),
@@ -2479,76 +2894,141 @@ mod tests {
             replica_member(&replica_keys[2], ReplicaRole::Observer),
         ];
         members.sort_by_key(|member| member.replica().node);
-        let config = AgentConfig {
-            identity: AgentIdentity {
-                space,
-                agent,
-                owner,
-                profile: AgentProfile::Shared,
-                runtime_deployment: package.deployment_id(),
-                runtime_program: package.manifest.program,
-                runtime_producer: package.deployment_signature.producer,
+        let placeholder_descriptor = clean_descriptor_for_runtime(
+            &placeholder,
+            clean_space,
+            clean_agent,
+            owner,
+            nonce,
+            &members,
+            &authority_key,
+        );
+        let placeholder_request =
+            crate::agent_sdk::ManagementRequest::Create(Box::new(placeholder_descriptor.clone()));
+        let created_state = clean_runtime_state(&[0x41]);
+        let mut create_case = scripted_management_case(
+            &placeholder_descriptor,
+            crate::agent_sdk::RuntimeState::default(),
+            placeholder_request,
+            Some(1),
+            &authority_key,
+            created_state.clone(),
+            crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                crate::agent_sdk::ManagementReply::Created(placeholder_descriptor.identity.clone()),
+            )),
+        );
+        copy_from_first_input_to_all_outputs(
+            &mut create_case,
+            &clean_identity_bytes(&placeholder_descriptor.identity),
+        );
+        let inspect = crate::agent_sdk::ManagementRequest::InspectActors {
+            after: None,
+            limit: crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16,
+        };
+        let inspect_case = scripted_management_case(
+            &placeholder_descriptor,
+            created_state.clone(),
+            inspect,
+            None,
+            &authority_key,
+            created_state.clone(),
+            crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                crate::agent_sdk::ManagementReply::Actors(crate::agent_sdk::ActorDirectoryPage {
+                    entries: Vec::new(),
+                    next: None,
+                }),
+            )),
+        );
+        let rejected_management = crate::agent_sdk::ManagementRequest::Suspend {
+            actor: crate::agent_sdk::ActorId([0xb1; 32]),
+            expected_deployment: crate::agent_sdk::DeploymentId([0xb2; 32]),
+        };
+        let rejected_management_case = scripted_management_case(
+            &placeholder_descriptor,
+            created_state.clone(),
+            rejected_management,
+            Some(2),
+            &authority_key,
+            created_state.clone(),
+            crate::agent_sdk::RuntimeOutcome::Management(Err(
+                crate::agent_sdk::ManagementError::NotFound,
+            )),
+        );
+        let rejected_invocation_case = scripted_rejected_invocation_case(
+            created_state.clone(),
+            crate::agent_sdk::InvocationWork {
+                space: placeholder_descriptor.identity.space,
+                agent: placeholder_descriptor.identity.agent,
+                runtime_deployment: placeholder_descriptor.identity.runtime_deployment,
+                invocation: crate::agent_sdk::InvocationId([0xb3; 32]),
+                actor: crate::agent_sdk::ActorId([0xb4; 32]),
+                incarnation: crate::agent_sdk::Hash([0xb5; 32]),
+                deployment: crate::agent_sdk::DeploymentId([0xb6; 32]),
+                program: crate::agent_sdk::ProgramId([0xb7; 32]),
+                mode: crate::agent_sdk::MethodMode::Merge,
+                origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+                roles: crate::agent_sdk::InvocationRoleClaims::none(),
+                message: vec![0xb8],
+                installation_data: None,
+                availability: Vec::new(),
+                gas: 1_000,
+                recovery_only: false,
             },
-            creation_nonce: nonce,
-            authority: authority.clone(),
-            system_authority_genesis: None,
-            runtime_package: BlobRef::of_bytes(&package.encode()),
-            runtime_contract: RuntimePackageContract::canonical(),
-            capabilities: RuntimeCapabilities::standard(),
-            replicas: members.iter().map(AgentReplicaMember::replica).collect(),
+        );
+        let admitted_runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
+            "shared-host-current-abi",
+            0x72,
+            vec![
+                create_case,
+                inspect_case,
+                rejected_management_case,
+                rejected_invocation_case,
+            ],
+        );
+        let descriptor = clean_descriptor_for_runtime(
+            &admitted_runtime,
+            clean_space,
+            clean_agent,
+            owner,
+            nonce,
+            &members,
+            &authority_key,
+        );
+        let request = crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+        let receipt = clean_management_receipt(&descriptor, &request, 1, &authority_key);
+        let catalog_reference = BlobRef {
+            hash: Hash(admitted_runtime.package_ref().hash.0),
+            len: admitted_runtime.package_ref().len,
         };
-        config.validate().unwrap();
-        let inner = LifecycleRequest::Create(config.clone());
-        let claim = AgentAuthorityClaim {
-            authority: authority.clone(),
-            space,
-            agent,
-            principal: owner,
-            credential: CredentialId([0x24; 32]),
-            capability: CapabilityId::named("agent.create.shared"),
-            operation: inner.commitment(),
-            sequence: 1,
-            valid_from: 10,
-            valid_until: 30,
-        };
-        let receipt = AgentAuthorityReceipt {
-            signature: authority_key
-                .sign(&claim.signing_message().0)
-                .to_bytes()
-                .to_vec(),
-            claim,
-        };
-        let authorized = LifecycleRequest::Authorized {
-            admission: LifecycleAuthorityAdmission {
-                receipt,
-                observed_slot: 20,
-            },
-            request: Box::new(inner.clone()),
-        };
+        assert!(catalog_reference.matches(admitted_runtime.exact_bytes()));
         let runtime = RuntimeBinding {
             space,
             agent,
-            deployment: config.identity.runtime_deployment,
-            program: config.identity.runtime_program,
-            producer: config.identity.runtime_producer,
-            package: config.runtime_package.clone(),
+            deployment: DeploymentId(descriptor.identity.runtime_deployment.0),
+            program: ProgramId(descriptor.identity.runtime_program.0),
+            producer: ProducerId(descriptor.identity.runtime_producer.0),
+            package: catalog_reference.clone(),
             runtime_abi: super::super::RUNTIME_ABI_ID,
             execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
         };
         let create = ReplayInput {
             runtime: runtime.clone(),
-            operation: ReplayOperation::Management {
-                request: authorized.clone(),
+            operation: ReplayOperation::CleanManage {
+                request: request.clone(),
+                authority: receipt.clone(),
+                observed_slot: 20,
             },
         };
         create.validate().unwrap();
-        let mut standard = StandardAgentRuntime::new();
-        standard.apply(authorized).unwrap();
-        let post_create = encode_standard_runtime_state(&standard.snapshot());
-        let catalog_reference = config.runtime_package.clone();
+        let post_create = super::super::wire::RuntimeState {
+            control: created_state.control,
+            linear: created_state.linear,
+            merge: created_state.merge,
+            local: created_state.local,
+        };
         let expectations = AgentGenesisExpectations::new(
             runtime.commitment(),
-            inner.commitment(),
+            Hash(request.commitment().0),
             system_genesis_post_create_state_commitment(&post_create).unwrap(),
             system_genesis_artifact_closure_commitment(core::slice::from_ref(&catalog_reference))
                 .unwrap(),
@@ -2572,9 +3052,14 @@ mod tests {
         )
         .unwrap();
         let signer = system_member.signer();
-        let system_committee =
-            AuthorityCommittee::new(space, authority.commitment(), 1, None, vec![system_member])
-                .unwrap();
+        let system_committee = AuthorityCommittee::new(
+            space,
+            Hash(descriptor.authority.commitment().0),
+            1,
+            None,
+            vec![system_member],
+        )
+        .unwrap();
         let genesis_claim = AgentGenesisClaim::new(
             authority.agent,
             AgentJournalGenesisId::new([0x92; 32]),
@@ -2602,11 +3087,12 @@ mod tests {
         let provision = AgentGenesisProvision::new(proposal, replicas, evidence, decision).unwrap();
         let catalog = vec![RuntimeBlob {
             reference: catalog_reference,
-            bytes: package.encode(),
+            bytes: admitted_runtime.exact_bytes().to_vec(),
         }];
         Fixture {
             provision,
             catalog,
+            descriptor,
             authority,
             authority_key,
             committee_authority: committee_authority_binding(&key(0xe1)),
@@ -2768,58 +3254,39 @@ mod tests {
         host.request_snapshot_compaction(fixture.agent).unwrap()
     }
 
-    fn append_local_invocation_and_acknowledgement(
+    fn append_rejected_local_invocation(
         host: &mut SharedAgentHost,
         fixture: &Fixture,
         discriminator: u8,
     ) {
-        let invocation = ActorInvocation {
-            invocation: InvocationId([discriminator; 32]),
-            actor: ActorId([discriminator.wrapping_add(1); 32]),
-            incarnation: Hash([discriminator.wrapping_add(2); 32]),
-            deployment: DeploymentId([discriminator.wrapping_add(3); 32]),
-            program: ProgramId([discriminator.wrapping_add(4); 32]),
-            mode: MethodMode::Local,
-            auth: ActorInvocationAuth::anonymous(),
+        let work = crate::agent_sdk::InvocationWork {
+            space: fixture.descriptor.identity.space,
+            agent: fixture.descriptor.identity.agent,
+            runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+            invocation: crate::agent_sdk::InvocationId([discriminator; 32]),
+            actor: crate::agent_sdk::ActorId([discriminator.wrapping_add(1); 32]),
+            incarnation: crate::agent_sdk::Hash([discriminator.wrapping_add(2); 32]),
+            deployment: crate::agent_sdk::DeploymentId([discriminator.wrapping_add(3); 32]),
+            program: crate::agent_sdk::ProgramId([discriminator.wrapping_add(4); 32]),
+            mode: crate::agent_sdk::MethodMode::Local,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
             message: vec![discriminator],
+            installation_data: None,
             availability: Vec::new(),
             gas: 1_000,
+            recovery_only: false,
         };
-        let claim = ActorInvocationClaim {
-            authority: fixture.authority.clone(),
-            space: fixture.space,
-            agent: fixture.agent,
-            principal: None,
-            credential: None,
-            authorization: invocation.authorization_message(),
-            auth: invocation.auth.clone(),
-            valid_from: 10,
-            valid_until: 30,
-        };
-        let receipt = ActorInvocationReceipt {
-            signature: fixture
-                .authority_key
-                .sign(&claim.signing_message().0)
-                .to_bytes()
-                .to_vec(),
-            claim,
-        };
-        host.agents
-            .get_mut(&fixture.agent)
-            .unwrap()
-            .driver
-            .append_acknowledged_local_for_test(
-                ReplayOperation::Invoke {
-                    invocation: invocation.clone(),
-                    authority: receipt.clone(),
-                    observed_slot: 20,
-                },
-                ReplayOperation::Acknowledge {
-                    invocation,
-                    authority: receipt,
-                },
-            )
-            .unwrap();
+        let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, 20),
+        );
+        assert_eq!(
+            host.apply_clean_local(fixture.agent, work, authorization)
+                .unwrap(),
+            crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                crate::agent_sdk::InvocationError::NotFound,
+            )),
+        );
     }
 
     #[cfg(feature = "network")]
@@ -2828,44 +3295,34 @@ mod tests {
         fixture: &Fixture,
         discriminator: u8,
     ) -> MergeEventId {
-        let invocation = ActorInvocation {
-            invocation: InvocationId([discriminator; 32]),
-            actor: ActorId([discriminator.wrapping_add(1); 32]),
-            incarnation: Hash([discriminator.wrapping_add(2); 32]),
-            deployment: DeploymentId([discriminator.wrapping_add(3); 32]),
-            program: ProgramId([discriminator.wrapping_add(4); 32]),
-            mode: MethodMode::Merge,
-            auth: ActorInvocationAuth::anonymous(),
+        let work = crate::agent_sdk::InvocationWork {
+            space: fixture.descriptor.identity.space,
+            agent: fixture.descriptor.identity.agent,
+            runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+            invocation: crate::agent_sdk::InvocationId([discriminator; 32]),
+            actor: crate::agent_sdk::ActorId([discriminator.wrapping_add(1); 32]),
+            incarnation: crate::agent_sdk::Hash([discriminator.wrapping_add(2); 32]),
+            deployment: crate::agent_sdk::DeploymentId([discriminator.wrapping_add(3); 32]),
+            program: crate::agent_sdk::ProgramId([discriminator.wrapping_add(4); 32]),
+            mode: crate::agent_sdk::MethodMode::Merge,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
             message: vec![discriminator],
+            installation_data: None,
             availability: Vec::new(),
             gas: 1_000,
+            recovery_only: false,
         };
-        let claim = ActorInvocationClaim {
-            authority: fixture.authority.clone(),
-            space: fixture.space,
-            agent: fixture.agent,
-            principal: None,
-            credential: None,
-            authorization: invocation.authorization_message(),
-            auth: invocation.auth.clone(),
-            valid_from: 10,
-            valid_until: 30,
-        };
-        let receipt = ActorInvocationReceipt {
-            signature: fixture
-                .authority_key
-                .sign(&claim.signing_message().0)
-                .to_bytes()
-                .to_vec(),
-            claim,
-        };
+        let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, 20),
+        );
         host.agents
             .get_mut(&fixture.agent)
             .unwrap()
             .driver
-            .publish_merge_for_test(ReplayOperation::Invoke {
-                invocation,
-                authority: receipt,
+            .publish_merge_for_test(ReplayOperation::CleanInvoke {
+                work,
+                authorization,
                 observed_slot: 20,
             })
             .unwrap()
@@ -2883,38 +3340,22 @@ mod tests {
         sequence: u64,
         discriminator: u8,
     ) -> ReplayOperation {
-        let request = LifecycleRequest::Suspend {
-            actor: ActorId([discriminator; 32]),
-            expected_deployment: DeploymentId([discriminator.wrapping_add(1); 32]),
+        let request = crate::agent_sdk::ManagementRequest::Suspend {
+            actor: crate::agent_sdk::ActorId([discriminator; 32]),
+            expected_deployment: crate::agent_sdk::DeploymentId(
+                [discriminator.wrapping_add(1); 32],
+            ),
         };
-        let claim = AgentAuthorityClaim {
-            authority: fixture.authority.clone(),
-            space: fixture.space,
-            agent: fixture.agent,
-            principal: PrincipalId([0x12; 32]),
-            credential: CredentialId([0x24; 32]),
-            capability: CapabilityId::named(request.required_capability().unwrap()),
-            operation: request.commitment(),
+        let authority = clean_management_receipt(
+            &fixture.descriptor,
+            &request,
             sequence,
-            valid_from: 10,
-            valid_until: 30,
-        };
-        let receipt = AgentAuthorityReceipt {
-            signature: fixture
-                .authority_key
-                .sign(&claim.signing_message().0)
-                .to_bytes()
-                .to_vec(),
-            claim,
-        };
-        ReplayOperation::Management {
-            request: LifecycleRequest::Authorized {
-                admission: LifecycleAuthorityAdmission {
-                    receipt,
-                    observed_slot: 20,
-                },
-                request: Box::new(request),
-            },
+            &fixture.authority_key,
+        );
+        ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot: 20,
         }
     }
 
@@ -3343,9 +3784,12 @@ mod tests {
             .unwrap();
         assert!(matches!(
             repeated_denial,
-            PreparedCleanManagement::Denied(crate::agent_sdk::RuntimeOutcome::Management(Err(
-                crate::agent_sdk::ManagementError::NotFound
-            )))
+            PreparedCleanManagement::Denied {
+                outcome: crate::agent_sdk::RuntimeOutcome::Management(Err(
+                    crate::agent_sdk::ManagementError::NotFound
+                )),
+                ..
+            }
         ));
         assert_eq!(
             host.show(fixture.shared.agent)
@@ -3612,9 +4056,9 @@ mod tests {
 
         // The signed checkpoint predecessor must remain distinct from the
         // Ordered publication successor when Local work advanced the head.
-        // The rejected invocation plus acknowledgement leaves no live result
-        // which could independently block checkpoint creation.
-        append_local_invocation_and_acknowledgement(&mut host, &fixture, 0xb3);
+        // The clean rejected invocation consumes its result synchronously, so
+        // no live result can independently block checkpoint creation.
+        append_rejected_local_invocation(&mut host, &fixture, 0xb3);
 
         let first_candidate = host.request_snapshot_compaction(fixture.agent).unwrap();
         assert_eq!(first_candidate.claim().ordered().agent(), fixture.agent);
@@ -4046,6 +4490,7 @@ mod tests {
         assert!(handler.handle(raft).is_err());
 
         drop(attachment);
+        drop(handler);
         drop(host);
         join_live_network(network);
     }
@@ -4055,7 +4500,8 @@ mod tests {
     fn clean_network_attachment_retires_stale_owner_and_rebuilds_after_restart() {
         let directory = TempDirectory::new("clean_network_restart");
         let fixture = fixture(0x28);
-        let mut opened = open_host(&directory, &fixture);
+        let local = NodeId::of_authenticated_peer(&peer_id(&fixture.replica_keys[0]));
+        let mut opened = open_host_on_node(&directory, &fixture, local);
         let status = opened
             .provision(
                 fixture.provision.clone(),
@@ -4144,8 +4590,12 @@ mod tests {
                 if found == route
         ));
 
+        drop(first_owner);
+        drop(replacement_owner);
         drop(Arc::try_unwrap(host).ok().unwrap().into_inner().unwrap());
-        let reopened = Arc::new(std::sync::Mutex::new(open_host(&directory, &fixture)));
+        let reopened = Arc::new(std::sync::Mutex::new(open_host_on_node(
+            &directory, &fixture, local,
+        )));
         assert_eq!(
             reopened.lock().unwrap().require_transport(fixture.agent),
             Err(SharedAgentHostError::TransportNotAttached)
