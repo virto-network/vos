@@ -5171,6 +5171,142 @@ mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn standard_private_policy_provenance_survives_more_than_1024_runtime_controls() {
+        use crate::agent_sdk::contract::RuntimeResourcePolicy;
+        use crate::agent_sdk::{ManagementReply, RuntimeOutcome};
+
+        const NON_POLICY_CONTROLS: u64 = 1_025;
+
+        let (descriptor, created, _) =
+            create_clean_management_state(crate::agent_sdk::AgentProfile::Private);
+        let initial = descriptor.initial_resource_policy();
+        let policy = RuntimeResourcePolicy {
+            max_actors: 2,
+            ..initial
+        };
+        let policy_request = private_runtime_management_request(
+            &descriptor,
+            0,
+            None,
+            crate::agent_sdk::PrivateRuntimeMutation::SetResourcePolicy(policy),
+        );
+        let policy_control = match &policy_request {
+            crate::agent_sdk::ManagementRequest::PrivateControl { control, .. } => {
+                control.commitment()
+            }
+            _ => unreachable!(),
+        };
+        let policy_receipt =
+            private_runtime_management_receipt(&descriptor, &policy_request, 1, 2, 10);
+        let mut state = apply_clean_management_test(
+            created,
+            &descriptor,
+            policy_request,
+            Some(policy_receipt),
+            2,
+        )
+        .state;
+
+        let install = clean_install_request(
+            &descriptor,
+            "provenance-churn",
+            None,
+            0xc1,
+            crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Merge),
+        );
+        let actor = install.entry.actor;
+        let deployment = install.entry.deployment;
+        let mut previous = policy_control;
+        for sequence in 1..=NON_POLICY_CONTROLS {
+            let mutation = if sequence == 1 {
+                crate::agent_sdk::PrivateRuntimeMutation::Install(install.clone())
+            } else if sequence % 2 == 0 {
+                crate::agent_sdk::PrivateRuntimeMutation::Suspend {
+                    actor,
+                    expected_deployment: deployment,
+                }
+            } else {
+                crate::agent_sdk::PrivateRuntimeMutation::Resume {
+                    actor,
+                    expected_deployment: deployment,
+                }
+            };
+            let request =
+                private_runtime_management_request(&descriptor, sequence, Some(previous), mutation);
+            previous = match &request {
+                crate::agent_sdk::ManagementRequest::PrivateControl { control, .. } => {
+                    control.commitment()
+                }
+                _ => unreachable!(),
+            };
+            let receipt = private_runtime_management_receipt(&descriptor, &request, 1, 3, 10);
+            let applied =
+                apply_clean_management_test(state, &descriptor, request, Some(receipt), 3);
+            assert!(matches!(
+                applied.outcome,
+                RuntimeOutcome::Management(Ok(ManagementReply::Installed(_)
+                    | ManagementReply::Suspended(_)
+                    | ManagementReply::Resumed(_)))
+            ));
+            state = applied.state;
+        }
+
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+        assert_eq!(
+            decoded.private_management_dispositions.len(),
+            super::super::standard::MAX_AUTHORITY_DISPOSITIONS
+        );
+        assert_eq!(decoded.active_resource_policy, Some(policy));
+        let retained_policy_rows = decoded
+            .private_management_dispositions
+            .iter()
+            .filter(|item| {
+                matches!(
+                    &item.result,
+                    Ok(ManagementReply::ResourcePolicySet(retained)) if *retained == policy
+                )
+            })
+            .count();
+        assert_eq!(retained_policy_rows, 1);
+        assert_eq!(
+            legacy_state_to_clean(encode_standard_runtime_state(&decoded)),
+            state,
+            "policy provenance and the bounded disposition selection survive reopen"
+        );
+        StandardAgentRuntime::restore(decoded.clone()).unwrap();
+
+        let mut altered_policy = decoded.clone();
+        altered_policy.active_resource_policy = Some(initial);
+        assert!(matches!(
+            StandardAgentRuntime::restore(altered_policy),
+            Err(super::super::LifecycleError::InvalidRequest)
+        ));
+
+        let policy_index = decoded
+            .private_management_dispositions
+            .iter()
+            .position(|item| matches!(&item.result, Ok(ManagementReply::ResourcePolicySet(_))))
+            .unwrap();
+        let mut altered_provenance = decoded.clone();
+        altered_provenance.private_management_dispositions[policy_index].result =
+            Ok(ManagementReply::ResourcePolicySet(initial));
+        assert!(matches!(
+            StandardAgentRuntime::restore(altered_provenance),
+            Err(super::super::LifecycleError::InvalidRequest)
+        ));
+
+        let mut missing_provenance = decoded;
+        missing_provenance
+            .private_management_dispositions
+            .remove(policy_index);
+        assert!(matches!(
+            StandardAgentRuntime::restore(missing_provenance),
+            Err(super::super::LifecycleError::InvalidRequest)
+        ));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn clean_management_retries_expiry_restart_and_authority_checks_are_exact() {
         use crate::agent_sdk::{
             ManagementError, ManagementReply, ManagementRequest, RuntimeOutcome,
